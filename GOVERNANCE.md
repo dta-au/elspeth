@@ -3,7 +3,7 @@
 ## Project Status
 
 ELSPETH is an open-source, MIT-licensed, high-assurance pipeline platform on the
-0.7.1 release line. The repository is maintained as a public
+0.8.0 release line. The repository is maintained as a public
 open-source project for evaluation and pilot-adoption planning. It does not
 claim a completed whole-platform independent assurance assessment.
 
@@ -47,10 +47,12 @@ Before a public release, the maintainer should confirm:
 
 ## Maintainer Continuity
 
-The current executive summary identifies maintainer continuity as a material
-residual risk. This governance file does not remove that risk. It makes the
-release authority and decision record explicit so future maintainers and
-adopting organisations can see where decisions are meant to land.
+ELSPETH operates in single-maintainer mode, recorded in
+`docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md`,
+and maintainer continuity is a material residual risk. This governance file
+does not remove that risk. It makes the release authority and decision record
+explicit so future maintainers and adopting organisations can see where
+decisions are meant to land.
 
 ## Security Governance
 

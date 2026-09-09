@@ -613,6 +613,8 @@ class TestHasRefResolveInvariant:
         from elspeth.web.secrets import service as service_module
 
         class _SlowCounter(int):
+            _delay_seconds: float
+
             def __new__(cls, value: int, delay_seconds: float):
                 obj = int.__new__(cls, value)
                 obj._delay_seconds = delay_seconds
@@ -810,3 +812,171 @@ class TestHasRefResolveInvariant:
         assert item.reason is None
         assert service.has_ref("u1", "TEST_KEY", auth_provider_type="local") is False
         assert service.resolve("u1", "TEST_KEY", auth_provider_type="local") is None
+
+
+class TestResolveScoped:
+    """``resolve_scoped`` reads exactly one store and shares ``resolve``'s
+    miss contract.
+
+    Every unresolvable condition collapses to ``None`` so that
+    ``resolve_secret_refs`` (core/secrets.py) can bucket all misses into one
+    ``SecretResolutionError`` — but the three conditions must stay
+    distinguishable to an operator: a missing fingerprint key and an
+    undecryptable row each emit their own rate-limited breadcrumb
+    (``_log_fingerprint_missing_rate_limited`` /
+    ``_log_secret_decryption_rate_limited``), while genuine absence emits
+    nothing.  None of them may ever surface as a success, and no scope may
+    fall through to another store.
+    """
+
+    @staticmethod
+    def _reset_breadcrumb_state(monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.secrets import service as service_module
+
+        monkeypatch.setattr(service_module, "_fingerprint_missing_last_logged_at", None)
+        monkeypatch.setattr(service_module, "_fingerprint_missing_suppressed", 0)
+        monkeypatch.setattr(service_module, "_secret_decryption_last_logged_at", None)
+        monkeypatch.setattr(service_module, "_secret_decryption_suppressed", 0)
+
+    def test_each_scope_reads_only_its_own_store(
+        self,
+        service: WebSecretService,
+        user_store: UserSecretStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Same name in both stores: the operator-selected scope decides, no shadowing."""
+        monkeypatch.setenv("TEST_KEY", "server-val")
+        user_store.set_secret("TEST_KEY", value="user-val", user_id="u1", auth_provider_type="local")
+
+        user_result = service.resolve_scoped("u1", "TEST_KEY", "user", auth_provider_type="local")
+        assert user_result is not None
+        assert user_result.scope == "user"
+        assert user_result.value == "user-val"
+
+        server_result = service.resolve_scoped("u1", "TEST_KEY", "server", auth_provider_type="local")
+        assert server_result is not None
+        assert server_result.scope == "server"
+        assert server_result.value == "server-val"
+
+    def test_scope_mismatch_never_falls_through_to_the_other_store(
+        self,
+        service: WebSecretService,
+        user_store: UserSecretStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A user-only secret asked for as server (and vice versa) is absent, not borrowed."""
+        from elspeth.web.secrets import service as service_module
+
+        self._reset_breadcrumb_state(monkeypatch)
+        user_store.set_secret("USER_ONLY", value="user-val", user_id="u1", auth_provider_type="local")
+        monkeypatch.setenv("TEST_KEY", "server-val")
+
+        with patch.object(service_module, "_slog") as mock_slog:
+            assert service.resolve_scoped("u1", "USER_ONLY", "server", auth_provider_type="local") is None
+            assert service.resolve_scoped("u1", "TEST_KEY", "user", auth_provider_type="local") is None
+
+        # Absence is absence: no deployment-error breadcrumb for a plain miss.
+        assert mock_slog.error.call_count == 0
+
+    def test_org_scope_has_no_store_and_never_resolves(
+        self,
+        service: WebSecretService,
+        user_store: UserSecretStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``org`` is a declared SecretScope with no backing store: absent in both."""
+        from elspeth.web.secrets import service as service_module
+
+        self._reset_breadcrumb_state(monkeypatch)
+        monkeypatch.setenv("TEST_KEY", "server-val")
+        user_store.set_secret("TEST_KEY", value="user-val", user_id="u1", auth_provider_type="local")
+
+        with patch.object(service_module, "_slog") as mock_slog:
+            assert service.resolve_scoped("u1", "TEST_KEY", "org", auth_provider_type="local") is None
+
+        assert mock_slog.error.call_count == 0
+
+    def test_absent_secret_returns_none_with_no_breadcrumb(
+        self,
+        service: WebSecretService,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SecretNotFoundError from either store is the honest 'absent' outcome."""
+        from elspeth.web.secrets import service as service_module
+
+        self._reset_breadcrumb_state(monkeypatch)
+
+        with patch.object(service_module, "_slog") as mock_slog:
+            assert service.resolve_scoped("u1", "NONEXISTENT", "user", auth_provider_type="local") is None
+            assert service.resolve_scoped("u1", "NONEXISTENT", "server", auth_provider_type="local") is None
+
+        assert mock_slog.error.call_count == 0
+
+    @pytest.mark.parametrize("scope", ["user", "server"])
+    def test_missing_fingerprint_key_returns_none_and_emits_fingerprint_breadcrumb(
+        self,
+        service: WebSecretService,
+        user_store: UserSecretStore,
+        monkeypatch: pytest.MonkeyPatch,
+        scope: str,
+    ) -> None:
+        """FingerprintKeyMissingError is recorded distinctly from absence and decryption failure."""
+        from elspeth.web.secrets import service as service_module
+
+        self._reset_breadcrumb_state(monkeypatch)
+        monkeypatch.setenv("TEST_KEY", "server-val")
+        user_store.set_secret("TEST_KEY", value="user-val", user_id="u1", auth_provider_type="local")
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY")
+
+        with patch.object(service_module, "_slog") as mock_slog:
+            result = service.resolve_scoped("u1", "TEST_KEY", scope, auth_provider_type="local")  # type: ignore[arg-type]
+
+        assert result is None
+        assert mock_slog.error.call_count == 1
+        args, kwargs = mock_slog.error.call_args_list[0]
+        assert args[0] == "secret_resolve_fingerprint_key_missing"
+        assert "ELSPETH_FINGERPRINT_KEY" in kwargs["detail"]
+
+    def test_undecryptable_user_row_returns_none_and_emits_decryption_breadcrumb(
+        self,
+        engine: sa.engine.Engine,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SecretDecryptionError is recorded distinctly, and a same-named server secret is NOT substituted."""
+        from elspeth.web.secrets import service as service_module
+
+        self._reset_breadcrumb_state(monkeypatch)
+        monkeypatch.setenv("TEST_KEY", "server-val")
+        writer_store = UserSecretStore(engine=engine, master_key="test-master-key-32chars-minimum!")
+        writer_store.set_secret("TEST_KEY", value="user-val", user_id="u1", auth_provider_type="local")
+
+        rotated_service = WebSecretService(
+            user_store=UserSecretStore(engine=engine, master_key="rotated-master-key"),
+            server_store=ServerSecretStore(allowlist=("TEST_KEY",)),
+        )
+
+        with patch.object(service_module, "_slog") as mock_slog:
+            result = rotated_service.resolve_scoped("u1", "TEST_KEY", "user", auth_provider_type="local")
+
+        assert result is None
+        assert mock_slog.error.call_count == 1
+        args, kwargs = mock_slog.error.call_args_list[0]
+        assert args[0] == "secret_resolve_decryption_failed"
+        assert "cannot be decrypted" in kwargs["detail"]
+
+    def test_binds_auth_provider_for_resolve_scoped(
+        self,
+        service: WebSecretService,
+        user_store: UserSecretStore,
+    ) -> None:
+        """resolve_scoped through the adapter uses the bound auth_provider_type."""
+        from elspeth.web.secrets.service import ScopedSecretResolver
+
+        user_store.set_secret("KEY", value="secret-val", user_id="u1", auth_provider_type="oidc")
+        oidc_resolver = ScopedSecretResolver(service, auth_provider_type="oidc")
+        local_resolver = ScopedSecretResolver(service, auth_provider_type="local")
+
+        result = oidc_resolver.resolve_scoped("u1", "KEY", "user")
+        assert result is not None
+        assert result.value == "secret-val"
+        assert local_resolver.resolve_scoped("u1", "KEY", "user") is None

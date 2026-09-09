@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts import NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.sink_effects import SinkEffectInputKind, SinkEffectMember, SinkEffectMemberCandidate, SinkEffectRole
 from elspeth.core.landscape.database import LandscapeDB
@@ -32,7 +32,7 @@ from elspeth.core.landscape.schema import (
     sink_effect_members_table,
     sink_effects_table,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, register_test_node
 
 
 @pytest.fixture
@@ -108,8 +108,12 @@ def test_pipeline_reservation_is_idempotent_under_reverse_arrival(db_factory: tu
     db, factory = db_factory
     run_id, sink_id, members = _pipeline_members(factory)
 
-    first = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, tuple(reversed(members))))
-    second = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+    first = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, tuple(reversed(members))), coordination_token=leader_coordination_token(factory, run_id)
+    )
+    second = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    )
 
     assert isinstance(first, SinkEffectReservationResult)
     assert first.new_effect is not None
@@ -132,6 +136,27 @@ def test_pipeline_reservation_is_idempotent_under_reverse_arrival(db_factory: tu
         assert conn.scalar(select(func.count()).select_from(operations_table)) == 1
 
 
+def test_pipeline_reservation_refuses_terminal_run_before_effect_mutation(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    db, factory = db_factory
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    factory.run_lifecycle.finalize_run(
+        RunStatus.FAILED,
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
+
+    with pytest.raises(ValueError, match="terminal run status"):
+        factory.execution.sink_effects.reserve(
+            _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+        )
+
+    with db.read_only_connection() as conn:
+        assert conn.scalar(select(func.count()).select_from(sink_effects_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(sink_effect_members_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(operations_table)) == 0
+
+
 @pytest.mark.parametrize("terminal_status", (NodeStateStatus.COMPLETED, NodeStateStatus.FAILED))
 def test_pipeline_reservation_refuses_non_open_latest_sink_state_before_mutation(
     db_factory: tuple[LandscapeDB, RecorderFactory],
@@ -151,7 +176,9 @@ def test_pipeline_reservation_refuses_non_open_latest_sink_state_before_mutation
         )
 
     with pytest.raises(ValueError, match="latest sink-node state must be open"):
-        factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+        factory.execution.sink_effects.reserve(
+            _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+        )
 
     with db.read_only_connection() as conn:
         assert conn.scalar(select(func.count()).select_from(sink_effects_table)) == 0
@@ -162,8 +189,12 @@ def test_pipeline_reservation_refuses_non_open_latest_sink_state_before_mutation
 def test_overlap_partitions_finalized_open_and_unbound_members(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
     db, factory = db_factory
     run_id, sink_id, members = _pipeline_members(factory, 4)
-    finalized = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1])).new_effect
-    opened = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:3])).new_effect
+    finalized = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1]), coordination_token=leader_coordination_token(factory, run_id)
+    ).new_effect
+    opened = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:3]), coordination_token=leader_coordination_token(factory, run_id)
+    ).new_effect
     assert finalized is not None and opened is not None
     now = datetime.now(UTC)
     with db.engine.begin() as conn:
@@ -187,7 +218,9 @@ def test_overlap_partitions_finalized_open_and_unbound_members(db_factory: tuple
             )
         )
 
-    result = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+    result = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    )
 
     assert result.finalized_effect_ids == (finalized.effect_id,)
     assert result.open_effect_ids == (opened.effect_id,)
@@ -198,7 +231,9 @@ def test_overlap_partitions_finalized_open_and_unbound_members(db_factory: tuple
 def test_existing_member_lineage_divergence_fails_closed(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
     _db, factory = db_factory
     run_id, sink_id, members = _pipeline_members(factory, 1)
-    factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+    factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    )
     divergent_lineage = "[[0,[]]]"
     divergent = replace(
         members[0],
@@ -207,14 +242,22 @@ def test_existing_member_lineage_divergence_fails_closed(db_factory: tuple[Lands
     )
 
     with pytest.raises(ValueError, match="divergent"):
-        factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, (divergent,)))
+        factory.execution.sink_effects.reserve(
+            _pipeline_request(run_id, sink_id, (divergent,)), coordination_token=leader_coordination_token(factory, run_id)
+        )
 
 
 def test_replacing_target_allocates_monotonic_stream_predecessors(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
     _db, factory = db_factory
     run_id, sink_id, members = _pipeline_members(factory, 2)
-    first = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
-    second = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    first = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
+    second = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
 
     assert first is not None and second is not None
     assert (first.stream_sequence, first.predecessor_effect_id) == (0, None)
@@ -311,14 +354,49 @@ def test_export_reservation_is_zero_member_and_idempotent(db_factory: tuple[Land
         primary_effect_id=None,
     )
 
-    first = factory.execution.sink_effects.reserve(request)
-    second = factory.execution.sink_effects.reserve(request)
+    first = factory.execution.sink_effects.reserve(request, coordination_token=leader_coordination_token(factory, run_id))
+    second = factory.execution.sink_effects.reserve(request, coordination_token=leader_coordination_token(factory, run_id))
 
     assert first.new_effect is not None
     assert second.new_effect is None
     assert second.open_effect_ids == (first.new_effect.effect_id,)
     assert factory.execution.sink_effects.get_members(first.new_effect.effect_id) == ()
     with db.read_only_connection() as conn:
+        assert conn.scalar(select(func.count()).select_from(sink_effect_export_snapshots_table)) == 1
+
+
+def test_export_reservation_rejects_a_different_target_identity_for_the_same_run(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    db, factory = db_factory
+    run_id, sink_id, _members = _pipeline_members(factory, 1)
+    snapshot_id = _insert_snapshot(db, run_id)
+    original = SinkEffectReservationRequest(
+        run_id=run_id,
+        sink_node_id=sink_id,
+        role=SinkEffectRole.PRIMARY,
+        input_kind=SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT,
+        requested_target_hash="c" * 64,
+        members=(),
+        audit_export_snapshot_id=snapshot_id,
+        config_hash="c" * 64,
+        replacing_target=False,
+        primary_effect_id=None,
+    )
+    factory.execution.sink_effects.reserve(original, coordination_token=leader_coordination_token(factory, run_id))
+
+    with pytest.raises(ValueError, match="target identity"):
+        factory.execution.sink_effects.reserve(
+            replace(
+                original,
+                requested_target_hash="d" * 64,
+                config_hash="d" * 64,
+            ),
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+
+    with db.read_only_connection() as conn:
+        assert conn.scalar(select(func.count()).select_from(sink_effects_table)) == 1
         assert conn.scalar(select(func.count()).select_from(sink_effect_export_snapshots_table)) == 1
 
 
@@ -341,10 +419,20 @@ def test_concurrent_export_reservation_reuses_one_effect_and_association(
         primary_effect_id=None,
     )
     second = make_factory(db)
+    # BOTH seats are read BEFORE any task starts, and that ordering is required.
+    # `pool.submit` starts task 1 immediately, so evaluating the second token as a
+    # submit ARGUMENT reads the seat while task 1 is inside its fenced write
+    # transaction. `live_leader` opens its own connection for that read, and under
+    # SQLite's StaticPool the "new" connection is the SAME DBAPI connection, so the
+    # read autobegins inside an open transaction: "cannot start a transaction within
+    # a transaction". A real pool hands out a distinct connection, so this is a
+    # property of the in-memory test harness rather than of the fence.
+    first_token = leader_coordination_token(factory, run_id)
+    second_token = leader_coordination_token(second, run_id)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = (
-            pool.submit(factory.execution.sink_effects.reserve, request),
-            pool.submit(second.execution.sink_effects.reserve, request),
+            pool.submit(factory.execution.sink_effects.reserve, request, coordination_token=first_token),
+            pool.submit(second.execution.sink_effects.reserve, request, coordination_token=second_token),
         )
         results = tuple(future.result(timeout=5) for future in futures)
 
@@ -401,10 +489,14 @@ def test_pipeline_reservation_chunks_reads_beyond_parameter_ceiling(db_factory: 
     count = _TOKEN_ID_CHUNK_SIZE + 100
     run_id, sink_id, members = _pipeline_members(factory, count=count)
 
-    first = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+    first = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    )
     assert first.new_effect is not None
 
-    second = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+    second = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    )
     assert second.new_effect is None
     assert second.open_effect_ids == (first.new_effect.effect_id,)
     with db.read_only_connection() as conn:

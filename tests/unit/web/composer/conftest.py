@@ -6,7 +6,7 @@ resolve ``dict[str, typing.Any]`` (raised as ``InvalidArgument`` at example
 generation), and several MANIFEST argument models use ``Annotated[dict[str,
 Any], Sensitive(summarizer=...)]`` for option/slot/patch fields.
 
-Two distinct Hypothesis-resolution issues are addressed here:
+Three distinct Hypothesis-resolution issues are addressed here:
 
 1.  **``dict[str, Any]`` resolution.**  Hypothesis cannot generate values for
     ``typing.Any`` because there is no runtime instance of ``Any``.  We register
@@ -24,7 +24,14 @@ Two distinct Hypothesis-resolution issues are addressed here:
     ``Field(default_factory=dict)`` so the sentinel arm never appears in the
     generation strategy.
 
-**Why the 4 overrides are not auto-generated.**  Each ``st.builds(...)``
+3.  **Cross-field source selection.** ``SetPipelineArgumentsModel`` requires
+    exactly one of ``source`` or ``sources`` to be supplied and non-null.
+    Hypothesis cannot infer that ``model_validator`` contract from the field
+    annotations, so its default strategy generates invalid neither/both
+    combinations. An explicit top-level strategy chooses one branch and omits
+    the other field entirely.
+
+**Why the overrides are not auto-generated.**  Each ``st.builds(...)``
 override below carries **load-bearing per-field customizations** beyond the
 ``options`` sentinel issue.  For example, ``_set_pipeline_source_strategy``
 narrows ``inline_blob`` to ``st.one_of(st.none(), st.from_type(_InlineBlobModel))``
@@ -68,11 +75,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args, get_origin
 from unittest.mock import MagicMock
-from uuid import uuid4
 
 import hypothesis.strategies as st
 import pytest
@@ -83,6 +88,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.core.config import validate_runtime_node_name
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
@@ -90,7 +96,9 @@ from elspeth.web.composer import tools as tools_module
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
+    SetSourceFromBlobsArgumentsModel,
     ToolRedaction,
     _InlineBlobModel,
     _NodeTriggerModel,
@@ -109,10 +117,11 @@ from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.config import WebSettings
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.composer_lease import install_fenced_compose_adapter
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _dict_strategy(thing: type) -> st.SearchStrategy[dict[Any, Any]]:
@@ -186,6 +195,16 @@ def _set_source_from_blob_strategy() -> st.SearchStrategy[SetSourceFromBlobArgum
     )
 
 
+def _set_source_from_blobs_strategy() -> st.SearchStrategy[SetSourceFromBlobsArgumentsModel]:
+    return st.builds(
+        SetSourceFromBlobsArgumentsModel,
+        blob_ids=st.lists(st.text(), min_size=1, max_size=5),
+        on_success=st.text(),
+        on_validation_failure=st.one_of(st.none(), st.text()),
+        options=_OPTIONS_STRATEGY,
+    )
+
+
 def _set_pipeline_source_strategy() -> st.SearchStrategy[_SetPipelineSourceModel]:
     return st.builds(
         _SetPipelineSourceModel,
@@ -208,6 +227,32 @@ def _set_pipeline_named_source_strategy() -> st.SearchStrategy[_SetPipelineNamed
     )
 
 
+@st.composite
+def _set_pipeline_arguments_strategy(draw: st.DrawFn) -> SetPipelineArgumentsModel:
+    """Generate only the model's exactly-one-source-selection contract."""
+    common = {
+        "nodes": draw(st.lists(st.from_type(_PipelineNodeModel), max_size=3)),
+        "edges": draw(st.lists(st.from_type(_PipelineEdgeModel), max_size=3)),
+        "outputs": draw(st.lists(st.from_type(_PipelineOutputModel), max_size=3)),
+        "metadata": draw(st.one_of(st.none(), st.from_type(_PipelineMetadataModel))),
+    }
+    if draw(st.booleans()):
+        return SetPipelineArgumentsModel(
+            source=draw(st.from_type(_SetPipelineSourceModel)),
+            **common,
+        )
+    return SetPipelineArgumentsModel(
+        sources=draw(
+            st.dictionaries(
+                st.text(),
+                st.from_type(_SetPipelineNamedSourceModel),
+                max_size=3,
+            )
+        ),
+        **common,
+    )
+
+
 def _pipeline_node_strategy() -> st.SearchStrategy[_PipelineNodeModel]:
     return st.builds(
         _PipelineNodeModel,
@@ -216,7 +261,7 @@ def _pipeline_node_strategy() -> st.SearchStrategy[_PipelineNodeModel]:
         input=st.text(),
         plugin=st.one_of(st.none(), st.text()),
         on_success=st.one_of(st.none(), st.text()),
-        on_error=st.one_of(st.none(), st.text()),
+        on_error=st.one_of(st.none(), st.text(min_size=1)),
         options=_OPTIONS_STRATEGY,
         condition=st.one_of(st.none(), st.text()),
         # F3: ``routes`` is now ``dict[str, str]`` (route-label → sink/connection
@@ -247,10 +292,18 @@ def _pipeline_output_strategy() -> st.SearchStrategy[_PipelineOutputModel]:
     )
 
 
+def _is_runtime_node_name(value: str) -> bool:
+    try:
+        validate_runtime_node_name(value, field_label="Transform name")
+    except ValueError:
+        return False
+    return True
+
+
 def _splice_transform_node_strategy() -> st.SearchStrategy[_SpliceTransformNodeModel]:
     return st.builds(
         _SpliceTransformNodeModel,
-        id=st.text(),
+        id=st.from_regex(r"[a-zA-Z][a-zA-Z0-9_-]{0,37}", fullmatch=True).filter(_is_runtime_node_name),
         plugin=st.text(),
         options=_OPTIONS_STRATEGY,
         on_error=st.one_of(st.none(), st.text()),
@@ -286,23 +339,28 @@ def _repair_tool_call_strategy() -> st.SearchStrategy[_RepairToolCallShadowModel
 
 
 st.register_type_strategy(SetSourceFromBlobArgumentsModel, _set_source_from_blob_strategy())
+st.register_type_strategy(SetSourceFromBlobsArgumentsModel, _set_source_from_blobs_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
 st.register_type_strategy(_PipelineOutputModel, _pipeline_output_strategy())
 st.register_type_strategy(_SpliceTransformNodeModel, _splice_transform_node_strategy())
 st.register_type_strategy(_RepairToolCallShadowModel, _repair_tool_call_strategy())
+st.register_type_strategy(SetPipelineArgumentsModel, _set_pipeline_arguments_strategy())
 
 
-# Mirror of the four explicit ``st.register_type_strategy`` calls above.  This
+# Mirror of the default-factory ``st.register_type_strategy`` calls above. This
 # tuple is the single source of truth that the drift guard consults — if you
 # add a new ``st.register_type_strategy(Model, ...)`` for a model with
 # ``Field(default_factory=dict)``, you MUST add ``Model`` to this tuple in the
 # same edit.  Conversely, adding a new MANIFEST model with
 # ``Field(default_factory=dict)`` and forgetting an override here will cause
-# the drift guard to raise at conftest import time.
+# the drift guard to raise at conftest import time. The cross-field
+# ``SetPipelineArgumentsModel`` override has no default-factory dict field and
+# is intentionally outside this narrower inventory.
 _OVERRIDE_REGISTERED_MODELS: tuple[type[BaseModel], ...] = (
     SetSourceFromBlobArgumentsModel,
+    SetSourceFromBlobsArgumentsModel,
     _SetPipelineSourceModel,
     _SetPipelineNamedSourceModel,
     _PipelineNodeModel,
@@ -503,7 +561,9 @@ def _fake_llm_response(
                 id=str(call["id"]),
                 function=_FakeFunction(
                     name=str(call["name"]),
-                    arguments=json.dumps(call.get("arguments", {})),
+                    arguments=json.dumps(
+                        {"pipeline": call.get("arguments", {})} if call["name"] == "set_pipeline" else call.get("arguments", {})
+                    ),
                 ),
             )
             for call in tool_calls
@@ -600,23 +660,16 @@ def _composer_available_for_phase3(monkeypatch: pytest.MonkeyPatch) -> None:
 def result_session_id(composer_service_with_real_sessions: ComposerServiceImpl) -> str:
     """Session id used by ``_run_one_turn_for_test`` result assertions."""
 
-    session_id = str(uuid4())
-    now = datetime.now(UTC)
     sessions_service = composer_service_with_real_sessions._sessions_service
-    with sessions_service._engine.begin() as conn:
-        conn.execute(
-            sessions_table.insert().values(
-                id=session_id,
-                user_id="phase3-test-user",
-                auth_provider_type="local",
-                title="Phase 3 test session",
-                trust_mode="auto_commit",
-                density_default="high",
-                created_at=now,
-                updated_at=now,
-            )
-        )
-    return session_id
+    assert sessions_service is not None
+    session = sessions_service.session_operation_authority.create_session_with_initial_fence(
+        user_id="phase3-test-user",
+        auth_provider_type="local",
+        title="Phase 3 test session",
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    return str(session.id)
 
 
 def build_test_sessions_service(
@@ -638,7 +691,7 @@ def build_test_sessions_service(
     )
     if engine is None:
         initialize_session_schema(resolved_engine)
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         resolved_engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),
@@ -692,10 +745,10 @@ def fake_llm_two_tool_calls(fake_llm_emitting_n_tool_calls: Any) -> _FakeCompose
 
 
 @pytest.fixture
-def fake_llm_one_set_pipeline_tool_call(tmp_path: Path) -> _FakeComposeLLM:
+def fake_llm_one_set_pipeline_tool_call(tmp_path: Path, result_session_id: str) -> _FakeComposeLLM:
     """Fake LLM that proposes one valid full-pipeline replacement."""
 
-    input_path = tmp_path / "blobs" / "input.csv"
+    input_path = tmp_path / "blobs" / result_session_id / "input.csv"
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text("value\n1\n", encoding="utf-8")
 
@@ -711,7 +764,7 @@ def fake_llm_one_set_pipeline_tool_call(tmp_path: Path) -> _FakeComposeLLM:
                                 "plugin": "csv",
                                 "on_success": "source_out",
                                 "options": {"path": str(input_path), "schema": {"mode": "observed"}},
-                                "on_validation_failure": "quarantine",
+                                "on_validation_failure": "discard",
                             },
                             "nodes": [
                                 {
@@ -738,7 +791,7 @@ def fake_llm_one_set_pipeline_tool_call(tmp_path: Path) -> _FakeComposeLLM:
                                     "sink_name": "main",
                                     "plugin": "csv",
                                     "options": {
-                                        "path": str(tmp_path / "outputs" / "output.csv"),
+                                        "path": str(tmp_path / "outputs" / result_session_id / "output.csv"),
                                         "schema": {"mode": "observed"},
                                         "mode": "write",
                                         "collision_policy": "auto_increment",
@@ -757,7 +810,7 @@ def fake_llm_one_set_pipeline_tool_call(tmp_path: Path) -> _FakeComposeLLM:
 
 
 @pytest.fixture
-def fake_llm_create_blob_then_set_pipeline(tmp_path: Path) -> _FakeComposeLLM:
+def fake_llm_create_blob_then_set_pipeline(tmp_path: Path, result_session_id: str) -> _FakeComposeLLM:
     """Fake LLM that emits a create_blob proposal followed by a set_pipeline.
 
     Reproduces the live-staging failure shape from session
@@ -774,13 +827,13 @@ def fake_llm_create_blob_then_set_pipeline(tmp_path: Path) -> _FakeComposeLLM:
     valid set_pipeline becomes a pending proposal awaiting operator approval.
     """
 
-    input_path = tmp_path / "blobs" / "agency_urls.csv"
+    input_path = tmp_path / "blobs" / result_session_id / "agency_urls.csv"
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text(
         "url\nhttps://www.example.gov\nhttps://www.example2.gov\n",
         encoding="utf-8",
     )
-    output_path = tmp_path / "outputs" / "review.csv"
+    output_path = tmp_path / "outputs" / result_session_id / "review.csv"
 
     return _FakeComposeLLM(
         (
@@ -1151,3 +1204,11 @@ def inject_IntegrityError_on_chat_messages(monkeypatch: pytest.MonkeyPatch) -> N
         return original_insert(self, *args, **kwargs)
 
     monkeypatch.setattr(SessionServiceImpl, "_insert_chat_message", _raise_for_chat_messages)
+
+
+@pytest.fixture(autouse=True)
+def _fenced_compose_for_legacy_tests(monkeypatch):
+    """Legacy compose() / _run_one_turn_for_test callers that name a session but
+    carry no session-operation context acquire an exact, short-lived COMPOSE
+    lease (the shared adapter in tests/helpers/composer_lease.py)."""
+    install_fenced_compose_adapter(monkeypatch)

@@ -1,0 +1,9 @@
+// Fence conflicts: the 409 body "Session operation is already active"
+// (src/elspeth/web/app.py) joined to the two replica names of the probe
+// window. P1 expects exactly one 409 per trial.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated between (datetime(__WINDOW_START__) .. datetime(__WINDOW_END__))
+| where ContainerAppName_s == "__APP_NAME__"
+| where Log_s has "Session operation is already active"
+| summarize Conflicts = count() by RevisionName_s, ContainerGroupName_g
+| order by RevisionName_s asc

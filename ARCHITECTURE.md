@@ -2,31 +2,31 @@
 
 C4 model documentation for the ELSPETH auditable pipeline framework.
 
-**Last Updated:** 2026-07-23 (synchronized with 0.7.1 release line)
-**Framework Version:** 0.7.1 (package metadata aligned at 0.7.1)
+**Last Updated:** 2026-09-08 (synchronized with 0.8.0 release line)
+**Framework Version:** 0.8.0 (package metadata aligned at 0.8.0)
 **Status:** Pre-release
 
 ---
 
 ## At a Glance
 
-| Question | Answer |
-|----------|--------|
-| **What is ELSPETH?** | Auditable Sense/Decide/Act pipeline framework with YAML, CLI/TUI, and Web Composer authoring surfaces |
+ | Question | Answer |
+ | ---------- | -------- |
+ | **What is ELSPETH?** | Auditable Sense/Decide/Act pipeline framework with YAML, CLI/TUI, and Web Composer authoring surfaces |
 | **Core subsystems?** | 11 major subsystems (20+ including sub-components) across 5 architectural tiers |
 | **Data flow?** | Source → Transforms/Gates → Sinks (all recorded) |
 | **Audit storage?** | SQLite/SQLCipher (dev) / PostgreSQL (prod) |
 | **Extension model?** | pluggy-based plugin system |
-| **Production LOC** | ~310,600 Python lines across 667 files in `src/elspeth/` (frontend TSX/CSS counts not included) |
-| **Test LOC** | ~727,300 Python lines across 1,565 files (2.3:1 ratio) |
+| **Production LOC** | ~455,000 Python lines across 805 files in `src/elspeth/` (frontend TSX/CSS and the standalone `gateway/` package not included) |
+| **Test LOC** | ~1,160,500 Python lines across 2,093 files (2.55:1 ratio) |
 
 ---
 
 ## How to Read This Document
 
-| Audience | Start Here |
-|----------|------------|
-| **New developers** | [System Context](#level-1-system-context-diagram) → [Container Diagram](#level-2-container-diagram) → [Quality Assessment](#quality-assessment) |
+ | Audience | Start Here |
+ | ---------- | ------------ |
+ | **New developers** | [System Context](#level-1-system-context-diagram) → [Container Diagram](#level-2-container-diagram) → [Quality Assessment](#quality-assessment) |
 | **Plugin authors** | [Plugins Components](#33-plugins-components) → [Schema Contract Validation](#schema-contract-validation-flow) |
 | **Engine contributors** | [Engine Components](#31-engine-components) → [Pipeline Execution Flow](#pipeline-execution-flow) → [Fork/Join Processing](#forkjoin-processing-flow) |
 | **Operators** | [Deployment View](#deployment-view) → [Telemetry Flow](#telemetry-flow-diagram) |
@@ -71,21 +71,31 @@ C4Context
 
     System(elspeth, "ELSPETH", "Auditable Sense/Decide/Act pipeline framework with CLI and Web Composer authoring")
 
-    System_Ext(datasources, "Data Sources", "CSV, JSON, APIs, databases")
+    System_Ext(datasources, "Data Sources", "CSV, JSON, APIs, databases, S3, Azure Blob")
     System_Ext(destinations, "Data Destinations", "Files, databases, message queues")
-    System_Ext(llm, "LLM Providers", "Azure OpenAI, OpenRouter")
+    System_Ext(llm, "LLM Providers", "Azure OpenAI, OpenRouter, AWS Bedrock")
+    System_Ext(gateway, "LLM Compatibility Gateway", "Separately deployed elspeth-llm-gateway service")
 
     Rel(operator, elspeth, "Authors and executes pipelines", "CLI/YAML or authenticated Web Composer")
     Rel(auditor, elspeth, "Queries lineage", "CLI/TUI/MCP")
     Rel(elspeth, datasources, "Reads data from", "Various protocols")
     Rel(elspeth, destinations, "Writes data to", "Various protocols")
     Rel(elspeth, llm, "Calls for decisions", "HTTP/API")
+    Rel(elspeth, gateway, "Calls for decisions", "OpenAI Chat Completions subset over HTTP")
+    Rel(gateway, llm, "Translates to the organisation's own invoke API", "HTTP + OAuth2")
 ```
+
+**On the gateway.** `gateway/` is a standalone package (`elspeth-llm-gateway`)
+with its own `pyproject.toml`, test suite, and container image. It is not part
+of the `elspeth` wheel and nothing under `src/elspeth/` imports it: ELSPETH
+reaches it over HTTP like any other OpenAI-compatible endpoint, through the
+`gateway` LLM provider. It therefore appears here as an external system rather
+than inside the container boundary below.
 
 **Key relationships:**
 
 | Actor/System | Interaction |
-|--------------|-------------|
+| -------------- | ------------- |
 | Pipeline Operator | Authors YAML or uses Web Composer, executes pipelines, and monitors runs |
 | Auditor | Queries lineage through CLI, TUI, or MCP and verifies decisions |
 | Data Sources | CSV, JSON, APIs - read by Source plugins |
@@ -156,26 +166,30 @@ C4Container
 ### Container Responsibilities
 
 | Container | Technology | LOC | Purpose |
-|-----------|------------|-----|---------|
-| **CLI** | Typer | ~2,200 | User commands: `run`, `explain`, `validate`, `resume` |
-| **Web app + Composer** | FastAPI + React | ~133,700 Python | Authenticated sessions, guided/freeform authoring, validation, execution, and review |
-| **TUI** | Textual | ~800 | Interactive lineage exploration |
-| **MCP Server** | Python | ~3,600 | Read-only analysis API with domain-specific analyzers |
-| **Engine** | Python | ~32,300 | Run lifecycle, durable scheduling, DAG execution, and effect coordination |
-| **Plugins** | pluggy | ~47,700 | Extensible sources, transforms, effect-safe sinks, LLM providers, and clients |
-| **Landscape** | SQLAlchemy Core | ~32,100 | Audit repositories, durable work/effect ledgers, querying, export, and SQLCipher support |
+| ----------- | ------------ | ----- | --------- |
+| **CLI** | Typer | ~4,900 | User commands: `run`, `explain`, `validate`, `resume` |
+| **Web app + Composer** | FastAPI + React | ~231,700 Python | Authenticated sessions, guided/freeform authoring, validation, execution, and review |
+| **TUI** | Textual | ~2,300 | Interactive lineage exploration |
+| **MCP Server** | Python | ~4,800 | Read-only analysis API with domain-specific analyzers |
+| **Engine** | Python | ~42,400 | Run lifecycle, durable scheduling, DAG execution, and effect coordination |
+| **Plugins** | pluggy | ~65,400 | Extensible sources, transforms, effect-safe sinks, LLM providers, and clients |
+| **Landscape** | SQLAlchemy Core | ~37,400 | Audit repositories, durable work/effect ledgers, querying, export, and SQLCipher support |
 | **Testing** (`src/elspeth/testing/`) | Python | ~900 | `elspeth-xdist-auto` pytest plugin shipped inside the `elspeth` package — distinct from the project's own `tests/` test suite, which is not part of the shipped package and is where the ChaosLLM / ChaosWeb / ChaosEngine test fixtures live |
-| **Telemetry** | Python | ~1,200 | Real-time event export (OTLP, Datadog, Azure Monitor) |
-| **Checkpoint** | Python | ~600 | Crash recovery with topology validation |
-| **Rate Limiting** | pyrate-limiter | ~300 | External call throttling with persistence |
-| **Core** | Python | ~5,000 | Config, canonical JSON, DAG package, payload store |
-| **Contracts** | Python | ~28,300 | Shared dataclasses, enums, protocols (leaf module) |
-| **Audit DB** | SQLite/SQLCipher/PostgreSQL | — | Complete audit trail and effect storage (41 tables; SQLite schema epoch 29) |
+| **Telemetry** | Python | ~3,800 | Real-time event export (OTLP, Datadog, Azure Monitor) |
+| **Checkpoint** | Python | ~2,400 | Crash recovery with topology validation |
+| **Rate Limiting** | pyrate-limiter | ~500 | External call throttling with persistence |
+| **Core** | Python | ~23,400 | Config, canonical JSON, DAG package, payload store |
+| **Contracts** | Python | ~33,000 | Shared dataclasses, enums, protocols (leaf module) |
+| **Audit DB** | SQLite/SQLCipher/PostgreSQL | — | Complete audit trail and effect storage (46 tables; SQLite schema epoch 38) |
 | **Payload Store** | Filesystem | — | Content-addressable blob storage with retention |
 
-**Inventory measured from committed `HEAD` on 2026-07-23:** ~310,600 production
-Python lines across 667 files in `src/elspeth/`; ~727,300 test Python lines across 1,565 files
-(2.3:1). Frontend TypeScript and CSS are not included.
+**Inventory measured from committed `HEAD` on 2026-09-08 (`wc -l` over tracked
+`.py` files):** ~455,000 production Python lines across 805 files in
+`src/elspeth/`; ~1,160,500 test Python lines across 2,093 files (2.55:1).
+Per-container counts above use the same instrument, and **Core** excludes
+`core/landscape`, `core/checkpoint`, and `core/rate_limit`, which carry their
+own rows. Frontend TypeScript and CSS are not included, nor is the standalone
+`gateway/` package.
 
 ---
 
@@ -216,12 +230,12 @@ C4Component
 ```
 
 | Component | File | LOC | Responsibility |
-|-----------|------|-----|----------------|
-| **Orchestrator** | `orchestrator/` | ~3,500 | Begin run → register nodes/edges → process rows → complete run |
-| **RowProcessor** | `processor.py` | ~1,860 | Work queue-based DAG traversal, fork/join handling |
+| ----------- | ------ | ----- | ---------------- |
+| **Orchestrator** | `orchestrator/` | ~14,055 | Begin run → register nodes/edges → process rows → complete run |
+| **RowProcessor** | `processor.py` | ~5,546 | Work queue-based DAG traversal, fork/join handling |
 | **DAGNavigator** | `dag_navigator.py` | ~250 | DAG edge traversal and next-node resolution |
 | **TokenManager** | `tokens.py` | ~393 | Create, fork, coalesce, expand tokens |
-| **Executors** | `executors/` | ~2,190 | Transform, gate, sink, aggregation execution (5 modules) |
+| **Executors** | `executors/` | ~5,506 | Transform, gate, sink, aggregation, collector execution (6 node-kind modules) |
 | **SchedulerDrainCoordinator** | `scheduler_drain.py` | — | Claims durable work, repairs expired leases, and converges terminal handoff. |
 | **SinkEffectCoordinator** | `executors/sink_effects.py` | — | Reserves, prepares, fences, reconciles, and finalizes external publication. |
 | **CoalesceExecutor** | `coalesce_executor.py` | ~1,054 | Fork/join merge barrier with policy-driven merging |
@@ -230,7 +244,7 @@ C4Component
 | **Triggers** | `triggers.py` | ~301 | Evaluate count/timeout/condition triggers for aggregation |
 | **ExpressionParser** | `core/expression_parser.py` | ~652 | Safe AST-based expression evaluation (no eval) — lives in `core/` (used by config validation) |
 | **BatchAdapter** | `batch_adapter.py` | ~226 | Batch transform output routing |
-| **Clock** | `clock.py` | ~11 | Testable time abstraction |
+| **Clock** | `clock.py` | ~119 | Testable time abstraction |
 
 ### 3.2 Landscape Components
 
@@ -250,7 +264,7 @@ C4Component
         Component(query_repo, "QueryRepository", "Python", "Lineage and investigation queries")
         Component(effect_repo, "SinkEffectRepository", "Python", "Effect reservation, fencing, attempts, and finalization")
         Component(database, "LandscapeDB", "SQLAlchemy Core", "Connection management")
-        Component(schema, "Schema", "SQLAlchemy Core", "41 tables and epoch-29 invariants")
+        Component(schema, "Schema", "SQLAlchemy Core", "46 tables and epoch-38 invariants")
         Component(exporter, "Exporter", "Python", "Audit exports and sealed snapshots")
         Component(journal, "Journal Outbox", "Python", "Transaction-owned JSONL publication")
     }
@@ -275,7 +289,7 @@ C4Component
 ```
 
 | Component | File | Responsibility |
-|-----------|------|----------------|
+| ----------- | ------ | ---------------- |
 | **RecorderFactory** | `factory.py` | Composition root for repositories and plugin audit adapters. |
 | **RunLifecycleRepository** | `run_lifecycle_repository.py` | Run lifecycle, graph registration, per-source state, attribution, and web plugin-policy evidence. |
 | **DataFlowRepository** | `data_flow_repository.py` | Rows, tokens, ancestry, outcomes, validation errors, and durable coalesce effects. |
@@ -283,11 +297,11 @@ C4Component
 | **SchedulerRepository** | `scheduler_repository.py` | Durable work items, compare-and-swap leases, recovery, and run coordination. |
 | **QueryRepository** | `query_repository.py` | Operator lineage and investigation queries. |
 | **LandscapeDB** | `database.py` | Connection handling, schema validation, SQLite/SQLCipher/PostgreSQL support. |
-| **Schema** | `schema.py` | Authoritative 41-table, epoch-29 schema and constraints. |
+| **Schema** | `schema.py` | Authoritative 46-table, epoch-38 schema and constraints. |
 | **Exporter** | `exporter.py` | Complete audit export, including effect streams and attempts. |
 | **Journal** | `journal.py` | Transaction-owned sidecar-journal outbox and recovery drain. |
 
-### Audit Trail Tables (41 Total)
+### Audit Trail Tables (46 Total)
 
 ```
 runs (run lifecycle) → run_attributions / preflight_results / run_sources / run_web_plugin_policy
@@ -313,14 +327,19 @@ token_outcomes (terminal states)
 secret_resolutions (Key Vault usage)
 token_work_items / scheduler_events (durable scheduler)
 run_coordination / run_coordination_events / run_workers
-coalesce_branch_losses
+token_lineage_frames → group_records / group_losses (unified lineage and loss ledger)
+aggregation_results → aggregation_result_members / aggregation_result_outputs
 checkpoints, auth_events
+elspeth_schema_identity (store identity and epoch bookkeeping)
 ```
 
 **Critical pattern:** identity and recovery are run-scoped. Composite keys bind
 nodes, edges, states, rows, tokens, ancestry, validation errors, routing, and
-sink-effect members to one run. Epoch 29 also persists canonical node output
-contract hashes, durable batch-expansion claims, and the sidecar-journal outbox.
+sink-effect members to one run. The schema also persists canonical node output
+contract hashes, durable batch-expansion claims, and the sidecar-journal outbox
+(added at epoch 29). Epoch 30 adds `token_work_items.row_union_name`, recording
+which row-union barrier group a durable work item belongs to; a store written at
+epoch 29 lacks the column and is not migrated.
 A sink or export result is not complete until its effect reaches `FINALIZED`;
 an uncertain external result remains durable and blocked rather than being
 silently replayed.
@@ -343,10 +362,12 @@ C4Component
         Component(hookspecs, "Hookspecs", "pluggy", "Hook specifications")
     }
 
-    Container_Boundary(sources, "Sources (6 registered)") {
+    Container_Boundary(sources, "Sources (9 registered)") {
         Component(csv_source, "CSVSource", "Python", "Load from CSV")
         Component(json_source, "JSONSource", "Python", "Load from JSON/JSONL")
         Component(azure_blob_source, "AzureBlobSource", "Python", "Load from Azure Blob")
+        Component(aws_s3_source, "AWSS3Source", "Python", "Load from AWS S3")
+        Component(llm_source, "LLMSource", "Python", "Emit at most one row from one authored prompt")
         Component(null_source, "NullSource", "Python", "Empty source for testing")
     }
 
@@ -362,32 +383,36 @@ C4Component
         Component(blob_fetch, "BlobFetch", "Python", "SSRF-safe remote document fetch to payload store")
         Component(blob_csv, "BlobCSVExpand", "Python", "Expand stored CSV blobs into rows")
         Component(azure_di, "AzureDocumentIntelligence", "Python", "External document layout extraction")
+        Component(textract, "AWSTextractDocumentAnalysis", "Python", "AWS Textract document analysis, profile-bound locations")
         Component(content_safety, "ContentSafety", "Python", "Azure Content Safety screening")
         Component(prompt_shield, "PromptShield", "Python", "Azure Prompt Shield detection")
     }
 
     Container_Boundary(llm, "LLM Transforms") {
-        Component(llm_transform, "LLMTransform", "Python", "Unified LLM (azure/openrouter providers, single/multi-query)")
+        Component(llm_transform, "LLMTransform", "Python", "Unified LLM (azure/openrouter/bedrock/gateway providers, single/multi-query)")
     }
 
-    Container_Boundary(sinks, "Sinks (6 registered)") {
+    Container_Boundary(sinks, "Sinks (9 registered)") {
         Component(csv_sink, "CSVSink", "Python", "Write to CSV")
         Component(json_sink, "JSONSink", "Python", "Write to JSON/JSONL")
         Component(db_sink, "DatabaseSink", "Python", "Write to database")
         Component(azure_blob_sink, "AzureBlobSink", "Python", "Write to Azure Blob")
+        Component(aws_s3_sink, "AWSS3Sink", "Python", "Write to AWS S3")
     }
 
     Container_Boundary(clients, "Audited Clients (4)") {
         Component(http_client, "AuditedHTTPClient", "Python", "HTTP with audit recording")
         Component(llm_client, "AuditedLLMClient", "Python", "LLM with audit recording")
-        Component(replayer, "ReplayerClient", "Python", "Replay recorded calls")
-        Component(verifier, "VerifierClient", "Python", "Verify against recorded calls")
+        Component(replayer, "CallReplayer", "Python", "Replay recorded calls")
+        Component(verifier, "CallVerifier", "Python", "Verify against recorded calls")
     }
 
     Rel(base, protocols, "Implements")
     Rel(csv_source, base, "Extends BaseSource")
     Rel(json_source, base, "Extends BaseSource")
     Rel(azure_blob_source, base, "Extends BaseSource")
+    Rel(aws_s3_source, base, "Extends BaseSource")
+    Rel(llm_source, base, "Extends BaseSource")
     Rel(passthrough, base, "Extends BaseTransform")
     Rel(field_mapper, base, "Extends BaseTransform")
     Rel(batch_stats, base, "Extends BaseTransform")
@@ -396,6 +421,7 @@ C4Component
     Rel(blob_fetch, base, "Extends BaseTransform")
     Rel(blob_csv, base, "Extends BaseTransform")
     Rel(azure_di, base, "Extends BaseTransform")
+    Rel(textract, base, "Extends BaseTransform")
     Rel(content_safety, base, "Extends BaseTransform")
     Rel(prompt_shield, base, "Extends BaseTransform")
     Rel(llm_transform, base, "Extends BaseTransform")
@@ -407,19 +433,20 @@ C4Component
     Rel(json_sink, base, "Extends BaseSink")
     Rel(db_sink, base, "Extends BaseSink")
     Rel(azure_blob_sink, base, "Extends BaseSink")
+    Rel(aws_s3_sink, base, "Extends BaseSink")
 ```
 
 | Component | Count/Purpose |
-|-----------|---------------|
-| **Protocols** | 4 runtime-checkable interfaces (Source, Transform, BatchTransform, Sink) |
+| --- | --- |
+| **Protocols** | 4 plugin interfaces (Source, Transform, BatchTransform, Sink); only `TransformProtocol` is `@runtime_checkable`, because the engine `isinstance`-discriminates transforms during DAG traversal — the other three are type-checking only ([ADR-032](docs/architecture/adr/032-validate-by-trust-domain.md)) |
 | **Base Classes** | Abstract implementations with common functionality |
 | **Results** | Typed results (`TransformResult`, `SourceRow`) |
 | **PluginContext** | Runtime context passed to all plugin methods — phase-typed via `SourceContext`, `TransformContext`, `SinkContext`, `LifecycleContext` protocols (defined in `contracts/contexts.py`) |
 | **PluginManager** | pluggy-based discovery and registration |
-| **Sources** | Registry-discovered source plugins including azure_blob, csv, dataverse, json, null, and text |
-| **Transforms** | Registry-discovered transform plugins including LLM, RAG retrieval, web scrape, `blob_fetch`, `blob_csv_expand`, `azure_document_intelligence`, field/value/type transforms, and statistical batch transforms |
-| **LLM Transforms** | Unified LLMTransform (azure/openrouter providers, single/multi-query strategies) |
-| **Sinks** | Registry-discovered sink plugins including azure_blob, chroma_sink, csv, database, dataverse, and json |
+| **Sources** | Registry-discovered source plugins: `aws_s3`, `azure_blob`, `blob_rows`, `csv`, `dataverse`, `json`, `llm`, `null`, `text` |
+| **Transforms** | Registry-discovered transform plugins including LLM, RAG retrieval, web scrape, `blob_fetch`, `blob_csv_expand`, `azure_document_intelligence`, `aws_textract_document_analysis`, Azure and AWS Bedrock content-safety/prompt-shield screening, field/value/type transforms, `report_assemble`, and statistical batch transforms |
+| **LLM Transforms** | Unified LLMTransform (azure, openrouter, bedrock, and gateway providers; single/multi-query strategies) |
+| **Sinks** | Registry-discovered sink plugins: `aws_s3`, `azure_blob`, `chroma_sink`, `csv`, `database`, `dataverse`, `document`, `json`, `text` |
 | **Clients** | 4 audited clients (HTTP, LLM, Replayer, Verifier) |
 
 **Total Plugin Ecosystem:** registry-discovered plugins across Source,
@@ -433,7 +460,7 @@ narrative, as the exact-count authority. Sub-package layout: `infrastructure/`,
 Plugin methods accept narrowed protocol types instead of the full `PluginContext`:
 
 | Protocol | Used By | Key Fields |
-|----------|---------|------------|
+| ---------- | --------- | ------------ |
 | `SourceContext` | `load()` | `run_id`, `node_id`, `record_validation_error()`, `record_call()` |
 | `TransformContext` | `process()` / `accept()` | `state_id`, `token`, `record_call()`, checkpoint API |
 | `SinkContext` | `write()` | `contract`, `landscape`, `run_id`, `record_call()` |
@@ -563,7 +590,7 @@ stateDiagram-v2
 **Terminal states:**
 
 | State | Meaning |
-|-------|---------|
+| ------- | --------- |
 | `COMPLETED` | Reached output sink |
 | `ROUTED` | Gate sent to named sink |
 | `FORKED` | Split to multiple paths (parent token) |
@@ -573,6 +600,7 @@ stateDiagram-v2
 | `FAILED` | Processing error, not recoverable |
 | `EXPANDED` | Parent token for deaggregation (1→N expansion) |
 | `BUFFERED` | Temporarily held in aggregation (non-terminal, becomes COMPLETED on flush) |
+| `ABANDONED` | Non-terminal path recorded as `(outcome=NULL, path=ABANDONED, completed=False)` for a token whose fate nothing will ever decide — written only by `complete_run` inside its fenced terminal transaction, and only when the run is non-resumable ([ADR-038](docs/architecture/adr/038-non-terminal-abandoned-path.md)). Resumable runs keep buffered tokens honestly open. Accounting separates `tokens.abandoned` from `tokens.pending`, and run closure gains an `abandoned` state |
 
 ### Fork/Join Processing Flow
 
@@ -623,6 +651,31 @@ sequenceDiagram
 - **Merge Strategies**: `union`, `nested`, `select`
 - **Audit Trail**: Complete lineage from parent through children to merged output
 
+#### Row-union barriers
+
+A `row_union` is a distinct barrier from coalesce, declared in its own top-level
+`row_unions:` settings section and built as a `ROW_UNION` node. Where coalesce
+*merges* branch tokens into one, a row union is plugin-free and require-all: it
+waits for every declared branch, then releases those branch rows **unchanged**
+in declared branch order, which is what long-format processing needs. Branch
+order is bound into topology identity, cross-origin branches are rejected at
+build time, and `token_work_items.row_union_name` (Landscape epoch 30) records
+group membership so the barrier survives crash recovery. `RowUnionExecutor`
+implements the barrier and fails closed.
+
+#### Scope-bound collectors
+
+A collector is the second scope-bound barrier alongside coalesce and row union.
+It closes an expansion group opened by a multi-row transform: the collector is
+declared in the top-level `collectors:` settings section, the opener/closer
+pairing in `scopes:`, and the barrier is built as a `COLLECTOR` node. Group
+arrival is governed by a required `require_all` / `best_effort` policy, and
+`token_work_items.collector_name` records group membership one column over from
+`row_union_name`, so the barrier survives crash recovery. `CollectorExecutor`
+implements the barrier, and settlement outcomes report through the closed
+`GroupSettlementReason` vocabulary
+([ADR-042](docs/architecture/adr/042-group-settlement-observability.md)).
+
 ---
 
 ## Deployment View
@@ -670,10 +723,17 @@ C4Deployment
 | Development | SQLite | SQLite/SQLCipher | Local filesystem |
 | Supported AWS ECS profile | Aurora PostgreSQL | Aurora PostgreSQL | EFS plus task-role S3 |
 
-The 0.7.1 AWS profile supports one web task at a time. Validate-only startup,
-the deployment doctor, readiness checks, and schema-owner separation are part
-of the deployment contract; mixed-version rollout across the pre-1.0 schema
-cutover is not supported.
+The 0.8.0 AWS profile supports one web task at a time. Validate-only startup,
+the deployment doctor (`elspeth doctor`), readiness checks, and schema-owner
+separation are part of the deployment contract; mixed-version rollout across the
+pre-1.0 schema cutover is not supported.
+
+The maintained deployment set is Docker Compose, AWS ECS, native Linux systemd,
+one Azure Ubuntu VM, and Kubernetes BYO. Azure Container Apps support is
+deferred pending cross-instance admission and fencing; its Bicep bundle ships in
+`deploy/azure-container-apps/`, and the replica > 1 live acceptance on dev
+hardware is the outstanding receipt. See the
+[deployment platform matrix](docs/reference/deployment-platforms.md).
 
 ---
 
@@ -729,7 +789,7 @@ graph LR
 **Telemetry Granularity Levels:**
 
 | Level | Events | Use Case |
-|-------|--------|----------|
+| ------- | -------- | ---------- |
 | `lifecycle` | Run start/complete, phase transitions (~10-20 events/run) | High-level monitoring |
 | `rows` | Above + row creation, transform completion, gate routing (N×M events) | Detailed tracking |
 | `full` | Above + external call details (LLM, HTTP, SQL) | Deep debugging |
@@ -936,7 +996,7 @@ flowchart TB
 ### Trust Tier Summary
 
 | Tier | Trust Level | Coercion | On Error |
-|------|-------------|----------|----------|
+| ------ | ------------- | ---------- | ---------- |
 | **Tier 1** (Audit DB) | Full trust | Never | Crash immediately |
 | **Tier 2** (Pipeline) | Elevated ("probably OK") | Never | Return error result |
 | **Tier 3** (External) | Zero trust | At boundary | Quarantine row |
@@ -950,7 +1010,7 @@ ELSPETH uses ADRs to document significant architectural choices.
 ### Documented ADRs
 
 | ADR | Title | Decision | Rationale |
-|-----|-------|----------|-----------|
+| ----- | ------- | ---------- | ----------- |
 | **ADR-001** | Plugin-level concurrency | Pool-based with FIFO ordering | Maintains auditability while enabling parallelism |
 | **ADR-002** | Routing copy mode limitation | Move-only (no copy) | Prevents ambiguous audit trail for routed tokens |
 | **ADR-003** | Schema validation lifecycle | Two-phase (contract → type) at DAG construction | Catches mismatches before processing |
@@ -975,11 +1035,37 @@ ELSPETH uses ADRs to document significant architectural choices.
 | **ADR-022** | Shareable reviews | Add signed share tokens and composer completion events | Freezes reviewable composition state with auditable completion gestures |
 | **ADR-023** | Custom Python CI analyzer | Maintain `elspeth-lints` for project-specific static invariants | Captures architecture and audit rules that general linters cannot express |
 | **ADR-024** | Delivery governance for single-maintainer mode | Govern release and CI/CD delivery for single-maintainer operation | Makes delivery controls explicit where team-size assumptions do not apply |
+| **ADR-025** | Multi-source ingestion | The pipeline source surface is plural by contract and by code; the singular `source` surface is deleted, not deprecated | Removes the special case rather than carrying two ingestion shapes |
+| **ADR-026** | Durable token scheduler | ELSPETH owns a durable token scheduler as a first-class engine primitive; the scheduler row is authoritative for resume, and in-memory work state is a cache that must never diverge from it | Resume replays from one durable authority instead of reconstructing work from memory |
+| **ADR-027** | Composer operator set sampling | Nullable `composer_temperature` / `composer_seed` on `WebSettings`, defaulting to `None` so the field is omitted from the provider request | Makes Composer LLM sampling explicit operator configuration instead of a hidden default |
+| **ADR-028** | QUEUE and COALESCE are not duplicates | Keep them separate; a future Barrier abstraction targets aggregation + coalesce, not queue + coalesce | The structural twins are aggregation and coalesce; unifying queue with them would merge unlike semantics |
+| **ADR-029** | Journal is barrier-buffer truth | The scheduler journal (`token_work_items` BLOCKED rows) is the single source of truth for barrier-buffer membership and payload on resume; the blob checkpoint-state families are deleted | One durable record for buffered work instead of two that can disagree |
+| **ADR-030** | Multi-worker deployment shape | A pack of cooperating OS processes on one host sharing one WAL SQLite audit database, coordinated as one epoch-fenced leader plus claim-only followers | Bounds the supported concurrency shape so audit determinism survives |
+| **ADR-031** | Tutorial is a fixed-script canary | Keep the tutorial maximally fragile and preserve backend parity permanently — no tutorial-only normalisation or shortcuts | Tutorial breakage is an early warning about the general path, so it must stay on that path |
+| **ADR-032** | Validate by trust domain | Choose boundary validation by trust domain: `isinstance` against a concrete class ELSPETH defines for internal boundaries, parse-and-construct for everything else | A structural (`runtime_checkable` Protocol) check is not a security control — an impostor passes |
+| **ADR-033** | Deferred-intent admission contract | Decide contradiction within one exact subject identity and closed count-bound arithmetic; explicitly decline existential subject resolution | Bounds the checker to decidable questions instead of open-ended witness search |
+| **ADR-034** | Audited inline blob content | Widen `blob_ref` with an explicit `mode` discriminator instead of adding a sibling `blob_content_ref` form | One reference shape with a declared mode beats two near-identical shapes |
+| **ADR-035** | Audit hash raw vs stored asymmetry | The raw/sanitized hashing asymmetry is deliberate and must not be unified: error-path hashes fingerprint the raw external input | The two hashes answer different evidentiary questions; merging them destroys one |
+| **ADR-036** | Textract profile-bound bucket | Move bucket identity to config lowering and out of the web-authorable surface; the transform gains static `bucket` / `key_prefix` options mutually exclusive with `bucket_field` | Config lowering has a custody seam; the web authoring surface does not |
+| **ADR-037** | Interpretation caps govern LLM churn only | The interpretation rate caps are an allow-list of one — they apply to `vague_term` and nothing else, counted on the population the check governs | A cap is coherent only where the user authored the term and the LLM has a bake-into-the-prompt fallback |
+| **ADR-038** | Non-terminal ABANDONED path | Add `TerminalPath.ABANDONED` — `(outcome=NULL, path=ABANDONED, completed=False)` — for a token whose fate nothing will ever decide | Amends ADR-019: a finished run must not claim its work is still in flight |
+| **ADR-039** | Unconstrained text framing | Add `TextFraming.UNCONSTRAINED` as a positive claim in the closed vocabulary, distinct from the `UNKNOWN` abstention | A real member is compared by set membership, so a consumer that does not accept it gets a hard `CONFLICT` independent of `unknown_policy` |
+| **ADR-040** | Composer/runtime validation posture | Three validation surfaces, not two: composition validation, runtime preflight, and executor-level per-row enforcement | Stage 1 must never accept what the runtime rejects; abstention is legitimate and global equivalence is explicitly not the target |
+| **ADR-041** | State-engine supported profiles | Two required profiles: `sqlite-wal` (single-process or one-host leader with claim-only followers) and `postgresql-16` (maintained AWS single-leader deployment) | PostgreSQL 16 is first-class for that deployment, not a provisional port; multi-replica scheduling remains unsupported |
+| **ADR-042** | Group settlement observability | `GroupSettlementReason` is the closed four-member vocabulary for coalesce and scope-failure settlement, with one lineage read authority | Emission sites reference members, never strings; row_union keeps its own closed reasons |
+| **ADR-043** | Project tooling | Filigree and Loomweave only above the ruff/mypy baseline; everything else ruled out until superseded | A tool carrying standing agent instructions is a recorded decision, not an ad-hoc install |
+| **ADR-046** | Audit grade is a product characteristic | Product surfaces keep audit grade; the project's own tooling gets ordinary engineering hygiene | Ceremony around caches and trackers buys no integrity; destructive shared-state actions still need an operator go-ahead |
+| **ADR-047** | Landscape database-clock authority | Every custody, liveness, expiry and takeover decision reads its "now" from the Landscape database inside the deciding transaction; no authority verb takes an injected clock | One clock owned by the transaction owner removes the injected-`now` seam from coordination decisions |
+| **ADR-048** (Proposed) | Required coordination token for Landscape mutations | Every Landscape mutation API takes one required, keyword-only concrete token, chosen per verb scope (`CoordinationToken` run-scoped, `WorkerMembershipToken` member/item/claim-scoped) | A defaulted or optional token is an unfenced arm; a Protocol or union would let an impostor through |
+
+ADR-034 and ADR-035 were renumbered in 0.7.2 from colliding `025-` and `026-`
+filenames; the record now runs 000–048, with 044 and 045 unused. ADR-048 is
+Proposed; every other record listed above is Accepted.
 
 ### Implicit Architectural Decisions
 
 | Technology | Choice | Rationale |
-|------------|--------|-----------|
+| ------------ | -------- | ----------- |
 | **Database ORM** | SQLAlchemy Core (not ORM) | Audit trail needs precise SQL control, multi-DB support |
 | **Plugin System** | pluggy | Battle-tested (pytest uses it), clean hook specifications |
 | **Graph Library** | NetworkX | Industry-standard, topological sort, cycle detection |
@@ -999,15 +1085,15 @@ ongoing CI enforcement.
 ### Design Characteristics
 
 | Dimension | Evidence |
-|-----------|----------|
+| ----------- | ---------- |
 | **Maintainability** | Clean module boundaries, consistent patterns across subsystems |
-| **Testability** | 2.6:1 test-to-production LOC ratio, mutation testing, property tests |
+| **Testability** | 2.55:1 test-to-production LOC ratio, mutation testing, property tests |
 | **Type Safety** | mypy strict mode, runtime-checkable protocols, NewType aliases |
 | **Documentation** | ADRs, runbooks, architecture docs, and trust-boundary guides |
 | **Error Handling** | Three-tier trust model with distinct rules per boundary |
 | **Security** | HMAC fingerprinting, AST-based expression parsing (no eval), SQLCipher support |
 | **Performance** | Batch operations, connection pooling, rate limiting |
-| **Complexity** | Some large files remain (orchestrator ~2,070 LOC, processor ~1,860 LOC) |
+| **Complexity** | Some large files remain (`web/sessions/service.py` ~14,321 LOC, `web/composer/service.py` ~10,298 LOC, `engine/processor.py` ~5,546 LOC) |
 
 ### Design Principles
 
@@ -1020,8 +1106,8 @@ ongoing CI enforcement.
 ### Areas for Future Improvement
 
 | Area | Concern | Priority |
-|------|---------|----------|
-| **Large Files** | orchestrator/core.py (~2,070 LOC), processor.py (~1,860 LOC) | Medium |
+| ------ | --------- | ---------- |
+| **Large Files** | web/sessions/service.py (~14,321 LOC), web/composer/service.py (~10,298 LOC), engine/processor.py (~5,546 LOC) | Medium |
 | **Aggregation Complexity** | Multiple state machines (buffer/trigger/flush) | Medium |
 | **Composite PK Queries** | `nodes` table joins require care | Low |
 | **API Documentation** | No generated docs (pdoc/sphinx) | Low |
@@ -1029,10 +1115,10 @@ ongoing CI enforcement.
 ### Risk Assessment
 
 | Category | Status | Evidence |
-|----------|--------|----------|
+| ---------- | -------- | ---------- |
 | **Audit Integrity** | ✅ Low Risk | Tier 1 crash policy, NaN/Infinity rejected |
 | **Type Safety** | ✅ Low Risk | mypy strict, runtime protocol verification |
-| **Test Coverage** | ✅ Low Risk | 2.6:1 ratio, mutation testing, property tests |
+| **Test Coverage** | ✅ Low Risk | 2.55:1 ratio, mutation testing, property tests |
 | **Resume Safety** | ✅ Low Risk | Full topology hash (BUG-COMPAT-01 fix applied) |
 
 ---
@@ -1042,7 +1128,7 @@ ongoing CI enforcement.
 ### Key Architectural Decisions
 
 | Decision | Rationale |
-|----------|-----------|
+| ---------- | ----------- |
 | **SQLAlchemy Core** (not ORM) | Audit trail needs precise SQL, not object mapping |
 | **pluggy** | Battle-tested (pytest), clean hook system |
 | **Canonical JSON** (RFC 8785) | Deterministic hashing for audit integrity |
@@ -1056,7 +1142,7 @@ ongoing CI enforcement.
 2. **Containers** - 11 major subsystems across 5 architectural tiers
 3. **Components** - Internal structure of Engine, Landscape, Plugins (with LOC counts)
 4. **Data Flow** - Pipeline execution and fork/join processing with telemetry
-5. **Token Lifecycle** - State transitions for row processing (9 terminal states)
+5. **Token Lifecycle** - State transitions for row processing (the ADR-019 two-axis model: 3 `TerminalOutcome` values across 16 `TerminalPath` values, of which `buffered` and `abandoned` are non-terminal)
 6. **Deployment** - Development and production configurations
 7. **Trust Boundaries** - Three-tier data trust model
 8. **Telemetry Flow** - Real-time operational visibility alongside audit trail
@@ -1067,12 +1153,12 @@ ongoing CI enforcement.
 
 **Key Metrics:**
 
-- Production LOC: ~236,100 (598 Python files in `src/elspeth/`; frontend TSX/CSS not included)
-- Test LOC: ~619,900 (1,391 Python files, 2.6:1 ratio)
+- Production LOC: ~455,000 (805 Python files in `src/elspeth/`; frontend TSX/CSS and the standalone `gateway/` package not included)
+- Test LOC: ~1,160,500 (2,093 Python files, 2.55:1 ratio)
 - Subsystems: 11 major (20+ including sub-components)
 - Plugins: registry-discovered via `discover_all_plugins()` — the same code path as `elspeth plugins list`
-- ADRs: 30+ accepted records (excluding the 000 template)
-- Status: Pre-release (0.7.1)
+- ADRs: 46 numbered records (excluding the 000 template)
+- Status: Pre-release (0.8.0)
 
 All diagrams use Mermaid syntax for version control compatibility.
 

@@ -40,6 +40,60 @@ describe("ExplainDialog", () => {
     expect(screen.getByText(/Source data — 5 URLs/)).toBeInTheDocument();
   });
 
+  it("renders the real narrative shape as prose and a LIST, not preformatted text (elspeth-d74ab492dd)", async () => {
+    // Fixture shaped from build_narrative (explain.py): intro line, blank
+    // line, then consecutive "- " rows with NO blank line between them, then
+    // a blank line and a retention paragraph. This is the shape the pre-wrap
+    // deletion actually risks.
+    vi.mocked(api.fetchAuditReadinessExplain).mockResolvedValueOnce({
+      session_id: SESSION_ID,
+      composition_version: 1,
+      narrative:
+        "When you run this pipeline, ELSPETH will record:\n\n"
+        + "- Source data — each row from the CSV input. SHA-256 hash recorded.\n"
+        + "- Output results — written to CSV.\n\n"
+        + "Retention: 90 days by default.",
+    });
+    const { container } = render(<ExplainDialog sessionId={SESSION_ID} compositionVersion={1} onClose={() => {}} />);
+    await screen.findByText(/When you run this pipeline/);
+    expect(container.querySelector("pre")).toBeNull();
+    // Both bullets survive as SEPARATE list items — the assertion that a
+    // collapsed line pair would fail. This is the a11y win the CSS comment
+    // now claims: a list role and an item count a <pre> cannot provide.
+    const items = container.querySelectorAll(".explain-dialog-narrative li");
+    expect(items).toHaveLength(2);
+    expect(items[0]).toHaveTextContent("Source data");
+    expect(items[1]).toHaveTextContent("Output results");
+    expect(container.querySelectorAll(".explain-dialog-narrative p")).toHaveLength(2);
+  });
+
+  it("passes identifiers and markdown-active punctuation through unaltered (audit fidelity)", async () => {
+    // An audit narrative is generated prose that may contain node ids and
+    // literal punctuation. Markdown TRANSFORMS text: `_wrapped_` becomes
+    // emphasis, a leading `#` becomes a heading. Moving this surface from
+    // <pre> to a markdown renderer is only safe if the narrative survives it,
+    // and a fidelity failure is a finding worth having before this lands.
+    //
+    // The tokens here are chosen to be markdown-ACTIVE: a space-surrounded
+    // `*` and an intraword `_` are INERT in GFM, so a fixture using those
+    // would pass whether or not fidelity held.
+    vi.mocked(api.fetchAuditReadinessExplain).mockResolvedValueOnce({
+      session_id: SESSION_ID,
+      composition_version: 1,
+      narrative: "# Retention\n\n_wrapped_ and node submit_failed closed the sink.",
+    });
+    const { container } = render(<ExplainDialog sessionId={SESSION_ID} compositionVersion={1} onClose={() => {}} />);
+    await screen.findByText(/submit_failed/);
+    const narrative = container.querySelector(".explain-dialog-narrative");
+    // submit_failed survives verbatim: GFM does not open emphasis on an
+    // intraword underscore. This is the assertion that matters for ids.
+    expect(narrative?.textContent).toContain("node submit_failed closed the sink.");
+    // The two markdown-active tokens ARE transformed, and this test PINS that
+    // rather than asserting it away — see the transformation ruling in the plan.
+    expect(narrative?.querySelector("h1")).not.toBeNull();
+    expect(narrative?.querySelector("em")?.textContent).toBe("wrapped");
+  });
+
   it("uses the cached narrative when present without refetching", async () => {
     useAuditReadinessStore.setState({
       explainsBySession: {

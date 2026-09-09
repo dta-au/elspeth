@@ -57,7 +57,7 @@ def _accounting(
     if emitted is None:
         emitted = terminal + pending
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=source_rows),
+        source=RunAccountingSource(rows_processed=source_rows, rows_rejected=0, rows_read=source_rows),
         tokens=RunAccountingTokens(
             emitted=emitted,
             terminal=terminal,
@@ -65,6 +65,7 @@ def _accounting(
             failed=failed,
             structural=structural,
             pending=pending,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(
             routed_success=routed_success,
@@ -127,21 +128,23 @@ class TestDiscardSummary:
 
     def test_accepts_matching_total(self) -> None:
         summary = DiscardSummary(
-            total=6,
+            total=10,
             validation_errors=1,
             transform_errors=2,
             sink_discards=3,
+            gate_errors=4,
         )
 
-        assert summary.total == 6
+        assert summary.total == 10
 
     def test_rejects_mismatched_total(self) -> None:
         with pytest.raises(pydantic.ValidationError, match="Discard summary total mismatch"):
             DiscardSummary(
-                total=5,
+                total=9,
                 validation_errors=1,
                 transform_errors=2,
                 sink_discards=3,
+                gate_errors=4,
             )
 
 
@@ -179,7 +182,10 @@ class TestValidationResult:
                     component_id="rate_coolness",
                     component_type="transform",
                     message="Interpretation review is pending for 'coolness'.",
-                    suggestion="Resolve the pending interpretation review before running.",
+                    suggestion=(
+                        "Resolve the pending interpretation review before running. "
+                        "If no review card is shown, send a composer message so the pending reviews are surfaced."
+                    ),
                     error_code="interpretation_review_pending",
                 )
             ],
@@ -593,6 +599,31 @@ class TestCompletedDataAccounting:
         assert data.accounting.tokens.succeeded == 95
         assert data.accounting.tokens.failed == 3
 
+    def test_all_quarantined_completed_with_failures_accepted(self) -> None:
+        """An all-quarantined run has succeeded == 0 and is still legal.
+
+        Mirrors the engine's terminal_clean_indicator
+        (contracts/run_result.py): a run that quarantined every row made a
+        clean determination on every row and is COMPLETED_WITH_FAILURES,
+        not FAILED (elspeth-47fa7c01eb).
+        """
+        data = CompletedData(
+            status="completed_with_failures",
+            accounting=_accounting(source_rows=6, succeeded=0, failed=6, quarantined=6),
+            landscape_run_id="lscape-quarantined",
+        )
+        assert data.accounting.tokens.succeeded == 0
+        assert data.accounting.routing.quarantined == 6
+
+    def test_completed_with_failures_without_clean_terminal_rejected(self) -> None:
+        """No success AND no quarantine: the engine contract requires FAILED."""
+        with pytest.raises(pydantic.ValidationError, match="clean terminal indicator"):
+            CompletedData(
+                status="completed_with_failures",
+                accounting=_accounting(source_rows=3, succeeded=0, failed=3, quarantined=0),
+                landscape_run_id="lscape-1",
+            )
+
     def test_aggregation_source_rows_and_output_tokens_are_separate(self) -> None:
         data = CompletedData(
             status="completed",
@@ -754,7 +785,7 @@ class TestStrictCoercionRejected:
                 started_at=None,
                 finished_at=None,
                 accounting=RunAccounting(
-                    source=RunAccountingSource(rows_processed="7"),  # type: ignore[arg-type]
+                    source=RunAccountingSource(rows_processed="7", rows_rejected=0, rows_read=7),  # type: ignore[arg-type]
                     tokens=RunAccountingTokens(
                         emitted=0,
                         terminal=0,
@@ -762,6 +793,7 @@ class TestStrictCoercionRejected:
                         failed=0,
                         structural=0,
                         pending=0,
+                        abandoned=0,
                     ),
                     routing=RunAccountingRouting(
                         routed_success=0,
@@ -785,7 +817,7 @@ class TestStrictCoercionRejected:
                 run_id="r1",
                 status="completed",
                 accounting=RunAccounting(
-                    source=RunAccountingSource(rows_processed=10),
+                    source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
                     tokens=RunAccountingTokens(
                         emitted=12,
                         terminal=12,
@@ -793,6 +825,7 @@ class TestStrictCoercionRejected:
                         failed="2",  # type: ignore[arg-type]
                         structural=0,
                         pending=0,
+                        abandoned=0,
                     ),
                     routing=RunAccountingRouting(
                         routed_success=0,
@@ -826,7 +859,7 @@ class TestStrictCoercionRejected:
             CompletedData(
                 status="completed_with_failures",
                 accounting=RunAccounting(
-                    source=RunAccountingSource(rows_processed="100"),  # type: ignore[arg-type]
+                    source=RunAccountingSource(rows_processed="100", rows_rejected=0, rows_read=100),  # type: ignore[arg-type]
                     tokens=RunAccountingTokens(
                         emitted=98,
                         terminal=98,
@@ -834,6 +867,7 @@ class TestStrictCoercionRejected:
                         failed=3,
                         structural=0,
                         pending=0,
+                        abandoned=0,
                     ),
                     routing=RunAccountingRouting(
                         routed_success=0,
@@ -1116,6 +1150,40 @@ class TestRunStatusAccounting:
         )
         assert resp.accounting is not None
         assert resp.accounting.tokens.failed == 3
+
+    def test_completed_with_failures_accepts_all_quarantined_run(self) -> None:
+        """Run c69b6ab6 shape: every row quarantined, zero successes.
+
+        The engine contract treats quarantine as a clean terminal outcome
+        (terminal_clean_indicator = succeeded > 0 OR quarantined > 0); the
+        web projection must not re-derive that invariant without the
+        quarantine arm (elspeth-47fa7c01eb).
+        """
+        resp = RunStatusResponse(
+            run_id="r1",
+            status="completed_with_failures",
+            started_at=datetime.now(tz=UTC),
+            finished_at=datetime.now(tz=UTC),
+            accounting=_accounting(source_rows=6, succeeded=0, failed=6, quarantined=6),
+            error=None,
+            landscape_run_id="lscape-quarantined",
+        )
+        assert resp.accounting is not None
+        assert resp.accounting.tokens.succeeded == 0
+        assert resp.accounting.routing.quarantined == 6
+
+    def test_completed_with_failures_rejects_no_clean_terminal_indicator(self) -> None:
+        """succeeded == 0 and quarantined == 0 stays rejected: engine requires FAILED."""
+        with pytest.raises(pydantic.ValidationError, match="clean terminal indicator"):
+            RunStatusResponse(
+                run_id="r1",
+                status="completed_with_failures",
+                started_at=datetime.now(tz=UTC),
+                finished_at=datetime.now(tz=UTC),
+                accounting=_accounting(source_rows=3, succeeded=0, failed=3, quarantined=0),
+                error=None,
+                landscape_run_id="lscape-1",
+            )
 
     def test_completed_with_failures_rejects_no_failure_tokens(self) -> None:
         with pytest.raises(pydantic.ValidationError, match=r"tokens\.failed > 0"):

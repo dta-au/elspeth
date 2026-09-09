@@ -2,12 +2,14 @@
   "knob_schema": {
     "fields": [
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
         "nullable": false,
-        "required": true
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -17,7 +19,8 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Name of the row field whose value is the absolute URL to fetch. Values MUST include an explicit 'http://' or 'https://' scheme; bare hostnames (e.g. 'www.example.gov.au') are rejected at fetch time by the SSRF guard. If the upstream source emits scheme-less values, normalize them in the source data or add an upstream value_transform that prepends 'https://' before this transform.",
@@ -25,7 +28,8 @@
         "label": "URL Field",
         "name": "url_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Output field that receives the fetched page content.",
@@ -33,7 +37,8 @@
         "label": "Content Field",
         "name": "content_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Output field that receives the page fingerprint.",
@@ -41,7 +46,8 @@
         "label": "Fingerprint Field",
         "name": "fingerprint_field",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "markdown",
@@ -55,7 +61,8 @@
         "label": "Format",
         "name": "format",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": " ",
@@ -64,7 +71,8 @@
         "label": "Text Separator",
         "name": "text_separator",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "content",
@@ -77,7 +85,8 @@
         "label": "Fingerprint Mode",
         "name": "fingerprint_mode",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "HTML element names to remove before extracting page text.",
@@ -86,7 +95,8 @@
         "label": "Strip Elements",
         "name": "strip_elements",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "HTTP fetching policy, timeout, contact, and host allowlist settings.",
@@ -94,7 +104,8 @@
         "label": "HTTP",
         "name": "http",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       }
     ]
   },

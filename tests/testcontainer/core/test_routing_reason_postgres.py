@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event, select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType, RoutingEvent, RoutingMode, RoutingSpec
 from elspeth.contracts.errors import AuditIntegrityError, ConfigGateReason
@@ -28,8 +28,8 @@ _SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, str, str]:

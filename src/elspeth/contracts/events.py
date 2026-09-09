@@ -30,6 +30,10 @@ from elspeth.contracts.token_usage import TokenUsage
 
 _PHASE_ERROR_MESSAGE_MAX_CHARS = 500
 _PHASE_ERROR_MESSAGE_TRUNCATION_SUFFIX = "...<truncated>"
+_ENGINE_SPAN_ID_HEX_CHARS = frozenset("0123456789abcdef")
+_ENGINE_SPAN_ATTRIBUTE_MAX_CHARS = 256
+_ENGINE_SPAN_ATTRIBUTE_SEQUENCE_LIMIT = 128
+_ENGINE_SPAN_EXCEPTION_TYPE_MAX_CHARS = 128
 
 
 def _bounded_phase_error_message(message: str) -> str:
@@ -86,6 +90,25 @@ class RunCompletionStatus(StrEnum):
     FAILED = "failed"
     PARTIAL = "partial"
     INTERRUPTED = "interrupted"
+
+
+class EngineSpanName(StrEnum):
+    """Closed engine-operation span vocabulary."""
+
+    RUN = "run"
+    SOURCE = "source"
+    ROW = "row"
+    TRANSFORM = "transform"
+    GATE = "gate"
+    AGGREGATION = "aggregation"
+    SINK = "sink"
+
+
+class EngineSpanStatus(StrEnum):
+    """Terminal status for an engine-operation span."""
+
+    OK = "ok"
+    ERROR = "error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +260,183 @@ class TelemetryEvent:
         return result
 
 
+_ENGINE_SPAN_ALLOWED_ATTRIBUTES: Mapping[EngineSpanName, frozenset[str]] = MappingProxyType(
+    {
+        EngineSpanName.RUN: frozenset({"run.id"}),
+        EngineSpanName.SOURCE: frozenset({"plugin.name", "plugin.type"}),
+        EngineSpanName.ROW: frozenset({"row.id", "token.id"}),
+        EngineSpanName.TRANSFORM: frozenset(
+            {
+                "plugin.name",
+                "plugin.type",
+                "node.id",
+                "token.id",
+                "token.ids",
+                "token.ids.total_count",
+                "token.ids.truncated_count",
+            }
+        ),
+        EngineSpanName.GATE: frozenset({"plugin.name", "plugin.type", "node.id", "token.id"}),
+        EngineSpanName.AGGREGATION: frozenset(
+            {
+                "plugin.name",
+                "plugin.type",
+                "node.id",
+                "batch.id",
+                "token.ids",
+                "token.ids.total_count",
+                "token.ids.truncated_count",
+            }
+        ),
+        EngineSpanName.SINK: frozenset(
+            {
+                "plugin.name",
+                "plugin.type",
+                "node.id",
+                "token.ids",
+                "token.ids.total_count",
+                "token.ids.truncated_count",
+            }
+        ),
+    }
+)
+
+
+def _validate_engine_span_datetime(value: object, field_name: str) -> None:
+    if type(value) is not datetime or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be an aware datetime")
+
+
+def _validate_engine_span_id(value: object, field_name: str, *, optional: bool = False) -> None:
+    if optional and value is None:
+        return
+    if (
+        type(value) is not str
+        or len(value) != 16
+        or value == "0000000000000000"
+        or any(character not in _ENGINE_SPAN_ID_HEX_CHARS for character in value)
+    ):
+        raise ValueError(f"{field_name} must be exactly 16 lowercase hexadecimal characters")
+
+
+def _validate_engine_span_exception_type(value: object) -> None:
+    if value is None:
+        return
+    if type(value) is not str or not value or len(value) > _ENGINE_SPAN_EXCEPTION_TYPE_MAX_CHARS:
+        raise ValueError("exception_type must be a bounded exception class name")
+    if not (value[0].isascii() and (value[0].isalpha() or value[0] == "_")):
+        raise ValueError("exception_type must be a bounded exception class name")
+    if any(not (character.isascii() and (character.isalnum() or character == "_")) for character in value[1:]):
+        raise ValueError("exception_type must be a bounded exception class name")
+
+
+def _validate_engine_span_attributes(
+    name: EngineSpanName,
+    attributes: Mapping[str, str | tuple[str, ...]],
+) -> None:
+    allowed = _ENGINE_SPAN_ALLOWED_ATTRIBUTES[name]
+    for key, value in attributes.items():
+        if type(key) is not str or key not in allowed:
+            raise ValueError(f"engine span attribute {key!r} is not allowed for {name.value}")
+        if type(value) is str:
+            if len(value) > _ENGINE_SPAN_ATTRIBUTE_MAX_CHARS:
+                raise ValueError(f"engine span attribute {key!r} exceeds the bounded string limit")
+            continue
+        if type(value) is not tuple or len(value) > _ENGINE_SPAN_ATTRIBUTE_SEQUENCE_LIMIT:
+            raise ValueError(f"engine span attribute {key!r} must be a bounded string or string tuple")
+        if any(type(item) is not str or len(item) > _ENGINE_SPAN_ATTRIBUTE_MAX_CHARS for item in value):
+            raise ValueError(f"engine span attribute {key!r} contains an invalid string")
+
+
+@dataclass(frozen=True, slots=True)
+class EngineSpanCompleted(TelemetryEvent):
+    """One completed engine operation exported through the telemetry fan-out.
+
+    The event carries only a closed set of bounded, opaque identifiers. Raw
+    exception messages, row content, and content-derived hashes never cross
+    this observability boundary.
+    """
+
+    name: EngineSpanName
+    started_at: datetime
+    trace_started_at: datetime
+    span_id: str
+    parent_span_id: str | None
+    status: EngineSpanStatus
+    exception_type: str | None
+    attributes: Mapping[str, str | tuple[str, ...]]
+
+    def __post_init__(self) -> None:
+        if type(self.run_id) is not str or not self.run_id or len(self.run_id) > _ENGINE_SPAN_ATTRIBUTE_MAX_CHARS:
+            raise ValueError("run_id must be a bounded non-empty string")
+        if type(self.name) is not EngineSpanName:
+            raise TypeError("name must be EngineSpanName")
+        if type(self.status) is not EngineSpanStatus:
+            raise TypeError("status must be EngineSpanStatus")
+        _validate_engine_span_datetime(self.timestamp, "timestamp")
+        _validate_engine_span_datetime(self.started_at, "started_at")
+        _validate_engine_span_datetime(self.trace_started_at, "trace_started_at")
+        # The durable trace origin may come from a different host. Preserve it
+        # as canonical identity without assuming wall clocks are synchronized.
+        if self.started_at > self.timestamp:
+            raise ValueError("engine span timestamps must satisfy started_at <= timestamp")
+        _validate_engine_span_id(self.span_id, "span_id")
+        _validate_engine_span_id(self.parent_span_id, "parent_span_id", optional=True)
+        _validate_engine_span_exception_type(self.exception_type)
+        if self.status is EngineSpanStatus.OK and self.exception_type is not None:
+            raise ValueError("successful engine spans cannot carry exception_type")
+        freeze_fields(self, "attributes")
+        if type(self.attributes) is not MappingProxyType:
+            raise TypeError("attributes must freeze to an exact MappingProxyType")
+        _validate_engine_span_attributes(self.name, self.attributes)
+
+
+_CLEANUP_FIELD_MAX_CHARS = 64
+
+
+def _validate_cleanup_field(value: object, field_name: str) -> None:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty owned string")
+    if len(value) > _CLEANUP_FIELD_MAX_CHARS:
+        raise ValueError(f"{field_name} must be at most {_CLEANUP_FIELD_MAX_CHARS} characters")
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceCleanupFailed(TelemetryEvent):
+    """Telemetry-only system-health signal for plugin resource cleanup."""
+
+    component: str
+    resource: str
+    error_type: str
+    suppressed: bool
+    state_id: str | None = None
+    operation_id: str | None = None
+    token_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name, owned_value in (
+            ("component", self.component),
+            ("resource", self.resource),
+            ("error_type", self.error_type),
+        ):
+            _validate_cleanup_field(owned_value, field_name)
+        if type(self.suppressed) is not bool:
+            raise TypeError("suppressed must be bool")
+        for field_name, parent_value in (
+            ("state_id", self.state_id),
+            ("operation_id", self.operation_id),
+            ("token_id", self.token_id),
+        ):
+            if parent_value is not None and (type(parent_value) is not str or not parent_value.strip()):
+                raise ValueError(f"{field_name} must be a non-empty exact string when present")
+        row_parent = self.state_id is not None or self.token_id is not None
+        operation_parent = self.operation_id is not None
+        if row_parent == operation_parent:
+            raise ValueError("ResourceCleanupFailed requires exactly one row or operation parent")
+        if row_parent and (self.state_id is None or self.token_id is None):
+            raise ValueError("ResourceCleanupFailed row parent requires state_id and token_id")
+
+
 def _event_field_to_serializable(obj: Any) -> Any:
     """Recursively convert a value to a plain-dict tree.
 
@@ -386,15 +586,21 @@ class FieldResolutionApplied(TelemetryEvent):
 class RowCreated(TelemetryEvent):
     """Emitted when a new row enters the pipeline from the source.
 
+    Producers carry the real content hash for in-process audited correlation.
+    Before the event reaches telemetry observers or exporters,
+    ``TelemetryManager`` projects it to an egress-safe event whose
+    ``content_hash`` is ``None``. ``None`` means intentionally omitted; egress
+    must never substitute a shared marker that could be mistaken for a hash.
+
     Attributes:
         row_id: Stable source row identity
         token_id: Token instance for this row in the DAG
-        content_hash: Hash of the row content for deduplication
+        content_hash: Producer-side row hash, or ``None`` in the egress projection
     """
 
     row_id: str
     token_id: str
-    content_hash: str
+    content_hash: str | None
 
 
 # =============================================================================

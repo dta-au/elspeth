@@ -2,7 +2,7 @@
 
 LLMTransform dispatches to SingleQueryStrategy or MultiQueryStrategy
 based on whether queries are configured. Provider dispatch (Azure,
-OpenRouter, Bedrock) is handled via _PROVIDERS registry.
+OpenRouter, Bedrock, Gateway) is handled via _PROVIDERS registry.
 
 Architecture:
     LLMTransform (BatchTransformMixin)
@@ -15,7 +15,6 @@ Architecture:
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -30,14 +29,18 @@ from pydantic import Field as PydanticField
 
 from elspeth.contracts import Determinism, TransformErrorReason, TransformResult, propagate_contract
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, TextPart, parts_hash
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
-from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
+from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import register_value_source_plugin
+from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
+from elspeth.core.llm_provider_validation import LLM_PROVIDER_NAMES
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
@@ -56,35 +59,39 @@ from elspeth.plugins.transforms.llm import (
     populate_llm_operational_fields,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
+from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig, resolve_image_parts
 from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langfuse_tracer
-from elspeth.plugins.transforms.llm.multi_query import QuerySpec, ResponseFormat, resolve_queries
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QuerySpec, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
+    LLMAuditParent,
     LLMProvider,
     LLMQueryResult,
     ParsedFinishReason,
     UnrecognizedFinishReason,
+    classify_finish_reason_failure,
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig, _configure_azure_monitor
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig, OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
-from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant, strip_markdown_fences, validate_field_value
+from elspeth.plugins.transforms.llm.validation import (
+    build_structured_response_directive,
+    extract_structured_fields,
+    strip_markdown_fences,
+)
 
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
+    from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
 
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 
-
-_FINISH_REASON_ERRORS: dict[FinishReason, tuple[str, str]] = {
-    FinishReason.LENGTH: ("response_truncated", "Response truncated (finish_reason=length)"),
-    FinishReason.CONTENT_FILTER: ("content_filtered", "Response blocked by provider content filter"),
-}
 
 # Bounded local retry constants for sequential multi-query transient errors.
 # Mirrors transforms/azure/base.py _CAPACITY_RETRY_* constants.
@@ -121,10 +128,9 @@ def _serialize_finish_reason(finish_reason: ParsedFinishReason) -> str | None:
     return str(finish_reason)  # type: ignore[unreachable]  # pragma: no cover — exhaustive, but future-proof
 
 
-def _shutdown_event_is_set(shutdown_event: object | None) -> bool:
-    """Return True only for concrete cancellation signals, not arbitrary mocks."""
-    is_set = getattr(shutdown_event, "is_set", None)
-    return callable(is_set) and is_set() is True
+def _shutdown_event_is_set(shutdown_event: threading.Event | None) -> bool:
+    """Return whether the declared cancellation signal has been set."""
+    return shutdown_event is not None and shutdown_event.is_set()
 
 
 def _shutdown_requested_result(
@@ -188,55 +194,18 @@ def _finish_reason_error(
             reason["content_length"] = content_length
         return reason
 
-    # Allowlist: explicit STOP is a known-good completion.
-    if finish_reason == FinishReason.STOP:
+    failure = classify_finish_reason_failure(finish_reason)
+    if failure is None:
         return None
-
-    # Absent finish_reason (None) is a valid response shape for some providers
-    # (e.g. Azure SDK omits raw_response or choices in certain configurations).
-    # This is provider-normal behavior, not a defect. The provider already
-    # validated content is non-empty via LLMQueryResult, and logged a warning
-    # about "truncation undetectable".
-    #
-    # Callers record finish_reason in success_reason.metadata so the audit
-    # trail distinguishes None (absent) from STOP (confirmed completion).
-    # This is queryable via MCP diagnose() for operational visibility.
-    if finish_reason is None:
-        return None
-
-    # Known-bad reasons with specific error messages.
-    if isinstance(finish_reason, FinishReason):
-        entry = _FINISH_REASON_ERRORS.get(finish_reason)
-        if entry is not None:
-            reason_key, error_message = entry
-            return _FinishReasonError(
-                result=TransformResult.error(
-                    cast(
-                        TransformErrorReason,
-                        _build_reason(reason=reason_key, finish_reason=finish_reason.value),
-                    ),
-                    retryable=False,
-                ),
-                error_message=error_message,
-            )
-        # entry is None: this FinishReason is not in the error dict but is also
-        # not STOP — fall through to the catch-all so it is rejected.
-
-    # Catch-all: any finish reason not explicitly allowlisted (including
-    # known enum members not in STOP or error dict, and unrecognized values)
-    # is an error. Uses _serialize_finish_reason as the single source of truth
-    # for string conversion. None was handled above; raw_value is always str.
-    raw_value = _serialize_finish_reason(finish_reason)
-    assert raw_value is not None, "finish_reason=None was handled above — unreachable"
     return _FinishReasonError(
         result=TransformResult.error(
             cast(
                 TransformErrorReason,
-                _build_reason(reason="unexpected_finish_reason", finish_reason=raw_value),
+                _build_reason(reason=failure.reason, finish_reason=failure.finish_reason),
             ),
             retryable=False,
         ),
-        error_message=f"Unexpected finish reason: {raw_value}",
+        error_message=failure.error_message,
     )
 
 
@@ -247,14 +216,19 @@ def _finish_reason_error(
 
 # NOTE: type[LLMProvider] won't work here — mypy doesn't support type[Protocol]
 # for structural subtyping. The concrete classes (AzureLLMProvider,
-# OpenRouterLLMProvider, BedrockLLMProvider) are verified against LLMProvider by mypy at their
-# definition sites. The provider class is stored here for documentation only —
-# actual construction uses isinstance narrowing in _create_provider().
+# OpenRouterLLMProvider, BedrockLLMProvider, GatewayLLMProvider) are verified
+# against LLMProvider by mypy at their definition sites. The provider class is
+# stored here for documentation only — actual construction uses isinstance
+# narrowing in _create_provider().
 _PROVIDERS: dict[str, tuple[type[LLMConfig], type]] = {
     "azure": (AzureOpenAIConfig, AzureLLMProvider),
     "openrouter": (OpenRouterConfig, OpenRouterLLMProvider),
     "bedrock": (BedrockConfig, BedrockLLMProvider),
+    "gateway": (GatewayConfig, GatewayLLMProvider),
 }
+
+if _PROVIDERS.keys() != LLM_PROVIDER_NAMES:
+    raise FrameworkBugError("LLM provider implementations must exactly implement the core provider binding contract")
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +246,7 @@ class QueryStrategy(Protocol):
         *,
         provider: LLMProvider,
         tracer: LangfuseTracer,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult: ...
 
 
@@ -287,6 +262,14 @@ class SingleQueryStrategy:
     max_tokens: int | None
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
+    apply_declared_output_field_contracts: Callable[[SchemaContract], SchemaContract]
+    image_specs: tuple[ImageInputConfig, ...] = ()
+    max_image_bytes: int = 0
+    max_images_per_call: int = 0
+    # Top-level structured output (single-prompt lift of the per-query pair).
+    # Extracted fields land UNPREFIXED — no query name exists to prefix with.
+    output_fields: tuple[OutputFieldConfig, ...] = ()
+    response_format: ResponseFormat = ResponseFormat.STANDARD
 
     def execute(
         self,
@@ -295,6 +278,7 @@ class SingleQueryStrategy:
         *,
         provider: LLMProvider,
         tracer: LangfuseTracer,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute single LLM query and build output row."""
         state_id = ctx.state_id
@@ -303,7 +287,7 @@ class SingleQueryStrategy:
         if ctx.token is None:
             raise RuntimeError("LLMTransform requires ctx.token")
         token_id = ctx.token.token_id
-        shutdown_event = cast("threading.Event | None", getattr(ctx, "shutdown_event", None))
+        shutdown_event = ctx.shutdown_event
 
         # 1. Render template (THEIR DATA — wrap)
         try:
@@ -318,16 +302,51 @@ class SingleQueryStrategy:
                 error_reason["template_file_path"] = self.template.template_source
             return TransformResult.error(error_reason)
 
-        # 2. Build messages
-        messages: list[dict[str, str]] = []
+        # 1b. Resolve config-declared image inputs (THEIR DATA — wrap). A
+        # resolve failure is a row-level error result; the provider must
+        # never be called on it.
+        image_parts: tuple[ImagePart, ...] = ()
+        if self.image_specs:
+            resolved = resolve_image_parts(
+                row,
+                payload_store=payload_store,
+                specs=self.image_specs,
+                max_image_bytes=self.max_image_bytes,
+                max_images_per_call=self.max_images_per_call,
+            )
+            if isinstance(resolved, TransformResult):
+                return resolved
+            image_parts = resolved
+        tracer_extra_metadata: dict[str, Any] | None = {"image_parts": [p.audit_view() for p in image_parts]} if image_parts else None
+
+        # 1c. Build the provider response constraint and exact prompt sent
+        # (shared with multi-query mode and the LLM source). No output_fields
+        # → (None, unchanged prompt), exactly the pre-structured behavior.
+        response_format, provider_prompt = build_structured_response_directive(
+            schema_name="single_output",
+            output_fields=self.output_fields,
+            response_format=self.response_format,
+            prompt=rendered.prompt,
+        )
+
+        # 2. Build messages. Images append AFTER the standard-mode schema
+        # suffix, so the schema text and the images travel in the same user
+        # message (multi-query parity).
+        messages: list[ChatMessage] = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": rendered.prompt})
+            messages.append(ChatMessage(role="system", content=self.system_prompt))
+        user_content: str | tuple[ContentPart, ...] = provider_prompt
+        content_hash: str | None = None
+        if image_parts:
+            user_content = (TextPart(text=provider_prompt), *image_parts)
+            content_hash = parts_hash(user_content)
+        messages.append(ChatMessage(role="user", content=user_content))
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result()
 
         # 3. Call provider (EXTERNAL — errors classified by provider)
+        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -335,18 +354,20 @@ class SingleQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                state_id=state_id,
-                token_id=token_id,
+                audit_parent=trace_parent,
+                response_format=response_format,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=tracer_extra_metadata,
+                system_prompt=self.system_prompt,
             )
             return TransformResult.error(
                 {"reason": "context_length_exceeded", "error": str(e)},
@@ -355,12 +376,14 @@ class SingleQueryStrategy:
         except LLMClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=tracer_extra_metadata,
+                system_prompt=self.system_prompt,
             )
             if e.retryable:
                 raise
@@ -378,12 +401,14 @@ class SingleQueryStrategy:
         )
         if finish_reason_error is not None:
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=tracer_extra_metadata,
+                system_prompt=self.system_prompt,
             )
             return finish_reason_error.result
 
@@ -392,17 +417,28 @@ class SingleQueryStrategy:
 
         # Record success in tracer
         tracer.record_success(
-            token_id=token_id,
+            parent=trace_parent,
             query_name="single",
-            prompt=rendered.prompt,
+            prompt=provider_prompt,
             response_content=content,
-            model=self.model,
+            model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
+            extra_metadata=tracer_extra_metadata,
+            system_prompt=self.system_prompt,
         )
 
-        # 6. Build output row — operational fields only
+        # 6. Build output row — operational fields plus any declared
+        # structured fields. LLM response content is Tier 3 — parse and
+        # validate immediately (shared with multi-query mode); extracted
+        # fields land unprefixed, raw content stays in response_field for
+        # audit traceability.
         output = row.to_dict()
+        if self.output_fields:
+            extracted, extraction_error = extract_structured_fields(content, self.output_fields)
+            if extraction_error is not None:
+                return TransformResult.error(extraction_error, retryable=False)
+            output.update(extracted)
         output[self.response_field] = content
         populate_llm_operational_fields(
             output,
@@ -420,6 +456,7 @@ class SingleQueryStrategy:
             lookup_hash=rendered.lookup_hash,
             lookup_source=rendered.lookup_source,
             system_prompt_source=self.system_prompt_source,
+            parts_hash=content_hash,
         )
 
         # 8. Propagate contract
@@ -428,13 +465,14 @@ class SingleQueryStrategy:
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self.apply_declared_output_field_contracts(output_contract)
         output_contract = self.align_output_contract(output_contract)
 
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={
                 "action": "enriched",
-                "fields_added": [self.response_field],
+                "fields_added": [self.response_field, *(field.suffix for field in self.output_fields)],
                 "metadata": {
                     "model": result.model,
                     "finish_reason": _serialize_finish_reason(result.finish_reason),
@@ -469,6 +507,10 @@ class MultiQueryStrategy:
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
     align_output_row_contract: Callable[[PipelineRow], PipelineRow]
+    apply_declared_output_field_contracts: Callable[[SchemaContract], SchemaContract]
+    image_specs: tuple[ImageInputConfig, ...] = ()
+    max_image_bytes: int = 0
+    max_images_per_call: int = 0
     executor: PooledExecutor | None = None
     max_capacity_retry_seconds: int = 3600
     _query_templates: Mapping[str, PromptTemplate] = field(init=False, default_factory=dict)
@@ -495,6 +537,7 @@ class MultiQueryStrategy:
         *,
         provider: LLMProvider,
         tracer: LangfuseTracer,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute all queries, returning atomic success or failure."""
         state_id = ctx.state_id
@@ -503,11 +546,11 @@ class MultiQueryStrategy:
         if ctx.token is None:
             raise RuntimeError("LLMTransform requires ctx.token")
         token_id = ctx.token.token_id
-        shutdown_event = cast("threading.Event | None", getattr(ctx, "shutdown_event", None))
+        shutdown_event = ctx.shutdown_event
 
         if self.executor is not None:
-            return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event)
-        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event)
+            return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
+        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
 
     @dataclass(frozen=True, slots=True)
     class _QuerySuccess:
@@ -539,6 +582,7 @@ class MultiQueryStrategy:
         provider: LLMProvider,
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
+        payload_store: PayloadStore | None = None,
     ) -> _QuerySuccess | TransformResult:
         """Execute a single query within a multi-query row.
 
@@ -596,11 +640,49 @@ class MultiQueryStrategy:
                 retryable=False,
             )
 
-        # Build messages
-        messages: list[dict[str, str]] = []
+        # Resolve config-declared image inputs (THEIR DATA — wrap). Resolved
+        # from the full row, not the synthetic template_ctx above — image
+        # fields are never template variables. A resolve failure is a
+        # row-level error result; the provider must never be called on it.
+        image_parts: tuple[ImagePart, ...] = ()
+        if self.image_specs:
+            resolved = resolve_image_parts(
+                row,
+                payload_store=payload_store,
+                specs=self.image_specs,
+                max_image_bytes=self.max_image_bytes,
+                max_images_per_call=self.max_images_per_call,
+            )
+            if isinstance(resolved, TransformResult):
+                return resolved
+            image_parts = resolved
+        tracer_extra_metadata: dict[str, Any] | None = {"image_parts": [p.audit_view() for p in image_parts]} if image_parts else None
+
+        # Build the provider response constraint and exact prompt sent for
+        # this query (shared with single-prompt mode and the LLM source).
+        response_format, provider_prompt = build_structured_response_directive(
+            schema_name=f"{spec.name}_output",
+            output_fields=spec.output_fields or (),
+            response_format=spec.response_format,
+            prompt=rendered.prompt,
+        )
+
+        # Build messages. Images append AFTER the standard-mode schema suffix
+        # above, so the schema text and the images travel in the same user
+        # message.
+        messages: list[ChatMessage] = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": rendered.prompt})
+            messages.append(ChatMessage(role="system", content=self.system_prompt))
+        user_content: str | tuple[ContentPart, ...] = provider_prompt
+        content_hash: str | None = None
+        if image_parts:
+            user_content = (TextPart(text=provider_prompt), *image_parts)
+            content_hash = parts_hash(user_content)
+        messages.append(ChatMessage(role="user", content=user_content))
+        # Langfuse reconstructs the outbound messages from these separate
+        # values. Match the provider's truthy inclusion rule so an explicitly
+        # empty system prompt is omitted from both records.
+        tracer_system_prompt = self.system_prompt or None
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result(query_name=spec.name, query_index=query_idx)
@@ -608,25 +690,7 @@ class MultiQueryStrategy:
         # Execute query
         query_max_tokens = spec.max_tokens or self.max_tokens
 
-        # Build response_format for structured output requests
-        response_format: dict[str, Any] | None = None
-        if spec.output_fields:
-            if spec.response_format == ResponseFormat.STRUCTURED:
-                properties = {f.suffix: f.to_json_schema() for f in spec.output_fields}
-                response_format = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": f"{spec.name}_output",
-                        "schema": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": list(properties),
-                        },
-                    },
-                }
-            else:
-                response_format = {"type": "json_object"}
-
+        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -634,19 +698,20 @@ class MultiQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=query_max_tokens,
-                state_id=state_id,
-                token_id=token_id,
+                audit_parent=trace_parent,
                 response_format=response_format,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=tracer_extra_metadata,
+                system_prompt=tracer_system_prompt,
             )
             return TransformResult.error(
                 {
@@ -660,12 +725,14 @@ class MultiQueryStrategy:
         except LLMClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=tracer_extra_metadata,
+                system_prompt=tracer_system_prompt,
             )
             if e.retryable:
                 raise  # Pool catches with AIMD; sequential catches and returns error
@@ -689,12 +756,14 @@ class MultiQueryStrategy:
         )
         if finish_reason_error is not None:
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=tracer_extra_metadata,
+                system_prompt=tracer_system_prompt,
             )
             return finish_reason_error.result
 
@@ -702,77 +771,32 @@ class MultiQueryStrategy:
         content = strip_markdown_fences(result.content)
 
         tracer.record_success(
-            token_id=token_id,
+            parent=trace_parent,
             query_name=spec.name,
-            prompt=rendered.prompt,
+            prompt=provider_prompt,
             response_content=content,
-            model=self.model,
+            model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
+            extra_metadata=tracer_extra_metadata,
+            system_prompt=tracer_system_prompt,
         )
 
         # Build partial output for this query
         partial: dict[str, Any] = {}
 
-        # JSON parsing + field extraction when output_fields configured
+        # JSON parsing + field extraction when output_fields configured.
+        # LLM response content is Tier 3 — parse and validate immediately
+        # (shared with single-prompt mode and the LLM source).
         if spec.output_fields:
-            # LLM response content is Tier 3 — parse and validate immediately
-            try:
-                parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
-            except (json.JSONDecodeError, ValueError) as e:
-                return TransformResult.error(
-                    {
-                        "reason": "json_parse_failed",
-                        "query_name": spec.name,
-                        "query_index": query_idx,
-                        "error": str(e),
-                        "raw_response_preview": content[:500],
-                    },
-                    retryable=False,
-                )
-            if not isinstance(parsed, dict):
-                return TransformResult.error(
-                    {
-                        "reason": "invalid_json_type",
-                        "query_name": spec.name,
-                        "query_index": query_idx,
-                        "expected": "object",
-                        "actual": type(parsed).__name__,
-                    },
-                    retryable=False,
-                )
-            # Extract typed fields into prefixed output columns.
-            # Validate field presence — Tier 3 boundary: if the LLM omitted
-            # a declared field, that's an error, not a silent None.
-            for field in spec.output_fields:
-                field_key = f"{spec.name}_{field.suffix}"
-                if field.suffix not in parsed:
-                    return TransformResult.error(
-                        {
-                            "reason": "missing_output_field",
-                            "query_name": spec.name,
-                            "query_index": query_idx,
-                            "field": field.suffix,
-                            "available_fields": list(parsed.keys()),
-                        },
-                        retryable=False,
-                    )
-                # Validate value type — Tier 3 boundary: LLM may return
-                # wrong types in standard mode (no API schema enforcement)
-                type_error = validate_field_value(parsed[field.suffix], field)
-                if type_error is not None:
-                    return TransformResult.error(
-                        {
-                            "reason": "field_type_mismatch",
-                            "query_name": spec.name,
-                            "query_index": query_idx,
-                            "field": field.suffix,
-                            "error": type_error,
-                            "value": repr(parsed[field.suffix])[:200],
-                        },
-                        retryable=False,
-                    )
-                partial[field_key] = parsed[field.suffix]
+            extracted, extraction_error = extract_structured_fields(content, spec.output_fields)
+            if extraction_error is not None:
+                extraction_error["query_name"] = spec.name
+                extraction_error["query_index"] = query_idx
+                return TransformResult.error(extraction_error, retryable=False)
+            # Typed fields land in prefixed output columns.
+            for suffix, value in extracted.items():
+                partial[f"{spec.name}_{suffix}"] = value
             # Also store raw content for audit traceability
             partial[f"{spec.name}_{self.response_field}"] = content
         else:
@@ -794,6 +818,7 @@ class MultiQueryStrategy:
             lookup_hash=rendered.lookup_hash,
             lookup_source=rendered.lookup_source,
             system_prompt_source=self.system_prompt_source,
+            parts_hash=content_hash,
         )
         # Record finish_reason so audit trail distinguishes None (absent) from
         # STOP (confirmed completion). See Bug elspeth-393d2459aa.
@@ -856,6 +881,7 @@ class MultiQueryStrategy:
         provider: LLMProvider,
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute queries sequentially (pool_size=1 fallback).
 
@@ -885,6 +911,7 @@ class MultiQueryStrategy:
                         provider,
                         tracer,
                         shutdown_event,
+                        payload_store,
                     )
                     break  # success or non-retryable error result - exit retry loop
                 except LLMClientError as e:
@@ -952,6 +979,7 @@ class MultiQueryStrategy:
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self.apply_declared_output_field_contracts(output_contract)
         output_contract = self.align_output_contract(output_contract)
 
         return TransformResult.success(
@@ -972,6 +1000,7 @@ class MultiQueryStrategy:
         provider: LLMProvider,
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
+        payload_store: PayloadStore | None = None,
     ) -> TransformResult:
         """Execute queries in parallel via PooledExecutor with AIMD retry.
 
@@ -1003,6 +1032,7 @@ class MultiQueryStrategy:
                     "tracer": tracer,
                     "token_id": token_id,
                     "state_id": state_id,
+                    "payload_store": payload_store,
                 },
                 state_id=state_id,
                 row_index=i,
@@ -1021,6 +1051,7 @@ class MultiQueryStrategy:
                 work["provider"],
                 work["tracer"],
                 shutdown_event,
+                work["payload_store"],
             )
             if isinstance(result, TransformResult):
                 return result  # Error passthrough
@@ -1112,6 +1143,7 @@ class MultiQueryStrategy:
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self.apply_declared_output_field_contracts(output_contract)
         output_contract = self.align_output_contract(output_contract)
 
         return TransformResult.success(
@@ -1140,27 +1172,69 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         "azure"      → AzureOpenAIConfig + AzureLLMProvider
         "openrouter" → OpenRouterConfig  + OpenRouterLLMProvider
         "bedrock"    → BedrockConfig     + BedrockLLMProvider
+        "gateway"    → GatewayConfig     + GatewayLLMProvider
 
     Strategy selection:
         queries is not None → MultiQueryStrategy
         queries is None     → SingleQueryStrategy
     """
 
+    # response_field names the row field the LLM response is WRITTEN to
+    # ("Field name for LLM response in output"), not a column that is read.
+    output_naming_config_keys = frozenset({"response_field"})
     name = "llm"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f79bf0f2944245ad"
+    source_file_hash: str | None = "sha256:9d2acfb21a7717f5"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
+    # elspeth-e6e552ce34: the LLM ADDS response fields and never rewrites an
+    # input field's value in place. A response field colliding with a
+    # guaranteed input is rejected at build by
+    # validate_transform_output_field_collisions, which is what keeps this
+    # promise sound for the type-resolution walk; a stray undeclared column a
+    # response could overwrite is never resolvable (no ancestor vouches for
+    # it), so no build verdict rests on its value.
+    preserves_input_values = True
     _provider: LLMProvider | None
+    capability_tags: tuple[str, ...] = ("llm", "generation", "structured-output")
+
+    usage_when_to_use = (
+        "Use an operator-approved profile for text generation or structured-output workflows. "
+        "ELSPETH records prompts, responses, the returned model, and input/output tokens when reported by the provider "
+        "in the audit trail. "
+        "Returned provider content is untrusted before LLM reuse or tool routing."
+    )
+    usage_when_not_to_use = (
+        "Do not put provider credentials or endpoints in web-authored options; the operator profile "
+        "owns those bindings. Do not use this non-deterministic transform where replay must reproduce "
+        "the same generated value without a recorded provider response."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: llm\n"
+        "  options:\n"
+        "    profile: approved-structured-generation\n"
+        "    prompt_template: 'Summarise {{ row.document_text }} in one sentence.'\n"
+        "    required_input_fields: [document_text]\n"
+        "    response_field: generated_summary\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def get_config_model(cls, config: dict[str, Any] | None = None) -> type[LLMConfig]:
         """Dispatch to provider-specific config class based on config["provider"]."""
-        provider = config.get("provider") if config is not None else None
+        provider = config["provider"] if config is not None and "provider" in config else None
+        if provider is not None and not isinstance(provider, str):
+            # ``provider in _PROVIDERS`` on an unhashable value (a mapping from
+            # a free-form ``upsert_node`` options payload) raised TypeError and
+            # crashed the composer's Stage-1 validator; a wrong-typed provider
+            # is a config error like an unknown one (elspeth-2ed41f0a4a).
+            raise ValueError(f"LLM 'provider' must be a string naming one of: {sorted(_PROVIDERS)}")
         if provider is not None and provider in _PROVIDERS:
             config_cls, _ = _PROVIDERS[provider]
             return config_cls
@@ -1235,19 +1309,23 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     def probe_config(cls) -> dict[str, Any]:
         """Minimal no-network config for the ADR-009 forward invariant.
 
-        Uses ``openai/gpt-4o`` because it's a stable presence in
+        Uses ``openai/gpt-5`` because it's a stable presence in
         ``litellm.model_list``'s OpenRouter slice — the probe never
         actually makes a network call (preflight mode defers all
         external client setup), but the value-source compliance walker
         runs at construction time, so the model identifier MUST satisfy
-        the OpenRouter catalog declaration. A model that drops in/out
-        across litellm versions (e.g. ``gpt-4o-mini``) would make probes
-        flaky against the catalog snapshot.
+        the OpenRouter catalog declaration. Pick a family's BASE id: a
+        point-version or dated variant that drops in/out across litellm
+        versions (e.g. ``gpt-4o-2024-05-13``) would make probes flaky
+        against the catalog snapshot, and the web service primes this
+        catalog LIVE at boot, so a provider-retired id (``gpt-4o``,
+        EOL'd upstream 2026-09) starts failing construction in
+        deployments even while the bundled snapshot still lists it.
         """
         return {
             "provider": "openrouter",
             "api_key": "probe-key",
-            "model": "openai/gpt-4o",
+            "model": "openai/gpt-5",
             "prompt_template": "{{ row.llm_probe_text }}",
             "schema": {"mode": "observed"},
             "required_input_fields": [],
@@ -1278,16 +1356,15 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         class _InvariantProvider:
             def execute_query(
                 self,
-                messages: list[dict[str, str]],
+                messages: Sequence[ChatMessage],
                 *,
                 model: str,
                 temperature: float,
                 max_tokens: int | None,
-                state_id: str,
-                token_id: str,
+                audit_parent: LLMAuditParent,
                 response_format: object | None = None,
             ) -> LLMQueryResult:
-                del messages, model, temperature, max_tokens, state_id, token_id, response_format
+                del messages, model, temperature, max_tokens, audit_parent, response_format
                 return LLMQueryResult(
                     content="probe response",
                     usage=TokenUsage.known(1, 1),
@@ -1311,23 +1388,49 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             probe_provider.close()
 
     def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(config)
+        profile_alias = require_lowered_llm_profile_alias(config)
+        if profile_alias is None:
+            base_config = config
+        else:
+            # Consume the nominal admission proof at the plugin boundary and
+            # retain only the opaque plain-string alias in audit config.
+            base_config = dict(config)
+            base_config["profile_alias"] = profile_alias
+        super().__init__(base_config)
 
         # Provider dispatch from single registry.
         # config is user YAML (Tier 3 boundary) — distinguish missing key from unknown value.
-        provider_name = config.get("provider")
-        if provider_name is None:
+        if "provider" not in base_config:
             raise ValueError(f"LLM config missing required 'provider' key. Valid providers: {sorted(_PROVIDERS)}")
+        provider_name = base_config["provider"]
         if provider_name not in _PROVIDERS:
             raise ValueError(f"Unknown LLM provider '{provider_name}'. Valid providers: {sorted(_PROVIDERS)}")
         config_cls, _ = _PROVIDERS[provider_name]
+
+        # `profile_alias` is a provenance-only marker the batch/CLI operator
+        # profile catalog lowering pass (core.config._lower_llm_profile_nodes)
+        # leaves in `self.config` (converted from its nominal admission marker
+        # to an ordinary string before BaseTransform.__init__ above) purely so
+        # the DAG's per-node audit config and the run's settings_json snapshot
+        # can answer "which llm_profiles alias did this node use" — no provider
+        # config model declares this field, and every provider config class
+        # forbids extra fields, so it must be excluded before validation rather
+        # than declared on LLMConfig itself. Named distinctly from the authored
+        # `profile` selector key on purpose: keying the retained alias as
+        # `profile` here would put a lowered node right back into the exact shape
+        # _lower_llm_profile_nodes's own ambiguity check rejects (`profile`
+        # + `provider` both present), making that pass unsafe to run twice
+        # over its own output.
+        provider_config = (
+            {key: value for key, value in base_config.items() if key != "profile_alias"} if "profile_alias" in base_config else base_config
+        )
 
         # Parse config with provider-specific model.
         # config_cls is one of the registered provider config classes at runtime;
         # from_dict() returns Self on the subclass, but mypy sees type[LLMConfig].
         self._config = cast(
-            "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig",
-            config_cls.from_dict(config, plugin_name=self.name),
+            "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig",
+            config_cls.from_dict(provider_config, plugin_name=self.name),
         )
         self._initialize_declared_input_fields(self._config)
 
@@ -1393,6 +1496,12 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         pool_config = self._config.pool_config
         self._query_executor: PooledExecutor | None = PooledExecutor(pool_config) if pool_config is not None else None
 
+        # Config-declared image inputs — empty tuple (text-only) when unset,
+        # same shape both strategies expect.
+        image_specs: tuple[ImageInputConfig, ...] = tuple(self._config.image_inputs or ())
+        max_image_bytes = self._config.max_image_bytes
+        max_images_per_call = self._config.max_images_per_call
+
         # Strategy dispatch: queries is not None → multi-query
         if self._config.queries is not None:
             query_specs = resolve_queries(self._config.queries)
@@ -1407,6 +1516,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 response_field=self._response_field,
                 align_output_contract=self._align_output_contract,
                 align_output_row_contract=self._align_output_row_contract,
+                apply_declared_output_field_contracts=self._apply_declared_output_field_contracts,
+                image_specs=image_specs,
+                max_image_bytes=max_image_bytes,
+                max_images_per_call=max_images_per_call,
                 executor=self._query_executor,
                 max_capacity_retry_seconds=self._max_capacity_retry_seconds,
             )
@@ -1425,7 +1538,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
             # Output schema config with prefixed fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
-            # See: docs/superpowers/specs/2026-03-20-output-schema-contract-enforcement-design.md
+            # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, prefixed_guaranteed)
 
             # Pydantic output schema with prefixed LLM fields
@@ -1444,6 +1557,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 extracted_fields=extracted if extracted else None,
             )
         else:
+            single_output_fields = tuple(self._config.output_fields or ())
             self._strategy = SingleQueryStrategy(
                 template=self._template,
                 system_prompt=self._system_prompt,
@@ -1453,39 +1567,55 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 max_tokens=self._max_tokens,
                 response_field=self._response_field,
                 align_output_contract=self._align_output_contract,
+                apply_declared_output_field_contracts=self._apply_declared_output_field_contracts,
+                image_specs=image_specs,
+                max_image_bytes=max_image_bytes,
+                max_images_per_call=max_images_per_call,
+                output_fields=single_output_fields,
+                response_format=self._config.response_format,
             )
 
-            # Single-query emits unprefixed fields (operational only — audit goes to success_reason)
-            guaranteed = get_llm_guaranteed_fields(self._response_field)
+            # Single-query emits unprefixed fields: operational side fields
+            # plus any declared structured fields (audit goes to success_reason).
+            # Structured fields are guaranteed on success — extraction fails
+            # the row when one is missing.
+            guaranteed = (
+                *get_llm_guaranteed_fields(self._response_field),
+                *(field.suffix for field in single_output_fields),
+            )
             self.declared_output_fields = frozenset(guaranteed)
 
             # Output schema config with LLM output fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
-            # See: docs/superpowers/specs/2026-03-20-output-schema-contract-enforcement-design.md
+            # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed)
 
-            # Pydantic output schema with unprefixed LLM fields
+            # Pydantic output schema with unprefixed LLM fields (structured
+            # fields carry their declared runtime types)
             self.output_schema = _build_augmented_output_schema(
                 base_schema_config=schema_config,
                 response_field=self._response_field,
                 schema_name=f"{self.name}OutputSchema",
+                extracted_fields=tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
+                or None,
             )
 
         # Provider instance — deferred to on_start() when recorder/telemetry available
         self._provider: LLMProvider | None = None
 
-        # Recorder, telemetry, rate limit (set in on_start)
+        # Recorder, telemetry, rate limit, payload store (set in on_start)
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
         self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._shutdown_event: threading.Event | None = None
+        self._payload_store: PayloadStore | None = None
 
         # Batch processing state
         self._batch_initialized = False
 
     @property
-    def provider_config(self) -> AzureOpenAIConfig | OpenRouterConfig | BedrockConfig:
+    def provider_config(self) -> AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig:
         """Read-only accessor for the typed provider config.
 
         Exposes the post-validation ``LLMConfig`` subclass so cross-cutting
@@ -1500,13 +1630,25 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         return self._config
 
     def output_semantics(self) -> OutputSemanticDeclaration:
-        """Declare that raw LLM response fields are strings.
+        """Declare that raw LLM response fields are unconstrained strings.
 
         Single-query mode emits ``response_field`` directly. Multi-query mode
         emits one raw response field per query using ``<query>_<response_field>``.
         Structured multi-query extracted fields have their own schema types, but
         this semantic contract only claims the raw response-content fields whose
         runtime value is mechanically known here.
+
+        ``text_framing=UNCONSTRAINED`` is a positive claim, not an abstention:
+        the value is free text and whether the model emits a newline is not
+        decidable before the run, under any configuration. Declaring UNKNOWN
+        instead would be an abstention, and ``compare_semantic`` can never
+        raise a CONFLICT against an abstention — which left a generative
+        producer ungateable and every wrong composition merely advisory
+        (ADR-039).
+
+        ``content_kind`` stays UNKNOWN deliberately. Prose or markdown is a
+        genuine unknown per response, and claiming either would manufacture
+        false conflicts against consumers that constrain that dimension.
         """
         from elspeth.contracts.plugin_semantics import (
             ContentKind,
@@ -1522,7 +1664,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     FieldSemanticFacts(
                         field_name=f"{spec.name}_{self._response_field}",
                         content_kind=ContentKind.UNKNOWN,
-                        text_framing=TextFraming.UNKNOWN,
+                        text_framing=TextFraming.UNCONSTRAINED,
                         value_type=SemanticValueType.STR,
                         fact_code="llm.response_field.string",
                         configured_by=("queries", "response_field"),
@@ -1536,7 +1678,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 FieldSemanticFacts(
                     field_name=self._response_field,
                     content_kind=ContentKind.UNKNOWN,
-                    text_framing=TextFraming.UNKNOWN,
+                    text_framing=TextFraming.UNCONSTRAINED,
                     value_type=SemanticValueType.STR,
                     fact_code="llm.response_field.string",
                     configured_by=("response_field", "queries"),
@@ -1565,11 +1707,14 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
         self._shutdown_event = ctx.shutdown_event
+        self._payload_store = ctx.payload_store
         limiter_name = (
             "azure_openai"
             if isinstance(self._config, AzureOpenAIConfig)
             else "bedrock"
             if isinstance(self._config, BedrockConfig)
+            else "gateway"
+            if isinstance(self._config, GatewayConfig)
             else "openrouter"
         )
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
@@ -1581,11 +1726,6 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # Must happen after provider creation — the OpenAI SDK must be available.
         if isinstance(self._tracing_config, AzureAITracingConfig):
             _configure_azure_monitor(self._tracing_config)
-            logger.info(
-                "Azure AI tracing initialized",
-                provider="azure_ai",
-                content_recording=self._tracing_config.enable_content_recording,
-            )
 
     def runtime_preflight(self, ctx: LifecycleContext) -> None:
         """Fail fast if the configured LLM provider/model cannot be reached."""
@@ -1644,6 +1784,27 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 limiter=self._limiter,
                 resolved_prompt_template_hash=self._resolved_prompt_template_hash,
             )
+        elif isinstance(self._config, GatewayConfig):
+            # GatewayConfig.api_key already carries the resolved bearer value
+            # — the same convention AzureOpenAIConfig.api_key and
+            # OpenRouterConfig.api_key use. Resolution from an operator
+            # secret reference happens upstream of config construction (the
+            # web path's ``resolve_secret_refs`` walk, or ``${VAR}``
+            # expansion for batch/CLI YAML), never here. See Phase 2 Task 4's
+            # report for why an earlier direct ``EnvSecretLoader`` lookup at
+            # this call site was replaced with this shared path.
+            return GatewayLLMProvider(
+                endpoint=self._config.endpoint,
+                api_key=self._config.api_key,
+                contract_major=self._config.contract_major,
+                required_capabilities=self._config.required_capabilities,
+                timeout_seconds=self._config.timeout_seconds,
+                recorder=self._recorder,
+                run_id=self._run_id,
+                telemetry_emit=self._telemetry_emit,
+                limiter=self._limiter,
+                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")
 
@@ -1667,7 +1828,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         """
         if self._provider is None:
             raise RuntimeError("Provider not initialized — _process_row called before on_start()")
-        self._shutdown_event = cast("threading.Event | None", getattr(ctx, "shutdown_event", None))
+        self._shutdown_event = ctx.shutdown_event
 
         blank_required_input = _blank_required_input_result(row, self.declared_input_fields)
         if blank_required_input is not None:
@@ -1678,6 +1839,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             ctx,
             provider=self._provider,
             tracer=self._tracer,
+            payload_store=self._payload_store,
         )
 
     def close(self) -> None:
@@ -1806,33 +1968,52 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             )
         return None
 
+    # ``@classmethod`` must stay OUTERMOST: ``trust_boundary`` reads the wrapped
+    # function's signature to resolve ``source_param``.
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source="composer node options snapshot as the planner authored it (post-call hint input)",
+        source_param="config_snapshot",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "returns advisory hint strings only; every member of config_snapshot is read by presence and "
+            "shape-checked before use, an absent or wrong-shaped member yields no hint, and nothing is raised, "
+            "coerced, or defaulted on malformed input"
+        ),
+        non_raising=True,
+    )
     def get_post_call_hints(
         cls,
         *,
         tool_name: str,
         config_snapshot: Mapping[str, object],
     ) -> tuple[str, ...]:
-        hints: list[str] = []
         # Manual _usage / _model field declared by hand → tell them it's automatic.
-        response_field = config_snapshot.get("response_field")
-        fields: object | None = None
-        fields_location = "schema.fields"
-        for schema_key, location in (("schema", "schema.fields"), ("output_schema", "output_schema.fields")):
-            schema_snapshot = config_snapshot.get(schema_key)
-            if isinstance(schema_snapshot, Mapping) and "fields" in schema_snapshot:
-                fields = schema_snapshot["fields"]
-                fields_location = location
-                break
-
-        if isinstance(response_field, str) and isinstance(fields, Sequence) and not isinstance(fields, (str, bytes)):
-            manual_appendix = {f"{response_field}_usage", f"{response_field}_model"}
-            declared = {field.split(":", 1)[0].strip() if isinstance(field, str) else "" for field in fields}
-            if manual_appendix & declared:
-                hints.append(
-                    f"You declared {sorted(manual_appendix & declared)!r} in the schema, but token-usage and model-ID fields are appended automatically. Remove them from {fields_location}."
-                )
-        return tuple(hints)
+        if "response_field" not in config_snapshot:
+            return ()
+        response_field = config_snapshot["response_field"]
+        if type(response_field) is not str:
+            return ()
+        manual_appendix = {f"{response_field}_usage", f"{response_field}_model"}
+        # The first schema alias that carries a `fields` member is the one the
+        # author wrote; every read stays inside this loop body so the snapshot
+        # is parsed where it is still the boundary's own input.
+        for schema_key, fields_location in (("schema", "schema.fields"), ("output_schema", "output_schema.fields")):
+            if schema_key not in config_snapshot:
+                continue
+            schema_snapshot = config_snapshot[schema_key]
+            if not isinstance(schema_snapshot, Mapping) or "fields" not in schema_snapshot:
+                continue
+            fields = schema_snapshot["fields"]
+            if isinstance(fields, Sequence) and not isinstance(fields, (str, bytes)):
+                declared = {field.split(":", 1)[0].strip() if isinstance(field, str) else "" for field in fields}
+                if manual_appendix & declared:
+                    return (
+                        f"You declared {sorted(manual_appendix & declared)!r} in the schema, but token-usage and model-ID fields are appended automatically. Remove them from {fields_location}.",
+                    )
+            return ()
+        return ()
 
 
 # Register opt-in for value-source compliance: the typed Pydantic config

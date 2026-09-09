@@ -14,22 +14,27 @@ so they are tested for structural validity only.
 
 from __future__ import annotations
 
+import csv
 import json
+import os
 import shutil
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-from sqlalchemy import select
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, select
 from typer.testing import CliRunner
 
 from elspeth.cli import app
+from elspeth.config_loading import load_settings
 from elspeth.contracts import RunStatus
-from elspeth.core.config import ElspethSettings, load_settings
+from elspeth.core.config import ElspethSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import rows_table, run_sources_table
+from elspeth.core.payload_store import FilesystemPayloadStore
 
 # Examples that contain ${VAR} env var references that would fail
 # load_settings without the env vars being set.
@@ -39,6 +44,7 @@ _EXAMPLES_WITH_ENV_VARS: frozenset[str] = frozenset(
         "azure_keyvault_secrets",
         "azure_openai_sentiment",
         "chroma_rag_qa",
+        "llm_source",
         "multi_query_assessment",
         "openrouter_multi_query_assessment",
         "openrouter_sentiment",
@@ -64,6 +70,33 @@ _EXAMPLES_WITH_FILE_REFS: frozenset[str] = frozenset(
 _EXAMPLES_WITHOUT_SETTINGS: frozenset[str] = frozenset(
     {
         "chaosllm",  # Contains only responses.jsonl (replay data)
+        # settings.generated.yaml is produced (and gitignored) by
+        # examples/textract_inline/scripts/prepare_document_blobs.py from
+        # operator-staged documents; there is no meaningful static pipeline
+        # to ship.
+        "textract_inline",
+    }
+)
+
+# Top-level YAML files that configure support data/services rather than an
+# ELSPETH pipeline. Keep this explicit so a newly named pipeline cannot escape
+# validation merely because it is not called settings.yaml.
+_AUXILIARY_EXAMPLE_YAMLS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("ab_llm_experiment", "chaos_config.yaml"),
+        ("chaosllm_endurance", "chaos_config.yaml"),
+        ("chaosllm_sentiment", "chaos_config.yaml"),
+        ("document_review_panel", "chaos_config.yaml"),
+        ("join_refused", "chaos_config.yaml"),
+        ("multi_query_assessment", "criteria_lookup.yaml"),
+        ("multi_worker", "chaos_config.yaml"),
+        ("multi_worker", "chaos_config_faults.yaml"),
+        ("multi_worker_showcase", "chaos_config.yaml"),
+        ("multi_worker_showcase", "chaos_config_faults.yaml"),
+        ("reference_join_fork_llm", "chaos_reply.yaml"),
+        ("reference_join_fork_llm", "chaos_triage.yaml"),
+        ("openrouter_multi_query_assessment", "criteria_lookup.yaml"),
+        ("schema_contracts_llm_assessment", "criteria_lookup.yaml"),
     }
 )
 
@@ -84,9 +117,9 @@ class TestShippedExamples:
     def _find_example_settings(examples_dir: Path) -> list[tuple[str, Path]]:
         """Find all settings YAML files in examples.
 
-        Returns a list of (example_name, yaml_path) tuples. Only files
-        whose name contains "settings" are included; auxiliary YAML files
-        (chaos_config.yaml, criteria_lookup.yaml) are excluded.
+        Returns a list of (example_name, yaml_path) tuples. Every top-level
+        YAML file is treated as a pipeline unless it appears in the explicit
+        auxiliary-file allowlist.
         """
         results: list[tuple[str, Path]] = []
         for example_dir in sorted(examples_dir.iterdir()):
@@ -94,8 +127,9 @@ class TestShippedExamples:
                 continue
             if example_dir.name in _EXAMPLES_WITHOUT_SETTINGS:
                 continue
-            for yaml_file in sorted(example_dir.glob("*.yaml")):
-                if "settings" in yaml_file.name:
+            yaml_files = sorted((*example_dir.glob("*.yaml"), *example_dir.glob("*.yml")))
+            for yaml_file in yaml_files:
+                if (example_dir.name, yaml_file.name) not in _AUXILIARY_EXAMPLE_YAMLS:
                     results.append((example_dir.name, yaml_file))
         return results
 
@@ -133,6 +167,7 @@ class TestShippedExamples:
             copied_example_dir,
             ignore=shutil.ignore_patterns("*.db", "*.db-shm", "*.db-wal", "*.jsonl", "payloads"),
         )
+        (copied_example_dir / "runs").mkdir(exist_ok=True)
         return copied_example_dir
 
     @staticmethod
@@ -195,18 +230,37 @@ class TestShippedExamples:
         """Every example directory has at least one settings file (or is excused)."""
         example_dirs = [d for d in sorted(example_pipeline_dir.iterdir()) if d.is_dir() and not d.name.startswith(".")]
         assert len(example_dirs) > 0, "No example directories found"
+        discovered_names = {name for name, _path in self._find_example_settings(example_pipeline_dir)}
 
         for d in example_dirs:
             if d.name in _EXAMPLES_WITHOUT_SETTINGS:
                 continue
-            yamls = list(d.glob("*.yaml")) + list(d.glob("*.yml"))
-            assert len(yamls) > 0, f"Example {d.name} has no YAML config files"
+            assert d.name in discovered_names, f"Example {d.name} has no pipeline config files"
 
     def test_discover_settings_files(self, example_pipeline_dir: Path) -> None:
         """Sanity check: discovery finds a reasonable number of settings files."""
         settings = self._find_example_settings(example_pipeline_dir)
         # We know there are 20+ example directories with settings
         assert len(settings) >= 20, f"Expected at least 20 settings files, found {len(settings)}"
+
+    def test_discovery_includes_named_pipeline_entrypoints(self, example_pipeline_dir: Path) -> None:
+        """Pipeline entry points need validation even when not named settings.yaml."""
+        discovered_paths = {path.relative_to(example_pipeline_dir) for _name, path in self._find_example_settings(example_pipeline_dir)}
+        expected_paths = {
+            Path("chroma_rag_indexed/index_pipeline.yaml"),
+            Path("chroma_rag_indexed/query_pipeline.yaml"),
+        }
+
+        assert expected_paths <= discovered_paths
+
+    def test_discovery_includes_new_top_level_pipeline_names(self, tmp_path: Path) -> None:
+        """A future pipeline name cannot silently escape shipped-config validation."""
+        example_dir = tmp_path / "named_pipeline"
+        example_dir.mkdir()
+        pipeline = example_dir / "workflow.yml"
+        pipeline.write_text("sources: {}\nsinks: {}\n", encoding="utf-8")
+
+        assert self._find_example_settings(tmp_path) == [("named_pipeline", pipeline)]
 
     def test_all_settings_are_valid_yaml(self, example_pipeline_dir: Path) -> None:
         """All example settings files are parseable YAML producing dicts."""
@@ -277,6 +331,62 @@ class TestShippedExamples:
                 assert source.plugin, f"{name}/{path.name}: source '{source_name}' plugin is empty"
             # Verify at least one sink exists
             assert len(loaded.sinks) > 0, f"{name}/{path.name}: no sinks defined"
+
+    def test_llm_source_example_is_one_static_prompt_to_one_json_sink(self, example_pipeline_dir: Path) -> None:
+        """The bounded LLM example is source-native and emits the configured field shape."""
+        settings_path = example_pipeline_dir / "llm_source" / "settings.yaml"
+        data: dict[str, Any] = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+
+        assert list(data["sources"]) == ["generated_briefing"]
+        source = data["sources"]["generated_briefing"]
+        assert source["plugin"] == "llm"
+        assert source["on_success"] == "result"
+
+        options = source["options"]
+        assert options["provider"] == "openrouter"
+        assert options["api_key"] == "${OPENROUTER_API_KEY}"
+        assert options["model"] == "openai/gpt-4.1-mini"
+        assert "base_url" not in options
+        assert isinstance(options["prompt_template"], str) and options["prompt_template"].strip()
+        assert "{{" not in options["prompt_template"]
+        assert "{%" not in options["prompt_template"]
+        assert options["response_field"] == "briefing"
+        assert options["schema"] == {"mode": "observed"}
+        assert options["on_validation_failure"] == "discard"
+
+        assert data.get("transforms", []) == []
+        assert list(data["sinks"]) == ["result"]
+        sink = data["sinks"]["result"]
+        assert sink["plugin"] == "json"
+        assert sink["on_write_failure"] == "discard"
+        assert sink["options"]["format"] == "jsonl"
+        assert sink["options"]["collision_policy"] == "auto_increment"
+        assert sink["options"]["schema"] == {"mode": "observed"}
+
+    def test_llm_source_example_cli_validation_makes_no_provider_request(
+        self,
+        example_pipeline_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Static CLI validation neither preflights nor executes the configured provider."""
+        from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+
+        def reject_provider_call(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("elspeth validate crossed the LLM provider boundary")
+
+        monkeypatch.setattr(OpenRouterLLMProvider, "runtime_preflight", reject_provider_call)
+        monkeypatch.setattr(OpenRouterLLMProvider, "execute_query", reject_provider_call)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "provider-token-placeholder")
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+
+        result = CliRunner().invoke(
+            app,
+            ["validate", "--settings", str(example_pipeline_dir / "llm_source" / "settings.yaml")],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Pipeline configuration valid" in result.output
 
     def test_multi_flow_example_executes_end_to_end(
         self,
@@ -377,6 +487,65 @@ class TestShippedExamples:
                     assert isinstance(t, dict), f"{name}/{path.name}: transform[{i}] must be a dict"
                     assert "plugin" in t, f"{name}/{path.name}: transform[{i}] missing 'plugin'"
 
+    @pytest.mark.parametrize(
+        ("example_name", "settings_name", "required_env_var"),
+        [
+            pytest.param("landscape_journal", "settings.yaml", None, id="landscape-journal"),
+            pytest.param(
+                "openrouter_multi_query_assessment",
+                "settings_journal.yaml",
+                "OPENROUTER_API_KEY",
+                id="openrouter-multi-query-assessment",
+            ),
+        ],
+    )
+    def test_shipped_journal_paths_resolve_next_to_audit_db_with_hostile_env(
+        self,
+        example_pipeline_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        example_name: str,
+        settings_name: str,
+        required_env_var: str | None,
+    ) -> None:
+        """Shipped journal examples keep their SQLite journal beside the audit DB."""
+        example_dir = self._copy_example_to_tmp(
+            example_pipeline_dir,
+            tmp_path,
+            example_name,
+        )
+        monkeypatch.chdir(tmp_path)
+        # A process-wide override must not redirect or disable this copied fixture.
+        monkeypatch.setenv("ELSPETH_LANDSCAPE__DUMP_TO_JSONL", "false")
+        for variable_name in tuple(os.environ):
+            if variable_name.startswith("ELSPETH_"):
+                monkeypatch.delenv(variable_name)
+        if required_env_var is not None:
+            monkeypatch.setenv(required_env_var, "test-openrouter-key")
+        settings = load_settings(example_dir / settings_name)
+
+        # LandscapeDB.from_url never creates the audit DB's parent directory
+        # (the `elspeth run` preflight owns that), so the example must ship
+        # its runs/ directory via a tracked .gitkeep for direct construction
+        # to work against a fresh checkout.
+        assert (example_dir / "runs").is_dir(), f"examples/{example_name}/runs/ must ship a tracked .gitkeep"
+        db = LandscapeDB.from_url(
+            settings.landscape.url,
+            dump_to_jsonl=settings.landscape.dump_to_jsonl,
+            dump_to_jsonl_path=settings.landscape.dump_to_jsonl_path,
+            dump_to_jsonl_include_payloads=settings.landscape.dump_to_jsonl_include_payloads,
+            dump_to_jsonl_payload_base_path=(
+                str(settings.payload_store.base_path)
+                if settings.landscape.dump_to_jsonl_payload_base_path is None
+                else settings.landscape.dump_to_jsonl_payload_base_path
+            ),
+        )
+        try:
+            assert db._journal is not None
+            assert db._journal._path == example_dir / "runs" / "audit.journal.jsonl"
+        finally:
+            db.close()
+
     def test_no_duplicate_sink_names(self, example_pipeline_dir: Path) -> None:
         """Sink names are unique within each settings file (YAML keys are unique by spec)."""
         settings = self._find_example_settings(example_pipeline_dir)
@@ -411,6 +580,43 @@ class TestShippedExamples:
         assert "durable scheduler" in readme
         assert "5,000-10,000 rows/sec" not in readme
 
+    def test_openrouter_sentiment_readme_matches_configured_outputs(self, example_pipeline_dir: Path) -> None:
+        """OpenRouter output documentation stays aligned with both live settings."""
+        openrouter_dir = example_pipeline_dir / "openrouter_sentiment"
+        openrouter_readme = (openrouter_dir / "README.md").read_text()
+        for settings_name in ("settings.yaml", "settings_pooled.yaml"):
+            settings = yaml.safe_load((openrouter_dir / settings_name).read_text())
+            output_name = Path(settings["sinks"]["output"]["options"]["path"]).name
+            assert output_name in openrouter_readme
+        assert "results.csv" not in openrouter_readme
+        assert "results_pooled.csv" not in openrouter_readme
+
+    def test_screened_row_union_readmes_document_partial_exit(self, example_pipeline_dir: Path) -> None:
+        """Designed PARTIAL examples document the CLI's nonzero exit contract."""
+        root_readme = (example_pipeline_dir / "README.md").read_text()
+        row_union_readme = (example_pipeline_dir / "row_union_ab_experiment" / "README.md").read_text()
+        assert "`row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1" in root_readme
+        assert "This designed `PARTIAL` result returns process exit 1" in row_union_readme
+
+    def test_checkpoint_resume_readme_supplies_settings(self, example_pipeline_dir: Path) -> None:
+        """Every repo-root resume command supplies the pipeline settings path."""
+        checkpoint_readme = (example_pipeline_dir / "checkpoint_resume" / "README.md").read_text()
+        resume_commands = [line for line in checkpoint_readme.splitlines() if line.startswith("elspeth resume ")]
+        resume_settings = [
+            line for line in checkpoint_readme.splitlines() if line.startswith("  --settings examples/checkpoint_resume/settings.yaml")
+        ]
+        assert len(resume_commands) == 2
+        assert len(resume_settings) == 2
+
+    def test_container_example_preserves_host_ownership_and_payloads(self, example_pipeline_dir: Path) -> None:
+        """The bind-mount walkthrough keeps secure runtime artifacts host-readable."""
+        container_dir = example_pipeline_dir / "threshold_gate_container"
+        container_readme = (container_dir / "README.md").read_text()
+        settings = yaml.safe_load((container_dir / "settings.yaml").read_text())
+
+        assert '--user "$(id -u):$(id -g)"' in container_readme
+        assert settings["payload_store"]["base_path"] == "/app/pipeline/runs/payloads"
+
     def test_chaosllm_endurance_documents_smoke_row_override(self, example_pipeline_dir: Path) -> None:
         """chaosllm_endurance must expose a bounded dogfood mode."""
         run_sh = (example_pipeline_dir / "chaosllm_endurance" / "run.sh").read_text()
@@ -425,3 +631,371 @@ class TestShippedExamples:
         assert "input.<rows>.csv" in readme
         assert "CHAOSLLM_ENDURANCE_ROWS=20" in readme
         assert "not gate dogfood" in agent_guide
+
+    def test_local_chaosllm_launchers_configure_secret_fingerprinting(self, example_pipeline_dir: Path) -> None:
+        """Local fake-key launchers work without relying on an ignored .env."""
+        fingerprint_env = example_pipeline_dir / "chaosllm_env.sh"
+        assert fingerprint_env.is_file()
+
+        clean_env = {key: value for key, value in os.environ.items() if key not in {"ELSPETH_FINGERPRINT_KEY", "ELSPETH_ALLOW_RAW_SECRETS"}}
+        generated = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; printf "%s|%s\\n" "${ELSPETH_FINGERPRINT_KEY:-}" "${ELSPETH_ALLOW_RAW_SECRETS:-}"',
+                "bash",
+                str(fingerprint_env),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=clean_env,
+        )
+        assert generated.returncode == 0, generated.stderr
+        generated_key, raw_secret_override = generated.stdout.strip().split("|", maxsplit=1)
+        assert generated_key
+        assert raw_secret_override == ""
+
+        operator_key = "operator-supplied-fingerprint-key"
+        preserved = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; printf "%s\\n" "$ELSPETH_FINGERPRINT_KEY"',
+                "bash",
+                str(fingerprint_env),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**clean_env, "ELSPETH_FINGERPRINT_KEY": operator_key},
+        )
+        assert preserved.returncode == 0, preserved.stderr
+        assert preserved.stdout.strip() == operator_key
+
+        for example_name in (
+            "chaosllm_sentiment",
+            "chaosllm_endurance",
+            "multi_worker",
+            "multi_worker_showcase",
+        ):
+            run_sh = (example_pipeline_dir / example_name / "run.sh").read_text()
+            assert 'source "$PROJECT_ROOT/examples/chaosllm_env.sh"' in run_sh
+
+        assert "ELSPETH_FINGERPRINT_KEY" in (example_pipeline_dir / "rate_limited_llm" / "README.md").read_text()
+        assert "ELSPETH_FINGERPRINT_KEY" in (example_pipeline_dir / "AGENTS.md").read_text()
+
+    def test_multi_worker_showcase_creates_shareable_child_work(self, example_pipeline_dir: Path) -> None:
+        """Showcase fan-out creates durable child items followers can claim."""
+        example_dir = example_pipeline_dir / "multi_worker_showcase"
+        settings: dict[str, Any] = yaml.safe_load((example_dir / "settings.yaml").read_text())
+
+        assert list(settings["sources"]) == ["primary"]
+        source = settings["sources"]["primary"]
+        assert source["plugin"] == "json"
+        assert source["on_success"] == "exploded"
+
+        explode = settings["transforms"][0]
+        assert explode["plugin"] == "json_explode"
+        assert explode["input"] == "exploded"
+        assert explode["on_success"] == "llm_input"
+        assert settings["transforms"][1]["input"] == "llm_input"
+
+        input_path = example_pipeline_dir.parent / source["options"]["path"]
+        input_rows = [json.loads(line) for line in input_path.read_text().splitlines() if line.strip()]
+        assert sum(len(row["items"]) for row in input_rows) == 200
+
+    def test_multi_worker_default_profiles_are_deterministic(self, example_pipeline_dir: Path) -> None:
+        """Self-verifying worker demos keep terminal faults opt-in."""
+        variants = {
+            "multi_worker": "ELSPETH_MULTI_WORKER_CHAOS_CONFIG",
+            "multi_worker_showcase": "ELSPETH_MULTI_WORKER_SHOWCASE_CHAOS_CONFIG",
+        }
+
+        for example_name, override_name in variants.items():
+            example_dir = example_pipeline_dir / example_name
+            default_config: dict[str, Any] = yaml.safe_load((example_dir / "chaos_config.yaml").read_text())
+            error_injection = default_config["error_injection"]
+            percentages = {key: value for key, value in error_injection.items() if key.endswith("_pct")}
+
+            assert percentages
+            assert all(value == 0.0 for value in percentages.values()), percentages
+
+            fault_config: dict[str, Any] = yaml.safe_load((example_dir / "chaos_config_faults.yaml").read_text())
+            fault_percentages = {key: value for key, value in fault_config["error_injection"].items() if key.endswith("_pct")}
+            assert any(value > 0.0 for value in fault_percentages.values())
+
+            launcher = (example_dir / "run.sh").read_text()
+            assert override_name in launcher
+
+    def test_multi_worker_launchers_reject_invalid_admission_setup(self, example_pipeline_dir: Path) -> None:
+        """Launchers reject invalid worker counts and occupied ChaosLLM ports."""
+        for example_name in ("multi_worker", "multi_worker_showcase"):
+            launcher = (example_pipeline_dir / example_name / "run.sh").read_text()
+
+            assert "WORKERS must be a positive integer" in launcher
+            assert "port $CHAOS_PORT is already in use" in launcher
+            readiness_loop = launcher.split("for i in $(seq 1 30); do", maxsplit=1)[1].split("done", maxsplit=1)[0]
+            assert readiness_loop.index('kill -0 "$CHAOS_PID"') < readiness_loop.index("curl -sf")
+
+    def test_multi_worker_summary_counts_terminal_row_outcomes(self, example_pipeline_dir: Path) -> None:
+        """The PASS summary excludes source/fan-out scheduler work items."""
+        launcher = (example_pipeline_dir / "multi_worker" / "run.sh").read_text()
+        total_rows_query = launcher.split('TOTAL_ROWS="', maxsplit=1)[1].split('"\n', maxsplit=1)[0]
+
+        assert "FROM token_outcomes" in total_rows_query
+        assert "completed=1" in total_rows_query
+        assert "outcome IN ('success','failure')" in total_rows_query
+
+    def test_multi_worker_showcase_stats_use_completed_terminal_outcomes(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
+        """Showcase stats distinguish successful and failed terminal outcomes."""
+        run_id = "run-under-test"
+        db_path = tmp_path / "audit.db"
+        metadata = MetaData()
+        work_item_rows = Table(
+            "token_work_items",
+            metadata,
+            Column("run_id", String, nullable=False),
+            Column("status", String, nullable=False),
+        )
+        terminal_outcome_rows = Table(
+            "token_outcomes",
+            metadata,
+            Column("run_id", String, nullable=False),
+            Column("outcome", String, nullable=True),
+            Column("completed", Integer, nullable=False),
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        metadata.create_all(engine)
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    work_item_rows.insert(),
+                    [{"run_id": run_id, "status": "terminal"} for _ in range(200)],
+                )
+                conn.execute(
+                    terminal_outcome_rows.insert(),
+                    [{"run_id": run_id, "outcome": "success", "completed": 1} for _ in range(192)]
+                    + [{"run_id": run_id, "outcome": "failure", "completed": 1} for _ in range(8)]
+                    + [
+                        {"run_id": run_id, "outcome": "expanded", "completed": 1},
+                        {"run_id": run_id, "outcome": "failure", "completed": 0},
+                        {"run_id": "other-run", "outcome": "failure", "completed": 1},
+                    ],
+                )
+        finally:
+            engine.dispose()
+
+        stats_helper = example_pipeline_dir / "multi_worker_showcase" / "outcome_stats.sh"
+        assert stats_helper.is_file(), "multi_worker_showcase must ship its outcome stats helper"
+        result = subprocess.run(
+            ["bash", stats_helper, db_path, run_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "200|192|8"
+
+    def test_multi_worker_showcase_stats_reject_invalid_inputs(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
+        """Outcome stats fail closed for invalid identity, storage, and output."""
+        stats_helper = example_pipeline_dir / "multi_worker_showcase" / "outcome_stats.sh"
+
+        empty_run_id = subprocess.run(
+            ["bash", stats_helper, tmp_path / "unused.db", ""],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert empty_run_id.returncode == 2
+        assert "invalid run id" in empty_run_id.stderr
+
+        missing_db = subprocess.run(
+            ["bash", stats_helper, tmp_path / "missing.db", "run-under-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert missing_db.returncode != 0
+        assert missing_db.stderr
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_sqlite = fake_bin / "sqlite3"
+        fake_sqlite.write_text("#!/usr/bin/env bash\necho 'not|valid'\n")
+        fake_sqlite.chmod(0o755)
+        invalid_result = subprocess.run(
+            ["bash", stats_helper, tmp_path / "unused.db", "run-under-test"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        )
+        assert invalid_result.returncode != 0
+        assert "invalid outcome counts" in invalid_result.stderr
+
+    def test_multi_worker_showcase_launcher_fails_closed_on_invalid_stats(self, example_pipeline_dir: Path) -> None:
+        """The showcase launcher propagates and validates outcome helper output."""
+        run_sh = (example_pipeline_dir / "multi_worker_showcase" / "run.sh").read_text()
+
+        assert "set -euo pipefail" in run_sh
+        assert 'OUTCOME_COUNTS="$(bash "$SCRIPT_DIR/outcome_stats.sh" "$DB" "$RUN_ID")"' in run_sh
+        assert "IFS='|' read -r TOTAL_ROWS SUCCEEDED FAILED EXTRA_COUNT" in run_sh
+        assert '[ -n "${EXTRA_COUNT:-}" ]' in run_sh
+        for field in ("TOTAL_ROWS", "SUCCEEDED", "FAILED"):
+            assert f'[[ ! "${field}" =~ ^[0-9]+$ ]]' in run_sh
+        assert "invalid outcome counts" in run_sh
+        assert '2>/dev/null || echo "0|0|0"' not in run_sh
+        assert "Failed outcomes:" in run_sh
+        assert "Quarantined:" not in run_sh
+        assert "CONTRIBUTING_WORKERS" in run_sh
+        assert "expected at least 2" in run_sh
+        assert "WORKER_FAILED" in run_sh
+
+    def test_retention_purge_readme_uses_current_cli_contract(self, example_pipeline_dir: Path) -> None:
+        """Retention instructions use positive ages and selector-aware explain."""
+        readme = (example_pipeline_dir / "retention_purge" / "README.md").read_text()
+
+        assert "--retention-days 0" not in readme
+        assert readme.count("--retention-days 7") >= 2
+        assert '--row "$ROW_ID"' in readme
+        assert "--no-tui" in readme
+        assert "interactive TUI" in readme
+
+    def test_blob_transform_offline_launcher_runs_from_clean_copy(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
+        """blob_transforms ships a self-contained offline launcher."""
+        repository_root = example_pipeline_dir.parent
+        tracked_result = subprocess.run(
+            ["git", "ls-files", "--", "examples/blob_transforms"],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        tracked_paths = {Path(line) for line in tracked_result.stdout.splitlines() if line}
+        required_paths = {
+            Path("examples/blob_transforms/run.sh"),
+            Path("examples/blob_transforms/input/feed_a.csv"),
+            Path("examples/blob_transforms/input/feed_b.csv"),
+        }
+        assert required_paths <= tracked_paths
+
+        for tracked_path in sorted(tracked_paths):
+            source_path = repository_root / tracked_path
+            copied_path = tmp_path / tracked_path
+            copied_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, copied_path)
+
+        copied_example_dir = tmp_path / "examples" / "blob_transforms"
+        (tmp_path / ".venv").symlink_to(repository_root / ".venv")
+
+        hosted_state = {
+            copied_example_dir / "payloads" / "hosted-sentinel": b"hosted payload sentinel\n",
+            copied_example_dir / "runs" / "audit.db": b"hosted audit sentinel\n",
+            copied_example_dir / "output" / "tutorial_html_blobs.jsonl": b'{"blob_ref":"hosted-sentinel"}\n',
+        }
+        for path, content in hosted_state.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+        hostile_binary = tmp_path / "ambient-python-bin"
+        hostile_binary.write_text("#!/usr/bin/env sh\nexit 97\n", encoding="utf-8")
+        hostile_binary.chmod(0o755)
+        launcher_env = {
+            **os.environ,
+            "PYTHON_BIN": str(hostile_binary),
+            "ELSPETH_BIN": str(hostile_binary),
+        }
+        launcher_env.pop("ELSPETH_BLOB_TRANSFORMS_PYTHON_BIN", None)
+        launcher_env.pop("ELSPETH_BLOB_TRANSFORMS_CLI_BIN", None)
+        # Run under a permissive umask: the launcher must produce a private
+        # payload-store directory even when the host default would not.
+        result = subprocess.run(
+            ["bash", "-c", 'umask 0002 && exec bash "$1"', "bash", str(copied_example_dir / "run.sh")],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            # The launcher now runs five audited pipelines, each with a fresh
+            # CLI process. Preserve the former single-pipeline budget per run;
+            # 120 seconds total can expire during healthy progress under CI load.
+            timeout=5 * 120,
+            check=False,
+            env=launcher_env,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        observed_hosted_state = {path: path.read_bytes() if path.is_file() else None for path in hosted_state}
+        assert observed_hosted_state == hosted_state
+
+        with (copied_example_dir / "input" / "csv_blob_manifest.csv").open(newline="", encoding="utf-8") as f:
+            manifest = list(csv.DictReader(f))
+        assert [row["source_name"] for row in manifest] == ["feed_a", "feed_b"]
+
+        blob_refs = [row["blob_ref"] for row in manifest]
+        assert len(blob_refs) == 2
+        assert len(set(blob_refs)) == 2
+        payload_store = FilesystemPayloadStore(copied_example_dir / "payloads" / "offline")
+        for source_name, blob_ref in zip(("feed_a", "feed_b"), blob_refs, strict=True):
+            assert payload_store.retrieve(blob_ref) == (copied_example_dir / "input" / f"{source_name}.csv").read_bytes()
+        assert (copied_example_dir / "runs" / "offline_audit.db").is_file()
+
+        with (copied_example_dir / "output" / "expanded_csv_rows.csv").open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        manifest_by_source = {row["source_name"]: row for row in manifest}
+        expected_rows: list[tuple[str, str, str, str, str]] = []
+        for source_name in ("feed_a", "feed_b"):
+            with (copied_example_dir / "input" / f"{source_name}.csv").open(newline="", encoding="utf-8") as f:
+                fixture_rows = list(csv.DictReader(f))
+            expected_rows.extend(
+                (
+                    source_name,
+                    manifest_by_source[source_name]["blob_ref"],
+                    fixture_row["id"],
+                    fixture_row["text"],
+                    str(row_index),
+                )
+                for row_index, fixture_row in enumerate(fixture_rows)
+            )
+
+        assert [(row["source_name"], row["blob_ref"], row["id"], row["text"], row["csv_row_index"]) for row in rows] == expected_rows
+
+    def test_blob_transform_documents_canonical_launcher(self, example_pipeline_dir: Path) -> None:
+        """blob_transforms documents its clean-checkout launcher everywhere."""
+        command = "./examples/blob_transforms/run.sh"
+        assert command in (example_pipeline_dir / "blob_transforms" / "README.md").read_text()
+        assert command in (example_pipeline_dir / "README.md").read_text()
+        assert command in (example_pipeline_dir / "AGENTS.md").read_text()
+
+    def test_blob_transform_hosted_launcher_repairs_payload_permissions(
+        self,
+        example_pipeline_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The hosted-fetch launcher makes its payload root safe before execution."""
+        source_example_dir = example_pipeline_dir / "blob_transforms"
+        copied_example_dir = tmp_path / "examples" / "blob_transforms"
+        shutil.copytree(source_example_dir, copied_example_dir)
+
+        payload_dir = copied_example_dir / "payloads"
+        payload_dir.chmod(0o775)
+        fake_cli = tmp_path / "verify-hosted-payload-mode"
+        fake_cli.write_text(
+            '#!/usr/bin/env bash\ntest "$(stat -c %a examples/blob_transforms/payloads)" = "700"\n',
+            encoding="utf-8",
+        )
+        fake_cli.chmod(0o755)
+
+        launcher = copied_example_dir / "run_hosted_fetch.sh"
+        result = subprocess.run(
+            ["bash", str(launcher)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "ELSPETH_BLOB_TRANSFORMS_CLI_BIN": str(fake_cli)},
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert payload_dir.stat().st_mode & 0o077 == 0

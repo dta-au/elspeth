@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
+from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import (
     Determinism,
@@ -81,7 +82,9 @@ class TestRecorderCrashesOnInvalidEnums:
         run = _begin_run(landscape_factory)
 
         with pytest.raises((AttributeError, TypeError, ValueError)):
-            landscape_factory.run_lifecycle.complete_run(run.run_id, status="bogus_status")  # type: ignore[arg-type]
+            landscape_factory.run_lifecycle.complete_run(
+                status="bogus_status", coordination_token=leader_coordination_token(landscape_factory, run.run_id)
+            )  # type: ignore[arg-type]
 
     def test_invalid_node_type_crashes(self, landscape_db: LandscapeDB, landscape_factory: RecorderFactory) -> None:
         """register_node with an invalid node_type must crash.

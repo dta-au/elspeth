@@ -15,14 +15,18 @@ We intercept the asyncio loop's exception handler directly because
 warning through ``logger.getLogger("asyncio")`` whose default handler
 holds a reference to the pre-redirect ``sys.stderr``.
 
-The fix is a done-callback drain in ``finally`` so the exception is
-considered retrieved. These tests pin that contract so a future refactor
-of ``async_workers.py`` cannot reintroduce the journal noise.
+The fix (as of elspeth-5269b43bca) is to cancel the abandoned wrapper
+future in ``finally``: a cancelled ``asyncio`` future never receives the
+worker's late exception, so there is nothing left unretrieved — and a
+submission still queued is dropped before it ever occupies a thread. These
+tests pin that contract so a future refactor of ``async_workers.py`` cannot
+reintroduce the journal noise.
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
 
@@ -179,7 +183,6 @@ def test_uses_shared_bounded_executor() -> None:
     Concurrent calls run on threads from the same "async-worker" pool, and
     shutdown_async_workers() tears it down so a fresh pool is lazily rebuilt.
     """
-    import threading
 
     async def scenario() -> None:
         def _get_thread_info() -> tuple[int, str]:
@@ -198,3 +201,150 @@ def test_uses_shared_bounded_executor() -> None:
         assert async_workers._SHARED_EXECUTOR is None
 
     _run_in_isolated_loop(scenario)
+
+
+# ---------------------------------------------------------------------------
+# elspeth-5269b43bca — admission is bounded by WORKER lifetime, not awaiter
+# lifetime.  A caller that times out and gives up does not free the slot its
+# sync work still occupies; the pool therefore stops admitting new work at a
+# fixed ceiling instead of queueing forever, and every abandoned submission
+# that had not yet started is dropped rather than left to run for nobody.
+# ---------------------------------------------------------------------------
+
+
+def _hung_worker(started: threading.Event, release: threading.Event, started_count: list[int], count_lock: threading.Lock) -> str:
+    with count_lock:
+        started_count[0] += 1
+    started.set()
+    release.wait()
+    return "released"
+
+
+def test_admission_is_bounded_while_timed_out_workers_continue() -> None:
+    """Timed-out callers must not free admission; a saturated pool rejects fast.
+
+    Phase A is the ticket's retry storm: every ``wait_for`` abandons its
+    awaiter after 50ms while the sync worker stays parked on ``release``.
+    Before the fix each retry queued another copy behind the 16 hung threads
+    (unbounded queue depth). Now the hung threads keep their admission, the
+    abandoned queued copies are dropped, and outstanding admissions equal the
+    work that is actually running — never the number of retries.
+
+    Phase B saturates the pool with LIVE awaiters (queued, not abandoned) and
+    proves an unrelated worker-backed call is rejected within the bounded
+    admission wait rather than sitting behind them until its client gives up.
+
+    Phase C proves recovery once the hung workers finish.
+    """
+    from elspeth.web import async_workers
+
+    release = threading.Event()
+    started = threading.Event()
+    started_count = [0]
+    count_lock = threading.Lock()
+    max_workers = async_workers.MAX_WORKERS
+    capacity = async_workers.ADMISSION_CAPACITY
+
+    async def settle() -> None:
+        # ``_chain_future`` propagates the wrapper's cancellation to the
+        # concurrent future through a loop callback, so give it a tick.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    async def scenario() -> None:
+        assert async_workers.outstanding_admissions() == 0
+
+        # Phase A — retry storm past capacity, every caller giving up.
+        for _ in range(capacity + 8):
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(
+                    run_sync_in_worker(_hung_worker, started, release, started_count, count_lock),
+                    timeout=0.05,
+                )
+            await settle()
+            assert async_workers.outstanding_admissions() <= max_workers
+        assert started_count[0] == max_workers, "abandoned queued retries must never start"
+        assert async_workers.outstanding_admissions() == max_workers
+
+        # Phase B — saturate with live awaiters and probe an unrelated call.
+        queued = [
+            asyncio.create_task(run_sync_in_worker(_hung_worker, started, release, started_count, count_lock))
+            for _ in range(capacity - max_workers)
+        ]
+        await asyncio.sleep(0.05)
+        assert async_workers.outstanding_admissions() == capacity
+        unrelated_started = time.monotonic()
+        with pytest.raises(async_workers.AsyncWorkerAdmissionTimeoutError):
+            await run_sync_in_worker(lambda: "unrelated")
+        elapsed = time.monotonic() - unrelated_started
+        assert elapsed < async_workers.ADMISSION_WAIT_SECONDS + 1.0, elapsed
+        # Rejection did not disturb the outstanding accounting.
+        assert async_workers.outstanding_admissions() == capacity
+
+        # Phase C — recovery once the hung workers finish.
+        release.set()
+        assert await asyncio.gather(*queued) == ["released"] * len(queued)
+        deadline = time.monotonic() + 5.0
+        while async_workers.outstanding_admissions() != 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert async_workers.outstanding_admissions() == 0
+        assert started_count[0] == capacity
+        assert await run_sync_in_worker(lambda: "unrelated") == "unrelated"
+
+    try:
+        _run_in_isolated_loop(scenario)
+    finally:
+        release.set()
+
+
+def test_abandoned_queued_work_never_starts() -> None:
+    """A submission abandoned before a thread picked it up must be dropped.
+
+    Fill every worker thread with awaited (not abandoned) hung work, submit
+    one more under a tiny ``wait_for``, and let it time out while still
+    queued. When the pool drains, that queued function must not run: an
+    abandoned request's work is not load-bearing and, left queued, it would
+    hold admission and a thread for nobody.
+    """
+    from elspeth.web import async_workers
+
+    release = threading.Event()
+    started = threading.Event()
+    started_count = [0]
+    count_lock = threading.Lock()
+    orphan_ran = threading.Event()
+
+    def orphan() -> None:
+        orphan_ran.set()
+
+    async def scenario() -> None:
+        assert async_workers.outstanding_admissions() == 0
+        occupants = [
+            asyncio.create_task(run_sync_in_worker(_hung_worker, started, release, started_count, count_lock))
+            for _ in range(async_workers.MAX_WORKERS)
+        ]
+        deadline = time.monotonic() + 5.0
+        while started_count[0] < async_workers.MAX_WORKERS and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert started_count[0] == async_workers.MAX_WORKERS
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(run_sync_in_worker(orphan), timeout=0.05)
+        # The abandoned submission released its admission as soon as the
+        # wrapper's cancellation reached the queued concurrent future (one
+        # loop callback later) — nothing is left to finish.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert async_workers.outstanding_admissions() == async_workers.MAX_WORKERS
+
+        release.set()
+        assert await asyncio.gather(*occupants) == ["released"] * async_workers.MAX_WORKERS
+        # Give the pool a moment to pick up anything still queued.
+        await asyncio.sleep(0.2)
+        assert not orphan_ran.is_set(), "abandoned queued work ran after its caller gave up"
+        assert async_workers.outstanding_admissions() == 0
+
+    try:
+        _run_in_isolated_loop(scenario)
+    finally:
+        release.set()

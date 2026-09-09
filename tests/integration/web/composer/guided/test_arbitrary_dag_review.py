@@ -8,16 +8,17 @@ commit point.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.sessions.models import guided_operation_events_table, guided_operations_table
+from tests.helpers.guided_leases import abandon_guided_worker_leases
+from tests.integration.web.composer.guided.test_plural_sources_outputs import _stage_minimal_plural_proposal
 from tests.integration.web.composer.guided.test_respond import (
     TestStep2IntraStep as _Step2Journey,
 )
@@ -43,6 +44,11 @@ def _bound_action(turn: dict, *, chosen: list[str], operation_id: str | None = N
         "draft_hash": turn["payload"]["draft_hash"],
         "chosen": chosen,
     }
+
+
+def _source_success_edge(turn: dict) -> dict:
+    """Select a success edge that can move to the other reviewed output."""
+    return next(connection for connection in turn["payload"]["connections"] if connection["flow"]["kind"] == "source_success")
 
 
 class _SimulatedWorkerCrash(BaseException):
@@ -88,11 +94,14 @@ def test_review_wiring_changes_only_checkpoint_and_keeps_proposal_pending(
         if str(proposal.id) == proposal_turn["payload"]["proposal_id"]
     )
     assert proposal.status == "pending"
+    # elspeth-ed67eb9d0d: "changes only checkpoint" now includes moving the
+    # pending proposal's anchor onto that checkpoint, recorded as one
+    # non-terminal ``proposal.rebased`` event. The row stays pending.
     assert [
         event.event_type
         for event in asyncio.run(service.list_proposal_events(UUID(session_id)))
         if str(event.proposal_id) == proposal_turn["payload"]["proposal_id"]
-    ] == ["proposal.created"]
+    ] == ["proposal.created", "proposal.rebased"]
 
 
 def test_confirm_wiring_is_the_only_commit_and_consumption_point(
@@ -130,7 +139,8 @@ def test_confirm_wiring_is_the_only_commit_and_consumption_point(
         event.event_type
         for event in asyncio.run(service.list_proposal_events(UUID(session_id)))
         if str(event.proposal_id) == proposal_turn["payload"]["proposal_id"]
-    ] == ["proposal.created", "proposal.accepted"]
+        # ``proposal.rebased`` between them is the wire-review anchor move.
+    ] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
     assert _get_guided(composer_test_client, session_id)["terminal"]["kind"] == "completed"
 
 
@@ -257,7 +267,11 @@ def test_wire_projection_uses_the_pending_candidate_stable_ids_and_exact_contrac
 def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     composer_test_client: TestClient,
 ) -> None:
-    session_id, staged = _stage(composer_test_client, filename="corrected-wire.jsonl")
+    session_id, staged = _stage_minimal_plural_proposal(
+        composer_test_client,
+        suffix="corrected-wire",
+        source_count=3,
+    )
     original = staged["next_turn"]["payload"]
     reviewed = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
@@ -265,7 +279,11 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     )
     assert reviewed.status_code == 200, reviewed.json()
     wire_turn = reviewed.json()["next_turn"]
-    target = wire_turn["payload"]["connections"][0]["from_endpoint"]
+    selected_edge = _source_success_edge(wire_turn)
+    target = {
+        "kind": "edge",
+        "stable_id": selected_edge["stable_id"],
+    }
     operation_id = str(uuid4())
     correction_request = {
         "operation_id": operation_id,
@@ -273,7 +291,7 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
         "proposal_id": original["proposal_id"],
         "draft_hash": original["draft_hash"],
         "edit_target": target,
-        "correction_feedback": "Route the reviewed source through the requested processing before the output.",
+        "correction_feedback": "Route the reviewed source to the other reviewed output.",
     }
     service = composer_test_client.app.state.session_service
     messages_before = asyncio.run(service.get_messages(UUID(session_id), limit=None))
@@ -309,6 +327,9 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     events = asyncio.run(service.list_proposal_events(UUID(session_id)))
     assert [event.event_type for event in events if str(event.proposal_id) == original["proposal_id"]] == [
         "proposal.created",
+        # The wire-review advance moved this proposal's anchor before the
+        # correction superseded it (elspeth-ed67eb9d0d).
+        "proposal.rebased",
         "proposal.rejected",
     ]
     rejected = next(
@@ -394,22 +415,34 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
     state_versions_before = asyncio.run(service.get_state_versions(UUID(session_id)))
     proposal_events_before = asyncio.run(service.list_proposal_events(UUID(session_id)))
 
+    engine = composer_test_client.app.state.session_engine
+
+    def _worker_lost(reason: str) -> _SimulatedWorkerCrash:
+        # A lost process runs no cleanup; its leases lapse and another
+        # replica takes the operation over. Model that here: both of this
+        # worker's authorities lapse BEFORE its exception reaches the lease
+        # guard, so the guard finds no live authority to terminalise (the
+        # Q3 ruling: a takeover is not a failure) and the row stays
+        # ``in_progress`` for the recovery below to claim.
+        abandon_guided_worker_leases(engine, session_id=session_id, operation_id=operation_id)
+        return _SimulatedWorkerCrash(reason)
+
     if crash_point == "after_admission":
 
         async def crash_before_dispatch(**_kwargs):
-            raise _SimulatedWorkerCrash("worker lost after admission")
+            raise _worker_lost("worker lost after admission")
 
         monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", crash_before_dispatch)
     elif crash_point == "after_compute_before_record":
 
         async def crash_before_dispatch_record(*_args, **_kwargs):
-            raise _SimulatedWorkerCrash("worker lost after prepared computation and before durable record")
+            raise _worker_lost("worker lost after prepared computation and before durable record")
 
         monkeypatch.setattr(service, "record_guided_pipeline_dispatch", crash_before_dispatch_record)
     else:
 
         async def crash_before_accept(*_args, **_kwargs):
-            raise _SimulatedWorkerCrash("worker lost after durable dispatch")
+            raise _worker_lost("worker lost after durable dispatch")
 
         monkeypatch.setattr(service, "accept_guided_pipeline_proposal", crash_before_accept)
 
@@ -430,8 +463,7 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
     assert asyncio.run(service.get_state_versions(UUID(session_id))) == state_versions_before
     assert asyncio.run(service.list_proposal_events(UUID(session_id))) == proposal_events_before
 
-    engine = composer_test_client.app.state.session_engine
-    with engine.begin() as connection:
+    with engine.connect() as connection:
         operation = (
             connection.execute(
                 select(guided_operations_table)
@@ -441,14 +473,12 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
             .mappings()
             .one()
         )
+        # The lease guard saw the crash escape with both authorities already
+        # lapsed and did NOT terminalise the row: no failure is recorded
+        # against an operation another replica may still legitimately finish.
         assert operation["status"] == "in_progress"
+        assert operation["failure_code"] is None
         assert operation["proposal_id"] == wire_turn["payload"]["proposal_id"]
-        connection.execute(
-            update(guided_operations_table)
-            .where(guided_operations_table.c.session_id == session_id)
-            .where(guided_operations_table.c.operation_id == operation_id)
-            .values(lease_expires_at=datetime.now(UTC) - timedelta(minutes=1))
-        )
 
     if crash_point == "after_admission":
         monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", original_prepare)
@@ -477,6 +507,7 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
     proposal_events = asyncio.run(service.list_proposal_events(UUID(session_id)))
     assert [event.event_type for event in proposal_events if str(event.proposal_id) == wire_turn["payload"]["proposal_id"]] == [
         "proposal.created",
+        "proposal.rebased",
         "proposal.accepted",
     ]
     with engine.connect() as connection:
@@ -520,7 +551,11 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     wire_action: str,
     winner: str,
 ) -> None:
-    session_id, staged = _stage(composer_test_client, filename=f"revert-{winner}-wire-{wire_action}.jsonl")
+    session_id, staged = _stage_minimal_plural_proposal(
+        composer_test_client,
+        suffix=f"revert-{winner}-wire-{wire_action}",
+        source_count=3,
+    )
     proposal = staged["next_turn"]["payload"]
     reviewed = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
@@ -536,18 +571,22 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     versions = asyncio.run(service.get_state_versions(UUID(session_id)))
     target_state_id = str(versions[0].id)
     state_count_before = len(versions)
-    correction_feedback = "Route the source through the corrected topology before confirmation."
+    correction_feedback = "Route the reviewed source to the other reviewed output."
     wire_operation_id = str(uuid4())
     if wire_action == "confirm":
         wire_request = _bound_action(wire_turn, chosen=["confirm_wiring"], operation_id=wire_operation_id)
         original_wire = service.admit_guided_pipeline_confirmation
     else:
+        selected_edge = _source_success_edge(wire_turn)
         wire_request = {
             "operation_id": wire_operation_id,
             "turn_token": wire_turn["turn_token"],
             "proposal_id": proposal["proposal_id"],
             "draft_hash": proposal["draft_hash"],
-            "edit_target": wire_turn["payload"]["connections"][0]["from_endpoint"],
+            "edit_target": {
+                "kind": "edge",
+                "stable_id": selected_edge["stable_id"],
+            },
             "correction_feedback": correction_feedback,
         }
         original_wire = service.stage_guided_pipeline_proposal
@@ -588,39 +627,50 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
         blocking_wire,
     )
 
-    async def race_and_replay():
+    loser = "wire" if winner == "revert" else "revert"
+
+    async def race():
         async with (
             AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://wire-worker") as wire_client,
             AsyncClient(transport=ASGITransport(app=peer_app), base_url="http://revert-worker") as revert_client,
         ):
-            revert_task = asyncio.create_task(revert_client.post(f"/api/sessions/{session_id}/state/revert", json=revert_request))
-            wire_task = asyncio.create_task(wire_client.post(f"/api/sessions/{session_id}/guided/respond", json=wire_request))
-            await asyncio.wait_for(asyncio.gather(revert_entered.wait(), wire_entered.wait()), timeout=10)
+            clients = {"revert": revert_client, "wire": wire_client}
+            paths = {"revert": f"/api/sessions/{session_id}/state/revert", "wire": f"/api/sessions/{session_id}/guided/respond"}
+            bodies = {"revert": revert_request, "wire": wire_request}
+            entered = {"revert": revert_entered, "wire": wire_entered}
+            winner_task = asyncio.create_task(clients[winner].post(paths[winner], json=bodies[winner]))
+            await asyncio.wait_for(entered[winner].wait(), timeout=10)
+            # Independent workers serialise at the session-operation lease:
+            # the second worker is refused with the platform's 409 while the
+            # first holds the session, before any row or double of its own.
+            refused = await asyncio.wait_for(clients[loser].post(paths[loser], json=bodies[loser]), timeout=10)
+            assert not entered[loser].is_set()
             release_race.set()
-            reverted, wired = await asyncio.wait_for(
-                asyncio.gather(revert_task, wire_task),
-                timeout=20,
-            )
-            revert_replay = await wire_client.post(
-                f"/api/sessions/{session_id}/state/revert",
-                json=revert_request,
-            )
-            wire_replay = await revert_client.post(
-                f"/api/sessions/{session_id}/guided/respond",
-                json=wire_request,
-            )
-            return reverted, wired, revert_replay, wire_replay
+            winner_response = await asyncio.wait_for(winner_task, timeout=20)
+            return refused, winner_response
 
-    reverted, wired, revert_replay, wire_replay = asyncio.run(race_and_replay())
-    responses = {"revert": reverted, "wire": wired}
-    replays = {"revert": revert_replay, "wire": wire_replay}
-    loser = "wire" if winner == "revert" else "revert"
-    assert responses[winner].status_code == 200, responses[winner].json()
-    assert responses[loser].status_code == 409, responses[loser].json()
-    assert responses[loser].json()["detail"]["failure_code"] == "stale_conflict"
-    for action in ("revert", "wire"):
-        assert replays[action].status_code == responses[action].status_code
-        assert replays[action].json() == responses[action].json()
+    async def retry_and_replay():
+        async with (
+            AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://wire-worker") as wire_client,
+            AsyncClient(transport=ASGITransport(app=peer_app), base_url="http://revert-worker") as revert_client,
+        ):
+            clients = {"revert": revert_client, "wire": wire_client}
+            paths = {"revert": f"/api/sessions/{session_id}/state/revert", "wire": f"/api/sessions/{session_id}/guided/respond"}
+            bodies = {"revert": revert_request, "wire": wire_request}
+            loser_response = await asyncio.wait_for(clients[loser].post(paths[loser], json=bodies[loser]), timeout=20)
+            replays = {
+                "revert": await wire_client.post(paths["revert"], json=revert_request),
+                "wire": await revert_client.post(paths["wire"], json=wire_request),
+            }
+            return loser_response, replays
+
+    refused, winner_response = asyncio.run(race())
+    assert refused.status_code == 409, refused.json()
+    assert refused.json() == {"detail": "Session operation is already active"}
+    assert winner_response.status_code == 200, winner_response.json()
+    # The refused worker never reached its double and published nothing: the
+    # race's exact publication is the winner's alone.
+    assert not (wire_entered if loser == "wire" else revert_entered).is_set()
     assert len(asyncio.run(service.get_state_versions(UUID(session_id)))) == state_count_before + 1
     proposals = {str(item.id): item for item in asyncio.run(service.list_composition_proposals(UUID(session_id)))}
     events = asyncio.run(service.list_proposal_events(UUID(session_id)))
@@ -634,19 +684,20 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     if winner == "revert":
         assert set(proposals) == {proposal["proposal_id"]}
         assert proposals[proposal["proposal_id"]].status == "rejected"
-        assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
+        assert [event.event_type for event in events] == ["proposal.created", "proposal.rebased", "proposal.rejected"]
         assert all(message.content != correction_feedback for message in messages)
         assert dispatches == []
     elif wire_action == "confirm":
         assert set(proposals) == {proposal["proposal_id"]}
         assert proposals[proposal["proposal_id"]].status == "committed"
-        assert [event.event_type for event in events] == ["proposal.created", "proposal.accepted"]
+        assert [event.event_type for event in events] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
         assert len(dispatches) == 1
     else:
         assert len(proposals) == 2
         assert proposals[proposal["proposal_id"]].status == "rejected"
         assert [event.event_type for event in events if str(event.proposal_id) == proposal["proposal_id"]] == [
             "proposal.created",
+            "proposal.rebased",
             "proposal.rejected",
         ]
         successor = next(item for proposal_id, item in proposals.items() if proposal_id != proposal["proposal_id"])
@@ -678,17 +729,47 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     operations = {row["operation_id"]: row for row in operation_rows}
     winner_operation_id = revert_operation_id if winner == "revert" else wire_operation_id
     loser_operation_id = wire_operation_id if winner == "revert" else revert_operation_id
-    assert set(operations) == {revert_operation_id, wire_operation_id}
+    # Refused at the session fence, the loser reserved no operation at all.
+    assert set(operations) == {winner_operation_id}
     assert operations[winner_operation_id]["status"] == "completed"
     assert operations[winner_operation_id]["failure_code"] is None
-    assert operations[loser_operation_id]["status"] == "failed"
-    assert operations[loser_operation_id]["failure_code"] == "stale_conflict"
-    assert operations[loser_operation_id]["result_kind"] is None
-    assert operations[loser_operation_id]["result_state_id"] is None
-    assert operations[loser_operation_id]["proposal_id"] is None
     event_kinds = {
         operation_id: [row["event_kind"] for row in operation_event_rows if row["operation_id"] == operation_id]
         for operation_id in (revert_operation_id, wire_operation_id)
     }
     assert event_kinds[winner_operation_id][-1] == "completed"
-    assert event_kinds[loser_operation_id][-1] == "failed"
+    assert event_kinds[loser_operation_id] == []
+
+    # The refused worker retries once the lease is free, and every request
+    # replays exactly on the other worker.
+    loser_response, replays = asyncio.run(retry_and_replay())
+    responses = {winner: winner_response, loser: loser_response}
+    for action in ("revert", "wire"):
+        assert replays[action].status_code == responses[action].status_code
+        assert replays[action].json() == responses[action].json()
+    versions_after_retry = asyncio.run(service.get_state_versions(UUID(session_id)))
+    with engine.connect() as connection:
+        retry_rows = {
+            row["operation_id"]: row
+            for row in connection.execute(
+                select(guided_operations_table)
+                .where(guided_operations_table.c.session_id == session_id)
+                .where(guided_operations_table.c.operation_id.in_((revert_operation_id, wire_operation_id)))
+            ).mappings()
+        }
+    if winner == "revert":
+        # The wire action names a proposal the revert made inactive: refused
+        # at the guided turn contract before any reservation, publishing
+        # nothing on the retry either.
+        assert loser_response.status_code == 409, loser_response.json()
+        assert loser_response.json() == {"detail": "proposal_id and draft_hash do not identify the active guided proposal"}
+        assert set(retry_rows) == {revert_operation_id}
+        assert len(versions_after_retry) == state_count_before + 1
+    else:
+        # A revert issued after the wire action settled is a legitimate new
+        # operation: it completes and publishes exactly one more state.
+        assert loser_response.status_code == 200, loser_response.json()
+        assert set(retry_rows) == {revert_operation_id, wire_operation_id}
+        assert retry_rows[revert_operation_id]["status"] == "completed"
+        assert retry_rows[revert_operation_id]["result_state_id"] == loser_response.json()["id"]
+        assert len(versions_after_retry) == state_count_before + 2

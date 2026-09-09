@@ -23,12 +23,16 @@ from dataclasses import replace
 from typing import Any, Final, cast
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import (
+    REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+    ToolArgumentError,
+)
 from elspeth.web.composer.state import (
     CompositionState,
     ValidationSummary,
@@ -39,6 +43,7 @@ from elspeth.web.composer.tools._common import (
     ToolContext,
     ToolHandler,
     ToolResult,
+    _composition_canonical_interpretation_requirement_error,
     _failure_result,
     build_plugin_schemas_for_failure,
     normalize_tool_result_validation,
@@ -59,11 +64,13 @@ from elspeth.web.composer.tools._registry import (
     should_augment_with_plugin_schemas,
 )
 from elspeth.web.composer.tools.discovery import _SESSION_AWARE_TOOL_NAMES
+from elspeth.web.composer.tools.generation import build_validation_guidance
 from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_VALUES,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 
 __all__ = [
     "_inject_prior_validation",
@@ -135,7 +142,10 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
             "in each response. Do NOT call this tool in a loop, do NOT use it "
             "as a substitute for reading validator output. Availability is "
             "operator-configured; the mandatory END sign-off checkpoint runs "
-            "independently of this on-demand escape."
+            "independently of this on-demand escape. Each reply carries `status` "
+            "(`SUCCESS`, `BUDGET_EXHAUSTED`, `COMPOSE_TIMEOUT`, `DEADLINE_TOO_CLOSE`, "
+            "or `ADVISOR_ERROR`), the `guidance` text, `budget_remaining`, and a "
+            "`note` restating that the guidance is advice, not configuration."
         ),
         "parameters": {
             "type": "object",
@@ -209,10 +219,12 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "Ask the user to review an LLM-authored assumption before it is "
             "finalised into the pipeline. This session-aware, kind-tagged "
             "review surface handles vague terms, invented source data, "
-            "LLM prompt templates, and pipeline-shaping decisions. Use "
+            "pipeline-shaping decisions, model choices, and source data "
+            "contracts. Prompt-template reviews are surfaced automatically "
+            "by the backend; never request one through this tool. Use "
             "affected_node_id='source' for "
-            "invented_source; use the LLM node id for vague_term and "
-            "llm_prompt_template; use the implementing node id for "
+            "invented_source and source_data_contract; use the LLM node id "
+            "for vague_term and llm_model_choice; use the implementing node id for "
             "pipeline_decision. Surface ONE assumption per call. The user "
             "will see your draft and resolve it in the review surface. Do not ask "
             "the user in assistant prose; this tool is the review surface. If "
@@ -221,35 +233,60 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "Do not call this merely because a concrete operator is present "
             "(e.g., 'rate 1-10'), but do call it when you authored the scale "
             "semantics, rubric, thresholds, category meaning, or subjective "
-            "criterion definition behind that operator. Prompt-template review "
-            "is not a substitute for an authored rubric/definition review. "
-            "For LLM prompt templates, copying the user's supplied prompt "
-            "verbatim is user-authored; creating a prompt template from the "
-            "user's goal, data, or prose is LLM-authored and must be reviewed. "
+            "criterion definition behind that operator. The backend's automatic "
+            "prompt-template review is not a substitute for an authored "
+            "rubric/definition review. "
             "Do not call this for terms the user already defined in the "
-            "conversation."
+            "conversation. The result's `_kind` tells you what happened: "
+            "`interpretation_review_pending` means the card is staged — wait "
+            "for the user; `interpretation_review_suppressed_by_opt_out` means "
+            "no card will appear because this session opted out "
+            "(`interpretation_review_disabled` is true and "
+            "`interpretation_source` names the automatic interpretation that "
+            "stood in) — proceed without waiting; "
+            "`interpretation_review_pending_idempotent` means an identical "
+            "request was already staged — treat it as pending. `message` "
+            "restates the outcome in prose."
         ),
         "parameters": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["affected_node_id", "kind", "user_term", "llm_draft"],
+            "required": ["affected_node_id", "kind", "user_term"],
             "properties": {
                 "affected_node_id": {
                     "type": "string",
-                    "description": "Component id. Use 'source' for invented source data; use the LLM node id for vague terms and prompt templates.",
+                    "description": (
+                        "Component id. Use 'source' or 'source:<name>' for invented source data and source data contracts; "
+                        "use the LLM node id for vague terms and model choices."
+                    ),
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["vague_term", "invented_source", "llm_prompt_template", "pipeline_decision", "llm_model_choice"],
-                    "description": "Class of assumption being surfaced for review.",
+                    "enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES),
+                    "description": (
+                        "Class of assumption being surfaced for review. source_data_contract asks the user to "
+                        "acknowledge the data contract for an uploaded/path-bound source the pipeline requires "
+                        "fields from: target 'source' or 'source:<name>', set user_term='source_data_contract', "
+                        "and OMIT llm_draft — the server computes the demanded field set from the graph."
+                    ),
                 },
                 "user_term": {
                     "type": "string",
-                    "description": "Stable user-facing label for the assumption being reviewed.",
+                    "description": (
+                        "Stable user-facing label for the assumption being reviewed; for kind='pipeline_decision', "
+                        "copy exactly one of drop_raw_html_fields, prompt_injection_shield_recommendation, or "
+                        "web_scrape_http_identity and never mint a decision term."
+                    ),
                 },
                 "llm_draft": {
                     "type": "string",
-                    "description": "LLM-authored interpretation, source data, or prompt template text.",
+                    "description": (
+                        "OMIT this when the review site already carries a staged "
+                        "interpretation_requirements draft (the normal case): the server resolves "
+                        "the staged draft verbatim, which is more reliable than re-transmitting "
+                        "multi-line text. Provide it only for a site with no staged draft, or to "
+                        "assert an exact match; if provided it must byte-match the staged draft."
+                    ),
                 },
             },
         },
@@ -274,12 +311,11 @@ def get_tool_definitions() -> list[dict[str, Any]]:
     invalidates the cache for every follow-up turn.
 
     The skill at ``src/elspeth/web/composer/skills/pipeline_composer.md``
-    enumerates the same tool set in its Foundation-knowledge section
-    (under "## CRITICAL: Tool Schema Availability"). Any skill ↔ runtime
-    drift is caught by the per-tool prose tests in ``test_skill_drift.py``;
-    the older inventory-parser drift gate (which existed because
-    ``get_tool_definitions()`` was hand-maintained) was retired when
-    declarations became the source of truth.
+    enumerates the same tool set under "## Tool Inventory", in an autogen
+    block maintained by ``scripts/cicd/generate_skill_inventory.py``.
+    Skill ↔ runtime drift is caught by running that script with
+    ``--check``, which regenerates the block from the same declaration
+    registry (plus the two inline carve-outs) and fails on any difference.
     """
     # Every entry on every call is freshly ``deep_thaw``ed from the deeply
     # immutable module-level registry. This guarantees mutually-isolated
@@ -384,6 +420,22 @@ def _inject_prior_validation(
 # ``_inject_prior_validation`` wrap step in ``execute_tool``.
 _ALL_MUTATION_TOOL_NAMES: Final[frozenset[str]] = _MUTATION_TOOL_NAMES | _BLOB_MUTATION_TOOL_NAMES | _SECRET_MUTATION_TOOL_NAMES
 
+# Every public tool that can publish a new CompositionState. Blob-only
+# create/update/delete tools are intentionally excluded: they persist blob
+# records/files but never publish composition state, so a composition gate
+# after their handler would be too late to protect those external side effects.
+_COMPOSITION_STATE_MUTATION_TOOL_NAMES: Final[frozenset[str]] = (
+    _MUTATION_TOOL_NAMES
+    | _SECRET_MUTATION_TOOL_NAMES
+    | frozenset(
+        {
+            "set_source_from_blob",
+            "set_source_from_blobs",
+            "wire_blob_inline_ref",
+        }
+    )
+)
+
 
 def _closed_root_schema(tool_name: str) -> dict[str, Any]:
     """Return the tool's argument schema with a fail-closed root object."""
@@ -393,7 +445,7 @@ def _closed_root_schema(tool_name: str) -> dict[str, Any]:
     return schema
 
 
-def _schema_error_path(error: Any) -> str:
+def _schema_error_path(error: ValidationError) -> str:
     parts = ["arguments"]
     for segment in error.absolute_path:
         if isinstance(segment, int):
@@ -405,19 +457,21 @@ def _schema_error_path(error: Any) -> str:
     return ".".join(parts)
 
 
-def _json_type_label(value: Any) -> str:
+def _json_type_label(value: str | list[str]) -> str:
+    """Render the declared schema's type union without coercing its members."""
     if isinstance(value, str):
         return value
-    if isinstance(value, Iterable):
-        return " or ".join(str(item) for item in value)
-    return str(value)
+    return " or ".join(value)
 
 
-def _schema_error_summary(error: Any) -> str:
+def _schema_error_summary(error: ValidationError) -> str:
     path = _schema_error_path(error)
-    if error.validator == "required" and isinstance(error.instance, Mapping):
-        required = tuple(str(item) for item in error.validator_value)
-        missing = tuple(item for item in required if item not in error.instance)
+    # jsonschema emits a required failure only for an object instance. The
+    # required names come from our meta-validated tool declaration schema.
+    if error.validator == "required":
+        required = tuple(cast(list[str], error.validator_value))
+        instance = cast(Mapping[str, Any], error.instance)
+        missing = tuple(item for item in required if item not in instance)
         if missing:
             missing_paths = tuple(f"{path}.{item}" for item in missing)
             plural = "properties" if len(missing) != 1 else "property"
@@ -425,7 +479,7 @@ def _schema_error_summary(error: Any) -> str:
     if error.validator == "additionalProperties":
         return f"{path} contains unsupported properties"
     if error.validator == "type":
-        return f"{path} must be of type {_json_type_label(error.validator_value)}"
+        return f"{path} must be of type {_json_type_label(cast(str | list[str], error.validator_value))}"
     if error.validator == "enum":
         return f"{path} must be one of the declared values"
     return f"{path} violates schema rule '{error.validator}'"
@@ -435,7 +489,7 @@ def _schema_argument_model_name(tool_name: str) -> str:
     return "".join(part.capitalize() for part in tool_name.split("_")) + "ArgumentsModel"
 
 
-def _schema_tool_argument_error(tool_name: str, error: Any) -> ToolArgumentError:
+def _schema_tool_argument_error(tool_name: str, error: ValidationError) -> ToolArgumentError:
     return ToolArgumentError(
         argument=f"{tool_name} arguments",
         expected=f"object conforming to {_schema_argument_model_name(tool_name)} ({_schema_error_summary(error)})",
@@ -475,19 +529,19 @@ def _augment_with_plugin_schemas(
 
     For the mutation tools whose declarations set
     ``augments_on_failure=True`` (derived into
-    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), scan
-    ``result.validation.errors``
-    for ``Invalid options for <kind> '<plugin>'`` messages and embed the
-    full ``get_plugin_schema`` payload for every named plugin. Eliminates
-    the second round-trip the LLM would otherwise burn calling
-    ``get_plugin_schema`` after each rejection (see composer session
-    47cfbb5e on staging: 13 tool calls + 18 LLM rounds to converge a
-    4-plugin pipeline because the model never preloaded schemas).
+    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), read the structural
+    ``ValidationEntry.plugin_identity`` each producer stamped on its
+    rejection and embed the full ``get_plugin_schema`` payload for every
+    stamped plugin — never an identity parsed from the message
+    (elspeth-f60d638661). Eliminates the second round-trip the LLM would
+    otherwise burn calling ``get_plugin_schema`` after each rejection (see
+    composer session 47cfbb5e on staging: 13 tool calls + 18 LLM rounds to
+    converge a 4-plugin pipeline because the model never preloaded schemas).
 
-    No-op when the mutation succeeded, when no error message matches the
-    option-shape pattern, when the result already carries
-    ``plugin_schemas`` (handler set it directly), or when ``tool_name`` is
-    not one of the augmentation-eligible tools.
+    No-op when the mutation succeeded, when no error entry carries an
+    identity, when the result already carries ``plugin_schemas`` (handler
+    set it directly), or when ``tool_name`` is not one of the
+    augmentation-eligible tools.
     """
     if not should_augment_with_plugin_schemas(tool_name):
         return result
@@ -503,6 +557,37 @@ def _augment_with_plugin_schemas(
     return replace(result, plugin_schemas=schemas)
 
 
+def _augment_with_validation_guidance(result: ToolResult, tool_name: str) -> ToolResult:
+    """Attach inline catalogue repair guidance to a failed mutation.
+
+    The freeform twin of the planner surface's rejection enrichment
+    (``pipeline_planner._allowlisted_candidate_feedback``, which resolves the
+    same catalogue through ``explain_validation_code``). Without it the
+    freeform tool loop shipped a bare closed code and the model had to spend
+    a turn on ``explain_validation_error`` to learn the fix — the exact
+    round-trip ``plugin_schemas`` already eliminates for option-shape
+    failures (elspeth-5ff149dc4e; live session 891b7b1e burned a turn on
+    ``no_source_configured`` this way).
+
+    Scoped to mutation tools deliberately. Only ``_ToolResultResponseModel``
+    and the ``_tool_result_response_keys`` declarative entries admit the key;
+    a discovery tool such as ``get_blob_content`` answers to its own
+    ``extra="forbid"`` response model, and an unscoped augmentation would
+    fail its response path closed.
+
+    No-op on success, when the handler already set the field, and whenever
+    the envelope carries no error entries.
+    """
+    if tool_name not in _ALL_MUTATION_TOOL_NAMES:
+        return result
+    if result.success or result.validation_guidance is not None:
+        return result
+    guidance = build_validation_guidance(entry.error_code for entry in result.validation.errors)
+    if guidance is None:
+        return result
+    return replace(result, validation_guidance=guidance)
+
+
 def finalize_tool_result(
     result: ToolResult,
     *,
@@ -515,7 +600,34 @@ def finalize_tool_result(
     if tool_name in _ALL_MUTATION_TOOL_NAMES:
         result = _inject_prior_validation(result, prior_validation)
     result = _augment_with_plugin_schemas(result, tool_name, catalog, context)
-    return normalize_tool_result_validation(result, catalog)
+    result = normalize_tool_result_validation(result, catalog)
+    # Strictly after normalization: it can CONCATENATE the revalidated state's
+    # entries onto the rejections (_common.normalize_tool_result_validation),
+    # and guidance derived from the pre-normalization set would silently omit
+    # every code those entries introduce.
+    return _augment_with_validation_guidance(result, tool_name)
+
+
+def _enforce_composition_interpretation_gate(
+    result: ToolResult,
+    *,
+    tool_name: str,
+    prior_state: CompositionState,
+) -> ToolResult:
+    """Reject a successful public state mutation before its result is published."""
+    if not result.success or tool_name not in _COMPOSITION_STATE_MUTATION_TOOL_NAMES:
+        return result
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        result.updated_state,
+        tool_name=tool_name,
+    )
+    if canonical_error is None:
+        return result
+    return _failure_result(
+        prior_state,
+        canonical_error,
+        error_code="interpretation_requirements_invalid",
+    )
 
 
 def execute_tool(
@@ -529,10 +641,12 @@ def execute_tool(
     session_engine: Engine | None = None,
     session_id: str | None = None,
     secret_service: WebSecretResolver | None = None,
+    secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     baseline: CompositionState | None = None,
     prior_validation: ValidationSummary | None = None,
     runtime_preflight: RuntimePreflight | None = None,
+    structural_preflight: RuntimePreflight | None = None,
     max_blob_storage_per_session_bytes: int | None = None,
     user_message_id: str | None = None,
     user_message_content: str | None = None,
@@ -542,7 +656,11 @@ def execute_tool(
     composer_skill_hash: str | None = None,
     tool_arguments_hash: str | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
+    executing_proposal_id: str | None = None,
+    validate_arguments: bool = False,
+    require_data_dir_for_paths: bool = False,
     raise_schema_argument_errors: bool = False,
+    _interpretation_requirements_are_internal: bool = False,
 ) -> ToolResult:
     """Execute a composition tool by name.
 
@@ -572,6 +690,9 @@ def execute_tool(
         secret_service: ``WebSecretResolver`` — auth-scoped secret-reference
             resolver. Required for secret tools. Production wiring passes a
             ``ScopedSecretResolver`` (``elspeth.web.secrets.service``).
+        secret_wiring_policy: Server-authored secret→destination allowlist
+            consulted by ``wire_secret_ref`` (elspeth-f3c1aafd25). ``None``
+            denies every wiring — deny-by-default, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for diff_pipeline comparisons.
         prior_validation: Pre-computed validation for the current state.
@@ -583,6 +704,11 @@ def execute_tool(
             Only applied to preview_pipeline. Pre-computed in the async
             compose loop and injected here as a cheap synchronous callback
             so execute_tool() stays synchronous.
+        structural_preflight: Optional callback for the interpretation-
+            tolerant preflight, applied only to preview_pipeline. Wired by
+            callers whose strict Stage-2 result is handoff-shaped so the
+            preview can additionally surface structural findings the strict
+            ledger skipped behind the pending review (elspeth-229e9e8195).
         max_blob_storage_per_session_bytes: Configured per-session blob
             storage quota for assistant-created session artifacts. Defaults
             to ``None`` so the blob plane can fall back to its historical
@@ -600,11 +726,20 @@ def execute_tool(
         composer_skill_hash: Hash of the composer skill markdown used for
             the request.
         tool_arguments_hash: Canonical audited arguments hash for this tool
-            call.
+            call. This is optional audit evidence only; its presence never
+            controls argument admission or path-policy enforcement.
+        validate_arguments: Enforce the declared closed JSON Schema before
+            handler dispatch. Public LLM/MCP entry points must enable this.
+        require_data_dir_for_paths: Fail closed when source-local paths are
+            supplied without a dispatcher data directory. Public LLM/MCP
+            entry points must enable this.
         raise_schema_argument_errors: When true, audited declaration-schema
             failures raise ``ToolArgumentError`` for compose-loop ARG_ERROR
             routing. Direct callers keep the historical failed-``ToolResult``
             contract by leaving this false.
+        _interpretation_requirements_are_internal: Private server-owned
+            proposal revalidation seam. It is not a declared tool argument
+            and must remain false for public LLM/MCP dispatch.
     """
     if catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
@@ -617,12 +752,12 @@ def execute_tool(
         **_SECRET_DISCOVERY_TOOLS,
         **_SECRET_MUTATION_TOOLS,
     }
-    handler = all_handlers.get(tool_name)
-    if handler is None:
+    if tool_name not in all_handlers:
         return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
+    handler = all_handlers[tool_name]
     current_validation = prior_validation or catalog.validate_composition_state(state).validation
 
-    if tool_arguments_hash is not None:
+    if validate_arguments or raise_schema_argument_errors:
         argument_error = _validate_tool_arguments(
             tool_name,
             arguments,
@@ -647,14 +782,16 @@ def execute_tool(
         catalog=catalog,
         plugin_snapshot=plugin_snapshot,
         data_dir=data_dir,
-        require_data_dir_for_paths=tool_arguments_hash is not None,
+        require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,
         secret_service=secret_service,
+        secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,
         baseline=baseline,
         current_validation=current_validation,
         runtime_preflight=runtime_preflight,
+        structural_preflight=structural_preflight,
         max_blob_storage_per_session_bytes=max_blob_storage_per_session_bytes,
         user_message_id=user_message_id,
         user_message_content=user_message_content,
@@ -664,9 +801,16 @@ def execute_tool(
         composer_skill_hash=composer_skill_hash,
         tool_arguments_hash=tool_arguments_hash,
         reviewed_source_authority=reviewed_source_authority,
+        executing_proposal_id=executing_proposal_id,
+        _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )
 
     result = handler(arguments, state, context)
+    result = _enforce_composition_interpretation_gate(
+        result,
+        tool_name=tool_name,
+        prior_state=state,
+    )
 
     return finalize_tool_result(
         result,
@@ -697,14 +841,14 @@ def execute_discovery_tool_with_context(
         **_BLOB_DISCOVERY_TOOLS,
         **_SECRET_DISCOVERY_TOOLS,
     }
-    handler = discovery_handlers.get(tool_name)
-    if handler is None:
+    if tool_name not in discovery_handlers:
         raise ToolArgumentError(
             argument="tool_name",
             expected="a declared read-only discovery tool",
             actual_type="mutation_or_unknown",
             code="DISCOVERY_ONLY",
         )
+    handler = discovery_handlers[tool_name]
     argument_error = _validate_tool_arguments(tool_name, arguments, state, raise_on_error=True)
     assert argument_error is None
     if _requires_secret_context(tool_name) and (context.secret_service is None or context.user_id is None):

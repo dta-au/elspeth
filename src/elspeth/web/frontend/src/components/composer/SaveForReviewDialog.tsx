@@ -22,7 +22,9 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { Button, Input } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { useExecutionStore } from "@/stores/executionStore";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 
 const COPY_FEEDBACK_TIMEOUT_MS = 2000;
@@ -44,6 +46,9 @@ export function SaveForReviewDialog(): JSX.Element | null {
   const error = useShareableReviewStore((s) => s.error);
   const close = useShareableReviewStore((s) => s.close);
   const openAndMark = useShareableReviewStore((s) => s.openAndMark);
+  const validationResult = useExecutionStore((s) => s.validationResult);
+  const completionReady =
+    validationResult?.readiness?.completion_ready === true;
 
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const copyTimeoutRef = useRef<number | null>(null);
@@ -106,6 +111,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
   }
 
   function _onRetry() {
+    if (!completionReady) return;
     // The store has the session id captured from the original openAndMark
     // call. If we lost it (resetSession between attempts), the retry path
     // would no-op; the user closes and re-opens via the CompletionBar.
@@ -145,14 +151,22 @@ export function SaveForReviewDialog(): JSX.Element | null {
           {!inFlight && error !== null && (
             <div role="alert" className="save-for-review-error" data-testid="save-for-review-error">
               <p>{error}</p>
-              <button
+              <Button
+                compact
                 type="button"
-                className="btn btn-compact"
                 onClick={_onRetry}
+                disabled={!completionReady}
+                aria-disabled={!completionReady || undefined}
+                title={
+                  !completionReady
+                    ? validationResult?.readiness?.blockers[0]?.detail ??
+                      "Resolve completion blockers before trying again."
+                    : undefined
+                }
                 data-testid="save-for-review-retry"
               >
                 Try again
-              </button>
+              </Button>
             </div>
           )}
 
@@ -167,7 +181,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
               </p>
               <div className="save-for-review-url-row">
                 <label htmlFor="save-for-review-url">Share URL</label>
-                <input
+                <Input
                   id="save-for-review-url"
                   type="text"
                   readOnly
@@ -175,17 +189,23 @@ export function SaveForReviewDialog(): JSX.Element | null {
                   onFocus={(e) => e.currentTarget.select()}
                   data-testid="save-for-review-url-input"
                 />
-                <button
+                <Button
+                  compact
                   type="button"
-                  className="btn btn-compact"
                   onClick={() => void _onCopy()}
                   data-testid="save-for-review-copy"
                   aria-label="Copy share URL to clipboard"
                 >
-                  {copyState === "idle" && "Copy"}
-                  {copyState === "copied" && "Copied!"}
-                  {copyState === "failed" && "Copy failed — select & copy manually"}
-                </button>
+                  {/* The failure message is NOT a third button label
+                      (elspeth-6eb60a33a9). `.btn` and `.btn-compact` both
+                      declare white-space: nowrap, so a full sentence made the
+                      button grow, which reflowed this flex row under the
+                      pointer that had just clicked it — the control moved away
+                      at the moment the user was reacting to the error. The
+                      label stays two states wide and the message renders
+                      below the row, exactly as UserAdminDialog does it. */}
+                  {copyState === "copied" ? "Copied!" : "Copy"}
+                </Button>
                 <a
                   href={absoluteShareUrl}
                   target="_blank"
@@ -195,6 +215,24 @@ export function SaveForReviewDialog(): JSX.Element | null {
                   Open in new tab
                 </a>
               </div>
+              {/* Live region for the copy outcome. It is mounted empty and only
+                  its TEXT changes, because a region inserted with its content
+                  already inside it is not reliably announced. role="status"
+                  (polite) rather than role="alert": this dialog already owns an
+                  assertive region for the mint failure above, and the user
+                  triggered this message themselves by clicking Copy — it does
+                  not warrant interrupting whatever is being read. The tone
+                  class is applied with the text so an idle empty span paints
+                  no banner. */}
+              <span
+                role="status"
+                className={copyState === "failed" ? "save-for-review-error" : undefined}
+                data-testid="save-for-review-copy-status"
+              >
+                {copyState === "failed"
+                  ? "Copy failed — select the share URL above and copy it manually."
+                  : ""}
+              </span>
               <p className="save-for-review-tip">
                 The link grants a different authenticated user read-only access
                 to a frozen snapshot of this pipeline. Recipients must have an
@@ -204,14 +242,14 @@ export function SaveForReviewDialog(): JSX.Element | null {
           )}
 
           <footer>
-            <button
+            <Button
               type="button"
-              className="btn save-for-review-close"
+              className="save-for-review-close"
               onClick={close}
               data-testid="save-for-review-close"
             >
               Close
-            </button>
+            </Button>
           </footer>
         </div>
       </section>

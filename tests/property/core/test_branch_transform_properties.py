@@ -19,6 +19,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import SinkProtocol, SourceProtocol
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import CoalesceName
 from elspeth.core.config import CoalesceSettings, GateSettings, SourceSettings
 from elspeth.core.dag import ExecutionGraph
@@ -149,7 +151,7 @@ class TestTokenBranchIdentity:
         coalesce executor uses token.branch_name to identify which branch
         each arriving token belongs to.
         """
-        token = make_token_info(branch_name=branch_name)
+        token = make_token_info(lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-branch-identity", member_key=branch_name),))
 
         for value in values[:num_updates]:
             new_data = make_pipeline_row({"value": value})
@@ -183,7 +185,7 @@ class TestTokenBranchIdentity:
         row_data = {key: f"val_{i}" for i, key in enumerate(data_keys)}
         row_data["branch_name"] = "not_the_real_branch"
 
-        token = make_token_info(branch_name=branch_name)
+        token = make_token_info(lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-branch-identity", member_key=branch_name),))
         token = token.with_updated_data(make_pipeline_row(row_data))
 
         assert token.branch_name == branch_name, "branch_name was corrupted by row data containing a 'branch_name' field"

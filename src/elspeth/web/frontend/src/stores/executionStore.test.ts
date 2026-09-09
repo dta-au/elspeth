@@ -3,13 +3,25 @@ import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { useSessionStore } from "./sessionStore";
 import { connectToRun } from "@/api/websocket";
+import {
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
-import type { Run, RunAccounting, RunDiagnostics, RunEvent, ValidationResult } from "@/types/index";
+import type {
+  Run,
+  RunAccounting,
+  RunDiagnostics,
+  RunEvent,
+  RunProgress,
+  ValidationResult,
+} from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 
 // Mock the API client
 vi.mock("@/api/client", () => ({
   validatePipeline: vi.fn(),
+  listInterpretationEvents: vi.fn().mockResolvedValue([]),
   executePipeline: vi.fn(),
   cancelRun: vi.fn(),
   createRunWebSocketTicket: vi.fn(),
@@ -82,6 +94,25 @@ describe("executionStore.validate", () => {
     expect(state.isValidating).toBe(false);
   });
 
+  it("refreshes review cards repaired by backend validation", async () => {
+    const result: ValidationResult = {
+      is_valid: false,
+      summary: "Review required",
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: BLOCKED_READINESS,
+    };
+    const { validatePipeline } = await import("@/api/client");
+    (validatePipeline as ReturnType<typeof vi.fn>).mockResolvedValue(result);
+    const refreshAll = vi.fn(async () => {});
+    useInterpretationEventsStore.setState({ refreshAll } as never);
+
+    await useExecutionStore.getState().validate("session-1");
+
+    expect(refreshAll).toHaveBeenCalledWith("session-1");
+  });
+
   it("stores validation result on failure without side effects", async () => {
     const failedResult: ValidationResult = {
       is_valid: false,
@@ -114,8 +145,9 @@ describe("executionStore.validate", () => {
 
     await useExecutionStore.getState().validate("session-1");
 
-    // validate() should only store the result — no cross-store side effects.
-    // Orchestration (system messages, LLM feedback) is handled by subscriptions.
+    // Validation stores the result; orchestration (system messages, LLM
+    // feedback) remains in subscriptions. The only cross-store action is the
+    // review-card refresh pinned separately above.
     const state = useExecutionStore.getState();
     expect(state.validationResult).toEqual(failedResult);
     expect(state.isValidating).toBe(false);
@@ -163,6 +195,9 @@ describe("executionStore.validate", () => {
     expect(state.validationResult).toBeNull();
     expect(state.isValidating).toBe(false);
     expect(state.error).toContain("internal error");
+    expect(state.validationError).toBe(
+      "Validation encountered an internal error. Please try again.",
+    );
     // Catch path must return false so the caller does not cache this version.
     expect(result).toBe(false);
   });
@@ -286,8 +321,8 @@ function makeInterpretationEvent(
 
 function makeAccounting(overrides: Partial<RunAccounting> = {}): RunAccounting {
   return {
-    source: { rows_processed: 1 },
-    sources: { source: { rows_processed: 1 } },
+    source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 },
+    sources: { source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 } },
     tokens: {
       emitted: 9_324,
       terminal: 9_324,
@@ -295,6 +330,7 @@ function makeAccounting(overrides: Partial<RunAccounting> = {}): RunAccounting {
       failed: 0,
       structural: 1,
       pending: 0,
+      abandoned: 0,
     },
     routing: {
       routed_success: 0,
@@ -407,6 +443,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
       token_count: 1,
       preview_limit: 50,
       preview_truncated: false,
+      discard_count: 0,
       state_counts: { completed: 1 },
       operation_counts: { source_load: 1 },
       latest_activity_at: null,
@@ -416,10 +453,8 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
         token_id: "token-1",
         row_id: "row-1",
         row_index: 0,
-        branch_name: null,
-        fork_group_id: null,
+        lineage: [],
         join_group_id: null,
-        expand_group_id: null,
         step_in_pipeline: null,
         created_at: "2026-04-26T05:31:58.000Z",
         terminal_outcome: "completed",
@@ -442,6 +477,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
     ],
     operations: [],
     artifacts: [],
+    discards: [],
     failure_detail: null,
     ...overrides,
   };
@@ -572,6 +608,7 @@ describe("executionStore fanout guard", () => {
     expect(executePipeline).toHaveBeenCalledWith(
       "session-1",
       undefined,
+      undefined,
       "state-1",
     );
     expect(state.pendingFanoutGuard).toEqual(guard);
@@ -591,6 +628,7 @@ describe("executionStore fanout guard", () => {
       })
       .mockResolvedValueOnce({ run_id: "run-1" });
 
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
     await useExecutionStore.getState().execute("session-1");
     const runId = await useExecutionStore.getState().confirmFanoutExecution();
 
@@ -602,11 +640,393 @@ describe("executionStore fanout guard", () => {
         accepted: true,
         token: "ack-line-explode",
       },
+      undefined,
       "state-1",
     );
     expect(state.pendingFanoutGuard).toBeNull();
     expect(state.pendingFanoutSessionId).toBeNull();
     expect(state.activeRunId).toBe("run-1");
+  });
+
+  it("settles a stale fanout guard without executing when live readiness is false", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 428,
+      detail: guard.summary,
+      error_type: "execution_fanout_ack_required",
+      fanout_guard: guard,
+    });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    useExecutionStore.getState().setValidationResult(
+      makeValidationResult({
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+    );
+
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledTimes(1);
+    expect(state.pendingFanoutGuard).toBeNull();
+    expect(state.pendingFanoutSessionId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(
+      "This pipeline is no longer ready to run. Validate it again before executing.",
+    );
+  });
+
+  it("settles a stale fanout guard without executing when readiness is missing", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 428,
+      detail: guard.summary,
+      error_type: "execution_fanout_ack_required",
+      fanout_guard: guard,
+    });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    useExecutionStore.getState().setValidationResult({
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+    } as unknown as ValidationResult);
+
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledTimes(1);
+    expect(state.pendingFanoutGuard).toBeNull();
+    expect(state.pendingFanoutSessionId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(
+      "This pipeline is no longer ready to run. Validate it again before executing.",
+    );
+  });
+
+  it("settles the guard synchronously at dispatch so the dialog closes atomically (elspeth-8363555f05)", async () => {
+    const { executePipeline } = await import("@/api/client");
+    let resolveDispatch: (value: { run_id: string }) => void = () => {};
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: guard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: guard,
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveDispatch = resolve;
+          }),
+      );
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+
+    const confirmPromise = useExecutionStore.getState().confirmFanoutExecution();
+
+    // BEFORE the dispatch resolves: the guard is already settled, so the
+    // ConfirmDialog (mounted solely off pendingFanoutGuard) is gone — no
+    // second Execute activation, and no Cancel affordance that would read
+    // as a successful cancellation while the request is in flight.
+    const inFlight = useExecutionStore.getState();
+    expect(inFlight.pendingFanoutGuard).toBeNull();
+    expect(inFlight.pendingFanoutSessionId).toBeNull();
+
+    resolveDispatch({ run_id: "run-atomic" });
+    expect(await confirmPromise).toBe("run-atomic");
+    expect(useExecutionStore.getState().activeRunId).toBe("run-atomic");
+  });
+
+  it("makes a second confirmation during dispatch a no-op instead of a duplicate run", async () => {
+    const { executePipeline } = await import("@/api/client");
+    let resolveDispatch: (value: { run_id: string }) => void = () => {};
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: guard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: guard,
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveDispatch = resolve;
+          }),
+      );
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+
+    const first = useExecutionStore.getState().confirmFanoutExecution();
+    const second = useExecutionStore.getState().confirmFanoutExecution();
+
+    expect(await second).toBeNull();
+    resolveDispatch({ run_id: "run-once" });
+    expect(await first).toBe("run-once");
+    // 1 initial 428 + exactly 1 acknowledged dispatch — never a duplicate.
+    expect(executePipeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("restores the guard when the acknowledged dispatch itself returns a fresh 428", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const freshGuard = { ...guard, ack_token: "ack-rotated" };
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: guard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: guard,
+      })
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: freshGuard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: freshGuard,
+      });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    // Atomic settle must not dead-end a rotated token: the fresh guard
+    // re-arms the dialog for a new explicit confirmation.
+    expect(state.pendingFanoutGuard).toEqual(freshGuard);
+    expect(state.pendingFanoutSessionId).toBe("session-1");
+  });
+});
+
+describe("executionStore secret guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
+    } as never);
+  });
+
+  const secretGuard = {
+    ack_token: "secret-ack-1",
+    summary: "This run uses 1 stored secret.",
+    wirings: [
+      {
+        secret_name: "OPENROUTER_API_KEY",
+        component_id: "classify_line",
+        component_type: "transform" as const,
+        plugin: "llm_transform",
+        option_key: "api_key",
+      },
+    ],
+  };
+
+  const fanoutGuard = {
+    ack_token: "fanout-ack-1",
+    risk_level: "high" as const,
+    summary: "LLM transform 'classify_line' may make an unknown number of OpenRouter calls.",
+    risks: [],
+  };
+
+  it("holds a 428 secret guard for explicit user approval", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValue({
+      status: 428,
+      detail: secretGuard.summary,
+      error_type: "execution_secret_approval_required",
+      secret_guard: secretGuard,
+    });
+
+    const runId = await useExecutionStore.getState().execute("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledWith(
+      "session-1",
+      undefined,
+      undefined,
+      "state-1",
+    );
+    expect(state.pendingSecretGuard).toEqual(secretGuard);
+    expect(state.pendingSecretSessionId).toBe("session-1");
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBeNull();
+  });
+
+  it("retries execution with the approved secret guard token", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: secretGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: secretGuard,
+      })
+      .mockResolvedValueOnce({ run_id: "run-1" });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBe("run-1");
+    expect(executePipeline).toHaveBeenLastCalledWith(
+      "session-1",
+      undefined,
+      {
+        accepted: true,
+        token: "secret-ack-1",
+      },
+      "state-1",
+    );
+    expect(state.pendingSecretGuard).toBeNull();
+    expect(state.pendingSecretSessionId).toBeNull();
+    expect(state.activeRunId).toBe("run-1");
+  });
+
+  it("carries both tokens when the fanout guard fires after the secret approval", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: secretGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: secretGuard,
+      })
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: fanoutGuard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: fanoutGuard,
+      })
+      .mockResolvedValueOnce({ run_id: "run-1" });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const secretRunId = await useExecutionStore
+      .getState()
+      .confirmSecretExecution();
+
+    // The approved secret dispatch hit the fanout guard: no run yet, the
+    // fanout dialog arms, and the approved secret token is held for the
+    // acknowledged re-send.
+    expect(secretRunId).toBeNull();
+    const armed = useExecutionStore.getState();
+    expect(armed.pendingSecretGuard).toBeNull();
+    expect(armed.pendingFanoutGuard).toEqual(fanoutGuard);
+    expect(armed.pendingFanoutSessionId).toBe("session-1");
+
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBe("run-1");
+    expect(executePipeline).toHaveBeenLastCalledWith(
+      "session-1",
+      {
+        accepted: true,
+        token: "fanout-ack-1",
+      },
+      {
+        accepted: true,
+        token: "secret-ack-1",
+      },
+      "state-1",
+    );
+    expect(state.pendingFanoutGuard).toBeNull();
+    expect(state.pendingFanoutSessionId).toBeNull();
+    expect(state.activeRunId).toBe("run-1");
+  });
+
+  it("settles a stale secret guard without executing when live readiness is false", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 428,
+      detail: secretGuard.summary,
+      error_type: "execution_secret_approval_required",
+      secret_guard: secretGuard,
+    });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    useExecutionStore.getState().setValidationResult(
+      makeValidationResult({
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+    );
+
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledTimes(1);
+    expect(state.pendingSecretGuard).toBeNull();
+    expect(state.pendingSecretSessionId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(
+      "This pipeline is no longer ready to run. Validate it again before executing.",
+    );
+  });
+
+  it("restores the guard when the approved dispatch itself returns a fresh 428", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const freshGuard = { ...secretGuard, ack_token: "secret-ack-rotated" };
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: secretGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: secretGuard,
+      })
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: freshGuard.summary,
+        error_type: "execution_secret_approval_required",
+        secret_guard: freshGuard,
+      });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const runId = await useExecutionStore.getState().confirmSecretExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    // Atomic settle must not dead-end a re-keyed token: the fresh guard
+    // re-arms the dialog for a new explicit approval.
+    expect(state.pendingSecretGuard).toEqual(freshGuard);
+    expect(state.pendingSecretSessionId).toBe("session-1");
+  });
+
+  it("drops a late secret guard after the active session changes", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const pendingExecute = deferred<never>();
+    (executePipeline as ReturnType<typeof vi.fn>).mockReturnValue(
+      pendingExecute.promise,
+    );
+
+    const executePromise = useExecutionStore.getState().execute("session-1");
+    useSessionStore.setState({ activeSessionId: "session-2" } as never);
+    pendingExecute.reject({
+      status: 428,
+      detail: secretGuard.summary,
+      error_type: "execution_secret_approval_required",
+      secret_guard: secretGuard,
+    });
+    const runId = await executePromise;
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(state.pendingSecretGuard).toBeNull();
+    expect(state.pendingSecretSessionId).toBeNull();
+    expect(state.error).toBeNull();
+    expect(state.isExecuting).toBe(false);
   });
 });
 
@@ -645,6 +1065,75 @@ describe("executionStore.cancel", () => {
     const state = useExecutionStore.getState();
     expect(state.runs[0].cancel_requested).toBe(true);
     expect(state.progress?.cancel_requested).toBe(true);
+    // Nothing terminal happened, so no outcome may be recorded — otherwise
+    // the toast and badge would fire on a run that is still draining.
+    expect(state.lastRunOutcome).toBeNull();
+  });
+
+  // Cancelling a not-yet-started run takes the backend's non-Event branch:
+  // status flips to "cancelled" in the response with NO run-event broadcast.
+  // Writing that into progress without recording the outcome strands the run
+  // twice — the toast waits on the WS 60s idle recheck, AND the loadRuns
+  // degraded-path reconciliation is disarmed by the very write (it is gated
+  // on progress NOT already being terminal). Net effect before this guard:
+  // no Run-tab badge at all and a toast up to a minute late.
+  it("records the terminal outcome when the response cancels a not-yet-started run", async () => {
+    const { cancelRun } = await import("@/api/client");
+    (cancelRun as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "cancelled",
+      cancel_requested: false,
+    });
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "pending" })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-launch",
+      progress: {
+        source_rows_processed: 0,
+        tokens_succeeded: 0,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+        cancel_requested: false,
+        accounting: null,
+        recent_errors: [],
+        status: "pending",
+      },
+    });
+    // A session switch after launch must not re-route the outcome: the
+    // stamp, not the session store, is the routing key.
+    useSessionStore.setState({ activeSessionId: "session-other" } as never);
+
+    await useExecutionStore.getState().cancel("run-1");
+
+    const state = useExecutionStore.getState();
+    expect(state.progress?.status).toBe("cancelled");
+    expect(state.lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "cancelled",
+      sessionId: "session-launch",
+    });
+  });
+
+  it("does not record an outcome for a cancelled run this tab does not own", async () => {
+    const { cancelRun } = await import("@/api/client");
+    (cancelRun as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "cancelled",
+      cancel_requested: false,
+    });
+    useExecutionStore.setState({
+      runs: [makeRun({ id: "run-other", status: "pending" })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-launch",
+      progress: null,
+    });
+
+    await useExecutionStore.getState().cancel("run-other");
+
+    const state = useExecutionStore.getState();
+    expect(state.runs[0].status).toBe("cancelled");
+    // The always-mounted surfaces speak for the ACTIVE run only.
+    expect(state.lastRunOutcome).toBeNull();
   });
 });
 
@@ -730,6 +1219,17 @@ describe("executionStore.loadRuns", () => {
     useSessionStore.setState({ activeSessionId: "session-1" } as never);
   });
 
+  it("returns loaded after applying the current session's run list", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const currentRuns = [makeRun({ id: "run-current" })];
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue(currentRuns);
+
+    const outcome = await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(outcome).toBe("loaded");
+    expect(useExecutionStore.getState().runs).toEqual(currentRuns);
+  });
+
   it("drops a run-list response that resolves after the active session changes", async () => {
     const { fetchRuns } = await import("@/api/client");
     const pendingRuns = deferred<Run[]>();
@@ -748,9 +1248,24 @@ describe("executionStore.loadRuns", () => {
         session_id: "session-1",
       }),
     ]);
-    await loadPromise;
+    const outcome = await loadPromise;
 
+    expect(outcome).toBe("stale");
     expect(useExecutionStore.getState().runs).toEqual([currentRun]);
+  });
+
+  it("returns unavailable without discarding cached runs when fetching fails", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const cachedRun = makeRun({ id: "run-cached" });
+    useExecutionStore.setState({ runs: [cachedRun] });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("network down"),
+    );
+
+    const outcome = await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(outcome).toBe("unavailable");
+    expect(useExecutionStore.getState().runs).toEqual([cachedRun]);
   });
 });
 
@@ -788,6 +1303,62 @@ describe("executionStore.rehydrateActiveRun", () => {
       expect.any(Function),
       expect.any(Object),
     );
+  });
+
+  // The launch-session stamp has TWO write sites and only execute()'s was
+  // covered. rehydrate is the page-reload-during-a-live-run path — precisely
+  // where a terminal WS event arrives later — so an unstamped rehydrate makes
+  // applyRunEvent copy sessionId: null into lastRunOutcome, RunOutcomeNotice
+  // dispatch {tab:"run", sessionId:null}, and ArtifactWorkspace DROP the
+  // intent as a session mismatch: "View run" silently no-ops while still
+  // acknowledging the toast away.
+  it("stamps the rehydrated session as the run's launch session", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-live", status: "running" }),
+    ]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+
+    await useExecutionStore.getState().rehydrateActiveRun("session-1");
+
+    expect(useExecutionStore.getState().activeRunSessionId).toBe("session-1");
+  });
+
+  it("routes a terminal event after rehydration to the rehydrated session, not null", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-live", status: "running" }),
+    ]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+
+    await useExecutionStore.getState().rehydrateActiveRun("session-1");
+
+    // rehydrateActiveRun opens the socket itself; take the handlers it
+    // registered rather than re-connecting, so this exercises the real
+    // reload path end to end.
+    const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock
+      .calls[0][2] as Record<
+      string,
+      (event: RunEvent, data: RunEvent["data"]) => void
+    >;
+    const completedEvent: RunEvent = {
+      run_id: "run-live",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: {
+        status: "completed",
+        accounting: makeAccounting(),
+        landscape_run_id: "landscape-run-1",
+      },
+    };
+
+    handlers.onComplete(completedEvent, completedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-live",
+      status: "completed",
+      sessionId: "session-1",
+    });
   });
 
   it("also reattaches a queued (pending) run", async () => {
@@ -895,6 +1466,375 @@ describe("executionStore run-disclosure acknowledgements", () => {
     useExecutionStore.getState().acknowledgeRunDisclosure("sess-2");
     useExecutionStore.getState().clearRunDisclosureAcks();
     expect(useExecutionStore.getState().runDisclosureAckBySession).toEqual({});
+  });
+});
+
+// Terminal-outcome surfacing (elspeth-3a7b7c7b37): lastRunOutcome is the
+// only run-lifecycle fact readable by always-mounted surfaces (the
+// RunOutcomeNotice toast, the Run-tab badge). It must carry the backend's
+// VERBATIM terminal status, only for the run this tab owns.
+describe("executionStore lastRunOutcome", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+  });
+
+  type RunEventHandler = (event: RunEvent, data: RunEvent["data"]) => void;
+
+  // Seeds the post-launch state execute() itself writes: activeRunId AND the
+  // launch session stamp that travels with it. The stamp is the ONLY session
+  // an outcome may carry — the tests below never let the session store's
+  // activeSessionId stand in for it.
+  function seedActiveRun(
+    launchSessionId: string = "session-1",
+  ): Record<string, RunEventHandler> {
+    const close = vi.fn();
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close });
+    useExecutionStore.setState({
+      runs: [makeRun()],
+      activeRunId: "run-1",
+      activeRunSessionId: launchSessionId,
+      progress: {
+        source_rows_processed: 0,
+        tokens_succeeded: 0,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+        cancel_requested: false,
+        accounting: null,
+        recent_errors: [],
+        status: "running",
+      },
+    });
+    useExecutionStore.getState().connectWebSocket("run-1");
+    return (connectToRun as ReturnType<typeof vi.fn>).mock
+      .calls[0][2] as Record<string, RunEventHandler>;
+  }
+
+  it("records the verbatim backend status for a completed_with_failures run", () => {
+    const handlers = seedActiveRun();
+    const completedEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: {
+        status: "completed_with_failures",
+        accounting: makeAccounting(),
+        landscape_run_id: "landscape-run-1",
+      },
+    };
+
+    handlers.onComplete(completedEvent, completedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed_with_failures",
+      sessionId: "session-1",
+    });
+  });
+
+  it("records a FAILED terminal outcome for the active run", () => {
+    const handlers = seedActiveRun();
+    const failedEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "failed",
+      data: {
+        status: "failed",
+        detail: "Pipeline execution failed (FrameworkBugError)",
+        node_id: null,
+      },
+    };
+
+    handlers.onFailed(failedEvent, failedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "failed",
+      sessionId: "session-1",
+    });
+  });
+
+  it("records a cancelled terminal outcome for the active run", () => {
+    const handlers = seedActiveRun();
+    const cancelledEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "cancelled",
+      data: {
+        status: "cancelled",
+        source_rows_processed: 1,
+        tokens_succeeded: 0,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+      },
+    };
+
+    handlers.onCancelled(cancelledEvent, cancelledEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "cancelled",
+      sessionId: "session-1",
+    });
+  });
+
+  it("does not record an outcome from a terminal event for a non-active run", () => {
+    const handlers = seedActiveRun();
+    const staleEvent: RunEvent = {
+      run_id: "run-other",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "failed",
+      data: { status: "failed", detail: "stale", node_id: null },
+    };
+
+    handlers.onFailed(staleEvent, staleEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("does not record an outcome from non-terminal progress events", () => {
+    const handlers = seedActiveRun();
+    const progressEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:00.000Z",
+      event_type: "progress",
+      data: {
+        source_rows_processed: 3,
+        tokens_succeeded: 2,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+      },
+    };
+
+    handlers.onProgress(progressEvent, progressEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("acknowledgeRunOutcome clears the outcome", () => {
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "completed", sessionId: "session-1" },
+    });
+
+    useExecutionStore.getState().acknowledgeRunOutcome();
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("reset clears the outcome", () => {
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "failed", sessionId: "session-1" },
+    });
+
+    useExecutionStore.getState().reset();
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("a fresh launch supersedes an unacknowledged outcome", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockResolvedValue({
+      run_id: "run-2",
+    });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
+    } as never);
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "failed", sessionId: "session-1" },
+    });
+
+    const runId = await useExecutionStore.getState().execute("session-1");
+
+    expect(runId).toBe("run-2");
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  // The session-switch window (elspeth-3a7b7c7b37): a session switch commits
+  // useSessionStore.activeSessionId BEFORE useSession's passive effect calls
+  // reset(), so a WS terminal event can land while activeSessionId already
+  // names the NEW session but the store still owns the OLD run. Reading the
+  // session store at event time mis-files the outcome under the session the
+  // user just moved to, where RunOutcomeNotice would surface a stranger's
+  // run. The launch stamp is the only attribution that survives that window.
+  it("stamps the LAUNCH session, not the session active when the terminal event lands", () => {
+    const handlers = seedActiveRun("session-A");
+    useSessionStore.setState({ activeSessionId: "session-B" } as never);
+    const completedEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: {
+        status: "completed",
+        accounting: makeAccounting(),
+        landscape_run_id: "landscape-run-1",
+      },
+    };
+
+    handlers.onComplete(completedEvent, completedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed",
+      sessionId: "session-A",
+    });
+  });
+
+  it("execute stamps the launching session onto activeRunSessionId", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockResolvedValue({
+      run_id: "run-2",
+    });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
+    } as never);
+
+    await useExecutionStore.getState().execute("session-1");
+
+    expect(useExecutionStore.getState().activeRunSessionId).toBe("session-1");
+  });
+
+  it("reset clears the launch session stamp with the run", () => {
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+    });
+
+    useExecutionStore.getState().reset();
+
+    expect(useExecutionStore.getState().activeRunId).toBeNull();
+    expect(useExecutionStore.getState().activeRunSessionId).toBeNull();
+  });
+});
+
+// Degraded-path reconciliation (elspeth-3a7b7c7b37): when the WebSocket drops
+// its terminal event, the 3s loadRuns poll is the only remaining evidence the
+// run finished. loadRuns must convert that evidence into the same two facts
+// the WS branch writes — a recorded outcome and a reconciled progress.status —
+// and must do so ONLY for the run this tab owns.
+describe("executionStore loadRuns degraded-path reconciliation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+  });
+
+  function inFlightProgress(): RunProgress {
+    return {
+      source_rows_processed: 2,
+      tokens_succeeded: 1,
+      tokens_failed: 0,
+      tokens_quarantined: 0,
+      tokens_routed_success: 0,
+      tokens_routed_failure: 0,
+      cancel_requested: true,
+      accounting: null,
+      recent_errors: [],
+      status: "running",
+    };
+  }
+
+  it("records the outcome and reconciles progress when the poll finds the active run terminal", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const terminalRow = makeRun({
+      status: "completed_with_failures",
+      accounting: makeAccounting(),
+      finished_at: "2026-04-26T05:32:08.000Z",
+    });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([terminalRow]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: inFlightProgress(),
+    });
+
+    const outcome = await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(outcome).toBe("loaded");
+    const state = useExecutionStore.getState();
+    // Verbatim backend status, stamped with the LAUNCH session — the same
+    // contract the WS terminal branch writes.
+    expect(state.lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed_with_failures",
+      sessionId: "session-1",
+    });
+    // ProgressView must stop claiming a live run, and a cancel request that
+    // can no longer be honoured must not survive the terminal transition.
+    expect(state.progress?.status).toBe("completed_with_failures");
+    expect(state.progress?.cancel_requested).toBe(false);
+    expect(state.progress?.accounting).toEqual(terminalRow.accounting);
+  });
+
+  it("stamps the launch session on the degraded outcome, not the currently active session", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ status: "failed", finished_at: "2026-04-26T05:32:08.000Z" }),
+    ]);
+    useSessionStore.setState({ activeSessionId: "session-B" } as never);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-A",
+      progress: inFlightProgress(),
+    });
+
+    await useExecutionStore.getState().loadRuns("session-B");
+
+    expect(useExecutionStore.getState().lastRunOutcome?.sessionId).toBe(
+      "session-A",
+    );
+  });
+
+  it("does not reconcile a terminal row for a run this tab is not attached to", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-other", status: "failed" }),
+      makeRun({ id: "run-1", status: "running" }),
+    ]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: inFlightProgress(),
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(state.lastRunOutcome).toBeNull();
+    expect(state.progress?.status).toBe("running");
+    expect(state.runs).toHaveLength(2);
+  });
+
+  it("does not re-record an outcome once progress already reads terminal", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ status: "completed", finished_at: "2026-04-26T05:32:08.000Z" }),
+    ]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { ...inFlightProgress(), status: "completed", cancel_requested: false },
+      // The WS branch already recorded and the operator already acknowledged.
+      lastRunOutcome: null,
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
   });
 });
 
@@ -1164,7 +2104,9 @@ describe("executionStore progress events advance live accounting", () => {
   it("refreshes the run list after terminal completion so discard summaries reach the UI", async () => {
     const close = vi.fn();
     const accounting = makeAccounting({
-      source: { rows_processed: 0 },
+      // Reconciles with the discard_summary below (validation_errors: 2) —
+      // the backend rejects the contradictory shape.
+      source: { rows_processed: 0, rows_rejected: 2, rows_read: 2 },
       tokens: {
         emitted: 0,
         terminal: 0,
@@ -1172,6 +2114,7 @@ describe("executionStore progress events advance live accounting", () => {
         failed: 0,
         structural: 0,
         pending: 0,
+        abandoned: 0,
       },
     });
     (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close });
@@ -1185,6 +2128,7 @@ describe("executionStore progress events advance live accounting", () => {
           total: 2,
           validation_errors: 2,
           transform_errors: 0,
+          gate_errors: 0,
           sink_discards: 0,
           stages: [
             {

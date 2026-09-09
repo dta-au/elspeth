@@ -100,7 +100,15 @@ class NodeType(StrEnum):
     GATE = "gate"
     AGGREGATION = "aggregation"
     COALESCE = "coalesce"
+    ROW_UNION = "row_union"
+    COLLECTOR = "collector"
     SINK = "sink"
+
+
+# The rule text every node-name collision reports, generated ONCE from the
+# authority above. It used to be hand-typed three times across core/config
+# and web/composer/state and drifted between them (elspeth-1768ad240c).
+UNIQUE_NODE_NAMES_RULE = "All node names must be unique across every node kind: " + ", ".join(member.value for member in NodeType) + "."
 
 
 class Determinism(StrEnum):
@@ -158,9 +166,10 @@ class RoutingMode(StrEnum):
     COPY: Token clones to destination AND continues on current path
     DIVERT: Token is diverted from normal flow to error/quarantine sink.
             Like MOVE, but semantically distinct: represents failure handling,
-            not intentional routing. Used for source quarantine and transform
-            on_error edges. These are structural markers in the DAG — rows
-            reach these sinks via exception handling, not by traversing the edge.
+            not intentional routing. Used for source quarantine, transform
+            on_error, and config-gate on_error edges. These are structural
+            markers in the DAG — rows reach these sinks via exception handling,
+            not by traversing the edge.
 
     Stored in the database.
     """
@@ -211,13 +220,17 @@ class TerminalPath(StrEnum):
     sink received) or TRANSIENT (sink-write fallback for visibility).
 
     Stored alongside ``TerminalOutcome`` in the post-Stage-2 ``token_outcomes``
-    schema.  ``BUFFERED`` is the only non-terminal path — it pairs with
-    ``outcome IS NULL`` to mark a row that hasn't decided yet.
+    schema.  Two paths are non-terminal, both pairing with ``outcome IS
+    NULL``: ``BUFFERED`` marks a row that hasn't decided yet and may still
+    decide; ``ABANDONED`` (ADR-038) marks a row that never decided and never
+    will — its run terminated in a state no resume can recover, recorded by
+    run finalization, never by an executor.
     """
 
     DEFAULT_FLOW = "default_flow"
     GATE_ROUTED = "gate_routed"
     GATE_DISCARDED = "gate_discarded"
+    GATE_ERROR_DISCARDED = "gate_error_discarded"
     ON_ERROR_ROUTED = "on_error_routed"
     FILTER_DROPPED = "filter_dropped"
     COALESCED = "coalesced"
@@ -229,6 +242,7 @@ class TerminalPath(StrEnum):
     EXPAND_PARENT = "expand_parent"
     BATCH_CONSUMED = "batch_consumed"
     BUFFERED = "buffered"
+    ABANDONED = "abandoned"
 
 
 # Closed-set partition over the cross-product of TerminalOutcome and
@@ -241,6 +255,7 @@ _LEGAL_TERMINAL_PAIRS: frozenset[tuple[TerminalOutcome, TerminalPath]] = frozens
         (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW),
         (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED),
         (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED),
+        (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED),
         (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED),
         (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
         (TerminalOutcome.SUCCESS, TerminalPath.COALESCED),
@@ -257,6 +272,7 @@ _LEGAL_TERMINAL_PAIRS: frozenset[tuple[TerminalOutcome, TerminalPath]] = frozens
 _NON_TERMINAL_PATHS: frozenset[TerminalPath] = frozenset(
     {
         TerminalPath.BUFFERED,
+        TerminalPath.ABANDONED,
     }
 )
 
@@ -287,6 +303,31 @@ if _paths_overlap:
         f"BOTH _LEGAL_TERMINAL_PAIRS and _NON_TERMINAL_PATHS — these sets must be "
         f"disjoint (a path is either terminal-paired or non-terminal, never both)."
     )
+
+
+class GroupSettlementReason(StrEnum):
+    """Closed vocabulary for coalesce / scope-failure group-settlement
+    dispositions (unified-lineage spec §2/§6.4, ADR-042).
+
+    The StrEnum IS the vocabulary: emission sites reference these members,
+    never string literals. ``SCOPE_GROUP_FAILED`` is the reason for a member
+    terminated because its group had already FAILED when the member arrived
+    — never ``LATE_ARRIVAL_AFTER_MERGE``, which is reserved for arrival after
+    a SUCCESSFUL merge. The durable discriminator is release status at the
+    closer (``has_released_group_for_node``: a status-COMPLETED node_state),
+    not completion — a failed closure sets ``completed_at`` too.
+
+    SCOPE (META-9.3): coalesce and scope/collector closers only. row_union's
+    own closed reasons (``row_union_branch_lost``, ``late_arrival_after_release``,
+    ``row_union_group_failed`` in ``engine/row_union_executor.py``) are a
+    sibling vocabulary and stay outside this enum by ruling.
+    """
+
+    LATE_ARRIVAL_AFTER_MERGE = "late_arrival_after_merge"
+    SCOPE_GROUP_FAILED = "scope_group_failed"
+    EMPTY_EXPANSION = "empty_expansion"
+    ALL_MEMBERS_LOST = "all_members_lost"
+
 
 # Outcome exhaustiveness: every TerminalOutcome value MUST be the lifecycle
 # answer for at least one legal terminal pair.  An unused outcome would mean
@@ -409,6 +450,15 @@ class OutputMode(StrEnum):
     TRANSFORM = "transform"
 
 
+class AggregationMemberAction(StrEnum):
+    """Durable action a successful aggregation result applies to one member."""
+
+    CONSUME_BATCH = "consume_batch"
+    QUARANTINE = "quarantine"
+    DROP_FILTERED = "drop_filtered"
+    CONTINUE_PASSTHROUGH = "continue_passthrough"
+
+
 # ── Plugin catalog types (Phase 7A) ──────────────────────────────────────
 #
 # These types are referenced by base plugin classes (L3) and protocols (L0)
@@ -525,13 +575,23 @@ def is_llm_authored_creation_modality(modality: CreationModality) -> bool:
     return modality.requires_llm_provenance()
 
 
-def error_edge_label(transform_id: str) -> str:
-    """Canonical label for a transform error DIVERT edge.
+def error_edge_label(producer_id: str) -> str:
+    """Canonical label for a processing-node error DIVERT edge.
 
-    Shared between DAG construction (dag.py) and error-routing audit recording
-    (executors.py, processor.py) to prevent label drift.
+    Shared between DAG construction and transform/config-gate error-routing
+    audit recording to prevent label drift.
 
     Args:
-        transform_id: Stable transform name for error-route labels.
+        producer_id: Stable transform or config-gate name for error-route labels.
     """
-    return f"__error_{transform_id}__"
+    return f"__error_{producer_id}__"
+
+
+# Lineage-frame kinds (unified lineage spec rev 3.2, §4.1). Closed vocabulary:
+# a FORK group is opened by a fork gate (member_key = declared branch name); an
+# EXPAND group by a multi-row transform activation (member_key = member
+# token_id). A new kind requires a spec amendment — the frames table and
+# group_records both carry a CHECK over this enum.
+class FrameKind(StrEnum):
+    FORK = "fork"
+    EXPAND = "expand"

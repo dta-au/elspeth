@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CANONICAL_TUTORIAL_PROMPT,
+  TUTORIAL_TRANSFORMS_PROMPT,
   initialTutorialState,
   isAbandonOnPageHide,
   progressForTutorialState,
@@ -15,6 +16,15 @@ describe("tutorialMachine", () => {
       "Scrape these three synthetic project-brief pages and, for each page, " +
         "have an LLM write a short summary of the page. Remove the raw HTML and " +
         "write the rows to a json file.",
+    );
+  });
+
+  it("pins the transform-stage projection and scraping authority", () => {
+    expect(TUTORIAL_TRANSFORMS_PROMPT).toBe(
+      "For each row, fetch the page at its `url`, then have an LLM write a short " +
+        "`summary`. Finally drop the raw HTML and fingerprint columns and retain " +
+        "exactly `url` and `summary`. Use noreply@dta.gov.au as the " +
+        "scraping abuse contact. Scraping reason: 'ELSPETH tutorial demonstration'.",
     );
   });
 });
@@ -125,6 +135,32 @@ describe("isAbandonOnPageHide", () => {
     // composer.tutorial.abandon_total.
     expect(isAbandonOnPageHide("audit", true)).toBe(false);
     expect(isAbandonOnPageHide("run", true)).toBe(false);
+  });
+});
+
+describe("tutorialReducer run stage (I-1: the run never auto-fires)", () => {
+  it("guidedCompleted lands on the run stage with no run identity", () => {
+    const run = tutorialReducer(
+      { ...initialTutorialState, step: "guided" },
+      { type: "guidedCompleted", sessionId: "sess-123" },
+    );
+    expect(run.step).toBe("run");
+    expect(run.runId).toBeNull();
+  });
+
+  it("a resumed run stage without a run identity lands on the run stage", () => {
+    // Whether the reload happened before Run was clicked or mid-run, the
+    // persisted fields cannot tell the two apart (no run identity yet), and
+    // nothing may execute on the learner's behalf: the run turn waits for an
+    // explicit Run click, and Exit still cancels whatever may be running.
+    const state = resumeTutorialState({
+      stage: "run",
+      sessionId: "sess-1",
+      runId: null,
+      sourceDataHash: null,
+    });
+    expect(state.step).toBe("run");
+    expect(state.runId).toBeNull();
   });
 });
 

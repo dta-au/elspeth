@@ -69,6 +69,8 @@ class _DeliberatelyMisannotatedDropper(BaseTransform):
     source_file_hash: str | None = None
     config_model = TransformDataConfig
     passes_through_input = True  # LIE — this transform actually drops fields.
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)

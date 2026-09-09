@@ -9,12 +9,59 @@ from uuid import UUID
 from sqlalchemy import Engine, select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ReviewedSourceAuthority
+from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 from elspeth.web.sessions.models import blobs_table, sessions_table
 
 _BLOB_PATH_PREFIX = "blob:"
 _BLOB_PATH_KEYS = frozenset({"path", "file"})
+
+
+def _recorded_content_hash_prefix(raw_source: Mapping[str, Any], *, stable_id: str) -> str | None:
+    """Parse the reviewed record's content identity anchor, if recorded.
+
+    Guided review captures the inspected blob's ``content_hash`` prefix into
+    the resolved source record; legacy records and non-blob sources carry
+    ``None``.  A present-but-malformed anchor is an integrity anomaly, not
+    an absent one.
+    """
+    value = raw_source["content_hash_prefix"] if "content_hash_prefix" in raw_source else None
+    if value is None:
+        return None
+    if type(value) is not str or not value:
+        raise AuditIntegrityError(f"reviewed_sources[{stable_id!r}].content_hash_prefix must be a non-empty string when present")
+    return value
+
+
+@trust_boundary(
+    tier=3,
+    source="web-authored reviewed source options (untrusted mapping values persisted with the session)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises AuditIntegrityError when source-authoring metadata is present but not a mapping, or its "
+        "content_hash is present but not a non-empty string; absence at either level yields None"
+    ),
+    test_ref="tests/unit/web/composer/test_set_pipeline_candidate.py::test_authoring_content_hash_rejects_non_mapping_authoring_metadata",
+    test_fingerprint="8e9130a57ff74f9db27a5c387f797e43636f4f52e58d9de04bad09a679427820",
+)
+def _authoring_content_hash(options: Mapping[str, Any], *, stable_id: str) -> str | None:
+    """Parse the full content hash pinned by source-authoring metadata."""
+    authoring = options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None
+    if authoring is None:
+        return None
+    if not isinstance(authoring, Mapping):
+        raise AuditIntegrityError(f"reviewed_sources[{stable_id!r}] source authoring metadata must be a mapping")
+    value = authoring["content_hash"] if "content_hash" in authoring else None
+    if value is None:
+        return None
+    if type(value) is not str or not value:
+        raise AuditIntegrityError(f"reviewed_sources[{stable_id!r}] source authoring content_hash must be a non-empty string")
+    return value
 
 
 def _canonical_blob_id(value: object, *, field_name: str) -> str:
@@ -29,6 +76,18 @@ def _canonical_blob_id(value: object, *, field_name: str) -> str:
     return value
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored reviewed-source facts carried on the proposal (untrusted persisted session state)",
+    source_param="reviewed_facts",
+    suppresses=("R5",),
+    invariant=(
+        "raises AuditIntegrityError on anchor mismatch or any present-but-malformed reviewed source record; "
+        "an absent reviewed_sources key yields None (no private authority granted)"
+    ),
+    test_ref="tests/unit/web/composer/test_set_pipeline_candidate.py::test_reviewed_source_authority_rejects_non_mapping_reviewed_sources",
+    test_fingerprint="0fa240f7a4335754f2c2fd09a3d22c4380e91e0bd780001aa120a35cdf242a58",
+)
 def resolve_reviewed_source_authority(
     *,
     engine: Engine | None,
@@ -47,8 +106,10 @@ def resolve_reviewed_source_authority(
     if reviewed_anchor_hash(reviewed_facts) != expected_reviewed_anchor_hash:
         raise AuditIntegrityError("reviewed source authority does not match the current reviewed anchor")
     sources = reviewed_facts["reviewed_sources"] if "reviewed_sources" in reviewed_facts else None
-    if not isinstance(sources, Mapping):
+    if sources is None:
         return None
+    if not isinstance(sources, Mapping):
+        raise AuditIntegrityError("reviewed source authority reviewed_sources must be a mapping when present")
     if type(session_id) is not str or not session_id:
         raise AuditIntegrityError("reviewed source authority requires a non-empty session_id")
     if type(user_id) is not str or not user_id:
@@ -60,12 +121,20 @@ def resolve_reviewed_source_authority(
     source_blob_ids: dict[str, str] = {}
     sentinel_blob_ids: dict[str, str] = {}
     raw_storage_paths: dict[str, tuple[str, ...]] = {}
+    reviewed_hash_prefixes: dict[str, str] = {}
+    authoring_hashes: dict[str, str] = {}
     for stable_id, raw_source in sources.items():
         if type(stable_id) is not str or not stable_id or not isinstance(raw_source, Mapping):
             raise AuditIntegrityError("reviewed source authority contains a malformed source record")
         options = raw_source["options"] if "options" in raw_source else None
         if not isinstance(options, Mapping):
             raise AuditIntegrityError("reviewed source authority contains malformed source options")
+        recorded_prefix = _recorded_content_hash_prefix(raw_source, stable_id=stable_id)
+        if recorded_prefix is not None:
+            reviewed_hash_prefixes[stable_id] = recorded_prefix
+        pinned_hash = _authoring_content_hash(options, stable_id=stable_id)
+        if pinned_hash is not None:
+            authoring_hashes[stable_id] = pinned_hash
         referenced_ids: set[str] = set()
         if "blob_ref" in options:
             referenced_ids.add(
@@ -84,13 +153,15 @@ def resolve_reviewed_source_authority(
                 referenced_ids.add(blob_id)
                 sentinel_blob_ids[option_value] = blob_id
             elif type(option_value) is str:
-                raw_storage_paths[stable_id] = (*raw_storage_paths.get(stable_id, ()), option_value)
+                recorded_paths = raw_storage_paths[stable_id] if stable_id in raw_storage_paths else ()
+                raw_storage_paths[stable_id] = (*recorded_paths, option_value)
         if len(referenced_ids) > 1:
             raise AuditIntegrityError("reviewed source blob custody fields disagree")
         if referenced_ids:
             source_blob_ids[stable_id] = next(iter(referenced_ids))
 
     verified_storage_by_blob_id: dict[str, str] = {}
+    verified_hash_by_blob_id: dict[str, str] = {}
     with engine.connect() as conn:
         session_owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == session_id)).scalar_one_or_none()
         if session_owner != user_id:
@@ -101,6 +172,7 @@ def resolve_reviewed_source_authority(
                     blobs_table.c.session_id,
                     blobs_table.c.status,
                     blobs_table.c.storage_path,
+                    blobs_table.c.content_hash,
                 ).where(blobs_table.c.id == blob_id)
             ).first()
             if row is None:
@@ -111,16 +183,38 @@ def resolve_reviewed_source_authority(
                 raise AuditIntegrityError("reviewed blob authority references a blob that is not ready")
             if type(row.storage_path) is not str or not row.storage_path:
                 raise AuditIntegrityError("reviewed blob authority has a malformed storage path")
+            if type(row.content_hash) is not str or not row.content_hash:
+                raise AuditIntegrityError("reviewed blob authority references a ready blob without a content hash")
             verified_storage_by_blob_id[blob_id] = row.storage_path
+            verified_hash_by_blob_id[blob_id] = row.content_hash
+
+    # Content identity binding: authority is granted for the BYTES that were
+    # reviewed, not for a blob id/path.  update_blob mutates bytes and hash
+    # in place while keeping id, path, session, and ready status — every
+    # location/lifecycle check above still passes — so the recorded review
+    # anchors must match the live content hash or the stale reviewed facts
+    # would silently auto-authorize unreviewed bytes (elspeth-b3feba9a7c).
+    for stable_id, blob_id in source_blob_ids.items():
+        live_hash = verified_hash_by_blob_id[blob_id]
+        recorded_prefix = reviewed_hash_prefixes[stable_id] if stable_id in reviewed_hash_prefixes else None
+        if recorded_prefix is not None and not live_hash.startswith(recorded_prefix):
+            raise AuditIntegrityError(
+                "reviewed blob authority no longer matches the reviewed content; the blob changed after review and requires re-review"
+            )
+        pinned_hash = authoring_hashes[stable_id] if stable_id in authoring_hashes else None
+        if pinned_hash is not None and pinned_hash != live_hash:
+            raise AuditIntegrityError(
+                "reviewed source authoring content_hash no longer matches the live blob; the blob changed after review and requires re-review"
+            )
 
     for stable_id, paths in raw_storage_paths.items():
-        source_blob_id = source_blob_ids.get(stable_id)
-        if source_blob_id is None:
+        if stable_id not in source_blob_ids:
             # A non-blob path is authorized only by the exact reviewed source
             # binding at the candidate boundary.  Session ownership was still
             # verified above, and the normal credential/plugin/S2 path checks
             # remain mandatory after that binding matches.
             continue
+        source_blob_id = source_blob_ids[stable_id]
         if any(path != verified_storage_by_blob_id[source_blob_id] for path in paths):
             raise AuditIntegrityError("reviewed source raw storage path differs from its owned ready blob")
 
@@ -130,3 +224,41 @@ def resolve_reviewed_source_authority(
         reviewed_sources=sources,
         verified_blob_paths={sentinel: verified_storage_by_blob_id[blob_id] for sentinel, blob_id in sentinel_blob_ids.items()},
     )
+
+
+def resolve_owned_composition_source_authority(
+    *,
+    engine: Engine | None,
+    session_id: str,
+    user_id: str | None,
+    state: CompositionState,
+) -> ReviewedSourceAuthority:
+    """Verify exact owned-state source bindings for private settlement.
+
+    The synthesized reviewed-facts shape never leaves this function. It lets
+    the existing candidate boundary reuse its closed, hash-matched
+    ``ReviewedSourceAuthority`` contract while the proposal itself remains a
+    freeform proposal with an empty public reviewed-facts anchor.
+    """
+    reviewed_sources = {
+        source_name: {
+            "name": source_name,
+            "plugin": source.plugin,
+            "options": deep_thaw(source.options),
+            "observed_columns": [],
+            "sample_rows": [],
+            "on_validation_failure": source.on_validation_failure,
+        }
+        for source_name, source in state.sources.items()
+    }
+    private_facts = {"reviewed_sources": reviewed_sources}
+    authority = resolve_reviewed_source_authority(
+        engine=engine,
+        session_id=session_id,
+        user_id=user_id,
+        reviewed_facts=private_facts,
+        expected_reviewed_anchor_hash=reviewed_anchor_hash(private_facts),
+    )
+    if authority is None:
+        raise AuditIntegrityError("owned composition source authority could not be established")
+    return authority

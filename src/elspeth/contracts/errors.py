@@ -61,16 +61,18 @@ def _scrub_traceback_for_audit(traceback_text: str) -> str:
             if scrub_text_for_audit(tail_text) != tail_text:
                 redacted_indexes.update(range(tail_start, run_stop))
 
-    for run_start, run_stop in nonstructural_runs:
-        for start in range(run_start, run_stop):
-            window_stop = min(run_stop, start + _TRACEBACK_SECRET_WINDOW_SIZE)
-            for stop in range(start + 2, window_stop + 1):
-                window_indexes = range(start, stop)
-                if any(index in redacted_indexes for index in window_indexes):
-                    continue
-                window_text = _join_line_parts(line_parts[start:stop])
-                if scrub_text_for_audit(window_text) != window_text:
-                    redacted_indexes.update(window_indexes)
+    # Scan bounded windows across every line boundary. Exception text is
+    # attacker-controlled and may itself look like traceback structure, so a
+    # structural classification must not create a secret-scrubbing boundary.
+    for window_size in range(2, _TRACEBACK_SECRET_WINDOW_SIZE + 1):
+        for start in range(len(line_parts) - window_size + 1):
+            stop = start + window_size
+            window_indexes = range(start, stop)
+            if any(index in redacted_indexes for index in window_indexes):
+                continue
+            window_text = _join_line_parts(line_parts[start:stop])
+            if scrub_text_for_audit(window_text) != window_text:
+                redacted_indexes.update(window_indexes)
 
     return "".join(
         f"{scrubbed_content_by_index[index] if index not in redacted_indexes else _REDACTED_SECRET}{line_ending}"
@@ -210,6 +212,46 @@ class ExecutionError:
 
 
 @dataclass(frozen=True, slots=True)
+class RowUnionFailureReason:
+    """Frozen DTO for row_union barrier failure payloads.
+
+    Used by RowUnionExecutor when recording fork-branch UNION ALL barrier
+    failures. v1 is require_all with no partial release, so every failure
+    consumes the whole pending group: any timeout, lost branch, or
+    end-of-source flush of an incomplete group fails all held branches.
+    """
+
+    failure_reason: str  # Why the union failed (e.g., "row_union_timeout")
+    expected_branches: tuple[str, ...]  # Branches declared for the union
+    branches_arrived: tuple[str, ...]  # Branches held when the failure fired
+    timeout_ms: int | None = None  # Timeout that triggered failure (if applicable)
+
+    def __post_init__(self) -> None:
+        """Validate row_union failure record invariants."""
+        if not self.failure_reason:
+            raise ValueError("RowUnionFailureReason.failure_reason must not be empty")
+        if not self.expected_branches:
+            raise ValueError("RowUnionFailureReason.expected_branches must not be empty")
+        if self.timeout_ms is not None and self.timeout_ms < 0:
+            raise ValueError(f"RowUnionFailureReason.timeout_ms must be non-negative, got {self.timeout_ms}")
+        freeze_fields(self, "expected_branches", "branches_arrived")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to audit-trail dict.
+
+        Omits None-valued optional fields for compact JSON.
+        """
+        d: dict[str, Any] = {
+            "failure_reason": self.failure_reason,
+            "expected_branches": list(self.expected_branches),
+            "branches_arrived": list(self.branches_arrived),
+        }
+        if self.timeout_ms is not None:
+            d["timeout_ms"] = self.timeout_ms
+        return d
+
+
+@dataclass(frozen=True, slots=True)
 class CoalesceFailureReason:
     """Frozen DTO for coalesce/barrier failure payloads.
 
@@ -223,11 +265,18 @@ class CoalesceFailureReason:
     merge_policy: str  # Merge policy in effect
     timeout_ms: int | None = None  # Timeout that triggered failure (if applicable)
     select_branch: str | None = None  # Target branch for select policy (if applicable)
+    # META-40: the settlement disposition of the MEMBER whose hold this
+    # payload closes (a GroupSettlementReason value — "scope_group_failed"
+    # for a survivor of the failing group), carried BESIDE the group-level
+    # cause in ``failure_reason``. Omitted from the audit dict when None.
+    member_disposition: str | None = None
 
     def __post_init__(self) -> None:
         """Validate coalesce failure record invariants."""
         if not self.failure_reason:
             raise ValueError("CoalesceFailureReason.failure_reason must not be empty")
+        if self.member_disposition is not None and not self.member_disposition:
+            raise ValueError("CoalesceFailureReason.member_disposition must not be empty when set")
         if not self.merge_policy:
             raise ValueError("CoalesceFailureReason.merge_policy must not be empty")
         if not self.expected_branches:
@@ -251,6 +300,8 @@ class CoalesceFailureReason:
             d["timeout_ms"] = self.timeout_ms
         if self.select_branch is not None:
             d["select_branch"] = self.select_branch
+        if self.member_disposition is not None:
+            d["member_disposition"] = self.member_disposition
         return d
 
 
@@ -267,6 +318,19 @@ class ConfigGateReason(TypedDict):
 
     condition: str
     result: str
+
+
+class ConfigGateErrorReason(TypedDict):
+    """Reason for diverting a row whose config-gate expression failed.
+
+    This is row-scoped failure evidence, distinct from ``ConfigGateReason``:
+    the latter proves a successful routing decision, while this payload proves
+    why no configured route label could be produced for this row.
+    """
+
+    condition: str
+    error_type: str
+    error: str
 
 
 # RoutingReason union is defined after TransformErrorReason (see RoutingReason below)
@@ -385,6 +449,17 @@ class RowErrorEntry(TypedDict):
     error: NotRequired[str | dict[str, Any]]
 
 
+class BucketRegionVerificationEvidence(TypedDict):
+    """Safe per-row proof that an S3 bucket region was verified."""
+
+    configured_region: str
+    observed_region: str
+    proof_source: Literal["response_field", "response_header", "error_header"]
+    http_status: int
+    cache_status: Literal["live", "cached"]
+    provider_code: NotRequired[str]
+
+
 class UsageStats(TypedDict, total=False):
     """LLM token usage statistics.
 
@@ -429,6 +504,7 @@ TransformErrorCategory = Literal[
     "llm_call_failed",
     "network_error",
     "permanent_error",
+    "retry_exhausted",  # Engine retry budget exhausted; final underlying error is preserved
     "retry_timeout",
     "transient_error_no_retry",  # Transient error (connection/timeout) but retry disabled
     # Field/validation errors
@@ -448,6 +524,17 @@ TransformErrorCategory = Literal[
     "csv_config_error",
     "csv_column_count_mismatch",
     "too_many_rows",
+    "too_many_images",  # Row-declared image inputs exceed configured max_images_per_call
+    "expand_width_exceeded",  # ENGINE-synthesized (like retry_exhausted): a multi-row expansion exceeds
+    # settings.max_expand_group_width; refused at the opener before the mint transaction (elspeth-258bd49d81)
+    # PDF rasterization (Tier 2 - document bytes that did not survive rendering)
+    "pdf_encrypted",  # password/security-protected PDF; no password path exists
+    "pdf_malformed",  # pdfium could not parse the document
+    "pdf_page_render_failed",  # page(s) refused for render error, memory exhaustion, or invalid geometry; fires under
+    # on_page_failure=fail_document, and unconditionally when zero pages survive regardless of on_page_failure
+    "pdf_page_too_large",  # a page exceeded max_page_pixels or max_page_bytes; fires under on_page_failure=fail_document,
+    # and unconditionally when zero pages survive regardless of on_page_failure
+    "render_timeout",  # the document exceeded render_timeout_seconds (wall clock or CPU budget)
     # Template errors
     "template_rendering_failed",
     "template_context_failed",  # Multi-query template context build failed (missing field)
@@ -527,6 +614,19 @@ TransformErrorCategory = Literal[
     "poll_timeout",  # async analyze operation did not reach a terminal status within budget
     "operation_location_missing",  # 202 response lacked the Operation-Location header
     "operation_location_untrusted",  # Operation-Location host != configured endpoint (security)
+    # Amazon Textract asynchronous document analysis
+    "bucket_region_mismatch",
+    "bucket_region_unverified",
+    "submit_failed",
+    "poll_failed",
+    "partial_success",
+    "pagination_cycle",
+    "pagination_limit_exceeded",
+    "too_many_blocks",
+    "result_too_large",
+    # reference_join: the row key was absent from the reference table, or an
+    # output path did not resolve against the entry that matched.
+    "reference_miss",
 ]
 
 
@@ -566,7 +666,7 @@ class TransformErrorReason(TypedDict):
         response: Full response object for debugging
         response_keys: Keys present in response dict
         body_preview: HTTP body preview for errors
-        content_type: Content-Type header value
+        content_type: Raw Content-Type header value; None when the header was absent
 
     Type validation context:
         expected: Expected type or value
@@ -588,6 +688,7 @@ class TransformErrorReason(TypedDict):
         skipped_reasons: Structured reasons for candidate hits rejected before final output
 
     Rate limiting/timeout context:
+        attempts: Total attempts made before an engine retry budget was exhausted
         elapsed_seconds: Time elapsed before timeout
         max_seconds: Maximum allowed time
         status_code: HTTP status code
@@ -635,6 +736,10 @@ class TransformErrorReason(TypedDict):
     field: NotRequired[str]
     error_type: NotRequired[str]
     message: NotRequired[str]
+    code: NotRequired[str]
+    configured_region: NotRequired[str]
+    observed_region: NotRequired[str]
+    bucket_region_verification: NotRequired[BucketRegionVerificationEvidence]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]
@@ -671,10 +776,12 @@ class TransformErrorReason(TypedDict):
     response: NotRequired[dict[str, Any]]
     response_keys: NotRequired[list[str] | None]
     body_preview: NotRequired[str]  # HTTP body preview; absent = empty/unavailable
-    content_type: NotRequired[str]
+    content_type: NotRequired[str | None]  # Raw Content-Type header; None = the server sent none
     body_size: NotRequired[int]  # Actual response body size in bytes (body_too_large errors)
     max_body_bytes: NotRequired[int]  # Configured limit in bytes (body_too_large errors)
     max_blob_bytes: NotRequired[int]  # Configured blob parser limit in bytes
+    list_index: NotRequired[int]  # Position within a list-valued row column (image_inputs)
+    max_images: NotRequired[int]  # Configured max_images_per_call limit (too_many_images)
     phase: NotRequired[str]  # Parser phase: skip_rows, header, data, etc.
     line_number: NotRequired[int]  # Source text line number for parser errors
     row_number: NotRequired[int]  # Data row number for parser errors
@@ -682,6 +789,16 @@ class TransformErrorReason(TypedDict):
     max_output_rows: NotRequired[int]  # Configured row-expansion limit
     skip_rows: NotRequired[int]  # Configured leading rows to skip
     rows_skipped: NotRequired[int]  # Actual rows skipped before exhaustion
+
+    # Reference-table join context (reference_join)
+    reference_key_value: NotRequired[str]  # The row's join key, as matched against the table
+    unresolved_fields: NotRequired[list[str]]  # Output fields the lookup could not produce
+
+    # PDF rasterization context
+    detail: NotRequired[str]  # Renderer-supplied detail string (document or page refusal)
+    max_pages: NotRequired[int]  # Configured page-count ceiling (too_many_rows from pdf_rasterize)
+    page_count: NotRequired[int]  # Observed page count, when the renderer reported one
+    refused_pages: NotRequired[list[dict[str, Any]]]  # Per-page {page_number, kind, detail} refusal entries
 
     # Type validation context
     expected: NotRequired[str]
@@ -698,6 +815,7 @@ class TransformErrorReason(TypedDict):
     violations: NotRequired[list[dict[str, Any]]]
 
     # Rate limiting/timeout context
+    attempts: NotRequired[int]  # Total attempts made before the engine retry budget was exhausted
     elapsed_seconds: NotRequired[float]
     max_seconds: NotRequired[float]
     elapsed_hours: NotRequired[float]  # Batch timeout (hours scale)
@@ -770,10 +888,11 @@ class SinkDiversionReason(TypedDict):
 
 # Discriminated union - field presence distinguishes variants:
 # - ConfigGateReason has "condition" and "result"
+# - ConfigGateErrorReason has "condition", "error_type", and "error"
 # - TransformErrorReason has "reason" (error category string)
 # - SourceQuarantineReason has "quarantine_error"
 # - SinkDiversionReason has "diversion_reason"
-RoutingReason = ConfigGateReason | TransformErrorReason | SourceQuarantineReason | SinkDiversionReason
+RoutingReason = ConfigGateReason | ConfigGateErrorReason | TransformErrorReason | SourceQuarantineReason | SinkDiversionReason
 
 
 # =============================================================================
@@ -799,7 +918,7 @@ class MaxRetriesExceeded(Exception):
         super().__init__(f"Max retries ({attempts}) exceeded: {last_error}")
 
 
-# TIER-2: Control-flow signal for interrupted runs (SIGINT/SIGTERM) — run is resumable; not a system corruption or framework bug.
+# TIER-2: Control-flow signal for interrupted runs (SIGINT/SIGTERM) — not a system corruption or framework bug.
 class GracefulShutdownError(Exception):
     """Raised when a pipeline run is interrupted by a shutdown signal.
 
@@ -807,7 +926,11 @@ class GracefulShutdownError(Exception):
     orchestrator stopped processing new rows due to SIGINT/SIGTERM but
     completed all in-flight work (aggregation flush, sink writes, checkpoints).
 
-    The run is marked INTERRUPTED and is resumable via ``elspeth resume``.
+    The run is marked INTERRUPTED. Whether it is *resumable* depends on
+    state this exception cannot see (source lifecycle, resume baseline —
+    elspeth-1f5b83cd28), so the message suggests the ``elspeth resume``
+    dry-run probe rather than promising ``--execute`` will succeed; the CLI
+    handlers consult the shared gate and print the definitive guidance.
     """
 
     def __init__(
@@ -831,7 +954,7 @@ class GracefulShutdownError(Exception):
         self.rows_routed_failure = rows_routed_failure
         self.routed_destinations: Mapping[str, int] = deep_freeze(dict(routed_destinations) if routed_destinations is not None else {})
         super().__init__(
-            f"Pipeline interrupted after {rows_processed} rows (run_id={run_id}). Resume with: elspeth resume {run_id} --execute"
+            f"Pipeline interrupted after {rows_processed} rows (run_id={run_id}). Check resumability with: elspeth resume {run_id}"
         )
 
 
@@ -863,6 +986,43 @@ class AuditIntegrityError(Exception):
     ) -> None:
         super().__init__(*args)
         self.failed_turn = failed_turn
+
+
+@tier_1_error(
+    reason="ADR-008: guided reviewed-source custody cannot bind to the live sources — the audit trail's source provenance is unprovable",
+    caller_module=__name__,
+)
+class GuidedCustodyIntegrityError(AuditIntegrityError):
+    """Raised when a guided session's retained source review cannot bind.
+
+    Every guided blob custody validator and the custody projection raise this
+    subclass so a read arm can name the condition (a stable 409 on a legacy
+    tip persisted before the write gate) without catching the whole
+    ``AuditIntegrityError`` family as if it were custody.
+    """
+
+
+# TIER-2: Authoring-state lowering defect — the state is malformed, no audit mutation has begun, and the author can repair and retry.
+class PipelineLoweringError(ValueError):
+    """Raised when a composition state cannot be lowered to runtime pipeline YAML.
+
+    This names one half of a family split at the lowering layer:
+
+    - **Authoring-state defects** (this class): the state itself is malformed —
+      a gate without a condition, a coalesce without a policy, a transform whose
+      ``on_error`` was never defaulted at the mutation boundary. The
+      ``validate_pipeline`` seam converts these into red validation verdicts so the
+      author (human or LLM) gets a repairable signal instead of a 500.
+    - **Code invariants** (``RuntimeError``, ``AuditIntegrityError``, and friends):
+      the lowering code or its inputs violate an invariant ELSPETH owns — node-type
+      lowering drift, a non-dict YAML document, a hand-constructed contract type.
+      These must keep escaping as 500s; converting them would misroute a bug into
+      the author-repairable channel.
+
+    Subclassing ``ValueError`` keeps existing ``except ValueError`` handlers on the
+    non-validation lowering paths (export, MCP, shareable reviews) behaving as
+    before, while letting the validation seam catch exactly this type.
+    """
 
 
 # TIER-2: Multi-worker lease coordination signal — the worker's lease was reaped
@@ -941,6 +1101,42 @@ class RunLeadershipLostError(Exception):
         )
 
 
+# This worker's run_workers row is no longer 'active' (departed, or evicted by
+# the leader's housekeeping sweep / a takeover), so its membership-fenced
+# transaction was refused by the membership verify-UPDATE and rolled back with
+# ZERO durable mutation (ADR-030 D4, second fence). The refusal is best-effort
+# attributed via a fence_refusal coordination event; the worker abandons
+# cleanly under the single-use identity doctrine. Sibling of
+# RunLeadershipLostError: same discipline, one fence down.
+# TIER-2: Legitimate multi-worker coordination — this worker's membership ended; the fenced write rolled back cleanly with zero mutation, not audit corruption.
+class RunMembershipLostError(Exception):
+    """Raised when the membership fence verify-UPDATE misses (ADR-030 D4).
+
+    The first statement of every membership-fenced transaction is a
+    conditional UPDATE on ``run_workers`` matching ``(run_id, worker_id,
+    status='active')``. When no active row matches, an existing registration
+    means this worker departed or was evicted. The entire transaction rolls
+    back before any payload write, and the worker must abandon this identity.
+    A missing registration raises ``AuditIntegrityError`` instead.
+
+    Attributes:
+        run_id: The run whose membership fence refused this worker.
+        worker_id: The identity whose ``run_workers`` row is no longer active.
+        verb: The fenced verb that was refused (forensic attribution; also
+            recorded in the best-effort ``fence_refusal`` coordination event).
+    """
+
+    def __init__(self, *, run_id: str, worker_id: str, verb: str) -> None:
+        self.run_id = run_id
+        self.worker_id = worker_id
+        self.verb = verb
+        super().__init__(
+            f"Run membership lost for run_id={run_id!r}: worker_id={worker_id!r} "
+            f"is no longer an active member (refused at verb {verb!r}). "
+            "The worker departed or was evicted; abandon work under this identity."
+        )
+
+
 # This worker's run_workers registry row left 'active' (evicted by the leader's
 # housekeeping sweep, or departed at finalize). Single-use identity doctrine
 # (ADR-030): the row never returns to 'active'; the drain loop abandons
@@ -1000,8 +1196,11 @@ class FollowerSeatDeadError(Exception):
     """Raised when the leader seat expires while the follower is draining.
 
     The follower has already departed cleanly (``depart_worker`` called).
-    The run is NOT complete — the operator must use ``elspeth resume`` to
-    take over the run (design §B.1 step 5, §C.3).
+    The run is NOT complete — the operator must take it over with
+    ``elspeth resume`` when the shared resume gates admit it, or finalize it
+    with ``elspeth abandon`` when they refuse (design §B.1 step 5, §C.3;
+    elspeth-5dd23f4df9). The CLI consults the gates and prints whichever verb
+    can succeed.
 
     Attributes:
         worker_id: The follower's worker identity.
@@ -1014,8 +1213,30 @@ class FollowerSeatDeadError(Exception):
         super().__init__(
             f"Follower {worker_id!r} detected no live leader for run {run_id!r}. "
             "The follower has departed cleanly. "
-            f"Use `elspeth resume {run_id}` to take over the run."
+            f"Take over the run with `elspeth resume {run_id}` if it is resumable, "
+            f"or finalize it with `elspeth abandon {run_id}`."
         )
+
+
+# elspeth-5dd23f4df9: `elspeth abandon` preflight refusal — the run is absent,
+# already terminal, or led by a LIVE seat. Operator-interpretable, zero
+# mutation; the takeover CAS stays the arbiter for the preflight/write race.
+# TIER-2: Operator-interpretable refuse signal, not audit corruption — abandon refuses rather than seizing a live or terminal run.
+class AbandonRefusedError(Exception):
+    """Raised when ``elspeth abandon`` cannot act on the named run.
+
+    The advisory preflight (``engine/orchestrator/abandon.py``) refuses before
+    any mutation when the run does not exist, is already terminal, or is led
+    by a LIVE seat — only a dead (expired or vacant) leader seat may be taken
+    over. The takeover CAS remains the arbiter for the race between the
+    preflight and the seat write; a CAS loss surfaces as
+    :class:`~elspeth.core.checkpoint.recovery.NonResumableRunError`.
+    """
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        super().__init__(f"Cannot abandon run {run_id!r}: {reason}")
 
 
 # The audit DB write lock is held by a live or frozen process, so the takeover
@@ -1062,12 +1283,12 @@ class CoalesceCollisionError(Exception):
     enforcement. The pipeline author chose to fail-fast on union merge collisions
     rather than allow last_wins/first_wins resolution. The CoalesceMetadata is
     captured BEFORE raising so the orchestrator's failure path can persist
-    collision provenance and value fingerprints to the audit trail without
+    value-independent collision provenance to the audit trail without
     storing the raw colliding branch values.
 
     Attributes:
         metadata: CoalesceMetadata with union_field_origins and
-                  audit-safe union_field_collision_values populated.
+                  union_field_collisions populated without value-derived material.
     """
 
     def __init__(self, message: str, *, metadata: "CoalesceMetadata") -> None:
@@ -1169,7 +1390,7 @@ class IncompleteSourceResumeError(Exception):
         super().__init__(
             f"Cannot resume run {run_id!r} to completion: source lifecycle is incomplete "
             f"({source_summary}). Current resume replays only persisted row payloads; "
-            "unread source rows may exist. Start a fresh run or use a source-aware resume path."
+            "unread source rows may exist. Start a fresh run."
         )
 
 
@@ -1355,6 +1576,15 @@ class PluginRetryableError(Exception):
     must inherit from this class. The processor catches PluginRetryableError
     and dispatches to retry logic based on the retryable attribute.
 
+    Deliberate engine-classified carve-out: the processor additionally treats
+    the Python runtime's canonical transient transport signals —
+    ``ConnectionError`` and ``TimeoutError`` — and the contract-owned
+    ``CapacityError`` (``retryable`` always True) as retryable, because they
+    can surface from beneath provider SDKs without a plugin seam to classify
+    them. No other unclassified exception is retried; in particular bare
+    ``OSError`` (``FileNotFoundError``, ``PermissionError``, ...) is a plugin
+    bug-class and crashes.
+
     Attributes:
         retryable: Whether the error is transient and should be retried.
         status_code: HTTP status code if applicable (for audit context).
@@ -1408,15 +1638,25 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
     """Raised when a plugin violates its contract with the framework.
 
     This indicates a bug in a plugin (Source, Transform, Gate, Sink) that must
-    be fixed. Unlike user data errors (which are quarantined), plugin bugs
-    MUST crash the pipeline per CLAUDE.md's "plugin bugs must crash" rule.
+    be fixed. It is nonetheless TIER 2 — a row-level failure, as the marker
+    above says. At the transform seam the engine ROUTES it through the node's
+    ``on_error`` destination and counts the row as failed, rather than aborting
+    the run (elspeth-181db83da7); registering a subclass in ``TIER_1_ERRORS`` is
+    what opts it back out of that, per ADR-008 §"TIER_1 registration is
+    load-bearing". Seams other than the transform executor — sinks, the
+    aggregation flush — still abort; that asymmetry is tracked, not designed.
+
+    This docstring previously read "plugin bugs MUST crash the pipeline per
+    CLAUDE.md's 'plugin bugs must crash' rule", citing a CLAUDE.md section that
+    no longer exists, and contradicted its own tier marker six lines above.
 
     Examples of conditions that trigger this:
     - Transform emits non-canonical data (NaN, Infinity, non-serializable types)
     - Plugin returns wrong type from method
     - Plugin violates interface contract
 
-    Recovery: Fix the plugin. These errors indicate bugs in plugin code.
+    Recovery: Fix the plugin. These errors indicate bugs in plugin code — a
+    routed row records the bug as evidence, it does not excuse it.
 
     Base class accepts a positional message, matching RuntimeError. Subclasses
     add structured fields and override to_audit_dict() to contribute them to
@@ -1434,7 +1674,7 @@ class PluginContractViolation(AuditEvidenceBase, RuntimeError):
 
 
 # TIER-2: Plugin success-empty misuse — row-level contract bug remains fully auditable and does not imply Tier-1 framework or audit-record corruption.
-class ZeroEmissionSuccessContractViolation(PluginContractViolation, AuditEvidenceBase):
+class ZeroEmissionSuccessContractViolation(PluginContractViolation):
     """Raised when ``success_empty()`` is used outside the filter declaration path.
 
     Tier 2 by design. The engine can still record a row-level FAILED outcome,

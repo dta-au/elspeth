@@ -1,99 +1,84 @@
 # Maintained DAG Scenario Corpus
 
-This directory holds the evergreen, executable inventory used to answer a
-specific question: which parts of Elspeth's mandatory directed acyclic graph
-(DAG) lifecycle have current production-path evidence?
+This directory contains the live, executable inventory used to answer one
+question: which parts of ELSPETH's mandatory DAG lifecycle have current
+production-path evidence?
 
-Start with the [v1 manifest](v1/manifest.yaml). It contains all 15 mandatory
-scenarios, all 11 assessment dimensions, the evidence registry, owned gaps,
-observable exit gates, and the cases that the production-path harness runs.
-The [DAG information hub](../README.md) supplies the broader completeness
-assessment and remediation context.
+Start with the [v1 corpus manifest](v1/manifest.yaml). It is the sole source for
+the current schema version, scenario and dimension inventories, evidence
+registry, and derived verdict. The [DAG information hub](../README.md) explains
+how this evidence fits the broader product-quality criteria.
 
 ## Authority boundary
 
-These files have distinct jobs:
+These sources have distinct jobs:
 
 - The [completeness criteria](../completeness-criteria.md) define the quality
-  bar and the mandatory scenario set. Change them only when the intended bar
-  changes.
-- The [v1 manifest](v1/manifest.yaml) is the authoritative live inventory of
-  scenario cells, declared evidence, ownership, exit gates, and executable
-  case declarations.
+  bar and mandatory scenarios.
+- The [v1 manifest](v1/manifest.yaml) owns the live scenario inventory,
+  evidence and verdict inputs, gap metadata, exit gates, and executable cases.
 - The [typed schema](../../../../tests/fixtures/dag_scenario_corpus/schema.py)
-  defines the closed manifest and observed-evidence shapes. It also derives
+  defines the closed manifest and observed-evidence shapes and derives
   `complete` only when every cell is `pass` or `not_applicable`.
 - The [strict loader](../../../../tests/fixtures/dag_scenario_corpus/loader.py)
-  binds the manifest to the exact scenario and dimension inventory, rejects
-  duplicate or orphaned declarations, validates fixtures, and checks evidence
-  locators.
+  rejects duplicate, missing, orphaned, or invalid declarations and validates
+  fixtures and evidence locators.
 - The [production-path harness](../../../../tests/fixtures/dag_scenario_corpus/harness.py)
-  executes registered cases and returns one common `ScenarioRunEvidence`
-  record for configuration, build, runtime, audit, and recovery facts.
+  executes registered cases and returns common configuration, build, runtime,
+  audit, and recovery evidence.
+- The [unit contract test](../../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py)
+  pins the exact scenario, dimension, case, and evidence registries and checks
+  the links from this live documentation.
 
-The manifest does not replace the criteria, and a dated assessment does not
-replace the live manifest. Documentary evidence can explain a cell, but only
-executable `harness` or `pytest` evidence can support `pass`.
+Filigree does not replace the manifest. It owns delivery status, dependencies,
+and work ownership. Conversely, the manifest's `owner_issue` values connect
+evidence gaps to work but do not replace live tracker state.
+
+## Product criteria and lifecycle cells
+
+The assessment uses two related but non-interchangeable views. The framework
+defines product-quality criteria for the overall DAG capability. The manifest
+evaluates executable lifecycle cells for each mandatory scenario.
+
+The criteria judge whether the product is supportable as a whole. The cells
+show exactly where executable scenario evidence exists or remains incomplete.
 
 ## Status vocabulary
 
-The manifest accepts exactly these lower-case statuses:
-
 | Status | Meaning | Required shape |
 | --- | --- | --- |
-| `pass` | Current executable evidence proves the complete requirement for this cell. | One or more evidence IDs, including at least one `harness` or `pytest` reference; no reason, owner, or exit gate. |
-| `partial` | Current evidence proves part, but not all, of the requirement. | A precise reason, Filigree owner issue, and observable exit gate. Evidence may be attached. |
-| `fail` | Current evidence demonstrates behavior that misses the requirement. | A precise reason, Filigree owner issue, and observable exit gate. Evidence may be attached. |
-| `unknown` | Adequate current production-path evidence has not been executed or does not exist. | A precise reason, Filigree owner issue, and observable exit gate. Evidence may be attached. |
-| `not_applicable` | The dimension genuinely does not apply to this scenario. | A narrow applicability reason; no evidence, owner, or exit gate. |
+| `pass` | Current executable evidence proves the complete cell. | At least one applicable `harness` or `pytest` evidence reference; no gap metadata. |
+| `partial` | Evidence proves part, but not all, of the cell. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `fail` | Evidence demonstrates behavior that misses the requirement. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `unknown` | Adequate current production-path evidence has not been executed or does not exist. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `not_applicable` | The dimension genuinely does not apply. | Narrow reason; no evidence, owner, or exit gate. |
 
-`unknown` is a result, not a skipped test and not permission to infer success.
-Keep the cell visible and owned until executable evidence proves a different
-status. Registered harness cases must run normally: do not hide a coverage gap
-with `skip`, `xfail`, or a plan-only reference.
+Documentary evidence may explain a cell, but only executable `harness` or
+`pytest` evidence can support `pass`. `unknown` remains an owned result; it is
+not permission to infer success or hide a case with `skip` or `xfail`.
 
-## Register executable evidence
-
-Use one of the two executable evidence kinds.
+## Register and promote evidence
 
 For a corpus harness case:
 
-1. Add deterministic inputs and canonical YAML below
+1. Add deterministic inputs and canonical YAML under
    `tests/fixtures/dag_scenario_corpus/v1/<scenario-id>/`.
-2. Add a case beneath that scenario's `cases` list. Its locator is
-   `<scenario-id>:<case-id>`.
-3. Add one top-level evidence record with `kind: harness`, the same locator,
-   a precise claim, and the stages it proves.
-4. Reference that evidence ID only from cells its assertions actually prove.
-5. Extend the table-driven assertions in the
-   [production-path integration test](../../../../tests/integration/core/dag/test_dag_scenario_production_path.py)
-   when the common expectation schema is not sufficient.
+2. Add the case to the matching manifest scenario with the narrowest honest
+   workflow: `build`, `run`, or `recovery`.
+3. Add a top-level `kind: harness` evidence record with the same
+   `<scenario-id>:<case-id>` locator and only the stages it proves.
+4. Reference the evidence only from cells its assertions directly prove.
+5. Extend the table-driven production-path integration assertions when the
+   common expectation schema is insufficient.
 
-For an existing executable test, add a top-level record with `kind: pytest`
-and a repository-relative pytest node locator such as
-`tests/path/test_file.py::test_name`. The loader validates that the file and
-node exist, and the contract suite batch-collects every declared pytest
-locator.
+For an existing executable test, use `kind: pytest` and a repository-relative
+pytest node locator. The loader validates the file and node, and the contract
+suite batch-collects every declared pytest locator.
 
-Use `document` and `decision` references only as supporting context. They
-cannot make a cell pass by themselves.
-
-## Promote a cell
-
-Promote evidence and status in the same commit:
-
-1. Add or strengthen the executable assertion and observe it fail for the
-   missing behavior or proof.
-2. Make the production path and assertion pass.
-3. Register the exact evidence locator in the manifest.
-4. Attach the evidence ID to every cell it directly proves.
-5. Change a cell to `pass` only when that evidence covers the whole cell, then
-   remove its `reason`, `owner_issue`, and `exit_gate` fields.
-6. Run the focused contract and integration suites before committing.
-
-If evidence closes only part of the gap, keep `partial` and rewrite its reason
-and exit gate to state exactly what remains. Do not promote a nearby cell by
-analogy.
+Promote evidence and status in the same commit. Change a cell to `pass` only
+when evidence covers the whole cell, then remove its `reason`, `owner_issue`,
+and `exit_gate`. When evidence closes only part of a gap, retain `partial` and
+rewrite the reason and exit gate to state exactly what remains.
 
 ## Run the focused checks
 
@@ -112,36 +97,38 @@ Run every registered production-path harness case:
   tests/integration/core/dag/test_dag_scenario_production_path.py
 ```
 
-The [unit contract suite](../../../../tests/unit/architecture/test_dag_scenario_corpus_contract.py)
-must reject malformed inventory or evidence. The integration suite must run
-registered cases without skips or expected failures and must assert the
+The unit suite must reject malformed inventory or evidence. The integration
+suite must run registered cases without skips or expected failures and assert
 observed evidence, not merely successful process exit.
-
-## Dated assessments
-
-The live corpus evolves; [dated assessments](../assessments/) remain immutable
-records of one commit. A new assessment should cite:
-
-- `docs/architecture/dag/scenario-corpus/v1/manifest.yaml`;
-- the manifest `schema_version`;
-- the assessed Git commit; and
-- the exact corpus commands and observed results.
-
-Do not rewrite an older assessment when the manifest changes. Add a new dated
-assessment, or add an explicit erratum when the older record itself is wrong.
-The [assessment framework](../assessment-framework.md) defines the complete
-snapshot workflow.
 
 ## Active Filigree work
 
-The foundation and remaining corpus coverage are tracked by
-Filigree issue `elspeth-ef29ef6ba4`. Inspect its live state rather than copying
-a status into this evergreen page:
+This status snapshot was taken on 2026-08-29. It is navigation aid only; use
+the commands below for current status, ownership, and dependencies.
+
+| Issue | Snapshot status | Purpose |
+| --- | --- | --- |
+| `elspeth-ef29ef6ba4` | `in_progress`; blocked by `elspeth-cb1053fe46` | Complete the maintained production-path scenario matrix. |
+| `elspeth-cb1053fe46` | `open`; blocks `elspeth-ef29ef6ba4` | Define and gate the supported scale envelope. |
+| `elspeth-be41d0ea25` | `open` | Repair and CI-bind the normative execution-graph contract. |
 
 ```bash
 filigree show elspeth-ef29ef6ba4 --json
+filigree show elspeth-cb1053fe46 --json
+filigree show elspeth-be41d0ea25 --json
 ```
 
-Keep the issue open while applicable cells still rely on incomplete evidence
-owned by it. Close it only when its full acceptance scope—not merely the
-manifest and harness foundation—is satisfied.
+Do not copy tracker-maintained case totals into this page. The manifest and
+contract test own corpus counts; Filigree owns the state of the work.
+
+## Historical assessment work
+
+Temporary dated notes may be useful while collecting evidence. Before such
+work is retired, update the live manifest first and run its contract test.
+Public readers should use Git history to inspect earlier manifests and
+verdicts. Maintainers may also keep an optional local archive outside the
+published documentation tree, but the live docs must not depend on a dated
+snapshot or present one as current authority.
+
+The [assessment framework](../assessment-framework.md) defines the complete
+reassessment workflow.

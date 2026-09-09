@@ -20,8 +20,11 @@ from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentManagementActionShapeError,
     DeferredIntentRejected,
     DeferredIntentUnsupported,
+    DeferredIntentValidation,
+    _message_requires_stated_constraint,
     create_deferred_stage_intent,
     deferred_intent_action_from_dict,
+    deferred_intent_instruction_text,
     deferred_intent_management_action_from_dict,
     validate_deferred_intent_action,
 )
@@ -32,16 +35,22 @@ from elspeth.web.composer.guided.intent_management import (
     schema8_deferred_management_rewind_step,
 )
 from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.resolved import SinkOutputResolved
+from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.stage_subjects import (
     ComponentCountConstraint,
+    EdgeRouteConstraint,
     OptionValueConstraint,
     PluginSubject,
     StableSubject,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
+    SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+
+from .stated_demand_oracle import assert_demand_is_satisfiable
 
 INTENT_ID = "11111111-1111-4111-8111-111111111111"
 MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
@@ -1093,6 +1102,1327 @@ def test_live_unique_catalog_identity_is_accepted_only_at_its_responsible_later_
     assert wrong_target == DeferredIntentRejected(reason="wrong_responsible_stage")
 
 
+def test_stated_predicate_is_a_topology_constraint_without_plugin_option_schema_authority() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated amount predicate at the topology stage.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content="Later apply a gate where csv amount is greater than 500.",
+    )
+
+    assert result == DeferredIntentAccepted(action=action)
+
+
+def test_stated_gate_routing_is_a_topology_constraint_with_closed_future_output_names() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route amount-threshold rows to the two named outputs.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=(
+            "This is an orders CSV. Later on I want a gate that routes rows with amount greater than 500 to a "
+            "high_value JSON sink, and everything else to a standard JSON sink. Every row must land in exactly one of them."
+        ),
+    )
+
+    assert result == DeferredIntentAccepted(action=action)
+
+
+@pytest.mark.parametrize(
+    ("value", "true_target", "false_target"),
+    (
+        (999, "high_value", "standard"),
+        (500, "standard", "high_value"),
+    ),
+)
+def test_stated_gate_routing_rejects_solver_facts_not_grounded_in_the_operator_message(
+    value: int,
+    true_target: str,
+    false_target: str,
+) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route the stated threshold.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=value,
+                true_target=true_target,
+                false_target=false_target,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=("Later route rows with amount greater than 500 to high_value, and everything else to standard."),
+    )
+
+    assert result == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_condition_only_constraint_cannot_underrepresent_an_explicit_routing_instruction() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated amount predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=("Later route rows with amount greater than 500 to high_value, and everything else to standard."),
+    )
+
+    assert result == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_grounding_rejects_broad_equals_and_negated_route_false_accepts() -> None:
+    subject = PluginSubject(
+        kind="plugin",
+        subject_id="33333333-3333-4333-8333-333333333333",
+        plugin_kind="source",
+        plugin_name="csv",
+    )
+    actions = (
+        (
+            DeferredIntentAction(
+                target_stage="topology",
+                catalog_kind=None,
+                catalog_name=None,
+                redacted_summary="Wrong equality.",
+                constraints=(
+                    StatedPredicateConstraint(
+                        kind="stated_predicate",
+                        subject=subject,
+                        column="amount",
+                        operator="equals",
+                        value="greater",
+                    ),
+                ),
+            ),
+            "amount is greater than 500",
+        ),
+        (
+            DeferredIntentAction(
+                target_stage="topology",
+                catalog_kind=None,
+                catalog_name=None,
+                redacted_summary="Negated target.",
+                constraints=(
+                    StatedGateRoutingConstraint(
+                        kind="stated_gate_routing",
+                        subject=subject,
+                        column="amount",
+                        operator="greater_than",
+                        value=500,
+                        true_target="high_value",
+                        false_target="standard",
+                    ),
+                ),
+            ),
+            "amount greater than 500 not to high_value but to manual_review, and everything else to standard",
+        ),
+    )
+
+    for action, message in actions:
+        assert validate_deferred_intent_action(
+            action,
+            receiving_stage="source",
+            catalog=_view((("source", "csv"),)),
+            guided=GuidedSession.initial(),
+            originating_message_content=message,
+        ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def _stated_gate_routing_action_for_grounding() -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later do not apply a gate where csv amount is greater than 500.",
+        "Later route csv rows with amount greater than 500; never send them to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_semantic_negation_outside_the_matched_tokens(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route the stated threshold.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount > 500 to high_value, and every other row to standard.",
+        "Later send csv rows where amount > 500 into high_value; the rest go into standard.",
+        "Later send csv rows where amount > 500 to high_value; the rest go to standard.",
+        "Later route csv rows where status equals priority to high_value, and everything else to standard.",
+    ),
+)
+def test_explicit_gate_routing_prose_cannot_be_retained_as_a_weaker_constraint_kind(message: str) -> None:
+    """Every message here can ground a StatedGateRoutingConstraint drawn from
+    its own tokens (see the oracle test below), so the routing demand is
+    satisfiable and a weaker kind is still refused. The five messages that
+    used to sit in this list and could NOT ground one are now in
+    ``test_gate_prose_the_closed_grammar_cannot_bind_no_longer_deadlocks``."""
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind="transform",
+        catalog_name="passthrough",
+        redacted_summary="Preserve a source during topology authoring.",
+        constraints=(
+            SubjectPresenceConstraint(
+                kind="subject_presence",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                present=True,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("transform", "passthrough"))),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+_CSV_SOURCE_SUBJECT = PluginSubject(
+    kind="plugin",
+    subject_id="33333333-3333-4333-8333-333333333333",
+    plugin_kind="source",
+    plugin_name="csv",
+)
+_WEAKER_KIND_ACTION = DeferredIntentAction(
+    target_stage="topology",
+    catalog_kind="transform",
+    catalog_name="passthrough",
+    redacted_summary="Preserve a source during topology authoring.",
+    constraints=(SubjectPresenceConstraint(kind="subject_presence", subject=_CSV_SOURCE_SUBJECT, present=True),),
+)
+_STATED_PREDICATE_ACTION = DeferredIntentAction(
+    target_stage="topology",
+    catalog_kind=None,
+    catalog_name=None,
+    redacted_summary="Apply the stated predicate.",
+    constraints=(
+        StatedPredicateConstraint(
+            kind="stated_predicate",
+            subject=_CSV_SOURCE_SUBJECT,
+            column="amount",
+            operator="greater_than",
+            value=500,
+        ),
+    ),
+)
+_UNBINDABLE_GATE_PROSE: tuple[tuple[str, str | None], ...] = (
+    # (message, demand the derived classifier now raises)
+    # No operator the closed grammar recognises — nothing can ground.
+    ("Later route csv rows where amount exceeds 500 to high_value, and everything else to standard.", None),
+    ("Later route csv rows where amount is higher than 500 to high_value, and everything else to standard.", None),
+    ("Later route csv rows where amount is between 500 and 1000 to high_value, and everything else to standard.", None),
+    ("Later route csv rows where status is priority to high_value, and everything else to standard.", None),
+    ("Later add a gate for csv rows whose amount exceeds 500.", None),
+    ("Later add a gate for csv rows whose amount is higher than 500.", None),
+    ("Later add a gate for csv rows whose amount is between 500 and 1000.", None),
+    ("Later add a gate for csv rows where status is priority.", None),
+    ("Later add a gate which routes csv rows with amount exceeding 500 to high_value.", None),
+    ("Later route csv rows with amount exceeding 500 to high_value.", None),
+    # The true segment ends in ", with", which the destination grammar does not close.
+    ("Later route csv rows where amount > 500 into high_value, with remaining rows landing in standard.", None),
+    # One destination and no false branch: a gate-routing constraint needs
+    # both targets, so only the predicate half is bindable.
+    ("Later add a gate that routes csv rows with amount greater than 500 to high_value.", "predicate"),
+    ("Later send csv rows with amount greater than 500 to high_value.", "predicate"),
+)
+
+
+@pytest.mark.parametrize(("message", "expected_demand"), _UNBINDABLE_GATE_PROSE)
+def test_gate_prose_the_closed_grammar_cannot_bind_no_longer_deadlocks(message: str, expected_demand: str | None) -> None:
+    """The accepted cost of elspeth-3d392c04ca, stated so nobody mistakes it
+    for a regression.
+
+    Each of these messages used to raise a routing demand that NO closed
+    tuple could satisfy (proven per message by the oracle test below), so
+    every retain was rejected ``stated_fact_unproven``, degraded to
+    constraint-free clarification debt, and wire confirmation 409'd with no
+    exit. The 2026-08-26 fix-shape ruling accepted, with eyes open, that
+    such prose now retains the strongest kind that CAN bind — a predicate
+    where one grounds, otherwise the planner's weaker kind — instead of
+    deadlocking. The genuine-routing-the-grammar-cannot-express class is
+    tracked on elspeth-6155f11add; do not widen the grammar from here.
+    """
+
+    catalog = _view((("source", "csv"), ("transform", "passthrough")))
+    assert _message_requires_stated_constraint(message) == expected_demand
+    weaker = validate_deferred_intent_action(
+        _WEAKER_KIND_ACTION,
+        receiving_stage="source",
+        catalog=catalog,
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    )
+    if expected_demand is None:
+        assert weaker == DeferredIntentAccepted(action=_WEAKER_KIND_ACTION)
+        return
+    # A predicate demand still refuses the weaker kind, and the predicate
+    # that grounds is accepted: the condition is kept, the lone destination
+    # (which the closed tuple cannot carry) is the recorded loss.
+    assert weaker == DeferredIntentRejected(reason="stated_fact_unproven")
+    assert validate_deferred_intent_action(
+        _STATED_PREDICATE_ACTION,
+        receiving_stage="source",
+        catalog=catalog,
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentAccepted(action=_STATED_PREDICATE_ACTION)
+
+
+_CONTROL_ROUTING_MESSAGE = (
+    "This is an orders CSV. Later on I want a gate that routes rows with amount greater than 500 to a "
+    "high_value JSON sink, and everything else to a standard JSON sink. Every row must land in exactly one of them."
+)
+_LIVE_COLLECTOR_MESSAGE = (
+    "Read this synthetic multi-document JSON file, split each document into one row per section, "
+    "have an LLM write a one-sentence gist of each section, then gather each document's section rows back "
+    "together into a single batch per document (every section must make it back — fail the document if one is lost) "
+    "and write one summary row per document to a JSON file.\n"
+    "https://dta-au.github.io/elspeth/tutorial-site/multi-doc-sections.json"
+)
+
+
+_ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS = (
+    # elspeth-6155f11add's six: genuine routing prose the closed grammar
+    # cannot bind (categorical / boolean / null-check gates, and two whose
+    # destinations are joined by a bare " and " the destination grammar does
+    # not close on). The false-negative direction of the canary
+    # (elspeth-b24ec0945f option (b)): the derived demand must stay silent
+    # here BECAUSE nothing grounds, and the oracle proves nothing grounds.
+    "route flagged rows to review and everything else to standard",
+    "a gate that sends approved records to approved and the rest to rejected",
+    "send rows where the urgent flag is set to fast, otherwise to slow",
+    "route records with a missing email to quarantine and the rest to main",
+    "route rows where status equals cancelled to review and everything else to main",
+    "route rows where amount is greater than 500 to high_value and the rest to standard",
+)
+
+
+def _restated_routing_action(column: str, value: object, *, true_target: str, false_target: str) -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=_CSV_SOURCE_SUBJECT,
+                column=column,
+                operator="equals",
+                value=value,
+                true_target=true_target,
+                false_target=false_target,
+            ),
+        ),
+    )
+
+
+# elspeth-6155f11add Option 2 (brief-side, ruled 2026-09-06): the four
+# literal-free prompts above, each paired with the working-skeleton
+# restatement the guided brief now teaches the planner to hand back to the
+# user (comment 7916's A/B), and the routing constraint that restatement
+# grounds. The raw prompt is the SAME rule in prose the closed grammar cannot
+# bind: a boolean flag, a categorical membership, a boolean phrased as "is
+# set", a null check.
+_LITERAL_FREE_ROUTING_RESTATEMENTS: tuple[tuple[str, str, DeferredIntentAction], ...] = (
+    (
+        "route flagged rows to review and everything else to standard",
+        "Route csv rows with flagged equals true to review, and everything else to standard.",
+        _restated_routing_action("flagged", True, true_target="review", false_target="standard"),
+    ),
+    (
+        "a gate that sends approved records to approved and the rest to rejected",
+        "Route csv rows with approved equals true to approved, and everything else to rejected.",
+        _restated_routing_action("approved", True, true_target="approved", false_target="rejected"),
+    ),
+    (
+        "send rows where the urgent flag is set to fast, otherwise to slow",
+        "Route csv rows with urgent equals true to fast, and everything else to slow.",
+        _restated_routing_action("urgent", True, true_target="fast", false_target="slow"),
+    ),
+    (
+        "route records with a missing email to quarantine and the rest to main",
+        "Route csv rows with email equals null to quarantine, and everything else to main.",
+        _restated_routing_action("email", None, true_target="quarantine", false_target="main"),
+    ),
+)
+
+
+def test_literal_free_routing_prompts_are_exactly_the_first_four_adversarial_prompts() -> None:
+    """The A/B below is over the four prompts the ticket calls p1-p4; keep it
+    bound to the adversarial tuple so a reworded fixture cannot drift the two
+    apart silently."""
+
+    assert tuple(raw for raw, _, _ in _LITERAL_FREE_ROUTING_RESTATEMENTS) == _ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS[:4]
+
+
+@pytest.mark.parametrize(("raw", "restated", "routing_action"), _LITERAL_FREE_ROUTING_RESTATEMENTS, ids=("p1", "p2", "p3", "p4"))
+def test_the_literal_restatement_the_brief_teaches_grounds_where_the_raw_prompt_silently_downgrades(
+    raw: str, restated: str, routing_action: DeferredIntentAction
+) -> None:
+    """Offline, zero-provider A/B behind the Option 2 ruling on elspeth-6155f11add.
+
+    RAW: the routing rule in the user's own literal-free prose. No closed
+    tuple grounds, so the derived demand is silent, the routing constraint is
+    rejected ``stated_fact_unproven`` — and the weaker kind is ACCEPTED. That
+    acceptance is the silent downgrade: a gate-free pipeline can claim it and
+    the routing rule is banked as delivered. The brief now tells the planner
+    not to encode the rule from such a message at all.
+
+    RESTATED: the same rule as the comparison literal the brief teaches, in
+    the sentence it tells the planner to hand back to the user. The demand is
+    raised, the routing constraint is accepted, and the weaker kind is now
+    refused. Nothing in ``deferred_intents`` changed for this: the A/B is the
+    evidence that the brief-side fix targets the shape that grounds today,
+    and it turns red the day the grammar stops binding one of these classes.
+    """
+
+    catalog = _view((("source", "csv"), ("transform", "passthrough")))
+
+    def verdict(action: DeferredIntentAction, message: str) -> DeferredIntentValidation:
+        return validate_deferred_intent_action(
+            action,
+            receiving_stage="source",
+            catalog=catalog,
+            guided=GuidedSession.initial(),
+            originating_message_content=message,
+        )
+
+    assert _message_requires_stated_constraint(raw) is None
+    assert verdict(routing_action, raw) == DeferredIntentRejected(reason="stated_fact_unproven")
+    assert verdict(_WEAKER_KIND_ACTION, raw) == DeferredIntentAccepted(action=_WEAKER_KIND_ACTION)
+
+    assert _message_requires_stated_constraint(restated) == "routing"
+    assert verdict(routing_action, restated) == DeferredIntentAccepted(action=routing_action)
+    assert verdict(_WEAKER_KIND_ACTION, restated) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        _CONTROL_ROUTING_MESSAGE,
+        _CONTROL_ROUTING_MESSAGE.replace("greater than 500", "greater than\n500"),
+        "Later add a gate that routes csv rows with amount > 500 to high_value, and every other row to standard.",
+        "Later send csv rows where amount > 500 into high_value; the rest go into standard.",
+        "Later send csv rows where amount > 500 to high_value; the rest go to standard.",
+        "Later route csv rows where status equals priority to high_value, and everything else to standard.",
+        _LIVE_COLLECTOR_MESSAGE,
+        *(message for message, _ in _UNBINDABLE_GATE_PROSE),
+        *_ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS,
+    ),
+)
+def test_a_stated_demand_is_raised_only_when_the_real_validator_accepts_some_stated_action(message: str) -> None:
+    """The property the ticket asked to pin, with the production validator as
+    the oracle: demand raised ⇒ at least one satisfying action exists.
+
+    Not tautological — the demand is derived inside ``deferred_intents`` from
+    the grounding span, while this oracle enumerates the token space on its
+    own and asks ``validate_deferred_intent_action``, which also runs subject
+    grounding and the catalog. The hard-wrapped control (``\\n`` between the
+    operator and its literal) is the counterexample that refuted a
+    grammar-keyed guard on 2026-08-26: grounding tolerates the newline, so
+    the demand must survive it too.
+    """
+
+    demand = _message_requires_stated_constraint(message)
+    assert_demand_is_satisfiable(message, demand, _view((("source", "csv"),)))
+
+
+def test_hard_wrapped_routing_prose_keeps_its_demand_and_refuses_the_weaker_kind() -> None:
+    """The whitespace wedge, pinned directly: the same control that grounds on
+    one line grounds with a line break before the literal, so the demand
+    must still be raised there and the weaker kind still refused."""
+
+    wrapped = _CONTROL_ROUTING_MESSAGE.replace("greater than 500", "greater than\n500")
+    assert _message_requires_stated_constraint(wrapped) == "routing"
+    assert validate_deferred_intent_action(
+        _WEAKER_KIND_ACTION,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("transform", "passthrough"))),
+        guided=GuidedSession.initial(),
+        originating_message_content=wrapped,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_the_live_collector_message_raises_no_stated_demand_and_its_structural_retains_are_accepted() -> None:
+    """elspeth-3d392c04ca verbatim: one word ("split") tripped the routing
+    demand on a message with no comparison anywhere, so every retain was
+    rejected. Both retains the planner actually sent now validate."""
+
+    assert _message_requires_stated_constraint(_LIVE_COLLECTOR_MESSAGE) is None
+    catalog = _view((("source", "json"), ("sink", "json"), ("transform", "llm")))
+    llm_presence = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind="transform",
+        catalog_name="llm",
+        redacted_summary="LLM gist per section row.",
+        constraints=(
+            SubjectPresenceConstraint(
+                kind="subject_presence",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="transform",
+                    plugin_name="llm",
+                ),
+                present=True,
+            ),
+        ),
+    )
+    node_count = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="At least one topology node.",
+        constraints=(
+            ComponentCountConstraint(
+                kind="component_count", component_kind="node", plugin_kind=None, plugin_name=None, operator="at_least", count=1
+            ),
+        ),
+    )
+    for action in (llm_presence, node_count):
+        assert validate_deferred_intent_action(
+            action,
+            receiving_stage="source",
+            catalog=catalog,
+            guided=GuidedSession.initial(),
+            originating_message_content=_LIVE_COLLECTOR_MESSAGE,
+        ) == DeferredIntentAccepted(action=action)
+
+
+def _control_gate_routing_action() -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route amount-threshold rows to the two named outputs.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=_CSV_SOURCE_SUBJECT,
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+
+def test_edit_command_demand_and_grounding_read_the_replacement_instruction_while_the_hash_binds_the_envelope() -> None:
+    """The only documented exit from clarification debt is ``Edit exact intent
+    <UUID>: <instruction>``. The demand and grounding used to be computed
+    over that whole envelope — so a restated routing instruction tripped the
+    demand again and raised out of the persistence path (addendum 7992 #4),
+    and even a perfectly grounded gate constraint failed the affirmative
+    prefix because the envelope preceded it. Now the instruction is what is
+    read; the audit hash still binds the whole message."""
+
+    instruction = "Later add a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard."
+    envelope = f"Edit exact intent {INTENT_ID}: {instruction}"
+    assert deferred_intent_instruction_text(envelope) == instruction
+    assert deferred_intent_instruction_text(instruction) == instruction
+
+    gate = _control_gate_routing_action()
+    created = create_deferred_stage_intent(
+        gate,
+        receiving_stage="source",
+        intent_id=INTENT_ID,
+        originating_message_id=MESSAGE_ID,
+        originating_message_content=envelope,
+        guided=GuidedSession.initial(),
+    )
+    assert created.message_content_hash == stable_hash(envelope)
+    assert created.constraints == gate.constraints
+
+    # The demand is computed on the instruction, so a weaker kind on the
+    # same envelope is refused at the persistence seam, not persisted.
+    with pytest.raises(InvariantError, match="closed stated constraint"):
+        create_deferred_stage_intent(
+            _WEAKER_KIND_ACTION,
+            receiving_stage="source",
+            intent_id=INTENT_ID,
+            originating_message_id=MESSAGE_ID,
+            originating_message_content=envelope,
+            guided=GuidedSession.initial(),
+        )
+
+    prior = create_deferred_stage_intent(
+        _action(),
+        receiving_stage="source",
+        intent_id=INTENT_ID,
+        originating_message_id=MESSAGE_ID,
+        originating_message_content="private prior instruction",
+    )
+    result = resolve_deferred_intent_management(
+        DeferredIntentEditAction(
+            intent_id=prior.intent_id,
+            selection_token=intent_management_module.deferred_intent_management_option(prior).selection_token,
+            replacement=gate,
+        ),
+        guided=replace(GuidedSession.initial(), deferred_intents=(prior,)),
+        catalog=_view((("source", "csv"), ("transform", "llm"))),
+        originating_message_id="55555555-5555-4555-8555-555555555555",
+        originating_message_content=envelope,
+    )
+    assert type(result) is DeferredIntentManagementApplied
+    assert result.effective_intent.constraints == gate.constraints
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate only if approved that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate if the owner approves that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate provided the owner agrees that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate subject to security review that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate after the change is signed off that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved and route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later add a gate only if approved then route csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved but route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later add a gate only if approved while route csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved also route csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved; route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later add a gate only if approved: route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Only after security review. Later route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Pending owner sign-off. Later route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_unrepresented_authority_preconditions(message: str) -> None:
+    assert validate_deferred_intent_action(
+        _stated_gate_routing_action_for_grounding(),
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize("row_qualifier", ("priority", "authorized", "pending"))
+def test_stated_grounding_rejects_unrepresented_row_qualifier(row_qualifier: str) -> None:
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=("77777777-7777-4777-8777-777777777777",),
+        reviewed_sources={
+            "77777777-7777-4777-8777-777777777777": SourceResolved(
+                name="orders",
+                plugin="csv",
+                options={"path": "/data/orders.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+    assert validate_deferred_intent_action(
+        _stated_gate_routing_action_for_grounding(),
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=guided,
+        originating_message_content=(
+            f"Later add a gate for {row_qualifier} rows where amount greater than 500 to high_value, and everything else to standard."
+        ),
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_grounding_accepts_exact_live_stable_subject_name_with_ambiguous_plugins() -> None:
+    orders_id = "77777777-7777-4777-8777-777777777777"
+    returns_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(orders_id, returns_id),
+        reviewed_sources={
+            orders_id: SourceResolved(
+                name="orders",
+                plugin="csv",
+                options={"path": "/data/orders.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            returns_id: SourceResolved(
+                name="returns",
+                plugin="csv",
+                options={"path": "/data/returns.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=StableSubject(kind="stable", component_kind="source", stable_id=orders_id),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=guided,
+        originating_message_content=(
+            "Later route orders rows with amount greater than 500 to high_value, and everything else to standard."
+        ),
+    ) == DeferredIntentAccepted(action=action)
+
+
+def test_stated_constraint_rejects_nonexistent_stable_subject_even_when_text_matches() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=StableSubject(
+                    kind="stable",
+                    component_kind="source",
+                    stable_id="99999999-9999-4999-8999-999999999999",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view(()),
+        guided=GuidedSession.initial(),
+        originating_message_content="Later apply a gate where amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_plugin_subject_rejects_ambiguous_same_plugin_sources() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+    source_ids = (
+        "77777777-7777-4777-8777-777777777777",
+        "88888888-8888-4888-8888-888888888888",
+    )
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=source_ids,
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name=f"source_{index}",
+                plugin="csv",
+                options={"path": f"/data/source_{index}.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+            for index, stable_id in enumerate(source_ids, start=1)
+        },
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=guided,
+        originating_message_content="Later apply a gate where csv amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_plugin_subject_rejects_exact_live_id_when_message_names_another_source() -> None:
+    csv_id = "77777777-7777-4777-8777-777777777777"
+    json_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(csv_id, json_id),
+        reviewed_sources={
+            csv_id: SourceResolved(
+                name="csv_source",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            json_id: SourceResolved(
+                name="json_source",
+                plugin="json",
+                options={"path": "/data/input.jsonl"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id=json_id,
+                    plugin_kind="source",
+                    plugin_name="json",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("source", "json"))),
+        guided=guided,
+        originating_message_content="Later apply a gate to csv rows where amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_plugin_subject_ignores_destination_plugin_words_when_binding_source() -> None:
+    csv_id = "77777777-7777-4777-8777-777777777777"
+    json_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(csv_id, json_id),
+        reviewed_sources={
+            csv_id: SourceResolved(
+                name="csv_source",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            json_id: SourceResolved(
+                name="json_source",
+                plugin="json",
+                options={"path": "/data/input.jsonl"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id=json_id,
+                    plugin_kind="source",
+                    plugin_name="json",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("source", "json"))),
+        guided=guided,
+        originating_message_content=(
+            "Later route csv rows where amount is greater than 500 to a high_value JSON sink, and everything else to standard."
+        ),
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_stable_subject_rejects_message_that_names_a_different_live_source() -> None:
+    csv_id = "77777777-7777-4777-8777-777777777777"
+    json_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(csv_id, json_id),
+        reviewed_sources={
+            csv_id: SourceResolved(
+                name="csv_source",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            json_id: SourceResolved(
+                name="json_source",
+                plugin="json",
+                options={"path": "/data/input.jsonl"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=StableSubject(kind="stable", component_kind="source", stable_id=json_id),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view(()),
+        guided=guided,
+        originating_message_content="Later apply a gate to csv rows where amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_grounding_does_not_turn_an_unrelated_word_limit_into_a_row_predicate() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="result",
+                operator="less_than",
+                value=50,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=(
+            "Summarize each csv result in under 50 words, then route errors to high_value and everything else to standard."
+        ),
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount greater than 500 and amount less than 1000 "
+        "to high_value, and everything else to standard.",
+        "Later add a gate that routes csv rows with amount greater than 500 or priority equals true "
+        "to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_unrepresented_compound_predicates(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount greater than 500 to high_value and audit_copy, and everything else to standard.",
+        "Later add a gate that routes csv rows with amount greater than 500 to high_value after first sending them "
+        "to manual_review, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_unrepresented_extra_branch_destinations(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later avoid a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later skip the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later prohibit routing csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later, no gate should route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later refrain from routing csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later remove the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later delete the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later disable the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we cannot use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we can't use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we can\u2019t use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we won't use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we won\u2019t use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_negative_authority_verbs(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_predicate_rejects_unrepresented_exclusion_clause() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content="Later apply a gate where csv amount is greater than 500, excluding priority rows.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    ("edge_type", "target_stage", "expected"),
+    (
+        ("route_true", "topology", DeferredIntentAccepted),
+        ("route_false", "topology", DeferredIntentAccepted),
+        ("fork", "topology", DeferredIntentAccepted),
+        ("on_success", "topology", DeferredIntentRejected),
+    ),
+)
+def test_gate_route_constraints_belong_to_topology_instead_of_wire_review(
+    edge_type: str,
+    target_stage: str,
+    expected: type[DeferredIntentAccepted] | type[DeferredIntentRejected],
+) -> None:
+    action = DeferredIntentAction(
+        target_stage=target_stage,  # type: ignore[arg-type]
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated gate route while authoring topology.",
+        constraints=(
+            EdgeRouteConstraint(
+                kind="edge_route",
+                from_subject=StableSubject(
+                    kind="stable",
+                    component_kind="node",
+                    stable_id="33333333-3333-4333-8333-333333333333",
+                ),
+                edge_type=edge_type,  # type: ignore[arg-type]
+                to_subject=StableSubject(
+                    kind="stable",
+                    component_kind="output",
+                    stable_id="44444444-4444-4444-8444-444444444444",
+                ),
+                present=True,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view(()),
+        guided=GuidedSession.initial(),
+    )
+
+    assert type(result) is expected
+    if expected is DeferredIntentRejected:
+        assert result == DeferredIntentRejected(reason="wrong_responsible_stage")
+
+
 def test_kind_qualified_name_resolves_without_guessing_across_other_plugin_kinds() -> None:
     action = _action()
     result = validate_deferred_intent_action(
@@ -1260,7 +2590,7 @@ def test_management_resolution_cancels_one_exact_stable_id_and_edits_in_place() 
         guided=guided,
         catalog=catalog,
         originating_message_id="55555555-5555-4555-8555-555555555555",
-        originating_message_content=f"edit exact intent {INTENT_ID}",
+        originating_message_content=f"edit exact intent {INTENT_ID}: require the named transform",
     )
 
     assert type(cancelled) is DeferredIntentManagementApplied
@@ -1345,7 +2675,7 @@ def test_management_edit_exposes_replacement_as_effective_rewind_authority(
         guided=replace(GuidedSession.initial(), deferred_intents=(prior, preserved)),
         catalog=_view((("transform", "llm"), ("sink", "json"))),
         originating_message_id="55555555-5555-4555-8555-555555555555",
-        originating_message_content=f"private edit instruction {prior.intent_id}",
+        originating_message_content=f"Edit exact intent {prior.intent_id}: replace the saved instruction",
     )
 
     assert type(result) is DeferredIntentManagementApplied
@@ -1370,7 +2700,7 @@ def test_management_cancel_keeps_prior_intent_as_effective_rewind_authority() ->
         guided=replace(GuidedSession.initial(), deferred_intents=(prior,)),
         catalog=_view((("transform", "llm"),)),
         originating_message_id="55555555-5555-4555-8555-555555555555",
-        originating_message_content="private cancellation",
+        originating_message_content=f"Cancel exact intent {prior.intent_id}.",
     )
 
     assert type(result) is DeferredIntentManagementApplied
@@ -1474,16 +2804,57 @@ def test_management_rejects_model_intent_id_and_selection_token_mixup_without_mu
 
 
 @pytest.mark.parametrize(
-    ("message_template", "applied"),
+    ("intent_count", "action_kind", "message_template", "applied"),
     [
-        ("Cancel the count-one instruction.", False),
-        ("Cancel exact intent {second_id}.", False),
-        ("Compare {first_id} with {second_id}, then cancel one.", False),
-        ("Cancel exact intent {first_id}.", True),
+        pytest.param(1, "cancel", "Cancel exact intent {first_id}.", True, id="single-explicit-cancel"),
+        pytest.param(
+            1,
+            "edit",
+            "Edit exact intent {first_id}: require one named transform.",
+            True,
+            id="single-explicit-edit",
+        ),
+        pytest.param(1, "cancel", "Cancel the count-one instruction.", False, id="single-ambiguous"),
+        pytest.param(1, "cancel", "Keep this saved instruction; explain it.", False, id="single-explanation-only"),
+        pytest.param(
+            1,
+            "cancel",
+            "Do not cancel exact intent {first_id}; explain it.",
+            False,
+            id="single-contradictory",
+        ),
+        pytest.param(1, "edit", "Cancel exact intent {first_id}.", False, id="single-action-mismatch"),
+        pytest.param(2, "cancel", "Cancel exact intent {first_id}.", True, id="plural-explicit-cancel"),
+        pytest.param(
+            2,
+            "edit",
+            "Edit exact intent {first_id}: require one named transform.",
+            True,
+            id="plural-explicit-edit",
+        ),
+        pytest.param(2, "cancel", "Cancel the count-one instruction.", False, id="plural-ambiguous"),
+        pytest.param(2, "cancel", "Cancel exact intent {second_id}.", False, id="plural-wrong-target"),
+        pytest.param(
+            2,
+            "cancel",
+            "Compare {first_id} with {second_id}, then cancel one.",
+            False,
+            id="plural-multiple-targets",
+        ),
+        pytest.param(2, "cancel", "Explain exact intent {first_id}.", False, id="plural-explanation-only"),
+        pytest.param(
+            2,
+            "cancel",
+            "Do not cancel exact intent {first_id}; explain it.",
+            False,
+            id="plural-contradictory",
+        ),
+        pytest.param(2, "edit", "Cancel exact intent {first_id}.", False, id="plural-action-mismatch"),
     ],
-    ids=["zero-current-uuids", "coherent-wrong-pair", "multiple-current-uuids", "one-matching-current-uuid"],
 )
-def test_multiple_distinct_pending_intents_require_one_matching_private_uuid(
+def test_management_requires_exact_action_specific_user_authority(
+    intent_count: int,
+    action_kind: str,
     message_template: str,
     applied: bool,
 ) -> None:
@@ -1494,10 +2865,13 @@ def test_multiple_distinct_pending_intents_require_one_matching_private_uuid(
         count=2,
         message="second private",
     )
-    guided = replace(GuidedSession.initial(), deferred_intents=(first, second))
-    action = DeferredIntentCancelAction(
-        intent_id=first.intent_id,
-        selection_token=intent_management_module.deferred_intent_management_option(first).selection_token,
+    deferred_intents = (first,) if intent_count == 1 else (first, second)
+    guided = replace(GuidedSession.initial(), deferred_intents=deferred_intents)
+    selection_token = intent_management_module.deferred_intent_management_option(first).selection_token
+    action = (
+        DeferredIntentCancelAction(intent_id=first.intent_id, selection_token=selection_token)
+        if action_kind == "cancel"
+        else DeferredIntentEditAction(intent_id=first.intent_id, selection_token=selection_token, replacement=_action())
     )
 
     result = resolve_deferred_intent_management(
@@ -1510,27 +2884,13 @@ def test_multiple_distinct_pending_intents_require_one_matching_private_uuid(
 
     if applied:
         assert type(result) is DeferredIntentManagementApplied
-        assert result.deferred_intents == (second,)
+        if action_kind == "cancel":
+            assert result.deferred_intents == (() if intent_count == 1 else (second,))
+        else:
+            assert tuple(intent.intent_id for intent in result.deferred_intents) == tuple(intent.intent_id for intent in deferred_intents)
     else:
         assert type(result) is intent_management_module.DeferredIntentManagementAmbiguous
-        assert guided.deferred_intents == (first, second)
-
-
-def test_single_pending_intent_still_accepts_natural_language_selection() -> None:
-    intent = _count_intent(intent_id=INTENT_ID, message_id=MESSAGE_ID, count=1, message="private")
-
-    result = resolve_deferred_intent_management(
-        DeferredIntentCancelAction(
-            intent_id=intent.intent_id,
-            selection_token=intent_management_module.deferred_intent_management_option(intent).selection_token,
-        ),
-        guided=replace(GuidedSession.initial(), deferred_intents=(intent,)),
-        catalog=_view((("transform", "llm"),)),
-        originating_message_id="55555555-5555-4555-8555-555555555555",
-        originating_message_content="Cancel the saved count-one instruction.",
-    )
-
-    assert type(result) is DeferredIntentManagementApplied
+        assert guided.deferred_intents == deferred_intents
 
 
 def test_identical_management_options_require_private_message_to_name_exact_uuid() -> None:
@@ -1621,3 +2981,172 @@ def _encoded_action() -> dict[str, object]:
 def test_deferred_intent_management_decoder_rejects_every_malformed_shape(payload: object) -> None:
     with pytest.raises(DeferredIntentManagementActionShapeError):
         deferred_intent_management_action_from_dict(payload)
+
+
+def test_deferred_intent_management_decoder_names_a_missing_action_discriminator() -> None:
+    """A cancel payload that is complete except for ``action`` is a missing-key shape error.
+
+    The decoder reads ``action`` in membership form (``"action" in value`` then
+    ``value["action"]``) rather than ``.get``; the absent key must surface as
+    its own diagnostic instead of silently decoding as an unsupported ``None``.
+    """
+
+    with pytest.raises(DeferredIntentManagementActionShapeError, match="missing its action discriminator"):
+        deferred_intent_management_action_from_dict({"intent_id": INTENT_ID, "selection_token": SELECTION_TOKEN})
+
+
+def test_create_deferred_clarification_intent_is_constraint_free_and_prose_free() -> None:
+    """Last-resort retention (R2-F15): durable, unclaimable, no user prose.
+
+    The empty constraint set keeps the intent permanently unclaimable
+    (``evaluate_deferred_intent_coverage`` rejects claims on constraint-free
+    intents — pinned in test_deferred_intent_coverage), so it stays visibly
+    pending until the user cancels it or edits it into a structural intent.
+    """
+    from elspeth.web.composer.guided.deferred_intents import create_deferred_clarification_intent
+
+    private_prose = "Later do the private-needle thing."
+    intent = create_deferred_clarification_intent(
+        receiving_stage="source",
+        intent_id="00000000-0000-4000-8000-000000000777",
+        originating_message_id="00000000-0000-4000-8000-000000000778",
+        originating_message_content=private_prose,
+    )
+
+    assert intent.receiving_stage == "source"
+    assert intent.target_stage == "wire_review"
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
+    assert "private-needle" not in intent.redacted_summary
+    assert intent.message_content_hash == stable_hash(private_prose)
+    # The management surface must be able to list/select it.
+    option = intent_management_module.deferred_intent_management_option(intent)
+    assert option.intent_id == intent.intent_id
+    assert option.structural_constraints == ()
+
+
+def _count(
+    *,
+    component_kind: str,
+    operator: str,
+    count: int,
+) -> ComponentCountConstraint:
+    return ComponentCountConstraint(
+        kind="component_count",
+        component_kind=component_kind,  # type: ignore[arg-type]
+        plugin_kind=None,
+        plugin_name=None,
+        operator=operator,  # type: ignore[arg-type]
+        count=count,
+    )
+
+
+def _bare_action(*, target_stage: str, constraints: tuple[ComponentCountConstraint, ...]) -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage=target_stage,  # type: ignore[arg-type]
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Retain one structural requirement.",
+        constraints=constraints,
+    )
+
+
+def _validate(action: DeferredIntentAction, *, receiving_stage: str) -> object:
+    return validate_deferred_intent_action(
+        action,
+        receiving_stage=receiving_stage,  # type: ignore[arg-type]
+        catalog=_view((("transform", "llm"),)),
+        guided=GuidedSession.initial(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("component_kind", "receiving_stage", "target_stage"),
+    [
+        ("node", "output", "topology"),
+        ("edge", "output", "wire_review"),
+        ("output", "source", "output"),
+    ],
+    ids=("node-topology", "edge-wire-review", "output-output"),
+)
+def test_at_least_zero_count_is_rejected_as_non_discriminating(
+    component_kind: str,
+    receiving_stage: str,
+    target_stage: str,
+) -> None:
+    """``count >= 0`` holds for every pipeline, so it can never witness delivery.
+
+    Each case passes ``validate_deferred_intent_structure`` on its own — the
+    constraint's responsible stage IS the target stage and the target IS later
+    than the receiving stage — so per-constraint stage gating would not touch
+    it.  Only the non-discrimination guard rejects it (elspeth-fc948ddecf).
+    """
+
+    action = _bare_action(
+        target_stage=target_stage,
+        constraints=(_count(component_kind=component_kind, operator="at_least", count=0),),
+    )
+
+    assert _validate(action, receiving_stage=receiving_stage) == DeferredIntentRejected(reason="non_discriminating_constraint")
+
+
+def test_non_discriminating_filler_is_rejected_even_beside_a_discriminating_sibling() -> None:
+    """One tautological filler poisons the whole action, siblings notwithstanding.
+
+    This is the reported shape: an already-true source count raises the
+    ``max()`` responsible-stage fold nowhere useful while the vacuous node
+    count carries the fold to ``topology``.  Requiring merely ONE
+    discriminating constraint would admit it, because a source count IS
+    discriminating in general — it is only unfalsifiable once the source stage
+    has settled.
+    """
+
+    action = _bare_action(
+        target_stage="topology",
+        constraints=(
+            _count(component_kind="source", operator="at_least", count=1),
+            _count(component_kind="node", operator="at_least", count=0),
+        ),
+    )
+
+    assert _validate(action, receiving_stage="output") == DeferredIntentRejected(reason="non_discriminating_constraint")
+
+
+@pytest.mark.parametrize(
+    ("operator", "count"),
+    [("at_least", 1), ("equals", 0), ("at_most", 0), ("equals", 3)],
+    ids=("at-least-one", "equals-zero", "at-most-zero", "equals-three"),
+)
+def test_discriminating_component_counts_stay_accepted(operator: str, count: int) -> None:
+    """Positive control: a guard that rejected everything would read green.
+
+    ``equals 0`` and ``at_most 0`` matter specifically — both are legal zero
+    counts that a schema-level ``"minimum": 1`` patch would have banned, and
+    both genuinely exclude pipelines (any pipeline with a node fails them).
+    """
+
+    action = _bare_action(
+        target_stage="topology",
+        constraints=(_count(component_kind="node", operator=operator, count=count),),
+    )
+
+    assert _validate(action, receiving_stage="output") == DeferredIntentAccepted(action=action)
+
+
+def test_durable_intent_creation_fails_closed_on_a_non_discriminating_constraint() -> None:
+    """The durable constructor refuses independently of the validate path."""
+
+    action = _bare_action(
+        target_stage="topology",
+        constraints=(_count(component_kind="node", operator="at_least", count=0),),
+    )
+
+    with pytest.raises(InvariantError, match="satisfied by every pipeline"):
+        create_deferred_stage_intent(
+            action,
+            receiving_stage="output",
+            intent_id="00000000-0000-4000-8000-0000000004a1",
+            originating_message_id="00000000-0000-4000-8000-0000000004a2",
+            originating_message_content="Later add a passthrough step before the rows land.",
+        )

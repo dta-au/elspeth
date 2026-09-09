@@ -9,7 +9,7 @@ migration, no ``record_guided_event()`` method.
 Tier 1 (audit-trust). Coercion forbidden — invalid input crashes.
 Events go through the existing recorder via ``recorder.record(invocation)``.
 
-See docs/superpowers/specs/2026-05-11-composer-guided-mode-design.md §9.1.
+See docs/specs/2026-05-11-composer-guided-mode-design.md §9.1.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from elspeth.web.composer.guided.state_machine import DeferredStageIntent, Termi
 # the audit trail never records a record with an invalid discriminator value.
 _VALID_EMITTERS: frozenset[str] = frozenset({"server", "llm"})
 _VALID_ADVANCE_REASONS: frozenset[str] = frozenset({"user_advanced", "auto_advanced"})
-_VALID_STAGE_NAMES: frozenset[str] = frozenset({"source", "output", "topology", "wire_review"})
 
 
 def _build_invocation(
@@ -262,16 +261,6 @@ def emit_intent_cancelled(
 
     if type(intent) is not DeferredStageIntent:
         raise TypeError("intent must be an exact DeferredStageIntent")
-    try:
-        parsed_intent_id = uuid.UUID(intent.intent_id)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("intent_id must be a canonical UUID string") from exc
-    if str(parsed_intent_id) != intent.intent_id:
-        raise ValueError("intent_id must be a canonical UUID string")
-    if intent.receiving_stage not in _VALID_STAGE_NAMES:
-        raise ValueError("receiving_stage is outside the closed stage vocabulary")
-    if intent.target_stage not in _VALID_STAGE_NAMES:
-        raise ValueError("target_stage is outside the closed stage vocabulary")
     invocation = _build_invocation(
         tool_name="guided_intent_cancelled",
         payload={

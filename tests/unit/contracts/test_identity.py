@@ -1,11 +1,27 @@
 """Tests for identity contracts."""
 
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from typing import Any
 
 import pytest
 
-from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import (
+    LineageFrame,
+    TokenInfo,
+    innermost_expand_frame,
+    innermost_fork_frame,
+    innermost_own_frame,
+    lineage_path_from_json,
+    lineage_path_to_json,
+    path_branch_name,
+    path_expand_group_id,
+    path_fork_group_id,
+    pop_fork_frame,
+    truncate_at_closer_frame,
+)
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.testing import make_field
 
@@ -40,7 +56,7 @@ class TestTokenInfo:
         assert token.branch_name is None
 
     def test_token_info_with_branch(self) -> None:
-        """Can create TokenInfo with branch_name."""
+        """branch_name is derived (ruling 21) from the innermost FORK frame in lineage_path."""
         contract = _make_contract()
         pipeline_row = PipelineRow({}, contract)
 
@@ -48,7 +64,7 @@ class TestTokenInfo:
             row_id="row-123",
             token_id="tok-456",
             row_data=pipeline_row,
-            branch_name="sentiment",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="sentiment"),),
         )
 
         assert token.branch_name == "sentiment"
@@ -86,8 +102,11 @@ class TestTokenInfo:
         pipeline_row = PipelineRow({}, contract)
 
         token = TokenInfo(row_id="r", token_id="t", row_data=pipeline_row)
+        # branch_name is a derived, read-only property (ruling 21) — not a
+        # dataclass field — so its own frozen-enforcement coverage lives at
+        # the lineage_path field below, not a direct property assignment.
         with pytest.raises(FrozenInstanceError):
-            token.branch_name = "sentiment"  # type: ignore[misc]  # testing frozen enforcement
+            token.lineage_path = ()  # type: ignore[misc]  # testing frozen enforcement
         with pytest.raises(FrozenInstanceError):
             token.row_id = "new_row_id"  # type: ignore[misc]  # testing frozen enforcement
 
@@ -101,10 +120,10 @@ class TestTokenInfo:
             row_id="row-1",
             token_id="tok-1",
             row_data=original_row,
-            branch_name="path_a",
-            fork_group_id="fork-123",
-            join_group_id="join-456",
-            expand_group_id="expand-789",
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork-123", member_key="path_a"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-789", member_key="tok-child"),
+            ),
         )
 
         updated = original.with_updated_data(updated_row)
@@ -118,7 +137,6 @@ class TestTokenInfo:
         assert updated.token_id == "tok-1"
         assert updated.branch_name == "path_a"
         assert updated.fork_group_id == "fork-123"
-        assert updated.join_group_id == "join-456"
         assert updated.expand_group_id == "expand-789"
 
     def test_with_updated_data_preserves_resume_fields(self) -> None:
@@ -141,45 +159,55 @@ class TestTokenInfo:
         assert updated.resume_attempt_offset == 3
         assert updated.resume_checkpoint_id == "ck-abc"
 
-
-class TestTokenInfoLineageFieldGuards:
-    """Empty-string lineage fields corrupt coalesce keys — must be rejected."""
-
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
-    def test_rejects_empty_string_lineage_field(self, field: str) -> None:
+    def test_lineage_path_defaults_empty_and_survives_with_updated_data(self) -> None:
         contract = _make_contract()
-        kwargs: dict[str, Any] = {
-            "row_id": "r1",
-            "token_id": "t1",
-            "row_data": PipelineRow({"x": 1}, contract=contract),
-        }
-        kwargs[field] = ""
-        with pytest.raises(ValueError, match=f"TokenInfo.{field} must be None or non-empty string"):
-            TokenInfo(**kwargs)
+        path = (LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),)
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=PipelineRow({"field": "v"}, contract),
+            lineage_path=path,
+        )
+        assert token.lineage_path == path
+        updated = token.with_updated_data(PipelineRow({"field": "w"}, contract))
+        assert updated.lineage_path == path
+        bare = TokenInfo(row_id="row-1", token_id="tok-2", row_data=PipelineRow({"field": "v"}, contract))
+        assert bare.lineage_path == ()
 
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
-    def test_accepts_none_lineage_field(self, field: str) -> None:
-        contract = _make_contract()
-        kwargs: dict[str, Any] = {
-            "row_id": "r1",
-            "token_id": "t1",
-            "row_data": PipelineRow({"x": 1}, contract=contract),
-        }
-        kwargs[field] = None
-        t = TokenInfo(**kwargs)
-        assert getattr(t, field) is None
+    @pytest.mark.parametrize(
+        "bad_path",
+        [
+            pytest.param([LineageFrame(kind=FrameKind.FORK, group_id="g", member_key="m")], id="list-not-tuple"),
+            pytest.param((("fork", "g", "m"),), id="raw-tuple-entry"),
+        ],
+    )
+    def test_lineage_path_rejects_untyped_values(self, bad_path: object) -> None:
+        with pytest.raises(TypeError):
+            TokenInfo(
+                row_id="row-1",
+                token_id="tok-1",
+                row_data=PipelineRow({"field": "v"}, _make_contract()),
+                lineage_path=bad_path,  # type: ignore[arg-type]
+            )
 
-    @pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id"])
-    def test_accepts_non_empty_lineage_field(self, field: str) -> None:
-        contract = _make_contract()
-        kwargs: dict[str, Any] = {
-            "row_id": "r1",
-            "token_id": "t1",
-            "row_data": PipelineRow({"x": 1}, contract=contract),
-        }
-        kwargs[field] = "valid_value"
-        t = TokenInfo(**kwargs)
-        assert getattr(t, field) == "valid_value"
+    def test_token_info_has_no_join_group_id(self) -> None:
+        """§4.1 / ruling 20: a merge is an event, not a membership — the join
+        context rides RowResult/PendingOutcome/WorkItem carriers, never TokenInfo."""
+        import dataclasses
+
+        assert "join_group_id" not in {f.name for f in dataclasses.fields(TokenInfo)}
+
+
+# TestTokenInfoLineageFieldGuards (empty-string branch_name/fork_group_id/
+# expand_group_id rejected at TokenInfo construction) is retired by the WS1b
+# flip: those three are no longer TokenInfo constructor kwargs at all — they
+# are derived, read-only properties over lineage_path (ruling 21). A
+# TokenInfo literally cannot be built with an empty member_key/group_id
+# anymore: LineageFrame.__post_init__ refuses it before TokenInfo ever sees
+# the value — see TestLineageFrame::test_frame_rejects_bad_fields below.
+# TestTokenInfo::test_token_info_with_branch and
+# ::test_with_updated_data_preserves_lineage cover the None/non-empty
+# derived-property reads that remain meaningful at this layer.
 
 
 class TestTokenInfoResumeOffsetInvariant:
@@ -232,6 +260,149 @@ class TestTokenInfoResumeOffsetInvariant:
         t = TokenInfo(**self._kwargs(resume_attempt_offset=0, resume_checkpoint_id="ck-1"))
         assert t.resume_attempt_offset == 0
         assert t.resume_checkpoint_id == "ck-1"
+
+
+class TestLineageFrame:
+    def test_frame_construction_and_freeze(self) -> None:
+        frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a")
+        assert frame.kind is FrameKind.FORK
+        with pytest.raises(FrozenInstanceError):
+            frame.group_id = "other"  # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        ("kind", "group_id", "member_key"),
+        [
+            pytest.param("fork", "fg-1", "path_a", id="kind-is-a-bare-string"),
+            pytest.param(FrameKind.FORK, "", "path_a", id="empty-group-id"),
+            pytest.param(FrameKind.EXPAND, "eg-1", "", id="empty-member-key"),
+            pytest.param(FrameKind.EXPAND, None, "m", id="none-group-id"),
+        ],
+    )
+    def test_frame_rejects_bad_fields(self, kind: object, group_id: object, member_key: object) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            LineageFrame(kind=kind, group_id=group_id, member_key=member_key)  # type: ignore[arg-type]
+
+    def test_json_round_trip_outermost_first(self) -> None:
+        path = (
+            LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-9"),
+            LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),
+        )
+        assert lineage_path_from_json(lineage_path_to_json(path)) == path
+        assert lineage_path_from_json(lineage_path_to_json(())) == ()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param("not json", id="not-json"),
+            pytest.param('{"a": 1}', id="not-a-list"),
+            pytest.param('[["fork", "fg-1"]]', id="two-element-frame"),
+            pytest.param('[["merge", "g", "m"]]', id="unknown-kind"),
+        ],
+    )
+    def test_json_rejects_corrupt_payloads(self, raw: str) -> None:
+        with pytest.raises(ValueError):
+            lineage_path_from_json(raw)
+
+    def test_innermost_helpers_pick_the_innermost_of_each_kind(self) -> None:
+        outer_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-outer", member_key="a")
+        expand = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+        inner_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-inner", member_key="b")
+        path = (outer_fork, expand, inner_fork)
+        assert innermost_fork_frame(path) is inner_fork
+        assert innermost_expand_frame(path) is expand
+        assert innermost_fork_frame(()) is None
+        assert innermost_expand_frame((outer_fork,)) is None
+
+    def test_path_wrappers_derive_the_retiring_stored_fields(self) -> None:
+        outer_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-outer", member_key="a")
+        expand = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+        inner_fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-inner", member_key="b")
+        path = (outer_fork, expand, inner_fork)
+        assert path_branch_name(path) == "b"
+        assert path_fork_group_id(path) == "fg-inner"
+        assert path_expand_group_id(path) == "eg-1"
+        assert path_branch_name(()) is None
+        assert path_fork_group_id(()) is None
+        assert path_expand_group_id((outer_fork,)) is None
+
+
+def _never_release(_group_id: str) -> bool:
+    raise AssertionError("is_release_group must not be consulted when the closer's frame is innermost")
+
+
+def _release_groups(*group_ids: str) -> Callable[[str], bool]:
+    return lambda group_id: group_id in group_ids
+
+
+class TestTruncateAtCloserFrame:
+    """META-38 guarded truncation: byte-identical to the old strict pop when
+    the closer's frame is innermost; passes through collector release-group
+    frames ONLY (the caller's written-fact predicate); everything else
+    refuses exactly as before."""
+
+    OUTER = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+    FORK = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+    RELEASE_1 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="r1")
+    RELEASE_2 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-2", member_key="r2")
+
+    def test_innermost_match_is_the_old_strict_pop_and_never_consults_the_predicate(self) -> None:
+        assert truncate_at_closer_frame((self.OUTER, self.FORK), kind=FrameKind.FORK, group_id="fg-1", is_release_group=_never_release) == (
+            self.OUTER,
+        )
+        assert truncate_at_closer_frame((self.OUTER,), kind=FrameKind.EXPAND, group_id="eg-1", is_release_group=_never_release) == ()
+
+    def test_one_release_frame_above_the_closer_frame_is_truncated_through(self) -> None:
+        path = (self.OUTER, self.FORK, self.RELEASE_1)
+        assert truncate_at_closer_frame(path, kind=FrameKind.FORK, group_id="fg-1", is_release_group=_release_groups("rel-1")) == (
+            self.OUTER,
+        )
+
+    def test_two_stacked_release_frames_are_truncated_through(self) -> None:
+        # collector-in-collector: the inner release is itself released again.
+        path = (self.OUTER, self.RELEASE_1, self.RELEASE_2)
+        assert (
+            truncate_at_closer_frame(path, kind=FrameKind.EXPAND, group_id="eg-1", is_release_group=_release_groups("rel-1", "rel-2")) == ()
+        )
+
+    def test_a_non_release_frame_above_the_closer_frame_raises(self) -> None:
+        # An unclosed real scope inside the closing region is NOT skippable.
+        path = (self.OUTER, self.FORK, LineageFrame(kind=FrameKind.EXPAND, group_id="eg-open", member_key="t"))
+        with pytest.raises(OrchestrationInvariantError, match="not a collector release group"):
+            truncate_at_closer_frame(path, kind=FrameKind.FORK, group_id="fg-1", is_release_group=_release_groups("rel-1"))
+
+    @pytest.mark.parametrize(
+        ("path", "kind", "group_id"),
+        [
+            pytest.param((), FrameKind.FORK, "fg-1", id="empty-path"),
+            pytest.param(
+                (LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="t"),),
+                FrameKind.FORK,
+                "eg-1",
+                id="wrong-kind",
+            ),
+            pytest.param(
+                (LineageFrame(kind=FrameKind.FORK, group_id="fg-2", member_key="a"),),
+                FrameKind.FORK,
+                "fg-1",
+                id="wrong-group",
+            ),
+        ],
+    )
+    def test_refuses_an_absent_closer_frame(self, path: tuple[LineageFrame, ...], kind: FrameKind, group_id: str) -> None:
+        # The walk consults the predicate on a non-matching innermost frame
+        # (it must decide whether to skip it); nothing here is a release.
+        with pytest.raises(OrchestrationInvariantError, match="no matching"):
+            truncate_at_closer_frame(path, kind=kind, group_id=group_id, is_release_group=_release_groups())
+
+
+class TestPopForkFrameIsUnaffectedByReleaseFrames:
+    def test_pass_through_pop_preserves_a_release_frame_above_the_fork_frame(self) -> None:
+        # row_union's pop (ruling 27) searches for its FORK frame and keeps
+        # every other frame in place — a collector release-group frame
+        # stacked above it survives, exactly like a surviving EXPAND frame.
+        fork = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+        release = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="r1")
+        assert pop_fork_frame((fork, release), group_id="fg-1") == (release,)
 
 
 class TestTokenInfoExtraFields:
@@ -296,3 +467,27 @@ class TestTokenInfoExtraFields:
         assert result["amount"] == 100
         assert result["computed_field"] == "extra"
         assert result["nested"] == {"a": 1}
+
+
+class TestInnermostOwnFrame:
+    OUTER = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1")
+    FORK = LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="a")
+    RELEASE_1 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-1", member_key="r1")
+    RELEASE_2 = LineageFrame(kind=FrameKind.EXPAND, group_id="rel-2", member_key="r2")
+
+    def test_innermost_non_release_frame_is_the_own_frame(self) -> None:
+        assert innermost_own_frame((self.OUTER, self.FORK), is_release_group=_release_groups()) == (1, self.FORK)
+
+    def test_a_run_of_release_frames_is_skipped(self) -> None:
+        # expand-of-a-release → close → two consecutive release frames.
+        path = (self.OUTER, self.RELEASE_1, self.RELEASE_2)
+        assert innermost_own_frame(path, is_release_group=_release_groups("rel-1", "rel-2")) == (0, self.OUTER)
+
+    def test_all_release_frames_or_empty_is_none(self) -> None:
+        assert innermost_own_frame((self.RELEASE_1,), is_release_group=_release_groups("rel-1")) is None
+        assert innermost_own_frame((), is_release_group=_never_release) is None
+
+    def test_an_unreleased_expand_is_the_own_frame_not_skipped(self) -> None:
+        # The shape innermost_fork_frame would wrongly skip.
+        open_scope = LineageFrame(kind=FrameKind.EXPAND, group_id="eg-open", member_key="t")
+        assert innermost_own_frame((self.FORK, open_scope), is_release_group=_release_groups("rel-1")) == (1, open_scope)

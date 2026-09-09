@@ -22,11 +22,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided.chat_solver import GuidedChatEmptyOutcome, maybe_resolve_step_2_sink_chat
+from elspeth.web.composer.guided.chat_solver import (
+    GuidedChatEmptyOutcome,
+    GuidedToolArgumentShapeError,
+    maybe_resolve_step_2_sink_chat,
+)
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
@@ -223,6 +228,7 @@ async def test_sink_loop_threads_parallel_tool_calls() -> None:
             catalog=_POLICY_CATALOG,
             plugin_snapshot=_PLUGIN_SNAPSHOT,
             user_id="u1",
+            max_tool_calls_per_turn=2,
         )
 
     assert result.sink is not None
@@ -236,6 +242,156 @@ async def test_sink_loop_threads_parallel_tool_calls() -> None:
     assert {tc["id"] for tc in assistant_msgs[0]["tool_calls"]} == {"c1", "c2"}
     # Both discovery calls were audited.
     assert {inv.tool_name for inv in recorder.invocations} == {"list_sinks", "get_plugin_schema"}
+
+
+@pytest.mark.asyncio
+async def test_sink_loop_schema_success_marks_the_session_tracker() -> None:
+    """F2: a step-2 get_plugin_schema SUCCESS reaches the marking hook.
+
+    The hook is the seam the route binds to
+    ``ComposerServiceImpl._mark_plugin_schema_loaded`` — same
+    ``(plugin_type, plugin_name)`` key shape the freeform batch writes.
+    ``list_sinks`` is discovery too but is deliberately NOT a schema load.
+    """
+    responses = [
+        _response(
+            tool_calls=[
+                _tool_call("c1", "list_sinks", {}),
+                _tool_call("c2", "get_plugin_schema", {"plugin_type": "sink", "name": "json"}),
+            ]
+        ),
+        _response(tool_calls=[_tool_call("c3", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    marks: list[tuple[str, str]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save as jsonl",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+            max_tool_calls_per_turn=2,
+            mark_schema_loaded=lambda plugin_type, name: marks.append((plugin_type, name)),
+        )
+
+    assert result.sink is not None
+    assert marks == [("sink", "json")]
+
+
+class _FailingSchemaCatalog(_SinkCatalog):
+    """A policy-visible sink whose schema fetch fails the catalog contract."""
+
+    def list_sources(self) -> list[PluginSummary]:
+        return []
+
+    def list_transforms(self) -> list[PluginSummary]:
+        return []
+
+    def list_sinks(self) -> list[PluginSummary]:
+        return [
+            *super().list_sinks(),
+            PluginSummary(name="broken", description="Broken sink", plugin_type="sink", config_fields=[]),
+        ]
+
+    def get_schema(self, plugin_type: str, name: str) -> PluginSchemaInfo:
+        if (plugin_type, name) == ("sink", "json"):
+            return super().get_schema(plugin_type, name)
+        raise ValueError("plugin_not_found")
+
+
+@pytest.mark.asyncio
+async def test_sink_loop_schema_failure_never_marks_the_session_tracker() -> None:
+    """A semantically-failed get_plugin_schema threads back but never marks."""
+    catalog = _FailingSchemaCatalog()
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="guided-sink-policy",
+        principal_scope="local:alice",
+        available=frozenset({PluginId("sink", "json"), PluginId("sink", "broken")}),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="guided-sink-generation",
+    )
+    profiles = MagicMock(spec=OperatorProfileRegistry)
+    profiles.public_schema.side_effect = lambda _plugin_id, schema, **_kwargs: schema
+    view = PolicyCatalogView(catalog, snapshot, profiles)
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "get_plugin_schema", {"plugin_type": "sink", "name": "broken"})]),
+        _response(tool_calls=[_tool_call("c2", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    marks: list[tuple[str, str]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save as jsonl",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=view,
+            plugin_snapshot=snapshot,
+            user_id="u1",
+            mark_schema_loaded=lambda plugin_type, name: marks.append((plugin_type, name)),
+        )
+
+    assert result.sink is not None
+    assert marks == []
+
+
+@pytest.mark.asyncio
+async def test_sink_loop_rejects_over_limit_batch_before_any_dispatch() -> None:
+    """An oversized allowed batch is one malformed response, not partial work."""
+    response = _response(
+        tool_calls=[
+            _tool_call("c1", "list_sinks", {}),
+            _tool_call("c2", "get_plugin_schema", {"plugin_type": "sink", "name": "json"}),
+            _tool_call("c3", "list_sinks", {}),
+        ]
+    )
+    recorder = BufferingRecorder()
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return response
+
+    with (
+        patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake),
+        patch("elspeth.web.composer.guided._discovery.execute_tool", autospec=True) as execute_tool_spy,
+        pytest.raises(GuidedToolArgumentShapeError, match="per-turn tool call limit"),
+    ):
+        await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="inspect every sink",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            recorder=recorder,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+            max_tool_calls_per_turn=2,
+        )
+
+    execute_tool_spy.assert_not_called()
+    assert recorder.invocations == ()
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
 
 
 @pytest.mark.asyncio
@@ -410,3 +566,139 @@ async def test_sink_loop_single_shot_when_no_catalog() -> None:
     # Terminal guided actions remain available, but no discovery tools are offered.
     offered_names = {t["function"]["name"] for t in captured[0]}
     assert offered_names == {"resolve_sink", "retain_deferred_intent", "manage_deferred_intent"}
+
+
+_INVALID_CONFIG_RESOLVE_SINK_ARGS = {
+    "resolution": "sink",
+    "output": {
+        "name": "results",
+        "plugin": "json",
+        # flexible without fields fails JSONSinkConfig validation — the exact
+        # shape that wedged the first-run tutorial (elspeth-a88c07cd47): the
+        # options passed shape checks, were staged as server-held prefill,
+        # and every subsequent /guided/respond echo died in from_dict.
+        "options": {"path": "out.json", "schema": {"mode": "flexible"}},
+        "required_fields": [],
+        "schema_mode": "flexible",
+        "on_write_failure": "discard",
+    },
+    "assistant_message": "Saved the results as a JSON file.",
+}
+
+
+@pytest.mark.asyncio
+async def test_sink_resolve_invalid_plugin_config_feeds_back_and_repairs() -> None:
+    """A resolve_sink whose options fail the plugin config model is NOT terminal.
+
+    The solver validates resolved options through the real sink config model,
+    threads the config error back as the tool result, and the model's
+    corrected second resolve_sink resolves normally.
+    """
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "resolve_sink", _INVALID_CONFIG_RESOLVE_SINK_ARGS)]),
+        _response(tool_calls=[_tool_call("c2", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    recorder = BufferingRecorder()
+    captured_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        captured_messages.append(kwargs["messages"])
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save the results as a json file",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            recorder=recorder,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+        )
+
+    assert result.sink is not None
+    assert result.sink.outputs[0].options["schema"] == {"mode": "observed"}
+
+    # The second round must carry the validation feedback keyed to c1.
+    second_call_messages = captured_messages[1]
+    feedback = [m for m in second_call_messages if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
+    assert len(feedback) == 1
+    assert "fields" in feedback[0]["content"]
+    # ... preceded by the assistant tool-call request it answers.
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in second_call_messages)
+    # One recorded LLM call per provider round.
+    assert len(recorder.llm_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sink_resolve_unknown_plugin_feeds_back_and_repairs() -> None:
+    """A hallucinated sink name is repairable within the same Send."""
+    unknown_plugin_args = {
+        **_RESOLVE_SINK_ARGS,
+        "output": {
+            **_RESOLVE_SINK_ARGS["output"],
+            "plugin": "hallucinated_sink_plugin",
+        },
+    }
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "resolve_sink", unknown_plugin_args)]),
+        _response(tool_calls=[_tool_call("c2", "resolve_sink", _RESOLVE_SINK_ARGS)]),
+    ]
+    captured_messages: list[list[dict[str, Any]]] = []
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        captured_messages.append(kwargs["messages"])
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save the results",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+        )
+
+    assert result.sink is not None
+    assert result.sink.outputs[0].plugin == "json"
+    feedback = [message for message in captured_messages[1] if message.get("role") == "tool" and message.get("tool_call_id") == "c1"]
+    assert len(feedback) == 1
+    assert "Unknown sink type" in feedback[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_sink_resolve_invalid_plugin_config_at_cap_returns_empty() -> None:
+    """Config-invalid resolves never wedge: at the iteration cap the loop
+    degrades to the advisory fallback instead of staging toxic prefill."""
+    responses = [
+        _response(tool_calls=[_tool_call("c1", "resolve_sink", _INVALID_CONFIG_RESOLVE_SINK_ARGS)]),
+    ]
+
+    async def _fake(**kwargs: Any) -> SimpleNamespace:
+        return responses.pop(0)
+
+    with patch("elspeth.web.composer.guided.chat_solver._litellm_acompletion", side_effect=_fake):
+        result = await maybe_resolve_step_2_sink_chat(
+            model="m",
+            user_message="save the results as a json file",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            state=_empty_state(),
+            catalog=_POLICY_CATALOG,
+            plugin_snapshot=_PLUGIN_SNAPSHOT,
+            user_id="u1",
+            max_discovery_iters=1,
+        )
+
+    assert type(result) is GuidedChatEmptyOutcome

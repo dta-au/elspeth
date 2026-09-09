@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import inspect
 import json
 from collections.abc import Iterator
@@ -16,10 +17,14 @@ import pytest
 import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
+from starlette.routing import Route
 
+from elspeth.contracts.blobs import BlobNotFoundError, BlobStateError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import (
     GuidedStep,
@@ -39,7 +44,11 @@ from elspeth.web.composer.guided.state_machine import (
     guided_reviewed_anchor_hash,
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase
+from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
 from elspeth.web.sessions.models import guided_operations_table
@@ -48,9 +57,12 @@ from elspeth.web.sessions.routes._helpers import _initial_composition_state_with
 from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedRespondRequest
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.guided_leases import abandon_guided_worker_leases
+from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -59,21 +71,44 @@ def file_composer_test_client(composer_test_client: TestClient, tmp_path: Path) 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'respond-races.db'}")
     initialize_session_schema(engine)
     composer_test_client.app.state.session_engine = engine
-    composer_test_client.app.state.session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.respond.races"),
     )
+    composer_test_client.app.state.session_service = session_service
+    composer_test_client.app.state.composer_progress_registry = ComposerProgressRegistry()
     try:
         yield composer_test_client
     finally:
         engine.dispose()
 
 
-def _create_session(client: TestClient) -> str:
+_GOAL_FIRST_INTENT = "Summarize each row and save the summaries as JSON"
+
+
+def _create_session(client: TestClient, *, intent: str | None = None) -> str:
+    """Create a session, optionally rooting it in a goal.
+
+    Rootless by DEFAULT here, unlike the walk-oriented helpers: most of this
+    module pins what a respond settlement writes from a genuinely empty
+    session — "no persisted state yet", exact version and message counts — and
+    a start would put a checkpoint and a root row there before the test began.
+
+    Pass ``intent`` for the walks that reach the Step-2 finish: goal-first
+    (elspeth-378cfa0e18) refuses a planner run without one.
+    """
+
     response = client.post("/api/sessions", json={"title": "schema-8 respond"})
     assert response.status_code == 201, response.json()
-    return response.json()["id"]
+    session_id = response.json()["id"]
+    if intent is not None:
+        started = client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={"profile": "live", "intent": intent, "operation_id": str(uuid4())},
+        )
+        assert started.status_code == 200, started.json()
+    return session_id
 
 
 def _with_active_step3(guided: GuidedSession, active: GuidedProposalRef) -> GuidedSession:
@@ -97,10 +132,17 @@ def _with_active_step3(guided: GuidedSession, active: GuidedProposalRef) -> Guid
 def _start(client: TestClient, session_id: str) -> dict:
     response = client.post(
         f"/api/sessions/{session_id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid4())},
+        json={"profile": "tutorial", "intent": _GOAL_FIRST_INTENT, "operation_id": str(uuid4())},
     )
     assert response.status_code == 200, response.json()
     return response.json()
+
+
+def _stage_proposal(client: TestClient, *, filename: str) -> tuple[str, dict]:
+    # This walk runs the Step-2 finish, so the session must carry a goal.
+    session_id = _create_session(client, intent=_GOAL_FIRST_INTENT)
+    staged = _Step2Journey()._stage_proposal(client, session_id, filename=filename)
+    return session_id, staged
 
 
 def _live_body(turn: dict, **overrides: object) -> dict:
@@ -137,6 +179,82 @@ def _payload_file_count(client: TestClient) -> int:
     return sum(path.is_file() for path in client.app.state.payload_store.base_path.rglob("*"))
 
 
+_NON_FILE_SOURCE = "azure_blob"
+
+
+def _enable_non_file_source(client: TestClient) -> None:
+    """Authorize one blob-inspection-INCOMPATIBLE source for this deployment.
+
+    These tests only need a source that cannot be schema-inspected from an
+    uploaded file. ``aws_s3`` used to play that role, but the web authoring
+    surface now declines it categorically (``WEB_SURFACE_PROHIBITED``), so it is
+    never offered or selectable in a web session — the subject here is the
+    non-file selection path, not the S3 policy.
+    """
+    settings = client.app.state.settings.model_copy(
+        update={
+            "plugin_allowlist": (
+                *client.app.state.settings.plugin_allowlist,
+                f"source:{_NON_FILE_SOURCE}",
+            )
+        }
+    )
+    runtime_policy = RuntimeWebPluginConfig.from_settings(settings)
+    client.app.state.settings = settings
+    client.app.state.web_plugin_policy = compile_web_plugin_policy(
+        registry=get_shared_plugin_manager(),
+        settings=runtime_policy,
+    )
+    client.app.state.operator_profile_registry = OperatorProfileRegistry(
+        policy=client.app.state.web_plugin_policy,
+        settings=runtime_policy,
+    )
+
+
+class _ReadRaceBlobService:
+    def __init__(self, record: object, outcome: bytes | Exception) -> None:
+        self._record = record
+        self._outcome = outcome
+
+    async def get_blob(
+        self,
+        _blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> object:
+        # An explicit source_blob_id resolves via get_blob (a direct,
+        # session-qualified lookup) rather than list_blobs + Python filter —
+        # see inspect_selected_ready_session_blob. Both tests using this fake
+        # select an explicit blob_id, so this is the method exercised now.
+        assert type(session_operation_context) is SessionOperationContext
+        return self._record
+
+    async def list_blobs(self, _session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[object]:
+        del limit, offset
+        return [self._record]
+
+    async def read_blob_content_prefix_verified(
+        self,
+        _blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        assert type(session_operation_context) is SessionOperationContext
+        # inspect_selected_ready_session_blob now streams+verifies via this
+        # method instead of read_blob_content. This fake stands in for a
+        # (possibly non-compliant) BlobServiceProtocol implementation: on the
+        # bytes-mismatch path it returns a hash genuinely computed from the
+        # changed bytes it "read", which will not match the original
+        # record.content_hash the caller already holds — that mismatch is
+        # exactly what source_inspection.py's own verification must catch.
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        content = self._outcome
+        computed_hash = hashlib.sha256(content).hexdigest()
+        return content[:prefix_bytes], computed_hash, len(content)
+
+
 def _guided_audit_events(client: TestClient, session_id: str) -> list[tuple[str, dict[str, object]]]:
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
     events: list[tuple[str, dict[str, object]]] = []
@@ -154,7 +272,8 @@ def _persist_guided(client: TestClient, session_id: str, guided: GuidedSession) 
     state = replace(_initial_composition_state_with_guided_session(), guided_session=guided)
     state_dict = state.to_dict()
     asyncio.run(
-        client.app.state.session_service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            client.app.state.session_service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_dict["sources"],
@@ -236,7 +355,7 @@ def test_http_output_edit_omits_hidden_policy_and_preserves_server_reviewed_valu
     assert form_turn["type"] == "schema_form"
     assert form_turn["payload"]["prefilled"]["on_write_failure"] == "failures"
 
-    output_path = Path(client.app.state.settings.data_dir) / "outputs" / "revised.jsonl"
+    output_path = Path(client.app.state.settings.data_dir) / "outputs" / session_id / "revised.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     submitted_options = {
         "path": str(output_path),
@@ -350,7 +469,373 @@ def test_first_prospective_response_settles_schema8_and_replays_exactly_after_dr
     assert _respond_operation_count(composer_test_client, session_id) == 1
 
 
-def test_preflight_and_settlement_share_one_server_identity_and_inspection_authority(
+def test_plural_source_selections_bind_each_intent_to_its_exact_blob_and_replay_first(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    earlier = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={
+            "filename": "earlier-source.csv",
+            "content": "earlier_id,earlier_label\n1,first\n",
+            "mime_type": "text/csv",
+        },
+    )
+    assert earlier.status_code == 201, earlier.json()
+    newer = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={
+            "filename": "newer-other-source.csv",
+            "content": "newer_id,newer_label\n2,second\n",
+            "mime_type": "text/csv",
+        },
+    )
+    assert newer.status_code == 201, newer.json()
+    fetched = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+    assert fetched.status_code == 200, fetched.json()
+    turn = fetched.json()["next_turn"]
+    body = _live_body(
+        turn,
+        chosen=["csv"],
+        source_blob_id=earlier.json()["id"],
+    )
+
+    first = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+
+    assert first.status_code == 200, first.json()
+    first_selection_json = first.json()
+    first_prefilled = first_selection_json["next_turn"]["payload"]["prefilled"]
+    assert first_prefilled["path"] == f"blob:{earlier.json()['id']}"
+    assert first_prefilled["schema"]["fields"] == [
+        "earlier_id: int",
+        "earlier_label: str",
+    ]
+    persisted_guided = first_selection_json["composition_state"]["composer_meta"]["guided_session"]
+    first_stable_id, intent = next(iter(persisted_guided["pending_source_intents"].items()))
+    assert intent["inspection_facts"]["redacted_identity"]["blob_id"] == earlier.json()["id"]
+    assert intent["inspection_facts"]["redacted_identity"]["blob_id"] != newer.json()["id"]
+    response_payload = load_guided_json_payload(
+        composer_test_client.app.state.payload_store,
+        payload_id=first_selection_json["guided_session"]["history"][0]["response_hash"],
+        purpose="turn_response",
+    )
+    assert deep_thaw(response_payload.payload) == {
+        "chosen": ["csv"],
+        "source_blob_id": earlier.json()["id"],
+    }
+
+    first_form = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            first_selection_json["next_turn"],
+            edited_values={"plugin": "csv", "options": first_prefilled},
+        ),
+    )
+    assert first_form.status_code == 200, first_form.json()
+    assert first_form.json()["next_turn"]["type"] == "inspect_and_confirm"
+    first_review = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(first_form.json()["next_turn"], edited_values={"columns": ["earlier_id", "earlier_label"]}),
+    )
+    assert first_review.status_code == 200, first_review.json()
+    assert first_review.json()["next_turn"]["type"] == "review_components"
+
+    added = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            first_review.json()["next_turn"],
+            component_action={"action": "add", "component_kind": "source"},
+        ),
+    )
+    assert added.status_code == 200, added.json()
+    assert added.json()["next_turn"]["type"] == "single_select"
+
+    second_selection = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            added.json()["next_turn"],
+            chosen=["csv"],
+            source_blob_id=newer.json()["id"],
+        ),
+    )
+    assert second_selection.status_code == 200, second_selection.json()
+    plural_guided = second_selection.json()["composition_state"]["composer_meta"]["guided_session"]
+    assert plural_guided["source_order"][0] == first_stable_id
+    assert plural_guided["reviewed_sources"][first_stable_id]["options"]["path"] == f"blob:{earlier.json()['id']}"
+    second_stable_id, second_intent = next(iter(plural_guided["pending_source_intents"].items()))
+    assert second_stable_id != first_stable_id
+    assert second_intent["inspection_facts"]["redacted_identity"]["blob_id"] == newer.json()["id"]
+
+    monkeypatch.setattr(
+        guided_route,
+        "inspect_selected_ready_session_blob",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("replay re-read mutable blob state")),
+    )
+
+    replay = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+
+    assert replay.status_code == 200, replay.json()
+    assert replay.json() == first_selection_json
+    replay_intents = replay.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
+    assert replay_intents[first_stable_id]["inspection_facts"]["redacted_identity"]["blob_id"] == earlier.json()["id"]
+
+
+def test_source_selection_without_blob_identity_does_not_fall_back_to_latest_upload(
+    composer_test_client: TestClient,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    for filename, content in (
+        ("earlier.csv", "earlier_id\n1\n"),
+        ("newer.csv", "newer_id\n2\n"),
+    ):
+        upload = composer_test_client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": filename, "content": content, "mime_type": "text/csv"},
+        )
+        assert upload.status_code == 201, upload.json()
+
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(turn, chosen=["csv"]),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["next_turn"]["payload"]["prefilled"] == {"schema": {"mode": "observed"}}
+    intents = response.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
+    assert next(iter(intents.values()))["inspection_facts"] is None
+
+
+def test_non_file_source_without_blob_identity_ignores_one_unrelated_ready_blob(
+    composer_test_client: TestClient,
+) -> None:
+    _enable_non_file_source(composer_test_client)
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "unrelated.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    assert _NON_FILE_SOURCE in {option["id"] for option in turn["payload"]["options"]}
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(turn, chosen=[_NON_FILE_SOURCE]),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["next_turn"]["payload"]["plugin"] == _NON_FILE_SOURCE
+    intents = response.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
+    assert next(iter(intents.values()))["inspection_facts"] is None
+
+
+def test_non_file_source_rejects_explicit_incompatible_blob_before_reservation(
+    composer_test_client: TestClient,
+) -> None:
+    _enable_non_file_source(composer_test_client)
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "unrelated.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    assert _NON_FILE_SOURCE in {option["id"] for option in turn["payload"]["options"]}
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            turn,
+            chosen=[_NON_FILE_SOURCE],
+            source_blob_id=uploaded.json()["id"],
+        ),
+    )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "source_blob_id is not valid for the selected source plugin."
+    assert _respond_operation_count(composer_test_client, session_id) == 0
+
+
+def test_source_selection_rejects_blob_identity_outside_ready_session_set_before_reservation(
+    composer_test_client: TestClient,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(turn, chosen=["csv"], source_blob_id=str(uuid4())),
+    )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "Selected source blob is not a ready upload for this session."
+    assert _respond_operation_count(composer_test_client, session_id) == 0
+
+
+@pytest.mark.parametrize("failure_kind", ("deleted", "not_ready"))
+def test_source_selection_maps_fenced_get_to_read_lifecycle_drift_to_stale_conflict(
+    composer_test_client: TestClient,
+    failure_kind: str,
+) -> None:
+    # Renamed from ...maps_list_to_read...: an explicit selection now
+    # resolves via a direct get_blob lookup, not list_blobs + Python
+    # filter (see inspect_selected_ready_session_blob). The invariant this
+    # test pins — a blob that goes missing/not-ready between resolution and
+    # read raises SourceInspectionBlobLifecycleError. The exact operation is
+    # already reserved at that point, so the fenced failure settles as a
+    # redacted stale-conflict response rather than a pre-reservation 400.
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "racing.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    blob_id = UUID(uploaded.json()["id"])
+    original_blob_service = composer_test_client.app.state.blob_service
+    record = next(record for record in asyncio.run(original_blob_service.list_blobs(UUID(session_id), limit=None)) if record.id == blob_id)
+    secret_canary = "private-race-detail"
+    failure: Exception
+    if failure_kind == "deleted":
+        failure = BlobNotFoundError(f"{blob_id}-{secret_canary}")
+    else:
+        failure = BlobStateError(str(blob_id), message=f"not ready: {secret_canary}")
+    composer_test_client.app.state.blob_service = _ReadRaceBlobService(record, failure)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=["csv"], source_blob_id=str(blob_id)),
+        )
+    finally:
+        composer_test_client.app.state.blob_service = original_blob_service
+
+    assert response.status_code == 409, response.json()
+    assert response.json()["detail"]["failure_code"] == "stale_conflict"
+    assert secret_canary not in response.text
+    assert _respond_operation_count(composer_test_client, session_id) == 1
+
+
+def test_source_selection_fails_closed_when_read_bytes_do_not_match_fetched_hash(
+    composer_test_client: TestClient,
+) -> None:
+    # Renamed from ...match_listed_hash...: the record's content_hash now
+    # comes from get_blob rather than list_blobs. The invariant this test
+    # pins is unchanged and remains load-bearing: source_inspection.py's own
+    # hash re-verification against `record.content_hash` is not redundant
+    # with a compliant BlobServiceProtocol implementation's internal check —
+    # it independently certifies the content_hash_prefix this module stamps
+    # into redacted_identity, catching a case (simulated here by a fake that
+    # skips its own verification) where the bytes returned by read_blob_content
+    # don't match the hash on the record snapshot this module already holds.
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "stable.csv", "content": "listed_id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    blob_id = UUID(uploaded.json()["id"])
+    original_blob_service = composer_test_client.app.state.blob_service
+    record = next(record for record in asyncio.run(original_blob_service.list_blobs(UUID(session_id), limit=None)) if record.id == blob_id)
+    composer_test_client.app.state.blob_service = _ReadRaceBlobService(record, b"changed_id\n2\n")
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=["csv"], source_blob_id=str(blob_id)),
+        )
+    finally:
+        composer_test_client.app.state.blob_service = original_blob_service
+
+    assert response.status_code == 500, response.json()
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert _respond_operation_count(composer_test_client, session_id) == 1
+
+
+@pytest.mark.parametrize(
+    "action_kind",
+    ("review_wiring", "reject", "component_revise", "prose_revise"),
+)
+def test_step3_closed_actions_reject_source_blob_identity_before_reservation(
+    composer_test_client: TestClient,
+    action_kind: str,
+) -> None:
+    session_id, staged = _stage_proposal(composer_test_client, filename=f"illegal-{action_kind}.jsonl")
+    turn = staged["next_turn"]
+    payload = turn["payload"]
+    operation_id = str(uuid4())
+    body = _live_body(
+        turn,
+        operation_id=operation_id,
+        proposal_id=payload["proposal_id"],
+        draft_hash=payload["draft_hash"],
+        source_blob_id=str(uuid4()),
+    )
+    if action_kind == "review_wiring":
+        body["chosen"] = ["review_wiring"]
+    elif action_kind == "reject":
+        body["control_signal"] = "reject"
+    elif action_kind == "component_revise":
+        body["edit_target"] = payload["edit_targets"][0]
+    else:
+        body["edited_values"] = {"revision_instruction": "Add one audited transform."}
+    operation_count_before = _respond_operation_count(composer_test_client, session_id)
+
+    response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "source_blob_id is only valid for a Step 1 source selection."
+    assert _respond_operation_count(composer_test_client, session_id) == operation_count_before
+
+
+@pytest.mark.parametrize("action_kind", ("confirm_wiring", "correction"))
+def test_step4_closed_actions_reject_source_blob_identity_before_reservation(
+    composer_test_client: TestClient,
+    action_kind: str,
+) -> None:
+    session_id, staged = _stage_proposal(composer_test_client, filename=f"illegal-{action_kind}.jsonl")
+    proposal_turn = staged["next_turn"]
+    reviewed = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            proposal_turn,
+            chosen=["review_wiring"],
+            proposal_id=proposal_turn["payload"]["proposal_id"],
+            draft_hash=proposal_turn["payload"]["draft_hash"],
+        ),
+    )
+    assert reviewed.status_code == 200, reviewed.json()
+    wire_turn = reviewed.json()["next_turn"]
+    wire_payload = wire_turn["payload"]
+    operation_id = str(uuid4())
+    body = _live_body(
+        wire_turn,
+        operation_id=operation_id,
+        proposal_id=wire_payload["proposal_id"],
+        draft_hash=wire_payload["draft_hash"],
+        source_blob_id=str(uuid4()),
+    )
+    if action_kind == "confirm_wiring":
+        body["chosen"] = ["confirm_wiring"]
+    else:
+        body["correction_feedback"] = "Correct this source before confirmation."
+        body["edit_target"] = {
+            "kind": "source",
+            "stable_id": wire_payload["sources"][0]["stable_id"],
+        }
+    operation_count_before = _respond_operation_count(composer_test_client, session_id)
+
+    response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "source_blob_id is only valid for a Step 1 source selection."
+    assert _respond_operation_count(composer_test_client, session_id) == operation_count_before
+
+
+def test_preflight_defers_inspection_until_reserved_settlement(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -375,24 +860,33 @@ def test_preflight_and_settlement_share_one_server_identity_and_inspection_autho
         return original_answer(*args, **kwargs)
 
     inspection_calls = 0
+    inspection_contexts: list[SessionOperationContext] = []
 
     async def inspect_once(*_args: object, **_kwargs: object) -> SourceInspectionFacts:
         nonlocal inspection_calls
         inspection_calls += 1
         if inspection_calls > 1:
             raise AssertionError("settlement re-read mutable inspection authority")
+        context = _kwargs["session_operation_context"]
+        assert type(context) is SessionOperationContext
+        inspection_contexts.append(context)
+        assert context.fence.session_id == session_id
+        assert context.operation_kind is SessionOperationKind.COMPOSE
+        assert _respond_operation_count(composer_test_client, session_id) == 1
         return facts
 
     monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", capture_authority)
-    monkeypatch.setattr(guided_route, "_inspect_latest_ready_session_blob", inspect_once)
+    monkeypatch.setattr(guided_route, "inspect_selected_ready_session_blob", inspect_once)
 
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 200, response.json()
     assert inspection_calls == 1
+    assert len(inspection_contexts) == 1
     assert len(captured) == 2
-    assert captured[0] == captured[1]
-    stable_id, captured_facts = captured[0]
+    assert captured[0][0] == captured[1][0]
+    assert captured[0][1] is None
+    stable_id, captured_facts = captured[1]
     assert captured_facts is facts
     assert stable_id != UUID(body["operation_id"])
     assert stable_id != UUID(int=0)
@@ -520,7 +1014,10 @@ def test_step3_matching_proposal_binding_requires_durable_payload_before_reserva
     )
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
 
 
@@ -647,6 +1144,76 @@ def test_schema_form_plugin_mismatch_never_selects_a_client_named_model_or_reser
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
 
 
+def test_unsupported_guided_selection_never_reaches_operator_logs(
+    composer_test_client: TestClient,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    canary = "raw-guided-selection-canary-7f3a9d"
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=[canary]),
+        )
+
+    assert response.status_code == 400, response.json()
+    rejection = next(entry for entry in logs if entry["event"] == "guided.respond_turn_contract_rejected")
+    assert rejection["rejection_code"] == "invalid_guided_response"
+    assert rejection["exc_class"] == "ValueError"
+    assert "error_detail" not in rejection
+    # The generic branch must log the class ONLY — its messages echo raw
+    # client-supplied values, and the audit scrubber redacts secret-shaped
+    # text, not arbitrary client text.
+    assert "exc_message" not in rejection
+    assert canary not in repr(logs)
+
+
+def test_web_surface_policy_rejection_reaches_operator_logs_with_distinct_code(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S7: a deployment-policy refusal must be diagnosable from the log alone.
+
+    The generic contract-rejection branch logs the exception class only (see
+    the canary test above), which left a policy refusal indistinguishable
+    from any authoring mistake — "invalid_guided_response ValueError" — with
+    the policy explanation dropped on the floor. The policy error's message
+    is server-composed end to end, so its branch logs the explanation under
+    its own closed rejection code. The client response body stays the closed
+    generic 400 either way.
+    """
+    from structlog.testing import capture_logs
+
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+    from elspeth.web.sessions.routes.composer import guided as guided_route
+
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    explanation = "source plugin 'aws_s3' is prohibited on the web authoring surface: policy-explanation-sentinel"
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        raise WebSurfacePolicyRejectedError(explanation)
+
+    monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", reject)
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=["csv"]),
+        )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "Guided response does not satisfy the current turn contract."
+    assert "policy-explanation-sentinel" not in response.text
+    rejection = next(entry for entry in logs if entry["event"] == "guided.respond_turn_contract_rejected")
+    assert rejection["rejection_code"] == "web_surface_policy_rejected"
+    assert rejection["exc_class"] == "WebSurfacePolicyRejectedError"
+    assert "policy-explanation-sentinel" in rejection["exc_message"]
+
+
 def test_expired_operation_is_not_taken_over_before_live_preflight(
     composer_test_client: TestClient,
 ) -> None:
@@ -659,20 +1226,34 @@ def test_expired_operation_is_not_taken_over_before_live_preflight(
     body["turn_token"] = "0" * 64
     request_model = guided_route.GuidedRespondRequest.model_validate(body, strict=True)
     service = composer_test_client.app.state.session_service
-    claim = asyncio.run(
-        service.reserve_guided_operation(
-            session_id=UUID(session_id),
-            operation_id=body["operation_id"],
-            kind="guided_respond",
-            request_hash=guided_operation_request_hash(
+    session_context = asyncio.run(
+        service._run_sync(
+            lambda: service.session_operation_authority.acquire(
                 session_id=UUID(session_id),
-                kind="guided_respond",
-                request=request_model,
-            ),
-            actor="composer_route",
-            lease_seconds=300,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
         )
     )
+    try:
+        claim = asyncio.run(
+            service.reserve_guided_operation(
+                session_id=UUID(session_id),
+                operation_id=body["operation_id"],
+                kind="guided_respond",
+                request_hash=guided_operation_request_hash(
+                    session_id=UUID(session_id),
+                    kind="guided_respond",
+                    request=request_model,
+                ),
+                actor="composer_route",
+                lease_seconds=300,
+                session_operation_context=session_context,
+            )
+        )
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, session_context))
     assert isinstance(claim, GuidedOperationClaimed)
     with composer_test_client.app.state.session_engine.begin() as connection:
         connection.execute(
@@ -726,7 +1307,10 @@ def test_preflight_invariant_is_sanitized_without_reservation_or_mutation(
         response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert secret_canary not in response.text
     entry = next(log for log in logs if log["event"] == "guided.invariant_violated")
     assert entry["exc_class"] == "InvariantError"
@@ -788,7 +1372,10 @@ def test_orphan_wire_occurrence_fails_closed_before_reservation_or_mutation(
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
     assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before
@@ -921,6 +1508,210 @@ def test_respond_handler_has_no_legacy_or_unfenced_mutation_calls() -> None:
     assert {"renew_guided_operation", "settle_guided_state_operation"} <= attributes
 
 
+def test_respond_sink_preflight_uses_owned_session_record_for_path_namespace() -> None:
+    """Filesystem scope must come from the ownership-verified record, not route input."""
+    tree = ast.parse(inspect.getsource(guided_route.post_guided_respond))
+    ownership_assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call)
+        and isinstance(node.value.value.func, ast.Name)
+        and node.value.value.func.id == "_verify_session_ownership"
+    ]
+
+    assert len(ownership_assignments) == 1
+    assert [ast.unparse(target) for target in ownership_assignments[0].targets] == ["owned_session"]
+
+    # The deployment sink admission lives inside the shared transition
+    # boundary (elspeth-ef92db3e16): every projection call in this route
+    # must thread the ownership-verified session id into it, and the
+    # boundary itself must perform the admission exactly once.
+    answer_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_schema8_answer_and_project_next"
+    ]
+    assert len(answer_calls) == 2, [ast.unparse(call) for call in answer_calls]
+    for call in answer_calls:
+        session_keyword = next(keyword for keyword in call.keywords if keyword.arg == "session_id")
+        assert ast.unparse(session_keyword.value) == "str(owned_session.id)"
+
+    helper_tree = ast.parse(inspect.getsource(guided_route._schema8_answer_and_project_next))
+    admission_calls = [
+        node
+        for node in ast.walk(helper_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_schema8_require_runnable_sink_form"
+    ]
+    assert len(admission_calls) == 1
+
+    # Chat parity: the atomic chat transition threads the ownership-verified
+    # session id into the same shared boundary.
+    from elspeth.web.sessions.routes.composer import guided_chat_atomic
+
+    chat_tree = ast.parse(inspect.getsource(guided_chat_atomic.post_guided_chat_schema8))
+    chat_calls = [
+        node
+        for node in ast.walk(chat_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_schema8_answer_and_project_next"
+    ]
+    assert len(chat_calls) == 1
+    chat_session_keyword = next(keyword for keyword in chat_calls[0].keywords if keyword.arg == "session_id")
+    assert ast.unparse(chat_session_keyword.value) == "str(owned_session.id)"
+
+
+def _drive_manual_edit_to_sink_schema_form(client: TestClient) -> tuple[str, str, dict]:
+    """Seed a reviewed output and drive the manual respond route to its
+    Step-2 sink schema form via the review-components edit action."""
+    session_id = _create_session(client)
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "33333333-3333-4333-8333-333333333333"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "input.csv"},
+                observed_columns=("id", "name"),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="output",
+                plugin="json",
+                options={"path": "old.jsonl"},
+                required_fields=("id",),
+                schema_mode="observed",
+                on_write_failure="failures",
+            )
+        },
+    )
+    _persist_guided(client, session_id, guided)
+
+    review = client.get(f"/api/sessions/{session_id}/guided")
+    assert review.status_code == 200, review.json()
+    review_turn = review.json()["next_turn"]
+    assert review_turn["type"] == "review_components"
+    editing = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            review_turn,
+            component_action={"action": "edit", "target": {"kind": "output", "stable_id": output_id}},
+        ),
+    )
+    assert editing.status_code == 200, editing.json()
+    form_turn = editing.json()["next_turn"]
+    assert form_turn["type"] == "schema_form"
+    return session_id, output_id, form_turn
+
+
+_FOREIGN_SESSION_ID = "99999999-9999-4999-8999-999999999999"
+
+
+def _traversal_sink_path(data_dir: Path, session_id: str) -> str:
+    return "reports/../../../escape.jsonl"
+
+
+def _foreign_outputs_sink_path(data_dir: Path, session_id: str) -> str:
+    # Explicitly session-scoped FOREIGN relative path: resolve_sink_data_path
+    # must keep it foreign (never adopt it under the caller's directory) so
+    # the allowlist rejects it.
+    return f"outputs/{_FOREIGN_SESSION_ID}/hijack.jsonl"
+
+
+def _foreign_blob_sink_path(data_dir: Path, session_id: str) -> str:
+    return str(data_dir / "blobs" / _FOREIGN_SESSION_ID / "hijack.jsonl")
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [_traversal_sink_path, _foreign_outputs_sink_path, _foreign_blob_sink_path],
+    ids=["dot-dot-traversal", "cross-session-outputs-relative", "cross-session-blob-absolute"],
+)
+def test_manual_sink_form_answer_rejects_traversal_and_cross_session_paths(
+    composer_test_client: TestClient,
+    vector: object,
+) -> None:
+    """Deployment sink admission on the MANUAL respond lane (elspeth-ef92db3e16).
+
+    Traversal and cross-session paths must 400 at the form boundary — before
+    the transition runs — leaving the reviewed output and the pending edit
+    untouched. Pre-fix the admission ran only on the freeform set_output tool,
+    so a manual form submission carried these paths into reviewed authority.
+    """
+    client = composer_test_client
+    session_id, output_id, form_turn = _drive_manual_edit_to_sink_schema_form(client)
+    data_dir = Path(client.app.state.settings.data_dir)
+    rejected = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            form_turn,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": vector(data_dir, session_id),  # type: ignore[operator]
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "fail_if_exists",
+                },
+            },
+        ),
+    )
+    assert rejected.status_code == 400, rejected.json()
+    assert "allowed" in rejected.json()["detail"]
+    record = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None and record.composer_meta is not None
+    guided_after = GuidedSession.from_dict(deep_thaw(record.composer_meta)["guided_session"])
+    assert guided_after.reviewed_outputs[output_id].options == {"path": "old.jsonl"}
+    # begin_component_edit only marks the edit target; a pending intent is
+    # created by a SUCCESSFUL answer, so a rejected one must leave none.
+    assert guided_after.pending_output_intents == {}
+    assert guided_after.active_edit_target is not None
+    assert guided_after.active_edit_target.stable_id == output_id
+
+
+def test_manual_sink_form_answer_admits_own_session_blob_path(
+    composer_test_client: TestClient,
+) -> None:
+    """The caller's own ``blobs/<session_id>`` subtree is inside
+    ``allowed_sink_directories``: the manual lane must ADMIT it — the
+    over-rejection guard for elspeth-ef92db3e16's admission move."""
+    client = composer_test_client
+    session_id, output_id, form_turn = _drive_manual_edit_to_sink_schema_form(client)
+    data_dir = Path(client.app.state.settings.data_dir)
+    blob_path = data_dir / "blobs" / session_id / "derived.jsonl"
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            form_turn,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": str(blob_path),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        ),
+    )
+    assert staged.status_code == 200, staged.json()
+    assert staged.json()["next_turn"]["type"] == "multi_select_with_custom"
+    record = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None and record.composer_meta is not None
+    guided_after = GuidedSession.from_dict(deep_thaw(record.composer_meta)["guided_session"])
+    staged_options = guided_after.pending_output_intents[output_id].options
+    assert staged_options is not None
+    assert staged_options["path"] == str(blob_path)
+
+
 def test_respond_settlement_shares_chat_lock_and_never_polls_under_it() -> None:
     from elspeth.web.sessions.routes.composer import guided_chat_atomic
 
@@ -972,7 +1763,10 @@ def test_only_one_schema8_respond_route_is_registered(composer_test_client: Test
     routes = [
         route
         for route in composer_test_client.app.routes
-        if getattr(route, "path", None) == "/api/sessions/{session_id}/guided/respond" and "POST" in getattr(route, "methods", set())
+        # ``Route`` (not ``APIRoute``) so a duplicate registered through the
+        # bare Starlette API would still be counted; ``Mount`` is not a
+        # ``Route`` and carries no methods, exactly as before.
+        if isinstance(route, Route) and route.path == "/api/sessions/{session_id}/guided/respond" and "POST" in (route.methods or set())
     ]
     assert len(routes) == 1
     session_id = _create_session(composer_test_client)
@@ -1143,6 +1937,9 @@ def test_settlement_failure_rolls_back_state_and_evidence_and_returns_only_safe_
     assert failure_log["exc_class"] == failure_type.__name__
     assert failure_log["site"] == "post_guided_respond"
     assert failure_log["frames"]
+    # R2-F16b: the correlation field is always emitted (None here — this app
+    # carries no RequestIdMiddleware).
+    assert "request_id" in failure_log
     assert secret_canary not in repr(logs)
     assert asyncio.run(service.get_state_versions(UUID(session_id))) == []
     assert asyncio.run(service.get_messages(UUID(session_id), limit=None)) == []
@@ -1399,10 +2196,16 @@ def test_route_adapter_dispatches_all_six_schema8_stage_transitions(
         "_schema8_schema_authority",
         lambda **_kwargs: guided_route.SchemaFormAuthority(knobs={"fields": []}, model_validated_options={}),
     )
+
+    class _AvailableCatalog:
+        def unavailable_reason(self, _plugin_id: object) -> None:
+            return None
+
     updated, _payload = guided_route._schema8_transition(
         guided,
         turn,
         request_model,
+        catalog=_AvailableCatalog(),
         new_stable_id=server_stable_id,
     )
 
@@ -1504,6 +2307,7 @@ def test_route_adapter_dispatches_closed_component_review_actions(
         guided,
         turn,
         request,
+        catalog=object(),  # Component actions do not consult the catalog.
         new_stable_id=UUID("33333333-3333-4333-8333-333333333333"),
     )
 
@@ -1562,18 +2366,7 @@ def test_route_takeover_uses_live_fence_and_stale_worker_joins_winner(
         async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
             stale = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
             await asyncio.wait_for(first_at_settle.wait(), timeout=3)
-            with engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "UPDATE guided_operations SET lease_expires_at = :expired "
-                        "WHERE session_id = :session_id AND operation_id = :operation_id"
-                    ),
-                    {
-                        "expired": datetime.now(UTC) - timedelta(seconds=1),
-                        "session_id": session_id,
-                        "operation_id": body["operation_id"],
-                    },
-                )
+            abandon_guided_worker_leases(engine, session_id=session_id, operation_id=body["operation_id"])
             winner = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
             await asyncio.wait_for(takeover_reserved.wait(), timeout=3)
             allow_stale_settle.set()

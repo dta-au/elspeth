@@ -1,11 +1,26 @@
 # ADR-030: Multi-Worker Deployment Shape — One-Host WAL Pack
 
 **Date:** 2026-06-11
-**Status:** Accepted (Proposed at slice 0; Accepted at slice 5 of elspeth-1396d3f790)
-**Deciders:** John Morrissey, Claude Fable 5
+**Status:** Accepted (Proposed at slice 0; Accepted at slice 5 of
+elspeth-1396d3f790; amended by ADR-041 on 2026-08-11)
+**Deciders:** ELSPETH maintainer
 **Tags:** scheduler, coordination, multi-worker, deployment, sqlite, wal,
           leader-election, fencing, multi-source-token-scheduler, adr-026,
           precondition-9
+
+## Amendment (2026-08-11)
+
+**Amended by ADR-041:** this document remains the historical decision for the
+0.6.0 SQLite WAL one-host worker pack. ADR-041 supersedes only D7's future-port
+posture and the Supported / NOT supported section's PostgreSQL runtime refusal:
+PostgreSQL 16 single-leader is now a required first-class state-engine backend
+for the maintained AWS Landscape deployment. The SQLite one-host leader/follower
+profile remains governed here. PostgreSQL multi-replica scheduling, multi-host
+follower scheduling, and multiple web replicas remain unsupported and require
+their own catalog/profile revision and evidence.
+
+The original text below is preserved as the dated 0.6.0 decision rather than
+rewritten to appear as though PostgreSQL was supported at that time.
 
 ## Context
 
@@ -102,8 +117,15 @@ rows never return to `active`; a returning process mints a fresh uuid.
 Shutdown: follower SIGINT = finish/abandon current claim, depart, exit 0;
 leader SIGINT = `checkpoint_interrupted_progress`, fenced
 `update_run_status(INTERRUPTED)`, `leader_release` with the seat zeroed.
-Recovery of any leaderless run is `elspeth resume`. Followers never
-auto-promote.
+Recovery of any leaderless run is `elspeth resume` when the shared resume
+gates admit it, and `elspeth abandon` when they refuse (2026-09-08,
+elspeth-5dd23f4df9): resume's source-lifecycle gate (ADR-038) refuses while
+any source is outside the source-complete set, and the pull-then-process
+ingest loop records `EXHAUSTED` only after the last row's traversal returns —
+so a leader that dies mid-run leaves a run resume cannot take. `abandon`
+takes the dead seat through the same takeover CAS and finalizes INTERRUPTED
+under it, which is the fenced arm the ADR-038 abandonment sweep runs on
+(`engine/orchestrator/abandon.py`). Followers never auto-promote.
 
 ### D4 — Fencing: epoch verify-and-extend + membership, both in-statement
 
@@ -218,6 +240,11 @@ follower auto-promotion.
 
 ### Negative Consequences
 
+- An `IO_WRITE` or `EXTERNAL_CALL` transform can finish external work after
+  the hard item-stall budget has authorized takeover. The old result and
+  scheduler disposition are fenced, but the external operation is not:
+  transform execution is at-least-once across takeover and requires
+  plugin/provider idempotency or reconciliation.
 - At-least-once external sink emission across leader suspension remains,
   bounded to one in-flight batch, ledger-refused and audit-attributed — the
   irreducible residue of fencing non-transactional side effects with a
@@ -257,9 +284,12 @@ follower auto-promotion.
 ### Tickets
 
 - **elspeth-1396d3f790** — cross-process multi-worker run coordination
-  (option c), the feature this ADR shapes.
+  (option c), the feature this ADR shapes. Commits `cb0680166` and `b5b3eb035`
+  preserve its design and acceptance. Live successors are `elspeth-b5d7aa5655`
+  (make web runtime multi-replica safe) and `elspeth-4d6c0dd0f5` (remediate
+  deferred-platform review failures before multi-replica integration).
 - **elspeth-2f23292372** — resume() entry guard (option b), landed; gains
-  seat-liveness precision under this ADR.
+  seat-liveness precision under this ADR. Archived store only (closed there).
 - **elspeth-6116873e3b / elspeth-7bb7124e8f** — G25b isolation and G25h chaos
   campaigns (slice 5).
 - **elspeth-3977d8ab60** — batches-row-COMPLETED-before-complete_barrier

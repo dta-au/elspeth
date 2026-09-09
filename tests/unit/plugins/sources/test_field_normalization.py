@@ -437,3 +437,99 @@ class TestFieldResolutionImmutability:
         )
         original_mapping["injected"] = "evil"
         assert "injected" not in resolution.resolution_mapping
+
+
+class TestUndeclaredRowFields:
+    """``undeclared_row_fields`` is the shared config-time coverage predicate.
+
+    Both authoring surfaces call it (``LLMConfig`` and the composer's
+    ``_validate_prompt_template_variable_bindings``), so a defect here is a
+    defect in both at once (elspeth-a9ba80cb0b).
+    """
+
+    def _u(self, fields: set[str], declared: list[str]) -> tuple[str, ...]:
+        from elspeth.plugins.sources.field_normalization import undeclared_row_fields
+
+        return undeclared_row_fields(fields, declared)
+
+    def test_reports_a_field_the_declaration_does_not_cover(self) -> None:
+        assert self._u({"case_study"}, ["case_study_1"]) == ("case_study",)
+
+    def test_literal_match_covers(self) -> None:
+        assert self._u({"case_study"}, ["case_study"]) == ()
+
+    def test_wider_declaration_covers(self) -> None:
+        assert self._u({"case_study"}, ["case_study", "audit_id"]) == ()
+
+    def test_reports_only_the_shortfall_sorted(self) -> None:
+        assert self._u({"zeta", "alpha", "a"}, ["a"]) == ("alpha", "zeta")
+
+    def test_a_declarable_variant_is_reported_not_bridged(self) -> None:
+        """Coverage is EXACT, because render-time resolution is.
+
+        ``SchemaContract.find_name`` matches a field's ``normalized_name`` OR
+        its ``original_name`` — two exact spellings, neither knowable at config
+        time. So ``{{ row.Name }}`` against a declared ``name`` resolves only if
+        the producer's original header happened to be ``Name``; measured
+        against a row whose one column is ``a_b``, twelve declarable spellings
+        (``A_B``, ``a__b``, ``A_B_``, ...) raise on every row and one renders.
+        An earlier version bridged these through ``normalize_field_name`` and
+        silenced all twelve, including plain typos of the declared name.
+        """
+        assert self._u({"Name"}, ["name"]) == ("Name",)
+        assert self._u({"a__b"}, ["a_b"]) == ("a__b",)
+        assert self._u({"A_B_"}, ["a_b"]) == ("A_B_",)
+
+    def test_undeclarable_literal_is_bridged_to_its_canonical_key(self) -> None:
+        """The one sound inference, and it runs the OTHER way.
+
+        A literal that is not a legal declaration entry can never be a
+        ``normalized_name``, so it can only be an ``original_name`` and the row
+        key it resolves to IS its canonical form.
+        """
+        assert self._u({"Original Header"}, ["original_header"]) == ()
+        assert self._u({"class"}, ["class_"]) == ()
+        assert self._u({"meta.prompt"}, ["meta_prompt"]) == ()
+
+    def test_undeclarable_literal_is_reported_when_its_canonical_key_is_not_declared(self) -> None:
+        """Dropping these unconditionally was a false negative, not caution.
+
+        The declaration omitting the field entirely was accepted and then
+        raised at render for every row — while the sibling declared-fields
+        validator was already telling authors to declare exactly this name.
+        """
+        assert self._u({"Original Header"}, ["something_else"]) == ("Original Header",)
+        assert self._u({"class"}, ["unrelated"]) == ("class",)
+
+    def test_a_literal_with_no_declarable_form_is_dropped(self) -> None:
+        """There is nothing to ask for: ``'!!!'`` normalizes to nothing."""
+        assert self._u({"!!!"}, ["x"]) == ()
+
+    def test_declarable_underscore_is_reported(self) -> None:
+        """``_`` IS a legal declaration entry, so its shortfall is repairable."""
+        assert self._u({"_"}, ["x"]) == ("_",)
+        assert self._u({"_"}, ["_"]) == ()
+
+    def test_undeclarable_declaration_entries_cover_nothing(self) -> None:
+        assert self._u({"a"}, ["Original Header"]) == ("a",)
+
+    def test_empty_inputs(self) -> None:
+        assert self._u(set(), ["a"]) == ()
+        assert self._u({"a"}, []) == ("a",)
+
+    def test_the_repair_the_renderer_names_is_the_one_the_check_accepts(self) -> None:
+        """``describe_undeclared_row_fields`` and ``undeclared_row_fields`` are
+        the repair and the check for one contract, and they disagreed once."""
+        from elspeth.plugins.sources.field_normalization import (
+            declarable_field_name,
+            describe_undeclared_row_fields,
+        )
+
+        for literal in ("Original Header", "class", "meta.prompt", "case_study", "Name"):
+            covering = declarable_field_name(literal)
+            assert covering is not None
+            assert self._u({literal}, [covering]) == (), f"{literal!r} not cleared by its own named repair"
+            rendered = describe_undeclared_row_fields((literal,))
+            assert covering in rendered
+
+        assert declarable_field_name("!!!") is None

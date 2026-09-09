@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { cancelTutorialRun, runTutorialPipeline } from "@/api/client";
-import { AlertBanner } from "@/components/ui";
+import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+import { AlertBanner, Button } from "@/components/ui";
 import type { TutorialRunResponse } from "@/types/api";
-import { TUTORIAL_RUN_PREAMBLE, TUTORIAL_SHIELD_OVERRIDE_CAVEAT, TURN_4_PRIMARY_BUTTON } from "./copy";
+import {
+  TUTORIAL_RUN_PREAMBLE,
+  TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
+  TUTORIAL_SHIELD_WIRED_NOTE,
+  TURN_4_PRIMARY_BUTTON,
+  TURN_4_READY_BODY,
+  TURN_4_RUN_BUTTON,
+} from "./copy";
 import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
 
 interface TutorialTurn4RunProps {
@@ -131,6 +139,14 @@ export function TutorialTurn4Run({
   onCancelled,
   onBack,
 }: TutorialTurn4RunProps): JSX.Element {
+  // The run never auto-fires (I-1). `armed` flips true on the learner's Run
+  // click and gates the run effect below. It initialises TRUE only when this
+  // session already has a cached run — the in-page audit → Back → run
+  // remount, where the completed result is re-viewable and offering Run
+  // again would be a second execution. A fresh mount (first arrival, or a
+  // resume after reload — the cache is module-level and dies with the page)
+  // starts disarmed on the pre-run card.
+  const [armed, setArmed] = useState(() => tutorialRunCache.has(sessionId));
   const [result, setResult] = useState<TutorialRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState<RunPhase>("fetch");
@@ -146,6 +162,11 @@ export function TutorialTurn4Run({
   }, []);
 
   useEffect(() => {
+    if (!armed) {
+      // Pre-run card: no request, no phase timers. The learner has not
+      // clicked Run yet.
+      return;
+    }
     let active = true;
     setResult(null);
     setError(null);
@@ -216,7 +237,15 @@ export function TutorialTurn4Run({
     // captured at the most recent effect run, which is fine here: onCancelled
     // is a stable "dispatch a fixed action" callback, not state-dependent.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, retryNonce]);
+  }, [sessionId, retryNonce, armed]);
+
+  const onRunClick = (): void => {
+    setArmed(true);
+    // The Run button the learner just pressed leaves the DOM; put focus on
+    // the heading (now "Running your pipeline.") so keyboard and AT users
+    // are not dropped at the document root.
+    headingRef.current?.focus();
+  };
 
   const onCancelClick = (): void => {
     abandonTutorialRun(sessionId);
@@ -228,19 +257,93 @@ export function TutorialTurn4Run({
     setRetryNonce((n) => n + 1);
   };
 
+  /**
+   * Which prompt-shield teaching moment is true for THIS deployment.
+   *
+   * Both strings state a checkable fact about the pipeline the user is watching
+   * run, so neither may be rendered on a guess. Three states, not two:
+   *
+   * - `"wired"` — a shield is selected AND the control mode is `required`. Only
+   *   then is every clause true: coverage validation would have refused the
+   *   pipeline otherwise, so a shield is certainly in it.
+   * - `"absent"` — no shield selected, so the deployment cannot have wired one.
+   * - `null` — selected but merely `recommend`, or the policy is unreadable.
+   *   Under `recommend` the aid asks for a shield and nothing enforces it, so
+   *   whether this pipeline has one is unknowable from policy alone; claiming
+   *   either way would be the same falsehood this conditional exists to remove.
+   */
+  const [shieldNote, setShieldNote] = useState<"wired" | "absent" | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPluginPolicy()
+      .then((snapshot) => {
+        if (cancelled) {
+          return;
+        }
+        const selected = snapshot.data.selections.some(
+          (selection) =>
+            selection.capability === "prompt_shield" && selection.plugin_id !== null,
+        );
+        if (!selected) {
+          setShieldNote("absent");
+          return;
+        }
+        const required = snapshot.data.control_modes.some(
+          (control) =>
+            control.capability === "prompt_shield" && control.mode === "required",
+        );
+        setShieldNote(required ? "wired" : null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setShieldNote(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const phaseText = describePhase(phase);
 
   return (
     <section className="tutorial-turn" aria-labelledby="tutorial-run-title">
       <p className="tutorial-kicker">Run</p>
       <h2 id="tutorial-run-title" ref={headingRef} tabIndex={-1}>
-        Running your pipeline.
+        {armed ? "Running your pipeline." : "Ready to run."}
       </h2>
       <AlertBanner tone="info" className="tutorial-disclosure">
         {TUTORIAL_RUN_PREAMBLE}
       </AlertBanner>
-      <p className="tutorial-callout">{TUTORIAL_SHIELD_OVERRIDE_CAVEAT}</p>
-      {result === null && error === null && (
+      {shieldNote !== null && (
+        <p className="tutorial-callout">
+          {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
+        </p>
+      )}
+      {!armed && (
+        // Pre-run card (I-1): the committed graph sits in the pipeline pane
+        // beside this card; the run waits for the learner's explicit click.
+        // No role="status" here — nothing is in progress yet.
+        <>
+          <p className="tutorial-run-ready">{TURN_4_READY_BODY}</p>
+          <div className="tutorial-actions">
+            <Button variant="primary" onClick={onRunClick}>
+              {TURN_4_RUN_BUTTON}
+            </Button>
+            {onBack !== undefined && (
+              <Button
+                variant="bare"
+                className="tutorial-link-button"
+                onClick={onBack}
+              >
+                Back
+              </Button>
+            )}
+          </div>
+        </>
+      )}
+      {armed && result === null && error === null && (
         <>
           <div
             role="status"
@@ -252,13 +355,7 @@ export function TutorialTurn4Run({
           </div>
           {showCancel && (
             <div className="tutorial-actions">
-              <button
-                type="button"
-                className="btn"
-                onClick={onCancelClick}
-              >
-                Cancel run
-              </button>
+              <Button onClick={onCancelClick}>Cancel run</Button>
             </div>
           )}
         </>
@@ -269,21 +366,17 @@ export function TutorialTurn4Run({
             {error}
           </p>
           <div className="tutorial-actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={onRetryClick}
-            >
+            <Button variant="primary" onClick={onRetryClick}>
               Retry
-            </button>
+            </Button>
             {onBack !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="tutorial-link-button"
                 onClick={onBack}
               >
                 Back
-              </button>
+              </Button>
             )}
           </div>
         </>
@@ -303,22 +396,18 @@ export function TutorialTurn4Run({
           )}
           <TutorialResultTable rows={result.rows} />
           <div className="tutorial-actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => onCompleted(result)}
-            >
+            <Button variant="primary" onClick={() => onCompleted(result)}>
               {TURN_4_PRIMARY_BUTTON}
-            </button>
+            </Button>
             {onBack !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="tutorial-link-button"
                 onClick={onBack}
                 aria-label="Back to the pipeline build"
               >
                 Back
-              </button>
+              </Button>
             )}
           </div>
         </>
@@ -347,7 +436,7 @@ function TutorialResultTable({ rows }: { rows: RunResultRow[] }): JSX.Element {
         <thead>
           <tr>
             {columns.map((column) => (
-              <th key={column}>{titleCase(column)}</th>
+              <th key={column}>{titleCaseLabel(column)}</th>
             ))}
           </tr>
         </thead>
@@ -391,10 +480,6 @@ function stringifyCell(value: unknown): string {
     return String(value);
   }
   return JSON.stringify(value);
-}
-
-function titleCase(value: string): string {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function formatError(err: unknown): string {

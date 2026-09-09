@@ -11,9 +11,10 @@ Tests cover:
 
 from __future__ import annotations
 
+import inspect
 from collections import defaultdict as collections_defaultdict
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, ClassVar, cast
 from unittest.mock import patch
@@ -122,14 +123,12 @@ _TOKEN = Token(
     row_id="row-1",
     created_at=_DT,
     run_id="run-1",
-    fork_group_id=None,
     join_group_id=None,
-    expand_group_id=None,
-    branch_name=None,
     step_in_pipeline=0,
 )
 
 _SCHEDULER_EVENT = SchedulerEvent(
+    seq=1,
     event_id="sched-evt-1",
     run_id="run-1",
     token_id="tok-1",
@@ -501,6 +500,9 @@ class _QueryRecorder:
     node_states: list[Any]
     routing_events: list[Any]
     state_calls: list[Any]
+    lineage_paths: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    group_records: list[Any] = field(default_factory=list)
+    group_losses: list[Any] = field(default_factory=list)
 
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
         for offset in range(0, len(self.rows), batch_size):
@@ -509,6 +511,15 @@ class _QueryRecorder:
     def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
         wanted = set(row_ids)
         return [token for token in self.tokens if token.row_id in wanted]
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[Any, ...]]:
+        return {token_id: self.lineage_paths.get(token_id, ()) for token_id in token_ids}
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return self.group_records
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return self.group_losses
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         wanted = set(token_ids)
@@ -581,11 +592,32 @@ class _ExportReadModelRecorder:
     def get_artifacts(self, run_id: str) -> list[Any]:
         return self._execution.get_artifacts(run_id)
 
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effect_attempts_for_run(self, run_id: str) -> list[Any]:
+        return []
+
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
         return self._query.iter_rows_for_run(run_id, batch_size=batch_size)
 
     def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
         return self._query.get_tokens_for_rows(run_id, row_ids)
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[Any, ...]]:
+        return self._query.get_lineage_paths_for_tokens(run_id, token_ids)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return self._query.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return self._query.get_group_losses_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         return self._query.get_token_parents_for_tokens(token_ids)
@@ -664,6 +696,25 @@ def _make_exporter(
             artifacts=artifacts,
         ),
     )
+
+
+class _IncompleteSinkEffectReadModel:
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any]:
+        return []
+
+
+def test_sink_effect_export_requires_the_complete_read_model_contract() -> None:
+    exporter = _make_exporter()
+    exporter._read_model = cast(Any, _IncompleteSinkEffectReadModel())
+
+    with pytest.raises(AttributeError, match="get_sink_effect_attempts_for_run"):
+        list(exporter._iter_sink_effect_records("run-1"))
 
 
 def _make_export_read_model(
@@ -993,22 +1044,173 @@ class TestExportRunSigned:
 
 
 class _SpyReadModel:
-    """Delegating read-model proxy that records every query-family call."""
+    """Explicit delegating read-model proxy that records every query-family call.
 
-    def __init__(self, inner: Any) -> None:
+    Every public method of :class:`_ExportReadModelRecorder` is written out
+    here rather than resolved by a catch-all ``__getattr__``. Because
+    ``test_first_record_yields_before_later_query_families`` asserts
+    ``touched <= allowed``, an unrecorded family would make that assertion pass
+    vacuously — so construction pins the recorded surface against the wrapped
+    recorder's public surface, and a newly added query family fails loudly
+    here until it is written out below.
+    """
+
+    _RECORDED: ClassVar[frozenset[str]] = frozenset(
+        {
+            "get_run",
+            "get_run_attribution",
+            "get_web_plugin_policy_evidence",
+            "get_secret_resolutions_for_run",
+            "get_nodes",
+            "get_edges",
+            "get_validation_errors_for_run",
+            "get_transform_errors_for_run",
+            "get_operations_for_run",
+            "get_all_operation_calls_for_run",
+            "get_batches",
+            "get_all_batch_members_for_run",
+            "get_artifacts",
+            "get_sink_effect_streams_for_run",
+            "get_sink_effects_for_run",
+            "get_sink_effect_members_for_run",
+            "get_sink_effect_attempts_for_run",
+            "iter_rows_for_run",
+            "get_tokens_for_rows",
+            "get_lineage_paths_for_tokens",
+            "get_group_records_for_run",
+            "get_group_losses_for_run",
+            "get_token_parents_for_tokens",
+            "get_token_outcomes_for_tokens",
+            "get_scheduler_events_for_tokens",
+            "get_node_states_for_tokens",
+            "get_routing_events_for_states",
+            "get_calls_for_states",
+        }
+    )
+
+    def __init__(self, inner: _ExportReadModelRecorder) -> None:
         self._inner = inner
         self.calls: list[str] = []
+        surface = {name for name, _func in inspect.getmembers(_ExportReadModelRecorder, inspect.isfunction) if not name.startswith("_")}
+        assert surface == self._RECORDED, (
+            f"_SpyReadModel records {sorted(self._RECORDED - surface)} that no longer exist and misses "
+            f"{sorted(surface - self._RECORDED)} — an unrecorded query family makes the streaming assertion vacuous"
+        )
 
-    def __getattr__(self, name: str) -> Any:
-        original = getattr(self._inner, name)
-        if not callable(original):
-            return original
+    def _record(self, name: str) -> None:
+        self.calls.append(name)
 
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            self.calls.append(name)
-            return original(*args, **kwargs)
+    def get_run(self, run_id: str) -> Run | None:
+        self._record("get_run")
+        return self._inner.get_run(run_id)
 
-        return wrapper
+    def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
+        self._record("get_run_attribution")
+        return self._inner.get_run_attribution(run_id)
+
+    def get_web_plugin_policy_evidence(self, run_id: str) -> WebPluginPolicyEvidence | None:
+        self._record("get_web_plugin_policy_evidence")
+        return self._inner.get_web_plugin_policy_evidence(run_id)
+
+    def get_secret_resolutions_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_secret_resolutions_for_run")
+        return self._inner.get_secret_resolutions_for_run(run_id)
+
+    def get_nodes(self, run_id: str) -> list[Any]:
+        self._record("get_nodes")
+        return self._inner.get_nodes(run_id)
+
+    def get_edges(self, run_id: str) -> list[Any]:
+        self._record("get_edges")
+        return self._inner.get_edges(run_id)
+
+    def get_validation_errors_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_validation_errors_for_run")
+        return self._inner.get_validation_errors_for_run(run_id)
+
+    def get_transform_errors_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_transform_errors_for_run")
+        return self._inner.get_transform_errors_for_run(run_id)
+
+    def get_operations_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_operations_for_run")
+        return self._inner.get_operations_for_run(run_id)
+
+    def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_all_operation_calls_for_run")
+        return self._inner.get_all_operation_calls_for_run(run_id)
+
+    def get_batches(self, run_id: str) -> list[Any]:
+        self._record("get_batches")
+        return self._inner.get_batches(run_id)
+
+    def get_all_batch_members_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_all_batch_members_for_run")
+        return self._inner.get_all_batch_members_for_run(run_id)
+
+    def get_artifacts(self, run_id: str) -> list[Any]:
+        self._record("get_artifacts")
+        return self._inner.get_artifacts(run_id)
+
+    def get_sink_effect_streams_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effect_streams_for_run")
+        return self._inner.get_sink_effect_streams_for_run(run_id)
+
+    def get_sink_effects_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effects_for_run")
+        return self._inner.get_sink_effects_for_run(run_id)
+
+    def get_sink_effect_members_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effect_members_for_run")
+        return self._inner.get_sink_effect_members_for_run(run_id)
+
+    def get_sink_effect_attempts_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_sink_effect_attempts_for_run")
+        return self._inner.get_sink_effect_attempts_for_run(run_id)
+
+    def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
+        self._record("iter_rows_for_run")
+        return self._inner.iter_rows_for_run(run_id, batch_size=batch_size)
+
+    def get_tokens_for_rows(self, run_id: str, row_ids: Sequence[str]) -> list[Any]:
+        self._record("get_tokens_for_rows")
+        return self._inner.get_tokens_for_rows(run_id, row_ids)
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[Any, ...]]:
+        self._record("get_lineage_paths_for_tokens")
+        return self._inner.get_lineage_paths_for_tokens(run_id, token_ids)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_group_records_for_run")
+        return self._inner.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_group_losses_for_run")
+        return self._inner.get_group_losses_for_run(run_id)
+
+    def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_token_parents_for_tokens")
+        return self._inner.get_token_parents_for_tokens(token_ids)
+
+    def get_token_outcomes_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_token_outcomes_for_tokens")
+        return self._inner.get_token_outcomes_for_tokens(run_id, token_ids)
+
+    def get_scheduler_events_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_scheduler_events_for_tokens")
+        return self._inner.get_scheduler_events_for_tokens(run_id, token_ids)
+
+    def get_node_states_for_tokens(self, run_id: str, token_ids: Sequence[str]) -> list[Any]:
+        self._record("get_node_states_for_tokens")
+        return self._inner.get_node_states_for_tokens(run_id, token_ids)
+
+    def get_routing_events_for_states(self, state_ids: Sequence[str]) -> list[Any]:
+        self._record("get_routing_events_for_states")
+        return self._inner.get_routing_events_for_states(state_ids)
+
+    def get_calls_for_states(self, state_ids: Sequence[str]) -> list[Any]:
+        self._record("get_calls_for_states")
+        return self._inner.get_calls_for_states(state_ids)
 
 
 def _make_row(index: int) -> Row:
@@ -1064,7 +1266,10 @@ class TestExportRunStreaming:
                 yield batch
 
         read_model = _SpyReadModel(read_model)
-        read_model.iter_rows_for_run = counting_iter  # type: ignore[attr-defined]
+        # Shadowing the explicit method with an instance attribute: the counting
+        # generator matches iter_rows_for_run's signature exactly, so no
+        # suppression is needed now that the method is written out.
+        read_model.iter_rows_for_run = counting_iter
         exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, row_batch_size=1)
 
         iterator = exporter.export_run("run-1")
@@ -1463,7 +1668,6 @@ class TestTokenOutcomeRecords:
         assert o["recorded_at"] == _DT2.isoformat()
         assert o["sink_name"] == "output"
         assert o["batch_id"] is None
-        assert o["fork_group_id"] is None
         assert o["error_hash"] is None
 
     def test_token_outcome_follows_token_parent(self) -> None:
@@ -1503,6 +1707,7 @@ class TestSchedulerEventRecords:
         events = [r for r in records if r["record_type"] == "scheduler_event"]
         assert len(events) == 1
         e = events[0]
+        assert e["seq"] == 1
         assert e["event_id"] == "sched-evt-1"
         assert e["run_id"] == "run-1"
         assert e["token_id"] == "tok-1"
@@ -2151,9 +2356,9 @@ class TestTimestampPreservation:
             type_records = [r for r in records if r["record_type"] == record_type]
             assert len(type_records) >= 1, f"No {record_type} records found"
             for rec in type_records:
-                for field in fields:
-                    assert rec[field] is not None, f"{record_type}.{field} is None — timestamp not preserved"
-                    assert isinstance(rec[field], str), f"{record_type}.{field} is {type(rec[field])}, expected str"
+                for field_name in fields:
+                    assert rec[field_name] is not None, f"{record_type}.{field_name} is None — timestamp not preserved"
+                    assert isinstance(rec[field_name], str), f"{record_type}.{field_name} is {type(rec[field_name])}, expected str"
 
 
 class TestFullPipelineExport:
@@ -2227,10 +2432,7 @@ class TestFullPipelineExport:
             row_id="row-2",
             created_at=_DT2,
             run_id="run-1",
-            fork_group_id=None,
             join_group_id=None,
-            expand_group_id=None,
-            branch_name=None,
             step_in_pipeline=0,
         )
         kwargs: dict[str, Any] = {

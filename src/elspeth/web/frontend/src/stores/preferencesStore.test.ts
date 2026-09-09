@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { selectTutorialCompleted, usePreferencesStore } from "./preferencesStore";
+import { selectShowAdvanced, selectTutorialCompleted, usePreferencesStore } from "./preferencesStore";
 import { resetStore } from "@/test/store-helpers";
 import {
   fetchUserComposerPreferences,
@@ -47,6 +47,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -75,6 +76,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-12T05:00:00Z",
     });
 
@@ -111,6 +113,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -156,6 +159,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -184,6 +188,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -216,6 +221,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-19T12:30:00Z",
     });
 
@@ -271,6 +277,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-09T00:00:00Z",
     });
     // Simulate the in-flight write settling shortly after the click.
@@ -324,6 +331,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null;
       tutorial_run_id: null;
       tutorial_source_data_hash: null;
+      show_advanced: false;
       updated_at: string;
     }) => void;
     mockUpdate.mockImplementationOnce(
@@ -348,6 +356,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-09T00:00:00Z",
     });
 
@@ -372,6 +381,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-09T00:00:00Z",
     });
 
@@ -382,42 +392,6 @@ describe("preferencesStore", () => {
       tutorial_completed_via: "exit",
     });
     expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(true);
-  });
-
-  it("resetTutorial clears tutorial_completed_at through the PATCH contract", async () => {
-    usePreferencesStore.setState({
-      loaded: true,
-      defaultMode: "guided",
-      tutorialCompletedAt: "2026-05-19T12:00:00Z",
-      tutorialCompleted: true,
-    });
-    mockUpdate.mockResolvedValueOnce({
-      default_mode: "guided",
-      banner_dismissed_at: null,
-      freeform_intro_dismissed_at: null,
-      tutorial_completed_at: null,
-      tutorial_stage: null,
-      tutorial_session_id: null,
-      tutorial_run_id: null,
-      tutorial_source_data_hash: null,
-      updated_at: "2026-05-19T12:30:00Z",
-    });
-
-    await usePreferencesStore.getState().resetTutorial();
-
-    // Completion AND the resume fields clear in one PATCH: Reset is also
-    // offered mid-tutorial (the wedged-resume escape hatch), where a stale
-    // stage/session surviving the reset would resume straight back into the
-    // state being escaped.
-    expect(mockUpdate).toHaveBeenCalledWith({
-      tutorial_completed_at: null,
-      tutorial_stage: null,
-      tutorial_session_id: null,
-      tutorial_run_id: null,
-      tutorial_source_data_hash: null,
-    });
-    expect(usePreferencesStore.getState().tutorialCompletedAt).toBeNull();
-    expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(false);
   });
 
   it("dismissDefaultChangedBanner persists timestamp", async () => {
@@ -432,6 +406,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: stamp,
     });
 
@@ -492,6 +467,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -521,6 +497,7 @@ describe("preferencesStore", () => {
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-15T00:00:00Z",
     });
 
@@ -583,6 +560,22 @@ describe("preferencesStore", () => {
     expect(state.writeError).not.toBeNull();
     expect(state.writeError).toMatch(/corrupt/i);
     expect(state.writeError).toMatch(/administrator|operator|contact/i);
+  });
+
+  it("leaves showAdvanced false and surfaces the error when the payload is rejected (elspeth-7d07df6438)", async () => {
+    // The decoder lives in api/preferencesDecoder.ts and is exercised in
+    // isolation there; this pins the CONSEQUENCE of a rejection through the
+    // store's existing fail-closed catch (bootstrap never fabricates a
+    // preference the user never set — see the block comment above).
+    mockFetch.mockRejectedValueOnce(
+      new Error("Invalid composer preferences at composer-preferences: missing show_advanced"),
+    );
+
+    await usePreferencesStore.getState().bootstrap();
+
+    const state = usePreferencesStore.getState();
+    expect(state.showAdvanced).toBe(false);
+    expect(state.writeError).not.toBeNull();
   });
 
   it("resolveDefaultMode throws immediately without re-bootstrapping when loaded=true and defaultMode=null", async () => {
@@ -689,6 +682,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-16T00:00:00Z",
     });
 
@@ -712,6 +706,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-16T00:00:00Z",
     });
 
@@ -758,6 +753,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-05-16T00:00:00Z",
     });
 
@@ -778,6 +774,7 @@ describe("preferencesStore — banner cluster + error surface (Phase 1B Panel)",
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: stamp,
     });
 
@@ -863,6 +860,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: "sess-1",
       tutorial_run_id: "run-1",
       tutorial_source_data_hash: "hash-1",
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -886,6 +884,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: "sess-2",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -921,6 +920,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: "sess-3",
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -953,6 +953,7 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
       tutorial_session_id: null,
       tutorial_run_id: null,
       tutorial_source_data_hash: null,
+      show_advanced: false,
       updated_at: "2026-07-02T00:00:00Z",
     });
 
@@ -964,5 +965,152 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
     expect(state.tutorialSessionId).toBeNull();
     expect(state.tutorialRunId).toBeNull();
     expect(state.tutorialSourceDataHash).toBeNull();
+  });
+
+  it("loads showAdvanced from the payload and defaults to false before bootstrap", async () => {
+    expect(usePreferencesStore.getState().showAdvanced).toBe(false);
+    mockFetch.mockResolvedValueOnce({
+      default_mode: "guided",
+      banner_dismissed_at: null,
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: true,
+      updated_at: "2026-05-15T00:00:00Z",
+    });
+    await usePreferencesStore.getState().bootstrap();
+    expect(selectShowAdvanced(usePreferencesStore.getState())).toBe(true);
+  });
+
+  it("setShowAdvanced writes optimistically and reverts on failure", async () => {
+    mockUpdate.mockRejectedValueOnce(new Error("offline"));
+    await expect(usePreferencesStore.getState().setShowAdvanced(true)).rejects.toThrow("offline");
+    const state = usePreferencesStore.getState();
+    expect(state.showAdvanced).toBe(false);
+    expect(state.writeError).toMatch(/Couldn't save your preference/);
+    expect(mockUpdate).toHaveBeenCalledWith({ show_advanced: true });
+  });
+
+  it("resetTutorial clears tutorial_completed_at through the PATCH contract", async () => {
+    usePreferencesStore.setState({
+      loaded: true,
+      defaultMode: "guided",
+      tutorialCompletedAt: "2026-05-19T12:00:00Z",
+      tutorialCompleted: true,
+    });
+    mockUpdate.mockResolvedValueOnce({
+      default_mode: "guided",
+      banner_dismissed_at: null,
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: false,
+      updated_at: "2026-05-19T12:30:00Z",
+    });
+
+    await usePreferencesStore.getState().resetTutorial();
+
+    // Completion AND the resume fields clear in one PATCH: Reset is also
+    // offered mid-tutorial (the wedged-resume escape hatch), where a stale
+    // stage/session surviving the reset would resume straight back into the
+    // state being escaped.
+    expect(mockUpdate).toHaveBeenCalledWith({
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+    });
+    expect(usePreferencesStore.getState().tutorialCompletedAt).toBeNull();
+    expect(selectTutorialCompleted(usePreferencesStore.getState())).toBe(false);
+  });
+});
+
+// ── Rate-limit retry (2026-08-16 bucket-split plan, Task 6) ────────────────
+// The tutorial's own stage-persist burst can transiently exhaust the write
+// bucket; the completion save is the one write whose loss has a durable
+// consequence (the tutorial re-shows on next load), so it retries exactly
+// once after a rate-limited 429, waiting out the envelope's retry_after.
+describe("preferencesStore — markTutorialGraduated 429 retry", () => {
+  const completedPayload = {
+    default_mode: "guided" as const,
+    banner_dismissed_at: null,
+    freeform_intro_dismissed_at: null,
+    tutorial_completed_at: "2026-08-16T00:00:00Z",
+    tutorial_stage: null,
+    tutorial_session_id: null,
+    tutorial_run_id: null,
+    tutorial_source_data_hash: null,
+    show_advanced: false,
+    updated_at: "2026-08-16T00:00:00Z",
+  };
+
+  beforeEach(() => {
+    resetStore(usePreferencesStore);
+    vi.clearAllMocks();
+  });
+
+  it("retries the graduation PATCH once after a rate-limited failure", async () => {
+    vi.useFakeTimers();
+    mockUpdate
+      .mockRejectedValueOnce({ status: 429, error_type: "rate_limited", detail: "…", retry_after: 2 })
+      .mockResolvedValueOnce(completedPayload); // reuse the file's payload fixture
+    const promise = usePreferencesStore.getState().markTutorialGraduated();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(promise).resolves.toBe(completedPayload.tutorial_completed_at);
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+    expect(usePreferencesStore.getState().writeError).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("gives up after the second rate-limited failure and surfaces the detail", async () => {
+    vi.useFakeTimers();
+    mockUpdate.mockRejectedValue({
+      status: 429, error_type: "rate_limited",
+      detail: "Rate limit exceeded. Try again in 2 seconds.", retry_after: 2,
+    });
+    const promise = usePreferencesStore.getState().markTutorialGraduated();
+    promise.catch(() => undefined); // assertion happens via store state below
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(promise).rejects.toMatchObject({ status: 429 });
+    expect(mockUpdate).toHaveBeenCalledTimes(2); // exactly one retry, no loop
+    expect(usePreferencesStore.getState().writeError).toContain("Rate limit exceeded");
+    expect(usePreferencesStore.getState().writing).toBe(false);
+    vi.useRealTimers();
+  });
+
+  // Invariant test, not a behaviour test. The whole store assumes `writing`
+  // is held for about one round-trip: markTutorialGraduated's own wait loop
+  // bounds at 5000ms, and five sibling actions — resetTutorial above all,
+  // the mid-tutorial wedged-resume escape hatch — silently `return` while
+  // it is true. A retry that sleeps out a large server-supplied retry_after
+  // (the live incident reported 26s) would hold the flag far past that
+  // bound: the double-stamp guard would lapse and Reset would go dead
+  // exactly when a struggling user reaches for it. So a retry_after above
+  // the cap does NOT sleep — it fails fast with the actionable detail.
+  // If someone raises MAX_RETRY_AFTER_WAIT_MS past the wait-loop bound,
+  // this test is what should stop them.
+  it("does not retry — or hold the write flag — when retry_after exceeds the cap", async () => {
+    mockUpdate.mockRejectedValue({
+      status: 429,
+      error_type: "rate_limited",
+      detail: "Rate limit exceeded. Try again in 26 seconds.",
+      retry_after: 26,
+    });
+    const promise = usePreferencesStore.getState().markTutorialGraduated();
+    await expect(promise).rejects.toMatchObject({ status: 429 });
+    // Exactly one attempt: no sleep, no second PATCH.
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    // Flag released immediately, so resetTutorial et al. stay reachable.
+    expect(usePreferencesStore.getState().writing).toBe(false);
+    expect(usePreferencesStore.getState().writeError).toContain(
+      "Try again in 26 seconds",
+    );
   });
 });

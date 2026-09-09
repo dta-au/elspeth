@@ -11,8 +11,11 @@ Security boundaries tested:
 from __future__ import annotations
 
 import io
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
+import pytest
 import structlog
 from fastapi import FastAPI
 from sqlalchemy.pool import StaticPool
@@ -24,11 +27,13 @@ from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import guided_operations_table, sessions_table
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Test app factory
@@ -47,7 +52,7 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -111,6 +116,51 @@ def _upload_blob(
     return body
 
 
+def _insert_session_fork_operation(blob_service: BlobServiceImpl, session_id: str, *, status: str) -> str:
+    """Persist one valid session-fork operation for a REST retention test."""
+    operation_id = str(uuid4())
+    now = datetime.now(UTC)
+    values: dict[str, Any] = {
+        "session_id": session_id,
+        "operation_id": operation_id,
+        "kind": "session_fork",
+        "status": status,
+        "request_hash": "f" * 64,
+        "attempt": 1,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if status == "in_progress":
+        values.update(lease_token="fork-lease", lease_expires_at=now + timedelta(hours=1))
+    elif status == "failed":
+        values.update(settled_at=now, failure_code="operation_failed")
+    elif status == "completed":
+        target_session_id = str(uuid4())
+        with blob_service._engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=target_session_id,
+                    user_id="alice",
+                    auth_provider_type="local",
+                    title="Fork child",
+                    forked_from_session_id=session_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        values.update(
+            settled_at=now,
+            result_kind="session",
+            result_session_id=target_session_id,
+            response_hash="e" * 64,
+        )
+    else:
+        raise AssertionError(f"unsupported test fork status {status!r}")
+    with blob_service._engine.begin() as conn:
+        conn.execute(guided_operations_table.insert().values(**values))
+    return operation_id
+
+
 # ---------------------------------------------------------------------------
 # Upload tests
 # ---------------------------------------------------------------------------
@@ -134,14 +184,16 @@ class TestUploadBlob:
         assert "storage_path" not in body
 
     def test_upload_blob_rejects_disallowed_mime_type(self, tmp_path) -> None:
-        """MIME allowlist: image/jpeg is not a data format."""
+        """MIME allowlist: image/gif is neither a data format nor an
+        approved binary document (jpeg/png/pdf are admitted since
+        elspeth-0c6a343921 through the signature-verified binary branch)."""
         app, _, _ = _make_app(tmp_path)
         client = TestClient(app)
         session_id = _create_session(client)
 
         resp = client.post(
             f"/api/sessions/{session_id}/blobs",
-            files={"file": ("photo.jpg", io.BytesIO(b"\xff\xd8\xff"), "image/jpeg")},
+            files={"file": ("anim.gif", io.BytesIO(b"GIF89a\x00"), "image/gif")},
         )
         assert resp.status_code == 415
 
@@ -293,13 +345,34 @@ class TestPreviewBlob:
 
 
 class TestDeleteBlob:
+    @pytest.mark.parametrize(
+        ("fork_status", "expected_status"),
+        [("in_progress", 409), ("completed", 204), ("failed", 204)],
+    )
+    def test_session_fork_retention_lifecycle(self, tmp_path, fork_status: str, expected_status: int) -> None:
+        app, _, blob_service = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+        blob = _upload_blob(client, session_id)
+        operation_id = _insert_session_fork_operation(blob_service, session_id, status=fork_status)
+
+        response = client.delete(f"/api/sessions/{session_id}/blobs/{blob['id']}")
+
+        assert response.status_code == expected_status
+        if fork_status == "in_progress":
+            assert operation_id in response.json()["detail"]
+            assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").status_code == 200
+        else:
+            assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").status_code == 404
+
     def test_pending_proposal_conflict_returns_409(self, tmp_path, monkeypatch) -> None:
         app, _, blob_service = _make_app(tmp_path)
         client = TestClient(app)
         session_id = _create_session(client)
         blob = _upload_blob(client, session_id)
 
-        async def reject_pending_proposal(blob_id) -> None:
+        async def reject_pending_proposal(blob_id, *, session_operation_context) -> None:
+            del session_operation_context
             raise BlobPendingProposalError(str(blob_id), proposal_id="proposal-pending")
 
         monkeypatch.setattr(blob_service, "delete_blob", reject_pending_proposal)
@@ -331,7 +404,7 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -383,8 +456,15 @@ class TestIDORProtection:
         resp = bob.get(f"/api/sessions/{bob_session}/blobs/{blob['id']}")
         assert resp.status_code == 404
 
-    def test_blob_delete_from_wrong_session_returns_404(self, tmp_path) -> None:
-        """DELETE another user's blob returns 404."""
+    def test_blob_delete_from_wrong_session_is_a_no_op_204(self, tmp_path) -> None:
+        """DELETE another user's blob is indistinguishable from deleting a missing one.
+
+        The service reads as the caller's session fence, so a foreign blob is
+        a ``BlobNotFoundError`` there, and the fenced route's delete is
+        idempotent (a missing blob is 204, the cleanup-capable shape the
+        contract gate mandates). The same 204 for "missing" and "not yours"
+        leaks nothing; the blob itself is untouched.
+        """
         alice, bob = self._make_two_session_app(tmp_path)
 
         alice_session = _create_session(alice, "Alice Session")
@@ -392,7 +472,10 @@ class TestIDORProtection:
         blob = _upload_blob(alice, alice_session)
 
         resp = bob.delete(f"/api/sessions/{bob_session}/blobs/{blob['id']}")
-        assert resp.status_code == 404
+        assert resp.status_code == 204
+        missing = bob.delete(f"/api/sessions/{bob_session}/blobs/{uuid4()}")
+        assert missing.status_code == 204
+        assert alice.get(f"/api/sessions/{alice_session}/blobs/{blob['id']}/content").content
 
     def test_blob_download_from_wrong_session_returns_404(self, tmp_path) -> None:
         """GET content for another user's blob returns 404."""
@@ -746,3 +829,166 @@ class TestUTF16Uploads:
         )
         assert resp.status_code == 201, resp.text
         assert resp.json()["mime_type"] == "text/plain"
+
+
+# ---------------------------------------------------------------------------
+# Binary-document admission (elspeth-0c6a343921): jpeg/png/pdf uploads under
+# normal blob custody, signature-verified against the DECLARED MIME type.
+# ---------------------------------------------------------------------------
+
+_JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_PDF_BYTES = b"%PDF-1.7\n1 0 obj\n%%EOF"
+
+
+class TestBinaryDocumentUpload:
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "content"),
+        [
+            ("page-1.jpg", "image/jpeg", _JPEG_BYTES),
+            ("page-1.png", "image/png", _PNG_BYTES),
+            ("doc.pdf", "application/pdf", _PDF_BYTES),
+        ],
+    )
+    def test_valid_binary_upload_admitted_with_full_provenance(self, tmp_path, filename: str, content_type: str, content: bytes) -> None:
+        import hashlib
+
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        body = _upload_blob(client, session_id, content=content, filename=filename, content_type=content_type)
+
+        assert body["mime_type"] == content_type
+        assert body["size_bytes"] == len(content)
+        assert body["content_hash"] == hashlib.sha256(content).hexdigest()
+        assert body["status"] == "ready"
+        assert body["created_by"] == "user"
+        assert body["source_description"] == "uploaded"
+
+    def test_empty_binary_body_rejected(self, tmp_path) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("empty.png", io.BytesIO(b""), "image/png")},
+        )
+        assert resp.status_code == 422
+
+    def test_binary_over_textract_inline_ceiling_rejected(self, tmp_path) -> None:
+        from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES
+
+        # App-level limit above the binary ceiling so THIS gate is the one
+        # that fires (the general limit is a separate 413).
+        app, _, _ = _make_app(tmp_path, max_upload_bytes=BINARY_DOCUMENT_MAX_BYTES + 1024)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        oversized = _PNG_BYTES + b"\x00" * BINARY_DOCUMENT_MAX_BYTES
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("big.png", io.BytesIO(oversized), "image/png")},
+        )
+        assert resp.status_code == 413
+        assert "Textract inline ceiling" in resp.json()["detail"]
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "content"),
+        [
+            # A different known signature is a mismatch, never a reclassification.
+            ("fake.png", "image/png", _JPEG_BYTES),
+            ("fake.jpg", "image/jpeg", _PNG_BYTES),
+            # Leading bytes defeat the offset-zero rule.
+            ("bom.pdf", "application/pdf", b"\xef\xbb\xbf" + _PDF_BYTES),
+            ("space.pdf", "application/pdf", b" " + _PDF_BYTES),
+            # An embedded signature later in the payload does not count.
+            ("embedded.pdf", "application/pdf", b"garbage" + _PDF_BYTES),
+            # Truncated signature.
+            ("short.jpg", "image/jpeg", b"\xff\xd8"),
+        ],
+    )
+    def test_signature_disagreement_rejected(self, tmp_path, filename: str, content_type: str, content: bytes) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": (filename, io.BytesIO(content), content_type)},
+        )
+        assert resp.status_code == 415
+        assert "signature" in resp.json()["detail"].lower()
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            # An ASCII-only PDF decodes as UTF-8, so the text sniffer would
+            # classify it text/plain; declaring a text/none MIME must not
+            # smuggle a known binary signature past the binary branch's
+            # declared-MIME/signature agreement and size admission.
+            "text/plain",
+            "application/octet-stream",
+        ],
+    )
+    def test_binary_signature_declared_as_text_rejected(self, tmp_path, content_type: str) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("doc.pdf", io.BytesIO(_PDF_BYTES), content_type)},
+        )
+        assert resp.status_code == 415
+        assert "signature" in resp.json()["detail"].lower()
+
+    def test_unsupported_binary_mime_stays_rejected(self, tmp_path) -> None:
+        """TIFF is a non-goal: it falls through to the text path's 415."""
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("doc.tiff", io.BytesIO(b"II*\x00rest"), "image/tiff")},
+        )
+        assert resp.status_code == 415
+
+    def test_inline_text_route_rejects_binary_signature_content(self, tmp_path) -> None:
+        """A pasted string carrying a known binary signature is the same
+        declaration mismatch as the upload route's text-path smuggle."""
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": "doc.txt", "mime_type": "text/plain", "content": _PDF_BYTES.decode("ascii")},
+        )
+        assert resp.status_code == 415
+        assert "signature" in resp.json()["detail"].lower()
+
+    def test_inline_text_route_rejects_binary_mime(self, tmp_path) -> None:
+        """The string-content inline route keeps its text-only vocabulary."""
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": "x.png", "mime_type": "image/png", "content": "not really binary"},
+        )
+        assert resp.status_code == 422
+
+    def test_binary_blob_downloads_byte_identical(self, tmp_path) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+        body = _upload_blob(client, session_id, content=_PDF_BYTES, filename="doc.pdf", content_type="application/pdf")
+
+        resp = client.get(f"/api/sessions/{session_id}/blobs/{body['id']}/content")
+        assert resp.status_code == 200
+        assert resp.content == _PDF_BYTES
+        assert resp.headers["content-type"].startswith("application/pdf")

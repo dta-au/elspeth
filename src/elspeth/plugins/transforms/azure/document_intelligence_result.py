@@ -52,6 +52,12 @@ def operation_location_host_matches(operation_url: str, endpoint: str) -> bool:
     try:
         op = urlparse(operation_url)
         ep = urlparse(endpoint)
+        # ParseResult.port performs validation lazily and can raise for malformed
+        # or out-of-range ports, so keep access inside the fail-closed guard.
+        parsed_op_port = op.port
+        parsed_ep_port = ep.port
+        op_port = parsed_op_port if parsed_op_port is not None else 443
+        ep_port = parsed_ep_port if parsed_ep_port is not None else 443
     except ValueError:
         return False
     if op.scheme != "https" or not op.hostname:
@@ -60,8 +66,6 @@ def operation_location_host_matches(operation_url: str, endpoint: str) -> bool:
         return False
     # Compare effective ports, normalizing the https default (443) so an explicit
     # ":443" matches an absent port. A same-host but attacker-port URL is rejected.
-    op_port = op.port if op.port is not None else 443
-    ep_port = ep.port if ep.port is not None else 443
     return op_port == ep_port
 
 

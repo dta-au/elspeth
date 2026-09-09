@@ -8,9 +8,12 @@ worker via ``_run_sync``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,12 +88,73 @@ class StatePayload:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditMessageDraft:
+    """One row of an audit cohort for ``SessionServiceImpl.add_messages_atomic``.
+
+    A cohort is one logical unit of audit evidence (the LLM-call sidecars
+    of one compose request, the tool-invocation breadcrumbs of one turn,
+    one planner evidence set) that must become durable together or not at
+    all (elspeth-90231248dc). Rows share the caller-supplied
+    ``writer_principal``; per-row fields are only the ones that
+    legitimately vary inside one cohort.
+
+    ``composition_state_id``, when set, overrides the cohort-level
+    ``composition_state_id`` parameter of ``add_messages_atomic`` for
+    this row; ``None`` falls back to the cohort-level value. One turn's
+    tool rows carry the post-compose state id while its LLM sidecars
+    carry the pre-send state id, and forcing those into separate
+    transactions to express that difference is exactly the partial-cohort
+    defect elspeth-90231248dc removed — the override lets the whole turn
+    settle as one cohort.
+
+    ``tool_call_id`` / ``parent_assistant_id`` must satisfy the same
+    role biconditional CHECKs as ``add_message``: set exactly when
+    ``role="tool"``, ``None`` otherwise.
+    """
+
+    role: ChatMessageRole
+    content: str
+    tool_calls: tuple[Mapping[str, Any], ...] | None = None
+    tool_call_id: str | None = None
+    parent_assistant_id: str | None = None
+    composition_state_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # ``tool_calls`` carries audit envelopes that must not change between
+        # cohort construction and the atomic insert. Both readers already
+        # expect frozen shapes: ``add_messages_atomic`` ``deep_thaw``s before
+        # the DB write, and ``record_settled_composer_audit_message`` admits
+        # ``MappingProxyType`` alongside ``dict``. ``None`` passes through
+        # ``deep_freeze`` unchanged.
+        freeze_fields(self, "tool_calls")
+
+
+@dataclass(frozen=True, slots=True)
 class RedactedToolRow:
     """One persisted tool row, with redactions already applied."""
 
     tool_call_id: str
     content: str  # JSON-serialised redacted response
     composition_state_payload: StatePayload | None  # set iff state advanced
+
+
+@dataclass(frozen=True, slots=True)
+class RejectionRecord:
+    """One refused mutation's durable reason (elspeth-3e28029d2f).
+
+    UNREDACTED by design — operator ruling 2026-09-02: the reason a composer
+    mutation tool refused a payload persists as session data (the private
+    audit-attribution surface, like ``chat_messages.raw_content``), while the
+    public ``tool`` chat row stays redacted. ``planner_payload`` is the exact
+    serialized response the planner saw — the text and the reasoning.
+    ``tool_call_id`` must name one of the turn's persisted tool rows.
+    """
+
+    tool_call_id: str
+    tool_name: str
+    error_code: str | None  # first coded validation entry, else failure class
+    message: str  # extracted human-readable reason
+    planner_payload: str  # JSON-serialised unredacted response
 
 
 @dataclass(frozen=True, slots=True)

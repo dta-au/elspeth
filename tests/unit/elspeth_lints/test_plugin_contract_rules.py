@@ -13,8 +13,11 @@ from elspeth_lints.core.protocols import RuleContext
 from elspeth_lints.rules.plugin_contract.component_type import RULE as COMPONENT_TYPE_RULE
 from elspeth_lints.rules.plugin_contract.plugin_hashes.rule import (
     EXPECTED_PLUGIN_COUNT,
+    PLUGIN_DIRS,
     PluginHashesRule,
     compute_source_file_hash,
+    discover_plugin_files,
+    extract_plugin_attributes,
 )
 from elspeth_lints.rules.plugin_contract.plugin_hashes.rule import (
     scan_root as scan_plugin_hashes_root,
@@ -346,6 +349,50 @@ def test_plugin_hashes_reports_missing_source_file_hash(tmp_path: Path) -> None:
 
     assert [finding.rule_id for finding in findings] == ["PH2"]
     assert "source_file_hash" in findings[0].message
+
+
+def test_plugin_hashes_scans_and_extracts_nested_llm_source(tmp_path: Path) -> None:
+    plugin = tmp_path / "plugins" / "sources" / "llm" / "source.py"
+    _write(
+        plugin,
+        """
+        class LLMSource(BaseSource):
+            name = "llm"
+            plugin_version = "1.0.0"
+            source_file_hash = "sha256:0000000000000000"
+        """,
+    )
+    declared_hash = compute_source_file_hash(plugin)
+    plugin.write_text(
+        plugin.read_text(encoding="utf-8").replace("sha256:0000000000000000", declared_hash),
+        encoding="utf-8",
+    )
+
+    assert "plugins/sources/llm" in PLUGIN_DIRS
+    assert plugin in discover_plugin_files(tmp_path)
+    attributes = extract_plugin_attributes(plugin)
+    assert [(item.class_name, item.plugin_version, item.source_file_hash) for item in attributes] == [("LLMSource", "1.0.0", declared_hash)]
+    assert scan_plugin_hashes_root(tmp_path, min_plugins=1) == []
+
+    plugin.write_text(plugin.read_text(encoding="utf-8") + "\n# stale\n", encoding="utf-8")
+    findings = scan_plugin_hashes_root(tmp_path, min_plugins=1)
+    assert [finding.rule_id for finding in findings] == ["PH3"]
+    assert findings[0].file_path == "plugins/sources/llm/source.py"
+
+
+def test_plugin_hashes_reports_missing_hash_for_nested_llm_source(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "plugins" / "sources" / "llm" / "source.py",
+        """
+        class LLMSource(BaseSource):
+            name = "llm"
+            plugin_version = "1.0.0"
+        """,
+    )
+
+    findings = scan_plugin_hashes_root(tmp_path, min_plugins=1)
+    assert [finding.rule_id for finding in findings] == ["PH2"]
+    assert findings[0].file_path == "plugins/sources/llm/source.py"
 
 
 def test_plugin_hashes_reports_missing_hash_for_module_constant_name(tmp_path: Path) -> None:

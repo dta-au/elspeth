@@ -66,6 +66,7 @@ const guidedSession: GuidedSession = {
   terminal: null,
   chat_history: [],
   chat_turn_seq: 0,
+  reviewed_components: { sources: [], outputs: [] },
   profile: null,
 };
 const completedResponse: GetGuidedResponse = {
@@ -121,7 +122,7 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
     });
   });
 
-  it("loses the submitted text immediately, then permits revised text after authoritative cancellation", async () => {
+  it("restores the submitted text after authoritative cancellation, then permits revised text", async () => {
     const user = userEvent.setup();
     apiMocks.startGuidedSession
       .mockImplementationOnce(
@@ -143,8 +144,10 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
 
     // The input keeps its place while the start is pending (the old pending
     // swap that unmounted it is retired — operator 2026-07-23); the box
-    // cleared on send and the text is nowhere client-persisted, so the
-    // submitted prompt is still unrecoverable-by-design.
+    // clears on send and stays empty while the operation is in flight. The
+    // text is never client-PERSISTED (no storage), but since
+    // elspeth-49b467d91a it is retained in component state and restored
+    // when the send verifiably fails to deliver.
     expect(screen.getByLabelText("Message input")).toHaveValue("");
     expect(screen.getByRole("status")).toHaveTextContent("Guided setup running");
     expect(window.sessionStorage.getItem("elspeth_guided_operation_retries_v2")).not.toContain(
@@ -153,9 +156,17 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
 
     await user.click(screen.getByRole("button", { name: "Stop" }));
     const recoveredTextarea = await screen.findByLabelText("Message input");
-    expect(recoveredTextarea).toHaveValue("");
+    // Authoritative cancellation settled with no durable checkpoint — the
+    // typed prompt comes back instead of being lost (elspeth-49b467d91a).
+    await waitFor(() =>
+      expect(recoveredTextarea).toHaveValue("Original prompt that is not persisted"),
+    );
     expect(useSessionStore.getState().error).toMatch(/revise your request and send it again/i);
+    expect(window.sessionStorage.getItem("elspeth_guided_operation_retries_v2") ?? "").not.toContain(
+      "Original prompt that is not persisted",
+    );
 
+    await user.clear(recoveredTextarea);
     await user.type(recoveredTextarea, "Revised prompt");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -203,5 +214,62 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
       name: "Describe what you want",
     });
     expect(section.contains(document.activeElement)).toBe(true);
+  });
+
+  // ── T0: the goal card, end to end through the real ChatInput ─────────────
+  //
+  // Goal-first (elspeth-378cfa0e18). This is the ONE transition the tutorial
+  // canary cannot cover — the tutorial's start is programmatic, so its learner
+  // never sees the goal card — which is why the routing is pinned here against
+  // the real input rather than only at the store boundary.
+  it("routes the goal typed on the pre-start card into POST /guided/start as the intent", async () => {
+    const user = userEvent.setup();
+    apiMocks.startGuidedSession.mockResolvedValueOnce(completedResponse);
+    // The adopted GET stub: step 1, a first turn, and NO composition state.
+    useSessionStore.setState({
+      guidedSession: { ...guidedSession, step: "step_1_source" },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+        },
+      },
+      compositionState: null,
+    } as never);
+
+    render(<ChatPanel />);
+
+    // The goal card stands in for the decision card, and the composer asks the
+    // goal question rather than the step-1 source question — this Send does
+    // not answer the turn, it establishes the session's root intent.
+    screen.getByRole("heading", { name: "What should this pipeline produce?" });
+    expect(screen.getByLabelText("Message input")).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("what should come out the other end"),
+    );
+    // Explain must not be offered pre-start: it sends a canned question down
+    // this same cold-start path, so pressing it would make "why am I seeing
+    // this?" the session's root intent and the planner's brief.
+    expect(screen.queryByRole("button", { name: "Explain this step" })).toBeNull();
+
+    await user.type(
+      screen.getByLabelText("Message input"),
+      "Summarise every page as one JSON row.",
+    );
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.startGuidedSession).toHaveBeenCalledTimes(1),
+    );
+    expect(apiMocks.startGuidedSession.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        profile: "live",
+        intent: "Summarise every page as one JSON row.",
+      }),
+    );
   });
 });

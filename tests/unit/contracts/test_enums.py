@@ -32,6 +32,7 @@ class TestTwoAxisMapping:
             (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW),
             (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED),
             (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED),
+            (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED),
             (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED),
             (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
             (TerminalOutcome.SUCCESS, TerminalPath.COALESCED),
@@ -44,9 +45,10 @@ class TestTwoAxisMapping:
             (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED),
         }
 
-    def test_non_terminal_path_is_buffered(self) -> None:
-        """The only non-terminal path is BUFFERED."""
-        assert set(_NON_TERMINAL_PATHS) == {TerminalPath.BUFFERED}
+    def test_non_terminal_paths_are_buffered_and_abandoned(self) -> None:
+        """The non-terminal paths are BUFFERED (undecided, may yet decide) and
+        ABANDONED (undecided, nothing will ever decide it — ADR-038)."""
+        assert set(_NON_TERMINAL_PATHS) == {TerminalPath.BUFFERED, TerminalPath.ABANDONED}
 
     def test_diverted_has_two_flavors(self) -> None:
         """Sink fallback and discard mode remain distinct terminal pair flavors."""
@@ -88,12 +90,13 @@ class TestTerminalOutcome:
 class TestTerminalPath:
     """Tests for TerminalPath enum (ADR-019)."""
 
-    def test_fourteen_values(self) -> None:
-        """TerminalPath has 14 values: 13 terminal paths + BUFFERED."""
+    def test_sixteen_values(self) -> None:
+        """TerminalPath has 16 values: 14 terminal paths + BUFFERED + ABANDONED."""
         assert {p.value for p in TerminalPath} == {
             "default_flow",
             "gate_routed",
             "gate_discarded",
+            "gate_error_discarded",
             "on_error_routed",
             "filter_dropped",
             "coalesced",
@@ -105,12 +108,14 @@ class TestTerminalPath:
             "expand_parent",
             "batch_consumed",
             "buffered",
+            "abandoned",
         }
 
     def test_coercion_from_string(self) -> None:
         """TerminalPath can be created from string values (DB read path)."""
         assert TerminalPath("default_flow") == TerminalPath.DEFAULT_FLOW
         assert TerminalPath("buffered") == TerminalPath.BUFFERED
+        assert TerminalPath("abandoned") == TerminalPath.ABANDONED
 
     def test_invalid_value_raises(self) -> None:
         """Invalid string raises ValueError — no silent fallback."""

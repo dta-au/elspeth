@@ -2,26 +2,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 import elspeth.contracts as contracts
 import elspeth.contracts.data as data_contracts
 from elspeth.contracts import CompatibilityResult
 
-DATA_CONTRACT_EXPORTS = frozenset(
+# Each export named once, then bound to the two objects whose identity is the
+# claim: the package-level re-export and the L0 data-contract original. Written
+# out rather than resolved off both modules by name (ADR-032) — a name that
+# stops existing on either side is now an ImportError-grade collection failure
+# instead of a probe result.
+DATA_CONTRACT_EXPORT_PAIRS: Mapping[str, tuple[object, object]] = MappingProxyType(
     {
-        "CompatibilityResult",
-        "PluginSchema",
-        "SchemaValidationError",
-        "check_compatibility",
-        "validate_row",
+        "CompatibilityResult": (contracts.CompatibilityResult, data_contracts.CompatibilityResult),
+        "PluginSchema": (contracts.PluginSchema, data_contracts.PluginSchema),
+        "SchemaValidationError": (contracts.SchemaValidationError, data_contracts.SchemaValidationError),
+        "check_compatibility": (contracts.check_compatibility, data_contracts.check_compatibility),
+        "validate_row": (contracts.validate_row, data_contracts.validate_row),
     }
 )
+
+DATA_CONTRACT_EXPORTS = frozenset(DATA_CONTRACT_EXPORT_PAIRS)
 
 
 def test_contracts_re_exports_plugin_schema_data_surface() -> None:
     """The package-level contracts API points at the L0 data contract module."""
     assert set(contracts.__all__) >= DATA_CONTRACT_EXPORTS
-    for name in DATA_CONTRACT_EXPORTS:
-        assert getattr(contracts, name) is getattr(data_contracts, name)
+    for name, (re_exported, original) in DATA_CONTRACT_EXPORT_PAIRS.items():
+        assert re_exported is original, f"contracts.{name} is not the elspeth.contracts.data object"
 
 
 class TestCompatibilityResultErrorMessage:

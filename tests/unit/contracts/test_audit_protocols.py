@@ -10,12 +10,15 @@ from elspeth.contracts import CallStatus, CallType, RoutingMode, RoutingSpec, Sc
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.audit_protocols import CallRecorder, PluginAuditWriter
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import MissingFieldViolation, SinkDiversionReason, TransformErrorReason
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
+
+_TOKEN = CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
 
 
 def _public_method_names(cls: type[object]) -> set[str]:
@@ -342,21 +345,21 @@ class TestReadinessCheckRoutesToRunLifecycle:
         _execution, _data_flow, run_lifecycle = repos
 
         writer.record_readiness_check(
-            "run-1",
             name="chroma",
             collection="docs",
             reachable=True,
             count=42,
             message="OK",
+            coordination_token=_TOKEN,
         )
 
         run_lifecycle.record_readiness_check.assert_called_once_with(
-            "run-1",
             name="chroma",
             collection="docs",
             reachable=True,
             count=42,
             message="OK",
+            coordination_token=_TOKEN,
         )
 
 

@@ -39,11 +39,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal
 
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.identifiers import validate_field_name
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.token_usage import TokenUsage
 
 if TYPE_CHECKING:
     from elspeth.contracts import PluginSchema
+    from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig
 
 # Metadata field suffixes for contract-stable fields (downstream can depend on these)
 LLM_GUARANTEED_SUFFIXES: tuple[str, ...] = (
@@ -148,7 +150,13 @@ def _build_llm_output_schema_config(
     schema_config: SchemaConfig,
     guaranteed_fields: Iterable[str],
 ) -> SchemaConfig:
-    """Build LLM output schema config while preserving current audit-field policy."""
+    """Build LLM output schema config while preserving current audit-field policy.
+
+    Guaranteed LLM output fields absent from an explicit authored fields
+    tuple are declared as required any-typed fields — a guaranteed field
+    the schema does not declare is an invalid SchemaConfig state
+    (elspeth-97487736ca).
+    """
     base_guaranteed = set(schema_config.guaranteed_fields or ())
     output_fields = base_guaranteed | set(guaranteed_fields)
     upstream_declared = schema_config.guaranteed_fields is not None
@@ -158,9 +166,90 @@ def _build_llm_output_schema_config(
         guaranteed_fields_result = None
     return SchemaConfig(
         mode=schema_config.mode,
-        fields=schema_config.fields,
+        fields=declare_missing_guaranteed_fields(schema_config.fields, guaranteed_fields_result),
         guaranteed_fields=guaranteed_fields_result,
         required_fields=schema_config.required_fields,
+    )
+
+
+def build_llm_source_output_schema_config(
+    schema_config: SchemaConfig,
+    response_field: str,
+    structured_output_fields: tuple[OutputFieldConfig, ...] = (),
+) -> SchemaConfig:
+    """Add the fields guaranteed by a single-request LLM source.
+
+    Explicit authored fields may repeat an LLM output field only with its
+    runtime type; fields, guarantees, and audit_fields outside the
+    emitted values are rejected because a source has no upstream row from
+    which to preserve them, and required_fields are rejected outright
+    because a source has no input row to require fields of
+    (elspeth-fb202d3793). The returned schema preserves the authored mode
+    and contract metadata while making all emitted fields required
+    and guaranteed. ``structured_output_fields`` (the source's top-level
+    structured-output declaration) join the emitted set with their declared
+    runtime types — extraction fails the row before emission when one is
+    missing, so on success they are always present.
+    """
+    validate_field_name(response_field, "response_field")
+    structured_names = tuple(field.suffix for field in structured_output_fields)
+    guaranteed_fields = (*get_llm_guaranteed_fields(response_field), *structured_names)
+    expected_types = {f"{response_field}{suffix}": _SUFFIX_SCHEMA_TYPES[suffix] for suffix in LLM_GUARANTEED_SUFFIXES}
+    expected_types.update({field.suffix: _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value] for field in structured_output_fields})
+
+    authored_fields = schema_config.fields or ()
+    authored_by_name = {field.name: field for field in authored_fields}
+    unsupported_fields = sorted(set(authored_by_name) - set(expected_types))
+    if unsupported_fields:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_fields)
+        raise ValueError(
+            f"LLM source schema field(s) {unsupported} are outside the emitted fields; "
+            "an LLM source does not emit arbitrary authored fields"
+        )
+    unsupported_guarantees = sorted(set(schema_config.guaranteed_fields or ()) - set(expected_types))
+    if unsupported_guarantees:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_guarantees)
+        raise ValueError(
+            f"LLM source guaranteed field(s) {unsupported} are outside the emitted fields; "
+            "an LLM source does not emit arbitrary authored fields"
+        )
+    if schema_config.required_fields is not None:
+        required = ", ".join(repr(field_name) for field_name in sorted(schema_config.required_fields))
+        raise ValueError(f"LLM source schema declares required_fields {required}; a source has no input row, so it cannot require fields")
+    unsupported_audit = sorted(set(schema_config.audit_fields or ()) - set(expected_types))
+    if unsupported_audit:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_audit)
+        raise ValueError(
+            f"LLM source audit field(s) {unsupported} are outside the emitted fields; an LLM source does not emit arbitrary authored fields"
+        )
+    for field_name, expected_type in expected_types.items():
+        if field_name not in authored_by_name:
+            continue
+        authored_field = authored_by_name[field_name]
+        if authored_field.field_type != expected_type:
+            actual_type = authored_field.field_type
+            raise ValueError(f"LLM source schema field {field_name!r} must have type {expected_type!r}, got {actual_type!r}")
+        if not authored_field.required:
+            raise ValueError(f"LLM source schema field {field_name!r} must be required")
+        if authored_field.nullable:
+            raise ValueError(f"LLM source schema field {field_name!r} must be non-nullable")
+
+    if schema_config.fields is None:
+        output_fields = None
+    else:
+        output_fields = authored_fields + tuple(
+            FieldDefinition(name=field_name, field_type=field_type)
+            for field_name, field_type in expected_types.items()
+            if field_name not in authored_by_name
+        )
+
+    output_guarantees = tuple(sorted(set(schema_config.guaranteed_fields or ()) | set(guaranteed_fields)))
+    return SchemaConfig(
+        mode=schema_config.mode,
+        fields=output_fields,
+        guaranteed_fields=output_guarantees,
+        required_fields=schema_config.required_fields,
+        audit_fields=schema_config.audit_fields,
     )
 
 
@@ -196,6 +285,7 @@ def build_llm_audit_metadata(
     lookup_hash: str | None,
     lookup_source: str | None,
     system_prompt_source: str | None,
+    parts_hash: str | None = None,
 ) -> dict[str, str | None]:
     """Build audit provenance dict for inclusion in success_reason["metadata"].
 
@@ -210,12 +300,17 @@ def build_llm_audit_metadata(
         lookup_hash: SHA-256 of lookup data (None if no lookup).
         lookup_source: Config file path of lookup data (None if no lookup).
         system_prompt_source: Config file path of system prompt (None if inline).
+        parts_hash: SHA-256 over the user message's content parts (from
+            ``chat_parts.parts_hash``) when image inputs were bound into the
+            call. ``None`` for a text-only call — the key is omitted entirely
+            rather than emitted as null, so text-only audit metadata stays
+            byte-identical to the pre-image tree.
 
     Returns:
         Dict of audit field names to values, ready to merge into
         success_reason["metadata"].
     """
-    return {
+    metadata: dict[str, str | None] = {
         f"{field_prefix}_template_hash": template_hash,
         f"{field_prefix}_variables_hash": variables_hash,
         f"{field_prefix}_template_source": template_source,
@@ -223,12 +318,16 @@ def build_llm_audit_metadata(
         f"{field_prefix}_lookup_source": lookup_source,
         f"{field_prefix}_system_prompt_source": system_prompt_source,
     }
+    if parts_hash is not None:
+        metadata[f"{field_prefix}_parts_hash"] = parts_hash
+    return metadata
 
 
 def _build_augmented_output_schema(
     base_schema_config: SchemaConfig,
     response_field: str,
     schema_name: str,
+    extracted_fields: tuple[tuple[str, _FieldType], ...] | None = None,
 ) -> type[PluginSchema]:
     """Build an output schema that includes LLM-added fields.
 
@@ -244,6 +343,9 @@ def _build_augmented_output_schema(
         base_schema_config: The base schema config from plugin options.
         response_field: Base field name (e.g., "llm_response").
         schema_name: Name for the generated Pydantic model class.
+        extracted_fields: (field_name, schema_type) tuples from single-mode
+            structured output_fields config — unprefixed fields extracted
+            from the LLM JSON response (e.g. (("score", "int"),)).
 
     Returns:
         A PluginSchema subclass with input fields plus LLM output fields.
@@ -272,6 +374,16 @@ def _build_augmented_output_schema(
         for suffix in LLM_GUARANTEED_SUFFIXES
         if f"{response_field}{suffix}" not in existing_names
     )
+    if extracted_fields is not None:
+        seen = existing_names | {field.name for field in extra_fields}
+        extra_fields = (
+            *extra_fields,
+            *(
+                FieldDefinition(name=field_name, field_type=field_type, required=False)
+                for field_name, field_type in extracted_fields
+                if field_name not in seen
+            ),
+        )
 
     augmented_config = SchemaConfig(
         # Use flexible mode so extra fields from upstream are accepted

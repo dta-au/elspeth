@@ -1056,3 +1056,166 @@ class TestRawSchemaHelpers:
         )
 
         assert guaranteed == frozenset()
+
+    def test_llm_single_request_infers_response_trio(self) -> None:
+        """Single-request llm nodes guarantee the response trio (elspeth-db98d3f660)."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": "briefing",
+                "schema": {"mode": "observed"},
+            },
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset({"briefing", "briefing_usage", "briefing_model"})
+
+    def test_llm_single_request_defaults_response_field(self) -> None:
+        """Absent response_field falls back to the plugin default llm_response."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {"schema": {"mode": "observed"}},
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset({"llm_response", "llm_response_usage", "llm_response_model"})
+
+    def test_llm_single_request_unions_trio_with_explicit_guarantees(self) -> None:
+        """Runtime augmentation unions declared guarantees with the trio; raw synthesis must match."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": "briefing",
+                "schema": {"mode": "observed", "guaranteed_fields": ["briefing"]},
+            },
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset({"briefing", "briefing_usage", "briefing_model"})
+
+    def test_llm_multi_query_does_not_infer_unprefixed_trio(self) -> None:
+        """Multi-query llm transforms emit prefixed fields; the unprefixed trio is not guaranteed."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": "briefing",
+                "queries": [{"name": "quality", "template": "Rate {{ row.text }}"}],
+                "schema": {"mode": "observed"},
+            },
+            owner="transform:assess",
+        )
+
+        assert guaranteed == frozenset()
+
+    @pytest.mark.parametrize("response_field", ["class", "not-valid", 7])
+    def test_llm_invalid_response_field_does_not_infer_trio(
+        self,
+        response_field: object,
+    ) -> None:
+        """Invalid response_field values must not synthesize guarantees."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": response_field,
+                "schema": {"mode": "observed"},
+            },
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset()
+
+
+class TestSchemaTrustBoundaryCharacterization:
+    """Direct raising characterization for this module's ``@trust_boundary`` parse sites.
+
+    Each test is named by a decorator's ``test_ref`` and is bound to it by
+    ``test_fingerprint``. The gate requires the raising assertion to invoke the
+    decorated symbol through its declared ``source_param`` in this body — never via a
+    helper — so every call below is written out in full.
+    """
+
+    def test_field_definition_parse_rejects_non_string_dict_name(self) -> None:
+        """``FieldDefinition.parse`` rejects a round-trip dict whose 'name' is not a str."""
+        from elspeth.contracts.schema import FieldDefinition
+
+        with pytest.raises(ValueError, match="'name' and 'type' must be strings"):
+            FieldDefinition.parse({"name": 7, "type": "int", "required": True, "nullable": False})
+
+    def test_parse_field_names_list_rejects_non_sequence(self) -> None:
+        """``_parse_field_names_list`` rejects a value that is neither None nor a list/tuple."""
+        from elspeth.contracts.schema import _parse_field_names_list
+
+        with pytest.raises(ValueError, match="must be a list of field names"):
+            _parse_field_names_list({"id": "int"}, "guaranteed_fields")
+
+    def test_normalize_field_spec_rejects_non_string_non_mapping(self) -> None:
+        """``_normalize_field_spec`` rejects a spec that is neither a str nor a Mapping."""
+        from elspeth.contracts.schema import _normalize_field_spec
+
+        with pytest.raises(ValueError, match="must be a string like"):
+            _normalize_field_spec(7, index=0)
+
+    def test_normalize_field_spec_rejects_non_bool_json_schema_required(self) -> None:
+        """The JSON-Schema authoring shape defaults 'required'/'nullable' but never coerces them."""
+        from elspeth.contracts.schema import _normalize_field_spec
+
+        with pytest.raises(ValueError, match="'required' must be a bool"):
+            _normalize_field_spec({"name": "id", "field_type": "int", "required": "yes"}, index=0)
+
+    def test_normalize_field_spec_defaults_only_the_json_schema_flags(self) -> None:
+        """Absent 'required'/'nullable' default only in the JSON-Schema shape, not the round-trip one."""
+        from elspeth.contracts.schema import _normalize_field_spec
+
+        assert _normalize_field_spec({"name": "id", "field_type": "int"}, index=0) == {
+            "name": "id",
+            "type": "int",
+            "required": True,
+            "nullable": False,
+        }
+        with pytest.raises(ValueError, match="'required' key is missing"):
+            _normalize_field_spec({"name": "id", "type": "int"}, index=0)
+
+    def test_schema_config_from_dict_rejects_non_mapping(self) -> None:
+        """``SchemaConfig.from_dict`` rejects any non-Mapping config outright."""
+        from elspeth.contracts.schema import SchemaConfig
+
+        with pytest.raises(ValueError, match="must be a Mapping"):
+            SchemaConfig.from_dict(["mode: observed"])  # type: ignore[arg-type]
+
+    def test_parse_raw_schema_config_rejects_non_mapping(self) -> None:
+        """``parse_raw_schema_config`` rejects a present-but-non-Mapping schema block."""
+        from elspeth.contracts.schema import parse_raw_schema_config
+
+        with pytest.raises(ValueError, match="schema config must be a mapping"):
+            parse_raw_schema_config("mode: observed", owner="source:csv")
+
+    def test_get_raw_producer_guaranteed_fields_rejects_malformed_schema_block(self) -> None:
+        """``get_raw_producer_guaranteed_fields`` rejects malformed raw options with ValueError."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        with pytest.raises(ValueError, match="schema config must be a mapping"):
+            get_raw_producer_guaranteed_fields("llm", {"schema": "mode: observed"}, owner="source:llm")
+
+    def test_get_aggregation_contract_options_rejects_non_mapping_nested_options(self) -> None:
+        """A nested ``options`` wrapper of the wrong shape is rejected, not ignored."""
+        from elspeth.contracts.schema import get_aggregation_contract_options
+
+        with pytest.raises(ValueError, match="nested contract options must be a mapping"):
+            get_aggregation_contract_options({"options": ["not-a-mapping"]}, owner="node:agg")
+
+    def test_parse_raw_required_input_fields_rejects_bare_string(self) -> None:
+        """A bare-string ``required_input_fields`` is the common YAML slip and must crash."""
+        from elspeth.contracts.schema import _parse_raw_required_input_fields
+
+        with pytest.raises(ValueError, match="must be a list of field names, not a bare string"):
+            _parse_raw_required_input_fields("customer_id", owner="node:agg", field_name="required_input_fields")

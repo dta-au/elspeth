@@ -92,6 +92,9 @@ def test_step1_prefill_stays_observed_for_env_var_header(composer_test_client: T
     # A Tier-3 uploaded CSV whose header is a ${VAR} placeholder must not be
     # promoted into explicit schema.fields specs: those strings later flow through
     # the runtime YAML loader, where ${VAR} would resolve host env on the CLI path.
+    # No observed+guaranteed_fields fallback either (John's ruling, 2026-08-27):
+    # the inspected source is user-provided, so its header is a SAMPLE — guarantee
+    # ratification belongs to the ask-the-user flow, never a silent prefill.
     sess = _create_session(composer_test_client, "step1-prefill-env-header")
     resp = composer_test_client.post(
         f"/api/sessions/{sess}/blobs/inline",

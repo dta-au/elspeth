@@ -32,13 +32,14 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts import TokenInfo, TransformResult
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import AggregationSettings
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     scheduler_events_table,
     token_work_items_table,
 )
@@ -49,8 +50,10 @@ from elspeth.engine.orchestrator.types import ExecutionCounters, PipelineConfig
 from elspeth.engine.processor import _LiveBarrierHold
 from elspeth.testing import make_row, make_token_info
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import age_barrier_hold
 from tests.unit.engine.test_processor import (
     BarrierJournalRestoreContext,
+    _make_claimed_work_item,
     _make_factory,
     _make_mock_transform,
     _make_processor,
@@ -124,7 +127,7 @@ class TestBackdatedAcceptTiming:
         T0, so it fires at T0+10 — invariant under takeover (§H 476).
         """
         clock = MockClock(start=1_700_000_000.0)
-        _db, factory = _make_factory()
+        db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor = _agg_processor(
             factory,
@@ -142,10 +145,16 @@ class TestBackdatedAcceptTiming:
         # T0: a prior leader deposited the BLOCKED row and crashed before
         # adoption (barrier_adopted_epoch stays NULL).
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
-        _persist_blocked_scheduler_work(factory, processor, token, node_id=AGG_NODE, barrier_key=str(AGG_NODE), adopted=False)
+        work_item_id = _persist_blocked_scheduler_work(
+            factory, processor, token, node_id=AGG_NODE, barrier_key=str(AGG_NODE), adopted=False
+        )
 
         # T0+5: the new leader's first intake adopts with the backdated anchor.
+        # The hold's age is measured on the Landscape database clock (ADR-047),
+        # which the mock clock cannot move: the five seconds are written into
+        # the row's past while the mock clock paces the trigger.
         clock.advance(5.0)
+        age_barrier_hold(db.engine, work_item_id, seconds_ago=5.0)
         intake_results = processor.run_barrier_intake(ctx)
         assert intake_results == []
         assert processor.get_aggregation_buffer_count(AGG_NODE) == 1
@@ -193,13 +202,17 @@ class TestLateArrivalRelease:
     """§H 478 / §E.3a — late branches are journal-released by the intake."""
 
     def test_late_arrival_is_released_with_late_arrival_context(self) -> None:
-        late_token = TokenInfo(row_id="row-1", token_id="tok-late", row_data=make_row({}), branch_name="path_b")
+        late_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-late",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
+        )
         coalesce = Mock(spec=CoalesceExecutor)
         coalesce.accept.return_value = CoalesceOutcome(
             held=False,
             failure_reason="late_arrival_after_merge",
             consumed_tokens=(late_token,),
-            outcomes_recorded=True,
             late_arrival=True,
         )
         db, factory = _make_factory()
@@ -213,7 +226,9 @@ class TestLateArrivalRelease:
         _persist_blocked_scheduler_work(
             factory, processor, late_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False
         )
-        processor._live_barrier_holds[late_token.token_id] = _LiveBarrierHold(token=late_token, barrier_key="merge")
+        processor._live_barrier_holds[late_token.token_id] = _LiveBarrierHold(
+            token=late_token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 
@@ -244,8 +259,8 @@ class TestLateArrivalRelease:
         assert processor.has_unresolved_scheduler_work() is False
 
 
-class TestBranchLossHandOff:
-    """§H 479 / §E.5 — record-then-notify, one-drain-step must-fail, takeover."""
+class TestGroupLossHandOff:
+    """§H 479 / §6.2 — record-then-notify, one-drain-step must-fail, takeover."""
 
     def _forked_processor(self, factory: Any, coalesce_executor: Any, *, barrier_restore: Any = None) -> Any:
         return _make_processor(
@@ -260,14 +275,18 @@ class TestBranchLossHandOff:
     def test_loss_record_rides_the_failing_branch_disposition(self) -> None:
         """A failing branch's durable loss commits with its mark_failed, and the
         require_all must-fail consequence surfaces in the SAME drain step."""
-        held_token = TokenInfo(row_id="row-1", token_id="tok-held", row_data=make_row({}), branch_name="path_a")
+        held_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-held",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_a"),),
+        )
         coalesce = Mock(spec=CoalesceExecutor)
         # The in-claim notify (retained at N=1) fails the group immediately.
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
             held=False,
             failure_reason="branch_lost:path_b",
             consumed_tokens=(held_token,),
-            outcomes_recorded=True,
         )
         db, factory = _make_factory()
         processor = self._forked_processor(factory, coalesce)
@@ -278,16 +297,25 @@ class TestBranchLossHandOff:
         )
 
         # Branch B's claim ends in a lossy FAILURE disposition.
-        losing_token = TokenInfo(row_id="row-1", token_id="tok-lost", row_data=make_row({}), branch_name="path_b")
-        sibling_results = processor._notify_coalesce_of_lost_branch(losing_token, "quarantined:boom", [])
+        losing_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-lost",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
+        )
+        sibling_results = processor._settle_member_losses(losing_token, "quarantined:boom", [])
         assert len(sibling_results) == 1  # must-fail within the same drain step
         assert sibling_results[0].token.token_id == "tok-held"
 
         # The staged loss rides the claim's own disposition transaction.
-        spec = processor._take_claim_branch_loss("tok-lost")
-        assert spec is not None
-        assert (spec.coalesce_name, spec.row_id, spec.branch_name, spec.token_id) == ("merge", "row-1", "path_b", "tok-lost")
-        assert spec.recorded_by == processor._scheduler_lease_owner
+        # Frame-authenticated (spec §6.2): the claim guard checks the staged
+        # spec's (group_id, member_key) against the CLAIMED token's own
+        # lineage_path, which is the losing token's own frame here.
+        claimed = _make_claimed_work_item(token_id="tok-lost", lineage_path=losing_token.lineage_path)
+        losses = processor._take_claim_group_losses(claimed)
+        assert len(losses) == 1
+        (spec,) = losses
+        assert (spec.closer_name, spec.group_id, spec.member_key, spec.token_id) == ("merge", "fg-adr030-test", "path_b", "tok-lost")
 
         # Drive the disposition the drain would issue and prove atomic commit.
         from tests.unit.engine.test_processor import _persist_token_for_scheduler
@@ -301,22 +329,24 @@ class TestBranchLossHandOff:
             step_index=2,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(losing_token.row_data),
-            available_at=processor._clock.now_utc(),
             lease_owner="test-harness",
             lease_seconds=60,
-            now=processor._clock.now_utc(),
         )
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
-            now=processor._clock.now_utc(),
             expected_lease_owner="test-harness",
-            branch_loss=spec,
+            group_losses=losses,
         )
         with db.connection() as conn:
-            loss_rows = conn.execute(select(coalesce_branch_losses_table)).mappings().all()
+            loss_rows = conn.execute(select(group_losses_table)).mappings().all()
         assert len(loss_rows) == 1
-        assert loss_rows[0]["branch_name"] == "path_b"
+        assert loss_rows[0]["member_key"] == "path_b"
         assert loss_rows[0]["adopted_epoch"] is None  # intake-pending replay cursor
+        # GroupLossSpec carries no recorded_by (unlike the retired
+        # BranchLossSpec): the disposition layer stamps the lease owner it
+        # already holds — the attribution invariant moves to this durable
+        # ledger row.
+        assert loss_rows[0]["recorded_by"] == "test-harness"
 
         # The next intake marks the loss adopted; the in-memory replay dedups
         # via has_recorded_branch_loss (record-then-notify already ran).
@@ -325,7 +355,7 @@ class TestBranchLossHandOff:
         assert results == [] and child_items == []
         coalesce.notify_branch_lost.assert_called_once()  # the in-claim call only
         with db.connection() as conn:
-            adopted_epoch = conn.execute(select(coalesce_branch_losses_table.c.adopted_epoch)).scalar_one()
+            adopted_epoch = conn.execute(select(group_losses_table.c.adopted_epoch)).scalar_one()
         assert adopted_epoch == 1
 
     def test_loss_survives_takeover_via_restore_ledger_seed(self) -> None:
@@ -334,7 +364,12 @@ class TestBranchLossHandOff:
         bootstrap = self._forked_processor(factory, Mock(spec=CoalesceExecutor))
         # Durable image left by the dead leader: branch A held+adopted at the
         # coalesce, branch B's loss recorded with its disposition.
-        held_token = TokenInfo(row_id="row-1", token_id="tok-held", row_data=make_row({}), branch_name="path_a")
+        held_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-held",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_a"),),
+        )
         _persist_blocked_scheduler_work(
             factory, bootstrap, held_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=True
         )
@@ -351,7 +386,12 @@ class TestBranchLossHandOff:
             attempt=0,
             resume_checkpoint_id=None,
         )
-        losing_token = TokenInfo(row_id="row-1", token_id="tok-lost", row_data=make_row({}), branch_name="path_b")
+        losing_token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-lost",
+            row_data=make_row({}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-adr030-test", member_key="path_b"),),
+        )
         from tests.unit.engine.test_processor import _persist_token_for_scheduler
 
         _persist_token_for_scheduler(factory, losing_token, ingest_sequence=0)
@@ -363,24 +403,22 @@ class TestBranchLossHandOff:
             step_index=2,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(losing_token.row_data),
-            available_at=bootstrap._clock.now_utc(),
             lease_owner="dead-leader",
             lease_seconds=60,
-            now=bootstrap._clock.now_utc(),
         )
-        from elspeth.core.landscape.scheduler_repository import BranchLossSpec
+        from elspeth.core.landscape.scheduler_repository import GroupLossSpec
 
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
-            now=bootstrap._clock.now_utc(),
             expected_lease_owner="dead-leader",
-            branch_loss=BranchLossSpec(
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="path_b",
-                token_id="tok-lost",
-                reason="quarantined:boom",
-                recorded_by="dead-leader",
+            group_losses=(
+                GroupLossSpec(
+                    closer_name="merge",
+                    group_id="fg-adr030-test",
+                    member_key="path_b",
+                    token_id="tok-lost",
+                    reason="quarantined:boom",
+                ),
             ),
         )
 
@@ -398,9 +436,11 @@ class TestBranchLossHandOff:
         # still-pending key: the loss did NOT die with the dead leader.
         restore_call = takeover_coalesce.restore_from_journal.call_args
         assert restore_call is not None
+        # Keyed on GroupLossSpec.group_id directly (WS4 Task 9, C-2) — no
+        # more row_id translation for this merge.
         seeded = restore_call.kwargs["scalars"]
-        assert ("merge", "row-1") in seeded
-        assert dict(seeded[("merge", "row-1")].lost_branches) == {"path_b": "quarantined:boom"}
+        assert ("merge", "fg-adr030-test") in seeded
+        assert dict(seeded[("merge", "fg-adr030-test")].lost_branches) == {"path_b": "quarantined:boom"}
         assert [i.token_id for i in restore_call.kwargs["items"]] == ["tok-held"]
 
 
@@ -426,7 +466,6 @@ class TestEofGating:
             step_index=1,
             ingest_sequence=3,
             row_payload_json=factory.scheduler.serialize_row_payload(slow_token.row_data),
-            available_at=processor._clock.now_utc(),
         )
 
         config = MagicMock(spec=PipelineConfig)

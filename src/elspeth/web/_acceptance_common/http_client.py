@@ -1,0 +1,446 @@
+"""Bounded HTTP transport shared by every acceptance provider.
+
+Moved from ``_aws_ecs_acceptance/http_client.py`` (the client and its CA-bundle
+check), ``_aws_ecs_acceptance/contracts.py`` (timeouts, response bounds, the
+origin normaliser) and ``_aws_ecs_acceptance/state.py`` (the credentials).
+One addition: :meth:`AcceptanceHttpClient.request_json_with_instance` also
+returns the ``X-Elspeth-Instance`` response header, which is how the
+replicas > 1 probes learn which replica answered without trusting routing.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Any, Literal, Self
+from urllib.parse import urlsplit
+
+import httpx
+
+from elspeth.contracts.trust_boundary import trust_boundary
+
+from .errors import AcceptanceCheckError, AcceptanceHttpError, AcceptanceInputError, acceptance_step
+
+CONNECT_TIMEOUT_SECONDS = 5.0
+READ_TIMEOUT_SECONDS = 15.0
+WRITE_TIMEOUT_SECONDS = 10.0
+POOL_TIMEOUT_SECONDS = 5.0
+MAX_JSON_RESPONSE_BYTES = 1024 * 1024
+MAX_BLOB_RESPONSE_BYTES = 8 * 1024 * 1024
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+INSTANCE_HEADER = "X-Elspeth-Instance"
+"""The response header every ELSPETH web process stamps with its instance id."""
+
+_NO_BODY = object()
+
+# Operator-supplied trust-bundle environment variables the underlying HTTP
+# stack honors.  An unreadable bundle otherwise only surfaces as an opaque
+# connect failure (or an internal error at client construction), which cost
+# real debugging time during the 2026-07-30 cold install (F12).
+# HTTPX consumes SSL_CERT_FILE through its trust-environment handling. The
+# requests-specific REQUESTS_CA_BUNDLE variable must not block this client.
+_CA_BUNDLE_ENV_VARS = ("SSL_CERT_FILE",)
+
+
+def normalize_acceptance_origin(raw: str) -> str:
+    """Validate and return one exact canonical acceptance origin."""
+
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise AcceptanceInputError("acceptance base origin is invalid") from None
+    if (
+        not raw
+        or parsed.scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise AcceptanceInputError("acceptance base origin is invalid")
+    try:
+        hostname.encode("ascii")
+    except UnicodeEncodeError:
+        raise AcceptanceInputError("acceptance base origin is invalid") from None
+    if parsed.scheme == "http" and hostname not in _LOOPBACK_HOSTS:
+        raise AcceptanceInputError("acceptance base origin requires HTTPS except for exact loopback hosts")
+    if port is not None and not 1 <= port <= 65535:
+        raise AcceptanceInputError("acceptance base origin is invalid")
+
+    default_port = 443 if parsed.scheme == "https" else 80
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    canonical = f"{parsed.scheme}://{rendered_host}"
+    if port is not None and port != default_port:
+        canonical = f"{canonical}:{port}"
+    if raw != canonical:
+        raise AcceptanceInputError("acceptance base origin must be an exact normalized origin")
+    return canonical
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceCredentials:
+    """One mutually exclusive acceptance authentication mode."""
+
+    mode: Literal["local", "bearer"]
+    username: str | None = None
+    password: str | None = None
+    bearer_token: str | None = None
+
+    @classmethod
+    @trust_boundary(
+        tier=3,
+        source="the acceptance authentication assignment (ELSPETH_ACCEPTANCE_USERNAME / ELSPETH_ACCEPTANCE_PASSWORD / ELSPETH_ACCEPTANCE_BEARER_TOKEN) in the acceptance harness process environment",
+        source_param="env",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises AcceptanceInputError before use unless the environment supplies exactly one complete "
+            "authentication mode - both local names and no bearer token, or a bearer token and neither "
+            "local name - and never echoes a credential value into the error; returns only the owned "
+            "frozen AcceptanceCredentials"
+        ),
+        test_ref=(
+            "tests/unit/web/aws_ecs_acceptance/test_contracts_secure_state.py::"
+            "test_auth_input_rejects_missing_partial_or_mixed_modes_without_echo"
+        ),
+        test_fingerprint="a51e2c2305179ac0b8a94f65977545487d6286a11eb0206a4cd2e138505ca35c",
+    )
+    def from_env(cls, env: Mapping[str, str]) -> Self:
+        username = env.get("ELSPETH_ACCEPTANCE_USERNAME") or None
+        password = env.get("ELSPETH_ACCEPTANCE_PASSWORD") or None
+        bearer_token = env.get("ELSPETH_ACCEPTANCE_BEARER_TOKEN") or None
+        has_local_part = username is not None or password is not None
+        has_local = username is not None and password is not None
+        if bearer_token is not None and not has_local_part:
+            return cls(mode="bearer", bearer_token=bearer_token)
+        if has_local and bearer_token is None:
+            return cls(mode="local", username=username, password=password)
+        raise AcceptanceInputError("acceptance authentication must use exactly one complete environment mode")
+
+
+def _require_readable_ca_bundle(env: Mapping[str, str]) -> None:
+    """Fail closed with a named code when a declared CA bundle is unreadable."""
+
+    for name in _CA_BUNDLE_ENV_VARS:
+        if name not in env or not env[name]:
+            continue
+        value = env[name]
+        try:
+            with open(value, "rb") as handle:
+                handle.read(1)
+        except OSError:
+            raise AcceptanceHttpError(
+                f"acceptance CA bundle named by {name} is not readable",
+                error_code="ca_unreadable",
+            ) from None
+
+
+class AcceptanceHttpClient:
+    """Bounded, no-redirect, same-origin HTTP client for acceptance checks."""
+
+    def __init__(
+        self,
+        *,
+        origin: str,
+        credentials: AcceptanceCredentials,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.origin = origin
+        self.credentials = credentials
+        self._bearer_token = credentials.bearer_token
+        with acceptance_step("client_setup"):
+            try:
+                self._client = httpx.Client(
+                    base_url=origin,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(
+                        connect=CONNECT_TIMEOUT_SECONDS,
+                        read=READ_TIMEOUT_SECONDS,
+                        write=WRITE_TIMEOUT_SECONDS,
+                        pool=POOL_TIMEOUT_SECONDS,
+                    ),
+                    transport=transport,
+                )
+            except OSError:
+                # The only filesystem the client touches at construction is
+                # the TLS trust store; an unreadable operator CA bundle is
+                # the known cause (F12).
+                raise AcceptanceHttpError(
+                    "acceptance TLS trust store could not be loaded",
+                    error_code="ca_unreadable",
+                ) from None
+
+    @classmethod
+    def from_env(
+        cls,
+        env: Mapping[str, str],
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> Self:
+        with acceptance_step("client_setup"):
+            _require_readable_ca_bundle(env)
+            origin = normalize_acceptance_origin(env["ELSPETH_ACCEPTANCE_BASE_URL"] if "ELSPETH_ACCEPTANCE_BASE_URL" in env else "")
+            credentials = AcceptanceCredentials.from_env(env)
+        return cls(origin=origin, credentials=credentials, transport=transport)
+
+    def __enter__(self) -> Self:
+        self._client.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self._client.__exit__(exc_type, exc_value, traceback)
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_statuses: set[int],
+        json_body: object = _NO_BODY,
+    ) -> object:
+        """Send one bounded request and decode a bounded JSON response."""
+
+        _status, decoded = self.request_json_with_status(
+            method,
+            path,
+            expected_statuses=expected_statuses,
+            json_body=json_body,
+        )
+        return decoded
+
+    def request_json_with_status(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_statuses: set[int],
+        json_body: object = _NO_BODY,
+    ) -> tuple[int, object]:
+        status, _instance_id, decoded = self.request_json_with_instance(
+            method,
+            path,
+            expected_statuses=expected_statuses,
+            json_body=json_body,
+        )
+        return status, decoded
+
+    def request_json_with_instance(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_statuses: set[int],
+        json_body: object = _NO_BODY,
+    ) -> tuple[int, str | None, object]:
+        """Send one bounded request; return the status, the answering instance id, and the decoded JSON.
+
+        The instance id is the ``X-Elspeth-Instance`` header the web process
+        stamps on every response, or ``None`` when the response carries none
+        (a process older than the header, or an intermediary's own error page).
+        """
+
+        status, instance_id, content = self._request_bounded(
+            method,
+            path,
+            expected_statuses=expected_statuses,
+            json_body=json_body,
+            limit=MAX_JSON_RESPONSE_BYTES,
+        )
+        try:
+            return status, instance_id, json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise AcceptanceHttpError(
+                "acceptance response contained malformed JSON",
+                error_code="response_shape_invalid",
+            ) from None
+
+    def request_multipart_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_statuses: set[int],
+        files: Mapping[str, tuple[str, bytes, str]],
+    ) -> object:
+        _status, _instance_id, content = self._request_bounded(
+            method,
+            path,
+            expected_statuses=expected_statuses,
+            files=files,
+            limit=MAX_JSON_RESPONSE_BYTES,
+        )
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise AcceptanceHttpError(
+                "acceptance response contained malformed JSON",
+                error_code="response_shape_invalid",
+            ) from None
+
+    def request_bytes(self, method: str, path: str, *, expected_statuses: set[int]) -> bytes:
+        _status, _instance_id, content = self._request_bounded(
+            method,
+            path,
+            expected_statuses=expected_statuses,
+            limit=MAX_BLOB_RESPONSE_BYTES,
+        )
+        return content
+
+    def authenticate(self, *, register: bool) -> None:
+        """Resolve local credentials to a token, or retain the supplied bearer token."""
+
+        if self.credentials.mode == "bearer":
+            if register:
+                raise AcceptanceInputError("registration is available only for local acceptance authentication")
+            return
+        username = self.credentials.username
+        password = self.credentials.password
+        if username is None or password is None:
+            raise AcceptanceInputError("local acceptance authentication is incomplete")
+
+        if register:
+            with acceptance_step("register"):
+                status, body = self.request_json_with_status(
+                    "POST",
+                    "/api/auth/register",
+                    expected_statuses={200, 409},
+                    json_body={"username": username, "password": password, "display_name": username},
+                )
+                if status == 200:
+                    self._accept_auth_token(body)
+                    return
+        with acceptance_step("login"):
+            body = self.request_json(
+                "POST",
+                "/api/auth/login",
+                expected_statuses={200},
+                json_body={"username": username, "password": password},
+            )
+            self._accept_auth_token(body)
+
+    @trust_boundary(
+        tier=3,
+        source="JSON body of POST /api/auth/login and POST /api/auth/register returned by the deployed web service",
+        source_param="body",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises AcceptanceCheckError('authentication_response') before the token is retained when the "
+            "authentication response body is not a dict, its access_token is not a non-empty str of at most 64 KiB, "
+            "or its token_type is not exactly 'bearer'; never coerces external values"
+        ),
+        test_ref=(
+            "tests/unit/web/aws_ecs_acceptance/test_http_capture.py::test_accept_auth_token_rejects_a_non_contractual_authentication_body"
+        ),
+        test_fingerprint="85cc7fa3bd32be401645a1b5c7dddbcf8336e755611b3060665c8212ecaf60c3",
+    )
+    def _accept_auth_token(self, body: object) -> None:
+        """Retain a bearer token only from a contractual authentication response."""
+
+        if not isinstance(body, dict):
+            raise AcceptanceCheckError("authentication_response")
+        token = body.get("access_token")
+        token_type = body.get("token_type")
+        if type(token) is not str or not token or len(token) > 64 * 1024 or token_type != "bearer":
+            raise AcceptanceCheckError("authentication_response")
+        self._bearer_token = token
+
+    def _request_bounded(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_statuses: set[int],
+        json_body: object = _NO_BODY,
+        files: Mapping[str, tuple[str, bytes, str]] | None = None,
+        limit: int,
+    ) -> tuple[int, str | None, bytes]:
+        if not path.startswith("/") or path.startswith("//"):
+            raise AcceptanceInputError("acceptance request requires a relative API path")
+        parsed_path = urlsplit(path)
+        if parsed_path.scheme or parsed_path.netloc:
+            raise AcceptanceInputError("acceptance request requires a relative API path")
+
+        headers: dict[str, str] = {}
+        if self._bearer_token is not None:
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
+        kwargs: dict[str, Any] = {"headers": headers}
+        if json_body is not _NO_BODY:
+            kwargs["json"] = json_body
+        if files is not None:
+            kwargs["files"] = files
+        request = self._client.build_request(method, path, **kwargs)
+        try:
+            response = self._client.send(request, stream=True)
+            try:
+                self.validate_response_origin(response.request.url)
+                content = self._read_bounded(response, limit=limit)
+                if response.status_code not in expected_statuses:
+                    raise AcceptanceHttpError(
+                        "acceptance request returned an unexpected HTTP status",
+                        error_code="unexpected_http_status",
+                        status=response.status_code,
+                    )
+                status = response.status_code
+                instance_id = self._instance_header(response)
+            finally:
+                response.close()
+        except AcceptanceHttpError:
+            raise
+        except httpx.TimeoutException:
+            raise AcceptanceHttpError("acceptance request timeout", error_code="request_timeout") from None
+        except httpx.HTTPError:
+            raise AcceptanceHttpError("acceptance HTTP transport failed", error_code="connection_failed") from None
+        return status, instance_id, content
+
+    @staticmethod
+    def _instance_header(response: httpx.Response) -> str | None:
+        """The answering instance id, or ``None`` when the response carries none.
+
+        Tier-3 inbound header: bounded to the same shape the web process
+        enforces on its own id before stamping it, so a hostile intermediary
+        cannot smuggle an arbitrary string into a probe receipt.
+        """
+
+        if INSTANCE_HEADER not in response.headers:
+            return None
+        value = response.headers[INSTANCE_HEADER]
+        if (
+            len(value) > 128
+            or not value
+            or not all(character.isalnum() or character in "._-" for character in value)
+            or not value[0].isalnum()
+        ):
+            raise AcceptanceHttpError("acceptance response carried a malformed instance header", error_code="response_shape_invalid")
+        return value
+
+    def validate_response_origin(self, url: httpx.URL) -> None:
+        """Require an HTTP response URL to remain on the configured origin."""
+
+        try:
+            response_origin = normalize_acceptance_origin(f"{url.scheme}://{url.netloc.decode('ascii')}")
+        except AcceptanceInputError:
+            raise AcceptanceHttpError("acceptance response was cross-origin", error_code="cross_origin_response") from None
+        if response_origin != self.origin:
+            raise AcceptanceHttpError("acceptance response was cross-origin", error_code="cross_origin_response")
+
+    @staticmethod
+    def _read_bounded(response: httpx.Response, *, limit: int) -> bytes:
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_bytes():
+            size += len(chunk)
+            if size > limit:
+                raise AcceptanceHttpError("acceptance response body was too large", error_code="response_too_large")
+            chunks.append(chunk)
+        return b"".join(chunks)

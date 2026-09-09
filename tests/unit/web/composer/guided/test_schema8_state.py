@@ -251,13 +251,13 @@ def _full_session() -> GuidedSession:
     )
 
 
-def test_schema10_round_trip_retains_plural_order_and_stable_ids_after_restart() -> None:
+def test_schema11_round_trip_retains_plural_order_and_stable_ids_after_restart() -> None:
     session = _full_session()
 
     encoded = session.to_dict()
     restored = GuidedSession.from_dict(encoded)
 
-    assert GUIDED_SESSION_SCHEMA_VERSION == 10
+    assert GUIDED_SESSION_SCHEMA_VERSION == 11
     assert restored == session
     assert restored.source_order == (SOURCE_B, SOURCE_A)
     assert restored.output_order == (OUTPUT_B, OUTPUT_A)
@@ -939,6 +939,23 @@ def test_source_and_output_edit_targets_resolve_only_reviewed_components() -> No
     )
     with pytest.raises(InvariantError, match="active_edit_target"):
         replace(pending_output_session, active_edit_target=ComponentTarget(kind="output", stable_id=OUTPUT_A))
+
+
+def test_malformed_active_edit_target_is_not_laundered_into_absence() -> None:
+    """The owned target contract fails before overlap policy can mislabel it."""
+    with pytest.raises(TypeError, match="active_edit_target must be ComponentTarget or None"):
+        GuidedSession(
+            step=GuidedStep.STEP_1_SOURCE,
+            source_order=(SOURCE_A,),
+            reviewed_sources={SOURCE_A: _source("incoming", "/data/incoming.csv")},
+            pending_source_intents={SOURCE_A: _source_intent(name="incoming")},
+            active_edit_target=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_state_machine_does_not_reexport_resolved_sink_compatibility_facade() -> None:
+    """Callers import the resolved carrier from its owning module."""
+    assert "SinkResolved" not in vars(state_machine)
 
 
 @pytest.mark.parametrize(

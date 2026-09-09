@@ -11,6 +11,7 @@ import pytest
 
 from elspeth.contracts import Call, CallStatus, CallType, TokenUsage
 from elspeth.contracts.call_data import LLMCallRequest, LLMCallResponse
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -244,7 +245,7 @@ class TestLLMClientErrorBranchTelemetry:
             telemetry_emit=events.append,
         )
         with pytest.raises(LLMClientError):
-            client.chat_completion(model="gpt-4", messages=[{"role": "user", "content": "Hi"}])
+            client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hi")])
         return events
 
     def test_empty_choices_emits_error_telemetry(self) -> None:
@@ -315,7 +316,7 @@ class TestLLMClientTelemetry:
 
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Verify response
@@ -371,7 +372,7 @@ class TestLLMClientTelemetry:
         with pytest.raises(LLMClientError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # Verify telemetry event
@@ -415,7 +416,7 @@ class TestLLMClientTelemetry:
 
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Call succeeds without error
@@ -449,7 +450,7 @@ class TestLLMClientTelemetry:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Verify order: Landscape first, then telemetry
@@ -477,7 +478,7 @@ class TestLLMClientTelemetry:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Verify telemetry event has None token_usage
@@ -505,9 +506,9 @@ class TestLLMClientTelemetry:
         )
 
         # Make multiple calls
-        client.chat_completion(model="gpt-4", messages=[{"role": "user", "content": "First"}])
-        client.chat_completion(model="gpt-4", messages=[{"role": "user", "content": "Second"}])
-        client.chat_completion(model="gpt-4", messages=[{"role": "user", "content": "Third"}])
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="First")])
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Second")])
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Third")])
 
         # Verify one event per call
         assert len(emitted_events) == 3
@@ -547,7 +548,7 @@ class TestLLMClientTelemetry:
         # Call should succeed despite telemetry failure
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Verify call succeeded
@@ -589,7 +590,7 @@ class TestLLMClientTelemetry:
         with pytest.raises(Exception, match="Database connection failed"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # CRITICAL: No telemetry should have been emitted

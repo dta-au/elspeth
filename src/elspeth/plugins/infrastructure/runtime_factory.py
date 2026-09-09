@@ -8,7 +8,7 @@ already-instantiated primitives.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
@@ -20,13 +20,21 @@ from elspeth.contracts.sink_effects import (
     SinkEffectExecutionPurpose,
     SinkEffectRuntimeBinding,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.engine.orchestrator.preflight import (
     validate_audit_export_sink_type_capability,
     validate_sink_effect_type_capability,
 )
 
 if TYPE_CHECKING:
-    from elspeth.core.config import AggregationSettings, ElspethSettings, LandscapeExportSettings, SourceSettings, TransformSettings
+    from elspeth.core.config import (
+        AggregationSettings,
+        CollectorSettings,
+        ElspethSettings,
+        LandscapeExportSettings,
+        SourceSettings,
+        TransformSettings,
+    )
     from elspeth.core.dag.wiring import WiredTransform
 
 
@@ -47,6 +55,7 @@ class PluginBundle:
     sinks: Mapping[str, SinkProtocol]
     aggregations: Mapping[str, tuple[TransformProtocol, AggregationSettings]]
     sink_effect_bindings: Mapping[str, SinkEffectRuntimeBinding]
+    collectors: Mapping[str, tuple[TransformProtocol, CollectorSettings]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         from elspeth.contracts.errors import OrchestrationInvariantError
@@ -63,7 +72,7 @@ class PluginBundle:
         for sink_name, binding in self.sink_effect_bindings.items():
             if binding.sink_name != sink_name or binding.sink is not self.sinks[sink_name]:
                 raise OrchestrationInvariantError("PluginBundle sink effect binding must retain the exact named sink instance")
-        freeze_fields(self, "sources", "source_settings_map", "transforms", "sinks", "aggregations", "sink_effect_bindings")
+        freeze_fields(self, "sources", "source_settings_map", "transforms", "sinks", "aggregations", "sink_effect_bindings", "collectors")
 
     @property
     def sink_effect_modes(self) -> Mapping[str, str]:
@@ -116,13 +125,13 @@ def instantiate_plugins_from_config(
         aggregations = {}
         for agg_config in config.aggregations:
             transform_cls = manager.get_transform_by_name(agg_config.plugin)
-            transform = transform_cls(dict(agg_config.options))
-            transform.on_success = agg_config.on_success
-            transform.on_error = agg_config.on_error
-
             # Aggregations require transforms that can consume multiple rows.
             # A non-batch-aware transform would silently ignore the trigger.
-            if not transform.is_batch_aware:
+            # Decided on the CLASS, before construction: is_batch_aware is a
+            # class attribute, and a plugin that is illegal for this node kind
+            # must be refused for THAT reason, not for whatever its own config
+            # validator happens to reject first (elspeth-98a0a9e732).
+            if not transform_cls.is_batch_aware:
                 raise ValueError(
                     f"Aggregation '{agg_config.name}' uses transform '{agg_config.plugin}' "
                     f"which has is_batch_aware=False. Aggregations require batch-aware "
@@ -130,8 +139,27 @@ def instantiate_plugins_from_config(
                     f"Use a batch-aware transform like 'batch_stats' or 'batch_replicate', "
                     f"or set is_batch_aware=True on your custom transform."
                 )
+            transform = transform_cls(dict(agg_config.options))
+            transform.on_success = agg_config.on_success
+            transform.on_error = agg_config.on_error
 
             aggregations[agg_config.name] = (transform, agg_config)
+
+        collectors = {}
+        for collector_config in config.collectors:
+            transform_cls = manager.get_transform_by_name(collector_config.plugin)
+            # Same ordering as the aggregation arm: the kind verdict comes
+            # from the class, before the plugin's own constructor can fail on
+            # its config and hide the real problem (elspeth-98a0a9e732).
+            if not transform_cls.is_batch_aware:
+                raise ValueError(
+                    f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' "
+                    f"which has is_batch_aware=False. Collectors reuse the batch-transform plugin "
+                    f"contract and require batch-aware plugins."
+                )
+            transform = transform_cls(dict(collector_config.options))
+            transform.on_success = collector_config.on_success
+            collectors[collector_config.name] = (transform, collector_config)
 
         from elspeth.plugins.infrastructure.base import BaseSink
 
@@ -141,7 +169,7 @@ def instantiate_plugins_from_config(
         for sink_name, sink_config in config.sinks.items():
             sink_cls = manager.get_sink_by_name(sink_config.plugin)
             if sink_name == delayed_export_sink:
-                if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink):
+                if issubclass(sink_cls, BaseSink):
                     options = dict(sink_config.options)
                     config_model = sink_cls.get_config_model(options)
                     if config_model is not None:
@@ -152,7 +180,7 @@ def instantiate_plugins_from_config(
             sinks[sink_name]._on_write_failure = sink_config.on_write_failure
             resolved_mode = (
                 sink_cls._resolve_sink_effect_mode(dict(sink_config.options), purpose=sink_effect_purpose)
-                if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
+                if issubclass(sink_cls, BaseSink)
                 else None
             )
             if resolved_mode is not None and type(resolved_mode) is not ResolvedSinkEffectMode:
@@ -173,6 +201,7 @@ def instantiate_plugins_from_config(
             sinks=sinks,
             aggregations=aggregations,
             sink_effect_bindings=sink_effect_bindings,
+            collectors=collectors,
         )
 
     # Value-source compliance check. Single source of truth: every entry point
@@ -180,15 +209,18 @@ def instantiate_plugins_from_config(
     # YAML with hallucinated values is rejected at construction time.
     from elspeth.engine.orchestrator.preflight import validate_value_source_compliance
 
-    validate_value_source_compliance(_value_source_wired_transforms(bundle))
+    validate_value_source_compliance(
+        _value_source_wired_transforms(bundle),
+        sources=bundle.sources,
+    )
     return bundle
 
 
 def _expand_env_placeholders_for_raw_preflight(
-    value: object,
+    options: Mapping[str, object],
     *,
     deferrable_env_vars: frozenset[str],
-) -> tuple[object, bool]:
+) -> tuple[dict[str, object], bool]:
     """Expand ``${VAR}``/``${VAR:-default}`` for pre-secret-loading preflight checks.
 
     Mirrors the loader's ``_expand_env_vars`` semantics (same placeholder
@@ -205,12 +237,50 @@ def _expand_env_placeholders_for_raw_preflight(
     the loader is about to replace would validate the wrong configuration.
 
     Returns:
-        Tuple of (expanded value, fully_resolved).
+        Tuple of (expanded options, fully_resolved).
 
     Raises:
         ValueError: A referenced variable is unset, has no default, and is not
             deferrable — the same failure the loader itself would raise later.
     """
+    expanded: dict[str, object] = {}
+    fully_resolved = True
+    for key, entry in options.items():
+        expanded[key], entry_resolved = _expand_env_placeholder_value(entry, deferrable_env_vars=deferrable_env_vars)
+        fully_resolved = fully_resolved and entry_resolved
+    return expanded, fully_resolved
+
+
+@trust_boundary(
+    tier=3,
+    source="raw sink option values (untrusted, pre-pydantic YAML/JSON) walked for ${VAR} placeholders before secret loading",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError for a ${VAR} placeholder in any nested str whose variable is unset, has no default, "
+        "and is not deferrable; every other value shape is returned unchanged"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_expand_env_placeholder_value_rejects_unset_variable",
+    test_fingerprint="e2720d03d06785e90247f1f6f6418ca25183415ebb95d8b58f9d06e5615d4525",
+)
+def _expand_env_placeholder_value(value: object, *, deferrable_env_vars: frozenset[str]) -> tuple[object, bool]:
+    """Expand one raw option value; nested mappings and lists recurse."""
+    if isinstance(value, str):
+        return _expand_env_placeholder_string(value, deferrable_env_vars=deferrable_env_vars)
+    if isinstance(value, Mapping):
+        return _expand_env_placeholders_for_raw_preflight(value, deferrable_env_vars=deferrable_env_vars)
+    if isinstance(value, list):
+        entries: list[object] = []
+        fully_resolved = True
+        for entry in value:
+            expanded, entry_resolved = _expand_env_placeholder_value(entry, deferrable_env_vars=deferrable_env_vars)
+            entries.append(expanded)
+            fully_resolved = fully_resolved and entry_resolved
+        return entries, fully_resolved
+    return value, True
+
+
+def _expand_env_placeholder_string(text: str, *, deferrable_env_vars: frozenset[str]) -> tuple[str, bool]:
     import os
     import re
 
@@ -218,38 +288,37 @@ def _expand_env_placeholders_for_raw_preflight(
 
     fully_resolved = True
 
-    def _expand_string(text: str) -> str:
-        def replacer(match: re.Match[str]) -> str:
-            nonlocal fully_resolved
-            var_name = match.group(1)
-            default = match.group(2)  # None if no default specified
-            if var_name in deferrable_env_vars:
-                fully_resolved = False
-                return match.group(0)
-            env_value = os.environ.get(var_name)
-            if env_value is not None:
-                return env_value
-            if default is not None:
-                return default
-            raise ValueError(
-                f"Required environment variable '{var_name}' is not set. "
-                f"Either set the variable or use ${{{var_name}:-default}} syntax for optional values."
-            )
+    def replacer(match: re.Match[str]) -> str:
+        nonlocal fully_resolved
+        var_name = match.group(1)
+        default = match.group(2)  # None if no default specified
+        if var_name in deferrable_env_vars:
+            fully_resolved = False
+            return match.group(0)
+        if var_name in os.environ:
+            return os.environ[var_name]
+        if default is not None:
+            return default
+        raise ValueError(
+            f"Required environment variable '{var_name}' is not set. "
+            f"Either set the variable or use ${{{var_name}:-default}} syntax for optional values."
+        )
 
-        return _ENV_VAR_PATTERN.sub(replacer, text)
-
-    def _expand_value(item: object) -> object:
-        if isinstance(item, str):
-            return _expand_string(item)
-        if isinstance(item, Mapping):
-            return {key: _expand_value(entry) for key, entry in item.items()}
-        if isinstance(item, list):
-            return [_expand_value(entry) for entry in item]
-        return item
-
-    return _expand_value(value), fully_resolved
+    return _ENV_VAR_PATTERN.sub(replacer, text), fully_resolved
 
 
+@trust_boundary(
+    tier=3,
+    source="web/CLI-authored raw pipeline configuration mapping (untrusted, pre-pydantic YAML/JSON)",
+    source_param="raw_config",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError for every raw_config-derived shape deviation across 'sinks', its "
+        "named entries, their 'plugin' and 'options'; never silently defaults or skips a malformed entry"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_validate_sink_effect_eligibility_rejects_non_mapping_sinks",
+    test_fingerprint="e54d5759fd061a58136b1da749152d310620cd074d2c34641e9ed7aeb6340767",
+)
 def validate_sink_effect_eligibility_from_raw_config(
     raw_config: Mapping[str, object],
     *,
@@ -279,7 +348,7 @@ def validate_sink_effect_eligibility_from_raw_config(
     from elspeth.plugins.infrastructure.base import BaseSink
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
-    if not isinstance(purpose, SinkEffectExecutionPurpose):
+    if type(purpose) is not SinkEffectExecutionPurpose:
         raise TypeError("Sink effect eligibility purpose must be exact SinkEffectExecutionPurpose")
     if type(expand_env_placeholders) is not bool:
         raise TypeError("Sink effect eligibility expand_env_placeholders must be an exact bool")
@@ -287,9 +356,14 @@ def validate_sink_effect_eligibility_from_raw_config(
         raise TypeError("Sink effect eligibility deferrable_env_vars must be an exact frozenset of strings")
     if deferrable_env_vars and not expand_env_placeholders:
         raise ValueError("Sink effect eligibility deferrable_env_vars requires expand_env_placeholders=True")
-    raw_sinks = raw_config.get("sinks")
+    if "sinks" not in raw_config:
+        raise ValueError("'sinks' must be a mapping/object for sink effect eligibility")
+    raw_sinks = raw_config["sinks"]
     if not isinstance(raw_sinks, Mapping):
         raise ValueError("'sinks' must be a mapping/object for sink effect eligibility")
+    for raw_sink_name in raw_sinks:
+        if not isinstance(raw_sink_name, str) or not raw_sink_name:
+            raise ValueError("Sink names must be non-empty strings for sink effect eligibility")
 
     export_settings = validate_landscape_export_settings_from_raw_config(raw_config)
     delayed_export_name: str | None = None
@@ -308,15 +382,15 @@ def validate_sink_effect_eligibility_from_raw_config(
     manager = None
     modes: dict[str, ResolvedSinkEffectMode] = {}
     for sink_name in selected_names:
-        if not isinstance(sink_name, str) or not sink_name:
-            raise ValueError("Sink names must be non-empty strings for sink effect eligibility")
         component = raw_sinks[sink_name]
         if not isinstance(component, Mapping):
             raise ValueError(f"Sink {sink_name!r} must be a mapping/object")
-        plugin_name = component.get("plugin")
+        if "plugin" not in component:
+            raise ValueError(f"Sink {sink_name!r} plugin must be a non-empty string")
+        plugin_name = component["plugin"]
         if not isinstance(plugin_name, str) or not plugin_name:
             raise ValueError(f"Sink {sink_name!r} plugin must be a non-empty string")
-        raw_options = component.get("options", {})
+        raw_options = component["options"] if "options" in component else {}
         if not isinstance(raw_options, Mapping):
             raise ValueError(f"Sink {sink_name!r} options must be a mapping/object")
         options = dict(raw_options)
@@ -331,8 +405,6 @@ def validate_sink_effect_eligibility_from_raw_config(
                 # adapter mode yet. The post-expansion admission gates re-run
                 # adapter mode resolution and remain authoritative.
                 continue
-            if not isinstance(expanded_options, dict):  # pragma: no cover - dict in, dict out
-                raise TypeError("expanded sink options must be a mapping")
             options = expanded_options
         if manager is None:
             manager = get_shared_plugin_manager()
@@ -354,32 +426,48 @@ def validate_sink_effect_eligibility_from_raw_config(
     return modes
 
 
+@trust_boundary(
+    tier=3,
+    source="web/CLI-authored raw pipeline configuration mapping (untrusted, pre-pydantic YAML/JSON)",
+    source_param="raw_config",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError unless 'landscape' and 'landscape.export', when present, are mappings; "
+        "never silently defaults a malformed section"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_validate_landscape_export_settings_rejects_non_mapping_landscape",
+    test_fingerprint="00ad72be64f927816212e8328687e5d7fc78a80c757a5ee5997cb5dd60acc5b6",
+)
 def validate_landscape_export_settings_from_raw_config(raw_config: Mapping[str, object]) -> LandscapeExportSettings:
     """Normalize bounded raw export settings through the authoritative model."""
     from elspeth.core.config import LandscapeExportSettings
 
-    raw_landscape = raw_config.get("landscape")
-    if raw_landscape is None:
+    if "landscape" not in raw_config:
         return LandscapeExportSettings()
+    raw_landscape = raw_config["landscape"]
     if not isinstance(raw_landscape, Mapping):
         raise ValueError("'landscape' must be a mapping/object before sink effect eligibility")
-    raw_export = raw_landscape.get("export")
-    if raw_export is None:
+    if "export" not in raw_landscape:
         return LandscapeExportSettings()
+    raw_export = raw_landscape["export"]
     if not isinstance(raw_export, Mapping):
         raise ValueError("'landscape.export' must be a mapping/object before sink effect eligibility")
     return LandscapeExportSettings.model_validate(dict(raw_export))
 
 
 def _value_source_wired_transforms(bundle: PluginBundle) -> tuple[WiredTransform, ...]:
-    """Return ordinary and aggregation-backed transforms for value-source checks."""
+    """Return ordinary, aggregation-backed, and collector-backed transforms for value-source checks."""
     from elspeth.core.dag.wiring import WiredTransform
 
     aggregation_transforms = tuple(
         WiredTransform(plugin=transform, settings=cast("TransformSettings", agg_settings))
         for transform, agg_settings in bundle.aggregations.values()
     )
-    return (*bundle.transforms, *aggregation_transforms)
+    collector_transforms = tuple(
+        WiredTransform(plugin=transform, settings=cast("TransformSettings", collector_settings))
+        for transform, collector_settings in bundle.collectors.values()
+    )
+    return (*bundle.transforms, *aggregation_transforms, *collector_transforms)
 
 
 def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRuntimeBinding]:
@@ -405,14 +493,17 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
         sink._on_write_failure = sink_config.on_write_failure
         from elspeth.plugins.infrastructure.base import BaseSink
 
-        resolved_mode = (
-            sink_cls._resolve_sink_effect_mode(
+        is_base_sink = issubclass(sink_cls, BaseSink)
+        resolved_mode = None
+        publication_preflight = None
+        if is_base_sink:
+            base_sink_type = cast(type[BaseSink], sink_cls)
+            resolved_mode = base_sink_type._resolve_sink_effect_mode(
                 dict(sink_config.options),
                 purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
             )
-            if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
-            else None
-        )
+            export_format = AuditExportFormat(config.landscape.export.format)
+            publication_preflight = cast(BaseSink, sink)._resolve_audit_export_publication_preflight(export_format)
         if resolved_mode is not None and type(resolved_mode) is not ResolvedSinkEffectMode:
             raise TypeError("Sink _resolve_sink_effect_mode must return ResolvedSinkEffectMode or None")
         return SinkEffectRuntimeBinding(
@@ -422,6 +513,7 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
             config_fingerprint=stable_hash(dict(sink_config.options)),
             purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
             effect_mode=resolved_mode,
+            audit_export_publication_preflight=publication_preflight,
         )
 
     return factory

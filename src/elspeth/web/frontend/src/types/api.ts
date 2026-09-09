@@ -7,6 +7,7 @@ export type {
   UserProfile,
   Session,
   ChatMessage,
+  ChatMessageSegment,
   ToolCall,
   NodeSpec,
   EdgeSpec,
@@ -99,6 +100,8 @@ export interface UserComposerPreferencesPayload {
   tutorial_session_id: string | null;
   tutorial_run_id: string | null;
   tutorial_source_data_hash: string | null;
+  // Detail level (elspeth-9c11df65f8). false = standard view.
+  show_advanced: boolean;
   // Nullable to mirror the backend Panel-U1 contract: when no DB row
   // exists for the user, the GET response represents the in-server
   // default and updated_at is null (no write event has occurred to
@@ -119,6 +122,7 @@ export interface UpdateUserComposerPreferencesPayload {
   tutorial_session_id?: string | null;
   tutorial_run_id?: string | null;
   tutorial_source_data_hash?: string | null;
+  show_advanced?: boolean;
   // Request-only telemetry discriminator: marks a completion write as an
   // explicit in-tutorial exit (elspeth-61591e64bb). Only valid alongside a
   // non-null tutorial_completed_at in the same PATCH; never echoed back.
@@ -223,7 +227,18 @@ export interface SharedInspectResponse {
   composition_snapshot: _CompositionState;
   yaml: string;
   audit_readiness: _AuditReadinessSnapshot;
+  /**
+   * Opaque identity id of the sharer — what the share token's signature
+   * binds. Not human-readable; do not render it as a name except as the
+   * legacy fallback described on `created_by_username`.
+   */
   created_by_user_id: string;
+  /**
+   * Human-readable name of the sharer, frozen into the snapshot at
+   * mark-time. `null` for snapshots minted before the backend carried it;
+   * those blobs are immutable signed bytes and cannot be backfilled.
+   */
+  created_by_username: string | null;
   created_at: string;
   expires_at: string;
 }

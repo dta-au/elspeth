@@ -12,8 +12,30 @@ from elspeth.web.composer.guided.profile import (
     TUTORIAL_PROFILE,
     WorkflowProfile,
     WorkflowProfileKind,
+    kind_for_profile,
     profile_for_kind,
 )
+
+
+class TestKindForProfile:
+    """The inverse the guided root-custody helper is load-bearing on.
+
+    A completed ``guided_start``'s request DTO is not persisted, so the only
+    way to recover the ``profile`` discriminator it was hashed under is the
+    profile constant its result checkpoint carries. If this inverse drifts, a
+    rooted session stops verifying and the planner refuses to run on it.
+    """
+
+    @pytest.mark.parametrize("kind", list(WorkflowProfileKind))
+    def test_round_trips_every_closed_kind(self, kind: WorkflowProfileKind) -> None:
+        assert kind_for_profile(profile_for_kind(kind)) is kind
+
+    def test_refuses_a_profile_no_server_preset_mints(self) -> None:
+        # ``WorkflowProfile`` is a plain pair of booleans, so a corrupt
+        # checkpoint can decode to a combination no preset produces. Guessing
+        # a kind for it would forge start-operation authority.
+        with pytest.raises(InvariantError, match=r"kind_for_profile"):
+            kind_for_profile(WorkflowProfile(coaching=True, bookends=False))
 
 
 class TestWorkflowProfileShape:

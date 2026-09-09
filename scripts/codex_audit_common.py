@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import re
 import subprocess
@@ -91,8 +90,8 @@ EXCLUDE_SUFFIXES = {".pyc", ".pyo"}
 # Project instruction documents and skills that encode project-specific local rules
 # (tier model, engine patterns, etc.). These are auto-loaded into agent context
 # so static analysis prompts have the full authoritative rule set, not just the
-# CLAUDE.md summary. Prefer Codex-native AGENTS.md and `.agents/skills`, while
-# retaining CLAUDE.md / `.claude/skills` as migration fallbacks.
+# CLAUDE.md summary. `.agents/skills` is the single canonical skills tree
+# (`.claude/skills` holds symlinks into it); CLAUDE.md is retained as a fallback.
 PROJECT_CONTEXT_FILES = ["AGENTS.md", "CLAUDE.md"]
 SKILL_NAMES = [
     "tier-model-deep-dive",
@@ -100,7 +99,7 @@ SKILL_NAMES = [
     "config-contracts-guide",
     "logging-telemetry-policy",
 ]
-SKILL_ROOTS = [".agents/skills", ".claude/skills"]
+SKILL_ROOTS = [".agents/skills"]
 
 REPORT_METADATA_FILENAMES = frozenset({"RUN_METADATA.md", "SUMMARY.md", "FINDINGS_INDEX.md"})
 PRIORITY_COPY_DIR = "by-priority"
@@ -298,23 +297,9 @@ def make_codex_rate_limiter(rate_limit: int | None) -> AsyncRequestRateLimiter |
     return AsyncRequestRateLimiter(max_calls=rate_limit)
 
 
-async def _await_rate_limiter(rate_limiter: Any) -> None:
-    """Acquire a rate-limit slot, preferring the shared async wrapper API."""
-    acquire = getattr(rate_limiter, "acquire", None)
-    if acquire is not None:
-        acquired = acquire()
-        if inspect.isawaitable(acquired):
-            await acquired
-        return
-
-    acquire_async = getattr(rate_limiter, "try_acquire_async", None)
-    if acquire_async is not None:
-        await acquire_async("codex_api")
-        return
-
-    acquired = rate_limiter.try_acquire("codex_api")
-    if asyncio.iscoroutine(acquired):
-        await acquired
+async def _await_rate_limiter(rate_limiter: AsyncRequestRateLimiter) -> None:
+    """Acquire a slot from the owned Codex subprocess rate limiter."""
+    await rate_limiter.acquire()
 
 
 async def append_log(
@@ -693,7 +678,7 @@ async def run_codex_with_retry_and_logging(
     log_lock: asyncio.Lock,
     file_display: str,
     output_display: str,
-    rate_limiter: Any | None,
+    rate_limiter: AsyncRequestRateLimiter | None,
     evidence_gate_summary_prefix: str = "",
     output_schema: Path | None = None,
     structured_markdown_field: str | None = None,

@@ -13,13 +13,13 @@ exit, it queries `scheduler_events` grouped by `from_lease_owner` and asserts
 ## Pipeline shape
 
 ```
-input.jsonl (1 row, items array of 600 texts)
+input.jsonl (1 row, items array of 120 texts)
   └─> [exploded] ─> json_explode ─> [llm_input] ─> llm_0 (ChaosLLM sentiment) ─> output/results.json
                                                                                   ─> output/quarantined.json
 ```
 
-The `json` source reads one JSONL row whose `items` array contains 600 short
-text strings. The `json_explode` transform fans them out into 600 individual
+The `json` source reads one JSONL row whose `items` array contains 120 short
+text strings. The `json_explode` transform fans them out into 120 individual
 tokens, each carrying a single `text` field. This gives the leader+follower
 pack enough work to share before the leader drains the queue alone.
 
@@ -44,7 +44,16 @@ pass the **same** `settings.yaml`.
 
 # Scale to 3 followers (4-way pack)
 WORKERS=3 ./examples/multi_worker/run.sh
+
+# Opt in to retry/error-routing faults; this may end PARTIAL and fail the
+# launcher's clean-run assertion.
+ELSPETH_MULTI_WORKER_CHAOS_CONFIG=examples/multi_worker/chaos_config_faults.yaml \
+  ./examples/multi_worker/run.sh
 ```
+
+The default `chaos_config.yaml` adds latency but injects no terminal faults, so
+the self-verifying concurrency demonstration has a deterministic exit-0
+contract. `chaos_config_faults.yaml` retains the resilience profile separately.
 
 The follower invocation inside `run.sh` is:
 
@@ -55,14 +64,19 @@ The follower invocation inside `run.sh` is:
 **There is no `--execute` flag on `elspeth join`** — join executes
 unconditionally. Only `elspeth run` takes `--execute`.
 
+The launcher also sources `examples/chaosllm_env.sh`. In a clean checkout it
+generates one process-scoped `ELSPETH_FINGERPRINT_KEY` before starting the
+leader, so the leader and every follower inherit the same audit-fingerprinting
+key. The inline ChaosLLM token is fake and the endpoint is local; no real
+OpenRouter credential or service is used.
+
 ## Join-window timing (design risk)
 
 A follower can only attach while the run is `running`. The poll loop requires
 RUNNING *and* ≥1 `leased` token work item before launching followers, so the
 leader is demonstrably processing before any follower joins. The input is sized
-to 600 exploded items and `chaos_config.yaml` includes `slow_response_pct: 1.0`
-/ `slow_response_sec: [1, 3]` so the leader cannot drain the queue before
-followers attach under normal ChaosLLM latency.
+to 120 exploded items and `chaos_config.yaml` adds per-call latency, so the
+leader cannot drain the queue before followers attach under normal execution.
 
 If the assertion fails with "only 1 worker completed rows", the leader finished
 before the follower joined (fast-drain race). Do not add sleeps — raise
@@ -92,11 +106,12 @@ Per-worker attribution (scheduler_events grouped by from_lease_owner):
 <worker_id>|leader|<N>
 <worker_id>|follower|<M>
 
-✓ PASS: leader + 1 follower(s) shared 600 rows across 2 workers
+✓ PASS: leader + 1 follower(s) shared 120 rows across 2 workers
 ```
 
-Success: `output/results.json` (completed rows) and `output/quarantined.json`
-(rows that exhausted retries against ChaosLLM faults).
+Success: `output/results.json` contains all 120 completed rows. The optional
+fault profile may also create `output/quarantined.json` for retry-exhausted
+rows.
 
 ## Exit-code semantics (`elspeth join`)
 
@@ -123,8 +138,9 @@ retained here.*
   `PRAGMA query_only=ON` so the verification never contends with live worker
   writes. Note: `token_work_items.lease_owner` is nulled on terminal/failed
   and is not a reliable attribution source in multi-worker mode.
-- **`json_explode`** — fans one JSONL record whose `items` array has 600
-  elements into 600 individual work tokens, giving the pack enough shared work
+- **`json_explode`** — fans one JSONL record whose `items` array has 120
+  elements into 120 individual work tokens, giving the pack enough shared work
   to demonstrate concurrent processing.
-- **ChaosLLM** (`chaosllm_sentiment` shape) — keyless mock LLM with configurable
-  latency and fault injection; `--workers 1` required (errorworks constraint).
+- **ChaosLLM** (`chaosllm_sentiment` shape) — keyless mock LLM with deterministic
+  default latency and a separate opt-in fault profile; `--workers 1` keeps the
+  local server single-process.

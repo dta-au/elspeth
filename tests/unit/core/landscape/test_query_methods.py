@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -17,7 +18,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.errors import AuditIntegrityError, CoalesceFailureReason
+from elspeth.contracts.errors import AuditIntegrityError, CoalesceFailureReason, RowUnionFailureReason
 from elspeth.contracts.payload_store import (
     IntegrityError as PayloadIntegrityError,
 )
@@ -632,11 +633,18 @@ class TestGetTokenParents:
 
     def test_returns_parents_after_coalesce(self):
         _, factory = _setup_full()
-        # Create a second token to coalesce with
-        factory.data_flow.create_token("row-1", token_id="tok-2")
+        # coalesce_tokens' durable strict pop (spec rulings 24/28) requires an
+        # innermost shared FORK lineage frame on every parent, so the coalesce
+        # partners here are real fork_token children rather than two
+        # independently-created tokens.
+        children, _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
+            row_id="row-1",
+            branches=["path-a", "path-b"],
+        )
 
         merged = factory.data_flow.coalesce_tokens(
-            parent_refs=[TokenRef(token_id="tok-1", run_id="run-1"), TokenRef(token_id="tok-2", run_id="run-1")],
+            parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
             row_id="row-1",
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
@@ -646,8 +654,8 @@ class TestGetTokenParents:
 
         assert len(parents) == 2
         parent_ids = [p.parent_token_id for p in parents]
-        assert "tok-1" in parent_ids
-        assert "tok-2" in parent_ids
+        assert children[0].token_id in parent_ids
+        assert children[1].token_id in parent_ids
         # Ordered by ordinal
         assert parents[0].ordinal == 0
         assert parents[1].ordinal == 1
@@ -1247,20 +1255,31 @@ class TestGetAllTokenParentsForRun:
 
     def test_returns_parents_from_coalesce(self):
         _, factory = _setup_full()
-        factory.data_flow.create_token("row-1", token_id="tok-2")
+        # coalesce_tokens' durable strict pop (spec rulings 24/28) requires an
+        # innermost shared FORK lineage frame on every parent, so the coalesce
+        # partners here are real fork_token children rather than two
+        # independently-created tokens.
+        children, _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
+            row_id="row-1",
+            branches=["path-a", "path-b"],
+        )
 
         merged = factory.data_flow.coalesce_tokens(
-            parent_refs=[TokenRef(token_id="tok-1", run_id="run-1"), TokenRef(token_id="tok-2", run_id="run-1")],
+            parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
             row_id="row-1",
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
         )
 
-        parents = factory.query.get_all_token_parents_for_run("run-1")
+        # get_all_token_parents_for_run returns every token_parents row in the
+        # run — including the fork's own child->tok-1 rows — so scope the
+        # assertion to the coalesce's own merged-token parent rows.
+        parents = [p for p in factory.query.get_all_token_parents_for_run("run-1") if p.token_id == merged.token_id]
 
         assert len(parents) == 2
         parent_token_ids = {p.parent_token_id for p in parents}
-        assert parent_token_ids == {"tok-1", "tok-2"}
+        assert parent_token_ids == {children[0].token_id, children[1].token_id}
         for p in parents:
             assert p.token_id == merged.token_id
 
@@ -2097,7 +2116,6 @@ class TestGetAllTokenOutcomesForRun:
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
-            fork_group_id="fg-1",
         )
 
         outcomes = factory.query.get_all_token_outcomes_for_run("run-1")
@@ -2157,6 +2175,60 @@ class TestAuditRunStatusProjection:
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 1
 
+    def test_row_union_failed_node_state_counts_as_failed_barrier(self):
+        _db, factory = _setup(run_id="run-1")
+        register_test_node(factory.data_flow, "run-1", "row-union-1", node_type=NodeType.ROW_UNION, plugin_name="row_union")
+        factory.data_flow.create_row(
+            "run-1",
+            "source-0",
+            0,
+            {"value": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        factory.data_flow.create_token("row-1", token_id="tok-branch-a")
+        factory.execution.begin_node_state("tok-branch-a", "row-union-1", "run-1", 0, {"value": 1}, state_id="rus-a")
+        factory.execution.complete_node_state(
+            state_id="rus-a",
+            status=NodeStateStatus.FAILED,
+            error=RowUnionFailureReason(
+                failure_reason="row_union_timeout",
+                expected_branches=("branch_a", "branch_b"),
+                branches_arrived=("branch_a",),
+            ),
+            duration_ms=0.0,
+        )
+
+        assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 1
+
+    def test_row_union_late_arrival_after_release_is_not_a_failed_barrier(self):
+        _db, factory = _setup(run_id="run-1")
+        register_test_node(factory.data_flow, "run-1", "row-union-1", node_type=NodeType.ROW_UNION, plugin_name="row_union")
+        factory.data_flow.create_row(
+            "run-1",
+            "source-0",
+            0,
+            {"value": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        factory.data_flow.create_token("row-1", token_id="tok-late")
+        factory.execution.begin_node_state("tok-late", "row-union-1", "run-1", 0, {"value": 1}, state_id="rus-late")
+        factory.execution.complete_node_state(
+            state_id="rus-late",
+            status=NodeStateStatus.FAILED,
+            error=RowUnionFailureReason(
+                failure_reason="late_arrival_after_release",
+                expected_branches=("branch_a", "branch_b"),
+                branches_arrived=(),
+            ),
+            duration_ms=0.0,
+        )
+
+        assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 0
+
     def test_attribution_failed_states_at_non_coalesce_nodes_do_not_count(self):
         """The anchor is nodes.node_type='coalesce': an ordinary transform
         failure must not register as a coalesce barrier failure."""
@@ -2214,10 +2286,16 @@ class TestAuditRunStatusProjection:
 # =============================================================================
 
 
-def _grouped_by(items: list, key: str) -> dict[str, list]:
+def _grouped_by(items: list, key: Callable[[Any], str]) -> dict[str, list]:
+    """Group owned audit records by an explicit accessor.
+
+    The caller passes the accessor (``lambda token: token.row_id``) rather than a
+    field name, so the parent-id read is a direct attribute access on the owned
+    record type instead of a reflective lookup.
+    """
     grouped: dict[str, list] = {}
     for item in items:
-        grouped.setdefault(getattr(item, key), []).append(item)
+        grouped.setdefault(key(item), []).append(item)
     return grouped
 
 
@@ -2307,7 +2385,7 @@ class TestGetTokensForRows:
 
         tokens = factory.query.get_tokens_for_rows("run-1", ["row-a", "row-b"])
 
-        grouped = _grouped_by(tokens, "row_id")
+        grouped = _grouped_by(tokens, lambda token: token.row_id)
         for row_id in ("row-a", "row-b"):
             assert [t.token_id for t in grouped[row_id]] == [t.token_id for t in factory.query.get_tokens(row_id)]
 
@@ -2336,9 +2414,9 @@ class TestGetTokensForRows:
         factory.query._QUERY_CHUNK_SIZE = 1  # force one IN-chunk per row
 
         chunked = factory.query.get_tokens_for_rows("run-1", ["row-a", "row-b"])
-        assert _grouped_by(chunked, "row_id").keys() == _grouped_by(unchunked, "row_id").keys()
-        for row_id, group in _grouped_by(unchunked, "row_id").items():
-            assert [t.token_id for t in _grouped_by(chunked, "row_id")[row_id]] == [t.token_id for t in group]
+        assert _grouped_by(chunked, lambda token: token.row_id).keys() == _grouped_by(unchunked, lambda token: token.row_id).keys()
+        for row_id, group in _grouped_by(unchunked, lambda token: token.row_id).items():
+            assert [t.token_id for t in _grouped_by(chunked, lambda token: token.row_id)[row_id]] == [t.token_id for t in group]
 
 
 class TestGetTokenParentsForTokens:
@@ -2361,7 +2439,7 @@ class TestGetTokenParentsForTokens:
 
         parents = factory.query.get_token_parents_for_tokens(child_ids)
 
-        grouped = _grouped_by(parents, "token_id")
+        grouped = _grouped_by(parents, lambda parent: parent.token_id)
         assert set(grouped.keys()) == set(child_ids)
         for child_id in child_ids:
             assert [(p.parent_token_id, p.ordinal) for p in grouped[child_id]] == [
@@ -2403,7 +2481,7 @@ class TestGetNodeStatesForTokens:
 
         states = factory.query.get_node_states_for_tokens("run-1", ["tok-1", "tok-2"])
 
-        grouped = _grouped_by(states, "token_id")
+        grouped = _grouped_by(states, lambda state: state.token_id)
         for token_id in ("tok-1", "tok-2"):
             assert [s.state_id for s in grouped[token_id]] == [s.state_id for s in factory.query.get_node_states_for_token(token_id)]
         assert [s.state_id for s in grouped["tok-1"]] == ["st-1-early", "st-1-late"]
@@ -2450,8 +2528,8 @@ class TestGetTokenOutcomesForTokens:
 
         outcomes = factory.query.get_token_outcomes_for_tokens("run-1", ["tok-1", "tok-2"])
 
-        grouped = _grouped_by(outcomes, "token_id")
-        full = _grouped_by(factory.query.get_all_token_outcomes_for_run("run-1"), "token_id")
+        grouped = _grouped_by(outcomes, lambda outcome: outcome.token_id)
+        full = _grouped_by(factory.query.get_all_token_outcomes_for_run("run-1"), lambda outcome: outcome.token_id)
         assert grouped.keys() == full.keys()
         for token_id, group in full.items():
             assert [o.outcome_id for o in grouped[token_id]] == [o.outcome_id for o in group]
@@ -2484,7 +2562,6 @@ class TestGetSchedulerEventsForTokens:
         factory.data_flow.create_token("row-1", token_id="tok-1")
         factory.data_flow.create_token("row-2", token_id="tok-2")
         payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, _MINIMAL_CONTRACT))
-        now = datetime.now(UTC)
         for token_id, row_id, ingest in (("tok-1", "row-1", 0), ("tok-2", "row-2", 1)):
             factory.scheduler.enqueue_ready(
                 run_id="run-1",
@@ -2493,7 +2570,6 @@ class TestGetSchedulerEventsForTokens:
                 node_id="transform-1",
                 step_index=1,
                 ingest_sequence=ingest,
-                available_at=now,
                 row_payload_json=payload,
             )
         return factory
@@ -2503,8 +2579,8 @@ class TestGetSchedulerEventsForTokens:
 
         events = factory.query.get_scheduler_events_for_tokens("run-1", ["tok-1", "tok-2"])
 
-        grouped = _grouped_by(events, "token_id")
-        full = _grouped_by(factory.query.get_scheduler_events(run_id="run-1"), "token_id")
+        grouped = _grouped_by(events, lambda event: event.token_id)
+        full = _grouped_by(factory.query.get_scheduler_events(run_id="run-1"), lambda event: event.token_id)
         assert grouped.keys() == full.keys()
         for token_id, group in full.items():
             assert [e.event_id for e in grouped[token_id]] == [e.event_id for e in group]

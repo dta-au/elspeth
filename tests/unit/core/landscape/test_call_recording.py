@@ -221,6 +221,20 @@ class TestAllocateCallIndex:
 class TestRecordCall:
     """Tests for recording external calls linked to a node_state."""
 
+    def test_rejects_bool_call_index_before_inserting_audit_row(self):
+        _db, factory, state_id = _setup()
+
+        with pytest.raises(FrameworkBugError, match="call_index must be an exact integer"):
+            factory.execution.record_call(
+                state_id,
+                True,
+                CallType.HTTP,
+                CallStatus.SUCCESS,
+                request_data=RawCallPayload({"url": "https://example.com"}),
+            )
+
+        assert factory.query.get_calls(state_id) == []
+
     def test_creates_call_with_request_hash(self):
         _db, factory, state_id = _setup()
         idx = factory.execution.allocate_call_index(state_id)

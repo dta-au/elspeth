@@ -14,6 +14,7 @@ describe("OIDC redacting reporter", () => {
       JWT,
       "https://example.invalid/callback?code=secret-code&state=secret-state#access_token=secret-token",
       "code_verifier=secret-verifier",
+      "nonce=secret-nonce&code_challenge=secret-challenge&client_secret=secret-client-secret",
       "Cookie: session=secret-cookie",
       "Authorization: secret-header",
       '{"cookie":"session=structured-cookie","x-api-key":"structured-key"}',
@@ -28,6 +29,9 @@ describe("OIDC redacting reporter", () => {
       "secret-state",
       "secret-token",
       "secret-verifier",
+      "secret-nonce",
+      "secret-challenge",
+      "secret-client-secret",
       "secret-cookie",
       "secret-header",
       "structured-cookie",
@@ -42,6 +46,7 @@ describe("OIDC redacting reporter", () => {
     const raw = [
       '{"code":"json-code-secret","state":"json-state-secret","access_token":"json-access-secret"}',
       "{ id_token: 'object-id-secret', refresh_token: object-refresh-secret }",
+      '{"nonce":"json-nonce-secret","code_challenge":"json-challenge-secret","client_secret":"json-client-secret"}',
     ].join("\n");
 
     const sanitized = sanitizeReporterText(raw, {});
@@ -52,6 +57,9 @@ describe("OIDC redacting reporter", () => {
       "json-access-secret",
       "object-id-secret",
       "object-refresh-secret",
+      "json-nonce-secret",
+      "json-challenge-secret",
+      "json-client-secret",
     ]) {
       expect(sanitized).not.toContain(forbidden);
     }

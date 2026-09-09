@@ -21,9 +21,11 @@
 // matching change in the others fails CI (vocabulary parity test on
 // adds/removes, TS compiler on type drift).
 //
-// Unknown flags (no entry here) render as a small grey "unknown" chip with
-// the raw flag string as label; this is the forward-compatibility path
-// for flags added on the backend without a corresponding frontend update.
+// Unknown flags (no entry here) render nothing: AuditCharacteristicIcon
+// returns null, and PluginCard filters them out of the list before render
+// so an all-unknown flag set never announces an empty audit-characteristics
+// group. This is the forward-compatibility path for flags added on the
+// backend without a corresponding frontend update.
 // ============================================================================
 
 /** Closed vocabulary of audit-characteristic flag strings.
@@ -48,7 +50,7 @@
  * Forward compatibility for unknown-on-the-wire flags is preserved by
  * keeping ``lookupAuditCharacteristic(flag: string)`` accepting
  * ``string`` — an unknown wire value still resolves to ``null`` and
- * renders the grey "unknown" chip rather than crashing.
+ * renders nothing (PluginCard filters it out) rather than crashing.
  */
 export type AuditCharacteristicFlag =
   // Determinism-derived (composed from Determinism enum)
@@ -80,8 +82,10 @@ export interface AuditCharacteristicMeta {
   flag: AuditCharacteristicFlag;
   /** Short label shown next to the icon on the card. */
   label: string;
-  /** Single-character or short glyph (Unicode) used as the icon. */
-  glyph: string;
+  /* The former `glyph` column (one emoji per flag) was deleted with the
+     hidden .audit-icon-glyph span it fed (elspeth-09a1a87051): the emoji
+     were outside the product's sanctioned glyph set (gear / warning /
+     empty-set) and only ever rendered into a display:none span. */
   /** Plain-language tooltip explaining the flag to a non-developer. */
   tooltip: string;
   /** Visual tone — "positive" renders as a green checkmark-style chip;
@@ -95,7 +99,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "deterministic",
     label: "deterministic",
-    glyph: "≡",
     tooltip:
       "Plugin produces identical output on every run with the same input. " +
       "Safe to re-run; no replay machinery needed.",
@@ -104,7 +107,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "seeded",
     label: "seeded",
-    glyph: "🎲",
     tooltip:
       "Plugin uses pseudo-randomness controlled by a seed. Replay captures " +
       "the seed; re-running with the same seed reproduces the output.",
@@ -113,7 +115,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "io_read",
     label: "reads I/O",
-    glyph: "📥",
     tooltip:
       "Plugin reads from an external file, environment variable, or local " +
       "filesystem. Replay captures what was read.",
@@ -122,7 +123,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "io_write",
     label: "writes I/O",
-    glyph: "📤",
     tooltip:
       "Plugin writes to a file, environment, or local filesystem. Be " +
       "careful — replay re-applies the side effects.",
@@ -130,8 +130,11 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   },
   {
     flag: "external_call",
-    label: "Network call",
-    glyph: "🌐",
+    // Sentence-case like every other label here — the twelve chips render
+    // side by side in one wrapping row, and a lone capital reads as a proper
+    // noun or a more important characteristic (elspeth-cfa3faad35). The two
+    // "I/O" labels and "HMAC-signed" keep their capitals: those are acronyms.
+    label: "network call",
     tooltip:
       "Plugin reaches an external system over the network (HTTP, API, " +
       "service call). Replay records the request and response.",
@@ -140,7 +143,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "non_deterministic",
     label: "non-deterministic",
-    glyph: "⁇",
     tooltip:
       "Plugin output is not reproducible from inputs alone. Replay must " +
       "record the full output verbatim.",
@@ -151,7 +153,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "quarantine",
     label: "quarantines bad rows",
-    glyph: "🛡",
     tooltip:
       "Source quarantines malformed rows to a designated sink instead of " +
       "crashing or silently discarding them. The audit trail records " +
@@ -160,18 +161,17 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   },
   {
     flag: "coerce",
-    label: "coerces types",
-    glyph: "↔",
+    label: "can coerce types",
     tooltip:
-      "Plugin coerces external string-typed cells to typed columns at the " +
-      "Tier-3 boundary (e.g., \"42\" → 42). Coercion is meaning-preserving; " +
-      "fabrication is not. See CLAUDE.md \"Data Manifesto\" for the rule.",
+      "With a fixed or flexible schema, the plugin can coerce external " +
+      "string-typed cells to declared column types at the Tier-3 boundary " +
+      "(e.g., \"42\" → 42). Observed schemas have no declared types, so " +
+      "CSV cells remain strings.",
     tone: "positive",
   },
   {
     flag: "retention",
     label: "retention-aware",
-    glyph: "🗄",
     tooltip:
       "Plugin respects the configured retention policy — data emitted or " +
       "stored by this plugin will be purged according to the pipeline's " +
@@ -183,7 +183,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "provenance",
     label: "extra provenance",
-    glyph: "🔍",
     tooltip:
       "Plugin emits additional provenance records beyond the standard " +
       "pipeline lineage (e.g., per-row hashes of source bytes).",
@@ -192,7 +191,6 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "signed",
     label: "HMAC-signed",
-    glyph: "🔏",
     tooltip:
       "Plugin output is HMAC-signed for tamper-evidence. The signing key " +
       "is part of the audit trail.",
@@ -201,13 +199,22 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   {
     flag: "credentials",
     label: "needs credentials",
-    glyph: "🔑",
     tooltip:
       "Plugin requires user secrets (API keys, tokens) to operate. " +
       "Credentials are stored via the secret-handling pathway, not in " +
       "pipeline config.",
     tone: "attention",
   },
+];
+
+/** The three flags that change what happens to the reader's data — the
+ *  default-visible subset (elspeth-8555a6a9e0); the other nine render only
+ *  with show_advanced. Shared by PluginCard's strip and FilterChipStrip so
+ *  the two splits cannot drift. */
+export const DEFAULT_VISIBLE_AUDIT_FLAGS: readonly AuditCharacteristicFlag[] = [
+  "quarantine",
+  "credentials",
+  "external_call",
 ];
 
 const _byFlag = new Map<string, AuditCharacteristicMeta>(

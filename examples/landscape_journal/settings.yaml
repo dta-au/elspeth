@@ -1,7 +1,7 @@
 landscape:
   url: sqlite:///examples/landscape_journal/runs/audit.db
   dump_to_jsonl: true
-  dump_to_jsonl_path: examples/landscape_journal/runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
 sources:
   primary:
     plugin: json

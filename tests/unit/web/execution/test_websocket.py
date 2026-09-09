@@ -236,7 +236,7 @@ def _accounting(
 ) -> RunAccounting:
     terminal = succeeded + failed + structural
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=source_rows),
+        source=RunAccountingSource(rows_processed=source_rows, rows_rejected=0, rows_read=source_rows),
         tokens=RunAccountingTokens(
             emitted=terminal + pending,
             terminal=terminal,
@@ -244,6 +244,7 @@ def _accounting(
             failed=failed,
             structural=structural,
             pending=pending,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
         integrity=RunAccountingIntegrity(
@@ -383,7 +384,10 @@ class TestWebSocketIDOR:
             broadcaster=broadcaster,
         )
         ticket = _issue_ws_ticket(app, "run-1", user=user)
-        websocket = await _call_websocket(app, "run-1", ticket=ticket)
+        websocket = FakeWebSocket(app)
+        with pytest.raises(RunSessionIntegrityError) as caught:
+            await _websocket_endpoint(app)(websocket, "run-1", ticket=ticket)
+        assert caught.value is svc.ownership
         assert websocket.accepted is True
         assert websocket.close_code == 1011
         assert "not found" not in (websocket.close_reason or "").lower()
@@ -391,6 +395,122 @@ class TestWebSocketIDOR:
 
 class TestWebSocketTimeoutRecovery:
     """Timeout path must probe authoritative status, not send ad-hoc payloads."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["seed", "idle_recheck"])
+    @pytest.mark.parametrize("logger_fails", [False, True])
+    async def test_accounting_corruption_escapes_after_internal_error_close(self, phase: str, logger_fails: bool) -> None:
+        from elspeth.web.execution import routes
+
+        run_id = str(uuid4())
+        app = _create_ws_test_app()
+        websocket = FakeWebSocket(app)
+        corruption = routes._RunStatusIntegrityError("private accounting evidence")
+        initial = routes._LoadedRunStatus(
+            response=RunStatusResponse(
+                run_id=run_id,
+                status="running",
+                started_at=datetime.now(tz=UTC),
+                finished_at=None,
+                error=None,
+                landscape_run_id=None,
+            ),
+            record=FakeRunRecord(),
+        )
+        outcomes = [corruption] if phase == "seed" else [initial, corruption]
+        with (
+            patch.object(
+                routes,
+                "_load_run_status_snapshot_with_accounting",
+                new=AsyncMock(spec=routes._load_run_status_snapshot_with_accounting, side_effect=outcomes),
+            ),
+            patch.object(routes.asyncio, "wait_for", new=AsyncMock(spec=routes.asyncio.wait_for, side_effect=TimeoutError())),
+            patch.object(routes.slog, "error", side_effect=OSError("logger unavailable") if logger_fails else None),
+            pytest.raises(routes._RunStatusIntegrityError) as caught,
+        ):
+            await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+        assert caught.value is corruption
+        assert websocket.close_code == 1011
+        assert websocket.sent_json == []
+        assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
+
+    @pytest.mark.asyncio
+    async def test_run_row_vanishing_after_seed_is_integrity_failure_not_4004(self) -> None:
+        """A run row the seed snapshot found cannot legitimately disappear.
+
+        No ELSPETH writer deletes a ``runs`` row: ``decide_and_soft_archive``
+        physically deletes only a session with no durable history and
+        soft-archives one that has a run, and run admission shares the
+        per-session ARCHIVE fence, so the ``runs.session_id`` cascade never
+        fires for an existing run. So ``_RunStatusNotFoundError`` on the idle recheck is Tier-1
+        referential corruption, not the seed path's client-facing not-found:
+        it must take the 1011 integrity path and escape, never a benign 4004.
+        """
+        from elspeth.web.execution import routes
+
+        run_id = str(uuid4())
+        app = _create_ws_test_app()
+        websocket = FakeWebSocket(app)
+        vanished = routes._RunStatusNotFoundError()
+        initial = routes._LoadedRunStatus(
+            response=RunStatusResponse(
+                run_id=run_id,
+                status="running",
+                started_at=datetime.now(tz=UTC),
+                finished_at=None,
+                error=None,
+                landscape_run_id=None,
+            ),
+            record=FakeRunRecord(),
+        )
+        with (
+            patch.object(
+                routes,
+                "_load_run_status_snapshot_with_accounting",
+                new=AsyncMock(spec=routes._load_run_status_snapshot_with_accounting, side_effect=[initial, vanished]),
+            ),
+            patch.object(routes.asyncio, "wait_for", new=AsyncMock(spec=routes.asyncio.wait_for, side_effect=TimeoutError())),
+            patch.object(routes.slog, "error") as logged,
+            pytest.raises(routes._RunStatusIntegrityError) as caught,
+        ):
+            await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+        assert caught.value.__cause__ is vanished
+        assert websocket.close_code == 1011
+        assert "not found" not in (websocket.close_reason or "").lower()
+        assert websocket.sent_json == []
+        logged.assert_called_once_with(
+            "websocket_run_status_integrity_error",
+            run_id=run_id,
+            phase="idle_recheck",
+            exc_class="_RunStatusIntegrityError",
+        )
+        assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
+
+    @pytest.mark.asyncio
+    async def test_seed_not_found_still_closes_4004_without_raising(self) -> None:
+        """The seed-phase sentinel keeps the client-facing 4004 the judge
+        accepted for that arm (web.yaml, ``websocket_run_progress`` R6
+        ``fp=406b6b78b3682f23``): no event has been streamed yet, and the
+        1011-and-raise reclassification above is scoped to the idle recheck,
+        where the seed snapshot has already proven the row existed."""
+        from elspeth.web.execution import routes
+
+        run_id = str(uuid4())
+        app = _create_ws_test_app()
+        websocket = FakeWebSocket(app)
+        with (
+            patch.object(
+                routes,
+                "_load_run_status_snapshot_with_accounting",
+                new=AsyncMock(spec=routes._load_run_status_snapshot_with_accounting, side_effect=[routes._RunStatusNotFoundError()]),
+            ),
+            patch.object(routes.slog, "error") as logged,
+        ):
+            await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+        assert websocket.close_code == 4004
+        assert websocket.sent_json == []
+        logged.assert_not_called()
+        assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
 
     @staticmethod
     def _make_authed_app(execution_service: FakeExecutionService) -> FastAPI:
@@ -543,8 +663,12 @@ class TestWebSocketTimeoutRecovery:
                 run_id=run_id,
                 sequence=2,
                 timestamp=timestamp,
-                event_type="failed",
-                data={"status": "failed", "detail": "pipeline crashed", "node_id": None},
+                event_type="completed",
+                data={
+                    "status": "completed",
+                    "accounting": _accounting().model_dump(mode="json"),
+                    "landscape_run_id": "land-1",
+                },
             ),
             RunEventRecord(
                 id=uuid4(),
@@ -558,7 +682,8 @@ class TestWebSocketTimeoutRecovery:
 
         websocket = await _call_websocket(app, str(run_id), ticket=_issue_ws_ticket(app, str(run_id)))
 
-        assert [payload["event_type"] for payload in websocket.sent_json] == ["progress", "failed", "error"]
+        assert [payload["event_type"] for payload in websocket.sent_json] == ["progress", "completed", "error"]
+        assert websocket.sent_json[1]["data"]["accounting"]["tokens"]["succeeded"] == 1
         assert websocket.close_code == 1000
 
     @pytest.mark.asyncio

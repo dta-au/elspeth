@@ -46,3 +46,9 @@ allow_hits:
     owner: "@elspeth-maintainers"
     reason: "Retrieval chunk metadata is external search API response data and the runtime type is dict[str, Any]."
     safety: "pre-existing exemption — content audit pending in Plan B"
+
+  # GroupBindingRegistry: _expand_groups is the runtime EXPAND-group mint-path index.
+  - key: "src/elspeth/core/dag/group_bindings.py:immutability.frozen_annotations:_module_:fp=src/elspeth/core/dag/group_bindings.py:GroupBindingRegistry:_expand_groups"
+    owner: "@elspeth-maintainers"
+    reason: "GroupBindingRegistry._expand_groups indexes runtime-minted EXPAND group ids (generate_id(), unknowable at build time) to their scope binding; register_expand_group writes it after construction, symmetric with ToolBatchContext.discovery_cache above."
+    safety: "Verified: only register_expand_group mutates it (self._expand_groups[group_id] = binding); _fork_binding_by_member/_expand_binding_by_opener, the two indices that ARE build-time-derivable, are frozen via deep_freeze in __post_init__ instead."

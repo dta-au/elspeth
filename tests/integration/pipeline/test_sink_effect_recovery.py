@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select, update
 
 from elspeth.contracts import NodeStateStatus, NodeType, PendingOutcome, RoutingMode, TerminalOutcome, TerminalPath, TokenInfo
 from elspeth.contracts.audit import SinkEffect, SinkEffectMemberRecord, TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.diversion import RowDiversion
 from elspeth.contracts.errors import (
     AuditIntegrityError,
@@ -20,6 +24,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
@@ -28,17 +33,37 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
     SinkEffectRole,
+    SinkEffectState,
 )
+from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import node_states_table, routing_events_table, sink_effect_members_table
+from elspeth.core.landscape.schema import (
+    node_states_table,
+    routing_events_table,
+    scheduler_events_table,
+    sink_effect_members_table,
+    sink_effects_table,
+    token_outcomes_table,
+    token_work_items_table,
+)
 from elspeth.engine.executors.sink import SinkExecutor
 from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkEffectInjectedFault
+from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
+from elspeth.engine.orchestrator.types import ExecutionCounters, PipelineConfig
+from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from tests.fixtures.base_classes import create_observed_contract
-from tests.fixtures.landscape import make_factory, register_test_node
-from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget, PartitioningObservableSink
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
+from tests.fixtures.plugins import ListSource
+from tests.fixtures.sink_effects import (
+    DuplicateObservableSink,
+    DuplicateObservableTarget,
+    PartitioningObservableSink,
+    ReaffirmingObservableSink,
+)
 
 
 @pytest.mark.parametrize(
@@ -99,6 +124,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             factory=factory,
             worker_id="worker-a",
             sink_effect_fault_hook=fail_once,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
         ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=sink_id)
         with pytest.raises(SinkEffectInjectedFault):
@@ -110,6 +136,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
                 sink_name="output",
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in [token]},
             )
 
         recovered_factory = make_factory(db)
@@ -122,6 +149,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             [token],
@@ -130,12 +158,251 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in [token]},
         )
 
         assert target.publication_count == 1
         assert artifact is not None and artifact.sink_effect_id == target.effect_id
         assert counts.total == 0
         assert recovered_factory.data_flow.get_token_outcome(token.token_id) is not None
+    finally:
+        db.close()
+
+
+def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect(tmp_path: Path) -> None:
+    """A lost post-sink scheduler callback is repairable scheduler debt.
+
+    This is an in-process crash-window proof, not an OS-kill test: the injected
+    exception fires from the production batched scheduler callback only after
+    the sink effect, artifact, operation, node state, and token outcome are
+    durable. A fresh processor's public resume drain must consume the terminal
+    outcome witness and terminalize the PENDING_SINK row without rebuilding a
+    RowResult or invoking the external sink a second time.
+    """
+
+    class _LostSchedulerTerminalizer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def mark_sink_bound_scheduler_terminal_many(self, token_ids: tuple[str, ...]) -> None:
+            self.calls.append(token_ids)
+            raise RuntimeError("injected loss before scheduler terminalization")
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'ts14-callback-loss.db'}")
+    try:
+        factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}])
+        (token,) = tokens
+        leader = leader_coordination_token(factory, run_id)
+        datetime.now(UTC)
+        ready = factory.scheduler.enqueue_ready(
+            run_id=run_id,
+            token_id=token.token_id,
+            row_id=token.row_id,
+            node_id=sink_id,
+            step_index=1,
+            ingest_sequence=0,
+            row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+        )
+        claimed = factory.scheduler.claim_ready(
+            run_id=run_id,
+            lease_owner=leader.worker_id,
+            lease_seconds=300,
+        )
+        assert claimed is not None and claimed.work_item_id == ready.work_item_id
+        parked = factory.scheduler.mark_pending_sink(
+            work_item_id=claimed.work_item_id,
+            row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+            sink_name="output",
+            outcome=TerminalOutcome.SUCCESS.value,
+            path=TerminalPath.DEFAULT_FLOW.value,
+            error_hash=None,
+            error_message=None,
+            expected_lease_owner=leader.worker_id,
+            worker_id=leader.worker_id,
+        )
+        assert parked.status is TokenWorkStatus.PENDING_SINK
+
+        target = DuplicateObservableTarget()
+        sink = DuplicateObservableSink(target)
+        sink.node_id = sink_id
+        pending_outcome = PendingOutcome(
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            scheduler_pending_sink=True,
+        )
+        pending_tokens = {"output": [(token, pending_outcome)]}
+        lost_terminalizer = _LostSchedulerTerminalizer()
+        coordinator = SinkFlushCoordinator(span_factory=SpanFactory(), checkpoints=object())  # type: ignore[arg-type]
+        config = PipelineConfig(
+            sources={"source": ListSource([])},
+            transforms=(),
+            sinks={"output": sink},  # type: ignore[dict-item]
+            sink_effect_modes={"output": "write"},
+        )
+
+        with pytest.raises(RuntimeError, match="injected loss before scheduler terminalization"):
+            coordinator.write_pending_to_sinks(
+                factory=factory,
+                run_id=run_id,
+                config=config,
+                ctx=ctx,
+                counters=ExecutionCounters(),
+                pending_tokens=pending_tokens,
+                sink_id_map={SinkName("output"): NodeID(sink_id)},
+                edge_map={},
+                sink_step=1,
+                scheduler_terminalizer=lost_terminalizer,
+                worker_id=leader.worker_id,
+                coordination_token=leader,
+            )
+
+        assert lost_terminalizer.calls == [(token.token_id,)]
+        assert pending_tokens == {"output": [(token, pending_outcome)]}
+        assert target.publication_count == 1
+        outcome_before = factory.data_flow.get_token_outcome(token.token_id)
+        assert outcome_before is not None
+        assert (outcome_before.outcome, outcome_before.path, outcome_before.sink_name) == (
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            "output",
+        )
+
+        (effect_before,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        (artifact_before,) = factory.execution.get_artifacts(run_id)
+        (operation_before,) = factory.execution.get_operations_for_run(run_id)
+        assert effect_before.state is SinkEffectState.FINALIZED
+        assert artifact_before.sink_effect_id == effect_before.effect_id
+        assert operation_before.sink_effect_id == effect_before.effect_id
+        assert operation_before.status == "completed"
+        with db.connection() as conn:
+            callback_loss_image = conn.execute(
+                select(
+                    token_work_items_table.c.work_item_id,
+                    token_work_items_table.c.status,
+                    token_work_items_table.c.lease_owner,
+                    token_work_items_table.c.pending_sink_name,
+                    token_work_items_table.c.pending_outcome,
+                    token_work_items_table.c.pending_path,
+                ).where(token_work_items_table.c.token_id == token.token_id)
+            ).one()
+        assert tuple(callback_loss_image) == (
+            parked.work_item_id,
+            TokenWorkStatus.PENDING_SINK.value,
+            leader.worker_id,
+            "output",
+            TerminalOutcome.SUCCESS.value,
+            TerminalPath.DEFAULT_FLOW.value,
+        )
+
+        recovered_factory = make_factory(db)
+        source_node_id = NodeID("source")
+        traversal = DAGTraversalContext(
+            node_step_map={source_node_id: 0},
+            node_to_plugin={},
+            node_to_next={source_node_id: None},
+            coalesce_node_map={},
+            structural_node_ids=frozenset({source_node_id}),
+        )
+        resumed = RowProcessor(
+            execution=recovered_factory.execution,
+            data_flow=recovered_factory.data_flow,
+            span_factory=SpanFactory(),
+            run_id=run_id,
+            source_node_id=source_node_id,
+            source_on_success="output",
+            traversal=traversal,
+            scheduler=recovered_factory.scheduler,
+            scheduler_lease_owner=leader.worker_id,
+            coordination_token=leader,
+        )
+
+        assert resumed.drain_scheduled_work(ctx) == []
+        assert target.publication_count == 1
+
+        (effect_after,) = recovered_factory.execution.sink_effects.get_effects_for_run(run_id)
+        (artifact_after,) = recovered_factory.execution.get_artifacts(run_id)
+        (operation_after,) = recovered_factory.execution.get_operations_for_run(run_id)
+        assert effect_after.effect_id == effect_before.effect_id == target.effect_id
+        assert artifact_after.artifact_id == artifact_before.artifact_id
+        assert artifact_after.sink_effect_id == effect_before.effect_id
+        assert operation_after.operation_id == operation_before.operation_id
+        assert operation_after.sink_effect_id == effect_before.effect_id
+        assert recovered_factory.data_flow.get_token_outcome(token.token_id) == outcome_before
+
+        with db.connection() as conn:
+            work_after = conn.execute(
+                select(
+                    token_work_items_table.c.work_item_id,
+                    token_work_items_table.c.status,
+                    token_work_items_table.c.lease_owner,
+                    token_work_items_table.c.pending_sink_name,
+                    token_work_items_table.c.pending_outcome,
+                    token_work_items_table.c.pending_path,
+                ).where(token_work_items_table.c.token_id == token.token_id)
+            ).one()
+            outcome_rows = conn.execute(
+                select(
+                    token_outcomes_table.c.token_id,
+                    token_outcomes_table.c.outcome,
+                    token_outcomes_table.c.path,
+                    token_outcomes_table.c.completed,
+                    token_outcomes_table.c.sink_name,
+                ).where(token_outcomes_table.c.token_id == token.token_id)
+            ).all()
+            scheduler_events = conn.execute(
+                select(
+                    scheduler_events_table.c.event_type,
+                    scheduler_events_table.c.from_status,
+                    scheduler_events_table.c.to_status,
+                    scheduler_events_table.c.from_lease_owner,
+                    scheduler_events_table.c.to_lease_owner,
+                    scheduler_events_table.c.caller_owner,
+                ).where(scheduler_events_table.c.token_id == token.token_id)
+            ).all()
+
+        assert tuple(work_after) == (
+            parked.work_item_id,
+            TokenWorkStatus.TERMINAL.value,
+            None,
+            "output",
+            TerminalOutcome.SUCCESS.value,
+            TerminalPath.DEFAULT_FLOW.value,
+        )
+        assert [tuple(row) for row in outcome_rows] == [
+            (
+                token.token_id,
+                TerminalOutcome.SUCCESS.value,
+                TerminalPath.DEFAULT_FLOW.value,
+                True,
+                "output",
+            )
+        ]
+        event_image = {row.event_type: tuple(row)[1:] for row in scheduler_events}
+        assert len(event_image) == len(scheduler_events) == 4
+        assert event_image == {
+            SchedulerEventType.ENQUEUE.value: (None, TokenWorkStatus.READY.value, None, None, None),
+            SchedulerEventType.CLAIM_READY.value: (
+                TokenWorkStatus.READY.value,
+                TokenWorkStatus.LEASED.value,
+                None,
+                leader.worker_id,
+                leader.worker_id,
+            ),
+            SchedulerEventType.MARK_PENDING_SINK.value: (
+                TokenWorkStatus.LEASED.value,
+                TokenWorkStatus.PENDING_SINK.value,
+                leader.worker_id,
+                leader.worker_id,
+                leader.worker_id,
+            ),
+            SchedulerEventType.MARK_PENDING_SINK_TERMINAL.value: (
+                TokenWorkStatus.PENDING_SINK.value,
+                TokenWorkStatus.TERMINAL.value,
+                leader.worker_id,
+                None,
+                leader.worker_id,
+            ),
+        }
     finally:
         db.close()
 
@@ -214,6 +481,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         with pytest.raises(RuntimeError, match="between primary and failsink"):
@@ -229,6 +497,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
             )
 
         effects = factory.execution.sink_effects.get_effects_for_run(run.run_id)
@@ -251,6 +520,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_primary,  # type: ignore[arg-type]
             [accepted, diverted],
@@ -263,6 +533,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
         )
 
         assert artifact is not None and artifact.sink_effect_id == primary_effect.effect_id
@@ -341,6 +612,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=stop_after_first_primary,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 primary,  # type: ignore[arg-type]
                 [first_token],
@@ -353,6 +625,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [first_token]},
             )
 
         recovered_factory = make_factory(db)
@@ -367,6 +640,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-b",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_primary,  # type: ignore[arg-type]
             [first_token, second_token],
@@ -379,6 +653,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [first_token, second_token]},
         )
 
         effects = recovered_factory.execution.sink_effects.get_effects_for_run(run.run_id)
@@ -443,6 +718,7 @@ def test_failsink_validation_rejection_terminalizes_states_and_outcomes(tmp_path
                 run.run_id,
                 factory=factory,
                 worker_id="worker-a",
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 primary,  # type: ignore[arg-type]
                 [accepted, diverted],
@@ -455,6 +731,7 @@ def test_failsink_validation_rejection_terminalizes_states_and_outcomes(tmp_path
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
             )
 
         assert failsink_target.publication_count == 0
@@ -527,6 +804,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=fail_once,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 first_sink,  # type: ignore[arg-type]
                 tokens[:1],
@@ -535,6 +813,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
                 sink_name="output",
                 pending_outcome=pending,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens[:1]},
             )
 
         recovered_factory = make_factory(db)
@@ -547,6 +826,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,
@@ -555,6 +835,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
             sink_name="output",
             pending_outcome=pending,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -612,12 +893,12 @@ def test_redrive_after_crash_before_reservation_recovers(
         original_reserve = SinkEffectReservation.reserve
         reserve_calls = 0
 
-        def crash_once(self: SinkEffectReservation, request: object) -> object:
+        def crash_once(self: SinkEffectReservation, request: object, *, coordination_token: CoordinationToken) -> object:
             nonlocal reserve_calls
             reserve_calls += 1
             if reserve_calls == 1:
                 raise RuntimeError("injected crash before sink-effect reservation")
-            return original_reserve(self, request)  # type: ignore[arg-type]
+            return original_reserve(self, request, coordination_token=coordination_token)  # type: ignore[arg-type]
 
         monkeypatch.setattr(SinkEffectReservation, "reserve", crash_once)
 
@@ -631,6 +912,7 @@ def test_redrive_after_crash_before_reservation_recovers(
                 run.run_id,
                 factory=factory,
                 worker_id="worker-a",
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 first_sink,  # type: ignore[arg-type]
                 tokens,
@@ -639,6 +921,7 @@ def test_redrive_after_crash_before_reservation_recovers(
                 sink_name="output",
                 pending_outcome=pending,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Wedge-state precondition: every token's node state is still OPEN
@@ -673,6 +956,7 @@ def test_redrive_after_crash_before_reservation_recovers(
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,
@@ -681,6 +965,7 @@ def test_redrive_after_crash_before_reservation_recovers(
             sink_name="output",
             pending_outcome=pending,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -738,6 +1023,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             first_sink,  # type: ignore[arg-type]
             tokens[:2],
@@ -746,6 +1032,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             sink_name="output",
             pending_outcome=pending,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens[:2]},
         )
         assert first_counts.discard_mode == 1
 
@@ -771,6 +1058,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=fail_once,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 second_sink,  # type: ignore[arg-type]
                 tokens[2:],
@@ -779,6 +1067,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
                 sink_name="output",
                 pending_outcome=pending,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens[2:]},
             )
 
         # Recover the union batch: both effects' dispositions must be applied.
@@ -792,6 +1081,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,
@@ -801,6 +1091,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             pending_outcome=pending,
             effect_mode="write",
             on_token_written=lambda token: None,
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -846,6 +1137,7 @@ def test_all_diverted_primary_finalizes_virtual_no_publication_before_discard(tm
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             sink,  # type: ignore[arg-type]
             [token],
@@ -854,6 +1146,7 @@ def test_all_diverted_primary_finalizes_virtual_no_publication_before_discard(tm
             sink_name="output",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in [token]},
         )
 
         assert artifact is not None
@@ -865,6 +1158,73 @@ def test_all_diverted_primary_finalizes_virtual_no_publication_before_discard(tm
         assert outcome is not None
         assert outcome.outcome is TerminalOutcome.FAILURE
         assert outcome.path is TerminalPath.SINK_DISCARDED
+    finally:
+        db.close()
+
+
+def test_reaffirmed_effect_finalizes_no_publication_without_lease_commit_or_reconcile(tmp_path: Path) -> None:
+    """A content-identity idempotent no-op (elspeth-9a78b3a02f) must ride the
+    same NO_PUBLICATION short-circuit as virtual/inherited: no lease, no
+    commit_effect, no reconcile_effect, and it is audited as inherited."""
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'reaffirmed.db'}")
+    try:
+        factory = make_factory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+        sink_id = register_test_node(factory.data_flow, run.run_id, "primary", node_type=NodeType.SINK, plugin_name="reaffirming")
+        token = _effect_tokens(
+            factory,
+            run_id=run.run_id,
+            source_id=source_id,
+            rows=[{"value": 1}],
+        )[0]
+        target = DuplicateObservableTarget()
+        sink = ReaffirmingObservableSink(target)
+        sink.node_id = sink_id
+        ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=sink_id)
+
+        artifact, counts = SinkExecutor(
+            factory.execution,
+            factory.data_flow,
+            SpanFactory(),
+            run.run_id,
+            factory=factory,
+            worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        ).write(
+            sink,  # type: ignore[arg-type]
+            [token],
+            ctx,
+            1,
+            sink_name="output",
+            pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
+            effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in [token]},
+        )
+
+        assert artifact is not None
+        assert artifact.publication_performed is False
+        assert artifact.publication_evidence_kind == "inherited"
+        assert sink.commit_calls == 0
+        assert sink.reconcile_calls == 0
+        assert counts.discard_mode == 0
+        outcome = factory.data_flow.get_token_outcome(token.token_id)
+        assert outcome is not None
+        assert outcome.outcome is TerminalOutcome.SUCCESS
+
+        # The Artifact row only ever carries the coarse "inherited" evidence
+        # kind (design deliberately did not add a first-class "reaffirmed"
+        # ArtifactPublicationEvidenceKind). The finer distinction must still
+        # survive durably in the finalized effect's own persisted plan, or
+        # a reaffirmed no-op is genuinely indistinguishable from a real
+        # inherited no-op in the audit trail — the opposite of what the
+        # design traded evidence-schema churn to preserve.
+        effects = factory.execution.sink_effects.get_effects_for_run(run.run_id)
+        (finalized_effect,) = [effect for effect in effects if effect.sink_node_id == sink_id]
+        assert finalized_effect.state is SinkEffectState.FINALIZED
+        assert finalized_effect.plan_json is not None
+        persisted_plan = json.loads(finalized_effect.plan_json)
+        assert persisted_plan["safe_evidence"]["publication_kind"] == "reaffirmed"
     finally:
         db.close()
 
@@ -906,6 +1266,7 @@ def _executor_for(
         factory=factory,
         worker_id="worker-a",
         sink_effect_fault_hook=fault_hook,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
 
 
@@ -958,6 +1319,7 @@ def test_redrive_with_missing_node_state_witness_fails_closed(tmp_path: Path) ->
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Corrupt the durable image: the interrupted member row survives while
@@ -978,6 +1340,7 @@ def test_redrive_with_missing_node_state_witness_fails_closed(tmp_path: Path) ->
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
         assert target.publication_count == 0
     finally:
@@ -1026,6 +1389,7 @@ def test_durable_partition_dropping_a_requested_token_fails_closed(tmp_path: Pat
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1049,6 +1413,7 @@ def test_finalized_member_stripped_of_disposition_fails_accepted_checkpoint(tmp_
             sink_name="output",
             pending_outcome=_PENDING_SUCCESS,
             effect_mode="write",
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
         assert artifact is not None
 
@@ -1079,6 +1444,7 @@ def test_finalized_member_stripped_of_disposition_fails_accepted_checkpoint(tmp_
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
                 on_token_written=lambda token: None,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1119,6 +1485,7 @@ def test_durable_partition_referencing_missing_effect_fails_closed(tmp_path: Pat
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1187,6 +1554,7 @@ def test_malformed_commit_diversion_attribution_fails_closed(
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1220,6 +1588,7 @@ def test_in_memory_diversion_log_disagreeing_with_durable_partition_fails_closed
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1234,6 +1603,57 @@ class _UnattributedDivertingSink(PartitioningObservableSink):
         return replace(plan, safe_evidence=evidence)
 
 
+def test_live_diversion_without_durable_attribution_fails_closed(tmp_path: Path) -> None:
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'live-unattributed.db'}")
+    try:
+        factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}, {"value": 2, "divert": True}])
+        sink = _UnattributedDivertingSink(DuplicateObservableTarget(), name="primary")
+        sink.node_id = sink_id
+
+        with pytest.raises(LandscapeRecordError, match="attribution must cover every diverted member"):
+            _executor_for(factory, run_id).write(
+                sink,  # type: ignore[arg-type]
+                tokens,
+                ctx,
+                1,
+                sink_name="output",
+                pending_outcome=_PENDING_SUCCESS,
+                effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
+            )
+    finally:
+        db.close()
+
+
+class _DivergentLiveReasonSink(PartitioningObservableSink):
+    def prepare_effect(self, request: SinkEffectPrepareRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectPlan:
+        plan = super().prepare_effect(request, ctx)
+        self._diversions = (RowDiversion(row_index=1, reason="tampered live reason", row_data={"value": 2, "divert": True}),)
+        return plan
+
+
+def test_live_diversion_reason_must_match_durable_attribution(tmp_path: Path) -> None:
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'live-reason-divergence.db'}")
+    try:
+        factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}, {"value": 2, "divert": True}])
+        sink = _DivergentLiveReasonSink(DuplicateObservableTarget(), name="primary")
+        sink.node_id = sink_id
+
+        with pytest.raises(AuditIntegrityError, match="live reason disagrees with durable attribution"):
+            _executor_for(factory, run_id).write(
+                sink,  # type: ignore[arg-type]
+                tokens,
+                ctx,
+                1,
+                sink_name="output",
+                pending_outcome=_PENDING_SUCCESS,
+                effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
+            )
+    finally:
+        db.close()
+
+
 def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: Path) -> None:
     """A recovered effect (no in-memory diversion log — its plan was durably
     bound before the crash, so ``prepare_effect`` never re-runs) must find its
@@ -1244,7 +1664,7 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
     try:
         factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}, {"value": 2, "divert": True}])
         target = DuplicateObservableTarget()
-        first_sink = _UnattributedDivertingSink(target, name="primary")
+        first_sink = PartitioningObservableSink(target, name="primary")
         first_sink.node_id = sink_id
         with pytest.raises(SinkEffectInjectedFault):
             _executor_for(factory, run_id, fault_hook=_fail_once(SinkEffectExecutionSeam.BEFORE_EFFECT)).write(
@@ -1255,12 +1675,31 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
+            )
+
+        with db.write_connection() as conn:
+            effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.sink_node_id == sink_id)).one()
+            plan_json = effect_row.plan_json
+            if type(plan_json) is not str:
+                raise AssertionError("prepared test effect must carry a durable plan")
+            plan_payload = json.loads(plan_json)
+            if type(plan_payload) is not dict:
+                raise AssertionError("prepared test effect plan must be an object")
+            plan_evidence = plan_payload["safe_evidence"]
+            if type(plan_evidence) is not dict:
+                raise AssertionError("prepared test effect evidence must be an object")
+            del plan_evidence["diversion_attribution"]
+            conn.execute(
+                update(sink_effects_table)
+                .where(sink_effects_table.c.effect_id == effect_row.effect_id)
+                .values(plan_json=json.dumps(plan_payload, sort_keys=True, separators=(",", ":")))
             )
 
         recovered_factory = make_factory(db)
-        recovered_sink = _UnattributedDivertingSink(target, name="primary")
+        recovered_sink = PartitioningObservableSink(target, name="primary")
         recovered_sink.node_id = sink_id
-        with pytest.raises(AuditIntegrityError, match="recovered effect is missing durable diversion attribution"):
+        with pytest.raises(AuditIntegrityError, match="missing durable diversion attribution"):
             _executor_for(recovered_factory, run_id).write(
                 recovered_sink,  # type: ignore[arg-type]
                 tokens,
@@ -1269,6 +1708,7 @@ def test_recovered_diversion_without_durable_attribution_fails_closed(tmp_path: 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1304,6 +1744,7 @@ def test_failsink_diverting_a_linked_member_is_a_framework_bug(tmp_path: Path) -
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1338,6 +1779,7 @@ def test_redrive_with_missing_divert_routing_event_fails_closed(tmp_path: Path) 
             failsink_name="failsink",
             failsink_effect_mode="write",
             failsink_edge_id=edge_id,
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
         assert counts.failsink_mode == 1
 
@@ -1366,6 +1808,7 @@ def test_redrive_with_missing_divert_routing_event_fails_closed(tmp_path: Path) 
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1401,6 +1844,7 @@ def test_redrive_with_completed_failsink_primary_anchor_fails_closed(tmp_path: P
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Corrupt the interrupted image through the repository itself: close
@@ -1432,6 +1876,7 @@ def test_redrive_with_completed_failsink_primary_anchor_fails_closed(tmp_path: P
                 failsink_name="failsink",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1462,6 +1907,7 @@ def test_redrive_with_completed_discard_primary_anchor_fails_closed(tmp_path: Pa
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         open_ids = factory.execution.get_open_node_state_ids(run_id, node_ids=(sink_id,), token_ids=(diverted.token_id,))
@@ -1484,6 +1930,7 @@ def test_redrive_with_completed_discard_primary_anchor_fails_closed(tmp_path: Pa
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1513,6 +1960,7 @@ def test_redrive_with_divergent_discard_outcome_fails_closed(tmp_path: Path) -> 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # A rival recorded a discard outcome that disagrees with the durable
@@ -1537,6 +1985,7 @@ def test_redrive_with_divergent_discard_outcome_fails_closed(tmp_path: Path) -> 
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1569,6 +2018,7 @@ def test_failsink_execution_requires_name_mode_and_routing_edge(tmp_path: Path) 
                 failsink_name=None,
                 failsink_effect_mode="write",
                 failsink_edge_id=edge_id,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
     finally:
         db.close()
@@ -1597,6 +2047,7 @@ def test_on_token_written_checkpoints_every_token_exactly_once_discard_mode(tmp_
             pending_outcome=_PENDING_SUCCESS,
             effect_mode="write",
             on_token_written=lambda token: checkpointed.append(token.token_id),
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -1633,6 +2084,7 @@ def test_on_token_written_checkpoints_every_token_exactly_once_failsink_mode(tmp
             failsink_effect_mode="write",
             failsink_edge_id=edge_id,
             on_token_written=lambda token: checkpointed.append(token.token_id),
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert artifact is not None
@@ -1670,6 +2122,7 @@ def test_primary_tokens_checkpointed_before_diverted_tokens(tmp_path: Path) -> N
             pending_outcome=_PENDING_SUCCESS,
             effect_mode="write",
             on_token_written=lambda token: checkpointed.append(token.token_id),
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert counts.discard_mode == 2
@@ -1708,6 +2161,7 @@ def test_primary_validation_rejection_terminalizes_states_and_outcomes(tmp_path:
                 sink_name="output",
                 pending_outcome=_PENDING_SUCCESS,
                 effect_mode="write",
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # The rejection happened before any effect was reserved or published.

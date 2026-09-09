@@ -1,0 +1,44 @@
+[Unit]
+Description=ELSPETH Web Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elspeth
+Group=elspeth
+WorkingDirectory=/opt/elspeth
+EnvironmentFile=/etc/elspeth/elspeth-web.env
+Environment=ELSPETH_WEB__DEPLOYMENT_TARGET=linux-systemd
+Environment=WEB_CONCURRENCY=1
+
+RuntimeDirectory=elspeth
+RuntimeDirectoryMode=0700
+StateDirectory=elspeth
+StateDirectoryMode=0700
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/elspeth/data/blobs /var/lib/elspeth/payloads
+ExecStart=/usr/bin/env /opt/elspeth/.venv/bin/elspeth web --host 0.0.0.0 --port 8451
+
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+# Security hardening retained from the staging service.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+ReadWritePaths=/var/lib/elspeth /run/elspeth
+
+[Install]
+WantedBy=multi-user.target

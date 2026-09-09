@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from elspeth.contracts import (
+    ConfigGateErrorReason,
     ConfigGateReason,
+    ExecutionError,
+    FailureInfo,
     GateResult,
     RouteDestination,
     RouteDestinationKind,
@@ -17,6 +20,7 @@ from elspeth.contracts import (
     RoutingReason,
     RoutingSpec,
     TokenInfo,
+    error_edge_label,
 )
 from elspeth.contracts.enums import (
     NodeStateStatus,
@@ -26,6 +30,7 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.node_state_context import GateEvaluationContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import GateSettings
@@ -49,6 +54,31 @@ slog = structlog.get_logger(__name__)
 _GATE_VALUE_PREVIEW_CHARS = 80
 
 
+def _classify_handled_gate_evaluation_error(exc: ExpressionEvaluationError) -> str:
+    """Return bounded failure evidence without copying row-derived exception text."""
+    cause_type = type(exc.__cause__)
+    if cause_type is KeyError:
+        return "gate expression evaluation failed: missing key"
+    if cause_type is IndexError:
+        return "gate expression evaluation failed: index out of range"
+    if cause_type is TypeError:
+        return "gate expression evaluation failed: incompatible runtime types"
+    if cause_type is ZeroDivisionError:
+        return "gate expression evaluation failed: division by zero"
+    if cause_type is OverflowError:
+        return "gate expression evaluation failed: arithmetic overflow"
+    if cause_type is ValueError:
+        return "gate expression evaluation failed: invalid runtime value"
+    return "gate expression evaluation failed"
+
+
+@observation_boundary(
+    tier=3,
+    source="row-derived gate expression result (ExpressionParser output over untrusted row data)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="Always returns bounded, scrubbed audit metadata for any value; never raises.",
+)
 def _describe_untrusted_gate_value(value: Any) -> str:
     """Return bounded metadata for row-derived gate expression results."""
     if isinstance(value, str):
@@ -125,6 +155,7 @@ class GateExecutor:
         step_resolver: StepResolver,
         edge_map: dict[tuple[NodeID, str], str] | None = None,
         route_resolution_map: dict[tuple[NodeID, str], RouteDestination] | None = None,
+        error_edge_ids: dict[NodeID, str] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -134,12 +165,14 @@ class GateExecutor:
             step_resolver: Resolves NodeID to 1-indexed audit step position
             edge_map: Maps (node_id, label) -> edge_id for routing
             route_resolution_map: Maps (node_id, label) -> resolved route destination
+            error_edge_ids: Maps config-gate node IDs to their DIVERT edge IDs.
         """
         self._execution = execution
         self._spans = span_factory
         self._step_resolver = step_resolver
         self._edge_map = edge_map or {}
         self._route_resolution_map = route_resolution_map or {}
+        self._error_edge_ids = error_edge_ids or {}
         self._condition_parser_cache: dict[tuple[str, str, str], ExpressionParser] = {}
 
     def _resolve_route_destination(self, *, node_id: str, route_label: str) -> RouteDestination:
@@ -275,31 +308,96 @@ class GateExecutor:
         # NodeStateGuard guarantees the node state reaches terminal status.
         # If any unhandled exception occurs before guard.complete() is called,
         # the guard auto-completes the state as FAILED in __exit__.
-        with NodeStateGuard(
-            self._execution,
-            token_id=token.token_id,
-            node_id=node_id,
-            run_id=ctx.run_id,
-            step_index=step,
-            input_data=input_dict,
-        ) as guard:
-            # Create parser and evaluate condition
-            with self._spans.gate_span(
+        with (
+            self._spans.gate_span(
                 gate_config.name,
                 node_id=node_id,
-                input_hash=input_hash,
                 token_id=token.token_id,
-            ):
-                start = time.perf_counter()
-                try:
-                    parser = self._get_condition_parser(gate_config=gate_config, node_id=node_id)
-                    # Pass PipelineRow directly - it implements __getitem__ and .get()
-                    # This preserves dual-name access (normalized and original field names)
-                    eval_result = parser.evaluate(token.row_data)
-                    duration_ms = (time.perf_counter() - start) * 1000
-                except (ExpressionEvaluationError, ExpressionSecurityError, ExpressionSyntaxError):
-                    duration_ms = (time.perf_counter() - start) * 1000
+                run_id=ctx.run_id,
+            ) as gate_span,
+            NodeStateGuard(
+                self._execution,
+                token_id=token.token_id,
+                node_id=node_id,
+                run_id=ctx.run_id,
+                step_index=step,
+                input_data=input_dict,
+                auto_fail_phase="gate_evaluation_routing",
+            ) as guard,
+        ):
+            start = time.perf_counter()
+            try:
+                parser = self._get_condition_parser(gate_config=gate_config, node_id=node_id)
+                # Pass PipelineRow directly - it implements __getitem__ and .get()
+                # This preserves dual-name access (normalized and original field names)
+                eval_result = parser.evaluate(token.row_data)
+                duration_ms = (time.perf_counter() - start) * 1000
+            except ExpressionEvaluationError as exc:
+                self._spans.mark_error(gate_span, exc)
+                duration_ms = (time.perf_counter() - start) * 1000
+                on_error = gate_config.on_error
+                if on_error is None:
                     raise
+
+                error_message = _classify_handled_gate_evaluation_error(exc)
+                failure = FailureInfo(
+                    exception_type=type(exc).__name__,
+                    message=error_message,
+                )
+                error_reason: ConfigGateErrorReason = {
+                    "condition": gate_config.condition,
+                    "error_type": type(exc).__name__,
+                    "error": error_message,
+                }
+                route_label = error_edge_label(gate_config.name)
+                action = RoutingAction.route(
+                    route_label,
+                    mode=RoutingMode.DIVERT,
+                    reason=error_reason,
+                )
+
+                if on_error != "discard":
+                    try:
+                        edge_id = self._error_edge_ids[NodeID(node_id)]
+                    except KeyError as missing_edge:
+                        raise OrchestrationInvariantError(
+                            f"Gate '{node_id}' has on_error={on_error!r} but no DIVERT edge registered. "
+                            "DAG construction should have created an __error_{name}__ edge."
+                        ) from missing_edge
+                    self._execution.record_routing_event(
+                        state_id=guard.state_id,
+                        edge_id=edge_id,
+                        mode=RoutingMode.DIVERT,
+                        reason=error_reason,
+                    )
+
+                guard.complete(
+                    NodeStateStatus.FAILED,
+                    duration_ms=duration_ms,
+                    error=ExecutionError(
+                        exception=error_message,
+                        exception_type=type(exc).__name__,
+                    ),
+                )
+
+                result = GateResult(
+                    row=input_dict,
+                    action=action,
+                    contract=token.row_data.contract,
+                )
+                result.input_hash = input_hash
+                result.duration_ms = duration_ms
+                updated_token = token.with_updated_data(token.row_data)
+                return GateOutcome(
+                    result=result,
+                    updated_token=updated_token,
+                    sink_name=on_error if on_error != "discard" else None,
+                    discarded=on_error == "discard",
+                    error=failure,
+                )
+            except (ExpressionSecurityError, ExpressionSyntaxError):
+                duration_ms = (time.perf_counter() - start) * 1000
+                raise
 
             # Convert evaluation result to route label
             if isinstance(eval_result, bool):

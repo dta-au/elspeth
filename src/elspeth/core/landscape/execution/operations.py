@@ -9,10 +9,12 @@ write(). Operation-parented call rows themselves live with
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import bindparam, select
+from sqlalchemy.engine import Connection
 
 from elspeth.contracts import FrameworkBugError, Operation, OperationType
 from elspeth.contracts.errors import AuditIntegrityError
@@ -28,6 +30,13 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
 
 _COMPLETABLE_OPERATION_STATUSES = frozenset({"completed", "failed"})
+
+
+def _elapsed_milliseconds(*, started_at: datetime, completed_at: datetime) -> float:
+    """Return a non-negative elapsed duration across SQLite/PG timestamp shapes."""
+    normalized_start = started_at if started_at.tzinfo is not None else started_at.replace(tzinfo=UTC)
+    normalized_end = completed_at if completed_at.tzinfo is not None else completed_at.replace(tzinfo=UTC)
+    return max(0.0, (normalized_end - normalized_start).total_seconds() * 1000.0)
 
 
 class OperationRepository:
@@ -187,6 +196,69 @@ class OperationRepository:
             self._operation_loader.load(row)
         except AuditIntegrityError as exc:
             raise LandscapePostCommitError(f"Operation {operation_id} became unreadable immediately after completion: {exc}") from exc
+
+    def fail_open_effect_operations_for_run(
+        self,
+        run_id: str,
+        *,
+        completed_at: datetime,
+        error_message: str,
+        conn: Connection,
+    ) -> tuple[Operation, ...]:
+        """Fail open effect-linked operations inside a caller-owned transaction.
+
+        This is the run-finalization primitive. It deliberately does not open
+        or commit a transaction: the terminal run stamp, token abandonment,
+        and these operation transitions must share one atomic fence. Only
+        ``open`` rows with a durable sink-effect identity are candidates;
+        completed, failed, pending, and legacy effect-less operations remain
+        immutable.
+        """
+        if not error_message or len(error_message) > 256:
+            raise FrameworkBugError("effect-operation finalization requires a non-empty error_message of at most 256 characters")
+
+        candidates = conn.execute(
+            select(operations_table)
+            .where(operations_table.c.run_id == run_id)
+            .where(operations_table.c.sink_effect_id.is_not(None))
+            .where(operations_table.c.status == "open")
+            .order_by(operations_table.c.operation_id)
+            .with_for_update()
+        ).fetchall()
+        if not candidates:
+            return ()
+        # ONE statement executed once over every locked row (ADR-048: a DML
+        # construction executes exactly once inside its fence, never per
+        # iteration); the per-row duration rides in as a bound parameter.
+        rows = [
+            {
+                "failed_operation_id": candidate.operation_id,
+                "failed_duration_ms": _elapsed_milliseconds(started_at=candidate.started_at, completed_at=completed_at),
+            }
+            for candidate in candidates
+        ]
+        result = conn.execute(
+            operations_table.update()
+            .where(operations_table.c.operation_id == bindparam("failed_operation_id"))
+            .where(operations_table.c.status == "open")
+            .values(
+                status="failed",
+                completed_at=completed_at,
+                duration_ms=bindparam("failed_duration_ms"),
+                error_message=error_message,
+            ),
+            rows,
+        )
+        if result.rowcount != len(rows):
+            raise AuditIntegrityError(
+                f"effect-operation finalization lost locked open rows: expected {len(rows)} updates, affected {result.rowcount}"
+            )
+        updated = conn.execute(
+            select(operations_table)
+            .where(operations_table.c.operation_id.in_([candidate.operation_id for candidate in candidates]))
+            .order_by(operations_table.c.operation_id)
+        ).fetchall()
+        return tuple(self._operation_loader.load(row) for row in updated)
 
     def get_operation(self, operation_id: str) -> Operation | None:
         """Get an operation by ID.

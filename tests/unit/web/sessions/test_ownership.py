@@ -9,9 +9,8 @@ import pytest
 from fastapi import HTTPException
 
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.sessions import protocol
 from elspeth.web.sessions.ownership import verify_session_ownership
-from elspeth.web.sessions.protocol import SessionRecord
+from elspeth.web.sessions.protocol import SessionNotFoundError, SessionRecord
 
 _SESSION_ID = UUID("11111111-1111-1111-1111-111111111111")
 _USER = UserIdentity(user_id="alice", username="alice")
@@ -34,8 +33,7 @@ def _request(session_service: object) -> object:
 
 class _MissingSessionService:
     async def get_session(self, session_id: UUID) -> SessionRecord:
-        not_found_error = getattr(protocol, "SessionNotFoundError", ValueError)
-        raise not_found_error(session_id)
+        raise SessionNotFoundError(session_id)
 
 
 class _BuggySessionService:

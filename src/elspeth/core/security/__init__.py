@@ -12,6 +12,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.security import (
+    fingerprint_key_available,
     get_fingerprint_key,
     secret_fingerprint,
 )
@@ -110,6 +111,7 @@ __all__ = [
     "SecretLoader",
     "SecretNotFoundError",
     "SecretRef",
+    "fingerprint_key_available",
     "get_fingerprint_key",
     "load_secrets_from_config",
     "secret_fingerprint",

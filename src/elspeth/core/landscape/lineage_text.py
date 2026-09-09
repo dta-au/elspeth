@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.identity import path_branch_name
 from elspeth.core.landscape.serialization import serialize_datetime
 
 if TYPE_CHECKING:
@@ -26,8 +27,9 @@ class LineageTextFormatter:
 
         lines.append(f"Token: {result.token.token_id}")
         lines.append(f"Row: {result.token.row_id}")
-        if result.token.branch_name:
-            lines.append(f"Branch: {result.token.branch_name}")
+        branch_name = path_branch_name(result.token.lineage_path)
+        if branch_name:
+            lines.append(f"Branch: {branch_name}")
         lines.append("")
 
         lines.append("--- Source ---")

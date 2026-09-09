@@ -2,7 +2,7 @@
 
 Index of the documentation shipped in this repository.
 
-**Framework status:** `0.7.1`
+**Framework status:** `0.8.0`
 **Archive note:** current release, architecture, contract, guide, reference, and
 runbook docs remain visible here. Implemented plans, superseded specs, generated
 review sidecars, and other internal work product are removed from active public
@@ -15,13 +15,25 @@ history.
 ## Start Here
 
 | You are... | Read this first |
-|------------|----------------|
+| ---------- | --------------- |
 | New to ELSPETH | [Your First Pipeline](guides/your-first-pipeline.md) then [User Manual](guides/user-manual.md) |
+| Deploying a new AWS stack | [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md), then the [Terraform package reference](../deploy/aws-ecs/terraform/README.md) |
 | Building or operating pipelines | [Configuration Reference](reference/configuration.md), [Runbooks](runbooks/index.md), and [Troubleshooting](guides/troubleshooting.md) |
 | Investigating audit data | [Landscape MCP Analysis](guides/landscape-mcp-analysis.md) and [Architecture Overview](../ARCHITECTURE.md) |
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
 | Contributing to the codebase | [Contributing](../CONTRIBUTING.md) |
-| Evaluating ELSPETH | [Executive Summary](release/executive-summary.md), [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), [Public-Sector Assessment Mapping](release/assessment-mapping.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
+| Evaluating ELSPETH | [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
+| Reviewing delivery confidence and decisions | [Project Control](project-control/README.md) — the control registers are maintained by the project but not published in the repository |
+
+---
+
+## Project Control
+
+ELSPETH uses a lean four-document control set, not a full project-management
+method: a Project Control Report with supporting T&M, RAID, and milestone and
+forecast registers. They are maintained by the project but are not published
+in this repository; [docs/project-control/README.md](project-control/README.md)
+explains the arrangement and how to request them.
 
 ---
 
@@ -30,17 +42,18 @@ history.
 Current architecture and design references.
 
 - [Repository Directory Strategy](repository-structure.md) — purpose of every top-level folder and where new files belong
+- [Maintainer Toolchain](maintainer/toolchain.md) — how the maintainer's own agents work (tracker, code map, delegation); not a requirement for contributors
 - [Architecture Overview](../ARCHITECTURE.md) — C4 model, data flows, and system-level orientation
 - [System Overview](architecture/overview.md) — compatibility pointer to the maintained root architecture overview
 - [Requirements Matrix](architecture/requirements.md) — compatibility pointer to current requirement and contract sources
 - [Subsystems](architecture/subsystems.md) — compatibility pointer to current subsystem diagrams and ADRs
 - [Token Lifecycle](architecture/token-lifecycle.md) — row identity through forks and joins
 - [State Engine](architecture/state_engine/README.md) — canonical durable scheduler, barrier, sink-effect, proof-catalog, and assessment authority
-- [DAG Information and Completeness](architecture/dag/README.md) — permanent criteria, assessment framework, current verdict, and dated evidence
+- [DAG Information and Completeness](architecture/dag/README.md) — live criteria, executable scenario evidence, current verdict, and delivery ownership
 - [Landscape System](architecture/landscape.md) — audit trail architecture
 - [Landscape Entry Points](architecture/landscape-entry-points.md) — where audit records are created
-- [Telemetry](architecture/telemetry.md) — operational visibility architecture
 - [Barrier Machinery](architecture/barrier-machinery.md) — aggregation and coalesce as structural twins; paired-surfaces table and paired-change checklist
+- [LLM Compatibility Gateway](../gateway/README.md) — the standalone `elspeth-llm-gateway` service: a strict OpenAI Chat Completions subset over an organisation's own invoke API, deployed separately from ELSPETH
 - [ADR Index](architecture/adr/README.md) — accepted architecture decisions
 
 ## Contracts
@@ -54,6 +67,7 @@ authors, and integrators must uphold.
 - [System Operations](contracts/system-operations.md)
 - [Execution Graph](contracts/execution-graph.md)
 - [Token Outcome Assurance](contracts/token-outcomes/README.md)
+- [Plugin Catalogue Reference Content](contracts/plugin-catalogue-reference-content.md)
 
 ## Guides
 
@@ -61,14 +75,16 @@ Tutorials and operator/developer how-to material.
 
 - [Your First Pipeline](guides/your-first-pipeline.md)
 - [User Manual](guides/user-manual.md)
+- [Web Composer in One Hour — training plan (draft)](guides/composer-training-one-hour.md)
 - [Test System](guides/test-system.md)
 - [Data Trust and Error Handling](guides/data-trust-and-error-handling.md)
+- [Identity Providers](guides/identity-providers.md)
 - [Telemetry Guide](guides/telemetry.md)
 - [Tier-2 Tracing](guides/tier2-tracing.md)
 - [Landscape MCP Analysis](guides/landscape-mcp-analysis.md)
-- [Clarion for Codex Agents](guides/clarion-for-codex-agents.md)
 - [Troubleshooting](guides/troubleshooting.md)
 - [Docker](guides/docker.md)
+- [Deployment Platforms](reference/deployment-platforms.md)
 
 ## Reference
 
@@ -93,17 +109,19 @@ Runbooks and production procedures.
 - [Backup and Recovery](runbooks/backup-and-recovery.md)
 - [Configure Key Vault Secrets](runbooks/configure-keyvault-secrets.md)
 - [Ansible Ubuntu Deployment](runbooks/ansible-ubuntu-deployment.md)
+- [Caddy Development Install Refresh](runbooks/caddy-development-refresh.md)
+- [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md)
+- [AWS ECS Existing-Service Redeploy](runbooks/aws-ecs-existing-service-redeploy.md)
+- [AWS ECS Full Disposable Acceptance](runbooks/aws-ecs-deployment.md)
 
 ## Release History
 
 Audience-facing release and evaluation documents. See the
 [release docs README](release/README.md) for the full index.
 
-- [Executive Summary](release/executive-summary.md) — capability and assurance brief for Australian public-sector evaluators *(DRAFT — awaiting operator sign-off)*
 - [Composer Guide](release/composer-guide.md) — current user-facing guide to the web authoring surface
 - [Platform Architecture](release/platform-architecture.md) — current platform architecture, trust-boundary, and operational-responsibility overview
-- [Public-Sector Assessment Mapping](release/assessment-mapping.md) — current evidence map for government evaluation touchpoints
-- [Audit and Lineage Guarantees](release/guarantees.md) — long-lived assurance narrative; refreshed per release (current contract surface; §1–§10 RC-3 base, §11–§14 RC-5.2 additions)
+- [Audit and Lineage Guarantees](release/guarantees.md) — long-lived assurance narrative; refreshed per release (current contract surface; §1–§10 RC-3 base, §11–§14 RC-5.2 additions, §15 RC-6 additions, §16 AWS ECS operator telemetry)
 - Per-period progress and velocity reports (RC-1 to RC-5) are internal work
   product and no longer ship as active public docs.
 - Superseded RC snapshots such as `feature-inventory.md`,

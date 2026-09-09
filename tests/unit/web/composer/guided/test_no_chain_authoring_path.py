@@ -131,16 +131,27 @@ def test_reachable_surfaces_share_one_planner_implementation_boundary() -> None:
 def test_reachable_surfaces_share_one_lock_assuming_commit_boundary() -> None:
     compose_tree = _module_tree("src/elspeth/web/sessions/routes/composer/compose.py")
     guided_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided.py")
+    settlement_tree = _module_tree("src/elspeth/web/sessions/routes/composer/pipeline_settlement.py")
     freeform_route = _named_scope(compose_tree, "recompose")
     guided_route = _named_scope(guided_tree, "post_guided_respond")
+    auto_commit_adapter = _named_scope(settlement_tree, "settle_auto_commit_intent")
 
-    assert _call_count(freeform_route, "settle_pipeline_proposal_under_compose_lock") == 1
+    # Freeform auto-commit reaches the one shared settlement coordinator
+    # through the trust-checking adapter (elspeth-01d4c6e683): the route
+    # calls the adapter exactly once, and the adapter contains exactly one
+    # call to settle_pipeline_proposal_under_compose_lock.
+    assert _call_count(freeform_route, "settle_auto_commit_intent") == 1
+    assert _call_count(freeform_route, "settle_pipeline_proposal_under_compose_lock") == 0
+    assert _call_count(auto_commit_adapter, "settle_pipeline_proposal_under_compose_lock") == 1
+    # The revocation fallback is not a second transaction: settlement owns
+    # the durable auto_commit.revoked event before raising its outcome.
+    assert _call_count(auto_commit_adapter, "record_auto_commit_revocation") == 0
     assert _call_count(guided_route, "prepare_pipeline_proposal_commit") == 1
     assert _call_count(guided_route, "accept_guided_pipeline_proposal") == 1
 
 
-def test_guided_full_router_seam_is_late_bound_with_one_production_controller() -> None:
-    """Guided-full stays isolated in the late-bound Task-5 route module."""
+def test_guided_full_router_seam_has_one_production_controller() -> None:
+    """Guided-full stays isolated in its dedicated route module."""
 
     guided_source = (_ROOT / "src/elspeth/web/sessions/routes/composer/guided.py").read_text(encoding="utf-8")
     guided_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided.py")
@@ -150,40 +161,10 @@ def test_guided_full_router_seam_is_late_bound_with_one_production_controller() 
 
     assert "PlannerSurface.GUIDED_FULL" not in guided_source
     assert "/api/sessions/{session_id}/guided/plan" in app.openapi()["paths"]
-    assert (
-        next(node.name for node in reversed(guided_tree.body) if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef))
-        == "post_guided_convert"
-    )
-    late_import, late_include = guided_tree.body[-2:]
-    assert isinstance(late_import, ast.ImportFrom)
-    assert late_import.level == 1
-    assert late_import.module == "guided_plan"
-    assert [(alias.name, alias.asname) for alias in late_import.names] == [("router", "guided_plan_router")]
-    assert ast.unparse(late_include) == "router.include_router(guided_plan_router)"
+    assert _call_count(guided_tree, "include_router") == 1
     handlers = [
         node.name
         for node in guided_plan_tree.body
         if isinstance(node, ast.AsyncFunctionDef) and any(isinstance(decorator, ast.Call) for decorator in node.decorator_list)
     ]
     assert handlers == ["post_guided_plan"]
-
-
-def test_guided_route_handler_module_positions_remain_at_the_signed_layout() -> None:
-    guided_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided.py")
-    expected_positions = {
-        "get_guided": 47,
-        "get_guided_tutorial_sample": 48,
-        "post_guided_reenter": 49,
-        "post_guided_start": 50,
-        "post_guided_respond": 64,
-        "post_guided_chat": 66,
-        "post_guided_convert": 67,
-    }
-
-    actual_positions = {
-        node.name: index
-        for index, node in enumerate(guided_tree.body)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in expected_positions
-    }
-
-    assert actual_positions == expected_positions

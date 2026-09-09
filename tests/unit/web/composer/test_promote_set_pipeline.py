@@ -42,6 +42,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
@@ -60,6 +61,25 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+
+
+def _option_shape_summary(
+    *,
+    mapping: int = 0,
+    sequence: int = 0,
+    set_: int = 0,
+    scalar: int = 0,
+) -> dict[str, object]:
+    return {
+        "_option_shape": "mapping",
+        "entry_count": mapping + sequence + set_ + scalar,
+        "value_shape_counts": {
+            "mapping": mapping,
+            "scalar": scalar,
+            "sequence": sequence,
+            "set": set_,
+        },
+    }
 
 
 def _empty_state() -> CompositionState:
@@ -330,7 +350,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         user_message_content = "Use this exact text file:\nhello"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
         catalog = _mock_catalog()
-        output_path = tmp_path / "outputs" / "out.csv"
+        output_path = tmp_path / "outputs" / session_id / "out.csv"
 
         args = {
             "source": {
@@ -338,7 +358,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                 "on_success": "rows",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",
@@ -393,7 +413,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                 "on_success": "rows",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",
@@ -438,7 +458,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                 "on_success": "rows",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",
@@ -507,7 +527,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         """CSV prevalidation accepts the field shape exposed by plugin JSON Schema."""
         user_message_content = "Use this exact CSV:\nurl\nhttps://example.test\n"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
-        output_path = tmp_path / "outputs" / "out.csv"
+        output_path = tmp_path / "outputs" / session_id / "out.csv"
 
         args = {
             "source": {
@@ -847,10 +867,8 @@ class TestPromoteSetPipelineArgErrorRouting:
     def test_set_pipeline_rejects_raw_cleanup_review_on_llm_node(self) -> None:
         """A raw-cleanup review must be attached to the field_mapper doing the cleanup."""
         cleanup_requirement = {
-            "id": "drop_raw_html_review",
             "kind": "pipeline_decision",
             "user_term": "drop_raw_html_fields",
-            "status": "pending",
             "draft": "Drop the scraped raw HTML and fingerprint fields before saving the JSON output.",
         }
         args = {
@@ -892,6 +910,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                         "model": "anthropic/claude-haiku-4.5",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Read {{ row.content }}.",
+                        "required_input_fields": ["content"],
                         "schema": {"mode": "observed"},
                         INTERPRETATION_REQUIREMENTS_KEY: [cleanup_requirement],
                     },
@@ -990,15 +1009,9 @@ class TestPromoteSetPipelineArgErrorRouting:
                     "schema": {"mode": "observed"},
                     INTERPRETATION_REQUIREMENTS_KEY: [
                         {
-                            "id": "source_review",
                             "kind": "invented_source",
                             "user_term": "inline_source_url_list",
-                            "status": "pending",
                             "draft": "url\nhttps://example.test\n",
-                            "event_id": None,
-                            "accepted_value": None,
-                            "accepted_artifact_hash": None,
-                            "resolved_prompt_template_hash": None,
                         }
                     ],
                 },
@@ -1061,6 +1074,7 @@ class TestPromoteSetPipelineArgErrorRouting:
                         "model": "anthropic/claude-haiku-4.5",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Summarise {{ row.text }}.",
+                        "required_input_fields": ["text"],
                         "schema": {"mode": "observed"},
                     },
                 }
@@ -1135,6 +1149,54 @@ _CANARY_SOURCE_API_KEY = "CANARY-SET-PIPELINE-SOURCE-API-KEY-DO-NOT-LEAK"
 _CANARY_NODE_SECRET_REF = "CANARY-SET-PIPELINE-NODE-SECRET-REF-DO-NOT-LEAK"
 _CANARY_NODE_DSN = "CANARY-SET-PIPELINE-NODE-DSN-DO-NOT-LEAK"
 _CANARY_OUTPUT_CREDENTIAL = "CANARY-SET-PIPELINE-OUTPUT-CREDENTIAL-DO-NOT-LEAK"
+_CANARY_METADATA_NAME = "CANARY-SET-PIPELINE-METADATA-NAME-DO-NOT-LEAK"
+_CANARY_METADATA_DESCRIPTION = "CANARY-SET-PIPELINE-METADATA-DESCRIPTION-DO-NOT-LEAK"
+
+
+def test_set_pipeline_metadata_matches_set_metadata_redaction_contract() -> None:
+    """Equivalent metadata mutations must persist one identical safe projection."""
+    metadata = {
+        "name": _CANARY_METADATA_NAME,
+        "description": _CANARY_METADATA_DESCRIPTION,
+    }
+    pipeline_args = _minimal_valid_args()
+    pipeline_args["metadata"] = metadata
+    telemetry = NoopRedactionTelemetry()
+
+    pipeline_redacted = redact_tool_call_arguments("set_pipeline", pipeline_args, telemetry=telemetry)
+    patch_redacted = redact_tool_call_arguments("set_metadata", {"patch": metadata}, telemetry=telemetry)
+
+    assert pipeline_redacted["metadata"] == patch_redacted["patch"] == "<metadata-patch:description,name>"
+    serialized = json.dumps(pipeline_redacted, sort_keys=True)
+    assert _CANARY_METADATA_NAME not in serialized
+    assert _CANARY_METADATA_DESCRIPTION not in serialized
+
+
+def test_set_pipeline_redaction_does_not_reintroduce_absent_inline_blob_default() -> None:
+    """Absent and explicit-null legacy custody fields have one audit shape.
+
+    ``PipelineProposal`` validation materializes ``source.inline_blob=None``
+    while the provider-authored proposal may omit the field. The redacted
+    authority hash must not change merely because that schema default crossed
+    the proposal replay boundary.
+    """
+    omitted = _minimal_valid_args()
+    explicit_null = _minimal_valid_args()
+    explicit_null["source"]["inline_blob"] = None
+
+    omitted_redaction = redact_tool_call_arguments(
+        "set_pipeline",
+        omitted,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    explicit_null_redaction = redact_tool_call_arguments(
+        "set_pipeline",
+        explicit_null,
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert omitted_redaction == explicit_null_redaction
+    assert "inline_blob" not in omitted_redaction["source"]
 
 
 def test_redaction_substitutes_source_options_via_summarizer() -> None:
@@ -1162,10 +1224,7 @@ def test_redaction_substitutes_source_options_via_summarizer() -> None:
     assert redacted["source"]["on_success"] == "rows"
     # options collapses to the summarizer's str output.
     assert isinstance(redacted["source"]["options"], str)
-    assert json.loads(redacted["source"]["options"]) == {
-        "blob_ref": "<redacted-option-value>",
-        "path": "<redacted-option-value>",
-    }
+    assert json.loads(redacted["source"]["options"]) == _option_shape_summary(scalar=2)
     # The canary path MUST NOT appear anywhere in the redacted output.
     serialized = json.dumps(redacted, sort_keys=True)
     assert _CANARY_PATH not in serialized
@@ -1254,8 +1313,8 @@ def test_redaction_substitutes_nested_node_and_output_dicts() -> None:
     # summarizer's canonical-JSON shape output.
     assert isinstance(redacted["nodes"][0]["options"], str)
     assert isinstance(redacted["outputs"][0]["options"], str)
-    assert json.loads(redacted["nodes"][0]["options"]) == {"prompt_template": "<redacted-option-value>"}
-    assert json.loads(redacted["outputs"][0]["options"]) == {"path": "<redacted-option-value>"}
+    assert json.loads(redacted["nodes"][0]["options"]) == _option_shape_summary(scalar=1)
+    assert json.loads(redacted["outputs"][0]["options"]) == _option_shape_summary(scalar=1)
     # ``routes`` and ``trigger`` pass through with their original shapes
     # — structurally exempt under §4.4.2 (closed-list scalar element types).
     assert redacted["nodes"][0]["routes"] == {"true": _CANARY_ROUTES}
@@ -1321,20 +1380,9 @@ def test_redaction_redacts_sensitive_set_pipeline_option_values_inside_summaries
 
     redacted = redact_tool_call_arguments("set_pipeline", args, telemetry=tel)
 
-    assert json.loads(redacted["source"]["options"]) == {
-        "api_key": "<redacted-option-value>",
-        "dsn": "<redacted-option-value>",
-        "path": "<redacted-option-value>",
-    }
-    assert json.loads(redacted["nodes"][0]["options"]) == {
-        "api_key": {"secret_ref": "<redacted-option-value>"},
-        "connection_string": "<redacted-option-value>",
-        "prompt_template": "<redacted-option-value>",
-    }
-    assert json.loads(redacted["outputs"][0]["options"]) == {
-        "credential": "<redacted-option-value>",
-        "path": "<redacted-option-value>",
-    }
+    assert json.loads(redacted["source"]["options"]) == _option_shape_summary(scalar=3)
+    assert json.loads(redacted["nodes"][0]["options"]) == _option_shape_summary(mapping=1, scalar=2)
+    assert json.loads(redacted["outputs"][0]["options"]) == _option_shape_summary(scalar=2)
     serialized = json.dumps(redacted, sort_keys=True)
     for canary in (
         _CANARY_PATH,
@@ -1400,7 +1448,7 @@ class TestSetPipelineInlineBlobTsvDelimiter:
                     "sink_name": "rows",
                     "plugin": "csv",
                     "options": {
-                        "path": str(tmp_path / "outputs" / "out.csv"),
+                        "path": str(tmp_path / "outputs" / session_id / "out.csv"),
                         "schema": {"mode": "observed"},
                         "mode": "write",
                         "collision_policy": "auto_increment",
@@ -1535,3 +1583,330 @@ class TestSetPipelineQueue:
         # Atomic: the exact prior state/version is untouched.
         assert result.updated_state.version == state.version
         assert result.updated_state.nodes == state.nodes
+
+
+_ROW_UNION_NODE_ENTRY: dict[str, Any] = {
+    "id": "variant_union",
+    "node_type": "row_union",
+    "plugin": None,
+    "input": "control_done",
+    "on_success": "unioned_rows",
+    "options": {},
+    "branches": {
+        "control": "control_done",
+        "treatment": "treatment_done",
+    },
+    "timeout_seconds": 30.0,
+}
+
+
+def _valid_args_with_row_union(override: dict[str, Any] | None = None) -> dict[str, Any]:
+    node = dict(_ROW_UNION_NODE_ENTRY)
+    if override is not None:
+        node.update(override)
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "control_done",
+            "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+        },
+        "nodes": [node],
+        "edges": [],
+        "outputs": [],
+    }
+
+
+class TestSetPipelineRowUnion:
+    def test_pipeline_node_transport_remains_open_and_accepts_timeout(self) -> None:
+        from elspeth.web.composer.redaction import _PipelineNodeModel
+
+        assert _PipelineNodeModel.model_fields["node_type"].annotation is str
+        model = _PipelineNodeModel.model_validate(_ROW_UNION_NODE_ENTRY)
+        assert model.node_type == "row_union"
+        assert model.timeout_seconds == 30.0
+
+    def test_set_pipeline_persists_canonical_row_union(self) -> None:
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union(),
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is True, result.to_dict()
+        union = result.updated_state.nodes[0]
+        assert union.node_type == "row_union"
+        assert union.timeout_seconds == 30.0
+        assert dict(union.branches or {}) == {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+
+    @pytest.mark.parametrize("invalid_timeout", [True, "30"])
+    def test_timeout_rejects_non_numeric_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            _execute_set_pipeline(
+                _valid_args_with_row_union({"timeout_seconds": invalid_timeout}),
+                state,
+                ToolContext(catalog=_mock_catalog()),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+    @pytest.mark.parametrize("timeout_seconds", [30, 30.5])
+    def test_timeout_accepts_actual_int_and_float_values(self, timeout_seconds: int | float) -> None:
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union({"timeout_seconds": timeout_seconds}),
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert result.updated_state.nodes[0].timeout_seconds == float(timeout_seconds)
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            {
+                "id": "transform_node",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "transformed",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "gate_node",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "discard", "false": "discard"},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "aggregation_node",
+                "node_type": "aggregation",
+                "plugin": None,
+                "input": "rows",
+                "on_success": "aggregated",
+                "on_error": "discard",
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "queue_node",
+                "node_type": "queue",
+                "plugin": None,
+                "input": "queue_node",
+                "options": {},
+                "timeout_seconds": 30,
+            },
+        ],
+        ids=["transform", "gate", "aggregation", "queue"],
+    )
+    def test_timeout_rejects_non_barrier_node_types_atomically(self, node: dict[str, Any]) -> None:
+        state = _empty_state()
+        arguments = {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+            },
+            "nodes": [node],
+            "edges": [],
+            "outputs": [],
+        }
+
+        result = _execute_set_pipeline(arguments, state, ToolContext(catalog=_mock_catalog()))
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert "timeout_seconds" in result.data["error"]
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"plugin": "passthrough"},
+            {"input": "not_the_first_branch"},
+            {"on_success": None},
+            {"branches": {"only": "control_done"}},
+        ],
+    )
+    def test_set_pipeline_rejects_malformed_row_union_atomically(self, override: dict[str, Any]) -> None:
+        state = _empty_state()
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union(override),
+            state,
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+
+    @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
+    def test_set_pipeline_rejects_invalid_row_union_timeout_before_mutation(self, invalid_timeout: float) -> None:
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            _execute_set_pipeline(
+                _valid_args_with_row_union({"timeout_seconds": invalid_timeout}),
+                state,
+                ToolContext(catalog=_mock_catalog()),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+
+class TestEchoedServerOwnedMetadata:
+    """Echo-tolerant reserved-key gates (elspeth-c67fbbbd83, option ii).
+
+    Session 2e0c8ea3 seq 19: a read-modify-write ``set_pipeline`` echoing the
+    server-stamped ``source_authoring`` block was rejected as reserved and cost
+    a full planner turn. An EXACT echo of the stored block is now dropped with
+    an advisory note; any non-matching value — a single field included — still
+    rejects, so the provenance-forgery guard is intact.
+    """
+
+    def _bound_blob_state(self, tmp_path: Path) -> tuple[Any, CompositionState, dict[str, Any]]:
+        """Bind an LLM-authored inline CSV, returning (ctx, state, source options)."""
+        user_message_content = "Create a tiny generated CSV for the pipeline."
+        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
+        ctx = ToolContext(
+            catalog=_mock_catalog(),
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
+        )
+        bind = _execute_set_pipeline(
+            {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"schema": {"mode": "observed"}},
+                    "inline_blob": {
+                        "filename": "generated.csv",
+                        "mime_type": "text/csv",
+                        "content": "name,score\nada,42\n",
+                    },
+                    "on_validation_failure": "discard",
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            _empty_state(),
+            ctx,
+        )
+        assert bind.success is True, bind.data
+        options = dict(deep_thaw(bind.updated_state.sources["source"].options))
+        return ctx, bind.updated_state, options
+
+    def _echo_args(self, stored_options: dict[str, Any], **option_overrides: Any) -> dict[str, Any]:
+        """set_pipeline args echoing the stored source through source.blob_id."""
+        echoed = {
+            "schema": stored_options["schema"],
+            SOURCE_AUTHORING_KEY: stored_options[SOURCE_AUTHORING_KEY],
+            INTERPRETATION_REQUIREMENTS_KEY: stored_options[INTERPRETATION_REQUIREMENTS_KEY],
+        }
+        echoed.update(option_overrides)
+        return {
+            "source": {
+                "plugin": "csv",
+                "blob_id": stored_options["blob_ref"],
+                "on_success": "rows",
+                "options": echoed,
+                "on_validation_failure": "discard",
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+        }
+
+    def test_exact_echo_is_accepted_with_an_advisory_note(self, tmp_path: Path) -> None:
+        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+
+        result = _execute_set_pipeline(self._echo_args(stored_options), state, ctx)
+
+        assert result.success is True, result.data
+        note = result.data["server_owned_metadata_note"]
+        assert "source_authoring" in note
+        assert "interpretation_requirements" in note
+        # The server values survive untouched — the echo neither altered nor
+        # duplicated them.
+        options = result.updated_state.sources["source"].options
+        assert deep_thaw(options[SOURCE_AUTHORING_KEY]) == stored_options[SOURCE_AUTHORING_KEY]
+        requirements = deep_thaw(options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert len(requirements) == 1
+        assert requirements[0]["id"] == "source_review:inline_source_data"
+        assert requirements[0]["status"] == "pending"
+
+    @pytest.mark.parametrize(
+        "tampered_field, tampered_value",
+        [
+            ("review_event_id", "forged-event"),
+            ("modality", CreationModality.VERBATIM.value),
+            ("content_hash", "0" * 64),
+            ("resolved_kind", "forged-kind"),
+        ],
+    )
+    def test_echo_differing_in_any_single_field_still_rejects(self, tmp_path: Path, tampered_field: str, tampered_value: str) -> None:
+        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+        tampered = {**stored_options[SOURCE_AUTHORING_KEY], tampered_field: tampered_value}
+
+        result = _execute_set_pipeline(
+            self._echo_args(stored_options, **{SOURCE_AUTHORING_KEY: tampered}),
+            state,
+            ctx,
+        )
+
+        assert result.success is False
+        assert SOURCE_AUTHORING_KEY in result.data["error"]
+
+    def test_tampered_requirement_row_still_rejects(self, tmp_path: Path) -> None:
+        """A row claiming resolver-owned resolution the server never wrote
+        matches nothing in stored state and keeps the elspeth-4496f61e30
+        rejection."""
+        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+        forged_resolved = {**stored_options[INTERPRETATION_REQUIREMENTS_KEY][0], "status": "resolved"}
+
+        result = _execute_set_pipeline(
+            self._echo_args(
+                stored_options,
+                **{
+                    SOURCE_AUTHORING_KEY: stored_options[SOURCE_AUTHORING_KEY],
+                    INTERPRETATION_REQUIREMENTS_KEY: [forged_resolved],
+                },
+            ),
+            state,
+            ctx,
+        )
+
+        assert result.success is False
+        assert "resolved" in result.data["error"]
+
+    def test_forged_block_without_a_stored_counterpart_still_rejects(self, tmp_path: Path) -> None:
+        """No stored source at all: nothing can match, so the reserved-key
+        rejection is unchanged (the manual-authoring guard's original case)."""
+        ctx, _state, stored_options = self._bound_blob_state(tmp_path)
+
+        result = _execute_set_pipeline(
+            self._echo_args(stored_options),
+            _empty_state(),
+            ctx,
+        )
+
+        assert result.success is False
+        assert SOURCE_AUTHORING_KEY in result.data["error"]

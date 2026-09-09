@@ -35,7 +35,7 @@
       ],
       "tool": {
         "driver": {
-          "informationUri": "https://github.com/johnm-dta/elspeth/tree/main/elspeth-lints",
+          "informationUri": "https://github.com/dta-au/elspeth/tree/main/elspeth-lints",
           "name": "elspeth-lints",
           "rules": [
             {

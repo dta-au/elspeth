@@ -26,11 +26,18 @@ These tests pin the closure:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
 
 from elspeth.web.composer.state import (
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
+    _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
+    _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+    _TRANSFORM_OUTPUT_COLLISION_EXPLANATION,
+    _TRANSFORM_OUTPUT_COLLISION_FIX,
     CompositionState,
     EdgeSpec,
     NodeSpec,
@@ -39,11 +46,16 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
+    route_destination_facts,
 )
+from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
+    _PLUGIN_UNAVAILABLE_FIXES,
+    _VALIDATION_ERROR_PATTERNS,
     explain_validation_code,
 )
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
 
 
 def _empty_state() -> CompositionState:
@@ -58,7 +70,7 @@ def _make_source(
         plugin="csv",
         on_success=on_success,
         options={"path": "/data/input.csv", **(options or {})},
-        on_validation_failure="quarantine",
+        on_validation_failure="discard",
     )
 
 
@@ -193,6 +205,77 @@ class TestStructuralRejectionCodes:
         assert _entries_with_code(result, "no_source_configured")
         assert _entries_with_code(result, "no_sinks_configured")
 
+    def test_an_implicit_aggregation_is_a_reachable_producer(self) -> None:
+        """An aggregation that omits on_success publishes under its own NAME.
+
+        ``AggregationSettings.on_success`` is ``str | None = None`` and
+        ``core/dag/builder.py`` does ``if agg_settings.on_success is None:
+        register_producer(agg_settings.name, ...)``. The composer's reachable-
+        target set restated that rule by hand and covered only ``coalesce``, so
+        a pipeline the runtime builds and runs was rejected here with
+        ``node_input_not_reachable`` on the aggregation's CONSUMER — an
+        authoring dead end with nothing for the repair loop to fix.
+        """
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="row_batcher",
+                input="rows",
+                on_success=None,
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_make_transform("reader", "agg", "main"))
+        state = state.with_output(_make_output())
+        result = state.validate()
+        assert not _entries_with_code(result, "node_input_not_reachable"), [e.to_dict() for e in result.errors]
+
+    def test_an_orphan_queue_is_still_unreachable(self) -> None:
+        """The guard the aggregation arm must NOT dissolve.
+
+        A queue's ``input`` IS its own id (``queue_node_contract_error``
+        enforces it), so if the reachable-target set added every implicit
+        self-publisher's id — the shape ``published_success_connection``
+        returns — a queue would satisfy its OWN input and this rejection would
+        silently disappear. Queue is therefore deliberately excluded at that
+        one site; coalesce and aggregation are safe because their ``input``
+        names a different connection.
+        """
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="q",
+                node_type="queue",
+                plugin=None,
+                input="q",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_make_transform("reader", "q", "main"))
+        state = state.with_output(_make_output())
+        result = state.validate()
+        assert not result.is_valid
+        assert _entries_with_code(result, "node_input_not_reachable"), [e.to_dict() for e in result.errors]
+
     def test_unreachable_input_carries_code(self) -> None:
         state = _empty_state()
         state = state.with_source(_make_source(on_success="rows"))
@@ -211,6 +294,145 @@ class TestStructuralRejectionCodes:
         result = state.validate()
         assert not result.is_valid
         assert _entries_with_code(result, "duplicate_connection_producer"), [e.to_dict() for e in result.errors]
+
+    def test_a_contended_implicitly_publishing_aggregation_reports_instead_of_crashing(self) -> None:
+        """``validate()`` used to raise ``KeyError`` on this shape, not return a rejection.
+
+        An aggregation that omits ``on_success`` publishes under its own id
+        (``core/dag/builder.py`` registers ``agg_settings.name``), so a gate
+        route ALSO naming that id is a genuine duplicate producer, and
+        ``ProducerResolver`` — which asks ``published_success_connection`` —
+        duly flagged it. The schema-contract validator's description
+        bookkeeping restated the publishing rule by hand as "coalesce with no
+        on_success", so it recorded NO first description for the aggregation;
+        the gate's description landed in that slot instead, and the reporting
+        loop's ``duplicate_descs[connection_name][0]`` then indexed a key
+        nothing had written.
+
+        The result was an unhandled ``KeyError`` escaping ``CompositionState.
+        validate()`` on a planner-authorable shape — a crash, not a validation
+        error. Deriving the description from the same helper the resolver uses
+        keeps the two bookkeepings in step by construction.
+        """
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="rows",
+                on_success=None,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 10},
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="router",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row.n > 1",
+                routes={"hit": "agg"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(_make_transform("reader", "agg", "main"))
+        state = state.with_output(_make_output())
+
+        result = state.validate()
+
+        assert not result.is_valid
+        duplicates = _entries_with_code(result, "duplicate_connection_producer")
+        assert duplicates, [e.to_dict() for e in result.errors]
+        message = duplicates[0].message
+        assert "aggregation 'agg'" in message, (
+            "The aggregation is the FIRST producer of 'agg' and must be named as such. Reporting only "
+            f"the gate hides the node the author actually has to fix. Got: {message!r}"
+        )
+
+    def test_implicit_self_publishers_stay_clean_and_gain_no_overlap_error(self) -> None:
+        """Pins the side effect of deriving the producer description from the helper.
+
+        Recording a description also feeds ``internal_connection_names``, which
+        ``connection_sink_name_overlap`` reads — so deriving the description
+        widened that set to include queue and aggregation ids, which the
+        hand-written "coalesce only" form never recorded.
+
+        The widening is inert BY CONSTRUCTION, and this test enforces the
+        reasoning rather than leaving it argued: ``_record_description`` guards
+        the ``internal_connection_names.add`` with ``if connection_name not in
+        sink_names``, so a name capable of joining the overlap set can never be
+        added by the producer side at all. A valid pipeline whose queue and
+        whose on_success-omitting aggregation each publish under their own id
+        must therefore still validate CLEAN.
+        """
+        queue_state = _empty_state()
+        queue_state = queue_state.with_source(_make_source(on_success="q"))
+        queue_state = queue_state.with_node(
+            NodeSpec(
+                id="q",
+                node_type="queue",
+                plugin=None,
+                input="q",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        queue_state = queue_state.with_node(_make_transform("reader", "q", "main"))
+        queue_state = queue_state.with_output(_make_output())
+        queue_result = queue_state.validate()
+        assert queue_result.is_valid, [e.to_dict() for e in queue_result.errors]
+
+        agg_state = _empty_state()
+        agg_state = agg_state.with_source(_make_source(on_success="rows"))
+        agg_state = agg_state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="rows",
+                on_success=None,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+            )
+        )
+        agg_state = agg_state.with_node(_make_transform("reader", "agg", "main"))
+        agg_state = agg_state.with_output(_make_output())
+        agg_result = agg_state.validate()
+        assert agg_result.is_valid, [e.to_dict() for e in agg_result.errors]
+
+        for result in (queue_result, agg_result):
+            assert not _entries_with_code(result, "connection_sink_name_overlap"), [e.to_dict() for e in result.errors]
+            assert not _entries_with_code(result, "duplicate_connection_producer"), [e.to_dict() for e in result.errors]
 
     def test_aggregation_missing_on_error_carries_code(self) -> None:
         state = _empty_state()
@@ -281,12 +503,23 @@ class TestStructuralRejectionCodes:
 
 
 class TestClosedCodeCatalogueInvariants:
+    def test_unknown_node_type_guidance_includes_row_union_n_to_n_reconvergence(self) -> None:
+        guidance = explain_validation_code("unknown_node_type")
+
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "row_union" in explanation
+        assert "row_union" in fix
+        assert "N-to-N" in fix
+
     def test_schema_contract_codes_are_registered_and_explainable(self) -> None:
         for code in (
             "schema_contract_violation",
             "sink_contract_violation",
             "locked_input_extras",
             "sink_locked_extras",
+            "transform_contract_violation",
+            "transform_declared_output_not_guaranteed",
             "contract_config_invalid",
             "node_input_not_reachable",
             "duplicate_connection_producer",
@@ -295,12 +528,359 @@ class TestClosedCodeCatalogueInvariants:
             "no_sinks_configured",
             "aggregation_missing_on_error",
             "coalesce_branch_unreachable",
+            "coalesce_branch_alias_unreachable",
+            "coalesce_schema_mode_mixed",
+            "row_union_config_invalid",
+            "row_union_name_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+            "row_union_branch_alias_unreachable",
+            "row_union_branch_unreachable",
+            "row_union_branch_not_downstream",
+            "row_union_branch_aggregation_invalid",
+            "row_union_nested_fork_invalid",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
+            "row_union_on_success_must_be_connection",
+            "row_union_on_success_dangling",
+            "fork_branch_multiple_barriers",
+            "gate_duplicate_fork_branch",
         ):
             assert code in _CLOSED_VALIDATION_ERROR_CODES, code
             guidance = explain_validation_code(code)
             assert guidance is not None, f"{code} does not resolve to catalogue guidance"
             explanation, fix = guidance
             assert explanation and fix
+
+    def test_prompt_template_undeclared_row_fields_resolves_to_its_own_guidance(self) -> None:
+        """The single-prompt declaration guard must not fall through to either sibling.
+
+        ``prompt_template_unbound_variables`` advises "rewrite each name as
+        '{{ row.<field> }}'" — circular here, because the reference already IS
+        ``row.<field>``; the defect is that the DECLARATION does not cover it.
+        ``query_template_unbound_row_fields`` advises ``input_fields`` and
+        ``row.source_row``, neither of which a single-prompt node has
+        (elspeth-a9ba80cb0b).
+        """
+        assert "prompt_template_undeclared_row_fields" in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code("prompt_template_undeclared_row_fields")
+        assert guidance is not None, "prompt_template_undeclared_row_fields does not resolve to catalogue guidance"
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "required_input_fields" in explanation
+        assert "required_input_fields" in fix
+
+        assert guidance != explain_validation_code("prompt_template_unbound_variables")
+        assert guidance != explain_validation_code("query_template_unbound_row_fields")
+
+        # Neither sibling's vocabulary: a single-prompt node has no per-query
+        # ``input_fields`` and no ``row.source_row``.
+        assert "input_fields" not in fix.replace("options.required_input_fields", "").replace("required_input_fields", "")
+        assert "source_row" not in fix
+
+        # The advice must not steer the planner to the one repair that clears
+        # this error by withdrawing the contract for every OTHER field too.
+        assert "withdraws the contract for every field" in fix
+
+        # Rewrite-the-reference must LEAD. ``verify_declared_required_fields``
+        # is a plain set difference over row keys with no dual-name limb, so
+        # declaring a read name the producer does not guarantee is accepted at
+        # config time and then raises on every row — leading with it would hand
+        # the planner a repair that clears this error and breaks the run
+        # (elspeth-a9ba80cb0b). This is the claim the catalogue must carry, not
+        # a property of whatever string happened to be written first.
+        assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
+        assert "ONLY if the upstream producer guarantees that exact name" in fix
+        assert "fails every row at run time" in fix
+
+    def test_transform_contract_advice_has_exactly_one_owner(self) -> None:
+        """The catalogue must SERVE ``state``'s advice, never restate it.
+
+        These two texts reach the planner on disjoint paths — the rendered
+        message only ever on a tool call, this catalogue only ever on the
+        one-shot planner's repair turn, which projects
+        ``explanation``/``suggested_fix`` from the error_code and withholds the
+        message. So a second copy here cannot be caught by reading either path:
+        88137581b rewrote the message and left this catalogue on advice written
+        a month earlier, and the planner alternated remedy sets depending on how
+        it had learned of the error (elspeth-920bd88299).
+
+        Identity, not equality: a copied string would satisfy ``==`` on the day
+        it was copied and drift on the next edit, which is the failure being
+        pinned.
+        """
+        for code, expected in (
+            (
+                "transform_declared_output_not_guaranteed",
+                (_TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION, _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX),
+            ),
+            (
+                "transform_contract_violation",
+                (_TRANSFORM_OUTPUT_COLLISION_EXPLANATION, _TRANSFORM_OUTPUT_COLLISION_FIX),
+            ),
+            (
+                "prompt_template_undeclared_row_fields",
+                (_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION, _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX),
+            ),
+        ):
+            guidance = explain_validation_code(code)
+            assert guidance is not None, code
+            explanation, fix = guidance
+            assert explanation is expected[0], f"{code} explanation is a copy, not the shared constant"
+            assert fix is expected[1], f"{code} fix is a copy, not the shared constant"
+
+    def test_the_two_transform_contract_rules_do_not_share_repair_advice(self) -> None:
+        """Rule C and Rule D are different defects and must resolve differently.
+
+        They shared one error_code until elspeth-920bd88299, and the catalogue
+        is keyed on the code — so one entry was served to both. A Rule D
+        collision on an ``llm`` node received field_mapper advice naming
+        ``mapping`` and ``select_only``, options that node does not have.
+        """
+        declared = explain_validation_code("transform_declared_output_not_guaranteed")
+        collision = explain_validation_code("transform_contract_violation")
+        assert declared is not None and collision is not None
+        assert declared != collision
+
+        # Rule D's advice must not name field_mapper-only options: it fires for
+        # any transform, most visibly an llm rewriting in place.
+        collision_text = " ".join(collision)
+        assert "select_only" not in collision_text, collision_text
+        assert "response_field" in collision_text, collision_text
+
+        # Rule C's advice must not claim the field cannot be EMITTED. It is
+        # emitted whenever the source is present; what is missing is the
+        # GUARANTEE, and conflating the two is what produced remedies telling
+        # authors to map a field the mapping already targets.
+        declared_text = " ".join(declared)
+        assert "guarantee" in declared_text, declared_text
+
+    def test_row_union_topology_codes_resolve_to_topology_guidance(self) -> None:
+        """The new codes must not fall through to the intrinsic entry.
+
+        ``explain_validation_code`` returns the first matching pattern, so a
+        mis-ordered catalogue entry would silently route a topology code to
+        the node-shape guidance ("give every branch a non-empty unique
+        alias") — the exact mis-advice the code split removes.
+        """
+        intrinsic = explain_validation_code("row_union_branch_invalid")
+        assert intrinsic is not None
+
+        downstream = explain_validation_code("row_union_branch_not_downstream")
+        assert downstream is not None
+        assert downstream != intrinsic
+        assert "downstream" in downstream[0] or "downstream" in downstream[1]
+
+        branch_aggregation = explain_validation_code("row_union_branch_aggregation_invalid")
+        assert branch_aggregation is not None
+        assert branch_aggregation not in (intrinsic, downstream)
+        # 2026-08-23 remedy enrichment (Task 9 ruling, F1 fix round): the
+        # remedy no longer recommends output_mode: passthrough — rule 6
+        # (ruling 25) bans aggregators inside every bound region regardless
+        # of mode, so that advice would land the planner straight in a NEW
+        # rejection (the exact wasted-turn defect this pin flip closes).
+        assert "passthrough" not in branch_aggregation[1]
+        assert "rule 6" in branch_aggregation[1]
+        assert "trigger" not in branch_aggregation[1]
+
+        nested_fork = explain_validation_code("row_union_nested_fork_invalid")
+        assert nested_fork is not None
+        assert nested_fork not in (intrinsic, downstream, branch_aggregation)
+        assert "nested fork" in nested_fork[0].lower()
+        assert "before" in nested_fork[1] or "terminate" in nested_fork[1]
+
+        invalid_name = explain_validation_code("row_union_name_invalid")
+        assert invalid_name is not None
+        assert "name" in invalid_name[0].lower()
+        assert "letters" in invalid_name[1].lower()
+
+        downstream_group = explain_validation_code("row_union_downstream_group_invalid")
+        assert downstream_group is not None
+        assert downstream_group not in (intrinsic, downstream, branch_aggregation, nested_fork)
+        assert "indivisible" in downstream_group[0] or "indivisible" in downstream_group[1]
+        assert "end_of_source" in downstream_group[1]
+        assert "branches" not in downstream_group[1]
+
+        schema_incompatible = explain_validation_code("row_union_schema_incompatible")
+        assert schema_incompatible is not None
+        assert schema_incompatible not in (intrinsic, downstream, downstream_group)
+        assert "long-format" in schema_incompatible[0]
+        assert "row_union_schema" in schema_incompatible[1]
+
+        # The cross-node barrier-ownership code sits in the same cluster and
+        # must not fall through to any row_union node-shape entry either.
+        multiple_barriers = explain_validation_code("fork_branch_multiple_barriers")
+        assert multiple_barriers is not None
+        assert multiple_barriers not in (intrinsic, downstream)
+        assert "barrier" in multiple_barriers[0]
+
+    def test_on_error_closer_out_of_region_resolves_both_the_code_and_the_runtime_text(self) -> None:
+        """Task 11 (spec §7 rule 9): same shape as the scope_escalate pin
+        above and for the same reason — the entry is outside
+        ``_CLOSED_VALIDATION_ERROR_CODES`` (Stage 1 deliberately RELAXES
+        instead of mirroring the out-of-region rejection, so it never emits
+        this code), which means the runtime-message route (the alternation's
+        second limb, surfaced via ``preview_pipeline``'s Stage-2 build error)
+        is the only live route and would otherwise ship unpinned.
+        """
+        by_code = explain_validation_code("on_error_closer_out_of_region")
+        assert by_code is not None
+        assert "closer" in by_code[0]
+        assert "sink name or 'discard'" in by_code[1]
+
+        # Representative fragment of the real builder message
+        # (core/dag/builder.py rule-9 resolution pass).
+        by_runtime_text = explain_validation_code(
+            "Transform 'cleanup' on_error 'merge_paths' names closer 'merge_paths' but 'cleanup' "
+            "is not inside that closer's bound region. A closer is a legal on_error target only "
+            "from inside its own region (spec §7 rule 9)."
+        )
+        assert by_runtime_text == by_code
+
+    def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
+        """The multi-query row-binding code must not fall through to the
+        single-prompt unbound-variables entry: the repair is different (bind
+        the variable in that query's input_fields, or use row.source_row),
+        and the single-prompt advice ("rewrite as row.<field>") would send
+        the planner in a circle — the reference already IS row.<field>."""
+        assert "query_template_unbound_row_fields" in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code("query_template_unbound_row_fields")
+        assert guidance is not None, "query_template_unbound_row_fields does not resolve to catalogue guidance"
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "input_fields" in explanation
+        assert "input_fields" in fix
+        assert "source_row" in fix
+
+        single_prompt = explain_validation_code("prompt_template_unbound_variables")
+        assert single_prompt is not None
+        assert guidance != single_prompt
+
+    @pytest.mark.parametrize(
+        "code",
+        ("guided_amend_contract_violation", "guided_revision_unchanged"),
+    )
+    def test_guided_prose_amend_codes_are_closed_and_actionable(self, code: str) -> None:
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "correction_target" not in explanation
+        assert "correction_target" not in fix
+        assert "private" not in explanation.lower()
+        assert "private" not in fix.lower()
+
+    @pytest.mark.parametrize(
+        "code",
+        (
+            "guided_delta_unknown_stable_id",
+            "guided_delta_duplicate_stable_id",
+            "guided_delta_authority_violation",
+            "guided_delta_nonincident_route",
+            "guided_delta_unknown_reference",
+            "guided_delta_reviewed_failure_route_required",
+            # guided_collector_not_authorable was RETIRED with the WS6 guided
+            # collector-guard lift (ruling 7878, elspeth-88bb77953c): the
+            # guided lane now authors and projects collectors, so the binder
+            # refusal and its code no longer exist.
+            "guided_collector_opener_unresolved",
+        ),
+    )
+    def test_guided_delta_codes_are_closed_and_actionable(self, code: str) -> None:
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "tutorial" not in explanation.lower()
+        assert "tutorial" not in fix.lower()
+        assert "private" not in explanation.lower()
+        assert "private" not in fix.lower()
+
+    def test_reviewed_output_projection_conflict_is_closed_and_actionable(self) -> None:
+        code = "reviewed_output_projection_conflict"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "select-only field_mapper" in explanation
+        assert "VALUES" in explanation
+        assert "missing_fields" in explanation
+        assert "options.mapping value" in fix
+        assert "reviewed output form" in fix
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+    def test_review_reconciliation_failed_is_closed_and_actionable(self) -> None:
+        """The reconciliation rejection must be explainable on BOTH surfaces.
+
+        Session f33fa7c3 (2026-09-01): ``set_pipeline`` rejected with
+        ``review_reconciliation_failed``, the planner called
+        ``explain_validation_error`` with the verbatim message, and the code
+        was in neither ``_VALIDATION_ERROR_PATTERNS`` nor the closed
+        catalogue — so the tool fell through to its no-match branch and
+        answered "does not match any known validation message or closed
+        error_code". The planner had nothing new and resubmitted an identical
+        payload. Both lookup paths are pinned here: the freeform tool matches
+        the MESSAGE, and the one-shot planner feedback
+        (``_allowlisted_candidate_feedback``) strips the message and can only
+        resolve the bare CODE.
+        """
+        code = "review_reconciliation_failed"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+        # The freeform tool's primary pass matches the raw rejection message,
+        # which now carries the interpolated cause after the colon.
+        message = (
+            "Authoritative interpretation-review reconciliation failed: resolved interpretation "
+            "requirement 'model_choice_review:enrich' hash drifted. Re-inspect the exact "
+            "set_pipeline_arguments payload and retry."
+        )
+        assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
+
+    def test_vague_term_unwired_is_closed_and_actionable(self) -> None:
+        """The unwired-vague_term rejection must be explainable on both surfaces.
+
+        Session 4c42a794 (2026-09-01): ``set_pipeline`` committed a pending
+        vague_term requirement with no resolvable prompt wiring. The guard
+        that now rejects that shape must not repeat the
+        ``review_reconciliation_failed`` mistake (see the test above): a coded
+        rejection the explainer cannot resolve leaves the planner
+        blind-repeating, so the code is pinned in the closed catalogue and the
+        message is pinned against the pattern table.
+        """
+        code = "vague_term_unwired"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        # The repair is wiring, not restaging: the fix must name the
+        # structured wiring mechanism the resolver actually consumes.
+        assert "prompt_template_parts" in (explanation + fix)
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+        message = (
+            "Pending vague_term review is not wired for resolution on node 'score_lead': "
+            "requirement 'lead quality:score_lead' (user term 'lead quality') has no resolvable prompt wiring."
+        )
+        assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
 
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
@@ -419,12 +999,13 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         assert [entry["component"] for entry in feedback["validation"]["errors"]] == ["rejected_mutation"]
         assert _candidate_rejection_codes(result) == ("validation_error",)
 
-    def test_validated_candidate_rejections_pass_through_ungated(self) -> None:
+    def test_validated_candidate_rejections_pass_through_ungated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without a rejected_mutation entry, every real error must survive.
 
         Guards the instance-1 class (built candidate validated, real errors,
         e.g. coalesce_branch_unreachable) against over-gating.
         """
+        import elspeth.web.composer.pipeline_planner as planner_module
         from elspeth.web.composer.pipeline_planner import (
             _allowlisted_candidate_feedback,
             _candidate_rejection_codes,
@@ -441,11 +1022,28 @@ class TestPlannerFeedbackCarriesStructuralFacts:
             validation=ValidationSummary(is_valid=False, errors=entries, warnings=(), suggestions=()),
             affected_nodes=(),
         )
+        monkeypatch.setattr(
+            planner_module,
+            "coalesce_reachability_facts",
+            # A realistic fact value: the real function never emits an entry
+            # without unreachable_branches, so a double that omits it could
+            # not catch the projection dropping a field.
+            lambda _state: {
+                "merge": {
+                    "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
+                    "produced_connections": ["left", "right"],
+                }
+            },
+        )
         feedback = _allowlisted_candidate_feedback(result)
         assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [
             "coalesce_branch_unreachable",
             "node_input_not_reachable",
         ]
+        assert feedback["validation"]["errors"][0]["connectivity"] == {
+            "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
+            "produced_connections": ["left", "right"],
+        }
         assert _candidate_rejection_codes(result) == ("coalesce_branch_unreachable", "node_input_not_reachable")
 
     def test_rejection_trail_codes_never_empty_when_entries_exist(self) -> None:
@@ -471,6 +1069,66 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         )
         codes = _candidate_rejection_codes(result)
         assert codes == ("validation_error", "schema_contract_violation")
+
+
+class TestFullReplacementRejectionsWithholdStaleStateEntries:
+    """set_pipeline rejections carry no stale pre-mutation state entries.
+
+    elspeth-e89e6bf47a: the planner-side ``_rejection_entries`` gate protects
+    only the planner surface. The freeform chat loop (``serialize_tool_result``)
+    and the composer MCP server both serialize ``ToolResult.to_dict()``
+    verbatim, so for the full-replacement tool the pre-mutation state's errors
+    (``no_source_configured`` / ``no_sinks_configured`` on an empty session)
+    must not exist at the producer — a repair loop reading error codes is
+    otherwise told to fix a source/sink the rejected candidate configured
+    correctly. Discovery tools and incremental mutations keep the default
+    disclosure: there the standing state is what survives the rejection, and
+    restricted surfaces read its errors through failure results (see the
+    pipeline-state disclosure tests).
+    """
+
+    def test_failure_result_withholds_state_entries_only_when_asked(self) -> None:
+        from elspeth.web.composer.tools._common import _failure_result
+
+        withheld = _failure_result(
+            _empty_state(),
+            "Node 'enrich': Invalid options for transform 'llm': provider: Field required",
+            error_code="plugin_options_invalid",
+            with_state_validation=False,
+        )
+
+        assert not withheld.validation.is_valid
+        assert [entry.component for entry in withheld.validation.errors] == ["rejected_mutation"]
+        assert [entry.error_code for entry in withheld.validation.errors] == ["plugin_options_invalid"]
+        assert withheld.validation.warnings == ()
+        assert withheld.validation.suggestions == ()
+
+        disclosed = _failure_result(
+            _empty_state(),
+            "Component 'missing-component' not found.",
+        )
+        disclosed_codes = {entry.error_code for entry in disclosed.validation.errors}
+        assert {"no_source_configured", "no_sinks_configured"} <= disclosed_codes
+
+    def test_normalization_does_not_reattach_withheld_stale_state_errors(self) -> None:
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.tools._common import _failure_result, normalize_tool_result_validation
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+        catalog_service = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog_service)
+        catalog = PolicyCatalogView.for_trained_operator(catalog_service, snapshot)
+
+        result = _failure_result(
+            _empty_state(),
+            "Node 'enrich': Invalid options for transform 'llm': provider: Field required",
+            error_code="plugin_options_invalid",
+            with_state_validation=False,
+        )
+        normalized = normalize_tool_result_validation(result, catalog)
+
+        assert [entry.component for entry in normalized.validation.errors] == ["rejected_mutation"]
 
 
 def _make_gate(id: str, input: str, fork_to: tuple[str, ...]) -> NodeSpec:
@@ -555,37 +1213,123 @@ class TestCoalesceReachabilityFacts:
         facts = coalesce_reachability_facts(state)
         assert facts == {
             "merge": {
-                "unreachable_branches": {"branch_a": "a_done", "branch_b": "b_done"},
+                # One record per broken branch, each carrying its own lure:
+                # the repair reads "this branch is broken AND this node broke
+                # it" as one fact, with no join back by connection name
+                # (guided attempt 14, session 04200b45 — the model wired
+                # branch transforms to the reviewed sink 3x with the bare
+                # facts live).
+                "unreachable_branches": [
+                    {
+                        "branch": "branch_a",
+                        "consumed_connection": "a_done",
+                        "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
+                    },
+                    {
+                        "branch": "branch_b",
+                        "consumed_connection": "b_done",
+                        "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
+                    },
+                ],
                 # Sink names and the coalesce's own published id are excluded:
                 # both pass the membership walk today but are not connections a
                 # branch value should be steered toward.
                 "produced_connections": ["branch_a", "branch_b", "rows"],
-                # The lure, named: each unreachable branch whose branch-side
-                # transform publishes to a SINK instead of the expected
-                # connection (guided attempt 14, session 04200b45 — the model
-                # wired branch transforms to the reviewed sink 3x with the
-                # bare facts live).
-                "sink_targeting_branches": [
-                    {"node_id": "t_a", "on_success_sink": "main", "expected_connection": "a_done"},
-                    {"node_id": "t_b", "on_success_sink": "main", "expected_connection": "b_done"},
-                ],
             }
         }
+
+    def test_produced_connections_are_sorted_on_a_fixture_authored_out_of_order(self) -> None:
+        """The sort pin must not depend on the hash seed.
+
+        The three-element fixtures elsewhere in this class pin
+        ``produced_connections`` sortedness only on seeds whose set iteration
+        happens to be alphabetical (an unsorted emitter survived at
+        PYTHONHASHSEED=5 under red-team mutation M6). Six connections authored
+        in non-alphabetical order make accidental agreement 1-in-720.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        aliases = ("zeta", "eta", "beta", "alpha", "gamma")
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(_make_gate("fan_out", "rows", aliases))
+        for alias in aliases:
+            state = state.with_node(_make_transform(f"t_{alias}", alias, "main"))
+        state = state.with_node(_make_coalesce("merge", {alias: f"{alias}_done" for alias in aliases}))
+        state = state.with_node(_make_transform("tidy", "merge", "main"))
+        state = state.with_output(_make_output())
+
+        facts = coalesce_reachability_facts(state)
+        produced = facts["merge"]["produced_connections"]
+        assert produced == ["alpha", "beta", "eta", "gamma", "rows", "zeta"]
+        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == list(aliases)
 
     def test_reachability_facts_handle_list_form_branches(self) -> None:
         from elspeth.web.composer.state import coalesce_reachability_facts
 
         state = _orphaned_coalesce_state(("a_done", "b_done"))
         facts = coalesce_reachability_facts(state)
-        # List-form branch keys are the arriving connection names themselves —
-        # nothing consumes them as an input, so no branch-side transform chain
-        # exists to attribute a sink lure to.
+        # List-form branch keys are the arriving connection names themselves,
+        # so they are identity branches and never carry a lure — see
+        # test_identity_branch_never_carries_a_sink_lure for the case where a
+        # transform DOES consume the name. The record states branch and
+        # connection as the same string outright; the old mapping form encoded
+        # this as {"a_done": "a_done"}, which reads like an alias->connection
+        # pair carrying information it does not have.
         assert facts == {
             "merge": {
-                "unreachable_branches": {"a_done": "a_done", "b_done": "b_done"},
+                "unreachable_branches": [
+                    {"branch": "a_done", "consumed_connection": "a_done"},
+                    {"branch": "b_done", "consumed_connection": "b_done"},
+                ],
                 "produced_connections": ["branch_a", "branch_b", "rows"],
             }
         }
+
+    def test_identity_branch_never_carries_a_sink_lure(self) -> None:
+        """An identity branch must not name a lure — the walk finds a CONSUMER.
+
+        ``_sink_lure`` walks from the branch NAME. For a mapped branch that
+        name is the fork alias, so the transform consuming it is the branch's
+        producer and re-pointing its on_success is the correct repair. For an
+        identity branch the name IS the consumed connection, so the walk finds
+        a node competing for the connection the coalesce awaits. Naming it
+        would make the planner set that node's on_success to its own input —
+        a self-loop rejected as ``pipeline_cycle``, burning a repair turn in
+        the payload that exists to stop exactly that.
+
+        Here ``t_a`` consumes ``a_done`` (the identity branch name) and
+        publishes to the sink, so the pre-guard code DID attribute a lure.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(_make_gate("fan_out", "rows", ("branch_a", "branch_b")))
+        state = state.with_node(_make_transform("t_a", "a_done", "main"))
+        state = state.with_node(_make_coalesce("merge", ("a_done", "b_done")))
+        state = state.with_node(_make_transform("tidy", "merge", "main"))
+        state = state.with_output(_make_output())
+        facts = coalesce_reachability_facts(state)
+        assert facts["merge"]["unreachable_branches"] == [
+            {"branch": "a_done", "consumed_connection": "a_done"},
+            {"branch": "b_done", "consumed_connection": "b_done"},
+        ]
+
+    def test_unreachable_branches_follow_authored_order_not_sorted_order(self) -> None:
+        """Order is the order the planner authored, never sorted.
+
+        Pinned because the list form makes order observable where the old
+        mapping's was incidental: a reader matching record N against its own
+        emitted branches must see them in the order it wrote them. The branch
+        names here sort into the opposite order, so a ``sorted()`` slipped
+        into the emitter fails this and passes a same-order fixture.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        state = _orphaned_coalesce_state({"branch_b": "b_done", "branch_a": "a_done"})
+        facts = coalesce_reachability_facts(state)
+        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == ["branch_b", "branch_a"]
 
     def test_sink_lure_attribution_follows_transform_chains_and_skips_non_sink_dangles(self) -> None:
         """The lure walk follows a branch's transform CHAIN to the sink hop.
@@ -607,8 +1351,15 @@ class TestCoalesceReachabilityFacts:
         state = state.with_node(_make_transform("tidy", "merge", "main"))
         state = state.with_output(_make_output())
         facts = coalesce_reachability_facts(state)
-        assert facts["merge"]["sink_targeting_branches"] == [
-            {"node_id": "t_mid", "on_success_sink": "main", "expected_connection": "a_done"},
+        assert facts["merge"]["unreachable_branches"] == [
+            {
+                "branch": "branch_a",
+                "consumed_connection": "a_done",
+                "sink_lure": {"node_id": "t_mid", "publishes_to_sink": "main"},
+            },
+            # branch_b is unreachable but carries NO sink_lure: t_b dangles to
+            # a non-sink name, so there is no sink-publishing hop to name.
+            {"branch": "branch_b", "consumed_connection": "b_done"},
         ]
 
     def test_reachability_facts_empty_for_correctly_wired_coalesce(self) -> None:
@@ -640,14 +1391,78 @@ class TestCoalesceReachabilityFacts:
         projected = feedback["validation"]["errors"][0]
         assert projected["error_code"] == "coalesce_branch_unreachable"
         assert "message" not in projected
+        # The one PROJECTION-level assertion for this payload: it proves the
+        # facts cross _allowlisted_candidate_feedback unmodified. The other
+        # sites call coalesce_reachability_facts directly, so only this one
+        # would catch the projection dropping or reshaping a field.
         assert projected["connectivity"] == {
-            "unreachable_branches": {"branch_a": "a_done", "branch_b": "b_done"},
-            "produced_connections": ["branch_a", "branch_b", "rows"],
-            "sink_targeting_branches": [
-                {"node_id": "t_a", "on_success_sink": "main", "expected_connection": "a_done"},
-                {"node_id": "t_b", "on_success_sink": "main", "expected_connection": "b_done"},
+            "unreachable_branches": [
+                {
+                    "branch": "branch_a",
+                    "consumed_connection": "a_done",
+                    "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
+                },
+                {
+                    "branch": "branch_b",
+                    "consumed_connection": "b_done",
+                    "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
+                },
             ],
+            "produced_connections": ["branch_a", "branch_b", "rows"],
         }
+
+    def test_route_destination_entries_ship_only_their_own_fields_keys(self) -> None:
+        """A component whose on_success AND on_error both dangle gets two entries, each with its own field's keys.
+
+        ``route_destination_facts`` merges both findings into one dict per
+        component; attaching that dict to every entry shipped
+        ``dangling_on_success`` / ``consumable_connections`` under the on_error
+        code and ``dangling_on_error`` under the on_success code — keys the
+        code's guidance never names and the teaching gate never enumerated
+        (red-team finding on bc8b9e237). The consumer now projects each entry
+        to ``route_destination_fact_keys(code)``; this pins that projection on
+        the doubly-dangling fixture the finding used.
+        """
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback, route_destination_fact_keys
+        from elspeth.web.composer.tools import ToolResult
+
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="t1",
+                node_type="transform",
+                plugin="value_transform",
+                input="rows",
+                on_success="nowhere",
+                on_error="ghost_sink",
+                options={"schema": {"mode": "observed"}, "operations": [{"target": "_placeholder", "expression": "row['text']"}]},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(_make_output())
+        validation = state.validate()
+        codes = {entry.error_code for entry in validation.errors}
+        assert {"transform_on_success_dangling", "transform_on_error_unknown_sink"} <= codes
+        # The producer really does merge: both fields' keys live in one dict.
+        assert set(route_destination_facts(state)["node:t1"]) == {
+            "dangling_on_success",
+            "declared_sinks",
+            "consumable_connections",
+            "dangling_on_error",
+        }
+
+        feedback = _allowlisted_candidate_feedback(ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=()))
+        shipped = {entry["error_code"]: set(entry["connectivity"]) for entry in feedback["validation"]["errors"] if "connectivity" in entry}
+        assert shipped["transform_on_success_dangling"] == route_destination_fact_keys("transform_on_success_dangling")
+        assert shipped["transform_on_error_unknown_sink"] == route_destination_fact_keys("transform_on_error_unknown_sink")
+        assert "dangling_on_success" not in shipped["transform_on_error_unknown_sink"]
+        assert "dangling_on_error" not in shipped["transform_on_success_dangling"]
 
     def test_allowlisted_feedback_omits_connectivity_for_other_codes(self) -> None:
         from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
@@ -657,7 +1472,7 @@ class TestCoalesceReachabilityFacts:
             component="node:merge",
             message="anything",
             severity="high",
-            error_code="coalesce_missing_policy",
+            error_code="coalesce_missing_branches",
         )
         result = ToolResult(
             success=False,
@@ -667,6 +1482,80 @@ class TestCoalesceReachabilityFacts:
         )
         feedback = _allowlisted_candidate_feedback(result)
         assert "connectivity" not in feedback["validation"]["errors"][0]
+
+
+class TestPluginUnavailabilityFamilyIsExplainable:
+    """Every plugin-unavailability reason must resolve to actionable guidance.
+
+    ``_plugin_policy_failure`` emits each ``PluginUnavailableReason`` value as a
+    tool ``error_code``, so any of them can reach the planner's redacted repair
+    feedback — where the code is the ONLY surviving signal. Until this sweep the
+    whole family resolved to nothing through ``explain_validation_code``: the
+    model saw a bare token like ``credential_unavailable`` with no way to learn
+    whether to pick a different plugin, wait for an operator, or stop trying, and
+    so re-emitted the same rejected selection until its budget ran out. Same
+    failure shape as the coded-but-unexplained rejections the rest of this module
+    pins, one layer up.
+    """
+
+    def test_every_reason_is_in_the_closed_catalogue_and_resolves(self) -> None:
+        for reason in PluginUnavailableReason:
+            assert reason.value in _CLOSED_VALIDATION_ERROR_CODES, reason
+            guidance = explain_validation_code(reason.value)
+            assert guidance is not None, f"{reason.value} does not resolve to catalogue guidance"
+            explanation, fix = guidance
+            assert explanation and fix
+
+    def test_explanations_are_reused_from_the_tool_copy_not_restated(self) -> None:
+        """One source of truth: the tool failure and the explain entry cannot drift.
+
+        The tool's own message already carries a plain-language cause per reason
+        (``_PLUGIN_UNAVAILABLE_EXPLANATIONS``). Transcribing it into the explain
+        catalogue would let the two answers to "why can't I use this plugin?"
+        diverge silently, which is how a model ends up told to repair something
+        an operator must fix (or vice versa).
+        """
+        for reason in PluginUnavailableReason:
+            guidance = explain_validation_code(reason.value)
+            assert guidance is not None
+            explanation, _fix = guidance
+            assert _PLUGIN_UNAVAILABLE_EXPLANATIONS[reason] in explanation, reason
+
+    def test_fix_table_is_total_over_the_enum(self) -> None:
+        """A new reason joins both halves or fails at import, never half-wired."""
+        assert set(_PLUGIN_UNAVAILABLE_FIXES) == set(PluginUnavailableReason)
+        assert all(_PLUGIN_UNAVAILABLE_FIXES[reason].strip() for reason in PluginUnavailableReason)
+
+    def test_web_surface_prohibition_tells_the_planner_the_refusal_is_categorical(self) -> None:
+        """The one reason with NO repair must say so, or the budget burns.
+
+        Every other reason names something an operator could change.
+        ``WEB_SURFACE_PROHIBITED`` names something nothing can change, so the fix
+        must forbid re-emission outright rather than suggest another attempt.
+        """
+        guidance = explain_validation_code(PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value)
+        assert guidance is not None
+        _explanation, fix = guidance
+        lowered = fix.lower()
+
+        assert "categorical" in lowered
+        assert "do not re-emit" in lowered
+
+    def test_reason_codes_do_not_shadow_an_unrelated_catalogue_entry(self) -> None:
+        """Exact-code patterns only: these codes are short and generic.
+
+        A loose alternation here would make an unrelated full validation message
+        resolve to a plugin-policy explanation. Every other closed code must keep
+        resolving to its own guidance with the family added.
+        """
+        family = {reason.value for reason in PluginUnavailableReason}
+        for code in _CLOSED_VALIDATION_ERROR_CODES:
+            if code in family:
+                continue
+            guidance = explain_validation_code(code)
+            assert guidance is not None, code
+            explanation, _fix = guidance
+            assert "cannot be used in this deployment" not in explanation, code
 
 
 if __name__ == "__main__":  # pragma: no cover

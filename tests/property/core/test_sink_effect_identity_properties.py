@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from hypothesis import given
 from hypothesis import strategies as st
 
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import SinkEffectMemberCandidate, SinkEffectRole
 from elspeth.core.landscape.execution.sink_effect_identity import (
     compute_pipeline_effect_identity,
@@ -19,9 +20,8 @@ class _Token:
     token_id: str
     row_id: str
     run_id: str = "run-1"
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
+    lineage_path: tuple[LineageFrame, ...] = ()
 
 
 @dataclass(frozen=True)

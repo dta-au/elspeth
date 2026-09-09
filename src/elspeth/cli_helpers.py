@@ -47,7 +47,7 @@ def resolve_database_url(
     Raises:
         ValueError: If database file not found, settings invalid, or neither provided
     """
-    from elspeth.core.config import load_settings
+    from elspeth.config_loading import load_settings
 
     config: ElspethSettings | None = None
 

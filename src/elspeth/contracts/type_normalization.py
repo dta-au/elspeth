@@ -14,6 +14,8 @@ import math
 from datetime import datetime
 from typing import Any, Final, cast
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 # NOTE: numpy and pandas are imported LAZILY inside normalize_type_for_contract()
 # to avoid breaking the contracts leaf module boundary. Importing them at module
 # level pulls in 400+ modules just for type normalization.
@@ -141,6 +143,20 @@ def require_supported_contract_type(value: Any) -> type:
     return cast(type, normalized_type)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one pipeline-row value during SchemaContract.validate() — Tier-3 external row data whose runtime "
+        "type is being classified so exotic types quarantine instead of crashing the run"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns an owned primitive type for recognized numpy/pandas/stdlib values and type(value) for "
+        "everything else, so the caller records a TypeMismatchViolation; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def classify_runtime_type(value: Any) -> type:
     """Classify a value's type for runtime validation comparison.
 

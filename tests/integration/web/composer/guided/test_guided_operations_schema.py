@@ -23,8 +23,9 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 SESSION_ID = "00000000-0000-4000-8000-000000000001"
 OPERATION_ID = "00000000-0000-4000-8000-000000000002"
@@ -96,14 +97,15 @@ def engine():
                 updated_at=NOW,
             )
         )
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-operation-schema"),
     )
     with patch("elspeth.web.sessions.service.uuid.uuid4", return_value=UUID(STATE_ID)):
         state = asyncio.run(
-            service.save_composition_state(
+            _save_composition_state_with_compose_authority(
+                service,
                 UUID(SESSION_ID),
                 CompositionStateData(is_valid=False),
                 provenance="session_seed",
@@ -127,6 +129,7 @@ def _operation(**overrides: object) -> dict[str, object]:
         "proposal_id": None,
         "result_kind": None,
         "result_state_id": None,
+        "result_message_id": None,
         "result_session_id": None,
         "response_hash": None,
         "failure_code": None,
@@ -361,7 +364,16 @@ def test_request_cancelled_is_closed_terminal_failure(engine) -> None:
         {"status": "in_progress", "lease_token": None},
         {"status": "in_progress", "lease_expires_at": None},
         {"status": "in_progress", "settled_at": NOW},
+        {"status": "in_progress", "unproducible_output_fields": ["client"]},
         {"status": "completed", "lease_token": "stale", "lease_expires_at": NOW},
+        {
+            "status": "completed",
+            "settled_at": NOW,
+            "result_kind": "composition_state",
+            "result_state_id": STATE_ID,
+            "response_hash": RESPONSE_HASH,
+            "unproducible_output_fields": ["client"],
+        },
         {
             "status": "completed",
             "settled_at": NOW,
@@ -391,6 +403,22 @@ def test_request_cancelled_is_closed_terminal_failure(engine) -> None:
             "failure_code": "raw provider error: secret",
             "lease_token": None,
             "lease_expires_at": None,
+        },
+        {
+            "status": "failed",
+            "settled_at": NOW,
+            "failure_code": "provider_timeout",
+            "lease_token": None,
+            "lease_expires_at": None,
+            "unproducible_output_fields": [],
+        },
+        {
+            "status": "failed",
+            "settled_at": NOW,
+            "failure_code": "provider_timeout",
+            "lease_token": None,
+            "lease_expires_at": None,
+            "unproducible_output_fields": {"field": "client"},
         },
     ],
 )
@@ -425,6 +453,7 @@ def test_completed_and_failed_terminal_bundles_are_accepted(engine) -> None:
                     lease_token=None,
                     lease_expires_at=None,
                     failure_code="provider_unavailable",
+                    unproducible_output_fields=["amount_aud", "client"],
                     settled_at=NOW,
                 )
             )

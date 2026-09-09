@@ -1,10 +1,10 @@
 # ADR: Replace default_sink with Explicit Per-Transform Sink Routing
 
-**Status:** Approved (with conditions)
-**Bead:** `elspeth-rapid-o639`
+**Status:** Accepted
+**Implementation:** commit `0769a69c6`
 **Date:** 2026-02-09
-**Decision Makers:** Architecture Review Board
-**Review Board Verdict:** Unanimous Approve (3/3) with required changes — all incorporated below
+**Decision Makers:** ELSPETH maintainer
+**Review evidence:** Three-lens advisory design review; required clarifications are incorporated below
 
 ## Context
 
@@ -304,19 +304,19 @@ Per CLAUDE.md's No Legacy Code Policy: "WE HAVE NO USERS YET." A phased rollout 
 - **Mid-chain `on_success` ("circuit breaker")** — allow a mid-chain transform to declare `on_success`, making it structurally terminal. Requires dead-code detection (unreachable downstream transforms) and reachability validation. Deferred to a separate ADR.
 - **`elspeth scaffold` command** — generate YAML templates with `on_success` pre-wired to reduce configuration friction.
 
-## Review Board Decisions
+## Decision Clarifications
 
-| Question | Decision | Vote |
-|----------|----------|------|
-| Q1: Source-only pipelines | Option (a): `on_success` on `SourceProtocol` | 2-1 (Architect + Systems vs QA) |
-| Q2: Gate `continue` at terminal | Option (a): validation error | Unanimous |
-| Q3: RowOutcome semantics | Keep `COMPLETED` + `sink_name` distinct from `ROUTED` + `sink_name` | Unanimous |
-| Q4: Coalesce output routing | Option (a): `on_success` on coalesce config (terminal only) | Unanimous |
-| Q5: Aggregation output routing | Option (a): `on_success` when terminal, omit when mid-chain | Unanimous |
-| `branch_name` vs `on_success` | `on_success` is sole routing authority; `branch_name` is lineage metadata only | Unanimous |
-| Phased rollout | Rejected — atomic change per No Legacy Code Policy | Unanimous |
-| Mid-chain `on_success` | Deferred to future ADR — terminal-only for V1 | Unanimous |
-| `on_error`/`on_success` symmetry | Conceptually parallel, mechanically different (DIVERT vs MOVE) — document, don't mirror | Unanimous |
+| Question | Decision |
+|----------|----------|
+| Q1: Source-only pipelines | Option (a): `on_success` on `SourceProtocol` |
+| Q2: Gate `continue` at terminal | Option (a): validation error |
+| Q3: RowOutcome semantics | Keep `COMPLETED` + `sink_name` distinct from `ROUTED` + `sink_name` |
+| Q4: Coalesce output routing | Option (a): `on_success` on coalesce config (terminal only) |
+| Q5: Aggregation output routing | Option (a): `on_success` when terminal, omit when mid-chain |
+| `branch_name` vs `on_success` | `on_success` is sole routing authority; `branch_name` is lineage metadata only |
+| Phased rollout | Rejected — atomic change per No Legacy Code Policy |
+| Mid-chain `on_success` | Deferred to future ADR — terminal-only for V1 |
+| `on_error`/`on_success` symmetry | Conceptually parallel, mechanically different (DIVERT vs MOVE) — document, don't mirror |
 
 ## References
 

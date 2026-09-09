@@ -112,7 +112,7 @@ class _PeerSimulatingSource(_TestSourceBase):
             self._write_peer_journal_rows()
 
     def _write_peer_journal_rows(self) -> None:
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         with self._db.connection() as conn:
             run_id = str(conn.execute(select(runs_table.c.run_id)).scalar_one())
             source_node_id = str(
@@ -150,17 +150,15 @@ class _PeerSimulatingSource(_TestSourceBase):
             step_index=int(sample["step_index"]),
             ingest_sequence=PEER_INGEST_SEQUENCE,
             row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-            available_at=now,
         )
         register_test_worker(self._db, run_id=run_id, worker_id=PEER_OWNER)
-        claimed = repo.claim_ready(run_id=run_id, lease_owner=PEER_OWNER, lease_seconds=3600, now=now)
+        claimed = repo.claim_ready(run_id=run_id, lease_owner=PEER_OWNER, lease_seconds=3600)
         assert claimed is not None and claimed.token_id == token.token_id
         if self._peer_completes_into_barrier:
             repo.mark_blocked(
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key=str(sample["barrier_key"]),
-                now=now,
                 expected_lease_owner=PEER_OWNER,
             )
 
@@ -231,12 +229,11 @@ class TestEofFlushQuiescenceGating:
 
         # ── Phase 2: the slow peer completes into the barrier... ───────────
         repo = TokenSchedulerRepository(db.engine)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         repo.mark_blocked(
             work_item_id=str(peer_row["work_item_id"]),
             queue_key=None,
             barrier_key=str(blocked[0]["barrier_key"]),
-            now=now,
             expected_lease_owner=PEER_OWNER,
         )
 

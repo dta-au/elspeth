@@ -15,9 +15,11 @@ from elspeth.contracts.composer_progress import (
 )
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
+    advisor_checkpoint_progress_event,
     client_cancelled_progress_event,
     convergence_progress_event,
 )
+from elspeth.web.sessions.routes._helpers import _composer_progress_sink
 
 
 class TestComposerProgressEvent:
@@ -141,6 +143,16 @@ class TestConvergenceProgressEvent:
         assert event.likely_next is not None
         assert "wall-clock" in event.likely_next.lower()
 
+    def test_end_advisor_progress_is_evidence_scoped_without_approval_claim(self) -> None:
+        event = advisor_checkpoint_progress_event("end")
+
+        assert event.headline == "I'm asking the advisor model to review the completion evidence."
+        assert event.likely_next == ("The advisor may flag a blocker visible in the supplied evidence before the composer finalizes.")
+        assert event.evidence == ("A second, model-distinct advisor is reviewing the bounded completion evidence.",)
+        rendered = " ".join((event.headline, event.likely_next))
+        assert "sign off" not in rendered
+        assert "approve" not in rendered
+
     def test_composition_budget_emits_distinct_event(self) -> None:
         event = convergence_progress_event(budget_exhausted="composition")
         assert event.phase == "failed"
@@ -171,6 +183,54 @@ class TestConvergenceProgressEvent:
 
 
 class TestComposerProgressRegistry:
+    @pytest.mark.parametrize(
+        ("older_request_id", "newer_request_id"),
+        (
+            ("freeform-older", "guided-newer"),
+            ("guided-older", "freeform-newer"),
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_shared_route_sink_rejects_late_cross_surface_publishers_in_either_direction(
+        self,
+        older_request_id: str,
+        newer_request_id: str,
+    ) -> None:
+        """Freeform and guided surfaces participate in one latest-request domain."""
+        registry = ComposerProgressRegistry()
+        older = _composer_progress_sink(
+            registry,
+            session_id="session-1",
+            request_id=older_request_id,
+            user_id="user-1",
+        )
+        newer = _composer_progress_sink(
+            registry,
+            session_id="session-1",
+            request_id=newer_request_id,
+            user_id="user-1",
+        )
+
+        await newer(
+            ComposerProgressEvent(
+                phase="calling_model",
+                headline="The newer composer request is active.",
+                evidence=("The newer request owns progress custody.",),
+            )
+        )
+        await older(
+            ComposerProgressEvent(
+                phase="failed",
+                headline="The older composer request settled late.",
+                evidence=("The superseded request must not regain custody.",),
+                reason="provider_unavailable",
+            )
+        )
+
+        latest = await registry.get_latest("session-1")
+        assert latest.request_id == newer_request_id
+        assert latest.phase == "calling_model"
+
     @pytest.mark.asyncio
     async def test_returns_idle_snapshot_when_session_has_no_progress(self) -> None:
         registry = ComposerProgressRegistry()
@@ -261,6 +321,21 @@ class TestComposerProgressRegistry:
         assert enriched.inflight_requests == 1
         registry.end_request("session-1")
 
+    def test_end_request_rejects_unmatched_teardown(self) -> None:
+        """A missing begin_request is an owned lifecycle-contract defect."""
+        registry = ComposerProgressRegistry()
+
+        with pytest.raises(KeyError, match="session-1"):
+            registry.end_request("session-1")
+
+    def test_end_request_rejects_double_teardown(self) -> None:
+        registry = ComposerProgressRegistry()
+        registry.begin_request("session-1")
+        registry.end_request("session-1")
+
+        with pytest.raises(KeyError, match="session-1"):
+            registry.end_request("session-1")
+
     @pytest.mark.asyncio
     async def test_list_active_snapshots_carry_live_inflight_count(self) -> None:
         """The operator /_active view reports the LIVE count, not publish-time zero.
@@ -309,6 +384,62 @@ class TestComposerProgressRegistry:
 
         assert snapshot.phase == "idle"
         assert snapshot.updated_at <= datetime.now(UTC)
+
+    @pytest.mark.asyncio
+    async def test_clear_revokes_a_bound_request_sink(self) -> None:
+        registry = ComposerProgressRegistry()
+        progress = registry.bind_request(
+            session_id="session-1",
+            request_id="operation-1",
+            user_id="user-1",
+        )
+        await progress(
+            ComposerProgressEvent(
+                phase="calling_model",
+                headline="The guided planner is active.",
+                evidence=("A bounded request is running.",),
+            )
+        )
+
+        await registry.clear("session-1")
+        await progress(
+            ComposerProgressEvent(
+                phase="failed",
+                headline="A late operation attempted to publish.",
+                evidence=("The cleared request sink completed late.",),
+                reason="service_setup_failed",
+            )
+        )
+
+        assert (await registry.get_latest("session-1")).phase == "idle"
+        assert await registry.list_active(user_id="user-1") == ()
+
+        replacement = registry.bind_request(
+            session_id="session-1",
+            request_id="operation-2",
+            user_id="user-2",
+        )
+        await replacement(
+            ComposerProgressEvent(
+                phase="calling_model",
+                headline="A replacement guided planner is active.",
+                evidence=("A new bounded request owns the session.",),
+            )
+        )
+        await progress(
+            ComposerProgressEvent(
+                phase="failed",
+                headline="The archived operation completed too late.",
+                evidence=("The old request sink no longer has custody.",),
+                reason="service_setup_failed",
+            )
+        )
+
+        latest = await registry.get_latest("session-1")
+        assert latest.request_id == "operation-2"
+        assert latest.phase == "calling_model"
+        assert await registry.list_active(user_id="user-1") == ()
+        assert [snapshot.request_id for snapshot in await registry.list_active(user_id="user-2")] == ["operation-2"]
 
     @pytest.mark.asyncio
     async def test_list_active_returns_only_non_terminal_phases(self) -> None:
@@ -467,3 +598,31 @@ class TestComposerProgressRegistry:
 
         assert alice_active == ()
         assert {snap.session_id for snap in bob_active} == {"session-shared-id"}
+
+
+def test_composer_progress_reason_typescript_mirror_is_complete() -> None:
+    """The SPA's ``ComposerProgressReason`` union is a HAND-WRITTEN mirror with no pin — and it had drifted.
+
+    Python carried ``tool_call_cap_exceeded``; the TypeScript union did not, so the type asserted a value the
+    server could send could not occur. It went unnoticed because the only surface reaching that code was the
+    guided one, and freeform hardcoded ``provider_unavailable`` over every planner outcome — fixing that
+    attribution (elspeth-ad5628ecda) made the missing member reachable on a second surface. The sibling
+    vocabulary (``GuidedOperationFailureCode``) is pinned both by a test and by a pre-commit mirror check
+    (``scripts/cicd/check_slot_type_cross_language.py``); this one was not.
+    """
+    import re
+    from pathlib import Path
+    from typing import get_args
+
+    from elspeth.contracts.composer_progress import ComposerProgressReason
+
+    ts_path = Path(__file__).resolve().parents[4] / "src/elspeth/web/frontend/src/types/index.ts"
+    body = re.search(r"export type ComposerProgressReason =(.*?);", ts_path.read_text(), re.S)
+    assert body is not None, "the TypeScript union was renamed or removed; update this pin"
+    # Only the union arms — a bare `"..."` on a `|` line. Comment prose is skipped by construction.
+    declared = {m.group(1) for line in body.group(1).splitlines() if (m := re.match(r'\s*\|\s*"([a-z_]+)"\s*$', line))}
+
+    assert declared == set(get_args(ComposerProgressReason.__value__)), (
+        f"missing from TypeScript: {sorted(set(get_args(ComposerProgressReason.__value__)) - declared)}; "
+        f"absent from Python: {sorted(declared - set(get_args(ComposerProgressReason.__value__)))}"
+    )

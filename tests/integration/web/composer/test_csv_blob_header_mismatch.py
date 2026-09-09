@@ -17,6 +17,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import execute_tool
+from elspeth.web.execution.schemas import ValidationCheck, ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
@@ -149,6 +150,21 @@ def _state_with_blob_source(
     return result.updated_state
 
 
+def _passing_runtime_preflight(_state: CompositionState) -> ValidationResult:
+    """Hold Stage 2 constant so Stage 3 is the only stage moving the verdict.
+
+    ``preview_pipeline`` fails closed when no preflight is wired, which would
+    make every case in this file red for a reason that has nothing to do with
+    the proof diagnostics it exists to pin.
+    """
+    return ValidationResult(
+        is_valid=True,
+        checks=[ValidationCheck(name="settings_load", passed=True, detail="Settings loaded.", affected_nodes=(), outcome_code=None)],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+
 def _preview_data(engine: Engine, session_id: str, state: CompositionState) -> dict[str, Any]:
     catalog = _catalog()
     result = execute_tool(
@@ -159,6 +175,7 @@ def _preview_data(engine: Engine, session_id: str, state: CompositionState) -> d
         plugin_snapshot=catalog.snapshot,
         session_engine=engine,
         session_id=session_id,
+        runtime_preflight=_passing_runtime_preflight,
     )
     assert result.success is True, result.data
     return result.data
@@ -195,7 +212,7 @@ def test_csv_blob_without_header_and_no_declared_overlap_blocks(schema_mode: str
     assert matching[0]["evidence_locator"]["observed_header_count"] == 1
     assert matching[0]["evidence_locator"]["observed_headers_redacted"] is True
     assert "observed_headers" not in matching[0]["evidence_locator"]
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
 
 
 def test_csv_blob_with_matching_header_does_not_block(tmp_path: Path) -> None:
@@ -220,7 +237,7 @@ def test_csv_blob_with_matching_header_does_not_block(tmp_path: Path) -> None:
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_blob_with_normalized_header_does_not_block(tmp_path: Path) -> None:
@@ -245,7 +262,7 @@ def test_csv_blob_with_normalized_header_does_not_block(tmp_path: Path) -> None:
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_blob_with_field_mapping_header_does_not_block(tmp_path: Path) -> None:
@@ -273,7 +290,7 @@ def test_csv_blob_with_field_mapping_header_does_not_block(tmp_path: Path) -> No
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_blob_with_normalization_collision_returns_blocking_diagnostic(tmp_path: Path) -> None:
@@ -299,7 +316,7 @@ def test_csv_blob_with_normalization_collision_returns_blocking_diagnostic(tmp_p
     matching = [item for item in data["proof_diagnostics"] if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
     assert matching
     assert matching[0]["severity"] == "blocking"
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
     # The raw resolver exception text (which quotes the colliding header values)
     # must NOT be echoed — header-resolution failure means a headerless/malformed
     # CSV can make a data row look like headers, so observed values are withheld.
@@ -335,7 +352,7 @@ def test_csv_blob_with_invalid_field_mapping_returns_blocking_diagnostic(tmp_pat
     matching = [item for item in data["proof_diagnostics"] if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
     assert matching
     assert matching[0]["severity"] == "blocking"
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
     # Raw resolver text (which quotes the unmatched field_mapping keys / headers)
     # is withheld; observed values are redacted to a count.
     diagnostic_blob = repr(matching[0])
@@ -369,7 +386,7 @@ def test_csv_blob_headerless_columns_mode_does_not_block(tmp_path: Path) -> None
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True
 
 
 def test_csv_fixed_schema_omits_columns_redacts_observed_values(tmp_path: Path) -> None:
@@ -411,7 +428,7 @@ def test_csv_fixed_schema_omits_columns_redacts_observed_values(tmp_path: Path) 
     assert "observed_columns" not in ev
     assert ev["missing_column_count"] >= 1
     assert "missing_columns" not in ev
-    assert data["is_valid"] is False
+    assert data["preview_is_valid"] is False
 
 
 def test_jsonl_blob_does_not_fire_csv_header_mismatch(tmp_path: Path) -> None:
@@ -436,4 +453,4 @@ def test_jsonl_blob_does_not_fire_csv_header_mismatch(tmp_path: Path) -> None:
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
-    assert data["is_valid"] is True
+    assert data["preview_is_valid"] is True

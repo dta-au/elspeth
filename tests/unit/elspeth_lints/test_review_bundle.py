@@ -51,13 +51,14 @@ def _new_judgment_action(**overrides: Any) -> BundleAction:
 def _bundle(actions: tuple[BundleAction, ...], *, rekey: RekeyPlan | None = None) -> ReviewBundle:
     return ReviewBundle(
         bundle_id="sample-bundle",
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root="src/elspeth",
         allowlist_dir="config/cicd/enforce_tier_model",
-        source_rev="deadbeef",
+        source_rev="a" * 40,
         source_dirty=True,
+        source_snapshot_sha256="b" * 64,
         actions=actions,
         rekey=rekey,
     )
@@ -123,6 +124,44 @@ def test_load_bundle_rejects_malformed_action_per_kind() -> None:
         load_bundle(_serialize_with_actions([justify]))
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("source_rev", None),
+        ("source_rev", ""),
+        ("source_rev", "DEADBEEF" * 5),
+        ("source_rev", "deadbeef"),
+        ("source_snapshot_sha256", None),
+        ("source_snapshot_sha256", ""),
+        ("source_snapshot_sha256", "A" * 64),
+        ("source_snapshot_sha256", "a" * 63),
+    ],
+)
+def test_load_bundle_rejects_incomplete_or_invalid_source_binding(field: str, invalid: Any) -> None:
+    data = json.loads(dump_bundle(_bundle(())))
+    data[field] = invalid
+
+    with pytest.raises(ValueError, match=field):
+        load_bundle(json.dumps(data))
+
+
+def test_load_bundle_rejects_v1() -> None:
+    data = json.loads(dump_bundle(_bundle(())))
+    data["schema_version"] = 1
+
+    with pytest.raises(ValueError, match="schema_version=1"):
+        load_bundle(json.dumps(data))
+
+
+@pytest.mark.parametrize("field", ("source_rev", "source_dirty", "source_snapshot_sha256"))
+def test_load_bundle_rejects_missing_source_binding_field(field: str) -> None:
+    data = json.loads(dump_bundle(_bundle(())))
+    del data[field]
+
+    with pytest.raises(ValueError, match=field):
+        load_bundle(json.dumps(data))
+
+
 def test_load_bundle_rejects_incoherent_lane_kind() -> None:
     incoherent = {
         "lane": "new_judgment",
@@ -134,12 +173,96 @@ def test_load_bundle_rejects_incoherent_lane_kind() -> None:
         load_bundle(_serialize_with_actions([incoherent]))
 
 
+def test_load_bundle_rejects_duplicate_action_identity_across_kinds() -> None:
+    key = "plugins/widget.py:R1:Widget:lookup:fp=abc123"
+    actions = [
+        {
+            "lane": "resign",
+            "kind": "rotation",
+            "key": key,
+            "source_file": "plugins.yaml",
+        },
+        {
+            "lane": "resign",
+            "kind": "stale_delete",
+            "key": key,
+            "source_file": "plugins.yaml",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="duplicate semantic action identity"):
+        load_bundle(_serialize_with_actions(actions))
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "invalid"),
+    [
+        ("bundle", "source_rev", []),
+        ("bundle", "source_dirty", "false"),
+        ("action", "file_path", []),
+        ("action", "symbol", 7),
+        ("action", "rule", {}),
+        ("action", "fingerprint", []),
+        ("action", "scope_fingerprint", 7),
+        ("action", "ast_path", {}),
+        ("action", "draft_rationale", []),
+        ("action", "diagnosis_status", 7),
+        ("action", "source_file", []),
+        ("preview", "authoritative", 0),
+    ],
+)
+def test_load_bundle_rejects_truthy_and_wrong_typed_optional_fields(
+    location: str,
+    field: str,
+    invalid: Any,
+) -> None:
+    data = json.loads(dump_bundle(_bundle((_new_judgment_action(),))))
+    target = data if location == "bundle" else data["actions"][0]
+    if location == "preview":
+        target = data["actions"][0]["preview"]
+    target[field] = invalid
+
+    with pytest.raises(ValueError, match=field):
+        load_bundle(json.dumps(data))
+
+
+@pytest.mark.parametrize("source_file", ("../outside.yaml", "/tmp/outside.yaml", "nested/plugins.yaml"))
+@pytest.mark.parametrize("kind", ("rotation", "stale_delete"))
+def test_bundle_action_rejects_nonlocal_source_file(kind: str, source_file: str) -> None:
+    with pytest.raises(ValueError, match="source_file"):
+        BundleAction(
+            lane="resign",
+            kind=kind,
+            key="plugins/widget.py:R1:Widget:lookup:fp=abc123",
+            source_file=source_file,
+        )
+
+
 def test_load_bundle_rejects_unknown_key() -> None:
     bundle = _bundle((_new_judgment_action(),))
     data = json.loads(dump_bundle(bundle))
     data["surprise"] = "not a field"
     with pytest.raises(ValueError):
         load_bundle(json.dumps(data))
+
+
+def test_load_bundle_rejects_duplicate_json_keys_at_every_depth() -> None:
+    text = dump_bundle(_bundle((_new_judgment_action(),)))
+    duplicate_top_level = text.replace(
+        '"bundle_id": "sample-bundle",',
+        '"bundle_id": "sample-bundle",\n  "bundle_id": "sample-bundle",',
+        1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON object key 'bundle_id'"):
+        load_bundle(duplicate_top_level)
+
+    duplicate_nested = text.replace(
+        '"kind": "justify",',
+        '"kind": "justify",\n      "kind": "justify",',
+        1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON object key 'kind'"):
+        load_bundle(duplicate_nested)
 
 
 def test_write_then_read_bundle(tmp_path: Path) -> None:
@@ -163,13 +286,14 @@ def _serialize_with_actions(action_dicts: list[dict[str, Any]]) -> str:
     return json.dumps(
         {
             "bundle_id": "sample-bundle",
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": "2026-06-28T00:00:00+00:00",
             "staged_by": "agent-x",
             "root": "src/elspeth",
             "allowlist_dir": "config/cicd/enforce_tier_model",
-            "source_rev": None,
+            "source_rev": "a" * 40,
             "source_dirty": False,
+            "source_snapshot_sha256": "b" * 64,
             "actions": action_dicts,
             "rekey": None,
         }

@@ -38,7 +38,7 @@ class TestNullSource:
         from elspeth.plugins.sources.null_source import NullSource
 
         source = NullSource({})
-        # Direct access - no hasattr() per CLAUDE.md
+        # Direct access through the nominal class contract.
         assert issubclass(source.output_schema, PluginSchema)
 
     def test_null_source_close_is_idempotent(self) -> None:
@@ -62,9 +62,20 @@ class TestNullSource:
         from elspeth.plugins.sources.null_source import NullSource
 
         source = NullSource({})
-        assert hasattr(source, "plugin_version")
         assert isinstance(source.plugin_version, str)
         assert source.plugin_version != ""
+
+    def test_null_source_reference_content_preserves_writable_protocol_types(self) -> None:
+        """Populated catalogue prose remains writable through SourceProtocol."""
+        from elspeth.plugins.sources.null_source import NullSource
+
+        annotations = NullSource.__annotations__
+        assert annotations["usage_when_to_use"] == str | None
+        assert annotations["usage_when_not_to_use"] == str | None
+        assert annotations["example_use"] == str | None
+        for value in (NullSource.usage_when_to_use, NullSource.usage_when_not_to_use, NullSource.example_use):
+            assert isinstance(value, str)
+            assert value.strip()
 
     def test_null_source_on_success_via_bridge(self) -> None:
         """NullSource on_success is set by instantiation bridge, not config."""

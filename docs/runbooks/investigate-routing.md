@@ -179,12 +179,36 @@ sqlite3 -header -column runs/audit.db "
 "
 ```
 
+### Step 7: Source-Validation Discards (No Token Exists)
+
+A row discarded at source validation (`on_validation_failure: discard`) is
+never admitted into the pipeline: it has no `rows` entry, no token, and no
+terminal outcome, and the `source_load` operation completes normally. Token-
+and outcome-anchored queries return nothing for it. The recorded reason lives
+only in `validation_errors` with `destination = 'discard'` (Step 6 query),
+and on these web surfaces:
+
+- `GET /api/runs/<id>/diagnostics` — the `discards` section carries the
+  recorded, boundary-scrubbed rejection reasons (`summary.discard_count` is
+  the unbounded total).
+- Run accounting — `accounting.source.rows_read` (rows the source read),
+  `rows_processed` (rows admitted), and `rows_rejected` (rows discarded at
+  source validation; always equals `discard_summary.validation_errors`).
+- The web service log — one aggregate `run_completed_with_discarded_rows`
+  warning per terminal run with discards (counts and node ids only).
+
+`ELSPETH_PLANNER_REJECTION_DETAIL_LOG` does not apply here: it is a
+compose-time seam that logs why the Composer planner rejected a *candidate
+pipeline* during authoring. It never logs runtime source-row validation
+failures; use the `discards` diagnostics section above instead.
+
 ## Common Findings
 
 | Symptom | Check |
 |---------|-------|
 | All rows took the same branch | Compare routing events across several rows and inspect the configured condition. |
 | Row was discarded | Check validation and transform errors, then inspect `token_outcomes.path`. |
+| Run is `empty` and rows "vanished" | Step 7: source-validation discards leave no token; read `diagnostics.discards` / `validation_errors`. |
 | Row entered a batch | Check `token_outcomes.batch_id` and batch records for the same run. |
 | `explain` cannot find a row | Confirm the row belongs to the supplied run ID; row/run ownership is enforced. |
 | Terminal count looks wrong | Use `completed`, not the retired `is_terminal` column. |

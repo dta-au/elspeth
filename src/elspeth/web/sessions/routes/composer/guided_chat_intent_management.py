@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, cast
@@ -11,6 +12,8 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer.guided.chat_solver import PLUGIN_FREE_NODE_TYPES
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentAccepted,
     DeferredIntentAction,
@@ -20,8 +23,10 @@ from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentManagementAction,
     DeferredIntentRejected,
     DeferredIntentUnsupported,
+    create_deferred_clarification_intent,
     create_deferred_stage_intent,
     validate_deferred_intent_action,
+    validate_deferred_intent_structure,
 )
 from elspeth.web.composer.guided.intent_management import (
     DeferredIntentManagementAmbiguous,
@@ -36,6 +41,7 @@ from elspeth.web.composer.guided.protocol import GuidedStep, Turn, TurnType
 from elspeth.web.composer.guided.stage_subjects import StageName
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedProposalRef, GuidedSession, TurnRecord
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.sessions._guided_step_chat import StepChatResult
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.protocol import (
@@ -100,13 +106,22 @@ class DeferredRequestUnchanged:
 class DeferredRequestRetained:
     guided: GuidedSession
     chat: StepChatResult
-    retained_intent_id: UUID
+    # One id per intent appended by this request, in append order
+    # (elspeth-3a21f09f09: a message naming N future stages appends up to N).
+    retained_intent_ids: tuple[UUID, ...]
 
     def __post_init__(self) -> None:
-        if type(self.retained_intent_id) is not UUID:
-            raise TypeError("DeferredRequestRetained.retained_intent_id must be an exact UUID")
-        if not any(intent.intent_id == str(self.retained_intent_id) for intent in self.guided.deferred_intents):
-            raise AuditIntegrityError("retained deferred request lost its exact stable intent")
+        if (
+            type(self.retained_intent_ids) is not tuple
+            or not self.retained_intent_ids
+            or any(type(intent_id) is not UUID for intent_id in self.retained_intent_ids)
+        ):
+            raise TypeError("DeferredRequestRetained.retained_intent_ids must be a non-empty tuple of exact UUIDs")
+        if len(set(self.retained_intent_ids)) != len(self.retained_intent_ids):
+            raise AuditIntegrityError("retained deferred request repeats a stable intent id")
+        present = {intent.intent_id for intent in self.guided.deferred_intents}
+        if any(str(intent_id) not in present for intent_id in self.retained_intent_ids):
+            raise AuditIntegrityError("retained deferred request lost an exact stable intent")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -165,12 +180,26 @@ def _validate_managed_request_checkpoint(request: DeferredRequestManaged) -> Non
 
 @dataclass(frozen=True, slots=True)
 class DeferredRequestAuthority:
-    """Stable authority needed to retain or manage one deferred request."""
+    """Stable authority needed to retain or manage one deferred request.
+
+    ``new_intent_ids`` is minted one-per-action by the route (at least one, so
+    the clarification degrade path always has an id); actions whose
+    disposition appends nothing simply leave their id unused.
+    """
 
     guided: GuidedSession
     catalog: PolicyCatalogView
     originating_message: GuidedOriginatingUserMessageDraft
-    new_intent_id: UUID
+    new_intent_ids: tuple[UUID, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.new_intent_ids) is not tuple
+            or not self.new_intent_ids
+            or any(type(intent_id) is not UUID for intent_id in self.new_intent_ids)
+            or len(set(self.new_intent_ids)) != len(self.new_intent_ids)
+        ):
+            raise TypeError("DeferredRequestAuthority.new_intent_ids must be a non-empty tuple of distinct exact UUIDs")
 
 
 def _guided_stage_name(step: GuidedStep) -> StageName:
@@ -185,16 +214,55 @@ def _guided_stage_name(step: GuidedStep) -> StageName:
     raise AuditIntegrityError("Guided Chat step is outside the closed stage vocabulary")
 
 
+def _contradiction_chat(rejection: DeferredIntentRejected, *, latency_ms: int, retained: bool) -> StepChatResult:
+    """Render one distinct, actionable contradiction rejection (ADR-033).
+
+    The message names the exact conflicting retained intent and its
+    edit/cancel recourse (model: the planning blocker message), never the
+    collapsed catch-all.  ``retained`` selects the wording for the R2-F15
+    clarification-retention path versus a rejected edit of an existing
+    intent, which leaves the original saved instruction in place.
+    """
+
+    contradiction = rejection.contradiction
+    if contradiction is not None and contradiction.conflicting_intent_id is not None:
+        conflict = (
+            f"It contradicts saved instruction {contradiction.conflicting_intent_id} "
+            f"({contradiction.conflicting_intent_summary}) under the closed rule {contradiction.rule!r}."
+        )
+        recourse = f"Edit or cancel exact intent {contradiction.conflicting_intent_id}, or restate this instruction so the two agree."
+    else:
+        rule = "constraint_contradiction" if contradiction is None else contradiction.rule
+        conflict = f"Its structural constraints contradict each other under the closed rule {rule!r}."
+        recourse = "Restate it as one consistent structural requirement."
+    retention = (
+        "I kept your instruction as a pending clarification instead of applying it. "
+        if retained
+        else "I did not change your saved instructions. "
+    )
+    return StepChatResult(
+        assistant_message=f"{retention}{conflict} {recourse}",
+        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+        latency_ms=latency_ms,
+        error_class="DeferredIntentContradiction",
+    )
+
+
 def _deferred_disposition_chat(
     disposition: DeferredIntentAccepted | DeferredIntentClarification | DeferredIntentUnsupported | DeferredIntentRejected,
     *,
+    catalog: PolicyCatalogView,
     latency_ms: int,
 ) -> StepChatResult:
     if type(disposition) is DeferredIntentAccepted:
         message = f"I saved that instruction for the {disposition.action.target_stage.replace('_', ' ')} stage."
+        status = ComposerChatTurnStatus.SUCCESS
+        error_class = None
     elif type(disposition) is DeferredIntentClarification:
         kinds = ", ".join(disposition.plugin_kinds)
         message = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}). Which category did you mean?"
+        status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+        error_class = "DeferredIntentClarification"
     elif type(disposition) is DeferredIntentUnsupported:
         if disposition.reason.value == "plugin_not_enabled":
             message = f"The {disposition.plugin_kind} plugin {disposition.plugin_name!r} is not enabled by the current policy."
@@ -202,13 +270,280 @@ def _deferred_disposition_chat(
             message = f"The {disposition.plugin_kind} plugin {disposition.plugin_name!r} is not installed."
         else:
             message = f"The {disposition.plugin_kind} plugin {disposition.plugin_name!r} is currently unavailable."
+        alternatives = _policy_visible_alternatives(
+            catalog,
+            plugin_kind=disposition.plugin_kind,
+            excluded_name=disposition.plugin_name,
+        )
+        if alternatives:
+            message = f"{message} Policy-visible {disposition.plugin_kind} alternatives: {', '.join(alternatives)}."
+        else:
+            message = f"{message} No policy-visible {disposition.plugin_kind} alternatives are available."
+        status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+        error_class = "DeferredIntentUnsupported"
     else:
+        rejected = cast(DeferredIntentRejected, disposition)
+        if rejected.reason == "constraint_contradiction":
+            return _contradiction_chat(rejected, latency_ms=latency_ms, retained=False)
         message = "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
+        status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+        error_class = "DeferredIntentRejected"
     return StepChatResult(
         assistant_message=message,
-        status=ComposerChatTurnStatus.SUCCESS,
+        status=status,
         latency_ms=latency_ms,
-        error_class=None,
+        error_class=error_class,
+    )
+
+
+_MAX_POLICY_VISIBLE_ALTERNATIVES = 5
+
+
+def _message_names_identifier(message: str, identifier: str) -> bool:
+    """Match one canonical catalog identifier without alias normalization."""
+
+    return re.search(rf"(?<![a-z0-9_]){re.escape(identifier)}(?![a-z0-9_])", message.casefold()) is not None
+
+
+def _message_names_node_kind(message: str, node_kind: str) -> bool:
+    """Match a canonical node-kind word or its regular ``s`` plural.
+
+    This is deliberately separate from :func:`_message_names_identifier`:
+    ``collectors`` names a category in user prose, but it does not name a
+    catalog plugin whose exact identifier is ``collector``. All currently
+    taught node kinds pluralize by appending ``s`` (including ``coalesce`` ->
+    ``coalesces``); aliases and embedded identifiers remain out of scope.
+    """
+
+    return _message_names_identifier(message, node_kind) or _message_names_identifier(message, f"{node_kind}s")
+
+
+def _has_unmentioned_unavailable_action_identity(
+    action: DeferredIntentAction,
+    *,
+    catalog: PolicyCatalogView,
+    originating_message_content: str,
+) -> bool:
+    """Recognize only the model-authored unavailable catalog identity seam."""
+
+    if action.catalog_kind is None or action.catalog_name is None:
+        return False
+    if _message_names_identifier(originating_message_content, action.catalog_name):
+        return False
+    try:
+        plugin_id = PluginId.parse(f"{action.catalog_kind}:{action.catalog_name}")
+    except ValueError:
+        return False
+    return catalog.unavailable_reason(plugin_id) is not None
+
+
+def _policy_visible_alternatives(
+    catalog: PolicyCatalogView,
+    *,
+    plugin_kind: PluginKind,
+    excluded_name: str,
+) -> tuple[str, ...]:
+    if plugin_kind == "source":
+        plugins = catalog.list_sources()
+    elif plugin_kind == "transform":
+        plugins = catalog.list_transforms()
+    else:
+        plugins = catalog.list_sinks()
+    names = sorted(plugin.name for plugin in plugins if plugin.name != excluded_name)
+    return tuple(names[:_MAX_POLICY_VISIBLE_ALTERNATIVES])
+
+
+def _retained_unverified_chat(
+    disposition: DeferredIntentClarification | DeferredIntentRejected,
+    *,
+    intent_id: UUID,
+    latency_ms: int,
+) -> StepChatResult:
+    """Render one retained-but-unverified disposition (R2-F15).
+
+    The instruction is kept as constraint-free clarification debt, so the copy
+    must say it was kept and name the specific missing detail — never the
+    collapsed "couldn't retain" catch-all that implies the instruction is gone.
+
+    It must also name the intent and the EXACT commands that act on it. The
+    debt blocks wire confirmation (409) and nothing can claim it; the only
+    exits are ``Edit exact intent <UUID>: ...`` and ``Cancel exact intent
+    <UUID>.``, and the UUID reaches the user only through this message —
+    "restate it" mints a NEW intent and leaves the old one standing
+    (elspeth-3d392c04ca, addendum 7992 #2). ``_contradiction_chat`` already
+    names its recourse this way.
+    """
+
+    if type(disposition) is DeferredIntentClarification:
+        kinds = ", ".join(disposition.plugin_kinds)
+        detail = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}), so say which category you meant."
+        error_class = "DeferredIntentClarification"
+    else:
+        reason = cast(DeferredIntentRejected, disposition).reason
+        if reason == "wrong_responsible_stage":
+            detail = "Its target stage does not match the stage its structural content belongs to, so name the stage that should own it."
+        elif reason in {"catalog_kind_mismatch", "malformed_catalog_identity"}:
+            detail = "The plugin it names does not match the catalog under that category, so name the exact plugin and its category."
+        else:
+            detail = "I couldn't verify its structural details against your message, so state the concrete structural requirement."
+        error_class = "DeferredIntentRejected"
+    recourse = (
+        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
+    )
+    return StepChatResult(
+        assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail} {recourse}",
+        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+        latency_ms=latency_ms,
+        error_class=error_class,
+    )
+
+
+def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
+    """Explain an unavailable model-authored catalog identity the user never named.
+
+    The message is COMPOSED, not selected: a shared frame open; at most one
+    plugin-free clause plus the collector and aggregation clauses when the
+    message names those kinds; and a shared frame close (filigree
+    elspeth-270e81443d, review comment 7977 §7.1). A message naming a collector
+    AND a structural node gets BOTH clauses, and the frame is emitted once
+    either way. Three reasons the collector teaching composes rather than
+    competes:
+
+    * Nothing true is lost. A collector arm that WON would have taken the gate
+      clause away from "add a collector and a gate", trading one teaching line
+      for another; appending buys the collector case at no price.
+    * It deletes the ordering question. `PLUGIN_FREE_NODE_TYPES` is scanned with
+      `next()`, which returns the first member in TUPLE order that the message
+      names — for "a queue and a gate" that is `gate`, because `gate` precedes
+      `queue` in the tuple, NOT because of where the words appear in the
+      message. That limitation survives — only ONE structural clause is ever
+      emitted, so "a queue and a gate" teaches `gate` only — but it no longer
+      decides whether the collector clause fires at all.
+    * Every clause is a GENERAL TRUTH, true regardless of what happened in the
+      turn, so no clause CAN be false and none needs a provenance hedge to make
+      it safe. An unwanted match therefore costs at most an unhelpful sentence,
+      never a wrong one. Two classes reach that state, and the second is the
+      larger: NEGATION ("no collector needed" still gets its correct gate
+      clause, plus a true but unsolicited collector definition) and HOMONYMS
+      ("the garbage collector is slow" and "add a data collector for the survey"
+      both emit the full EXPAND-scope paragraph, verified). Detecting negation
+      is banned — `_message_names_node_kind` is a word-boundary matcher with no
+      notion of it, and a negation parse would fail in the opposite direction on
+      "no gate, add a collector". Homonym disambiguation is worse still: it
+      needs to know what the user meant. Tolerating both is the price of never
+      printing a falsehood, and it is the right trade only because every clause
+      is unconditionally true.
+
+    Note what the frame deliberately does NOT say. The only caller sits inside
+    the `_has_unmentioned_unavailable_action_identity` guard, so an unavailable
+    plugin the user never named is always what happened — that is what the frame
+    open states, and its "for it" refers to the retained instruction, which IS
+    the action the guard just checked. But nothing reaching this function says
+    WHICH node that plugin was for, or what kind of plugin it is.
+    `DeferredIntentAction` carries only target_stage / catalog_kind /
+    catalog_name / redacted_summary / constraints; there is no node_type, and
+    this function receives none of it. So "the plugin I proposed FOR THE
+    COLLECTOR" is unverifiable BY CONSTRUCTION — for "add a collector and a
+    scoring transform" the unavailable plugin may belong to the transform, and
+    `catalog_kind` may be "sink" rather than "transform". No clause may
+    attribute the plugin to a node, and none does.
+
+    Clause order is structural, then collector, then aggregation. Not the order
+    comment 7977 §7.1 lists, deliberately: it puts "not a transform plugin"
+    directly beside "IS backed by a batch-transform plugin", and that contrast
+    is the whole reason the collector clause exists (comment 7911). The two
+    plugin-bearing kinds then sit together.
+
+    AGGREGATION IS THE THIRD PLUGIN-HOSTING KIND, and it has a clause on its
+    own merits: under composition a second true clause costs nothing, and an
+    author who names an aggregation needs the same thing a collector author
+    needs. Do NOT cite AGENTS.md WS6 for this, as an earlier version of this
+    docstring did — WS6 requires every `node_type` dispatch site to carry "a
+    collector arm or a deliberate documented exclusion", and the collector arm
+    above already satisfies it. (This function is not really such a dispatch
+    site either: `_message_names_node_kind` is a singular/plural word matcher
+    over user prose, not a dispatch on `node_type`.) Its field list is NOT the collector's and was
+    verified separately against `state.py`'s aggregation arm, because the
+    obvious guess is wrong in both directions: an aggregation's mandatory
+    fields are `plugin` and `on_error` (`aggregation_missing_plugin`,
+    `aggregation_missing_on_error`); `trigger` is OPTIONAL — runtime treats a
+    missing or empty trigger as end-of-source-only — and `output_mode` is
+    optional too, merely constrained to `OutputMode` when present. There is no
+    `trigger_kinds` field at all. So an aggregation clause modelled on the
+    collector's "it needs A, B and C" shape would print a falsehood; the
+    asymmetry is real and the clause states it.
+
+    `transform` is the fourth plugin-hosting kind and is deliberately EXCLUDED,
+    but NOT for the reason an earlier version of this docstring gave. It is not
+    "the default reading" of an unavailable identity: `catalog_kind` is
+    source|transform|sink and the guard requires a non-null one, so nothing
+    defaults to transform — and when no clause fires the frame never says
+    "transform plugin" at all, so there is nothing already implied. The real
+    reason is narrower: the other clauses exist to correct a specific wrong
+    inference (a plugin-free kind mistaken for a plugin, or a plugin-bearing
+    topology kind mistaken for an ordinary transform). A transform IS an
+    ordinary transform, so there is no wrong inference to correct.
+
+    Node-kind matching deliberately accepts the exact canonical word and its
+    regular ``s`` plural, but no aliases or embedded identifiers. One known gap
+    remains worth a reader's caution: the aggregation clause's "IS backed by a
+    batch-transform plugin" is enforced for a COLLECTOR at composer time
+    (`collector_plugin_not_batch_aware`) but for an aggregation only at RUN time
+    (`orchestrator/aggregation.py`) — `CompositionState.validate()` accepts an
+    aggregation whose plugin is not batch-aware. The sentence states the
+    contract correctly; the composer simply does not check that half of it.
+
+    Collector is also deliberately absent from `PLUGIN_FREE_NODE_TYPES`, and
+    that is enforced rather than merely intended: the scanned tuple IS
+    `chat_solver.PLUGIN_FREE_NODE_TYPES`, whose membership rule is exactly "a
+    {x} is a built-in topology node, not a transform plugin" is TRUE of x. A
+    collector is plugin-BEARING (barrier-scopes spec §3 types it as a
+    transform plugin, and a collector with no `plugin` is rejected outright),
+    so it cannot appear there without failing that module's own partition
+    assert against `NodeType`. Adding it would have printed a falsehood; it is
+    no longer possible to add it here at all.
+    """
+    clauses: list[str] = []
+    # ``chat_solver.PLUGIN_FREE_NODE_TYPES`` is read directly, not through a
+    # local alias: the alias this used to carry shared its name with an
+    # engine constant answering a DIFFERENT predicate (traversal-inert;
+    # elspeth-ea38638721). The membership rule is exactly the clause below —
+    # "a {x} is a built-in topology node, not a transform plugin" — which is
+    # the plugin-free partition, guarded at module load against ``NodeType``.
+    # ORDER is load-bearing: ``next()`` returns the first member in TUPLE
+    # order the message names, so "a queue and a gate" teaches ``gate``
+    # because it precedes ``queue`` there.
+    structural_node = next(
+        (node_type for node_type in PLUGIN_FREE_NODE_TYPES if _message_names_node_kind(user_message, node_type)),
+        None,
+    )
+    if structural_node is not None:
+        clauses.append(f"A {structural_node} is a built-in topology node, not a transform plugin. ")
+    if _message_names_node_kind(user_message, "collector"):
+        clauses.append(
+            "A collector is a built-in topology node that IS backed by a batch-transform plugin, and it closes "
+            "an EXPAND scope — it needs scope_name, scope_opener and scope_policy. Name the batch behaviour you "
+            "want and the scope it should close. "
+        )
+    if _message_names_node_kind(user_message, "aggregation"):
+        clauses.append(
+            "An aggregation is a built-in topology node that IS backed by a batch-transform plugin, and it "
+            "needs on_error; a trigger is optional and only ADDS early flushes, because the end-of-source "
+            "flush always happens. Name the batch behaviour you want. "
+        )
+    message = (
+        "I kept that future-stage instruction, but its structure was not verified. "
+        "The plugin I proposed for it is not available here, and you did not ask for it by name, "
+        "so I did not treat it as a deployment problem. "
+        f"{''.join(clauses)}"
+        "Clarify the concrete topology structure and I'll firm it up."
+    )
+    return StepChatResult(
+        assistant_message=message,
+        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+        latency_ms=latency_ms,
+        error_class="DeferredIntentModelCatalogIdentity",
     )
 
 
@@ -240,7 +575,8 @@ def _apply_deferred_management(
             error_class = "DeferredIntentBindingMismatch"
         else:
             assistant_message = (
-                "More than one saved instruction has that structure. Name the exact intent UUID so I can change the right one."
+                "Use an exact command before I change a saved instruction: "
+                "'Cancel exact intent <UUID>.' or 'Edit exact intent <UUID>: <new instruction>'."
             )
             error_class = "DeferredIntentAmbiguous"
         unavailable = StepChatResult(
@@ -283,41 +619,182 @@ def _apply_deferred_management(
             DeferredIntentAccepted | DeferredIntentClarification | DeferredIntentUnsupported | DeferredIntentRejected,
             management,
         ),
+        catalog=catalog,
         latency_ms=chat.latency_ms,
     )
     return DeferredRequestUnchanged(guided=guided, chat=rejected_chat)
 
 
+def _append_clarification_intent(
+    guided: GuidedSession,
+    *,
+    intent_id: UUID,
+    originating_message: GuidedOriginatingUserMessageDraft,
+) -> GuidedSession:
+    retained = create_deferred_clarification_intent(
+        receiving_stage=_guided_stage_name(guided.step),
+        intent_id=str(intent_id),
+        originating_message_id=str(originating_message.message_id),
+        originating_message_content=originating_message.content,
+    )
+    return replace(guided, deferred_intents=(*guided.deferred_intents, retained))
+
+
+def _apply_one_deferred_action(
+    action: DeferredIntentAction,
+    *,
+    guided: GuidedSession,
+    catalog: PolicyCatalogView,
+    originating_message: GuidedOriginatingUserMessageDraft,
+    intent_id: UUID,
+    latency_ms: int,
+) -> tuple[GuidedSession, StepChatResult, UUID | None]:
+    """Apply ONE action's disposition against the evolving guided state.
+
+    Returns the (possibly appended-to) guided state, the disposition chat, and
+    the appended intent id (``None`` when the disposition appends nothing).
+    Each action keeps the exact per-action disposition machinery the singular
+    path had; the fold in :func:`apply_deferred_request` composes them
+    (elspeth-3a21f09f09).
+    """
+    structural_rejection = validate_deferred_intent_structure(
+        action,
+        receiving_stage=_guided_stage_name(guided.step),
+    )
+    if structural_rejection is not None:
+        if structural_rejection.reason == "wrong_responsible_stage":
+            # The action claims a later target, so it IS a future-stage
+            # instruction whose encoding the server cannot verify — the
+            # R2-F15 retention net keeps it as clarification debt. The
+            # structural diagnostic still wins over the catalog-identity
+            # copy (precedence).
+            return (
+                _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+                _retained_unverified_chat(structural_rejection, intent_id=intent_id, latency_ms=latency_ms),
+                intent_id,
+            )
+        # target_not_later: by its own claim this is not a future-stage
+        # instruction — the current-stage flow owns the content, so
+        # retaining it would mint spurious wire-blocking debt.
+        return (
+            guided,
+            _deferred_disposition_chat(structural_rejection, catalog=catalog, latency_ms=latency_ms),
+            None,
+        )
+    if _has_unmentioned_unavailable_action_identity(
+        action,
+        catalog=catalog,
+        originating_message_content=originating_message.content,
+    ):
+        return (
+            _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+            _model_catalog_identity_chat(user_message=originating_message.content, latency_ms=latency_ms),
+            intent_id,
+        )
+    disposition = validate_deferred_intent_action(
+        action,
+        receiving_stage=_guided_stage_name(guided.step),
+        catalog=catalog,
+        guided=guided,
+        originating_message_content=originating_message.content,
+    )
+    if type(disposition) is DeferredIntentRejected and disposition.reason == "constraint_contradiction":
+        # ADR-033 rejection path: a contradiction rejection routes through
+        # the R2-F15 retention net — the instruction is kept as
+        # clarification debt, never silently dropped — and the chat names
+        # the exact conflicting retained intent with edit/cancel recourse.
+        return (
+            _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+            _contradiction_chat(disposition, latency_ms=latency_ms, retained=True),
+            intent_id,
+        )
+    if type(disposition) in {DeferredIntentClarification, DeferredIntentRejected}:
+        # Every remaining unverified disposition retains the instruction as
+        # clarification debt (R2-F15): the constraint-free intent carries a
+        # content hash and closed summary only, so no unproven fact, option
+        # literal, or mis-kinded identity persists.
+        return (
+            _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
+            _retained_unverified_chat(
+                cast(DeferredIntentClarification | DeferredIntentRejected, disposition),
+                intent_id=intent_id,
+                latency_ms=latency_ms,
+            ),
+            intent_id,
+        )
+    resolved_chat = _deferred_disposition_chat(disposition, catalog=catalog, latency_ms=latency_ms)
+    if type(disposition) is not DeferredIntentAccepted:
+        # DeferredIntentUnsupported: an unavailable plugin remains a
+        # distinct catalog/availability error, never clarification debt
+        # (the user manual's explicit carve-out).
+        return guided, resolved_chat, None
+    retained = create_deferred_stage_intent(
+        disposition.action,
+        receiving_stage=_guided_stage_name(guided.step),
+        intent_id=str(intent_id),
+        originating_message_id=str(originating_message.message_id),
+        originating_message_content=originating_message.content,
+        guided=guided,
+    )
+    return (
+        replace(guided, deferred_intents=(*guided.deferred_intents, retained)),
+        resolved_chat,
+        intent_id,
+    )
+
+
+def _compose_disposition_chats(chats: tuple[StepChatResult, ...]) -> StepChatResult:
+    """Compose N per-action disposition chats into the turn's one chat.
+
+    Messages join in action order; the FIRST non-success disposition supplies
+    the composed status and error_class so the transcript and audit keep the
+    not-applied signal (the F1 honesty contract) even when a sibling action
+    succeeded in the same Send.
+    """
+    if len(chats) == 1:
+        return chats[0]
+    failed = next((candidate for candidate in chats if candidate.status is not ComposerChatTurnStatus.SUCCESS), None)
+    return StepChatResult(
+        assistant_message=" ".join(candidate.assistant_message for candidate in chats),
+        status=chats[0].status if failed is None else failed.status,
+        latency_ms=chats[0].latency_ms,
+        error_class=None if failed is None else failed.error_class,
+    )
+
+
 def apply_deferred_request(
-    deferred_action: DeferredIntentAction | None,
+    deferred_actions: tuple[DeferredIntentAction, ...],
     management_action: DeferredIntentManagementAction | None,
     *,
     authority: DeferredRequestAuthority,
     chat: StepChatResult,
 ) -> DeferredRequestApplication:
-    if deferred_action is not None:
-        disposition = validate_deferred_intent_action(
-            deferred_action,
-            receiving_stage=_guided_stage_name(authority.guided.step),
-            catalog=authority.catalog,
-            guided=authority.guided,
-        )
-        resolved_chat = _deferred_disposition_chat(disposition, latency_ms=chat.latency_ms)
-        if type(disposition) is not DeferredIntentAccepted:
-            return DeferredRequestUnchanged(guided=authority.guided, chat=resolved_chat)
-        retained = create_deferred_stage_intent(
-            disposition.action,
-            receiving_stage=_guided_stage_name(authority.guided.step),
-            intent_id=str(authority.new_intent_id),
-            originating_message_id=str(authority.originating_message.message_id),
-            originating_message_content=authority.originating_message.content,
-        )
-        prospective = replace(authority.guided, deferred_intents=(*authority.guided.deferred_intents, retained))
-        return DeferredRequestRetained(
-            guided=prospective,
-            chat=resolved_chat,
-            retained_intent_id=authority.new_intent_id,
-        )
+    if deferred_actions:
+        if len(authority.new_intent_ids) != len(deferred_actions):
+            raise AuditIntegrityError("deferred request authority must mint exactly as many intent ids as actions")
+        guided = authority.guided
+        disposition_chats: list[StepChatResult] = []
+        retained_intent_ids: list[UUID] = []
+        for action, intent_id in zip(deferred_actions, authority.new_intent_ids, strict=True):
+            guided, action_chat, appended_id = _apply_one_deferred_action(
+                action,
+                guided=guided,
+                catalog=authority.catalog,
+                originating_message=authority.originating_message,
+                intent_id=intent_id,
+                latency_ms=chat.latency_ms,
+            )
+            disposition_chats.append(action_chat)
+            if appended_id is not None:
+                retained_intent_ids.append(appended_id)
+        composed_chat = _compose_disposition_chats(tuple(disposition_chats))
+        if retained_intent_ids:
+            return DeferredRequestRetained(
+                guided=guided,
+                chat=composed_chat,
+                retained_intent_ids=tuple(retained_intent_ids),
+            )
+        return DeferredRequestUnchanged(guided=guided, chat=composed_chat)
     if management_action is not None:
         return _apply_deferred_management(
             management_action,
@@ -329,10 +806,40 @@ def apply_deferred_request(
     return DeferredRequestUnchanged(guided=authority.guided, chat=chat)
 
 
-def deferred_request_retained_intent_id(application: DeferredRequestApplication) -> UUID | None:
+def apply_deferred_clarification(
+    *,
+    authority: DeferredRequestAuthority,
+    chat: StepChatResult,
+) -> DeferredRequestRetained:
+    """Append the constraint-free clarification intent for one failed Send.
+
+    Last-resort retention (R2-F15): the Send carried future-stage
+    instructions whose encoding could not be verified — the model failed to
+    express them as well-formed actions even after its bounded repair turn, or
+    the action it produced was rejected by settlement validation. The whole
+    message is kept as ONE clarification intent bound to the private
+    originating message; the settlement command carries
+    ``retained_deferred_intent_ids`` exactly like an ordinary retain, so
+    ``_verify_guided_deferred_intent_append`` verifies the append and message
+    binding unchanged.
+    """
+    intent_id = authority.new_intent_ids[0]
+    prospective = _append_clarification_intent(
+        authority.guided,
+        intent_id=intent_id,
+        originating_message=authority.originating_message,
+    )
+    return DeferredRequestRetained(
+        guided=prospective,
+        chat=chat,
+        retained_intent_ids=(intent_id,),
+    )
+
+
+def deferred_request_retained_intent_ids(application: DeferredRequestApplication) -> tuple[UUID, ...]:
     if type(application) is DeferredRequestRetained:
-        return application.retained_intent_id
-    return None
+        return application.retained_intent_ids
+    return ()
 
 
 def deferred_request_management(application: DeferredRequestApplication) -> DeferredRequestManaged | None:
@@ -373,10 +880,13 @@ def _prepare_schema8_management_rewind(
     )
     invalidated_proposal = None
     if invalidated_active_proposal is not None:
+        # A real supersession: the deferred-intent rewind displaces the
+        # pending proposal with a re-planned successor.
         invalidated_proposal = GuidedPendingProposalInvalidation(
             proposal_id=invalidated_active_proposal.proposal_id,
             draft_hash=invalidated_active_proposal.draft_hash,
             reviewed_facts=guided_private_reviewed_facts(authority.current_guided),
+            reason="superseded",
         )
     rewound_guided = replace(
         authority.prospective,
@@ -432,14 +942,16 @@ def maybe_prepare_schema8_management_rewind(
 
 
 __all__ = [
+    "DeferredRequestApplication",
     "DeferredRequestAuthority",
     "DeferredRequestCancelled",
     "DeferredRequestEdited",
     "DeferredRequestRetained",
     "DeferredRequestUnchanged",
     "ManagementRewindAuthority",
+    "apply_deferred_clarification",
     "apply_deferred_request",
     "deferred_request_management",
-    "deferred_request_retained_intent_id",
+    "deferred_request_retained_intent_ids",
     "maybe_prepare_schema8_management_rewind",
 ]

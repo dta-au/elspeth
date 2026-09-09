@@ -1,0 +1,3 @@
+{"doc_id": "DOC-1", "title": "Q3 field survey", "pages": [{"page_no": 1, "reading": 12}, {"page_no": 2, "reading": 18}, {"page_no": 3, "reading": 15}]}
+{"doc_id": "DOC-2", "title": "Q3 lab replicate", "pages": [{"page_no": 1, "reading": 21}, {"page_no": 2, "reading": "smudged"}, {"page_no": 3, "reading": 19}]}
+{"doc_id": "DOC-3", "title": "Q3 control set", "pages": [{"page_no": 1, "reading": 9}, {"page_no": 2, "reading": 11}]}

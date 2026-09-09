@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import pytest
 from sqlalchemy import event
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.call_data import RawCallPayload
@@ -23,8 +23,8 @@ _SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 def _seed_parent(factory: RecorderFactory, parent_kind: Literal["state", "operation"]) -> str:

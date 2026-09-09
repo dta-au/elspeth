@@ -170,6 +170,24 @@ def _make_advisor_tool_call(
     )
 
 
+def _make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> _FakeLLMResponse:
+    return _FakeLLMResponse(
+        choices=[
+            _FakeChoice(
+                message=_FakeMessage(
+                    content=None,
+                    tool_calls=[
+                        _FakeToolCall(
+                            id=call_id,
+                            function=_FakeFunction(name=name, arguments=json.dumps(arguments)),
+                        )
+                    ],
+                )
+            )
+        ]
+    )
+
+
 def _make_text_only_response(content: str) -> _FakeLLMResponse:
     return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))])
 
@@ -355,7 +373,10 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     assert mock_acompletion.call_count == 1
     advisor_call_kwargs = mock_acompletion.call_args.kwargs
     assert advisor_call_kwargs["model"] == "anthropic/claude-sonnet-4-6"
-    assert advisor_call_kwargs["max_tokens"] == 1500  # default completion cap
+    # 8192 (was 1500): advisor reasoning shares max_tokens and Anthropic
+    # thinking has a 1024-token floor that must fit inside it
+    # (elspeth-dc459d438e).
+    assert advisor_call_kwargs["max_tokens"] == 8192  # default completion cap
 
     # Outer ComposerToolInvocation should be present in the recorder.
     invocations = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
@@ -854,6 +875,8 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
         mock_llm.side_effect = [
+            _make_tool_call("call_metadata", "set_metadata", {"patch": {"name": "Prepared"}}),
+            _make_tool_call("call_sources", "list_sources", {}),
             _make_advisor_tool_call("call_deadline"),
             _make_text_only_response("would incorrectly continue"),
         ]
@@ -861,13 +884,18 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
         await service.compose("help me", [], state)
 
     assert exc_info.value.budget_exhausted == "timeout"
-    assert mock_llm.call_count == 1
+    assert exc_info.value.max_turns == 2
+    assert mock_llm.call_count == 3
     advisor_await = mock_advisor.await_args
     assert advisor_await is not None
     advisor_timeout = advisor_await.kwargs["timeout"]
     assert advisor_timeout == 5.0
-    assert len(exc_info.value.tool_invocations) == 1
-    assert "COMPOSE_TIMEOUT" in _result_canonical(exc_info.value.tool_invocations[0])
+    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+        "call_metadata",
+        "call_sources",
+        "call_deadline",
+    ]
+    assert "COMPOSE_TIMEOUT" in _result_canonical(exc_info.value.tool_invocations[-1])
 
 
 @pytest.mark.asyncio
@@ -889,12 +917,22 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
         ),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        mock_llm.side_effect = [_make_advisor_tool_call("call_zero_remaining")]
+        mock_llm.side_effect = [
+            _make_tool_call("call_sources", "list_sources", {}),
+            _make_tool_call("call_transforms", "list_transforms", {}),
+            _make_advisor_tool_call("call_zero_remaining"),
+        ]
         await service.compose("help me", [], _empty_state())
 
     assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.max_turns == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
+    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+        "call_sources",
+        "call_transforms",
+        "call_zero_remaining",
+    ]
     invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
     assert len(invocations) == 1
     payload = json.loads(_result_canonical(invocations[0]))
@@ -1054,9 +1092,14 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     """F5: If LiteLLM (or its codec, httpx, json, anything) raises an
     exception class NOT in the typed except clauses of
     _call_advisor_with_audit, the inner ComposerLLMCall record MUST still
-    land. Otherwise the broad-except in the compose-loop interception
-    has an audit gap for exactly the failure mode that justifies its
-    tier-model allowlist entry.
+    land — the audit trail preserves the failure mode either way.
+
+    An unclassified class is one nothing identified as a provider fault, so
+    the interception no longer degrades it into ADVISOR_ERROR: it keeps
+    unwinding, carrying the record on the exception. Telling the composer
+    LLM "the provider is unavailable" on the strength of an unrecognised
+    exception is a guess, and it hides first-party defects raised by this
+    module's own admission helpers inside the same protected block.
     """
     catalog = _mock_catalog()
     service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
@@ -1068,21 +1111,64 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     # stays None and the finally block skips record_llm_call.
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         patch(
             "elspeth.web.composer.service._litellm_acompletion",
             new_callable=AsyncMock,
             side_effect=ValueError("unexpected codec failure"),
         ),
+        pytest.raises(ValueError, match="unexpected codec failure") as exc_info,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help me", [], state)
+        await service.compose("help me", [], state)
 
-    advisor_llm_calls = [c for c in result.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
+    advisor_llm_calls = [c for c in exc_info.value.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
     assert len(advisor_llm_calls) == 1, (
         "ComposerLLMCall record missing for unclassified exception — the audit-trail-preserves-everything claim is broken"
     )
     assert advisor_llm_calls[0].status.name != "SUCCESS"
     assert advisor_llm_calls[0].error_class == "ValueError"
+    assert mock_persist.await_count == 1, "the advisor dispatch escaped before P4 could publish its outer audit row"
+    persist_kwargs = mock_persist.await_args.kwargs
+    assert persist_kwargs["crash_pending"] is True
+    failed_outcome = persist_kwargs["tool_outcomes"][-1]
+    assert failed_outcome.call.function.name == "request_advisor_hint"
+    assert failed_outcome.error_class == "ValueError"
+    assert failed_outcome.error_message == "ValueError"
+    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    assert persisted_failure["_redaction_status"] == "plugin_crash"
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_still_degrades_into_structured_advisor_feedback() -> None:
+    """The contained arm survives the narrowing: a named transport fault degrades.
+
+    Pins the boundary the propagation tests carve out — an ``httpx`` transport
+    error is a recognised Tier-3 provider fault, so the composer LLM still
+    gets ADVISOR_ERROR feedback and the turn continues rather than the whole
+    compose request failing on a network blip.
+    """
+    import httpx
+
+    catalog = _mock_catalog()
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    turns = [_make_advisor_tool_call("call_transport"), _make_text_only_response("moving on")]
+
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch(
+            "elspeth.web.composer.service._litellm_acompletion",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("connection refused"),
+        ),
+    ):
+        mock_llm.side_effect = turns
+        result = await service.compose("help me", [], _empty_state())
+
+    invs = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    assert len(invs) == 1
+    assert "ADVISOR_ERROR" in _result_canonical(invs[0])
+    assert "ConnectError" in _result_canonical(invs[0])
 
 
 @pytest.mark.asyncio
@@ -1115,6 +1201,52 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
     assert "ADVISOR_ERROR" in _result_canonical(invs[0]), "empty advisor content was treated as success — should be ADVISOR_ERROR"
+
+    advisor_calls = [c for c in result.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
+    assert len(advisor_calls) == 1
+    assert advisor_calls[0].status.name == "MALFORMED_RESPONSE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(["chunk-a", "chunk-b"], id="list"),
+        pytest.param({"text": "advice"}, id="dict"),
+        pytest.param(7, id="int"),
+        pytest.param("   \n\t ", id="whitespace"),
+        pytest.param("", id="empty-string"),
+    ],
+)
+async def test_advisor_non_string_content_classified_as_malformed(content: object) -> None:
+    """Regression for elspeth-b6be9e991f: the advisor emptiness probe used
+    ``str(raw_content).strip()`` but returned the ORIGINAL object, so a
+    list/dict/int content (which stringifies non-empty) passed as SUCCESS and
+    escaped as wrong-typed guidance. Only an exact non-empty ``str`` may
+    reach the guidance surface; everything else is MALFORMED_RESPONSE.
+    """
+    catalog = _mock_catalog()
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    state = _empty_state()
+    turns = [_make_advisor_tool_call("call_nonstr"), _make_text_only_response("ok")]
+    malformed_response = _FakeLLMResponse(
+        choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))],  # type: ignore[arg-type]
+    )
+
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch(
+            "elspeth.web.composer.service._litellm_acompletion",
+            new_callable=AsyncMock,
+            return_value=malformed_response,
+        ),
+    ):
+        mock_llm.side_effect = turns
+        result = await service.compose("help", [], state)
+
+    invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
+    assert len(invs) == 1
+    assert "ADVISOR_ERROR" in _result_canonical(invs[0]), "non-string advisor content was treated as success — should be ADVISOR_ERROR"
 
     advisor_calls = [c for c in result.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
     assert len(advisor_calls) == 1
@@ -1403,3 +1535,44 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
         "advisor cancellation recorded the inner LLM audit row in memory but did not "
         "attach it to the CancelledError for route-level persistence"
     )
+
+
+@pytest.mark.asyncio
+async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_provider_outage() -> None:
+    """A defect raised inside the advisor call keeps unwinding.
+
+    The interception's handler is scoped to ``advisor_provider_failure_types``
+    — the provider SDK, transport and malformed-response families. An
+    ``AuditIntegrityError`` out of the audit recorder is none of those:
+    converting it into an ADVISOR_ERROR tool result would tell the composer
+    LLM the provider was unavailable, record ``finish_success`` over a Tier-1
+    corruption signal, and let the turn continue on a broken audit trail.
+    """
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    catalog = _mock_catalog()
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    original = AuditIntegrityError("recorder could not seal the advisor call")
+
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
+        pytest.raises(AuditIntegrityError, match="recorder could not seal") as exc_info,
+    ):
+        mock_llm.side_effect = [
+            _make_advisor_tool_call("call_first_party_bug"),
+            _make_text_only_response("would incorrectly continue"),
+        ]
+        mock_advisor.side_effect = original
+        await service.compose("help me", [], _empty_state())
+
+    assert exc_info.value is original
+    assert mock_persist.await_count == 1
+    persist_kwargs = mock_persist.await_args.kwargs
+    assert persist_kwargs["crash_pending"] is True
+    failed_outcome = persist_kwargs["tool_outcomes"][-1]
+    assert failed_outcome.call.function.name == "request_advisor_hint"
+    assert failed_outcome.error_class == "AuditIntegrityError"
+    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    assert persisted_failure["_redaction_status"] == "plugin_crash"

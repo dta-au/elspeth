@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Protocol, get_origin
 
 import pytest
 
 from elspeth.contracts.config import protocols as _protocols_module
-from elspeth.contracts.config import runtime as _runtime_module
 from elspeth.contracts.config.protocols import (
     RuntimeCheckpointProtocol,
     RuntimeConcurrencyProtocol,
@@ -22,6 +23,8 @@ from elspeth.contracts.config.protocols import (
 from elspeth.contracts.config.runtime import (
     ExporterConfig,
     RuntimeCheckpointConfig,
+    RuntimeConcurrencyConfig,
+    RuntimeRateLimitConfig,
     RuntimeRetryConfig,
     RuntimeTelemetryConfig,
 )
@@ -54,10 +57,18 @@ def _is_runtime_protocol(obj: Any) -> bool:
         return False
     if not (obj.__name__.startswith("Runtime") and obj.__name__.endswith("Protocol")):
         return False
-    # Runtime-checkable Protocols expose ``__protocol_attrs__`` on recent
-    # CPython and the legacy ``_is_runtime_protocol`` attribute. Accept either,
-    # mirroring the compound check in ``test_protocol_is_runtime_checkable``.
-    return getattr(obj, "__protocol_attrs__", None) is not None or getattr(obj, "_is_runtime_protocol", False)
+    if Protocol not in obj.__mro__:
+        return False
+    # Probe the live behaviour rather than CPython-private attributes, exactly
+    # as ``test_protocol_is_runtime_checkable`` does below: a Protocol that is
+    # not ``@runtime_checkable`` raises TypeError from ``isinstance``. The
+    # private attribute names differ across CPython versions, and a sentinel
+    # ``getattr`` over them would OR-fall-back into a false pass.
+    try:
+        isinstance(object(), obj)
+    except TypeError:
+        return False
+    return True
 
 
 def _discover_runtime_protocols() -> list[type]:
@@ -67,17 +78,40 @@ def _discover_runtime_protocols() -> list[type]:
     return sorted(discovered, key=lambda cls: cls.__name__)
 
 
+# The ``Runtime<Name>Protocol`` → ``Runtime<Name>Config`` pairing, written out.
+# Discovery below still enumerates the protocols module, so a protocol added in
+# production without an entry here raises the same hard AttributeError it always
+# did — the convention stays a load-bearing gate rather than becoming a stale
+# hand-list — but the pairing itself is a named class reference, not a name
+# resolved off a module (ADR-032).
+PROTOCOL_CONFIG_CLASSES: Mapping[type, type] = MappingProxyType(
+    {
+        RuntimeCheckpointProtocol: RuntimeCheckpointConfig,
+        RuntimeConcurrencyProtocol: RuntimeConcurrencyConfig,
+        RuntimeRateLimitProtocol: RuntimeRateLimitConfig,
+        RuntimeRetryProtocol: RuntimeRetryConfig,
+        RuntimeTelemetryProtocol: RuntimeTelemetryConfig,
+    }
+)
+
+
 def _config_class_for(protocol: type) -> type:
     """Resolve the ``Runtime<Name>Config`` class paired with a ``Runtime<Name>Protocol``."""
     config_name = protocol.__name__.removesuffix("Protocol") + "Config"
-    config_cls = getattr(_runtime_module, config_name, None)
+    config_cls = PROTOCOL_CONFIG_CLASSES.get(protocol)
     if config_cls is None:
         raise AttributeError(
             f"Protocol {protocol.__name__!r} has no matching runtime config class. "
             f"Expected ``elspeth.contracts.config.runtime.{config_name}`` per the "
-            "Runtime<Name>Protocol → Runtime<Name>Config naming convention. Add the "
-            "config class or rename the protocol."
+            "Runtime<Name>Protocol → Runtime<Name>Config naming convention, paired "
+            "in PROTOCOL_CONFIG_CLASSES. Add the config class, add the pairing, or "
+            "rename the protocol."
         )
+    assert config_cls.__name__ == config_name, (
+        f"PROTOCOL_CONFIG_CLASSES pairs {protocol.__name__!r} with "
+        f"{config_cls.__name__!r}, which breaks the Runtime<Name>Protocol → "
+        f"Runtime<Name>Config naming convention (expected {config_name!r})."
+    )
     return config_cls
 
 
@@ -130,16 +164,81 @@ PROTOCOL_EXPECTED_METHODS: dict[type, set[str]] = {
     RuntimeTelemetryProtocol: set(),
 }
 
+# Named readers for each protocol property on the paired config instance. The
+# runtime configs are frozen slots dataclasses, so there is no data-container
+# view to read them from and no reason to resolve the name dynamically: each
+# property is a real field, read directly (ADR-032). Coverage against the
+# discovered property set is asserted in
+# ``TestCrossValidation.test_default_instance_exposes_all_protocol_properties``,
+# so a protocol that grows a property fails loudly instead of going unread.
+CONFIG_PROPERTY_READERS: Mapping[type, Mapping[str, Callable[[Any], object]]] = MappingProxyType(
+    {
+        RuntimeRetryProtocol: MappingProxyType(
+            {
+                "max_attempts": lambda config: config.max_attempts,
+                "base_delay": lambda config: config.base_delay,
+                "max_delay": lambda config: config.max_delay,
+                "exponential_base": lambda config: config.exponential_base,
+                "jitter": lambda config: config.jitter,
+            }
+        ),
+        RuntimeRateLimitProtocol: MappingProxyType(
+            {
+                "enabled": lambda config: config.enabled,
+                "default_requests_per_minute": lambda config: config.default_requests_per_minute,
+                "persistence_path": lambda config: config.persistence_path,
+            }
+        ),
+        RuntimeConcurrencyProtocol: MappingProxyType(
+            {
+                "max_workers": lambda config: config.max_workers,
+            }
+        ),
+        RuntimeCheckpointProtocol: MappingProxyType(
+            {
+                "enabled": lambda config: config.enabled,
+                "frequency": lambda config: config.frequency,
+            }
+        ),
+        RuntimeTelemetryProtocol: MappingProxyType(
+            {
+                "enabled": lambda config: config.enabled,
+                "granularity": lambda config: config.granularity,
+                "backpressure_mode": lambda config: config.backpressure_mode,
+                "fail_on_total_exporter_failure": lambda config: config.fail_on_total_exporter_failure,
+                "max_consecutive_failures": lambda config: config.max_consecutive_failures,
+                "exporter_configs": lambda config: config.exporter_configs,
+            }
+        ),
+    }
+)
+
+
+def _get_protocol_properties(protocol: type) -> dict[str, property]:
+    """The public properties a Protocol class defines, name → descriptor.
+
+    Reads the class dictionaries along the MRO rather than resolving each name
+    from ``dir()`` with a sentinel ``getattr``: the question is "what does this
+    class define", which the class dict answers exactly (ADR-032).
+    """
+    properties: dict[str, property] = {}
+    for klass in reversed(protocol.__mro__):
+        for name, value in vars(klass).items():
+            if not name.startswith("_") and isinstance(value, property):
+                properties[name] = value
+    return properties
+
 
 def _get_protocol_property_names(protocol: type) -> set[str]:
     """Extract property names defined in a Protocol class (excludes dunder)."""
-    return {name for name in dir(protocol) if not name.startswith("_") and isinstance(getattr(protocol, name, None), property)}
+    return set(_get_protocol_properties(protocol))
 
 
 def _get_protocol_property_return_type(protocol: type, prop_name: str) -> Any:
     """Get the return type annotation from a Protocol property getter."""
-    prop = getattr(protocol, prop_name)
-    assert isinstance(prop, property)
+    properties = _get_protocol_properties(protocol)
+    assert prop_name in properties, f"{protocol.__name__} defines no property {prop_name!r}"
+    prop = properties[prop_name]
     fget = prop.fget
     assert fget is not None
     sig = inspect.signature(fget)
@@ -158,8 +257,9 @@ def _normalize_type_name(t: Any) -> str:
         return clean.split("[")[0] if "[" in clean else clean
     if isinstance(t, type):
         return t.__name__
-    # GenericAlias like tuple[ExporterConfig, ...]
-    origin = getattr(t, "__origin__", None)
+    # GenericAlias like tuple[ExporterConfig, ...]. ``typing.get_origin`` is the
+    # public API for that question — no private-attribute probe needed.
+    origin = get_origin(t)
     if origin is not None:
         return origin.__name__ if isinstance(origin, type) else str(origin)
     return str(t)
@@ -444,9 +544,15 @@ class TestCrossValidation:
     def test_default_instance_exposes_all_protocol_properties(self, protocol: type, config_cls: Any) -> None:
         instance = config_cls.default()
         protocol_props = _get_protocol_property_names(protocol)
-        for prop_name in protocol_props:
+        readers = CONFIG_PROPERTY_READERS[protocol]
+        assert set(readers) == protocol_props, (
+            f"CONFIG_PROPERTY_READERS[{protocol.__name__}] has drifted from the "
+            f"protocol's properties: unread {sorted(protocol_props - set(readers))}, "
+            f"stale {sorted(set(readers) - protocol_props)}"
+        )
+        for prop_name, read in readers.items():
             # Access should not raise; value should not be sentinel
-            value = getattr(instance, prop_name)
+            value = read(instance)
             assert value is not None or prop_name in {
                 "persistence_path",
             }, f"{config_cls.__name__}.default().{prop_name} returned None unexpectedly"

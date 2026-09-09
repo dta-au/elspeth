@@ -1,0 +1,219 @@
+# A/B Experiment — Fork One Case Study To TWO PROMPTS, Union The Pair
+#
+#   source ─(routed)─> [variant_fork] ─┬─ arm_a ─> assess_a (terse rubric)  ─> tag_a ─┐
+#                                       └─ arm_b ─> assess_b (WEIGHTED RUBRIC) ─> tag_b ┤
+#                                                                        [variant_union]
+#                                              ─(experiment_in)─> [prompt_experiment] ─> output
+#
+# WHAT THIS ADDS OVER examples/row_union_ab_experiment
+# ----------------------------------------------------
+# That example scores its two arms with deterministic expressions and says so:
+# "in production the two branches would be LLM calls with different prompts".
+# This is that example with the LLM calls put back in. Every arm is a real
+# provider round trip; only the endpoint is a local mock, so the example still
+# runs offline and costs nothing.
+#
+# THE VARIABLE UNDER TEST IS THE PROMPT, AND ONLY THE PROMPT.
+# Both arms call the SAME model (chaosllm/analyst-v1) with the same
+# temperature, the same input fields and the same declared output fields. The
+# single difference is the rubric in `template:`. settings_models.yaml is the
+# mirror image — one prompt, two models — so the pair isolates one factor each.
+#
+# WHY row_union AND NOT coalesce OR A QUEUE
+# -----------------------------------------
+# coalesce is an N-to-1 FIELD merge: it would collapse the two assessments into
+# one wide row (arm_a_score + arm_b_score as columns), which the batch
+# statistics plugins cannot consume — they need one row per observation with a
+# discriminator column. A queue is an UNCORRELATED fan-in: it interleaves
+# whatever arrives, so a batch boundary could fall between a case's two
+# assessments. row_union correlates on row_id and releases the pair as one
+# indivisible group: 8 cases in, 16 scored rows out, in long format.
+#
+# EVERY ARM IS FAIL-CLOSED WITH ITS SIBLING.
+# If one arm's LLM call exhausts its retries, the row_union cannot form the
+# pair, and the surviving sibling terminates rather than being silently
+# reported as an unpaired observation. That is why chaos_config.yaml zeroes
+# fault injection: an injected 429 here does not degrade the experiment, it
+# ends it. Terminal-fault behaviour is the subject of chaosllm_endurance.
+#
+# NOTE ON THE TRIGGER: an aggregation downstream of a row_union may only use
+# the implicit end-of-source trigger (`trigger: {}`). A count/timeout/condition
+# trigger could fire between a case's two arms and split the group, so the
+# graph builder rejects it at build time.
+#
+# Prerequisite: ChaosLLM on port 8199 with this directory's chaos_config.yaml.
+# Use ./examples/ab_llm_experiment/run.sh, which starts and stops it for you.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/ab_llm_experiment/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'case_id: str'
+        - 'title: str'
+        - 'case_study: str'
+      on_validation_failure: discard
+
+gates:
+# Fork every case into the two prompt arms. The condition is constant because
+# the fork is unconditional — every case is assessed by both arms.
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+  - arm_a
+  - arm_b
+
+transforms:
+# ARM A — the incumbent prompt: one sentence, no criteria breakdown.
+- name: assess_a
+  plugin: llm
+  input: arm_a
+  on_success: a_assessed
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/analyst-v1
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a governance risk assessor. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "rationale": "<one sentence>"}.
+    prompt_template: 'Assess: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      assessment:
+        input_fields:
+          input_1: case_study
+        template: |
+          Score this case study 0-100 for governance risk.
+
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: rationale
+          type: string
+
+# ARM B — the candidate prompt: the same question behind an explicit weighted
+# rubric. "WEIGHTED RUBRIC" is the marker the mock server keys its uplift on,
+# so the measured lift is attributable to this prompt and nothing else.
+- name: assess_b
+  plugin: llm
+  input: arm_b
+  on_success: b_assessed
+  on_error: discard
+  options:
+    provider: openrouter
+    api_key: fake-key-chaosllm-does-not-check
+    base_url: http://127.0.0.1:8199/v1
+    model: chaosllm/analyst-v1
+    timeout_seconds: 15
+    temperature: 0.0
+    system_prompt: |
+      You are a governance risk assessor. Respond ONLY with a JSON object of
+      the form {"score": <integer 0-100>, "rationale": "<one sentence>"}.
+    prompt_template: 'Assess: {{ row.input_1 }}'
+    required_input_fields: []
+    schema:
+      mode: observed
+    queries:
+      assessment:
+        input_fields:
+          input_1: case_study
+        template: |
+          WEIGHTED RUBRIC
+          Score this case study 0-100 for governance risk, weighting:
+            - control failure severity          40%
+            - detectability before impact       30%
+            - remediation cost and difficulty   20%
+            - recurrence likelihood             10%
+          Score each dimension before combining, then report the weighted total.
+
+          {{ row.input_1 }}
+        output_fields:
+        - suffix: score
+          type: integer
+        - suffix: rationale
+          type: string
+
+# Tag each arm with its variant label and lift the typed score the LLM returned
+# into the long-format `score` column the comparison consumes. The multi-query
+# form names its outputs `<query>_<suffix>`, hence `assessment_score`.
+- name: tag_a
+  plugin: value_transform
+  input: a_assessed
+  on_success: a_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'control'"
+    - target: score
+      expression: "row['assessment_score'] * 1.0"
+
+- name: tag_b
+  plugin: value_transform
+  input: b_assessed
+  on_success: b_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'treatment'"
+    - target: score
+      expression: "row['assessment_score'] * 1.0"
+
+row_unions:
+# Wait for BOTH arms of a case, then release both tokens as one group.
+# Declared branch order is the release order, so control precedes treatment
+# for every case.
+- name: variant_union
+  branches:
+    arm_a: a_scored
+    arm_b: b_scored
+  on_success: experiment_in
+
+aggregations:
+# Long-format cross-variant statistics over the whole unioned stream.
+- name: prompt_experiment
+  plugin: batch_experiment_compare
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    variant_field: prompt_variant
+    score_field: score
+    baseline_variant: control
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/ab_llm_experiment/output/prompt_experiment.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/ab_llm_experiment/runs/audit.db

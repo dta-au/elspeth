@@ -11,12 +11,12 @@ web.catalog, composer_mcp.session).
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -27,7 +27,14 @@ from mcp.types import CallToolResult, TextContent, Tool
 from pydantic import BaseModel
 
 from elspeth.composer_mcp.audit import JsonlEventRecorder
-from elspeth.composer_mcp.session import InvalidSessionIdError, SessionManager, SessionNotFoundError, _validate_session_id
+from elspeth.composer_mcp.session import (
+    InvalidSessionIdError,
+    SessionCheckout,
+    SessionCheckoutMismatchError,
+    SessionManager,
+    SessionNotFoundError,
+    _validate_session_id,
+)
 from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
@@ -35,12 +42,15 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.audit import build_canonicalization_sentinel
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.state import CompositionState, EdgeContractDict, PipelineMetadata, ValidationEntryDict
 from elspeth.web.composer.tools import (
     _DISCOVERY_TOOLS,
     _MUTATION_TOOLS,
@@ -50,37 +60,24 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     validate_composer_file_sink_collision_policy,
 )
-from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.composer.tools._dispatch import _validate_tool_arguments
+from elspeth.web.composer.yaml_generator import (
+    generate_public_composition_dict,
+    generate_public_yaml,
+)
+from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
     RuntimePreflightFailure,
     RuntimePreflightKey,
 )
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 __all__ = ["create_server", "main"]
 
 logger = logging.getLogger(__name__)
-
-
-class _ValidationEntryPayload(TypedDict):
-    component: str
-    message: str
-    severity: str
-
-
-_EdgeContractPayload = TypedDict(
-    "_EdgeContractPayload",
-    {
-        "from": str,
-        "to": str,
-        "producer_guarantees": list[str],
-        "consumer_requires": list[str],
-        "missing_fields": list[str],
-        "satisfied": bool,
-    },
-)
 
 
 class _SemanticEdgeContractPayload(TypedDict):
@@ -95,11 +92,21 @@ class _SemanticEdgeContractPayload(TypedDict):
 
 
 class _ValidationPayload(TypedDict):
+    """The MCP session-tool error payload's validation block.
+
+    Entries and edge contracts are the composer state module's own wire
+    dicts (``ValidationEntry.to_dict()`` / ``EdgeContract.to_dict()``), not
+    mirrors of them (elspeth-e405ad7cd2, systems ledger #41/#42). This block
+    is deliberately NARROWER than ``ToolResult.to_dict()["validation"]``: it
+    carries no ``graph_repair_suggestions``, which are computed from the
+    envelope's own validation at serialization time (#43).
+    """
+
     is_valid: bool
-    errors: list[_ValidationEntryPayload]
-    warnings: list[_ValidationEntryPayload]
-    suggestions: list[_ValidationEntryPayload]
-    edge_contracts: list[_EdgeContractPayload]
+    errors: list[ValidationEntryDict]
+    warnings: list[ValidationEntryDict]
+    suggestions: list[ValidationEntryDict]
+    edge_contracts: list[EdgeContractDict]
     semantic_contracts: list[_SemanticEdgeContractPayload]
 
 
@@ -317,13 +324,16 @@ async def _mcp_preview_runtime_preflight(
     key = RuntimePreflightKey(
         session_scope=session_scope,
         state_version=state.version,
+        state_content_hash=composition_content_hash(state),
         settings_hash=settings_hash,
     )
 
     async def worker() -> ValidationResult:
-        return await asyncio.wait_for(run_preflight(state), timeout=timeout_seconds)
+        return await run_preflight(state)
 
-    entry = await coordinator.run(key, worker)
+    # The budget is per caller; the coordinator keeps the preflight admitted
+    # until it actually finishes (elspeth-5269b43bca).
+    entry = await coordinator.run(key, worker, timeout=timeout_seconds)
     if isinstance(entry, RuntimePreflightFailure):
         raise entry.original_exc
     return entry
@@ -337,6 +347,8 @@ def _dispatch_tool(
     scratch_dir: Path,
     baseline: CompositionState | None = None,
     runtime_preflight: RuntimePreflight | None = None,
+    session_manager: SessionManager | None = None,
+    session_checkout_ref: list[SessionCheckout | None] | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call and return a result dict.
 
@@ -347,9 +359,13 @@ def _dispatch_tool(
     CompositionState), and may include ``data``.
     """
     if tool_name in _SESSION_TOOL_NAMES:
-        return _dispatch_session_tool(tool_name, arguments, state, scratch_dir)
+        if session_manager is None or session_checkout_ref is None:
+            raise RuntimeError("session dispatch requires server-owned persistence authority")
+        return _dispatch_session_tool(tool_name, arguments, state, session_manager, session_checkout_ref)
 
     if tool_name in _COMPOSER_TOOL_NAMES:
+        argument_error = _validate_tool_arguments(tool_name, arguments, state, raise_on_error=True)
+        assert argument_error is None
         control_error = _tool_file_sink_collision_control_error(tool_name, arguments, state)
         if control_error is not None:
             return {
@@ -368,6 +384,9 @@ def _dispatch_tool(
             data_dir=None,
             baseline=baseline,
             runtime_preflight=runtime_preflight,
+            validate_arguments=True,
+            require_data_dir_for_paths=True,
+            raise_schema_argument_errors=True,
         )
         response = result.to_dict()
         response["state"] = result.updated_state.to_dict()
@@ -384,7 +403,7 @@ def _dispatch_tool(
     }
 
 
-def _edge_contract_to_payload(contract: Any) -> _EdgeContractPayload:
+def _edge_contract_to_payload(contract: Any) -> EdgeContractDict:
     """Serialize an edge contract without leaking a dict[str, Any] return."""
     payload = contract.to_dict()
     return {
@@ -480,11 +499,10 @@ def _dispatch_session_tool(
     tool_name: str,
     arguments: dict[str, Any],
     state: CompositionState,
-    scratch_dir: Path,
+    manager: SessionManager,
+    active_checkout_ref: list[SessionCheckout | None],
 ) -> dict[str, Any]:
     """Handle session management tools."""
-    manager = SessionManager(scratch_dir)
-
     if tool_name == "new_session":
         # Tier-3 MCP args. ``name`` is optional (required: []); its schema
         # documents the default "Untitled Pipeline", so absence is a declared
@@ -492,7 +510,12 @@ def _dispatch_session_tool(
         # the value must match the advertised string schema exactly.
         name = _new_session_name_argument(arguments)
         session_id, new_state = manager.new_session(name=name)
-        manager.save(session_id, new_state)
+        saved = manager.save_if_current(session_id, new_state, expected_token=None)
+        active_checkout_ref[0] = SessionCheckout(
+            session_id=session_id,
+            state=new_state,
+            token=saved.token,
+        )
         return {
             "success": True,
             "data": {"session_id": session_id, "name": name},
@@ -501,7 +524,22 @@ def _dispatch_session_tool(
 
     if tool_name == "save_session":
         session_id = _session_id_argument(arguments)
-        manager.save(session_id, state)
+        active_checkout = active_checkout_ref[0]
+        if active_checkout is None or active_checkout.session_id != session_id:
+            raise SessionCheckoutMismatchError(
+                requested_session_id=session_id,
+                active_session_id=active_checkout.session_id if active_checkout is not None else None,
+            )
+        saved = manager.save_if_current(
+            session_id,
+            state,
+            expected_token=active_checkout.token,
+        )
+        active_checkout_ref[0] = SessionCheckout(
+            session_id=session_id,
+            state=state,
+            token=saved.token,
+        )
         return {
             "success": True,
             "data": {"session_id": session_id},
@@ -511,17 +549,18 @@ def _dispatch_session_tool(
     if tool_name == "load_session":
         session_id = _session_id_argument(arguments)
         try:
-            loaded = manager.load(session_id)
+            checkout = manager.checkout(session_id)
         except SessionNotFoundError:
             return {
                 "success": False,
                 "error": f"Session not found: {session_id}",
                 "state": state.to_dict(),
             }
+        active_checkout_ref[0] = checkout
         return {
             "success": True,
             "data": {"session_id": session_id},
-            "state": loaded.to_dict(),
+            "state": checkout.state.to_dict(),
         }
 
     if tool_name == "list_sessions":
@@ -554,7 +593,7 @@ def _dispatch_session_tool(
             return {
                 "success": False,
                 "error": control_error,
-                "state": state.to_dict(),
+                "state": generate_public_composition_dict(state),
             }
         validation = state.validate()
         if not validation.is_valid:
@@ -562,13 +601,13 @@ def _dispatch_session_tool(
                 "success": False,
                 "error": "Current composition state is invalid. Fix validation errors before calling generate_yaml.",
                 "validation": _validation_to_dict(validation),
-                "state": state.to_dict(),
+                "state": generate_public_composition_dict(state),
             }
         yaml_str = generate_public_yaml(state)
         return {
             "success": True,
             "data": yaml_str,
-            "state": state.to_dict(),
+            "state": generate_public_composition_dict(state),
         }
 
     # Should not be reachable — _SESSION_TOOL_NAMES is derived from
@@ -579,8 +618,9 @@ def _dispatch_session_tool(
 def create_server(
     catalog: CatalogService,
     scratch_dir: Path,
-    runtime_preflight: McpRuntimePreflight | None = None,
-    runtime_preflight_settings_hash: str | None = None,
+    *,
+    runtime_preflight: McpRuntimePreflight | None,
+    runtime_preflight_settings_hash: str | None,
     runtime_preflight_timeout_seconds: float = 5.0,
     runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
     session_scope_provider: SessionScopeProvider | None = None,
@@ -591,9 +631,23 @@ def create_server(
     Args:
         catalog: Plugin catalog for discovery tools.
         scratch_dir: Directory for session persistence.
-        runtime_preflight: Optional async callable for runtime-equivalent preflight.
-            When provided with runtime_preflight_settings_hash, preview_pipeline
-            will include runtime validation results.
+        runtime_preflight: Async callable for runtime-equivalent preflight, or
+            an explicit None. Keyword-required and without a default: an
+            omitted preflight makes every preview_pipeline call fail closed —
+            ``data["preview_is_valid"]`` is false however the authoring check
+            came out, and ``data["preview_errors"]`` carries a
+            ``runtime_preflight_not_run`` entry naming the stage that did not
+            run — so every caller must take a visible position rather than
+            inherit one.
+
+            Deliberately STRICT-ONLY (elspeth-229e9e8195): the MCP surface
+            wires no interpretation-tolerant ``structural_preflight``, so
+            preview_pipeline here never emits ``data["structural_preview"]``.
+            ``McpRuntimePreflight`` carries no tolerance parameter by design —
+            the MCP operator channel has no compose-loop repair budget for the
+            block to steer, and a handoff-shaped verdict already names the
+            pending review. Extending tolerance to MCP is a deliberate
+            decision, not an omission to "fix" in passing.
         runtime_preflight_settings_hash: Hash of settings relevant to runtime
             validation. Required when runtime_preflight is configured.
         runtime_preflight_timeout_seconds: Per-call timeout for runtime preflight.
@@ -607,6 +661,7 @@ def create_server(
         Configured MCP Server ready for stdio transport.
     """
     server = Server("elspeth-composer")
+    session_manager = SessionManager(scratch_dir)
     coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
     session_id_ref: list[str | None] = [None]
     audit_recorder: ComposerToolRecorder = (
@@ -637,6 +692,8 @@ def create_server(
     state_ref: list[CompositionState] = [initial_state]
     # B5: Baseline for diff_pipeline — captured at session create/load.
     baseline_ref: list[CompositionState] = [initial_state]
+    # Exact durable evidence for the state snapshot from the active session.
+    session_checkout_ref: list[SessionCheckout | None] = [None]
 
     tool_defs = _build_tool_defs()
 
@@ -733,6 +790,13 @@ def create_server(
                 # Pre-dispatch ARG_ERROR: malformed LLM arguments.
                 return _argument_error_result(ValueError(f"arguments not canonicalizable ({type(canonicalization_failed).__name__})"))
 
+            if name in _COMPOSER_TOOL_NAMES:
+                try:
+                    argument_error = _validate_tool_arguments(name, arguments, state_ref[0], raise_on_error=True)
+                    assert argument_error is None
+                except ToolArgumentError as exc:
+                    return _argument_error_result(exc)
+
             if name == "preview_pipeline" and runtime_preflight is not None:
                 try:
                     if runtime_preflight_settings_hash is None:
@@ -770,6 +834,8 @@ def create_server(
                     scratch_dir,
                     baseline=baseline_ref[0],
                     runtime_preflight=runtime_preflight_callback,
+                    session_manager=session_manager,
+                    session_checkout_ref=session_checkout_ref,
                 )
             except ToolArgumentError as exc:
                 return _argument_error_result(exc)
@@ -788,7 +854,12 @@ def create_server(
             try:
                 if "state" in result_dict:
                     new_state = CompositionState.from_dict(result_dict["state"])
-                    state_ref[0] = new_state
+                    # generate_yaml is a read-only public-export operation.
+                    # Its adjacent state is intentionally the scrubbed public
+                    # projection, so never replace the private working state
+                    # with that projection after validating its wire shape.
+                    if name != "generate_yaml":
+                        state_ref[0] = new_state
                     # Capture baseline when session is created or loaded.
                     # load_session can return success=False on SessionNotFoundError;
                     # in that case, leave session_id_ref unchanged so the scratch
@@ -804,9 +875,14 @@ def create_server(
                     # so subsequent calls use the unsaved scope unless a
                     # new/load_session resolves a fresh id.
                     if name == "delete_session" and result_dict["success"]:
-                        clear_session_after_audit = True
+                        deleted_sid: str = result_dict["data"]["session_id"]
+                        active_checkout = session_checkout_ref[0]
+                        clear_session_after_audit = active_checkout is not None and active_checkout.session_id == deleted_sid
                     # B4: Redact storage paths from the response sent to the agent.
-                    result_dict["state"] = redact_source_storage_path(result_dict["state"])
+                    if name == "generate_yaml":
+                        result_dict["state"] = generate_public_composition_dict(state_ref[0])
+                    else:
+                        result_dict["state"] = redact_source_storage_path(result_dict["state"])
                 response_text = json.dumps(result_dict, indent=2)
             except (KeyError, TypeError, ValueError) as readback_exc:
                 # Tier-1 read-back failure on our own dispatch output.
@@ -826,25 +902,30 @@ def create_server(
             result_canonical: str | None
             result_hash: str | None
             version_after: int | None
+            result_canonicalization_failure: BaseException | None = None
 
             if status == ComposerToolStatus.SUCCESS and result_dict is not None:
                 # Result canonicalization happens AFTER state-mutation +
                 # redaction so the recorded result mirrors what was sent
-                # back to the LLM. Wrap in try/except per Solution-architect
-                # review H3: a non-finite float / non-serializable type in
-                # ``result_dict`` would otherwise raise from finally and
-                # mask the success return entirely. Fall back to a sentinel
-                # canonical so the audit row still lands.
+                # back to the LLM. Crash-on-anomaly, no sentinel fallback
+                # (see web.composer.audit.finish_dispatch): ``result_dict``
+                # is our own handler's output, so an un-canonicalizable
+                # value is a bug in our code — reclassify as PLUGIN_CRASH
+                # and re-raise after the audit row lands, never substitute
+                # synthesized evidence under a SUCCESS status. The sentinel
+                # form is reserved for the Tier-3 *arguments* path above.
                 try:
                     result_canonical = canonical_json(result_dict)
                     result_hash = stable_hash(result_dict)
+                    version_after = state_ref[0].version
                 except (ValueError, TypeError) as canon_result_exc:
-                    # Shared sentinel discipline — see
-                    # web.composer.audit.build_canonicalization_sentinel.
-                    sentinel = build_canonicalization_sentinel(canon_result_exc, result_dict)
-                    result_canonical = canonical_json(sentinel)
-                    result_hash = stable_hash(sentinel)
-                version_after = state_ref[0].version
+                    result_canonicalization_failure = canon_result_exc
+                    status = ComposerToolStatus.PLUGIN_CRASH
+                    error_class = type(canon_result_exc).__name__
+                    error_message = type(canon_result_exc).__name__
+                    result_canonical = None
+                    result_hash = None
+                    version_after = None
             elif status == ComposerToolStatus.ARG_ERROR and error_payload_for_audit is not None:
                 # ARG_ERROR: record the error payload that was returned to
                 # the LLM (Solution-architect H4 symmetry with web side).
@@ -876,16 +957,82 @@ def create_server(
                 latency_ms=latency_ms,
                 actor="composer-mcp:cli",
             )
-            audit_recorder.record(invocation)
-            if clear_session_after_audit:
-                session_id_ref[0] = None
+            try:
+                audit_recorder.record(invocation)
+            finally:
+                if clear_session_after_audit:
+                    session_id_ref[0] = None
+                    session_checkout_ref[0] = None
+            if result_canonicalization_failure is not None:
+                # The client must not receive an unaudited success; the
+                # PLUGIN_CRASH row above is the durable record. Raising
+                # from ``finally`` discards the pending success return.
+                raise result_canonicalization_failure
 
     return server
 
 
-async def run_server(catalog: CatalogService, scratch_dir: Path) -> None:
+@dataclass(frozen=True)
+class _StdioValidationSettings:
+    """The ValidationSettings surface a stdio process can honestly supply."""
+
+    data_dir: Path
+
+
+def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> Server:
+    """Build the stdio server with a runtime-equivalent preflight wired in.
+
+    Factored out of ``run_server`` so the construction the shipped transport
+    uses is the construction under test.
+    """
+    settings = _StdioValidationSettings(data_dir=data_dir)
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    # A validation-internal path-scoping token, NOT an identity. Three
+    # constraints make it necessary, and none of them are visible at the call
+    # below:
+    #
+    # 1. ``allowed_sink_directories`` / ``allowed_source_directories``
+    #    (web/paths.py) return ``()`` for ``session_id=None`` BY DESIGN — that
+    #    is web tenancy, where a caller without a session owns no directory.
+    #    Passing None here rejects every pipeline that reads or writes a local
+    #    file, and publishes it as an honest-looking ``is_valid: false``.
+    # 2. A single-user stdio process has no tenancy boundary to enforce and no
+    #    session identity to borrow, so it scopes itself once per process.
+    #    Threading the live MCP session id back in does NOT work: it is None
+    #    for any unsaved composition, which is the common case.
+    # 3. Nothing the user keeps carries it — ``generate_public_yaml`` takes no
+    #    session_id and emits authored paths verbatim.
+    #
+    # Traversal out of ``data_dir`` is still rejected; this widens no boundary.
+    session_id = uuid.uuid4().hex[:12]
+
+    async def stdio_runtime_preflight(state: CompositionState) -> ValidationResult:
+        return await run_sync_in_worker(
+            validate_pipeline,
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            secret_service=None,
+            session_id=session_id,
+        )
+
+    return create_server(
+        catalog,
+        scratch_dir,
+        runtime_preflight=stdio_runtime_preflight,
+        # Both extras change the verdict for one data_dir, so both belong in
+        # the key: a coordinator shared with an in-process web server would
+        # otherwise serve its policy-filtered verdict for our snapshot.
+        runtime_preflight_settings_hash=f"{runtime_preflight_settings_hash(settings)}:{plugin_snapshot.snapshot_hash}:{session_id}",
+    )
+
+
+async def run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> None:
     """Run the MCP server with stdio transport."""
-    server = create_server(catalog, scratch_dir)
+    server = _build_stdio_server(catalog, scratch_dir, data_dir)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
@@ -984,6 +1131,14 @@ def main() -> None:
         default=Path(".composer-scratch"),
         help="Directory for session persistence (default: .composer-scratch)",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help=(
+            "Root for runtime preflight path checks (default: data). preview_pipeline reports source and sink paths that resolve outside this directory as invalid."
+        ),
+    )
     args = parser.parse_args()
 
     # Lazy import to avoid pulling in the full catalog at module level.
@@ -993,4 +1148,4 @@ def main() -> None:
 
     import asyncio
 
-    asyncio.run(run_server(catalog, args.scratch_dir))
+    asyncio.run(run_server(catalog, args.scratch_dir, args.data_dir))

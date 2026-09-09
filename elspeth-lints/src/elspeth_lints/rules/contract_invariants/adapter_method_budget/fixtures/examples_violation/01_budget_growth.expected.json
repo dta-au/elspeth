@@ -1,0 +1,12 @@
+[
+  {
+    "column": 0,
+    "file_path": "src/elspeth/core/landscape/plugin_audit_writer.py",
+    "fingerprint": "budget-growth:14",
+    "line": 4,
+    "message": "PluginAuditWriterAdapter has 14 public methods (ratchet: 13). Methods: method_00, method_01, method_02, method_03, method_04, method_05, method_06, method_07, method_08, method_09, method_10, method_11, method_12, method_13",
+    "rule_id": "contract_invariants.adapter_method_budget",
+    "severity": "error",
+    "suggestion": "If a new method is genuinely needed, consider whether the caller should inject the specific repository directly instead."
+  }
+]

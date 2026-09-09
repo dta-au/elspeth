@@ -13,11 +13,19 @@ predicate:
     kind in ("source", "sink") or
     plugin_cls.determinism in _AUDIT_FLAGGED_DETERMINISMS
 
-i.e. every Source and every Sink is uniformly boundary, and a Transform
-is boundary iff its declared ``Determinism`` is one of the audit-flagged
-classes (currently ``IO_READ``, ``EXTERNAL_CALL``, and
+i.e. every Source and every Sink is uniformly boundary, and a transform-
+registry plugin is boundary iff its declared ``Determinism`` is one of the
+audit-flagged classes (currently ``IO_READ``, ``EXTERNAL_CALL``, and
 ``NON_DETERMINISTIC``). This module does NOT participate in that
 classification.
+
+"Transform" there is the PLUGIN kind, not the node kind. Collector and
+aggregation nodes host transform-registry plugins too, so the panel
+enumerates every node type in
+``elspeth.web.audit_readiness.service.PLUGIN_HOSTING_NODE_TYPES`` and
+resolves each node's plugin through the transform registry. The maps in
+this module are keyed by plugin name and are node-kind-agnostic, exactly
+as the classification is.
 
 WHY THIS MODULE EXISTS — AUDIT DISCOVERABILITY
 ==============================================
@@ -77,6 +85,44 @@ ADDING A NEW BOUNDARY PLUGIN
   4. A code reviewer seeing the diff to this file now has the explicit
      signal: "this PR adds a new Tier-3 crossing; route through
      audit-architecture review."
+  5. Check the two PANEL surfaces that render the new plugin. Steps 1-4
+     make the catalog addition impossible to land silently; they say
+     nothing about the surfaces that show it to the operator, and this
+     step exists because that gap shipped a real defect
+     (elspeth-1c8a4b6199 — a boundary plugin hosted on a collector was
+     dropped from the panel's inventory, from its ``detail`` and from its
+     ``component_ids``, with no test and no checklist step pointing at
+     it). The surfaces are:
+
+       - ``service._build_plugin_trust_row`` — the boundary inventory.
+       - ``explain.build_narrative`` / ``explain._describe_plugin_node`` —
+         the Explain-tab prose.
+
+     Both enumerate ``service.PLUGIN_HOSTING_NODE_TYPES``, so a plugin
+     hostable on a collector or an aggregation is inventoried with NO
+     code change. Two things that mechanism cannot do for you:
+
+       a. ``_describe_plugin_node`` dispatches on the plugin NAME. A
+          boundary plugin with no arm there falls through to the untailored
+          per-kind line, which names the external system not at all. Add an
+          arm if the plugin reaches a system an auditor must be told about.
+       b. If you change the ``detail`` wire shape — the ``[kind] id
+          (name)`` token, or which components are enumerated — bump
+          ``service._BOUNDARY_RULE_VERSION``. Its docstring explains why
+          a persisted verdict must remain reconstructible.
+
+ADDING A NEW NODE TYPE
+======================
+
+The inverse trap, and the reason step 5 can promise "no code change".
+``PLUGIN_HOSTING_NODE_TYPES`` is derived by EXCLUSION from the composer's
+``NodeType`` Literal, so a node type added without an entry in
+``service._PLUGINLESS_NODE_TYPES`` defaults to being enumerated by the
+panel. That default is the safe one for an audit inventory. If the new
+node type genuinely hosts no plugin (it is wired ``plugin=null``, like
+gate/coalesce/queue/row_union), add it to ``_PLUGINLESS_NODE_TYPES``
+explicitly — opting a node kind OUT of the audit inventory is a decision
+that must be recorded, never inherited by omission.
 
 Sources and sinks are uniformly boundary by architecture: there is no
 such thing as an "internal source" or "internal sink" in ELSPETH (a
@@ -120,13 +166,15 @@ from elspeth.contracts.enums import Determinism
 # derivable from kind + the predicate in
 # ``_build_plugin_trust_row``). Transforms classify as boundary iff
 # their declared determinism is in ``_AUDIT_FLAGGED_DETERMINISMS``.
-
+#
 EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
     "aws_s3": Determinism.IO_READ,
     "azure_blob": Determinism.IO_READ,
+    "blob_rows": Determinism.IO_READ,
     "csv": Determinism.IO_READ,
     "dataverse": Determinism.EXTERNAL_CALL,
     "json": Determinism.IO_READ,
+    "llm": Determinism.NON_DETERMINISTIC,
     "null": Determinism.DETERMINISTIC,
     "text": Determinism.IO_READ,
 }
@@ -138,6 +186,7 @@ EXPECTED_SINK_DETERMINISMS: dict[str, Determinism] = {
     "csv": Determinism.IO_WRITE,
     "database": Determinism.IO_WRITE,
     "dataverse": Determinism.EXTERNAL_CALL,
+    "document": Determinism.IO_WRITE,
     "json": Determinism.IO_WRITE,
     "text": Determinism.IO_WRITE,
 }
@@ -145,11 +194,15 @@ EXPECTED_SINK_DETERMINISMS: dict[str, Determinism] = {
 EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "aws_bedrock_content_safety": Determinism.EXTERNAL_CALL,
     "aws_bedrock_prompt_shield": Determinism.EXTERNAL_CALL,
+    "aws_textract_document_analysis": Determinism.EXTERNAL_CALL,
+    "aws_textract_inline_analysis": Determinism.EXTERNAL_CALL,
     "azure_content_safety": Determinism.EXTERNAL_CALL,
     "azure_document_intelligence": Determinism.EXTERNAL_CALL,
     "azure_prompt_shield": Determinism.EXTERNAL_CALL,
     "blob_csv_expand": Determinism.IO_READ,
     "blob_fetch": Determinism.EXTERNAL_CALL,
+    "blob_json_expand": Determinism.IO_READ,
+    "blob_text_expand": Determinism.IO_READ,
     "batch_classifier_metrics": Determinism.DETERMINISTIC,
     "batch_data_quality_report": Determinism.DETERMINISTIC,
     "batch_distribution_profile": Determinism.DETERMINISTIC,
@@ -168,7 +221,11 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "line_explode": Determinism.DETERMINISTIC,
     "llm": Determinism.NON_DETERMINISTIC,  # manual curation (LLM API boundary)
     "passthrough": Determinism.DETERMINISTIC,
+    "pdf_rasterize": Determinism.IO_READ,
     "rag_retrieval": Determinism.EXTERNAL_CALL,
+    # DETERMINISTIC, not IO_READ: reference_join's table is materialized into its
+    # config at load, so the transform opens nothing at row time.
+    "reference_join": Determinism.DETERMINISTIC,
     "report_assemble": Determinism.DETERMINISTIC,
     "truncate": Determinism.DETERMINISTIC,
     "type_coerce": Determinism.DETERMINISTIC,

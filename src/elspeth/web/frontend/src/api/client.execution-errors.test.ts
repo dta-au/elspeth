@@ -111,6 +111,59 @@ describe("parseResponse execution error envelopes", () => {
     expect(error.errors).toEqual([entry]);
   });
 
+  it("carries request_id from the fail-closed audit-integrity envelope (F-4)", async () => {
+    // app.py's AuditIntegrityError handler emits request_id at the top level
+    // of the body (not nested under detail) — the banner names it as the
+    // support reference.
+    const response = {
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: async () => ({
+        error_type: "audit_integrity_error",
+        detail:
+          "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+        diagnostic: "no_failed_turn_metadata",
+        reason: "originated outside compose-loop annotation scope",
+        request_id: "req-abc123",
+      }),
+    } as Response;
+
+    let error: ApiError | null = null;
+    try {
+      await parseResponse(response);
+    } catch (raised) {
+      error = raised as ApiError;
+    }
+
+    expect(error).toMatchObject({
+      status: 500,
+      error_type: "audit_integrity_error",
+      request_id: "req-abc123",
+    });
+  });
+
+  it("carries failure_code from a guided terminal-failure envelope (F13-D)", async () => {
+    const error = await parseApiError(
+      {
+        error_type: "guided_operation_terminal_failure",
+        failure_code: "policy_blocked",
+        detail:
+          "This pipeline is blocked by a deployment policy and cannot be built as configured. " +
+          "Change the highlighted component — retrying will fail the same way.",
+      },
+      422,
+      "Unprocessable Entity",
+    );
+
+    expect(error).toMatchObject({
+      status: 422,
+      error_type: "guided_operation_terminal_failure",
+      failure_code: "policy_blocked",
+    });
+    expect(error.detail).toContain("blocked by a deployment policy");
+  });
+
   it("drops malformed structured entries instead of exposing a false typed contract", async () => {
     const valid = {
       component_id: "rate",

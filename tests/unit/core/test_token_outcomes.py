@@ -98,9 +98,6 @@ class TestTokenOutcomeDataclass:
         )
         assert outcome.sink_name is None
         assert outcome.batch_id is None
-        assert outcome.fork_group_id is None
-        assert outcome.join_group_id is None
-        assert outcome.expand_group_id is None
         assert outcome.error_hash is None
         assert outcome.context_json is None
 
@@ -184,13 +181,14 @@ class TestTokenOutcomesTableSchema:
             "recorded_at",
             "sink_name",
             "batch_id",
-            "fork_group_id",
-            "join_group_id",
-            "expand_group_id",
             "error_hash",
             "context_json",
         }
         assert required.issubset(columns)
+        # fork_group_id/join_group_id/expand_group_id retired from
+        # token_outcomes (D2 flip): the roster of record moved to
+        # token_lineage_frames + group_records.
+        assert not {"fork_group_id", "join_group_id", "expand_group_id"} & columns
 
     def test_outcome_id_is_primary_key(self) -> None:
         from elspeth.core.landscape.schema import token_outcomes_table
@@ -405,15 +403,28 @@ class TestOutcomeContractValidation:
                 path=TerminalPath.GATE_ROUTED,
             )
 
-    def test_forked_requires_fork_group_id(self, factory, run_with_token) -> None:
-        """(TRANSIENT, FORK_PARENT) outcome must have fork_group_id."""
+    def test_forked_forbids_every_discriminator_field(self, factory, run_with_token) -> None:
+        """(TRANSIENT, FORK_PARENT) outcome forbids every discriminator field.
+
+        D2 flip: fork_group_id is retired from token_outcomes — the roster of
+        record moved to token_lineage_frames + group_records. Recording now
+        succeeds with none of the discriminator fields set; supplying one
+        raises (the pair forbids sink_name/batch_id/error_hash).
+        """
         run, token = run_with_token
 
-        with pytest.raises(ValueError, match=r"\(TRANSIENT, FORK_PARENT\) outcome requires fork_group_id"):
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
+            outcome=TerminalOutcome.TRANSIENT,
+            path=TerminalPath.FORK_PARENT,
+        )
+
+        with pytest.raises(ValueError, match=r"\(TRANSIENT, FORK_PARENT\).*forbids"):
             factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.FORK_PARENT,
+                batch_id="batch-1",
             )
 
     def test_failed_requires_error_hash(self, factory, run_with_token) -> None:
@@ -438,27 +449,43 @@ class TestOutcomeContractValidation:
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
             )
 
-    def test_coalesced_requires_join_group_id(self, factory, run_with_token) -> None:
-        """(SUCCESS, COALESCED) outcome must have join_group_id."""
+    def test_coalesced_forbids_every_field_except_sink_name(self, factory, run_with_token) -> None:
+        """(SUCCESS, COALESCED) outcome accepts only sink_name.
+
+        D2 flip: join_group_id is retired from token_outcomes — it lives only
+        on the merged TOKEN (ruling 20), not the per-parent outcome record.
+        """
         run, token = run_with_token
 
-        with pytest.raises(ValueError, match=r"\(SUCCESS, COALESCED\) outcome requires join_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
-                outcome=TerminalOutcome.SUCCESS,
-                path=TerminalPath.COALESCED,
-                sink_name="default",
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.COALESCED,
+            sink_name="default",
+        )
 
-    def test_expanded_requires_expand_group_id(self, factory, run_with_token) -> None:
-        """(TRANSIENT, EXPAND_PARENT) outcome must have expand_group_id."""
+    def test_expanded_forbids_every_discriminator_field(self, factory, run_with_token) -> None:
+        """(TRANSIENT, EXPAND_PARENT) outcome forbids every discriminator field.
+
+        D2 flip: expand_group_id is retired from token_outcomes — the roster
+        of record moved to token_lineage_frames + group_records. Recording
+        now succeeds with none of the discriminator fields set; supplying one
+        raises (the pair forbids sink_name/batch_id/error_hash).
+        """
         run, token = run_with_token
 
-        with pytest.raises(ValueError, match=r"\(TRANSIENT, EXPAND_PARENT\) outcome requires expand_group_id"):
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
+            outcome=TerminalOutcome.TRANSIENT,
+            path=TerminalPath.EXPAND_PARENT,
+        )
+
+        with pytest.raises(ValueError, match=r"\(TRANSIENT, EXPAND_PARENT\).*forbids"):
             factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.EXPAND_PARENT,
+                batch_id="batch-1",
             )
 
     def test_buffered_requires_batch_id(self, factory, run_with_token) -> None:

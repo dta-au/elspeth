@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager
+from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import cache
-from typing import TYPE_CHECKING, Any, Final
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Final, get_args
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -28,42 +27,57 @@ from elspeth.contracts import (
     SecretResolution,
     SecretResolutionInput,
 )
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
     mint_worker_id,
 )
+from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunLeadershipLostError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.preflight import PreflightResult
-from elspeth.contracts.runtime_val_manifest import _assert_runtime_val_registries_frozen, build_runtime_val_manifest
+from elspeth.contracts.runtime_val_manifest import (
+    RuntimeValRegistryFingerprint,
+    _assert_runtime_val_registries_frozen,
+    build_runtime_val_manifest,
+    runtime_val_registry_fingerprint,
+)
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
-from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape._database_ops import DatabaseOps, _safe_database_error_message
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
+from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
-from elspeth.core.landscape.model_loaders import RunLoader
+from elspeth.core.landscape.execution.operations import OperationRepository
+from elspeth.core.landscape.model_loaders import OperationLoader, RunLoader, TokenOutcomeLoader
 from elspeth.core.landscape.reproducibility import compute_grade
 from elspeth.core.landscape.run_coordination_repository import (
+    CoordinationEventRow,
     RunCoordinationRepository,
     fenced_leader_transaction,
-    record_coordination_event,
+    record_coordination_events,
 )
 from elspeth.core.landscape.schema import (
+    SOURCE_COMPLETE_LIFECYCLE_STATES,
     RunSourceLifecycleState,
+    checkpoints_table,
     nodes_table,
     preflight_results_table,
     run_attributions_table,
-    run_coordination_table,
     run_sources_table,
     run_web_plugin_policy_table,
     run_workers_table,
     runs_table,
     secret_resolutions_table,
+    token_outcomes_table,
     token_work_items_table,
+    tokens_table,
 )
 
 if TYPE_CHECKING:
@@ -132,8 +146,13 @@ _IMMUTABLE_SUCCESS_RUN_STATUSES = frozenset(
 )
 _IMMUTABLE_SUCCESS_RUN_STATUS_VALUES = tuple(status.value for status in _IMMUTABLE_SUCCESS_RUN_STATUSES)
 
-_AUTH_PROVIDER_TYPES = frozenset({"local", "oidc", "entra"})
+# Derived from the L0 contract rather than restated: this is a write-side
+# guard, and a guard that restates its authority drifts from it silently.
+# The schema CHECK stays hand-written on purpose -- changing what the
+# database admits must cost an epoch bump, not follow a Literal edit.
+_AUTH_PROVIDER_TYPES: Final[frozenset[str]] = frozenset(get_args(AuthProviderType))
 _OPENROUTER_CATALOG_SOURCES = frozenset({"live", "bundled"})
+_NON_RESUMABLE_EFFECT_OPERATION_ERROR: Final[str] = "run finalized as non-resumable before sink effect completed"
 
 # 64 lowercase hex chars — matches the canonical sha256 hex digest format
 # produced by ``hashlib.sha256(...).hexdigest()``. Used by the Tier-1
@@ -178,22 +197,36 @@ def _validate_openrouter_catalog_snapshot(*, sha256: str, source: str) -> None:
         raise AuditIntegrityError(f"openrouter_catalog_source must be one of {sorted(_OPENROUTER_CATALOG_SOURCES)!r}, got {source!r}")
 
 
-@cache
-def _cached_frozen_runtime_val_manifest_json() -> str:
-    """Serialize the process's frozen runtime-VAL registries once.
+@lru_cache(maxsize=4)
+def _cached_frozen_runtime_val_manifest_json(fingerprint: RuntimeValRegistryFingerprint) -> str:
+    """Serialize the frozen runtime-VAL registries once per registry state.
 
     Building the manifest hashes source, bytecode, and transitive helper
-    dependencies. Those inputs cannot change after the registries are frozen
-    in a production worker, so recomputing them for every run adds latency
-    without adding evidence. The uncached builder remains authoritative for
-    direct drift probes that deliberately mutate code objects.
+    dependencies (seconds of work), so ``begin_run()`` must not pay it per
+    run. The cache is keyed on ``runtime_val_registry_fingerprint()``
+    rather than being process-wide: a process whose registries change
+    between runs must never write an earlier registry's manifest into a
+    later run header (elspeth-68bc1e3d3a). The uncached builder remains
+    authoritative for direct drift probes that deliberately mutate code
+    objects.
     """
+    del fingerprint  # cache key only; the builder reads the live registries
     return canonical_json(build_runtime_val_manifest())
 
 
 def _frozen_runtime_val_manifest_json() -> str:
     _assert_runtime_val_registries_frozen()
-    return _cached_frozen_runtime_val_manifest_json()
+    return _cached_frozen_runtime_val_manifest_json(runtime_val_registry_fingerprint())
+
+
+def _already_terminal_error(run_id: str, existing_status: str) -> AuditIntegrityError:
+    return AuditIntegrityError(
+        f"Cannot complete run {run_id}: already terminal "
+        f"(status={existing_status!r}). Terminal runs are immutable — "
+        f"the audit record's status and completed_at timestamp cannot "
+        f"be overwritten. Resume path must transition to RUNNING via "
+        f"update_run_status() before re-completing."
+    )
 
 
 class RunLifecycleRepository:
@@ -212,12 +245,41 @@ class RunLifecycleRepository:
         # read-only LandscapeDB handle (which never calls begin_run) does not
         # pay — or fail — the coordination repository's Tier-1 PRAGMA probe.
         self._run_coordination: RunCoordinationRepository | None = None
+        # Lazy (ADR-038): complete_run's abandonment sweep records
+        # (NULL, ABANDONED) token outcomes through the real outcomes recorder
+        # so its Tier-1 pair validation applies identically; constructed on
+        # first FAILED/INTERRUPTED finalize.
+        self._token_outcomes: TokenOutcomeRepository | None = None
+        # Lazy (TS19/F14): non-resumable finalization closes open durable
+        # sink-effect operations through a caller-owned transaction primitive.
+        self._operation_repository: OperationRepository | None = None
 
     @property
     def _coordination_repo(self) -> RunCoordinationRepository:
         if self._run_coordination is None:
             self._run_coordination = RunCoordinationRepository(self._db.engine)
         return self._run_coordination
+
+    @property
+    def _outcomes_repo(self) -> TokenOutcomeRepository:
+        if self._token_outcomes is None:
+            self._token_outcomes = TokenOutcomeRepository(
+                self._db,
+                self._ops,
+                token_outcome_loader=TokenOutcomeLoader(),
+                ownership=RowTokenOwnership(self._ops),
+            )
+        return self._token_outcomes
+
+    @property
+    def _operations_repo(self) -> OperationRepository:
+        if self._operation_repository is None:
+            self._operation_repository = OperationRepository(
+                self._db,
+                self._ops,
+                operation_loader=OperationLoader(),
+            )
+        return self._operation_repository
 
     def begin_run(
         self,
@@ -365,12 +427,13 @@ class RunLifecycleRepository:
                         evidence=web_plugin_policy_evidence,
                     )
                 # Composes into THIS transaction (connection-accepting form):
-                # the runs row above satisfies the run_coordination FK.
+                # the runs row above satisfies the run_coordination FK. The
+                # seat's deadline is Landscape database time (ADR-047); the
+                # forensic ``timestamp`` above never reaches it.
                 coordination.register_run_leader_on(
                     conn,
                     run_id=run.run_id,
                     worker_id=worker_id,
-                    now=timestamp,
                     window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                     entry_point="run",
                 )
@@ -432,28 +495,32 @@ class RunLifecycleRepository:
 
     def complete_run(
         self,
-        run_id: str,
         status: RunStatus,
         *,
         reproducibility_grade: ReproducibilityGrade | None = None,
-        token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
     ) -> Run:
-        """Complete a pipeline run (§D run finalization, ADR-030).
+        """Complete the run the token leads (§D run finalization, ADR-030 / ADR-048).
 
-        One write transaction carries, in order:
+        One leader-fenced write transaction carries, in order:
 
-        1. the verify-and-extend leader epoch fence (FIRST statement, when
-           ``token`` is supplied) — a deposed leader's finalize is refused
-           with ``RunLeadershipLostError`` and a ``fence_refusal`` event;
+        1. the verify-and-extend leader epoch fence (FIRST statement) — a
+           deposed leader's finalize is refused with
+           ``RunLeadershipLostError`` and a ``fence_refusal`` event;
         2. the terminal conditional UPDATE — for SUCCESS statuses
            (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY) it carries the
            in-statement quiescence arm ``NOT EXISTS (READY/LEASED/BLOCKED/
            PENDING_SINK token_work_items)`` so a run can never be stamped
            successful over residual scheduler work; FAILED/INTERRUPTED check
            only fence + immutability (the journal is left intact for resume);
-        3. follower departure hygiene (no-op at N=1) + ``worker_depart``
+        3. ADR-038 abandonment of undecided tokens when the run is
+           non-resumable, plus fail-open of effect-linked operations;
+        4. follower departure hygiene (no-op at N=1) + ``worker_depart``
            events;
-        4. the ``finalize`` run_coordination event.
+        5. the ``finalize`` run_coordination event.
+
+        The run is ``coordination_token.run_id``: there is no second run id
+        to disagree with the authority (ADR-048 §2).
 
         rowcount-0 diagnosis order (§D): **already-terminal ⇒
         AuditIntegrityError** (the durable immutability backstop — this
@@ -464,24 +531,12 @@ class RunLifecycleRepository:
         non-terminal run ⇒ RunLeadershipLostError**; **residual work ⇒
         OrchestrationInvariantError**; run-not-found ⇒ AuditIntegrityError.
 
-        Args:
-            run_id: Run to complete
-            status: Final RunStatus (COMPLETED, FAILED, or INTERRUPTED)
-            reproducibility_grade: Optional final grade. When None, preserves
-                any grade already stored on the run (e.g., from begin_run).
-            token: Leader fencing token (ADR-030). ``None`` preserves the
-                unfenced legacy arm for direct repository-level callers; the
-                engine always threads the token minted at run/resume start.
-
-        Returns:
-            Updated Run model
-
         Raises:
             AuditIntegrityError: If status is not a terminal run status
-            AuditIntegrityError: If run_id not found or already terminal
+            AuditIntegrityError: If the run is not found or already terminal
             OrchestrationInvariantError: If a SUCCESS finalize found residual
                 scheduler work (quiescence violation)
-            RunLeadershipLostError: If ``token`` is stale (epoch fence)
+            RunLeadershipLostError: If ``coordination_token`` is stale
         """
         if status not in _TERMINAL_RUN_STATUSES:
             raise AuditIntegrityError(
@@ -505,7 +560,7 @@ class RunLifecycleRepository:
         is_success_status = status in _IMMUTABLE_SUCCESS_RUN_STATUSES
         residual_work_exists = (
             select(token_work_items_table.c.work_item_id)
-            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.run_id == coordination_token.run_id)
             .where(
                 token_work_items_table.c.status.in_(
                     (
@@ -518,49 +573,26 @@ class RunLifecycleRepository:
             )
             .exists()
         )
+        terminal_values = [s.value for s in _TERMINAL_RUN_STATUSES]
 
-        # Atomic conditional UPDATE: only succeeds when current status is NOT
-        # already terminal.  Once a run reaches COMPLETED/FAILED/INTERRUPTED,
-        # its terminal status and completed_at are the legal record and must
-        # not be overwritten (Bug 3c77199a70).  The resume path transitions
-        # FAILED/INTERRUPTED → RUNNING inside the acquire_run_leadership
-        # takeover CAS (epoch 21, ADR-030 §B.4), so by the time
-        # complete_run() is called the status is RUNNING.
-        _terminal_values = [s.value for s in _TERMINAL_RUN_STATUSES]
-
-        def _already_terminal_error(existing_status: str) -> AuditIntegrityError:
-            return AuditIntegrityError(
-                f"Cannot complete run {run_id}: already terminal "
-                f"(status={existing_status!r}). Terminal runs are immutable — "
-                f"the audit record's status and completed_at timestamp cannot "
-                f"be overwritten. Resume path must transition to RUNNING via "
-                f"update_run_status() before re-completing."
-            )
-
-        write_ctx = (
-            self._db.write_connection()
-            if token is None
-            else fenced_leader_transaction(
+        try:
+            with fenced_leader_transaction(
                 self._db.engine,
-                token=token,
-                now=timestamp,
+                token=coordination_token,
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="complete_run",
-            )
-        )
-        try:
-            self._complete_run_in(
-                write_ctx,
-                run_id=run_id,
-                status=status,
-                values=values,
-                is_success_status=is_success_status,
-                residual_work_exists=residual_work_exists,
-                terminal_values=_terminal_values,
-                timestamp=timestamp,
-                token=token,
-                already_terminal_error=_already_terminal_error,
-            )
+            ) as conn:
+                self._complete_run_in(
+                    conn,
+                    run_id=coordination_token.run_id,
+                    status=status,
+                    values=values,
+                    is_success_status=is_success_status,
+                    residual_work_exists=residual_work_exists,
+                    terminal_values=terminal_values,
+                    timestamp=timestamp,
+                    coordination_token=coordination_token,
+                )
         except RunLeadershipLostError:
             # §D rowcount-0 diagnosis ORDER: already-terminal wins over fence.
             # The fence is structurally the FIRST statement of the fenced
@@ -571,20 +603,29 @@ class RunLifecycleRepository:
             # connection (the refused transaction has rolled back; the
             # fence_refusal event stands as honest forensics that a fence
             # WAS refused).
-            with self._db.engine.connect() as read_conn:
-                existing = read_conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
-            if existing is not None and existing.status in _terminal_values:
-                raise _already_terminal_error(str(existing.status)) from None
+            existing_status = self._terminal_status_after_refusal(coordination_token.run_id, terminal_values=terminal_values)
+            if existing_status is not None:
+                raise _already_terminal_error(coordination_token.run_id, existing_status) from None
             raise
 
-        run = self.get_run(run_id)
+        run = self.get_run(coordination_token.run_id)
         if run is None:
-            raise AuditIntegrityError(f"Run {run_id} not found after UPDATE - database corruption or transaction failure")
+            raise AuditIntegrityError(
+                f"Run {coordination_token.run_id} not found after UPDATE - database corruption or transaction failure"
+            )
         return run
+
+    def _terminal_status_after_refusal(self, run_id: str, *, terminal_values: list[str]) -> str | None:
+        """The run's status when it is already terminal, read after a refused fence; else None."""
+        with self._db.engine.connect() as read_conn:
+            existing = read_conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+        if existing is not None and existing.status in terminal_values:
+            return str(existing.status)
+        return None
 
     def _complete_run_in(
         self,
-        write_ctx: AbstractContextManager[Connection],
+        conn: Connection,
         *,
         run_id: str,
         status: RunStatus,
@@ -593,85 +634,215 @@ class RunLifecycleRepository:
         residual_work_exists: Any,
         terminal_values: list[str],
         timestamp: datetime,
-        token: CoordinationToken | None,
-        already_terminal_error: Callable[[str], AuditIntegrityError],
+        coordination_token: CoordinationToken,
     ) -> None:
-        """The fenced/plain transaction body of :meth:`complete_run`."""
-        _terminal_values = terminal_values
-        with write_ctx as conn:
-            terminal_update = runs_table.update().where(runs_table.c.run_id == run_id).where(runs_table.c.status.notin_(_terminal_values))
-            if is_success_status:
-                terminal_update = terminal_update.where(~residual_work_exists)
-            result = conn.execute(terminal_update.values(**values))
-            if result.rowcount == 0:
-                existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
-                if existing is not None and existing.status in _terminal_values:
-                    raise already_terminal_error(str(existing.status))
-                if existing is None:
-                    raise AuditIntegrityError(f"Cannot complete run {run_id}: run not found")
-                # Run exists, not terminal ⇒ the quiescence arm refused
-                # (only reachable for SUCCESS statuses).
-                raise OrchestrationInvariantError(
-                    f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
-                    "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
-                    "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+        """The fenced transaction body of :meth:`complete_run`, on the caller's fenced connection."""
+        # The SUCCESS quiescence arm rides in the SAME statement as the stamp;
+        # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
+        quiescence_clauses = [~residual_work_exists] if is_success_status else []
+        result = conn.execute(
+            runs_table.update()
+            .where(runs_table.c.run_id == run_id)
+            .where(runs_table.c.status.notin_(terminal_values))
+            .where(*quiescence_clauses)
+            .values(**values)
+        )
+        if result.rowcount == 0:
+            existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+            if existing is not None and existing.status in terminal_values:
+                raise _already_terminal_error(run_id, str(existing.status))
+            if existing is None:
+                raise AuditIntegrityError(f"Cannot complete run {run_id}: run not found")
+            # Run exists, not terminal ⇒ the quiescence arm refused
+            # (only reachable for SUCCESS statuses).
+            raise OrchestrationInvariantError(
+                f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
+                "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
+                "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+            )
+
+        # ADR-038 fate decision: the terminal stamp above succeeded, so the
+        # run is now immutably dead and its resumability facts are frozen.
+        # If no resume can ever decide the run's undecided tokens, record
+        # that — inside this same fenced transaction, so a deposed leader's
+        # refused stamp never leaves false abandonment records behind.
+        if status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
+            non_resumable_arms, incomplete_sources = self._non_resumability_in(conn, run_id=run_id)
+            if non_resumable_arms:
+                self._abandon_undecided_tokens_in(
+                    conn,
+                    run_id=run_id,
+                    status=status,
+                    non_resumable_arms=non_resumable_arms,
+                    incomplete_sources=incomplete_sources,
+                )
+                self._operations_repo.fail_open_effect_operations_for_run(
+                    run_id,
+                    completed_at=timestamp,
+                    error_message=_NON_RESUMABLE_EFFECT_OPERATION_ERROR,
+                    conn=conn,
                 )
 
-            # §D follower-departure hygiene (no-op at N=1, evented).
-            follower_ids = (
-                conn.execute(
-                    select(run_workers_table.c.worker_id)
-                    .where(run_workers_table.c.run_id == run_id)
-                    .where(run_workers_table.c.status == "active")
-                    .where(run_workers_table.c.role == "follower")
-                    .order_by(run_workers_table.c.registered_at)
-                )
-                .scalars()
-                .all()
+        # §D follower-departure hygiene (no-op at N=1, evented).
+        follower_ids = (
+            conn.execute(
+                select(run_workers_table.c.worker_id)
+                .where(run_workers_table.c.run_id == run_id)
+                .where(run_workers_table.c.status == "active")
+                .where(run_workers_table.c.role == "follower")
+                .order_by(run_workers_table.c.registered_at)
             )
-            if follower_ids:
-                conn.execute(
-                    run_workers_table.update()
-                    .where(run_workers_table.c.worker_id.in_(follower_ids))
-                    .where(run_workers_table.c.status == "active")
-                    .values(status="departed", departed_at=timestamp)
-                )
-                for follower_id in follower_ids:
-                    record_coordination_event(
-                        conn,
-                        run_id=run_id,
+            .scalars()
+            .all()
+        )
+        if follower_ids:
+            conn.execute(
+                run_workers_table.update()
+                .where(run_workers_table.c.worker_id.in_(follower_ids))
+                .where(run_workers_table.c.status == "active")
+                .values(status="departed", departed_at=timestamp)
+            )
+
+        # §D ledger rows for this finalize — one ``worker_depart`` per departed
+        # follower and the ``finalize`` event attributed to the fencing token —
+        # in ONE statement (ADR-048: a helper's DML executes once per fence,
+        # never per iteration).
+        record_coordination_events(
+            conn,
+            run_id=run_id,
+            events=(
+                *(
+                    CoordinationEventRow(
                         event_type="worker_depart",
                         worker_id=follower_id,
                         leader_epoch=None,
                         recorded_at=timestamp,
                         context={"reason": "run_finalized"},
                     )
-
-            # §D finalize event. Attribution: the fencing token when present,
-            # else the seat row (token-less legacy/repository callers); a run
-            # without a seat row (raw-SQL fixtures) records no finalize event.
-            if token is not None:
-                finalize_worker: str | None = token.worker_id
-                finalize_epoch: int | None = token.leader_epoch
-            else:
-                seat = conn.execute(
-                    select(
-                        run_coordination_table.c.leader_worker_id,
-                        run_coordination_table.c.leader_epoch,
-                    ).where(run_coordination_table.c.run_id == run_id)
-                ).one_or_none()
-                finalize_worker = None if seat is None else seat.leader_worker_id
-                finalize_epoch = None if seat is None else int(seat.leader_epoch)
-            if finalize_worker is not None:
-                record_coordination_event(
-                    conn,
-                    run_id=run_id,
+                    for follower_id in follower_ids
+                ),
+                CoordinationEventRow(
                     event_type="finalize",
-                    worker_id=finalize_worker,
-                    leader_epoch=finalize_epoch,
+                    worker_id=coordination_token.worker_id,
+                    leader_epoch=coordination_token.leader_epoch,
                     recorded_at=timestamp,
                     context={"status": status.value},
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _non_resumability_in(conn: Connection, *, run_id: str) -> tuple[tuple[str, ...], dict[str, str]]:
+        """Compute the structural resume refusal once for all finalization sweeps."""
+        source_states = conn.execute(
+            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
+        ).fetchall()
+        incomplete_sources = {
+            str(row.source_name): str(row.lifecycle_state)
+            for row in source_states
+            if str(row.lifecycle_state) not in SOURCE_COMPLETE_LIFECYCLE_STATES
+        }
+        checkpoint_exists = bool(
+            conn.execute(select(select(checkpoints_table.c.checkpoint_id).where(checkpoints_table.c.run_id == run_id).exists())).scalar()
+        )
+        non_resumable_arms: list[str] = []
+        if not checkpoint_exists:
+            non_resumable_arms.append("no_checkpoint")
+        if not source_states:
+            non_resumable_arms.append("no_source_records")
+        if incomplete_sources:
+            non_resumable_arms.append("incomplete_sources")
+        return tuple(non_resumable_arms), incomplete_sources
+
+    def _abandon_undecided_tokens_in(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        status: RunStatus,
+        non_resumable_arms: tuple[str, ...],
+        incomplete_sources: Mapping[str, str],
+    ) -> None:
+        """ADR-038: record (NULL, ABANDONED) for tokens nothing will ever decide.
+
+        Runs inside :meth:`_complete_run_in`'s transaction — only on the
+        FENCED arm (the caller gates on ``token is not None``), after the
+        FAILED/INTERRUPTED terminal UPDATE has succeeded. Fires only when the
+        run is non-resumable, tested arm for arm against the structural
+        refusals a future resume would hit (``engine/orchestrator/resume.py``):
+
+        - no checkpoint rows            → no resume point exists;
+        - no ``run_sources`` records    → ``EmptyResumeStateError``;
+        - any source lifecycle outside ``SOURCE_COMPLETE_LIFECYCLE_STATES``
+                                        → ``IncompleteSourceResumeError``.
+
+        When the run IS resumable, undecided tokens keep their BUFFERED
+        acceptances and accounting stays honestly ``closure='open'`` — a
+        resume may yet decide them. The write is idempotent under the
+        documented re-finalize path (terminal → ``update_run_status(RUNNING)``
+        → re-complete): tokens already bearing an ABANDONED row are excluded.
+        On any other path the terminal UPDATE's already-terminal refusal is
+        the single-winner gate, so the sweep cannot run twice.
+        """
+        decided_or_abandoned = (
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+            .where(
+                or_(
+                    token_outcomes_table.c.completed == 1,
+                    token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
                 )
+            )
+            .exists()
+        )
+        # PostgreSQL needs two statements under READ COMMITTED. First lock
+        # every token for the dying run in stable order. A single
+        # ``NOT EXISTS ... FOR UPDATE`` statement is insufficient: when it
+        # waits behind a decided writer, the subquery may retain the
+        # statement's pre-wait snapshot and still classify that token as
+        # undecided. The second statement below begins only after all token
+        # locks are held, so it receives a fresh snapshot containing every
+        # outcome committed by a lock winner. Outcome writers use the same
+        # token-first order and, after acquiring it, refuse a pre-existing
+        # ABANDONED row. Together those two arms forbid either race winner
+        # from producing decided-plus-abandoned history.
+        #
+        # SQLite ignores FOR UPDATE, but its BEGIN IMMEDIATE transaction
+        # already owns the single writer slot for both statements.
+        conn.execute(
+            select(tokens_table.c.token_id)
+            .where(tokens_table.c.run_id == run_id)
+            .order_by(tokens_table.c.token_id)
+            .with_for_update(of=tokens_table)
+        ).fetchall()
+        undecided_token_ids = (
+            conn.execute(
+                select(tokens_table.c.token_id)
+                .where(tokens_table.c.run_id == run_id)
+                .where(~decided_or_abandoned)
+                .order_by(tokens_table.c.token_id)
+            )
+            .scalars()
+            .all()
+        )
+        if not undecided_token_ids:
+            return
+
+        context = {
+            "abandoned_by": "run_finalization",
+            "run_status": status.value,
+            "non_resumable_arms": non_resumable_arms,
+            "incomplete_sources": incomplete_sources,
+        }
+        for token_id in undecided_token_ids:
+            self._outcomes_repo.record_token_outcome(
+                TokenRef(token_id=str(token_id), run_id=run_id),
+                None,
+                TerminalPath.ABANDONED,
+                context=context,
+                conn=conn,
+            )
 
     def get_run(self, run_id: str) -> Run | None:
         """Get a run by ID.
@@ -764,21 +935,22 @@ class RunLifecycleRepository:
 
     def record_source_field_resolution(
         self,
-        run_id: str,
         resolution_mapping: Mapping[str, str],
         normalization_version: str | None,
+        *,
+        coordination_token: CoordinationToken,
     ) -> None:
-        """Record field resolution mapping computed during source.load().
+        """Record the field resolution mapping computed during source.load().
 
         This captures the mapping from original header names (as read from the file)
         to final field names (after normalization and/or field_mapping applied).
         Must be called after source.load() completes but before processing begins.
 
         Args:
-            run_id: Run to update
             resolution_mapping: Dict mapping original header name → final field name
             normalization_version: Algorithm version used for normalization, or None if
                                    no normalization was applied (passthrough or explicit columns)
+            coordination_token: The run's current leader token; the run is its ``run_id``.
 
         Note:
             This is necessary because field resolution depends on actual file headers
@@ -791,16 +963,33 @@ class RunLifecycleRepository:
         }
         resolution_json = canonical_json(resolution_data)
 
-        stmt = runs_table.update().where(runs_table.c.run_id == run_id).values(source_field_resolution_json=resolution_json)
         try:
-            self._ops.execute_update(stmt, context=f"record_source_field_resolution run_id={run_id}")
-        except LandscapeRecordNotFoundError as exc:
-            raise AuditIntegrityError(f"Cannot record source field resolution for run {run_id!r}: run not found") from exc
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_source_field_resolution",
+            ) as conn:
+                result = conn.execute(
+                    runs_table.update()
+                    .where(runs_table.c.run_id == coordination_token.run_id)
+                    .values(source_field_resolution_json=resolution_json)
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(f"Cannot record source field resolution for run {coordination_token.run_id!r}: run not found")
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_source_field_resolution",
+                    action="update",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
 
     def record_run_source(
         self,
         *,
-        run_id: str,
         source_node_id: str,
         source_name: str,
         plugin_name: str,
@@ -810,26 +999,16 @@ class RunLifecycleRepository:
         schema_contract: SchemaContract | None = None,
         field_resolution_mapping: Mapping[str, str] | None = None,
         normalization_version: str | None = None,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Record per-source run metadata keyed by source node.
 
         Multi-source runs cannot honestly store schema, field resolution, or
         lifecycle as run-level singleton columns. This table preserves the
         configuration source name and source node identity for audit queries.
+        The node existence check, the upsert decision and the write share one
+        leader-fenced transaction (ADR-048).
         """
-        source_node = self._ops.execute_fetchone(
-            select(nodes_table.c.node_type).where(nodes_table.c.run_id == run_id).where(nodes_table.c.node_id == source_node_id)
-        )
-        if source_node is None:
-            raise AuditIntegrityError(
-                f"run_sources source_node_id={source_node_id!r} does not exist for run_id={run_id!r}; "
-                "per-source resume metadata must reference a registered graph node."
-            )
-        if source_node.node_type != NodeType.SOURCE.value:
-            raise AuditIntegrityError(
-                f"run_sources source_node_id={source_node_id!r} for run_id={run_id!r} references "
-                f"node_type={source_node.node_type!r}; expected {NodeType.SOURCE.value!r}."
-            )
         try:
             lifecycle = RunSourceLifecycleState(lifecycle_state)
         except ValueError as exc:
@@ -863,36 +1042,68 @@ class RunLifecycleRepository:
             "lifecycle_state": lifecycle.value,
             "recorded_at": now(),
         }
-        existing = self._ops.execute_fetchone(
-            select(run_sources_table.c.source_node_id)
-            .where(run_sources_table.c.run_id == run_id)
-            .where(run_sources_table.c.source_node_id == source_node_id)
-        )
-        if existing is None:
-            self._ops.execute_insert(
-                run_sources_table.insert().values(
-                    run_id=run_id,
-                    source_node_id=source_node_id,
-                    **values,
-                ),
-                context="run_sources",
-            )
-            return
-
-        self._ops.execute_update(
-            run_sources_table.update()
-            .where(run_sources_table.c.run_id == run_id)
-            .where(run_sources_table.c.source_node_id == source_node_id)
-            .values(**values),
-            context="run_sources",
-        )
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_run_source",
+            ) as conn:
+                source_node = conn.execute(
+                    select(nodes_table.c.node_type)
+                    .where(nodes_table.c.run_id == coordination_token.run_id)
+                    .where(nodes_table.c.node_id == source_node_id)
+                ).fetchone()
+                if source_node is None:
+                    raise AuditIntegrityError(
+                        f"run_sources source_node_id={source_node_id!r} does not exist for run_id={coordination_token.run_id!r}; "
+                        "per-source resume metadata must reference a registered graph node."
+                    )
+                if source_node.node_type != NodeType.SOURCE.value:
+                    raise AuditIntegrityError(
+                        f"run_sources source_node_id={source_node_id!r} for run_id={coordination_token.run_id!r} references "
+                        f"node_type={source_node.node_type!r}; expected {NodeType.SOURCE.value!r}."
+                    )
+                existing = conn.execute(
+                    select(run_sources_table.c.source_node_id)
+                    .where(run_sources_table.c.run_id == coordination_token.run_id)
+                    .where(run_sources_table.c.source_node_id == source_node_id)
+                ).fetchone()
+                if existing is None:
+                    inserted = conn.execute(
+                        run_sources_table.insert().values(
+                            run_id=coordination_token.run_id,
+                            source_node_id=source_node_id,
+                            **values,
+                        )
+                    )
+                    if inserted.rowcount == 0:
+                        raise LandscapeRecordError("run_sources — zero rows affected (audit write failure)")
+                    return
+                updated = conn.execute(
+                    run_sources_table.update()
+                    .where(run_sources_table.c.run_id == coordination_token.run_id)
+                    .where(run_sources_table.c.source_node_id == source_node_id)
+                    .values(**values)
+                )
+                if updated.rowcount == 0:
+                    raise LandscapeRecordNotFoundError("run_sources — zero rows affected; target row vanished inside the transaction")
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_run_source",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id} source_node_id={source_node_id}",
+                )
+            ) from exc
 
     def update_run_source_contract(
         self,
         *,
-        run_id: str,
         source_node_id: str,
         schema_contract: SchemaContract,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Persist a first-row-inferred schema contract for one source.
 
@@ -906,11 +1117,17 @@ class RunLifecycleRepository:
         audit_record = ContractAuditRecord.from_contract(schema_contract)
         schema_contract_json = audit_record.to_json()
         schema_contract_hash = schema_contract.version_hash()
+        run_id = coordination_token.run_id
 
-        with self._db.write_connection() as conn:
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="update_run_source_contract",
+        ) as conn:
             result = conn.execute(
                 run_sources_table.update()
-                .where(run_sources_table.c.run_id == run_id)
+                .where(run_sources_table.c.run_id == coordination_token.run_id)
                 .where(run_sources_table.c.source_node_id == source_node_id)
                 .where(run_sources_table.c.schema_contract_json.is_(None))
                 .values(
@@ -927,7 +1144,7 @@ class RunLifecycleRepository:
                     run_sources_table.c.schema_contract_json,
                     run_sources_table.c.schema_contract_hash,
                 )
-                .where(run_sources_table.c.run_id == run_id)
+                .where(run_sources_table.c.run_id == coordination_token.run_id)
                 .where(run_sources_table.c.source_node_id == source_node_id)
             ).fetchone()
             if existing is None:
@@ -1168,32 +1385,37 @@ class RunLifecycleRepository:
                 f"failed to parse stored JSON — database corruption (Tier 1 violation). "
                 f"Parse error: {exc}"
             ) from exc
-        if not isinstance(resolution_data, dict):
-            raise AuditIntegrityError(
-                f"Corrupt field resolution data for run {run_id} in {location}: expected dict, got {type(resolution_data).__name__}"
-            )
-
-        # Tier 1: resolution_mapping MUST exist if JSON is stored
-        # record_source_field_resolution() always stores this key, so missing = corruption
-        if "resolution_mapping" not in resolution_data:
+        # Tier 1 (our data): record_source_field_resolution() always stores
+        # {"resolution_mapping": {str: str}}. Direct access — shape corruption
+        # crashes as AuditIntegrityError derived from the NATURAL failure
+        # (KeyError/TypeError/AttributeError), never from a defensive
+        # isinstance re-check of our own fixed contract (ADR-032).
+        try:
+            resolution_mapping = resolution_data["resolution_mapping"]
+        except KeyError as exc:
             raise AuditIntegrityError(
                 f"Corrupt field resolution data for run {run_id} in {location}: "
                 f"missing required key 'resolution_mapping'. "
                 f"This indicates database corruption — field resolution writers always store this key."
-            )
+            ) from exc
+        except TypeError as exc:
+            raise AuditIntegrityError(
+                f"Corrupt field resolution data for run {run_id} in {location}: expected dict, got {type(resolution_data).__name__}"
+            ) from exc
 
-        resolution_mapping = resolution_data["resolution_mapping"]
-        if not isinstance(resolution_mapping, dict):
+        try:
+            entries = resolution_mapping.items()
+        except AttributeError as exc:
             raise AuditIntegrityError(
                 f"Corrupt resolution_mapping for run {run_id} in {location}: expected dict, got {type(resolution_mapping).__name__}"
-            )
+            ) from exc
 
-        # Verify all keys and values are strings (Tier 1 — crash on corruption)
-        # Key type check is defense-in-depth: JSON keys are always strings after json.loads(),
-        # but guards against hypothetical non-JSON deserialization paths.
         validated_mapping: dict[str, str] = {}
-        for key, value in resolution_mapping.items():
-            if not isinstance(key, str) or not isinstance(value, str):
+        for key, value in entries:
+            # json.loads guarantees str keys; values must be exactly str per
+            # the writer's fixed contract — exact-type check, crash on
+            # corruption (no hypothetical-deserializer key re-check).
+            if type(value) is not str:
                 raise AuditIntegrityError(
                     f"Corrupt resolution_mapping entry for run {run_id} in {location}: "
                     f"expected str->str, got {type(key).__name__}->{type(value).__name__}"
@@ -1202,23 +1424,8 @@ class RunLifecycleRepository:
 
         return validated_mapping
 
-    def _execute_atomic_inserts(self, *, context: str, statements: list[Any]) -> None:
-        """Execute one or more INSERTs in a single transaction with audit error normalization."""
-        if not statements:
-            return
-        try:
-            with self._db.write_connection() as conn:
-                for stmt in statements:
-                    result = conn.execute(stmt)
-                    if result.rowcount == 0:
-                        raise LandscapeRecordError(f"{context} — zero rows affected (audit write failure)")
-        except LandscapeRecordError:
-            raise
-        except SQLAlchemyError as exc:
-            raise LandscapeRecordError(f"{context} — database rejected audit write: {type(exc).__name__}: {exc}") from exc
-
-    def update_run_status(self, run_id: str, status: RunStatus, *, token: CoordinationToken | None = None) -> None:
-        """Update run status without setting completed_at.
+    def update_run_status(self, status: RunStatus, *, coordination_token: CoordinationToken) -> None:
+        """Update the led run's status without setting completed_at.
 
         Used for intermediate status changes. For final completion, use
         complete_run() instead. (Epoch 21: the resume path's FAILED/
@@ -1227,21 +1434,17 @@ class RunLifecycleRepository:
         §B.4.)
 
         Args:
-            run_id: Run to update
             status: New RunStatus
-            token: Leader fencing token (ADR-030 §C.4 row 4). When supplied,
-                the verify-and-extend epoch fence is the FIRST statement of
-                this verb's transaction; the immutability predicates stay
-                beneath as the durable backstop. ``None`` preserves the
-                unfenced legacy arm for direct repository-level callers.
+            coordination_token: Leader fencing token (ADR-030 §C.4 row 4,
+                ADR-048). The verify-and-extend epoch fence is the FIRST
+                statement of this verb's transaction; the immutability
+                predicates stay beneath as the durable backstop.
 
         Raises:
-            AuditIntegrityError: If run_id not found or current status is COMPLETED (immutable)
+            AuditIntegrityError: If the run is not found or its status is COMPLETED (immutable)
+            RunLeadershipLostError: If ``coordination_token`` is stale
 
         Note:
-            This encapsulates run status updates for Orchestrator recovery.
-            Only updates status field — does not set completed_at or reproducibility_grade.
-
             COMPLETED runs are immutable — a completed run succeeded and its audit
             record is final. FAILED and INTERRUPTED runs CAN be transitioned back
             to RUNNING during resume (orchestrator recovery path).
@@ -1251,19 +1454,14 @@ class RunLifecycleRepository:
                 f"update_run_status() cannot set status to {status.value!r}. "
                 "Use complete_run() so completed_at is recorded in the audit trail."
             )
+        run_id = coordination_token.run_id
 
-        write_ctx = (
-            self._db.write_connection()
-            if token is None
-            else fenced_leader_transaction(
-                self._db.engine,
-                token=token,
-                now=now(),
-                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-                verb="update_run_status",
-            )
-        )
-        with write_ctx as conn:
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="update_run_status",
+        ) as conn:
             # When resuming to RUNNING, clear completed_at atomically.
             # A run cannot be simultaneously RUNNING and completed — that's
             # an impossible state that confuses operational tooling and auditors.
@@ -1272,12 +1470,12 @@ class RunLifecycleRepository:
                 values["completed_at"] = None
             result = conn.execute(
                 runs_table.update()
-                .where(runs_table.c.run_id == run_id)
+                .where(runs_table.c.run_id == coordination_token.run_id)
                 .where(runs_table.c.status.notin_(_IMMUTABLE_SUCCESS_RUN_STATUS_VALUES))
                 .values(**values)
             )
             if result.rowcount == 0:
-                existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+                existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == coordination_token.run_id)).fetchone()
                 if existing is not None and existing.status in _IMMUTABLE_SUCCESS_RUN_STATUS_VALUES:
                     existing_status = RunStatus(existing.status)
                     raise AuditIntegrityError(
@@ -1289,41 +1487,55 @@ class RunLifecycleRepository:
 
     def record_secret_resolutions(
         self,
-        run_id: str,
         resolutions: list[SecretResolutionInput],
+        *,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Record secret resolution events from deferred records.
 
         Called by orchestrator after run is created. The resolution records
         were captured during load_secrets_from_config() before the run existed.
 
-        All inserts are batched in a single transaction for atomicity —
-        either all resolutions are recorded or none are.
+        All rows go in ONE leader-fenced INSERT — either all resolutions are
+        recorded or none are.
 
         Args:
-            run_id: The run ID to associate resolutions with
             resolutions: Typed resolution records from load_secrets_from_config().
+            coordination_token: The run's current leader token; the run is its ``run_id``.
         """
         if not resolutions:
             return
-        statements = [
-            secret_resolutions_table.insert().values(
-                resolution_id=generate_id(),
-                run_id=run_id,
-                timestamp=rec.timestamp,
-                env_var_name=rec.env_var_name,
-                source=rec.source,
-                vault_url=rec.vault_url,
-                secret_name=rec.secret_name,
-                fingerprint=rec.fingerprint,
-                resolution_latency_ms=rec.resolution_latency_ms,
-            )
+        rows = [
+            {
+                "resolution_id": generate_id(),
+                "run_id": coordination_token.run_id,
+                "timestamp": rec.timestamp,
+                "env_var_name": rec.env_var_name,
+                "source": rec.source,
+                "vault_url": rec.vault_url,
+                "secret_name": rec.secret_name,
+                "fingerprint": rec.fingerprint,
+                "resolution_latency_ms": rec.resolution_latency_ms,
+            }
             for rec in resolutions
         ]
-        self._execute_atomic_inserts(
-            context=f"record_secret_resolutions run_id={run_id}",
-            statements=statements,
-        )
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_secret_resolutions",
+            ) as conn:
+                conn.execute(secret_resolutions_table.insert(), rows)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_secret_resolutions",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
 
     def get_secret_resolutions_for_run(self, run_id: str) -> list[SecretResolution]:
         """Get all secret resolution records for a run.
@@ -1360,19 +1572,20 @@ class RunLifecycleRepository:
 
     def record_preflight_results(
         self,
-        run_id: str,
         preflight: PreflightResult,
+        *,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Record pre-flight dependency and gate results in the audit trail.
 
         Called by orchestrator after run is created. Pre-flight results were
         captured during bootstrap_and_run() before the run existed.
 
-        All inserts are batched in one explicit write transaction.
+        All rows go in ONE leader-fenced INSERT.
 
         Args:
-            run_id: The run ID to associate results with
             preflight: Combined pre-flight results (dependencies + gates)
+            coordination_token: The run's current leader token; the run is its ``run_id``.
         """
         rows_to_insert = []
 
@@ -1380,7 +1593,7 @@ class RunLifecycleRepository:
             rows_to_insert.append(
                 {
                     "result_id": generate_id(),
-                    "run_id": run_id,
+                    "run_id": coordination_token.run_id,
                     "result_type": "dependency_run",
                     "name": dep.name,
                     "result_json": canonical_json(
@@ -1399,7 +1612,7 @@ class RunLifecycleRepository:
             rows_to_insert.append(
                 {
                     "result_id": generate_id(),
-                    "run_id": run_id,
+                    "run_id": coordination_token.run_id,
                     "result_type": "commencement_gate",
                     "name": gate.name,
                     "result_json": canonical_json(
@@ -1416,30 +1629,44 @@ class RunLifecycleRepository:
         if not rows_to_insert:
             return
 
-        self._execute_atomic_inserts(
-            context=f"record_preflight_results run_id={run_id}",
-            statements=[preflight_results_table.insert().values(**row_data) for row_data in rows_to_insert],
-        )
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_preflight_results",
+            ) as conn:
+                conn.execute(preflight_results_table.insert(), rows_to_insert)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_preflight_results",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
 
     def record_readiness_check(
         self,
-        run_id: str,
         *,
         name: str,
         collection: str,
         reachable: bool,
         count: int | None,
         message: str,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Record a readiness check result in the audit trail.
 
         Called by transforms during on_start() after a provider readiness
         check passes. Records the collection state at startup time so
         auditors can answer "what was the collection state when this ran?"
+        The token reaches here by value through ``PluginContext`` (ADR-048 §3).
         """
         row_data = {
             "result_id": generate_id(),
-            "run_id": run_id,
+            "run_id": coordination_token.run_id,
             "result_type": "readiness_check",
             "name": name,
             "result_json": canonical_json(
@@ -1453,10 +1680,23 @@ class RunLifecycleRepository:
             "created_at": now(),
         }
 
-        self._execute_atomic_inserts(
-            context=f"record_readiness_check run_id={run_id}",
-            statements=[preflight_results_table.insert().values(**row_data)],
-        )
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_readiness_check",
+            ) as conn:
+                conn.execute(preflight_results_table.insert().values(**row_data))
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="record_readiness_check",
+                    action="write",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id}",
+                )
+            ) from exc
 
     def list_runs(self, *, status: RunStatus | None = None) -> list[Run]:
         """List all runs in the database.
@@ -1477,24 +1717,24 @@ class RunLifecycleRepository:
 
     def set_export_status(
         self,
-        run_id: str,
         status: ExportStatus,
         *,
         error: str | None = None,
         export_format: str | None = None,
         export_sink: str | None = None,
+        coordination_token: CoordinationToken,
     ) -> None:
-        """Set export status for a run.
+        """Set export status for the led run.
 
         This is separate from run status so export failures don't mask
         successful pipeline completion.
 
         Args:
-            run_id: Run to update
             status: ExportStatus (PENDING, COMPLETED, or FAILED)
             error: Error message if status is FAILED
             export_format: Format used (csv, json)
             export_sink: Sink name used for export
+            coordination_token: The run's current leader token; the run is its ``run_id``.
         """
         # Validate error/status consistency — error is only meaningful with FAILED
         if error is not None and status != ExportStatus.FAILED:
@@ -1524,28 +1764,136 @@ class RunLifecycleRepository:
         if export_sink is not None:
             updates["export_sink"] = export_sink
 
-        stmt = runs_table.update().where(runs_table.c.run_id == run_id).values(**updates)
         try:
-            self._ops.execute_update(stmt, context=f"set_export_status run_id={run_id} status={status.value}")
-        except LandscapeRecordNotFoundError as exc:
-            raise AuditIntegrityError(f"Cannot set export status to {status.value!r}: run {run_id} not found") from exc
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="set_export_status",
+            ) as conn:
+                result = conn.execute(runs_table.update().where(runs_table.c.run_id == coordination_token.run_id).values(**updates))
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(f"Cannot set export status to {status.value!r}: run {coordination_token.run_id} not found")
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(
+                    operation="set_export_status",
+                    action="update",
+                    exc=exc,
+                    context=f"run_id={coordination_token.run_id} status={status.value}",
+                )
+            ) from exc
 
-    def finalize_run(self, run_id: str, status: RunStatus, *, token: CoordinationToken | None = None) -> Run:
-        """Finalize a run by computing grade and completing it.
+    def set_export_failed_unless_completed(self, *, error: str, coordination_token: CoordinationToken) -> bool:
+        """Record FAILED unless a concurrent exporter already completed.
+
+        Returns ``True`` when FAILED was recorded and ``False`` when an
+        existing COMPLETED status won the race. The compare-and-set and the
+        winner read share one leader-fenced write transaction, so a timeout
+        path cannot regress durable completion evidence.
+        """
+        if type(error) is not str:
+            raise TypeError("error must be an exact string")
+        run_id = coordination_token.run_id
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="set_export_failed_unless_completed",
+        ) as conn:
+            updated = conn.execute(
+                runs_table.update()
+                .where(
+                    runs_table.c.run_id == coordination_token.run_id,
+                    or_(
+                        runs_table.c.export_status.is_(None),
+                        runs_table.c.export_status != ExportStatus.COMPLETED.value,
+                    ),
+                )
+                .values(
+                    export_status=ExportStatus.FAILED.value,
+                    exported_at=None,
+                    export_error=error,
+                )
+            )
+            if updated.rowcount == 1:
+                return True
+            current_status = conn.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == coordination_token.run_id))
+            if current_status is None:
+                raise AuditIntegrityError(f"Cannot set export status to 'failed': run {run_id} not found")
+            if current_status != ExportStatus.COMPLETED.value:
+                raise AuditIntegrityError(
+                    f"Cannot set export status to 'failed': run {run_id} changed to unsupported status {current_status!r}"
+                )
+            return False
+
+    def set_export_pending_unless_completed(
+        self,
+        *,
+        export_format: str | None = None,
+        export_sink: str | None = None,
+        coordination_token: CoordinationToken,
+    ) -> bool:
+        """Record PENDING unless a concurrent exporter already completed.
+
+        Returns ``True`` when PENDING was recorded and ``False`` when durable
+        COMPLETED status won the race. This is the resume admission CAS: a
+        delayed recovery worker cannot regress peer completion after its
+        earlier eligibility read.
+        """
+        updates: dict[str, Any] = {
+            "export_status": ExportStatus.PENDING.value,
+            "exported_at": None,
+            "export_error": None,
+        }
+        if export_format is not None:
+            updates["export_format"] = export_format
+        if export_sink is not None:
+            updates["export_sink"] = export_sink
+        run_id = coordination_token.run_id
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="set_export_pending_unless_completed",
+        ) as conn:
+            updated = conn.execute(
+                runs_table.update()
+                .where(
+                    runs_table.c.run_id == coordination_token.run_id,
+                    or_(
+                        runs_table.c.export_status.is_(None),
+                        runs_table.c.export_status != ExportStatus.COMPLETED.value,
+                    ),
+                )
+                .values(**updates)
+            )
+            if updated.rowcount == 1:
+                return True
+            current_status = conn.scalar(select(runs_table.c.export_status).where(runs_table.c.run_id == coordination_token.run_id))
+            if current_status is None:
+                raise AuditIntegrityError(f"Cannot set export status to 'pending': run {run_id} not found")
+            if current_status != ExportStatus.COMPLETED.value:
+                raise AuditIntegrityError(
+                    f"Cannot set export status to 'pending': run {run_id} changed to unsupported status {current_status!r}"
+                )
+            return False
+
+    def finalize_run(self, status: RunStatus, *, coordination_token: CoordinationToken) -> Run:
+        """Finalize the led run by computing its grade and completing it.
 
         Convenience method that:
         1. Computes the reproducibility grade based on node determinism
         2. Completes the run with the specified status and computed grade
 
         Args:
-            run_id: Run to finalize
             status: Final RunStatus (COMPLETED, FAILED, or INTERRUPTED)
-            token: Leader fencing token (ADR-030), threaded through to
-                ``complete_run`` where the verify-and-extend epoch fence is
-                the first statement of the terminal transaction. A deposed
-                leader's finalize (incl. the FAILED/INTERRUPTED ceremonies)
-                is refused with ``RunLeadershipLostError`` — "the run is no
-                longer its to fail" (§C.4 row 4).
+            coordination_token: Leader fencing token (ADR-030), threaded
+                through to ``complete_run`` where the verify-and-extend epoch
+                fence is the first statement of the terminal transaction. A
+                deposed leader's finalize (incl. the FAILED/INTERRUPTED
+                ceremonies) is refused with ``RunLeadershipLostError`` — "the
+                run is no longer its to fail" (§C.4 row 4).
 
         Returns:
             Updated Run model
@@ -1554,11 +1902,9 @@ class RunLifecycleRepository:
             Grade computation and run completion execute in separate transactions.
             This is an accepted limitation — the invariant that all nodes are registered
             before finalize_run is called ensures the grade is stable between reads.
-            A single-transaction approach would require refactoring compute_grade's
-            database access (tracked for future consideration).
         """
-        grade = self.compute_reproducibility_grade(run_id)
-        return self.complete_run(run_id, status, reproducibility_grade=grade, token=token)
+        grade = self.compute_reproducibility_grade(coordination_token.run_id)
+        return self.complete_run(status, reproducibility_grade=grade, coordination_token=coordination_token)
 
     def compute_reproducibility_grade(self, run_id: str) -> ReproducibilityGrade:
         """Compute reproducibility grade for a run based on node determinism.

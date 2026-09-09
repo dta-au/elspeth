@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import errno
+import os
+import threading
+import traceback
 import uuid
 from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import insert, select
+from sqlalchemy import event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -18,10 +26,14 @@ from elspeth.web.execution.schemas import (
     RunAccountingTokens,
     RunStatusResponse,
 )
+from elspeth.web.sessions.archive_quarantine import archive_quarantine_paths, list_archive_quarantine_manifests
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
+    chat_messages_table,
     composer_completion_events_table,
     composition_states_table,
+    guided_operation_events_table,
     run_events_table,
     runs_table,
     sessions_table,
@@ -33,13 +45,19 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     CompositionStateData,
     CompositionStateRecord,
+    GuidedOperationClaimed,
     RunAlreadyActiveError,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditDraft,
+    RunDiagnosticsAuthorityLostError,
     RunRecord,
     SessionRecord,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import QuarantineCleanupError, SessionServiceImpl
+from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import seed_session_operation_fence
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -61,7 +79,7 @@ def engine():
 @pytest.fixture
 def service(engine):
     """Create a SessionServiceImpl backed by the in-memory engine."""
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -184,7 +202,7 @@ class TestSessionCRUD:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = SessionServiceImpl(
+        service_with_dir = DualFencedSessionServiceHarness(
             engine,
             data_dir=data_dir,
             telemetry=build_sessions_telemetry(),
@@ -226,7 +244,7 @@ class TestSessionCRUD:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        service_with_dir = SessionServiceImpl(
+        service_with_dir = DualFencedSessionServiceHarness(
             engine,
             data_dir=data_dir,
             telemetry=build_sessions_telemetry(),
@@ -240,24 +258,91 @@ class TestSessionCRUD:
         blob_file = blob_dir / "some-blob_data.csv"
         blob_file.write_text("col1\nval1")
 
-        quarantine_dir = data_dir / ".archive_quarantine" / sid
-
         def fail_rmtree(_path: object) -> None:
-            raise OSError("permission denied removing staged blob directory")
+            raise OSError(errno.EACCES, "permission denied removing staged blob directory", str(blob_dir))
 
-        monkeypatch.setattr("elspeth.web.sessions.service.shutil.rmtree", fail_rmtree)
+        class _FailingRmtreeShutil:
+            """Stand-in for the ``shutil`` name as seen from inside
+            ``elspeth.web.sessions.archive_quarantine`` (where the purge now
+            lives), scoped to that module only.
 
-        with pytest.raises(QuarantineCleanupError, match=r"delete committed.*quarantine cleanup failed") as exc_info:
+            ``monkeypatch.setattr("...service.shutil.rmtree", ...)`` would
+            resolve ``...service.shutil`` to the *real* ``shutil`` module
+            (Python modules are process-wide singletons; the service module
+            merely imports the same object everyone else does) and replace
+            ``shutil.rmtree`` for the whole process during the test.
+            Rebinding the ``shutil`` *name inside the service module's own
+            namespace* keeps the failure local to the code path under test;
+            the service path under test only requires ``shutil.rmtree``.
+            """
+
+            rmtree = staticmethod(fail_rmtree)
+
+        monkeypatch.setattr("elspeth.web.sessions.archive_quarantine.shutil", _FailingRmtreeShutil())
+
+        from structlog.testing import capture_logs
+
+        with (
+            capture_logs() as records,
+            pytest.raises(QuarantineCleanupError, match=r"archive committed.*quarantine cleanup remains pending") as exc_info,
+        ):
             await service_with_dir.archive_session(session.id)
-        assert isinstance(exc_info.value.__cause__, OSError)
-        assert "permission denied removing staged blob directory" in str(exc_info.value.__cause__)
+
+        # Ratified redaction contract (platform fec6a4f32; testcontainer twin
+        # test_postgres_postcommit_purge_failure_remains_discoverable): the
+        # exception, however it is rendered — message, notes, the full chained
+        # traceback — never carries the filesystem detail. The 2026-08-31 sweep
+        # (7b402f716) transplanted ``from cleanup_exc`` back over ``from None``
+        # citing a runbook that does not exist in the tree (elspeth-ada35955b6).
+        rendered = "\n".join((str(exc_info.value), "".join(traceback.format_exception(exc_info.value))))
+        assert "permission denied removing staged blob directory" not in rendered
+        assert str(data_dir) not in rendered
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+        # The causal fact is discoverable on the SERVICE LOG, as structured
+        # fields the operator can act on — never the exception's own text and
+        # never a path (the quarantine obligation is located from the identity).
+        cleanup_records = [r for r in records if r["event"] == "session_archive_quarantine_cleanup_failed"]
+        assert len(cleanup_records) == 1
+        (record,) = cleanup_records
+        assert record["log_level"] == "error"
+        assert record["session_id"] == str(session.id)
+        assert isinstance(record["operation_id"], str) and uuid.UUID(record["operation_id"])
+        assert isinstance(record["operation_epoch"], int)
+        # errno.EACCES materialises as the PermissionError subclass — the type
+        # name is a safe operator fact; the message and filename are not logged.
+        assert record["error_type"] == "PermissionError"
+        assert record["errno"] == errno.EACCES
+        assert record["strerror"] == os.strerror(errno.EACCES)
+        assert set(record) == {
+            "event",
+            "log_level",
+            "session_id",
+            "operation_id",
+            "operation_epoch",
+            "error_type",
+            "errno",
+            "strerror",
+        }
+        for emitted in records:
+            flattened = repr(emitted)
+            assert "permission denied removing staged blob directory" not in flattened
+            assert str(data_dir) not in flattened
 
         with pytest.raises(ValueError):
             await service_with_dir.get_session(session.id)
 
         assert not blob_dir.exists()
-        assert quarantine_dir.is_dir()
-        assert (quarantine_dir / blob_file.name).read_text() == "col1\nval1"
+        # The archive quarantine is an exact per-operation obligation
+        # (.archive_quarantine/v1/<session>/<epoch>-<operation>/payload); the
+        # staged payload must survive the failed purge byte-for-byte.
+        (manifest,) = list_archive_quarantine_manifests(data_dir, session.id)
+        assert manifest.identity.session_id == session.id
+        assert manifest.source_present is True
+        payload_dir = archive_quarantine_paths(data_dir, manifest.identity).payload
+        assert payload_dir.is_dir()
+        assert (payload_dir / blob_file.name).read_text() == "col1\nval1"
 
 
 class TestRunEvents:
@@ -277,6 +362,7 @@ class TestRunEvents:
                     updated_at=created_at,
                 )
             )
+            seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
             conn.execute(
                 insert(composition_states_table).values(
                     id=str(state_id),
@@ -701,79 +787,6 @@ class TestGetStateInSession:
             await service.get_state_in_session(uuid.uuid4(), session.id)
 
 
-class TestSetActiveState:
-    """Tests for set_active_state -- revert by copying a prior version."""
-
-    @pytest.mark.asyncio
-    async def test_revert_creates_new_version(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
-        )
-        await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "api"}, is_valid=True), provenance="session_seed"
-        )
-        # Revert to v1 -- should create v3 as a copy of v1
-        reverted = await service.set_active_state(session.id, v1.id)
-        assert reverted.version == 3
-        # Content should match v1, not v2
-        assert reverted.sources == v1.sources
-        # Lineage: reverted state records where it came from (D6)
-        assert reverted.derived_from_state_id == v1.id
-
-    @pytest.mark.asyncio
-    async def test_revert_preserves_named_sources(self, service) -> None:
-        session = await service.create_session("alice", "Multi-source", "local")
-        sources = {
-            "orders": {"plugin": "csv", "on_success": "orders_rows", "on_validation_failure": "discard", "options": {"path": "orders.csv"}},
-            "refunds": {
-                "plugin": "csv",
-                "on_success": "refunds_rows",
-                "on_validation_failure": "discard",
-                "options": {"path": "refunds.csv"},
-            },
-        }
-        v1 = await service.save_composition_state(
-            session.id,
-            CompositionStateData(sources=sources, is_valid=True),
-            provenance="session_seed",
-        )
-        await service.save_composition_state(
-            session.id,
-            CompositionStateData(source={"plugin": "json", "on_success": "rows", "on_validation_failure": "discard", "options": {}}),
-            provenance="session_seed",
-        )
-
-        reverted = await service.set_active_state(session.id, v1.id)
-
-        assert reverted.sources == sources
-
-    @pytest.mark.asyncio
-    async def test_revert_preserves_history(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        v2 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.set_active_state(session.id, v2.id)
-        versions = await service.get_state_versions(session.id)
-        # All three versions should exist (v1, v2, v3)
-        assert len(versions) == 3
-        assert [v.version for v in versions] == [1, 2, 3]
-
-    @pytest.mark.asyncio
-    async def test_revert_state_not_found_raises(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        with pytest.raises(ValueError, match="not found"):
-            await service.set_active_state(session.id, uuid.uuid4())
-
-    @pytest.mark.asyncio
-    async def test_revert_state_wrong_session_raises(self, service) -> None:
-        s1 = await service.create_session("alice", "Session 1", "local")
-        s2 = await service.create_session("alice", "Session 2", "local")
-        state = await service.save_composition_state(s1.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        with pytest.raises(ValueError, match="does not belong"):
-            await service.set_active_state(s2.id, state.id)
-
-
 class TestGetRun:
     """Tests for get_run -- fetch a RunRecord by UUID."""
 
@@ -873,7 +886,7 @@ class TestAdr019LegacyCounterReadCompatibility:
     @staticmethod
     def _accounting_from_run(run: RunRecord) -> RunAccounting:
         return RunAccounting(
-            source=RunAccountingSource(rows_processed=run.rows_processed),
+            source=RunAccountingSource(rows_processed=run.rows_processed, rows_rejected=0, rows_read=run.rows_processed),
             tokens=RunAccountingTokens(
                 emitted=run.rows_succeeded + run.rows_failed,
                 terminal=run.rows_succeeded + run.rows_failed,
@@ -881,6 +894,7 @@ class TestAdr019LegacyCounterReadCompatibility:
                 failed=run.rows_failed,
                 structural=0,
                 pending=0,
+                abandoned=0,
             ),
             routing=RunAccountingRouting(
                 routed_success=run.rows_routed_success,
@@ -1129,80 +1143,6 @@ class TestLandscapeRunIdWriteOnce:
 
 class TestCancelOrphanedRuns:
     """Tests for D5 -- cancel_orphaned_runs."""
-
-    @pytest.mark.asyncio
-    async def test_cancels_stale_running_run(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        # Cancel with max_age_seconds=0 so ANY running run is considered stale
-        cancelled = await service.cancel_orphaned_runs(
-            session.id,
-            max_age_seconds=0,
-        )
-        assert len(cancelled) == 1
-        assert cancelled[0].id == run.id
-        assert cancelled[0].status == "cancelled"
-
-    @pytest.mark.asyncio
-    async def test_does_not_cancel_recent_running_run(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        # max_age_seconds=3600 -- run was just created, so not stale
-        cancelled = await service.cancel_orphaned_runs(
-            session.id,
-            max_age_seconds=3600,
-        )
-        assert len(cancelled) == 0
-
-    @pytest.mark.asyncio
-    async def test_does_not_cancel_completed_runs(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-orphan-1")
-        cancelled = await service.cancel_orphaned_runs(
-            session.id,
-            max_age_seconds=0,
-        )
-        assert len(cancelled) == 0
-
-    @pytest.mark.asyncio
-    async def test_cancel_unblocks_session_for_new_run(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
-        # Session should now accept a new run
-        run2 = await service.create_run(session.id, state.id)
-        assert run2.status == "pending"
-
-    @pytest.mark.asyncio
-    async def test_cancel_includes_pending_orphans(self, service) -> None:
-        """A run stuck in 'pending' (crash before transition to running) is also cleaned."""
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        # Create run that stays in pending (simulates crash before running transition)
-        await service.create_run(session.id, state.id)
-        cancelled = await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
-        assert len(cancelled) == 1
-        assert cancelled[0].status == "cancelled"
-
-    @pytest.mark.asyncio
-    async def test_cancel_does_not_touch_completed_runs(self, service) -> None:
-        """Completed runs are never cancelled regardless of age."""
-        session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        run = await service.create_run(session.id, state.id)
-        await service.update_run_status(run.id, "running")
-        await service.update_run_status(run.id, "completed", landscape_run_id="lscp-orphan-2")
-        cancelled = await service.cancel_orphaned_runs(session.id, max_age_seconds=0)
-        assert len(cancelled) == 0
 
 
 class TestCancelAllOrphanedRuns:
@@ -1533,6 +1473,235 @@ class TestArchiveSessionWithActiveRun:
         assert session.id in [s.id for s in with_archived], "Soft-archived session must be retrievable via include_archived"
 
 
+class _FrozenClock:
+    """Stand in for the ``datetime`` module with a caller-controlled ``now``."""
+
+    def __init__(self, clock: dict[str, datetime]) -> None:
+        self._clock = clock
+
+    def now(self, tz=None):
+        del tz
+        return self._clock["now"]
+
+
+class TestRunDiagnosticsAuditMessage:
+    """add_run_diagnostics_audit_message proves authority durably (elspeth-0fcf68d50f)."""
+
+    async def _session_state_run(self, service):
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        run = await service.create_run(session.id, state.id)
+        return session, state, run
+
+    @pytest.mark.asyncio
+    async def test_audit_row_is_stamped_under_the_lock_not_at_call_entry(self, service, monkeypatch) -> None:
+        """The audit row must be timed by the transaction that writes it.
+
+        An append that waits on the session lock must not carry a timestamp
+        from before the transaction it commits in. The clock is advanced
+        exactly when the lock is taken, so a pre-lock capture is
+        distinguishable from a post-lock one without depending on timing.
+        """
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        before_lock = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+        after_lock = datetime(2026, 8, 2, 12, 0, 30, tzinfo=UTC)
+        clock = {"now": before_lock}
+        import elspeth.web.coordination.run_diagnostics_authority as authority_module
+
+        original_lock = authority_module.locked_session_transaction
+
+        @contextlib.contextmanager
+        def advance_clock_on_lock(engine, session_id):
+            clock["now"] = after_lock
+            with original_lock(engine, session_id) as conn:
+                yield conn
+
+        monkeypatch.setattr(authority_module, "locked_session_transaction", advance_clock_on_lock)
+        monkeypatch.setattr(authority_module, "datetime", _FrozenClock(clock))
+
+        record = await service.add_run_diagnostics_audit_message(authority, "stamped under the lock")
+
+        assert record.created_at == after_lock, "the audit row was stamped before the writing transaction acquired the lock"
+
+    @pytest.mark.asyncio
+    async def test_service_delegates_to_handle_free_repository_authority(self, service) -> None:
+        """The service must own no inline writer — every append goes through the authority."""
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        class RefusingAuthority:
+            def append_audit_message(self, **_kwargs) -> ChatMessageRecord:
+                raise RuntimeError("delegated-to-run-diagnostics-authority")
+
+        service._run_diagnostics_audit_authority = RefusingAuthority()
+
+        with pytest.raises(RuntimeError, match="delegated-to-run-diagnostics-authority"):
+            await service.add_run_diagnostics_audit_message(authority, "must delegate")
+
+    @pytest.mark.asyncio
+    async def test_success_appends_run_attributed_audit_row(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        record = await service.add_run_diagnostics_audit_message(
+            authority,
+            "diagnostics explanation audited",
+            tool_calls=[{"_kind": "llm_call_audit", "run_id": str(run.id), "call": {}}],
+        )
+
+        assert record.role == "audit"
+        assert record.writer_principal == "run_diagnostics"
+        assert record.composition_state_id == state.id
+        messages = await service.get_messages(session.id)
+        (stored,) = [m for m in messages if m.id == record.id]
+        assert stored.writer_principal == "run_diagnostics"
+        assert stored.sequence_no == record.sequence_no
+        refreshed = await service.get_session(session.id)
+        assert refreshed.updated_at >= session.updated_at
+
+    @pytest.mark.asyncio
+    async def test_missing_run_refused_without_consuming_sequence(self, service) -> None:
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        before = await service.add_message(session.id, "user", "hello", writer_principal="route_user_message")
+        authority = RunDiagnosticsAuditAuthority(run_id=uuid.uuid4(), session_id=session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "orphaned")
+        assert exc_info.value.reason == "run_missing"
+
+        after = await service.add_message(session.id, "user", "again", writer_principal="route_user_message")
+        assert after.sequence_no == before.sequence_no + 1, "refused authority must not consume a chat sequence number"
+        contents = [m.content for m in await service.get_messages(session.id)]
+        assert "orphaned" not in contents
+
+    @pytest.mark.asyncio
+    async def test_state_rebound_refused(self, service) -> None:
+        session, _state, run = await self._session_state_run(service)
+        other_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=other_state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "wrong state")
+        assert exc_info.value.reason == "run_rebound"
+
+    @pytest.mark.asyncio
+    async def test_foreign_session_refused(self, service) -> None:
+        _session, state, run = await self._session_state_run(service)
+        other_session = await service.create_session("alice", "Other", "local")
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=other_session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "wrong session")
+        assert exc_info.value.reason == "run_rebound"
+        assert await service.get_messages(other_session.id) == []
+
+    @pytest.mark.asyncio
+    async def test_archived_session_refused(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        # A session with a durable run is soft-archived, so the row and
+        # its archived_at survive for this authority check to see.
+        await service.archive_session(session.id)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "after archive")
+        assert exc_info.value.reason == "session_archived"
+
+    @pytest.mark.asyncio
+    async def test_missing_session_refused(self, service) -> None:
+        _session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=uuid.uuid4(), state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "no session")
+        assert exc_info.value.reason == "session_missing"
+
+
+class TestRunDiagnosticsAuditMessagesAtomic:
+    """The diagnostics cohort settles all-or-nothing (elspeth-90231248dc)."""
+
+    async def _session_state_run(self, service):
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        run = await service.create_run(session.id, state.id)
+        return session, state, run
+
+    @pytest.mark.asyncio
+    async def test_cohort_lands_contiguously_under_one_authority_proof(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+        drafts = tuple(
+            RunDiagnosticsAuditDraft(
+                content=f"diagnostics call {i}",
+                tool_calls=({"_kind": "llm_call_audit", "run_id": str(run.id), "call": {}},),
+            )
+            for i in range(3)
+        )
+
+        records = await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
+
+        assert [r.content for r in records] == ["diagnostics call 0", "diagnostics call 1", "diagnostics call 2"]
+        sequence_nos = [r.sequence_no for r in records]
+        assert sequence_nos == list(range(sequence_nos[0], sequence_nos[0] + 3)), "cohort rows must occupy one contiguous sequence block"
+        assert len({r.created_at for r in records}) == 1, "cohort rows must share one transaction timestamp"
+        stored = await service.get_messages(session.id)
+        by_id = {m.id: m for m in stored}
+        for record in records:
+            assert by_id[record.id].writer_principal == "run_diagnostics"
+            assert by_id[record.id].composition_state_id == state.id
+
+    @pytest.mark.asyncio
+    async def test_mid_cohort_failure_leaves_zero_rows_durable(self, service) -> None:
+        """A cohort whose LAST row cannot be written must persist nothing.
+
+        The unserializable envelope on the final draft makes its INSERT
+        raise after the earlier rows' INSERTs executed in the same
+        transaction — if any prefix survives, the write path is a
+        per-row loop again, which is the defect this method removed.
+        """
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+        drafts = (
+            RunDiagnosticsAuditDraft(content="prefix row 0"),
+            RunDiagnosticsAuditDraft(content="prefix row 1"),
+            RunDiagnosticsAuditDraft(content="poison row", tool_calls=({"payload": object()},)),
+        )
+
+        with pytest.raises(Exception):  # noqa: B017 - dialect-specific serialization error class
+            await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
+
+        contents = [m.content for m in await service.get_messages(session.id)]
+        assert "prefix row 0" not in contents, "mid-cohort failure durably committed a prefix"
+        assert "prefix row 1" not in contents, "mid-cohort failure durably committed a prefix"
+
+    @pytest.mark.asyncio
+    async def test_lost_authority_refuses_whole_cohort(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        await service.archive_session(session.id)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_messages_atomic(
+                authority,
+                (RunDiagnosticsAuditDraft(content="after archive"),),
+            )
+        assert exc_info.value.reason == "session_archived"
+
+    @pytest.mark.asyncio
+    async def test_empty_cohort_is_a_noop(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+        before = await service.get_session(session.id)
+
+        assert await service.add_run_diagnostics_audit_messages_atomic(authority, ()) == ()
+
+        refreshed = await service.get_session(session.id)
+        assert refreshed.updated_at == before.updated_at, "an empty cohort must not bump updated_at"
+
+
 class TestGetMessagesNonexistentSession:
     """Tests for get_messages behavior with a nonexistent session."""
 
@@ -1616,96 +1785,352 @@ class TestPagination:
         assert versions[1].version == 5
 
 
-class TestPruneStateVersions:
-    """Tests for prune_state_versions -- delete old versions, preserve recent and run-referenced."""
+class TestAddMessageWithTranscript:
+    """Single-transaction write+read for the freeform send snapshot (F-1).
+
+    ``add_message`` + ``get_messages`` as a pair reads the transcript on a
+    DIFFERENT pooled connection than the insert; a stale reader (pinned
+    snapshot, read/write-splitting proxy) then returns a transcript that
+    does not yet contain the committed row, and the route's Tier-1
+    snapshot guard fires as a false 500. ``add_message_with_transcript``
+    performs both on one connection in one write-locked transaction, so
+    the returned transcript ends at the inserted row by construction.
+    """
 
     @pytest.mark.asyncio
-    async def test_prune_deletes_old_versions(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        for _ in range(5):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+    async def test_returns_inserted_record_and_full_ordered_transcript(self, service) -> None:
+        session = await service.create_session("alice", "Combined", "local")
+        await service.add_message(session.id, "user", "First", writer_principal="route_user_message")
+        await service.add_message(session.id, "assistant", "Second", writer_principal="compose_loop")
 
-        deleted = await service.prune_state_versions(session.id, keep_latest=2)
-        assert deleted == 3
+        record, transcript = await service.add_message_with_transcript(
+            session.id,
+            "user",
+            "Third",
+            writer_principal="route_user_message",
+        )
 
-        remaining = await service.get_state_versions(session.id)
-        assert len(remaining) == 2
-        assert [v.version for v in remaining] == [4, 5]
-
-    @pytest.mark.asyncio
-    async def test_prune_preserves_run_referenced_versions(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-
-        # Create a run referencing v1
-        await service.create_run(session.id, v1.id)
-
-        # Prune keeping only latest 1 -- v1 should survive (run-referenced), v2 deleted
-        deleted = await service.prune_state_versions(session.id, keep_latest=1)
-        assert deleted == 1  # only v2 deleted
-
-        remaining = await service.get_state_versions(session.id)
-        remaining_versions = [v.version for v in remaining]
-        assert 1 in remaining_versions  # preserved by run reference
-        assert 2 not in remaining_versions  # deleted
-        assert 3 in remaining_versions  # kept as latest
+        assert record.role == "user"
+        assert record.content == "Third"
+        assert record.writer_principal == "route_user_message"
+        assert [message.content for message in transcript] == ["First", "Second", "Third"]
+        assert transcript[-1].id == record.id
+        sequence_numbers = [message.sequence_no for message in transcript]
+        assert sequence_numbers == sorted(sequence_numbers)
+        # The transcript is exactly what a fresh get_messages would return.
+        assert await service.get_messages(session.id, limit=None) == transcript
 
     @pytest.mark.asyncio
-    async def test_prune_returns_zero_when_nothing_to_prune(self, service) -> None:
-        session = await service.create_session("alice", "Pipeline", "local")
-        for _ in range(2):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+    async def test_persists_pre_send_state_provenance(self, service) -> None:
+        session = await service.create_session("alice", "Provenance", "local")
+        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
-        deleted = await service.prune_state_versions(session.id, keep_latest=5)
-        assert deleted == 0
+        record, transcript = await service.add_message_with_transcript(
+            session.id,
+            "user",
+            "hello",
+            composition_state_id=state.id,
+            writer_principal="route_user_message",
+        )
+
+        assert record.composition_state_id == state.id
+        assert transcript[-1].composition_state_id == state.id
 
     @pytest.mark.asyncio
-    async def test_prune_preserves_derived_from_lineage(self, service) -> None:
-        """States referenced via derived_from_state_id must survive pruning.
+    async def test_rejects_cross_session_composition_state(self, service) -> None:
+        """Parity with add_message: the _assert_state_in_session guard fires."""
+        s1 = await service.create_session("alice", "One", "local")
+        s2 = await service.create_session("alice", "Two", "local")
+        foreign_state = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
-        Scenario: v1 (normal), v2 (normal), v3 (revert to v1).
-        Prune with keep_latest=1 keeps v3 (latest).  v1 must survive
-        because v3.derived_from_state_id points at it.  v2 can be deleted.
+        with pytest.raises(RuntimeError, match="add_message_with_transcript"):
+            await service.add_message_with_transcript(
+                s1.id,
+                "user",
+                "hello",
+                composition_state_id=foreign_state.id,
+                writer_principal="route_user_message",
+            )
+
+        assert await service.get_messages(s1.id, limit=None) == []
+
+    @pytest.mark.asyncio
+    async def test_bumps_session_updated_at(self, service) -> None:
+        session = await service.create_session("alice", "Updated", "local")
+
+        await service.add_message_with_transcript(session.id, "user", "hello", writer_principal="route_user_message")
+
+        refreshed = await service.get_session(session.id)
+        assert refreshed.updated_at >= session.updated_at
+
+    @pytest.mark.asyncio
+    async def test_combined_read_sees_its_own_write_despite_pinned_stale_snapshot(self, tmp_path) -> None:
+        """T1 (SQLite WAL variant of the pinned-snapshot stale reader).
+
+        A second connection holds an open read transaction whose WAL
+        snapshot predates the write. That stale view stays stale across
+        the commit — the faithful reproduction of the production read-
+        after-write split — while the combined method's same-transaction
+        read contains its own insert. Asserting on the combined method's
+        OWN read (not on the stale reader healing) is the non-vacuous
+        post-fix contract.
         """
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        # Revert to v1 — creates v3 with derived_from_state_id = v1.id
-        v3 = await service.set_active_state(session.id, v1.id)
-        assert v3.derived_from_state_id == v1.id
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'stale-reader-sessions.db'}")
+        initialize_session_schema(engine)
+        try:
+            service = DualFencedSessionServiceHarness(
+                engine,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.stale-reader"),
+            )
+            session = await service.create_session("alice", "Stale", "local")
+            await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
 
-        deleted = await service.prune_state_versions(session.id, keep_latest=1)
-        assert deleted == 1  # only v2 deleted
+            def _count(conn) -> int:
+                return conn.execute(
+                    select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))
+                ).scalar_one()
 
-        remaining = await service.get_state_versions(session.id)
-        remaining_ids = {v.id for v in remaining}
-        assert v1.id in remaining_ids, "v1 must survive — referenced by v3.derived_from_state_id"
-        assert v3.id in remaining_ids, "v3 must survive — it is the latest version"
+            stale_reader = engine.connect()
+            try:
+                # First read opens the deferred transaction and pins the
+                # WAL snapshot at one seed row.
+                assert _count(stale_reader) == 1
+
+                record, transcript = await service.add_message_with_transcript(
+                    session.id,
+                    "user",
+                    "hello",
+                    writer_principal="route_user_message",
+                )
+
+                # The pinned snapshot still cannot see the committed
+                # insert — the stale-reader condition is real...
+                assert _count(stale_reader) == 1
+                # ...and irrelevant: the combined method read its own
+                # write inside the insert's transaction.
+                assert [message.content for message in transcript] == ["seed", "hello"]
+                assert transcript[-1].id == record.id
+            finally:
+                stale_reader.rollback()
+                stale_reader.close()
+        finally:
+            engine.dispose()
 
     @pytest.mark.asyncio
-    async def test_prune_preserves_transitive_derived_lineage(self, service) -> None:
-        """Transitive derived_from chains must be fully preserved.
+    async def test_insert_and_transcript_select_share_one_connection_and_transaction(self, tmp_path) -> None:
+        """Pin the MECHANISM, not just the outcome: one connection, one txn.
 
-        Scenario: v1, v2, v3 (revert→v1), v4, v5 (revert→v3).
-        Prune with keep_latest=1 keeps v5.  v3 must survive (v5 points
-        at it), and v1 must survive (v3 points at it).  v2 and v4 can go.
+        The sibling tests prove the returned transcript contains the insert;
+        this one proves HOW — the ``INSERT INTO chat_messages`` and the
+        transcript ``SELECT`` execute on the same DBAPI connection with no
+        commit between them. A regression that reintroduced a second pooled
+        connection (or committed the insert before reading) could still pass
+        the outcome tests on dialects without a stale reader; this listener
+        pin goes red on the split itself.
         """
-        session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        # v3: revert to v1
-        v3 = await service.set_active_state(session.id, v1.id)
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        # v5: revert to v3
-        v5 = await service.set_active_state(session.id, v3.id)
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'one-conn-sessions.db'}")
+        initialize_session_schema(engine)
+        try:
+            service = DualFencedSessionServiceHarness(
+                engine,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.one-conn"),
+            )
+            session = await service.create_session("alice", "OneConn", "local")
+            await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
 
-        deleted = await service.prune_state_versions(session.id, keep_latest=1)
-        assert deleted == 2  # v2 and v4 deleted
+            # One ordered event log: cursor executions tagged with their
+            # DBAPI connection id, interleaved with commit markers.
+            events: list[tuple[str, int, str]] = []
 
-        remaining = await service.get_state_versions(session.id)
-        remaining_ids = {v.id for v in remaining}
-        assert v1.id in remaining_ids, "v1 must survive — v3.derived_from_state_id"
-        assert v3.id in remaining_ids, "v3 must survive — v5.derived_from_state_id"
-        assert v5.id in remaining_ids, "v5 must survive — latest version"
+            def record_statement(conn, cursor, statement, parameters, context, executemany) -> None:
+                events.append(("execute", id(conn.connection.dbapi_connection), statement))
+
+            def record_commit(conn) -> None:
+                events.append(("commit", id(conn.connection.dbapi_connection), "COMMIT"))
+
+            event.listen(engine, "before_cursor_execute", record_statement)
+            event.listen(engine, "commit", record_commit)
+            try:
+                record, transcript = await service.add_message_with_transcript(
+                    session.id,
+                    "user",
+                    "hello",
+                    writer_principal="route_user_message",
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", record_statement)
+                event.remove(engine, "commit", record_commit)
+
+            assert transcript[-1].id == record.id  # sanity: the outcome still holds
+
+            insert_indices = [
+                index
+                for index, (kind, _conn_id, statement) in enumerate(events)
+                if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
+            ]
+            assert len(insert_indices) == 1, [entry[2] for entry in events]
+            insert_index = insert_indices[0]
+            transcript_select_indices = [
+                index
+                for index, (kind, _conn_id, statement) in enumerate(events)
+                if kind == "execute"
+                and statement.lstrip().upper().startswith("SELECT")
+                and "chat_messages" in statement
+                and "ORDER BY chat_messages.sequence_no" in statement
+            ]
+            assert len(transcript_select_indices) == 1, [entry[2] for entry in events]
+            select_index = transcript_select_indices[0]
+
+            # The read follows the write...
+            assert insert_index < select_index
+            # ...on the SAME DBAPI connection...
+            assert events[insert_index][1] == events[select_index][1]
+            # ...with no commit in between: the SELECT ran inside the
+            # insert's own transaction, which is the read-your-own-write
+            # guarantee the docstring claims.
+            between = events[insert_index + 1 : select_index]
+            assert all(kind != "commit" for kind, _conn_id, _statement in between), [entry[:2] for entry in between]
+        finally:
+            engine.dispose()
+
+
+class TestGuidedFailureCohortPoisonPill:
+    """T5: a mismatched failure cohort fails closed with a DISTINCT message."""
+
+    @pytest.mark.asyncio
+    async def test_mismatched_cohort_rejects_reads_with_message_distinct_from_snapshot_guard(self, engine, service) -> None:
+        session = await service.create_session("alice", "Poison", "local")
+        claim = await service.reserve_guided_operation(
+            session_id=session.id,
+            operation_id="poison-op",
+            kind="guided_start",
+            request_hash="a" * 64,
+            actor="worker",
+            lease_seconds=30,
+        )
+        assert isinstance(claim, GuidedOperationClaimed)
+        # One structurally valid failed event whose cohort commits a
+        # fabricated evidence row that has no durable counterpart. The
+        # events table is UPDATE/DELETE-protected by trigger, so the
+        # poison pill is injected as the operation's single terminal
+        # event directly.
+        fabricated_row = {
+            "message_id": str(uuid.uuid4()),
+            "sequence_no": 1,
+            "content_hash": stable_hash("fabricated-evidence"),
+            "tool_calls_hash": stable_hash([]),
+        }
+        authority: dict[str, object] = {
+            "schema": "guided_failure_audit_cohort.v1",
+            "count": 1,
+            "rows": [fabricated_row],
+        }
+        poisoned_cohort = {**authority, "aggregate_digest": stable_hash(authority)}
+        with engine.begin() as conn:
+            conn.execute(
+                insert(guided_operation_events_table).values(
+                    session_id=str(session.id),
+                    operation_id="poison-op",
+                    sequence=2,
+                    event_kind="failed",
+                    actor="tamper",
+                    attempt=claim.fence.attempt,
+                    prior_attempt=None,
+                    lease_expires_at=None,
+                    request_hash="a" * 64,
+                    failure_audit_cohort=poisoned_cohort,
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+
+        with pytest.raises(AuditIntegrityError, match="does not match the exact durable evidence rows") as excinfo:
+            await service.get_messages(session.id, limit=None)
+        # The http_audit_integrity_error handler logs message=str(exc);
+        # this phrasing must stay distinguishable from the send_message
+        # transcript snapshot guard's copy.
+        assert "does not end at inserted user" not in str(excinfo.value)
+
+        # The combined write+read path applies the same fail-closed
+        # verification over the same rows.
+        with pytest.raises(AuditIntegrityError, match="does not match the exact durable evidence rows"):
+            await service.add_message_with_transcript(
+                session.id,
+                "user",
+                "hello",
+                writer_principal="route_user_message",
+            )
+
+
+class TestCreateRunSessionLockDomain:
+    """Run admission must share the same-session custody lock domain.
+
+    ``_execute_update_blob`` / ``_execute_delete_blob`` evaluate their
+    active-run guards inside ``locked_session_transaction`` and rely on run
+    admission being mutually exclusive with that lock: if ``create_run``
+    commits through a bare ``engine.begin()`` instead, the blob mutation and
+    the run INSERT can each pass their guards concurrently (the PostgreSQL
+    advisory lock never blocks the unlocked INSERT), letting a run capture a
+    blob mid-mutation (elspeth-3d1d1fcb6c).
+    """
+
+    def test_create_run_waits_for_session_custody_lock(self, tmp_path) -> None:
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        initialize_session_schema(engine)
+        service = DualFencedSessionServiceHarness(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test"),
+        )
+        session = asyncio.run(service.create_session("alice", "Lock domain", "local"))
+        state = asyncio.run(
+            service.save_composition_state(
+                session.id,
+                CompositionStateData(is_valid=True),
+                provenance="session_seed",
+            )
+        )
+
+        lock_held = threading.Event()
+        release = threading.Event()
+        run_created = threading.Event()
+        failures: list[BaseException] = []
+
+        def hold_custody_lock() -> None:
+            try:
+                with locked_session_transaction(engine, str(session.id)):
+                    lock_held.set()
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("custody lock holder was never released")
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+                lock_held.set()
+
+        def admit_run() -> None:
+            try:
+                asyncio.run(service.create_run(session.id, state.id))
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+            finally:
+                run_created.set()
+
+        holder = threading.Thread(target=hold_custody_lock, name="custody-lock-holder")
+        holder.start()
+        assert lock_held.wait(timeout=5)
+        runner = threading.Thread(target=admit_run, name="run-admitter")
+        runner.start()
+        try:
+            assert not run_created.wait(timeout=1.0), (
+                "create_run committed while the session custody lock was held; run admission escaped the blob/run lock domain"
+            )
+        finally:
+            release.set()
+            holder.join(timeout=10)
+            runner.join(timeout=10)
+
+        assert run_created.wait(timeout=10)
+        assert failures == []
+        active = asyncio.run(service.get_active_run(session.id))
+        assert active is not None
+        assert active.status == "pending"

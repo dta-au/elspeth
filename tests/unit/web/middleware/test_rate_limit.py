@@ -7,9 +7,13 @@ import time
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.middleware.rate_limit import (
+    ComposerRateLimiter,
+    get_rate_limiter,
+    get_write_rate_limiter,
+)
 
 
 class TestRateLimiterConstruction:
@@ -243,3 +247,31 @@ class TestRateLimiterPerUserLocks:
             return_exceptions=True,
         )
         assert all(isinstance(r, HTTPException) for r in results)
+
+
+def test_write_rate_limiter_dependency_reads_distinct_app_state() -> None:
+    """get_write_rate_limiter must return app.state.write_rate_limiter,
+    never the strict composer bucket — the whole point of the split."""
+    app = FastAPI()
+    app.state.rate_limiter = ComposerRateLimiter(limit=1)
+    app.state.write_rate_limiter = ComposerRateLimiter(limit=60)
+    scope = {"type": "http", "app": app, "headers": []}
+    request = Request(scope)
+    strict = asyncio.run(get_rate_limiter(request))
+    write = asyncio.run(get_write_rate_limiter(request))
+    assert write is app.state.write_rate_limiter
+    assert strict is app.state.rate_limiter
+    assert write is not strict
+
+
+def test_web_settings_write_rate_limit_defaults_to_60() -> None:
+    from elspeth.web.config import WebSettings
+
+    settings = WebSettings(
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    assert settings.write_rate_limit_per_minute == 60

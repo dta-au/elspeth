@@ -1,6 +1,7 @@
 # ELSPETH User Manual
 
-This manual covers day-to-day usage of the ELSPETH CLI for running auditable pipelines.
+This manual covers day-to-day use of the ELSPETH CLI and Web Composer for
+building and running auditable pipelines.
 
 ## Table of Contents
 
@@ -14,7 +15,7 @@ This manual covers day-to-day usage of the ELSPETH CLI for running auditable pip
 8. [Resuming Failed Runs](#resuming-failed-runs)
 9. [Health Checks](#health-checks)
 10. [Examples](#examples-walkthrough)
-11. [Web Composer: Guided Mode](#web-composer-guided-mode)
+11. [Web Composer workspace and guided mode](#web-composer-guided-mode)
 
 ---
 
@@ -22,12 +23,14 @@ This manual covers day-to-day usage of the ELSPETH CLI for running auditable pip
 
 ### Installation
 
+Install Python 3.12 or newer and `uv`, then synchronize the locked source
+checkout:
+
 ```bash
-# Clone and install
-git clone https://github.com/johnm-dta/elspeth.git
+git clone https://github.com/dta-au/elspeth.git
 cd elspeth
-uv venv && source .venv/bin/activate
-uv pip install -e ".[all]"  # Full installation with LLM support
+uv sync --frozen --all-extras
+source .venv/bin/activate
 ```
 
 ### Verify Installation
@@ -75,8 +78,13 @@ Options:
 | `plugins list` | List available plugins |
 | `purge` | Delete old payloads to free storage |
 | `resume` | Resume a failed run from checkpoint |
+| `export-resume` | Resume a finalized run's unfinished audit export |
+| `join` | Attach to a running pipeline as a follower worker |
+| `abandon` | Finalize a run whose leader died, recording its undecided work as abandoned |
 | `health` | Check system health for deployment verification |
 | `web` | Start the web application server |
+| `composer users` | Add, remove, and bootstrap local Composer web users |
+| `doctor` | Deployment readiness checks (`deployment`, `aws-ecs`) |
 
 ---
 
@@ -114,13 +122,52 @@ elspeth run --settings settings.yaml --execute --format json
 
 ### Run Output
 
+Console mode prints one bracketed line per phase, streaming progress lines, and
+a single summary line. From
+`elspeth run --settings examples/boolean_routing/settings.yaml --execute`:
+
 ```
-Run completed: RunStatus.COMPLETED
-  Rows processed: 100
-  Run ID: e58480edd52a4292809928bd6425f4ed
+[DATABASE] Connecting...
+[DATABASE] ✓ Completed in 0.17s
+[GRAPH] Building...
+[GRAPH] ✓ Completed in 0.00s
+[SOURCE] Initializing → csv...
+[SOURCE] ✓ Completed in 0.00s
+[PROCESS] Processing...
+  Processing: 1 rows | 53 rows/sec | ✓1 ✗0 ⚠0 ↪1 ↯0
+  Processing: 10 rows | 27 rows/sec | ✓10 ✗0 ⚠0 ↪10 ↯0
+[PROCESS] ✓ Completed in 0.37s
+
+✓ Run COMPLETED: 10 rows processed | ✓10 succeeded | ✗0 failed | ⚠0 quarantined | →10 routed (rejected:5, approved:5) | 0.39s total
 ```
 
-The **Run ID** is your key for querying the audit trail later.
+The `→N routed` clause appears only when the run routed rows; the destination
+order and the elapsed times vary per run.
+
+Console mode does not print the run ID. To capture it for querying the audit
+trail later, use `--format json` — the `run_completed` and `execution_result`
+events both carry `run_id` — or query the most recent run with
+`elspeth explain --run latest`.
+
+### Exit Codes
+
+`elspeth run --execute` (and `elspeth resume --execute`) exit with the
+engine's completion taxonomy, so scripts and CI wrappers can branch on the
+result:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Completed successfully — every row reached a clean outcome. Also returned for a run whose source yielded zero rows. |
+| 1 | Completed with failures — at least one row failed or was quarantined (including a run where every row was quarantined). |
+| 2 | Failed — no row reached success or quarantine. |
+| 3 | Interrupted or evicted before completion. |
+| 4 | Framework or audit-integrity error. |
+
+Rows a source drops via a configured `on_validation_failure: discard` never
+enter the pipeline: the validation error is still recorded in the audit
+trail, but the run exits `0` when every ingested row succeeds. A transform's
+`on_error: discard` is different — the dropped row is recorded as a
+quarantined outcome, so the run reports completed-with-failures (exit `1`).
 
 ---
 
@@ -135,40 +182,65 @@ elspeth plugins list
 Output:
 ```
 SOURCES:
+  aws_s3               - Load bounded CSV, JSON-array, or JSONL rows from one immutable S3 object.
   azure_blob           - Load rows from Azure Blob Storage.
+  blob_rows            - Emit one five-field custody row per configured managed blob.
   csv                  - Load rows from a CSV file.
   dataverse            - Load rows from Microsoft Dataverse via OData v4 REST API.
   json                 - Load rows from a JSON file.
   null                 - A source that yields no rows.
   text                 - Load one output row per text line into a configured column.
+  llm                  - Issue one authored prompt and emit at most one validated source row.
 
 TRANSFORMS:
-  azure_document_intelligence - Enrich rows with Azure AI Document Intelligence extraction.
-  blob_csv_expand     - Expand a payload-store CSV blob into rows.
-  blob_fetch          - Fetch an operator-authorised remote document into the payload store.
+  batch_classifier_metrics - Compute classifier confusion matrix and F-score metrics over a batch.
+  batch_data_quality_report - Report field-level batch quality counts and rates.
+  batch_distribution_profile - Compute distribution summaries over aggregation batches.
+  batch_drift_compare  - Compare baseline and current cohort distributions over a batch.
+  batch_effect_size    - Compute Cohen's d and Hedges' g for batch variant comparisons.
+  batch_experiment_compare - Compare experiment variants over a batch using mean deltas.
+  batch_outlier_annotator - Annotate batch rows with z-score and robust-z outlier signals.
+  batch_paired_preference - Compare paired variant scores over an aggregation batch.
   batch_replicate      - Replicate rows based on a copies field.
-  batch_stats          - Compute aggregate statistics over a batch, optionally per group_by value.
+  batch_stats          - Compute aggregate statistics over a batch of rows.
+  batch_threshold_summary - Report threshold match counts and rates for finite numeric batch values.
+  batch_top_k          - Report most frequent scalar values over a batch.
+  blob_csv_expand      - Parse a CSV blob and emit one output row per CSV data row.
+  blob_fetch           - Fetch an HTTP(S) URL into the run payload store and emit a blob reference.
+  blob_json_expand     - Parse a JSON document and emit one output row per record.
+  blob_text_expand     - Decode a text blob from the payload store and emit one row per line or chunk.
   field_mapper         - Map, rename, and select row fields.
   json_explode         - Explode a JSON array field into multiple rows.
   keyword_filter       - Filter rows containing blocked content patterns.
+  line_explode         - Explode a string field into one output row per line.
   passthrough          - Pass rows through unchanged.
-  report_assemble      - Assemble a batch of text rows into one report row with pagination metadata.
+  pdf_rasterize        - Render each page of a PDF into a PNG payload and emit one row per page.
+  reference_join       - Match a row field against a reference table and add named fields to the row.
+  report_assemble      - Assemble a paginated report from a flushed batch of text rows.
   truncate             - Truncate string fields to specified maximum lengths.
   type_coerce          - Perform explicit, strict, per-field type normalization.
   value_transform      - Apply expressions to compute new or modified field values.
   web_scrape           - Fetch webpages, extract content, generate fingerprints.
+  aws_bedrock_content_safety - Block configured harmful-content categories through Bedrock Guardrails.
+  aws_bedrock_prompt_shield - Block prompt attacks identified by an operator-owned Guardrail.
+  aws_textract_document_analysis - Enrich S3 document references through asynchronous Amazon Textract analysis.
+  aws_textract_inline_analysis - Enrich managed-blob document rows through synchronous Amazon Textract analysis.
   azure_content_safety - Analyze content using Azure Content Safety API.
+  azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
   llm                  - Unified LLM transform with provider dispatch and strategy selection.
   rag_retrieval        - Enriches rows with retrieval-augmented context from search providers.
 
 SINKS:
+  aws_s3               - Write bounded cumulative CSV, JSON, or JSONL objects to AWS S3.
   azure_blob           - Write rows to Azure Blob Storage.
-  chroma_sink          - Write rows to a Chroma vector database.
+  chroma_sink          - Write pipeline rows into a ChromaDB collection.
   csv                  - Write rows to a CSV file.
   database             - Write rows to a database table.
   dataverse            - Write rows to Microsoft Dataverse via OData v4 REST API.
+  document             - Write one configured field's whole value to a file, byte-for-byte.
   json                 - Write rows to a JSON file.
+  text                 - Write one configured string field per canonical LF-delimited record.
 ```
 
 ### Filter by Type
@@ -275,11 +347,15 @@ elspeth resume run-abc123 --settings settings.yaml --database ./runs/audit.db
 
 Output:
   Run run-abc123 can be resumed.
+
   Resume point:
-    Token ID: token-xyz
-    Node ID: transform_2
     Sequence number: 45
+    Has barrier scalars: No
+    Blocked barrier rows (journal): 0
     Unprocessed rows: 55
+
+  Dry run - use --execute to actually resume processing.
+  Topology validation passed - checkpoint is compatible with current config.
 ```
 
 ### Execute Resume
@@ -295,6 +371,51 @@ Resume mode:
 - Uses `NullSource` (data comes from stored payloads)
 - Appends to existing output files (doesn't overwrite)
 - Continues from last successful checkpoint
+- Exits with the same [exit codes](#exit-codes) as `elspeth run --execute`
+
+### Leaderless Runs (`abandon`)
+
+In a multi-worker pack (`elspeth run` leader plus `elspeth join` followers),
+a leader that is killed mid-run leaves the run `running` with an expired
+seat. Followers notice the dead seat and exit 2. `elspeth resume` can take
+the seat over, but it refuses while any source is still `loading`: resume
+replays only the rows that were persisted, so it cannot prove that no unread
+source rows exist. Because a source is recorded `exhausted` only after its
+last row has finished processing, that refusal covers almost the whole life
+of a run.
+
+`elspeth abandon` is the way out. It takes the dead leader's seat through the
+same takeover CAS resume uses and finalizes the run as `interrupted` under
+that seat: every token nothing will ever decide is recorded as `abandoned`
+(ADR-038), open sink effects are failed, followers are departed, and the
+seat is vacated. The abandoned work stays in the audit trail; reprocess the
+source with a fresh run.
+
+```bash
+# Dry run - show the leaderless state and whether resume would work instead
+elspeth abandon run-abc123 --settings settings.yaml --database ./runs/audit.db
+
+Output:
+  Run run-abc123
+    Status: running
+    Leader seat: worker:run-abc123:1f3a… (expired 2026-09-08 03:12:44+00:00)
+    Sources: primary=loading
+    Scheduler work items: leased=1, pending_sink=119, terminal=1
+    Undecided tokens: 120
+    Resumable: no — this run cannot be resumed: source lifecycle is incomplete (primary=loading) …
+
+  Dry run - use --execute to take the dead leader's seat and finalize the run as interrupted.
+    120 undecided token(s) would be recorded as abandoned (ADR-038).
+
+# Take the seat and finalize
+elspeth abandon run-abc123 --settings settings.yaml --database ./runs/audit.db --execute
+```
+
+`abandon` refuses (exit 1) when the run does not exist, is already terminal,
+or is led by a live seat — a live-led run should be joined, not abandoned.
+When the dry run reports `Resumable: yes`, prefer `elspeth resume`; abandoning
+a resumable run finalizes it as `interrupted` without abandoning any token,
+and it stays resumable.
 
 ---
 
@@ -319,6 +440,9 @@ elspeth health --json
 |--------|-------------|
 | `--verbose, -v` | Include detailed check information |
 | `--json, -j` | Output as JSON |
+| `--host TEXT` | Web server host to check. Defaults to `ELSPETH_WEB__HOST` or `127.0.0.1` |
+| `--port, -p INTEGER` | Web server port to check. Defaults to `ELSPETH_WEB__PORT` or `8451` |
+| `--skip-web / --check-web` | Skip the web interface check. Default: skip (batch containers). Use `--check-web` to probe |
 
 ### What Gets Checked
 
@@ -326,20 +450,27 @@ elspeth health --json
 - **commit**: Git commit SHA (if available)
 - **python**: Python version
 - **database**: Database connectivity (if `DATABASE_URL` is set)
+- **config_dir**: Configuration directory
+- **output_dir**: Output directory
 - **plugins**: Plugin availability
+- **web**: Web interface reachability (skipped unless `--check-web` is passed)
 
 ### Example JSON Output
 
 ```json
 {
   "status": "healthy",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "commit": "abc123f",
   "checks": {
-    "version": {"status": "ok", "value": "0.7.1"},
+    "version": {"status": "ok", "value": "0.8.0"},
+    "commit": {"status": "ok", "value": "abc123f"},
     "python": {"status": "ok", "value": "3.13.1"},
     "database": {"status": "ok", "value": "connected"},
-    "plugins": {"status": "ok", "value": "6 sources, 19 transforms, 6 sinks"}
+    "config_dir": {"status": "ok", "value": "./config"},
+    "output_dir": {"status": "ok", "value": "./output"},
+    "plugins": {"status": "ok", "value": "9 sources, 37 transforms, 9 sinks"},
+    "web": {"status": "skip", "value": "skipped via --skip-web"}
   }
 }
 ```
@@ -491,7 +622,56 @@ pipelines without hand-editing YAML. Start it with:
 elspeth web
 ```
 
-Then open the URL printed on the console (typically <http://localhost:8765>).
+Then open the URL printed on the console (typically <http://localhost:8451>).
+
+### Using the desktop workspace
+
+On desktop, the Composer keeps authoring and the current pipeline together in
+one workspace. The authoring pane contains freeform chat or the current guided
+step. The pipeline workspace stays beside it so you can inspect the artifact
+without leaving the conversation.
+
+- Drag the divider to resize the authoring pane. You can also focus the divider
+  and use Left/Right Arrow, Shift+Left/Right Arrow for larger steps, or Home/End
+  for its minimum or maximum width.
+- Select **Collapse authoring pane** when you want more room for the pipeline.
+  **Restore authoring pane** reopens it; the collapsed control continues to
+  report busy, error, or unread authoring status.
+- Use **Graph**, **Spec**, **YAML**, **Checks**, and **Run** to switch the
+  persistent pipeline view. Graph and Run are always available; Spec, YAML, and
+  Checks become available once the pipeline has content, and YAML also appears
+  while a YAML proposal is pending review. Spec summarizes its
+  components and configuration, YAML provides the current export controls,
+  Checks carries a status badge and renders validation and audit content
+  inline, and Run shows current or recent execution results.
+- Guided sessions show a **History** tab in the Inspector when completed
+  decisions are available.
+- Use **Focus Graph** for an optional full-screen graph. The persistent Graph
+  tab remains the normal working view.
+
+The workspace action bar keeps state-dependent actions such as **Save for
+review** and **Run pipeline** reachable without scrolling the conversation.
+**Import YAML** sits between them when the **Detail level** preference is set
+to **Show technical detail**, which is not the default. Export is not on the
+bar: the YAML tab's **Copy** and **Download** controls carry it. The plugin
+catalog opens from the artifact workspace toolbar.
+
+When the workspace is too narrow for both main panes, use the **Compose** and
+**Pipeline** switcher to choose which pane is visible. Pane resizing is disabled
+in this narrow layout.
+
+Two global shortcuts select and focus persistent artifact tabs:
+
+| Shortcut | Result |
+| --- | --- |
+| `Ctrl/Cmd+Shift+G` | Select Graph. |
+| `Ctrl/Cmd+Shift+Y` | Select YAML when the pipeline has content. |
+
+These shortcuts select the workspace tab; they do not open Focus Graph. Press
+`?` outside a text field to see the complete keyboard-shortcut reference.
+
+The saved pane width and collapsed state are local interface preferences. They
+do not change the pipeline, session, validation, audit, or execution semantics.
 
 When you create a new session, the composer starts in **Guided Mode** unless
 your Composer preference says otherwise. Guided mode is LLM-primary: each stage
@@ -499,10 +679,19 @@ sends the operator's instruction to the shared pipeline planner, which returns a
 validated proposal. Guided records the reviewed facts as it goes and
 materializes the pipeline when you confirm the wiring.
 
-Guided sessions are created through `POST /guided/start`. The response carries
-a closed-enum `WorkflowProfile` so ELSPETH can distinguish a normal guided
-session from the passive first-run tutorial. Tutorial profile state is stripped
-on fork so it cannot leak into an ordinary session.
+Guided sessions are created through `POST /guided/start`, and start with your
+goal: the request requires a one-sentence `intent` ("what should come out the
+other end"), which becomes the session's durable root and opens its transcript.
+That goal is what the planner builds from at the end of the output stage, and it
+stays the planner's root through later revisions. A guided session that has no
+goal and no retained instruction cannot plan at all — finishing outputs answers
+`guided_planner_intent_required` rather than asking the planner to build from
+nothing. Switching a worked freeform session across with `POST /guided/convert`
+takes a goal the same way.
+
+The response carries a closed-enum `WorkflowProfile` so ELSPETH can distinguish
+a normal guided session from the passive first-run tutorial. Tutorial profile
+state is stripped on fork so it cannot leak into an ordinary session.
 
 ### Guided and freeform differ in interaction, not in capability
 
@@ -514,26 +703,43 @@ planner, produce the same canonical pipeline draft, and are checked by the same
 runtime validators, the same graph contracts, and the same audit trail.
 
 The choice of mode changes the conversation, not the pipeline language: the same
-canonical structures are available on both surfaces. Switching modes never
-discards pipeline state — only the authoring surface changes. (The staged guided
-conversation has two known, tracked exceptions, described under Known
-limitations below; those are specific defects being fixed, not a capability
-boundary.)
+canonical structures are available on both surfaces.
+
+### Switching between guided and freeform
+
+What a mode switch carries is **not symmetric**, and the asymmetry is a property
+of the wizard, not a capability boundary:
+
+- **Guided → freeform** carries the graph exactly. Dropping to freeform hands
+  the completed or in-progress pipeline to the freeform surface unchanged.
+- **Freeform → guided, re-entering after a guided exit** resumes the wizard you
+  left, with its reviewed stages intact.
+- **Freeform → guided for the first time**, or after a YAML import, starts a
+  **fresh wizard as a new version**. The existing draft is not adopted into the
+  wizard's stages: it stays in the session's version history and remains
+  reachable there, but the guided conversation begins from the source stage
+  rather than from your draft.
+
+So the safe reading is: guided → freeform loses nothing, and going back the way
+you came loses nothing. Turning guided on over freeform work for the first time
+is a new start — park anything you still want to edit in freeform before you do
+it.
 
 ### What guided mode is for
 
 Guided mode builds the pipeline through ordered stages:
 
 1. **Source** — describe where the data comes from. The source driver can revise
-   a committed source in place and can route a URL-row source to the web-scrape
-   recipe when that shape is appropriate.
+   a committed source in place. A URL-row source that needs page content is
+   bridged by the ordinary `web_scrape` transform, which the planner proposes
+   like any other node.
 2. **Sink** — describe where results should land and which output fields matter.
    The sink driver supports free-text intent and commits the resulting sink
    configuration only after validation.
 3. **Transforms** — describe how to bridge the source to the sink. The transform
-   stage may apply a recipe-backed path or a model-proposed transform chain, but
-   the committed pipeline still passes the same runtime-oriented validators as
-   YAML.
+   stage produces a model-proposed transform chain — there is no server-derived
+   alternative path — but the committed pipeline still passes the same
+   runtime-oriented validators as YAML.
 4. **Wiring** — review the final graph shape. `STEP_4_WIRE` rebuilds edges from
    model connection labels, renders the contract overlay, and accepts only a
    valid `CONFIRM_WIRING` payload.
@@ -546,22 +752,32 @@ blank proposal.
 
 Both guided and freeform author the full canonical set of pipeline structures:
 
-- **Linear transform chains** — a source through one or more transforms to a
+- **Linear transform chains** (`linear_transform`) — a source through one or
+  more transforms to a
   sink.
-- **Conditional gates** — route rows down different paths by a condition.
-- **Multiple outputs** — fan a stream out to several sinks, including a
+- **Conditional gates** (`conditional_gate`) — route rows down different paths
+  by a condition.
+- **Multiple outputs** (`multi_output`) — fan a stream out to several sinks,
+  including a
   write-failure fallback to another output.
-- **Fork and coalesce** — split a stream into parallel branches and merge them
-  back, including require-all union merges.
-- **Multi-source queue fan-in** — several sources feeding one downstream queue.
-- **Batch aggregation** — compute statistics over batches or groups.
-- **Row expansion** — expand one row into many (deaggregation, JSON explode).
-- **Error routing** — send failed rows to a dedicated failure output.
-- **Structured LLM output consumed downstream** — a typed multi-field LLM result
-  that later stages read by field.
+- **Fork and coalesce** (`fork_coalesce`) — split a stream into parallel branches
+  and merge them back, including require-all union merges.
+- **Fork and row union** (`row_union`) — wait for every correlated fork branch,
+  then release the original rows unchanged in declared branch order for
+  downstream processing.
+- **Multi-source queue fan-in** (`multi_source_queue`) — several sources feeding
+  one downstream queue.
+- **Batch aggregation** (`aggregation`) — compute statistics over batches or
+  groups.
+- **Row expansion** (`row_expansion`) — expand one row into many (deaggregation,
+  JSON explode).
+- **Error routing** (`error_routing`) — send failed rows to a dedicated failure
+  output.
+- **Structured LLM output consumed downstream** (`structured_llm`) — a typed
+  multi-field LLM result that later stages read by field.
 
-These are the same nine canonical classes the parity corpus verifies across
-every authoring surface; none of them is freeform-only.
+These are the canonical classes the live parity corpus verifies across every
+authoring surface; none of them is freeform-only.
 
 ### Choosing between guided and freeform
 
@@ -572,9 +788,13 @@ Because capability is identical, pick the interaction that fits how you think:
 - **Freeform** suits describing the whole pipeline at once, or refining a draft
   when you already know which plugins you want to wire together.
 
-Neither choice limits what you can build. Switch whenever the other interaction
-would be more convenient; the chat history and the pipeline draft carry over
-unchanged.
+Neither choice limits what you can build. Switching guided → freeform is
+lossless, and re-entering guided from that exit resumes the same wizard. Turning
+guided *on* for the first time — or after a YAML import — starts a fresh wizard
+instead of adopting the current draft, so finish or park freeform work you want
+to keep editing before you switch that direction. See
+[Switching between guided and freeform](#switching-between-guided-and-freeform)
+for the exact contract.
 
 ### Wrong-stage mentions are retained, not rejected
 
@@ -589,8 +809,13 @@ that owns the request has already been reviewed, guided opens the stable
 back/edit flow for that stage instead. Early-stage work is stored as interaction
 facts rather than a frozen partial pipeline, so a later requirement triggers a
 typed rewind to the affected stage and a replan — never an "unsupported
-topology" dead-end. (An unavailable plugin, by contrast, remains a distinct
-catalog/availability error.)
+topology" dead-end. A message that mixes a current-stage answer with a
+future-stage instruction applies both: the current stage is configured and the
+instruction is saved in the same turn. If guided cannot immediately verify the
+structure of a future-stage instruction, it still keeps it — as a pending
+instruction awaiting clarification — and asks you for the missing detail
+rather than dropping the request. (An unavailable plugin, by contrast, remains
+a distinct catalog/availability error.)
 
 ### Validation, interpretation, and sign-off
 
@@ -600,9 +825,11 @@ validation summary, and graph impact for review.
 
 If a stage depends on a subjective interpretation, guided mode surfaces a
 pending interpretation card and blocks advancement until the card is reviewed.
-At the final wiring stage, the advisor sign-off path can return
-`REQUEST_ADVISOR`; that re-emits the wire turn for review rather than
-auto-completing the pipeline.
+Advisor sign-off is a completion gate rather than a wiring-stage outcome: an
+`advisor_signoff` fact bound to the reviewed graph's fingerprint withholds
+completion until a compose turn obtains a current review, and the advisor
+checkpoint that feeds it records a `clean`, `flagged`, `unavailable`, or
+`malformed` verdict.
 
 ### Completion and execution
 
@@ -628,23 +855,6 @@ substitute a tutorial-only planner, remove capabilities from the planner schema,
 or rewrite the guided rules. Whatever you author in the tutorial transfers
 directly to a real guided session.
 
-### Known limitations of the staged conversation
-
-Two topologies are not yet authorable through the staged guided conversation:
-
-- a **require-all (union) coalesce** — a fork whose parallel branches merge with
-  a require-all union (elspeth-93dd908354); and
-- a **cross-sink `on_write_failure` fallback** — an output whose write-failure
-  route targets another sink (elspeth-b83b5b3204).
-
-These are specific, tracked defects in how the staged conversation projects
-connections and sink options — not capability boundaries. The staged
-conversation therefore authors seven of the nine canonical structures directly.
-The same shared planner represents both topologies without trouble, so full
-parity is available today: build these two shapes in **freeform** (the
-single-turn `/guided/plan` endpoint authors them too). Both defects are being
-fixed so the staged conversation reaches the other two as well.
-
 ### See also
 
 - Historical guided-mode technical design material is preserved in git history
@@ -662,10 +872,13 @@ For comprehensive troubleshooting, see the [Troubleshooting Guide](troubleshooti
 
 **"ELSPETH_FINGERPRINT_KEY is not set"** - Set the key or allow raw secrets for development:
 ```bash
-export ELSPETH_FINGERPRINT_KEY="your-key"
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 # OR for development only:
 export ELSPETH_ALLOW_RAW_SECRETS=true
 ```
+
+Persist the generated production fingerprint key in the deployment secret
+manager; changing it breaks credential correlation across audit records.
 
 **"Unknown plugin: xyz"** - Check available plugins with `elspeth plugins list` (names are case-sensitive).
 

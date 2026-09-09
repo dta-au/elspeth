@@ -1,15 +1,34 @@
 // ============================================================================
-// ui/ primitive library — adopt-as-touched policy (elspeth-e1c5ad0b53)
+// ui/ primitive library — FULL-MIGRATION policy (operator decision 2026-08-14)
 //
-// When an edit touches a control that one of these primitives covers (a raw
-// <button> the Button primitive matches, a hand-rolled status/type chip,
-// a bare labelled <input>), swap in the primitive as part of that edit rather
-// than patching the bespoke copy — that is how a11y fixes (e.g. StatusBadge's
-// ⚠/∅ glyph map) propagate instead of being re-fixed one file at a time.
-// No big-bang sweeps; no new primitive without a concrete first consumer.
-// Unused primitives get retired: Card, Tabs, and Textarea were deleted in
-// wave 3 of the 2026-07-02 UX remediation because they had no consumer and
-// no mechanical adoption site (see epic elspeth-6cf0e1e188 notes).
+// The previous adopt-as-touched policy (elspeth-e1c5ad0b53) did not move the
+// number: at approval time the census stood at 217 raw <button> against 10
+// <Button>. On 2026-08-14 the operator approved a one-time full migration of
+// every raw <button>/<input> outside components/ui/ onto these primitives,
+// executed as the D3 wave. The mechanical rule the wave applied — and the
+// rule for any control written from now on:
+//
+//   - className "btn" / "btn …" -> <Button>, variant mapped from
+//     btn-primary/-danger/-ghost, compact from btn-compact; mapped classes
+//     stripped, the rest kept. type defaults to "button", so every button
+//     inside a <form> carries an explicit type decision.
+//   - any other (bespoke) className -> <Button variant="bare" className=…>
+//     verbatim. Bespoke recipes were NOT collapsed onto .btn in this wave.
+//   - <input> -> <Input>; the non-text types {checkbox, radio, range, file,
+//     color} omit the .input base class by the type rule, and a text-like
+//     field with a complete bespoke recipe takes `bare` (className verbatim,
+//     no .input chrome — Button's variant="bare" for inputs).
+//
+// primitiveCensus.test.ts (this directory) enforces the end state from now
+// on: zero raw <button> AND zero raw <input> outside components/ui/, both
+// gated LIVE. The input half briefly shipped staged (six bespoke-recipe text
+// inputs waited on the `bare` escape); it went live the same wave once
+// Input grew `bare` and the six sites migrated. Do not add new raw sites.
+//
+// Unused primitives still get retired: Card, Tabs, and Textarea were deleted
+// in wave 3 of the 2026-07-02 UX remediation because they had no consumer
+// and no mechanical adoption site (see epic elspeth-6cf0e1e188 notes). No
+// new primitive without a concrete first consumer.
 // ============================================================================
 
 export { Button } from "./Button";

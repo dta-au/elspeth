@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.tools import get_tool_definitions
 
 __all__ = [
@@ -158,6 +159,17 @@ def _build_tool_required_paths_index() -> dict[str, tuple[_CompiledRequiredPath,
     return index
 
 
+@trust_boundary(
+    tier=3,
+    source="LLM-emitted tool-call arguments (untrusted model output JSON)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns False when any ancestor segment is absent or the cursor is not a mapping; never raises on "
+        "malformed value input (the NotImplementedError guard is conditioned on the first-party compiled ancestor, not on value)"
+    ),
+    non_raising=True,
+)
 def _optional_ancestor_present(value: object, ancestor: RequiredPath) -> bool:
     """Walk down ``value`` along ``ancestor``; return False as soon as a segment is absent.
 

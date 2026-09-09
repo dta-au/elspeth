@@ -13,11 +13,12 @@ import pytest
 import structlog
 from sqlalchemy.pool import StaticPool
 
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -35,7 +36,7 @@ def engine():
 @pytest.fixture
 def service(engine):
     """Create a SessionServiceImpl backed by the in-memory engine."""
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -67,15 +68,35 @@ class TestDatetimeTimezoneRoundTrip:
     async def test_run_started_at_preserves_timezone(self, service) -> None:
         """started_at on a run record must be timezone-aware after retrieval."""
         session = await service.create_session("alice", "Run TZ Test", "local")
-        state = await service.save_composition_state(
+        compose_context = service.session_operation_authority.acquire(
             session_id=session.id,
-            state=CompositionStateData(source=None, nodes=[], edges=[], outputs=[], metadata_=None, is_valid=False),
-            provenance="session_seed",
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
-        run = await service.create_run(
+        try:
+            state = await service.save_composition_state(
+                session_id=session.id,
+                state=CompositionStateData(source=None, nodes=[], edges=[], outputs=[], metadata_=None, is_valid=False),
+                provenance="session_seed",
+                session_operation_context=compose_context,
+            )
+        finally:
+            service.session_operation_authority.release(compose_context)
+        execute_context = service.session_operation_authority.acquire(
             session_id=session.id,
-            state_id=state.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
+        try:
+            run = await service.create_run(
+                session_id=session.id,
+                state_id=state.id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            service.session_operation_authority.release(execute_context)
         fetched = await service.get_run(run.id)
 
         assert fetched.started_at is not None

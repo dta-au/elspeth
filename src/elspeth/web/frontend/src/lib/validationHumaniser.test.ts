@@ -6,8 +6,12 @@ import {
   humaniseValidationMessage,
   makePhraseFor,
 } from "./validationHumaniser";
-import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import {
+  COLLECTOR_PHRASE,
+  UNKNOWN_COMPONENT_PHRASE,
+} from "@/components/chat/guided/pipelineGloss";
 import { makeComposition } from "@/test/composerFixtures";
+import type { NodeSpec } from "@/types/index";
 
 // ── humaniseValidationMessage ───────────────────────────────────────────────
 
@@ -16,7 +20,7 @@ describe("humaniseValidationMessage", () => {
 
   it("passes an unrecognised message through untouched", () => {
     const finding = humaniseValidationMessage("Some other error", identityPhraseFor);
-    expect(finding).toEqual({ headline: "Some other error", raw: null });
+    expect(finding).toEqual({ headline: "Some other error", raw: null, namedSteps: [] });
   });
 
   it("humanises a two-sided contract violation with both producer and consumer phrases", () => {
@@ -41,12 +45,15 @@ describe("humaniseValidationMessage", () => {
   });
 
   it("humanises the backend transform contract shape without leaking its node id", () => {
+    // Rule C's own headline since elspeth-920bd88299 — it no longer shares
+    // "Transform contract violation" (nor an error_code) with the Rule D
+    // collision check, so this fixture exercises the second pattern.
     const message =
-      "Transform contract violation: node 'select_output_fields' (field_mapper) declares output fields " +
-      "[batch_size, customer_tier] (required) but with select_only: true the mapping will only emit " +
-      "[customer_tier]. Declared required output fields not produced by this transform: [batch_size]. " +
-      "Fix by removing the missing field(s) from the schema declaration, OR by extending `mapping` so " +
-      "the transform actually emits them, OR by setting select_only: false.";
+      "Transform output guarantee violation: node 'select_output_fields' (field_mapper) declares output " +
+      "fields [batch_size, customer_tier] (required) but with select_only: true the mapping can only " +
+      "guarantee [customer_tier]. Declared required output fields not guaranteed by this transform: " +
+      "[batch_size]. Those names are mapping TARGETS, and `schema` is this node's INPUT contract, so a " +
+      "target is usually absent from `schema.fields` altogether.";
 
     const finding = humaniseValidationMessage(
       message,
@@ -57,6 +64,23 @@ describe("humaniseValidationMessage", () => {
       "A step isn't connected correctly: \"choose the output fields\" doesn't match what the next step expects.",
     );
     expect(finding.headline).not.toContain("select_output_fields");
+    expect(finding.raw).toBe(message);
+  });
+
+  it("humanises the transform output collision shape (Rule D keeps the original headline)", () => {
+    const message =
+      "Transform contract violation: node 'rewrite' (llm) declares output fields [headline] but " +
+      "[headline] already arrive(s) on its input row. The engine rejects a transform that would " +
+      "overwrite an existing input field, so this pipeline fails on the first row.";
+
+    const finding = humaniseValidationMessage(
+      message,
+      (id) => (id === "rewrite" ? "rewrite the headline" : "unknown step"),
+    );
+
+    expect(finding.headline).toBe(
+      "A step isn't connected correctly: \"rewrite the headline\" doesn't match what the next step expects.",
+    );
     expect(finding.raw).toBe(message);
   });
 
@@ -134,7 +158,55 @@ describe("makePhraseFor", () => {
       outputs: [],
     });
     const phraseFor = makePhraseFor(state);
-    expect(phraseFor("node:rater")).toBe("rate each row");
+    // "rater" is an author-meaningful id (not trivially "llm"/"llm_2"), so
+    // the identity ladder title-cases it instead of the "rate each row"
+    // plugin gloss (elspeth-9f21f3c57d) — the same name the acknowledgement
+    // card shows.
+    expect(phraseFor("node:rater")).toBe("Rater");
+  });
+
+  it("keeps the plugin gloss for an id that is trivially its own plugin's name", () => {
+    const state = makeComposition(1, {
+      sources: {},
+      nodes: [
+        {
+          id: "llm_2",
+          node_type: "transform",
+          plugin: "llm",
+          input: "source",
+          on_success: null,
+          on_error: null,
+          options: {},
+        },
+      ],
+      outputs: [],
+    });
+    const phraseFor = makePhraseFor(state);
+    expect(phraseFor("llm_2")).toBe("rate each row");
+  });
+
+  it("prefers a node's authored description over both its title-cased id and the plugin gloss (elspeth-9f21f3c57d)", () => {
+    const state = makeComposition(1, {
+      sources: {},
+      nodes: [
+        {
+          id: "recommend_pairing",
+          node_type: "transform",
+          plugin: "llm",
+          input: "source",
+          on_success: null,
+          on_error: null,
+          options: {},
+          description: "Ask the LLM for a complementary colour pairing for this colour.",
+        },
+      ],
+      outputs: [],
+    });
+    const phraseFor = makePhraseFor(state);
+    // Label register: trailing full stop dropped.
+    expect(phraseFor("recommend_pairing")).toBe(
+      "Ask the LLM for a complementary colour pairing for this colour",
+    );
   });
 
   it("falls back to the neutral phrase for an id with no direct, stripped, fuzzy, or generated match", () => {
@@ -202,9 +274,11 @@ describe("makePhraseFor", () => {
     // "refunds_clean_v2" shares 1 meaningful token with "refunds_raw"
     // ('raw' is <4 chars and filtered) but 2 meaningful tokens with
     // "refunds_clean" ('refunds' + 'clean') — the more specific candidate
-    // must win regardless of map iteration order.
-    expect(phraseFor("refunds_clean_v2")).toBe("rate each row");
-    expect(phraseFor("refunds_clean_v2")).not.toBe("reshape each row");
+    // must win regardless of map iteration order. (Both nodes now resolve
+    // to their title-cased own names — elspeth-9f21f3c57d — which keeps the
+    // two candidates distinct and this assertion discriminating.)
+    expect(phraseFor("refunds_clean_v2")).toBe("Refunds Clean");
+    expect(phraseFor("refunds_clean_v2")).not.toBe("Refunds Raw");
   });
 
   // ── elspeth-ede84df6b3: a role-less generated id must not default to a ───
@@ -241,9 +315,38 @@ describe("makePhraseFor", () => {
     expect(phraseFor("output_csv_a1b2", "source")).toBe("write a CSV");
   });
 
+  it("prioritises an authoritative row_union type over generated id-role heuristics", () => {
+    const phraseFor = makePhraseFor(null);
+    expect(phraseFor("output_guided_row_union_a1b2", "row_union")).toBe(
+      "wait for every branch, then preserve every branch row",
+    );
+  });
+
+  it("prioritises an authoritative collector type over generated id-role heuristics", () => {
+    const phraseFor = makePhraseFor(null);
+
+    expect(phraseFor("output_guided_collector_a1b2", "collector")).toBe(
+      COLLECTOR_PHRASE,
+    );
+  });
+
   it("ignores an unrecognised component_type value and falls through to the id-substring guess", () => {
     const phraseFor = makePhraseFor(null);
     expect(phraseFor("transform_csv_normalize_a1b2c3", "graph")).toBe("process each row");
+  });
+
+  it("keeps structural barrier component types semantically distinct without a live composition", () => {
+    const phraseFor = makePhraseFor(null);
+
+    expect(phraseFor("barrier_a1b2", "row_union")).toBe(
+      "wait for every branch, then preserve every branch row",
+    );
+    expect(phraseFor("barrier_a1b2", "coalesce")).toBe(
+      "merge the branches",
+    );
+    expect(phraseFor("barrier_a1b2", "queue")).toBe(
+      "interleave the incoming rows",
+    );
   });
 
   it("does not let a bare 'source' or 'output' component match everything via fuzzy overreach", () => {
@@ -261,6 +364,133 @@ describe("makePhraseFor", () => {
   });
 });
 
+// ── makePhraseFor — defensive compiled-DAG-id strip (elspeth-9f21f3c57d) ────
+//
+// Compiled DAG ids embed the composer node id between a node-kind prefix and
+// a 12-hex hash suffix (`config_gate_fan_out_5176d9a61403` ↔ composer node
+// `fan_out`). The strip is a fallback AFTER the exact/map paths, recovers the
+// embedded composer id greedily (composer ids may contain underscores), and
+// re-runs the map/fuzzy resolution on it.
+
+describe("makePhraseFor — compiled-id strip", () => {
+  function stateWithNodes(nodes: NodeSpec[]) {
+    return makeComposition(1, { sources: {}, nodes, outputs: [] });
+  }
+
+  it("resolves a compiled id whose embedded composer id contains underscores (greedy capture)", () => {
+    const state = stateWithNodes([
+      {
+        id: "step_0123456789ab",
+        node_type: "transform",
+        plugin: "llm",
+        input: "source",
+        on_success: null,
+        on_error: null,
+        options: {},
+      },
+    ]);
+    const phraseFor = makePhraseFor(state);
+    expect(phraseFor("transform_step_0123456789ab_ab12cd34ef56")).toBe(
+      "Step 0123456789ab",
+    );
+  });
+
+  it("resolves a config_gate compiled id to the gate node it embeds (prefix vocabulary is compiled kinds, not node_type)", () => {
+    const state = stateWithNodes([
+      {
+        id: "fan_out",
+        node_type: "gate",
+        plugin: null,
+        input: "source",
+        on_success: null,
+        on_error: null,
+        options: {},
+        condition: "row.kind == 'colour'",
+      },
+    ]);
+    const phraseFor = makePhraseFor(state);
+    expect(phraseFor("config_gate_fan_out_5176d9a61403")).toBe("Fan Out");
+  });
+
+  it("still degrades an unmappable compiled id to the generic phrase", () => {
+    const phraseFor = makePhraseFor(makeComposition(1, { sources: {}, nodes: [], outputs: [] }));
+    expect(phraseFor("config_gate_ghost_aaaabbbbcccc")).toBe(UNKNOWN_COMPONENT_PHRASE);
+  });
+
+  it("leaves short-hash generated ids to the existing fuzzy/role ladder (12-hex suffix required)", () => {
+    const phraseFor = makePhraseFor(null);
+    // 8-hex suffixes (the guided generated-id shape pinned above) must not
+    // enter the strip; the role/format guess still answers.
+    expect(phraseFor("transform_guided_xform_0_abcd1234")).toBe("process each row");
+    expect(phraseFor("sink_guided_output_csv_abcd1234")).toBe("write a CSV");
+  });
+});
+
+// ── the session-2e0c8ea3 banner shape (elspeth-9f21f3c57d) ──────────────────
+
+describe("humaniseValidationMessage — compiled-id edge dump names the real steps", () => {
+  it("renders both composer step names for the exact session-2e0c8ea3 banner shape", () => {
+    const state = makeComposition(1, {
+      sources: {},
+      nodes: [
+        {
+          id: "fan_out",
+          node_type: "gate",
+          plugin: null,
+          input: "source",
+          on_success: null,
+          on_error: null,
+          options: {},
+          condition: "row.kind == 'colour'",
+        },
+        {
+          id: "recommend_pairing",
+          node_type: "transform",
+          plugin: "llm",
+          input: "fan_out",
+          on_success: null,
+          on_error: null,
+          options: {},
+          description: "Ask the LLM for a complementary colour pairing for this colour.",
+        },
+      ],
+      outputs: [],
+    });
+    const phraseFor = makePhraseFor(state);
+    const finding = humaniseValidationMessage(
+      "Schema contract violation: edge 'config_gate_fan_out_5176d9a61403' → 'transform_recommend_pairing_5176d9a61403'\n" +
+        "  Consumer (llm) requires fields: ['colour']\n" +
+        "  Producer (gate) guarantees: ['kind']\n" +
+        "  Missing fields: ['colour']",
+      phraseFor,
+    );
+    expect(finding.headline).toBe(
+      'Two steps aren\'t connected correctly: the "Fan Out" step\'s output ' +
+        'doesn\'t match what "Ask the LLM for a complementary colour pairing for this colour" expects.',
+    );
+    expect(finding.headline).not.toContain("this step");
+    expect(finding.headline).not.toContain("rate each row");
+    expect(finding.namedSteps).toEqual([
+      "Fan Out",
+      "Ask the LLM for a complementary colour pairing for this colour",
+    ]);
+  });
+
+  it("still degrades to the generic phrases when neither compiled id is mappable", () => {
+    const phraseFor = makePhraseFor(makeComposition(1, { sources: {}, nodes: [], outputs: [] }));
+    const finding = humaniseValidationMessage(
+      "Schema contract violation: edge 'config_gate_ghost_aaaabbbbcccc' → 'coalesce_phantom_aaaabbbbcccc'\n" +
+        "  Missing fields: ['x']",
+      phraseFor,
+    );
+    expect(finding.headline).toBe(
+      'Two steps aren\'t connected correctly: the "this step" step\'s output ' +
+        'doesn\'t match what "this step" expects.',
+    );
+    expect(finding.namedSteps).toEqual([]);
+  });
+});
+
 // ── formatFindingBody ───────────────────────────────────────────────────────
 
 describe("formatFindingBody", () => {
@@ -268,7 +498,7 @@ describe("formatFindingBody", () => {
     const body = formatFindingBody(
       1,
       "problem to fix",
-      { headline: "Prompt is empty", raw: null },
+      { headline: "Prompt is empty", raw: null, namedSteps: [] },
       "rater",
       "transform",
       (id) => (id === "rater" ? "rate each row" : UNKNOWN_COMPONENT_PHRASE),
@@ -280,7 +510,7 @@ describe("formatFindingBody", () => {
     const body = formatFindingBody(
       1,
       "problem to fix",
-      { headline: "Pipeline has no sink", raw: null },
+      { headline: "Pipeline has no sink", raw: null, namedSteps: [] },
       null,
       null,
       () => UNKNOWN_COMPONENT_PHRASE,
@@ -288,16 +518,66 @@ describe("formatFindingBody", () => {
     expect(body).toBe("1 problem to fix — Pipeline has no sink");
   });
 
-  it("omits the possessive prefix when the finding already carries a raw dump (already humanised)", () => {
+  it("omits the possessive prefix when the humanised headline already names this step", () => {
     const body = formatFindingBody(
       2,
       "problems to fix",
-      { headline: "Two steps aren't connected correctly: …", raw: "Schema contract violation: …" },
+      {
+        headline: "Two steps aren't connected correctly: …",
+        raw: "Schema contract violation: …",
+        namedSteps: ["rate each row", "write a CSV"],
+      },
       "rater",
       "transform",
       () => "rate each row",
     );
     expect(body).toBe("2 problems to fix — Two steps aren't connected correctly: …");
+  });
+
+  it("prefixes the resolved step name on a humanised finding whose headline could not name it (elspeth-9f21f3c57d)", () => {
+    // The message's own ids were unmappable (headline says "this step") but
+    // the finding's component_id resolves — the one name we have must reach
+    // the user rather than being suppressed with the raw dump.
+    const body = formatFindingBody(
+      1,
+      "problem to fix",
+      {
+        headline: 'Two steps aren\'t connected correctly: the "this step" step\'s output doesn\'t match what "this step" expects.',
+        raw: "Schema contract violation: …",
+        namedSteps: [],
+      },
+      "recommend_pairing",
+      "transform",
+      () => "Recommend Pairing",
+    );
+    expect(body).toBe(
+      "1 problem to fix — 'Recommend Pairing': Two steps aren't connected correctly: " +
+        'the "this step" step\'s output doesn\'t match what "this step" expects.',
+    );
+  });
+
+  it("never prefixes the generic phrase onto a humanised finding", () => {
+    const body = formatFindingBody(
+      1,
+      "problem to fix",
+      { headline: "A step isn't connected correctly: …", raw: "Schema contract violation: …", namedSteps: [] },
+      "ghost",
+      null,
+      () => UNKNOWN_COMPONENT_PHRASE,
+    );
+    expect(body).toBe("1 problem to fix — A step isn't connected correctly: …");
+  });
+
+  it("never prefixes a review-pending ('self'-naming) finding", () => {
+    const body = formatFindingBody(
+      1,
+      "problem to fix",
+      { headline: "The Summarise step is waiting for your review.", raw: "pipeline_decision review pending …", namedSteps: "self" },
+      "rater",
+      "transform",
+      () => "Rater",
+    );
+    expect(body).toBe("1 problem to fix — The Summarise step is waiting for your review.");
   });
 
   it("threads component_type into the phraseFor call so a role-less id resolves correctly", () => {
@@ -309,7 +589,7 @@ describe("formatFindingBody", () => {
     formatFindingBody(
       1,
       "problem to fix",
-      { headline: "Missing field", raw: null },
+      { headline: "Missing field", raw: null, namedSteps: [] },
       "csv_refunds_a1b2",
       "source",
       phraseFor,

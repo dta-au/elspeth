@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from azure.core.exceptions import ResourceNotFoundError
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -36,13 +37,9 @@ _CTX = RestrictedSinkEffectContext(
 )
 
 
-class ResourceNotFoundError(Exception):
-    pass
-
-
 class _Blob:
     def get_blob_properties(self) -> None:
-        raise ResourceNotFoundError
+        raise ResourceNotFoundError("missing")
 
 
 class _Container:
@@ -90,7 +87,9 @@ def _effect_plan(rows: list[dict[str, Any]]):
     return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         _CTX,

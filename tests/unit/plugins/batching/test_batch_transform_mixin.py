@@ -18,7 +18,7 @@ import pytest
 
 from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.contexts import TransformContext
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow
@@ -27,6 +27,7 @@ from elspeth.engine.batch_adapter import SharedBatchAdapter
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort, OutputPort
+from elspeth.plugins.infrastructure.batching.row_reorder_buffer import ShutdownError
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
@@ -385,6 +386,33 @@ class BlockingBatchTransform(BaseTransform, BatchTransformMixin):
 
 
 class TestBatchTransformMixinEviction:
+    def test_evicted_worker_integrity_failure_reaches_shutdown(self) -> None:
+        transform = SimpleBatchTransform()
+        transform.connect_output(CollectorOutputPort())
+        entered = threading.Event()
+        release = threading.Event()
+        failure = AuditIntegrityError("late worker corruption")
+
+        def fail_after_eviction(row: PipelineRow, ctx: TransformContext) -> TransformResult:
+            entered.set()
+            assert release.wait(timeout=5)
+            raise failure
+
+        token = make_token("late-integrity")
+        ctx = make_context(landscape=_make_factory(), token=token, state_id="late-state")
+        try:
+            transform.accept_row(make_pipeline_row({}), ctx, fail_after_eviction)
+            assert entered.wait(timeout=5)
+            assert transform.evict_submission(token.token_id, "late-state")
+        finally:
+            release.set()
+            with pytest.raises(AuditIntegrityError) as caught:
+                transform.shutdown_batch_processing()
+        assert caught.value is failure
+        with pytest.raises(AuditIntegrityError) as caught_flush:
+            transform.flush_batch_processing()
+        assert caught_flush.value is failure
+
     """Tests for eviction of timed-out submissions.
 
     When a waiter times out in the executor, the corresponding buffer entry
@@ -636,8 +664,9 @@ class FailingOutputPort:
     Used for testing release loop error handling with stale token detection.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, failure: Exception | None = None) -> None:
         self.results: list[tuple[Any, Any, Any]] = []
+        self._failure = failure
         self._fail_count = 0
         self._should_fail_at: set[int] = set()
         self._emit_count = 0
@@ -650,6 +679,8 @@ class FailingOutputPort:
         current = self._emit_count
         self._emit_count += 1
         if current in self._should_fail_at:
+            if self._failure is not None:
+                raise self._failure
             raise RuntimeError(f"Simulated output port failure at emit #{current}")
         self.results.append((token, result, state_id))
 
@@ -664,10 +695,19 @@ class TestReleaseLoopStaleTokenDetection:
     with token=None, it's a pre-unpack internal error -- re-raise immediately.
     """
 
-    def test_post_unpack_emit_failure_emits_exception_result(self) -> None:
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("output failed"),
+            TimeoutError("output timeout"),
+            ShutdownError("output closed"),
+            AuditIntegrityError("output integrity"),
+        ],
+    )
+    def test_post_unpack_emit_failure_emits_exception_result(self, failure: Exception) -> None:
         """When emit() fails AFTER unpacking entry.result, the exception handler
         should use the current token/state_id (not stale ones)."""
-        port = FailingOutputPort()
+        port = FailingOutputPort(failure)
         port.fail_at(0)  # First emit fails
 
         transform = SimpleBatchTransform()
@@ -701,6 +741,7 @@ class TestReleaseLoopStaleTokenDetection:
             # The token should be the CURRENT row's token, not stale
             assert emitted_token is token
             assert emitted_state == "state-0"
+            assert emitted_result.exception is failure
         finally:
             transform.shutdown_batch_processing(timeout=5.0)
 
@@ -756,8 +797,11 @@ class TestReleaseLoopStaleTokenDetection:
 class AlwaysFailingOutputPort:
     """Output port where every emit() raises — simulates a completely broken port."""
 
+    def __init__(self, failure: Exception | None = None) -> None:
+        self.failure = RuntimeError("Port is completely broken") if failure is None else failure
+
     def emit(self, token: Any, result: Any, state_id: Any) -> None:
-        raise RuntimeError("Port is completely broken")
+        raise self.failure
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
@@ -815,14 +859,19 @@ class TestShutdownRaisesOnThreadTimeout:
     Fix: raise FrameworkBugError to prevent false success reporting.
     """
 
-    def test_shutdown_completes_when_release_thread_already_crashed(self) -> None:
-        """When the release thread has already crashed (e.g., broken port),
-        shutdown_batch_processing completes without raising FrameworkBugError.
-
-        FrameworkBugError only fires when the thread is alive but didn't stop.
-        A crashed thread is already dead — join returns immediately.
-        """
-        port = AlwaysFailingOutputPort()
+    @pytest.mark.parametrize(
+        "failure, expected_error",
+        [
+            (RuntimeError("broken port"), FrameworkBugError),
+            (TimeoutError("broken port"), FrameworkBugError),
+            (AuditIntegrityError("broken port"), AuditIntegrityError),
+        ],
+    )
+    def test_shutdown_and_flush_raise_when_release_thread_already_crashed(
+        self, failure: Exception, expected_error: type[Exception]
+    ) -> None:
+        """Thread termination must not turn a broken output port into success."""
+        port = AlwaysFailingOutputPort(failure)
         transform = SimpleBatchTransform()
         transform.init_batch_processing(
             max_pending=5,
@@ -840,8 +889,10 @@ class TestShutdownRaisesOnThreadTimeout:
         transform._batch_release_thread.join(timeout=3.0)
         assert not transform._batch_release_thread.is_alive()
 
-        # Shutdown should complete without raising — thread is already dead
-        transform.shutdown_batch_processing(timeout=5.0)
+        with pytest.raises(expected_error):
+            transform.flush_batch_processing(timeout=0.1)
+        with pytest.raises(expected_error):
+            transform.shutdown_batch_processing(timeout=5.0)
 
 
 class TestBatchTransformMixinShutdownGuard:

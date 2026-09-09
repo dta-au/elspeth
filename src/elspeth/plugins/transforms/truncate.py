@@ -7,12 +7,13 @@ If the source outputs wrong types, the transform crashes immediately.
 """
 
 import copy
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -31,7 +32,10 @@ class TruncateConfig(TransformDataConfig):
         default_factory=dict,
         description="Mapping of field names to maximum lengths",
     )
-    suffix: str = Field(
+    suffix: Annotated[
+        str,
+        EmittedToOutput("truncate appends this to every truncated value, so it lands in row data and in every downstream artifact"),
+    ] = Field(
         default="",
         description="Suffix to append when truncating (e.g., '...'). Counts toward max length.",
     )
@@ -89,8 +93,27 @@ class Truncate(BaseTransform):
     name = "truncate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:393331d8a6a09fb0"
+    source_file_hash: str | None = "sha256:2896ce58bf9810c4"
     config_model = TruncateConfig
+    usage_when_to_use: str = (
+        "Use for a deterministic character-length cap on selected text fields, optionally reserving "
+        "part of that limit for a visible truncation suffix."
+    )
+    usage_when_not_to_use: str = (
+        "Not for token-aware model context management or semantic summarization: use provider-aware "
+        "input controls or a summarizing transform when character count is not the real limit."
+    )
+    example_use: str = """transform:
+  plugin: truncate
+  options:
+    fields:
+      notes: 80
+    suffix: "..."
+    strict: false
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("text", "truncation", "length-limit")
     passes_through_input = True
 
     def __init__(self, config: dict[str, Any]) -> None:

@@ -59,6 +59,8 @@ from jinja2.nodes import (
     Dict as DictNode,
 )
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import SchemaContract
 
@@ -78,7 +80,10 @@ ROW_API_DYNAMIC_ACCESS = "row-api"
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
-_CarrierPath = tuple[str | int, ...]
+# None retains a computed dictionary write key without inventing its value.
+# API and macro carriers currently produce concrete paths; row carriers may
+# contain unknown segments, which must match both literal and computed reads.
+_CarrierPath = tuple[str | int | None, ...]
 _CarrierPathPattern = tuple[str | int | None, ...]
 _MacroAliases = dict[str, frozenset[str]]
 _MacroContainerAliases = dict[str, dict[_CarrierPath, frozenset[str]]]
@@ -303,6 +308,21 @@ def _walk_ast(
         )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one Filter node of a parsed developer-authored Jinja template — externally authored content "
+        "whose argument expressions are arbitrary"
+    ),
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "a literal string 'attr' argument is recorded as a field or blocked name; any non-literal or "
+        "unknown-shape argument records ATTR_FILTER_DYNAMIC_ACCESS instead of being coerced or dropped; "
+        "never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _record_dynamic_attribute_filter_access(
     node: Filter,
     namespaces: frozenset[str],
@@ -368,6 +388,17 @@ def _record_dynamic_attribute_filter_access(
         _append_dynamic_access(dynamic_accesses, MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS)
 
 
+@trust_boundary(
+    tier=3,
+    source="filter argument expressions in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns the requested explicit keyword or literal mapping value; absent or opaque splats "
+        "return None without fabricating a value; callers classify opaque splats with _has_unknown_kwarg_values"
+    ),
+    non_raising=True,
+)
 def _filter_keyword_value(node: Filter, key: str) -> Node | None:
     for keyword in node.kwargs:
         if keyword.key == key:
@@ -1010,10 +1041,14 @@ def _macro_row_splat_targets(
     for node in ast.find_all(Call):
         for macro_name in _macro_names_for_callee(node.node, macros, macro_aliases, macro_container_aliases):
             macro = macros[macro_name]
+            # Macro.args is jinja2's declared List[Name] (parser grammar): no
+            # isinstance filter — a non-Name element is parse-tree corruption
+            # and must crash via .name, never be silently dropped (dropping
+            # loses exactly the dynamic-access report this scan exists for).
             if _iter_may_yield_row_object(node.dyn_args, frozenset(), row_collection_aliases, row_container_aliases):
-                targets.extend(target.name for target in macro.args[len(node.args) :] if isinstance(target, Name))
+                targets.extend(target.name for target in macro.args[len(node.args) :])
             if _node_references_name(node.dyn_kwargs, frozenset(row_container_aliases)):
-                targets.extend(target.name for target in macro.args if isinstance(target, Name))
+                targets.extend(target.name for target in macro.args)
     return targets
 
 
@@ -1034,7 +1069,10 @@ def _macro_api_splat_targets(
             macro = macros[macro_name]
             star_kind = _iter_may_yield_row_api_kind(node.dyn_args, api_aliases, row_api_container_aliases)
             if star_kind is not None:
-                targets.extend((target.name, star_kind) for target in macro.args[len(node.args) :] if isinstance(target, Name))
+                # Macro.args is jinja2's declared List[Name]: no isinstance
+                # filter — corruption crashes via .name rather than silently
+                # losing a row-API splat report.
+                targets.extend((target.name, star_kind) for target in macro.args[len(node.args) :])
             for target in macro.args:
                 keyword_kind = _row_api_mapping_key_kind(
                     node.dyn_kwargs,
@@ -1063,19 +1101,18 @@ def _callblock_argument_bindings(
             for caller_call in macro.find_all(Call):
                 if not isinstance(caller_call.node, Name) or caller_call.node.name != "caller":
                     continue
-                bindings.extend(
-                    (target, value) for target, value in zip(node.args, caller_call.args, strict=False) if isinstance(target, Name)
-                )
+                # CallBlock.args is jinja2's declared List[Name] (parser
+                # grammar): no isinstance filters — a non-Name element is
+                # parse-tree corruption that must crash via .name, never be
+                # silently unbound (an unbound target loses the security
+                # binding this analysis exists to trace).
+                bindings.extend(zip(node.args, caller_call.args, strict=False))
                 star_values = _literal_star_values(caller_call.dyn_args)
                 explicit_count = len(caller_call.args)
-                for target, value in zip(node.args[explicit_count:], star_values, strict=False):
-                    if isinstance(target, Name):
-                        bindings.append((target, value))
+                bindings.extend(zip(node.args[explicit_count:], star_values, strict=False))
                 if isinstance(caller_call.dyn_kwargs, DictNode):
                     dyn_kwargs = _literal_kwarg_values(caller_call.dyn_kwargs)
-                    bindings.extend(
-                        (target, dyn_kwargs[target.name]) for target in node.args if isinstance(target, Name) and target.name in dyn_kwargs
-                    )
+                    bindings.extend((target, dyn_kwargs[target.name]) for target in node.args if target.name in dyn_kwargs)
     return bindings
 
 
@@ -1139,11 +1176,14 @@ def _callblock_row_splat_targets(
             for caller_call in macro.find_all(Call):
                 if not isinstance(caller_call.node, Name) or caller_call.node.name != "caller":
                     continue
+                # CallBlock.args is jinja2's declared List[Name] (parser
+                # grammar): no isinstance filter — corruption crashes via
+                # .name rather than silently losing a row splat report.
                 if _iter_may_yield_row_object(caller_call.dyn_args, frozenset(), row_collection_aliases, row_container_aliases):
                     explicit_count = len(caller_call.args)
-                    targets.extend(target.name for target in node.args[explicit_count:] if isinstance(target, Name))
+                    targets.extend(target.name for target in node.args[explicit_count:])
                 if _node_references_name(caller_call.dyn_kwargs, frozenset(row_container_aliases)):
-                    targets.extend(target.name for target in node.args if isinstance(target, Name))
+                    targets.extend(target.name for target in node.args)
     return targets
 
 
@@ -1168,7 +1208,10 @@ def _callblock_api_splat_targets(
                 star_kind = _iter_may_yield_row_api_kind(caller_call.dyn_args, api_aliases, row_api_container_aliases)
                 if star_kind is not None:
                     explicit_count = len(caller_call.args)
-                    targets.extend((target.name, star_kind) for target in node.args[explicit_count:] if isinstance(target, Name))
+                    # CallBlock.args is jinja2's declared List[Name]: no
+                    # isinstance filter — corruption crashes via .name rather
+                    # than silently losing a row-API splat report.
+                    targets.extend((target.name, star_kind) for target in node.args[explicit_count:])
                 for target in node.args:
                     keyword_kind = _row_api_mapping_key_kind(
                         caller_call.dyn_kwargs,
@@ -1184,6 +1227,17 @@ def _callblock_api_splat_targets(
     return targets
 
 
+@trust_boundary(
+    tier=3,
+    source="positional splat expression in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns items only for literal List or Tuple nodes; absent or opaque splats return an empty "
+        "inspectable subset; _has_unknown_star_values separately identifies opaque non-None splats"
+    ),
+    non_raising=True,
+)
 def _literal_star_values(node: Node | None) -> list[Node]:
     if isinstance(node, (List, Tuple)):
         return list(node.items)
@@ -1194,6 +1248,17 @@ def _has_unknown_star_values(node: Node | None) -> bool:
     return node is not None and not isinstance(node, (List, Tuple))
 
 
+@trust_boundary(
+    tier=3,
+    source="keyword splat expression and arbitrary mapping keys in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns True for opaque splats or any mapping key that is not a string literal Const; "
+        "returns False only for no splat or mappings whose keys are all statically inspectable strings"
+    ),
+    non_raising=True,
+)
 def _has_unknown_kwarg_values(node: Node | None) -> bool:
     if node is None:
         return False
@@ -1202,6 +1267,20 @@ def _has_unknown_kwarg_values(node: Node | None) -> bool:
     return any(not (isinstance(pair.key, Const) and isinstance(pair.key.value, str)) for pair in node.items)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the dyn_kwargs Dict node of a parsed developer-authored Jinja template — externally authored "
+        "content whose dict keys are arbitrary expressions"
+    ),
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns only the pairs whose key is a literal string Const — the statically traceable subset; "
+        "non-literal keys are omitted from the result; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _literal_kwarg_values(node: DictNode) -> dict[str, Node]:
     values: dict[str, Node] = {}
     for pair in node.items:
@@ -1210,6 +1289,17 @@ def _literal_kwarg_values(node: DictNode) -> dict[str, Node]:
     return values
 
 
+@trust_boundary(
+    tier=3,
+    source="attribute expression in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "classifies tracked row API attribute references as get or row-api; other syntactic forms "
+        "return None, the explicit no-match result; no expression is evaluated or coerced"
+    ),
+    non_raising=True,
+)
 def _row_api_dynamic_access_kind(
     node: Node,
     namespaces: frozenset[str],
@@ -1225,6 +1315,21 @@ def _row_api_dynamic_access_kind(
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one expression node of a parsed developer-authored Jinja template — externally authored "
+        "content whose container literals may hold arbitrary key and value expressions"
+    ),
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns carrier-path entries only for statically recognizable container shapes (Name, access "
+        "paths, Dict/List/Tuple literals with literal string keys); unrecognized shapes contribute no "
+        "entries; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _row_api_container_entries(
     node: Node,
     api_aliases: dict[str, str],
@@ -1397,7 +1502,7 @@ def _carrier_path_matches_pattern_prefix(entry_path: _CarrierPath, path_pattern:
     if len(entry_path) < len(path_pattern):
         return False
     return all(
-        pattern_segment is None or pattern_segment == entry_segment
+        entry_segment is None or pattern_segment is None or pattern_segment == entry_segment
         for entry_segment, pattern_segment in zip(entry_path, path_pattern, strict=False)
     )
 
@@ -1433,7 +1538,7 @@ def _carrier_pattern_has_child_path(paths: frozenset[_CarrierPath], path_pattern
 
 
 def _carrier_path_has_child(entry_path: _CarrierPath, path: _CarrierPath) -> bool:
-    return len(entry_path) > len(path) and entry_path[: len(path)] == path and isinstance(entry_path[len(path)], int)
+    return _carrier_path_has_pattern_child(entry_path, path)
 
 
 def _carrier_path_has_pattern_child(entry_path: _CarrierPath, path_pattern: _CarrierPathPattern) -> bool:
@@ -1460,6 +1565,18 @@ def _merge_macro_names(name_sets: Iterable[frozenset[str]]) -> frozenset[str]:
     return frozenset(names)
 
 
+@trust_boundary(
+    tier=3,
+    source="container expression and arbitrary mapping keys in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "tracks contained row objects using literal string keys or None wildcard keys; unknown "
+        "mapping keys retain their row values; unrecognized expressions contribute no container paths, "
+        "and direct row expressions are classified separately by _node_is_row_object_expression"
+    ),
+    non_raising=True,
+)
 def _row_object_container_paths(
     node: Node,
     namespaces: frozenset[str],
@@ -1475,21 +1592,28 @@ def _row_object_container_paths(
         base_name, path = access_path
         entries = row_container_aliases.get(base_name)
         if entries:
-            return {entry_path[len(path) :] for entry_path in entries if entry_path[: len(path)] == path}
+            return {
+                entry_path[len(path) :]
+                for entry_path in entries
+                if len(entry_path) > len(path) and _carrier_path_matches_pattern_prefix(entry_path, path)
+            }
     dynamic_access_pattern = _row_api_dynamic_container_access_pattern(node)
     if dynamic_access_pattern is not None:
         base_name, path_pattern = dynamic_access_pattern
         entries = row_container_aliases.get(base_name)
         if entries:
             return {
-                entry_path[len(path_pattern) :] for entry_path in entries if _carrier_path_matches_pattern_prefix(entry_path, path_pattern)
+                entry_path[len(path_pattern) :]
+                for entry_path in entries
+                if len(entry_path) > len(path_pattern) and _carrier_path_matches_pattern_prefix(entry_path, path_pattern)
             }
     if isinstance(node, DictNode):
         paths: set[_CarrierPath] = set()
         for pair in node.items:
-            if not (isinstance(pair.key, Const) and isinstance(pair.key.value, str)):
-                continue
-            dict_key_path: _CarrierPath = (pair.key.value,)
+            if isinstance(pair.key, Const) and isinstance(pair.key.value, str):
+                dict_key_path: _CarrierPath = (pair.key.value,)
+            else:
+                dict_key_path = (None,)
             if _node_is_row_object_expression(pair.value, namespaces, row_collection_aliases, row_container_aliases):
                 paths.add(dict_key_path)
             paths.update(
@@ -1531,7 +1655,7 @@ def _row_object_container_access_matches(
         base_name, path = access_path
         if not path:
             return False
-        return path in row_container_aliases.get(base_name, frozenset())
+        return any(_carrier_path_matches_pattern(entry_path, path) for entry_path in row_container_aliases.get(base_name, frozenset()))
     dynamic_access_pattern = _row_api_dynamic_container_access_pattern(node)
     if dynamic_access_pattern is None:
         return False

@@ -18,6 +18,7 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
@@ -50,9 +51,8 @@ class _Token(Protocol):
     token_id: str
     row_id: str
     run_id: str
-    fork_group_id: str | None
     join_group_id: str | None
-    expand_group_id: str | None
+    lineage_path: tuple[LineageFrame, ...]
 
 
 class _Row(Protocol):
@@ -113,11 +113,16 @@ def _closed_safe_value(value: object, path: str) -> object:
 
 def _credential_free_hash(tag: str, value: Mapping[str, object], field_name: str) -> str:
     closed = _closed_safe_value(value, field_name)
-    if not isinstance(closed, dict):  # pragma: no cover - Mapping input guarantees this
+    if type(closed) is not dict:  # pragma: no cover - Mapping input guarantees this
         raise TypeError(f"{field_name} must be an object")
     if scrub_payload_for_audit(closed) != closed:
         raise ValueError(f"{field_name} must be credential-free")
     return _labeled_hash(tag, closed)
+
+
+def compute_sink_effect_target_hash(target_config: Mapping[str, object]) -> str:
+    """Return the credential-free identity hash for one publication target."""
+    return _credential_free_hash("sink-effect-target-v1", target_config, "target_config")
 
 
 def _labeled_hash(tag: str, payload: object) -> str:
@@ -161,7 +166,7 @@ class _BoundedLineageResolver:
             raise _audit_error(f"fan-in exceeds {MAX_LINEAGE_PARENTS}")
         if any(parent.token_id != token.token_id for parent in parents):
             raise _audit_error(f"token {token.token_id!r} has a relation child mismatch")
-        if not parents and any(value is not None for value in (token.fork_group_id, token.join_group_id, token.expand_group_id)):
+        if not parents and (token.join_group_id is not None or token.lineage_path):
             raise _audit_error(f"token {token.token_id!r} claims lineage metadata without a parent relation")
         ordinals = [parent.ordinal for parent in parents]
         if any(type(ordinal) is not int or ordinal < 0 for ordinal in ordinals):
@@ -285,7 +290,7 @@ def compute_pipeline_effect_identity(
     if [member.ordinal for member in member_tuple] != list(range(len(member_tuple))):
         raise ValueError("pipeline members must be dense and ordered")
     config_hash = _credential_free_hash("sink-effect-config-v1", sink_config, "sink_config")
-    requested_target_hash = _credential_free_hash("sink-effect-target-v1", target_config, "target_config")
+    requested_target_hash = compute_sink_effect_target_hash(target_config)
     membership = [
         {
             "ingest_sequence": member.ingest_sequence,
@@ -368,7 +373,7 @@ def compute_audit_export_effect_identity(
     )
     if descriptor.record_chain_algorithm != expected_chain:
         raise ValueError("signed manifest record-chain algorithm does not match snapshot signing mode")
-    target_config_hash = _credential_free_hash("sink-effect-target-v1", target_config, "target_config")
+    target_config_hash = compute_sink_effect_target_hash(target_config)
     manifest_component = final_manifest_identity_payload(descriptor)
     final_manifest_hash = hash_final_manifest_identity_payload(manifest_component)
     effect_payload: dict[str, ClosedAuditExportJSON] = {
@@ -424,5 +429,6 @@ __all__ = [
     "compute_audit_export_effect_identity",
     "compute_effect_identity",
     "compute_pipeline_effect_identity",
+    "compute_sink_effect_target_hash",
     "resolve_sink_effect_members",
 ]

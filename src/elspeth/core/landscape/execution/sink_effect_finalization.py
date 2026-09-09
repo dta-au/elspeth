@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, Final
 
-from sqlalchemy import Row, func, select
+from sqlalchemy import Row, bindparam, func, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -37,6 +37,7 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.artifacts import ArtifactRepository
 from elspeth.core.landscape.execution.node_states import NodeStateRepository
@@ -44,6 +45,7 @@ from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     decode_sink_effect_returned_result,
     encode_sink_effect_returned_result,
 )
+from elspeth.core.landscape.execution.sink_effect_lifecycle import lease_is_live
 from elspeth.core.landscape.model_loaders import (
     ArtifactLoader,
     NodeStateLoader,
@@ -51,6 +53,7 @@ from elspeth.core.landscape.model_loaders import (
     SinkEffectLoader,
     TokenOutcomeLoader,
 )
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     artifacts_table,
     node_states_table,
@@ -73,10 +76,6 @@ def _descriptor_payload(descriptor: ArtifactDescriptor) -> dict[str, object]:
         "path_or_uri": descriptor.path_or_uri,
         "size_bytes": descriptor.size_bytes,
     }
-
-
-def _utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _validate_result_diversion_attribution(attribution: object, diverted_ordinals: Sequence[int]) -> None:
@@ -134,15 +133,26 @@ class SinkEffectFinalization:
         )
         self._artifacts = ArtifactRepository(ops, artifact_loader=self._artifact_loader)
 
-    def finalize(self, request: SinkEffectFinalizeRequest) -> SinkEffectFinalizationResult:
+    def finalize(self, request: SinkEffectFinalizeRequest, *, coordination_token: CoordinationToken) -> SinkEffectFinalizationResult:
+        """Finalize one effect under the run's current leader token (ADR-048).
+
+        The fence is the transaction's first statement on every witness
+        restart, so a deposed leader cannot commit the artifact, the member
+        outcomes, or the effect's terminal state.
+        """
         if type(request) is not SinkEffectFinalizeRequest:
             raise TypeError("request must be exact SinkEffectFinalizeRequest")
         self._validate_outcome_shapes(request)
         for restart in range(_MAX_WITNESS_RESTARTS):
             optimistic = self._resolve_optimistic_witness(request)
             try:
-                with self._db.write_connection() as conn:
-                    result = self._finalize_on(conn, request, optimistic)
+                with fenced_leader_transaction(
+                    self._db.engine,
+                    token=coordination_token,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    verb="finalize",
+                ) as conn:
+                    result = self._finalize_on(conn, request, optimistic, coordination_token=coordination_token)
             except _WitnessChanged:
                 if restart + 1 == _MAX_WITNESS_RESTARTS:
                     raise LandscapeRecordError(
@@ -166,9 +176,6 @@ class SinkEffectFinalization:
                 member.path,
                 sink_name=member.sink_name,
                 batch_id=member.batch_id,
-                fork_group_id=member.fork_group_id,
-                join_group_id=member.join_group_id,
-                expand_group_id=member.expand_group_id,
                 error_hash=member.error_hash,
             )
 
@@ -208,10 +215,18 @@ class SinkEffectFinalization:
         conn: Connection,
         request: SinkEffectFinalizeRequest,
         optimistic: _OptimisticWitness,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
         optimistic_effect = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == request.effect_id)).fetchone()
         if optimistic_effect is None:
             raise LandscapeRecordError("sink effect disappeared before finalization")
+        if optimistic_effect.run_id != coordination_token.run_id:
+            # ADR-048 §2: the token proves leadership of ONE run; finalizing
+            # another run's effect is a cross-run write, refused before any lock.
+            raise LandscapeRecordError(
+                f"sink effect {request.effect_id!r} belongs to run {optimistic_effect.run_id!r}, not the coordination token's run"
+            )
         if optimistic_effect.state == SinkEffectState.FINALIZED.value:
             locked = self._lock_stream_and_effects(conn, optimistic_effect, optimistic.linked_effect_ids)
             effect = locked[request.effect_id]
@@ -241,10 +256,9 @@ class SinkEffectFinalization:
         self._after_state_locks(self._backend_pid(conn), tuple(sorted(state_id for _ordinal, state_id in current_state_ids)))
 
         locked = self._lock_stream_and_effects(conn, optimistic_effect, optimistic.linked_effect_ids)
-        locked_effect = locked.get(request.effect_id)
-        if locked_effect is None:
+        if request.effect_id not in locked:
             raise LandscapeRecordError("sink effect disappeared while acquiring finalization locks")
-        effect = locked_effect
+        effect = locked[request.effect_id]
         if effect.state == SinkEffectState.FINALIZED.value:
             raise _WitnessChanged
         self._validate_effect_authority(conn, request, effect, locked, members)
@@ -311,9 +325,6 @@ class SinkEffectFinalization:
                     sink_node_id=str(effect.sink_node_id),
                     artifact_id=artifact.artifact_id,
                     batch_id=finalization_member.batch_id,
-                    fork_group_id=finalization_member.fork_group_id,
-                    join_group_id=finalization_member.join_group_id,
-                    expand_group_id=finalization_member.expand_group_id,
                     error_hash=finalization_member.error_hash,
                     context=finalization_member.context,
                     conn=conn,
@@ -321,35 +332,29 @@ class SinkEffectFinalization:
                 )
             )
 
-        for ordinal in request.accepted_ordinals:
+        # One executemany UPDATE stamps every member's final disposition; the
+        # fencing gate forbids a DML construction inside a loop, and an
+        # audit-export effect has no members at all (an empty parameter set
+        # would execute the template unbound, so it is skipped outright).
+        member_dispositions = [
+            *({"member_ordinal": ordinal, "disposition": "accepted"} for ordinal in request.accepted_ordinals),
+            *({"member_ordinal": ordinal, "disposition": "diverted"} for ordinal in request.diverted_ordinals),
+        ]
+        if member_dispositions:
             conn.execute(
                 sink_effect_members_table.update()
                 .where(
                     sink_effect_members_table.c.effect_id == request.effect_id,
-                    sink_effect_members_table.c.ordinal == ordinal,
+                    sink_effect_members_table.c.ordinal == bindparam("member_ordinal"),
                     sink_effect_members_table.c.member_state != SinkEffectState.FINALIZED.value,
                 )
                 .values(
-                    prepared_disposition="accepted",
+                    prepared_disposition=bindparam("disposition"),
                     member_state=SinkEffectState.FINALIZED.value,
                     descriptor_hash=descriptor_hash,
                     evidence_hash=evidence_hash,
-                )
-            )
-        for ordinal in request.diverted_ordinals:
-            conn.execute(
-                sink_effect_members_table.update()
-                .where(
-                    sink_effect_members_table.c.effect_id == request.effect_id,
-                    sink_effect_members_table.c.ordinal == ordinal,
-                    sink_effect_members_table.c.member_state != SinkEffectState.FINALIZED.value,
-                )
-                .values(
-                    prepared_disposition="diverted",
-                    member_state=SinkEffectState.FINALIZED.value,
-                    descriptor_hash=descriptor_hash,
-                    evidence_hash=evidence_hash,
-                )
+                ),
+                member_dispositions,
             )
 
         self._advance_stream_head(conn, effect, descriptor_hash)
@@ -483,7 +488,8 @@ class SinkEffectFinalization:
                 raise LandscapeRecordError("sink effect finalization has stale lease owner")
             if effect.generation != request.generation:
                 raise LandscapeRecordError("sink effect finalization has stale generation")
-            if effect.lease_expires_at is None or _utc(effect.lease_expires_at) < now():
+            database_now = read_landscape_transaction_time(conn)
+            if not lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now):
                 raise LandscapeRecordError("sink effect finalization lease has expired")
         primary_effect_ids = {str(member.primary_effect_id) for member in members if member.primary_effect_id is not None}
         common_primary_effect_id = next(iter(primary_effect_ids)) if len(primary_effect_ids) == 1 else None
@@ -494,10 +500,11 @@ class SinkEffectFinalization:
                 raise LandscapeRecordError("failsink effect requires exact per-member primary linkage")
             for member in members:
                 primary_effect_id = str(member.primary_effect_id)
-                primary = linked.get(primary_effect_id)
+                if primary_effect_id not in linked:
+                    raise LandscapeRecordError("failsink effect requires every same-run primary effect to be finalized")
+                primary = linked[primary_effect_id]
                 if (
-                    primary is None
-                    or primary.run_id != effect.run_id
+                    primary.run_id != effect.run_id
                     or primary.role != SinkEffectRole.PRIMARY.value
                     or primary.state != SinkEffectState.FINALIZED.value
                 ):
@@ -517,8 +524,11 @@ class SinkEffectFinalization:
         elif primary_effect_ids:
             raise LandscapeRecordError("primary effect members cannot refer to another primary effect")
         if effect.predecessor_effect_id is not None:
-            predecessor = linked.get(str(effect.predecessor_effect_id))
-            if predecessor is None or predecessor.state != SinkEffectState.FINALIZED.value:
+            predecessor_effect_id = str(effect.predecessor_effect_id)
+            if predecessor_effect_id not in linked:
+                raise LandscapeRecordError("stream predecessor must be finalized before successor finalization")
+            predecessor = linked[predecessor_effect_id]
+            if predecessor.state != SinkEffectState.FINALIZED.value:
                 raise LandscapeRecordError("stream predecessor must be finalized before successor finalization")
         current = conn.execute(select(sink_effects_table.c.effect_id).where(sink_effects_table.c.effect_id == request.effect_id)).fetchone()
         if current is None:  # pragma: no cover - protected by row lock
@@ -532,7 +542,7 @@ class SinkEffectFinalization:
             plan = json.loads(effect.plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("sink effect durable plan is not valid JSON") from exc
-        if not isinstance(plan, dict):
+        if type(plan) is not dict:
             raise LandscapeRecordError("sink effect durable plan must be an object")
         exact_plan_fields = {
             "effect_id": effect.effect_id,
@@ -540,23 +550,27 @@ class SinkEffectFinalization:
             "plan_hash": effect.plan_hash,
             "descriptor_mode": effect.descriptor_mode,
         }
-        mismatches = [field for field, expected in exact_plan_fields.items() if plan.get(field) != expected]
+        mismatches = [field for field, expected in exact_plan_fields.items() if plan[field] != expected]
         if mismatches:
             raise LandscapeRecordError("sink effect durable plan disagrees with ledger fields: " + ", ".join(mismatches))
         descriptor_payload = _descriptor_payload(request.descriptor)
         descriptor_hash = stable_hash(descriptor_payload)
         mode = SinkEffectDescriptorMode(effect.descriptor_mode)
         if mode in {SinkEffectDescriptorMode.PRECOMPUTED, SinkEffectDescriptorMode.NO_PUBLICATION}:
-            if effect.expected_descriptor_hash != descriptor_hash or plan.get("expected_descriptor") != descriptor_payload:
+            if effect.expected_descriptor_hash != descriptor_hash or plan["expected_descriptor"] != descriptor_payload:
                 raise LandscapeRecordError("sink effect finalization descriptor differs from immutable plan")
         elif mode is SinkEffectDescriptorMode.RESULT_DERIVED:
             evidence = deep_thaw(request.evidence)
+            if type(evidence) is not dict:
+                raise LandscapeRecordError("result-derived evidence must be an object")
             expected_evidence = {
                 "accepted_ordinals": list(request.accepted_ordinals),
                 "descriptor": descriptor_payload,
                 "diverted_ordinals": list(request.diverted_ordinals),
             }
-            if isinstance(evidence, dict) and "diversion_attribution" in evidence:
+            if request.diverted_ordinals and "diversion_attribution" not in evidence:
+                raise LandscapeRecordError("result-derived diversion requires diversion attribution")
+            if "diversion_attribution" in evidence:
                 # Commit-time diverters (e.g. database constraints) bind their
                 # durable per-member attribution into the result evidence. When
                 # present it must exactly cover the diverted partition in order.

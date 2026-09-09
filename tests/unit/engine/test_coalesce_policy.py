@@ -127,7 +127,7 @@ def test_decision_matrix(
         event,
         arrived_count=arrived,
         lost_branches=_lost(*lost_names),
-        row_id="row_1",
+        group_id="g-1",
     )
     assert decision.action is action
     assert decision.failure_reason == reason
@@ -141,7 +141,7 @@ def test_require_all_loss_reason_sorts_branch_names() -> None:
         LOSS,
         arrived_count=1,
         lost_branches={"c": "error_routed", "a": "error_routed"},  # unsorted input
-        row_id="row_1",
+        group_id="g-1",
     )
     assert decision.action is FAIL
     assert decision.failure_reason == "branch_lost:a,c"
@@ -239,7 +239,7 @@ class TestStructuralGuarantees:
                         event,
                         arrived_count=arrived,
                         lost_branches=_lost(*lost_names),
-                        row_id="row_1",
+                        group_id="g-1",
                     )
                     assert decision.action is not WAIT, (settings.policy, event, arrived, lost_names)
 
@@ -254,7 +254,7 @@ class TestStructuralGuarantees:
                         event,
                         arrived_count=arrived,
                         lost_branches=_lost(*lost_names),
-                        row_id="row_1",
+                        group_id="g-1",
                     )
                     if decision.action is FAIL:
                         assert decision.require_failure_reason() == decision.failure_reason
@@ -277,10 +277,10 @@ class TestInvariantCrashes:
                 event,
                 arrived_count=1,
                 lost_branches={},
-                row_id="row_42",
+                group_id="g-42",
             )
         assert "my_merge" in str(exc_info.value)
-        assert "row_id='row_42'" in str(exc_info.value)
+        assert "fork_group_id='g-42'" in str(exc_info.value)
 
     @pytest.mark.parametrize("event", [ARRIVAL, TIMEOUT, FLUSH, LOSS], ids=["arrival", "timeout", "flush", "loss"])
     def test_quorum_without_quorum_count_crashes(self, event: CoalesceEvent) -> None:
@@ -292,7 +292,7 @@ class TestInvariantCrashes:
             quorum_count=None,
         )
         with pytest.raises(RuntimeError, match="quorum_count is None for quorum policy"):
-            decide_coalesce(settings, event, arrived_count=1, lost_branches={}, row_id="row_1")
+            decide_coalesce(settings, event, arrived_count=1, lost_branches={}, group_id="g-1")
 
     def test_require_quorum_count_returns_value(self) -> None:
         assert require_quorum_count(_settings(policy="quorum", quorum_count=2)) == 2
@@ -307,7 +307,7 @@ class TestInvariantCrashes:
             quorum_count=None,
         )
         with pytest.raises(RuntimeError, match="Unknown coalesce policy: 'bogus'"):
-            decide_coalesce(settings, event, arrived_count=1, lost_branches={}, row_id="row_1")
+            decide_coalesce(settings, event, arrived_count=1, lost_branches={}, group_id="g-1")
 
     def test_non_quorum_policy_never_reads_quorum_count(self) -> None:
         """require_quorum_count must not be consulted eagerly for other policies."""
@@ -316,10 +316,10 @@ class TestInvariantCrashes:
             for event in (ARRIVAL, TIMEOUT, FLUSH, LOSS):
                 if policy == "first" and event in (TIMEOUT, FLUSH):
                     continue  # arrived=0 needed to avoid the arrival invariant
-                decide_coalesce(settings, event, arrived_count=1, lost_branches={}, row_id="row_1")
+                decide_coalesce(settings, event, arrived_count=1, lost_branches={}, group_id="g-1")
             # zero-arrival resolution path for 'first'
             if policy == "first":
-                decide_coalesce(settings, TIMEOUT, arrived_count=0, lost_branches={}, row_id="row_1")
+                decide_coalesce(settings, TIMEOUT, arrived_count=0, lost_branches={}, group_id="g-1")
 
 
 class TestCoalesceDecisionInvariant:

@@ -27,11 +27,20 @@ from datetime import UTC, datetime
 import pytest
 
 from elspeth.contracts.audit import TokenOutcome
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.events import RunCompletionStatus
 from elspeth.contracts.run_result import RunResult
+from elspeth.core.checkpoint.recovery import (
+    GroupBindingView,
+    GroupSatisfiabilityResumeGate,
+    UnsatisfiableGroupMember,
+)
+from elspeth.core.checkpoint.recovery import ResumeCheck as _ResumeCheck
 from elspeth.engine.orchestrator import run_status
 from elspeth.engine.orchestrator.run_status import (
+    assert_bound_groups_settled_from_audit,
+    cli_completion_for,
     derive_resume_terminal_status_from_audit,
     is_counted_coalesced_output,
 )
@@ -204,3 +213,83 @@ def test_terminal_counter_parity_fields_follow_execution_counters() -> None:
     assert set(execution_counter_fields) == set(strict_fields) | excluded_fields
     assert strict_fields == tuple(field for field in execution_counter_fields if field not in excluded_fields)
     assert not [field for field in strict_fields if field not in run_result_fields]
+
+
+# ---------------------------------------------------------------------------
+# cli_completion_for: the CLI exit-code taxonomy (F17, elspeth-83ad093154)
+# ---------------------------------------------------------------------------
+# The `run` and `resume` commands exit the process with the code this mapping
+# returns; these tests lock the taxonomy so a drift here is caught before it
+# reaches CI/cron/ECS wrappers that branch on the exit code.
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_completion", "expected_exit_code"),
+    [
+        (RunStatus.COMPLETED, RunCompletionStatus.COMPLETED, 0),
+        (RunStatus.EMPTY, RunCompletionStatus.COMPLETED, 0),
+        (RunStatus.COMPLETED_WITH_FAILURES, RunCompletionStatus.PARTIAL, 1),
+        (RunStatus.FAILED, RunCompletionStatus.FAILED, 2),
+        (RunStatus.INTERRUPTED, RunCompletionStatus.INTERRUPTED, 3),
+    ],
+)
+def test_cli_completion_for_locks_exit_code_taxonomy(
+    terminal_status: RunStatus,
+    expected_completion: RunCompletionStatus,
+    expected_exit_code: int,
+) -> None:
+    assert cli_completion_for(terminal_status) == (expected_completion, expected_exit_code)
+
+
+def test_cli_completion_for_rejects_non_terminal_status() -> None:
+    with pytest.raises(OrchestrationInvariantError, match="terminal-status-only"):
+        cli_completion_for(RunStatus.RUNNING)
+
+
+# ---- assert_bound_groups_settled_from_audit (elspeth-76e936568e) ----
+
+
+class TestAssertBoundGroupsSettledFromAudit:
+    """The end-of-run post-condition is a THIRD consumer of the §8
+    group-satisfiability gate — same gate object, same bindings projection,
+    verdict text taken from the gate. These pins hold the wiring; the
+    gate's own semantics are pinned in tests/unit/core/checkpoint, and the
+    end-to-end refusal in tests/integration/pipeline."""
+
+    _DB = object()
+    _GRAPH = object()
+    _VIEW = GroupBindingView(fork_branch_closers={}, fork_branch_rosters={}, scope_opener_closers={})
+
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, gate: GroupSatisfiabilityResumeGate) -> list[tuple[object, str, object]]:
+        calls: list[tuple[object, str, object]] = []
+
+        def fake_view(graph: object) -> GroupBindingView:
+            assert graph is self._GRAPH
+            return self._VIEW
+
+        def fake_gate(db: object, run_id: str, bindings: object) -> GroupSatisfiabilityResumeGate:
+            calls.append((db, run_id, bindings))
+            return gate
+
+        monkeypatch.setattr(run_status, "group_binding_view_from_graph", fake_view)
+        monkeypatch.setattr(run_status, "check_group_satisfiability_resumable", fake_gate)
+        return calls
+
+    def test_settled_run_passes_and_the_gate_saw_the_graph_projection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = self._wire(monkeypatch, GroupSatisfiabilityResumeGate(unsatisfiable_members=(), check=_ResumeCheck(can_resume=True)))
+        assert assert_bound_groups_settled_from_audit(self._DB, "run-1", self._GRAPH) is None  # type: ignore[arg-type]
+        assert calls == [(self._DB, "run-1", self._VIEW)]
+
+    def test_unsettled_member_refuses_with_the_gates_own_verdict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        member = UnsatisfiableGroupMember(closer_name="stitch", group_id="grp-1", member_key="mem-1", kind=FrameKind.EXPAND)
+        reason = "1 bound-group member(s) can never settle — expand group 'grp-1' member 'mem-1' at closer 'stitch'"
+        self._wire(
+            monkeypatch,
+            GroupSatisfiabilityResumeGate(unsatisfiable_members=(member,), check=_ResumeCheck(can_resume=False, reason=reason)),
+        )
+        with pytest.raises(OrchestrationInvariantError) as exc_info:
+            assert_bound_groups_settled_from_audit(self._DB, "run-1", self._GRAPH)  # type: ignore[arg-type]
+        message = str(exc_info.value)
+        assert reason in message  # derived from the gate, not restated
+        assert "run-1" in message
+        assert "elspeth-76e936568e" in message

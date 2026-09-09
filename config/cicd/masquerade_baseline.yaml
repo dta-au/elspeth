@@ -1,0 +1,1250 @@
+# masquerade.attribute-probes baseline
+#
+# READ THIS BEFORE TRUSTING A GREEN GATE.
+#
+# This file adjudicates every getattr/hasattr/inspect.getattr_static/
+# __getattr__ site in src/elspeth, tests, scripts, and elspeth-lints/src
+# that is NOT covered by one of the gate's three permanent, structural
+# amnesties (a sentinel getattr on a @trust_boundary/@observation_boundary
+# source_param; assert [not] hasattr(...) in tests; a PEP 562 module
+# __getattr__ gated on a closed literal table). A site listed here is
+# TRACKED, not CLEARED.
+#
+# `classification: unadjudicated` means NOT YET REVIEWED. Most entries in
+# this file were seeded automatically from the corpus measured at gate
+# creation time (elspeth-b9ad1bbee3) and carry no human judgement about
+# whether the site is correct, defective, or should be rewritten. A
+# PASSING GATE MEANS "NOTHING NEW LANDED SINCE THE BASELINE WAS SEEDED" —
+# it does NOT mean "this corpus is clean". Only entries whose
+# classification is one of external-parse / approved-introspection /
+# reflection-owned-table / module-getattr / data-container-api, with a
+# real justification, have been reviewed.
+#
+# Identity is (path, qualname, kind) — no line numbers, so reformatting or
+# moving a site does not require re-adjudication, but renaming or
+# relocating it does (the old entry goes stale, a new one is required).
+# Multiple probe sites of the same kind inside one function share one
+# entry. `occurrences` is a REQUIRED exact count, and `probe_shapes` is a
+# sorted per-occurrence multiset of SHA-256 fingerprints over normalized
+# AST shapes (source positions excluded). Count drift catches additions /
+# removals; shape drift catches one-for-one semantic substitutions at the
+# same key and count. Whitespace-only reformatting keeps the same shape. A
+# legacy entry with no shapes may be loaded for migration, but it always
+# fires shape drift and its old review is not preserved by refresh.
+#
+# A baseline entry whose (path, qualname, kind) no longer exists AT ALL in
+# the tree is itself a gate failure (stale-baseline-entry) so this file
+# tracks reality and cannot silently rot as code moves out from under it.
+#
+# Governing document: docs/architecture/adr/032-validate-by-trust-domain.md
+
+entries:
+- path: elspeth-lints/src/elspeth_lints/core/judge.py
+  qualname: _consume_agent_messages
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - b4faada866688b2b682c965481d2fc97a4c7ec3e1d6f4fef76c454718a0247e4
+  classification: external-parse
+  justification: Parses the optional num_turns field from a terminal claude-agent-sdk
+    ResultMessage after nominal SDK message discrimination. The value is read once,
+    accepted only as an exact int or None, and retained only as owned turn-budget
+    evidence.
+- path: elspeth-lints/src/elspeth_lints/core/judge.py
+  qualname: _extract_cache_accounting
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 73b9b35c7e10e2e3507f0fd9c7e8cbe34ddd18f178b9d2847d59c84d2300d549
+  - eb558ae5b2a2af30694afd43c6c0eac73a9ffaa13c6c379c34e0cc57fdcefc95
+  classification: external-parse
+  justification: Parses compatibility-optional OpenAI/OpenRouter prompt-token detail
+    fields. Each foreign field is read once, exact-int validated, and reduced to the
+    owned int-or-None accounting tuple; provider objects do not escape.
+- path: elspeth-lints/src/elspeth_lints/core/judge.py
+  qualname: _extract_text_block
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 5d64249c2c40f4832e87b098f86dde63251fb1d094681828648cd50db00763c0
+  classification: external-parse
+  justification: Admits one foreign OpenAI/OpenRouter Choice finish_reason field with
+    a missing sentinel and exact-string validation before returning only owned text;
+    the raw provider response does not escape this boundary.
+- path: elspeth-lints/src/elspeth_lints/core/reaudit.py
+  qualname: _lookup_module_attr
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 40236a9297535c20c08a6e2fb3c8452a7024eb888cbf9783b9eb11527266a8a1
+  classification: module-getattr
+  justification: Resolves a constant from an imported module using the closed _RULE_VOCABULARY_REGISTRY.
+    The lookup has no default, missing names fail loudly, and callers validate the
+    resolved registry value before use.
+- path: elspeth-lints/src/elspeth_lints/core/sign_bundle_transaction.py
+  qualname: <module>
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 9c7c1c44dbb7139299312a3e2c326dbdb65e4e67910eb5e27d5ff54b7141ae6b
+  classification: module-getattr
+  justification: Probes the platform C library for the optional Linux renameat2 capability
+    at module initialization. Absence selects the explicit portable fallback; no arbitrary
+    attribute name or masquerader-controlled object is used.
+- path: src/elspeth/contracts/composer_llm_audit.py
+  qualname: ComposerChatTurn.to_dict
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - e4b10dfc7bc9e8f0816a9d1aa93008ec5828fcaf5bdb9f5176c4fbbc67da076c
+  classification: reflection-owned-table
+  justification: Serializes the dataclass_fields table of this owned frozen audit
+    carrier; both the field names and receiver are ELSPETH-owned.
+- path: src/elspeth/contracts/composer_llm_audit.py
+  qualname: ComposerLLMCall.to_dict
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - e4b10dfc7bc9e8f0816a9d1aa93008ec5828fcaf5bdb9f5176c4fbbc67da076c
+  classification: reflection-owned-table
+  justification: Serializes the dataclass_fields table of this owned frozen audit
+    carrier; both the field names and receiver are ELSPETH-owned.
+- path: src/elspeth/contracts/events.py
+  qualname: ExternalCallCompleted.to_dict
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 61d3bda2d057feae9f4186142a562a3a2e5788a3405a04ec051361960f8ddcbe
+  classification: reflection-owned-table
+  justification: Iterates dataclasses.fields(self) to serialize this owned event;
+    dynamic names come only from the owned dataclass declaration.
+- path: src/elspeth/contracts/events.py
+  qualname: _event_field_to_serializable
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - faa9e2b29ae5b674ea4eb2e084d62eae50de50309e9b29809479ae35a04e7f9c
+  classification: reflection-owned-table
+  justification: The receiver is first admitted as a dataclass instance and each name
+    comes from dataclasses.fields; this is generic owned-table serialization.
+- path: src/elspeth/contracts/freeze.py
+  qualname: freeze_fields
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 2039457aadedb3a3b7adb092ba894ddb2f2db7a6801f7f86bd39d7da1bd307e5
+  classification: reflection-owned-table
+  justification: Field names are explicitly checked against the receiver's declared
+    dataclass field table before access; unknown names fail before reflection.
+- path: src/elspeth/contracts/schema_contract.py
+  qualname: PipelineRow.__getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - 22c7a84047485eb85da19c93a1afdaf23e80f083179239b14fb71393c00a8af2
+  classification: data-container-api
+  justification: Dot-access API over row DATA delegating to self[key] (a Subscript,
+    not attribute forwarding to a foreign object), with a `_`-prefix recursion guard
+    and contract-mode-gated field resolution. The only instance-level __getattr__
+    found in production; adjudicated explicitly rather than assumed legitimate (PLAN.md
+    Finding 4).
+- path: src/elspeth/core/landscape/serialization.py
+  qualname: dataclass_to_dict
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 22f95c0f9eaec75f16d6d2f5d8ad89fb79e4d62f07bc257552bb6be81bdf63db
+  classification: reflection-owned-table
+  justification: Serializes a dataclass through dataclasses.fields; names originate
+    in the admitted dataclass declaration rather than caller-selected attributes.
+- path: src/elspeth/core/security/__init__.py
+  qualname: __getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - c781d204a0d92b0a4fd06115e699f25524310501be647a253b6048c21ba28eea
+  classification: module-getattr
+  justification: Module-level PEP 562 lazy-import facade over the closed _LAZY_EXPORTS
+    dict. The gate is a try/except KeyError rather than an if/raise chain, so it falls
+    outside this rule's flat sequential-if structural recognizer, but is the same
+    closed-table idiom as the amnestied facades (PLAN.md Finding 4).
+- path: src/elspeth/core/security/__init__.py
+  qualname: __getattr__
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 7a320d2426b5a415cd8a744e3d51ee1f442b457cc128f7ce597fa97d0f098a41
+  classification: module-getattr
+  justification: 'ADJUDICATED (lead, 2026-08-08): the getattr(import_module(...),
+    attr_name) inside the PEP 562 lazy-export facade. Reached only after (module_name,
+    attr_name) is unpacked from the closed _LAZY_EXPORTS dict; a KeyError becomes
+    AttributeError. Both the receiver (a module from import_module) and the name (a
+    dict value the module owns) are module-controlled, so nothing caller-supplied
+    reaches it.'
+- path: src/elspeth/engine/__init__.py
+  qualname: __getattr__
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 98aec98d8dc7d3152a2b90ae30ffa09b30eedeff364953cd64391d98a369686c
+  classification: module-getattr
+  justification: 'ADJUDICATED (lead, 2026-08-08): the getattr(import_module("elspeth.engine.orchestrator"),
+    name) inside the PEP 562 facade, guarded by `if name in _ORCHESTRATOR_EXPORTS`
+    (a closed set) with a terminal raise AttributeError. Same idiom and same reasoning
+    as core/security and engine/orchestrator: module-owned name, module receiver,
+    no masquerade surface.'
+- path: src/elspeth/engine/orchestrator/__init__.py
+  qualname: __getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - 7d43697f9d8c727f6d7d9bf51c40e6f5bab964949e7e41dca292f520ab60f87c
+  classification: module-getattr
+  justification: Module-level PEP 562 lazy-import facade gated on three closed export
+    sets via an if/elif/elif/else chain. The gate is real but uses elif, which this
+    rule's flat sequential-if recognizer does not match (PLAN.md Finding 4).
+- path: src/elspeth/engine/orchestrator/__init__.py
+  qualname: __getattr__
+  kind: getattr
+  occurrences: 3
+  probe_shapes:
+  - 6c8dee9546691654181cf10e84712d7b9102012d92c086bd1016b2d2940dd28e
+  - a74b18c441ee7cf0e644cbed24c6bf28e5e543d6fbe18041953baca6ab2a5559
+  - ee09c47dad6135ad41abaf4f8f2e6a56297aed2047cbf1731d62b96d1dbbb131
+  classification: module-getattr
+  justification: 'ADJUDICATED (lead, 2026-08-08): the three getattr(import_module(...),
+    name) calls in the PEP 562 facade body. Each is reached ONLY after name has passed
+    a closed literal export table (_TYPE_EXPORTS / _PLUGIN_TYPE_EXPORTS / _RUNTIME_EXPORTS),
+    with a terminal else: raise AttributeError. The name can never originate from
+    an untrusted source, and the receiver is a module obtained by import_module, not
+    a caller-supplied object — so no object can masquerade through it. This is the
+    explicit-table idiom the ticket asks authors to write, not a presence probe.'
+- path: src/elspeth/engine/orchestrator/counter_classification.py
+  qualname: apply_counter_increments
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
+  classification: reflection-owned-table
+  justification: Applies names from the closed owned CounterEffect.increments table
+    to the owned ExecutionCounters accumulator; no external name is admitted.
+- path: src/elspeth/engine/orchestrator/outcomes.py
+  qualname: reconcile_sink_write_diversions
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
+  classification: reflection-owned-table
+  justification: Reconciles the owned ExecutionCounters through the closed CounterEffect.increments
+    table used by the matching increment operation.
+- path: src/elspeth/plugins/infrastructure/base.py
+  qualname: BaseTransform.__init_subclass__
+  kind: getattr_static
+  occurrences: 1
+  probe_shapes:
+  - 91f5d8b6796e9449354f48bbc7bab41ef308dc6439e84d1f7b8a66709c997a97
+  classification: approved-introspection
+  justification: __init_subclass__ MRO check that a property wins resolution over
+    BaseTransform.input_schema, raising TypeError at class creation on shadowing (elspeth-d6eeb3a71d).
+    This site is ITSELF an anti-masquerading guard; a naive 'fix' would delete a real
+    control (PLAN.md Finding 4). Do not remove this check. Re-adjudicated 2026-08-29
+    (tier-B13) after dropping the dead None default — BaseTransform defines the property,
+    so the static lookup cannot miss on a subclass.
+- path: src/elspeth/plugins/infrastructure/base.py
+  qualname: BaseTransform._config_named_input_columns
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 775282907a5d0d2ff5fdc1e7bcf352fe5dfdc0bdb14e315ca1d5c5f0a1db2744
+  classification: reflection-owned-table
+  justification: Extracts values for names from the validated Pydantic model_fields
+    declaration; receiver and field-name table are both owned configuration types.
+    Re-adjudicated 2026-08-29 (tier-B13) after dropping the dead None default — every
+    declared field is present on a validated instance.
+- path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
+  qualname: AWSTextractDocumentAnalysisConfig._consistency
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 50e5df14678228b39e3a01a2d2abe0d791af8c65be314316cc5666823e508207
+  classification: reflection-owned-table
+  justification: Iterates the closed _FACET_NAMES table over the owned frozen Textract
+    extraction config to apply one uniform field invariant.
+- path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
+  qualname: AWSTextractDocumentAnalysisConfig.configured_output_fields
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 50e5df14678228b39e3a01a2d2abe0d791af8c65be314316cc5666823e508207
+  classification: reflection-owned-table
+  justification: Projects the closed _FACET_NAMES table from the owned frozen Textract
+    extraction config into configured output fields.
+- path: src/elspeth/plugins/transforms/azure/document_intelligence.py
+  qualname: AzureDocumentIntelligenceConfig.configured_output_fields
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - c5a27fadc6966e946c4d9a0bb92c7d046a16fbf7fbd0c77147da19293bb9f593
+  classification: reflection-owned-table
+  justification: Projects the closed _FACET_AZURE_KEYS table from the owned frozen
+    Azure extraction config; neither receiver nor attribute name is external.
+- path: src/elspeth/telemetry/exporters/console.py
+  qualname: ConsoleExporter._extract_pretty_details
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 9386f2ece23803c2d2f38e00d68dc55a2f71cfa9e6d27d6db9b96914c189bd9e
+  classification: reflection-owned-table
+  justification: Formats fields selected from the owned telemetry event dataclass
+    declaration; the event type and field-name table are ELSPETH-owned.
+- path: src/elspeth/telemetry/manager.py
+  qualname: _exporter_delivery_metrics
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - b39727aaec3c603f9f8d32a5d6efc42cc998f3157fa53e953d6af6ca63e229f8
+  classification: external-parse
+  justification: 'ADJUDICATED BY ADR-032 ITSELF, not by this ticket. Exporters arrive
+    from third-party pluggy plugins via elspeth_get_exporters with no type gate in
+    front of them, so this is a Tier-3 external boundary: sentinel getattr with _DELIVERY_METRICS_ABSENT,
+    then value assertions, with malformed-but-present metrics raising rather than
+    being downgraded to "absent". The function docstring records why it must NEVER
+    become a runtime_checkable Protocol isinstance check (Python 3.12+ resolves those
+    via getattr_static, which silently rejected valid forwarding exporters and vanished
+    their delivery accounting). Do not re-litigate; do not "harden" back into a Protocol
+    check.'
+- path: src/elspeth/web/composer/guided/chat_solver.py
+  qualname: _admit_deferred_intent_repair_thread
+  kind: getattr
+  occurrences: 5
+  probe_shapes:
+  - 1f69ba680d07143896dcd1151761f28d41183a680c756c9d25587c3c4363b392
+  - 1fab5e2cd0c15355ca00ce24014de2097c5214b46fced64132caf783125c91ae
+  - 8923dbae997288081cf903ae25b0685eaf68f4c703847ba2cc97e11ecc2138af
+  - a905194a017472185413fa6095a1c43d4c5fafccbba44e15c3720633640dda81
+  - ecb38be7903352a060352d3db42e1dbef66165c5dd79f830e3a0bc8101d31d76
+  classification: external-parse
+  justification: Sentinel-parses LiteLLM repair-thread objects, validates every retained
+    value, and constructs owned repair-thread carriers before downstream use.
+- path: src/elspeth/web/composer/service.py
+  qualname: _capture_composer_llm_completion_fields
+  kind: getattr
+  occurrences: 3
+  probe_shapes:
+  - 8db4dd38e8917a32cf84749b587527221cbc8312767ee17c50e0a4980ac562e4
+  - 9f646fbd5d363c11e29e145e250834754a3827fa6e8f2388c34a4e8c06988f9e
+  - a7184e0fea70413ed933dc47e8d4e8670fc3cecea4269eeb725222321e2ff63e
+  classification: external-parse
+  justification: 'Sentinel-parses choices, message, content, and tool_calls from one
+    unowned LiteLLM completion, validates every retained value, and constructs frozen
+    ELSPETH-owned message, tool-batch, and provider-metadata carriers before the raw
+    provider objects are discarded. Re-adjudicated 2026-08-31 (tier-remediation web-composer
+    lane): the new @trust_boundary decoration amnesties one probe on the declared
+    source param, dropping the non-amnestied count from 4 to 3; the parse form is
+    unchanged (docs/agents/sweeps/tier-remediation-2026-08-31/web-composer.md).'
+- path: src/elspeth/web/composer/tool_batch.py
+  qualname: _admit_tool_batch
+  kind: getattr
+  occurrences: 4
+  probe_shapes:
+  - 3d6732be63a057e1d0cc2ed0fbe7e62fba1a6c5fe6067b1d2c49d12e367a7c8a
+  - 55cd213a15fb02c51d0c916485e376da08f2d59a4e7b175717c6d8bf1e8180d2
+  - 57d599dfe21df71888a4ff1e12d0870553035537ec8c7795c37899b57429b6b3
+  - bbef1d6333743e88aa9c2e1ac768a450a7e289df9218e2e8cac1027b81ce17a2
+  classification: external-parse
+  justification: 'ADJUDICATED BY ADR-032 ITSELF — this is the ADR''s cited corrected
+    boundary, the site of P0 elspeth-9ea866438b. Provider tool-call objects are litellm/vendor-owned
+    and frequently hold their payload in pydantic __pydantic_extra__, so the four
+    steps here ARE the control: read each field once with a sentinel, assert the values,
+    construct the owned frozen _AdmittedToolCall, discard the original. The removed
+    runtime_checkable Protocol check was theatre — it admitted impostors and rejected
+    every genuine provider tool call. The module comment records why it must not return.
+    If the occurrence count drifts here, read the whole function before touching anything.'
+- path: src/elspeth/web/preferences/service.py
+  qualname: PreferencesService.update_composer_preferences._sync._resolve_progress
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 3a19ce2bf99e782c74fb93475dc61a1233d9fc430ccb0e31366a1a4c1b63b67f
+  - 90383565d72674725e160eae2a543739b896d7f246b12404280a46022cb4bef1
+  classification: reflection-owned-table
+  justification: Resolves names from the closed four-field tutorial progress table
+    across owned request and stored-preference models with identical declarations.
+- path: src/elspeth/web/schema_probe.py
+  qualname: _sqlstate
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - bdd7179b401a43a16833136dce3e9c9d043d31d53ecc61cceeb6e4de3f30bc80
+  - d6c05d350951b3a47b0320882c4e6fc66dbc952d352fad256f8422a2f00da7f8
+  classification: external-parse
+  justification: Parses optional sqlstate and pgcode attributes from external DBAPI
+    exceptions and retains only exact strings for closed retry classification.
+- path: src/elspeth/web/sessions/_auto_title.py
+  qualname: _admit_auto_title_completion
+  kind: getattr
+  occurrences: 4
+  probe_shapes:
+  - 67c92314923759122b3e0d1de1d639cc43aebc26a420449ebe0c120f1c8554fc
+  - 80d02de3a2733bf7d4a0d9a96cde6657f4cbbce28d016ab2a1b9f46c2108d5b6
+  - a8b62b0fd8171c2773430f5b978bf7b57bdd7e027cd01b8f0cd460b6c310c149
+  - db3bb4304cc994f95a592226a53d8d43d6424ba6f5965e3538badd99146fa1de
+  classification: external-parse
+  justification: Sentinel-parses the needed LiteLLM completion fields, validates their
+    exact container and value types, and returns an owned admitted carrier.
+- path: tests/testcontainer/web/test_session_operation_fence_postgres.py
+  qualname: test_postgres_fenced_mutation_supports_same_session_crud
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 93e3ff0f6e3cc35c90aaa41c9acc56cc368d9e061a6f54622807c42640a7f82d
+  classification: approved-introspection
+  justification: 'Deliberate reach into a name-mangled private state slot (P4-E8 elspeth-9b14a7a804,
+    reviewed 2026-09-05): the name comes from dir() and is asserted non-empty first;
+    the test''s subject is that every capability facet shares ONE private state object
+    and that the state exposes no connection handle. Two-argument form, no sentinel.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._annotation_has_no_return_provenance
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - d45d8abdf951b7a9fb1971f184e8cf189913d131e301904796eaabfd24e89bed
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._append_site
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads lineno/col_offset on a stdlib ast.AST node. Position attributes are optional
+    per node class (ast.Module, ast.arguments and operators carry none), so the 0
+    default is the documented absence value for a stdlib data structure, not a probe
+    on an owned contract.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._assigned_names
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._attribute_assignment_values
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 579386f3e9d790de138a63f96e5d21d4a81df896b8560c55f343f04f9ca886e9
+  - 7956712c6836a4fb45c6030110cd2464bbb0462af7ea937e3cf5e345cf454cc1
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._binding_annotation_qualified_name
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 27941abd33f6931464cbf6769a8a25d196cd4d9f2706c9ade47bcbb1b3a3a761
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._collect_aliases
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 27941abd33f6931464cbf6769a8a25d196cd4d9f2706c9ade47bcbb1b3a3a761
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._comprehension_target_binding
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._conditional_bindings_are_exhaustive
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  - ccfd2bb8dfa0280f53bb5555f016750adb439e3bb5e81bbe61b3a4fd80f5613e
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._conditional_guard_between
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  - ce4b2473e121dde2c333a1e46a6d2a5474f3d803b42df32145a4337922a81f8d
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._connection_acquisitions_for_expression
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._connection_acquisitions_for_name
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._connection_use_is_contained
+  kind: getattr
+  occurrences: 5
+  probe_shapes:
+  - 027d6b461817d06a73b2b6e737f14ada9fe5bbac1b60c07b688a06fcdc09db51
+  - 26c465e6f57710b3b899ab84fb7ebb939227d2ec53c34a7398e5cd0488c3da0e
+  - fda6294d66eecff6ffdec90ef19896a7005273dad528fc9cb2e35a39dacc6537
+  - fda6294d66eecff6ffdec90ef19896a7005273dad528fc9cb2e35a39dacc6537
+  - fda6294d66eecff6ffdec90ef19896a7005273dad528fc9cb2e35a39dacc6537
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-D6 elspeth-e483fe7f85, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._enclosing_function
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._if_branch_containing
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._is_descendant
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._is_in_sibling_branch
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  - ccfd2bb8dfa0280f53bb5555f016750adb439e3bb5e81bbe61b3a4fd80f5613e
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._lexical_scope
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._next_lexical_scope
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  - a8f69d3f239302deda8a08f871dd15ce2610b993dc8735b3441fe610f551f625
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._outer_statement
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._parameter_database_domain
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - a8f69d3f239302deda8a08f871dd15ce2610b993dc8735b3441fe610f551f625
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._position
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
+  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads lineno/col_offset on a stdlib ast.AST node. Position attributes are optional
+    per node class (ast.Module, ast.arguments and operators carry none), so the 0
+    default is the documented absence value for a stdlib data structure, not a probe
+    on an owned contract.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._resolvable_private_callee
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - d45d8abdf951b7a9fb1971f184e8cf189913d131e301904796eaabfd24e89bed
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-D6 elspeth-e483fe7f85, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _ProductionWriterCollector._write_executions_for
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _WrapperContainmentProof._wrapper_is_contained
+  kind: getattr
+  occurrences: 4
+  probe_shapes:
+  - 2449cd7f9a7ff99e6f8542745a8936acb62d1603cfacc8acec1dd84a101f627a
+  - 27941abd33f6931464cbf6769a8a25d196cd4d9f2706c9ade47bcbb1b3a3a761
+  - 4938ca1a57fd48cd6a8cb384fc0ba72c5c829b5965771a8232891077107ed9cf
+  - 4c29f5920a8a014c660d24dd593fc0508e59859354c5a58415c4ab5c5d5a5852
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-D6 elspeth-e483fe7f85, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _statement_fingerprint
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_session_db_mutation_authority.py
+  qualname: _symbol
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 51ad10efe7671fc29482838a9b164ae7fcd02d8f683220abc8be17026a78b28c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _Resolver.__init__
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 7f085537118f73bd5873efbee9048c257ad1bf42285a237b78d0d0849863a391
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _Resolver._has_wildcard_import
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - eab5e281cf238ed6fd67a551a0c2a0bc9e7dacebfd088cc6a5312237924605cb
+  - f3bfbb9c56e66f417d19523ba7faba6610a0f6f263c97de7dda37406acbbd67f
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    one occurrence reads the scanner-attached parent link on a stdlib ast.AST node
+    (absent by design at the tree root), the other reads lineno, which is optional
+    per stdlib node class. Both defaults are the documented absence values of a stdlib
+    data structure, not presence probes on an owned contract; neither selects a fallback
+    behaviour.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _Resolver._local_import
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - f3bfbb9c56e66f417d19523ba7faba6610a0f6f263c97de7dda37406acbbd67f
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads lineno/col_offset on a stdlib ast.AST node. Position attributes are optional
+    per node class (ast.Module, ast.arguments and operators carry none), so the 0
+    default is the documented absence value for a stdlib data structure, not a probe
+    on an owned contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _Resolver._scoped_import
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - eab5e281cf238ed6fd67a551a0c2a0bc9e7dacebfd088cc6a5312237924605cb
+  - f3bfbb9c56e66f417d19523ba7faba6610a0f6f263c97de7dda37406acbbd67f
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    one occurrence reads the scanner-attached parent link on a stdlib ast.AST node
+    (absent by design at the tree root), the other reads lineno, which is optional
+    per stdlib node class. Both defaults are the documented absence values of a stdlib
+    data structure, not presence probes on an owned contract; neither selects a fallback
+    behaviour.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _Resolver.binding
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - eab5e281cf238ed6fd67a551a0c2a0bc9e7dacebfd088cc6a5312237924605cb
+  - f3bfbb9c56e66f417d19523ba7faba6610a0f6f263c97de7dda37406acbbd67f
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    one occurrence reads the scanner-attached parent link on a stdlib ast.AST node
+    (absent by design at the tree root), the other reads lineno, which is optional
+    per stdlib node class. Both defaults are the documented absence values of a stdlib
+    data structure, not presence probes on an owned contract; neither selects a fallback
+    behaviour.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _Resolver.parameter
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - eab5e281cf238ed6fd67a551a0c2a0bc9e7dacebfd088cc6a5312237924605cb
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _ancestors
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  - 7f085537118f73bd5873efbee9048c257ad1bf42285a237b78d0d0849863a391
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-D8 elspeth-43ddb79074, reviewed 2026-09-06):
+    the one ancestor iterator behind iteration_source and _same_unit_helper; both
+    occurrences read the scanner-attached parent link on a stdlib ast.AST node. ast
+    nodes are not ELSPETH-owned types and the link is absent by design at the tree
+    root, so the sentinel default IS the root test, not a presence probe on an owned
+    contract. No fallback behaviour: the walk stops at the root.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _attribute_has_sessions_provenance
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _has_repeating_ancestor
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  - 7f085537118f73bd5873efbee9048c257ad1bf42285a237b78d0d0849863a391
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _is_descendant
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _is_statically_dead
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _lexical_scope
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _local_annotation_mentions_sessions
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - f3bfbb9c56e66f417d19523ba7faba6610a0f6f263c97de7dda37406acbbd67f
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads lineno/col_offset on a stdlib ast.AST node. Position attributes are optional
+    per node class (ast.Module, ast.arguments and operators carry none), so the 0
+    default is the documented absence value for a stdlib data structure, not a probe
+    on an owned contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _module_defines_top_level_name
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _mutation_callable_escapes
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 7f085537118f73bd5873efbee9048c257ad1bf42285a237b78d0d0849863a391
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _owner_function
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - eab5e281cf238ed6fd67a551a0c2a0bc9e7dacebfd088cc6a5312237924605cb
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _resolver_for_node
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  - e2dd9ee5fde6b20b87b217df3c4be9be524939da1f14f8bd9005fbe87909e30c
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads the scanner-attached parent link on a stdlib ast.AST node (absent at the
+    root, which raises InventoryScanError) and the scanner-attached _landscape_path
+    marker on the ast.Module it reaches, which is absent only on synthetic trees built
+    by the test itself. Both are the scanner''s own annotations on stdlib nodes, not
+    owned contracts.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _semantic_dml_boundary
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _symbol
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads a scanner-attached parent link on a stdlib ast.AST node. ast nodes are not
+    ELSPETH-owned types and the link is absent by design at the tree root, so the
+    sentinel default IS the root test, not a presence probe on an owned contract.
+    No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _trusted_qualified_name_is_mutated
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - eab5e281cf238ed6fd67a551a0c2a0bc9e7dacebfd088cc6a5312237924605cb
+  - f3bfbb9c56e66f417d19523ba7faba6610a0f6f263c97de7dda37406acbbd67f
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    one occurrence reads the scanner-attached parent link on a stdlib ast.AST node
+    (absent by design at the tree root), the other reads lineno, which is optional
+    per stdlib node class. Both defaults are the documented absence values of a stdlib
+    data structure, not presence probes on an owned contract; neither selects a fallback
+    behaviour.'
+- path: tests/unit/contracts/test_web_blob_fencing.py
+  qualname: _preceded_by_unconditional_exit
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - cdd158e0c477efd08f7eb0d28ebc8368bf3a9551224d0b548a8c08a25e9b1949
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    iterates the closed literal block-field table (body/orelse/finalbody, iter/test)
+    over stdlib ast statement nodes whose field sets differ per class; the None default
+    is the stdlib absence value and every hit is type-checked before use.'
+- path: tests/unit/contracts/test_web_blob_fencing.py
+  qualname: test_blob_protocols_and_implementation_require_exact_operation_context
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 4ba935c1fd5ced4d1b5994dbb80503eca64722a151315947f63a083876073194
+  classification: reflection-owned-table
+  justification: 'Presence IS the subject (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    a closed literal method table is iterated over the three owned blob surfaces and
+    an absent method is recorded as a named violation that fails the test; the sentinel
+    never selects a fallback behaviour.'
+- path: tests/unit/core/landscape/test_database_clock_authority.py
+  qualname: _ClockScanner._analyze_flow_block
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 55ae2bf942923ea24165d00e7853385027117ca35ec643e9fd3d4ac898c98dc5
+  - c1223ad9cdcd3f37c18b084c0569d8f812729393f25ca64e2579a25e473a4c37
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    iterates the closed literal block-field table (body/orelse/finalbody, iter/test)
+    over stdlib ast statement nodes whose field sets differ per class; the None default
+    is the stdlib absence value and every hit is type-checked before use.'
+- path: tests/unit/core/landscape/test_database_clock_authority.py
+  qualname: _ClockScanner._is_database_clock_callable
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 800777b10713f2dac7262d5f1458ea38c3ea858ddfb946773d7adcd34ebdea79
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads the scanner''s own _clock_union marker on a stdlib ast.Tuple it synthesised;
+    absent on every parser-produced node by construction. The isinstance(ast.Tuple)
+    guard precedes the read, so the False default only distinguishes synthesised from
+    parsed tuples, never an owned contract.'
+- path: tests/unit/core/landscape/test_database_clock_authority.py
+  qualname: _ClockScanner._is_process_clock_callable
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 800777b10713f2dac7262d5f1458ea38c3ea858ddfb946773d7adcd34ebdea79
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads the scanner''s own _clock_union marker on a stdlib ast.Tuple it synthesised;
+    absent on every parser-produced node by construction. The isinstance(ast.Tuple)
+    guard precedes the read, so the False default only distinguishes synthesised from
+    parsed tuples, never an owned contract.'
+- path: tests/unit/core/landscape/test_database_clock_authority.py
+  qualname: _ClockScanner._union_expression
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 904d5c44c33984622e7430680fc0bf72c1dc1419ab99ead460139838a0c32946
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    reads the scanner''s own _clock_union marker on a stdlib ast.Tuple it synthesised;
+    absent on every parser-produced node by construction. The isinstance(ast.Tuple)
+    guard precedes the read, so the False default only distinguishes synthesised from
+    parsed tuples, never an owned contract.'
+- path: tests/unit/core/landscape/test_database_clock_authority.py
+  qualname: _first_fence_contract_violations.transaction_path
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 547d0e11c69fa0f89644688977a402fbb1daf815f78f1c8abbe10039a1fd4548
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    iterates the closed literal block-field table (body/orelse/finalbody, iter/test)
+    over stdlib ast statement nodes whose field sets differ per class; the None default
+    is the stdlib absence value and every hit is type-checked before use.'
+- path: tests/unit/telemetry/test_delivery_metrics_contract.py
+  qualname: _DynamicDeliveryMetricsExporter.__getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - 7c69056f4c212a909c9c8b24c81bbe8577de69e0579a9791f931faad93982b7d
+  classification: approved-introspection
+  justification: 'The dynamic hook IS the subject under test, not a convenience. Third-party
+    exporters reach `_exporter_delivery_metrics` through the `elspeth_get_exporters`
+    pluggy hook with no type gate, and a wrapper exporter that resolves `delivery_metrics`
+    dynamically is the exact shape that used to make delivery accounting vanish silently
+    — since Python 3.12 a `runtime_checkable` Protocol `isinstance()` resolves members
+    via `inspect.getattr_static`, which bypasses `__getattr__` (ADR-032 rule 3, fixed
+    in aa04a5e69). It is not a forwarding delegate: it resolves exactly one name,
+    `delivery_metrics`, from its own `__dict__` and re-raises `AttributeError` for
+    every other name, so it delegates to nothing. Every explicit-contract rewrite
+    destroys the test: turning `delivery_metrics` into a real property makes this
+    class byte-equivalent to the sibling `_DeliveryMetricsExporter` two definitions
+    above (the static case is already covered there), and it also collapses `test_delivery_metrics_protocol_is_not_an_isinstance_gate`,
+    which requires an object whose attribute is invisible to `getattr_static` in order
+    to prove the capability Protocol cannot be used as a guard.'
+- path: tests/unit/web/coordination/test_session_operation_fence.py
+  qualname: test_mutation_facade_exposes_no_handle_and_closes_after_callback
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 93e3ff0f6e3cc35c90aaa41c9acc56cc368d9e061a6f54622807c42640a7f82d
+  classification: approved-introspection
+  justification: 'Deliberate reach into a name-mangled private state slot (P4-E8 elspeth-9b14a7a804,
+    reviewed 2026-09-05): the name comes from dir() and is asserted non-empty first;
+    the test''s subject is that every capability facet shares ONE private state object
+    and that the state exposes no connection handle. Two-argument form, no sentinel.'
+- path: tests/unit/web/coordination/test_session_operation_lifecycle.py
+  qualname: test_adopt_invalid_timing_releases_exact_context_before_preserving_validation_error
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - fc0165c6a8a21c2751c2bf53103a604c41aaa66227db02fa4152e2a7ea001b1f
+  classification: approved-introspection
+  justification: BaseException.__notes__ (PEP 678) exists only after add_note, so
+    the empty default is the documented 'no notes' value on a Python-runtime object,
+    not an owned contract (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05); the test
+    then asserts the notes' presence is exactly bound to the release_fails arm.
+- path: tests/unit/web/coordination/test_sqlite_session_operation_authority.py
+  qualname: test_sqlite_adapter_matches_postgres_authority_signatures
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 269412d607bbeaf61135c6ad32a34a46bd57e96e46f4b708a8c7a3107916d5e4
+  - 7fc97429ecfe1893fc6379f176b350065cc487487ec4bd68c52b3029bdb3c85b
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/execution/test_session_operation_lease.py
+  qualname: _function_node
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/execution/test_session_operation_lease.py
+  qualname: _required_parameter
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/sessions/guided_test_authority.py
+  qualname: DualFencedSessionServiceHarness._kw_writer._wrapped
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - bf0d01e03719bbca8c09adacfeed220c9cc7493f98f174f4e5293cd582b82080
+  classification: reflection-owned-table
+  justification: 'Test-harness writer factory (P4-E8 elspeth-9b14a7a804, reviewed
+    2026-09-05): getattr(super(), name) with the literal method name the factory was
+    called with, over the owned SessionServiceImpl base; an absent name raises AttributeError
+    at first call. Two-argument form, no sentinel.'
+- path: tests/unit/web/sessions/guided_test_authority.py
+  qualname: DualFencedSessionServiceHarness._run_writer._wrapped
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - bf0d01e03719bbca8c09adacfeed220c9cc7493f98f174f4e5293cd582b82080
+  classification: reflection-owned-table
+  justification: 'Test-harness writer factory (P4-E8 elspeth-9b14a7a804, reviewed
+    2026-09-05): getattr(super(), name) with the literal method name the factory was
+    called with, over the owned SessionServiceImpl base; an absent name raises AttributeError
+    at first call. Two-argument form, no sentinel.'
+- path: tests/unit/web/sessions/test_archive_quarantine.py
+  qualname: _inject_helper_fault_once
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 4ae22ba81af6244bad351e66e416371fef8d5e33bd2bf4a17546cb5b643d5cd3
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/sessions/test_operation_fence_wiring.py
+  qualname: _assert_no_authority_escape
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 6b9726f825192de086d234010cf68655fa0c2166b816a37a2d02e3601a7f25bd
+  classification: approved-introspection
+  justification: '__module__ provenance check over the members of a resolved annotation
+    union (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05): typing special forms are
+    not all classes, and the empty default means ''no module'', which the assertion
+    then proves is not a sqlalchemy module. It never grants a capability.'
+- path: tests/unit/web/sessions/test_operation_fence_wiring.py
+  qualname: _required_parameter
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - ebb75cd663f8a617e747f456545ea0cd953113d8943202a1fc4b1b9e00eef357
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/sessions/test_operation_fence_wiring.py
+  qualname: test_fenced_unit_of_work_exposes_only_exact_composed_capabilities
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/sessions/test_operation_fence_wiring.py
+  qualname: test_fenced_unit_of_work_exposes_only_exact_composed_capabilities
+  kind: getattr_static
+  occurrences: 1
+  probe_shapes:
+  - 2d7b06dbe34fac5ef7500ddd3bfb99cbba4dd3a63230b5daf44b30c78ccec52f
+  classification: approved-introspection
+  justification: inspect.getattr_static is the prescribed way to assert a name is
+    bound to a property DESCRIPTOR without triggering it (P4-E8 elspeth-9b14a7a804,
+    reviewed 2026-09-05); the test then asserts isinstance(property) and the fget
+    return annotation.
+- path: tests/unit/web/sessions/test_protocol.py
+  qualname: test_session_operation_authority_exposes_context_as_sole_action_capability
+  kind: getattr
+  occurrences: 3
+  probe_shapes:
+  - 4d47c5e8f0c3acc31e2c35d0f301a7c922bc5302d6b9a0ec92c0585160af7631
+  - 9316f7d0407b3432cc61b7bc49c3106de13910325d90944cf4f87ba0beb2c189
+  - b45e557e6995d4639e26487aeff1795f7b37e821205a866f6b708597fba28e89
+  classification: reflection-owned-table
+  justification: 'Two-argument getattr driven by a closed literal name table over
+    an ELSPETH-owned class or module (P4-E8 elspeth-9b14a7a804, reviewed 2026-09-05):
+    an absent name raises AttributeError and fails the test loudly; there is no sentinel
+    and no fallback arm.'
+- path: tests/unit/web/sessions/test_routes.py
+  qualname: TestLiteLLMErrorRedaction.test_guided_source_commit_failure_requires_tool_result_contract._ForgedToolResult.__getattr__
+  kind: dunder_getattr
+  occurrences: 1
+  probe_shapes:
+  - c24d9e914960e322d8a4059792ac0e6fadccb6fca8753a54d21fb83187423229
+  classification: approved-introspection
+  justification: 'The dynamic hook IS the subject under test, not a convenience. The
+    production helper `_guided_source_commit_failure_detail` (src/elspeth/web/sessions/routes/_helpers.py)
+    opens with `if type(tool_result) is not ToolResult: raise TypeError`, and this
+    test''s whole claim is that it reaches that raise WITHOUT touching a single attribute
+    of the forged object; the `__getattr__` that raises AssertionError is the tripwire
+    that makes a regression observable. It is not a forwarding delegate — it delegates
+    to nothing and resolves no name. Every explicit-contract alternative is strictly
+    weaker: per-field tripwire properties, `__slots__ = ()`, or a spec-bound mock
+    all let `getattr(obj, "<unenumerated name>", None)` return a default silently,
+    which is precisely the probe shape the test exists to forbid.'

@@ -8,14 +8,18 @@
 // ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { AcknowledgementLiveRegion, AcknowledgementStack } from "./AcknowledgementStack";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
-import type { InterpretationEvent } from "@/types/interpretation";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import type {
+  InterpretationEvent,
+  InterpretationResolveResponse,
+} from "@/types/interpretation";
 import type { CompositionState, NodeSpec } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
@@ -132,20 +136,25 @@ describe("AcknowledgementStack — ordering", () => {
   it("orders cards by pipeline step, then created_at", () => {
     useSessionStore.setState({
       compositionState: makeCompositionState([
-        makeNode("a", "llm"),
-        makeNode("b", "web_scrape"),
+        makeNode("llm", "llm"),
+        makeNode("web_scrape", "web_scrape"),
       ]),
     });
-    // e1 targets node b (later step) but was created earlier; e2 targets node a
-    // (earlier step). Step order must win → a (Summarise) before b (Fetch).
+    // e1 targets node "web_scrape" (later step) but was created earlier; e2
+    // targets node "llm" (earlier step). Step order must win → llm
+    // (Summarise) before web_scrape (Fetch). Both ids are trivially their own
+    // plugin name, so they resolve via the plugin verb, not their id (R2-F8b:
+    // every id is author-chosen — there is no Composer id generator — so a
+    // real author-given name like `extract_invoice` would be title-cased
+    // instead; see interpretationStepLabel.test.ts).
     seedPending([
       makeEvent("e1", {
-        affected_node_id: "b",
+        affected_node_id: "web_scrape",
         kind: "llm_model_choice",
         created_at: "2026-06-20T00:00:00Z",
       }),
       makeEvent("e2", {
-        affected_node_id: "a",
+        affected_node_id: "llm",
         kind: "llm_model_choice",
         created_at: "2026-06-22T00:00:00Z",
       }),
@@ -208,6 +217,27 @@ describe("AcknowledgementLiveRegion — count announce", () => {
     expect(status).toBeTruthy();
     expect((status.textContent ?? "").trim()).toBe("");
   });
+
+  // The whole reason this region is mounted separately from the stack is that
+  // the announcement must be a content MUTATION inside a node that already
+  // existed — a region inserted carrying its own text is the form with the
+  // documented AT failures. Every assertion above re-resolves the region by
+  // role AFTER rendering, which cannot tell a mutation from a replacement, so
+  // none of them guards that reason. Hold the element across the 0->1
+  // transition instead (elspeth-b46cd07678).
+  it("MUTATES the same region node across the 0->1 transition", () => {
+    useInterpretationEventsStore.setState({ pendingBySession: { [SID]: {} } });
+    render(<AcknowledgementLiveRegion sessionId={SID} />);
+    const before = screen.getByRole("status");
+    expect((before.textContent ?? "").trim()).toBe("");
+
+    act(() => {
+      seedPending([makeEvent("e1")]);
+    });
+
+    expect(screen.getByRole("status")).toBe(before);
+    expect(before.textContent).toMatch(/1 decision to acknowledge/i);
+  });
 });
 
 describe("AcknowledgementStack — foot-of-stack opt-out", () => {
@@ -269,6 +299,144 @@ describe("AcknowledgementStack — foot-of-stack opt-out", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/could not resolve interpretation/i);
+  });
+});
+
+describe("AcknowledgementStack — compositionState threading", () => {
+  // Truth test, not an existence test: the card can only render the accepted
+  // sibling value if the stack actually passes its subscribed
+  // compositionState down (elspeth-990f5ea562).
+  it("threads the live compositionState into each card so resolved slot values render", async () => {
+    const user = userEvent.setup();
+    const promptNode: NodeSpec = {
+      ...makeNode("llm", "llm"),
+      options: {
+        prompt_template_parts: [
+          { kind: "text", text: "Summarise " },
+          { kind: "interpretation_ref", requirement_id: "req-1" },
+          { kind: "text", text: " for an auditor." },
+        ],
+        interpretation_requirements: [
+          {
+            id: "req-1",
+            kind: "vague_term",
+            user_term: "punchy",
+            status: "resolved",
+            draft: "short and direct",
+            event_id: "evt-vague-1",
+            accepted_value: "concise and neutral",
+            accepted_artifact_hash: null,
+            resolved_prompt_template_hash: null,
+          },
+        ],
+      },
+    };
+    useSessionStore.setState({
+      compositionState: makeCompositionState([promptNode]),
+    });
+    seedPending([
+      makeEvent("e1", {
+        kind: "llm_prompt_template",
+        affected_node_id: "llm",
+        user_term: null,
+        llm_draft: "Summarise pending interpretation for an auditor.",
+      }),
+    ]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    // The PRIMARY render (first pre) carries the substitution; the frozen
+    // mask survives only inside the 'View original template' disclosure.
+    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
+    expect(primaryPre?.textContent).toContain("concise and neutral");
+    expect(primaryPre?.textContent).not.toContain("pending interpretation");
+  });
+});
+
+describe("AcknowledgementStack — removed node label (elspeth-93f5621f18)", () => {
+  it("names a deleted node by the step it was, and keeps the raw id on a data attribute", () => {
+    // An event whose affected node is absent from the loaded composition.
+    useSessionStore.setState({ compositionState: makeCompositionState([]) });
+    seedPending([makeEvent("e-ghost", { kind: "llm_prompt_template", affected_node_id: "ghost_node" })]);
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Ghost Node) · prompt" }),
+    ).toBeInTheDocument();
+    const card = screen.getByTestId("acknowledgement-card");
+    expect(card).toHaveAttribute("data-affected-node-id", "ghost_node");
+    // The ghost id is the author's own NAME for the step, so title-casing it
+    // into the heading is not an identifier leak — the raw form still lives
+    // only on data-affected-node-id.
+    expect(card).not.toHaveTextContent("ghost_node");
+    // The wave's acceptance gate, on the surface this task most changes: the
+    // raw id survives ONLY on data-affected-node-id, which the pin does not
+    // inspect (it reads text nodes and aria-labels).
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("gives two cards for two different removed nodes distinct titles (ux M-2)", () => {
+    // The defect: both read "Removed step · prompt", with the only
+    // disambiguator on data-affected-node-id — a forensic home invisible to
+    // every audience, so a user with two pending cards could not tell which
+    // deleted step each was about.
+    useSessionStore.setState({ compositionState: makeCompositionState([]) });
+    seedPending([
+      makeEvent("e-one", { kind: "llm_prompt_template", affected_node_id: "extract_invoice" }),
+      makeEvent("e-two", { kind: "llm_prompt_template", affected_node_id: "rate_coolness" }),
+    ]);
+    const { container } = render(<AcknowledgementStack sessionId={SID} />);
+
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Extract Invoice) · prompt" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Removed step (was Rate Coolness) · prompt" }),
+    ).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+});
+
+describe("AcknowledgementStack — focus restoration", () => {
+  // Pins the comment-documented fallback (stack effect: disabled button →
+  // section): after a sibling resolves, a still-gated prompt card's Approve
+  // is disabled, so focus lands on the card's labelled <section>.
+  it("falls back to a still-gated prompt card's section after a sibling resolves", async () => {
+    const user = userEvent.setup();
+    const first = makeEvent("e1", { created_at: "2026-06-20T00:00:00Z" });
+    const gated = makeEvent("e2", {
+      kind: "llm_prompt_template",
+      user_term: null,
+      llm_draft: "Classify {{ x }}.",
+      created_at: "2026-06-22T00:00:00Z",
+    });
+    seedPending([first, gated]);
+    const response: InterpretationResolveResponse = {
+      event: {
+        ...first,
+        choice: "accepted_as_drafted",
+        accepted_value: first.llm_draft,
+        resolved_at: "2026-06-22T01:00:00Z",
+      },
+      new_state: makeCompositionState([]),
+    };
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(response);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /acknowledge the llm's interpretation of cool/i,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(1);
+    });
+    expect(document.activeElement).toBe(
+      document.getElementById("ack-card-e2"),
+    );
   });
 });
 

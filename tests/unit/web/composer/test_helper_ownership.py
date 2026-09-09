@@ -81,7 +81,8 @@ def test_no_tool_finalize_uses_no_tool_policy_owner() -> None:
             "_no_mutation_empty_state_validation",
             "_RuntimePreflightCache",
             "_state_is_structurally_empty",
-            "_user_request_expects_pipeline_mutation",
+            "_PipelineMutationIntentDecision",
+            "_classify_pipeline_mutation_intent",
         }
         & service_imports
     )

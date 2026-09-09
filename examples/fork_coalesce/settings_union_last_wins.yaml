@@ -15,8 +15,8 @@
 # path_b's 50-char description wins.
 #
 # The audit trail records `union_field_origins` and
-# `union_field_collision_values` for every colliding field, so the full
-# provenance is preserved regardless of which branch the runtime selected.
+# `union_field_collisions` for every colliding field, preserving branch,
+# field, and winner provenance without value-derived hashes or types.
 #
 # NOTE: `union_collision_policy` is orthogonal to the arrival `policy`
 # (require_all / quorum / best_effort / first). They are separate axes:

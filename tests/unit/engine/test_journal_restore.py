@@ -16,18 +16,21 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, CoalescePendingScalars
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import AggregationSettings, CoalesceSettings, TriggerConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor
@@ -63,12 +66,14 @@ def _blocked_item(
     blocked_at: datetime | None,
     payload: str | None = None,
     branch_name: str | None = None,
+    fork_group_id: str = "fg-journal-test",
     coalesce_name: str | None = None,
     barrier_key: str | None = None,
     node_id: str = "node-1",
     attempt: int = 0,
 ) -> TokenWorkItem:
     """Build a BLOCKED journal row as list_blocked_barrier_items returns them."""
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="run_1",
@@ -84,10 +89,8 @@ def _blocked_item(
         created_at=_JOURNAL_T0,
         updated_at=_JOURNAL_T0,
         barrier_key=barrier_key if barrier_key is not None else (coalesce_name or node_id),
-        branch_name=branch_name,
-        fork_group_id=None,
+        lineage_path=lineage_path,
         join_group_id=None,
-        expand_group_id=None,
         coalesce_node_id=node_id if coalesce_name is not None else None,
         coalesce_name=coalesce_name,
         barrier_blocked_at=blocked_at,
@@ -112,11 +115,20 @@ def _coalesce_restorer(
     clock: MockClock | None = None,
 ) -> CoalesceJournalRestorer:
     execution = MagicMock(spec=ExecutionRepository)
-    execution.get_completed_row_ids_for_nodes.return_value = completed_pairs if completed_pairs is not None else set()
+    # get_completed_group_ids_for_nodes lives on BarrierRestoreReadModel, not
+    # ExecutionRepository (spec-checked here) — a fully autospec'd read-model
+    # INSTANCE (not a bare `spec=` on the unbound function, which would
+    # require every call site to also pass `self`) gives a correctly
+    # bound-method-shaped mock (WS4 Task 10:
+    # _reconstruct_completed_keys_from_landscape now queries this sibling).
+    execution.get_completed_group_ids_for_nodes = create_autospec(BarrierRestoreReadModel, instance=True).get_completed_group_ids_for_nodes
+    execution.get_completed_group_ids_for_nodes.return_value = completed_pairs if completed_pairs is not None else set()
     return CoalesceJournalRestorer(
         settings=settings if settings is not None else {"merge": _coalesce_settings()},
         node_ids=node_ids if node_ids is not None else {"merge": NodeID("co-1")},
-        barrier_restore_reads=SimpleNamespace(get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes),
+        barrier_restore_reads=SimpleNamespace(
+            get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
+        ),
         run_id="run_1",
         clock=clock if clock is not None else MockClock(start=100.0),
     )
@@ -159,7 +171,9 @@ class TestCoalesceJournalRestorer:
         assert isinstance(restored, RestoredCoalesceState)
         assert restored.token_count == 2
         (group,) = restored.pending
-        assert group.key == ("merge", "row_1")
+        # key is (coalesce_name, fork_group_id); both items share
+        # _blocked_item's default fork_group_id="fg-journal-test" (WS4 Task 10).
+        assert group.key == ("merge", "fg-journal-test")
         by_branch = {b.branch_name: b for b in group.branches}
         assert set(by_branch) == {"a", "b"}
         # Payloads survive the journal round-trip verbatim.
@@ -225,6 +239,46 @@ class TestCoalesceJournalRestorer:
         assert group.first_arrival == pytest.approx(100.0)
         assert restored.token_count == 0
 
+    def test_restore_groups_journal_items_by_fork_group_not_row(self) -> None:
+        """spec §5 (arch-M1): two sibling fork groups share row_id; restore
+        must rebuild TWO pending entries, not collide on a duplicate-branch
+        claim (WS4 Task 10)."""
+        restorer = _coalesce_restorer(settings={"merge_x": _coalesce_settings(name="merge_x", branches=["left", "right"])})
+        items = [
+            _blocked_item(
+                token_id="t-al", row_id="row-1", branch_name="left", fork_group_id="g-a", coalesce_name="merge_x", blocked_at=_JOURNAL_T0
+            ),
+            _blocked_item(
+                token_id="t-bl", row_id="row-1", branch_name="left", fork_group_id="g-b", coalesce_name="merge_x", blocked_at=_JOURNAL_T0
+            ),
+            _blocked_item(
+                token_id="t-ar", row_id="row-1", branch_name="right", fork_group_id="g-a", coalesce_name="merge_x", blocked_at=_JOURNAL_T0
+            ),
+        ]
+        restored = restorer.restore(
+            items=items,
+            scalars={},
+            state_ids={item.token_id: f"s-{item.token_id}" for item in items},
+            attempt_offsets={item.token_id: 0 for item in items},
+            resume_checkpoint_id="cp-1",
+            now=_JOURNAL_T0,
+        )
+        keys = {group.key for group in restored.pending}
+        assert keys == {("merge_x", "g-a"), ("merge_x", "g-b")}
+
+    def test_restore_rejects_journal_item_without_a_fork_frame(self) -> None:
+        restorer = _coalesce_restorer()
+        item = _blocked_item(token_id="t-x", row_id="row-1", branch_name=None, coalesce_name="merge", blocked_at=_JOURNAL_T0)
+        with pytest.raises(AuditIntegrityError, match="innermost FORK frame"):
+            restorer.restore(
+                items=[item],
+                scalars={},
+                state_ids={"t-x": "s-x"},
+                attempt_offsets={"t-x": 0},
+                resume_checkpoint_id="cp-1",
+                now=_JOURNAL_T0,
+            )
+
     def test_journal_groups_and_loss_only_scalars_coexist(self) -> None:
         """A loss-only scalar for key B must AUGMENT journal-backed groups for key A, not replace them.
 
@@ -246,9 +300,13 @@ class TestCoalesceJournalRestorer:
             now=_JOURNAL_T0,
         )
 
+        # The journal group keys on the item's fork_group_id
+        # ("fg-journal-test", _blocked_item's default); the scalar-only
+        # group keys on its own independent "row_9" — the two must stay
+        # distinct groups, which is exactly this test's point.
         by_key = {group.key: group for group in restored.pending}
-        assert set(by_key) == {("merge", "row_1"), ("merge", "row_9")}
-        assert [b.branch_name for b in by_key[("merge", "row_1")].branches] == ["a"]
+        assert set(by_key) == {("merge", "fg-journal-test"), ("merge", "row_9")}
+        assert [b.branch_name for b in by_key[("merge", "fg-journal-test")].branches] == ["a"]
         assert by_key[("merge", "row_9")].branches == ()
         assert dict(by_key[("merge", "row_9")].lost_branches) == {"b": "error_routed"}
         assert restored.token_count == 1
@@ -336,7 +394,11 @@ class TestCoalesceJournalRestorer:
             items=[
                 _blocked_item(token_id="t_a", row_id="row_1", branch_name="a", coalesce_name="merge", blocked_at=_JOURNAL_T0),
             ],
-            scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"b": "lost"})},
+            # Scalar key matches the item's default fork_group_id
+            # ("fg-journal-test") so both merge into ONE group (WS4 Task 10) —
+            # the point of this test is a group with both an arrived branch
+            # AND lost_branches, not two disconnected groups.
+            scalars={("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={"b": "lost"})},
             state_ids={"t_a": "s_a"},
             attempt_offsets={"t_a": 1},
             resume_checkpoint_id="cp-0",
@@ -357,8 +419,20 @@ class TestCoalesceFacadeValidateBeforeMutate:
 
     def _make_executor(self, settings: CoalesceSettings | None = None) -> CoalesceExecutor:
         execution = MagicMock(spec=ExecutionRepository)
-        execution.get_completed_row_ids_for_nodes.return_value = set()
-        execution.has_completed_row_for_node.return_value = False
+        # has_completed_group_for_node/get_completed_group_ids_for_nodes live
+        # on BarrierRestoreReadModel, not ExecutionRepository (spec-checked
+        # here). A fully autospec'd read-model INSTANCE (not a bare `spec=`
+        # on the unbound function, which would require every call site to
+        # also pass `self`) gives correctly bound-method-shaped mocks —
+        # assign explicitly before binding into the SimpleNamespace below
+        # (WS4 Task 8: the live notify_branch_lost/accept path queries
+        # has_completed_group_for_node; Task 10: CoalesceJournalRestorer's
+        # completed-key reconstruction queries get_completed_group_ids_for_nodes).
+        _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+        execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
+        execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+        execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
             execution=execution,
             span_factory=MagicMock(spec=SpanFactory),
@@ -368,8 +442,8 @@ class TestCoalesceFacadeValidateBeforeMutate:
             data_flow=MagicMock(spec=DataFlowRepository),
             clock=MockClock(start=100.0),
             barrier_restore_reads=SimpleNamespace(
-                get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-                has_completed_row_for_node=execution.has_completed_row_for_node,
+                has_completed_group_for_node=execution.has_completed_group_for_node,
+                get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
             ),
         )
         executor.register_coalesce(settings if settings is not None else _coalesce_settings(), NodeID("co-1"))
@@ -386,7 +460,9 @@ class TestCoalesceFacadeValidateBeforeMutate:
             resume_checkpoint_id="cp-0",
             now=_JOURNAL_T0,
         )
-        assert ("merge", "row_1") in executor._pending
+        # key is (coalesce_name, fork_group_id); _blocked_item's default
+        # fork_group_id is "fg-journal-test" (WS4 Task 10).
+        assert ("merge", "fg-journal-test") in executor._pending
 
         with pytest.raises(AuditIntegrityError, match="NULL barrier_blocked_at"):
             executor.restore_from_journal(
@@ -399,7 +475,7 @@ class TestCoalesceFacadeValidateBeforeMutate:
             )
 
         # The failed second restore must not have cleared the first.
-        assert ("merge", "row_1") in executor._pending
+        assert ("merge", "fg-journal-test") in executor._pending
 
     def test_facade_applies_journal_groups_and_loss_only_scalars_together(self) -> None:
         """Both populations land in executor._pending from one restore call."""
@@ -413,8 +489,8 @@ class TestCoalesceFacadeValidateBeforeMutate:
             now=_JOURNAL_T0,
         )
 
-        assert set(executor._pending) == {("merge", "row_1"), ("merge", "row_9")}
-        assert list(executor._pending[("merge", "row_1")].branches) == ["a"]
+        assert set(executor._pending) == {("merge", "fg-journal-test"), ("merge", "row_9")}
+        assert list(executor._pending[("merge", "fg-journal-test")].branches) == ["a"]
         assert executor._pending[("merge", "row_9")].branches == {}
         assert executor._pending[("merge", "row_9")].lost_branches == {"b": "error_routed"}
 
@@ -429,7 +505,12 @@ class TestCoalesceFacadeValidateBeforeMutate:
         executor = self._make_executor(_coalesce_settings(branches=["a", "b", "c"]))
         executor.restore_from_journal(
             items=[_blocked_item(token_id="t_a", row_id="row_1", branch_name="a", coalesce_name="merge", blocked_at=_JOURNAL_T0)],
-            scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"b": "error_routed"})},
+            # Scalar key matches the item's default fork_group_id
+            # ("fg-journal-test") so both merge into ONE restored group (WS4
+            # Task 10) — without this the notify below would target an
+            # unrelated, disconnected scalar-only group instead of "the
+            # restored key" the docstring means, weakening the proof.
+            scalars={("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={"b": "error_routed"})},
             state_ids={"t_a": "s_a"},
             attempt_offsets={"t_a": 1},
             resume_checkpoint_id="cp-0",
@@ -439,7 +520,7 @@ class TestCoalesceFacadeValidateBeforeMutate:
         # In-place mutation of the restored loss record must succeed; under
         # require_all the second loss makes the merge impossible, so the key
         # fails with BOTH losses recorded in the audit metadata.
-        outcome = executor.notify_branch_lost("merge", "row_1", "c", "error_routed")
+        outcome = executor.notify_branch_lost("merge", "fg-journal-test", "c", "error_routed")
 
         assert outcome is not None
         assert outcome.held is False
@@ -629,6 +710,85 @@ class TestAggregationFacadeValidateBeforeMutate:
         # The failed second restore must not have touched the applied state.
         assert executor.get_buffer_count(node_id) == 1
         assert executor.get_batch_id(node_id) == "batch-1"
+
+    def test_trigger_rejection_leaves_all_node_and_trigger_state_intact(self) -> None:
+        """A trigger-latch disagreement raises before applying any restored state."""
+        executor, node_id = self._make_executor()
+        executor.restore_from_journal(
+            node_id=node_id,
+            items=[
+                _blocked_item(token_id="t1", row_id="r1", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                _blocked_item(token_id="t2", row_id="r2", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                _blocked_item(token_id="t3", row_id="r3", node_id="agg-1", blocked_at=_JOURNAL_T0),
+            ],
+            member_order=["t1", "t2", "t3"],
+            batch_id="batch-1",
+            accepted_count_total=7,
+            completed_flush_count=2,
+            scalars=AggregationNodeScalars(count_fire_offset=0.0, condition_fire_offset=None),
+            attempt_offsets={"t1": 1, "t2": 2, "t3": 3},
+            resume_checkpoint_id="cp-0",
+            now=_JOURNAL_T0,
+        )
+        assert executor.should_flush(node_id) is True
+
+        node = executor._nodes[node_id]
+        original_settings = node.settings
+        original_trigger = node.trigger
+        original_trigger_config = original_trigger._config
+        original_trigger_clock = original_trigger._clock
+        original_condition_parser = original_trigger._condition_parser
+        original_tokens = tuple(node.tokens)
+        original_batch_id = node.batch_id
+        original_member_count = node.member_count
+        original_accepted_count_total = node.accepted_count_total
+        original_completed_flush_count = node.completed_flush_count
+        original_trigger_state = (
+            original_trigger._batch_count,
+            original_trigger._first_accept_time,
+            original_trigger._last_triggered,
+            original_trigger._count_fire_time,
+            original_trigger._condition_fire_time,
+            tuple(original_trigger._member_accept_times),
+            original_trigger._condition_fire_observed,
+        )
+
+        with pytest.raises(ValueError, match="count_fire_offset requires batch_count to satisfy configured count"):
+            executor.restore_from_journal(
+                node_id=node_id,
+                items=[
+                    _blocked_item(token_id="t4", row_id="r4", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                    _blocked_item(token_id="t5", row_id="r5", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                ],
+                member_order=["t4", "t5"],
+                batch_id="batch-2",
+                accepted_count_total=9,
+                completed_flush_count=4,
+                scalars=AggregationNodeScalars(count_fire_offset=0.0, condition_fire_offset=None),
+                attempt_offsets={"t4": 4, "t5": 5},
+                resume_checkpoint_id="cp-1",
+                now=_JOURNAL_T0,
+            )
+
+        assert node.settings is original_settings
+        assert node.trigger is original_trigger
+        assert original_trigger._config is original_trigger_config
+        assert original_trigger._clock is original_trigger_clock
+        assert original_trigger._condition_parser is original_condition_parser
+        assert tuple(node.tokens) == original_tokens
+        assert node.batch_id == original_batch_id
+        assert node.member_count == original_member_count
+        assert node.accepted_count_total == original_accepted_count_total
+        assert node.completed_flush_count == original_completed_flush_count
+        assert (
+            original_trigger._batch_count,
+            original_trigger._first_accept_time,
+            original_trigger._last_triggered,
+            original_trigger._count_fire_time,
+            original_trigger._condition_fire_time,
+            tuple(original_trigger._member_accept_times),
+            original_trigger._condition_fire_observed,
+        ) == original_trigger_state
 
     def test_facade_wires_buffered_count_not_accepted_total_into_trigger(self) -> None:
         """The trigger's restored batch_count is the BUFFERED row count, never the cumulative accept counter.

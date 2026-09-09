@@ -453,3 +453,45 @@ class TestValidateIntFieldFractionalFloats:
 
         with pytest.raises(ValueError, match="must be an integer"):
             RuntimeRetryConfig.from_policy({"max_attempts": 2.7})  # type: ignore[arg-type]  # deliberate: tests rejection of fractional float in int field
+
+
+class TestRetryPolicyValidatorTrustBoundary:
+    """Direct raising characterization for the ``@trust_boundary`` policy validators.
+
+    Each test is named by a decorator's ``test_ref`` and bound to it by
+    ``test_fingerprint``. The gate requires the raising assertion to invoke the
+    decorated symbol through its declared ``source_param`` in this body, so the calls
+    below pass the untrusted value positionally rather than through ``from_policy``.
+    """
+
+    def test_validate_int_field_rejects_non_numeric_string(self) -> None:
+        """A non-numeric string is rejected outright — never coerced, never defaulted."""
+        from elspeth.contracts.config.runtime import _validate_int_field
+
+        with pytest.raises(ValueError, match=r"max_attempts must be numeric, got 'abc'"):
+            _validate_int_field("max_attempts", "abc")
+
+    def test_validate_int_field_rejects_bool_and_none(self) -> None:
+        """``bool`` is an ``int`` subclass but not a token count; ``None`` is the common slip."""
+        from elspeth.contracts.config.runtime import _validate_int_field
+
+        with pytest.raises(ValueError, match="max_attempts must be numeric, got bool"):
+            _validate_int_field("max_attempts", True)
+        with pytest.raises(ValueError, match="max_attempts must be numeric, got None"):
+            _validate_int_field("max_attempts", None)
+
+    def test_validate_float_field_rejects_non_finite_string(self) -> None:
+        """``float('nan')`` accepts the string, so the finiteness check must run after coercion."""
+        from elspeth.contracts.config.runtime import _validate_float_field
+
+        with pytest.raises(ValueError, match=r"base_delay must be finite, got 'nan'"):
+            _validate_float_field("base_delay", "nan")
+
+    def test_validate_float_field_rejects_non_finite_float_and_bool(self) -> None:
+        """NaN/Infinity cannot be canonicalized (RFC 8785); ``bool`` is not a delay."""
+        from elspeth.contracts.config.runtime import _validate_float_field
+
+        with pytest.raises(ValueError, match="base_delay must be finite"):
+            _validate_float_field("base_delay", float("inf"))
+        with pytest.raises(ValueError, match="base_delay must be numeric, got bool"):
+            _validate_float_field("base_delay", False)

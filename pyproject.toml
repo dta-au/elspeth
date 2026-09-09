@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.7.1"
+version = "0.8.0"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -88,6 +88,7 @@ dependencies = [
     "chromadb>=1.5,<2",  # backs chroma_sink + rag_retrieval plugins
     "html2text>=2024.2.26",  # backs web_scrape + web_scrape_extraction transforms
     "beautifulsoup4>=4.14,<5",  # paired with html2text in web_scrape
+    "pypdfium2>=5.13,<6",  # backs the pdf_rasterize transform (imported only inside its worker subprocess)
 ]
 
 [project.optional-dependencies]
@@ -119,12 +120,13 @@ dev = [
     # HTTP mocking
     "respx>=0.23,<1",  # httpx mocking for web scrape tests
     "testcontainers[postgres]>=4.0,<5",  # Docker-backed Postgres for CL-PP-11 dialect-portability tests
-    "psycopg[binary]>=3.2,<4",  # Production PostgreSQL driver (psycopg v3)
-    "psycopg2-binary>=2.9,<3",  # Postgres DB-API driver for testcontainer lane (pre-built libpq wheel; testcontainers' default driver= is psycopg2)
+    "psycopg[binary]>=3.2,<4",  # Explicit postgresql+psycopg:// URLs (psycopg v3)
+    "psycopg2-binary>=2.9,<3",  # Bare postgresql:// URLs and testcontainers' default DB-API driver
 ]
 
 postgres = [
-    "psycopg[binary]>=3.2,<4",
+    "psycopg[binary]>=3.2,<4",  # Explicit postgresql+psycopg:// URLs (psycopg v3)
+    "psycopg2-binary>=2.9,<3",  # Bare postgresql:// URLs use SQLAlchemy's default psycopg2 driver
 ]
 
 llm = [
@@ -150,6 +152,7 @@ aws = [
     "botocore[crt]>=1.40,<2",
     "ijson>=3.3,<4",
     "jinja2>=3.1,<4",
+    "cryptography>=49,<50",
 ]
 
 mcp = [
@@ -215,8 +218,8 @@ all = [
     "asgi-lifespan>=2.1,<3",
     "respx>=0.23,<1",
     "testcontainers[postgres]>=4.0,<5",
-    "psycopg[binary]>=3.2,<4",
-    "psycopg2-binary>=2.9,<3",
+    "psycopg[binary]>=3.2,<4",  # Explicit postgresql+psycopg:// URLs (psycopg v3)
+    "psycopg2-binary>=2.9,<3",  # Bare postgresql:// URLs use SQLAlchemy's default psycopg2 driver
     # llm dependencies
     "jinja2>=3.1,<4",
     "openai>=2.36,<3",
@@ -230,6 +233,7 @@ all = [
     "boto3>=1.40,<2",
     "botocore[crt]>=1.40,<2",
     "ijson>=3.3,<4",
+    "cryptography>=49,<50",
     # mcp dependencies
     "mcp>=1.27,<2",
     # tracing dependencies
@@ -259,9 +263,9 @@ check-contracts = "scripts.check_contracts:main"
 elspeth-xdist-auto = "elspeth.testing.pytest_xdist_auto"
 
 [project.urls]
-Homepage = "https://github.com/johnm-dta/elspeth"
-Documentation = "https://github.com/johnm-dta/elspeth#readme"
-Repository = "https://github.com/johnm-dta/elspeth"
+Homepage = "https://github.com/dta-au/elspeth"
+Documentation = "https://github.com/dta-au/elspeth#readme"
+Repository = "https://github.com/dta-au/elspeth"
 
 [build-system]
 requires = ["hatchling"]
@@ -318,7 +322,10 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["T20"]  # Allow print in tests
 "scripts/**/*.py" = ["T20"]  # Allow print in CLI scripts
+".agents/skills/**/*.py" = ["T20"]  # Skill helper CLIs: print is the output channel the orchestrator parses
+".claude/skills/**/*.py" = ["T20"]  # Symlinks into .agents/skills; kept so a resolved path is treated the same
 "evals/composer-parity/live_acceptance.py" = ["T20"]  # CLI oracle: print/stderr is the accept/reject output channel
+"evals/composer-battery/*.py" = ["T20"]  # CLI: print is the report/stderr output channel
 "notes/**/*.py" = ["T20"]  # Ad-hoc diagnostic scripts — print is the output channel
 "docs-archive/**/*.py" = ["T20"]  # Archived sources are frozen-as-of-relocation; not maintained against current lint rules
 "elspeth-lints/src/elspeth_lints/rules/trust_tier/tier_model/rule.py" = [
@@ -370,6 +377,10 @@ module = [
     "ijson.*",
     "ddtrace.*",
     "sqlcipher3.*",
+    "pypdfium2",
+    "pypdfium2.*",
+    "pypdfium2_raw",
+    "pypdfium2_raw.*",
 ]
 ignore_missing_imports = true
 
@@ -440,7 +451,18 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    "-m", "not slow and not stress and not performance and not testcontainer",  # Skip slow/stress/performance/testcontainer tests by default
+    "-m", "not slow and not stress and not performance and not testcontainer and not live_provider",  # Remote-provider evidence is separately operator-gated
+    # The default selection IS the pre-merge gate (AGENTS.md), so it has to be
+    # a run somebody can actually sit through. The marker expression above
+    # selects 48,675 of the 49,121 collected tests (measured 2026-09-08 via
+    # `pytest tests/ --collect-only -q`); serial, that is many hours. At -n 12
+    # it is ~20 minutes. A gate nobody can run is not a gate, so parallelism is the
+    # default rather than a flag each caller has to remember.
+    #
+    # Override for a single test or a debugger with `-n 0`, which runs
+    # in-process: worker startup dominates a small selection, and pdb/-s do not
+    # work through xdist.
+    "-n", "12",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -453,6 +475,11 @@ markers = [
     "testcontainer: marks tests requiring Docker via testcontainers-python (deselect with '-m \"not testcontainer\"')",
     "fingerprint_baseline: Plan A baseline capture/verify across all elspeth-lints rules",
     "live_aws: marks opt-in tests that call live AWS services with operator-approved fixtures",
+    "live_provider: marks protected tests that cross a real remote-provider boundary",
+    "live_azure: marks protected tests that cross a real Azure service boundary",
+    "live_dataverse: marks protected tests that cross a real Dataverse boundary",
+    "live_chroma: marks protected tests that cross a real Chroma service boundary",
+    "terraform: marks tests that shell out to the terraform binary (deselect with '-m \"not terraform\"')",
 ]
 # Load .env file for integration tests (API keys)
 env_files = [".env"]

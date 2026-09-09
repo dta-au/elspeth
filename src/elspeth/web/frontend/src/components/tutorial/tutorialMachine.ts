@@ -20,17 +20,17 @@ export const CANONICAL_TUTORIAL_PROMPT =
 // prompt names the `url` column so the source declares it as a guaranteed field
 // (surface-or-record); the runtime-resolved sample URLs are appended to it.
 export const TUTORIAL_SOURCE_PROMPT =
-  "Create the source for this pipeline. The rows are these three project-brief " +
-  "pages; each row carries the page's address in a `url` column:";
+  "Please create a CSV source for this pipeline. The rows are these three " +
+  "project-brief pages; each row carries the page's address in a `url` column:";
 
 export const TUTORIAL_SINK_PROMPT =
   "Save the pipeline's results to a JSON file.";
 
 export const TUTORIAL_TRANSFORMS_PROMPT =
-  "For each row, fetch the page at its URL, then have an LLM write a short " +
-  "summary of the page. Finally drop the raw HTML and fingerprint columns so " +
-  "the saved rows keep only the summary. These are our own demo pages, so use " +
-  "noreply@dta.gov.au as the scraping abuse contact.";
+  "For each row, fetch the page at its `url`, then have an LLM write a short " +
+  "`summary`. Finally drop the raw HTML and fingerprint columns and retain " +
+  "exactly `url` and `summary`. Use noreply@dta.gov.au as the " +
+  "scraping abuse contact. Scraping reason: 'ELSPETH tutorial demonstration'.";
 
 export type TutorialStep =
   | "welcome"
@@ -226,10 +226,14 @@ export interface PersistedTutorialProgress {
  *  - `run` with a recorded run identity — the run had already completed
  *    before the reload (the identity is recorded when the result renders),
  *    so resume forward at `audit`: zero re-execution.
- *  - `run` without a run identity — the reload interrupted the run itself;
- *    resume at `run` (the run turn re-fires; if the pre-reload run is still
- *    active server-side the one-active-run invariant surfaces the friendly
- *    still-finishing message).
+ *  - `run` without a run identity — the reload happened before Run was
+ *    clicked, or interrupted the run itself; the persisted fields cannot tell
+ *    the two apart. Resume at `run`: the learner lands on the Run button and
+ *    nothing executes until they click it (I-1). If a pre-reload run is
+ *    still active server-side, clicking Run surfaces the one-active-run
+ *    invariant's friendly still-finishing message, and Exit cancels it (the
+ *    cancel endpoint is idempotent, so Exit from the pre-run card is a
+ *    harmless no-op).
  *  - `audit` — requires the recorded run identity; degrades to `run` when
  *    missing (audit cannot render without it).
  *  - `graduation` — graduation counts as reached once SHOWN; resume there,

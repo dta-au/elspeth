@@ -1,0 +1,7 @@
+input/pdf_manifest.csv
+output/*
+!output/.gitkeep
+runs/*
+!runs/.gitkeep
+payloads/*
+!payloads/.gitkeep

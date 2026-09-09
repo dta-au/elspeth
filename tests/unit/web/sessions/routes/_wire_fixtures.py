@@ -13,10 +13,10 @@ import dataclasses
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.profile import WorkflowProfile
 from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.state_machine import (
     GuidedSession,
     SinkOutputResolved,
-    SinkResolved,
     SourceResolved,
     TurnRecord,
 )

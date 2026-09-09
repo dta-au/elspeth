@@ -24,6 +24,11 @@ source ─(raw)─> content_screen ─┬─(screened)─> normalize ─> trim_n
 elspeth run --settings examples/deep_routing/settings.yaml --execute
 ```
 
+The packaged fixture deliberately contains two blocked-content rows. They are
+recorded as transform failures, routed to `quarantine.csv`, and make the run
+end `PARTIAL` with process exit 1. This is the expected demonstration result:
+all 20 inputs still reach exactly one terminal sink.
+
 ## Output
 
 Each row reaches exactly one of 7 sinks in `output/`:

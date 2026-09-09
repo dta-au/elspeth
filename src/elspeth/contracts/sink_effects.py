@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, NoReturn, final
+from typing import TYPE_CHECKING, Final, NoReturn, cast, final
 from urllib.parse import parse_qsl, urlsplit
 
 from elspeth.contracts.enums import CallType, TerminalOutcome, TerminalPath
@@ -19,6 +19,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, requ
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.results import ArtifactDescriptor, require_no_artifact_uri_credentials
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
 if TYPE_CHECKING:
@@ -127,6 +128,7 @@ class SinkEffectRuntimeBinding:
     config_fingerprint: str
     purpose: SinkEffectExecutionPurpose
     effect_mode: ResolvedSinkEffectMode | None
+    audit_export_publication_preflight: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.sink_name, str) or not self.sink_name.strip():
@@ -196,10 +198,13 @@ def _require_utc_microsecond_timestamp(value: object, field_name: str) -> None:
 
 def _require_bounded_positive_int(value: object, field_name: str, maximum: int) -> None:
     require_int(value, field_name)
-    assert isinstance(value, int)
-    if value < 1:
+    # require_int already proved value is int — cast() records that proof for
+    # the type checker without a redundant runtime re-check of the first-party
+    # Tier-1 validation guarantee.
+    checked = cast(int, value)
+    if checked < 1:
         raise ValueError(f"{field_name} must be strictly positive")
-    if value > maximum:
+    if checked > maximum:
         raise ValueError(f"{field_name} exceeds the code-owned maximum {maximum}")
 
 
@@ -212,12 +217,11 @@ def _validate_content_descriptor(
     max_size_bytes: int,
 ) -> None:
     _require_lower_hex_64(content_hash, f"{field_prefix}content_hash")
-    assert isinstance(content_hash, str)
     expected_ref = f"sha256:{content_hash}"
-    if content_ref != expected_ref:
+    if type(content_ref) is not str or content_ref != expected_ref:
         raise ValueError(f"{field_prefix}content_ref must equal {expected_ref!r}")
-    assert isinstance(content_ref, str)
     _reject_credential_bearing_reference(content_ref, f"{field_prefix}content_ref")
+
     _require_bounded_positive_int(size_bytes, f"{field_prefix}size_bytes", max_size_bytes)
 
 
@@ -245,6 +249,22 @@ def _reject_credential_bearing_reference(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be credential-free (known secret form detected)")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "sink-plugin-returned evidence payloads (SinkEffectCommitResult/SinkEffectReconcileResult/"
+        "SinkEffectInspection.evidence) — constructed by third-party sink plugin code ELSPETH does not own"
+    ),
+    source_param="evidence",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError when evidence is not a Mapping or contains a RestrictedAuditExportSnapshotReader; "
+        "raises ValueError when its canonical JSON exceeds the 64 KiB bound or is not credential-free; "
+        "never truncates or silently drops content"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_freeze_bounded_evidence_rejects_non_mapping",
+    test_fingerprint="e69dee2ea35162d11d9edb59c032e81549c02f221d3fa9d6144f8afbe8440797",
+)
 def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) -> Mapping[str, object]:
     if not isinstance(evidence, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
@@ -262,6 +282,22 @@ def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) ->
     return frozen
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "pipeline row values assembled by source/transform plugin code ELSPETH does not own, forwarded here "
+        "via SinkEffectMember/SinkEffectMemberCandidate row construction"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError on any value outside the canonical JSON-safe type set (str, bool, int, float, None, "
+        "Mapping, list/tuple) or on an embedded RestrictedAuditExportSnapshotReader, and raises ValueError on "
+        "an out-of-safe-range int or a non-finite float; never coerces or silently drops a value"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_freeze_canonical_row_value_rejects_unsupported_type",
+    test_fingerprint="6ccb739c009146c8f17fb813ae38e6060d8739887045a0b14cf33e98263aabc3",
+)
 def _freeze_canonical_row_value(value: object, path: str) -> object:
     """Detach one JSON/RFC-8785-safe value tree and reject authority objects."""
     if value is None or isinstance(value, (str, bool)):
@@ -289,8 +325,7 @@ def _freeze_canonical_row_value(value: object, path: str) -> object:
 
 
 def _contains_restricted_reader(value: object) -> bool:
-    reader_type = globals().get("RestrictedAuditExportSnapshotReader")
-    if isinstance(reader_type, type) and isinstance(value, reader_type):
+    if isinstance(value, RestrictedAuditExportSnapshotReader):
         return True
     if isinstance(value, Mapping):
         return any(_contains_restricted_reader(key) or _contains_restricted_reader(item) for key, item in value.items())
@@ -303,8 +338,9 @@ def _freeze_member_sequence(members_input: Sequence[SinkEffectMember], field_nam
     members = tuple(members_input)
     ordinals: list[int] = []
     for member in members:
-        if not isinstance(member, SinkEffectMember):
-            raise TypeError(f"{field_name} entries must be SinkEffectMember")
+        if type(member) is not SinkEffectMember:
+            raise TypeError(f"{field_name} entries must be exact SinkEffectMember values")
+
         ordinals.append(member.ordinal)
     if len(ordinals) != len(set(ordinals)):
         raise ValueError(f"{field_name} ordinals must be unique")
@@ -362,10 +398,12 @@ class SinkEffectMember:
     def __post_init__(self) -> None:
         require_int(self.ordinal, "ordinal", min_value=0)
         require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
-        for field_name in ("token_id", "row_id", "lineage_json"):
-            _require_nonempty_string(getattr(self, field_name), field_name)
-        for field_name in ("lineage_hash", "payload_hash", "pending_identity_hash"):
-            _require_lower_hex_64(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.token_id, "token_id")
+        _require_nonempty_string(self.row_id, "row_id")
+        _require_nonempty_string(self.lineage_json, "lineage_json")
+        _require_lower_hex_64(self.lineage_hash, "lineage_hash")
+        _require_lower_hex_64(self.payload_hash, "payload_hash")
+        _require_lower_hex_64(self.pending_identity_hash, "pending_identity_hash")
         try:
             lineage = json.loads(self.lineage_json)
         except json.JSONDecodeError as exc:
@@ -376,10 +414,10 @@ class SinkEffectMember:
             raise ValueError("lineage_json exceeds the 64 KiB limit")
         if sha256(self.lineage_json.encode("utf-8")).hexdigest() != self.lineage_hash:
             raise ValueError("lineage_hash must bind exact lineage_json")
-        for field_name in ("member_effect_id", "primary_effect_id"):
-            value = getattr(self, field_name)
-            if value is not None:
-                _require_lower_hex_64(value, field_name)
+        if self.member_effect_id is not None:
+            _require_lower_hex_64(self.member_effect_id, "member_effect_id")
+        if self.primary_effect_id is not None:
+            _require_lower_hex_64(self.primary_effect_id, "primary_effect_id")
         frozen_row = _freeze_canonical_row_value(self.row, "row")
         if not isinstance(frozen_row, Mapping):
             raise TypeError("row must be a mapping")
@@ -534,9 +572,7 @@ class SinkEffectFinalizationMember:
     path: TerminalPath
     sink_name: str | None = None
     batch_id: str | None = None
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
     error_hash: str | None = None
     context: Mapping[str, object] | None = None
 
@@ -588,8 +624,8 @@ class SinkEffectFinalizeRequest:
         require_no_artifact_uri_credentials(self.descriptor.path_or_uri)
         if type(self.publication_performed) is not bool:
             raise TypeError("publication_performed must be exact bool")
-        expected_performed = _EVIDENCE_PERFORMED.get(self.publication_evidence_kind)
-        if expected_performed is None or expected_performed is not self.publication_performed:
+        expected_performed = _EVIDENCE_PERFORMED[self.publication_evidence_kind]
+        if expected_performed is not self.publication_performed:
             raise ValueError("publication evidence kind contradicts publication_performed")
         accepted = tuple(self.accepted_ordinals)
         diverted = tuple(self.diverted_ordinals)
@@ -649,27 +685,28 @@ class SinkEffectIdentity:
     final_manifest_identity_hash: str | None = None
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "effect_id",
-            "artifact_id",
-            "artifact_idempotency_key",
-            "stream_id",
-            "config_hash",
-            "requested_target_hash",
-            "membership_or_manifest_hash",
-            "group_payload_hash",
-        ):
-            _require_lower_hex_64(getattr(self, field_name), field_name)
-        for field_name in ("snapshot_hash", "final_manifest_identity_hash"):
-            value = getattr(self, field_name)
-            if value is not None:
-                _require_lower_hex_64(value, field_name)
+        _require_lower_hex_64(self.effect_id, "effect_id")
+        _require_lower_hex_64(self.artifact_id, "artifact_id")
+        _require_lower_hex_64(self.artifact_idempotency_key, "artifact_idempotency_key")
+        _require_lower_hex_64(self.stream_id, "stream_id")
+        _require_lower_hex_64(self.config_hash, "config_hash")
+        _require_lower_hex_64(self.requested_target_hash, "requested_target_hash")
+        _require_lower_hex_64(self.membership_or_manifest_hash, "membership_or_manifest_hash")
+        _require_lower_hex_64(self.group_payload_hash, "group_payload_hash")
+        if self.snapshot_hash is not None:
+            _require_lower_hex_64(self.snapshot_hash, "snapshot_hash")
+        if self.final_manifest_identity_hash is not None:
+            _require_lower_hex_64(self.final_manifest_identity_hash, "final_manifest_identity_hash")
         _require_exact_enum(self.input_kind, SinkEffectInputKind, "input_kind")
         members = tuple(self.members)
         member_ids = tuple(self.member_ids)
         if any(type(member) is not SinkEffectMember for member in members):
             raise TypeError("members must contain exact SinkEffectMember values")
-        if any(not isinstance(member_id, str) or _LOWER_HEX_64.fullmatch(member_id) is None for member_id in member_ids):
+        # member_ids is a declared Sequence[str] on an owned frozen dataclass
+        # (Tier 1): a non-str element is a contract violation that crashes with
+        # the natural TypeError from fullmatch — no defensive type re-check
+        # converting it into the malformed-digest ValueError.
+        if any(_LOWER_HEX_64.fullmatch(member_id) is None for member_id in member_ids):
             raise ValueError("member_ids must contain lowercase SHA-256 digests")
         if self.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS:
             if not members or member_ids != tuple(member.member_effect_id for member in members):
@@ -687,12 +724,28 @@ class SinkEffectIdentity:
 class SinkEffectPipelineMembersInput:
     members: Sequence[SinkEffectMember]
     target_snapshot_members: Sequence[SinkEffectMember]
+    # Every member ever handed to this target's effect stream — diverted
+    # members INCLUDED — plus the current partition. The snapshot cannot carry
+    # this: it deliberately drops diverted members so a cumulative rebuild
+    # never republishes rejected rows, which leaves it indistinguishable from
+    # a fresh single-row run after an all-diverted predecessor. A sink whose
+    # rule quantifies over the whole run's delivery (DocumentSink's one-value
+    # rule) must read THIS count, not the snapshot length, or the rule holds
+    # only within one sink instance (elspeth-694f771c69).
+    target_delivered_member_count: int
 
     def __post_init__(self) -> None:
         members = _freeze_member_sequence(self.members, "members")
         if not members:
             raise ValueError("members must be non-empty")
         target_snapshot_members = _freeze_member_sequence(self.target_snapshot_members, "target_snapshot_members")
+        if type(self.target_delivered_member_count) is not int:
+            raise TypeError("target_delivered_member_count must be int")
+        if self.target_delivered_member_count < len(target_snapshot_members):
+            raise ValueError(
+                "target_delivered_member_count must be >= len(target_snapshot_members): "
+                "the snapshot is the delivered set minus diverted members, never more"
+            )
         object.__setattr__(self, "members", tuple(members))
         object.__setattr__(self, "target_snapshot_members", tuple(target_snapshot_members))
 
@@ -908,6 +961,18 @@ class RestrictedAuditExportSnapshotReader:
         raise TypeError("RestrictedAuditExportSnapshotReader cannot be serialized")
 
 
+@trust_boundary(
+    tier=3,
+    source="bytes returned by an injected audit-export blob-storage resolver (store_resolver) — external storage content",
+    source_param="content",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError when content is not bytes; raises ValueError when its length or SHA-256 hash does "
+        "not match the bound descriptor; never accepts content it cannot verify"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_verify_content_bytes_rejects_non_bytes_content",
+    test_fingerprint="9b22a8a8729263f8e7c7f7e86eec3a716c1cc8389f3fe13bd725493d138935d4",
+)
 def _verify_content_bytes(content: object, expected_hash: str, expected_size: int, label: str) -> None:
     if not isinstance(content, bytes):
         raise TypeError(f"{label} resolver must return bytes")
@@ -917,6 +982,21 @@ def _verify_content_bytes(content: object, expected_hash: str, expected_size: in
         raise ValueError(f"{label} hash does not match its bound descriptor")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "bytes returned by an injected audit-export blob-storage resolver (store_resolver) — external "
+        "storage content whose decoded JSON shape is unverified until this function promotes it"
+    ),
+    source_param="content",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the bytes are not canonical JSON UTF-8 for an exact v2 manifest dict, and "
+        "TypeError when a manifest field has the wrong exact type; never accepts a manifest it cannot verify"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_verify_signed_manifest_bytes_rejects_non_dict_json",
+    test_fingerprint="3bd157d4f24dc84a3eb08d513c06f71987484dd8d5ad0fa4424f6cda9a8a59a3",
+)
 def _verify_signed_manifest_bytes(
     content: bytes,
     binding: _AuditExportReaderBinding,
@@ -1026,8 +1106,9 @@ def _create_restricted_audit_export_snapshot_reader(
     _require_bounded_positive_int(max_chunk_records, "max_chunk_records", _AUDIT_EXPORT_MAX_CHUNK_RECORDS)
     _require_utc_microsecond_timestamp(exported_at, "exported_at")
     _require_utc_microsecond_timestamp(source_completed_at, "source_completed_at")
-    if not isinstance(source_status, str) or source_status not in {"completed", "completed_with_failures", "empty"}:
+    if source_status not in {"completed", "completed_with_failures", "empty"}:
         raise ValueError("source_status is not export-terminal")
+
     _require_lower_hex_64(last_chunk_seal_hash, "last_chunk_seal_hash")
     _require_lower_hex_64(snapshot_seal_hash, "snapshot_seal_hash")
     if serialization_version != _AUDIT_EXPORT_SERIALIZATION_VERSION:
@@ -1100,8 +1181,9 @@ class SinkEffectAuditExportSnapshotInput:
     def __post_init__(self) -> None:
         _require_lower_hex_64(self.snapshot_id, "snapshot_id")
         _require_nonempty_string(self.source_run_id, "source_run_id")
-        for field_name in ("registry_key_hash", "manifest_hash", "snapshot_hash"):
-            _require_lower_hex_64(getattr(self, field_name), field_name)
+        _require_lower_hex_64(self.registry_key_hash, "registry_key_hash")
+        _require_lower_hex_64(self.manifest_hash, "manifest_hash")
+        _require_lower_hex_64(self.snapshot_hash, "snapshot_hash")
         if self.serialization_version != _AUDIT_EXPORT_SERIALIZATION_VERSION:
             raise ValueError(f"serialization_version must equal {_AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         _require_exact_enum(self.export_format, AuditExportFormat, "export_format")
@@ -1113,8 +1195,9 @@ class SinkEffectAuditExportSnapshotInput:
         _require_bounded_positive_int(self.chunk_count, "chunk_count", _AUDIT_EXPORT_MAX_CHUNKS)
 
         chunks = tuple(self.chunks)
-        if any(not isinstance(chunk, AuditExportSnapshotChunkInput) for chunk in chunks):
-            raise TypeError("chunks entries must be AuditExportSnapshotChunkInput")
+        if any(type(chunk) is not AuditExportSnapshotChunkInput for chunk in chunks):
+            raise TypeError("chunks entries must be exact AuditExportSnapshotChunkInput values")
+
         ordinals = [chunk.ordinal for chunk in chunks]
         if ordinals != list(range(len(chunks))):
             raise ValueError("chunks ordinals must be dense and ordered from zero")
@@ -1194,18 +1277,19 @@ class SinkEffectPrepareRequest:
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.effect_id, "effect_id")
-        if not isinstance(self.effect_input, (SinkEffectPipelineMembersInput, SinkEffectAuditExportSnapshotInput)):
-            raise TypeError("effect_input must be a member of the closed sink effect input union")
-        if not isinstance(self.inspection, SinkEffectInspection):
-            raise TypeError("inspection must be SinkEffectInspection")
+        if type(self.effect_input) not in (SinkEffectPipelineMembersInput, SinkEffectAuditExportSnapshotInput):
+            raise TypeError("effect_input must be an exact member of the closed sink effect input union")
+        if type(self.inspection) is not SinkEffectInspection:
+            raise TypeError("inspection must be an exact SinkEffectInspection")
 
     @property
     def input_kind(self) -> SinkEffectInputKind:
         return self.effect_input.input_kind
 
     def validate_plan(self, plan: SinkEffectPlan) -> None:
-        if not isinstance(plan, SinkEffectPlan):
-            raise TypeError("plan must be SinkEffectPlan")
+        if type(plan) is not SinkEffectPlan:
+            raise TypeError("plan must be an exact SinkEffectPlan")
+
         if plan.effect_id != self.effect_id:
             raise ValueError("plan effect_id must equal request effect_id")
         if plan.input_kind is not self.input_kind:
@@ -1226,8 +1310,9 @@ class SinkEffectPlan:
     safe_evidence: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        for field_name in ("effect_id", "plan_hash", "payload_hash"):
-            _require_nonempty_string(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.effect_id, "effect_id")
+        _require_nonempty_string(self.plan_hash, "plan_hash")
+        _require_nonempty_string(self.payload_hash, "payload_hash")
         if self.protocol_version != SINK_EFFECT_PROTOCOL_VERSION:
             raise ValueError(f"protocol_version must equal {SINK_EFFECT_PROTOCOL_VERSION!r}")
         _require_exact_enum(self.input_kind, SinkEffectInputKind, "input_kind")
@@ -1244,9 +1329,11 @@ class SinkEffectPlan:
             raise ValueError(f"{self.descriptor_mode.value} descriptor_mode must not claim an expected_descriptor")
         frozen_evidence = _freeze_bounded_evidence(self.safe_evidence, "safe_evidence")
         if self.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION:
-            publication_kind = frozen_evidence.get("publication_kind")
-            if publication_kind not in {"inherited", "virtual"}:
-                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited or virtual")
+            if "publication_kind" not in frozen_evidence:
+                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited, virtual, or reaffirmed")
+            publication_kind = frozen_evidence["publication_kind"]
+            if publication_kind not in {"inherited", "virtual", "reaffirmed"}:
+                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited, virtual, or reaffirmed")
         object.__setattr__(self, "safe_evidence", deep_freeze(frozen_evidence))
 
 
@@ -1337,10 +1424,57 @@ class RestrictedSinkEffectContext:
     sink_node_id: str
 
     def __post_init__(self) -> None:
-        for field_name in ("run_id", "operation_id", "sink_node_id"):
-            _require_nonempty_string(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.run_id, "run_id")
+        _require_nonempty_string(self.operation_id, "operation_id")
+        _require_nonempty_string(self.sink_node_id, "sink_node_id")
         if not isinstance(self.run_started_at, datetime):
             raise TypeError("run_started_at must be datetime")
+
+
+class SinkEffectContract:
+    """Nominal participation marker for the recoverable effect contract.
+
+    Runtime plugin classes cross a genuine unknown-code boundary. Admission
+    uses this identity once, then trusts the declared contract directly and
+    fails loudly when any required declaration or method is missing.
+    """
+
+
+class MemberSinkEffectCapability:
+    """Nominal opt-in for sinks that publish one durable effect per member."""
+
+    def commit_member_effect(
+        self,
+        plan: SinkEffectPlan,
+        member: SinkEffectMember,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectCommitResult:
+        """Commit one member effect."""
+        raise NotImplementedError
+
+    def reconcile_member_effect(
+        self,
+        plan: SinkEffectPlan,
+        member: SinkEffectMember,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectReconcileResult:
+        """Reconcile one member effect."""
+        raise NotImplementedError
+
+
+class RestagingSinkEffectCapability:
+    """Nominal opt-in for sinks that can reconstruct a lost staged body."""
+
+    def restage_effect(
+        self,
+        plan: SinkEffectPlan,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> None:
+        """Rebuild and verify a staged body from durable input."""
+        raise NotImplementedError
 
 
 __all__ = [
@@ -1349,7 +1483,9 @@ __all__ = [
     "AuditExportSignedManifestInput",
     "AuditExportSigningMode",
     "AuditExportSnapshotChunkInput",
+    "MemberSinkEffectCapability",
     "ResolvedSinkEffectMode",
+    "RestagingSinkEffectCapability",
     "RestrictedAuditExportSnapshotReader",
     "RestrictedSinkEffectContext",
     "SinkEffectAttemptAction",
@@ -1358,6 +1494,7 @@ __all__ = [
     "SinkEffectAttemptState",
     "SinkEffectAuditExportSnapshotInput",
     "SinkEffectCommitResult",
+    "SinkEffectContract",
     "SinkEffectDescriptorMode",
     "SinkEffectExecutionPurpose",
     "SinkEffectFinalizationMember",

@@ -22,6 +22,7 @@ def test_user_preferences_table_columns() -> None:
         "tutorial_session_id",
         "tutorial_run_id",
         "tutorial_source_data_hash",
+        "show_advanced",
         "updated_at",
     }
 
@@ -88,3 +89,13 @@ def test_tutorial_resume_columns_are_nullable() -> None:
     table = metadata.tables["user_preferences"]
     for name in ("tutorial_stage", "tutorial_session_id", "tutorial_run_id", "tutorial_source_data_hash"):
         assert table.c[name].nullable, name
+
+
+def test_show_advanced_is_not_null_with_false_server_default() -> None:
+    """False is the standard-view default even at the DB level, so
+    pre-existing rows (created before this column existed) read as False
+    rather than NULL on the next server_default-backed recreation."""
+    table = metadata.tables["user_preferences"]
+    column = table.c.show_advanced
+    assert not column.nullable
+    assert column.server_default is not None

@@ -15,21 +15,30 @@ Fixtures live in ``tests/integration/web/conftest.py``:
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from elspeth.core.canonical import canonical_json
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
 
-from .conftest import _TEST_AUTHED_USER_ID, _passthrough_composition_state
+from .conftest import (
+    _TEST_AUTHED_USER_ID,
+    _passthrough_composition_state,
+    _save_composition_state_with_compose_authority,
+)
 
 # ── POST /mark-ready-for-review ─────────────────────────────────────────
 
@@ -112,9 +121,10 @@ def _seed_session_with_blob_subtree_sink(client: TestClient, *, user_id: str) ->
             auth_provider_type=settings.auth_provider,
         )
         (settings.data_dir / "blobs" / str(record.id)).mkdir(parents=True, exist_ok=True)
-        state_d = _passthrough_composition_state(settings.data_dir).to_dict()
+        state_d = _passthrough_composition_state(settings.data_dir, record.id).to_dict()
         state_d["outputs"][0]["options"]["path"] = str(settings.data_dir / "blobs" / str(record.id) / "review_out.csv")
-        await session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            session_service,
             record.id,
             CompositionStateData(
                 sources=state_d["sources"],
@@ -214,6 +224,193 @@ def test_get_shared_inspect_happy_path(
         "llm_interpretations",
         "secrets",
     }
+
+
+def _seed_session_with_described_state(client: TestClient, *, user_id: str) -> UUID:
+    """The conftest passthrough fixture with an authored description on the
+    source, the node and the sink — the shape the freeform tool surface
+    instructs the planner to produce on every step (``_STEP_DESCRIPTION_
+    DESCRIPTION``, tools/_common.py) and which the share mirror did not
+    declare from 2026-08-15 until elspeth-989d369d82."""
+    session_service = client.app.state.session_service
+    settings = client.app.state.settings
+
+    async def _seed() -> UUID:
+        record = await session_service.create_session(
+            user_id=user_id,
+            title="described fixture",
+            auth_provider_type=settings.auth_provider,
+        )
+        (settings.data_dir / "blobs" / str(record.id)).mkdir(parents=True, exist_ok=True)
+        (settings.data_dir / "outputs" / str(record.id)).mkdir(parents=True, exist_ok=True)
+        base = _passthrough_composition_state(settings.data_dir, record.id)
+        state = replace(
+            base,
+            sources={name: replace(source, description="Orders export") for name, source in base.sources.items()},
+            nodes=tuple(replace(node, description="Pass every row through unchanged") for node in base.nodes),
+            outputs=tuple(replace(output, description="Rows as received") for output in base.outputs),
+        )
+        state_d = state.to_dict()
+        await _save_composition_state_with_compose_authority(
+            session_service,
+            record.id,
+            CompositionStateData(
+                sources=state_d["sources"],
+                nodes=state_d["nodes"],
+                edges=state_d["edges"],
+                outputs=state_d["outputs"],
+                metadata_=state_d["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+        return record.id
+
+    return asyncio.run(_seed())
+
+
+def test_get_shared_inspect_resolves_a_pipeline_with_authored_step_descriptions(
+    audit_readiness_test_client: TestClient,
+) -> None:
+    """elspeth-989d369d82, the collector-free arm, end to end through the real
+    stack: persistence round-trip (``state_from_record`` keeps every key),
+    the mark-ready gate (200, token minted — the owner never runs the strict
+    mirror, so they got no signal), then resolve. Before the fix the resolve
+    was a bare 500 for the recipient; the mirror must now carry the prose."""
+    client = audit_readiness_test_client
+    session_id = _seed_session_with_described_state(client, user_id=_TEST_AUTHED_USER_ID)
+    token = _mint_token(client, session_id)
+
+    response = client.get(f"/api/sessions/shared/{token}")
+
+    assert response.status_code == 200, response.text
+    snapshot = response.json()["composition_snapshot"]
+    assert snapshot["sources"]["source"]["description"] == "Orders export"
+    assert [node["description"] for node in snapshot["nodes"]] == ["Pass every row through unchanged"]
+    assert [output["description"] for output in snapshot["outputs"]] == ["Rows as received"]
+
+
+def test_get_shared_inspect_attributes_the_share_to_the_username(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """The route must send the sharer's USERNAME, not only the identity id.
+
+    The shared view's banner names who shared the pipeline. Its recipient
+    has no login, so the opaque ``created_by_user_id`` names nobody to
+    them. The authenticated identity here carries a username distinct from
+    its user_id precisely so a route that passed ``user.user_id`` for both
+    would fail this test.
+    """
+    client, session_id = audit_readiness_client_with_state
+    named_identity = UserIdentity(user_id=_TEST_AUTHED_USER_ID, username="alice-the-analyst")
+
+    async def _named() -> UserIdentity:
+        return named_identity
+
+    original_override = client.app.dependency_overrides[get_current_user]
+    client.app.dependency_overrides[get_current_user] = _named
+    try:
+        token = _mint_token(client, session_id)
+        response = client.get(f"/api/sessions/shared/{token}")
+    finally:
+        client.app.dependency_overrides[get_current_user] = original_override
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created_by_username"] == "alice-the-analyst"
+    assert body["created_by_user_id"] == _TEST_AUTHED_USER_ID
+
+
+def test_shared_route_and_persistence_expose_only_public_projection(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """The path-only integration fixture must stay private across every carrier."""
+    client, session_id = audit_readiness_client_with_state
+    settings = client.app.state.settings
+    private_source_path = str(settings.data_dir / "blobs" / str(session_id) / "audit_readiness_fixture.csv")
+    private_sink_path = str(settings.data_dir / "outputs" / str(session_id) / "audit_readiness_fixture_out.csv")
+
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    marked_body = marked.json()
+    resolved = client.get(f"/api/sessions/shared/{marked_body['token']}")
+    assert resolved.status_code == 200, resolved.text
+    resolved_body = resolved.json()
+
+    digest_hex = marked_body["payload_digest"].removeprefix("sha256:")
+    stored_bytes = client.app.state.payload_store.retrieve(digest_hex)
+    stored_body = json.loads(stored_bytes)
+    with client.app.state.session_engine.connect() as conn:
+        audit_row = conn.execute(
+            select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session_id))
+        ).one()
+
+    for representation in (stored_body, resolved_body):
+        serialized = json.dumps(representation, sort_keys=True)
+        assert private_source_path not in serialized
+        assert private_sink_path not in serialized
+        assert "blob_ref" not in serialized
+        assert "secret(s) in your inventory" not in serialized
+
+    assert resolved_body["composition_snapshot"]["sources"]["source"]["plugin"] == "csv"
+    assert resolved_body["composition_snapshot"]["nodes"][0]["id"] == "pass"
+    assert resolved_body["composition_snapshot"]["outputs"][0]["name"] == "out"
+    assert private_source_path not in stored_body["yaml"]
+    assert audit_row.payload_digest == marked_body["payload_digest"]
+    assert private_source_path not in repr(audit_row)
+
+
+def test_shared_route_projects_legacy_signed_blob_without_rewriting_evidence(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """A valid outstanding token cannot bypass the current public projection."""
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    payload_store = client.app.state.payload_store
+    signed_payload = service._signer.verify(marked.json()["token"])
+    stored = json.loads(payload_store.retrieve(signed_payload.payload_digest.removeprefix("sha256:")))
+
+    private_path = "/srv/elspeth/blobs/alice/legacy-http.csv"
+    private_index = "/srv/elspeth/indexes/alice/legacy-http"
+    blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
+    stored["composition_snapshot"]["sources"]["source"]["options"].update(
+        {
+            "path": private_path,
+            "blob_ref": blob_id,
+            "mode": "bind_source",
+        }
+    )
+    stored["composition_snapshot"]["nodes"][0]["plugin"] = "llm"
+    stored["composition_snapshot"]["nodes"][0]["options"] = {
+        "prompt_template": "{{ lookup.path }}",
+        "lookup": {"path": "north", "file": "case.txt", "mode": "bind_source"},
+        "provider_config": {"persist_directory": private_index},
+    }
+    stored["yaml"] = f"legacy_path: {private_path}\nlegacy_blob: {blob_id}\n"
+    stored["audit_readiness"]["rows"][-1]["detail"] = "23 secret(s) in your inventory"
+    legacy_bytes = canonical_json(stored).encode()
+    digest_hex = payload_store.store(legacy_bytes)
+    legacy_token = service._signer.sign(
+        replace(
+            signed_payload,
+            nonce_hex="cd" * 16,
+            payload_digest=f"sha256:{digest_hex}",
+        )
+    )
+
+    response = client.get(f"/api/sessions/shared/{legacy_token}")
+
+    assert response.status_code == 200, response.text
+    serialized = response.text
+    for private_value in (private_path, private_index, blob_id, "23 secret(s) in your inventory"):
+        assert private_value not in serialized
+    expected_lookup = {"path": "north", "file": "case.txt", "mode": "bind_source"}
+    assert response.json()["composition_snapshot"]["nodes"][0]["options"]["lookup"] == expected_lookup
+    assert yaml.safe_load(response.json()["yaml"])["transforms"][0]["options"]["lookup"] == expected_lookup
+    assert payload_store.retrieve(digest_hex) == legacy_bytes
 
 
 def test_get_shared_inspect_recipient_is_not_creator(
@@ -330,17 +527,39 @@ def test_get_shared_inspect_blob_expired_returns_404(
     assert response.status_code == 404
 
 
+def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    client.app.state.rate_limiter = ComposerRateLimiter(limit=1)
+    client.app.state.write_rate_limiter = ComposerRateLimiter(limit=100)
+    # Two consecutive write-side calls succeed on a starved strict bucket:
+    r1 = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert r1.status_code in (200, 409)
+    r2 = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert r2.status_code in (200, 409)
+    # get_shared_inspect (token resolve) remains strict: the second
+    # resolve trips the limit=1 strict bucket.
+    token = "not-a-real-token"
+    first = client.get(f"/api/sessions/shared/{token}")
+    second = client.get(f"/api/sessions/shared/{token}")
+    assert 429 in (first.status_code, second.status_code)
+
+
 def test_mark_ready_for_review_audit_write_failure_returns_no_token(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If the audit insert raises, the request fails — no token returned, no blob exposed.
 
-    Mechanism: monkey-patch the engine's ``begin`` to raise. The service's
-    ``with self._sessions_db_engine.begin() as conn`` path then fails before
-    any blob is written. TestClient defaults to ``raise_server_exceptions=True``,
-    so the test catches the exception directly; the assertion that matters is
-    that NO blob was written, confirming audit-first ordering.
+    Mechanism: the audit row is written through the session-operation
+    authority's ``mutate`` seam (``transaction.composer_completion
+    .mark_ready_for_review`` under the exact BLOB_READ context), not through
+    a bare ``engine.begin()``. Injecting at that seam makes the audit insert
+    raise before any blob is written. TestClient defaults to
+    ``raise_server_exceptions=True``, so the test catches the exception
+    directly; the assertion that matters is that NO blob was written,
+    confirming audit-first ordering.
     """
     client, session_id = audit_readiness_client_with_state
 
@@ -355,16 +574,19 @@ def test_mark_ready_for_review_audit_write_failure_returns_no_token(
 
     monkeypatch.setattr(payload_store, "store", tracking_store)
 
-    # Break the engine's begin() to raise.
+    # Break the authority's mutate seam so the audit insert raises. Only the
+    # shareable-review service's reference is replaced: the route still
+    # acquires its BLOB_READ lease from the real session-service authority.
     service = client.app.state.shareable_review_service
 
     class _AuditWriteBoom(Exception): ...
 
-    class _BadEngine:
-        def begin(self):  # type: ignore[no-untyped-def]
+    class _AuditWriteFailingAuthority:
+        def mutate(self, session_operation_context, writer):  # type: ignore[no-untyped-def]
+            del session_operation_context, writer
             raise _AuditWriteBoom("audit write injected failure")
 
-    monkeypatch.setattr(service, "_sessions_db_engine", _BadEngine())
+    monkeypatch.setattr(service, "_session_operation_authority", _AuditWriteFailingAuthority())
 
     with pytest.raises(_AuditWriteBoom):
         client.post(f"/api/sessions/{session_id}/mark-ready-for-review")

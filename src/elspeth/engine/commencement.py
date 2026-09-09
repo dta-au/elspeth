@@ -10,10 +10,11 @@ from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.preflight import CommencementGateResult
 from elspeth.core.commencement_gate_expression import (
     COMMENCEMENT_GATE_ALLOWED_NAMES,
+    redact_commencement_gate_condition,
     validate_commencement_gate_condition,
 )
 from elspeth.core.dependency_config import CommencementGateConfig
-from elspeth.core.expression_parser import ExpressionParser
+from elspeth.core.expression_parser import ExpressionParser, ExpressionSecurityError
 from elspeth.engine.error_boundary import reraise_if_engine_crash_through
 
 
@@ -21,35 +22,30 @@ def build_preflight_context(
     *,
     dependency_results: dict[str, Any],
     collection_probes: dict[str, Any],
-    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the pre-flight context dict for gate expression evaluation.
 
-    Returns a namespace dict with three keys accessible in gate expressions:
+    Returns a namespace dict with two keys accessible in gate expressions:
     - ``dependency_runs``: {name: {run_id, settings_hash, duration_ms, indexed_at}} for each dependency
     - ``collections``: {name: {reachable, count}} for each probed collection
-    - ``env``: explicitly supplied non-secret gate environment values
+
+    There is deliberately no ``env`` namespace: it was never populated (the
+    sole caller passed nothing) and it was the surface of
+    elspeth-83261b699c — "Commencement gate non-bool failure can echo env
+    secret values into audit/error text".
     """
     return {
         "dependency_runs": dependency_results,
         "collections": collection_probes,
-        "env": env if env is not None else {},
     }
 
 
 def _build_audit_snapshot(context: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Build a frozen context snapshot for audit, excluding env values.
-
-    Env values are excluded because they may contain secrets (API keys, tokens).
-    Env key names are included so auditors know which variables were available
-    during gate evaluation without exposing their values.
-    """
-    env = context["env"]
+    """Build a frozen context snapshot for audit."""
     frozen: Mapping[str, Any] = deep_freeze(
         {
             "dependency_runs": context["dependency_runs"],
             "collections": context["collections"],
-            "env_keys": sorted(env.keys()),
         }
     )
     return frozen
@@ -77,17 +73,17 @@ def evaluate_commencement_gates(
     """Evaluate gates sequentially. Raises CommencementGateFailedError on failure.
 
     Context should be a namespace dict with keys from COMMENCEMENT_GATE_ALLOWED_NAMES
-    (collections, dependency_runs, env). Unknown keys are not rejected here —
+    (collections, dependency_runs). Unknown keys are not rejected here —
     the ExpressionParser restricts name access during evaluation.
-    The entire context dict (including explicit Tier 3 env values) is deep-frozen before evaluation.
+    The entire context dict is deep-frozen before evaluation.
     """
-    # Deep-freeze entire context for expression evaluation (Tier 3 boundary for explicit env)
     frozen_context = deep_freeze(context)
     # Build audit snapshot from the frozen context (same object used for evaluation) to ensure the snapshot reflects exactly what the gate saw.
     audit_snapshot = _build_audit_snapshot(frozen_context)
 
     results: list[CommencementGateResult] = []
     for gate in gates:
+        audited_condition = redact_commencement_gate_condition(gate.condition)
         try:
             parser = ExpressionParser(
                 gate.condition,
@@ -97,11 +93,13 @@ def evaluate_commencement_gates(
             if not isinstance(result, bool):
                 raise CommencementGateFailedError(
                     gate_name=gate.name,
-                    condition=gate.condition,
+                    condition=audited_condition,
                     reason=(
-                        # NB: do NOT include {result!r} — for a gate like env['API_KEY']
-                        # the result IS the raw secret value, and this reason bypasses the
-                        # env-scrubbed audit snapshot (elspeth-83261b699c). The type alone
+                        # NB: do NOT include {result!r} — for a gate like
+                        # dependency_runs['x']['run_id'] the result IS the raw
+                        # context value, and this reason bypasses the audit
+                        # snapshot (elspeth-83261b699c, whose original surface
+                        # was the now-removed env namespace). The type alone
                         # is the actionable diagnostic.
                         f"Gate expression returned {type(result).__name__}, "
                         f"not bool. Commencement gates must evaluate to True or False — "
@@ -113,13 +111,17 @@ def evaluate_commencement_gates(
             passed = result
         except CommencementGateFailedError:
             raise
-        except BaseException as exc:
+        except ExpressionSecurityError:
+            # Post-A1 the evaluator's fail-closed visit() raises this for a
+            # validator-allowed-but-evaluator-uncovered node — a framework
+            # bug, never a user's failing gate. Wrapping it below would
+            # relabel it "your gate failed"; let it crash through instead.
+            raise
+        except Exception as exc:
             reraise_if_engine_crash_through(exc)
-            if not isinstance(exc, Exception):
-                raise
             raise CommencementGateFailedError(
                 gate_name=gate.name,
-                condition=gate.condition,
+                condition=audited_condition,
                 reason=f"Expression raised {type(exc).__name__}",
                 context_snapshot=audit_snapshot,
             ) from exc
@@ -127,7 +129,7 @@ def evaluate_commencement_gates(
         if not passed:
             raise CommencementGateFailedError(
                 gate_name=gate.name,
-                condition=gate.condition,
+                condition=audited_condition,
                 reason="Condition evaluated to falsy",
                 context_snapshot=audit_snapshot,
             )
@@ -135,7 +137,7 @@ def evaluate_commencement_gates(
         results.append(
             CommencementGateResult(
                 name=gate.name,
-                condition=gate.condition,
+                condition=audited_condition,
                 result=True,
                 context_snapshot=audit_snapshot,
             )

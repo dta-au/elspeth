@@ -134,6 +134,7 @@ describe("pluginCatalogStore", () => {
       plugin_type: "source",
       description: "CSV source",
       json_schema: { type: "object" },
+      knob_schema: { fields: [] },
     }, "a"));
   });
 
@@ -317,6 +318,7 @@ describe("pluginCatalogStore", () => {
       plugin_type: "source",
       description: "CSV source",
       json_schema: { type: "object" },
+      knob_schema: { fields: [] },
     }, "a"));
     const store = createPluginCatalogStore();
     await store.getState().load({ principal: "local:alice", fingerprint: "a" });
@@ -414,6 +416,7 @@ describe("pluginCatalogStore", () => {
       plugin_type: "source",
       description: "CSV source",
       json_schema: { type: "object" },
+      knob_schema: { fields: [] },
     }, "b") as never);
     const store = createPluginCatalogStore();
     await store.getState().load({ principal: "bootstrap:alice" });

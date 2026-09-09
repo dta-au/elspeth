@@ -23,11 +23,14 @@
 // for its prefill action, and ChatInput.tsx remains the receiver.
 // ============================================================================
 
-import { useState, type MouseEvent } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import { Button } from "@/components/ui";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
-import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+import { DEFAULT_VISIBLE_AUDIT_FLAGS, lookupAuditCharacteristic } from "./auditCharacteristics";
+import { pluginDisplayName } from "./pluginDisplayName";
 
 /** Event name dispatched by InlineChatSourceEntry and consumed by
  *  ChatInput.tsx. Re-exported here for backwards compatibility with
@@ -101,7 +104,7 @@ function variantKindLabel(s: DiscriminatedSchema): string {
 function renderFields(properties: Record<string, JsonSchemaField>, required: string[] | undefined): JSX.Element[] {
   const req = new Set(required ?? []);
   return Object.entries(properties).map(([name, field]) => (
-    <div key={name}>
+    <div key={name} className="plugin-card-field-row">
       <span className="plugin-card-field-name">{name}</span>
       <span className="plugin-card-field-type">{field.type ?? "any"}</span>
       {req.has(name) && <span className="plugin-card-field-required">required</span>}
@@ -110,7 +113,9 @@ function renderFields(properties: Record<string, JsonSchemaField>, required: str
   ));
 }
 
-const PROSE_FALLBACK = "See the technical description above.";
+function hasCatalogText(value: string | null): value is string {
+  return value !== null && value.trim().length > 0;
+}
 
 export function PluginCard({
   plugin,
@@ -120,13 +125,37 @@ export function PluginCard({
   onRetrySchema,
   initialExpanded = false,
 }: PluginCardProps) {
-  const [expanded, setExpanded] = useState(initialExpanded);
-  const [detailsOpen, setDetailsOpen] = useState(false);
+  const showAdvanced = useShowAdvanced();
   const displayName = pluginDisplayName(plugin.name);
   const cardId = `${pluginCardIdSegment(plugin.plugin_type)}-${pluginCardIdSegment(plugin.name)}`;
+  const whenText = plugin.usage_when_to_use;
+  const avoidText = plugin.usage_when_not_to_use;
+  const exampleText = plugin.example_use;
+  const hasWhen = hasCatalogText(whenText);
+  const hasAvoid = hasCatalogText(avoidText);
+  const hasExample = hasCatalogText(exampleText);
+  const hasDetails = hasWhen || hasAvoid || hasExample;
+  const [expanded, setExpanded] = useState(initialExpanded);
+  const schemaOpen = expanded && showAdvanced;
+  const visibleAuditCharacteristics = [...plugin.audit_characteristics]
+    .filter((flag) => showAdvanced || (DEFAULT_VISIBLE_AUDIT_FLAGS as readonly string[]).includes(flag))
+    // An unknown flag renders nothing (AuditCharacteristicIcon), so leaving it
+    // in the list produces an EMPTY role="group" with an aria-label — a group
+    // announced as containing nothing. Drop it here instead.
+    .filter((flag) => lookupAuditCharacteristic(flag) !== null)
+    .sort();
+  const [detailsState, setDetailsState] = useState({ cardId, open: false });
+  const detailsOpen = hasDetails && detailsState.cardId === cardId && detailsState.open;
   const nameId = `plugin-card-name-${cardId}`;
   const detailsPanelId = `plugin-card-details-panel-${cardId}`;
   const schemaPanelId = `plugin-card-schema-panel-${cardId}`;
+
+  useEffect(() => {
+    setDetailsState((current) => {
+      if (current.cardId === cardId && (hasDetails || !current.open)) return current;
+      return { cardId, open: false };
+    });
+  }, [cardId, hasDetails]);
 
   function handleDisclosureClick(e: MouseEvent<HTMLButtonElement>) {
     e.preventDefault();
@@ -141,11 +170,6 @@ export function PluginCard({
 
   const configSchema = schema?.json_schema as (DiscriminatedSchema & JsonSchemaObject) | undefined;
 
-  const allFallback =
-    plugin.usage_when_to_use === null &&
-    plugin.usage_when_not_to_use === null &&
-    plugin.example_use === null;
-
   return (
     // role="article" + aria-labelledby promotes the card to a named region
     // (WCAG 1.3.1): the plugin name reads as the card's accessible name
@@ -158,9 +182,6 @@ export function PluginCard({
         <span className="plugin-card-title-group">
           <span id={nameId} className="plugin-card-name">{displayName}</span>
           <code className="plugin-card-id">{plugin.name}</code>
-          {isInternalPlugin(plugin.name) && (
-            <span className="plugin-card-internal-badge">internal</span>
-          )}
         </span>
         <span className="plugin-card-kind">{plugin.plugin_type}</span>
       </div>
@@ -169,7 +190,7 @@ export function PluginCard({
         {plugin.description}
       </div>
 
-      {plugin.audit_characteristics.length > 0 && (
+      {visibleAuditCharacteristics.length > 0 && (
         // role="group" so the aria-label is actually exposed — aria-label on
         // a role-less div (role=generic) is ignored by AT (WCAG 1.3.1,
         // elspeth-37293a3b7c).
@@ -178,62 +199,67 @@ export function PluginCard({
           role="group"
           aria-label="Audit characteristics"
         >
-          {[...plugin.audit_characteristics].sort().map((flag) => (
+          {visibleAuditCharacteristics.map((flag) => (
             <AuditCharacteristicIcon key={flag} flag={flag} />
           ))}
         </div>
       )}
 
       <div className="plugin-card-actions">
-        <button
-          type="button"
-          className="btn btn-small plugin-card-detail-toggle"
-          onClick={() => setDetailsOpen((open) => !open)}
-          aria-expanded={detailsOpen}
-          aria-controls={detailsPanelId}
-          aria-label={`Reference details for ${displayName}`}
-        >
-          Details
-        </button>
-        <button
-          type="button"
-          className="btn btn-small plugin-card-disclosure"
-          onClick={handleDisclosureClick}
-          aria-expanded={expanded}
-          aria-controls={schemaPanelId}
-          aria-label={`Schema for ${displayName}`}
-        >
-          Schema
-        </button>
+        {hasDetails && (
+          <Button
+            className="btn-small plugin-card-detail-toggle"
+            onClick={() =>
+              setDetailsState((current) => ({
+                cardId,
+                open: current.cardId === cardId ? !current.open : true,
+              }))
+            }
+            aria-expanded={detailsOpen}
+            aria-controls={detailsPanelId}
+            aria-label={`Reference details for ${displayName}`}
+          >
+            Details
+          </Button>
+        )}
+        {showAdvanced && (
+          <Button
+            className="btn-small plugin-card-disclosure"
+            onClick={handleDisclosureClick}
+            aria-expanded={schemaOpen}
+            aria-controls={schemaPanelId}
+            aria-label={`Schema for ${displayName}`}
+          >
+            Schema
+          </Button>
+        )}
       </div>
 
       {detailsOpen && (
         <div id={detailsPanelId} className="plugin-card-details">
-          {allFallback ? (
-            <div className="plugin-card-prose-fallback">{PROSE_FALLBACK}</div>
-          ) : (
-            <>
-              <ProseSection label="Use when" body={plugin.usage_when_to_use} />
-              <ProseSection label="Avoid when" body={plugin.usage_when_not_to_use} />
-              {plugin.example_use !== null && (
-                <div className="plugin-card-example">
-                  <div className="plugin-card-example-label">Example</div>
-                  <pre className="plugin-card-example-code">{plugin.example_use}</pre>
-                </div>
-              )}
-            </>
+          {hasWhen && (
+            <ProseSection label="Use when" body={whenText} />
+          )}
+          {hasAvoid && (
+            <ProseSection label="Avoid when" body={avoidText} />
+          )}
+          {hasExample && (
+            <div className="plugin-card-example">
+              <div className="plugin-card-example-label">Example</div>
+              <pre className="plugin-card-example-code">{exampleText}</pre>
+            </div>
           )}
         </div>
       )}
 
-      {expanded && (
+      {schemaOpen && (
         <div id={schemaPanelId} className="plugin-card-expanded">
           {schemaError ? (
             <div className="plugin-card-schema-error">
               <span>Failed to load schema.</span>
-              <button type="button" className="btn btn-small" onClick={handleRetry} aria-label="Retry loading schema">
+              <Button className="btn-small" onClick={handleRetry} aria-label="Retry loading schema">
                 Retry
-              </button>
+              </Button>
             </div>
           ) : schema === null || configSchema === undefined ? (
             <div role="status" aria-live="polite" className="plugin-card-schema-loading">
@@ -266,8 +292,7 @@ export function PluginCard({
   );
 }
 
-function ProseSection({ label, body }: { label: string; body: string | null }) {
-  if (body === null) return null;
+function ProseSection({ label, body }: { label: string; body: string }) {
   return (
     <div className="plugin-card-prose-section">
       <div className="plugin-card-prose-label">{label}:</div>

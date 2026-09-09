@@ -509,3 +509,36 @@ class TestQueryTemplateCompileParity:
 
         q = QueryDefinition(input_fields={"field_a": "field_a"}, template="Rate {{ field_a }}")
         assert q.template == "Rate {{ field_a }}"
+
+
+class TestMultiQueryOutputSemantics:
+    """ADR-039: the multi-query branch must claim framing like the single-query one.
+
+    Both branches of ``LLMTransform.output_semantics()`` describe generated
+    text. A declaration that drifts between them would leave one authoring
+    path gateable and the other silently not.
+    """
+
+    def test_multi_query_raw_response_fields_are_unconstrained_strings(self) -> None:
+        from elspeth.contracts.plugin_semantics import (
+            ContentKind,
+            SemanticValueType,
+            TextFraming,
+        )
+
+        transform = LLMTransform(_make_llm_config())
+        try:
+            declaration = transform.output_semantics()
+        finally:
+            transform.close()
+
+        assert len(declaration.fields) == 1
+        facts = declaration.fields[0]
+        # Multi-query names raw response fields "<query>_<response_field>".
+        assert facts.field_name.startswith("cs1_diag_")
+        assert facts.value_type is SemanticValueType.STR
+        assert facts.fact_code == "llm.response_field.string"
+        # content_kind abstains; text_framing makes a positive claim, because
+        # an abstention can never CONFLICT and so can never be gated.
+        assert facts.content_kind is ContentKind.UNKNOWN
+        assert facts.text_framing is TextFraming.UNCONSTRAINED

@@ -90,11 +90,25 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
     });
   });
 
+  // Full wire shape: decoded structurally since 69c910a56
+  // (preferencesDecoder.ts KEYS); a partial payload surfaces a preferences
+  // error banner instead of the composer defaults. The account must read as
+  // a RETURNING user (tutorial completed): with tutorial_completed_at null the
+  // decoded payload makes this a first run and App.tsx shows the tutorial
+  // welcome instead of the freeform Chat panel this spec drives.
   await page.route("**/api/composer-preferences", async (route) => {
     await route.fulfill({
       json: {
         default_mode: "freeform",
         banner_dismissed_at: null,
+        freeform_intro_dismissed_at: null,
+        tutorial_completed_at: "2026-05-14T00:00:00Z",
+        tutorial_stage: null,
+        tutorial_session_id: null,
+        tutorial_run_id: null,
+        tutorial_source_data_hash: null,
+        show_advanced: false,
+        updated_at: null,
       },
     });
   });
@@ -230,6 +244,22 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
   });
 }
 
+/** Since 5dbbb1439 the tool card's primary label is the humanised sentence
+ *  ("Proposed: Replaces the entire pipeline …") and the raw tool name is a
+ *  separate mono <code> element, so "<status>: <tool>" is no longer one text
+ *  node. Assert the card by its status prefix and its tool-name ribbon. */
+async function expectToolCard(
+  page: Page,
+  status: "Proposed" | "Applied" | "Rejected",
+  toolName: string,
+): Promise<void> {
+  const card = page
+    .getByRole("article")
+    .filter({ hasText: new RegExp(`^${status}:`) })
+    .filter({ has: page.locator("code", { hasText: new RegExp(`^${toolName}$`) }) });
+  await expect(card).toBeVisible();
+}
+
 test("explicit approve tool call is visible before commit", async ({ page }) => {
   await installDeterministicComposerRoutes(page);
 
@@ -238,7 +268,7 @@ test("explicit approve tool call is visible before commit", async ({ page }) => 
   await composer.createSession("Proposal workflow");
   await composer.sendMessage("Build a simple csv to json pipeline");
 
-  await expect(page.getByText(/Proposed: set_pipeline/)).toBeVisible();
+  await expectToolCard(page, "Proposed", "set_pipeline");
   const pendingChanges = page.getByRole("region", { name: /Pending changes/ });
   await expect(
     pendingChanges.getByRole("button", { name: /Accept proposal:/ }),
@@ -249,7 +279,7 @@ test("explicit approve tool call is visible before commit", async ({ page }) => 
 
   await pendingChanges.getByRole("button", { name: /Accept proposal:/ }).click();
 
-  await expect(page.getByText(/Applied: set_pipeline/)).toBeVisible();
+  await expectToolCard(page, "Applied", "set_pipeline");
   await expect(
     // Accessible name updated with the keyboard-focusable conversation region
     // (elspeth-5e43a0c8b2).

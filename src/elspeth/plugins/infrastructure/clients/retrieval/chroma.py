@@ -19,17 +19,24 @@ from __future__ import annotations
 import math
 import re
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import chromadb
+import chromadb.api
 import httpx
 from pydantic import BaseModel, field_validator, model_validator
 
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
-from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionConfig
+from elspeth.plugins.infrastructure.clients.retrieval.connection import (
+    ChromaConnectionConfig,
+    ChromaSearchMode,
+    _validated_chroma_http_client_args,
+)
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
 if TYPE_CHECKING:
@@ -42,7 +49,7 @@ class ChromaSearchProviderConfig(BaseModel):
     model_config = {"extra": "forbid", "frozen": True}
 
     collection: str
-    mode: Literal["ephemeral", "persistent", "client"] = "ephemeral"
+    mode: ChromaSearchMode = "ephemeral"
 
     persist_directory: str | None = None
 
@@ -102,6 +109,49 @@ class ChromaSearchProviderConfig(BaseModel):
         )
 
 
+@trust_boundary(
+    tier=3,
+    source="chromadb Collection.metadata as returned by the Chroma SDK / server for an existing collection",
+    source_param="collection_metadata",
+    suppresses=("R5",),
+    invariant=(
+        "raises RetrievalError(retryable=False) when the metadata is not a Mapping, carries no 'hnsw:space', "
+        "or its 'hnsw:space' is not a str; never substitutes a default distance function"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py::test_collection_distance_space_rejects_non_mapping_metadata",
+    test_fingerprint="aea5f064c296f13717d3bcd56351bf114f2e951151ea7492e77c5250122f6374",
+)
+def _collection_distance_space(collection_metadata: Any, collection_name: str) -> str:
+    """Parse the distance function an existing Chroma collection was built with.
+
+    Score normalization is only meaningful against the collection's real
+    ``hnsw:space``; a missing or malformed value must fail startup rather than
+    fall back to a guess. ``collection_name`` is only used for the message.
+    """
+    if not isinstance(collection_metadata, Mapping):
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} returned malformed metadata. "
+            "Score normalization requires an exact metadata mapping containing 'hnsw:space'.",
+            retryable=False,
+        )
+    if "hnsw:space" not in collection_metadata:
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has no 'hnsw:space' "
+            f"in metadata. Score normalization cannot proceed without a "
+            f"known distance function.",
+            retryable=False,
+        )
+    actual_space = collection_metadata["hnsw:space"]
+    if not isinstance(actual_space, str):
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has a non-string 'hnsw:space' "
+            f"({type(actual_space).__name__}) in metadata. Score normalization requires "
+            f"a named distance function.",
+            retryable=False,
+        )
+    return actual_space
+
+
 class ChromaSearchProvider:
     """ChromaDB implementation of RetrievalProvider.
 
@@ -123,26 +173,30 @@ class ChromaSearchProvider:
         self.last_skipped_count: int = 0
         self.last_skipped_reasons: list[dict[str, Any]] = []
 
+        client: chromadb.api.ClientAPI
         if config.mode == "ephemeral":
-            self._client = chromadb.Client()
+            client = chromadb.Client()
         elif config.mode == "persistent":
             # persist_directory is guaranteed non-None by validate_mode_requirements
             assert config.persist_directory is not None
-            self._client = chromadb.PersistentClient(path=config.persist_directory)
+            client = chromadb.PersistentClient(path=config.persist_directory)
         else:
             # host is guaranteed non-None by validate_mode_requirements
             assert config.host is not None
-            self._client = chromadb.HttpClient(
-                host=config.host,
-                port=config.port,
-                ssl=config.ssl,
+            client = chromadb.HttpClient(
+                **_validated_chroma_http_client_args(
+                    config.host,
+                    config.port,
+                    ssl=config.ssl,
+                )
             )
+        self._client: chromadb.api.ClientAPI | None = client
 
         # Retrieval providers must NOT create collections — that's a sink/indexing
         # concern. Using get_collection() ensures a typo in the collection name
         # fails fast at startup instead of silently creating an empty collection.
         try:
-            self._collection = self._client.get_collection(
+            self._collection = client.get_collection(
                 name=config.collection,
             )
         except (chromadb.errors.ChromaError, ConnectionError, OSError) as exc:
@@ -155,15 +209,7 @@ class ChromaSearchProvider:
             ) from exc
 
         # Validate distance function matches what the collection was created with.
-        collection_metadata = self._collection.metadata or {}
-        if "hnsw:space" not in collection_metadata:
-            raise RetrievalError(
-                f"Chroma collection {config.collection!r} has no 'hnsw:space' "
-                f"in metadata. Score normalization cannot proceed without a "
-                f"known distance function.",
-                retryable=False,
-            )
-        actual_space = collection_metadata["hnsw:space"]
+        actual_space = _collection_distance_space(self._collection.metadata, config.collection)
         if actual_space != config.distance_function:
             raise RetrievalError(
                 f"Chroma collection {config.collection!r} exists with "
@@ -205,6 +251,14 @@ class ChromaSearchProvider:
             # OS-level failures that bypass the ChromaDB SDK's own error wrapping
             self._record_error(state_id, count_start, count_request, exc, retryable=True)
             raise RetrievalError(f"Chroma connection failed during count: {exc}", retryable=True) from exc
+        if type(collection_count) is not int or collection_count < 0:
+            error = RetrievalError(
+                f"Chroma collection count returned malformed evidence: expected a non-negative exact int, "
+                f"got {collection_count!r} ({type(collection_count).__name__}).",
+                retryable=False,
+            )
+            self._record_error(state_id, count_start, count_request, error, retryable=False)
+            raise error
         if collection_count == 0:
             # The corpus is empty: no query() is issued and zero chunks are
             # returned. This is still an auditable retrieval decision — the
@@ -304,38 +358,48 @@ class ChromaSearchProvider:
             RetrievalError: On malformed response structure, corrupt distances,
                 or non-finite distance values.
         """
-        try:
-            raw_documents = results["documents"]
-            raw_distances = results["distances"]
-            raw_metadatas = results["metadatas"]
-            if raw_documents is None or raw_distances is None or raw_metadatas is None:
-                raise RetrievalError(
-                    "Chroma query returned None for documents/distances/metadatas",
-                    retryable=False,
-                )
-            documents = raw_documents[0]
-            distances = raw_distances[0]
-            metadatas = raw_metadatas[0]
-            ids = results["ids"][0]
-            # Tier 3 boundary: the four parallel arrays must agree in length.
-            # zip(..., strict=True) below would raise a bare ValueError on a
-            # mismatch — after the external query returned — bypassing the
-            # RetrievalError-only post-query audit handler in search(). Check
-            # here (inside the guard) so a non-sized value also surfaces as a
-            # TypeError → RetrievalError rather than escaping len().
-            if not (len(documents) == len(distances) == len(metadatas) == len(ids)):
-                raise RetrievalError(
-                    f"Chroma query for collection {self._config.collection!r} returned "
-                    f"mismatched result array lengths (documents={len(documents)}, "
-                    f"distances={len(distances)}, metadatas={len(metadatas)}, ids={len(ids)}). "
-                    f"This indicates a malformed SDK response or index corruption.",
-                    retryable=False,
-                )
-        except (KeyError, TypeError, IndexError) as exc:
+        if not isinstance(results, Mapping):
             raise RetrievalError(
-                f"Chroma query returned unexpected result structure: {exc}",
+                f"Chroma query returned unexpected result structure: expected a mapping, got {type(results).__name__}",
                 retryable=False,
-            ) from exc
+            )
+        required_fields = ("documents", "distances", "metadatas", "ids")
+        if any(field not in results for field in required_fields):
+            raise RetrievalError(
+                "Chroma query returned unexpected result structure: one or more required arrays are absent",
+                retryable=False,
+            )
+        batches: dict[str, list[Any]] = {}
+        for field in required_fields:
+            raw_batches = results[field]
+            if type(raw_batches) is not list or len(raw_batches) != 1 or type(raw_batches[0]) is not list:
+                raise RetrievalError(
+                    f"Chroma query returned unexpected result structure for {field}: expected exactly one list batch",
+                    retryable=False,
+                )
+            batches[field] = raw_batches[0]
+        documents = batches["documents"]
+        distances = batches["distances"]
+        metadatas = batches["metadatas"]
+        ids = batches["ids"]
+        if not (len(documents) == len(distances) == len(metadatas) == len(ids)):
+            raise RetrievalError(
+                f"Chroma query for collection {self._config.collection!r} returned "
+                f"mismatched result array lengths (documents={len(documents)}, "
+                f"distances={len(distances)}, metadatas={len(metadatas)}, ids={len(ids)}). "
+                f"This indicates a malformed SDK response or index corruption.",
+                retryable=False,
+            )
+        if any(type(doc_id) is not str or not doc_id for doc_id in ids):
+            raise RetrievalError(
+                "Chroma query returned an invalid document ID; every ID must be a non-empty exact string",
+                retryable=False,
+            )
+        if any(metadata is not None and type(metadata) is not dict for metadata in metadatas):
+            raise RetrievalError(
+                "Chroma query returned invalid metadata; every metadata item must be an exact mapping or None",
+                retryable=False,
+            )
 
         chunks: list[RetrievalChunk] = []
         skipped_items: list[dict[str, Any]] = []
@@ -361,26 +425,19 @@ class ChromaSearchProvider:
             if score < min_score:
                 continue
 
-            # RetrievalChunk validates score range and metadata JSON-serializability
-            # at construction, raising ValueError. `dict(metadata)` additionally
-            # raises TypeError for a truthy non-mapping metadata (e.g. an int or a
-            # list of non-pairs) from a corrupt index. Both originate in the
-            # post-query parse path, so both must become a RetrievalError for
-            # search()'s audit handler to record it — mirrors the wrap in
-            # AzureSearchProvider._parse_response. (The only TypeError source in
-            # this block is the Tier-3 dict(metadata) coercion; RetrievalChunk's
-            # kwargs are static and its __post_init__ raises only ValueError, so
-            # this does not mask an our-code bug.)
+            chunk_metadata: dict[str, Any] = {}
+            if metadata is not None:
+                chunk_metadata = dict(metadata)
             try:
                 chunks.append(
                     RetrievalChunk(
                         content=doc,
                         score=score,
                         source_id=doc_id,
-                        metadata=dict(metadata) if metadata else {},
+                        metadata=chunk_metadata,
                     )
                 )
-            except (ValueError, TypeError) as exc:
+            except ValueError as exc:
                 raise RetrievalError(
                     f"Chroma provider produced invalid chunk data for document {doc_id!r}: {exc}",
                     retryable=False,
@@ -396,10 +453,14 @@ class ChromaSearchProvider:
             )
         if self._distance_function == "cosine":
             return max(0.0, min(1.0, 1.0 - (distance / 2.0)))
-        elif self._distance_function == "l2":
+        if self._distance_function == "l2":
+            if distance < 0:
+                raise RetrievalError(
+                    f"Chroma returned negative L2 distance {distance!r} — possible index corruption",
+                    retryable=False,
+                )
             return 1.0 / (1.0 + distance)
-        else:  # ip
-            return max(0.0, min(1.0, 1.0 - distance))
+        return max(0.0, min(1.0, 1.0 - distance))
 
     def _record_error(
         self,
@@ -447,6 +508,8 @@ class ChromaSearchProvider:
 
         try:
             count = self._collection.count()
+            if type(count) is not int or count < 0:
+                raise ValueError(f"malformed collection count: expected a non-negative exact int, got {count!r} ({type(count).__name__})")
             if count > 0:
                 message = f"Collection '{collection_name}' has {count} documents"
             else:
@@ -469,4 +532,7 @@ class ChromaSearchProvider:
             )
 
     def close(self) -> None:
-        pass
+        client = self._client
+        self._client = None
+        if client is not None:
+            client.close()  # type: ignore[attr-defined]

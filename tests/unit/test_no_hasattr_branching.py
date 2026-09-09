@@ -6,6 +6,8 @@ import ast
 from collections import Counter
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_ROOT = REPO_ROOT / "tests"
 
@@ -20,6 +22,14 @@ _REVIEWED_HASATTR_SURFACE_CHECKS = tuple(
     line.strip()
     for line in """
 tests/integration/config/test_schema_validation_regression.py::hasattr(ExecutionGraph, 'from_plugin_instances')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(capability, 'execute')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(capability, 'session_id')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(capability, 'update')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(state, '_connection')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(transaction, 'execute')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(transaction.blobs, 'execute')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(transaction.runs, 'execute')
+tests/testcontainer/web/test_session_operation_fence_postgres.py::not hasattr(transaction.session, 'execute')
 tests/unit/contracts/test_config.py::hasattr(core_config, name)
 tests/unit/contracts/test_config.py::not hasattr(contract_config, name)
 tests/unit/contracts/test_engine_contracts.py::not hasattr(entry, '__dict__')
@@ -32,6 +42,7 @@ tests/unit/contracts/test_pipeline_row.py::not hasattr(row, '__dict__')
 tests/unit/contracts/test_secrets.py::not hasattr(item, 'value')
 tests/unit/contracts/test_tier_registry_migration.py::not hasattr(registry_mod, 'TIER_1_ERRORS')
 tests/unit/core/dag/test_graph_validation.py::hasattr(contract_types, 'NODE_ID_MAX_LENGTH')
+tests/unit/core/dag/test_public_api.py::not hasattr(coalesce_merge, 'merge_union_contracts')
 tests/unit/core/dag/test_public_api.py::not hasattr(dag, helper_name)
 tests/unit/core/dag/test_wiring_boundary.py::hasattr(wiring, 'WiredTransform')
 tests/unit/core/dag/test_wiring_boundary.py::not hasattr(core_facade, 'WiredTransform')
@@ -77,12 +88,15 @@ tests/unit/engine/orchestrator/test_types.py::not hasattr(types, 'RowProcessorHa
 tests/unit/engine/test_batch_adapter.py::not hasattr(waiter, '_entries')
 tests/unit/engine/test_batch_adapter.py::not hasattr(waiter, '_lock')
 tests/unit/engine/test_engine_facade.py::not hasattr(engine, name)
-tests/unit/engine/test_plugin_detection.py::hasattr(duck, 'process')
+tests/unit/engine/test_leader_drain_flush_bound.py::not hasattr(leader_drain, 'MAX_END_OF_INPUT_FLUSH_ITERATIONS')
+tests/unit/engine/test_leader_drain_flush_bound.py::not hasattr(leader_drain, 'derive_end_of_input_flush_bound')
 tests/unit/engine/test_plugin_detection.py::hasattr(duck, 'process')
 tests/unit/engine/test_work_items.py::not hasattr(DAGNavigator, 'create_continuation_work_item')
 tests/unit/engine/test_work_items.py::not hasattr(DAGNavigator, 'create_work_item')
 tests/unit/mcp/test_mcp_init.py::hasattr(elspeth.mcp, 'create_server')
 tests/unit/mcp/test_mcp_init.py::hasattr(elspeth.mcp, 'main')
+tests/unit/plugins/infrastructure/test_base_semantics.py::not hasattr(BaseSink, 'output_semantics')
+tests/unit/plugins/infrastructure/test_base_semantics.py::not hasattr(BaseSource, 'input_semantic_requirements')
 tests/unit/plugins/llm/test_pool_config.py::not hasattr(throttle_config, 'max_capacity_retry_seconds')
 tests/unit/plugins/llm/test_pool_config.py::not hasattr(throttle_config, 'pool_size')
 tests/unit/plugins/llm/test_pooled_executor.py::hasattr(entry, 'buffer_wait_ms')
@@ -97,7 +111,6 @@ tests/unit/plugins/sources/test_csv_source.py::hasattr(CSVSource, 'plugin_versio
 tests/unit/plugins/sources/test_csv_source.py::hasattr(source, 'output_schema')
 tests/unit/plugins/sources/test_json_source.py::hasattr(JSONSource, 'plugin_version')
 tests/unit/plugins/sources/test_json_source.py::hasattr(source, 'output_schema')
-tests/unit/plugins/sources/test_null_source.py::hasattr(source, 'plugin_version')
 tests/unit/plugins/test_base.py::hasattr(BaseTransform, 'on_complete')
 tests/unit/plugins/test_base.py::hasattr(BaseTransform, 'on_start')
 tests/unit/plugins/test_base.py::not hasattr(base, 'BaseAggregation')
@@ -115,8 +128,6 @@ tests/unit/plugins/test_builtin_plugin_metadata.py::hasattr(NullSource, 'plugin_
 tests/unit/plugins/test_builtin_plugin_metadata.py::hasattr(PassThrough, 'plugin_version')
 tests/unit/plugins/test_builtin_plugin_metadata.py::hasattr(TextSource, 'plugin_version')
 tests/unit/plugins/test_builtin_plugin_metadata.py::hasattr(Truncate, 'plugin_version')
-tests/unit/plugins/test_discovery.py::hasattr(cls, 'name')
-tests/unit/plugins/test_discovery.py::hasattr(hookimpl_obj, 'elspeth_get_source')
 tests/unit/plugins/test_integration.py::not hasattr(base, 'BaseAggregation')
 tests/unit/plugins/test_manager.py::hasattr(source, 'load')
 tests/unit/plugins/test_node_id_protocol.py::not hasattr(base, 'BaseAggregation')
@@ -152,14 +163,57 @@ tests/unit/telemetry/test_contracts.py::hasattr(config.backpressure_mode, 'value
 tests/unit/telemetry/test_contracts.py::hasattr(config.granularity, 'value')
 tests/unit/telemetry/test_contracts.py::hasattr(event, 'run_id')
 tests/unit/telemetry/test_contracts.py::hasattr(event, 'timestamp')
+tests/unit/telemetry/test_manager.py::not hasattr(projected_row, 'alternate_content_hash')
+tests/unit/telemetry/test_manager.py::not hasattr(projected_transform, 'alternate_content_hash')
 tests/unit/tui/test_lineage_tree.py::not hasattr(parent.children, 'append')
+tests/unit/web/composer/guided/test_collector_guard.py::not hasattr(guided_planning, '_reject_collector_candidate_nodes')
+tests/unit/web/composer/guided/test_collector_guard.py::not hasattr(guided_planning, '_require_collector_free_predecessor')
+tests/unit/web/composer/test_compose_loop_carriers.py::not hasattr(exc_info.value, 'response')
+tests/unit/web/composer/test_compose_loop_carriers.py::not hasattr(outcome, 'assistant_message')
+tests/unit/web/composer/test_compose_loop_carriers.py::not hasattr(outcome, 'response')
+tests/unit/web/composer/test_llm_usage_real_litellm.py::not hasattr(ModelResponse(), 'usage')
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_COMPOSER_LLM_SEED')
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_COMPOSER_LLM_TEMPERATURE')
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_composer_llm_seed_for_model')
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_litellm_completion_supports_param')
 tests/unit/web/composer/test_state.py::not hasattr(state, 'source')
 tests/unit/web/composer/test_state.py::not hasattr(state, 'source')
+tests/unit/web/coordination/test_contracts.py::not hasattr(context, '__dict__')
+tests/unit/web/coordination/test_session_derived_mutations.py::not hasattr(transaction, 'execute')
+tests/unit/web/coordination/test_session_derived_mutations.py::not hasattr(transaction.runs, 'execute')
+tests/unit/web/coordination/test_session_operation_fence.py::not hasattr(state, '_active_connection')
+tests/unit/web/coordination/test_session_operation_fence.py::not hasattr(state, '_connection')
+tests/unit/web/coordination/test_session_operation_fence.py::not hasattr(transaction, 'execute')
+tests/unit/web/coordination/test_session_operation_fence.py::not hasattr(transaction, 'session_id')
+tests/unit/web/coordination/test_session_operation_fence.py::not hasattr(transaction.session, 'execute')
+tests/unit/web/coordination/test_session_operation_fence.py::not hasattr(transaction.session, 'update')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, '_active_connection')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, 'connection')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, 'engine')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, 'execute')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, 'execute')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, 'session_id')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(capability, 'update')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(child_mutations, 'bind_guided_fork')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(coordination_repository, '_FORK_TRANSACTION_CONSTRUCTION_AUTHORIZATION')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(coordination_repository._SessionOperationAuthorityRepository, '_SessionOperationAuthorityRepository__active_locked_fork_pairs')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(coordination_repository._SessionOperationAuthorityRepository, '_SessionOperationAuthorityRepository__active_locked_fork_pairs_snapshot')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(parent_guided_mutations, 'append_child_messages')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(parent_guided_mutations, 'insert_child_state')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction, 'append_child_messages')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction, 'bind_guided_fork')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction, 'execute')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction, 'insert_child_state')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction.blobs, 'execute')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction.runs, 'execute')
+tests/unit/web/coordination/test_sqlite_session_operation_authority.py::not hasattr(transaction.session, 'execute')
 tests/unit/web/secrets/test_service.py::not hasattr(result, 'available')
+tests/unit/web/secrets/test_user_secret_authority.py::not hasattr(RepositoryUserSecretAuthority, 'execute')
+tests/unit/web/sessions/test_guided_operations_service.py::not hasattr(sessions_service_module, '_reject_guided_pending_proposal')
+tests/unit/web/sessions/test_guided_operations_service.py::not hasattr(sessions_service_module, '_require_no_active_guided_confirmation_admission')
+tests/unit/web/sessions/test_operation_fence_wiring.py::not hasattr(__import__('elspeth.web.sessions.pending_interpretation', fromlist=['x']), '_forbidden_validation_dependency')
+tests/unit/web/sessions/test_skill_markdown_history_authority.py::not hasattr(SkillMarkdownHistoryAuthority, 'connection')
+tests/unit/web/sessions/test_skill_markdown_history_authority.py::not hasattr(SkillMarkdownHistoryAuthority, 'engine')
 """.strip().splitlines()
 )
 
@@ -182,10 +236,9 @@ def test_hasattr_in_tests_is_limited_to_reviewed_surface_assertions() -> None:
     seen: Counter[str] = Counter()
     locations: dict[str, list[str]] = {}
     violations: list[str] = []
-    for path in sorted(TESTS_ROOT.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for parsed in iter_gate_sources(TESTS_ROOT):
+        path = parsed.path
+        tree = parsed.tree
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

@@ -292,6 +292,8 @@ class _ResumeLoopContextFake:
 @dataclass(frozen=True, slots=True)
 class _ResumeLoopProcessorFake:
     run_id: str
+    row_union_executor = None
+    collector_executor = None
 
     def has_scheduled_work(self) -> bool:
         return False
@@ -682,7 +684,6 @@ class TestResumeComprehensive:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(scheduled_row),
-            available_at=datetime.now(UTC),
         )
 
         output_path.write_text("id,value\n")

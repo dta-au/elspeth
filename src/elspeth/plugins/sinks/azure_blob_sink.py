@@ -33,6 +33,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
     SinkEffectExecutionPurpose,
@@ -45,9 +46,13 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
 )
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
-from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig
+from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig, validate_headers_value
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    HeaderModeOption,
+    validate_headers_value,
+)
 from elspeth.plugins.infrastructure.display_headers import (
     apply_display_headers,
     get_effective_display_headers,
@@ -65,12 +70,48 @@ from elspeth.plugins.sinks._remote_object_effects import (
     reconcile_remote_observation,
     remote_commit_result,
     remote_stage_missing,
+    require_commit_authority,
     restage_remote_object,
     validate_remote_plan,
 )
 
 if TYPE_CHECKING:
-    from azure.storage.blob import ContainerClient
+    from azure.storage.blob import BlobProperties, ContainerClient
+
+
+class AzureBlobRecordSerializationError(ValueError):
+    """A single ROW could not be serialized by the configured format.
+
+    Two row-attributable conditions raise it: the encoder wraps inside
+    ``_serialize_csv`` / ``_serialize_json`` / ``_serialize_jsonl`` (a value
+    csv/json cannot encode), and the fixed-schema extra-field preflight (a
+    property of one row, matching the AWS S3 twin's per-row
+    ``S3RecordSerializationError`` treatment). Catching it can never absorb
+    row-independent config integrity failures — the CUSTOM header-mapping
+    check raises bare ``ValueError`` outside the wraps and crashes, because
+    it indicates a configuration bug rather than an unserializable row.
+    """
+
+
+def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Declared Azure SDK and transport failures at the external seam."""
+    from azure.core.exceptions import AzureError
+
+    return (AzureError, ConnectionError, TimeoutError)
+
+
+def _azure_missing_exception_type() -> type[Exception]:
+    """The Azure SDK failure that means the blob does not exist."""
+    from azure.core.exceptions import ResourceNotFoundError
+
+    return ResourceNotFoundError
+
+
+def _azure_conditional_exception_types() -> tuple[type[Exception], ...]:
+    """Azure SDK failures raised when a server-side write condition rejects the upload."""
+    from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
+
+    return (ResourceExistsError, ResourceModifiedError)
 
 
 class CSVWriteOptions(BaseModel):
@@ -146,6 +187,11 @@ class AzureBlobSinkConfig(DataPluginConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
+    auth_mode: AzureAuthMethod | None = Field(
+        default=None,
+        description="Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+    )
+
     # Auth Option 1: Connection string
     connection_string: str | None = Field(
         default=None,
@@ -203,7 +249,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
         default_factory=CSVWriteOptions,
         description="CSV writing options (delimiter, encoding, include_header)",
     )
-    headers: str | dict[str, str] | None = Field(
+    headers: HeaderModeOption = Field(
         default=None,
         description="Header output mode: 'normalized', 'original', or {field: header} mapping",
     )
@@ -245,7 +291,8 @@ class AzureBlobSinkConfig(DataPluginConfig):
         """
         # Create AzureAuthConfig to validate auth fields
         # This will raise ValueError with descriptive messages if invalid
-        AzureAuthConfig(
+        auth = AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -254,6 +301,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
             client_id=self.client_id,
             client_secret=self.client_secret,
         )
+        object.__setattr__(self, "auth_mode", auth.auth_method)
         return self
 
     def get_auth_config(self) -> AzureAuthConfig:
@@ -263,6 +311,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
             AzureAuthConfig instance with the auth fields from this config.
         """
         return AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -307,7 +356,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
 AzureBlobSinkConfig.model_rebuild()
 
 
-class AzureBlobSink(BaseSink):
+class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     """Write rows to Azure Blob Storage.
 
     Config options:
@@ -340,7 +389,7 @@ class AzureBlobSink(BaseSink):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b548036e53250b4a"
+    source_file_hash: str | None = "sha256:577c2fdf00a680c4"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -350,6 +399,29 @@ class AzureBlobSink(BaseSink):
 
     # Resume capability: Azure Blobs are immutable - cannot append
     supports_resume: bool = False
+
+    usage_when_to_use: str = (
+        "Use when one bounded run must publish a cumulative CSV, JSON, or JSONL artifact to Azure Blob Storage using "
+        "exactly one operator-approved authentication method."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for append/resume, per-row blobs, mixed authentication methods, or an upload whose serialized "
+        "content cannot be kept within the configured bound."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: azure_blob
+    options:
+      use_managed_identity: true
+      account_url: https://records.blob.core.windows.net
+      container: outbound
+      blob_path: "runs/{{ run_id }}/results.jsonl"
+      format: jsonl
+      overwrite: false
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("azure", "blob", "cloud", "object-storage")
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -467,30 +539,68 @@ class AzureBlobSink(BaseSink):
         )
 
     @staticmethod
-    def _is_missing(error: BaseException) -> bool:
-        return type(error).__name__ == "ResourceNotFoundError" or getattr(error, "status_code", None) == 404
+    def _observation_from_properties(properties: BlobProperties) -> RemoteObjectObservation:
+        # ADR-032: the SDK object's class is not the control. Every field read
+        # below is asserted by value before it reaches the owned observation,
+        # and a field the SDK object does not carry at all (including a
+        # missing or None ``content_settings``) is the same malformed
+        # evidence as a wrong value: it routes into the precondition path
+        # rather than escaping as a raw AttributeError past
+        # ``_observe_effect_target``'s provider-exception handler.
+        try:
+            size: object = properties.size
+            etag: object = properties.etag
+            metadata_value: object = properties.metadata
+            raw_content_md5: object = properties.content_settings.content_md5
+        except AttributeError:
+            raise RemoteObjectPreconditionError("Azure blob properties do not carry the declared SDK shape") from None
+        if type(size) is not int or size < 0:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid size")
+        if type(etag) is not str or not etag:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid etag")
 
-    @staticmethod
-    def _observation_from_properties(properties: object) -> RemoteObjectObservation:
-        size = getattr(properties, "size", None)
-        etag = getattr(properties, "etag", None)
-        metadata_value = getattr(properties, "metadata", None)
-        metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
-        content_hash = metadata.get("elspeth_content_sha256")
-        effect_id = metadata.get("elspeth_effect_id")
-        plan_hash = metadata.get("elspeth_plan_hash")
-        protocol_version = metadata.get("elspeth_protocol_version")
-        content_settings = getattr(properties, "content_settings", None)
-        content_md5 = getattr(content_settings, "content_md5", None)
-        checksum_b64 = base64.b64encode(content_md5).decode("ascii") if isinstance(content_md5, (bytes, bytearray)) else None
+        if metadata_value is None:
+            metadata: Mapping[str, str] = {}
+        elif type(metadata_value) is dict and all(type(key) is str and type(value) is str for key, value in metadata_value.items()):
+            metadata = metadata_value
+        else:
+            raise RemoteObjectPreconditionError("Azure blob properties contain invalid metadata")
+
+        def optional_metadata(key: str) -> str | None:
+            if key not in metadata:
+                return None
+            value = metadata[key]
+            if not value:
+                raise RemoteObjectPreconditionError(f"Azure blob metadata {key!r} is empty")
+            return value
+
+        content_hash = optional_metadata("elspeth_content_sha256")
+        effect_id = optional_metadata("elspeth_effect_id")
+        plan_hash = optional_metadata("elspeth_plan_hash")
+        protocol_version = optional_metadata("elspeth_protocol_version")
+
+        content_md5: bytes | None
+        if raw_content_md5 is None:
+            content_md5 = None
+        elif type(raw_content_md5) is bytes:
+            content_md5 = raw_content_md5
+        elif type(raw_content_md5) is bytearray:
+            content_md5 = bytes(raw_content_md5)
+        else:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid content MD5")
+        if content_md5 is not None and len(content_md5) != 16:
+            raise RemoteObjectPreconditionError("Azure blob properties contain an invalid content MD5")
+        checksum_b64 = None
+        if content_md5 is not None:
+            checksum_b64 = base64.b64encode(content_md5).decode("ascii")
         return RemoteObjectObservation(
             exists=True,
-            etag=etag if isinstance(etag, str) and etag else None,
-            content_hash=content_hash if isinstance(content_hash, str) else None,
-            size_bytes=size if type(size) is int and size >= 0 else None,
-            effect_id=effect_id if isinstance(effect_id, str) else None,
-            plan_hash=plan_hash if isinstance(plan_hash, str) else None,
-            protocol_version=protocol_version if isinstance(protocol_version, str) else None,
+            etag=etag,
+            content_hash=content_hash,
+            size_bytes=size,
+            effect_id=effect_id,
+            plan_hash=plan_hash,
+            protocol_version=protocol_version,
             checksum_algorithm="md5" if checksum_b64 is not None else None,
             checksum_b64=checksum_b64,
         )
@@ -498,11 +608,9 @@ class AzureBlobSink(BaseSink):
     def _observe_effect_target(self, blob_path: str) -> RemoteObjectObservation:
         try:
             properties = self._get_container_client().get_blob_client(blob_path).get_blob_properties()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as error:
-            if self._is_missing(error):
-                return RemoteObjectObservation(False, None, None, None)
+        except _azure_missing_exception_type():
+            return RemoteObjectObservation(False, None, None, None)
+        except _azure_provider_exception_types():
             raise RemoteObjectPreconditionError("Azure blob inspection failed before effect dispatch") from None
         return self._observation_from_properties(properties)
 
@@ -514,8 +622,12 @@ class AzureBlobSink(BaseSink):
         blob_path = self._effect_blob_path(ctx)
         target = f"azure://{self._container}/{blob_path}"
         observation = self._observe_effect_target(blob_path)
-        if observation.exists and not self._overwrite and request.predecessor_descriptor is None:
-            raise ValueError(f"Blob '{blob_path}' already exists and overwrite=False") from None
+        # No rejection here: an existing blob's content identity is not yet
+        # known (the staged body doesn't exist until prepare_effect). The
+        # overwrite=False guard now lives in prepare_remote_object's decision
+        # block (raising the shared, typed RemoteObjectCollisionError), where
+        # it can distinguish an idempotent re-affirmation from a genuine
+        # collision instead of rejecting on existence alone.
         return inspect_remote_object(
             provider="azure_blob",
             target=target,
@@ -536,7 +648,7 @@ class AzureBlobSink(BaseSink):
             output_row = apply_display_headers(self, [row])[0] if self._format in {"json", "jsonl"} else row
             try:
                 self._serialize_rows([output_row])
-            except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
+            except AzureBlobRecordSerializationError as exc:
                 reason = (
                     f"CSV encoding ({self._csv_options.encoding}) failed: {exc}"
                     if self._format == "csv"
@@ -569,17 +681,18 @@ class AzureBlobSink(BaseSink):
         content = self._serialize_rows(rows)
         evidence = request.inspection.evidence
         predecessor: ArtifactDescriptor | None = None
-        if evidence.get("predecessor_declared") is True:
-            observed_hash = evidence.get("observed_content_hash")
-            observed_size = evidence.get("observed_size")
-            if not isinstance(observed_hash, str) or type(observed_size) is not int:
-                raise RemoteObjectPreconditionError("Azure predecessor inspection lacks exact content identity")
+        predecessor_declared = evidence["predecessor_declared"]
+        if predecessor_declared is True:
+            observed_hash = cast("str", evidence["observed_content_hash"])
+            observed_size = cast("int", evidence["observed_size"])
             predecessor = ArtifactDescriptor(
                 artifact_type="file",
                 path_or_uri=request.inspection.reference,
                 content_hash=observed_hash,
                 size_bytes=observed_size,
             )
+        elif predecessor_declared is not False:
+            raise RemoteObjectPreconditionError("Azure predecessor inspection declaration is invalid")
         return prepare_remote_object(
             effect_id=request.effect_id,
             provider="azure_blob",
@@ -591,6 +704,7 @@ class AzureBlobSink(BaseSink):
             diverted_ordinals=diverted,
             predecessor_descriptor=predecessor,
             checksum_algorithm="md5",
+            allow_replace=self._overwrite,
             diversion_attribution=diversion_attribution,
         )
 
@@ -600,10 +714,6 @@ class AzureBlobSink(BaseSink):
         if not blob_path or prefix + blob_path != target:
             raise RemoteObjectPreconditionError("Azure effect target does not match configured container")
         return blob_path
-
-    @staticmethod
-    def _is_conditional_failure(error: BaseException) -> bool:
-        return type(error).__name__ in {"ResourceExistsError", "ResourceModifiedError"} or getattr(error, "status_code", None) in {409, 412}
 
     def restage_effect(
         self,
@@ -638,6 +748,7 @@ class AzureBlobSink(BaseSink):
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectCommitResult:
         evidence, stage = validate_remote_plan(plan, provider="azure_blob", require_stage=True)
+        require_commit_authority(evidence, overwrite=self._overwrite)
         expected_target = f"azure://{self._container}/{self._effect_blob_path(ctx)}"
         if evidence.target != expected_target:
             raise RemoteObjectPreconditionError("Azure effect target diverges from the configured run target")
@@ -651,8 +762,8 @@ class AzureBlobSink(BaseSink):
         from azure.storage.blob import ContentSettings
 
         content_settings = ContentSettings(content_md5=bytearray(base64.b64decode(evidence.checksum_b64, validate=True)))
-        try:
-            with stage.open("rb") as body:
+        with stage.open("rb") as body:
+            try:
                 if evidence.precondition == "if_none_match":
                     blob_client.upload_blob(
                         body,
@@ -674,12 +785,10 @@ class AzureBlobSink(BaseSink):
                         content_settings=content_settings,
                         validate_content=True,
                     )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as error:
-            if self._is_conditional_failure(error):
+            except _azure_conditional_exception_types():
                 raise RemoteObjectPreconditionError("Azure conditional blob upload was rejected") from None
-            raise RemoteObjectEffectError("Azure blob upload outcome is unknown; reconciliation is required") from None
+            except _azure_provider_exception_types():
+                raise RemoteObjectEffectError("Azure blob upload outcome is unknown; reconciliation is required") from None
         return remote_commit_result(plan, evidence)
 
     def reconcile_effect(
@@ -792,8 +901,12 @@ class AzureBlobSink(BaseSink):
             for i, row in enumerate(rows):
                 extra = sorted(set(row) - allowed)
                 if extra:
-                    raise ValueError(
-                        f"AzureBlobSink CSV row {i} has unexpected fields: {extra}. This indicates an upstream transform/schema bug."
+                    # Row-attributable: in the per-member probe this diverts
+                    # exactly this row; on the post-preflight full-set path it
+                    # propagates uncaught, because preflight already vetted
+                    # every accepted row.
+                    raise AzureBlobRecordSerializationError(
+                        f"AzureBlobSink CSV row {i} has fields the fixed schema does not declare: {extra}."
                     )
 
         writer = csv.DictWriter(
@@ -802,26 +915,38 @@ class AzureBlobSink(BaseSink):
             delimiter=self._csv_options.delimiter,
         )
 
-        if self._csv_options.include_header:
-            if display_fields != data_fields:
-                header_writer = csv.writer(output, delimiter=self._csv_options.delimiter)
-                header_writer.writerow(display_fields)
-            else:
-                writer.writeheader()
+        # Encoder wrap: ONLY the csv/codec machinery runs inside this try, so
+        # the typed error can never absorb the schema/config ValueErrors
+        # raised above — those are upstream bugs and must crash.
+        try:
+            if self._csv_options.include_header:
+                if display_fields != data_fields:
+                    header_writer = csv.writer(output, delimiter=self._csv_options.delimiter)
+                    header_writer.writerow(display_fields)
+                else:
+                    writer.writeheader()
 
-        for row in rows:
-            writer.writerow(row)
+            for row in rows:
+                writer.writerow(row)
 
-        return output.getvalue().encode(self._csv_options.encoding)
+            return output.getvalue().encode(self._csv_options.encoding)
+        except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
+            raise AzureBlobRecordSerializationError(str(exc)) from exc
 
     def _serialize_json(self, rows: list[dict[str, Any]]) -> bytes:
         """Serialize rows to JSON array bytes."""
-        return json.dumps(rows, indent=2, allow_nan=False).encode("utf-8")
+        try:
+            return json.dumps(rows, indent=2, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise AzureBlobRecordSerializationError(str(exc)) from exc
 
     def _serialize_jsonl(self, rows: list[dict[str, Any]]) -> bytes:
         """Serialize rows to JSONL bytes (newline-delimited JSON)."""
-        lines = [json.dumps(row, allow_nan=False) for row in rows]
-        return "\n".join(lines).encode("utf-8")
+        try:
+            lines = [json.dumps(row, allow_nan=False) for row in rows]
+            return "\n".join(lines).encode("utf-8")
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise AzureBlobRecordSerializationError(str(exc)) from exc
 
     def set_resume_field_resolution(self, resolution_mapping: dict[str, str]) -> None:
         set_resume_field_resolution(self, resolution_mapping)

@@ -1,37 +1,56 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import TypedDict
+import re
+from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.secrets import collect_credential_field_violations
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
-from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+from elspeth.web.composer.yaml_generator import (
+    PUBLIC_EXPORT_REBIND_GUIDANCE,
+    PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
+    public_export_redaction,
+    public_export_redaction_header,
+    reattach_guided_blob_refs_for_public_export,
+)
 from elspeth.web.composer.yaml_importer import (
     MAX_RUNTIME_YAML_IMPORT_CHARS,
     RuntimeYamlImportError,
     composition_state_from_runtime_yaml,
 )
-from elspeth.web.interpretation_state import parse_interpretation_requirements
-from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, resolve_data_path
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.interpretation_state import InterpretationReviewSite, parse_interpretation_requirements
+from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
-from elspeth.web.sessions.protocol import GuidedCompositionStateResult, GuidedOperationSettlementConflictError
+from elspeth.web.sessions.protocol import (
+    GuidedCompositionStateResult,
+    GuidedOperationResult,
+    GuidedOperationSettlementConflictError,
+)
 from elspeth.web.sessions.routes.guided_operations import (
+    GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_lease_guard,
     guided_response_hash,
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
 
 from .._helpers import (
+    GUIDED_CUSTODY_REVERT_REFUSED_DETAIL,
     UTC,
     UUID,
     Any,
@@ -55,6 +74,8 @@ from .._helpers import (
     _composer_preferences_response,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _log_last_resort_diagnostic,
+    _named_guided_custody_projection,
     _record_composer_runtime_preflight_telemetry,
     _request_plugin_policy_context,
     _runtime_preflight_for_state,
@@ -62,17 +83,60 @@ from .._helpers import (
     _state_from_record,
     _state_response,
     _verify_session_ownership,
-    composer_completion_events_table,
     datetime,
     generate_public_yaml,
     get_current_user,
-    insert,
     record_session_completed,
     record_session_switched,
-    uuid4,
+    slog,
 )
 
 router = APIRouter()
+
+_STATE_REVERT_SURFACE_PROVENANCE = "state_revert"
+_E2E_SEED_SURFACE_PROVENANCE = "e2e_seed"
+
+
+async def _surface_reverted_interpretation_reviews(
+    service: SessionServiceProtocol,
+    *,
+    session_id: UUID,
+    state_record: Any,
+) -> None:
+    """Repair review-card debt for a fresh or replayed revert result."""
+    # Historical minimal service-authored checkpoints can predate populated
+    # metadata and therefore cannot be promoted to CompositionState. They also
+    # predate structured interpretation requirements; preserve their existing
+    # revert compatibility instead of turning this additive repair into a 500.
+    if state_record.metadata_ is None:
+        return
+    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+
+    # The replay joiner released the operation's session lease before this
+    # post-verification repair runs, and the settling caller's guided lease
+    # guard has already closed by the time it reaches here, so the repair
+    # writes hold their own short COMPOSE authority (fenced by analogy with
+    # the settling attempt). Same wrapper as the guided RESPOND repair hook
+    # in ``routes/composer/guided.py::_repair_replayed_surfacing_debt``.
+    async with await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    ) as repair_lease:
+        await surface_pending_interpretation_reviews_for_state(
+            _state_from_record(state_record),
+            sessions_service=service,
+            session_id=str(session_id),
+            current_state_id=str(state_record.id),
+            model_identifier=_STATE_REVERT_SURFACE_PROVENANCE,
+            model_version=_STATE_REVERT_SURFACE_PROVENANCE,
+            provider=_STATE_REVERT_SURFACE_PROVENANCE,
+            composer_skill_hash=_STATE_REVERT_SURFACE_PROVENANCE,
+            only_missing_evidence=True,
+            session_operation_context=repair_lease.context,
+        )
 
 
 def _composition_plugin_policy_findings(
@@ -118,9 +182,29 @@ def _reject_imported_plugin_policy(
     )
 
 
-class StateYamlResponse(TypedDict, total=False):
+class StateYamlRedaction(TypedDict):
+    """Structured account of the public export's custody redaction.
+
+    Mirrors the YAML header comment (``public_export_redaction_header``):
+    the export is deliberately redacted — this names exactly what was
+    stripped and how to re-bind it, instead of presenting the not-runnable
+    YAML bare (elspeth-06f92da0d9). Names only, never blob UUIDs: the
+    scrub ruling (2304d57fb, ``test_yaml_response_omits_source_blob_``
+    ``identity_sidecar``) forbids blob identity beside the scrubbed YAML,
+    which is why ``blob_linked_sources`` carries the sources whose
+    verified blob linkage was stripped rather than the ids themselves.
+    """
+
+    stripped_source_options: dict[str, list[str]]
+    stripped_output_options: dict[str, list[str]]
+    blob_linked_sources: list[str]
+    rebind_guidance: str
+
+
+class StateYamlResponse(TypedDict):
     yaml: str
-    source_blob_ids: dict[str, str]
+    # Omitted when the public projection stripped nothing.
+    redaction: NotRequired[StateYamlRedaction]
 
 
 class ImportStateYamlRequest(BaseModel):
@@ -146,18 +230,74 @@ class SeedCompositionStateRequest(BaseModel):
         "raises ValueError from path resolution rather than being coerced"
     ),
     test_ref="tests/unit/web/sessions/routes/composer/test_state_boundaries.py::test_source_options_reference_blob_storage_raises_on_nul_byte_path",
-    test_fingerprint="18ac99a70b815badb2f8ef53eb3061e7cb3d8b13299965bc591e559d2d961bf9",
+    test_fingerprint="b8fe8c2cfa05ee4a2ab7637e8c981a22226fee2b38657b770c649d13e96310ac",
 )
 def _source_options_reference_blob_storage(options: Mapping[str, Any], *, data_dir: str) -> bool:
-    allowed_dirs = allowed_source_directories(data_dir)
+    blob_root = managed_blob_directory(data_dir)
     for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
         value = options.get(key)
         if not isinstance(value, str):
             continue
         resolved = resolve_data_path(value, data_dir)
-        if any(resolved.is_relative_to(directory) for directory in allowed_dirs):
+        if resolved.is_relative_to(blob_root):
             return True
     return False
+
+
+# Exporter-authored marker line (see yaml_generator's
+# PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX — the prefix bytes are the
+# shared authority). Source names are runtime-valid component ids, so the
+# bounded \S{1,64} capture admits every legitimate name and nothing
+# multi-token; anything else in the pasted text is ignored.
+_REDACTED_SOURCE_MARKER_RE = re.compile(
+    "^" + re.escape(PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX) + r"(\S{1,64}) stripped=",
+    re.MULTILINE,
+)
+
+
+def _redaction_marker_source_names(yaml_text: str) -> frozenset[str]:
+    """Source names the pasted document's own export marker declares redacted.
+
+    Tier-3 parse of untrusted pasted text, scoped to the exact marker lines
+    ELSPETH's public exporter emits. A document with no marker (hand-written
+    YAML, hand-stripped marker) yields the empty set and the import falls
+    back to the pre-existing behaviour: the strict preflight refuses the
+    degraded state and it persists ``is_valid=False``.
+    """
+    return frozenset(_REDACTED_SOURCE_MARKER_RE.findall(yaml_text))
+
+
+def _reject_redacted_sources_without_rebind(state: CompositionState, *, yaml_text: str) -> None:
+    """400 the path-ABSENT redacted-export shape with re-bind guidance.
+
+    The public export deliberately strips source path/blob linkage
+    (elspeth-06f92da0d9). Re-importing that shape without ``source_blob_ids``
+    used to sail through Stage-1 and strand the user with a raw Pydantic
+    "path Field required" from the strict lane; the export's own marker lets
+    this guard name the real remedy instead. Runs AFTER
+    ``_state_with_imported_source_blobs`` so a supplied re-bind counts, and
+    accepts a hand-re-added path option (the path guards downstream still
+    police its value).
+    """
+    marked = _redaction_marker_source_names(yaml_text)
+    if not marked:
+        return
+    for source_name, source in state.sources.items():
+        if source_name not in marked:
+            continue
+        if "blob_ref" in source.options:
+            continue
+        if any(key in source.options for key in SOURCE_LOCAL_PATH_OPTION_KEYS):
+            continue
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Source '{source_name}' was custody-redacted at export: its local path / blob linkage was "
+                "stripped, so this YAML is not runnable as-is. Upload the source data to this session and "
+                f'include source_blob_ids={{"{source_name}": "<blob id>"}} with the import, '
+                "or re-add an allowed path option to the source."
+            ),
+        )
 
 
 @trust_boundary(
@@ -166,11 +306,11 @@ def _source_options_reference_blob_storage(options: Mapping[str, Any], *, data_d
     source_param="state",
     suppresses=("R1",),
     invariant=(
-        "raises HTTPException 400 for any source whose options reference session blob storage "
+        "raises HTTPException 400 for any source whose options reference managed blob storage "
         "without a blob_ref binding; blob_ref-bound and non-blob sources pass"
     ),
     test_ref="tests/unit/web/sessions/routes/composer/test_state_boundaries.py::test_reject_unbound_blob_storage_sources_raises_400_on_unbound_blob_path",
-    test_fingerprint="bdb265d5ce47ac3963b67735a2d485acdf4bc93c9d091f9b6c2da9c0571ca9a9",
+    test_fingerprint="36cb5dc337b093240d7028a644ba3088509f3b4760f6f694a78a59024afc995f",
 )
 def _reject_unbound_blob_storage_sources(state: CompositionState, *, data_dir: str) -> None:
     for source_name, source in state.sources.items():
@@ -190,17 +330,17 @@ def _reject_unbound_blob_storage_sources(state: CompositionState, *, data_dir: s
     tier=3,
     source="pasted/seeded CompositionState carrying web-authored source options",
     source_param="state",
-    suppresses=("R1",),
+    suppresses=("R1", "R5"),
     invariant=(
         "raises HTTPException 400 for any string source path outside the source allowlist; missing or non-string path values are skipped"
     ),
     test_ref=(
         "tests/unit/web/sessions/routes/composer/test_state_boundaries.py::test_reject_disallowed_source_paths_raises_400_outside_allowlist"
     ),
-    test_fingerprint="ee81505482c502b3bed9e0ce1ccb6fa1e94983ce0e147ebf6e6461bf61038ca1",
+    test_fingerprint="2a73310e1ab04480348b8533732615a322b9d47cdfc3a2ca634947af3d8e4b4f",
 )
-def _reject_disallowed_source_paths(state: CompositionState, *, data_dir: str) -> None:
-    allowed_dirs = allowed_source_directories(data_dir)
+def _reject_disallowed_source_paths(state: CompositionState, *, data_dir: str, session_id: str) -> None:
+    allowed_dirs = allowed_source_directories(data_dir, session_id=session_id)
     for source_name, source in state.sources.items():
         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
             value = source.options.get(key)
@@ -300,6 +440,7 @@ async def _state_with_imported_source_blobs(
     source_blob_ids: Mapping[str, str] | None,
     request: Request,
     session_id: UUID,
+    session_operation_context: SessionOperationContext,
 ) -> CompositionState:
     if not source_blob_ids:
         return state
@@ -321,7 +462,7 @@ async def _state_with_imported_source_blobs(
 
     for source_name, blob_id in requested_blobs:
         try:
-            blob = await blob_service.get_blob(blob_id)
+            blob = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
         except BlobNotFoundError:
             raise HTTPException(status_code=404, detail="Blob not found") from None
         if blob.session_id != session_id:
@@ -339,6 +480,7 @@ async def _state_with_imported_source_blobs(
             on_success=source.on_success,
             options=options,
             on_validation_failure=source.on_validation_failure,
+            description=source.description,
         )
 
     return CompositionState(
@@ -401,6 +543,10 @@ async def update_composer_preferences(
     # TOCTOU window — see plan §"Option not taken — read-before-write
     # from the route handler"). The PATCH response shape is unchanged;
     # we only project ``current`` into the response model.
+    # Deliberately NO session-operation lease here: the preferences writer is
+    # serialized on the per-session write lock, not the compose lease, so a
+    # mid-plan trust downgrade can land while a compose turn is in flight
+    # (elspeth-01d4c6e683; see the service docstring).
     transition = await service.update_composer_preferences(
         session.id,
         trust_mode=body.trust_mode,
@@ -408,36 +554,25 @@ async def update_composer_preferences(
         actor=f"user:{user.user_id}",
     )
 
-    # Phase 8 Task 2 Step 3 — per-session ``trust_mode`` switch emit.
-    #
-    # Guarded on actual change (transition-rate semantic, distinct
-    # from the account-level set-rate at preferences/routes.py).
-    # The service's ``trust_mode.changed`` audit row at
-    # ``sessions/service.py:1605-1619`` fires unconditionally on
-    # every PATCH including no-ops; emitting the counter
-    # unconditionally would over-count by the no-op rate. Guarding
-    # on ``prior != current`` also gives the Q4 contract: a
-    # combined PATCH that changes both ``trust_mode`` AND
-    # ``density_default`` fires the counter exactly once,
-    # attributed to the trust_mode change only.
-    #
-    # B1 (audit-primacy superset rule): the emit runs AFTER the
-    # audit row commits (the service ``_run_sync`` returned),
-    # which carries ``prior_trust_mode`` in its payload (B1
-    # extension at sessions/service.py:1614). Telemetry attributes
-    # are a strict subset of audit-recorded reality.
-    #
-    # Vocabulary (B1-r2): both attributes come from the per-session
-    # ``trust_mode`` CHECK-constraint vocabulary
-    # (``explicit_approve`` / ``auto_commit``), NOT the account-
-    # level ``default_composer_mode`` vocabulary.
+    # The awaited service return is the commit boundary. Everything below
+    # observes that durable transition and must not turn it into a retryable
+    # request failure. Cancellation and process-control exceptions still
+    # propagate because only ordinary Exception failures are downgraded.
     if transition.prior.trust_mode != transition.current.trust_mode:
-        telemetry: SessionsTelemetry = request.app.state.sessions_telemetry
-        record_session_switched(
-            telemetry,
-            from_mode=transition.prior.trust_mode,
-            to_mode=transition.current.trust_mode,
-        )
+        try:
+            telemetry: SessionsTelemetry = request.app.state.sessions_telemetry
+            record_session_switched(
+                telemetry,
+                from_mode=transition.prior.trust_mode,
+                to_mode=transition.current.trust_mode,
+            )
+        except Exception as telemetry_error:
+            _log_last_resort_diagnostic(
+                slog.error,
+                "composer_preferences_postcommit_telemetry_failed",
+                session_id=str(session.id),
+                exc_class=type(telemetry_error).__name__,
+            )
 
     return _composer_preferences_response(transition.current)
 
@@ -455,7 +590,8 @@ async def get_current_state(
     state = await service.get_current_state(session.id)
     if state is None:
         return None
-    return _state_response(state, policy_catalog=catalog)
+    with _named_guided_custody_projection():
+        return _state_response(state, policy_catalog=catalog)
 
 
 @router.get(
@@ -474,7 +610,11 @@ async def get_state_versions(
     service = request.app.state.session_service
     catalog, _snapshot = _request_plugin_policy_context(request, user)
     versions = await service.get_state_versions(session.id, limit=limit, offset=offset)
-    return [_state_response(v, policy_catalog=catalog) for v in versions]
+    # Never 409 the whole history and never omit a row: a version whose custody
+    # cannot bind serves the degraded (masked, custody_unavailable-named)
+    # projection beside untouched siblings, so a bindable version stays
+    # reachable for restore. The single-tip GET /state keeps its named 409.
+    return [_state_response(v, policy_catalog=catalog, degrade_unbindable_custody=True) for v in versions]
 
 
 @router.post(
@@ -496,6 +636,70 @@ async def revert_state(
     service = request.app.state.session_service
     catalog, _snapshot = _request_plugin_policy_context(request, user)
 
+    async def _replay(result: object) -> CompositionStateResponse:
+        """Project the stored response for an already-terminal revert.
+
+        MUST stay side-effect-free. This runs BEFORE the response-hash
+        integrity check in reserve_or_replay_guided_operation, so anything
+        written here would mutate audit-primary interpretation_events under a
+        projection not yet proven to match the stored response -- inserting
+        new review rows and superseding existing pending ones, then failing
+        verification afterwards. The surfacing debt a replayed revert may
+        still owe is repaired in _repair_reverted_surfacing_debt, which runs
+        only after that check.
+        """
+        if type(result) is not GuidedCompositionStateResult:
+            raise AuditIntegrityError("State revert replay has a non-state result locator")
+        replay_state = await service.get_state_in_session(result.state_id, session.id)
+        with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
+            return _state_response(replay_state, policy_catalog=catalog)
+
+    async def _repair_reverted_surfacing_debt(result: GuidedOperationResult) -> None:
+        """Repair the post-commit surfacing this revert's settlement owed.
+
+        revert_state_for_guided_operation terminalizes the operation in the
+        same transaction that writes the reverted state, but the surfacing
+        pass runs after it. An attempt that dies in between leaves the
+        operation terminal, so every retry lands here -- and without this the
+        reverted state keeps pending interpretation_requirements with no event
+        row, so no review card renders and /execute fails closed with nothing
+        the user can resolve.
+
+        The debt is computed per site against durable evidence in ANY
+        resolution status (``only_missing_evidence=True``), so this repairs
+        only genuinely missing sites and writes nothing once the settling
+        attempt -- or a prior replay -- covered them.
+
+        Identity comes from the operation's own result locator, re-resolved
+        here rather than closed over from _replay: after_verified receives the
+        same locator replay does, not the record replay fetched.
+        """
+        if type(result) is not GuidedCompositionStateResult:
+            raise AuditIntegrityError("State revert replay has a non-state result locator")
+        replay_state = await service.get_state_in_session(result.state_id, session.id)
+        await _surface_reverted_interpretation_reviews(
+            service,
+            session_id=session.id,
+            state_record=replay_state,
+        )
+
+    # ``after_verified`` rides BOTH lookups. This one is the terminal-replay
+    # probe -- the very path whose settlement may have died between the
+    # revert transaction and its surfacing pass -- so leaving the repair off
+    # it would make the H1 repair dead on exactly the path that owes it.
+    pending = await reserve_or_replay_guided_operation(
+        service=service,
+        session_id=session.id,
+        kind="state_revert",
+        request=body,
+        replay=_replay,
+        after_verified=_repair_reverted_surfacing_debt,
+        reserve_if_absent=False,
+        takeover_expired=False,
+    )
+    if pending is not None and not isinstance(pending, (GuidedOperationLease, GuidedOperationExpired)):
+        return pending
+
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     # Resolve the user-supplied target only after entering the same compose
     # exclusion domain as accept/compose. The state is immutable, so releasing
@@ -512,45 +716,89 @@ async def revert_state(
         if expected_current is None:
             raise AuditIntegrityError("State revert session unexpectedly has no current checkpoint")
 
-    async def _replay(result: object) -> CompositionStateResponse:
-        if type(result) is not GuidedCompositionStateResult:
-            raise AuditIntegrityError("State revert replay has a non-state result locator")
-        replay_state = await service.get_state_in_session(result.state_id, session.id)
-        return _state_response(replay_state, policy_catalog=catalog)
-
     reserved = await reserve_or_replay_guided_operation(
         service=service,
         session_id=session.id,
         kind="state_revert",
         request=body,
         replay=_replay,
+        after_verified=_repair_reverted_surfacing_debt,
     )
     if reserved is None:  # pragma: no cover - reserve_if_absent defaults true
         raise AuditIntegrityError("State revert operation was not reserved")
     if not isinstance(reserved, GuidedOperationLease):
         return reserved
 
-    async with compose_lock:
-        try:
-            new_state = await service.revert_state_for_guided_operation(
-                reserved.fence,
-                state_id=body.state_id,
-                expected_current_state_id=expected_current.id,
-                expected_current_state_version=expected_current.version,
-                actor="composer_route",
-                response_hash_factory=lambda record: guided_response_hash(_state_response(record, policy_catalog=catalog)),
-            )
-        except ValueError:
-            raise HTTPException(status_code=404, detail="State not found") from None
-        except GuidedOperationSettlementConflictError:
-            failure = await service.fail_guided_operation(
-                reserved.fence,
-                failure_code="stale_conflict",
-                actor="composer_route",
-            )
-            raise_guided_operation_failure(failure)
+    lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
+    try:
+        async with compose_lock:
+            try:
+                with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
+                    new_state = await service.revert_state_for_guided_operation(
+                        reserved.fence,
+                        state_id=body.state_id,
+                        expected_current_state_id=expected_current.id,
+                        expected_current_state_version=expected_current.version,
+                        actor="composer_route",
+                        response_hash_factory=lambda record: guided_response_hash(_state_response(record, policy_catalog=catalog)),
+                        session_operation_context=reserved.session_operation_context,
+                    )
+            except ValueError:
+                raise HTTPException(status_code=404, detail="State not found") from None
+            except GuidedOperationSettlementConflictError:
+                failure = await service.fail_guided_operation(
+                    reserved.fence,
+                    failure_code="stale_conflict",
+                    actor="composer_route",
+                    session_operation_context=reserved.session_operation_context,
+                )
+                raise_guided_operation_failure(failure)
+    finally:
+        await lease_guard.finish_active_exception()
 
-    return _state_response(new_state, policy_catalog=catalog)
+    await _surface_reverted_interpretation_reviews(
+        service,
+        session_id=session.id,
+        state_record=new_state,
+    )
+
+    with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
+        return _state_response(new_state, policy_catalog=catalog)
+
+
+_IMPORT_REVIEW_DEBT_TIMEOUT_DETAIL = "Review-debt check did not complete within the configured bound; import aborted."
+_SEED_REVIEW_DEBT_TIMEOUT_DETAIL = "Review-debt check did not complete within the configured bound; seed aborted."
+
+
+async def _review_debt_sites_off_loop(
+    state: CompositionState,
+    *,
+    request: Request,
+    timeout_detail: str,
+) -> tuple[InterpretationReviewSite, ...]:
+    """Run the pure review-debt check off the event loop, bounded (elspeth-e5a38115a6).
+
+    ``unsurfaceable_pending_interpretation_review_sites`` is CPU-bound — it
+    validates the composition several times — and both import routes call it
+    under the session's COMPOSE lease and compose lock. Called inline, it held
+    the loop for its whole duration, so one long import stalled every other
+    request on the deployment and outlived its own lease. It now runs on the
+    shared worker pool like the runtime preflight and under the same bound
+    (``composer_runtime_preflight_timeout_seconds``: one knob for "a static
+    check on the request path took too long"). The refusal is static: the
+    state under check is untrusted input on both routes, so nothing from it
+    reaches the detail. The worker's own exceptions propagate unchanged, so
+    each caller's malformed-metadata arm still sees the classes it handles.
+    """
+    from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+
+    try:
+        return await asyncio.wait_for(
+            run_sync_in_worker(unsurfaceable_pending_interpretation_review_sites, state),
+            timeout=request.app.state.settings.composer_runtime_preflight_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=timeout_detail) from exc
 
 
 @router.post(
@@ -565,69 +813,110 @@ async def import_state_yaml(
 ) -> CompositionStateResponse:
     """Seed a session's composition state from exported runtime YAML."""
     session = await _verify_session_ownership(session_id, user, request)
+    service: SessionServiceProtocol = request.app.state.session_service
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-    async with compose_lock:
-        try:
-            imported_state = composition_state_from_runtime_yaml(body.yaml)
-        except RuntimeYamlImportError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
-        imported_state = await _state_with_imported_source_blobs(
-            imported_state,
-            source_blob_ids=body.source_blob_ids,
-            request=request,
-            session_id=session.id,
-        )
-        _reject_unbound_blob_storage_sources(
-            imported_state,
-            data_dir=str(request.app.state.settings.data_dir),
-        )
-        _reject_disallowed_source_paths(
-            imported_state,
-            data_dir=str(request.app.state.settings.data_dir),
-        )
-        _reject_fabricated_secret_literals(
-            imported_state,
-            secret_service=request.app.state.scoped_secret_resolver,
-            user_id=str(user.user_id),
-        )
-        _reject_malformed_interpretation_requirements(imported_state)
+    try:
+        async with compose_lock:
+            try:
+                imported_state = composition_state_from_runtime_yaml(body.yaml)
+            except RuntimeYamlImportError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
+            imported_state = await _state_with_imported_source_blobs(
+                imported_state,
+                source_blob_ids=body.source_blob_ids,
+                request=request,
+                session_id=session.id,
+                session_operation_context=lease.context,
+            )
+            _reject_redacted_sources_without_rebind(imported_state, yaml_text=body.yaml)
+            _reject_unbound_blob_storage_sources(
+                imported_state,
+                data_dir=str(request.app.state.settings.data_dir),
+            )
+            _reject_disallowed_source_paths(
+                imported_state,
+                data_dir=str(request.app.state.settings.data_dir),
+                session_id=str(session.id),
+            )
+            _reject_fabricated_secret_literals(
+                imported_state,
+                secret_service=request.app.state.scoped_secret_resolver,
+                user_id=str(user.user_id),
+            )
+            _reject_malformed_interpretation_requirements(imported_state)
+            # Import must be atomic with respect to review recoverability. Reuse
+            # the generic Composer surfacer's own pure site-to-writer mapping so a
+            # pending site that cannot become a consumable event is rejected before
+            # the composition state is saved.
+            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
 
-        service: SessionServiceProtocol = request.app.state.session_service
-        state_data, _validation = await _state_data_from_composer_state(
-            imported_state,
-            settings=request.app.state.settings,
-            secret_service=request.app.state.scoped_secret_resolver,
-            user_id=str(user.user_id),
-            session_id=session.id,
-            plugin_snapshot=plugin_snapshot,
-            profile_registry=request.app.state.operator_profile_registry,
-            catalog=request.app.state.catalog_service,
-            runtime_preflight=None,
-            preflight_exception_policy="persist_invalid",
-            initial_version=imported_state.version,
-            telemetry_source="compose",
-        )
-        state_record = await service.save_composition_state(
-            session.id,
-            state_data,
-            provenance="session_seed",
-        )
-        await _surface_imported_interpretation_review_events(
-            service,
-            session_id=session.id,
-            state=imported_state,
-            composition_state_id=UUID(str(state_record.id)),
-        )
-        return _state_response(state_record, policy_catalog=catalog)
+            try:
+                unsurfaceable_sites = await _review_debt_sites_off_loop(
+                    imported_state,
+                    request=request,
+                    timeout_detail=_IMPORT_REVIEW_DEBT_TIMEOUT_DETAIL,
+                )
+            except (InvariantError, KeyError, TypeError, ValueError) as exc:
+                # These remain invariant failures for internally persisted state.
+                # At this route the state is untrusted YAML, so reject statically
+                # without echoing its field names or values.
+                raise HTTPException(
+                    status_code=400,
+                    detail="Imported YAML contains malformed interpretation review metadata.",
+                ) from exc
+            if unsurfaceable_sites:
+                site_labels = ", ".join(f"{site.component_id}:{site.kind.value}" for site in unsurfaceable_sites)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Imported YAML contains pending interpretation review site(s) that cannot be surfaced: "
+                        f"{site_labels}. Remove or repair the hand-written interpretation_requirements entry and re-import."
+                    ),
+                )
+
+            state_data, _validation = await _state_data_from_composer_state(
+                imported_state,
+                settings=request.app.state.settings,
+                secret_service=request.app.state.scoped_secret_resolver,
+                user_id=str(user.user_id),
+                session_id=session.id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=request.app.state.operator_profile_registry,
+                catalog=request.app.state.catalog_service,
+                runtime_preflight=None,
+                preflight_exception_policy="persist_invalid",
+                initial_version=imported_state.version,
+                telemetry_source="compose",
+            )
+            interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
+                imported_state,
+                model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
+                model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
+                provider=_YAML_IMPORT_SURFACE_PROVENANCE,
+                composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
+            )
+            response_state = await service.save_composition_state_with_interpretations(
+                session.id,
+                state_data,
+                provenance="session_seed",
+                interpretations=interpretation_drafts,
+                session_operation_context=lease.context,
+            )
+            with _named_guided_custody_projection():
+                return _state_response(response_state, policy_catalog=catalog)
+    finally:
+        await lease.close()
 
 
-# Provenance sentinel for interpretation events surfaced by the YAML import
-# path: no composer LLM context exists at this surface — the draft came from
-# the imported document — so all four audit provenance columns carry this
-# value instead of a model identity (the D2 "most audit-honest value
-# available" doctrine from ComposerServiceImpl._auto_surface_prompt_template_reviews).
 _YAML_IMPORT_SURFACE_PROVENANCE = "yaml_import"
 
 
@@ -638,93 +927,30 @@ def _reject_malformed_interpretation_requirements(state: CompositionState) -> No
     Legitimate exports never carry requirement rows (``strip_authoring_options``
     removes them at export) and the importer's auto-stagers only emit
     well-formed rows, so any malformed row here was hand-written into the
-    pasted document. Rejecting outright is the same
+    pasted document. Sources and nodes cross the same untrusted YAML boundary;
+    checking only nodes would turn a malformed source row into a later 500.
+    Rejecting outright is the same
     stricter-than-the-tool-path posture as ``_reject_fabricated_secret_literals``
     for this paste-facing entry point — and it guarantees the post-persist
     surfacing pass below can parse every row without a post-persist failure
-    path. Audit hygiene: name the node, never echo row content.
+    path. Audit hygiene: name the component, never echo row content.
     """
-    for node in state.nodes:
+    components = [
+        *((f"Source '{source_name}'", source.options) for source_name, source in state.sources.items()),
+        *((f"Node '{node.id}'", node.options) for node in state.nodes),
+    ]
+    for component, options in components:
         try:
-            parse_interpretation_requirements(node.options)
+            parse_interpretation_requirements(options)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Node '{node.id}' carries a malformed interpretation_requirements entry. "
+                    f"{component} carries a malformed interpretation_requirements entry. "
                     "Remove the hand-written interpretation_requirements block and re-import; "
                     "the importer stages review requirements itself."
                 ),
             ) from exc
-
-
-async def _surface_imported_interpretation_review_events(
-    service: SessionServiceProtocol,
-    *,
-    session_id: UUID,
-    state: CompositionState,
-    composition_state_id: UUID,
-) -> None:
-    """Surface a resolvable pending interpretation EVENT for every pending
-    requirement carried by the just-imported state (elspeth-ae5160c3cb).
-
-    Imported YAML never passes through the compose loop, so neither the
-    freeform finalization surfacer nor the guided B1 surfacer runs. Without
-    this pass the staged requirements block the run fail-closed (the
-    interpretation-state enumerators) while no review card exists and the
-    resolve path has nothing to target — an unrecoverable block.
-
-    Every row parses cleanly here by construction:
-    ``_reject_malformed_interpretation_requirements`` already 400-rejected
-    malformed rows pre-persist, so a parse failure at this seam is a
-    first-party bug and crashes honestly rather than being caught.
-
-    Mirrors the guided B1 W1 backstop: ``create_pending_interpretation_event``
-    raises a ValueError subclass on any writer-boundary mismatch (e.g. a
-    hand-written requirement row that fails its per-kind precondition), and
-    this runs after ``save_composition_state`` at a persist seam — so a
-    mismatched site is SKIPPED and stays fail-closed at the run-time gate
-    (advisory polarity) rather than 500ing the import after the state
-    already persisted. The requirements staged by the importer's own
-    auto-stagers always satisfy the boundary; only hand-crafted rows can
-    trip it.
-    """
-    for node in state.nodes:
-        requirements = parse_interpretation_requirements(node.options)
-        if requirements is None:
-            continue
-        for requirement in requirements:
-            if requirement["status"] != "pending":
-                continue
-            draft = requirement["draft"]
-            if type(draft) is not str or not draft:
-                continue
-            # kind/user_term are validated non-empty members by the parse above.
-            kind = InterpretationKind(requirement["kind"])
-            user_term = requirement["user_term"]
-            try:
-                await service.create_pending_interpretation_event(
-                    session_id=session_id,
-                    composition_state_id=composition_state_id,
-                    affected_node_id=node.id,
-                    tool_call_id=f"backend_auto_surface:{uuid4()}",
-                    user_term=user_term,
-                    kind=kind,
-                    llm_draft=draft,
-                    model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
-                    model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
-                    provider=_YAML_IMPORT_SURFACE_PROVENANCE,
-                    composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
-                )
-            except ValueError:
-                # W1 backstop, same shape and rationale as the guided B1
-                # surfacer (composer/service.py): the per-kind writer boundary
-                # is NECESSARY but not always SUFFICIENT to replicate here, a
-                # raise at this post-persist seam would 500 an import whose
-                # state already saved, and a skipped advisory surface stays
-                # fail-closed at the run-time gate. Deliberately not slog'd —
-                # a skipped advisory surface is not a telemetry/audit event.
-                continue
 
 
 @router.post(
@@ -743,55 +969,90 @@ async def seed_state_for_e2e(
 
     session = await _verify_session_ownership(session_id, user, request)
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
+    service: SessionServiceProtocol = request.app.state.session_service
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
 
     try:
         body = SeedCompositionStateRequest.model_validate(await request.json())
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        await lease.close()
         raise HTTPException(status_code=400, detail="Invalid seed request JSON") from exc
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-    async with compose_lock:
-        try:
-            seeded_state = CompositionState.from_dict(body.state)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
-        _reject_imported_plugin_policy(seeded_state, catalog, plugin_snapshot)
+    try:
+        async with compose_lock:
+            try:
+                seeded_state = CompositionState.from_dict(body.state)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
+            _reject_imported_plugin_policy(seeded_state, catalog, plugin_snapshot)
 
-        _reject_unbound_blob_storage_sources(
-            seeded_state,
-            data_dir=str(request.app.state.settings.data_dir),
-        )
-        _reject_disallowed_source_paths(
-            seeded_state,
-            data_dir=str(request.app.state.settings.data_dir),
-        )
-        _reject_fabricated_secret_literals(
-            seeded_state,
-            secret_service=request.app.state.scoped_secret_resolver,
-            user_id=str(user.user_id),
-        )
+            _reject_unbound_blob_storage_sources(
+                seeded_state,
+                data_dir=str(request.app.state.settings.data_dir),
+            )
+            _reject_disallowed_source_paths(
+                seeded_state,
+                data_dir=str(request.app.state.settings.data_dir),
+                session_id=str(session.id),
+            )
+            _reject_fabricated_secret_literals(
+                seeded_state,
+                secret_service=request.app.state.scoped_secret_resolver,
+                user_id=str(user.user_id),
+            )
+            _reject_malformed_interpretation_requirements(seeded_state)
+            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
 
-        service: SessionServiceProtocol = request.app.state.session_service
-        state_data, _validation = await _state_data_from_composer_state(
-            seeded_state,
-            settings=request.app.state.settings,
-            secret_service=request.app.state.scoped_secret_resolver,
-            user_id=str(user.user_id),
-            session_id=session.id,
-            plugin_snapshot=plugin_snapshot,
-            profile_registry=request.app.state.operator_profile_registry,
-            catalog=request.app.state.catalog_service,
-            runtime_preflight=None,
-            preflight_exception_policy="persist_invalid",
-            initial_version=seeded_state.version,
-            telemetry_source="state_seed",
-        )
-        state_record = await service.save_composition_state(
-            session.id,
-            state_data,
-            provenance="session_seed",
-        )
-        return _state_response(state_record, policy_catalog=catalog)
+            try:
+                unsurfaceable_sites = await _review_debt_sites_off_loop(
+                    seeded_state,
+                    request=request,
+                    timeout_detail=_SEED_REVIEW_DEBT_TIMEOUT_DETAIL,
+                )
+            except (InvariantError, KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
+            if unsurfaceable_sites:
+                raise HTTPException(status_code=400, detail="Composition state contains review debt that cannot be surfaced")
+
+            state_data, _validation = await _state_data_from_composer_state(
+                seeded_state,
+                settings=request.app.state.settings,
+                secret_service=request.app.state.scoped_secret_resolver,
+                user_id=str(user.user_id),
+                session_id=session.id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=request.app.state.operator_profile_registry,
+                catalog=request.app.state.catalog_service,
+                runtime_preflight=None,
+                preflight_exception_policy="persist_invalid",
+                initial_version=seeded_state.version,
+                telemetry_source="state_seed",
+            )
+            interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
+                seeded_state,
+                model_identifier=_E2E_SEED_SURFACE_PROVENANCE,
+                model_version=_E2E_SEED_SURFACE_PROVENANCE,
+                provider=_E2E_SEED_SURFACE_PROVENANCE,
+                composer_skill_hash=_E2E_SEED_SURFACE_PROVENANCE,
+            )
+            state_record = await service.save_composition_state_with_interpretations(
+                session.id,
+                state_data,
+                provenance="session_seed",
+                interpretations=interpretation_drafts,
+                session_operation_context=lease.context,
+            )
+            with _named_guided_custody_projection():
+                return _state_response(state_record, policy_catalog=catalog)
+    finally:
+        await lease.close()
 
 
 def _reattach_guided_blob_refs(state: CompositionState) -> CompositionState:
@@ -801,18 +1062,18 @@ def _reattach_guided_blob_refs(state: CompositionState) -> CompositionState:
 
     The manual set_source commit strips ``blob_ref`` from guided sources (it
     cannot prove ``path == storage_path``); it survives only in the persisted
-    reviewed source snapshot. Both export egress channels — the public-YAML storage-path omission
-    (``_strip_web_metadata(..., omit_blob_bound_source_paths=True)``) and the
-    ``source_blob_ids`` sidecar — key off ``source.options["blob_ref"]``, so
-    without this a guided blob source leaks its absolute storage path AND emits no
-    sidecar (breaking the export→re-import round-trip). Reattaching here lets the
-    existing ``blob_ref``-keyed export machinery treat guided sources exactly like
-    freeform blob-bound ones. Mirrors the snapshot cross-reference in
+    reviewed source snapshot. Public-YAML storage-path omission and live custody
+    verification both key off ``source.options["blob_ref"]``, so without this a
+    guided blob source leaks its absolute storage path or bypasses verification.
+    Reattaching here lets the existing ``blob_ref``-keyed export machinery treat
+    guided sources exactly like freeform blob-bound ones while verifying custody
+    before public export. Mirrors the snapshot cross-reference in
     ``redact_guided_snapshot_storage_paths``; never mutates ``state``.
 
-    Sources are matched to their reviewed snapshot by stable persisted source name
-    and storage-path-string equality, so plural sources cannot borrow one another's
-    binding even when they reference the same underlying file.
+    Private-path snapshots use stable source name plus exact path equality. Public
+    ``blob:<uuid>`` snapshots use the stable source name plus canonical blob identity;
+    ``_verified_yaml_export_blob_ids`` then proves the live session, status, ID, and
+    private storage path before either export artifact is returned.
     """
     return reattach_guided_blob_refs_for_public_export(state)
 
@@ -868,6 +1129,7 @@ async def _verified_yaml_export_blob_ids(
     *,
     request: Request,
     session_id: UUID,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, str]:
     """Verify every public-export blob sidecar entry against live custody."""
     source_blob_ids: dict[str, str] = {}
@@ -889,20 +1151,26 @@ async def _verified_yaml_export_blob_ids(
 
     if not parsed_blob_ids:
         return source_blob_ids
-    blob_service: BlobServiceProtocol | None = getattr(request.app.state, "blob_service", None)
-    if blob_service is None:
-        raise AuditIntegrityError("YAML export blob custody verification is unavailable")
+    blob_service: BlobServiceProtocol = request.app.state.blob_service
     for source, blob_id in parsed_blob_ids:
         try:
-            blob = await blob_service.get_blob(blob_id)
+            blob = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
         except BlobNotFoundError:
             raise AuditIntegrityError("YAML export blob custody verification failed") from None
-        source_paths = {value for key in SOURCE_LOCAL_PATH_OPTION_KEYS if type(value := source.options.get(key)) is str}
+        # ``BlobServiceProtocol`` is structural, so an implementation could
+        # hand back anything; ``BlobRecord`` is an owned, unsubclassed frozen
+        # dataclass, so exact-type is the closed check (ADR-032) and it fails
+        # closed — anything else aborts the export.
+        if type(blob) is not BlobRecord:
+            raise TypeError("BlobServiceProtocol.get_blob() must return BlobRecord")
+        source_paths = {
+            value for key in SOURCE_LOCAL_PATH_OPTION_KEYS if key in source.options and type(value := source.options[key]) is str
+        }
         if (
-            getattr(blob, "id", None) != blob_id
-            or getattr(blob, "session_id", None) != session_id
-            or getattr(blob, "status", None) != "ready"
-            or type(storage_path := getattr(blob, "storage_path", None)) is not str
+            blob.id != blob_id
+            or blob.session_id != session_id
+            or blob.status != "ready"
+            or type(storage_path := blob.storage_path) is not str
             or storage_path not in source_paths
         ):
             raise AuditIntegrityError("YAML export blob custody verification failed")
@@ -929,75 +1197,87 @@ async def get_state_yaml(
     """
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
-    state_record = await service.get_current_state(session.id)
-    if state_record is None:
-        raise HTTPException(status_code=404, detail="No composition state exists")
-    state = _state_from_record(state_record)
-    policy_catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
-    # Historical states must remain exportable in their authored, public form
-    # even when a component is no longer enabled.  Do not instantiate or lower
-    # such a component merely to serialize it for repair elsewhere.
-    if not _composition_plugin_policy_findings(state, policy_catalog):
-        await _require_yaml_export_preflight(
-            state,
+    # The export records a composer-completion event, so this is a writer:
+    # it takes COMPOSE authority and answers 409 while another compose is
+    # live (elspeth-bf52d495a2, option A).
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
+    try:
+        state_record = await service.get_current_state(session.id)
+        if state_record is None:
+            raise HTTPException(status_code=404, detail="No composition state exists")
+        state = _state_from_record(state_record)
+        policy_catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
+        # Historical states must remain exportable in their authored, public form
+        # even when a component is no longer enabled.  Do not instantiate or lower
+        # such a component merely to serialize it for repair elsewhere.
+        if not _composition_plugin_policy_findings(state, policy_catalog):
+            await _require_yaml_export_preflight(
+                state,
+                request=request,
+                session_id=session.id,
+                plugin_snapshot=plugin_snapshot,
+            )
+        # elspeth-b5ee205720: reconstitute blob_ref for guided blob-backed sources
+        # (stripped from committed options; retained only in the GuidedSession
+        # snapshot) so public-YAML path omission and live custody verification treat
+        # them as blob-bound. Kept
+        # AFTER preflight: blob_ref is extra=forbid for plugin configs and must not
+        # reach plugin instantiation. Preflight ran on the raw `state`; export uses
+        # the reattached copy.
+        export_state = _reattach_guided_blob_refs(state)
+        source_blob_ids = await _verified_yaml_export_blob_ids(
+            export_state,
             request=request,
             session_id=session.id,
-            plugin_snapshot=plugin_snapshot,
+            session_operation_context=lease.context,
         )
-    # elspeth-b5ee205720: reconstitute blob_ref for guided blob-backed sources
-    # (stripped from committed options; retained only in the GuidedSession
-    # snapshot) so BOTH export egress channels below — the public-YAML storage-path
-    # omission and the source_blob_ids sidecar — treat them as blob-bound. Kept
-    # AFTER preflight: blob_ref is extra=forbid for plugin configs and must not
-    # reach plugin instantiation. Preflight ran on the raw `state`; export uses
-    # the reattached copy.
-    export_state = _reattach_guided_blob_refs(state)
-    source_blob_ids = await _verified_yaml_export_blob_ids(
-        export_state,
-        request=request,
-        session_id=session.id,
-    )
-    yaml_str = generate_public_yaml(export_state)
+        # elspeth-06f92da0d9: this route is the one consumer that hands the user a
+        # document to keep, so it is where the deliberate custody redaction stops
+        # being invisible — header first, then the bare projection. The marker
+        # lives here rather than in ``generate_public_yaml`` because the MCP,
+        # share, and acceptance-import consumers of that function must keep bare
+        # bytes (see its docstring).
+        yaml_str = public_export_redaction_header(export_state) + generate_public_yaml(export_state)
 
-    # Phase 6A B3 — sessions-DB audit event for YAML export.
-    #
-    # Two Tier-1 audit events ship in Phase 6 (mark_ready_for_review and
-    # export_yaml). This is the export_yaml site. Sync, crash-on-failure
-    # per CLAUDE.md audit primacy — if this write fails the request
-    # fails, no YAML is returned, no carve-out is permitted. The write
-    # MUST land before the response is returned: the audit row is the
-    # legal record that the YAML was exported on the user's behalf.
-    #
-    # The state record was just read via ``service.get_current_state``
-    # above; ``state_record.id`` is the composition_state_id this
-    # export is bound to.
-    with request.app.state.session_engine.begin() as conn:
-        conn.execute(
-            insert(composer_completion_events_table).values(
-                id=str(uuid4()),
-                session_id=str(session_id),
-                composition_state_id=str(state_record.id),
-                event_type="export_yaml",
+        # Audit-first and fence-first: a failed or stale COMPOSE authority
+        # returns no YAML and emits no completion telemetry.
+        service.session_operation_authority.mutate(
+            lease.context,
+            lambda transaction: transaction.composer_completion.record_yaml_export(
+                composition_state_id=state_record.id,
                 actor=str(user.user_id),
                 created_at=datetime.now(UTC),
-                payload_digest=None,
-                expires_at=None,
-            )
+            ),
         )
 
-    # Phase 8 Sub-task 7c (telemetry-backfill: phase-6).
-    # composer.session.completed_total — fires AFTER the audit
-    # engine.begin() block has exited cleanly. If the audit INSERT
-    # raises, the with-block exits via exception, FastAPI converts
-    # it to a 5xx, and control never reaches this line — the counter
-    # stays at zero and the superset invariant (counter aggregates
-    # over committed audit rows) is structurally enforced.
-    record_session_completed(
-        request.app.state.sessions_telemetry,
-        completion_verb="export_yaml",
-    )
+        # Phase 8 Sub-task 7c (telemetry-backfill: phase-6).
+        # composer.session.completed_total — fires AFTER the audit
+        # fenced audit transaction has committed. If that write raises,
+        # control never reaches this line and the counter
+        # stays at zero and the superset invariant (counter aggregates
+        # over committed audit rows) is structurally enforced.
+        record_session_completed(
+            request.app.state.sessions_telemetry,
+            completion_verb="export_yaml",
+        )
 
-    response: StateYamlResponse = {"yaml": yaml_str}
-    if source_blob_ids:
-        response["source_blob_ids"] = source_blob_ids
-    return response
+        response: StateYamlResponse = {"yaml": yaml_str}
+        export_redaction = public_export_redaction(export_state)
+        if export_redaction["sources"] or export_redaction["outputs"]:
+            response["redaction"] = {
+                "stripped_source_options": export_redaction["sources"],
+                "stripped_output_options": export_redaction["outputs"],
+                # Names from the custody-verified sidecar map; the UUID values
+                # stay server-side (scrub ruling 2304d57fb).
+                "blob_linked_sources": sorted(source_blob_ids),
+                "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
+            }
+        return response
+    finally:
+        await lease.close()

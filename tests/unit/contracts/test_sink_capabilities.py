@@ -51,8 +51,8 @@ def test_sink_capability_plugins_are_registered_builtin_sinks() -> None:
 
 def test_sink_capability_message_text_is_shared() -> None:
     assert FAILSINK_ELIGIBLE_PLUGIN_TEXT == "csv or json"
-    assert FILE_SINK_PLUGIN_TEXT == "csv, json, or text"
-    assert FILE_SINK_PLUGIN_SLASH_TEXT == "csv/json/text"
+    assert FILE_SINK_PLUGIN_TEXT == "csv, document, json, or text"
+    assert FILE_SINK_PLUGIN_SLASH_TEXT == "csv/document/json/text"
 
 
 def test_text_sink_is_file_sink_but_not_lossless_failure_sink() -> None:

@@ -15,11 +15,11 @@
 //
 // ============================================================================
 
-import type { ComposerProgressSnapshot } from "@/types/api";
 import type {
   TurnPayload,
   GuidedProposalReviewState,
   GuidedRespondAction,
+  GuidedSourceBlobCandidate,
 } from "@/types/guided";
 import { SingleSelectTurn } from "./SingleSelectTurn";
 import { InspectAndConfirmTurn } from "./InspectAndConfirmTurn";
@@ -32,6 +32,16 @@ import { ComponentReviewTurn } from "./ComponentReviewTurn";
 interface GuidedTurnProps {
   turn: TurnPayload;
   onSubmit: (body: GuidedRespondAction) => void;
+  /** Ready uploads associated with this exact Step-1 single-select turn. */
+  sourceBlobCandidates?: readonly GuidedSourceBlobCandidate[];
+  /** This exact turn requires the user to make a fresh source-file choice. */
+  sourceBlobChoiceRequired?: boolean;
+  /** Gates only Step-1 actions that can bind an in-flight source upload. */
+  sourceUploadPending?: boolean;
+  /** Source blob uploaded after a Step-1 schema_form turn was emitted —
+   * forwarded to SchemaFormTurn's local-draft path prefill
+   * (elspeth-c70909c13a). Other turn types ignore it. */
+  sourceFormPathPrefill?: GuidedSourceBlobCandidate | null;
   disabled?: boolean;
   /** Tutorial mode — forwarded to leaf widgets that surface worked-example
    * teaching copy (e.g. SchemaFormTurn's on_validation_failure caveat). */
@@ -45,24 +55,33 @@ interface GuidedTurnProps {
   wireValidationIssues?: string[];
   /** Exact proposal/hash-bound local review lifecycle. Required by proposal turns. */
   proposalReviewState?: GuidedProposalReviewState | null;
-  /** Live compose progress (read-only) — forwarded to proposal turns so a
-   * pending decision submit shows the adaptive headline + elapsed readout. */
-  composerProgress?: ComposerProgressSnapshot | null;
+  /** Approve the proposed wiring without opening the wire review — forwarded
+   * to ProposePipelineTurn, which renders no such button without it. Not an
+   * onSubmit body: the parent owns the review→confirm chain the server
+   * requires (see sessionStore.approveWiring). */
+  onApproveWiring?: (binding: {
+    proposal_id: string;
+    draft_hash: string;
+  }) => void;
 }
 
 function guidedTurnInstanceKey(turn: TurnPayload): string {
-  return JSON.stringify([turn.step_index, turn.type, turn.payload]);
+  return JSON.stringify([turn.step_index, turn.type, turn.turn_token, turn.payload]);
 }
 
 export function GuidedTurn({
   turn,
   onSubmit,
+  sourceBlobCandidates,
+  sourceBlobChoiceRequired = false,
+  sourceUploadPending = false,
+  sourceFormPathPrefill = null,
   disabled = false,
   isTutorial = false,
   wirePendingAcknowledgements,
   wireValidationIssues,
   proposalReviewState,
-  composerProgress = null,
+  onApproveWiring,
 }: GuidedTurnProps) {
   const guardedSubmit = (body: GuidedRespondAction) => {
     if (disabled) return;
@@ -74,21 +93,14 @@ export function GuidedTurn({
   const turnInstanceKey = guidedTurnInstanceKey(turn);
   switch (turn.type) {
     case "single_select":
-      // Tutorial is a PASSIVE teaching device: the learner advances by pressing
-      // Send (the locked prompt builds the step), never by picking from this
-      // menu. The chips are a live, submit-on-click RIVAL driver whose options
-      // don't even include the scripted source (the source step builds a
-      // web_scrape; the menu lists azure_blob/csv/dataverse/json/text), so
-      // clicking ANY chip submits an off-script choice and derails the scripted
-      // build. Omit the pick widget in tutorial mode — the decision collapses to
-      // its heading + "press Send" caption. Live guided KEEPS the menu (there it
-      // is the real path for both audiences).
-      if (isTutorial) return null;
       return (
         <SingleSelectTurn
           key={turnInstanceKey}
           payload={turn.payload}
           onSubmit={guardedSubmit}
+          sourceBlobCandidates={sourceBlobCandidates}
+          sourceBlobChoiceRequired={sourceBlobChoiceRequired}
+          sourceUploadPending={sourceUploadPending}
           disabled={disabled}
           isTutorial={isTutorial}
         />
@@ -121,6 +133,7 @@ export function GuidedTurn({
           onSubmit={guardedSubmit}
           disabled={disabled}
           isTutorial={isTutorial}
+          sourceFormPathPrefill={sourceFormPathPrefill}
         />
       );
     case "review_components":
@@ -130,6 +143,7 @@ export function GuidedTurn({
           payload={turn.payload}
           onSubmit={guardedSubmit}
           disabled={disabled}
+          isTutorial={isTutorial}
         />
       );
     case "propose_pipeline":
@@ -142,9 +156,18 @@ export function GuidedTurn({
           payload={turn.payload}
           reviewState={proposalReviewState}
           onSubmit={guardedSubmit}
+          onApproveWiring={
+            onApproveWiring === undefined
+              ? undefined
+              : (binding) => {
+                  // Same gate guardedSubmit applies: a disabled turn must not
+                  // start the chain either.
+                  if (disabled) return;
+                  onApproveWiring(binding);
+                }
+          }
           disabled={disabled}
           isTutorial={isTutorial}
-          composerProgress={composerProgress}
         />
       );
     case "confirm_wiring":

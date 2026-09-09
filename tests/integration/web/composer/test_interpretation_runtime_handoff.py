@@ -57,6 +57,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
@@ -64,6 +65,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import calls_table
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
@@ -75,6 +77,8 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -149,7 +153,7 @@ def _make_session_service() -> tuple[SessionServiceImpl, Any]:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -267,7 +271,8 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
             "merge": None,
         }
     ]
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         sid,
         CompositionStateData(
             nodes=nodes,
@@ -379,7 +384,7 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
 
     response = client.chat_completion(
         model="stub-model",
-        messages=[{"role": "user", "content": resolved_template}],
+        messages=[ChatMessage(role="user", content=resolved_template)],
         resolved_prompt_template_hash=session_hash,
     )
     assert response.content == "7 / 10"
@@ -481,12 +486,14 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     monkeypatch.setattr("elspeth.plugins.infrastructure.clients.http.httpx.Client", _FakeHTTPXClient)
 
     result = provider.execute_query(
-        messages=[{"role": "user", "content": "Rate how modern this is."}],
+        messages=[ChatMessage(role="user", content="Rate how modern this is.")],
         model="openrouter/test-model",
         temperature=0.0,
         max_tokens=100,
-        state_id=node_state.state_id,
-        token_id=token.token_id,
+        audit_parent=LLMAuditParent.for_row(
+            state_id=node_state.state_id,
+            token_id=token.token_id,
+        ),
     )
 
     assert result.content == "7 / 10"
@@ -566,7 +573,7 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
     # interpretation event).
     client.chat_completion(
         model="stub-model",
-        messages=[{"role": "user", "content": "plain"}],
+        messages=[ChatMessage(role="user", content="plain")],
     )
 
     with db.connection() as conn:
@@ -608,7 +615,8 @@ async def test_session_db_records_match_runtime_landscape_join() -> None:
             "merge": None,
         }
     ]
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         sid,
         CompositionStateData(
             nodes=nodes,

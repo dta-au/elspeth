@@ -121,7 +121,7 @@ export function FreeformIntroduction() {
         disabled={writing}
         onClick={handleDismiss}
       >
-        {writing ? "Hiding…" : "Don’t show this again"}
+        {writing ? "Hiding…" : "Don't show this again"}
       </Button>
     </section>
   );

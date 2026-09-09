@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui";
 import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 
@@ -6,9 +7,9 @@ import { useSessionStore } from "@/stores/sessionStore";
  * half of the export/import round-trip for the "compose, export, hand-edit,
  * re-import" audience.
  *
- * Matches ExportYamlButton: this is only a side-rail trigger. The modal is
- * mounted at app-root level by ImportYamlModalHost so the full-screen dialog
- * never lives inside the `.layout-siderail` subtree.
+ * This is only a trigger. The modal is mounted at app-root level by
+ * ImportYamlModalHost so the full-screen dialog never lives inside the
+ * `.layout-siderail` subtree.
  */
 export function ImportYamlButton(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
@@ -16,15 +17,14 @@ export function ImportYamlButton(): JSX.Element | null {
   if (!activeSessionId) return null;
 
   return (
-    <button
-      type="button"
-      className="btn side-rail-import-yaml-btn"
+    <Button
+      className="side-rail-import-yaml-btn"
       onClick={() =>
         window.dispatchEvent(new CustomEvent(OPEN_IMPORT_YAML_MODAL_EVENT))
       }
       aria-label="Import YAML"
     >
       Import YAML
-    </button>
+    </Button>
   );
 }

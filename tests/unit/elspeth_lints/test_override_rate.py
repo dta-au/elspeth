@@ -1017,3 +1017,20 @@ def test_report_rate_on_empty_window_is_zero() -> None:
         blocked_without_override_in_window=0,
     )
     assert report.rate == 0.0
+
+
+def test_allowlist_hash_ignores_sign_bundle_staging_candidates(tmp_path: Path) -> None:
+    """The counter-snapshot hash binds allowlist content, not whatever staging left on disk."""
+    from elspeth_lints.core.override_rate import _compute_allowlist_hash
+    from elspeth_lints.core.sign_bundle_transaction import TRANSACTION_DIRNAME
+
+    enforce_root = _make_allowlist_dir(tmp_path)
+    (enforce_root / "enforce_x").mkdir(exist_ok=True)
+    (enforce_root / "enforce_x" / "a.yaml").write_text("allow_hits: []\n", encoding="utf-8")
+    before = _compute_allowlist_hash(enforce_root)
+
+    candidate = enforce_root / TRANSACTION_DIRNAME / "txn" / "candidate" / "enforce_x" / "a.yaml"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("allow_hits: [{key: decoy}]\n", encoding="utf-8")
+
+    assert _compute_allowlist_hash(enforce_root) == before

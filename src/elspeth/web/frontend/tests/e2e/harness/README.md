@@ -1,12 +1,12 @@
 # Tutorial reliability harness
 
 A repeatable, version-tagged battery that drives the first-run composer tutorial
-end-to-end against **staging** (`elspeth.foundryside.dev`), resets between each
+end-to-end against **staging** (`elspeth.example.gov.au`), resets between each
 run, grades every run on four dimensions, and reports how many worked plus a
 classified failure table.
 
-Design: `docs/superpowers/specs/2026-06-06-tutorial-reliability-harness-design.md`
-Plan: `docs/superpowers/plans/2026-06-06-tutorial-reliability-harness.md`
+Design: `docs/specs/2026-06-06-tutorial-reliability-harness-design.md`
+Plan: `docs/plans/2026-06-06-tutorial-reliability-harness.md`
 
 ## What's in this directory
 
@@ -24,15 +24,16 @@ re-run, diagnostics) live in `../helpers/tutorial-harness.ts`.
 
 The staging config (`playwright.staging.config.ts`) is single-worker,
 `fullyParallel:false`, `retries:0`, so runs are **sequential** (one shared
-`dta_user` account) and **all** runs execute even if some fail. Invoke from the
+configured staging account) and **all** runs execute even if some fail. Invoke from the
 frontend dir:
 
 ```bash
 cd src/elspeth/web/frontend
 HARNESS_BATCH_ID=batch-2026-06-06 HARNESS_BATCH_SIZE=10 \
-STAGING_BASE_URL=https://elspeth.foundryside.dev \
-STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
-PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+STAGING_BASE_URL=https://elspeth.example.gov.au \
+STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
+STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
+PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 npx playwright test --config=playwright.staging.config.ts tutorial-reliability.staging.spec.ts
 ```
 
@@ -40,6 +41,9 @@ npx playwright test --config=playwright.staging.config.ts tutorial-reliability.s
 |---------|---------|---------|
 | `HARNESS_BATCH_ID` | `skeleton` | Names the batch; results land under `tests/e2e/.harness-results/<batch_id>/` (gitignored) and the report lands at `notes/tutorial-reliability/<batch_id>.md`. |
 | `HARNESS_BATCH_SIZE` | `1` | How many independent tutorial runs the battery enumerates. |
+
+Set `STAGING_USERNAME` and `STAGING_PASSWORD` outside the repository before
+running the command.
 
 The four `STAGING_*` / `PLAYWRIGHT_BACKEND_BASE_URL` vars are required by
 `playwright.staging.config.ts` and the global-setup auth step.

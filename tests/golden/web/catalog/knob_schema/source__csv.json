@@ -2,20 +2,23 @@
   "knob_schema": {
     "fields": [
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
         "nullable": false,
-        "required": true
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
       },
       {
-        "description": "Filesystem path for the source input or sink output, resolved relative to the run data directory.",
+        "description": "On the web surface this field takes one of exactly two values: the sentinel \"blob:<uuid>\" naming a file uploaded to this session \u2014 normally prefilled for you, so leave it as it is \u2014 or a plain path that resolves inside this session's own subtree (a source reads from <data_dir>/blobs/<session_id>/; an output writes to <data_dir>/outputs/<session_id>/ or <data_dir>/blobs/<session_id>/). Every other path is rejected, including another session's subtree, a shared or deployment-level directory, and any absolute path outside those trees. Hand-authored YAML runs are not confined this way.",
         "kind": "text",
         "label": "Path",
         "name": "path",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Sink name for non-conformant rows, or 'discard' for explicit drop",
@@ -23,7 +26,8 @@
         "label": "On Validation Failure",
         "name": "on_validation_failure",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -33,7 +37,8 @@
         "label": "Columns",
         "name": "columns",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -42,7 +47,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": ",",
@@ -51,7 +57,8 @@
         "label": "Delimiter",
         "name": "delimiter",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "advanced"
       },
       {
         "default": "utf-8",
@@ -60,7 +67,8 @@
         "label": "Encoding",
         "name": "encoding",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "advanced"
       },
       {
         "default": 0,
@@ -69,7 +77,8 @@
         "label": "Skip Rows",
         "name": "skip_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "advanced"
       }
     ]
   },

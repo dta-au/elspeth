@@ -30,9 +30,19 @@
 //   styled as buttons (less consistent across screen readers). aria-pressed
 //   is the canonical accessibility pattern for two-state toggle buttons.
 //
-// CONTINUE INVARIANT:
+// PRIMARY GESTURE (design review 2026-09-02, I-3):
+//   This turn is asked at step 2, before any transform exists, so the fields
+//   the pipeline is about to produce are never among its options. The
+//   designed answer for a transform-bearing pipeline is therefore
+//   pass-through: the escape action leads the actions row as the primary
+//   control, "Pin these fields" follows as the secondary, and a one-line
+//   explanation under the question says why. It renders in every mode — the
+//   tutorial gets no special rendering (ADR-031). The backend pre-pins
+//   nothing (default_chosen is empty), so Pin starts disabled.
+//
+// PIN INVARIANT:
 //   The widget enforces "user must assert at least one field" by disabling
-//   the Continue button while chosen is empty AND customs is empty. This
+//   the Pin button while chosen is empty AND customs is empty. This
 //   prevents an empty submit that the backend would reject (Step 2's
 //   required-field reads cannot be satisfied by a zero-output sink). The
 //   negative branch is pinned in the test suite — clicking the disabled
@@ -66,7 +76,7 @@
 //   wherever the user actually was when the widget first appeared.
 //
 // SUBMIT WIRE SHAPE:
-//   handleContinue emits:
+//   handlePin emits:
 //     { chosen: [required field names in option order],
 //       custom_inputs: [...custom field names],
 //       edited_values: null,
@@ -85,11 +95,13 @@
 //   pair is otherwise indistinguishable from a stale client submitting nothing,
 //   so the backend fail-closes it). The backend treats passthrough as observed
 //   schema mode with no fixed required fields, using the persisted sink intent
-//   for plugin/options. NOT gated by continueDisabled — the Continue button's
-//   "must assert at least one field" invariant applies to Continue only; the
+//   for plugin/options. NOT gated by pinDisabled — the Pin button's
+//   "must assert at least one field" invariant applies to Pin only; the
 //   escape hatch is deliberately available even when nothing is chosen.
 
 import { useEffect, useId, useRef, useState } from "react";
+
+import { Button, Input } from "@/components/ui";
 import type {
   GuidedRespondAction,
   MultiSelectWithCustomPayload,
@@ -100,9 +112,12 @@ interface MultiSelectWithCustomTurnProps {
   onSubmit: (body: GuidedRespondAction) => void;
   disabled?: boolean;
   /**
-   * Tutorial passive mode: suppress the "Select all that apply, then press
-   * Continue" subtext that contradicts the "press Send" coaching note (mirrors
-   * SingleSelectTurn). The chips remain interactive.
+   * Accepted for the GuidedTurn dispatcher's uniform call shape; it changes
+   * nothing here. The explanation under the question names why pass-through
+   * is the default answer and holds in the tutorial as everywhere else
+   * (ADR-031), so there is no subtext to suppress. (Before I-3 this hid the
+   * "Select all that apply, then press Continue" line, which contradicted the
+   * tutorial's "press Send" coaching.)
    */
   isTutorial?: boolean;
 }
@@ -117,7 +132,6 @@ export function MultiSelectWithCustomTurn({
   payload,
   onSubmit,
   disabled = false,
-  isTutorial = false,
 }: MultiSelectWithCustomTurnProps) {
   const [selection, setSelection] = useState<Selection>(() => ({
     chosen: new Set(payload.default_chosen),
@@ -241,8 +255,8 @@ export function MultiSelectWithCustomTurn({
     });
   }
 
-  function handleContinue() {
-    // Disabled-button guard: this handler is only reachable when the Continue
+  function handlePin() {
+    // Disabled-button guard: this handler is only reachable when the Pin
     // button is enabled, but the type system can't prove that across the
     // render boundary. Narrow because TS doesn't see the cross-handler
     // invariant — illegal state would be a code bug worth catching, not user
@@ -278,7 +292,7 @@ export function MultiSelectWithCustomTurn({
     }
     const [firstCustom, ...remainingCustoms] = customs;
     if (firstCustom === undefined) {
-      throw new Error("enabled multi-select continue requires a selected or custom value");
+      throw new Error("enabled multi-select pin requires a selected or custom value");
     }
     onSubmit({
       ...common,
@@ -307,25 +321,22 @@ export function MultiSelectWithCustomTurn({
     });
   }
 
-  const continueDisabled =
+  const pinDisabled =
     selection.chosen.size === 0 && selection.customs.length === 0;
   const addDisabled = !canAddPending(selection);
 
   return (
     <div className="guided-turn guided-multi-select">
-      <fieldset
-        className="guided-chip-fieldset"
-        // Tutorial is passive: pressing Send builds the step. Suppress the
-        // "Select all that apply" subtext (it contradicts the coaching note) and
-        // drop its aria-describedby so the fieldset carries no dangling IDREF.
-        aria-describedby={isTutorial ? undefined : instructionId}
-      >
+      <fieldset className="guided-chip-fieldset" aria-describedby={instructionId}>
         <legend className="guided-chip-legend">{payload.question}</legend>
-        {!isTutorial && (
-          <p id={instructionId} className="guided-chip-instruction">
-            Select all that apply, then press Continue.
-          </p>
-        )}
+        {/* The one line that says why pass-through is the default answer
+            (I-3). Pinning asserts a per-row presence contract on the sink
+            (options.schema.required_fields), so the copy names that cost. */}
+        <p id={instructionId} className="guided-chip-instruction">
+          Transforms come next, so any fields they add are not listed yet. Pass
+          everything through unless the output must carry specific fields on
+          every row.
+        </p>
         {/* No role="group" on the inner div — <fieldset> already provides
             group semantics; duplicating creates two nested groups in the
             accessibility tree. */}
@@ -336,8 +347,8 @@ export function MultiSelectWithCustomTurn({
             const pressed = selection.chosen.has(option.id);
             return (
               <div key={option.id} className="guided-chip-item">
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="guided-chip-btn"
                   aria-pressed={pressed}
                   aria-describedby={hintId}
@@ -345,7 +356,7 @@ export function MultiSelectWithCustomTurn({
                   disabled={disabled}
                 >
                   {option.label}
-                </button>
+                </Button>
                 {option.hint !== null && (
                   <p id={hintId} className="guided-chip-hint">
                     {option.hint}
@@ -361,7 +372,10 @@ export function MultiSelectWithCustomTurn({
         <label htmlFor={customInputId} className="guided-custom-label">
           Custom field
         </label>
-        <input
+        {/* bare: .guided-custom-input is a complete bespoke recipe; .input's
+            chrome would restyle it (see SingleSelectTurn's identical note). */}
+        <Input
+          bare
           ref={customInputRef}
           id={customInputId}
           type="text"
@@ -383,14 +397,14 @@ export function MultiSelectWithCustomTurn({
           }}
           placeholder="Add a field name..."
         />
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-custom-submit-btn"
           onClick={handleAddCustom}
           disabled={disabled || addDisabled}
         >
           Add
-        </button>
+        </Button>
       </div>
 
       {selection.customs.length > 0 && (
@@ -398,7 +412,7 @@ export function MultiSelectWithCustomTurn({
           {selection.customs.map((value) => (
             <li key={value} className="guided-multi-custom-chip">
               <span className="guided-multi-custom-chip-label">{value}</span>
-              <button
+              <Button
                 ref={(el) => {
                   // Keep the ref-Map in sync with mount/unmount lifecycle.
                   // React invokes the callback with `el` on mount and `null`
@@ -410,7 +424,7 @@ export function MultiSelectWithCustomTurn({
                     removeBtnRefs.current.set(value, el);
                   }
                 }}
-                type="button"
+                variant="bare"
                 className="guided-multi-custom-remove-btn"
                 onClick={() => handleRemoveCustom(value)}
                 aria-label={`Remove ${value}`}
@@ -422,31 +436,33 @@ export function MultiSelectWithCustomTurn({
                     exception to the "no aria-label on visible-text controls"
                     rule — there is no useful visible text. */}
                 x
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
       )}
 
       <div className="guided-multi-actions">
+        {/* Escape first: it is the primary control (filled accent in
+            guided.css); Pin is the outlined secondary. */}
         {payload.escape_label !== null && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-multi-escape-btn"
             onClick={handleEscape}
             disabled={disabled}
           >
             {payload.escape_label}
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
-          className="guided-multi-continue-btn"
-          onClick={handleContinue}
-          disabled={disabled || continueDisabled}
+        <Button
+          variant="bare"
+          className="guided-multi-pin-btn"
+          onClick={handlePin}
+          disabled={disabled || pinDisabled}
         >
-          Continue
-        </button>
+          Pin these fields
+        </Button>
       </div>
     </div>
   );

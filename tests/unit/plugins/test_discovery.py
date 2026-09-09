@@ -1,17 +1,24 @@
 """Tests for dynamic plugin discovery."""
 
+import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, get_args
 
 import pytest
 
 from elspeth.contracts import Determinism
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.discovery import (
+    PLUGIN_SCAN_CONFIG,
     _canonical_module_name,
+    discover_all_plugins,
     discover_plugins_in_directory,
 )
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+PLUGIN_MATRIX_PATH = REPOSITORY_ROOT / "tests/golden/state_engine/plugin_lifecycle_matrix.json"
+V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 
 
 class TestDiscoverPlugins:
@@ -56,7 +63,7 @@ class TestDiscoverPlugins:
 
         # Should not crash or include base classes
         for cls in discovered:
-            assert hasattr(cls, "name"), f"{cls} has no name attribute"
+            assert isinstance(cls.name, str), f"{cls} has no string name attribute"
             assert cls.name != "", f"{cls} has empty name"
 
     def test_skips_abstract_classes(self) -> None:
@@ -196,6 +203,7 @@ class TestDiscoverAllPlugins:
         assert "json" in source_names
         assert "null" in source_names
         assert "aws_s3" in source_names
+        assert "llm" in source_names
         # Azure blob source lives in plugins/azure/
         assert "azure_blob" in source_names
         assert "web_source" not in source_names
@@ -253,9 +261,9 @@ class TestDiscoverAllPlugins:
         from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 
         # Expected counts verified during migration from hookimpl files
-        EXPECTED_SOURCE_COUNT = 7  # csv, json, null, aws_s3, azure_blob, dataverse, text
-        EXPECTED_TRANSFORM_COUNT = 31  # Existing 29 plus two AWS Bedrock Guardrail transforms
-        EXPECTED_SINK_COUNT = 8  # csv, json, text, database, aws_s3, azure_blob, dataverse, chroma_sink
+        EXPECTED_SOURCE_COUNT = 9  # Seven original sources plus llm plus blob_rows (elspeth-0c6a343921)
+        EXPECTED_TRANSFORM_COUNT = 37  # Existing 34 plus reference_join, blob_json_expand and blob_text_expand
+        EXPECTED_SINK_COUNT = 9  # csv, json, text, document, database, aws_s3, azure_blob, dataverse, chroma_sink
 
         discovered = discover_all_plugins()
 
@@ -271,6 +279,73 @@ class TestDiscoverAllPlugins:
             f"Sink count: expected {EXPECTED_SINK_COUNT}, got {len(discovered['sinks'])}. "
             f"Found: {[cls.name for cls in discovered['sinks']]}"  # type: ignore[attr-defined]
         )
+
+    def test_live_golden_and_v3_pb09_plugin_and_variant_sets_are_exact(self) -> None:
+        from elspeth.plugins.infrastructure.azure_auth import AzureAuthMethod
+        from elspeth.plugins.infrastructure.clients.dataverse import DataverseAuthConfig
+        from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchAuthMode
+        from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode, ChromaSearchMode
+        from elspeth.plugins.sources.llm.source import LLMSource
+        from elspeth.plugins.transforms.aws.textract_config_shared import AuthMode as TextractAuthMode
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        discovered = discover_all_plugins()
+        live_keys = {f"{kind.removesuffix('s')}:{cast(Any, plugin).name}" for kind, plugins in discovered.items() for plugin in plugins}
+        matrix = json.loads(PLUGIN_MATRIX_PATH.read_text(encoding="utf-8"))
+        golden_keys = {entry["plugin_key"] for entry in matrix["plugins"]}
+        catalog = json.loads(V3_CATALOG_PATH.read_text(encoding="utf-8"))
+        pb09 = next(leg for leg in catalog["legs"] if leg["id"] == "PB-09")
+        catalog_keys = {case["plugin_key"] for case in pb09["required_cases"]}
+
+        assert len(live_keys) == 55
+        assert live_keys == golden_keys == catalog_keys
+
+        dataverse_modes = get_args(DataverseAuthConfig.model_fields["method"].annotation)
+        variant_map = {
+            "source:azure_blob": set(get_args(AzureAuthMethod)),
+            "source:dataverse": set(dataverse_modes),
+            "source:llm": set(LLMSource.discriminated_variants()[1]),
+            "transform:aws_textract_document_analysis": set(get_args(TextractAuthMode)),
+            "transform:aws_textract_inline_analysis": set(get_args(TextractAuthMode)),
+            "transform:llm": set(LLMTransform.discriminated_variants()[1]),
+            "transform:rag_retrieval": {
+                *(f"azure-search-{mode.replace('_', '-')}" for mode in get_args(AzureSearchAuthMode)),
+                *(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
+            },
+            "sink:azure_blob": set(get_args(AzureAuthMethod)),
+            "sink:chroma_sink": set(get_args(ChromaConnectionMode)),
+            "sink:dataverse": set(dataverse_modes),
+        }
+        expected_pairs = {(plugin_key, variant) for plugin_key in live_keys for variant in variant_map.get(plugin_key, {"default"})}
+        golden_pairs = {(entry["plugin_key"], variant) for entry in matrix["plugins"] for variant in entry["variants"]}
+        catalog_pairs = {(case["plugin_key"], case["variant_id"]) for case in pb09["required_cases"]}
+
+        assert len(expected_pairs) == 76
+        assert expected_pairs == golden_pairs == catalog_pairs
+        assert {case["case_id"] for case in pb09["required_cases"]} == {
+            plugin_key if variant == "default" else f"{plugin_key}@{variant}" for plugin_key, variant in expected_pairs
+        }
+        assert all(
+            cell["status"] == "required" and cell["reason"] is None
+            for case in pb09["required_cases"]
+            for profile in case["cell_applicability"].values()
+            for cell in profile.values()
+        )
+
+    def test_source_scan_includes_nested_llm_directory(self) -> None:
+        assert PLUGIN_SCAN_CONFIG["sources"] == ["sources", "sources/llm"]
+
+    def test_repeated_discovery_returns_canonical_llm_source_identity(self) -> None:
+        from elspeth.plugins.infrastructure.discovery import discover_all_plugins
+        from elspeth.plugins.sources.llm.source import LLMSource
+
+        first = next(plugin for plugin in discover_all_plugins()["sources"] if plugin.name == "llm")
+        second = next(plugin for plugin in discover_all_plugins()["sources"] if plugin.name == "llm")
+
+        assert first is LLMSource
+        assert second is LLMSource
+        assert first is second
+        assert first.__module__ == "elspeth.plugins.sources.llm.source"
 
     def test_all_plugins_have_config_model(self) -> None:
         """Every registered plugin must declare a config_model (via ClassVar or get_config_model).
@@ -523,7 +598,7 @@ class TestCreateDynamicHookimpl:
 
         hookimpl_obj = create_dynamic_hookimpl([FakePlugin], "elspeth_get_source")
 
-        assert hasattr(hookimpl_obj, "elspeth_get_source")
+        assert callable(hookimpl_obj.elspeth_get_source)  # type: ignore[attr-defined]
 
     def test_hookimpl_returns_plugin_list(self) -> None:
         """Verify hookimpl method returns the plugin classes."""
@@ -843,11 +918,12 @@ class TestDualSysModulesRegistration:
         synthetic = f"elspeth.plugins._discovered.transforms.{plugin_file.stem}"
         parent = importlib.import_module("elspeth.plugins.transforms")
         child_name = plugin_file.stem
+        parent_namespace = vars(parent)
 
         # Ensure neither name exists before discovery
         sys.modules.pop(canonical, None)
         sys.modules.pop(synthetic, None)
-        if child_name in vars(parent):
+        if child_name in parent_namespace:
             delattr(parent, child_name)
 
         try:
@@ -862,13 +938,13 @@ class TestDualSysModulesRegistration:
             # Standard import machinery also binds a child module on its parent
             # package.  Discovery must preserve that contract even though it
             # loads the file through a synthetic name first.
-            assert getattr(parent, child_name) is sys.modules[canonical]
+            assert parent_namespace[child_name] is sys.modules[canonical]
             namespace: dict[str, object] = {}
             exec(f"import {canonical} as imported", namespace)
             assert namespace["imported"] is sys.modules[canonical]
         finally:
             canonical_module = sys.modules.get(canonical)
-            if canonical_module is not None and getattr(parent, child_name, None) is canonical_module:
+            if canonical_module is not None and parent_namespace.get(child_name) is canonical_module:
                 delattr(parent, child_name)
             sys.modules.pop(canonical, None)
             sys.modules.pop(synthetic, None)

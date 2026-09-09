@@ -23,6 +23,166 @@ def test_cli_accepts_empty_rule_set(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert captured.err == ""
 
 
+def test_cli_refuses_to_run_check_without_an_explicit_rule_selection(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Omitting --rules must fail loudly, never exit 0 having run nothing.
+
+    A ``check`` that silently selects no rules is indistinguishable from a
+    clean tree, so the documented gate command would certify anything.
+    """
+    from elspeth_lints.core.cli import main
+
+    exit_code = main(["check", "--root", str(tmp_path)])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "--rules" in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("selection", ["", "   ", ",,,", " , , ", " nothing ", "nothing,", ",nothing"])
+def test_cli_refuses_empty_parsed_rule_selections(
+    selection: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only the explicit ``nothing`` token may request an empty skeleton run."""
+    from elspeth_lints.core.cli import main
+
+    exit_code = main(["check", "--rules", selection, "--root", str(tmp_path)])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "--rules" in captured.err
+    assert captured.out == ""
+
+
+def test_cli_rules_all_token_selects_every_registered_rule() -> None:
+    """``--rules all`` is the affordance for running the whole registered set."""
+    from elspeth_lints.core.cli import _expand_rule_tokens
+
+    available = {"composer.catch_order", "immutability.freeze_guards"}
+
+    assert set(_expand_rule_tokens(("all",), available)) == available
+
+
+def test_cli_parser_accepts_fail_on_inert_for_check() -> None:
+    """The inert-rule gate is an explicit check-mode opt-in."""
+    from elspeth_lints.core.cli import _build_parser
+
+    parser = _build_parser()
+    args = parser.parse_args(["check", "--rules", "nothing", "--fail-on-inert"])
+
+    assert args.fail_on_inert is True
+    assert parser.parse_args(["check", "--rules", "nothing"]).fail_on_inert is False
+
+
+def test_cli_rotate_defaults_to_the_confined_source_root() -> None:
+    """The operator rotation verb must not require an unbounded root choice."""
+    from elspeth_lints.core.cli import _build_parser
+
+    args = _build_parser().parse_args(["rotate", "--allowlist-dir", "allowlist", "--dry-run"])
+
+    assert args.root == Path("src/elspeth")
+
+
+@pytest.mark.parametrize("config_path", [Path(".pre-commit-config.yaml"), Path(".github/workflows/ci.yaml")])
+def test_full_scan_incremental_policy_gates_fail_on_inert(config_path: Path) -> None:
+    """Full-corpus gates opt in; changed-file hooks may legitimately reach only a rule subset."""
+    import shlex
+
+    import yaml
+
+    from elspeth_lints.core.cli import _expand_rule_tokens, _parse_rules
+    from elspeth_lints.core.protocols import RuleScope
+    from elspeth_lints.core.registry import RuleRegistry
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if config_path.name == ".pre-commit-config.yaml":
+        command_sources = [hook["entry"] for repo in payload["repos"] for hook in repo.get("hooks", ()) if "entry" in hook]
+    else:
+        command_sources = [step["run"] for job in payload["jobs"].values() for step in job.get("steps", ()) if "run" in step]
+
+    registry = RuleRegistry()
+    registry.load_builtin_rules()
+    available = set(registry.ids())
+    audited_commands = 0
+    for source in command_sources:
+        logical_source = source.replace("\\\n", " ")
+        for line in logical_source.splitlines():
+            if "elspeth_lints.core.cli check" not in line:
+                continue
+            argv = shlex.split(line)
+            if "check" not in argv:
+                continue
+            check_args = argv[argv.index("check") + 1 :]
+            raw_rules = check_args[check_args.index("--rules") + 1]
+            selected_ids = _expand_rule_tokens(_parse_rules(raw_rules), available)
+            if not any(registry.get(rule_id).scope is RuleScope.INCREMENTAL for rule_id in selected_ids):
+                continue
+            audited_commands += 1
+            assert ("--fail-on-inert" in check_args) is ("--files" not in check_args), line
+
+    assert audited_commands == 6
+
+
+def test_cli_reports_a_missing_judge_key_as_an_operator_error_not_a_traceback(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A keyless run must fail closed with a remedy, not an unhandled stack trace.
+
+    The gate still refuses to run — verification is never downgraded on the
+    CLI's own initiative — but the operator is told which env var restores it.
+    """
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.allowlist import JudgeMetadataKeyUnavailableError
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    class KeylessRule:
+        id = "demo.keyless"
+        scope = RuleScope.WHOLE_REPO
+        metadata = RuleMetadata(
+            id=id,
+            name="Keyless",
+            description="Raises the operator-configuration error.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r".*\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree, file_path, context
+            raise JudgeMetadataKeyUnavailableError("ELSPETH_JUDGE_METADATA_HMAC_KEY is required to verify judge metadata.")
+
+    registry = RuleRegistry()
+    registry.register(KeylessRule())
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.keyless",
+            rule_set="static",
+            format="text",
+            root=tmp_path,
+            repo_root=None,
+            allowlist_dir=None,
+            files=[],
+            fail_on_inert=False,
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" in captured.err
+    assert "ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cli_honors_empty_rule_set_without_optional_rule_dependencies(tmp_path: Path) -> None:
     """A standalone install can run an empty check without optional rule imports."""
     env = _standalone_lints_env_without_runtime_packages(tmp_path)
@@ -184,8 +344,10 @@ def test_cli_refuses_explicit_files_outside_rule_path_filter(tmp_path: Path, cap
             rule_set="static",
             format="text",
             root=tmp_path,
+            repo_root=None,
             allowlist_dir=None,
             files=[outside],
+            fail_on_inert=False,
         ),
         registry=registry,
     )
@@ -194,6 +356,245 @@ def test_cli_refuses_explicit_files_outside_rule_path_filter(tmp_path: Path, cap
     captured = capsys.readouterr()
     assert "outside.py" in captured.err
     assert "demo.scoped" in captured.err
+
+
+def test_cli_fail_on_inert_rejects_incremental_rule_matching_only_lint_fixtures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A rule's synthetic examples cannot prove that it inspected production code."""
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    class InertRule:
+        id = "demo.inert"
+        scope = RuleScope.INCREMENTAL
+        metadata = RuleMetadata(
+            id=id,
+            name="Inert",
+            description="Only matches its own synthetic fixture.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"(^|/)target\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree, file_path, context
+            return ()
+
+    class LiveRule:
+        id = "demo.live"
+        scope = RuleScope.INCREMENTAL
+        metadata = RuleMetadata(
+            id=id,
+            name="Live",
+            description="Matches a production file.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"^live\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree, file_path, context
+            return ()
+
+    class TestsFixtureRule:
+        id = "demo.tests-fixture"
+        scope = RuleScope.INCREMENTAL
+        metadata = RuleMetadata(
+            id=id,
+            name="Tests fixture",
+            description="Matches real test-double code.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"^tests/fixtures/live\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree, file_path, context
+            return ()
+
+    fixture = tmp_path / "src" / "elspeth_lints" / "rules" / "demo" / "fixtures" / "target.py"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "live.py").write_text("value = 1\n", encoding="utf-8")
+    tests_fixture = tmp_path / "tests" / "fixtures" / "live.py"
+    tests_fixture.parent.mkdir(parents=True)
+    tests_fixture.write_text("value = 1\n", encoding="utf-8")
+    registry = RuleRegistry()
+    registry.register(InertRule())
+    registry.register(LiveRule())
+    registry.register(TestsFixtureRule())
+
+    unarmed_exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.inert,demo.live,demo.tests-fixture",
+            rule_set="static",
+            format="text",
+            root=tmp_path,
+            repo_root=None,
+            allowlist_dir=None,
+            files=None,
+            fail_on_inert=False,
+        ),
+        registry=registry,
+    )
+
+    assert unarmed_exit_code == 0
+    assert capsys.readouterr().out == ""
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.inert,demo.live,demo.tests-fixture",
+            rule_set="static",
+            format="text",
+            root=tmp_path,
+            repo_root=None,
+            allowlist_dir=None,
+            files=None,
+            fail_on_inert=True,
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "demo.inert" in captured.out
+    assert "demo.live" not in captured.out
+    assert "demo.tests-fixture" not in captured.out
+    assert "matched zero non-fixture Python files" in captured.out
+    assert InertRule.metadata.path_filter in captured.out
+
+
+def test_cli_fail_on_inert_accepts_incremental_rule_with_a_production_match(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One real matching file proves that an incremental rule was dispatched."""
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    class LiveRule:
+        id = "demo.live"
+        scope = RuleScope.INCREMENTAL
+        metadata = RuleMetadata(
+            id=id,
+            name="Live",
+            description="Matches production Python files.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"^target\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree, file_path, context
+            return ()
+
+    (tmp_path / "target.py").write_text("value = 1\n", encoding="utf-8")
+    registry = RuleRegistry()
+    registry.register(LiveRule())
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.live",
+            rule_set="static",
+            format="text",
+            root=tmp_path,
+            repo_root=None,
+            allowlist_dir=None,
+            files=None,
+            fail_on_inert=True,
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_cli_fail_on_inert_does_not_reclassify_whole_repo_rule_with_zero_diagnostic_matches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Whole-repo analyzers run independently of their diagnostic path filter."""
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    calls = 0
+
+    class WholeRepoRule:
+        id = "demo.whole"
+        scope = RuleScope.WHOLE_REPO
+        metadata = RuleMetadata(
+            id=id,
+            name="Whole repo",
+            description="Runs even when no diagnostic paths match.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"^missing/.*\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            nonlocal calls
+            del tree, file_path, context
+            calls += 1
+            return ()
+
+    registry = RuleRegistry()
+    registry.register(WholeRepoRule())
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.whole",
+            rule_set="static",
+            format="text",
+            root=tmp_path,
+            repo_root=None,
+            allowlist_dir=None,
+            files=None,
+            fail_on_inert=True,
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 0
+    assert calls == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
 
 
 def test_cli_surfaces_parse_and_read_errors_for_whole_repo_rules(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -237,8 +638,10 @@ def test_cli_surfaces_parse_and_read_errors_for_whole_repo_rules(tmp_path: Path,
             rule_set="static",
             format="json",
             root=tmp_path,
+            repo_root=None,
             allowlist_dir=None,
             files=None,
+            fail_on_inert=False,
         ),
         registry=registry,
     )
@@ -250,11 +653,16 @@ def test_cli_surfaces_parse_and_read_errors_for_whole_repo_rules(tmp_path: Path,
     assert {"parse-error", "read-error"} <= rule_ids
 
 
-def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A scoped whole-repo rule must not fail on malformed files outside its path_filter."""
     import argparse
     from collections.abc import Iterable
 
+    from elspeth_lints.core import ast_walker
     from elspeth_lints.core.cli import _run_check
     from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
     from elspeth_lints.core.registry import RuleRegistry
@@ -284,6 +692,14 @@ def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Pat
     (tmp_path / ".uv-cache").mkdir()
     (tmp_path / ".uv-cache" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
     (tmp_path / "outside.py").write_text("def broken(:\n", encoding="utf-8")
+    parsed_paths: list[str] = []
+    original_parse_python_file = ast_walker.parse_python_file
+
+    def recording_parse_python_file(path: Path) -> object:
+        parsed_paths.append(path.relative_to(tmp_path).as_posix())
+        return original_parse_python_file(path)
+
+    monkeypatch.setattr(ast_walker, "parse_python_file", recording_parse_python_file)
     registry = RuleRegistry()
     registry.register(ScopedWholeRepoRule())
 
@@ -296,6 +712,7 @@ def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Pat
             allowlist_dir=None,
             repo_root=None,
             files=None,
+            fail_on_inert=False,
         ),
         registry=registry,
     )
@@ -303,6 +720,77 @@ def test_cli_whole_repo_parse_diagnostics_respect_rule_path_filter(tmp_path: Pat
     assert exit_code == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out) == []
+    assert parsed_paths == ["src/good.py"]
+
+
+def test_cli_root_scan_excludes_nested_agent_worktrees_when_rule_path_filter_matches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A root scan must not report findings from another branch's worktree."""
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    class WebRule:
+        id = "demo.web"
+        scope = RuleScope.INCREMENTAL
+        metadata = RuleMetadata(
+            id=id,
+            name="Web",
+            description="Demo web rule with a production-shaped path filter.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r"(^|/)src/elspeth/web/.+\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree
+            display_path = file_path.relative_to(context.root).as_posix()
+            return (
+                Finding(
+                    rule_id=self.id,
+                    file_path=display_path,
+                    line=1,
+                    column=0,
+                    message="visited",
+                    fingerprint=display_path,
+                    severity=self.metadata.severity,
+                ),
+            )
+
+    live = tmp_path / "src" / "elspeth" / "web" / "live.py"
+    leaked = tmp_path / ".claude" / "worktrees" / "sibling" / "src" / "elspeth" / "web" / "leaked.py"
+    for source_path in (live, leaked):
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text("value = 1\n", encoding="utf-8")
+    registry = RuleRegistry()
+    registry.register(WebRule())
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.web",
+            rule_set="static",
+            format="json",
+            root=tmp_path,
+            allowlist_dir=None,
+            repo_root=None,
+            files=None,
+            fail_on_inert=False,
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert [finding["file_path"] for finding in payload] == ["src/elspeth/web/live.py"]
 
 
 def test_registry_decorator_registers_rule() -> None:

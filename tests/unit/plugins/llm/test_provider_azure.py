@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -23,7 +24,13 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult, UnrecognizedFinishReason
+from elspeth.plugins.transforms.llm.provider import (
+    FinishReason,
+    LLMAuditParent,
+    LLMProvider,
+    LLMQueryResult,
+    UnrecognizedFinishReason,
+)
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
 
 
@@ -73,7 +80,7 @@ class FakeUnderlyingAzureClient:
 @dataclass(frozen=True)
 class ChatCompletionCall:
     model: str
-    messages: list[dict[str, str]]
+    messages: Sequence[ChatMessage]
     temperature: float
     max_tokens: int | None
     response_format: dict[str, Any] | None
@@ -89,7 +96,7 @@ class FakeLLMClient:
     def chat_completion(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
@@ -132,8 +139,8 @@ def _make_provider(
 def _provider_llm_client(provider: AzureLLMProvider, client: FakeLLMClient) -> Iterator[None]:
     original_get = provider._get_llm_client
 
-    def get_llm_client(state_id: str, *, token_id: str | None = None) -> FakeLLMClient:
-        _ = state_id, token_id
+    def get_llm_client(audit_parent: LLMAuditParent) -> FakeLLMClient:
+        _ = audit_parent
         return client
 
     provider._get_llm_client = get_llm_client  # type: ignore[method-assign]
@@ -191,12 +198,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert isinstance(result, LLMQueryResult)
@@ -211,12 +220,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert result.finish_reason is FinishReason.STOP
@@ -226,12 +237,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert isinstance(result.finish_reason, UnrecognizedFinishReason)
@@ -242,12 +255,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(RateLimitError, match="429 rate limited"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_propagates_content_policy_error(self, provider: AzureLLMProvider) -> None:
@@ -255,12 +270,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_propagates_server_error(self, provider: AzureLLMProvider) -> None:
@@ -268,12 +285,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ServerError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_propagates_network_error(self, provider: AzureLLMProvider) -> None:
@@ -281,12 +300,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(NetworkError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_propagates_llm_client_error(self, provider: AzureLLMProvider) -> None:
@@ -294,12 +315,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(LLMClientError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_propagates_context_length_error(self, provider: AzureLLMProvider) -> None:
@@ -307,12 +330,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContextLengthError):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_execute_query_timeout_propagates_as_network_error(self, provider: AzureLLMProvider) -> None:
@@ -321,12 +346,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(NetworkError, match="timed out"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_no_raw_response_still_works(self, provider: AzureLLMProvider) -> None:
@@ -341,12 +368,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=None,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert result.finish_reason is None
@@ -364,12 +393,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client):
             result = provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=None,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert result.finish_reason is None
@@ -387,12 +418,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_whitespace_only_content_raises_content_policy_error(self, provider: AzureLLMProvider) -> None:
@@ -406,12 +439,14 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(ContentPolicyError, match="empty content"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_empty_content_with_tool_calls_finish_reason(self, provider: AzureLLMProvider) -> None:
@@ -426,13 +461,43 @@ class TestExecuteQuery:
 
         with _provider_llm_client(provider, client), pytest.raises(LLMClientError, match="tool_calls"):
             provider.execute_query(
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
+
+    def test_operation_parent_constructs_audited_client_and_records_operation_call(
+        self,
+        provider: AzureLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+    ) -> None:
+        def fail_create(**kwargs: Any) -> None:
+            del kwargs
+            raise RuntimeError("provider failure")
+
+        provider._underlying_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fail_create)),
+        )
+
+        with pytest.raises(LLMClientError):
+            provider.execute_query(
+                messages=[ChatMessage(role="user", content="hi")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            )
+
+        assert audit_recorder.calls == []
+        assert audit_recorder.allocated_state_ids == []
+        assert audit_recorder.allocated_operation_ids == ["operation-1"]
+        assert [call["operation_id"] for call in audit_recorder.operation_calls] == ["operation-1"]
+        assert provider._llm_clients == {}
 
 
 class TestClientCaching:
@@ -446,9 +511,9 @@ class TestClientCaching:
         provider = _make_provider(audit_recorder, telemetry_emit)
         provider._underlying_client = FakeUnderlyingAzureClient()
 
-        client1 = provider._get_llm_client("state-a", token_id="tok-1")
-        client2 = provider._get_llm_client("state-a", token_id="tok-1")
-        client3 = provider._get_llm_client("state-b", token_id="tok-2")
+        client1 = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
+        client2 = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
+        client3 = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-b", token_id="tok-2"))
 
         assert client1 is client2  # Same state_id → same client
         assert client1 is not client3  # Different state_id → different client
@@ -470,7 +535,7 @@ class TestClientCaching:
 
         def create_client() -> None:
             barrier.wait()
-            c = provider._get_llm_client("state-race", token_id="tok-1")
+            c = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-race", token_id="tok-1"))
             with collect_lock:
                 clients.append(c)
 
@@ -493,7 +558,7 @@ class TestClientCaching:
         underlying_client = FakeUnderlyingAzureClient()
         provider._underlying_client = underlying_client
 
-        provider._get_llm_client("state-1", token_id="tok-1")
+        provider._get_llm_client(LLMAuditParent.for_row(state_id="state-1", token_id="tok-1"))
 
         assert len(provider._llm_clients) == 1
         provider.close()

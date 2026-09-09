@@ -22,7 +22,7 @@ from pathlib import Path
 
 from tests.fixtures.base_classes import create_observed_contract, inject_write_failure
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
 from elspeth.contracts import NodeType, PendingOutcome, TokenInfo
 from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
@@ -102,6 +102,7 @@ class TestCSVSinkExecutorAuditChain:
             span_factory=SpanFactory(),
             run_id=setup.run_id,
             factory=setup.factory,
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         )
 
         # ── Drive the production path ──
@@ -117,6 +118,7 @@ class TestCSVSinkExecutorAuditChain:
                     path=TerminalPath.DEFAULT_FLOW,
                 ),
                 effect_mode="write",
+                join_group_id_by_token={token.token_id: None},
             )
         finally:
             sink.close()

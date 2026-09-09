@@ -96,8 +96,10 @@ def _assert_single_read_only_open(calls: list[dict[str, Any]]) -> None:
 
 class TestConvertedLoadersServeReadsReadOnly:
     def test_run_accounting_for_settings(self, audit_db_url: str, from_url_spy: list[dict[str, Any]]) -> None:
-        accounting = load_run_accounting_for_settings(_settings(audit_db_url), (RUN_ID, None))
+        batch = load_run_accounting_for_settings(_settings(audit_db_url), (RUN_ID, None))
 
+        accounting = batch.accounting
+        assert batch.corrupt == {}
         assert set(accounting) == {RUN_ID}
         assert accounting[RUN_ID].source.rows_processed == 0
         _assert_single_read_only_open(from_url_spy)
@@ -138,7 +140,8 @@ class TestConvertedLoadersServeReadsReadOnly:
         missing = tmp_path / "never-created.db"
         settings = _settings(f"sqlite:///{missing}")
 
-        assert load_run_accounting_for_settings(settings, (RUN_ID,)) == {}
+        missing_batch = load_run_accounting_for_settings(settings, (RUN_ID,))
+        assert missing_batch.accounting == {} and missing_batch.corrupt == {}
         assert load_discard_summaries_for_settings(settings, (RUN_ID,)) == {}
         assert not missing.exists()
 

@@ -180,6 +180,56 @@ def test_pipeline_proposal_is_recursively_immutable_and_detached() -> None:
     assert proposal.pipeline["nodes"][0]["options"]["rules"][0]["column"] == "name"
 
 
+def _nested_json_mapping(depth: int) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for _ in range(depth):
+        value = {"child": value}
+    return value
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        pytest.param(_nested_json_mapping(65), id="depth"),
+        pytest.param({"values": [None] * 10_000}, id="nodes"),
+        pytest.param({"values": ["x" * 61_700] * 17}, id="bytes"),
+    ],
+)
+def test_create_rejects_over_budget_json_with_audit_integrity_error(pipeline: dict[str, Any]) -> None:
+    with pytest.raises(AuditIntegrityError, match="pipeline"):
+        _create_proposal(pipeline=pipeline)
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        pytest.param(_nested_json_mapping(63), id="depth"),
+        pytest.param({"values": [None] * 9_984}, id="nodes"),
+        pytest.param({"values": ["x" * 65_400] * 16}, id="bytes"),
+    ],
+)
+def test_create_and_restore_accept_json_just_below_budgets(pipeline: dict[str, Any]) -> None:
+    proposal = _create_proposal(pipeline=pipeline)
+
+    assert PipelineProposal.from_dict(proposal.to_dict(), reviewed_facts=_reviewed_facts()) == proposal
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        pytest.param(_nested_json_mapping(65), id="depth"),
+        pytest.param({"values": [None] * 10_000}, id="nodes"),
+        pytest.param({"values": ["x" * 61_700] * 17}, id="bytes"),
+    ],
+)
+def test_restore_rejects_over_budget_json_with_audit_integrity_error(pipeline: dict[str, Any]) -> None:
+    payload = _create_proposal().to_dict()
+    payload["pipeline"] = pipeline
+
+    with pytest.raises(AuditIntegrityError, match="pipeline proposal payload"):
+        PipelineProposal.from_dict(payload, reviewed_facts=_reviewed_facts())
+
+
 def test_pipeline_proposal_rejects_plain_tuple_inside_mapping_proxy() -> None:
     with pytest.raises(AuditIntegrityError, match="got tuple"):
         _create_proposal(pipeline=MappingProxyType({"value": (1, 2)}))
@@ -210,11 +260,11 @@ def test_reviewed_anchor_hash_uses_versioned_deep_frozen_facts() -> None:
     assert reviewed_anchor_hash(facts) != expected
 
 
-def test_draft_hash_has_explicit_v2_expanded_envelope_golden_preimage() -> None:
-    """v2 deliberately supersedes the design's older pipeline-only v1 hash."""
+def test_draft_hash_has_explicit_v3_order_bound_envelope_golden_preimage() -> None:
+    """v3 adds row-union order binding to the expanded v2 envelope."""
     proposal = _create_proposal()
     expected_preimage = {
-        "schema": "composer.pipeline-proposal-envelope.v2",
+        "schema": "composer.pipeline-proposal-envelope.v3",
         "pipeline": _pipeline(),
         "base": {
             "kind": "present",
@@ -238,7 +288,7 @@ def test_draft_hash_has_explicit_v2_expanded_envelope_golden_preimage() -> None:
         '["name","score"],"credentials":{"secret_ref":"CSV_API_TOKEN"}},"plugin":"csv"}},"repair_count":1,'
         '"reviewed_anchor_hash":"'
         + reviewed_anchor_hash(_reviewed_facts())
-        + '","schema":"composer.pipeline-proposal-envelope.v2","skill_hash":"'
+        + '","schema":"composer.pipeline-proposal-envelope.v3","skill_hash":"'
         + "c" * 64
         + '","supersedes_draft_hash":"'
         + "d" * 64
@@ -471,6 +521,11 @@ def test_envelope_defines_no_duplicate_topology_dataclasses_or_rationale() -> No
 
 def test_composition_content_hash_exactly_matches_moved_legacy_preimage() -> None:
     class _State:
+        # Real CompositionState instances always carry the memo slot; the
+        # stand-in models that contract so the preimage pin exercises the
+        # same uncached-compute path.
+        _content_hash_memo: str | None = None
+
         def to_dict(self) -> dict[str, Any]:
             return {
                 "version": 17,
@@ -591,3 +646,83 @@ def test_create_hashes_and_seals_the_same_validated_mapping_snapshot() -> None:
 
     assert proposal.draft_hash == baseline.draft_hash
     assert deep_thaw(proposal.pipeline) == {"value": "safe"}
+
+
+class TestCompositionContentHashMemo:
+    """``composition_content_hash`` memoizes on the frozen instance (elspeth-ac85b0ab0e review).
+
+    Preflight identity keys rebuild the hash several times per composer turn;
+    without the memo each rebuild re-serializes the whole state via
+    ``to_dict``. The memo must never survive onto a modified copy — every
+    mutation constructor re-runs ``__init__``, which resets the slot.
+    """
+
+    @staticmethod
+    def _state():
+        from elspeth.web.composer.state import (
+            CompositionState,
+            OutputSpec,
+            PipelineMetadata,
+            SourceSpec,
+        )
+
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="main",
+                    plugin="csv",
+                    options={"path": "out.csv"},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_repeat_calls_serialize_once(self, monkeypatch) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from elspeth.web.composer.state import CompositionState
+
+        state = self._state()
+        calls = 0
+        real_to_dict = CompositionState.to_dict
+
+        def counting_to_dict(instance):
+            nonlocal calls
+            calls += 1
+            return real_to_dict(instance)
+
+        monkeypatch.setattr(CompositionState, "to_dict", counting_to_dict)
+        first = composition_content_hash(state)
+        second = composition_content_hash(state)
+        assert first == second
+        assert calls == 1
+
+    def test_mutated_copy_recomputes_and_differs(self) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+        state = self._state()
+        baseline = composition_content_hash(state)
+        renamed = state.with_metadata({"name": "renamed"})
+        assert composition_content_hash(renamed) != baseline
+
+    def test_version_only_copy_recomputes_to_the_same_content_hash(self) -> None:
+        """Version is excluded from content identity; the memo must not leak
+        a stale slot through ``replace`` either way."""
+        from dataclasses import replace
+
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+        state = self._state()
+        baseline = composition_content_hash(state)
+        bumped = replace(state, version=state.version + 1)
+        assert bumped._content_hash_memo is None
+        assert composition_content_hash(bumped) == baseline

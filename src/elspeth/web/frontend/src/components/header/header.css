@@ -9,10 +9,95 @@
 /* ---------------------------------------------------------------------------
    App Root & Alert Banners
    --------------------------------------------------------------------------- */
+/* The band along the top is RESERVED for the app-level overlay strips
+   (.app-notice-center in styles/shared.css, .run-outcome-notice-overlay in
+   execution.css, and .classification-banner below), which are fixed at
+   top: 0 and one --size-control tall.
+
+   Why reserve instead of letting them overlay (elspeth-1c4687ff67 follow-up):
+   those strips were taken out of flow so a notice's arrival would stop
+   displacing the whole viewport, but at top: 0 the 44px opaque bar covered the
+   header outright — the session switcher, version control and account menu all
+   sat inside its band, elementFromPoint returned the bar, and none of them
+   could be clicked while any notice was up.
+
+   Reserving is the only escape that keeps the no-shift contract. Seating the
+   strips BELOW the header instead was measured and rejected: there is no 44px
+   band anywhere in this layout that is neither chrome nor content the operator
+   must reach — header, then the artifact tab strip immediately under it, then
+   the workspace action bar at the bottom — so a full-width pinned strip always
+   covers something. Offsetting merely moved the occlusion onto Graph/Spec/
+   YAML/Run.
+
+   The reserve is the STRIP's height (a constant), not the header's (which is
+   40/37/45/~130px across the wrap and compact rules), so no measurement is
+   involved. It is unconditional because making it conditional on a notice
+   being mounted reintroduces exactly the arrival/dismiss shift
+   elspeth-1c4687ff67 removed. */
 .app-root {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  height: 100vh;
+  height: 100dvh;
+  padding-top: var(--size-control);
+}
+
+/* The shared-inspect route renders neither the header nor any overlay strip
+   (App.tsx short-circuits before them all), so there is nothing to reserve
+   for. */
+.app-root--shared-inspect {
+  padding-top: 0;
+}
+
+/* Protective-marking strip (ClassificationBanner.tsx): occupies the reserved
+   band rather than adding height anywhere. Fixed like its band-mates but with
+   NO z-index, so the notice/run-outcome strips (--z-overlay, opaque grounds)
+   paint over it while mounted — the marking is ambient deployment identity,
+   never urgent, and always loses that contest. Background comes from the
+   theme-invariant classification tokens (tokens.css); mono + caps + tracking
+   is the audit/forensic register the wordmark owns. */
+.classification-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--size-control);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-classification-text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  letter-spacing: var(--letter-spacing-caps);
+  /* No text-transform: the component emits each marking in its standard
+     PSPF form ("OFFICIAL: Sensitive", "PROTECTED//CABINET") and an
+     uppercase transform would rewrite it into a non-standard rendering. */
+}
+
+.classification-banner--unofficial {
+  background: var(--color-classification-unofficial-bg);
+}
+
+.classification-banner--official {
+  background: var(--color-classification-official-bg);
+}
+
+/* Yellow is the one ground the shared white ink fails on; the marking text
+   flips to the dark ink (11.6:1, pinned in colorContrast.test.ts). */
+.classification-banner--official-sensitive {
+  background: var(--color-classification-official-sensitive-bg);
+  color: var(--color-classification-text-dark);
+}
+
+.classification-banner--protected {
+  background: var(--color-classification-protected-bg);
+}
+
+/* The CABINET caveat changes the marking TEXT, not the classification
+   colour — it shares PROTECTED's blue ground. */
+.classification-banner--protected-cabinet {
+  background: var(--color-classification-protected-bg);
 }
 
 .alert-banner {
@@ -37,6 +122,18 @@
   min-height: var(--size-control-compact);
   margin-left: var(--space-md);
   flex-shrink: 0;
+  /* Exactly the property :hover changes (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast);
+}
+
+.alert-banner-action:hover {
+  background: var(--color-surface-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .alert-banner-action {
+    transition: none;
+  }
 }
 
 .alert-banner--info {
@@ -79,6 +176,12 @@
   flex: 1;
   min-height: 0;
   position: relative;
+  /* Short-viewport scroll path (elspeth-7aa9787996, WCAG 1.4.10): the shell
+     below (.app-layout) floors itself at a usable canvas height, so when the
+     viewport is shorter than that floor the overflow must scroll here — with
+     body{overflow:hidden} there is no other vertical scroll path. On tall
+     viewports the layout is exactly 100% and this never engages. */
+  overflow-y: auto;
 }
 
 /* ---------------------------------------------------------------------------
@@ -154,6 +257,22 @@
   }
 }
 
+@media (min-width: 961px) and (max-height: 800px) {
+  .app-header {
+    /* The row includes its 1px bottom border; reserve a full 36px content
+       box so compact controls never straddle adjacent application regions. */
+    height: calc(var(--size-control-compact) + 1px);
+    padding-inline: var(--space-sm);
+  }
+
+  .header-session-switcher-trigger,
+  .header-version-selector .version-selector-trigger,
+  .user-menu-trigger {
+    height: var(--size-control-compact);
+    min-height: var(--size-control-compact);
+  }
+}
+
 /* The header brand mark is rendered by the canonical <WordMark> primitive
    (components/ui/WordMark.tsx), which owns the mono/uppercase/tracking
    treatment — the rationale (JetBrains Mono = "audit/forensic" register, a
@@ -167,6 +286,44 @@
   background-color: var(--color-border);
 }
 
+/* ModelChip renders nothing until /api/system/status resolves (and stays
+   absent when no model is configured) — hide a separator left dangling as
+   the cluster's last child rather than special-casing the chip's mount. */
+.app-header-left .app-header-separator:last-child {
+  display: none;
+}
+
+/* Composer-model identity chip (elspeth-e9f7678de8), relocated here from the
+   chat-panel headers (elspeth-8fa71e6d15): identity chrome belongs in the
+   identity-chrome region, which has page width. Quiet reference chrome:
+   mono + muted so it reads as provenance metadata, not a control.
+   --color-text-muted passes 4.5:1 on both themes' page backgrounds (pinned
+   by colorContrast.test.ts). Truncates rather than overflows
+   (elspeth-0b70269ccc); the max-width fence keeps a long provider/model id
+   from crowding the session switcher at the 1280px minimum supported width
+   — the full value stays available via the chip's aria-label. */
+.chat-model-chip {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  color: var(--color-text-muted);
+  min-width: 0;
+
+  /* 48ch: wide enough for a full provider/vendor/model id like
+     "openrouter/anthropic/claude-sonnet-5" (36 chars) with headroom, while
+     still fencing a pathological id away from the session switcher at the
+     1280px minimum supported width. */
+  max-width: 48ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-model-chip-label {
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
 .header-session-switcher {
   position: relative;
 }
@@ -176,19 +333,130 @@
    the design system, so this selector only carries header-specific concerns
    if any are added later. No declarations here is correct. */
 
-.header-session-switcher-menu {
+/* Floating popover surface (elspeth-8c7ac37d49): one absolutely-positioned
+   box hung off the trigger that carries BOTH the filter-controls strip and
+   the menu. The strip used to render in flow inside the header wrapper, so
+   opening the switcher grew the 41px header to ~60px (clipping 10px above
+   the viewport, spilling 9px below the seam) and widened the wrapper to
+   ~314px, shoving the separator and the model chip right — and the menu,
+   anchored to the grown wrapper, dropped below the STRIP instead of below
+   its trigger. Because the popover is out of flow, the wrapper's in-flow
+   content is the trigger alone and the header's height contract holds.
+
+   Elevation (elspeth-4d38a73632): --shadow-dropdown is the tier whose own
+   token comment names menus, and it is what the user menu below already
+   composes. The stacking layer comes from the z-scale (--z-overlay IS 100
+   and its token comment names dropdowns), the corner matches the --radius-md
+   the other menus use, and the popover clears its trigger by the same
+   --space-xs the user menu does. overflow:hidden clips the internal menu
+   scroller to the rounded corner. */
+.header-session-switcher-popover {
   position: absolute;
-  top: 100%;
+  top: calc(100% + var(--space-xs));
   left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 280px;
+  max-height: 60vh;
+  overflow: hidden;
+  background: var(--color-surface-nav-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-dropdown);
+  z-index: var(--z-overlay);
+}
+
+/* Filter strip above the menu (elspeth-8c7ac37d49): these three classes were
+   emitted with NO definition anywhere in the barrel, so the filter field and
+   the show-archived checkbox rendered as white UA controls on the dark
+   --color-surface-nav-raised surface. The field takes the .input primitive's
+   vocabulary (input-border, elevated surface, the contrast-gated
+   --color-text-secondary placeholder pair, the app focus-ring idiom) at the
+   compact chrome rung this dense strip sits on. */
+.header-session-switcher-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+  padding: var(--space-xs) var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.header-session-switcher-filter {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--size-control-compact);
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+}
+
+.header-session-switcher-filter::placeholder {
+  /* --color-text-secondary, not -muted: the muted tone is only ~3.84:1 on
+     --color-surface-elevated (shared.css .input::placeholder rationale,
+     gated by colorContrast.test.ts). */
+  color: var(--color-text-secondary);
+}
+
+.header-session-switcher-filter:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.header-session-switcher-show-archived {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-height: var(--size-control-compact);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.header-session-switcher-show-archived input {
+  accent-color: var(--color-accent);
+}
+
+.header-session-switcher-show-archived input:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Archive-failure alert (elspeth-8c7ac37d49): a role="alert" strip that
+   renders while the menu is CLOSED (confirmArchive fires after the menu
+   dismisses), so it floats below the trigger rather than growing the header.
+   Undefined before, it rendered as bare body prose — no error affordance on
+   the one element whose entire job is to be noticed. The tint layers over an
+   opaque surface because --color-error-bg is a 12% wash and this box floats
+   over arbitrary workspace content. */
+.header-session-switcher-archive-error {
+  position: absolute;
+  top: calc(100% + var(--space-xs));
+  left: 0;
+  z-index: var(--z-overlay);
+  min-width: 280px;
+  max-width: 420px;
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-md);
+  background-color: var(--color-surface);
+  background-image: linear-gradient(var(--color-error-bg), var(--color-error-bg));
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+  box-shadow: var(--shadow-dropdown);
+}
+
+.header-session-switcher-menu {
   margin: 0;
   padding: var(--space-xs) 0;
   list-style: none;
-  background: var(--color-surface-nav-raised);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  min-width: 240px;
-  z-index: 100;
-  max-height: 60vh;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -298,9 +566,13 @@
 
 .user-menu-list {
   position: absolute;
-  top: calc(100% + 4px);
+  top: calc(100% + var(--space-xs));
   right: 0;
-  z-index: 50;
+  /* Was the bare literal 50. Tokenised to the tier it already sat on rather
+     than promoted: which layer a menu belongs on is a system-wide call that
+     also binds the chat, workspace and inspector menus, and it cannot be
+     settled — or seen — from inside this stylesheet. */
+  z-index: var(--z-popover);
   min-width: 200px;
   margin: 0;
   padding: var(--space-xs) 0;
@@ -309,6 +581,26 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-dropdown);
+}
+
+/* Signed-in identity header — a plain non-interactive row above the action
+   items (elspeth-312238838a). Default cursor signals "not clickable". */
+.user-menu-identity {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  cursor: default;
+}
+
+.user-menu-identity-name {
+  display: block;
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+}
+
+.user-menu-identity-username {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
 }
 
 .user-menu-item {
@@ -366,6 +658,42 @@
   grid-template-columns: minmax(140px, 1fr) auto auto;
   gap: var(--space-xs);
   padding: var(--space-1-5) var(--space-sm);
+}
+
+/* This field routes through ui/Input (D3 primitive census), whose .input base
+   binds the 44px --size-control rung. Its Save/Cancel siblings in this grid
+   are 36px btn-compact, so the unadjusted primitive left one 44px control in
+   a 36px row of the dense popover. Re-assert the compact rung and its
+   padding/type scale over .input — same dense-context move as
+   .catalog-search-input. The primitive's border/focus-ring/placeholder
+   vocabulary is adopted deliberately: those were UA-default chrome on the
+   dark popover, the defect class the ui primitives exist to retire. */
+.header-session-switcher-rename-input {
+  min-height: var(--size-control-compact);
+  padding: var(--space-2xs) var(--space-sm);
+  font-size: var(--font-size-sm);
+}
+
+/* Rename-failure alert (elspeth-8c7ac37d49): in-flow directly under the
+   rename form inside the popover — co-located with the field it describes
+   (aria-describedby binds them) — but previously undefined, so it read as
+   ordinary menu prose rather than an error. Same affordance family as the
+   archive alert above; --font-size-xs (the 12px floor) in the dense menu. */
+.header-session-switcher-rename-error {
+  margin: var(--space-2xs) var(--space-sm) var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-sm);
+  /* Same layered recipe as the archive strip above: the error wash is a
+     low-alpha tint, and this strip sits on the popover's nav-raised surface —
+     a ground the contrast gate's tint matrix does not enumerate. Bare
+     tint-on-nav-raised measured 4.06:1 in the light theme (under AA); riding
+     the tint on background-image over an opaque --color-surface restores the
+     gated error-on-surface pairing in both themes. */
+  background-color: var(--color-surface);
+  background-image: linear-gradient(var(--color-error-bg), var(--color-error-bg));
+  color: var(--color-error);
+  font-size: var(--font-size-xs);
 }
 
 .runs-history-item-summary {
@@ -482,4 +810,23 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   overflow-wrap: anywhere;
+}
+
+/* Composition-history tree: a run of consecutive indistinguishable "Edited"
+   versions collapses into one expandable node (elspeth-c8a402a9a4). The row
+   itself composes .version-selector-item, so only the group-specific
+   treatment lives here — a heavier label so the summary row reads as a
+   parent, and a bullet-free indent for the nested member list.
+
+   The sibling .version-selector-* rules live in components/inspector/
+   inspector.css (historical home of the whole dropdown); these two are here
+   because header.css is where the header's own additions belong. */
+.version-selector-group {
+  font-weight: 600;
+}
+
+.version-selector-group-members {
+  list-style: none;
+  margin: 0;
+  padding-left: 0.75rem;
 }

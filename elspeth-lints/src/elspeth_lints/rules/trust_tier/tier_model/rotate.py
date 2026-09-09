@@ -78,7 +78,8 @@ from elspeth_lints.core.allowlist import (
     _verify_judge_metadata_signature_at_load,
 )
 from elspeth_lints.core.allowlist_io import AllowlistIOError, parse_allow_hits
-from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
+from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
 
 from .rule import (
     Finding,
@@ -556,6 +557,33 @@ def apply_plan(
     accept_todo_debt: bool = False,
     rotation_log_path: Path | None = None,
 ) -> dict[str, ApplyResult]:
+    """Apply one plan while excluding coherent directory publication."""
+    if allowlist_dir is not None:
+        with allowlist_mutation_lock(allowlist_dir):
+            return _apply_plan_unlocked(
+                plan,
+                allowlist_dir=allowlist_dir,
+                remove_stale=remove_stale,
+                accept_todo_debt=accept_todo_debt,
+                rotation_log_path=rotation_log_path,
+            )
+    return _apply_plan_unlocked(
+        plan,
+        allowlist_dir=allowlist_dir,
+        remove_stale=remove_stale,
+        accept_todo_debt=accept_todo_debt,
+        rotation_log_path=rotation_log_path,
+    )
+
+
+def _apply_plan_unlocked(
+    plan: RotationPlan,
+    *,
+    allowlist_dir: Path | None = None,
+    remove_stale: bool = False,
+    accept_todo_debt: bool = False,
+    rotation_log_path: Path | None = None,
+) -> dict[str, ApplyResult]:
     """Apply rotations (and optionally stale-entry removals) to YAML files.
 
     Rotations replace the ``old_key`` by its YAML-AST node span via
@@ -656,7 +684,8 @@ def apply_plan(
                 text, removed = _remove_stale_entries(text, stale_keys)
             return text
 
-        atomic_update_text(path, mutate, encoding="utf-8")
+        with allowlist_mutation_lock(path.parent):
+            atomic_update_text(path, mutate, encoding="utf-8")
         result[source_file] = ApplyResult(
             rotations_applied=len(rotations),
             stale_entries_removed=removed,
@@ -1012,8 +1041,8 @@ def _load_rotation_manifest_records(*, rotation_log_path: Path, repo_root: Path)
         if not line.strip():
             continue
         try:
-            raw_record = json.loads(line)
-        except json.JSONDecodeError as exc:
+            raw_record = strict_json_loads(line)
+        except StrictJSONError as exc:
             raise RotationAuditError(f"{path}:{line_number}: malformed JSONL record: {exc}") from exc
         if not isinstance(raw_record, dict):
             raise RotationAuditError(f"{path}:{line_number}: rotation manifest record must be a JSON object")

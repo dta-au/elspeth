@@ -1,6 +1,7 @@
 # tests/plugins/clients/test_audited_llm_client.py
 """Tests for AuditedLLMClient."""
 
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
@@ -20,6 +22,10 @@ from elspeth.plugins.infrastructure.clients.llm import (
 )
 
 _DEFAULT_USAGE = object()
+
+# Smallest valid 1x1 PNG (signature-correct real image) — same fixture as
+# tests/unit/contracts/test_chat_parts.py.
+PNG_BYTES = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
 
 
 @dataclass
@@ -155,6 +161,65 @@ def empty_choices_response(
     )
 
 
+def test_telemetry_failure_is_acknowledged_without_formatting_external_error() -> None:
+    from structlog.testing import capture_logs
+
+    class UnprintableTransportError(OSError):
+        def __str__(self) -> str:
+            raise AssertionError("diagnostics must not execute an uncontrolled formatter")
+
+    execution = FakeExecutionRepository()
+
+    def fail_delivery(event: ExternalCallCompleted) -> None:
+        execution.assert_recorded_once()
+        assert event.status == CallStatus.SUCCESS
+        raise UnprintableTransportError("private provider payload")
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=fail_delivery,
+        underlying_client=FakeOpenAIClient(response=provider_response()),
+    )
+    with capture_logs() as records:
+        response = client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert response.content == "Hello!"
+    assert execution.last_record_call_kwargs["status"] == CallStatus.SUCCESS
+    assert records == [
+        {
+            "event": "telemetry_emit_failed",
+            "log_level": "warning",
+            "error_type": "UnprintableTransportError",
+            "run_id": "run-1",
+            "state_id": "state-1",
+            "operation_id": None,
+            "call_type": "llm",
+        }
+    ]
+
+
+@pytest.mark.parametrize("failure", [TypeError("broken callback"), KeyError("missing field")])
+def test_telemetry_programming_errors_propagate_after_audit(failure: Exception) -> None:
+    execution = FakeExecutionRepository()
+
+    def fail_delivery(event: ExternalCallCompleted) -> None:
+        execution.assert_recorded_once()
+        raise failure
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=fail_delivery,
+        underlying_client=FakeOpenAIClient(response=provider_response()),
+    )
+    with pytest.raises(type(failure)) as raised:
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+    assert raised.value is failure
+
+
 class TestLLMResponse:
     """Tests for LLMResponse dataclass."""
 
@@ -266,7 +331,7 @@ class TestAuditedLLMClient:
 
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Verify response
@@ -287,6 +352,36 @@ class TestAuditedLLMClient:
         assert call_kwargs["response_data"].to_dict()["content"] == "Hello!"
         assert call_kwargs["latency_ms"] > 0
 
+    def test_chat_completion_audits_bytes_free_and_wires_openai_dialect(self) -> None:
+        """The SDK sees wire form; the recorded LLMCallRequest sees audit form;
+        image bytes appear in neither the audit row nor its string form."""
+        from elspeth.contracts.chat_parts import ImagePart, TextPart
+
+        execution = self._create_mock_execution()
+        openai_client = self._create_mock_openai_client()
+        part = ImagePart.from_bytes(format="png", data=PNG_BYTES, blob_ref="a" * 64)
+        msgs = [ChatMessage(role="user", content=(TextPart(text="t"), part))]
+
+        client = AuditedLLMClient(
+            execution=execution,
+            state_id="state_123",
+            run_id="run_abc",
+            telemetry_emit=lambda event: None,
+            underlying_client=openai_client,
+            provider="openai",
+        )
+
+        client.chat_completion(model="gpt-4", messages=msgs)
+
+        sdk_messages = openai_client.single_create_kwargs()["messages"]
+        assert sdk_messages[0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+        execution.assert_recorded_once()
+        recorded = execution.last_record_call_kwargs["request_data"].to_dict()
+        audit_content = recorded["messages"][0]["content"]
+        assert audit_content[1] == part.audit_view()
+        assert "base64" not in str(recorded)
+
     def test_telemetry_emits_token_id_when_configured(self) -> None:
         """Telemetry event should carry token_id when provided."""
         execution = self._create_mock_execution()
@@ -304,7 +399,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         assert len(emitted_events) == 1
@@ -326,7 +421,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         assert len(emitted_events) == 1
@@ -348,11 +443,11 @@ class TestAuditedLLMClient:
         # Make multiple calls
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "First"}],
+            messages=[ChatMessage(role="user", content="First")],
         )
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Second"}],
+            messages=[ChatMessage(role="user", content="Second")],
         )
 
         # Check call indices
@@ -387,7 +482,7 @@ class TestAuditedLLMClient:
         with pytest.raises(LLMClientError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         assert str(exc_info.value) == "LLM provider request failed"
@@ -430,7 +525,7 @@ class TestAuditedLLMClient:
         )
 
         with pytest.raises(LLMClientError):
-            client.chat_completion(model="gpt-4", messages=[{"role": "user", "content": "Hi"}])
+            client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hi")])
 
         execution.assert_recorded_once()
         assert execution.last_record_call_kwargs["status"] == CallStatus.ERROR
@@ -451,7 +546,7 @@ class TestAuditedLLMClient:
         with pytest.raises(RateLimitError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # Verify error was recorded with retryable=True
@@ -474,7 +569,7 @@ class TestAuditedLLMClient:
         with pytest.raises(RateLimitError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
     def test_non_rate_substring_does_not_raise_rate_limit_error(self) -> None:
@@ -493,7 +588,7 @@ class TestAuditedLLMClient:
         with pytest.raises(LLMClientError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         assert type(exc_info.value) is LLMClientError
@@ -516,7 +611,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
             temperature=0.7,
             max_tokens=100,
         )
@@ -541,7 +636,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         call_kwargs = execution.last_record_call_kwargs
@@ -562,7 +657,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
             top_p=0.9,
             presence_penalty=0.5,
         )
@@ -610,7 +705,7 @@ class TestAuditedLLMClient:
         with pytest.raises(ContentPolicyError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
     def test_full_raw_response_recorded_in_audit_trail(self) -> None:
@@ -667,7 +762,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Verify raw_response is recorded in audit trail
@@ -732,7 +827,7 @@ class TestAuditedLLMClient:
 
         client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Give me options"}],
+            messages=[ChatMessage(role="user", content="Give me options")],
         )
 
         # Verify all choices are preserved in raw_response
@@ -802,7 +897,7 @@ class TestAuditedLLMClient:
         with pytest.raises(LLMClientError, match=r"tool_calls response.*not supported"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "What's the weather?"}],
+                messages=[ChatMessage(role="user", content="What's the weather?")],
             )
 
         # Verify ERROR call recorded in audit trail (not dropped)
@@ -848,7 +943,7 @@ class TestAuditedLLMClient:
 
         result = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Call should succeed (not crash)
@@ -885,7 +980,7 @@ class TestAuditedLLMClient:
 
         result = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         assert result.content == "Hello, aggregate usage!"
@@ -919,7 +1014,7 @@ class TestAuditedLLMClient:
         with pytest.raises(LLMClientError, match="empty choices"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         call_kwargs = execution.last_record_call_kwargs
@@ -950,7 +1045,7 @@ class TestAuditedLLMClient:
         with pytest.raises(LLMClientError, match="model"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         call_kwargs = execution.last_record_call_kwargs
@@ -990,7 +1085,7 @@ class TestAuditedLLMClient:
         with pytest.raises(LLMClientError, match="expected str"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         call_kwargs = execution.last_record_call_kwargs
@@ -1053,7 +1148,7 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
         with pytest.raises(LLMClientError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # The call MUST be recorded despite the AttributeError -- audit integrity
@@ -1097,7 +1192,7 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
         with pytest.raises(LLMClientError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # Exactly one ExternalCallCompleted emitted with ERROR status
@@ -1149,7 +1244,7 @@ class TestContentFabrication:
         with pytest.raises(ContentPolicyError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
     def test_null_content_records_call_before_raising(self) -> None:
@@ -1175,7 +1270,7 @@ class TestContentFabrication:
         with pytest.raises(ContentPolicyError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # The call MUST be recorded despite raising ContentPolicyError
@@ -1220,7 +1315,7 @@ class TestContentFabrication:
         with pytest.raises(ContentPolicyError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         assert len(emitted_events) == 1
@@ -1255,7 +1350,7 @@ class TestContentFabrication:
         with pytest.raises(LLMClientError, match="empty choices"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # Verify ERROR call recorded in audit trail (not dropped)
@@ -1279,7 +1374,7 @@ class TestContentFabrication:
 
         result = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
         assert result.content == ""
 
@@ -1318,7 +1413,7 @@ class TestModelDumpFailureRecordsCall:
         with pytest.raises(LLMClientError, match="serialize"):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "Hello"}],
+                messages=[ChatMessage(role="user", content="Hello")],
             )
 
         # The critical assertion: record_call was invoked despite the failure
@@ -1362,7 +1457,7 @@ class TestTier3UsageBoundary:
 
         result = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Float values should be coerced to None (unknown), not passed through
@@ -1392,7 +1487,7 @@ class TestTier3UsageBoundary:
 
         result = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
 
         # Bool values should be rejected by from_dict

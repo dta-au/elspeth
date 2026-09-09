@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import freeze_fields, require_int
+from elspeth.contracts.identity import LineageFrame
 
 
 class TokenWorkStatus(StrEnum):
@@ -67,21 +69,35 @@ class BufferedOutcomeSpec:
 
 
 @dataclass(frozen=True)
-class BranchLossSpec:
-    """Durable branch-loss record riding a lossy disposition (§E.5).
+class GroupLossSpec:
+    """Durable group-loss record riding a lossy disposition (spec §6.2, rev 3.2).
 
-    Passed to ``mark_failed`` / ``mark_pending_sink`` when the disposed item
-    is a fork-lineage branch feeding a coalesce: the loss row commits in the
-    SAME lease-fenced transaction as the disposition (record-then-notify
-    uniformity rule, design §E.5).
+    The unified replacement for the retired ``BranchLossSpec``: one loss
+    names one member of one group at one closer. Natural key = (run_id,
+    closer_name, group_id, member_key) — group-scoped, so the rev-2 ledger
+    key collision is structurally impossible. ``token_id`` is recorded for
+    lineage-corruption detection (same-key different-token raises Tier-1).
+    ``reason`` stays within the categorical branch-loss vocabulary — bare
+    shared tokens, never prose. ``recorded_by`` deliberately does NOT ride
+    the spec: the staging repository verb stamps the lease owner it already
+    holds.
     """
 
-    coalesce_name: str
-    row_id: str
-    branch_name: str
+    closer_name: str
+    group_id: str
+    member_key: str
     token_id: str
     reason: str
-    recorded_by: str
+
+
+@dataclass(frozen=True)
+class BarrierTerminalOutcomeSpec:
+    """One token terminal written atomically with barrier completion."""
+
+    token_id: str
+    outcome: TerminalOutcome
+    path: TerminalPath
+    error_hash: str | None = None
 
 
 def _validate_scheduler_enum(value: object, enum_type: type[StrEnum], field_name: str, *, optional: bool = False) -> None:
@@ -124,12 +140,17 @@ class TokenWorkItem:
     pending_path: str | None = None
     pending_error_hash: str | None = None
     pending_error_message: str | None = None
-    branch_name: str | None = None
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
+    # Epoch 35: typed lineage path (outermost first); column form is lineage_path_json.
+    lineage_path: tuple[LineageFrame, ...] = ()
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
+    row_union_name: str | None = None
+    # WS4 Task 6: the collector's barrier BINDING address (closer's address,
+    # not lineage — spec §4.3). barrier_key = "collector:<collector_name>:<group_id>"
+    # (compound, unlike coalesce/row_union's bare-name key) for a BLOCKED
+    # collector arrival row.
+    collector_name: str | None = None
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
     barrier_blocked_at: datetime | None = None
@@ -176,12 +197,13 @@ class BarrierEmission:
     queue_key: str | None = None
     barrier_key: str | None = None
     on_success_sink: str | None = None
-    branch_name: str | None = None
-    fork_group_id: str | None = None
     join_group_id: str | None = None
-    expand_group_id: str | None = None
+    # Epoch 35: typed lineage path (outermost first); column form is lineage_path_json.
+    lineage_path: tuple[LineageFrame, ...] = ()
     coalesce_node_id: str | None = None
     coalesce_name: str | None = None
+    row_union_name: str | None = None
+    collector_name: str | None = None
     attempt: int = 1
 
     def __post_init__(self) -> None:
@@ -204,8 +226,14 @@ class BlockedPendingSinkHandoff:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerEvent:
-    """Immutable audit event for a scheduler work-item transition."""
+    """Immutable audit event for a scheduler work-item transition.
 
+    ``seq`` is the row identity and the authoritative replay order (epoch 38);
+    ``event_id`` is a content digest of the transition and is not unique.
+    ``recorded_at`` is evidence, never an ordering key.
+    """
+
+    seq: int
     event_id: str
     run_id: str
     token_id: str
@@ -225,6 +253,7 @@ class SchedulerEvent:
     context_json: str = "{}"
 
     def __post_init__(self) -> None:
+        require_int(self.seq, "seq", min_value=1)
         _validate_scheduler_enum(self.event_type, SchedulerEventType, "event_type")
         _validate_scheduler_enum(self.from_status, TokenWorkStatus, "from_status", optional=True)
         _validate_scheduler_enum(self.to_status, TokenWorkStatus, "to_status")

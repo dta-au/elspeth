@@ -10,26 +10,36 @@ import re
 import secrets
 import shlex
 import sys
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from elspeth_lints.core.allowlist import AuditReviewVerdict, JudgeVerdict, is_substantive_audit_anchor
+from elspeth_lints.core import ast_walker
+from elspeth_lints.core.allowlist import (
+    _JUDGE_METADATA_SIGNATURE_ENV_VAR,
+    _JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR,
+    _JUDGE_METADATA_SIGNATURE_VERIFY_SHAPE_ONLY_WHEN_KEY_MISSING,
+    AuditReviewVerdict,
+    JudgeMetadataKeyUnavailableError,
+    JudgeVerdict,
+    is_substantive_audit_anchor,
+)
 from elspeth_lints.core.ast_walker import (
     ParsedPythonFile,
     PythonFileReadError,
     PythonSyntaxError,
-    walk_python_files,
+    iter_python_files,
 )
-from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.emitters.github import render_github
 from elspeth_lints.core.emitters.json import render_json
 from elspeth_lints.core.emitters.sarif import render_sarif
 from elspeth_lints.core.emitters.text import render_text
 from elspeth_lints.core.judge import (
     TRANSPORT_AGENT,
+    TRANSPORT_CODEX_CLI,
     TRANSPORT_OPENROUTER,
     AgentToolScope,
     build_readonly_tool_scope,
@@ -83,11 +93,26 @@ class _JudgeSignatureSigningFailure:
     exit_code: int
 
 
-# CLI spelling -> stored transport identity. The operator types the short
-# ``agent`` form; the persisted/threaded value is the canonical
-# ``claude_agent_sdk`` (TRANSPORT_AGENT). ``openrouter`` is the default so
-# unopted-in invocations keep the prior behaviour exactly.
-_CLI_TRANSPORT_CHOICES: dict[str, str] = {"openrouter": TRANSPORT_OPENROUTER, "agent": TRANSPORT_AGENT}
+@dataclass(frozen=True, slots=True)
+class _RemovedAllowHitsEntry:
+    """Exact YAML entry text plus its sequence position before removal."""
+
+    text: str
+    index: int
+
+
+# CLI spelling -> stored transport identity.  Keep ``agent`` as the legacy
+# Claude Agent SDK spelling and expose Codex explicitly rather than silently
+# rebinding old signed metadata to a different transport.
+_CLI_TRANSPORT_CHOICES: dict[str, str] = {
+    "openrouter": TRANSPORT_OPENROUTER,
+    "agent": TRANSPORT_AGENT,
+    "codex-cli": TRANSPORT_CODEX_CLI,
+}
+_READONLY_TOOL_TRANSPORTS: frozenset[str] = frozenset({TRANSPORT_AGENT, TRANSPORT_CODEX_CLI})
+_READONLY_TOOLS_TRANSPORT_ERROR = (
+    "--judge-tools readonly requires --judge-transport agent or codex-cli (the openrouter transport has no tool loop).\n"
+)
 
 
 def _add_judge_transport_arg(parser: argparse.ArgumentParser) -> None:
@@ -105,10 +130,11 @@ def _add_judge_transport_arg(parser: argparse.ArgumentParser) -> None:
         help=(
             "Which transport produces the verdict. 'openrouter' (default) uses "
             "the OpenAI-compatible SDK with temperature=0 (reproducible). 'agent' "
-            "uses the Claude Agent SDK (claude_code preset, no tools, cheaper via a "
-            "Claude subscription); it cannot pin temperature, so agent verdicts are "
-            "less reproducible (see reaudit). Requires the [judge-agent] extra and "
-            "Claude Code auth."
+            "uses the Claude Agent SDK and requires the [judge-agent] extra plus "
+            "Claude Code auth. 'codex-cli' uses the installed, authenticated Codex "
+            "CLI with a secret-stripped subprocess and sealed tool surface. Local "
+            "agent transports cannot pin temperature and are less reproducible "
+            "(see reaudit)."
         ),
     )
 
@@ -117,10 +143,10 @@ def _add_judge_tools_arg(parser: argparse.ArgumentParser) -> None:
     """Attach the ``--judge-tools`` flag (read-only investigation mode).
 
     'none' (default) keeps the blinded judge — it sees only the excerpt.
-    'readonly' lets the agent transport Read/Grep/Glob within the source tree +
-    allowlist dir (fail-closed PreToolUse guard) to resolve a would-be block for
-    lack of context. Requires ``--judge-transport agent`` (the OpenRouter path
-    has no tool loop). Since 2026-07-09 signing paths accept it too — the
+    'readonly' lets the agent transport Read/Grep/Glob throughout the checkout +
+    allowlist dir (fail-closed transport guard) to resolve a would-be block for
+    lack of context. Requires ``--judge-transport agent`` or ``codex-cli`` (the
+    OpenRouter path has no tool loop). Since 2026-07-09 signing paths accept it too — the
     excerpt-blinded signing judge systematically misjudged boundary code it
     could not see, forcing bulk operator overrides. In readonly mode the
     judge's rationale is passed through ``scrub_secrets`` before it is printed
@@ -132,9 +158,10 @@ def _add_judge_tools_arg(parser: argparse.ArgumentParser) -> None:
         default="none",
         help=(
             "Read-only tool access for the judge. 'none' (default) is blinded "
-            "(excerpt only). 'readonly' lets the agent transport Read/Grep/Glob "
-            "within src + allowlist dir to investigate; requires --judge-transport "
-            "agent. Less reproducible than blinded mode. Valid on signing paths "
+            "(excerpt only). 'readonly' lets a local agent transport Read/Grep/Glob "
+            "throughout the checkout (including tests, docs, scripts and config) "
+            "+ allowlist dir to investigate; requires --judge-transport "
+            "agent or codex-cli. Less reproducible than blinded mode. Valid on signing paths "
             "since 2026-07-09; readonly-mode judge rationales are secret-scrubbed "
             "before being persisted into signed allowlist entries."
         ),
@@ -276,6 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_migrate_judge_scope(args)
     if args.command == "check-judge-coverage":
         return _run_check_judge_coverage(args)
+    if args.command == "check-per-file-blanket-ratchet":
+        return _run_check_per_file_blanket_ratchet(args)
     if args.command == "check-judge-quality":
         return _run_check_judge_quality(args)
     if args.command == "check-trust-boundary-diff":
@@ -293,7 +322,14 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check = subparsers.add_parser("check", help="Run static-analysis rules")
-    check.add_argument("--rules", default="nothing", help="Comma-separated rule ids, or 'nothing' for the empty skeleton run")
+    check.add_argument(
+        "--rules",
+        default=None,
+        help=(
+            "Rule selection, required: 'all' for every registered rule, a comma-separated "
+            "list of rule ids, or 'nothing' for the empty skeleton run"
+        ),
+    )
     check.add_argument("--rule-set", choices=("static", "full"), default="static")
     check.add_argument("--format", choices=("text", "json", "sarif", "github"), default="text")
     check.add_argument("--root", type=Path, default=Path.cwd())
@@ -315,13 +351,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "When unset, each rule resolves its own per-rule default directory."
         ),
     )
+    check.add_argument(
+        "--fail-on-inert",
+        action="store_true",
+        help=(
+            "Fail when a selected incremental rule matches no non-fixture Python files. "
+            "Use for full-corpus gates; partial --files selections may legitimately reach only a subset of selected rules."
+        ),
+    )
     check.add_argument("--files", nargs="*", type=Path)
 
     rotate = subparsers.add_parser(
         "rotate",
         help="Rotate stale fingerprints in tier_model allowlist entries (mechanical, no judge)",
     )
-    rotate.add_argument("--root", type=Path, required=True, help="Source tree to scan (e.g. src/elspeth)")
+    rotate.add_argument(
+        "--root",
+        type=Path,
+        default=Path("src/elspeth"),
+        help="Source tree to scan. Default: src/elspeth.",
+    )
     rotate.add_argument(
         "--allowlist-dir",
         type=Path,
@@ -710,7 +759,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allowlist-dir",
         type=Path,
         default=Path("config/cicd/enforce_tier_model"),
-        help="Directory of per-module allowlist YAML files to repair in place",
+        help="Active directory of per-module allowlist YAML files to replace coherently on success",
     )
     sign_judge_signatures.add_argument(
         "--env-file",
@@ -769,9 +818,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "OPERATOR-ONLY: re-verify a staged review bundle against the source "
             "tree and fire it. The ONLY place a judge signature is minted from a "
             "bundle. Re-derives every binding from the tree and aborts on any "
-            "staleness BEFORE a single write; drift_repair / new_judgment run the "
+            "staleness BEFORE creating a transaction; deterministic stale-delete / "
+            "safe-rotation actions run first, then drift_repair / new_judgment run the "
             "real judge (re-judging prevents laundering a stale verdict over "
-            "changed content); rotation / stale_delete carry no verdict. Requires "
+            "changed content). All actions write to a recoverable private copy and "
+            "the active allowlist changes only through one coherent atomic directory "
+            "exchange after final re-verification. BLOCK/failure/interruption prints "
+            "a --resume command; --dry-run creates no transaction. Requires "
             "ELSPETH_JUDGE_METADATA_HMAC_KEY (an agent may PROPOSE the bundle, only "
             "an operator-held environment signs it)."
         ),
@@ -826,19 +879,66 @@ def _build_parser() -> argparse.ArgumentParser:
     sign_bundle.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the verify + per-lane plan without calling the judge, removing rows, or writing signed entries.",
+        help=(
+            "Print the verify + per-lane plan without calling the judge or "
+            "creating/writing a transaction, rotation log, or allowlist entry."
+        ),
     )
     sign_bundle.add_argument(
         "--yes",
         action="store_true",
-        help="Skip the interactive confirmation prompt before the (destructive) write phase.",
+        help="Skip the interactive confirmation prompt before creating/resuming the private transaction.",
+    )
+    sign_bundle.add_argument(
+        "--lanes",
+        type=_sign_bundle_lanes,
+        default=None,
+        metavar="LANE[,LANE]",
+        help=(
+            "Scope the transaction to a comma-separated subset of bundle lanes: "
+            "'resign' (drift_repair + rotation + stale_delete — new rationale optional) "
+            "and/or 'new_judgment' (justify — judges the staged "
+            "rationale). Unselected actions are never attempted, never judged, "
+            "and stay exactly as they are in the allowlist (fail-closed); the "
+            "coherent publish covers the selected lanes only. The selection is "
+            "journalled in the transaction and a resume must use the same "
+            "--lanes value (omitting the flag on resume inherits it). Default: "
+            "all lanes."
+        ),
+    )
+    sign_bundle.add_argument(
+        "--continue-on-block",
+        action="store_true",
+        help=(
+            "Do not stop the transaction on a judged BLOCKED verdict (exit-1 action "
+            "failure): journal the action as blocked, leave its entry fail-closed "
+            "(stale or absent — never signed), and continue with the remaining "
+            "actions. Verification/infrastructure failures (exit 2) still stop the "
+            "transaction. On completion the successful actions publish coherently "
+            "and the blocked keys are printed as a remediation worklist; the "
+            "command exits 3 instead of 0 so a partially-signed run is never "
+            "mistaken for a clean one. Blocked actions stay skipped on resume "
+            "(re-judging a recorded BLOCK would be verdict shopping); remediate "
+            "the code or rationale and re-stage instead."
+        ),
+    )
+    sign_bundle.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        metavar="TRANSACTION_DIR",
+        help=(
+            "Resume a preserved sign-bundle transaction. Re-verifies the bundle, "
+            "live source tree, unchanged active allowlist, transaction journal, "
+            "and every previously produced authoritative signature before continuing."
+        ),
     )
     sign_bundle.add_argument(
         "--rotation-log",
         type=Path,
         default=Path(".elspeth/rotations.log"),
         help=(
-            "JSONL audit manifest written when a rotation action applies, so "
+            "JSONL audit manifest finalized only with coherent publish when a rotation action applies, so "
             "check-rotation-audit finds a record for the allowlist key rewrite "
             "(mirrors `rotate --rotation-log`). Default: .elspeth/rotations.log."
         ),
@@ -852,6 +952,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_judge_transport_arg(sign_bundle)
     _add_judge_tools_arg(sign_bundle)
+    sign_bundle.add_argument(
+        "--judge-concurrency",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run up to N judge calls at once for new_judgment (justify) actions. Only the judge "
+            "subprocess overlaps: every candidate write, decision event, and journal entry is "
+            "still performed by one writer in bundle order, so crash/resume semantics are "
+            "unchanged. drift_repair, rotation, and stale_delete always run one at a time. "
+            f"1..{_SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY}; default 1."
+        ),
+    )
 
     rekey = subparsers.add_parser(
         "rekey",
@@ -1015,6 +1128,32 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    check_blankets = subparsers.add_parser(
+        "check-per-file-blanket-ratchet",
+        help=(
+            "Reject permanent multi-rule per-file suppressions when matched source "
+            "files are touched, and reject new or broadened blankets while "
+            "grandfathering untouched baseline-equivalent legacy debt."
+        ),
+    )
+    check_blankets.add_argument(
+        "--baseline-ref",
+        required=True,
+        help="Git ref whose permanent multi-rule blankets form the transitional debt baseline.",
+    )
+    check_blankets.add_argument(
+        "--allowlist-root",
+        type=Path,
+        default=Path("config/cicd"),
+        help="Allowlist tree to scan recursively. Default: config/cicd.",
+    )
+    check_blankets.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Repository working tree root used for Git baseline reads.",
+    )
+
     check_quality = subparsers.add_parser(
         "check-judge-quality",
         help=(
@@ -1046,10 +1185,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Maximum accepted corpus size. Default: 30.",
     )
+    _add_judge_transport_arg(check_quality)
+    _add_judge_tools_arg(check_quality)
+    check_quality.add_argument(
+        "--root",
+        type=Path,
+        default=Path("src/elspeth"),
+        help="Source tree the readonly judge may search. Default: src/elspeth.",
+    )
+    check_quality.add_argument(
+        "--allowlist-dir",
+        type=Path,
+        default=Path("config/cicd/enforce_tier_model"),
+        help="Allowlist directory the readonly judge may search alongside --root.",
+    )
     check_quality.add_argument(
         "--model",
         default=None,
-        help="OpenRouter model id. Defaults to the judge module's DEFAULT_JUDGE_MODEL.",
+        help=(
+            "Judge model id in the SELECTED transport's namespace (OpenRouter slug, "
+            "Agent SDK id, or Codex model). Defaults to that transport's own default."
+        ),
     )
     check_quality.add_argument(
         "--max-tokens",
@@ -1195,6 +1351,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
     requested_tokens = _parse_rules(args.rules)
+    if args.rules is None or (not requested_tokens and args.rules != "nothing"):
+        # An unselected or malformed-empty rule set used to fall through to
+        # the empty-findings emit below, so `check` exited 0 having evaluated
+        # nothing — a green that certified any tree. Refuse instead: silence
+        # here is indistinguishable from a clean result.
+        sys.stderr.write(
+            "check requires an explicit --rules selection: 'all' for every registered "
+            "rule, a comma-separated list of rule ids, or 'nothing' for the empty "
+            "skeleton run\n"
+        )
+        return 2
     if not requested_tokens:
         return _emit_findings([], output_format=args.format, rules=[])
 
@@ -1210,7 +1377,7 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
     if allowlist_dir is not None and not allowlist_dir.is_dir():
         sys.stderr.write(f"--allowlist-dir: {allowlist_dir} is not a directory\n")
         return 2
-    repo_root = getattr(args, "repo_root", None)
+    repo_root = args.repo_root
     if repo_root is not None and not repo_root.is_dir():
         sys.stderr.write(f"--repo-root: {repo_root} is not a directory\n")
         return 2
@@ -1227,16 +1394,42 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
     empty_tree = ast.Module(body=[], type_ignores=[])
     diagnostic_paths: set[Path] = set()
     if whole_repo_rules:
-        for item in walk_python_files(args.root, tuple(args.files or ()) or None):
-            if not _rules_for_path(item.path, root=args.root, rules=whole_repo_rules):
-                continue
+        for item, _applicable_rules in _walk_applicable_python_files(
+            args.root,
+            tuple(args.files or ()) or None,
+            rules=whole_repo_rules,
+        ):
             diagnostic = _diagnostic_finding_for_walk_item(item)
             if diagnostic is not None:
                 findings.append(diagnostic)
                 diagnostic_paths.add(item.path)
 
     for rule in whole_repo_rules:
-        findings.extend(rule.analyze(empty_tree, args.root, context))
+        try:
+            rule_findings = rule.analyze(empty_tree, args.root, context)
+            finding_base = repo_root if repo_root is not None else args.root
+            findings.extend(
+                finding
+                for finding in rule_findings
+                if not _duplicates_emitted_walk_diagnostic(
+                    finding,
+                    diagnostic_paths,
+                    finding_base=finding_base,
+                )
+            )
+        except JudgeMetadataKeyUnavailableError as exc:
+            # Operator configuration, not a defect in the scanned tree. Still
+            # fail-closed — the run refuses rather than verifying less — but
+            # name the remedy instead of surfacing a traceback.
+            sys.stderr.write(
+                f"{rule.id}: {exc}\n"
+                f"Set {_JUDGE_METADATA_SIGNATURE_ENV_VAR} to verify judge metadata, or set "
+                f"{_JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR}="
+                f"{_JUDGE_METADATA_SIGNATURE_VERIFY_SHAPE_ONLY_WHEN_KEY_MISSING} to accept shape-only "
+                "verification, which CANNOT detect forged or tampered judge metadata and must be "
+                "re-verified in a trusted context before any merge is authoritative.\n"
+            )
+            return 2
 
     if incremental_rules:
         explicit_files = tuple(args.files or ())
@@ -1249,11 +1442,14 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
                         f"({', '.join(rule.id for rule in incremental_rules)})\n"
                     )
                 return 2
-        for item in walk_python_files(args.root, explicit_files or None):
-            item_path = item.path
-            applicable_rules = _rules_for_path(item_path, root=args.root, rules=incremental_rules)
-            if not applicable_rules:
-                continue
+        matched_incremental_rule_ids: set[str] = set()
+        for item, applicable_rules in _walk_applicable_python_files(
+            args.root,
+            explicit_files or None,
+            rules=incremental_rules,
+        ):
+            if not _is_lint_rule_fixture_path(item.path):
+                matched_incremental_rule_ids.update(rule.id for rule in applicable_rules)
             if isinstance(item, PythonSyntaxError):
                 if item.path not in diagnostic_paths:
                     findings.append(_syntax_error_finding(item))
@@ -1272,11 +1468,24 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
                     findings.append(_read_error_finding(item))
                 continue
             findings.extend(_run_rules(item, applicable_rules, context=context))
+        if args.fail_on_inert:
+            # An INCREMENTAL rule with zero matches never reaches analyze(), so
+            # silence is a false clean. WHOLE_REPO rules are deliberately not
+            # checked here: their path_filter gates only the shared parse/read
+            # diagnostic walk, while analyze(empty_tree, root, context) runs
+            # independently above even when that filter matches nothing.
+            findings.extend(
+                _inert_incremental_rule_finding(rule, root=args.root)
+                for rule in incremental_rules
+                if rule.id not in matched_incremental_rule_ids
+            )
 
     return _emit_findings(findings, output_format=args.format, rules=selected_rules)
 
 
-def _parse_rules(raw: str) -> tuple[str, ...]:
+def _parse_rules(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
     rules = tuple(part.strip() for part in raw.split(",") if part.strip())
     if rules == ("nothing",):
         return ()
@@ -1287,7 +1496,9 @@ def _expand_rule_tokens(tokens: tuple[str, ...], available: set[str]) -> tuple[s
     expanded: list[str] = []
     unknown: list[str] = []
     for token in tokens:
-        if token.endswith("/*"):
+        if token == "all":
+            expanded.extend(sorted(available))
+        elif token.endswith("/*"):
             prefix = token[:-2].replace("/", ".")
             matches = sorted(rule_id for rule_id in available if rule_id.startswith(f"{prefix}."))
             if matches:
@@ -1312,6 +1523,27 @@ def _diagnostic_finding_for_walk_item(item: ParsedPythonFile | PythonSyntaxError
     if isinstance(item, PythonFileReadError):
         return _read_error_finding(item)
     return None
+
+
+def _duplicates_emitted_walk_diagnostic(
+    finding: Finding,
+    diagnostic_paths: set[Path],
+    *,
+    finding_base: Path,
+) -> bool:
+    """Return whether the CLI already emitted this whole-repo diagnostic.
+
+    Whole-repository rules may scan roots beyond ``--root`` and therefore
+    must surface their own parse/read failures.  Deduplicate only against
+    paths the generic prewalk actually emitted; treating an enclosing root as
+    blanket coverage can silently drop diagnostics excluded by a rule's path
+    filter or by ``--files``.
+    """
+    if finding.rule_id not in {"parse-error", "read-error"}:
+        return False
+    finding_path = Path(finding.file_path)
+    canonical_finding = (finding_path if finding_path.is_absolute() else finding_base / finding_path).resolve()
+    return any(path.resolve() == canonical_finding for path in diagnostic_paths)
 
 
 def _syntax_error_finding(item: PythonSyntaxError) -> Finding:
@@ -1344,12 +1576,49 @@ def _out_of_scope_explicit_files(files: Sequence[Path], *, root: Path, rules: li
     return out_of_scope
 
 
+def _walk_applicable_python_files(
+    root: Path,
+    files: Sequence[Path] | None,
+    *,
+    rules: list[Rule],
+) -> Iterator[tuple[ParsedPythonFile | PythonSyntaxError | PythonFileReadError, list[Rule]]]:
+    """Parse only Python files claimed by at least one selected rule."""
+    for file_path in iter_python_files(root, files):
+        applicable_rules = _rules_for_path(file_path, root=root, rules=rules)
+        if applicable_rules:
+            yield ast_walker.parse_python_file(file_path), applicable_rules
+
+
 def _rules_for_path(file_path: Path, *, root: Path, rules: list[Rule]) -> list[Rule]:
     return [rule for rule in rules if _path_matches_rule(file_path, root=root, rule=rule)]
 
 
 def _path_matches_rule(file_path: Path, *, root: Path, rule: Rule) -> bool:
     return re.search(rule.metadata.path_filter, _display_path(_candidate_path(root, file_path), root)) is not None
+
+
+def _is_lint_rule_fixture_path(file_path: Path) -> bool:
+    """Return whether ``file_path`` is one of elspeth-lints' synthetic rule fixtures."""
+    parts = file_path.parts
+    fixture_owner = ("src", "elspeth_lints", "rules")
+    for index in range(len(parts) - len(fixture_owner) + 1):
+        if parts[index : index + len(fixture_owner)] == fixture_owner:
+            return "fixtures" in parts[index + len(fixture_owner) :]
+    return False
+
+
+def _inert_incremental_rule_finding(rule: Rule, *, root: Path) -> Finding:
+    path_filter = rule.metadata.path_filter
+    return Finding(
+        rule_id=rule.id,
+        file_path=root.as_posix(),
+        line=0,
+        column=0,
+        message=(f"inert-rule: selected incremental rule matched zero non-fixture Python files (path_filter={path_filter})"),
+        fingerprint=f"inert-rule:{hashlib.sha256(path_filter.encode('utf-8')).hexdigest()[:16]}",
+        severity=Severity.ERROR,
+        suggestion=("Correct the rule path_filter or scanned root. Omit --fail-on-inert only for an intentionally partial --files scan."),
+    )
 
 
 def _candidate_path(root: Path, file_path: Path) -> Path:
@@ -1578,7 +1847,13 @@ def _run_dump_edges(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_justify(args: argparse.Namespace) -> int:
+def _run_justify(
+    args: argparse.Namespace,
+    *,
+    allow_hits_entry_index: int | None = None,
+    defer_override_rate_counter_snapshot: bool = False,
+    before_write: Callable[[], None] | None = None,
+) -> int:
     """Drive the cicd-judge gate for one proposed allowlist entry.
 
     Re-runs the tier_model rule against ``--file-path`` to locate the
@@ -1630,8 +1905,8 @@ def _run_justify(args: argparse.Namespace) -> int:
     transport: str = _CLI_TRANSPORT_CHOICES[args.judge_transport]
     tool_scope: AgentToolScope | None = None
     if args.judge_tools == "readonly":
-        if transport != TRANSPORT_AGENT:
-            sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+        if transport not in _READONLY_TOOL_TRANSPORTS:
+            sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
             return 2
         tool_scope = build_readonly_tool_scope(root=root, allowlist_dir=allowlist_dir)
 
@@ -1816,12 +2091,17 @@ def _run_justify(args: argparse.Namespace) -> int:
         )
         return 2
     try:
-        rationale_duplicate_count, similar_entries = _find_similar_allowlist_entries(
-            allowlist_dir=allowlist_dir,
-            rationale=args.rationale,
-            valid_rule_ids=valid_rule_ids,
-            exclude_key=finding_key,
-        )
+        # Under sign-bundle --judge-concurrency this runs in a worker thread
+        # while the main thread may be appending the previous action's entry;
+        # the (re-entrant, thread-aware) mutation lock makes the read see a
+        # whole directory, never a half-written file.
+        with allowlist_mutation_lock(allowlist_dir):
+            rationale_duplicate_count, similar_entries = _find_similar_allowlist_entries(
+                allowlist_dir=allowlist_dir,
+                rationale=args.rationale,
+                valid_rule_ids=valid_rule_ids,
+                exclude_key=finding_key,
+            )
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"allowlist similarity scan failed: {exc}\n")
         return 2
@@ -1869,6 +2149,13 @@ def _run_justify(args: argparse.Namespace) -> int:
         scrubbed_rationale = scrub_secrets(response.judge_rationale)
         if scrubbed_rationale.redactions:
             response = dataclass_replace(response, judge_rationale=scrubbed_rationale.text)
+
+    if before_write is not None:
+        # The write gate (sign-bundle --judge-concurrency): everything above is
+        # reads plus the judge call and may have run ahead of the transaction's
+        # serial write loop; nothing below — decision event, YAML append,
+        # verdict output — happens until the loop says this action is current.
+        before_write()
 
     # Resolve the verdict the entry will carry. If the operator
     # supplied --operator-override, the entry records
@@ -1972,16 +2259,22 @@ def _run_justify(args: argparse.Namespace) -> int:
         return 0
 
     yaml_entry = build_signed_yaml_entry()
-    _append_entry_to_yaml(target_yaml, yaml_entry)
-    _append_judge_decision_event_after_judge(
-        allowlist_dir=allowlist_dir,
-        finding=finding,
-        effective_verdict=write_verdict,
-        model_verdict=response.verdict,
-        recorded_at=response.recorded_at,
-        write_disposition="written",
-    )
-    _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
+    with allowlist_mutation_lock(allowlist_dir):
+        _append_entry_to_yaml(
+            target_yaml,
+            yaml_entry,
+            entry_index=allow_hits_entry_index,
+        )
+        _append_judge_decision_event_after_judge(
+            allowlist_dir=allowlist_dir,
+            finding=finding,
+            effective_verdict=write_verdict,
+            model_verdict=response.verdict,
+            recorded_at=response.recorded_at,
+            write_disposition="written",
+        )
+        if not defer_override_rate_counter_snapshot:
+            _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
     _emit_justify_output(
         args=args,
         verdict=write_verdict,
@@ -2231,43 +2524,21 @@ def _find_similar_allowlist_entries(
 ) -> tuple[int, tuple[Any, ...]]:
     """Return exact duplicate-rationale context for the judge prompt.
 
-    Exact normalized duplicates are a strong, auditable signal of
-    copy/paste rationale drift. Fuzzier similarity can be added later
-    without weakening this hard duplicate count.
+    Loads the allowlist and delegates to the shared derivation in
+    ``allowlist_similarity`` — the same one ``stage_preview`` and ``reaudit``
+    use, so the evidence the preview judge sees cannot drift from what the
+    fire-time judge sees (elspeth-0502deb48c).
     """
     from elspeth_lints.core.allowlist import load_allowlist
-    from elspeth_lints.core.judge import SimilarAllowlistEntry
-
-    normalized = _normalize_rationale_for_similarity(rationale)
-    if not normalized:
-        return 0, ()
+    from elspeth_lints.core.allowlist_similarity import find_similar_allowlist_entries
 
     allowlist = load_allowlist(allowlist_dir, valid_rule_ids=valid_rule_ids)
-    duplicates = [
-        entry for entry in allowlist.entries if entry.key != exclude_key and _normalize_rationale_for_similarity(entry.reason) == normalized
-    ]
-    similar_entries = tuple(
-        SimilarAllowlistEntry(
-            key=entry.key,
-            owner=entry.owner,
-            reason_excerpt=_reason_excerpt(entry.reason),
-        )
-        for entry in duplicates[:limit]
+    return find_similar_allowlist_entries(
+        allowlist.entries,
+        rationale=rationale,
+        exclude_key=exclude_key,
+        limit=limit,
     )
-    return len(duplicates), similar_entries
-
-
-def _normalize_rationale_for_similarity(text: str) -> str:
-    """Normalize rationale text for exact duplicate detection."""
-    return " ".join(text.casefold().split())
-
-
-def _reason_excerpt(text: str, *, limit: int = 240) -> str:
-    """Return a compact single-line rationale excerpt for prompt context."""
-    single_line = " ".join(text.split())
-    if len(single_line) <= limit:
-        return single_line
-    return single_line[: limit - 3] + "..."
 
 
 def _finding_symbol_matches(finding: Any, symbol_tuple: tuple[str, ...]) -> bool:
@@ -2276,7 +2547,7 @@ def _finding_symbol_matches(finding: Any, symbol_tuple: tuple[str, ...]) -> bool
 
 
 def _finding_symbol_context(finding: Any) -> tuple[str, ...]:
-    raw = getattr(finding, "symbol_context", ())
+    raw = finding.symbol_context
     return tuple(raw)
 
 
@@ -2292,7 +2563,7 @@ def _finding_canonical_key(finding: Any) -> str:
 
 
 def _finding_ast_path(finding: Any) -> str:
-    ast_path = getattr(finding, "ast_path", "")
+    ast_path = finding.ast_path
     if not isinstance(ast_path, str) or not ast_path:
         raise ValueError(
             f"finding {_finding_canonical_key(finding)} has no ast_path; "
@@ -2305,12 +2576,12 @@ def _finding_scope_fingerprint(finding: Any) -> str:
     """Return the finding's enclosing-scope fingerprint for a v2 binding.
 
     Tier-model findings carry ``scope_fingerprint`` (stamped by the scanner).
-    A trust_boundary ``protocols.Finding`` does NOT — so v2 justify is
-    TIER-MODEL-ONLY today; justifying a trust_boundary rule raises here
+    A trust_boundary ``protocols.Finding`` carries the shared contract's empty,
+    unstamped default — so v2 justify is TIER-MODEL-ONLY today; justifying a trust_boundary rule raises here
     (fail-closed) until that scanner stamps the field. Do not fabricate a
     value: an empty/absent scope_fingerprint cannot bind a v2 entry.
     """
-    scope_fingerprint = getattr(finding, "scope_fingerprint", "")
+    scope_fingerprint = finding.scope_fingerprint
     if not isinstance(scope_fingerprint, str) or not scope_fingerprint:
         raise ValueError(
             f"finding {_finding_canonical_key(finding)} has no scope_fingerprint; "
@@ -2323,7 +2594,7 @@ def _finding_scope_fingerprint(finding: Any) -> str:
 
 def _finding_file_fingerprint(finding: Any) -> str:
     """Return the source-file digest stamped by the scanner pass."""
-    file_fingerprint = getattr(finding, "file_fingerprint", "")
+    file_fingerprint = finding.file_fingerprint
     if not isinstance(file_fingerprint, str) or not file_fingerprint:
         raise ValueError(
             f"finding {_finding_canonical_key(finding)} has no file_fingerprint; "
@@ -2813,27 +3084,31 @@ def _upsert_audit_review_in_yaml(target_yaml: Path, *, entry_key: str, review_te
         new_lines = [*lines[:entry_start], *cleaned_entry, *lines[entry_end:]]
         return "".join(new_lines)
 
-    atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
 
 
-def _append_entry_to_yaml(target_yaml: Path, entry_text: str) -> None:
+def _append_entry_to_yaml(target_yaml: Path, entry_text: str, *, entry_index: int | None = None) -> None:
     """Insert one ``allow_hits`` entry into the per-module YAML file.
 
-    Append-only at the END of the existing ``allow_hits:`` block. If
-    the file does not exist, create it with an ``allow_hits:`` header.
-    If the file exists but has no ``allow_hits:`` block, append one at
-    the bottom. The full read → locate block → insert → write sequence
-    runs under ``atomic_update_text`` so concurrent justify invocations
-    cannot compute updates from the same old YAML. We deliberately do
-    NOT round-trip through PyYAML — the per-module YAMLs carry
-    multi-paragraph comments that ``yaml.dump`` would erase, and the
-    rotate command's surgical text-edit approach is the established
-    pattern in this codebase.
+    New entries append at the END of the existing ``allow_hits:`` block.
+    ``entry_index`` is reserved for drift repair: it inserts a replacement at
+    the stale row's original sequence position so re-signing does not create
+    reorder-only diffs. If the file does not exist, create it with an
+    ``allow_hits:`` header. If the file exists but has no ``allow_hits:`` block,
+    append one at the bottom. The full read → locate block → insert → write
+    sequence runs under ``atomic_update_text`` so concurrent justify
+    invocations cannot compute updates from the same old YAML. We deliberately
+    do NOT round-trip through PyYAML — the per-module YAMLs carry multi-paragraph
+    comments that ``yaml.dump`` would erase, and the rotate command's surgical
+    text-edit approach is the established pattern in this codebase.
     """
     entry_key = _entry_key_from_yaml_entry(entry_text)
 
     def append_to(current: str | None) -> str:
         if current is None:
+            if entry_index is not None:
+                raise ValueError(f"{target_yaml}: cannot restore allow_hits entry position into a missing file")
             return f"allow_hits:\n{entry_text}"
 
         lines = current.splitlines(keepends=True)
@@ -2857,6 +3132,8 @@ def _append_entry_to_yaml(target_yaml: Path, entry_text: str) -> None:
                 break
 
         if header_index is None:
+            if entry_index is not None:
+                raise ValueError(f"{target_yaml}: cannot restore allow_hits entry position without an allow_hits block")
             prefix = "" if not current or current.endswith("\n") else "\n"
             return current + f"{prefix}\nallow_hits:\n{entry_text}"
 
@@ -2899,10 +3176,21 @@ def _append_entry_to_yaml(target_yaml: Path, entry_text: str) -> None:
             replaced.extend(lines[cursor:])
             return "".join(replaced)
 
-        new_lines = [*lines[:block_end], entry_text, *lines[block_end:]]
+        insertion_point = block_end
+        if entry_index is not None:
+            entry_ranges = _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
+            if entry_index < 0 or entry_index > len(entry_ranges):
+                raise ValueError(
+                    f"{target_yaml}: allow_hits entry index {entry_index} is outside the current block with {len(entry_ranges)} entries"
+                )
+            if entry_index < len(entry_ranges):
+                insertion_point = entry_ranges[entry_index][0]
+
+        new_lines = [*lines[:insertion_point], entry_text, *lines[insertion_point:]]
         return "".join(new_lines)
 
-    atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
 
 
 def _emit_justify_output(
@@ -3082,13 +3370,13 @@ def _run_reaudit(args: argparse.Namespace) -> int:
     # ``--judge-transport agent`` sweep re-judges through the Agent SDK.
     transport: str = _CLI_TRANSPORT_CHOICES[args.judge_transport]
 
-    # Read-only tool-augmented investigation mode. Only valid with the agent
-    # transport (OpenRouter has no tool loop); the scope confines reads to the
-    # source tree + allowlist dir via a fail-closed PreToolUse guard.
+    # Read-only tool-augmented investigation mode. Local agent transports
+    # expose the whole checkout + allowlist dir through fail-closed guards;
+    # OpenRouter has no tool loop.
     tool_scope: AgentToolScope | None = None
     if args.judge_tools == "readonly":
-        if transport != TRANSPORT_AGENT:
-            sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+        if transport not in _READONLY_TOOL_TRANSPORTS:
+            sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
             return 2
         tool_scope = build_readonly_tool_scope(root=args.root.resolve(), allowlist_dir=allowlist_dir)
 
@@ -3347,8 +3635,8 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
     existing ``justify`` implementation. If a judge call fails, the stale row is
     restored so a rejected suppression does not erase the remaining backlog.
     """
-    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] != TRANSPORT_AGENT:
-        sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] not in _READONLY_TOOL_TRANSPORTS:
+        sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
         return 2
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
@@ -3402,17 +3690,20 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
         sys.stdout.write(
             f"sign-judge-signatures: [{index}/{len(specs)}] {spec.source}: {spec.file_path}:{spec.rule}:{spec.symbol}:fp={spec.fingerprint}\n"
         )
-        removed_stale_entry: str | None = None
+        removed_stale_entry: _RemovedAllowHitsEntry | None = None
         stale_yaml: Path | None = None
         try:
             if spec.stale_source_file is not None and spec.stale_key is not None:
                 stale_yaml = args.allowlist_dir / spec.stale_source_file
-                removed_stale_entry = _pop_allow_hits_entry(stale_yaml, spec.stale_key)
+                removed_stale_entry = _pop_allow_hits_entry_with_position(stale_yaml, spec.stale_key)
         except ValueError as exc:
             sys.stderr.write(f"sign-judge-signatures error: {exc}\n")
             return 2
 
-        exit_code = _run_justify(_namespace_for_signing_spec(spec, args))
+        exit_code = _run_justify(
+            _namespace_for_signing_spec(spec, args),
+            allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
+        )
         if exit_code != 0:
             failures.append(
                 _JudgeSignatureSigningFailure(
@@ -3423,7 +3714,11 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
                 )
             )
             if stale_yaml is not None and removed_stale_entry is not None:
-                _append_entry_to_yaml(stale_yaml, removed_stale_entry)
+                _append_entry_to_yaml(
+                    stale_yaml,
+                    removed_stale_entry.text,
+                    entry_index=removed_stale_entry.index,
+                )
                 sys.stderr.write(
                     "sign-judge-signatures: justify failed; restored the stale row for the blocked entry. "
                     "continuing with remaining entries.\n"
@@ -3626,7 +3921,12 @@ def _remove_diagnosed_stale_entries(allowlist_dir: Path, stale_keys: Sequence[tu
 
 def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
     """Remove and return one exact allow_hits entry from ``target_yaml``."""
-    removed_entry: str | None = None
+    return _pop_allow_hits_entry_with_position(target_yaml, entry_key).text
+
+
+def _pop_allow_hits_entry_with_position(target_yaml: Path, entry_key: str) -> _RemovedAllowHitsEntry:
+    """Remove one exact entry and retain its original sequence position."""
+    removed_entry: _RemovedAllowHitsEntry | None = None
 
     def remove_from(current: str | None) -> str:
         nonlocal removed_entry
@@ -3653,9 +3953,10 @@ def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
             block_end = idx
             break
 
+        entry_ranges = _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
         matching_ranges = [
             (entry_start, entry_end)
-            for entry_start, entry_end in _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
+            for entry_start, entry_end in entry_ranges
             if lines[entry_start].rstrip("\r\n") == f"- key: {entry_key}"
         ]
         if not matching_ranges:
@@ -3664,11 +3965,15 @@ def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
             raise ValueError(f"{target_yaml}: duplicate allow_hits entries found for key {entry_key!r}")
 
         entry_start, entry_end = matching_ranges[0]
-        removed_entry = "".join(lines[entry_start:entry_end])
+        removed_entry = _RemovedAllowHitsEntry(
+            text="".join(lines[entry_start:entry_end]),
+            index=entry_ranges.index((entry_start, entry_end)),
+        )
         new_lines = [*lines[:entry_start], *lines[entry_end:]]
         return _normalize_empty_allow_hits("".join(new_lines))
 
-    atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
     if removed_entry is None:
         raise ValueError(f"{target_yaml}: no allow_hits entry found for key {entry_key!r}")
     return removed_entry
@@ -3724,10 +4029,14 @@ def _remove_allow_hits_entries(target_yaml: Path, entry_keys: set[str]) -> None:
             del new_lines[entry_start:entry_end]
         return _normalize_empty_allow_hits("".join(new_lines))
 
-    atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
 
 
-def _namespace_for_signing_spec(spec: _JudgeSignatureSigningSpec, args: argparse.Namespace) -> argparse.Namespace:
+def _namespace_for_signing_spec(
+    spec: _JudgeSignatureSigningSpec,
+    args: argparse.Namespace,
+) -> argparse.Namespace:
     return argparse.Namespace(
         root=args.root,
         repo_root=args.repo_root,
@@ -3795,7 +4104,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     every binding from the live source (``verify_bundle_against_tree``) and
     aborts the whole run before a single write if any claim is stale (the
     atomicity gate -- "staging asserts, firing verifies"). After the confirm
-    gate, each action fires per-``kind``:
+    gate, actions fire into a durable private copy per-``kind``:
 
     * ``drift_repair`` re-runs the **real** judge through the
       ``sign-judge-signatures`` pop -> ``_run_justify`` -> restore-on-failure
@@ -3806,18 +4115,33 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
       ``apply_plan`` (no judge, no verdict) from the verify-time filtered plan;
     * ``stale_delete`` removes an orphaned entry (no judge).
 
-    Execute is **per-action non-transactional** by design (the verify gate is the
-    atomicity boundary): a mid-bundle BLOCK leaves earlier-accepted writes in
-    place, restores/skips the blocked action, and returns non-zero with a
-    per-action report.
+    Deterministic stale deletions and rotations run before paid judge work.
+    Successful actions are journalled so a later BLOCK or interruption can
+    resume without repeating accepted judge decisions.  The active allowlist is
+    changed only after every action succeeds, with an atomic whole-directory
+    exchange.
     """
-    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] != TRANSPORT_AGENT:
-        sys.stderr.write("--judge-tools readonly requires --judge-transport agent (the openrouter transport has no tool loop).\n")
+    if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] not in _READONLY_TOOL_TRANSPORTS:
+        sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
+        return 2
+    if not 1 <= args.judge_concurrency <= _SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY:
+        sys.stderr.write(f"sign-bundle: --judge-concurrency must be between 1 and {_SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY}.\n")
         return 2
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
-    from elspeth_lints.core.review_bundle import read_bundle
+    from elspeth_lints.core.review_bundle import load_bundle
+    from elspeth_lints.core.sign_bundle_transaction import (
+        SignBundleTransactionError,
+        assert_active_unchanged,
+        assert_resume_identity,
+        create_transaction,
+        load_manifest,
+        publication_disposition,
+        rollback_pending_publish,
+        source_validation_pending,
+        transaction_lock,
+    )
 
     try:
         _load_judge_signing_env_file(args.env_file)
@@ -3836,25 +4160,95 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        bundle = read_bundle(args.bundle)
+        bundle_bytes = args.bundle.read_bytes()
+        bundle = load_bundle(bundle_bytes.decode("utf-8"))
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"sign-bundle: cannot read bundle {args.bundle}: {exc}\n")
         return 2
+    verified_bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+
+    resume_manifest: dict[str, Any] | None = None
+    resume_disposition: str | None = None
+    signing_policy = _sign_bundle_signing_policy(args)
+    verification_allowlist_dir = args.allowlist_dir
+    if args.resume is not None:
+        try:
+            resume_manifest = load_manifest(args.resume)
+            assert_resume_identity(
+                resume_manifest,
+                bundle_path=args.bundle,
+                root=args.root,
+                allowlist_dir=args.allowlist_dir,
+                rotation_log=args.rotation_log,
+                signing_policy=signing_policy,
+            )
+            _assert_resume_lanes(resume_manifest, args)
+            resume_disposition = publication_disposition(resume_manifest)
+            if resume_disposition.startswith("published"):
+                # After the atomic swap the transaction's candidate path holds
+                # the original active tree. Re-derive bundle claims there while
+                # separately verifying journaled signatures in the live tree.
+                verification_allowlist_dir = Path(resume_manifest["candidate_dir"])
+        except SignBundleTransactionError as exc:
+            sys.stderr.write(f"sign-bundle: transaction error: {exc}\n")
+            return 2
 
     # --- Re-verify gate: the all-or-nothing atomicity boundary ---------------
     try:
-        verification = verify_bundle_against_tree(bundle, root=args.root, allowlist_dir=args.allowlist_dir)
+        verification = verify_bundle_against_tree(
+            bundle,
+            root=args.root,
+            allowlist_dir=verification_allowlist_dir,
+            bundle_allowlist_dir=args.allowlist_dir,
+        )
     except ValueError as exc:
+        if (
+            args.resume is not None
+            and not args.dry_run
+            and resume_manifest is not None
+            and resume_disposition is not None
+            and resume_disposition.startswith("published")
+            and source_validation_pending(resume_manifest)
+        ):
+            try:
+                with transaction_lock(args.allowlist_dir, create=False):
+                    pending_manifest = load_manifest(args.resume)
+                    rollback_pending_publish(args.resume, pending_manifest)
+            except SignBundleTransactionError as rollback_exc:
+                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-unverifiable publish: {rollback_exc}\n")
+                return 2
         sys.stderr.write(f"sign-bundle: verify error: {exc}\n")
         return 2
     if not verification.ok:
+        if (
+            args.resume is not None
+            and not args.dry_run
+            and resume_manifest is not None
+            and resume_disposition is not None
+            and resume_disposition.startswith("published")
+            and source_validation_pending(resume_manifest)
+        ):
+            try:
+                with transaction_lock(args.allowlist_dir, create=False):
+                    pending_manifest = load_manifest(args.resume)
+                    rollback_pending_publish(args.resume, pending_manifest)
+            except SignBundleTransactionError as exc:
+                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-invalid publish: {exc}\n")
+                return 2
         sys.stderr.write("sign-bundle: staged claims no longer match the source tree; refusing to sign (re-run stage_scan):\n")
         for mismatch in verification.mismatches:
             sys.stderr.write(f"  mismatch: {mismatch}\n")
         return 2
 
     # --- Pre-write summary (pure read) ---------------------------------------
-    _emit_sign_bundle_summary(bundle, args=args)
+    _emit_sign_bundle_summary(bundle, verification=verification, args=args)
+    if args.lanes is not None:
+        lane_set = set(args.lanes)
+        excluded = sum(1 for action in bundle.actions if action.lane not in lane_set)
+        sys.stdout.write(
+            f"sign-bundle: --lanes {','.join(args.lanes)} — {excluded} action(s) outside the selected lane(s) "
+            "will not be attempted and stay fail-closed.\n"
+        )
 
     if args.dry_run:
         sys.stdout.write("sign-bundle: dry-run; nothing written (re-run without --dry-run to fire).\n")
@@ -3864,10 +4258,148 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         sys.stderr.write("sign-bundle: aborted at the confirmation prompt; nothing written.\n")
         return 0
 
-    return _execute_sign_bundle(bundle, verification=verification, args=args)
+    tx_path: Path | None = None
+    manifest: dict[str, Any] | None = None
+    try:
+        with transaction_lock(args.allowlist_dir, create=True):
+            if args.resume is None:
+                tx_path, manifest = create_transaction(
+                    bundle_path=args.bundle,
+                    verified_bundle_sha256=verified_bundle_sha256,
+                    bundle_id=bundle.bundle_id,
+                    root=args.root,
+                    allowlist_dir=args.allowlist_dir,
+                    rotation_log=args.rotation_log,
+                    signing_policy=signing_policy,
+                    selected_lanes=args.lanes,
+                )
+                sys.stderr.write(f"sign-bundle: private transaction created at {tx_path}; if interrupted, resume with --resume {tx_path}\n")
+            else:
+                tx_path = args.resume.resolve()
+                manifest = load_manifest(tx_path)
+                assert_resume_identity(
+                    manifest,
+                    bundle_path=args.bundle,
+                    root=args.root,
+                    allowlist_dir=args.allowlist_dir,
+                    rotation_log=args.rotation_log,
+                    signing_policy=signing_policy,
+                )
+                _assert_resume_lanes(manifest, args)
+            disposition = publication_disposition(manifest)
+            if disposition == "not_published":
+                assert_active_unchanged(manifest)
+            outcome = _execute_sign_bundle(
+                bundle,
+                verification=verification,
+                args=args,
+                tx_path=tx_path,
+                manifest=manifest,
+                disposition=disposition,
+            )
+    except KeyboardInterrupt:
+        if tx_path is not None:
+            _emit_sign_bundle_recovery(args, tx_path, reason="interrupted")
+        else:
+            sys.stderr.write("sign-bundle: interrupted before a recovery transaction was created; active allowlist unchanged.\n")
+        return 130
+    except SignBundleTransactionError as exc:
+        sys.stderr.write(f"sign-bundle: transaction error: {exc}\n")
+        if tx_path is not None:
+            _emit_sign_bundle_recovery(args, tx_path, reason="transaction failed")
+        return 2
+    except Exception as exc:
+        # Unexpected failures are contained by the private-copy boundary.  Do
+        # not include repr(exc): provider/config exceptions may carry secrets.
+        sys.stderr.write(
+            f"sign-bundle: unexpected {type(exc).__name__}; the active allowlist was not left in a partial per-action state.\n"
+        )
+        if tx_path is not None:
+            _emit_sign_bundle_recovery(args, tx_path, reason="unexpected failure")
+        return 2
+
+    if outcome.resumable and tx_path is not None:
+        _emit_sign_bundle_recovery(args, tx_path, reason="action did not succeed")
+    return outcome.exit_code
 
 
-def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
+_SIGN_BUNDLE_LANES = ("new_judgment", "resign")
+
+# Ceiling for ``--judge-concurrency``: each in-flight judge is one ``codex
+# exec`` subprocess plus its own read-only MCP server, and the provider's
+# rate limit — not the CPU — is the real bound. Kept small on purpose.
+_SIGN_BUNDLE_MAX_JUDGE_CONCURRENCY = 8
+
+# Published, but some judged BLOCKs were skipped under --continue-on-block: the
+# signed subset is live and the blocked entries stay fail-closed. Distinct from
+# 0 so a partial run never reads as clean, and from 1/2 so it is not mistaken
+# for an unfinished transaction (see ``_SignBundleOutcome``).
+_SIGN_BUNDLE_EXIT_PUBLISHED_WITH_BLOCKS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _SignBundleOutcome:
+    """A finished ``sign-bundle`` transaction and whether resuming it can progress.
+
+    The exit code alone cannot answer the second question, which is why this
+    carries both. Exit 3 is reached only *after* the coherent publish, and exit 1
+    covers both a stopped-on-BLOCK transaction (resumable with
+    ``--continue-on-block``) and an all-blocked one that signed nothing (no work
+    left to advance). Offering the paste-ready ``--resume`` command on a terminal
+    outcome sends the operator into a loop: the command reproduces the same code
+    and the same guidance forever.
+    """
+
+    exit_code: int
+    resumable: bool
+
+
+def _sign_bundle_lanes(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated lane subset; reject unknown or empty selections."""
+    lanes = tuple(sorted({part.strip() for part in raw.split(",") if part.strip()}))
+    if not lanes:
+        raise argparse.ArgumentTypeError("--lanes requires at least one lane name")
+    unknown = [lane for lane in lanes if lane not in _SIGN_BUNDLE_LANES]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown lane(s) {', '.join(unknown)}; valid lanes: {', '.join(_SIGN_BUNDLE_LANES)}")
+    return lanes
+
+
+def _assert_resume_lanes(manifest: dict[str, Any], args: argparse.Namespace) -> None:
+    """A resumed transaction keeps its journalled lane scope.
+
+    Omitting --lanes on resume inherits the manifest's selection (written back
+    onto ``args`` so every downstream consumer sees the effective scope); an
+    explicit mismatch is refused rather than silently re-scoped.
+    """
+    from elspeth_lints.core.sign_bundle_transaction import SignBundleTransactionError
+
+    manifest_lanes = manifest.get("selected_lanes")
+    if args.lanes is None:
+        args.lanes = None if manifest_lanes is None else tuple(manifest_lanes)
+        return
+    if manifest_lanes is None or tuple(sorted(manifest_lanes)) != tuple(sorted(args.lanes)):
+        recorded = "all lanes" if manifest_lanes is None else ",".join(sorted(manifest_lanes))
+        raise SignBundleTransactionError(
+            f"resume --lanes mismatch: transaction was created for {recorded}, command selected {','.join(sorted(args.lanes))}"
+        )
+
+
+def _sign_bundle_signing_policy(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind every non-secret option that can change resumed judgment semantics."""
+    return {
+        "owner": args.owner,
+        "operator_override": args.operator_override,
+        "max_tokens": args.max_tokens,
+        "repo_root": None if args.repo_root is None else str(args.repo_root.resolve()),
+        "env_file": None if args.env_file is None else str(args.env_file.resolve()),
+        "justify_format": args.justify_format,
+        "judge_transport": args.judge_transport,
+        "judge_tools": args.judge_tools,
+    }
+
+
+def _emit_sign_bundle_summary(bundle: Any, *, verification: Any, args: argparse.Namespace) -> None:
     """Print the per-lane plan + the planned operator-override action count.
 
     The planned override **count** is the deterministic, load-bearing integer the
@@ -3876,16 +4408,27 @@ def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
     authoritative C3 number is a rolling-window recompute the CLI does post-write,
     so an inline projection here must not be mistaken for it.
     """
+    # Scope to --lanes: the operator confirms what will be attempted, so an
+    # unselected action must not appear as planned work or a planned override
+    # (mirrors the lane filter in _execute_sign_bundle).
+    selected_lanes = None if args.lanes is None else set(args.lanes)
+    selected_actions = [a for a in bundle.actions if selected_lanes is None or a.lane in selected_lanes]
     counts = {"justify": 0, "drift_repair": 0, "rotation": 0, "stale_delete": 0}
-    for action in bundle.actions:
+    for action in selected_actions:
         counts[action.kind] = counts.get(action.kind, 0) + 1
     planned_override = (counts["justify"] + counts["drift_repair"]) if args.operator_override else 0
 
     sys.stdout.write(
         "sign-bundle: "
-        f"{len(bundle.actions)} action(s) -- "
+        f"{len(selected_actions)} action(s) -- "
         f"new_judgment={counts['justify']}, drift_repair={counts['drift_repair']}, "
         f"rotation={counts['rotation']}, stale_delete={counts['stale_delete']}\n"
+    )
+    census = verification.target_census
+    sys.stdout.write(
+        "sign-bundle: empty-allowlist target census -- "
+        f"raw={census.raw_target_count}, exact_covered={census.exact_covered_count}, "
+        f"per_file_covered={census.per_file_covered_count}, uncovered={census.uncovered_count}\n"
     )
     sys.stdout.write(f"sign-bundle: planned operator-override actions: {planned_override}\n")
     sys.stdout.write(
@@ -3896,73 +4439,229 @@ def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
 
 def _confirm_sign_bundle() -> bool:
     """Interactive confirmation gate for the destructive write phase."""
-    sys.stdout.write("sign-bundle: proceed with the write phase? [y/N]: ")
+    sys.stdout.write("sign-bundle: proceed with the recoverable transaction? [y/N]: ")
     sys.stdout.flush()
     response = sys.stdin.readline()
     return response.strip().lower() in {"y", "yes"}
 
 
-def _execute_sign_bundle(bundle: Any, *, verification: Any, args: argparse.Namespace) -> int:
-    """Fire each action per-``kind`` after the verify gate + confirm gate."""
+def _execute_sign_bundle(
+    bundle: Any,
+    *,
+    verification: Any,
+    args: argparse.Namespace,
+    tx_path: Path,
+    manifest: dict[str, Any],
+    disposition: str,
+) -> _SignBundleOutcome:
+    """Resume/fire actions privately, then atomically publish one coherent tree."""
     diagnosis = verification.diagnosis
     specs, _stale_keys, unrepairable = _signing_specs_from_diagnosis(diagnosis)
     specs_by_stale_key = {spec.stale_key: spec for spec in specs if spec.stale_key is not None}
+    stale_delete_sources = {
+        item.key: item.source_file
+        for item in diagnosis.items
+        if any(action.kind == "stale_delete" and action.key == item.key for action in bundle.actions)
+    }
     unrepairable_keys = {item.key for item in unrepairable}
 
     # A drift_repair action that is no longer signable (now in `unrepairable`)
     # is a stale claim -- abort before any write, mirroring sign-judge-signatures.
-    blocked = {a.key for a in bundle.actions if a.kind == "drift_repair"} & unrepairable_keys
+    # Actions outside the selected lanes are never attempted, so their claims
+    # cannot gate the transaction.
+    selected_lanes = None if args.lanes is None else set(args.lanes)
+    blocked = {
+        a.key for a in bundle.actions if a.kind == "drift_repair" and (selected_lanes is None or a.lane in selected_lanes)
+    } & unrepairable_keys
     if blocked:
         sys.stderr.write("sign-bundle: drift_repair action(s) are no longer signable in the fresh diagnosis; re-run stage_scan:\n")
         for key in sorted(blocked):
             sys.stderr.write(f"  {key}\n")
-        return 2
+        # A stale claim is re-staged, not resumed: nothing was written, and a
+        # resume re-derives the same fresh diagnosis and stops here again.
+        return _SignBundleOutcome(2, resumable=False)
 
-    total = len(bundle.actions)
-    successes = 0
-    failures: list[str] = []
-    first_failure_code = 0
+    from elspeth_lints.core.sign_bundle_transaction import run_sign_bundle_transaction
 
-    for index, action in enumerate(bundle.actions, start=1):
-        if action.kind == "drift_repair":
-            code = _execute_drift_repair_action(action, specs_by_stale_key=specs_by_stale_key, args=args)
-        elif action.kind == "justify":
-            code = _execute_new_judgment_action(action, args=args)
-        elif action.kind == "rotation":
-            code = _execute_rotation_action(action, rotation_plan=verification.rotation_plan, args=args)
-        elif action.kind == "stale_delete":
-            code = _execute_stale_delete_action(action, args=args)
-        else:  # pragma: no cover - BundleAction.__post_init__ rejects unknown kinds
-            sys.stderr.write(f"sign-bundle: unknown action kind {action.kind!r}\n")
-            code = 2
-
-        if code == 0:
-            successes += 1
-        else:
-            failures.append(f"[{index}/{total}] {action.kind} {action.key} exit={code}")
-            if first_failure_code == 0:
-                first_failure_code = code
-
-    if successes:
-        # Baseline regen runs only AFTER a successful write phase (Task 2.5);
-        # an all-failed run wrote nothing, so there is nothing to re-baseline.
-        _maybe_regen_fingerprint_baseline(args)
-    _emit_sign_bundle_post_state(args)
-
-    if failures:
+    result = run_sign_bundle_transaction(
+        bundle=bundle,
+        verification=verification,
+        args=args,
+        tx_path=tx_path,
+        manifest=manifest,
+        disposition=disposition,
+        specs_by_stale_key=specs_by_stale_key,
+        execute_action=lambda action, action_args: _execute_one_sign_bundle_action(
+            action,
+            verification=verification,
+            specs_by_stale_key=specs_by_stale_key,
+            stale_delete_sources=stale_delete_sources,
+            args=action_args,
+        ),
+        continue_on_block=args.continue_on_block,
+        judge_concurrency=args.judge_concurrency,
+        prefetch_execute_action=lambda action, action_args, before_write: _execute_one_sign_bundle_action(
+            action,
+            verification=verification,
+            specs_by_stale_key=specs_by_stale_key,
+            stale_delete_sources=stale_delete_sources,
+            args=action_args,
+            before_write=before_write,
+        ),
+    )
+    if result.exit_code != 0:
+        if result.failed_key is None and result.blocked_count:
+            # --continue-on-block walked the whole bundle but every judge call
+            # was BLOCKED: nothing was signed and the active allowlist is
+            # untouched. Not an infrastructure failure — a worklist.
+            sys.stderr.write(
+                f"sign-bundle: no action was signed; {result.blocked_count} judged-BLOCK action(s) recorded. Remediate and re-stage.\n"
+            )
+            _emit_sign_bundle_blocked_worklist(result)
+            # Every selected action is journalled BLOCKED and a journalled BLOCK
+            # is never re-judged, so there is nothing left for a resume to fire
+            # and nothing to publish. Re-staging is the only move; naming a
+            # resume command here would contradict the line above.
+            return _SignBundleOutcome(result.exit_code, resumable=False)
         sys.stderr.write(
-            f"sign-bundle: {successes} succeeded / {len(failures)} failed (verify was the atomic gate; "
-            "execute is per-action -- earlier writes stand, the blocked action's prior state was restored/skipped):\n"
+            f"sign-bundle: transaction stopped after {result.completed_count} completed action(s); "
+            f"[{(result.failed_index or 0) + 1}/{len(bundle.actions)}] "
+            f"{result.failed_kind} {result.failed_key} exit={result.exit_code}.\n"
         )
-        for line in failures:
-            sys.stderr.write(f"  {line}\n")
-        return first_failure_code
+        if result.blocked_count:
+            _emit_sign_bundle_blocked_worklist(result)
+            if not args.continue_on_block:
+                # The recorded verdict is terminal for this transaction — a
+                # resume re-judges nothing. Name the only other move so the
+                # operator does not reach for one that would shop the verdict.
+                sys.stderr.write(
+                    "sign-bundle: judged BLOCK(s) are journalled and will NOT be re-judged on resume; "
+                    "resume with --continue-on-block to skip them and publish the survivors.\n"
+                )
+        return _SignBundleOutcome(result.exit_code, resumable=True)
+    _maybe_regen_fingerprint_baseline(args)
+    _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
+    _emit_sign_bundle_post_state(args)
+    prefix = "recovered completed coherent publish" if result.recovered_publish else "completed"
+    sys.stdout.write(f"sign-bundle: {prefix}; {result.completed_count} action(s) applied in one coherent publish.\n")
+    if result.blocked_count:
+        # Partial signing must never read as a clean run: the publish is
+        # coherent, but the blocked entries remain fail-closed and owe
+        # remediation. Distinct exit code 3 = published-with-blocks.
+        sys.stdout.write(
+            f"sign-bundle: {result.blocked_count} judged-BLOCK action(s) were skipped under --continue-on-block "
+            "and remain UNSIGNED (fail-closed).\n"
+        )
+        _emit_sign_bundle_blocked_worklist(result)
+        # The transaction is published and complete; only remediation is owed.
+        return _SignBundleOutcome(_SIGN_BUNDLE_EXIT_PUBLISHED_WITH_BLOCKS, resumable=False)
+    return _SignBundleOutcome(0, resumable=False)
 
-    sys.stdout.write(f"sign-bundle: completed; {successes} action(s) applied.\n")
-    return 0
+
+def _emit_sign_bundle_blocked_worklist(result: Any) -> None:
+    """Print the judged-BLOCK remediation worklist, one key per line."""
+    sys.stdout.write("sign-bundle: blocked (not signed) — remediation worklist:\n")
+    for key in result.blocked_keys:
+        sys.stdout.write(f"  BLOCKED {key}\n")
 
 
-def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, Any], args: argparse.Namespace) -> int:
+def _execute_one_sign_bundle_action(
+    action: Any,
+    *,
+    verification: Any,
+    specs_by_stale_key: dict[str, Any],
+    stale_delete_sources: dict[str, str],
+    args: argparse.Namespace,
+    before_write: Callable[[], None] | None = None,
+) -> int:
+    """Execute one already-verified bundle action against the private copy.
+
+    ``before_write`` is the transaction's write gate for a prefetched action
+    (see ``sign_bundle_transaction._JudgePrefetcher``). Only ``justify`` defers
+    its writes behind it; any other kind handed a gate takes it up front so the
+    contract "no candidate write before the gate opens" holds regardless.
+    """
+    if before_write is not None and action.kind != "justify":
+        before_write()
+    if action.kind == "drift_repair":
+        return _execute_drift_repair_action(
+            action,
+            specs_by_stale_key=specs_by_stale_key,
+            args=args,
+            defer_override_rate_counter_snapshot=True,
+        )
+    if action.kind == "justify":
+        if before_write is None:
+            return _execute_new_judgment_action(action, args=args, defer_override_rate_counter_snapshot=True)
+        return _execute_new_judgment_action(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=True,
+            before_write=before_write,
+        )
+    if action.kind == "rotation":
+        return _execute_rotation_action(action, rotation_plan=verification.rotation_plan, args=args)
+    if action.kind == "stale_delete":
+        source_file = stale_delete_sources.get(action.key)
+        if source_file is None:
+            sys.stderr.write(f"sign-bundle: stale_delete {action.key!r} has no fresh diagnosis owner.\n")
+            return 2
+        return _execute_stale_delete_action(action, source_file=source_file, args=args)
+    sys.stderr.write(f"sign-bundle: unknown action kind {action.kind!r}\n")
+    return 2
+
+
+def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reason: str) -> None:
+    """Print a paste-ready, secret-free resume command."""
+    command = [
+        "elspeth-lints",
+        "sign-bundle",
+        str(args.bundle.resolve()),
+        "--root",
+        str(args.root.resolve()),
+        "--allowlist-dir",
+        str(args.allowlist_dir.resolve()),
+        "--owner",
+        args.owner,
+        "--rotation-log",
+        str(args.rotation_log.resolve()),
+        "--judge-transport",
+        args.judge_transport,
+        "--judge-tools",
+        args.judge_tools,
+        "--resume",
+        str(tx_path),
+        "--yes",
+    ]
+    if args.repo_root is not None:
+        command.extend(("--repo-root", str(args.repo_root.resolve())))
+    if args.env_file is not None:
+        command.extend(("--env-file", str(args.env_file.resolve())))
+    if args.max_tokens is not None:
+        command.extend(("--max-tokens", str(args.max_tokens)))
+    if args.operator_override:
+        command.append("--operator-override")
+    if args.justify_format != "text":
+        command.extend(("--format", args.justify_format))
+    if args.continue_on_block:
+        command.append("--continue-on-block")
+    if args.lanes is not None:
+        command.extend(("--lanes", ",".join(args.lanes)))
+    if args.judge_concurrency != 1:
+        command.extend(("--judge-concurrency", str(args.judge_concurrency)))
+    sys.stderr.write(
+        f"sign-bundle: {reason}; private decisions preserved at {tx_path}.\n"
+        f"sign-bundle: re-verify and resume with:\n  {shlex.join(command)}\n"
+    )
+
+
+def _execute_drift_repair_action(
+    action: Any,
+    *,
+    specs_by_stale_key: dict[str, Any],
+    args: argparse.Namespace,
+    defer_override_rate_counter_snapshot: bool,
+) -> int:
     """Re-judge a drifted entry: pop the stale row, re-run justify, restore on failure.
 
     Replicates the ``sign-judge-signatures`` pop -> ``_run_justify`` ->
@@ -3979,19 +4678,37 @@ def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, A
         )
         return 2
 
-    removed_stale_entry: str | None = None
+    if action.draft_rationale is not None:
+        try:
+            rationale = _bounded_rationale_string(action.draft_rationale)
+        except argparse.ArgumentTypeError as exc:
+            sys.stderr.write(f"sign-bundle: drift_repair rationale error: {exc}\n")
+            return 2
+        # Only the proposed explanation changes. Identity, binding and stale-row
+        # ownership remain the fresh diagnosis's authority; signing still judges.
+        spec = replace(spec, rationale=rationale)
+
+    removed_stale_entry: _RemovedAllowHitsEntry | None = None
     stale_yaml: Path | None = None
     try:
         if spec.stale_source_file is not None and spec.stale_key is not None:
             stale_yaml = args.allowlist_dir / spec.stale_source_file
-            removed_stale_entry = _pop_allow_hits_entry(stale_yaml, spec.stale_key)
+            removed_stale_entry = _pop_allow_hits_entry_with_position(stale_yaml, spec.stale_key)
     except ValueError as exc:
         sys.stderr.write(f"sign-bundle: drift_repair error: {exc}\n")
         return 2
 
-    exit_code = _run_justify(_namespace_for_signing_spec(spec, args))
+    exit_code = _run_justify(
+        _namespace_for_signing_spec(spec, args),
+        allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
+        defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+    )
     if exit_code != 0 and stale_yaml is not None and removed_stale_entry is not None:
-        _append_entry_to_yaml(stale_yaml, removed_stale_entry)
+        _append_entry_to_yaml(
+            stale_yaml,
+            removed_stale_entry.text,
+            entry_index=removed_stale_entry.index,
+        )
         sys.stderr.write(
             f"sign-bundle: judge did not re-sign {action.key!r}; restored the original signed entry intact. "
             "No stale verdict was laundered onto the changed scope.\n"
@@ -3999,7 +4716,13 @@ def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, A
     return exit_code
 
 
-def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> int:
+def _execute_new_judgment_action(
+    action: Any,
+    *,
+    args: argparse.Namespace,
+    defer_override_rate_counter_snapshot: bool,
+    before_write: Callable[[], None] | None = None,
+) -> int:
     """Run the real judge for a brand-new finding inside the keyed step.
 
     ``new_judgment`` actions have no diagnose item (no entry exists yet), so the
@@ -4009,6 +4732,8 @@ def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> in
     prompt, never the verdict: the fire-time ``call_judge`` issues the
     authoritative ACCEPTED/BLOCKED independently ([O1] preserved).
     """
+    from elspeth_lints.core.review_bundle import DEFAULT_SIGN_BUNDLE_RATIONALE
+
     namespace = argparse.Namespace(
         root=args.root,
         repo_root=args.repo_root,
@@ -4017,7 +4742,7 @@ def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> in
         rule=action.rule or "trust_tier.tier_model",
         symbol=action.symbol,
         fingerprint=action.fingerprint,
-        rationale=action.draft_rationale or "Staged via sign-bundle; see bundle provenance for the agent rationale.",
+        rationale=action.draft_rationale or DEFAULT_SIGN_BUNDLE_RATIONALE,
         owner=args.owner,
         operator_override=args.operator_override,
         max_tokens=args.max_tokens,
@@ -4026,7 +4751,11 @@ def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> in
         judge_transport=args.judge_transport,
         judge_tools=args.judge_tools,
     )
-    return _run_justify(namespace)
+    return _run_justify(
+        namespace,
+        defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        before_write=before_write,
+    )
 
 
 def _execute_rotation_action(action: Any, *, rotation_plan: Any, args: argparse.Namespace) -> int:
@@ -4084,12 +4813,18 @@ def _execute_rotation_action(action: Any, *, rotation_plan: Any, args: argparse.
     return 0
 
 
-def _execute_stale_delete_action(action: Any, *, args: argparse.Namespace) -> int:
+def _execute_stale_delete_action(
+    action: Any,
+    *,
+    source_file: str,
+    args: argparse.Namespace,
+) -> int:
     """Surgically remove one orphaned ``allow_hits`` entry from its owning YAML."""
-    if action.source_file is None:  # pragma: no cover - enforced by BundleAction.__post_init__
-        sys.stderr.write(f"sign-bundle: stale_delete {action.key!r} is missing source_file.\n")
+    source_path = Path(source_file)
+    if source_path.is_absolute() or len(source_path.parts) != 1 or source_path.name != source_file:
+        sys.stderr.write(f"sign-bundle: stale_delete {action.key!r} has unsafe verified source_file {source_file!r}.\n")
         return 2
-    target_yaml = args.allowlist_dir / action.source_file
+    target_yaml = args.allowlist_dir / source_file
     try:
         _pop_allow_hits_entry(target_yaml, action.key)
     except ValueError as exc:
@@ -4249,6 +4984,35 @@ def _run_rekey(args: argparse.Namespace) -> int:
         )
         return 2
 
+    from elspeth_lints.core.source_snapshot import capture_source_snapshot
+
+    root = Path(args.root).resolve()
+    live_allowlist_dir = allowlist_dir.resolve()
+    if (
+        not Path(bundle.root).is_absolute()
+        or not Path(bundle.allowlist_dir).is_absolute()
+        or Path(bundle.root).resolve() != root
+        or Path(bundle.allowlist_dir).resolve() != live_allowlist_dir
+    ):
+        sys.stderr.write("rekey: staged bundle root/allowlist scope does not match the requested tree; re-run stage_rekey.\n")
+        return 2
+    try:
+        source = capture_source_snapshot(source_root=root, allowlist_dir=live_allowlist_dir)
+    except ValueError as exc:
+        sys.stderr.write(f"rekey: cannot verify staged source binding: {exc}\n")
+        return 2
+    if (
+        bundle.source_rev,
+        bundle.source_dirty,
+        bundle.source_snapshot_sha256,
+    ) != (
+        source.source_rev,
+        source.source_dirty,
+        source.source_snapshot_sha256,
+    ):
+        sys.stderr.write("rekey: staged source binding is stale; re-run stage_rekey before writing.\n")
+        return 2
+
     # --- Enumerate the FULL judge-gated set from the tree (source-less load) ---
     # Source-less load skips the production HMAC + file-fingerprint gates (the
     # entries are signed under the OLD key, which may already be retired from the
@@ -4396,7 +5160,8 @@ def _rekey_entries_in_yaml(target_yaml: Path, specs: list[_RekeyRewriteSpec]) ->
 
         return "".join(result_lines)
 
-    atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
 
 
 def _rekey_entry_signature_line(
@@ -4865,7 +5630,8 @@ def _rewrite_v1_entries_as_v2_in_yaml(target_yaml: Path, specs: list[_V2RewriteS
 
         return "".join(result_lines)
 
-    atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
 
 
 def _rewrite_entry_binding_lines(
@@ -5042,6 +5808,49 @@ def _run_check_judge_coverage(args: argparse.Namespace) -> int:
     return 1
 
 
+def _run_check_per_file_blanket_ratchet(args: argparse.Namespace) -> int:
+    """Handle the repo-wide permanent multi-rule blanket ratchet."""
+    from elspeth_lints.core.per_file_blanket_ratchet import (
+        PerFileBlanketRatchetError,
+        check_per_file_blanket_ratchet,
+    )
+
+    try:
+        report = check_per_file_blanket_ratchet(
+            allowlist_root=args.allowlist_root,
+            baseline_ref=args.baseline_ref,
+            repo_root=args.repo_root,
+        )
+    except PerFileBlanketRatchetError as exc:
+        sys.stderr.write(f"check-per-file-blanket-ratchet: cannot run: {exc}\n")
+        return 2
+
+    sys.stdout.write(
+        "check-per-file-blanket-ratchet: "
+        f"{report.head_blanket_count} permanent multi-rule blanket(s) at HEAD "
+        f"({report.grandfathered_count} grandfathered from "
+        f"{report.baseline_blanket_count} baseline); "
+        f"{len(report.violations)} violation(s).\n"
+    )
+    if report.passes:
+        return 0
+    sys.stdout.write("\nNew or broadened permanent multi-rule blankets:\n")
+    for violation in report.violations:
+        cap = "uncapped" if violation.max_hits is None else f"max_hits={violation.max_hits}"
+        touched = "" if violation.touched_file is None else f" touched_file={violation.touched_file!r}"
+        sys.stdout.write(
+            f"  {violation.source_file} :: per_file_rules[{violation.index}] "
+            f"pattern={violation.pattern!r} rules={','.join(violation.rules)} {cap}{touched}\n"
+            f"    {violation.reason}\n"
+        )
+    sys.stdout.write(
+        "\nFor touched source, replace the blanket with exact reviewed allow_hits "
+        "entries. Otherwise add an expiry, reduce it to one rule, or narrow its "
+        "rules/max_hits relative to the baseline.\n"
+    )
+    return 1
+
+
 def _run_check_judge_quality(args: argparse.Namespace) -> int:
     """Handle ``elspeth-lints check-judge-quality``.
 
@@ -5055,10 +5864,10 @@ def _run_check_judge_quality(args: argparse.Namespace) -> int:
     """
     from elspeth_lints.core.judge import (
         DEFAULT_JUDGE_MAX_TOKENS,
-        DEFAULT_JUDGE_MODEL,
         JudgeConfigurationError,
         JudgeContractError,
         JudgeTransportError,
+        build_readonly_tool_scope,
     )
     from elspeth_lints.core.judge_quality import (
         JudgeQualityError,
@@ -5068,6 +5877,16 @@ def _run_check_judge_quality(args: argparse.Namespace) -> int:
         render_judge_quality_report_text,
     )
 
+    transport = _CLI_TRANSPORT_CHOICES[args.judge_transport]
+    tool_scope = None
+    if args.judge_tools == "readonly":
+        if transport not in _READONLY_TOOL_TRANSPORTS:
+            sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
+            return 2
+        # The same scope the signing paths build, so this gate measures the
+        # judge that will actually sign rather than a blinded stand-in.
+        tool_scope = build_readonly_tool_scope(root=args.root.resolve(), allowlist_dir=args.allowlist_dir.resolve())
+
     try:
         cases = load_judge_quality_corpus(args.corpus)
         report = evaluate_judge_quality_corpus(
@@ -5076,8 +5895,12 @@ def _run_check_judge_quality(args: argparse.Namespace) -> int:
             min_accuracy=args.min_accuracy,
             min_cases=args.min_cases,
             max_cases=args.max_cases,
-            model_id=args.model or DEFAULT_JUDGE_MODEL,
+            # None stays None: call_judge resolves the default BY TRANSPORT,
+            # and the OpenRouter slug is invalid for the Codex/Agent paths.
+            model_id=args.model,
             max_tokens=args.max_tokens or DEFAULT_JUDGE_MAX_TOKENS,
+            transport=transport,
+            tool_scope=tool_scope,
         )
     except JudgeQualityError as exc:
         sys.stderr.write(f"check-judge-quality: cannot run: {exc}\n")

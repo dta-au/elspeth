@@ -1,14 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { useSessionStore } from "./sessionStore";
+import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
+  ApiError,
   ChatMessage,
   ComposerPreferences,
   ComposerRecoveryError,
   ComposerProgressSnapshot,
   CompositionState,
   CompositionProposal,
+  BlobMetadata,
 } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -38,6 +41,18 @@ vi.mock("@/api/client", () => ({
   archiveSession: vi.fn(),
   renameSession: vi.fn(),
   getGuided: vi.fn(),
+  respondGuided: vi.fn(),
+  // The three WRITING guided-entry routes. Mocked (rather than absent) so the
+  // goal-first tests below can assert they were NOT called: "nothing is
+  // persisted before the user states a goal" is the whole point of the
+  // GET-first probe, and an unmocked export makes that assertion impossible
+  // to state.
+  startGuidedSession: vi.fn(),
+  convertToGuided: vi.fn(),
+  reenterGuided: vi.fn(),
+  reconcileGuidedStartOperation: vi.fn(),
+  chatGuided: vi.fn(),
+  GuidedResponseReceiptError: class extends Error {},
   // Phase 1B — sessionStore.createSession calls resolveDefaultMode() on the
   // preferencesStore, which falls back to fetchUserComposerPreferences()
   // when the prefs store hasn't been bootstrapped. The default mock returns
@@ -60,6 +75,10 @@ vi.mock("@/api/client", () => ({
   // does not trip session-load tests; targeted assertions on the call live
   // in interpretationEventsStore.test.ts.
   listInterpretationEvents: vi.fn().mockResolvedValue([]),
+  listBlobs: vi.fn(),
+  uploadBlob: vi.fn(),
+  deleteBlob: vi.fn(),
+  downloadBlobContent: vi.fn(),
 }));
 
 // Mock the execution store dependency
@@ -90,6 +109,38 @@ function makeCompositionState(version: number, nodeIds: string[] = []): Composit
     edges: [],
     outputs: [],
     metadata: { name: null, description: null },
+  };
+}
+
+/**
+ * The lazy in-memory stub GET /guided returns for a session with no persisted
+ * guided state (get_guided's docstring): the first step-1 turn, an empty
+ * transcript, and `composition_state: null`. Nothing has been written — which
+ * is exactly what a guided-default session looks like before its goal.
+ */
+function guidedStubResponse() {
+  return {
+    guided_session: {
+      step: "step_1_source",
+      history: [],
+      terminal: null,
+      chat_history: [],
+      chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
+      profile: null,
+    },
+    next_turn: {
+      type: "single_select",
+      step_index: 0,
+      turn_token: "a".repeat(64),
+      payload: {
+        question: "Which source plugin should we use?",
+        options: [{ id: "csv", label: "CSV", hint: null }],
+        allow_custom: false,
+      },
+    },
+    terminal: null,
+    composition_state: null,
   };
 }
 
@@ -135,6 +186,32 @@ function makeRecoveryError(
       tool_responses_persisted: 1,
       transcript_url: null,
     },
+  };
+}
+
+// ── R2-F9: wall-clock timeout 422 (elspeth-114dd261bc) ─────────────────────
+//
+// The route handler persists the salvaged partial pipeline as a NEW
+// composition-state version and the next turn resumes from it, so the partial
+// IS the session's current state. Leaving the pre-request graph on screen —
+// under copy that says nothing was kept — is a lie the user acts on.
+function makeTimeoutError(overrides: Partial<ApiError> = {}): ApiError {
+  return {
+    status: 422,
+    error_type: "convergence",
+    detail: "Composer did not converge within 6 turns (budget exhausted: timeout).",
+    reason: "convergence_wall_clock_timeout",
+    recovery_text:
+      "Retry once the provider responds faster, or ask an operator to raise the composer wall-clock budget.",
+    timeout_seconds: 240,
+    partial_state: makeCompositionState(6),
+    failed_turn: {
+      assistant_message_id: "assistant-9",
+      tool_calls_attempted: 3,
+      tool_responses_persisted: 3,
+      transcript_url: null,
+    },
+    ...overrides,
   };
 }
 
@@ -363,6 +440,93 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().compositionStateLoaded).toBe(true);
       expect(useSessionStore.getState().compositionState).toBeNull();
     });
+
+    it("createSession requests authoring focus so a collapsed pane cannot hide a new session's composer", async () => {
+      // The collapsed-pane preference persists globally (localStorage), so
+      // without this a user who collapsed the pane once would find EVERY new
+      // session opening with the chat — the primary composing surface —
+      // hidden (2026-08-15 UX review). The request is a STORE FLAG, not a
+      // window event: createSession can run while ComposerWorkspace is
+      // unmounted (empty landing, tutorial graduation), where an event
+      // would land on zero listeners. ComposerWorkspace consumes the flag
+      // on mount or change (its truth-test lives beside that consumer).
+      // Session SWITCHES deliberately do not set it, so the standing
+      // preference still applies when revisiting existing sessions.
+      const apiMod = await import("@/api/client");
+      (apiMod.createSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "new-2",
+        title: "Session — 2 Jul 2026",
+        created_at: "2026-07-02T00:00:00Z",
+        updated_at: "2026-07-02T00:00:00Z",
+      });
+
+      await useSessionStore.getState().createSession();
+
+      expect(useSessionStore.getState().authoringFocusRequested).toBe(true);
+    });
+
+    it("createSession does not request authoring focus when session creation fails", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.createSession as ReturnType<typeof vi.fn>).mockRejectedValue(
+        new Error("boom"),
+      );
+
+      await useSessionStore.getState().createSession();
+
+      expect(useSessionStore.getState().authoringFocusRequested).toBe(false);
+    });
+
+    it("createSession transfers blob ownership before the new session can upload", async () => {
+      const apiMod = await import("@/api/client");
+      const blobA = {
+        id: "blob-a",
+        session_id: "session-a",
+        filename: "a.csv",
+        mime_type: "text/csv",
+        size_bytes: 1,
+        content_hash: "a".repeat(64),
+        created_at: "2026-07-26T00:00:00Z",
+        created_by: "user",
+        source_description: null,
+        status: "ready",
+        creation_modality: "verbatim",
+        created_from_message_id: null,
+        creating_model_identifier: null,
+        creating_model_version: null,
+        creating_provider: null,
+        creating_composer_skill_hash: null,
+        creating_arguments_hash: null,
+      } satisfies BlobMetadata;
+      const blobB = {
+        ...blobA,
+        id: "blob-b",
+        session_id: "session-b",
+        filename: "b.csv",
+        content_hash: "b".repeat(64),
+      } satisfies BlobMetadata;
+      useBlobStore.getState().reset();
+      (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockResolvedValue([blobA]);
+      await useBlobStore.getState().loadBlobs("session-a");
+      (apiMod.createSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "session-b",
+        title: "Session B",
+        created_at: "2026-07-26T00:00:00Z",
+        updated_at: "2026-07-26T00:00:00Z",
+      });
+
+      await useSessionStore.getState().createSession();
+
+      expect(useSessionStore.getState().activeSessionId).toBe("session-b");
+      expect(useBlobStore.getState().blobs).toEqual([]);
+
+      (apiMod.uploadBlob as ReturnType<typeof vi.fn>).mockResolvedValue(blobB);
+      const result = await useBlobStore
+        .getState()
+        .uploadBlob("session-b", new File(["b"], "b.csv"));
+
+      expect(result).toEqual(blobB);
+      expect(useBlobStore.getState().blobs).toEqual([blobB]);
+    });
   });
 
   describe("sendMessage optimistic insert", () => {
@@ -429,6 +593,68 @@ describe("sessionStore", () => {
       // Assistant message should be appended
       const asstMsg = state.messages.find((m) => m.role === "assistant");
       expect(asstMsg?.content).toBe("Hello back");
+    });
+
+    it("records whether the turn mutated the pipeline (elspeth-bf9c296ee5)", async () => {
+      // The terminal completion badge derives "Response ready" vs "Pipeline
+      // updated" from this flag — a discarded versionChanged means the badge
+      // can only ever guess.
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+
+      // Turn 1: composer returns a NEW state version → mutated.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        message: {
+          id: "asst-1",
+          session_id: "session-1",
+          role: "assistant",
+          content: "Added the source.",
+          tool_calls: null,
+          created_at: new Date().toISOString(),
+        },
+        state: makeCompositionState(2),
+      });
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+
+      // While the turn is in flight the flag must read null (unknown), not a
+      // stale verdict from the previous turn.
+      useSessionStore.setState({ lastComposeChangedPipeline: false });
+      const sendPromise = useSessionStore.getState().sendMessage("add a source");
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBeNull();
+      await sendPromise;
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(true);
+
+      // Turn 2: answer-only response (state: null) → not mutated.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        message: {
+          id: "asst-2",
+          session_id: "session-1",
+          role: "assistant",
+          content: "That plugin reads CSV files.",
+          tool_calls: null,
+          created_at: new Date().toISOString(),
+        },
+        state: null,
+      });
+      await useSessionStore.getState().sendMessage("what does csv do?");
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(false);
+
+      // Turn 3: composer echoes the SAME version → not mutated.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        message: {
+          id: "asst-3",
+          session_id: "session-1",
+          role: "assistant",
+          content: "No changes needed.",
+          tool_calls: null,
+          created_at: new Date().toISOString(),
+        },
+        state: makeCompositionState(2),
+      });
+      await useSessionStore.getState().sendMessage("looks fine?");
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(false);
     });
 
     it("refreshes pending interpretation events after a successful freeform compose turn", async () => {
@@ -548,6 +774,183 @@ describe("sessionStore", () => {
 
       const state = useSessionStore.getState();
       expect(state.error).toContain("couldn't complete the composition");
+    });
+
+    it("names the elapsed budget and the salvaged draft on a wall-clock timeout", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        makeTimeoutError(),
+      );
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(5),
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain(
+        "ELSPETH ran out of time (240s). Your partial pipeline was saved — continue from it or retry.",
+      );
+      // The body's own recovery_text names the next practical action.
+      expect(state.error).toContain(
+        "ask an operator to raise the composer wall-clock budget",
+      );
+      expect(state.error).not.toContain("after multiple attempts");
+    });
+
+    it("shows the salvaged partial pipeline instead of the stale graph", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const timeoutError = makeTimeoutError();
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        timeoutError,
+      );
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(5),
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.compositionState).toBe(timeoutError.partial_state);
+      // The recovery panel is now reachable (failed_turn rides the 422)...
+      expect(state.recoveryError).toBe(timeoutError);
+      // ...and its apply-confirmation gate exists to catch a CONCURRENT
+      // third-party edit. Our own fold-in of the partial is not one, so the
+      // baseline moves with the store rather than firing a false alarm.
+      expect(state.recoveryStartedCompositionVersion).toBe(6);
+    });
+
+    it("does not claim a saved draft when the timeout salvaged nothing", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        makeTimeoutError({ partial_state: null, failed_turn: null }),
+      );
+
+      const before = makeCompositionState(5);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: before,
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("ELSPETH ran out of time (240s).");
+      expect(state.error).not.toContain("partial pipeline was saved");
+      expect(state.compositionState).toBe(before);
+    });
+
+    it("omits the elapsed budget when the 422 did not report one", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        makeTimeoutError({ timeout_seconds: undefined }),
+      );
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      // Never name a number the response did not stand behind.
+      expect(useSessionStore.getState().error).toContain(
+        "ELSPETH ran out of time. Your partial pipeline was saved",
+      );
+    });
+
+    it("keeps the turn-budget copy for the non-timeout convergence causes", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 422,
+        error_type: "convergence",
+        detail: "ignored",
+        reason: "convergence_composition_budget",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("after multiple attempts");
+      expect(state.error).not.toContain("ran out of time");
+    });
+
+    it("threads failure_code onto the failed optimistic message for policy_blocked (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // policy_blocked is permanent by construction — a deployment policy
+      // refused the pipeline — so the failed row must carry the code for
+      // the Retry affordance to suppress itself (MessageBubble).
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 403,
+        detail: "This pipeline is not permitted by deployment policy.",
+        failure_code: "policy_blocked",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBe("policy_blocked");
+    });
+
+    it("leaves local_failure_code unset when the send failure carries no failure_code (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        detail: "Something went wrong.",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBeUndefined();
+    });
+
+    it("renders the honest audit-integrity banner and keeps the saved user row un-failed (F-4b)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // The fail-closed audit-integrity 500 is a READ-side verification
+      // refusal: the user row was committed before every raise site, so the
+      // banner must say "your message was saved" (with the request id as the
+      // support reference) and the optimistic row must NOT be marked failed —
+      // a failed marker invites re-sending a duplicate of a committed row.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        error_type: "audit_integrity_error",
+        detail:
+          "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+        request_id: "req-0123456789ab",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.error).toContain("ELSPETH stopped before replying");
+      expect(state.error).toContain("Your message was saved.");
+      expect(state.error).toContain("Reload the session");
+      expect(state.error).toContain("req-0123456789ab");
+      expect(state.messages[0].local_status).toBeUndefined();
+      expect(state.messages[0].local_error).toBeUndefined();
+    });
+
+    it("omits the request-id reference when the audit-integrity envelope carries none (F-4b)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        error_type: "audit_integrity_error",
+        detail: "ignored",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("Your message was saved.");
+      expect(state.error).not.toContain("request ID");
+      expect(state.messages[0].local_status).toBeUndefined();
     });
 
     it("maps a client-side AbortError to the compose-timeout copy, not the generic fallback", async () => {
@@ -708,6 +1111,146 @@ describe("sessionStore", () => {
           useInterpretationEventsStore.getState().pendingBySession["session-1"];
         expect(map?.["evt-abort"]).toBeDefined();
       });
+    });
+
+    it("states what persisted when a stopped turn had already saved pipeline changes (elspeth-2784531888)", async () => {
+      // In auto_commit mode a Stop can land after durable mutations. The
+      // generic "revise your request and send it again" copy misrepresents
+      // that outcome — once the abort resync observes the durable head, the
+      // banner must state what persisted instead of implying nothing did.
+      const apiMod = await import("@/api/client");
+      const controller = new AbortController();
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () =>
+              reject(controller.signal.reason),
+            );
+          }),
+      );
+      const appliedToolRow: ChatMessage = {
+        id: "asst-tools",
+        session_id: "session-1",
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call-1",
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+          },
+        ],
+        created_at: "2026-08-06T00:00:01Z",
+      };
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "user-1",
+          session_id: "session-1",
+          role: "user",
+          content: "hello",
+          tool_calls: null,
+          created_at: "2026-08-06T00:00:00Z",
+        },
+        appliedToolRow,
+      ]);
+      (
+        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(makeCompositionState(3));
+      (
+        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      const sendPromise = useSessionStore
+        .getState()
+        .sendMessage("hello", controller.signal);
+      controller.abort("compose_user_cancel");
+      await sendPromise;
+
+      const state = useSessionStore.getState();
+      // The banner states the durable outcome: 1 -> 3 is two saved changes.
+      expect(state.error).toContain("Composition stopped");
+      expect(state.error).toContain("2 pipeline changes");
+      expect(state.error).toContain("version 3");
+      expect(state.error).not.toContain("revise your request");
+      // The applied tool prefix stays in the transcript for inspection.
+      const toolRow = state.messages.find((m) => m.id === "asst-tools");
+      expect(toolRow?.tool_calls?.[0]?.function.name).toBe("set_pipeline");
+    });
+
+    it("states that nothing was saved when a stopped turn had not advanced the pipeline (elspeth-2784531888)", async () => {
+      const apiMod = await import("@/api/client");
+      const controller = new AbortController();
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () =>
+              reject(controller.signal.reason),
+            );
+          }),
+      );
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (
+        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(makeCompositionState(1));
+      (
+        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      const sendPromise = useSessionStore
+        .getState()
+        .sendMessage("hello", controller.signal);
+      controller.abort("compose_user_cancel");
+      await sendPromise;
+
+      const state = useSessionStore.getState();
+      // Version 1 -> 1: the explicit no-change statement replaces silence,
+      // and the revise-and-resend invitation stays because it is true.
+      expect(state.error).toContain("Composition stopped");
+      expect(state.error).toContain("No pipeline changes had been saved");
+      expect(state.error).toContain("revise your request");
+    });
+
+    it("keeps the saved-changes statement on the compose-timeout abort flavour (elspeth-2784531888)", async () => {
+      const apiMod = await import("@/api/client");
+      const controller = new AbortController();
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () =>
+              reject(controller.signal.reason),
+            );
+          }),
+      );
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (
+        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(makeCompositionState(2));
+      (
+        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      const sendPromise = useSessionStore
+        .getState()
+        .sendMessage("hello", controller.signal);
+      controller.abort("compose_timeout");
+      await sendPromise;
+
+      const state = useSessionStore.getState();
+      expect(state.error).toMatch(/took too long/i);
+      expect(state.error).toContain("1 pipeline change");
+      expect(state.error).toContain("version 2");
     });
 
     it("waits for the cancelled turn's terminal progress before resyncing", async () => {
@@ -1652,6 +2195,107 @@ describe("sessionStore", () => {
     });
   });
 
+  describe("freeform compose admission gate (elspeth-3f38ebb1b5)", () => {
+    // Exactly one freeform compose may be admitted per session: without a
+    // synchronous store-level gate, alternate entry points (Retry on a
+    // failed bubble, Use-as-input in the blob manager) could start a second
+    // compose whose AbortController replaced the first one's — leaving Stop
+    // owning only the newest request.
+    function assistantReply(id: string): {
+      message: ChatMessage;
+      state: null;
+    } {
+      return {
+        message: {
+          id,
+          session_id: "session-1",
+          role: "assistant",
+          content: "done",
+          tool_calls: null,
+          created_at: "2026-08-09T10:00:00Z",
+        },
+        state: null,
+      };
+    }
+
+    it("refuses a second sendMessage while one is in flight", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const first = deferred<{ message: ChatMessage; state: null }>();
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        first.promise,
+      );
+
+      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      const firstSend = useSessionStore.getState().sendMessage("first");
+      await Promise.resolve();
+
+      await useSessionStore.getState().sendMessage("second");
+
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      const userContents = useSessionStore
+        .getState()
+        .messages.filter((m) => m.role === "user")
+        .map((m) => m.content);
+      expect(userContents).toEqual(["first"]);
+
+      first.resolve(assistantReply("asst-gate-1"));
+      await firstSend;
+      expect(useSessionStore.getState().isComposing).toBe(false);
+    });
+
+    it("refuses retryMessage while a compose is in flight", async () => {
+      const { sendMessage: mockSendMessage, recompose: mockRecompose } =
+        await import("@/api/client");
+      const first = deferred<{ message: ChatMessage; state: null }>();
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        first.promise,
+      );
+
+      const failedMessage: ChatMessage = {
+        id: "failed-1",
+        session_id: "session-1",
+        role: "user",
+        content: "previously failed",
+        tool_calls: null,
+        created_at: "2026-08-09T09:59:00Z",
+        local_status: "failed",
+      };
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [failedMessage],
+      });
+      const firstSend = useSessionStore.getState().sendMessage("first");
+      await Promise.resolve();
+
+      await useSessionStore.getState().retryMessage("failed-1");
+
+      expect(mockRecompose).not.toHaveBeenCalled();
+      // The failed message must not have been flipped to pending by a
+      // refused retry.
+      expect(
+        useSessionStore
+          .getState()
+          .messages.find((m) => m.id === "failed-1")?.local_status,
+      ).toBe("failed");
+
+      first.resolve(assistantReply("asst-gate-2"));
+      await firstSend;
+    });
+
+    it("admits a new compose after the previous settles (control)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(assistantReply("asst-gate-3"))
+        .mockResolvedValueOnce(assistantReply("asst-gate-4"));
+
+      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      await useSessionStore.getState().sendMessage("first");
+      await useSessionStore.getState().sendMessage("second");
+
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe("renameSession", () => {
     it("persists a trimmed title and updates the matching session", async () => {
       const apiClient = await import("@/api/client");
@@ -2216,6 +2860,129 @@ describe("sessionStore", () => {
     });
   });
 
+  // ── Reload of a guided session that has not stated its goal ───────────────
+  //
+  // Goal-first (elspeth-378cfa0e18) removed the write that used to make this
+  // work by accident: convert persisted a rootless checkpoint, so a reload saw
+  // a real composition state and restored guided. With nothing persisted the
+  // probe returns the same lazy stub it returned the first time, and the only
+  // evidence that this session belongs on the guided surface is the account's
+  // default mode. Getting this wrong drops the user into freeform with the
+  // goal card gone — the failure the stub adoption exists to prevent.
+  describe("selectSession restores a goal-less guided-default session", () => {
+    async function setDefaultMode(mode: "guided" | "freeform"): Promise<void> {
+      const { usePreferencesStore } = await import("@/stores/preferencesStore");
+      usePreferencesStore.setState({
+        loaded: true,
+        defaultMode: mode,
+        bannerDismissedAt: null,
+        writing: false,
+      });
+    }
+
+    async function selectWithStub(
+      messages: ReadonlyArray<Record<string, unknown>> = [],
+    ): Promise<void> {
+      const apiClient = await import("@/api/client");
+      (apiClient.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
+        messages,
+      );
+      (
+        apiClient.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(null);
+      (
+        apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+      (
+        apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(null);
+      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue(
+        guidedStubResponse(),
+      );
+      await useSessionStore.getState().selectSession("sess-goal");
+    }
+
+    it("re-adopts the stub under a guided default so the session reopens on the goal card", async () => {
+      await setDefaultMode("guided");
+
+      await selectWithStub();
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).not.toBeNull();
+      expect(state.guidedNextTurn).not.toBeNull();
+      // Still nothing persisted: re-adopting must not be a write either.
+      expect(state.compositionState).toBeNull();
+      const apiClient = await import("@/api/client");
+      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
+      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
+    });
+
+    it("ignores the stub under a freeform default (a stub is not evidence of guided use)", async () => {
+      // The stub is returned for ANY session with no persisted guided state,
+      // including a brand-new freeform one. Adopting it unconditionally would
+      // flip a freeform-preferring user onto the guided surface on first load.
+      await setDefaultMode("freeform");
+
+      await selectWithStub();
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).toBeNull();
+      expect(state.guidedNextTurn).toBeNull();
+    });
+
+    it("leaves a worked freeform session in freeform even under a guided default", async () => {
+      // The stub is not a per-session signal — GET /guided answers with it for
+      // ANY session with no composition state, including a freeform session
+      // whose conversation never produced one (a message that triggered no
+      // compose tool call). Adopting on the preference alone would hide that
+      // real transcript behind the goal card, because the guided surface
+      // renders guided chat_history and not `messages`, and would do it
+      // retroactively to every message-only session the moment the user
+      // switched their default to guided. The adoption needs evidence about
+      // THIS session as well: an untouched one has no messages.
+      await setDefaultMode("guided");
+
+      await selectWithStub([
+        {
+          id: "user-1",
+          session_id: "sess-goal",
+          role: "user",
+          content: "what plugins can read a CSV?",
+          tool_calls: null,
+          created_at: "2026-09-03T00:00:00Z",
+        },
+      ]);
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).toBeNull();
+      expect(state.guidedNextTurn).toBeNull();
+      expect(state.messages).toHaveLength(1);
+    });
+
+    it("degrades to freeform when the default mode cannot be resolved", async () => {
+      // resolveDefaultMode throws when the preferences bootstrap produced no
+      // mode. Session selection must not become an error, and must not guess
+      // guided: the fallback is the same one createSession degrades to.
+      const { usePreferencesStore } = await import("@/stores/preferencesStore");
+      usePreferencesStore.setState({
+        loaded: true,
+        defaultMode: null,
+        bannerDismissedAt: null,
+        writing: false,
+      });
+
+      await selectWithStub();
+
+      const state = useSessionStore.getState();
+      expect(state.activeSessionId).toBe("sess-goal");
+      expect(state.guidedSession).toBeNull();
+      expect(state.error).toBeNull();
+    });
+  });
+
   describe("retryMessage abort handling", () => {
     it("drops stale retryMessage responses after the active session changes", async () => {
       const { recompose: mockRecompose } = await import("@/api/client");
@@ -2364,6 +3131,40 @@ describe("sessionStore", () => {
       expect(state.messages[0].local_error).toBe(state.error);
     });
 
+    it("surfaces the timeout copy and the salvaged draft on the recompose path (R2-F9)", async () => {
+      // The 422 handler is shared by send_message and recompose, so the
+      // store's two catch arms must not drift apart.
+      const { recompose: mockRecompose } = await import("@/api/client");
+      const timeoutError = makeTimeoutError();
+      (mockRecompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        timeoutError,
+      );
+
+      const userMessage: ChatMessage = {
+        id: "user-1",
+        session_id: "session-1",
+        role: "user",
+        content: "hello",
+        tool_calls: null,
+        created_at: new Date().toISOString(),
+      };
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [userMessage],
+        compositionState: makeCompositionState(5),
+      });
+
+      await useSessionStore.getState().retryMessage("user-1");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain(
+        "ELSPETH ran out of time (240s). Your partial pipeline was saved — continue from it or retry.",
+      );
+      expect(state.compositionState).toBe(timeoutError.partial_state);
+      expect(state.recoveryError).toBe(timeoutError);
+      expect(state.recoveryStartedCompositionVersion).toBe(6);
+    });
+
     it("resyncs durable server state after an aborted retry (elspeth-06a23adfcc)", async () => {
       const apiMod = await import("@/api/client");
       const controller = new AbortController();
@@ -2471,6 +3272,7 @@ describe("sessionStore", () => {
           terminal: { kind: "completed", reason: null },
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         } as never,
         guidedNextTurn: {} as never,
@@ -2558,6 +3360,101 @@ describe("sessionStore", () => {
     });
   });
 
+  describe("guided source lifecycle rejection", () => {
+    it("removes the rejected exact UUID even when authoritative blob refresh fails", async () => {
+      const sessionId = "00000000-0000-4000-8000-000000000101";
+      const rejectedId = "00000000-0000-4000-8000-000000000901";
+      const otherId = "00000000-0000-4000-8000-000000000902";
+      const detail =
+        "Selected source blob is no longer a ready upload for this session.";
+      const apiMod = await import("@/api/client");
+      (apiMod.respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 400,
+        detail,
+      });
+      (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error("authoritative refresh failed"),
+      );
+      useBlobStore.getState().reset();
+      useBlobStore.getState().activateSession(sessionId);
+      const blobFixture = {
+        id: rejectedId,
+        session_id: sessionId,
+        filename: "rejected.csv",
+        mime_type: "text/csv",
+        size_bytes: 16,
+        content_hash: "a".repeat(64),
+        created_at: "2026-07-27T00:00:00Z",
+        created_by: "user",
+        source_description: null,
+        status: "ready",
+        creation_modality: "verbatim",
+        created_from_message_id: null,
+        creating_model_identifier: null,
+        creating_model_version: null,
+        creating_provider: null,
+        creating_composer_skill_hash: null,
+        creating_arguments_hash: null,
+      } satisfies BlobMetadata;
+      useBlobStore.setState({
+        blobs: [
+          blobFixture,
+          {
+            ...blobFixture,
+            id: otherId,
+            filename: "other.csv",
+            content_hash: "b".repeat(64),
+          },
+        ],
+      });
+      useSessionStore.setState({
+        activeSessionId: sessionId,
+        guidedSession: {
+          step: "step_1_source",
+          history: [],
+          terminal: null,
+          chat_history: [],
+          chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
+          profile: null,
+        },
+        guidedNextTurn: {
+          type: "single_select",
+          step_index: 0,
+          turn_token: "a".repeat(64),
+          payload: {
+            question: "Choose a source",
+            options: [{ id: "csv", label: "CSV", hint: null }],
+            allow_custom: false,
+          },
+        },
+      });
+
+      const outcome = await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        source_blob_id: rejectedId,
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(apiMod.listBlobs).toHaveBeenCalledWith(sessionId);
+      expect(useBlobStore.getState().blobs.map((blob) => blob.id)).toEqual([
+        otherId,
+      ]);
+      expect(useBlobStore.getState().error).toBe("Failed to load files.");
+      expect(outcome).toEqual({
+        status: "not_applied",
+        reason: "rejected",
+        message: detail,
+      });
+      expect(useSessionStore.getState().error).toBe(detail);
+    });
+  });
+
   // ── Phase 1B: createSession honours composer default-mode preference ──
   describe("createSession honours default mode", () => {
     it("leaves guidedSession null when default mode is freeform", async () => {
@@ -2608,6 +3505,53 @@ describe("sessionStore", () => {
       await useSessionStore.getState().createSession();
 
       expect(enterGuided).toHaveBeenCalledTimes(1);
+      // The intent-less call is the contract: a brand-new session has no goal
+      // yet, so entry must land on the goal card (see the end-to-end pin
+      // below) rather than starting or converting anything.
+      expect(enterGuided).toHaveBeenCalledWith();
+    });
+
+    it("guided default: lands on the goal card by adopting the GET stub, writing NOTHING", async () => {
+      // The defect this pins (goal-first, elspeth-378cfa0e18): createSession's
+      // guided arm called enterGuided(), which called convertToGuided(), whose
+      // "no persisted state" branch PERSISTS a fresh rootless wizard. Every
+      // guided-default session was therefore created with a planner-reachable
+      // wizard behind no stated intent, and — because composition state was
+      // then non-null — the goal card could never render for it.
+      //
+      // enterGuided is deliberately NOT spied here: the sibling test above
+      // mocks it out and so proves only that the arm fires. This one runs the
+      // real action against a mocked GET so the routing itself is pinned.
+      const apiClient = await import("@/api/client");
+      const { usePreferencesStore } = await import("@/stores/preferencesStore");
+      usePreferencesStore.setState({
+        loaded: true,
+        defaultMode: "guided",
+        bannerDismissedAt: null,
+        writing: false,
+      });
+      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        id: "sess-goal",
+        title: "untitled",
+        created_at: "2026-05-14T00:00:00Z",
+        updated_at: "2026-05-14T00:00:00Z",
+      });
+      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        guidedStubResponse(),
+      );
+
+      await useSessionStore.getState().createSession();
+
+      const state = useSessionStore.getState();
+      expect(apiClient.getGuided).toHaveBeenCalledWith("sess-goal");
+      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
+      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
+      expect(state.guidedSession).not.toBeNull();
+      expect(state.guidedNextTurn).not.toBeNull();
+      // Null composition state IS the goal card's condition in ChatPanel, and
+      // it is the honest description of the session: nothing is persisted.
+      expect(state.compositionState).toBeNull();
+      expect(state.error).toBeNull();
     });
 
     it("prefs-bootstrap failure does NOT mask successful session creation (Panel M1)", async () => {

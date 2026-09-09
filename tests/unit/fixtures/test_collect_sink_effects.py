@@ -71,6 +71,7 @@ def test_collect_sink_effect_commit_is_idempotent_and_reconcilable() -> None:
             effect_input=SinkEffectPipelineMembersInput(
                 members=(_member({"value": 1}),),
                 target_snapshot_members=(),
+                target_delivered_member_count=1,
             ),
             inspection=inspection,
         ),

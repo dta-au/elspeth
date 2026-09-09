@@ -15,8 +15,12 @@ from pathlib import PurePosixPath
 from typing import Any, Final, Literal, cast
 from uuid import UUID
 
-from elspeth.contracts.freeze import deep_thaw
+from pydantic import JsonValue
+
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
+from elspeth.core.secrets import collect_credential_field_violations
 from elspeth.web.catalog.knob_schema import KnobSchema, validate_knob_schema
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, ControlSignal, GuidedStep, TurnType
@@ -26,12 +30,17 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_json_mapping,
     freeze_guided_str_sequence,
 )
+from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent
+from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
+from elspeth.web.composer.state import validate_composer_output_name
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
+from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 _PATH_OPTION_NAMES: Final = frozenset({"path", "file"})
 _SOURCE_KIND_PLUGIN: Final = {"csv": "csv", "json": "json", "jsonl": "json", "text": "text"}
+_SOURCE_BLOB_COMPATIBLE_PLUGINS: Final = frozenset(_SOURCE_KIND_PLUGIN.values())
 _KNOB_KINDS: Final = frozenset(
     {
         "text",
@@ -52,6 +61,11 @@ def _require_nonempty_exact_str(value: object, field_name: str) -> str:
     if type(value) is not str or value == "":
         raise TypeError(f"{field_name} must be a non-empty exact str")
     return value
+
+
+def source_plugin_accepts_blob_inspection(plugin: object) -> bool:
+    """Return whether a source choice can bind inspected session-blob bytes."""
+    return type(plugin) is str and plugin in _SOURCE_BLOB_COMPATIBLE_PLUGINS
 
 
 def _canonical_uuid(value: object, field_name: str) -> str:
@@ -91,6 +105,7 @@ class PluginSelectionResponse:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "chosen", freeze_guided_str_sequence(self.chosen, "PluginSelectionResponse.chosen"))
+        freeze_fields(self, "chosen")
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +118,7 @@ class SchemaFormResponse:
     def __post_init__(self) -> None:
         _require_nonempty_exact_str(self.plugin, "SchemaFormResponse.plugin")
         object.__setattr__(self, "options", freeze_guided_json_mapping(self.options, "SchemaFormResponse.options"))
+        freeze_fields(self, "options")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +149,7 @@ class SchemaFormAuthority:
             "server_options",
             freeze_guided_json_mapping(self.server_options, "SchemaFormAuthority.server_options"),
         )
+        freeze_fields(self, "knobs", "model_validated_options", "server_options")
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +160,7 @@ class InspectionResponse:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "columns", freeze_guided_str_sequence(self.columns, "InspectionResponse.columns"))
+        freeze_fields(self, "columns")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +180,7 @@ class FieldSelectionResponse:
         )
         if self.control_signal is not None and type(self.control_signal) is not ControlSignal:
             raise TypeError("FieldSelectionResponse.control_signal must be ControlSignal or None")
+        freeze_fields(self, "chosen", "custom_inputs")
 
 
 def _require_active_turn(
@@ -205,6 +224,16 @@ def _require_inspection_plugin_match(plugin: str, facts: SourceInspectionFacts) 
     expected_plugin = _SOURCE_KIND_PLUGIN[facts.source_kind] if facts.source_kind in _SOURCE_KIND_PLUGIN else None
     if expected_plugin is not None and plugin != expected_plugin:
         raise ValueError(f"selected source plugin {plugin!r} does not match inspection facts for {facts.source_kind!r} content")
+
+
+def _inspection_content_hash_prefix(facts: SourceInspectionFacts) -> str | None:
+    """The inspected content's hash prefix, when the inspection read bytes."""
+    if "content_hash_prefix" not in facts.redacted_identity:
+        return None
+    prefix = facts.redacted_identity["content_hash_prefix"]
+    if type(prefix) is not str or prefix == "":
+        raise InvariantError("inspection facts content_hash_prefix must be a non-empty exact str")
+    return prefix
 
 
 def _inspection_blob_id(facts: SourceInspectionFacts) -> str | None:
@@ -264,6 +293,21 @@ def _selected_plugin(response: PluginSelectionResponse, permitted_plugins: Seque
     if plugin not in _validated_permitted_plugins(permitted_plugins):
         raise ValueError(f"plugin {plugin!r} is not in the server-emitted permitted set")
     return plugin
+
+
+class WebSurfacePolicyRejectedError(ValueError):
+    """Deployment-policy refusal of a guided selection, safe for operator logs.
+
+    A ``ValueError`` subclass so every existing client-fault catch admits it
+    unchanged, but distinguishable at the guided 400 handler: its message is
+    server-composed end to end — the plugin name comes from the persisted
+    turn's own permitted set (membership is validated before the policy check
+    fires) and the explanation from the policy predicate — so, unlike the
+    generic selection ``ValueError`` whose message echoes the raw
+    client-supplied choice, its text may reach the operator log.
+    """
+
+    rejection_code = "web_surface_policy_rejected"
 
 
 def _next_component_name(base: str, existing_names: Sequence[str]) -> str:
@@ -347,6 +391,37 @@ def _sink_selection_target(
     if sum(item.phase == "plugin_selection" for item in session.pending_output_intents.values()) != 1:
         raise ValueError("sink selection target is ambiguous for the current turn occurrence")
     return stable_id, intent.name, False
+
+
+def _validated_sink_prefill_name(session: GuidedSession, stable_id: str, prefill_name: str) -> str:
+    validate_composer_output_name(prefill_name)
+    other_names = {
+        *(source.name for source in session.reviewed_sources.values()),
+        *(intent.name for intent in session.pending_source_intents.values()),
+        *(output.name for candidate_id, output in session.reviewed_outputs.items() if candidate_id != stable_id),
+        *(intent.name for candidate_id, intent in session.pending_output_intents.items() if candidate_id != stable_id),
+    }
+    if prefill_name in other_names:
+        raise ValueError("sink prefill name duplicates another guided component")
+    return prefill_name
+
+
+def _unused_stated_routing_output_names(session: GuidedSession, stable_id: str) -> tuple[str, ...]:
+    used_names = {
+        *(source.name for source in session.reviewed_sources.values()),
+        *(intent.name for intent in session.pending_source_intents.values()),
+        *(output.name for candidate_id, output in session.reviewed_outputs.items() if candidate_id != stable_id),
+        *(intent.name for candidate_id, intent in session.pending_output_intents.items() if candidate_id != stable_id),
+    }
+    unused: list[str] = []
+    for intent in session.deferred_intents:
+        for constraint in intent.constraints:
+            if type(constraint) is not StatedGateRoutingConstraint:
+                continue
+            for target in (constraint.true_target, constraint.false_target):
+                if target not in used_names and target not in unused:
+                    unused.append(target)
+    return tuple(unused)
 
 
 def _require_source_intent(session: GuidedSession, target_id: str, phase: str) -> tuple[str, SourceIntent]:
@@ -560,6 +635,17 @@ def _validated_merged_options(
     for option_name, option_value in merged.items():
         if option_name not in model_validated or stable_hash(model_validated[option_name]) != stable_hash(option_value):
             raise InvariantError(f"server model validation did not preserve submitted {plugin_kind} option {option_name!r}")
+    credential_fields = tuple(
+        dict.fromkeys(
+            collect_credential_field_violations(
+                model_validated,
+                additional_credential_fields=allowed_secret_ref_fields(plugin_kind, plugin_name),
+            )
+        )
+    )
+    if credential_fields:
+        field_list = ", ".join(credential_fields)
+        raise ValueError(f"literal credential values are not allowed for {plugin_kind} option field(s): {field_list}; use secret_ref")
     return (
         freeze_guided_json_mapping(model_validated, f"{plugin_kind} resolved options"),
         cast(Mapping[str, str], freeze_guided_json_mapping(structural, f"{plugin_kind} structural policies")),
@@ -721,6 +807,22 @@ def remove_reviewed_component(session: GuidedSession, target: ComponentTarget) -
     return replace(session, output_order=next_order, reviewed_outputs=next_reviewed_outputs)
 
 
+@trust_boundary(
+    tier=3,
+    source=("a client-submitted reorder request's stable-id collection, arriving as untyped wire input from the guided review routes"),
+    source_param="stable_ids",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError for a non-sequence value, for the str/bytes/bytearray character-sequence trap, and "
+        "for any member that is not an exact UUID; raises ValueError unless the submitted ids are an exact "
+        "permutation of the reviewed component ids; never reorders on a partial or defaulted collection"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_stage_transitions.py::"
+        "test_reorder_reviewed_components_rejects_non_sequence_and_non_uuid_stable_ids"
+    ),
+    test_fingerprint="31d6b383fe1fdf39d9c474a1960db71e17e9ddd23e3f49aa28fec9bb35801236",
+)
 def reorder_reviewed_components(
     session: GuidedSession,
     component_kind: Literal["source", "output"],
@@ -798,6 +900,44 @@ def transition_source_plugin_selection(
     return replace(session, source_order=source_order, pending_source_intents=pending)
 
 
+def transition_source_plugin_reselection(
+    session: GuidedSession,
+    *,
+    target_id: str,
+    turn: AnsweredTurn,
+    plugin: str,
+    permitted_plugins: Sequence[str],
+    inspection_facts: SourceInspectionFacts | None,
+) -> GuidedSession:
+    """Replace one pending source plugin while retaining its stable identity."""
+    _require_active_turn(
+        session,
+        turn,
+        expected_step=GuidedStep.STEP_1_SOURCE,
+        expected_turn_type=TurnType.SCHEMA_FORM,
+    )
+    stable_id, intent = _require_source_intent(session, target_id, "plugin_options")
+    selected = _selected_plugin(PluginSelectionResponse(chosen=(plugin,)), permitted_plugins)
+    if selected == intent.plugin:
+        raise ValueError("source plugin reselection must change the server-held plugin")
+    facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None
+    if facts is not None:
+        if facts.source_kind not in _SOURCE_KIND_PLUGIN:
+            raise ValueError("source plugin reselection cannot attach inspection facts of an unknown source kind")
+        _require_inspection_plugin_match(selected, facts)
+    pending = dict(session.pending_source_intents)
+    pending[stable_id] = SourceIntent(
+        name=intent.name,
+        phase="plugin_options",
+        plugin=selected,
+        options=None,
+        inspection_facts=facts,
+        observed_columns=(),
+        sample_rows=(),
+    )
+    return replace(session, pending_source_intents=pending)
+
+
 def transition_source_schema_form(
     session: GuidedSession,
     *,
@@ -870,11 +1010,19 @@ def transition_source_schema_form(
 
     _require_no_other_pending(session.pending_source_intents, stable_id, "source")
     reviewed = dict(session.reviewed_sources)
+    # No inspection facts were attached, so no blob was read and there are no
+    # observed headers to record. An explicit (fixed/flexible) schema is then
+    # the only field inventory the source has, and it is authoritative: the
+    # operator declared exactly those fields, and a declared field is
+    # implicitly guaranteed. Seeding it keeps the downstream field surfaces
+    # (the Step-2 output field picker, the chat and planner projections) from
+    # presenting an empty inventory as the fact that the source has no fields.
+    # Observed schemas declare none and still resolve with no columns.
     reviewed[stable_id] = SourceResolved(
         name=intent.name,
         plugin=intent.plugin,
         options=options,
-        observed_columns=(),
+        observed_columns=reviewed_schema_declared_field_names(options["schema"] if "schema" in options else None),
         sample_rows=(),
         on_validation_failure=structural["on_validation_failure"],
     )
@@ -933,6 +1081,7 @@ def transition_source_inspection_review(
         observed_columns=columns,
         sample_rows=(),
         on_validation_failure=on_validation_failure,
+        content_hash_prefix=_inspection_content_hash_prefix(facts),
     )
     pending = dict(session.pending_source_intents)
     del pending[stable_id]
@@ -959,6 +1108,7 @@ def transition_sink_plugin_selection(
     new_stable_id: UUID | None = None,
     target_id: str | None = None,
     prefill_options: Mapping[str, Any] | None = None,
+    prefill_name: str | None = None,
 ) -> GuidedSession:
     """Move one output from plugin selection to plugin options.
 
@@ -982,6 +1132,14 @@ def transition_sink_plugin_selection(
         target_id=target_id,
         new_stable_id=new_stable_id,
     )
+    required_names = _unused_stated_routing_output_names(session, stable_id)
+    if prefill_name is not None:
+        validated_prefill_name = _validated_sink_prefill_name(session, stable_id, prefill_name)
+        if required_names and validated_prefill_name not in required_names:
+            raise ValueError("sink prefill name does not match an unused stated routing target")
+        name = validated_prefill_name
+    elif required_names:
+        name = _validated_sink_prefill_name(session, stable_id, required_names[0])
     pending = dict(session.pending_output_intents)
     pending[stable_id] = SinkIntent(name=name, phase="plugin_options", plugin=plugin, options=prefill_options)
     output_order = (*session.output_order, stable_id) if created else session.output_order
@@ -1046,7 +1204,7 @@ def transition_sink_schema_form(
 _SINK_OUTPUT_POOL: Final = "outputs"
 
 
-def canonical_sink_local_paths(options: Mapping[str, Any]) -> dict[str, Any]:
+def canonical_sink_local_paths(options: Mapping[str, Any]) -> dict[str, JsonValue]:
     """Root relative sink path options in the managed outputs pool.
 
     Guided pipelines write to the deployment's managed outputs directory. A
@@ -1064,12 +1222,21 @@ def canonical_sink_local_paths(options: Mapping[str, Any]) -> dict[str, Any]:
     rejected here outright: canonicalizing them would silently rewrite
     intent, and no allowlist can prove them safe pre-resolution.
     """
-    updated = dict(options)
+    updated = cast(dict[str, JsonValue], dict(options))
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
-        value = updated.get(key)
+        if key not in updated:
+            continue
+        value = updated[key]
         if type(value) is not str or not value or value.startswith(BLOB_REF_PATH_PREFIX):
             continue
         raw = PurePosixPath(value)
+        # These messages interpolate ONLY server constants (the option key
+        # from SINK_LOCAL_PATH_OPTION_KEYS). Never interpolate the path
+        # VALUE: it is model/user-authored text, and quoting it into a
+        # message re-creates the parsed-attribution vector this family of
+        # messages was cleared of (elspeth-f60d638661).
+        if not raw.parts:
+            raise ValueError(f"option {key!r} must name a path, not the current directory")
         if ".." in raw.parts:
             raise ValueError(
                 f"option {key!r} must not contain '..' path segments; give a path like 'results.json' or 'reports/results.json'"
@@ -1127,12 +1294,37 @@ def transition_sink_field_review(
     _require_no_other_pending(session.pending_output_intents, stable_id, "output")
     reviewed = dict(session.reviewed_outputs)
     plugin_options, on_write_failure = _split_pending_structural(intent.options, "on_write_failure")
+    schema_mode = _sink_schema_mode(plugin_options)
+    selected = () if passthrough else (*chosen, *custom)
+    # A selection the sink's own explicit schema does not declare is a
+    # deterministic dead end, not a reviewable choice: guided_reviewed_sink_options
+    # later merges required_fields into options.schema.required_fields, and
+    # SchemaConfig requires required_fields to be a subset of the declared field
+    # names — a rejection that surfaces only at candidate validation, where sink
+    # options are server-restored reviewed authority the planner cannot repair
+    # (elspeth-398f150859; incident session 847ef691). Reject at review time
+    # instead, while the operator can still change the selection. Declared-name
+    # extraction mirrors the validator's precedence
+    # (reviewed_schema_declared_field_names). An explicit schema that declares
+    # no extractable fields is a schema-form defect on a different axis; it is
+    # deliberately not adjudicated here, so the guard keys on declared fields
+    # being present, not on the mode alone.
+    sink_schema = plugin_options["schema"] if "schema" in plugin_options else None
+    declared = reviewed_schema_declared_field_names(sink_schema)
+    if selected and declared:
+        undeclared = sorted(set(selected) - set(declared))
+        if undeclared:
+            raise ValueError(
+                f"selected fields are not declared by the sink's explicit {schema_mode!r} schema: "
+                f"{', '.join(undeclared)}. Declared fields are: {', '.join(sorted(declared))}. "
+                "Choose declared fields, or author the sink schema to include these."
+            )
     reviewed[stable_id] = SinkOutputResolved(
         name=intent.name,
         plugin=intent.plugin,
         options=plugin_options,
-        required_fields=() if passthrough else (*chosen, *custom),
-        schema_mode=_sink_schema_mode(plugin_options),
+        required_fields=selected,
+        schema_mode=schema_mode,
         on_write_failure=on_write_failure,
     )
     pending = dict(session.pending_output_intents)
@@ -1167,6 +1359,7 @@ __all__ = [
     "transition_sink_plugin_selection",
     "transition_sink_schema_form",
     "transition_source_inspection_review",
+    "transition_source_plugin_reselection",
     "transition_source_plugin_selection",
     "transition_source_schema_form",
 ]

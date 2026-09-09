@@ -3,9 +3,10 @@
 // dumping the visible-affordance inventory + guided/tutorial network outcomes so
 // the FIRST divergence is localized fast. Delete after debugging.
 //
-// Run: STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
-//      STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//      PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+// Run: STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
+//      STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
+//      STAGING_BASE_URL=https://elspeth.example.gov.au \
+//      PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //      npx playwright test --config=playwright.staging.config.ts tutorial-probe
 
 import { mkdirSync } from "node:fs";
@@ -108,7 +109,9 @@ test("probe: walk the staged guided tutorial", async ({ page }) => {
 
   // Turn-pump: resolve per-stage interpretation reviews, then advance via the
   // enabled stage primary, screenshotting + dumping affordances as state evolves.
-  const runHeading = page.getByRole("heading", { name: /Running your pipeline/i });
+  // The run turn mounts on its PRE-RUN card (I-1): "Ready to run." with an
+  // explicit Run button; nothing executes until it is clicked (below).
+  const runHeading = page.getByRole("heading", { name: /Ready to run/i });
   const acceptButtons = page.getByRole("button", { name: /^Accept /i });
   const promptRegions = page.getByRole("region", { name: "Prompt template review" });
   // "Review wiring" carries a send-first guard (below): the step-2→step-3
@@ -229,8 +232,12 @@ test("probe: walk the staged guided tutorial", async ({ page }) => {
     if (!advanced) await page.waitForTimeout(2500);
   }
 
-  // If we reached the run, confirm it actually completes (run POST + Continue).
+  // If we reached the run turn, click Run as the learner would (I-1: the run
+  // never auto-fires), then confirm it actually completes (run POST +
+  // Continue).
   if (await runHeading.isVisible().catch(() => false)) {
+    await shot(page, "run-ready");
+    await page.getByRole("button", { name: "Run", exact: true }).click();
     const done = page.getByRole("button", { name: "Continue", exact: true });
     await expect(done).toBeVisible({ timeout: 360_000 }).catch(() => {});
     await shot(page, "run-finished");

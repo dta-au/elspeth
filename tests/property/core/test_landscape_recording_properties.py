@@ -32,11 +32,12 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import path_expand_group_id
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, make_recorder_with_run
 
 # Minimal contract for tests that only care about token lifecycle, not contract content.
 _MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
@@ -133,7 +134,9 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
-            completed = factory.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+            completed = factory.run_lifecycle.complete_run(
+                RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+            )
             assert completed.status == RunStatus.COMPLETED
 
     @given(config=simple_configs)
@@ -144,7 +147,9 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
-            completed = factory.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+            completed = factory.run_lifecycle.complete_run(
+                RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+            )
             assert completed.completed_at is not None
 
     @given(config=simple_configs)
@@ -155,7 +160,9 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
-            completed = factory.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+            completed = factory.run_lifecycle.complete_run(
+                RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+            )
             assert completed.completed_at is not None
             assert completed.completed_at >= completed.started_at
 
@@ -196,7 +203,7 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
             run2 = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
-            factory.run_lifecycle.complete_run(run2.run_id, RunStatus.COMPLETED)
+            factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run2.run_id))
 
             running = factory.run_lifecycle.list_runs(status=RunStatus.RUNNING)
             assert all(r.status == RunStatus.RUNNING for r in running)
@@ -264,15 +271,18 @@ class TestTokenOutcomeContractProperties:
             )
         db.close()
 
-    def test_forked_requires_fork_group_id(self) -> None:
-        """Property: (TRANSIENT, FORK_PARENT) without fork_group_id raises ValueError."""
+    def test_forked_forbids_every_discriminator_field(self) -> None:
+        """Property: (TRANSIENT, FORK_PARENT) forbids sink_name/batch_id/error_hash.
+
+        D2 flip: fork_group_id is retired from token_outcomes — the roster of
+        record moved to token_lineage_frames + group_records.
+        """
         db, factory, run_id, token_id = self._setup()
-        with pytest.raises(ValueError, match=r"\(TRANSIENT, FORK_PARENT\) outcome requires fork_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token_id, run_id=run_id),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.FORK_PARENT,
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_id, run_id=run_id),
+            outcome=TerminalOutcome.TRANSIENT,
+            path=TerminalPath.FORK_PARENT,
+        )
         db.close()
 
     def test_failed_requires_error_hash(self) -> None:
@@ -308,27 +318,33 @@ class TestTokenOutcomeContractProperties:
             )
         db.close()
 
-    def test_coalesced_requires_join_group_id(self) -> None:
-        """Property: (SUCCESS, COALESCED) without join_group_id raises ValueError."""
+    def test_coalesced_accepts_only_sink_name(self) -> None:
+        """Property: (SUCCESS, COALESCED) accepts sink_name and no other discriminator.
+
+        D2 flip: join_group_id is retired from token_outcomes — it lives only
+        on the merged TOKEN (ruling 20), not the per-parent outcome record.
+        """
         db, factory, run_id, token_id = self._setup()
-        with pytest.raises(ValueError, match=r"\(SUCCESS, COALESCED\) outcome requires join_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token_id, run_id=run_id),
-                outcome=TerminalOutcome.SUCCESS,
-                path=TerminalPath.COALESCED,
-                sink_name="default",
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_id, run_id=run_id),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.COALESCED,
+            sink_name="default",
+        )
         db.close()
 
-    def test_expanded_requires_expand_group_id(self) -> None:
-        """Property: (TRANSIENT, EXPAND_PARENT) without expand_group_id raises ValueError."""
+    def test_expanded_forbids_every_discriminator_field(self) -> None:
+        """Property: (TRANSIENT, EXPAND_PARENT) forbids sink_name/batch_id/error_hash.
+
+        D2 flip: expand_group_id is retired from token_outcomes — the roster
+        of record moved to token_lineage_frames + group_records.
+        """
         db, factory, run_id, token_id = self._setup()
-        with pytest.raises(ValueError, match=r"\(TRANSIENT, EXPAND_PARENT\) outcome requires expand_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token_id, run_id=run_id),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.EXPAND_PARENT,
-            )
+        factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_id, run_id=run_id),
+            outcome=TerminalOutcome.TRANSIENT,
+            path=TerminalPath.EXPAND_PARENT,
+        )
         db.close()
 
     def test_buffered_requires_batch_id(self) -> None:
@@ -380,13 +396,13 @@ class TestSchemaContractRoundTripProperties:
             schema_config=_make_schema_config(),
         )
         factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id=source.node_id,
             source_name="primary",
             plugin_name="test",
             config_hash="confighash",
             lifecycle_state="loading",
             source_schema_json='{"mode": "observed"}',
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         return source.node_id
 
@@ -415,9 +431,9 @@ class TestSchemaContractRoundTripProperties:
             source_node_id = self._record_source(factory, run.run_id)
 
             factory.run_lifecycle.update_run_source_contract(
-                run_id=run.run_id,
                 source_node_id=source_node_id,
                 schema_contract=contract,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
             records = factory.run_lifecycle.get_run_source_resume_records(run.run_id)
 
@@ -465,9 +481,9 @@ class TestSchemaContractRoundTripProperties:
             source_node_id = self._record_source(factory, run.run_id)
 
             factory.run_lifecycle.update_run_source_contract(
-                run_id=run.run_id,
                 source_node_id=source_node_id,
                 schema_contract=contract,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
             records = factory.run_lifecycle.get_run_source_resume_records(run.run_id)
 
@@ -695,7 +711,7 @@ class TestReferentialIntegrityProperties:
             assert expand_group_id is not None
             for child in children:
                 assert child.row_id == row.row_id
-                assert child.expand_group_id == expand_group_id
+                assert path_expand_group_id(child.lineage_path) == expand_group_id
 
 
 # =============================================================================
@@ -725,9 +741,9 @@ class TestFieldResolutionProperties:
             )
 
             factory.run_lifecycle.record_source_field_resolution(
-                run_id=run.run_id,
                 resolution_mapping=mapping,
                 normalization_version="v1",
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
 
             retrieved = factory.run_lifecycle.get_source_field_resolution(run.run_id)

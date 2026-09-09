@@ -22,7 +22,7 @@ from elspeth.engine.executors.sink_effects import (
     SinkEffectExecutionSeam,
     SinkEffectInjectedFault,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members
 from tests.unit.engine.test_sink_effect_executor import _execution_request
@@ -60,6 +60,7 @@ def test_redrive_republishes_after_spool_loss(tmp_path: Path) -> None:
             factory=factory,
             worker_id="worker-a",
             fault_hook=_crash_at(SinkEffectExecutionSeam.BEFORE_EFFECT),
+            coordination_token=leader_token_for(db, run_id),
         )
         with pytest.raises(SinkEffectInjectedFault):
             first.execute(_execution_request(run_id, sink_id, members), _s3(store))
@@ -73,6 +74,7 @@ def test_redrive_republishes_after_spool_loss(tmp_path: Path) -> None:
         second = SinkEffectCoordinator(
             factory=make_factory(db, payload_store=payload_store),
             worker_id="worker-a",
+            coordination_token=leader_token_for(db, run_id),
         )
         result = second.execute(_execution_request(run_id, sink_id, members), _s3(store))
 

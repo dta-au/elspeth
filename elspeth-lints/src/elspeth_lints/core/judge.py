@@ -15,7 +15,7 @@ Design constraints (from the prototype plan, all load-bearing):
 * The judge is rule-agnostic — it consumes ``(file, rule_id, symbol,
   rationale, surrounding_code)`` and the input shape does not bake in
   ``tier_model``-specific assumptions. This is the abstraction that
-  ports to ``wardline``.
+  ports to other rule packages.
 * The judge's rationale is the new audit primitive. It is recorded
   verbatim and is independently re-readable months later when an auditor
   asks "why did we exempt this?". The YAML answers without re-running
@@ -28,13 +28,11 @@ Design constraints (from the prototype plan, all load-bearing):
   policy, silently coercing a malformed judge response into a
   default-shaped one would destroy the audit primitive's integrity.
 
-Transport: the judge calls Anthropic-family models via OpenRouter using
-the OpenAI-compatible chat-completions SDK. Project-wide standard. The
-OpenAI SDK is pointed at ``https://openrouter.ai/api/v1`` and uses the
-``OPENROUTER_API_KEY`` env var. Prompt caching uses Anthropic's
-``cache_control: {"type": "ephemeral"}`` markers, which OpenRouter
-forwards inline; cache-hit accounting comes back on
-``response.usage.prompt_tokens_details.cached_tokens``.
+Transports: the default calls Anthropic-family models via OpenRouter using the
+OpenAI-compatible chat-completions SDK. Local agent alternatives are explicit:
+the legacy Claude Agent SDK and an installed/authenticated Codex CLI. All three
+reduce their provider output to the same strict parsing/validation contract;
+the signed transport identity records which path produced a verdict.
 """
 
 from __future__ import annotations
@@ -43,6 +41,9 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
+import sys
+import tempfile
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -52,8 +53,8 @@ from typing import Any, cast
 from elspeth_lints.core.allowlist import JudgeVerdict
 
 # Default model identifier (OpenRouter slug — vendor prefix required).
-# The prototype is single-vendor by design; wardline will make this
-# configurable per-project.
+# The prototype is single-vendor by design; per-project configuration
+# is deferred.
 DEFAULT_JUDGE_MODEL: str = "anthropic/claude-opus-4-7"
 DEFAULT_JUDGE_MAX_TOKENS: int = 1024
 
@@ -63,6 +64,7 @@ DEFAULT_JUDGE_MAX_TOKENS: int = 1024
 # registry below so the two can't drift.
 TRANSPORT_OPENROUTER: str = "openrouter"
 TRANSPORT_AGENT: str = "claude_agent_sdk"
+TRANSPORT_CODEX_CLI: str = "codex_cli"
 
 # Per-transport default model. CRITICAL: DEFAULT_JUDGE_MODEL is an OpenRouter
 # *routing slug* ("anthropic/claude-opus-4-7" — the vendor prefix is required
@@ -71,6 +73,8 @@ TRANSPORT_AGENT: str = "claude_agent_sdk"
 # will reject the slug. Each transport therefore has its own default; call_judge
 # resolves by transport when the caller passes no explicit model_id.
 DEFAULT_AGENT_JUDGE_MODEL: str = "claude-opus-4-7"  # confirm the SDK-accepted id post-install (Task 2)
+DEFAULT_CODEX_JUDGE_MODEL: str = "gpt-5.6-sol"
+CODEX_JUDGE_REASONING_EFFORT: str = "high"
 
 # OpenRouter endpoint. The OpenAI SDK is pointed here rather than at
 # OpenAI's own endpoint so model identity (and therefore which family's
@@ -113,9 +117,8 @@ _OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 # Sections 3-8 are excerpted from CLAUDE.md verbatim where the wording is
 # load-bearing for the verdict (e.g. the fabrication-decision test, the
 # Decision Test table). The Three-Tier section (§3) additionally carries
-# the project's origin-vs-courier and "persisted external data re-read is
-# Tier-3" (second-order / stored-input) rules, and the "validation is
-# in-flight, not permanent" boundary. Worked examples and tables that do
+# the project's origin-vs-courier and serialization-preserves-authorship
+# rules. Worked examples and tables that do
 # not apply to allowlist-suppression decisions (deep_freeze patterns, DAG
 # transitions, etc.) are omitted only because they are irrelevant to a
 # suppression verdict — NOT to hit a size target.
@@ -183,6 +186,26 @@ disposition you found (RULE MISFIRES / GENUINE VIOLATION / PRESCRIBED
 FORM / BLOCK-PENDING) so the basis of the verdict is captured in the
 audit record.
 
+CONTROL-LOCATION CLAIMS — a rationale that says "the real gate lives
+elsewhere" (another function, a caller, an in-transaction check, a
+pinning test) is making a checkable claim, and it is the single most
+common way a wrong suppression gets signed. Two failure shapes, both
+seen in the 2026-08-28 burn-down audit:
+  (a) a contained/swallowed signal that LOOKS like a lost integrity gate
+      but the real gate is elsewhere — the rationale is right only if it
+      NAMES that gate by symbol and the code you can see is consistent
+      with it being reached on every path the flagged site covers;
+  (b) a removal or narrowing justified by "X already checks this" where
+      X does not exist, is not reached on the flagged path, or checks a
+      different property — the suppression then deletes the only control.
+Hold such a rationale to this bar: the control is named by SYMBOL (not a
+line number — lines rot while the signature stays valid), the visible
+code does not contradict its reachability, and a pinning test is named
+by nodeid where one is claimed. In tool mode, READ the named control and
+its test before crediting them. A control-location claim you cannot
+verify is BLOCK-PENDING, not ACCEPTED; a claim the code contradicts is
+GENUINE VIOLATION.
+
 You do NOT propose a code fix. Your only outputs are a verdict and the
 reasoning behind it. If the suppression is wrong, the agent is
 responsible for remediation — refactor, broaden a per-file rule, move the
@@ -232,7 +255,8 @@ Must be 100% pristine at all times. We wrote it, we own it, we trust it
 completely.
 
 - Bad data in the audit trail = crash immediately.
-- No coercion, no defaults, no silent recovery.
+- Read required values by direct access first.
+- No implicit coercion, no hidden defaults, no silent recovery.
 - Every field must be exactly what we expect — wrong type = crash, NULL
   where unexpected = crash, invalid enum value = crash.
 
@@ -240,6 +264,27 @@ Why: the audit trail is the legal record. Silently coercing bad data is
 evidence tampering. A defensive ``.get()`` on a row read out of the
 audit database is forbidden — if the field is missing, that is a
 catastrophic invariant break and must surface.
+
+If and only if a first-party domain contract explicitly authorizes
+synthesizing or correcting a Tier-1 value, the coercion must remain
+absolutely explicit and visible at the use site in this form:
+
+    value = owned["field"]
+    if value is weird:
+        value = correct_value
+
+The direct access happens first, so a missing required field still
+crashes. ``.get(default)``, truthiness fallback (``value or default``),
+exception fallback, implicit cast/coercion, and helper-hidden
+normalization are forbidden substitutes. A helper that conceals the
+branch makes an auditor unable to see where authored evidence became a
+synthetic value.
+
+Serialization never demotes Tier 1. Our-authored audit records,
+checkpoints, and transaction journals remain Tier 1 after JSON, YAML,
+SQL, ORM, or other serialization/deserialization. Read their required
+fields directly and let corruption raise; the transport format does not
+change authorship.
 
 ### Tier 2: Pipeline Data (Post-Source) — ELEVATED TRUST ("Probably OK")
 
@@ -250,10 +295,10 @@ The defining Tier-2 property is that the *shape* is guaranteed: a dict is
 a dict, an int is an int, because source validation or a typed contract
 established it. You trust the shape but NOT the value — ``divisor == 0``
 is type-valid and still a threat, so wrap operations on values. Because
-the shape is guaranteed, re-checking it with ``isinstance``/``getattr``/
-``.get`` is the forbidden defensive pattern. The contrapositive matters:
-if the shape is NOT contractually guaranteed at this point (see Tier 3),
-the data is not Tier 2, and shape-guarding it is legitimate.
+the shape is guaranteed, re-checking it with ``isinstance`` or ``.get``
+is the forbidden defensive pattern. The contrapositive matters: if the
+shape is NOT contractually guaranteed at this point (see Tier 3), the
+data is not Tier 2, and declared shape discrimination is legitimate.
 
 - Types are trustworthy (source validated and/or coerced them).
 - Values might still cause operation failures (division by zero, invalid
@@ -332,44 +377,21 @@ silent-recovery pattern, and it is forbidden even at a genuine Tier-3
 boundary. Guarding the shape never licenses trusting the *value*
 (division-by-zero and friends remain threats).
 
-### Validation is in-flight, not permanent — persisted external data is re-read as Tier-3
+### Serialization preserves authorship and trust tier
 
-A shape established by validation at write time is NOT guaranteed at a
-later read. Two independent reasons: (1) the persistent store is mutable
-— config DBs and audit rows can be hand-edited, restored from a stale
-backup, or tampered with between write and read; (2) the validating model
-can drift — the Pydantic/schema contract that accepted the value can
-change shape by the next read. So a value re-read from our own DB — even
-hydrated into a typed dataclass such as ``SourceSpec.options`` — is
-shape-UNGUARANTEED at the read site, and guarding/wrapping it there is
-honest, not redundant defensive code.
+Serialization is a courier, not an author. It never turns our statement
+into somebody else's statement, and it never turns somebody else's
+statement into ours. Our-authored audit/checkpoint/journal data remains
+Tier 1 when re-read and must use direct access with crash-on-corruption
+semantics. External-authored configuration or payload content that was
+stored without promotion remains external-origin; a first-party
+dataclass or database row carrying it does not claim authorship of its
+contents.
 
-This is the classic second-order / stored-input boundary. A rationale of
-the form "this config was validated once at the load boundary, so a
-``ValueError`` on re-read is a Tier-1 invariant break" is WRONG: the value
-is external-origin, the store is mutable, and re-reading it is a fresh
-Tier-3 boundary. ACCEPT a guard/wrap on persisted external-origin config
-re-read from our own storage; treat an unguarded re-read that can crash a
-tool or run on malformed stored input as the defect — not the guard.
-
-The deciding factor is chain of custody, not storage, and it explains the
-asymmetry you will see. Think of it as evidence handling: a value is
-trusted while it stays inside our trust domain, but writing it to disk and
-reading it back leaves it unattended with a custodian we don't fully
-control (filesystem, DB engine, serialization layer), so the reader must
-re-check the seal. What a broken seal MEANS differs by whose statement it
-is. A checkpoint WE authored, re-read from the same DB, stays Tier-1: it
-is our own statement under unbroken custody, a broken seal is tampering
-with our evidence, and the response is to crash — the "seal check" there
-is the NATURAL crash of direct access, never an added guard (a `.get()`/
-try-except on a Tier-1 read is the forbidden defensive pattern).
-``source.options`` THEY authored stays Tier-3: it is someone else's
-statement, persistence interrupted custody, a broken seal is a damaged
-delivery, and the response is an explicit boundary guard that quarantines.
-Persistence does not change whose statement a value is. So do NOT
-over-generalise this to "anything read from the DB is Tier-3": our-authored
-audit/checkpoint reads remain Tier-1. The question is always whose
-statement the value represents, not which table it came from.
+Do not classify data from the storage mechanism alone. Trace who authored
+the value and whether a declared boundary contract promoted it. In
+particular, never argue that JSON/SQL/ORM deserialization demotes Tier 1
+or licenses a defensive re-check of our own invariant.
 
 ``raise`` is not synonymous with ``crash``, and deciding the fate is not
 the raising code's job. The code at the point of detection has one
@@ -398,10 +420,10 @@ surrounding structure routes it, not whether it raises.
 - Sink: no coercion, expect types.
 - Our data (Landscape, checkpoints): crash on any anomaly —
   serialization doesn't change trust tier (we authored the *values*).
-- Persisted external-origin config (composer/user/operator-authored,
-  re-read from our DB): still Tier-3 — guarding/wrapping the re-read is
-  honest; "validated once" does not promote it, and living in a typed
-  dataclass (``SourceSpec``) is the container, not the tier.
+- Persisted external-origin config (composer/user/operator-authored)
+  that no declared first-party boundary contract promoted: still Tier-3.
+  Storage and a courier dataclass (``SourceSpec``) do not change
+  authorship; a real promotion contract does.
 
 ----------------------------------------------------------------
 Plugin Ownership: System Code, Not User Code
@@ -435,9 +457,12 @@ response body, a remote API payload — even when our own client made the
 call and returns the wrapper object. The external system controls that
 shape; no ELSPETH contract guarantees it; it is Tier-3 external data per
 the Quick Reference ("Transform on external calls: external response is
-Tier 3"). Shape-guarding or coercing such a value (``getattr``/``.get``/
-``isinstance`` on provider-variable or network-sourced fields) is the
-Tier-3 boundary pattern, NOT a Plugin-Ownership violation. The
+Tier 3"). Shape-guarding or coercing such a value (``.get`` /
+``isinstance`` on provider-variable or network-sourced fields) may be
+the Tier-3 boundary pattern. Sentinel-defaulted ``getattr`` extraction
+is permitted here under the parse-don't-validate rule below (ADR-032);
+what remains banned is duck-typed presence probing used to satisfy an
+ELSPETH-internal contract. The
 discriminator is NOT the courier ("what code returned the object") but
 trust-necessity-and-trustworthiness: does this code need to rely on the
 value's shape, and if so, is that shape actually guaranteed (trustworthy)
@@ -459,12 +484,57 @@ Defensive Programming: Forbidden. Offensive Programming: Encouraged
 
 ### What's Forbidden (Defensive Programming)
 
-Do not use ``.get()``, ``getattr()``, ``isinstance()``, or silent
-exception handling to suppress errors from nonexistent attributes,
-malformed data, or incorrect types. Access typed dataclass fields
-directly (``obj.field``), not defensively (``obj.get("field")``).
-``hasattr()`` is unconditionally banned — it swallows all exceptions
-from ``@property`` getters, not just missing attributes.
+Do not use ``.get()``, ``isinstance()``, or silent exception handling to
+suppress errors from nonexistent fields, malformed data, or incorrect
+types under a fixed contract. Access typed dataclass fields directly
+(``obj.field``), not defensively (``obj.get("field")``).
+
+Attribute presence probing used to satisfy an ELSPETH-INTERNAL contract
+is banned absolutely. Do not use ``getattr``, ``hasattr``,
+``inspect.getattr_static``, forwarding ``__getattr__``,
+property-swallowing exception nets, or any duck-typed presence probe to
+decide that an ELSPETH-owned object satisfies an ELSPETH contract.
+These let an object pretend to satisfy a different contract and can
+swallow arbitrary property failures. At a genuinely unknown-type
+boundary over objects ELSPETH itself constructs, use ``isinstance``
+discrimination against a declared concrete type that ELSPETH defines.
+
+Do NOT use a ``runtime_checkable`` ``Protocol`` for that discrimination
+(ADR-032). A Protocol ``isinstance()`` IS structural typing: it tests
+only that attributes with the right NAMES exist, which is exactly the
+duck typing this rule bans, so an arbitrary impostor declaring those
+names passes it. Since Python 3.12 it also resolves names through
+``inspect.getattr_static``, which bypasses ``__getattr__``, so it
+SILENTLY REJECTS legitimate objects whose fields resolve dynamically
+(``__getattr__`` forwarding; pydantic ``extra='allow'`` values held in
+``__pydantic_extra__``). It is permissive to impostors and strict
+against honest objects, and is never a security control. Consequence
+for tests: ``unittest.mock.Mock`` fails every such check, even with
+``spec=``, so a test passing a Mock exercises the reject branch
+silently and proves nothing about admission.
+
+At an EXTERNAL boundary — a third-party SDK object, an LLM provider
+reply, an HTTP or remote payload — do not authenticate the object's
+type at all. Parse, don't validate: read each needed field ONCE with a
+sentinel-defaulted ``getattr(obj, 'field', _MISSING)``, assert the
+VALUES (non-empty ``str``, parseable JSON, within bounds), construct an
+ELSPETH-owned frozen type from what survived, and propagate only that.
+That extraction is the CORRECT pattern there, not a violation of the
+ban above: the value assertions plus the read-once copy into an owned
+type ARE the boundary. Nominal typing against a vendor class is brittle
+(it breaks across SDK versions and across providers), and structural
+typing is both broken and useless; neither is the control.
+
+``hasattr`` is immune to the ``getattr_static`` hazard specifically —
+it calls the real ``getattr`` and so does see dynamically resolved
+attributes — but it remains banned as a presence probe under an
+internal contract, because it still lets an object pretend to satisfy
+one.
+
+Under a fixed contract, access the declared attribute directly and let
+breakage raise. Do not use ``isinstance`` to revalidate Tier 1 or
+another fixed contract; it is a boundary discriminator, not a general
+defensive recommendation.
 
 Defensive handling IS appropriate at trust boundaries.
 
@@ -568,13 +638,41 @@ decorator, not an allowlist entry. Emit:
 * ``should_use_decorator``: the parameter name (e.g. ``"arguments"``)
   that the agent should pass as the decorator's ``source_param``;
 * ``rationale``: explain that this finding is a structural Tier-3
-  boundary case and the remediation is
-  ``@trust_boundary(tier=3, source=<one-line description of the
-  external source>, source_param=<the parameter name>,
-  suppresses=(<the rule_id>,), invariant=<what the function
-  guarantees on malformed input>, test_ref=<pytest nodeid>,
-  test_fingerprint=<canonical AST fingerprint>)`` on the enclosing
-  function, followed by deletion of any related allowlist entries.
+  boundary case, identify which metadata contract applies and enumerate
+  its required and forbidden fields, and call for deletion of any related
+  allowlist entries. Do not emit decorator code or propose a concrete code
+  fix. The structured nudge identifies the applicable contract; the agent
+  remains responsible for implementation and evidence.
+
+There are exactly two valid decorator metadata contracts:
+
+1. Raising boundary metadata (the function rejects malformed input by raising)
+   requires ``tier=3``, ``source``, ``source_param``, ``suppresses``, an
+   invariant naming the raised exception and malformed-input guarantee,
+   and MUST include both ``test_ref=<pytest nodeid>`` and
+   ``test_fingerprint=<canonical AST fingerprint>``. It MUST omit
+   ``non_raising=True``. The nodeid must resolve to a current behavioral
+   test that exercises the malformed-input rejection, and the fingerprint
+   must bind that current test body. Never invent ``test_ref`` or
+   ``test_fingerprint`` values; enumerate them as required evidence and
+   leave their acquisition to the implementing agent.
+
+2. Non-raising boundary metadata covers genuinely non-raising
+   optional-extraction, advisory, and convert-to-result boundaries. Such
+   a boundary returns a sentinel or result on malformed input and never
+   raises on it. It requires ``tier=3``, ``source``, ``source_param``,
+   ``suppresses``, an invariant naming the sentinel/result behavior, and
+   MUST set ``non_raising=True``. It MUST omit both ``test_ref`` and
+   ``test_fingerprint``. This form is valid only when the companion gate
+   mechanically verifies that malformed-input guards do not raise.
+
+A raising form missing either test field is INVALID. A non-raising form
+carrying either test field is INVALID. ``non_raising=True`` on code whose
+malformed-input path raises is INVALID. Do not emit a decorator
+recommendation with missing or contradictory metadata. If the visible
+code does not establish which contract applies, keep
+``should_use_decorator: null`` and BLOCK pending the missing evidence
+rather than inventing metadata.
 
 If ANY of the three answers is no — the finding is not in a boundary
 function, the rule is not in {R1, R5}, or the subject is not rooted at
@@ -611,8 +709,10 @@ Example A — should suggest the decorator (BLOCKED + should_use_decorator):
   Verdict: ``BLOCKED``. Reason: all three conditions met (function
   takes external ``arguments``; R1 is in the suppressible set; the
   reported subject is rooted at ``arguments``). Emit
-  ``should_use_decorator: "arguments"`` and recommend the decorator
-  in the rationale.
+  ``should_use_decorator: "arguments"``. The rationale identifies the
+  raising metadata contract and enumerates its required and forbidden
+  fields; it does not generate decorator code or guess the behavioral
+  test's nodeid/fingerprint.
 
 Example B — regular ACCEPT inside an already-decorated function:
 
@@ -640,9 +740,9 @@ Example C — regular BLOCK (rationale shallow, no decorator help):
 
   Verdict: ``BLOCKED``. The decorator would not help (no external
   parameter; ``self._cache`` is not Tier-3 data). Emit
-  ``should_use_decorator: null``; the rationale describes a code-fix
-  task (use direct attribute access; let it KeyError if the cache
-  invariant is broken), not a legitimate suppression.
+  ``should_use_decorator: null``; the rationale identifies a
+  fixed-contract defensive-access violation and leaves the concrete
+  remediation to the agent.
 
 ================================================================
 Output schema
@@ -718,11 +818,11 @@ BLOCKED and make that uncertainty visible with lower ``confidence``.
    is the most common misapplication; check the data flow in the
    excerpt, not just the rationale's adjective. The mirror error is just
    as wrong, and licenses the opposite mistake (dropping a needed guard):
-   external-origin data dressed up as Tier-1/Tier-2 because it sits in one
-   of our dataclasses or was re-read from our DB ("validated once"). Trace
-   the value's contents to their origin, not to the object that carries
-   them — persisted composer/user config re-read from our storage is
-   Tier-3 at the read site.
+   external-origin data dressed up as Tier-1/Tier-2 merely because it
+   sits in one of our dataclasses or was stored in our DB. Trace the
+   value's contents to their author and any declared promotion contract,
+   not to the object or storage mechanism that carries them. Never demote
+   our-authored Tier-1 data because it crossed a serialization boundary.
 
 2. Apply the Defensive vs Offensive Decision Test directly to the
    finding. If the answer points to "let it crash" or "fix the root
@@ -743,6 +843,12 @@ BLOCKED and make that uncertainty visible with lower ``confidence``.
 6. Apply the fabrication-decision test if the rationale proposes to
    fill in an absent field with anything other than ``None``. If the
    answer is "this is fabrication", BLOCK.
+
+7. Does the rationale locate the real control somewhere other than the
+   flagged site? (CONTROL-LOCATION CLAIMS above.) If yes, name the
+   control by symbol in your recorded rationale and state whether you
+   verified it (read it / saw it in the excerpt / could not). Unverified
+   → BLOCK-PENDING; contradicted → BLOCKED.
 
 Also inspect ``allowlist_similarity`` in the request payload. A high
 ``rationale_duplicate_count`` or similar boilerplate entries is evidence
@@ -896,7 +1002,7 @@ class JudgeResponse:
     the audit trail loses information if we coerce ``None`` to ``0``.
 
     ``judge_transport`` records which transport produced this verdict
-    (``"openrouter"`` or ``"claude_agent_sdk"``) and is bound into the
+    (``"openrouter"``, ``"claude_agent_sdk"``, or ``"codex_cli"``) and is bound into the
     HMAC-signed v2 allowlist payload (justify write + migrate + validator
     all sign it). "How the verdict was produced" is therefore verdict
     metadata bound to and tamper-evident with the verdict itself: a forged
@@ -1131,13 +1237,16 @@ def _call_openrouter(
 # excerpt — identical input to the OpenRouter path. The tool-augmented mode
 # (``tool_scope`` set) lets the judge READ the surrounding source to resolve a
 # question the excerpt can't answer (e.g. "where does this parameter come
-# from?", "is the audit event recorded before this ceremony?"). The CLI permits
-# this only on non-signing reaudit runs. Signing paths stay blinded to the
-# bounded, scrubbed excerpt because tool reads happen inside the external agent
-# transport and raw tool output cannot be routed back through the local source
-# scrubber before it can influence a persisted rationale. What tool mode trades
-# away is verdict reproducibility, so the deterministic temperature=0 OpenRouter
-# path stays canonical for decay sweeps. See elspeth-ab5e093fa3.
+# from?", "is the audit event recorded before this ceremony?"). Signing paths
+# used ``--judge-tools readonly`` from 2026-07-27, because the excerpt-blinded
+# judge misjudged boundary code it could not see; the older "signing stays
+# blinded" rule is retired. Tool output does NOT round-trip through the local
+# source scrubber, so a persisted rationale can quote whatever the judge read:
+# the judge is an agentic peer with the same checkout access an agent working
+# here already has (operator ruling 2026-09-09), and its rationale is committed
+# verbatim. What tool mode trades away is verdict reproducibility, so the
+# deterministic temperature=0 OpenRouter path stays canonical for decay sweeps.
+# See elspeth-ab5e093fa3.
 #
 # SECURITY — the load-bearing guard. ``permission_mode="default"``
 # auto-approves read-only tools, so a ``can_use_tool`` callback is NEVER
@@ -1162,30 +1271,40 @@ _TOOL_SCOPE_GREP_NON_CONTENT_OUTPUT_MODES: frozenset[str] = frozenset({"count", 
 # (see ``_consume_agent_messages``), never a silent partial. 12 was twice
 # insufficient for real entries in the 2026-07-09 sitting (heartbeat R7 and a
 # large composer validator both hit the cap on consecutive runs while ruling
-# on genuinely deep call chains); 24 keeps the bound while covering them.
-_AGENT_TOOL_MODE_DEFAULT_MAX_TURNS: int = 24
+# on genuinely deep call chains); 24 kept the bound while covering them, then
+# starved the 2026-09-09 sitting three rounds running ("could not read the
+# named tests within the investigation budget" on a 3,000-line test file at
+# 400 lines per read). The bound is a loop guard, not an evidence ration:
+# 200 leaves a pathological run bounded while no honest investigation hits it.
+_AGENT_TOOL_MODE_DEFAULT_MAX_TURNS: int = 200
 
 # Basenames that must never be read even if they somehow sit inside an allowed
 # root — defense in depth. The HMAC signing key lived in a repo ``.env`` once
-# (the O1 breach); the roots already exclude the repo root, but a belt-and-
-# braces basename denylist costs nothing.
+# (the O1 breach); whole-checkout evidence access must not expose it.
 _TOOL_SCOPE_FORBIDDEN_BASENAMES: frozenset[str] = frozenset({".env"})
 
 # Appended to the system prompt ONLY in tool mode, OUTSIDE ``_STATIC_POLICY_BLOCK``
 # so ``JUDGE_POLICY_HASH`` (sha256 of the static block) is unchanged. That is
 # acceptable because the addendum is investigation MECHANICS (read tools, cite
 # what you read), not tier-model verdict CRITERIA — those live in the hashed
-# static block. Signing paths reject tool mode, so this addendum cannot enter a
-# signed allowlist entry's policy hash.
+# static block. Changing investigation scope does not change verdict criteria.
 _TOOL_MODE_ADDENDUM: str = """
 TOOL-AUGMENTED INVESTIGATION MODE (read-only)
 
-You may use the Read, Grep, and Glob tools to investigate the source tree when
+You may use the Read, Grep, and Glob tools to investigate the whole codebase when
 the excerpt alone does not let you decide. This exists so you can resolve a
 would-be "block pending more context" by going and looking — e.g. read the
 callers of the function, the definition of a type, or the call site that
-establishes an invariant. You can only read within the project source; writes,
-shell, and network are unavailable.
+establishes an invariant. The working directory is the checkout root: tests,
+documentation, scripts, configuration, and source are all available, including
+pinning tests named in a rationale. An external allowlist directory is also
+readable. Writes and network are unavailable. On the Codex transport a
+read-only shell is also available: prefer `grep -n` to locate a named test or
+symbol, then read the surrounding lines, rather than paging a large file.
+Finding paths are relative to the scanner's source root, normally src/elspeth,
+whereas tool paths are relative to the checkout. For example, locate a finding
+at web/blobs/service.py with Glob **/web/blobs/service.py, then read the returned
+path. Test nodeids already start with the repository-relative tests/ path.
 
 Security limits: Read may be denied for files that match the project's source
 secret scrubber, and Grep is available only with explicit non-content
@@ -1246,19 +1365,29 @@ def build_readonly_tool_scope(
     allowlist_dir: Path,
     max_turns: int = _AGENT_TOOL_MODE_DEFAULT_MAX_TURNS,
 ) -> AgentToolScope:
-    """Build the canonical read-only scope: the source tree + the allowlist dir.
+    """Build read-only evidence access to the whole checkout and the allowlist.
 
     Both roots are realpath-resolved so symlink/``..`` escapes are caught by the
-    prefix test in ``_tool_scope_decision``. ``cwd`` is the source ``root`` so a
-    pathless Grep/Glob defaults to scanning the source tree, never the repo root.
+    prefix test in ``_tool_scope_decision``. Canonical source trees use the
+    repository-root convention of boundary test references, without widening
+    into an enclosing checkout. Other layouts use the nearest Git marker,
+    including worktree markers, or keep the source root when none exists.
     """
     src_root = Path(os.path.realpath(root))
+    from elspeth_lints.rules.trust_boundary.shared import repository_root
+
+    repo_root = repository_root(src_root)
+    if repo_root == src_root:
+        repo_root = next(
+            (candidate for candidate in (src_root, *src_root.parents) if (candidate / ".git").exists()),
+            src_root,
+        )
     allow_root = Path(os.path.realpath(allowlist_dir))
     # De-dup while preserving order (root first, so it is a valid cwd).
-    roots: list[Path] = [src_root]
-    if allow_root != src_root:
+    roots: list[Path] = [repo_root]
+    if allow_root != repo_root:
         roots.append(allow_root)
-    return AgentToolScope(allowed_roots=tuple(roots), cwd=src_root, max_turns=max_turns)
+    return AgentToolScope(allowed_roots=tuple(roots), cwd=repo_root, max_turns=max_turns)
 
 
 def _tool_scope_candidate_paths(tool_name: str, tool_input: dict[str, Any], cwd: Path) -> list[Path]:
@@ -1314,12 +1443,25 @@ def _read_target_has_secret_redactions(path: Path) -> tuple[bool, str]:
     return True, f"{path} contains source bytes matched by secret scrubber pattern(s): {patterns}"
 
 
-def _tool_scope_decision(scope: AgentToolScope, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
+def _tool_scope_decision(
+    scope: AgentToolScope,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    scrubbed_reads: bool = False,
+) -> tuple[bool, str]:
     """Fail-closed allow/deny for one tool call. Pure logic; unit-testable.
 
     Allows ONLY a read-only tool whose realpath-resolved target sits inside an
     allowed root and is not a forbidden basename. Any uncertainty (unknown tool,
     unparseable input, out-of-root target, ``.env``) denies.
+
+    ``scrubbed_reads`` says the caller's Read returns ``scrub_secrets`` output,
+    never raw bytes (the Codex MCP server). A file that trips the scrubber is
+    then still readable — only the matched lines are redacted — instead of the
+    whole file going dark to the judge. The agent-SDK hook keeps the default:
+    its Read tool has no scrub point, so a redaction-bearing file is denied
+    outright there.
     """
     if tool_name not in _TOOL_SCOPE_READONLY_TOOLS:
         return False, (f"tool {tool_name!r} is not permitted in read-only judge-tools mode (allowed: {sorted(_TOOL_SCOPE_READONLY_TOOLS)})")
@@ -1335,11 +1477,13 @@ def _tool_scope_decision(scope: AgentToolScope, tool_name: str, tool_input: dict
     except Exception as exc:  # fail closed on any extraction failure
         return False, f"could not establish an in-scope target for {tool_name} (denied fail-closed): {exc}"
     for cand in candidates:
-        if cand.name in _TOOL_SCOPE_FORBIDDEN_BASENAMES:
+        if cand.name in _TOOL_SCOPE_FORBIDDEN_BASENAMES or cand.name.startswith(".env."):
             return False, f"{cand} is a forbidden file (basename denylist)"
+        if any(cand.is_relative_to(r) and ".git" in cand.relative_to(r).parts for r in scope.allowed_roots):
+            return False, f"{cand} is Git administration data, not codebase evidence"
         if not any(cand == r or cand.is_relative_to(r) for r in scope.allowed_roots):
             return False, (f"{cand} is outside the permitted roots {[str(r) for r in scope.allowed_roots]} (read-only judge-tools scope)")
-        if tool_name == "Read":
+        if tool_name == "Read" and not scrubbed_reads:
             has_redactions, reason = _read_target_has_secret_redactions(cand)
             if has_redactions:
                 return False, f"{reason}; Read denied so raw bytes cannot bypass source_excerpt.scrub_secrets"
@@ -1694,8 +1838,19 @@ async def _consume_agent_messages(
             raw_text = verdict_json
             stripped = verdict_json
         else:
-            num_turns = getattr(result_message, "num_turns", None)
-            if isinstance(num_turns, int) and max_turns is not None and num_turns >= max_turns:
+            missing = object()
+            raw_num_turns = getattr(result_message, "num_turns", missing)
+            if raw_num_turns is missing or raw_num_turns is None:
+                num_turns: int | None = None
+            elif type(raw_num_turns) is int:
+                num_turns = raw_num_turns
+            else:
+                raise JudgeContractError(
+                    f"agent ResultMessage.num_turns must be an exact int or None when reported; got {type(raw_num_turns).__name__}"
+                )
+            if num_turns is not None and num_turns < 0:
+                raise JudgeContractError(f"agent ResultMessage.num_turns must be non-negative; got {num_turns}")
+            if num_turns is not None and max_turns is not None and num_turns >= max_turns:
                 raise JudgeContractError(
                     f"agent turn budget (max_turns={max_turns}) exhausted before a verdict "
                     f"(num_turns={num_turns}); the final assistant message contained no "
@@ -1909,9 +2064,301 @@ def _is_agent_auth_error(exc: Exception) -> bool:
     return any(cls.__name__ in auth_names for cls in type(exc).__mro__)
 
 
+_CODEX_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ACCEPTED", "BLOCKED"]},
+        "rationale": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "should_use_decorator": {"type": ["string", "null"]},
+    },
+    "required": ["verdict", "rationale", "confidence", "should_use_decorator"],
+}
+
+# The Codex process must authenticate from its installed account state, not
+# from credentials held by the signing shell.  Keep this allowlist deliberately
+# small: the child needs executable discovery, its home/Codex home, locale, and
+# TLS trust roots.  Provider keys, HMAC keys, override tokens, cloud credentials,
+# proxy credentials, and arbitrary application env never cross the boundary.
+_CODEX_CHILD_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TERM",
+        "TMPDIR",
+        "CODEX_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
+_CODEX_CLI_TIMEOUT_SECONDS: int = 600
+_CODEX_READONLY_MCP_TOOLS: tuple[str, ...] = ("read_file", "grep_files", "glob_files")
+
+
+def _codex_child_env() -> dict[str, str]:
+    """Return the minimal, signing-secret-free environment for ``codex exec``."""
+    child = {name: value for name, value in os.environ.items() if name in _CODEX_CHILD_ENV_NAMES or name.startswith("LC_")}
+    child["NO_COLOR"] = "1"
+    return child
+
+
+def _codex_prompt(request: JudgeRequest, *, tool_mode: bool) -> str:
+    """Render the shared judge policy + dynamic request for the Codex CLI."""
+    user_blocks = _build_user_message_blocks(request)
+    dynamic_text = "\n\n".join(block["text"] for block in user_blocks)
+    tool_addendum = (
+        _TOOL_MODE_ADDENDUM + "\nOn this Codex transport, Read/Grep/Glob are named "
+        "read_file/grep_files/glob_files on the elspeth_judge_tools MCP server, and "
+        "your own shell tool works read-only in the checkout root.\n"
+        if tool_mode
+        else ""
+    )
+    return (
+        "Follow the ELSPETH judge policy below as the controlling task-specific "
+        "policy for this invocation. Do not propose a code fix. Your final "
+        "response must be only the JSON object required by the supplied output "
+        "schema.\n\n"
+        f"{_STATIC_POLICY_BLOCK}{tool_addendum}\n\n"
+        "JUDGE REQUEST\n\n"
+        f"{dynamic_text}"
+    )
+
+
+def _toml_string(value: str) -> str:
+    """Encode one string as a TOML basic string (JSON quoting is compatible)."""
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _codex_mcp_config_args(scope: AgentToolScope) -> list[str]:
+    """Build the sole MCP registration exposed to a tool-mode Codex judge."""
+    package_src = Path(__file__).resolve().parents[2]
+    server_args = [
+        "-m",
+        "elspeth_lints.mcp.codex_judge_tools",
+        "--cwd",
+        str(scope.cwd),
+        "--max-calls",
+        str(scope.max_turns),
+    ]
+    for root in scope.allowed_roots:
+        server_args.extend(["--allowed-root", str(root)])
+    pythonpath_table = "{ PYTHONPATH = " + _toml_string(str(package_src)) + " }"
+    enabled_tools = json.dumps(list(_CODEX_READONLY_MCP_TOOLS), ensure_ascii=True)
+    return [
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.command={_toml_string(sys.executable)}",
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.args={json.dumps(server_args, ensure_ascii=True)}",
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.env={pythonpath_table}",
+        "-c",
+        f"mcp_servers.elspeth_judge_tools.enabled_tools={enabled_tools}",
+        "-c",
+        "mcp_servers.elspeth_judge_tools.required=true",
+        "-c",
+        'mcp_servers.elspeth_judge_tools.default_tools_approval_mode="approve"',
+    ]
+
+
+def _codex_failure_detail(stdout: str, stderr: str) -> str:
+    """Extract bounded diagnostic text without echoing the judge prompt."""
+    candidates: list[str] = []
+    for raw_line in stdout.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error":
+            message = event.get("message")
+            if isinstance(message, str):
+                candidates.append(message)
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "error":
+            message = item.get("message")
+            if isinstance(message, str):
+                candidates.append(message)
+    if stderr.strip():
+        candidates.append(stderr.strip())
+    detail = " | ".join(candidates) or "no diagnostic text"
+    return detail[:1000]
+
+
+def _parse_codex_jsonl(stdout: str, *, requested_model: str) -> _TransportResult:
+    """Reduce ``codex exec --json`` events to the shared transport shape."""
+    final_text: str | None = None
+    usage: dict[str, Any] | None = None
+    for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise JudgeContractError(f"Codex CLI emitted malformed JSONL at line {line_number}: {exc}") from exc
+        if not isinstance(event, dict):
+            raise JudgeContractError(f"Codex CLI JSONL event at line {line_number} must be an object; got {type(event).__name__}")
+        item = event.get("item")
+        if event.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise JudgeContractError("Codex CLI agent_message.text must be a string")
+            final_text = text
+        if event.get("type") == "turn.completed":
+            candidate = event.get("usage")
+            if not isinstance(candidate, dict):
+                raise JudgeContractError("Codex CLI turn.completed event is missing its usage object")
+            usage = candidate
+
+    if final_text is None or not final_text.strip():
+        raise JudgeContractError("Codex CLI produced no final agent_message text")
+    if usage is None:
+        raise JudgeContractError("Codex CLI produced no turn.completed usage event")
+
+    input_tokens = usage.get("input_tokens")
+    cached_tokens = usage.get("cached_input_tokens")
+    if not isinstance(input_tokens, int) or isinstance(input_tokens, bool):
+        raise JudgeContractError(f"Codex CLI usage.input_tokens must be int; got {type(input_tokens).__name__}")
+    if cached_tokens is not None and (not isinstance(cached_tokens, int) or isinstance(cached_tokens, bool)):
+        raise JudgeContractError(f"Codex CLI usage.cached_input_tokens must be int or None; got {type(cached_tokens).__name__}")
+    if cached_tokens is not None and cached_tokens > input_tokens:
+        raise JudgeContractError(f"Codex CLI cached_input_tokens ({cached_tokens}) exceeds input_tokens ({input_tokens})")
+    return _TransportResult(
+        raw_text=final_text,
+        served_model_id=requested_model,
+        prompt_tokens_total=input_tokens,
+        prompt_tokens_cached=cached_tokens,
+    )
+
+
+def _call_codex_cli(
+    request: JudgeRequest,
+    model_id: str,
+    max_tokens: int,
+    *,
+    tool_scope: AgentToolScope | None = None,
+) -> _TransportResult:
+    """Codex CLI transport with a sealed tool surface and stripped credentials.
+
+    ``codex exec`` authenticates through the operator's installed Codex account
+    state (``CODEX_HOME`` / ``HOME``), while the subprocess environment omits
+    every signing/provider/application secret.  User config, repo rules, web,
+    apps, hooks, goals, memories, remote plugins, and subagents are disabled.
+    Tool mode runs in the checkout with Codex's native shell available under
+    the read-only sandbox, plus one local MCP server whose three read-only
+    tools enforce ``AgentToolScope``; blinded mode runs in an empty temporary
+    directory and registers no MCP.
+
+    Codex currently exposes no per-call completion-token cap, so ``max_tokens``
+    is accepted for the common transport contract but not forwarded.  The
+    output schema and shared parser still fail closed on truncation/malformed
+    output.
+    """
+    del max_tokens
+    prompt = _codex_prompt(request, tool_mode=tool_scope is not None)
+    base_config = [
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        f'model_reasoning_effort="{CODEX_JUDGE_REASONING_EFFORT}"',
+        # Codex's own shell tool stays ENABLED under ``--sandbox read-only``
+        # (operator ruling 2026-09-09): the judge investigates the checkout
+        # with grep/sed/cat at native speed and no per-call budget. Before
+        # this, three read-only MCP tools with a 24-call cap and 400-line
+        # reads starved the judge on any multi-thousand-line file, and an
+        # entry blocked three consecutive rounds as "could not read the named
+        # tests within the investigation budget". Read-only sandboxing is
+        # the write control; credential stripping in ``_codex_child_env`` is
+        # the [O1] control. Neither depends on the shell being off.
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "features.goals=false",
+        "-c",
+        "features.memories=false",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        "features.remote_plugin=false",
+        "-c",
+        "features.personality=false",
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="elspeth-judge-codex-") as temp_dir:
+        temp_root = Path(temp_dir)
+        schema_path = temp_root / "judge-response.schema.json"
+        schema_path.write_text(json.dumps(_CODEX_RESPONSE_SCHEMA, sort_keys=True), encoding="utf-8")
+        command = [
+            "codex",
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--model",
+            model_id,
+            "--json",
+            "--color",
+            "never",
+            "--output-schema",
+            str(schema_path),
+            # Tool mode runs IN the checkout so the native shell and the MCP
+            # reader see the same tree; blinded mode keeps the empty temp
+            # directory so a shell has nothing to look at.
+            "--cd",
+            str(tool_scope.cwd if tool_scope is not None else temp_root),
+            *base_config,
+        ]
+        if tool_scope is not None:
+            command.extend(_codex_mcp_config_args(tool_scope))
+        command.append("-")
+        try:
+            completed = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=_CODEX_CLI_TIMEOUT_SECONDS,
+                env=_codex_child_env(),
+            )
+        except FileNotFoundError as exc:
+            raise JudgeConfigurationError(
+                "The Codex CLI is required for --judge-transport codex-cli but "
+                "`codex` was not found on PATH. Install Codex CLI, authenticate "
+                "it, and re-run."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise JudgeTransportError(f"Codex CLI judge exceeded the {_CODEX_CLI_TIMEOUT_SECONDS}s transport timeout") from exc
+        except OSError as exc:
+            raise JudgeConfigurationError(f"Could not start the Codex CLI judge: {exc}") from exc
+
+    if completed.returncode != 0:
+        detail = _codex_failure_detail(completed.stdout, completed.stderr)
+        auth_markers = ("auth", "login", "credential", "not logged", "unauthorized")
+        if any(marker in detail.lower() for marker in auth_markers):
+            raise JudgeConfigurationError(
+                f"The Codex CLI could not authenticate for --judge-transport codex-cli. Run `codex login`, then re-run. Detail: {detail}"
+            )
+        raise JudgeTransportError(f"Codex CLI judge exited {completed.returncode}. Detail: {detail}")
+    return _parse_codex_jsonl(completed.stdout, requested_model=model_id)
+
+
 _TRANSPORTS: dict[str, Callable[..., _TransportResult]] = {
     TRANSPORT_OPENROUTER: _call_openrouter,
     TRANSPORT_AGENT: _call_agent_sdk,
+    TRANSPORT_CODEX_CLI: _call_codex_cli,
 }
 # Derive the valid-transport set from the registry so the two can't drift: a
 # transport that validates but has no registry entry would KeyError on lookup.
@@ -1930,17 +2377,17 @@ def call_judge(
     """Send a judge request through the selected transport and return the verdict.
 
     ``transport`` selects the provider path (``TRANSPORT_OPENROUTER`` /
-    ``TRANSPORT_AGENT``). When ``model_id`` is omitted, the default is resolved
+    ``TRANSPORT_AGENT`` / ``TRANSPORT_CODEX_CLI``). When ``model_id`` is omitted, the default is resolved
     **by transport** — the OpenRouter slug and the Agent-SDK model id are
     different namespaces (see ``DEFAULT_AGENT_JUDGE_MODEL``). ``transport_impl``
     is a test seam: inject a fake to exercise the shared validation path without
-    a real provider call. Both transports funnel their extracted assistant text
+    a real provider call. All transports funnel their extracted assistant text
     through the identical ``_parse_judge_payload`` → validators path, so a
     verdict is validated the same way regardless of origin.
 
-    ``tool_scope`` (agent transport only) enables the read-only tool-augmented
-    investigation mode, confined to that filesystem scope. The OpenRouter
-    transport rejects a non-None ``tool_scope`` (it has no tool loop). When
+    ``tool_scope`` (local agent transports only) enables the read-only
+    tool-augmented investigation mode, confined to that filesystem scope. The
+    OpenRouter transport rejects a non-None ``tool_scope`` (it has no tool loop). When
     ``tool_scope`` is None every transport is called exactly as before — the
     blinded path is unchanged — which also keeps the ``transport_impl`` test
     seam backward-compatible (fakes are invoked with the old 3-arg signature).
@@ -1960,7 +2407,12 @@ def call_judge(
     if model_id is None:
         # Resolve the default by transport: the OpenRouter routing slug
         # ("anthropic/...") is invalid for the Agent SDK and vice versa.
-        model_id = DEFAULT_AGENT_JUDGE_MODEL if transport == TRANSPORT_AGENT else DEFAULT_JUDGE_MODEL
+        if transport == TRANSPORT_AGENT:
+            model_id = DEFAULT_AGENT_JUDGE_MODEL
+        elif transport == TRANSPORT_CODEX_CLI:
+            model_id = DEFAULT_CODEX_JUDGE_MODEL
+        else:
+            model_id = DEFAULT_JUDGE_MODEL
 
     impl = transport_impl if transport_impl is not None else _TRANSPORTS[transport]
     # Pass tool_scope only when set, so existing 3-arg fakes and call sites are
@@ -2023,7 +2475,16 @@ def _extract_text_block(completion: Any) -> str:
             f"judge response must have exactly one choice; got {len(choices) if isinstance(choices, list) else type(choices).__name__}"
         )
     choice = choices[0]
-    finish_reason = getattr(choice, "finish_reason", None)
+    missing = object()
+    raw_finish_reason = getattr(choice, "finish_reason", missing)
+    if raw_finish_reason is missing or raw_finish_reason is None:
+        finish_reason: str | None = None
+    elif type(raw_finish_reason) is str:
+        finish_reason = raw_finish_reason
+    else:
+        raise JudgeContractError(
+            f"judge response choice.finish_reason must be a string or None when reported; got {type(raw_finish_reason).__name__}"
+        )
     if finish_reason == "length":
         raise JudgeContractError(
             "judge response finish_reason='length'; output was truncated by "
@@ -2053,17 +2514,24 @@ def _extract_cache_accounting(completion: Any) -> tuple[int, int | None]:
     """
     usage = completion.usage
     prompt_tokens_total = usage.prompt_tokens
-    if not isinstance(prompt_tokens_total, int):
+    if type(prompt_tokens_total) is not int:
         raise JudgeContractError(f"judge response usage.prompt_tokens must be int; got {type(prompt_tokens_total).__name__}")
+    if prompt_tokens_total < 0:
+        raise JudgeContractError(f"judge response prompt token accounting cannot be negative; got total={prompt_tokens_total}")
     details = getattr(usage, "prompt_tokens_details", None)
     if details is None:
         return prompt_tokens_total, None
     cached = getattr(details, "cached_tokens", None)
     if cached is None:
         return prompt_tokens_total, None
-    if not isinstance(cached, int):
+    if type(cached) is not int:
         raise JudgeContractError(
             f"judge response usage.prompt_tokens_details.cached_tokens must be int or None; got {type(cached).__name__}"
+        )
+    if cached < 0 or cached > prompt_tokens_total:
+        raise JudgeContractError(
+            "judge response prompt token accounting must satisfy "
+            f"0 <= cached_tokens <= prompt_tokens; got cached={cached}, total={prompt_tokens_total}"
         )
     return prompt_tokens_total, cached
 

@@ -29,8 +29,9 @@ from elspeth.contracts.enums import RoutingKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
+from elspeth.core.dag.group_bindings import CloserKind
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.work_items import WorkItem
@@ -40,6 +41,28 @@ if TYPE_CHECKING:
     from elspeth.engine.processor import RowProcessor
 
 logger = logging.getLogger(__name__)
+
+
+def _branch_loss_reason(transform_result: TransformResult, *, default: str) -> str:
+    """Bounded loss-ledger category for a failed transform result.
+
+    ONE derivation for both error arms (quarantine and error-routed) —
+    coalesce_branch_losses.reason / group_losses.reason is a String(64)
+    category token; the failure detail travels as an error_hash, never here.
+    Categories that carry their own audit meaning pass through explicitly;
+    everything else takes the arm's default.
+    """
+    reason = transform_result.reason
+    if reason is None:
+        return default
+    category = reason["reason"]
+    if category == "retry_exhausted":
+        return "max_retries_exceeded"
+    if category == "expand_width_exceeded":
+        # The expand-width fence (elspeth-258bd49d81): the refusal must be
+        # explicit in the loss ledger, not folded into "quarantined".
+        return "expand_width_exceeded"
+    return default
 
 
 # --- Discriminated union types for _process_single_token extraction ---
@@ -103,6 +126,7 @@ class TokenTraversalEngine:
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
         attempt_offset: int = 0,
+        row_union_name: RowUnionName | None = None,
     ) -> _TransformOutcome:
         """Handle a single transform node: execute with retry, route errors, handle multi-row.
 
@@ -141,7 +165,12 @@ class TokenTraversalEngine:
                 transform_result=transform_result,
             )
         except MaxRetriesExceeded as e:
-            # All retries exhausted - return FAILED outcome
+            # Defensive backstop for test seams or future processor
+            # implementations that raise above Processor's audited conversion.
+            # RowProcessor._execute_transform_with_retry owns normal retry
+            # exhaustion and returns a routable error result; an exception that
+            # still reaches this boundary has no trustworthy on_error target in
+            # scope, so preserve the fail-closed UNROUTED/barrier-loss behavior.
             error_hash = compute_error_hash(str(e), exception_type=type(e).__name__)
             self._processor._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
@@ -156,7 +185,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.UNROUTED,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 "max_retries_exceeded",
                 child_items,
@@ -193,6 +222,17 @@ class TokenTraversalEngine:
             if transform_result.rows is None:
                 raise OrchestrationInvariantError("is_multi_row guarantees rows is not None")
             if len(transform_result.rows) == 0:
+                # Spec §4.3 (2026-08-22 synthesis correction): an empty expansion
+                # mints a durable group record (member_count=0) — the referent a
+                # bound require_all empty-group failure needs — but ONLY for an
+                # opener: the mint is gated on creates_tokens. A plain filter's
+                # success_empty() is not an expansion and mints nothing.
+                # Idempotent per opener under re-driven claims.
+                if transform.creates_tokens:
+                    self._processor._token_manager.record_empty_expansion(
+                        current_token,
+                        self._processor._run_id,
+                    )
                 self._processor._record_dropped_by_filter_outcome(
                     token=current_token,
                     transform_name=transform.name,
@@ -204,7 +244,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.FILTER_DROPPED,
                 )
-                sibling_results = self._processor._notify_coalesce_of_lost_branch(
+                sibling_results = self._processor._settle_member_losses(
                     current_token,
                     "dropped_by_filter",
                     child_items,
@@ -228,6 +268,34 @@ class TokenTraversalEngine:
                     f"(Multi-row is allowed in aggregation passthrough mode.)"
                 )
 
+            # Expand-width fence (elspeth-258bd49d81): refuse an over-wide
+            # expansion HERE, ahead of the eager mint transaction, and route
+            # the parent through the ordinary transform error channel — the
+            # transform's own on_error decides quarantine vs error sink, and
+            # _settle_member_losses records the enclosing-group losses with
+            # the explicit expand_width_exceeded reason. The would-be group is
+            # never minted, so nothing downstream can wait on it. TokenManager
+            # carries the same ceiling as a fail-closed backstop at the mint
+            # seam for callers without a loss channel.
+            width_ceiling = self._processor._max_expand_group_width
+            if width_ceiling is not None and len(transform_result.rows) > width_ceiling:
+                refusal = TransformResult.error(
+                    {
+                        "reason": "expand_width_exceeded",
+                        "message": (
+                            f"Expansion at transform '{transform.name}' would mint {len(transform_result.rows)} "
+                            f"members, exceeding max_expand_group_width={width_ceiling}. Refused before the "
+                            f"mint transaction (settings.max_expand_group_width)."
+                        ),
+                    },
+                    retryable=False,
+                )
+                # error_sink from the execute call above is None here (the
+                # transform SUCCEEDED; the engine refuses the expansion), so
+                # route by the transform's own on_error — always non-None at
+                # runtime (TransformSettings requires it).
+                return self.handle_transform_error_status(refusal, current_token, transform.on_error, child_items)
+
             # Deaggregation: create child tokens for each output row
             # NOTE: Parent EXPANDED outcome is recorded atomically in expand_token()
             # Contract consistency is enforced by TransformResult.success_multi()
@@ -240,18 +308,58 @@ class TokenTraversalEngine:
                 run_id=self._processor._run_id,
             )
 
+            # A declared scope opener's children are bound members of an
+            # EXPAND group that closes at a collector (spec §3): they carry
+            # the collector CURSOR and nothing else — inside the scope the
+            # collector is the innermost barrier, and the enclosing
+            # coalesce/row_union cursor (if any) is re-derived from the
+            # remaining lineage when the collector releases
+            # (RowProcessor._released_collector_cursor). An unbound expansion
+            # keeps today's shape exactly.
+            bound_collector: CollectorName | None = None
+            if node_id in self._processor._opener_binding_by_node_id:
+                opener_binding = self._processor._opener_binding_by_node_id[node_id]
+                if opener_binding.closer_kind is CloserKind.COLLECTOR:
+                    bound_collector = CollectorName(opener_binding.closer_name)
+            if bound_collector is not None:
+                for child_token in child_tokens:
+                    child_items.append(
+                        self._processor._work_items.create_continuation(
+                            token=child_token,
+                            current_node_id=node_id,
+                            collector_name=bound_collector,
+                            on_success_sink=updated_sink,
+                        )
+                    )
+                return _TransformTerminal(
+                    result=RowResult(
+                        token=current_token,
+                        final_data=current_token.row_data,
+                        outcome=TerminalOutcome.TRANSIENT,
+                        path=TerminalPath.EXPAND_PARENT,
+                    )
+                )
+
             # Queue each child for continued processing.
             # Pass updated_sink so terminal children inherit the
             # expanding transform's sink instead of defaulting to source_on_success.
             # Children born during a re-drive get fresh token_ids with no prior node_states,
             # so they use the default resume_attempt_offset=0 / resume_checkpoint_id=None.
             for child_token in child_tokens:
-                child_coalesce_name = coalesce_name if coalesce_name is not None and child_token.branch_name is not None else None
+                on_branch = child_token.branch_name is not None
+                child_coalesce_name = coalesce_name if coalesce_name is not None and on_branch else None
+                # The barrier binding must survive expansion, exactly as the
+                # coalesce binding does. Dropping it lets the children walk
+                # through the structural barrier node and split their group
+                # silently; carrying it makes an unsatisfiable expansion
+                # (N children sharing one row_id) fail closed at the barrier.
+                child_row_union_name = row_union_name if row_union_name is not None and on_branch else None
                 child_items.append(
                     self._processor._work_items.create_continuation(
                         token=child_token,
                         current_node_id=node_id,
                         coalesce_name=child_coalesce_name,
+                        row_union_name=child_row_union_name,
                         on_success_sink=updated_sink,
                     )
                 )
@@ -289,12 +397,29 @@ class TokenTraversalEngine:
         Returns:
             _TransformTerminal with QUARANTINED or ROUTED_ON_ERROR outcome.
         """
-        if error_sink == "discard":
-            # Intentionally discarded - QUARANTINED
+        if error_sink == "discard" or (error_sink is not None and self._processor._group_bindings.is_error_routable_closer(error_sink)):
+            # Intentionally discarded - QUARANTINED. Also covers rule 9
+            # (spec §7, WS3 Task 9b, Ruling 50): on_error naming this
+            # transform's own enclosing region's closer settles EXACTLY as
+            # this branch — same terminal path, same branch_loss_reason,
+            # same group_losses row (closer/group/member/reason) — because
+            # spec §7 rule 9 requires the explicit route to settle "exactly
+            # as the omitted-on_error twin does". The DIVERT edge into the
+            # closer is a STRUCTURAL AUDIT MARKER only (WS2 Task 11's build
+            # side, recorded separately via record_routing_event) — the
+            # failing token must NEVER arrive at the closer as a
+            # pseudo-member through it; it terminalizes right here, exactly
+            # like a plain discard.
             # The QUARANTINED path tolerates an "unknown_error" fallback for
             # historical reasons; do NOT extend that fallback to ROUTED_ON_ERROR
             # below — see the offensive guard in the routed branch.
+            # The durable branch-loss reason is a bounded category token
+            # (coalesce_branch_losses.reason, String(64)); the failure detail
+            # travels as compute_error_hash(error_detail) on the token outcome,
+            # never inline — an unbounded repr overflows the column on
+            # PostgreSQL and the audit write kills the run (elspeth-74b795208f).
             error_detail = str(transform_result.reason) if transform_result.reason else "unknown_error"
+            branch_loss_reason = _branch_loss_reason(transform_result, default="quarantined")
             quarantine_error_hash = compute_error_hash(error_detail)
             self._processor._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
@@ -309,9 +434,9 @@ class TokenTraversalEngine:
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
-                f"quarantined:{error_detail}",
+                branch_loss_reason,
                 child_items,
             )
             current_result = RowResult(
@@ -338,11 +463,14 @@ class TokenTraversalEngine:
                 "ROUTED_ON_ERROR requires transform_result.reason; refusing to "
                 "fabricate FailureInfo.message='unknown_error' for audit hashing"
             )
+        # Category token only (see the quarantine arm above): the detail rides
+        # the FailureInfo below, which the accumulator hashes onto the outcome.
         error_detail = str(transform_result.reason)
+        branch_loss_reason = _branch_loss_reason(transform_result, default="error_routed")
 
-        sibling_results = self._processor._notify_coalesce_of_lost_branch(
+        sibling_results = self._processor._settle_member_losses(
             current_token,
-            f"error_routed:{error_detail}",
+            branch_loss_reason,
             child_items,
         )
         # Capture the originating transform error so the audit trail records both
@@ -372,6 +500,8 @@ class TokenTraversalEngine:
         coalesce_node_id: NodeID | None,
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> _GateOutcome:
         """Handle a gate node: evaluate, then fork/route/divert/continue.
 
@@ -402,22 +532,39 @@ class TokenTraversalEngine:
 
         # 2. Emit GateEvaluated telemetry AFTER Landscape recording succeeds
         # (Landscape recording happens inside execute_config_gate)
-        self._processor._emit_gate_evaluated(
-            token=current_token,
+        with best_effort(
+            "GateEvaluated telemetry after gate audit",
+            run_id=self._processor._run_id,
+            token_id=current_token.token_id,
             gate_name=gate.name,
-            gate_node_id=node_id,
-            routing_mode=outcome.result.action.mode,
-            destinations=self._processor._get_gate_destinations(outcome),
-        )
+        ):
+            self._processor._emit_gate_evaluated(
+                token=current_token,
+                gate_name=gate.name,
+                gate_node_id=node_id,
+                routing_mode=outcome.result.action.mode,
+                destinations=self._processor._get_gate_destinations(outcome),
+            )
 
-        # 3. Check if gate routed to a sink
+        # 3. A configured row-level evaluation failure is terminal for this
+        # token only. The source loop can continue with unaffected rows.
+        if outcome.error is not None:
+            return self.handle_gate_error_outcome(
+                outcome,
+                current_token,
+                child_items,
+            )
+
+        # 4. Check if gate routed to a sink
         if outcome.sink_name is not None:
             # NOTE: Do NOT record ROUTED outcome here - the token hasn't been written yet.
             # SinkExecutor.write() records the outcome AFTER sink durability is achieved.
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            # Category token only (String(64) audit column, elspeth-74b795208f):
+            # the sink name is durably recorded on the ROUTED token outcome.
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
-                f"gate_routed_to_sink:{outcome.sink_name}",
+                "gate_routed_to_sink",
                 child_items,
             )
             current_result = RowResult(
@@ -449,7 +596,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.GATE_DISCARDED,
                 )
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._settle_member_losses(
                 current_token,
                 "gate_discarded",
                 child_items,
@@ -464,11 +611,11 @@ class TokenTraversalEngine:
                 return _GateTerminal(result=(current_result, *sibling_results))
             return _GateTerminal(result=current_result)
 
-        # 4. Fork to paths
+        # 5. Fork to paths
         if outcome.result.action.kind == RoutingKind.FORK_TO_PATHS:
             return self.handle_gate_fork(outcome, current_token, node_id, child_items)
 
-        # 5. Jump to specific node
+        # 6. Jump to specific node
         if outcome.next_node_id is not None:
             # Validate jump target exists in the DAG (our data — crash on invariant violation).
             # Without this check, a nonexistent target silently passes the coalesce ordering
@@ -486,21 +633,135 @@ class TokenTraversalEngine:
             if resolved_sink is not None:
                 updated_sink = resolved_sink
 
-            # Re-validate coalesce ordering invariant after gate jump.
+            # Re-validate barrier ordering invariants after gate jump.
             # The initial check at entry only validates the starting node.
-            # A gate jump can move the token past its coalesce node,
-            # which would silently bypass join handling.
+            # A gate jump can move the token past its coalesce or row_union
+            # node, which would silently bypass barrier handling.
             #
             # IMPORTANT: Use outcome.next_node_id (not the caller's node_id param)
             # because we're validating the JUMP TARGET, not the current position.
-            if coalesce_node_id is not None:
-                jump_target_step = self._processor._node_step_map[outcome.next_node_id]
-                coalesce_barrier_step = self._processor._node_step_map[coalesce_node_id]
-                if jump_target_step > coalesce_barrier_step:
+            #
+            # The tuple is deliberately TWO-way where process_single_token's
+            # entry check is three-way (it also covers collector). The two
+            # sites have different threat models, so the asymmetry is
+            # justified rather than merely harmless (filigree
+            # elspeth-494491978d):
+            #
+            #   - The entry check validates an ARBITRARY work item's starting
+            #     cursor. Work items are rehydrated from the durable scheduler
+            #     store (SchedulerWorkCodec.work_item_from_scheduler —
+            #     "rehydrate a scheduler work item from its durable payload
+            #     snapshot"), so a cursor naming a barrier is not trusted to be
+            #     well-ordered and every barrier kind must be covered.
+            #   - This site validates a JUMP TARGET resolved in-process from
+            #     the build-time route map. In graphs built by
+            #     ExecutionGraph.from_plugin_instances — the only graph
+            #     constructor in src/ (grepping src/elspeth/ for a bare
+            #     ExecutionGraph constructor call matches this comment and
+            #     nothing else, because the search string appears here; tests
+            #     DO build one directly, ~350 sites, which is exactly how the
+            #     raw-invocation pins below reach shapes the builder refuses)
+            #     — a gate jump past a collector
+            #     barrier cannot be authored. ONE guard closes it:
+            #     validate_sese_regions (barrier-scopes spec §7 rule 4), run
+            #     straight-line at builder.py:1884 over every bound region.
+            #     Every collector is one: a collector with no `scopes:` entry
+            #     is rejected (builder.py:700-706) and group_bindings.py:303-315
+            #     mints an EXPAND binding for every scope unconditionally.
+            #
+            #     DERIVED, not restated: any non-DIVERT gate->target edge makes
+            #     the target forward-reachable from the opener, so rule 4 walks
+            #     it; the walk does not expand through the closer, so a walked
+            #     path avoiding the closer ends either at a sink (sink-inside
+            #     limb) or at a node with no success path back to the closer
+            #     (no-path-to-closer limb). DIVERT edges are the only ones rule
+            #     4 skips, and they only ever target sinks or closers
+            #     (builder.py:1439/1478/1504/1524/1963), never a processing
+            #     node — so an on_error leg can never become a next_node_id.
+            #     And _node_step_map's ORDER is a topological sort of the FULL
+            #     graph (builder.py:1971 calls ExecutionGraph.build_step_map,
+            #     which just numbers get_pipeline_node_sequence — an
+            #     nx.topological_sort over the whole edge set), so this trigger
+            #     jump_target_step > barrier_step implies no path from the
+            #     target back to the collector — exactly what rule 4 rejects.
+            #     This arm's trigger set is a SUBSET of rule 4's.
+            #
+            #     Two refusals fire EARLIER on particular shapes and are NOT
+            #     what makes this safe: routing onto the collector's own
+            #     on_success connection trips the duplicate-producer check
+            #     (builder.py:1018-1024), and that shape and a queue target
+            #     both trip rule 4's sink-inside limb ahead of the
+            #     no-path-to-closer limb. Neuter BOTH and that limb still
+            #     refuses all three (verified by mutation, 2026-08-26).
+            #     Neutering only ONE is not that experiment and does not show
+            #     it: with duplicate-producer alone neutered the sink-inside
+            #     limb catches the closer_output shape, and with sink-inside
+            #     alone neutered duplicate-producer still catches it. BOTH is
+            #     what isolates the guard that actually holds the line.
+            #
+            #     Scope of the guarantee: no token may leave a bound region on
+            #     a SUCCESS path except through its closer. A DIVERT leg
+            #     (on_error) CAN leave it — rule 4 skips DIVERT edges by
+            #     construction — and that is intended: the loss ledger carries
+            #     it. `group_losses` records the escaped member against its own
+            #     group with reason='error_routed', and the token keeps its
+            #     `token_lineage_frames` expand frame on the way out, which is
+            #     what makes the attribution land. Verified by 12 engine runs
+            #     2026-08-26 (single worker, SQLite, json_explode +
+            #     batch_stats); NOT verified under the concurrent scheduler.
+            #     Note this is the DIVERT path only — `fork_token` drops
+            #     `expand_group_id` on the FORK path.
+            #
+            #     Pinned in tests/unit/core/dag/test_bound_regions.py::TestSESEWalk
+            #     (test_gate_jump_onto_collector_output_rejected_by_duplicate_producer,
+            #     test_gate_queue_mediated_escape_from_collector_scope_rejected,
+            #     test_gate_sink_escape_from_collector_scope_rejected), alongside
+            #     test_gate_inside_collector_scope_builds. Those three pin the
+            #     refusals that fire FIRST. The load-bearing no-path-to-closer
+            #     limb — the subject of BREAKAGE TRIGGER (a) below — is pinned
+            #     separately, by
+            #     test_collector_region_gate_leg_without_path_to_closer_rejected
+            #     and its _control_builds sibling.
+            #
+            # SCOPE LIMITATION — everything above is a claim about THIS
+            # BARRIER TUPLE's reachability, and about nothing else in this
+            # function. It must NOT be read as "collector is handled
+            # correctly nearby". A DIFFERENT missing collector arm sits
+            # EARLIER in this same function on the JUMP path — the
+            # resolve_jump_target_sink call above, in
+            # engine/dag_navigator.py, a module in which the string
+            # "collector" does not appear at all. As filed 2026-08-26 that
+            # arm was reachable and fatal: a gate inside a collector-bound
+            # scope WHOSE COLLECTOR CLOSES TO A SINK validates clean and
+            # then aborts the run on the first good row. Filed as
+            # elspeth-b6a0a85a15 (P0) — read the ticket for its current
+            # state rather than trusting this line. A collector that is NOT
+            # terminal runs clean, so the trigger is not the loose "gate in
+            # a collector scope" shape; hunting for that one searches the
+            # wrong pipelines.
+            #
+            # BREAKAGE TRIGGER — widen this tuple to three-way if ANY of these
+            # stops holding: (a) rule 4's no-path-to-closer limb is narrowed or
+            # made conditional; (b) a collector becomes authorable without a
+            # `scopes:` entry, or a scope stops minting an EXPAND binding;
+            # (c) a graph reaches TokenTraversalEngine by any route other than
+            # from_plugin_instances; (d) a gate route target can resolve to a
+            # node reached only by a DIVERT edge. None of this is a reason not
+            # to widen the tuple — it is three lines and one parameter — only
+            # the reason it is not load-bearing today.
+            jump_target_step = self._processor._node_step_map[outcome.next_node_id]
+            for barrier_node_id, barrier_name, barrier_kind in (
+                (coalesce_node_id, coalesce_name, "coalesce"),
+                (row_union_node_id, row_union_name, "row_union"),
+            ):
+                if barrier_node_id is None or barrier_name is None:
+                    continue
+                barrier_step = self._processor._node_step_map[barrier_node_id]
+                if jump_target_step > barrier_step:
                     raise OrchestrationInvariantError(
                         f"Gate jump moved token '{current_token.token_id}' to node '{outcome.next_node_id}' "
-                        f"(step {jump_target_step}) which is past its coalesce node '{coalesce_node_id}' "
-                        f"(step {coalesce_barrier_step}). This would bypass join handling."
+                        f"(step {jump_target_step}) which is past its {barrier_kind} node '{barrier_node_id}' "
+                        f"(step {barrier_step}). This would bypass barrier handling."
                     )
 
             return _GateContinue(
@@ -509,7 +770,7 @@ class TokenTraversalEngine:
                 next_node_id=outcome.next_node_id,
             )
 
-        # 6. CONTINUE: config gate says "proceed to next structural node."
+        # 7. CONTINUE: config gate says "proceed to next structural node."
         if outcome.result.action.kind != RoutingKind.CONTINUE:
             raise OrchestrationInvariantError(
                 f"Unhandled config gate routing kind {outcome.result.action.kind!r} "
@@ -517,6 +778,92 @@ class TokenTraversalEngine:
                 f"Expected CONTINUE when no sink_name, fork, or next_node_id is set."
             )
         return _GateContinue(updated_token=current_token, updated_sink=current_on_success_sink)
+
+    def handle_gate_error_outcome(
+        self,
+        outcome: GateOutcome,
+        current_token: TokenInfo,
+        child_items: list[WorkItem],
+    ) -> _GateTerminal:
+        """Terminalize one gate-expression failure without aborting the run."""
+        failure = outcome.error
+        if failure is None:
+            raise OrchestrationInvariantError("Gate error handling requires FailureInfo evidence")
+
+        if outcome.discarded or (
+            outcome.sink_name is not None and self._processor._group_bindings.is_error_routable_closer(outcome.sink_name)
+        ):
+            # Also covers rule 9 (spec §7, WS3 Task 9b, Ruling 50): on_error
+            # naming this gate's own enclosing region's closer settles
+            # EXACTLY as this branch — same terminal path, same reason,
+            # same group_losses row — because spec §7 rule 9 requires the
+            # explicit route to settle "exactly as the omitted-on_error
+            # twin does". The DIVERT edge into the closer is a STRUCTURAL
+            # AUDIT MARKER only (WS2 Task 11's build side, recorded
+            # separately via record_routing_event) — the failing token
+            # must NEVER arrive at the closer as a pseudo-member through
+            # it; it terminalizes right here, exactly like a plain discard.
+            error_hash = compute_error_hash(
+                failure.message,
+                exception_type=failure.exception_type,
+            )
+            self._processor._data_flow.record_token_outcome(
+                ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.GATE_ERROR_DISCARDED,
+                error_hash=error_hash,
+            )
+            with best_effort(
+                "TokenCompleted telemetry after gate-error discard audit",
+                run_id=self._processor._run_id,
+                token_id=current_token.token_id,
+                failure_type=failure.exception_type,
+            ):
+                self._processor._emit_token_completed(
+                    current_token,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.GATE_ERROR_DISCARDED,
+                )
+            # Category token only (String(64) audit column, elspeth-74b795208f):
+            # exception class names are plugin-defined and unbounded; the
+            # failure detail is hashed onto the token outcome above.
+            sibling_results = self._processor._settle_member_losses(
+                current_token,
+                "gate_error_discarded",
+                child_items,
+            )
+            current_result = RowResult(
+                token=current_token,
+                final_data=current_token.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.GATE_ERROR_DISCARDED,
+            )
+            if sibling_results:
+                return _GateTerminal(result=(current_result, *sibling_results))
+            return _GateTerminal(result=current_result)
+
+        error_sink = outcome.sink_name
+        if error_sink is None:
+            raise OrchestrationInvariantError("Gate DIVERT outcome requires a named error sink or discarded=True")
+
+        # Category token only (String(64) audit column, elspeth-74b795208f);
+        # the FailureInfo on the routed result carries the detail.
+        sibling_results = self._processor._settle_member_losses(
+            current_token,
+            "gate_error_routed",
+            child_items,
+        )
+        current_result = RowResult(
+            token=current_token,
+            final_data=current_token.row_data,
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.ON_ERROR_ROUTED,
+            sink_name=error_sink,
+            error=failure,
+        )
+        if sibling_results:
+            return _GateTerminal(result=(current_result, *sibling_results))
+        return _GateTerminal(result=current_result)
 
     def handle_gate_fork(
         self,
@@ -540,21 +887,45 @@ class TokenTraversalEngine:
             _GateTerminal with FORKED outcome for the parent token.
         """
         for child_token in outcome.child_tokens:
-            # Look up coalesce info for this branch
+            # Look up barrier info for this branch (coalesce or row_union)
             cfg_branch_name = child_token.branch_name
             cfg_coalesce_name: CoalesceName | None = None
+            cfg_row_union_name: RowUnionName | None = None
 
             if cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_coalesce:
                 cfg_coalesce_name = self._processor._branch_to_coalesce[BranchName(cfg_branch_name)]
+            elif cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_row_union:
+                cfg_row_union_name = self._processor._branch_to_row_union[BranchName(cfg_branch_name)]
 
             # See config gate fork handler above for routing logic.
             # Children born during a re-drive get fresh token_ids with no prior node_states,
             # so they use the default resume_attempt_offset=0 / resume_checkpoint_id=None.
-            if cfg_coalesce_name is None and cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_sink:
+            if (
+                cfg_coalesce_name is None
+                and cfg_row_union_name is None
+                and cfg_branch_name
+                and BranchName(cfg_branch_name) in self._processor._branch_to_sink
+            ):
                 child_items.append(
                     self._processor._work_items.create(
                         token=child_token,
                         current_node_id=None,
+                    )
+                )
+            elif (
+                cfg_coalesce_name is None
+                and cfg_row_union_name is None
+                and cfg_branch_name
+                and BranchName(cfg_branch_name) in self._processor._unbound_branch_first_node
+            ):
+                # fork -> ordinary consumer, no barrier at all (spec §7 E2):
+                # dispatch straight to the branch's one consuming node.
+                # create_continuation's coalesce/row_union-only barrier path
+                # does not apply here — there is no barrier to restore.
+                child_items.append(
+                    self._processor._work_items.create(
+                        token=child_token,
+                        current_node_id=self._processor._unbound_branch_first_node[BranchName(cfg_branch_name)],
                     )
                 )
             else:
@@ -563,6 +934,7 @@ class TokenTraversalEngine:
                         token=child_token,
                         current_node_id=node_id,
                         coalesce_name=cfg_coalesce_name,
+                        row_union_name=cfg_row_union_name,
                     )
                 )
 
@@ -577,6 +949,39 @@ class TokenTraversalEngine:
             )
         )
 
+    def validate_barrier_ordering(
+        self,
+        token: TokenInfo,
+        current_node_id: NodeID | None,
+        barrier_node_id: NodeID | None,
+        barrier_name: str | None,
+        barrier_kind: str,
+    ) -> None:
+        """Reject work items that start downstream of their configured barrier.
+
+        Barrier handling triggers only on exact node equality. A malformed work
+        item starting past either barrier would therefore skip it silently.
+
+        Raises:
+            OrchestrationInvariantError: If the token starts downstream of its barrier.
+        """
+        if (
+            barrier_node_id is not None
+            and current_node_id is not None
+            and barrier_name is not None
+            and current_node_id != barrier_node_id
+            and current_node_id in self._processor._node_step_map
+            and barrier_node_id in self._processor._node_step_map
+        ):
+            current_step = self._processor._node_step_map[current_node_id]
+            barrier_step = self._processor._node_step_map[barrier_node_id]
+            if current_step > barrier_step:
+                raise OrchestrationInvariantError(
+                    f"Token {token.token_id} started at node '{current_node_id}' (step {current_step}), "
+                    f"which is downstream of {barrier_kind} '{barrier_name}' (step {barrier_step}). "
+                    f"Work items with {barrier_kind} metadata must start at or before the barrier."
+                )
+
     def validate_coalesce_ordering(
         self,
         token: TokenInfo,
@@ -584,30 +989,8 @@ class TokenTraversalEngine:
         coalesce_node_id: NodeID | None,
         coalesce_name: CoalesceName | None,
     ) -> None:
-        """Validate that tokens with coalesce metadata don't start downstream of their coalesce point.
-
-        A malformed work item starting past the coalesce node would silently skip coalesce handling
-        because _maybe_coalesce_token only triggers on exact node equality.
-
-        Raises:
-            OrchestrationInvariantError: If the token's starting node is downstream of its coalesce barrier.
-        """
-        if (
-            coalesce_node_id is not None
-            and current_node_id is not None
-            and coalesce_name is not None
-            and current_node_id != coalesce_node_id
-            and current_node_id in self._processor._node_step_map
-            and coalesce_node_id in self._processor._node_step_map
-        ):
-            current_step = self._processor._node_step_map[current_node_id]
-            coalesce_step = self._processor._node_step_map[coalesce_node_id]
-            if current_step > coalesce_step:
-                raise OrchestrationInvariantError(
-                    f"Token {token.token_id} started at node '{current_node_id}' (step {current_step}), "
-                    f"which is downstream of coalesce '{coalesce_name}' (step {coalesce_step}). "
-                    f"Work items with coalesce metadata must start at or before the coalesce point."
-                )
+        """Compatibility wrapper for the original coalesce-only helper."""
+        self.validate_barrier_ordering(token, current_node_id, coalesce_node_id, coalesce_name, "coalesce")
 
     def handle_terminal_token(
         self,
@@ -665,6 +1048,9 @@ class TokenTraversalEngine:
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
         attempt_offset: int = 0,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         """Process a single token through processing nodes starting at node_id.
 
@@ -690,7 +1076,7 @@ class TokenTraversalEngine:
         """
         current_token = token
         # MUTATION CONTRACT: child_items is passed by reference to _handle_transform_node(),
-        # _handle_gate_node(), _notify_coalesce_of_lost_branch(), and _maybe_coalesce_token().
+        # _handle_gate_node(), _settle_member_losses(), and _maybe_coalesce_token().
         # These methods append child WorkItems (fork paths, deaggregation, coalesce merges)
         # directly into this list. The caller returns child_items alongside the RowResult.
         # Do NOT replace with return-value-based patterns without updating all call sites.
@@ -717,7 +1103,13 @@ class TokenTraversalEngine:
                     context=f"start of token processing for token '{token.token_id}'",
                 )
 
-        self.validate_coalesce_ordering(token, current_node_id, coalesce_node_id, coalesce_name)
+        collector_node_id = self._processor._collector_node_for_cursor(collector_name) if collector_name is not None else None
+        for barrier_node_id, barrier_name, barrier_kind in (
+            (coalesce_node_id, coalesce_name, "coalesce"),
+            (row_union_node_id, row_union_name, "row_union"),
+            (collector_node_id, collector_name, "collector"),
+        ):
+            self.validate_barrier_ordering(token, current_node_id, barrier_node_id, barrier_name, barrier_kind)
 
         node_id: NodeID | None = current_node_id
         max_inner_iterations = len(self._processor._node_to_next) + 1
@@ -745,6 +1137,23 @@ class TokenTraversalEngine:
             if handled:
                 return (result, child_items)
 
+            handled, result = self._processor._maybe_row_union_token(
+                current_token,
+                current_node_id=node_id,
+                row_union_node_id=row_union_node_id,
+                row_union_name=row_union_name,
+            )
+            if handled:
+                return (result, child_items)
+
+            handled, result = self._processor._maybe_collector_token(
+                current_token,
+                current_node_id=node_id,
+                collector_name=collector_name,
+            )
+            if handled:
+                return (result, child_items)
+
             next_node_id = self._processor._nav.resolve_next_node(node_id)
             plugin = self._processor._nav.resolve_plugin_for_node(node_id)
             if plugin is None:
@@ -752,8 +1161,41 @@ class TokenTraversalEngine:
                 node_id = next_node_id
                 continue
 
-            # Type-safe plugin detection using protocols
-            if isinstance(plugin, TransformProtocol):
+            # Nominal (negative) dispatch — elspeth-8783933d99, ADR-032
+            # addendum. node_to_plugin is closed by construction (graph_wiring
+            # builds it from config.transforms + config.gates and raises on
+            # anything else), so "not a GateSettings" IS the transform arm.
+            # TransformProtocol conformance is deliberately NOT measured here:
+            # widening the runtime_checkable protocol silently de-classified
+            # every implementation missing the new member and the dispatch
+            # raise fired mid-traversal (ef5e6e593).
+            if isinstance(plugin, GateSettings):
+                # NOTE: child_items is mutated inside (fork paths, coalesce notifications).
+                gate_outcome = self.handle_gate_node(
+                    plugin,
+                    current_token,
+                    ctx,
+                    node_id,
+                    child_items,
+                    coalesce_node_id,
+                    coalesce_name,
+                    last_on_success_sink,
+                    row_union_node_id,
+                    row_union_name,
+                )
+                if isinstance(gate_outcome, _GateTerminal):
+                    return gate_outcome.result, child_items
+                current_token = gate_outcome.updated_token
+                last_on_success_sink = gate_outcome.updated_sink
+                if gate_outcome.next_node_id is not None:
+                    node_id = gate_outcome.next_node_id
+                    continue
+            else:
+                # Complementary arm: ``node_to_plugin`` is closed by
+                # construction, so "not a GateSettings" IS the transform.
+                # No third arm exists to guard — a `not isinstance(...)`
+                # re-test here would still admit any future third kind
+                # into this branch, so it guarded nothing.
                 row_transform = plugin
                 # Check if this is a batch-aware transform at an aggregation node
                 transform_node_id = row_transform.node_id
@@ -805,33 +1247,12 @@ class TokenTraversalEngine:
                     coalesce_name,
                     last_on_success_sink,
                     attempt_offset,
+                    row_union_name=row_union_name,
                 )
                 if isinstance(transform_outcome, _TransformTerminal):
                     return transform_outcome.result, child_items
                 current_token = transform_outcome.updated_token
                 last_on_success_sink = transform_outcome.updated_sink
-            elif isinstance(plugin, GateSettings):
-                # NOTE: child_items is mutated inside (fork paths, coalesce notifications).
-                gate_outcome = self.handle_gate_node(
-                    plugin,
-                    current_token,
-                    ctx,
-                    node_id,
-                    child_items,
-                    coalesce_node_id,
-                    coalesce_name,
-                    last_on_success_sink,
-                )
-                if isinstance(gate_outcome, _GateTerminal):
-                    return gate_outcome.result, child_items
-                current_token = gate_outcome.updated_token
-                last_on_success_sink = gate_outcome.updated_sink
-                if gate_outcome.next_node_id is not None:
-                    node_id = gate_outcome.next_node_id
-                    continue
-
-            else:
-                raise TypeError(f"Unknown transform type: {type(plugin).__name__}. Expected TransformProtocol or GateSettings.")
 
             node_id = next_node_id
 

@@ -83,6 +83,7 @@ class CollectSink(_TestSinkBase):
         sink = CollectSink("output", node_id="sink_node_123")
     """
 
+    name = "collect"
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"write"})
@@ -287,6 +288,8 @@ class FailingSink(CollectSink):
         sink = FailingSink("broken_sink")
         sink = FailingSink(error_message="Custom error")
     """
+
+    name = "failing_sink"
 
     def __init__(
         self,

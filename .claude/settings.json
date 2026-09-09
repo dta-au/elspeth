@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__filigree__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "filigree ensure-dashboard",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r \".tool_input.command // empty\" | grep -Eq \"commit --amend|pkill -f|checkout -- \" && { echo \"BLOCKED: dangerous git/proc command (commit --amend, pkill -f, checkout --) \u2014 refused by the PreToolUse guard in .claude/settings.json\" >&2; exit 2; } || exit 0"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "filigree session-context",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "filigree ensure-dashboard",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "loomweave hook session-start --path \"${CLAUDE_PROJECT_DIR}\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r \".tool_input.file_path // empty\" | { read -r f; [ -n \"$f\" ] || exit 0; ruff format \"$f\" 2>/dev/null; ruff check --select E9,F63,F7,F82 \"$f\"; }"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.venv/bin/python\" \"${CLAUDE_PROJECT_DIR}/.agents/skills/prove-it/stop_hook.py\"",
+            "timeout": 30,
+            "statusMessage": "prove-it: checking for an unproven completion"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "axiom-product-management@foundryside-marketplace": false,
+    "lyra-tui-designer@foundryside-marketplace": false
+  }
+}

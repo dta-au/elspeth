@@ -30,7 +30,9 @@ from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator.preflight import validate_sink_effect_capability
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks import _local_file_effects as local_effects
+from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribution
 from elspeth.plugins.sinks.csv_sink import CSVSink
+from elspeth.plugins.sinks.document_sink import DocumentSink
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sinks.text_sink import TextSink
 from tests.fixtures.base_classes import inject_write_failure
@@ -60,7 +62,7 @@ def _member(ordinal: int, row: dict[str, object], *, generation: str = "token") 
 
 
 def _prepare(
-    sink: CSVSink | JSONSink | TextSink,
+    sink: CSVSink | DocumentSink | JSONSink | TextSink,
     *,
     effect_id: str,
     rows: list[dict[str, object]],
@@ -86,7 +88,9 @@ def _prepare(
     return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=snapshot),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=snapshot, target_delivered_member_count=len(snapshot)
+            ),
             inspection=inspection,
         ),
         _CTX,
@@ -136,6 +140,34 @@ def test_local_effect_plans_persist_exact_diversion_attribution(tmp_path: Path, 
     assert recovered.diverted_ordinals is None
 
 
+def test_multiline_value_diverts_every_row_into_a_virtual_zero_byte_descriptor(tmp_path: Path) -> None:
+    """Pin the g11 signature: multiline text diverts, and nothing is published.
+
+    A generated announcement is multiline, and TextSink cannot represent a value
+    spanning records. Every row diverting leaves ``accepted`` empty, which is the
+    one way to reach the virtual no-publication descriptor — so a 0-byte artifact
+    carrying the empty-string hash is evidence of diversion, never of a failed
+    write (elspeth-afdf55a17c).
+    """
+    target = tmp_path / "announcement.txt"
+    sink = inject_write_failure(TextSink({"path": str(target), "field": "llm_response", "schema": _SCHEMA}))
+
+    plan = _prepare(sink, effect_id="c7" * 32, rows=[{"llm_response": "Announcing the release.\n\nIt ships today."}])
+
+    assert plan.safe_evidence["accepted_ordinals"] == ()
+    assert plan.safe_evidence["diverted_ordinals"] == (0,)
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["publication_kind"] == "virtual"
+    assert plan.expected_descriptor is not None
+    assert plan.expected_descriptor.content_hash == sha256(b"").hexdigest()
+    assert plan.expected_descriptor.size_bytes == 0
+    assert not target.exists()
+
+    diversion = sink._get_diversions()[0]
+    assert diversion.reason == "Text values cannot contain CR or LF record separators"
+    assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
+
+
 def test_json_effect_plan_persists_exact_diversion_attribution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -160,6 +192,83 @@ def test_json_effect_plan_persists_exact_diversion_attribution(
     assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
 
 
+def test_json_effect_diverts_a_row_that_cannot_be_encoded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "out.jsonl"
+    sink = inject_write_failure(JSONSink({"path": str(target), "format": "jsonl", "schema": _SCHEMA}))
+    real_dumps = json.dumps
+    encoding_error = UnicodeEncodeError("utf-8", "\udcff", 0, 1, "injected encoding failure")
+
+    class UnencodableJSON(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            del encoding, errors
+            raise encoding_error
+
+    def fail_encoding_for_selected_row(value, *args, **kwargs):
+        serialized = real_dumps(value, *args, **kwargs)
+        if isinstance(value, dict) and value.get("id") == 2:
+            return UnencodableJSON(serialized)
+        return serialized
+
+    monkeypatch.setattr(json, "dumps", fail_encoding_for_selected_row)
+    plan = _prepare(
+        sink,
+        effect_id="b0" * 32,
+        rows=[{"id": 1}, {"id": 2}],
+    )
+
+    assert plan.safe_evidence["accepted_ordinals"] == (0,)
+    assert plan.safe_evidence["diverted_ordinals"] == (1,)
+    assert _stage_path(plan).read_bytes() == b'{"id": 1}\n'
+    assert sink._get_diversions()[0].reason == f"JSON encoding (utf-8) failed: {encoding_error}"
+    assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
+
+
+def test_json_effect_rejects_a_predecessor_row_that_cannot_be_encoded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "out.jsonl"
+    config = {"path": str(target), "format": "jsonl", "schema": _SCHEMA}
+    first_sink = JSONSink(config)
+    first_result = first_sink.commit_effect(
+        _prepare(first_sink, effect_id="b1" * 32, rows=[{"id": 1}]),
+        _CTX,
+    )
+    real_dumps = json.dumps
+    encoding_error = UnicodeEncodeError("utf-8", "\udcff", 0, 1, "injected encoding failure")
+
+    class UnencodableJSON(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            del encoding, errors
+            raise encoding_error
+
+    def fail_encoding_for_predecessor_row(value, *args, **kwargs):
+        serialized = real_dumps(value, *args, **kwargs)
+        if isinstance(value, dict) and value.get("id") == 1:
+            return UnencodableJSON(serialized)
+        return serialized
+
+    monkeypatch.setattr(json, "dumps", fail_encoding_for_predecessor_row)
+    second_sink = JSONSink(config)
+    expected_message = f"Predecessor JSON snapshot is incompatible: JSON encoding (utf-8) failed: {encoding_error}"
+
+    with pytest.raises(ValueError) as exc_info:
+        _prepare(
+            second_sink,
+            effect_id="b2" * 32,
+            rows=[{"id": 2}],
+            predecessor=first_result.descriptor,
+            predecessor_rows=[{"id": 1}],
+        )
+
+    assert str(exc_info.value) == expected_message
+    assert isinstance(exc_info.value.__cause__, UnicodeEncodeError)
+    assert exc_info.value.__cause__ is encoding_error
+
+
 def test_csv_effect_thaws_nested_values_before_serialization(tmp_path: Path) -> None:
     sink = inject_write_failure(CSVSink({"path": str(tmp_path / "nested.csv"), "schema": _SCHEMA}))
     plan = _prepare(sink, effect_id="b1" * 32, rows=[{"id": 1, "metadata": {"tags": ["a", "b"]}}])
@@ -173,7 +282,7 @@ def test_local_effect_evidence_rejects_missing_or_unmatched_diversion_attributio
     plan = _prepare(sink, effect_id="ad" * 32, rows=[{"message": "accepted"}, {"message": 42}])
     evidence = dict(plan.safe_evidence)
     evidence.pop("diversion_attribution")
-    with pytest.raises(local_effects.LocalFilePreconditionError, match="diversion attribution"):
+    with pytest.raises(KeyError, match="diversion_attribution"):
         local_effects.LocalFileEffectPlanEvidence.from_mapping(evidence)
 
     evidence = dict(plan.safe_evidence)
@@ -182,34 +291,201 @@ def test_local_effect_evidence_rejects_missing_or_unmatched_diversion_attributio
         local_effects.LocalFileEffectPlanEvidence.from_mapping(evidence)
 
 
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "accepted_ordinals",
+        "diverted_ordinals",
+        "encoding",
+        "format_name",
+        "lock_path",
+        "predecessor_declared",
+        "predecessor_exists",
+        "predecessor_file_id",
+        "predecessor_hash",
+        "predecessor_size",
+        "publication_kind",
+        "schema",
+        "staged_file_id",
+        "staged_hash",
+        "staged_size",
+        "staging_path",
+        "stream_sequence",
+        "target_path",
+    ],
+)
+def test_local_owned_plan_evidence_requires_every_field(tmp_path: Path, missing_key: str) -> None:
+    sink = TextSink({"path": str(tmp_path / "out.txt"), "field": "message", "schema": _SCHEMA})
+    plan = _prepare(sink, effect_id="a1" * 32, rows=[{"message": "accepted"}])
+    evidence = dict(plan.safe_evidence)
+    evidence.pop(missing_key)
+
+    with pytest.raises(KeyError, match=missing_key):
+        local_effects.LocalFileEffectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    ("missing_key", "observed_key"),
+    [
+        ("schema", None),
+        ("effect_id", None),
+        ("target_path", None),
+        ("observed", None),
+        ("predecessor_declared", None),
+        ("observed", "exists"),
+        ("observed", "hash"),
+        ("observed", "size"),
+        ("observed", "file_id"),
+    ],
+)
+def test_local_owned_inspection_evidence_requires_every_field(
+    tmp_path: Path,
+    missing_key: str,
+    observed_key: str | None,
+) -> None:
+    effect_id = "a2" * 32
+    inspection = local_effects.inspect_local_effect(
+        target_path=tmp_path / "out.txt",
+        request=SinkEffectInspectionRequest(
+            effect_id=effect_id,
+            target="{}",
+            predecessor_descriptor=None,
+        ),
+    )
+    evidence = dict(inspection.evidence)
+    if observed_key is None:
+        evidence.pop(missing_key)
+        expected_missing_key = missing_key
+    else:
+        observed = dict(evidence["observed"])
+        observed.pop(observed_key)
+        evidence["observed"] = observed
+        expected_missing_key = observed_key
+    divergent = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match=expected_missing_key):
+        local_effects._inspection_snapshot(divergent, effect_id=effect_id)
+
+
+def _assert_plan_really_publishes(plan, rows: list[dict[str, object]]) -> None:
+    """Guard the reconciliation cases below against a diverted, no-op plan.
+
+    A sink that diverts every row still returns a plan, and a reconciliation
+    assertion made against it passes while proving nothing — there was no
+    atomic replace to abandon and no bytes to identify. ``DocumentSink`` makes
+    that failure mode reachable rather than hypothetical: hand it more than one
+    row and it publishes NO file at all (elspeth-afdf55a17c — a 0-byte result
+    is a diversion, never a failed write).
+    """
+    assert plan.descriptor_mode is not SinkEffectDescriptorMode.NO_PUBLICATION, (
+        "the plan publishes nothing, so the reconciliation assertions are vacuous"
+    )
+    assert plan.safe_evidence["accepted_ordinals"] == tuple(range(len(rows)))
+    assert plan.safe_evidence["diverted_ordinals"] == ()
+
+
+def _document_sink(path: Path) -> DocumentSink:
+    return inject_write_failure(DocumentSink({"path": str(path), "field": "message", "encoding": "utf-8", "schema": _SCHEMA}))
+
+
+# Which shared effect-protocol cases DocumentSink is deliberately absent from,
+# so a future reader does not read the gaps as oversights:
+#
+# - test_local_effect_plans_persist_exact_diversion_attribution asserts a MIXED
+#   partition (accepted (0,), diverted (1,)). DocumentSink can never produce
+#   one: one row is wholly accepted or wholly diverted, and two or more diverts
+#   every row. Its own equivalent is
+#   test_many_rows_in_one_effect_divert_every_row_and_publish_nothing in
+#   test_document_sink.py, which pins the same diversion_attribution evidence
+#   for the all-diverted shape.
+# - the append/baseline cases (test_append_*) and
+#   test_disjoint_effects_publish_predecessor_then_successor_without_loss do
+#   not apply at all: DocumentSink offers no append mode and refuses resume
+#   configuration outright, and a second effect diverts its own row rather than
+#   extending the document.
+# - the *_evidence_requires_every_field cases are parametrized over the missing
+#   key and call local_effects directly, so they are sink-agnostic already.
+
+
+# DocumentSink takes exactly ONE row on purpose in both cases below: it
+# publishes only when the cumulative snapshot holds a single member. This is
+# not a weakened case — a single verbatim multiline value IS the whole of what
+# the sink does, so one row exercises its complete publication path.
+@pytest.mark.parametrize(
+    ("sink", "rows"),
+    [
+        pytest.param(
+            lambda path: CSVSink({"path": str(path), "schema": _SCHEMA}),
+            [{"id": 1}, {"id": 2}],
+            id="csv",
+        ),
+        pytest.param(
+            _document_sink,
+            [{"message": "Announcement\n\n  * one\n  * two"}],
+            id="document",
+        ),
+    ],
+)
 def test_abandoned_atomic_replace_reconciles_by_staged_file_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    sink,
+    rows: list[dict[str, object]],
 ) -> None:
-    target = tmp_path / "out.csv"
-    sink = CSVSink({"path": str(target), "schema": _SCHEMA})
-    plan = _prepare(sink, effect_id="a" * 64, rows=[{"id": 1}, {"id": 2}])
+    """A crash between the replace and the response is recovered by file identity.
+
+    The reconciling sink is a FRESH instance: crash recovery happens in a new
+    process, so anything the committing instance held in memory is gone and the
+    verdict must come from the filesystem alone.
+    """
+    target = tmp_path / "out"
+    plan = _prepare(sink(target), effect_id="a" * 64, rows=rows)
+    _assert_plan_really_publishes(plan, rows)
 
     def crash_after_replace(_target: Path) -> None:
         raise RuntimeError("lost response")
 
     monkeypatch.setattr(local_effects, "_after_replace", crash_after_replace)
     with pytest.raises(RuntimeError, match="lost response"):
-        sink.commit_effect(plan, _CTX)
+        sink(target).commit_effect(plan, _CTX)
 
-    fresh = CSVSink({"path": str(target), "schema": _SCHEMA})
-    result = fresh.reconcile_effect(plan, _CTX)
+    result = sink(target).reconcile_effect(plan, _CTX)
     assert result.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
     assert result.descriptor == plan.expected_descriptor
 
 
-def test_equal_bytes_from_unrelated_inode_are_unknown(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("sink", "rows"),
+    [
+        pytest.param(
+            lambda path: TextSink({"path": str(path), "field": "message", "schema": _SCHEMA}),
+            [{"message": "hello"}],
+            id="text",
+        ),
+        pytest.param(
+            _document_sink,
+            [{"message": "Announcement\n\n  * one\n  * two"}],
+            id="document",
+        ),
+    ],
+)
+def test_equal_bytes_from_unrelated_inode_are_unknown(
+    tmp_path: Path,
+    sink,
+    rows: list[dict[str, object]],
+) -> None:
+    """Identical bytes are NOT proof this effect wrote them.
+
+    Reconciliation is keyed on staged-file identity, not content, so a target
+    some other writer happened to fill with the same bytes must grade UNKNOWN
+    rather than be claimed as this effect's own publication.
+    """
     target = tmp_path / "out.txt"
-    sink = TextSink({"path": str(target), "field": "message", "schema": _SCHEMA})
-    plan = _prepare(sink, effect_id="b" * 64, rows=[{"message": "hello"}])
+    plan = _prepare(sink(target), effect_id="b" * 64, rows=rows)
+    _assert_plan_really_publishes(plan, rows)
     target.write_bytes(_stage_path(plan).read_bytes())
 
-    result = TextSink({"path": str(target), "field": "message", "schema": _SCHEMA}).reconcile_effect(plan, _CTX)
+    result = sink(target).reconcile_effect(plan, _CTX)
 
     assert result.kind is SinkEffectReconcileKind.UNKNOWN
 
@@ -596,6 +872,39 @@ def test_no_publication_uses_exact_virtual_and_inherited_descriptors(tmp_path: P
     assert not _stage_path(inherited).exists()
 
 
+def test_no_publication_does_not_inherit_undeclared_existing_target(tmp_path: Path) -> None:
+    target = tmp_path / "shared-output.txt"
+    target.write_bytes(b"another run's bytes\n")
+    inspection = local_effects.inspect_local_effect(
+        target_path=target,
+        request=SinkEffectInspectionRequest(effect_id="a3" * 32, target="{}", predecessor_descriptor=None),
+    )
+
+    plan = local_effects.prepare_local_effect(
+        effect_id="a3" * 32,
+        input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        inspection=inspection,
+        chunks=(),
+        row_count=1,
+        accepted_ordinals=(),
+        diverted_ordinals=(0,),
+        diversion_attribution=(build_diversion_attribution(ordinal=0, reason="test diversion"),),
+        encoding="utf-8",
+        format_name="text",
+        stream_sequence=0,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["predecessor_exists"] is True
+    assert plan.safe_evidence["predecessor_declared"] is False
+    assert plan.safe_evidence["publication_kind"] == "virtual"
+    assert plan.expected_descriptor is not None
+    assert plan.expected_descriptor.content_hash == sha256(b"").hexdigest()
+    assert plan.expected_descriptor.size_bytes == 0
+    assert target.read_bytes() == b"another run's bytes\n"
+    assert not _stage_path(plan).exists()
+
+
 def test_effect_streaming_preserves_stateful_text_encodings(tmp_path: Path) -> None:
     csv_target = tmp_path / "utf16.csv"
     csv_sink = CSVSink({"path": str(csv_target), "schema": _SCHEMA, "encoding": "utf-16"})
@@ -646,3 +955,40 @@ def test_indented_json_array_effects_preserve_cumulative_format(tmp_path: Path) 
     )
     second_sink.commit_effect(second, _CTX)
     assert target.read_text() == json.dumps([{"id": 1}, {"id": 2}], indent=2)
+
+
+def test_stale_sweep_surfaces_unreadable_building_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-ENOENT lstat failure on a code-owned building name propagates.
+
+    Only the concurrent-removal race (the entry is already gone) may be
+    skipped; permission or I/O failures must not read as a clean sweep.
+    """
+    building = tmp_path / f"..out.txt.elspeth-{'5' * 64}.stage.abc123.building"
+    building.write_bytes(b"crashed")
+    original_lstat = Path.lstat
+
+    def deny(path: Path, *args: object, **kwargs: object) -> object:
+        if path == building:
+            raise PermissionError(13, "denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", deny)
+
+    with pytest.raises(PermissionError):
+        local_effects.cleanup_stale_local_effect_building_files(tmp_path)
+
+
+def test_stale_sweep_skips_entries_removed_by_a_concurrent_sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gone-between-glob-and-lstat race is the one silent skip: its goal is met."""
+    building = tmp_path / f"..out.txt.elspeth-{'5' * 64}.stage.abc123.building"
+    building.write_bytes(b"crashed")
+    original_lstat = Path.lstat
+
+    def vanish(path: Path, *args: object, **kwargs: object) -> object:
+        if path == building:
+            raise FileNotFoundError(2, "gone")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", vanish)
+
+    assert local_effects.cleanup_stale_local_effect_building_files(tmp_path) == 0

@@ -9,7 +9,6 @@ in-transaction claim CAS. Extracted from ``TokenSchedulerRepository``
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -17,8 +16,10 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
@@ -55,17 +56,16 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
         on_success_sink: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
         join_group_id: str | None = None,
-        expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Persist a READY token continuation.
@@ -89,27 +89,32 @@ class SchedulerQueueRepository:
         fenced transaction) and tests — legitimately have no registry row.
         """
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
-        values = ready_work_item_values(
-            run_id=run_id,
-            token_id=token_id,
-            row_id=row_id,
-            node_id=node_id,
-            step_index=step_index,
-            ingest_sequence=ingest_sequence,
-            row_payload_json=row_payload_json,
-            available_at=available_at,
-            attempt=attempt,
-            queue_key=queue_key,
-            barrier_key=barrier_key,
-            on_success_sink=on_success_sink,
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name=coalesce_name,
-        )
         with begin_write(self._engine) as conn:
+            # The row becomes available at Landscape database time (ADR-047):
+            # claim_ready admits it against that same clock, so a caller clock
+            # — whole seconds behind or microseconds ahead of the database —
+            # can neither park the row nor make it claimable early.
+            available_at = read_landscape_transaction_time(conn)
+            values = ready_work_item_values(
+                run_id=run_id,
+                token_id=token_id,
+                row_id=row_id,
+                node_id=node_id,
+                step_index=step_index,
+                ingest_sequence=ingest_sequence,
+                row_payload_json=row_payload_json,
+                available_at=available_at,
+                attempt=attempt,
+                queue_key=queue_key,
+                barrier_key=barrier_key,
+                on_success_sink=on_success_sink,
+                join_group_id=join_group_id,
+                lineage_path=lineage_path,
+                coalesce_node_id=coalesce_node_id,
+                coalesce_name=coalesce_name,
+                row_union_name=row_union_name,
+                collector_name=collector_name,
+            )
             # Membership fence (ADR-030 §G, slice 4): checked BEFORE the INSERT
             # and BEFORE the reference validation — an evicted caller must not
             # leave a READY orphan, and the fence is the outer guard (reference
@@ -159,20 +164,18 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
         on_success_sink: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
         join_group_id: str | None = None,
-        expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> TokenWorkItem:
         """Persist and claim READY work for an active registered worker.
 
@@ -192,20 +195,18 @@ class SchedulerQueueRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
             on_success_sink=on_success_sink,
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
             join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
             worker_id=lease_owner,
         )
 
@@ -219,20 +220,18 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
         on_success_sink: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
         join_group_id: str | None = None,
-        expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> TokenWorkItem:
         """Compatibility enqueue-and-claim for N=0 fixtures with no registry.
 
@@ -248,20 +247,18 @@ class SchedulerQueueRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
             on_success_sink=on_success_sink,
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
             join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
             worker_id=None,
         )
 
@@ -275,20 +272,18 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int,
         queue_key: str | None,
         barrier_key: str | None,
         on_success_sink: str | None,
-        branch_name: str | None,
-        fork_group_id: str | None,
         join_group_id: str | None,
-        expand_group_id: str | None,
         coalesce_node_id: str | None,
         coalesce_name: str | None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         worker_id: str | None,
     ) -> TokenWorkItem:
         with begin_write(self._engine) as conn:
@@ -301,20 +296,18 @@ class SchedulerQueueRepository:
                 step_index=step_index,
                 ingest_sequence=ingest_sequence,
                 row_payload_json=row_payload_json,
-                available_at=available_at,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 attempt=attempt,
                 queue_key=queue_key,
                 barrier_key=barrier_key,
                 on_success_sink=on_success_sink,
-                branch_name=branch_name,
-                fork_group_id=fork_group_id,
                 join_group_id=join_group_id,
-                expand_group_id=expand_group_id,
+                lineage_path=lineage_path,
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
+                row_union_name=row_union_name,
+                collector_name=collector_name,
                 worker_id=worker_id,
             )
         return item_from_mapping(row)
@@ -330,20 +323,18 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
         on_success_sink: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
         join_group_id: str | None = None,
-        expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
         worker_id: str | None = None,
     ) -> RowMapping:
         """Connection-accepting enqueue-and-claim: composes into the caller's transaction.
@@ -358,6 +349,9 @@ class SchedulerQueueRepository:
         helper and for ingest, whose leader-epoch CAS is the outer fence.
         """
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
+        # Available at the caller transaction's database time (ADR-047); the
+        # claim CAS below reads the same clock on the same connection.
+        available_at = read_landscape_transaction_time(conn)
         values = ready_work_item_values(
             run_id=run_id,
             token_id=token_id,
@@ -371,12 +365,12 @@ class SchedulerQueueRepository:
             queue_key=queue_key,
             barrier_key=barrier_key,
             on_success_sink=on_success_sink,
-            branch_name=branch_name,
-            fork_group_id=fork_group_id,
             join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
+            lineage_path=lineage_path,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
         )
         if worker_id is not None:
             fence_holds = conn.execute(select(active_worker_fence_clause(worker_id=worker_id, run_id=run_id))).scalar()
@@ -416,7 +410,6 @@ class SchedulerQueueRepository:
                 run_id=run_id,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 strict_membership_fenced=worker_id is not None,
             )
             if claimed is not None:
@@ -427,7 +420,6 @@ class SchedulerQueueRepository:
         self,
         *,
         coordination_token: CoordinationToken,
-        now: datetime,
         insert_row_and_token: Callable[[Connection], tuple[Row, Token]],
         token_id: str,
         row_id: str,
@@ -440,12 +432,12 @@ class SchedulerQueueRepository:
         queue_key: str | None = None,
         barrier_key: str | None = None,
         on_success_sink: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
         join_group_id: str | None = None,
-        expand_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
+        collector_name: str | None = None,
     ) -> tuple[Row, Token, TokenWorkItem]:
         """Fenced leader INGEST (ADR-030 §C.4 row 9): one IMMEDIATE transaction.
 
@@ -461,12 +453,17 @@ class SchedulerQueueRepository:
         ``coordination_token`` is REQUIRED — this verb has no legacy callers.
         Raises :class:`~elspeth.contracts.errors.RunLeadershipLostError` on a
         fence miss (``fence_refusal`` evented on a fresh connection).
+
+        Ingested work is available immediately, and "immediately" is Landscape
+        database time read inside the fenced transaction (ADR-047), not the
+        leader's process clock. ``available_at`` is compared against that same
+        clock by ``claim_ready``, so a leader whose clock ran fast can no
+        longer enqueue work that its own next claim refuses as not-yet-due.
         """
         run_id = coordination_token.run_id
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="ingest_row_with_initial_claim",
         ) as conn:
@@ -487,18 +484,16 @@ class SchedulerQueueRepository:
                 step_index=step_index,
                 ingest_sequence=ingest_sequence,
                 row_payload_json=row_payload_json,
-                available_at=now,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 queue_key=queue_key,
                 barrier_key=barrier_key,
                 on_success_sink=on_success_sink,
-                branch_name=branch_name,
-                fork_group_id=fork_group_id,
                 join_group_id=join_group_id,
-                expand_group_id=expand_group_id,
+                lineage_path=lineage_path,
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
+                row_union_name=row_union_name,
+                collector_name=collector_name,
             )
         return row_record, token_record, item_from_mapping(scheduled)

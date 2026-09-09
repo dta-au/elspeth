@@ -15,6 +15,64 @@ sqlcipher3 = pytest.importorskip("sqlcipher3", reason="sqlcipher3 not installed 
 class TestSQLCipherCreateAndRead:
     """Basic CRUD operations on an encrypted database."""
 
+    @pytest.mark.parametrize("option", ["check_same_thread", "uri"])
+    @pytest.mark.parametrize("value", ["tru", "invalid", "2"])
+    def test_malformed_boolean_query_rejected_before_database_creation(self, tmp_path: Path, option: str, value: str) -> None:
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "invalid-option.db"
+        with pytest.raises(ValueError, match="must be a boolean"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}?{option}={value}", passphrase="test-query-boolean")
+        assert not db_path.exists()
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "y", "t", "false", "0", "no", "off", "n", "f"])
+    def test_boolean_query_spelling_matches_sqlalchemy(self, tmp_path: Path, value: str) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sqlalchemy.exc import ProgrammingError
+
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "boolean-option.db"
+        with (
+            LandscapeDB.from_url(f"sqlite:///{db_path}?check_same_thread={value}", passphrase="test-query-boolean") as db,
+            db.engine.connect() as conn,
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            future = pool.submit(conn.exec_driver_sql, "SELECT 1")
+            if value in ("true", "1", "yes", "on", "y", "t"):
+                with pytest.raises(ProgrammingError, match="same thread"):
+                    future.result()
+            else:
+                assert future.result().scalar_one() == 1
+
+    @pytest.mark.parametrize(
+        "query",
+        ["timeout=1&timeout=2", "mode=rwc&mode=ro", "uri=true&uri=false", "cache=shared&cache=shared"],
+    )
+    def test_repeated_query_parameter_rejected_before_database_creation(self, tmp_path: Path, query: str) -> None:
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "ambiguous.db"
+        with pytest.raises(ValueError, match="SQLCipher URL query parameters must occur exactly once"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}?{query}", passphrase="test-repeated-query")
+        assert not db_path.exists()
+
+    def test_repeated_query_parameter_rejected_by_the_engine_boundary(self, tmp_path: Path) -> None:
+        """The @trust_boundary honesty test: the boundary itself refuses an ambiguous URL.
+
+        Calls ``_create_sqlcipher_engine`` directly through its ``url``
+        parameter — the decorated Tier-3 source — rather than through
+        ``from_url``, so the raising assertion is visible on the decorated
+        symbol and cannot be satisfied by an unrelated caller-side guard.
+        """
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "boundary-ambiguous.db"
+        with pytest.raises(ValueError, match="SQLCipher URL query parameters must occur exactly once"):
+            LandscapeDB._create_sqlcipher_engine(f"sqlite:///{db_path}?timeout=1&timeout=2", "test-boundary-passphrase")
+        assert not db_path.exists()
+
     def test_sqlcipher_create_and_read(self, tmp_path: Path) -> None:
         from sqlalchemy import select
 

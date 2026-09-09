@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from datetime import UTC, datetime
 
 import pytest
@@ -177,9 +178,11 @@ def test_l0_module_has_no_upward_imports() -> None:
 
     forbidden_prefixes = ("elspeth.core", "elspeth.engine", "elspeth.plugins", "elspeth.web", "elspeth.cli")
     for ref in audit.__dict__.values():
-        ref_module = getattr(ref, "__module__", None)
-        if ref_module is None:
-            continue
+        # Classes and functions carry their own ``__module__``; for any other
+        # value the name resolves through its type, which is what the old
+        # sentinel ``getattr`` was already reading. Narrow to the two cases and
+        # read the owned attribute directly.
+        ref_module = ref.__module__ if isinstance(ref, type) or inspect.isroutine(ref) else type(ref).__module__
         for prefix in forbidden_prefixes:
             assert not ref_module.startswith(prefix), f"composer_llm_audit imports {ref!r} from forbidden module {ref_module}"
 
@@ -356,6 +359,7 @@ def _make_chat_turn(**overrides: object) -> ComposerChatTurn:
         "status": ComposerChatTurnStatus.SUCCESS,
         "started_at": t,
         "finished_at": t,
+        "turn_token": "f" * 64,
         "error_class": None,
     }
     defaults.update(overrides)
@@ -472,6 +476,31 @@ def test_chat_turn_invariant_violated_with_error_class_succeeds() -> None:
 
     assert payload["status"] == "invariant_violated"
     assert payload["error_class"] == "InvariantError"
+
+
+def test_chat_turn_user_initiator_requires_turn_token() -> None:
+    """A USER chat turn always answers a validated occurrence (elspeth-ea80e34fdc)."""
+    with pytest.raises(ValueError, match="turn_token"):
+        _make_chat_turn(initiator=ComposerChatInitiator.USER, turn_token=None)
+
+
+def test_chat_turn_opener_initiator_rejects_turn_token() -> None:
+    """A server-initiated opener has no submitted occurrence token to record."""
+    with pytest.raises(ValueError, match="turn_token"):
+        _make_chat_turn(initiator=ComposerChatInitiator.STEP_ENTRY_OPENER, turn_token="f" * 64)
+
+
+def test_chat_turn_empty_turn_token_rejected() -> None:
+    with pytest.raises(ValueError, match="turn_token"):
+        _make_chat_turn(turn_token="")
+
+
+def test_chat_turn_turn_token_round_trips_through_to_dict() -> None:
+    turn = _make_chat_turn(turn_token="a1" * 32)
+
+    payload = turn.to_dict()
+
+    assert payload["turn_token"] == "a1" * 32
 
 
 def test_chat_turn_recorder_protocol_runtime_check() -> None:

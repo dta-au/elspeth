@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 import structlog
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
@@ -17,16 +18,18 @@ from elspeth.web.composer.state import (
 from elspeth.web.config import WebSettings
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -42,7 +45,7 @@ def engine():
 
 @pytest.fixture
 def sessions_service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions"),
@@ -117,42 +120,68 @@ def _pt_node() -> NodeSpec:
     )
 
 
-async def _persist(sessions_service, state: CompositionState):
-    from datetime import UTC, datetime
-
-    from sqlalchemy import insert
-
-    from elspeth.web.sessions.models import sessions_table
-
-    session_id = uuid4()
-    with sessions_service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="u",
-                auth_provider_type="local",
-                title="surfacer test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+async def _persist(sessions_service: SessionServiceImpl, state: CompositionState) -> tuple[UUID, UUID]:
+    session = await sessions_service.create_session("u", "surfacer test", "local")
+    session_id = session.id
     record = await _save_state_for_session(sessions_service, session_id, state)
     return session_id, record.id
 
 
-async def _save_state_for_session(sessions_service, session_id: UUID, state: CompositionState):
-    state_dict = state.to_dict()
-    record = await sessions_service.save_composition_state(
-        session_id,
-        CompositionStateData(
-            nodes=state_dict["nodes"],
-            sources=state_dict["sources"],
-            metadata_=state_dict["metadata"],
-            is_valid=True,
-        ),
-        provenance="tool_call",
+async def _surface(
+    composer: ComposerServiceImpl,
+    sessions_service: SessionServiceImpl,
+    state: CompositionState,
+    *,
+    session_id: UUID,
+    state_id: UUID,
+) -> None:
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
     )
-    return record
+    try:
+        await composer.surface_pending_interpretation_reviews(
+            state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            session_operation_context=context,
+        )
+    finally:
+        await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
+
+
+async def _save_state_for_session(
+    sessions_service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionState,
+) -> CompositionStateRecord:
+    state_dict = state.to_dict()
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await sessions_service.save_composition_state(
+            session_id,
+            CompositionStateData(
+                nodes=state_dict["nodes"],
+                sources=state_dict["sources"],
+                metadata_=state_dict["metadata"],
+                is_valid=True,
+            ),
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+    finally:
+        await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
 
 
 @pytest.mark.asyncio
@@ -167,7 +196,7 @@ async def test_surfacer_surfaces_prompt_template(tmp_path, sessions_service) -> 
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.LLM_PROMPT_TEMPLATE in kinds
@@ -230,7 +259,7 @@ async def test_surfacer_surfaces_model_choice(tmp_path, sessions_service) -> Non
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.LLM_MODEL_CHOICE in kinds
@@ -249,17 +278,16 @@ async def test_surfacer_is_idempotent(tmp_path, sessions_service) -> None:
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     mc = [e for e in events if e.kind is InterpretationKind.LLM_MODEL_CHOICE]
     assert len(mc) == 1
 
 
 @pytest.mark.asyncio
-async def test_model_choice_dedup_is_draft_aware(tmp_path, sessions_service) -> None:
-    """A stale pending event for the same node/kind/user_term but an old draft
-    must not deadlock the new staged requirement."""
+async def test_model_choice_changed_identity_supersedes_old_event(tmp_path, sessions_service) -> None:
+    """A newly staged model authority abandons the stale pending card."""
     composer = _composer(tmp_path, sessions_service)
     old_model = "anthropic/claude-sonnet-4.5"
     new_model = "anthropic/claude-sonnet-4.6"
@@ -272,7 +300,7 @@ async def test_model_choice_dedup_is_draft_aware(tmp_path, sessions_service) -> 
         version=1,
     )
     session_id, old_state_id = await _persist(sessions_service, old_state)
-    await composer.surface_pending_interpretation_reviews(old_state, session_id=str(session_id), current_state_id=str(old_state_id))
+    await _surface(composer, sessions_service, old_state, session_id=session_id, state_id=old_state_id)
 
     new_state = CompositionState(
         source=None,
@@ -283,11 +311,13 @@ async def test_model_choice_dedup_is_draft_aware(tmp_path, sessions_service) -> 
         version=2,
     )
     new_record = await _save_state_for_session(sessions_service, session_id, new_state)
-    await composer.surface_pending_interpretation_reviews(new_state, session_id=str(session_id), current_state_id=str(new_record.id))
-    events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    drafts = [e.llm_draft for e in events if e.kind is InterpretationKind.LLM_MODEL_CHOICE]
-    assert old_model in drafts
-    assert new_model in drafts
+    await _surface(composer, sessions_service, new_state, session_id=session_id, state_id=new_record.id)
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    model_events = [event for event in events if event.kind is InterpretationKind.LLM_MODEL_CHOICE]
+    assert [(event.llm_draft, event.choice) for event in model_events] == [
+        (old_model, InterpretationChoice.SUPERSEDED),
+        (new_model, InterpretationChoice.PENDING),
+    ]
 
 
 def _staged_vague_term_node() -> NodeSpec:
@@ -300,7 +330,12 @@ def _staged_vague_term_node() -> NodeSpec:
         on_success="out",
         on_error=None,
         options={
-            "prompt_template": "Rate how {{interpretation:cool}} this is.",
+            "prompt_template": "Rate how pending interpretation this is.",
+            PROMPT_TEMPLATE_PARTS_KEY: [
+                {"kind": "text", "text": "Rate how "},
+                {"kind": "interpretation_ref", "requirement_id": "vague_term_review:rate_node"},
+                {"kind": "text", "text": " this is."},
+            ],
             INTERPRETATION_REQUIREMENTS_KEY: [
                 {
                     "id": "vague_term_review:rate_node",
@@ -338,7 +373,7 @@ async def test_surfacer_surfaces_staged_vague_term(tmp_path, sessions_service) -
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     vt = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
     assert len(vt) == 1
@@ -382,7 +417,7 @@ async def test_surfacer_skips_bare_vague_term(tmp_path, sessions_service) -> Non
     # node has a non-empty prompt_template, so _find_llm_transform_node passes
     # and the else-branch does no VAGUE_TERM check; the skip is the designed
     # advisory polarity, not protection against a writer rejection.)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     vt = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
     assert vt == []
@@ -446,7 +481,7 @@ async def test_surfacer_skips_model_only_node_without_prompt_template(tmp_path, 
     )
     session_id, state_id = await _persist(sessions_service, state)
     # Must NOT raise even though the writer boundary would reject this shape.
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     mc = [e for e in events if e.kind is InterpretationKind.LLM_MODEL_CHOICE]
     assert mc == []
@@ -487,16 +522,13 @@ def _llm_authored_source() -> SourceSpec:
 
 
 @pytest.mark.asyncio
-async def test_surfacer_surfaces_invented_source(tmp_path, sessions_service) -> None:
-    # An LLM-authored default source carrying a staged invented_source
-    # requirement surfaces a resolvable pending event at the source-commit
-    # writer boundary. The default source lives in sources[SOURCE_COMPONENT_ID];
-    # the writer reads source.options.source_authoring.content_hash and the
-    # single pending INVENTED_SOURCE requirement.
+async def test_surfacer_surfaces_every_named_invented_source(tmp_path, sessions_service) -> None:
+    # Every LLM-authored named source carrying a staged invented_source
+    # requirement surfaces its own resolvable pending event.
     composer = _composer(tmp_path, sessions_service)
     state = CompositionState(
         source=None,
-        sources={SOURCE_COMPONENT_ID: _llm_authored_source()},
+        sources={SOURCE_COMPONENT_ID: _llm_authored_source(), "orders": _llm_authored_source()},
         nodes=(),
         edges=(),
         outputs=(),
@@ -504,10 +536,10 @@ async def test_surfacer_surfaces_invented_source(tmp_path, sessions_service) -> 
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    kinds = {e.kind for e in events}
-    assert InterpretationKind.INVENTED_SOURCE in kinds
+    invented_source_events = [event for event in events if event.kind is InterpretationKind.INVENTED_SOURCE]
+    assert {event.affected_node_id for event in invented_source_events} == {"source", "source:orders"}
 
 
 def _field_mapper_pipeline_decision_node(
@@ -571,16 +603,15 @@ async def test_surfacer_surfaces_pipeline_decision(tmp_path, sessions_service) -
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.PIPELINE_DECISION in kinds
 
 
 @pytest.mark.asyncio
-async def test_pipeline_decision_dedup_is_draft_aware(tmp_path, sessions_service) -> None:
-    """A stale raw-HTML-cleanup event for the same field_mapper decision must
-    not suppress a newly authored decision draft."""
+async def test_pipeline_decision_changed_identity_supersedes_old_event(tmp_path, sessions_service) -> None:
+    """A newly authored decision authority abandons the stale pending card."""
     composer = _composer(tmp_path, sessions_service)
     old_draft = "Drop raw HTML fields before writing output."
     new_draft = RAW_HTML_CLEANUP_REVIEW_DRAFT
@@ -593,7 +624,7 @@ async def test_pipeline_decision_dedup_is_draft_aware(tmp_path, sessions_service
         version=1,
     )
     session_id, old_state_id = await _persist(sessions_service, old_state)
-    await composer.surface_pending_interpretation_reviews(old_state, session_id=str(session_id), current_state_id=str(old_state_id))
+    await _surface(composer, sessions_service, old_state, session_id=session_id, state_id=old_state_id)
 
     new_state = CompositionState(
         source=None,
@@ -604,8 +635,10 @@ async def test_pipeline_decision_dedup_is_draft_aware(tmp_path, sessions_service
         version=2,
     )
     new_record = await _save_state_for_session(sessions_service, session_id, new_state)
-    await composer.surface_pending_interpretation_reviews(new_state, session_id=str(session_id), current_state_id=str(new_record.id))
-    events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    drafts = [e.llm_draft for e in events if e.kind is InterpretationKind.PIPELINE_DECISION]
-    assert old_draft in drafts
-    assert new_draft in drafts
+    await _surface(composer, sessions_service, new_state, session_id=session_id, state_id=new_record.id)
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    decision_events = [event for event in events if event.kind is InterpretationKind.PIPELINE_DECISION]
+    assert [(event.llm_draft, event.choice) for event in decision_events] == [
+        (old_draft, InterpretationChoice.SUPERSEDED),
+        (new_draft, InterpretationChoice.PENDING),
+    ]

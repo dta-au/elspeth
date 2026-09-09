@@ -25,7 +25,6 @@ are accepted, but quoted strings are recommended for clarity.
 
 from __future__ import annotations
 
-import keyword
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -33,7 +32,9 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field
 
-from elspeth.contracts.identifiers import validate_field_name, validate_field_names
+from elspeth.contracts.enums import NodeType
+from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name, validate_field_names
+from elspeth.contracts.trust_boundary import trust_boundary
 
 # Supported field types for schema definitions
 SUPPORTED_TYPES = frozenset({"str", "int", "float", "bool", "any"})
@@ -66,6 +67,15 @@ FIELD_PATTERN = re.compile(r"^(\w+):\s*(str|int|float|bool|any)(\?)?$")
 # output shape today. Do not extend this set without design review; broader
 # heuristic growth would rebuild runtime validation piecemeal in the composer.
 _TEXT_HEURISTIC_PLUGINS: frozenset[str] = frozenset({"text"})
+
+# Single-request "llm" nodes (the LLM source, and the LLM transform when no
+# `queries` are configured) always emit <response_field>, <response_field>_usage,
+# and <response_field>_model. Mirrors LLM_GUARANTEED_SUFFIXES in
+# plugins/transforms/llm/__init__.py (L0 cannot import L3); parity is pinned by
+# tests/unit/core/dag/test_llm_source_guarantees.py (elspeth-db98d3f660).
+_LLM_HEURISTIC_PLUGIN = "llm"
+_LLM_GUARANTEED_SUFFIXES: tuple[str, ...] = ("", "_usage", "_model")
+_LLM_DEFAULT_RESPONSE_FIELD = "llm_response"
 
 
 def _field_spec_invalid_identifier_message(name: str, spec: str) -> str:
@@ -112,6 +122,24 @@ class FieldDefinition:
     nullable: bool = False
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "one entry of a pipeline schema's `fields:` list, as written by a pipeline author in "
+            "settings YAML or replayed from a to_dict() audit round-trip — an untyped str | Mapping "
+            "ELSPETH does not own"
+        ),
+        source_param="spec",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError on every malformed spec — a dict missing 'name'/'type'/'required'/"
+            "'nullable', a non-str 'name' or 'type', a non-bool 'required'/'nullable', an unsupported "
+            "type token, or a string that does not match the 'name: type' grammar; never defaults a "
+            "missing round-trip key and never coerces a wrong-typed one"
+        ),
+        test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_field_definition_parse_rejects_non_string_dict_name",
+        test_fingerprint="7a511ea4ac92eabdf1cd47b609326cff4294fff686810aece8ed9b287a8d274b",
+    )
     def parse(cls, spec: str | Mapping[str, Any]) -> FieldDefinition:
         """Parse a field specification string or dict.
 
@@ -228,6 +256,22 @@ class FieldDefinition:
         }
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the raw `guaranteed_fields` / `required_fields` / `audit_fields` / `required_input_fields` "
+        "value from a pipeline author's settings YAML — an untyped object ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the value is neither None nor a list/tuple, and (via "
+        "validate_field_names) when any element is not a valid field-name string; None means "
+        "'unspecified' and is the only absence this boundary accepts"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_parse_field_names_list_rejects_non_sequence",
+    test_fingerprint="32d10607bdd94422928209219afb99200f0fa3dd1b2e378e85993e318dabfcf9",
+)
 def _parse_field_names_list(value: Any, field_name: str, *, empty_as_none: bool = True) -> tuple[str, ...] | None:
     """Parse a list of field names for guaranteed_fields/required_fields.
 
@@ -286,6 +330,24 @@ def _validate_contract_fields_subset(
         )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one entry of a pipeline schema's `fields:` list in settings YAML, a to_dict() audit "
+        "round-trip, or the JSON-Schema authoring shape advertised by get_plugin_schema() — an "
+        "untyped object ELSPETH does not own"
+    ),
+    source_param="spec",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ValueError on every spec that is not a str, not a Mapping, a multi-key YAML dict, a "
+        "round-trip dict missing 'required'/'nullable' or carrying a non-str name/type or non-bool "
+        "flag, or a JSON-Schema dict with unsupported keys; only the JSON-Schema authoring shape "
+        "defaults required=True/nullable=False, and that default is the shape's published contract"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_normalize_field_spec_rejects_non_string_non_mapping",
+    test_fingerprint="e3484089a912b9caa5232140ab611ba3ae13bbf4110c7f84115b00a94e3c8e79",
+)
 def _normalize_field_spec(spec: Any, *, index: int) -> str | Mapping[str, Any]:
     """Normalize a field spec for parsing.
 
@@ -422,6 +484,21 @@ class SchemaConfig:
     Schema Contracts (for DAG validation):
         - guaranteed_fields: Fields the producer GUARANTEES will exist AND are
           part of the stable API contract. Downstream can safely depend on these.
+
+          This is a COMPLETE claim, not a partial hint, and that is the one
+          surprising thing about it. Declaring any guarantee makes the producer
+          PARTICIPATE in the effective-guarantee vote, and build-time validation
+          then holds it to exactly the set it named — so ADDING a guarantee can
+          narrow what validation accepts. An observed source that lists
+          `guaranteed_fields: [id]` while its rows also carry `colour` will be
+          REJECTED at build time by a sink requiring `colour`, even though the
+          same pipeline builds and runs with the line removed.
+
+          Declaring NOTHING is therefore a meaningful choice, not an omission:
+          a producer with no `guaranteed_fields` ABSTAINS, and sink requirements
+          are enforced per row at runtime instead. Declare the complete set to
+          get build-time enforcement; declare nothing to defer to runtime. A
+          partial declaration is the one option that buys neither.
         - required_fields: Fields the consumer REQUIRES in input.
         - audit_fields: Fields that exist in output but are NOT part of the
           stability contract. These are for audit trail reconstruction and may
@@ -466,6 +543,25 @@ class SchemaConfig:
         return self.mode == "observed"
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "a plugin's `schema:` / `schema_config:` block as written by a pipeline author in "
+            "settings YAML, or the same block replayed from a to_dict() audit round-trip — an "
+            "untyped mapping ELSPETH does not own"
+        ),
+        source_param="config",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError on non-Mapping input, on a missing or unrecognised 'mode', on an "
+            "observed schema carrying explicit field definitions, on a fixed/flexible schema with a "
+            "missing, non-list or empty 'fields', on duplicate field names, and on contract fields "
+            "that name undeclared or optional fields; the optional contract keys are the only ones "
+            "whose absence is accepted, and absence means 'unspecified', never an empty guarantee"
+        ),
+        test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_schema_config_from_dict_rejects_non_mapping",
+        test_fingerprint="89e5b13f4e6056ad990aadee2994eec235812df0c6d9f1e68a3985dbf150fd98",
+    )
     def from_dict(cls, config: Mapping[str, Any]) -> SchemaConfig:
         """Parse schema configuration from dict.
 
@@ -734,6 +830,40 @@ class SchemaConfig:
         return explicit
 
 
+def declare_missing_guaranteed_fields(
+    fields: tuple[FieldDefinition, ...] | None,
+    guaranteed_fields: tuple[str, ...] | None,
+) -> tuple[FieldDefinition, ...] | None:
+    """Extend an explicit fields tuple so every guaranteed field is declared.
+
+    Output-contract builders compute guaranteed_fields as input guarantees
+    plus the fields the transform creates, then construct SchemaConfig
+    directly — bypassing the from_dict validator that rejects
+    'guaranteed_fields contains fields not declared in schema'. Under
+    mode: fixed the model built from such a config is extra='forbid' over
+    the declared fields alone, so the created field is simultaneously
+    guaranteed on output and forbidden by the output model, and the
+    transform's own emitted rows fail validation against its own contract
+    (elspeth-97487736ca).
+
+    Appends a required, any-typed FieldDefinition for each guaranteed name
+    not already declared: a guarantee asserts the field WILL exist, which
+    is required-ness, but the caller does not know its type. Authored
+    declarations are never modified — a guaranteed name already declared
+    keeps its authored type and (possibly optional) requiredness.
+
+    Returns fields unchanged when the schema is observed-style
+    (fields is None) or nothing is guaranteed.
+    """
+    if fields is None or not guaranteed_fields:
+        return fields
+    declared = {field.name for field in fields}
+    missing = [name for name in guaranteed_fields if name not in declared]
+    if not missing:
+        return fields
+    return fields + tuple(FieldDefinition(name=name, field_type="any", required=True) for name in missing)
+
+
 def raw_options_have_schema(options: Mapping[str, Any]) -> bool:
     """Return whether raw plugin options expose schema config under either alias."""
     return "schema" in options or "schema_config" in options
@@ -748,6 +878,22 @@ def _get_raw_schema_value(options: Mapping[str, Any]) -> object | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the value stored under a plugin's `schema:` / `schema_config:` option in settings YAML, "
+        "read before any Pydantic model has typed it — an untyped object ELSPETH does not own"
+    ),
+    source_param="raw_schema",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError, owner-prefixed so it surfaces as a pipeline validation error, when the "
+        "value is present but not a Mapping or when SchemaConfig.from_dict rejects it; only None "
+        "means 'this plugin declares no schema'"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_parse_raw_schema_config_rejects_non_mapping",
+    test_fingerprint="b79e69c3df098d18b47fdcf850a48ec5c68eb0bbe73f778f849240cc3873aeed",
+)
 def parse_raw_schema_config(raw_schema: object, *, owner: str) -> SchemaConfig | None:
     """Parse raw schema config for contract validation.
 
@@ -773,17 +919,72 @@ def get_raw_schema_config(
     return parse_raw_schema_config(_get_raw_schema_value(options), owner=owner)
 
 
+# Node kinds whose builder-produced node config nests the authored plugin
+# options under an ``options`` wrapper key, so the input contract lives one
+# level down rather than flat on the node config.
+#
+# ``builder.py`` writes exactly this shape for aggregations (``"options":
+# dict(agg_config.options)``) and, identically, for collectors (``"options":
+# dict(collector_config.options)``). Both are membership-tested here rather
+# than compared against a single ``node_type == "aggregation"`` literal: the
+# literal is what left a collector's declared ``schema.required_fields``
+# unread while the identical declaration was enforced on an aggregation
+# (elspeth-c3cbf5f4cd). Every other node kind carries its contract flat. The
+# unwrap stays a closed membership set rather than an unconditional structural
+# one because the same helper serves the composer, where ``node.options`` is
+# planner-authored and is not validated against the plugin's config model when
+# ``validate()`` runs — a draft carrying a junk key named ``options`` would
+# otherwise have its real flat contract silently replaced. (No plugin config
+# model declares an option named ``options``; every one is ``extra="forbid"``.)
+NESTED_CONTRACT_OPTIONS_NODE_TYPES: frozenset[NodeType] = frozenset({NodeType.AGGREGATION, NodeType.COLLECTOR})
+
+
+def node_type_nests_contract_options(node_type: str | None) -> bool:
+    """Return whether this node kind nests its input contract under ``options``.
+
+    Accepts the raw ``str`` node-type discriminator that graph node info and
+    composer ``NodeSpec`` both carry; ``NodeType`` is a ``StrEnum``, so plain
+    strings match its members.
+    """
+    return node_type in NESTED_CONTRACT_OPTIONS_NODE_TYPES
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "the raw options mapping of an aggregation or collector node as written by a pipeline author "
+        "in settings YAML, where the input contract may sit flat or under a nested `options:` "
+        "wrapper — untyped YAML ELSPETH does not own"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when an `options` key is present but its value is not a Mapping; a nested "
+        "wrapper of the wrong shape is a misconfiguration, never silently ignored in favour of the "
+        "flat mapping — that fallback would validate the node's contract against the wrong options"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_get_aggregation_contract_options_rejects_non_mapping_nested_options",
+    test_fingerprint="23e1dc35f43062b0b37961503a3e2825c0419a04b262cc00f7d5b0e71cd1ddac",
+)
 def get_aggregation_contract_options(
     options: Mapping[str, Any],
     *,
     owner: str,
 ) -> tuple[Mapping[str, Any], str]:
-    """Return the mapping that carries an aggregation's input contract.
+    """Return the mapping that carries a node's nested input contract.
 
-    Aggregation nodes accept their input contract under either flat
-    ``options`` or a nested ``options.options`` wrapper. This helper is the
-    single source of truth for that alias resolution; callers in
-    ``contracts/schema.py`` and ``web/composer/state.py`` rely on it.
+    Aggregation and collector nodes accept their input contract under either
+    flat ``options`` or a nested ``options.options`` wrapper — ``builder.py``
+    produces the identical nested shape for both. This helper is the single
+    source of truth for that alias resolution.
+
+    Gate the call on ``node_type_nests_contract_options``, never on a node-kind
+    literal: the six composer consumer-side sites in ``web/composer/state.py``
+    that once gated on ``node_type == "aggregation"`` were widened to the
+    predicate in elspeth-9d17af642e, so a third nesting kind added to
+    ``NESTED_CONTRACT_OPTIONS_NODE_TYPES`` inherits them. The producer-side
+    guarantee readers still read raw options (elspeth-94959b2d9a).
+
     Raises ``ValueError`` when ``options["options"]`` exists but is not a
     ``Mapping`` — that is a misconfiguration, not a recoverable shape.
     """
@@ -792,10 +993,23 @@ def get_aggregation_contract_options(
 
     nested_options = options["options"]
     if not isinstance(nested_options, Mapping):
-        raise ValueError(f"{owner} aggregation wrapper options must be a mapping, got {type(nested_options).__name__}")
+        raise ValueError(f"{owner} nested contract options must be a mapping, got {type(nested_options).__name__}")
     return nested_options, f"{owner} options"
 
 
+@trust_boundary(
+    tier=3,
+    source=("the raw `required_input_fields` value from a node's options in settings YAML — an untyped object ELSPETH does not own"),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError, owner-prefixed for pipeline validation, on a bare string (the common "
+        "YAML slip where one field name is written unbracketed) and on anything else "
+        "_parse_field_names_list rejects; only None means 'no declared input requirement'"
+    ),
+    test_ref="tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::test_parse_raw_required_input_fields_rejects_bare_string",
+    test_fingerprint="eb33636fd8b3f96ed07b0eef09cd2cfcf47457d847781a7772f2e77c0efd9fd9",
+)
 def _parse_raw_required_input_fields(
     value: object,
     *,
@@ -817,6 +1031,24 @@ def _parse_raw_required_input_fields(
         raise ValueError(f"{owner} {exc}") from exc
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "raw plugin options from a pipeline author's settings YAML or a composer draft — an untyped "
+        "mapping whose 'column'/'queries'/'response_field' keys ELSPETH does not own"
+    ),
+    source_param="options",
+    suppresses=("R1",),
+    invariant=(
+        "raises ValueError (via get_raw_schema_config) on a malformed schema block; absent optional keys "
+        "yield no guarantee rather than a fabricated one, matching the runtime source-config twins"
+    ),
+    test_ref=(
+        "tests/unit/contracts/test_schema_config.py::TestSchemaTrustBoundaryCharacterization::"
+        "test_get_raw_producer_guaranteed_fields_rejects_malformed_schema_block"
+    ),
+    test_fingerprint="b13d59c9126a716ce9bc3aaf2cefcfd70b7edaf2451cb546c748f311a7e6a460",
+)
 def get_raw_producer_guaranteed_fields(
     plugin_name: str | None,
     options: Mapping[str, Any],
@@ -835,8 +1067,27 @@ def get_raw_producer_guaranteed_fields(
     guaranteed = schema_config.get_effective_guaranteed_fields()
     if plugin_name in _TEXT_HEURISTIC_PLUGINS and schema_config.mode == "observed" and not schema_config.declares_guaranteed_fields:
         column = options.get("column")
-        if isinstance(column, str) and column.isidentifier() and not keyword.iskeyword(column):
+        # ``is_valid_field_name`` rather than a local ``isidentifier()`` +
+        # ``iskeyword()`` pair: this gate must accept exactly the names
+        # ``TextSourceConfig._validate_column`` accepts, and it does so by
+        # asking that same policy instead of restating it. A restatement reads
+        # identically until the policy moves, and then the gate silently
+        # abstains where the runtime source participates with ``{column}``.
+        if is_valid_field_name(column):
             return frozenset({column})
+    # Single-request llm arm (elspeth-db98d3f660): union — not replace — the
+    # trio, matching the runtime augmentation in both the LLM source config
+    # rewrite and the single-query LLM transform's _output_schema_config.
+    # `queries is not None` selects the multi-query strategy at runtime, whose
+    # emitted fields are query-prefixed, so it must not claim the bare trio.
+    if plugin_name == _LLM_HEURISTIC_PLUGIN and options.get("queries") is None:
+        response_field = options.get("response_field", _LLM_DEFAULT_RESPONSE_FIELD)
+        # Same derivation as the text arm above: the runtime twin
+        # (``build_llm_source_output_schema_config``) gates on
+        # ``validate_field_name(response_field, ...)``, so this gate asks that
+        # policy rather than restating its two clauses.
+        if is_valid_field_name(response_field):
+            return guaranteed | frozenset(f"{response_field}{suffix}" for suffix in _LLM_GUARANTEED_SUFFIXES)
     return guaranteed
 
 
@@ -862,7 +1113,7 @@ def get_raw_node_required_fields(
 
     contract_options = options
     contract_owner = owner
-    if node_type == "aggregation":
+    if node_type_nests_contract_options(node_type):
         contract_options, contract_owner = get_aggregation_contract_options(options, owner=owner)
         if contract_options is not options and "required_input_fields" in contract_options:
             required_input = _parse_raw_required_input_fields(

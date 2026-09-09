@@ -1,0 +1,477 @@
+"""Closed evidence projection and receipt verification."""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import cast
+
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.web._acceptance_common.testcontainer_run import ReceiptIndexRow, testcontainer_run_gate
+
+from .contracts import (
+    _EVIDENCE_KINDS,
+    _SHA256_PATTERN,
+    MAX_JSON_RESPONSE_BYTES,
+    AcceptanceCheckError,
+    AcceptanceStateError,
+    _control_timestamp,
+    _sha256,
+    _utc_timestamp,
+)
+from .gate_ledger import _gate_ledger_records_hash, _read_gate_ledger
+from .manifest_schema import _read_control_manifest
+from .receipt_contracts import _validate_stored_receipt
+from .scenario_inventory import _load_bound_scenario_inventory
+from .secure_documents import _read_protected_document, _write_protected_document
+from .state import _parse_state_timestamp
+
+_LOG_PROJECTION_FIELDS = (
+    "event_name",
+    "check",
+    "class_name",
+    "severity",
+    "status",
+    "outcome",
+    "task_revision",
+    "deployment_revision",
+    "count",
+    "ok",
+)
+
+
+def _safe_projection_value(field: str, value: object) -> object | None:
+    if field in {"count", "task_revision", "deployment_revision"}:
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+    if field == "ok":
+        return value if type(value) is bool else None
+    if type(value) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) is not None and "://" not in value:
+        return value
+    return None
+
+
+@observation_boundary(
+    tier=3,
+    source="the message field of one CloudWatch log event, which a deployed container may emit either as a JSON string or as an already-decoded mapping",
+    source_param="message",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "never raises on a malformed message: a value that is not a string or mapping, an oversized string "
+        "(measured with surrogatepass so a lone surrogate cannot fail the encode), an undecodable or too deeply "
+        "nested string, and a string that decodes to something other than a mapping all return None, which "
+        "leaves the caller projecting the raw log event instead"
+    ),
+)
+def _decoded_log_message(message: object) -> Mapping[str, object] | None:
+    if isinstance(message, Mapping):
+        return message
+    if not isinstance(message, str) or len(message.encode("utf-8", "surrogatepass")) > MAX_JSON_RESPONSE_BYTES:
+        return None
+    try:
+        decoded = json.loads(message)
+        return decoded if isinstance(decoded, Mapping) else None
+    except (json.JSONDecodeError, RecursionError):
+        return None
+
+
+@observation_boundary(
+    tier=3,
+    source="one CloudWatch log event, EventBridge deployment-event detail, or JSON-decoded log message emitted by the deployed web or doctor container",
+    source_param="record",
+    suppresses=("R1",),
+    invariant=(
+        "never raises on a malformed record once its caller has admitted it as a Mapping (sanitize_evidence's "
+        "isinstance checks on each event and detail, or _decoded_log_message's Mapping-only return): every field "
+        "is admitted only through _safe_projection_value's closed pattern and range checks, an unparseable "
+        "timestamp is dropped rather than recorded, and an unrecognised field is omitted, so the projection "
+        "carries no free-form external content"
+    ),
+)
+def _project_log_record(record: Mapping[str, object], *, timestamp: object | None = None) -> dict[str, object]:
+    projected: dict[str, object] = {}
+    candidate_timestamp = timestamp if timestamp is not None else record.get("timestamp")
+    if type(candidate_timestamp) is int and candidate_timestamp >= 0:
+        projected["timestamp"] = candidate_timestamp
+    elif type(candidate_timestamp) is str:
+        try:
+            _parse_state_timestamp(candidate_timestamp)
+        except AcceptanceStateError:
+            pass
+        else:
+            projected["timestamp"] = candidate_timestamp
+    for field in _LOG_PROJECTION_FIELDS:
+        value = _safe_projection_value(field, record.get(field))
+        if value is not None:
+            projected[field] = value
+    return projected
+
+
+@trust_boundary(
+    tier=3,
+    source="a raw diagnostic JSON document captured from the live acceptance account: a CloudWatch log page, an EventBridge deployment event, an ECS DescribeTaskDefinition response, or a terraform plan",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on an unknown evidence kind, a payload that is not a dict, a "
+        "plan_sha256 present for a non-terraform kind or absent for a terraform one, an events/resource_changes "
+        "member that is not a bounded list, a log event or resource change that is not a mapping, a task "
+        "definition whose revision, networkMode, containerDefinitions, volumes or requiresCompatibilities fail "
+        "their shape, and a resource change carrying an action outside the closed terraform set; "
+        "never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::test_sanitize_evidence_rejects_malformed_top_level_for_every_kind"
+    ),
+    test_fingerprint="8068669f831627ee5afbbbab3e579a58f547353c6f4360911b20e327d548a306",
+)
+def sanitize_evidence(kind: str, payload: object, *, plan_sha256: str | None = None) -> dict[str, object]:
+    """Project raw diagnostic JSON into one closed, content-free evidence schema."""
+
+    if kind not in _EVIDENCE_KINDS or not isinstance(payload, dict):
+        raise AcceptanceCheckError("sanitize_evidence_schema")
+    terraform_evidence = kind in {"terraform-plan", "terraform-destroy-plan"}
+    if terraform_evidence:
+        if type(plan_sha256) is not str or _SHA256_PATTERN.fullmatch(plan_sha256) is None:
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+    elif plan_sha256 is not None:
+        raise AcceptanceCheckError("sanitize_evidence_schema")
+    base: dict[str, object] = {
+        "schema": "elspeth.aws-ecs-sanitized-evidence.v2" if terraform_evidence else "elspeth.aws-ecs-sanitized-evidence.v1",
+        "kind": kind,
+    }
+    if terraform_evidence:
+        base["plan_sha256"] = plan_sha256
+    if kind in {"web-log", "doctor-log"}:
+        events = payload.get("events")
+        if not isinstance(events, list) or len(events) > 10_000:
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+        records: list[dict[str, object]] = []
+        for event in events:
+            if not isinstance(event, Mapping):
+                raise AcceptanceCheckError("sanitize_evidence_schema")
+            decoded = _decoded_log_message(event.get("message"))
+            source = event if decoded is None else decoded
+            projected = _project_log_record(source, timestamp=event.get("timestamp"))
+            if projected:
+                records.append(projected)
+        return {
+            **base,
+            "records": records,
+            "counts": {"input": len(events), "projected": len(records)},
+        }
+    if kind == "deployment-event":
+        detail = payload.get("detail", payload)
+        if not isinstance(detail, Mapping):
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+        projected = _project_log_record(detail, timestamp=payload.get("time"))
+        return {**base, "records": [projected] if projected else [], "counts": {"input": 1, "projected": bool(projected)}}
+    if kind == "task-definition":
+        task = payload.get("taskDefinition")
+        if not isinstance(task, Mapping):
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+        revision = task.get("revision")
+        network_mode = task.get("networkMode")
+        containers = task.get("containerDefinitions")
+        volumes = task.get("volumes")
+        compatibilities = task.get("requiresCompatibilities")
+        if (
+            type(revision) is not int
+            or revision < 1
+            or network_mode not in {"awsvpc", "bridge", "host", "none"}
+            or not isinstance(containers, list)
+            or not isinstance(volumes, list)
+            or not isinstance(compatibilities, list)
+        ):
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+        return {
+            **base,
+            "projection": {
+                "revision": revision,
+                "network_mode": network_mode,
+                "container_count": len(containers),
+                "volume_count": len(volumes),
+                "fargate_required": "FARGATE" in compatibilities,
+            },
+        }
+    changes = payload.get("resource_changes")
+    if not isinstance(changes, list) or len(changes) > 100_000:
+        raise AcceptanceCheckError("sanitize_evidence_schema")
+    counts = {"create": 0, "update": 0, "delete": 0, "replace": 0, "no-op": 0}
+    for resource_change in changes:
+        if not isinstance(resource_change, Mapping):
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+        change = resource_change.get("change")
+        actions = change.get("actions") if isinstance(change, Mapping) else None
+        if not isinstance(actions, list) or any(action not in {"create", "update", "delete", "no-op", "read"} for action in actions):
+            raise AcceptanceCheckError("sanitize_evidence_schema")
+        if set(actions) == {"create", "delete"}:
+            counts["replace"] += 1
+        elif actions == ["create"]:
+            counts["create"] += 1
+        elif actions == ["update"]:
+            counts["update"] += 1
+        elif actions == ["delete"]:
+            counts["delete"] += 1
+        elif actions == ["no-op"]:
+            counts["no-op"] += 1
+    return {
+        **base,
+        "projection": {
+            "resource_change_count": len(changes),
+            "create_count": counts["create"],
+            "update_count": counts["update"],
+            "delete_count": counts["delete"],
+            "replace_count": counts["replace"],
+            "no_op_count": counts["no-op"],
+            "has_delete": counts["delete"] > 0,
+            "has_replace": counts["replace"] > 0,
+        },
+    }
+
+
+def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object]) -> tuple[int, str]:
+    evidence = cast(dict[str, object], manifest["evidence"])
+    receipts = cast(list[object], evidence["receipts"])
+    candidate_sha = cast(str, manifest["candidate_sha"])
+    receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
+    for item in receipts:
+        record = cast(dict[str, object], item)
+        receipt_hash = cast(str, record["receipt_sha256"])
+        scenario_id = cast(str, record["scenario_id"])
+        kind = cast(str, record["kind"])
+        subject_sha256 = cast(str, record["subject_sha256"])
+        expected_acceptance_run_id_sha256: str | None = None
+        expected_cluster_id_sha256: str | None = None
+        if kind == "connection-budget":
+            inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
+            values = cast(dict[str, object], inventory["values"])
+            acceptance_run_id = cast(str, manifest["acceptance_run_id"])
+            cluster_id = cast(str, values["DB_CLUSTER_IDENTIFIER"])
+            expected_acceptance_run_id_sha256 = _sha256(acceptance_run_id.encode("utf-8"))
+            expected_cluster_id_sha256 = _sha256(cluster_id.encode("utf-8"))
+        document = _validate_stored_receipt(
+            _read_protected_document(receipt_directory / f"{receipt_hash}.json", check="cleanup_finalize_receipt"),
+            kind=kind,
+            scenario_id=scenario_id,
+            subject_sha256=subject_sha256,
+            candidate_sha=candidate_sha,
+            expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
+            expected_cluster_id_sha256=expected_cluster_id_sha256,
+        )
+        canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if _sha256(canonical) != receipt_hash:
+            raise AcceptanceCheckError("cleanup_finalize_receipt")
+    approvals = cast(list[object], evidence["approvals"])
+    evidence_records = {"receipts": receipts, "approvals": approvals}
+    return len(receipts) + len(approvals), _sha256(json.dumps(evidence_records, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+@trust_boundary(
+    tier=3,
+    source="the evidence-export receipt JSON document read back from disk, written by an evidence owner after an external export",
+    source_param="path",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a receipt that is not a mapping carrying exactly the closed "
+        "evidence-export field set, and on a schema, acceptance run identity, destination digest, receipts digest "
+        "or ledger-records digest that does not bind to the manifest and ledger the caller derived, on a verified "
+        "flag that is not exactly True, on an artifact_count that is not a positive int, and on an exported_at "
+        "outside the control timestamp grammar; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::"
+        "test_evidence_export_receipt_validators_reject_a_tampered_receipt_document"
+    ),
+    test_fingerprint="f88b6a15997a06224a97109ec6a912f168efe78e289ed6538b745321055bb92f",
+)
+def _validate_evidence_export_receipt(
+    path: Path,
+    *,
+    manifest: Mapping[str, object],
+    receipts_sha256: str,
+    ledger_records_sha256: str,
+) -> tuple[dict[str, object], str]:
+    receipt = _read_protected_document(path, check="evidence_export_receipt")
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema",
+        "acceptance_run_id",
+        "destination_sha256",
+        "receipts_sha256",
+        "ledger_records_sha256",
+        "artifact_count",
+        "exported_at",
+        "verified",
+    }:
+        raise AcceptanceCheckError("evidence_export_schema")
+    evidence = cast(Mapping[str, object], manifest["evidence"])
+    if (
+        receipt["schema"] != "elspeth.aws-ecs-evidence-export.v1"
+        or receipt["acceptance_run_id"] != manifest["acceptance_run_id"]
+        or receipt["destination_sha256"] != evidence["destination_sha256"]
+        or receipt["receipts_sha256"] != receipts_sha256
+        or receipt["ledger_records_sha256"] != ledger_records_sha256
+        or receipt["verified"] is not True
+        or type(receipt["artifact_count"]) is not int
+        or receipt["artifact_count"] < 1
+    ):
+        raise AcceptanceCheckError("evidence_export_binding")
+    _control_timestamp(receipt["exported_at"])
+    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return receipt, _sha256(canonical)
+
+
+@trust_boundary(
+    tier=3,
+    source="an evidence-export receipt JSON document re-read from disk to prove a manifest-recorded binding still holds",
+    source_param="path",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError before use on a receipt whose receipts_sha256 or ledger_records_sha256 is "
+        "absent, is not a str, or is not a well-formed sha256, on anything _validate_evidence_export_receipt "
+        "rejects when re-derived against those digests, and on a canonical digest that does not equal the "
+        "manifest-recorded expected_sha256; never coerces external values"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_evidence_gate_ledger.py::"
+        "test_evidence_export_receipt_validators_reject_a_tampered_receipt_document"
+    ),
+    test_fingerprint="f88b6a15997a06224a97109ec6a912f168efe78e289ed6538b745321055bb92f",
+)
+def _reverify_bound_evidence_export_receipt(
+    path: Path,
+    *,
+    manifest: Mapping[str, object],
+    expected_sha256: str,
+) -> None:
+    document = _read_protected_document(path, check="evidence_export_receipt")
+    receipts_sha256 = document.get("receipts_sha256")
+    ledger_records_sha256 = document.get("ledger_records_sha256")
+    if (
+        type(receipts_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(receipts_sha256) is None
+        or type(ledger_records_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(ledger_records_sha256) is None
+    ):
+        raise AcceptanceCheckError("evidence_export_schema")
+    _receipt, observed_sha256 = _validate_evidence_export_receipt(
+        path,
+        manifest=manifest,
+        receipts_sha256=receipts_sha256,
+        ledger_records_sha256=ledger_records_sha256,
+    )
+    if observed_sha256 != expected_sha256:
+        raise AcceptanceCheckError("evidence_export_binding")
+
+
+def create_evidence_export_receipt(
+    manifest_path: Path,
+    *,
+    ledger_path: Path,
+    output_path: Path,
+    artifact_count: int,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> dict[str, object]:
+    """Record an evidence owner's completed and verified external export."""
+
+    if type(artifact_count) is not int or not 1 <= artifact_count <= 100_000:
+        raise AcceptanceCheckError("evidence_export_schema")
+    manifest = _read_control_manifest(manifest_path)
+    ledger = _read_gate_ledger(ledger_path)
+    if ledger["candidate_sha"] != manifest["candidate_sha"]:
+        raise AcceptanceCheckError("evidence_export_binding")
+    evidence_record_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
+    if artifact_count < max(1, evidence_record_count):
+        raise AcceptanceCheckError("evidence_export_binding")
+    # REQUIRED testcontainer run (6b-4 option (b)): the export refuses unless
+    # the store holds exactly one passing `testcontainer-run` receipt for this
+    # candidate (the shared gate names what is missing) AND the ledger's
+    # `tests` stage — the run-level slot — recorded that receipt's hash.
+    receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
+    verdict = testcontainer_run_gate(
+        cast(list[ReceiptIndexRow], cast(Mapping[str, object], manifest["evidence"])["receipts"]),
+        provider="aws",
+        candidate_sha=cast(str, manifest["candidate_sha"]),
+        read_receipt=lambda receipt_sha256: _read_protected_document(
+            receipt_directory / f"{receipt_sha256}.json", check="testcontainer_run_receipt"
+        ),
+    )
+    if not verdict.passed:
+        assert verdict.reason is not None
+        raise AcceptanceCheckError(verdict.reason)
+    tests_record = next(
+        (record for record in cast(list[Mapping[str, object]], ledger["records"]) if record["check_id"] == "tests"),
+        None,
+    )
+    if tests_record is None or tests_record["receipt_hash"] != verdict.receipt_sha256:
+        raise AcceptanceCheckError("testcontainer_run_ledger")
+    receipt = {
+        "schema": "elspeth.aws-ecs-evidence-export.v1",
+        "acceptance_run_id": manifest["acceptance_run_id"],
+        "destination_sha256": cast(Mapping[str, object], manifest["evidence"])["destination_sha256"],
+        "receipts_sha256": receipts_sha256,
+        "ledger_records_sha256": _gate_ledger_records_hash(ledger),
+        "artifact_count": artifact_count,
+        "exported_at": _utc_timestamp(now()),
+        "verified": True,
+    }
+    _write_protected_document(
+        output_path,
+        receipt,
+        create=True,
+        exists_check="evidence_export_receipt",
+        write_check="evidence_export_receipt",
+        parent_check="evidence_export_receipt",
+    )
+    _validate_evidence_export_receipt(
+        output_path,
+        manifest=manifest,
+        receipts_sha256=receipts_sha256,
+        ledger_records_sha256=cast(str, receipt["ledger_records_sha256"]),
+    )
+    return receipt
+
+
+def _final_cleanup_receipt_document(
+    manifest_path: Path,
+    manifest: Mapping[str, object],
+    *,
+    ledger_sha256: str,
+    receipts_sha256: str,
+    committed_at: str,
+) -> dict[str, object]:
+    manifest_sha256 = _sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return {
+        "schema": "elspeth.aws-ecs-final-cleanup-receipt.v1",
+        "manifest_sha256": manifest_sha256,
+        "ledger_sha256": ledger_sha256,
+        "receipts_sha256": receipts_sha256,
+        "committed_at": committed_at,
+    }
+
+
+def _verify_final_cleanup_receipt(manifest_path: Path, manifest: Mapping[str, object]) -> None:
+    final_evidence = manifest["final_evidence"]
+    if final_evidence is None:
+        raise AcceptanceCheckError("cleanup_finalize_receipt")
+    final_evidence_record = cast(Mapping[str, object], final_evidence)
+    if final_evidence_record["phase"] != "committed":
+        raise AcceptanceCheckError("cleanup_finalize_receipt")
+    ledger = _read_gate_ledger(Path(cast(str, manifest["gate_ledger_path"])))
+    ledger_sha256 = _gate_ledger_records_hash(ledger)
+    _receipt_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
+    committed_at = final_evidence_record["committed_at"]
+    if type(committed_at) is not str:
+        raise AcceptanceCheckError("cleanup_finalize_receipt")
+    expected = _final_cleanup_receipt_document(
+        manifest_path,
+        manifest,
+        ledger_sha256=ledger_sha256,
+        receipts_sha256=receipts_sha256,
+        committed_at=committed_at,
+    )
+    final_receipt_path = manifest_path.with_name(f"{manifest_path.name}.final-receipt.json")
+    if _read_protected_document(final_receipt_path, check="cleanup_finalize_receipt") != expected:
+        raise AcceptanceCheckError("cleanup_finalize_receipt")

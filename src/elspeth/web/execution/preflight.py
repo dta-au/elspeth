@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +13,8 @@ from typing import Any, cast
 import yaml
 
 from elspeth.contracts import SinkProtocol
+from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
+from elspeth.contracts.aws_textract import TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES, TextractProfiledAuditIdentities
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -30,8 +32,9 @@ from elspeth.web.paths import (
     SINK_LOCAL_PATH_OPTION_KEYS,
     SOURCE_LOCAL_PATH_OPTION_KEYS,
     resolve_data_path,
+    resolve_sink_data_path,
 )
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginKind
 
 RUNTIME_CHECK_PLUGIN_INSTANTIATION = execution_schemas.RUNTIME_CHECK_PLUGIN_INSTANTIATION
 RUNTIME_CHECK_GRAPH_STRUCTURE = execution_schemas.RUNTIME_CHECK_GRAPH_STRUCTURE
@@ -77,7 +80,7 @@ class RuntimeGraphBundle:
     test_ref="tests/unit/web/execution/test_service.py::TestResolveYamlPaths::test_non_dict_yaml_raises_type_error",
     test_fingerprint="0b6962a40eb0f2ab584fb2c1de368235d046257d81da266750c8f8011e651c36",
 )
-def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str) -> str:
+def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id: str | None = None) -> str:
     """Rewrite relative source/sink paths in pipeline YAML to absolute paths.
 
     Plugins call PathConfig.resolved_path() with no base_dir, so relative
@@ -100,6 +103,7 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str) -> str:
         path_option_keys: tuple[str, ...],
         *,
         require_options: bool = False,
+        sink_paths: bool = False,
     ) -> None:
         if "options" not in component:
             if require_options:
@@ -111,7 +115,10 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str) -> str:
         path_options = cast(dict[str, Any], opts)
         for key in path_option_keys:
             if key in path_options and not Path(str(path_options[key])).is_absolute():
-                path_options[key] = str(resolve_data_path(str(path_options[key]), data_dir))
+                if sink_paths:
+                    path_options[key] = str(resolve_sink_data_path(str(path_options[key]), data_dir, session_id=session_id))
+                else:
+                    path_options[key] = str(resolve_data_path(str(path_options[key]), data_dir))
 
     if "source" in config:
         source = config["source"]
@@ -157,12 +164,45 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str) -> str:
                         cast(dict[str, Any], sink_cfg),
                         f"sinks.{sink_name}",
                         SINK_LOCAL_PATH_OPTION_KEYS,
+                        sink_paths=True,
                     )
 
     # Nested transform provider_config paths (RAG retrieval transforms carry a
     # local Chroma persist_directory under options.provider_config). Confine
     # the same way as sink paths: rewrite relative values to absolute under
     # data_dir so the allowlist approves what the plugin actually reads/writes.
+    #
+    # DOCUMENTED EXCLUSION: `collectors` and `aggregations` are deliberately not
+    # walked (elspeth-ca79b2c63a). `NESTED_LOCAL_PATH_OPTION_KEYS` is
+    # ("persist_directory",), carried only by `rag_retrieval`, which is not
+    # batch-aware and therefore illegal as a collector. Swept the live registry
+    # at 2026-08-26: none of the 13 batch-aware (collector-legal) transforms
+    # declares `provider_config` at all.
+    #
+    # NOTE — this walk is keyed on the generated YAML's top-level `transforms:`
+    # list, NOT on `node_type`. `yaml_generator` emits `transforms:`,
+    # `aggregations:` and `collectors:` as three SEPARATE lists, so this
+    # exclusion is invisible to a `node_type` sweep of the tree. That is how it
+    # survived elspeth-df8082552d's node-kind sweep, which found and widened the
+    # gates below; grep for the vocabulary a surface actually uses.
+    #
+    # The original rationale also argued consistency with the three siblings in
+    # the provider_config family. That argument is RETIRED, not weakened: two of
+    # those three (`execution/_validation_authoring.py::validate_path_policy`
+    # and `execution/service.py`'s runtime mirror) now enumerate every
+    # plugin-bearing node (elspeth-df8082552d), so this function is no longer
+    # consistent with them. The registry sweep above stands entirely on its own
+    # and is the whole of the reason.
+    #
+    # REACTIVATION TRIGGER — incidental containment, and CLOSER than it was.
+    # Widen this walk when any batch-aware plugin declares a `provider_config`
+    # holding a local path key. Note what changed underneath this trigger: it
+    # was written when the path gates could not see collector or aggregation
+    # nodes at all, so an unrewritten relative path was moot. Those gates now
+    # DO inspect those nodes, which makes this normalization the only remaining
+    # step between a collector's relative `persist_directory` and a refusal for
+    # the wrong reason — an allowlist rejection of a legitimate path, rather
+    # than a clean plugin-contract error. One plugin away, not someday.
     transforms = config.get("transforms")
     if transforms is not None:
         if not isinstance(transforms, list):
@@ -178,7 +218,7 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str) -> str:
                 continue
             for key in NESTED_LOCAL_PATH_OPTION_KEYS:
                 if key in provider_config and not Path(str(provider_config[key])).is_absolute():
-                    provider_config[key] = str(resolve_data_path(str(provider_config[key]), data_dir))
+                    provider_config[key] = str(resolve_sink_data_path(str(provider_config[key]), data_dir, session_id=session_id))
 
     return yaml.dump(config, default_flow_style=False)
 
@@ -202,6 +242,10 @@ def _configured_plugin_ids(settings: ElspethSettings) -> tuple[PluginId, ...]:
         *(PluginId("source", source.plugin) for source in settings.sources.values()),
         *(PluginId("transform", transform.plugin) for transform in settings.transforms),
         *(PluginId("transform", aggregation.plugin) for aggregation in settings.aggregations),
+        # Collectors are plugin-bearing (batch-transform contract, ADR-042):
+        # omitting them let a policy-hidden batch plugin execute as an
+        # EXPAND-group closer after authoring (2026-08-26 systems review).
+        *(PluginId("transform", collector.plugin) for collector in settings.collectors),
         *(PluginId("sink", sink.plugin) for sink in settings.sinks.values()),
     )
 
@@ -288,31 +332,186 @@ def _profiled_plugin_ids(plugin_snapshot: PluginAvailabilitySnapshot) -> frozens
     return frozenset(plugin_id for plugin_id, _aliases in plugin_snapshot.usable_profile_aliases)
 
 
-def _authored_sources(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    sources = config.get("sources")
-    if isinstance(sources, Mapping):
-        return sources
-    source = config.get("source")
-    if isinstance(source, Mapping):
-        return {"source": source}
-    return {}
+def bind_profiled_s3_source_audit_identities(
+    bundle: PluginBundle,
+    *,
+    authored_options_by_source: Mapping[str, object],
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities,
+) -> None:
+    """Bind nominal safe evidence identities to Web-profiled S3 sources."""
+    source_id = PluginId("source", "aws_s3")
+    if source_id not in _profiled_plugin_ids(plugin_snapshot):
+        if profiled_s3_audit_identities:
+            raise ValueError("profiled S3 audit identities require a matching frozen plugin profile")
+        return
+
+    from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+    allowed_aliases = dict(plugin_snapshot.usable_profile_aliases)[source_id]
+    identities_by_source = dict(profiled_s3_audit_identities)
+    if len(identities_by_source) != len(profiled_s3_audit_identities):
+        raise ValueError("profiled S3 audit identities contain duplicate source names")
+    bound_source_names: set[str] = set()
+    for source_name, source in bundle.sources.items():
+        if source.name != "aws_s3":
+            continue
+        runtime_source: object = source
+        if not isinstance(runtime_source, AWSS3Source):
+            raise TypeError("profiled aws_s3 source must be the owned AWSS3Source implementation")
+        try:
+            raw_options = authored_options_by_source[source_name]
+        except KeyError:
+            raise KeyError(f"audit-safe settings have no source named {source_name!r}") from None
+        if type(raw_options) is not dict:
+            raise TypeError(f"audit-safe options for source {source_name!r} must be an exact dict")
+        options = cast(dict[str, object], raw_options)
+        if set(options) - S3_PROFILED_AUDIT_SAFE_OPTION_NAMES:
+            raise ValueError(f"audit-safe options for source {source_name!r} contain a private binding field")
+        alias = options["profile"] if "profile" in options else None
+        relative_key = options["key"] if "key" in options else None
+        if type(alias) is not str or alias not in allowed_aliases:
+            raise ValueError(f"audit-safe options for source {source_name!r} do not select an available profile")
+        if type(relative_key) is not str:
+            raise ValueError(f"audit-safe options for source {source_name!r} do not carry an exact relative key")
+        try:
+            identity = identities_by_source[source_name]
+        except KeyError:
+            raise KeyError(f"profiled S3 audit identities have no source named {source_name!r}") from None
+        if identity.profile_alias != alias or identity.relative_key != relative_key:
+            raise ValueError(f"audit-safe options for source {source_name!r} do not match their nominal identity")
+        runtime_source._bind_profiled_audit_identity(
+            identity,
+            audit_safe_config=options,
+        )
+        bound_source_names.add(source_name)
+    if bound_source_names != set(identities_by_source):
+        raise ValueError("profiled S3 audit identities do not match the runtime S3 source set")
 
 
-def _authored_named_components(config: Mapping[str, Any], key: str) -> dict[str, Mapping[str, Any]]:
-    raw = config.get(key)
-    if not isinstance(raw, (list, tuple)):
-        return {}
-    return {
-        str(component["name"]): component for component in raw if isinstance(component, Mapping) and isinstance(component.get("name"), str)
-    }
+def bind_profiled_textract_audit_identities(
+    bundle: PluginBundle,
+    *,
+    authored_options_by_node: Mapping[str, object],
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities,
+) -> None:
+    """Bind nominal safe evidence identities to Web-profiled Textract transforms."""
+    transform_id = PluginId("transform", "aws_textract_document_analysis")
+    if transform_id not in _profiled_plugin_ids(plugin_snapshot):
+        if profiled_textract_audit_identities:
+            raise ValueError("profiled Textract audit identities require a matching frozen plugin profile")
+        return
+
+    from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
+
+    allowed_aliases = dict(plugin_snapshot.usable_profile_aliases)[transform_id]
+    identities_by_node = dict(profiled_textract_audit_identities)
+    if len(identities_by_node) != len(profiled_textract_audit_identities):
+        raise ValueError("profiled Textract audit identities contain duplicate node names")
+    bound_node_names: set[str] = set()
+    for wired in bundle.transforms:
+        if wired.settings.plugin != "aws_textract_document_analysis":
+            continue
+        node_name = wired.settings.name
+        runtime_transform: object = wired.plugin
+        if not isinstance(runtime_transform, AWSTextractDocumentAnalysis):
+            raise TypeError("profiled aws_textract_document_analysis transform must be the owned implementation")
+        try:
+            raw_options = authored_options_by_node[node_name]
+        except KeyError:
+            raise KeyError(f"audit-safe settings have no transform named {node_name!r}") from None
+        if type(raw_options) is not dict:
+            raise TypeError(f"audit-safe options for transform {node_name!r} must be an exact dict")
+        options = cast(dict[str, object], raw_options)
+        if set(options) - TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES:
+            raise ValueError(f"audit-safe options for transform {node_name!r} contain a private binding field")
+        alias = options["profile"] if "profile" in options else None
+        if type(alias) is not str or alias not in allowed_aliases:
+            raise ValueError(f"audit-safe options for transform {node_name!r} do not select an available profile")
+        try:
+            identity = identities_by_node[node_name]
+        except KeyError:
+            raise KeyError(f"profiled Textract audit identities have no transform named {node_name!r}") from None
+        if identity.profile_alias != alias:
+            raise ValueError(f"audit-safe options for transform {node_name!r} do not match their nominal identity")
+        runtime_transform._bind_profiled_audit_identity(identity, audit_safe_config=options)
+        bound_node_names.add(node_name)
+    if bound_node_names != set(identities_by_node):
+        raise ValueError("profiled Textract audit identities do not match the runtime transform set")
 
 
-def _authored_options(component: object) -> dict[str, Any] | None:
-    if not isinstance(component, Mapping):
-        return None
-    options = component.get("options")
-    if not isinstance(options, Mapping):
-        return None
+def _required_component_mapping(
+    config: Mapping[str, Any],
+    key: str,
+    *,
+    owner: str,
+) -> dict[str, dict[str, Any]]:
+    raw = config[key]
+    if type(raw) is not dict:
+        raise TypeError(f"{owner} '{key}' must be a dict, got {type(raw).__name__}")
+    components = cast(dict[str, Any], raw)
+    for component_name, component in components.items():
+        if type(component) is not dict:
+            raise TypeError(f"{owner} '{key}' component '{component_name}' must be a dict, got {type(component).__name__}")
+    return cast(dict[str, dict[str, Any]], components)
+
+
+def _required_component_list(
+    config: Mapping[str, Any],
+    key: str,
+    *,
+    owner: str,
+) -> list[MutableMapping[str, Any]]:
+    raw = config[key]
+    if type(raw) is not list:
+        raise TypeError(f"{owner} '{key}' must be a list, got {type(raw).__name__}")
+    components = raw
+    for index, component in enumerate(components):
+        if type(component) is not dict:
+            raise TypeError(f"{owner} '{key}' component at index {index} must be a dict, got {type(component).__name__}")
+    return cast(list[MutableMapping[str, Any]], components)
+
+
+def _authored_sources(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    if "sources" in config:
+        return _required_component_mapping(config, "sources", owner="Audit-safe authored settings")
+    if "source" in config:
+        source = config["source"]
+        if type(source) is not dict:
+            raise TypeError(f"Audit-safe authored settings 'source' must be a dict, got {type(source).__name__}")
+        return {"source": cast(dict[str, Any], source)}
+    raise KeyError("Audit-safe authored settings require 'sources' or historical 'source'")
+
+
+def _authored_named_components(config: Mapping[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    if key in config:
+        raw = config[key]
+    else:
+        raw = None
+    if raw is None:
+        raw = []
+    if type(raw) is not list:
+        raise TypeError(f"Audit-safe authored settings '{key}' must be a list, got {type(raw).__name__}")
+    components = raw
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, component in enumerate(components):
+        if type(component) is not dict:
+            raise TypeError(
+                f"Audit-safe authored settings '{key}' component at index {index} must be a dict, got {type(component).__name__}"
+            )
+        component_config = cast(dict[str, Any], component)
+        name = component_config["name"]
+        if type(name) is not str:
+            raise TypeError(f"Audit-safe authored settings '{key}' component at index {index} has non-string name {type(name).__name__}")
+        by_name[name] = component_config
+    return by_name
+
+
+def _authored_options(component: Mapping[str, Any]) -> dict[str, Any]:
+    options = component["options"]
+    if type(options) is not dict:
+        raise TypeError(f"Audit-safe authored plugin options must be a dict, got {type(options).__name__}")
     return cast(dict[str, Any], deep_thaw(options))
 
 
@@ -332,36 +531,56 @@ def _audit_safe_plugin_configs(
     authored_sources = _authored_sources(audit_safe_settings)
     authored_transforms = _authored_named_components(audit_safe_settings, "transforms")
     authored_aggregations = _authored_named_components(audit_safe_settings, "aggregations")
-    authored_sinks = audit_safe_settings.get("sinks")
-    sink_map = authored_sinks if isinstance(authored_sinks, Mapping) else {}
+    authored_collectors = _authored_named_components(audit_safe_settings, "collectors")
+    authored_sinks = _required_component_mapping(
+        audit_safe_settings,
+        "sinks",
+        owner="Audit-safe authored settings",
+    )
     restored: list[tuple[Any, Any]] = []
 
-    def substitute(plugin: Any, component: object, plugin_id: PluginId) -> None:
+    def substitute(
+        plugin: Any,
+        authored_components: Mapping[str, Mapping[str, Any]],
+        component_name: str,
+        plugin_id: PluginId,
+    ) -> None:
         if plugin_id not in profiled:
             return
+        component = authored_components[component_name]
         options = _authored_options(component)
-        if options is None:
-            raise RuntimeError("Audit-safe authored settings are missing profiled plugin options.")
         restored.append((plugin, plugin.config))
         plugin.config = options
 
     try:
         for source_name, source in bundle.sources.items():
-            substitute(source, authored_sources.get(source_name), PluginId("source", source.name))
+            substitute(source, authored_sources, source_name, PluginId("source", source.name))
         for wired in bundle.transforms:
             substitute(
                 wired.plugin,
-                authored_transforms.get(wired.settings.name),
+                authored_transforms,
+                wired.settings.name,
                 PluginId("transform", wired.settings.plugin),
             )
         for aggregation_name, (plugin, aggregation_settings) in bundle.aggregations.items():
             substitute(
                 plugin,
-                authored_aggregations.get(aggregation_name),
+                authored_aggregations,
+                aggregation_name,
                 PluginId("transform", aggregation_settings.plugin),
             )
+        # Latent today (no profiled plugin is batch-aware) but a profiled
+        # collector closer would otherwise snapshot its profile-lowered
+        # private config into the node audit instead of authored options.
+        for collector_name, (plugin, collector_settings) in bundle.collectors.items():
+            substitute(
+                plugin,
+                authored_collectors,
+                collector_name,
+                PluginId("transform", collector_settings.plugin),
+            )
         for sink_name, sink in bundle.sinks.items():
-            substitute(sink, sink_map.get(sink_name), PluginId("sink", sink.name))
+            substitute(sink, authored_sinks, sink_name, PluginId("sink", sink.name))
         yield
     finally:
         for plugin, executable_config in restored:
@@ -383,38 +602,55 @@ def audit_safe_resolved_config(
     authored_sources = _authored_sources(audit_safe_settings)
     authored_transforms = _authored_named_components(audit_safe_settings, "transforms")
     authored_aggregations = _authored_named_components(audit_safe_settings, "aggregations")
-    authored_sinks = audit_safe_settings.get("sinks")
-    sink_map = authored_sinks if isinstance(authored_sinks, Mapping) else {}
+    authored_collectors = _authored_named_components(audit_safe_settings, "collectors")
+    authored_sinks = _required_component_mapping(
+        audit_safe_settings,
+        "sinks",
+        owner="Audit-safe authored settings",
+    )
 
-    def restore_options(component: dict[str, Any], authored: object, kind: str) -> None:
-        plugin_name = component.get("plugin")
-        if not isinstance(plugin_name, str) or PluginId(cast(Any, kind), plugin_name) not in profiled:
+    def restore_options(
+        component: dict[str, Any],
+        authored_components: Mapping[str, Mapping[str, Any]],
+        component_name: str,
+        kind: PluginKind,
+    ) -> None:
+        plugin_name = component["plugin"]
+        if PluginId(kind, plugin_name) not in profiled:
             return
-        options = _authored_options(authored)
-        if options is None:
-            raise RuntimeError("Audit-safe authored settings are missing profiled plugin options.")
-        component["options"] = options
+        authored = authored_components[component_name]
+        component["options"] = _authored_options(authored)
 
-    resolved_sources = resolved.get("sources")
-    if isinstance(resolved_sources, dict):
-        for source_name, component in resolved_sources.items():
-            if isinstance(component, dict):
-                restore_options(component, authored_sources.get(source_name), "source")
-    resolved_transforms = resolved.get("transforms")
-    if isinstance(resolved_transforms, list):
-        for component in resolved_transforms:
-            if isinstance(component, dict):
-                restore_options(component, authored_transforms.get(str(component.get("name"))), "transform")
-    resolved_aggregations = resolved.get("aggregations")
-    if isinstance(resolved_aggregations, list):
-        for component in resolved_aggregations:
-            if isinstance(component, dict):
-                restore_options(component, authored_aggregations.get(str(component.get("name"))), "transform")
-    resolved_sinks = resolved.get("sinks")
-    if isinstance(resolved_sinks, dict):
-        for sink_name, component in resolved_sinks.items():
-            if isinstance(component, dict):
-                restore_options(component, sink_map.get(sink_name), "sink")
+    resolved_sources = _required_component_mapping(resolved, "sources", owner="Resolved audit config")
+    for source_name, source_component in resolved_sources.items():
+        restore_options(source_component, authored_sources, source_name, "source")
+    resolved_transforms = _required_component_list(resolved, "transforms", owner="Resolved audit config")
+    for transform_component in resolved_transforms:
+        restore_options(
+            cast(dict[str, Any], transform_component),
+            authored_transforms,
+            transform_component["name"],
+            "transform",
+        )
+    resolved_aggregations = _required_component_list(resolved, "aggregations", owner="Resolved audit config")
+    for aggregation_component in resolved_aggregations:
+        restore_options(
+            cast(dict[str, Any], aggregation_component),
+            authored_aggregations,
+            aggregation_component["name"],
+            "transform",
+        )
+    resolved_collectors = _required_component_list(resolved, "collectors", owner="Resolved audit config")
+    for collector_component in resolved_collectors:
+        restore_options(
+            cast(dict[str, Any], collector_component),
+            authored_collectors,
+            collector_component["name"],
+            "transform",
+        )
+    resolved_sinks = _required_component_mapping(resolved, "sinks", owner="Resolved audit config")
+    for sink_name, sink_component in resolved_sinks.items():
+        restore_options(sink_component, authored_sinks, sink_name, "sink")
     return resolved
 
 
@@ -431,6 +667,10 @@ def build_runtime_graph(settings: ElspethSettings, bundle: PluginBundle) -> Exec
         gates=list(settings.gates),
         coalesce_settings=(list(settings.coalesce) if settings.coalesce else None),
         queues=settings.queues,
+        row_union_settings=(list(settings.row_unions) if settings.row_unions else None),
+        collectors=bundle.collectors,
+        scope_settings=(list(settings.scopes) if settings.scopes else None),
+        max_bound_region_depth=settings.max_bound_region_depth,
     )
 
 
@@ -439,13 +679,37 @@ def build_validated_runtime_graph(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
     audit_safe_settings: Mapping[str, Any] | None = None,
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = (),
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = (),
 ) -> RuntimeGraphBundle:
     """Instantiate runtime plugins, build the graph, and run both runtime graph checks.
 
     The web wrapper always constructs under preflight mode. Lifecycle methods
     still run normally once the approved bundle reaches the orchestrator.
     """
+    profiled_s3_source = PluginId("source", "aws_s3") in _profiled_plugin_ids(plugin_snapshot)
+    if profiled_s3_source and audit_safe_settings is None:
+        raise ValueError("profiled S3 runtime requires audit-safe settings")
+    profiled_textract = PluginId("transform", "aws_textract_document_analysis") in _profiled_plugin_ids(plugin_snapshot)
+    if profiled_textract and audit_safe_settings is None:
+        raise ValueError("profiled Textract runtime requires audit-safe settings")
     bundle = instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
+    if profiled_s3_source:
+        authored_sources = _authored_sources(cast(Mapping[str, Any], audit_safe_settings))
+        bind_profiled_s3_source_audit_identities(
+            bundle,
+            authored_options_by_source={name: _authored_options(component) for name, component in authored_sources.items()},
+            plugin_snapshot=plugin_snapshot,
+            profiled_s3_audit_identities=profiled_s3_audit_identities,
+        )
+    if profiled_textract:
+        authored_transforms = _authored_named_components(cast(Mapping[str, Any], audit_safe_settings), "transforms")
+        bind_profiled_textract_audit_identities(
+            bundle,
+            authored_options_by_node={name: _authored_options(component) for name, component in authored_transforms.items()},
+            plugin_snapshot=plugin_snapshot,
+            profiled_textract_audit_identities=profiled_textract_audit_identities,
+        )
     if audit_safe_settings is None:
         graph = build_runtime_graph(settings, bundle)
     else:

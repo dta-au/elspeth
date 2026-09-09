@@ -18,12 +18,14 @@ schema as a full stack.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import insert
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -31,11 +33,62 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM, build_source_data_contract_draft
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.models import session_operation_fences_table
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.unit.web.conftest import _make_session
+from tests.unit.web.conftest import _make_session as _make_session_row
+
+
+def _make_session(conn: Any, **kwargs: Any) -> None:
+    _make_session_row(conn, **kwargs)
+    session_id = kwargs["session_id"]
+    created_at = datetime.now(UTC)
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=f"create-{session_id}",
+            lease_token=f"create-token-{session_id}",
+            operation_kind=SessionOperationKind.CREATE.value,
+            owner_instance_id="interpretation-routes-test-owner",
+            operation_epoch=1,
+            lease_expires_at=created_at,
+            released_at=created_at,
+        )
+    )
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 async def _post(test_client: TestClient, url: str, *, json: dict[str, Any]) -> Response:
@@ -195,6 +248,47 @@ def _llm_generated_source() -> dict[str, Any]:
     return source
 
 
+def _uploaded_source_contract_state(csv_path: str, *, required_fields: list[str]) -> dict[str, Any]:
+    """Build a real uploaded-source graph whose LLM consumer owns demand."""
+    return CompositionState(
+        source=None,
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="source",
+                options={"path": csv_path},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="rate",
+                node_type="transform",
+                plugin="llm",
+                input="source",
+                on_success="rated",
+                on_error="discard",
+                options={
+                    "prompt_template": "Rate {{ row.colour }}",
+                    "model": "gpt-test",
+                    "schema": {"mode": "observed"},
+                    "required_input_fields": required_fields,
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(name="Data contract route test", description=""),
+        version=1,
+    ).to_dict()
+
+
 async def _seed_session_with_pending_event(
     test_client: TestClient,
     *,
@@ -211,7 +305,8 @@ async def _seed_session_with_pending_event(
     service: SessionServiceImpl = test_client.app.state.session_service
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(sid), user_id=user_id)
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         sid,
         CompositionStateData(
             nodes=[node],
@@ -248,7 +343,8 @@ async def _seed_session_with_source_pending_event(test_client: TestClient) -> di
     service: SessionServiceImpl = test_client.app.state.session_service
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(sid), user_id="alice")
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         sid,
         CompositionStateData(
             source=_llm_generated_source(),
@@ -487,6 +583,161 @@ async def test_08b_resolve_existing_event_with_consumed_placeholder_returns_422(
     assert response.json()["detail"]["code"] == "interpretation_placeholder_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("reviewed_fields", "current_fields", "remove_source", "expected_current"),
+    [
+        pytest.param(["colour"], ["colour", "size"], False, "[colour, size]", id="demand-grows"),
+        pytest.param(["colour", "size"], ["colour"], False, "[colour]", id="demand-shrinks"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolve_source_data_contract_drift_names_source_and_field_change(
+    test_client: TestClient,
+    tmp_path: Path,
+    reviewed_fields: list[str],
+    current_fields: list[str],
+    remove_source: bool,
+    expected_current: str,
+) -> None:
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
+    session_id = uuid4()
+    service: SessionServiceImpl = test_client.app.state.session_service
+    with test_client.app.state.phase3_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    surfaced = _uploaded_source_contract_state(str(csv_path), required_fields=reviewed_fields)
+    surfaced_state = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=surfaced["sources"],
+            nodes=surfaced["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfaced_state.id,
+        affected_node_id="source",
+        tool_call_id="call_data_contract",
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        llm_draft=build_source_data_contract_draft(reviewed_fields, ("colour", "size")),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+    )
+
+    drifted = _uploaded_source_contract_state(str(csv_path), required_fields=current_fields)
+    await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources={} if remove_source else drifted["sources"],
+            nodes=drifted["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{event.id}/resolve",
+        json={"choice": "accepted_as_drafted"},
+    )
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "interpretation_source_data_contract_drift"
+    reviewed = f"[{', '.join(reviewed_fields)}]"
+    assert detail["message"] == (
+        f"The demanded-field contract for source 'source' changed from {reviewed} to {expected_current} "
+        "after this review was shown. Reload the session and review the current source data contract."
+    )
+    assert "LLM" not in detail["message"]
+    assert "prompt" not in detail["message"].lower()
+    assert "node" not in detail["message"].lower()
+
+
+@pytest.mark.parametrize(
+    ("current_fields", "remove_source"),
+    [
+        pytest.param([], False, id="demand-disappears"),
+        pytest.param(["colour"], True, id="source-removed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolve_after_site_death_is_already_resolved_not_eternal_drift(
+    test_client: TestClient,
+    tmp_path: Path,
+    current_fields: list[str],
+    remove_source: bool,
+) -> None:
+    """A commit that EXTINGUISHES the review site (demand collapses, or the
+    source is removed) supersedes the pending card in the same transaction
+    (elspeth-d73139155a), so a late Acknowledge gets the ordinary 409
+    already-resolved refusal — never the old unactionable drift alert whose
+    'reload and review' instruction re-rendered the same dead card."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
+    session_id = uuid4()
+    service: SessionServiceImpl = test_client.app.state.session_service
+    with test_client.app.state.phase3_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    surfaced = _uploaded_source_contract_state(str(csv_path), required_fields=["colour"])
+    surfaced_state = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=surfaced["sources"],
+            nodes=surfaced["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfaced_state.id,
+        affected_node_id="source",
+        tool_call_id="call_data_contract",
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        llm_draft=build_source_data_contract_draft(["colour"], ("colour", "size")),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+    )
+
+    killed = _uploaded_source_contract_state(str(csv_path), required_fields=current_fields)
+    await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources={} if remove_source else killed["sources"],
+            nodes=killed["nodes"],
+            metadata_={"name": "Data contract route test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+
+    events = await service.list_interpretation_events(session_id, status="all")
+    assert [row.choice for row in events] == [InterpretationChoice.SUPERSEDED]
+    assert await service.list_interpretation_events(session_id, status="pending") == []
+
+    response = await _post(
+        test_client,
+        f"/api/sessions/{session_id}/interpretations/{event.id}/resolve",
+        json={"choice": "accepted_as_drafted"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "interpretation_already_resolved"
+
+
 @pytest.mark.asyncio
 async def test_resolve_prompt_template_amended_returns_422(test_client: TestClient) -> None:
     seeded = await _seed_session_with_pending_event(
@@ -534,14 +785,30 @@ async def test_09_list_status_pending_returns_only_pending_events(
     seeded = await _seed_session_with_pending_event(test_client)
     session_id = seeded["session_id"]
 
-    # Add a second pending event then resolve the first.
+    # Add an unrelated review site, surface its pending event, then resolve the
+    # first. Re-surfacing the same site is now content-identity idempotent and
+    # correctly returns the original event rather than creating a duplicate.
     service: SessionServiceImpl = test_client.app.state.session_service
+    second_node = _llm_node(node_id="llm_transform_2", user_term="warm")
+    state_with_second_site = await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(
+            sources=seeded["state"].sources,
+            nodes=[*(seeded["state"].nodes or ()), second_node],
+            edges=seeded["state"].edges,
+            outputs=seeded["state"].outputs,
+            metadata_=seeded["state"].metadata_,
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
     second = await service.create_pending_interpretation_event(
         session_id=session_id,
-        composition_state_id=seeded["state"].id,
-        affected_node_id="llm_transform_1",
+        composition_state_id=state_with_second_site.id,
+        affected_node_id="llm_transform_2",
         tool_call_id="call_43",
-        user_term="cool",
+        user_term="warm",
         kind=InterpretationKind.VAGUE_TERM,
         llm_draft="Second draft",
         model_identifier="anthropic/claude-opus-4-7",

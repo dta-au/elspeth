@@ -27,6 +27,7 @@
 
 import { useCallback, useState, type ReactElement } from "react";
 import { Highlight, themes as prismThemes } from "prism-react-renderer";
+import { Button } from "@/components/ui";
 import { useTheme } from "@/hooks/useTheme";
 
 export interface CodeBlockProps {
@@ -269,14 +270,14 @@ export function CodeBlock({
     resolvedTheme === "dark" ? prismThemes.vsDark : prismThemes.vsLight;
 
   const copyButton = showCopy ? (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className="code-block-copy"
       onClick={handleCopy}
       aria-label={copied ? "Copied" : "Copy value"}
     >
       {copied ? "Copied" : "Copy"}
-    </button>
+    </Button>
   ) : null;
 
   if (renderPlain) {

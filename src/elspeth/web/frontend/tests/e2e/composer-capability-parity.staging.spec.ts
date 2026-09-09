@@ -1,40 +1,40 @@
 // ============================================================================
 // composer-capability-parity.staging.spec.ts — guided_staged live acceptance
 //
-// Plan 05 Task 5 authored / Task 6 executed. This spec drives the deployed
-// guided-staged authoring surface through the two-LLM colour hybrid pipeline
+// This spec drives the deployed guided-staged authoring surface through the
+// two-LLM colour hybrid pipeline
 // against a REAL provider, exports sanitized evidence for exactly one deployed
 // revision, and hands that evidence to the same Python oracle the freeform and
 // guided_full surfaces use (evals/composer-parity/live_acceptance.py).
 //
-// It is authored here but NOT run in the Task 5 workflow: it needs a live
-// staging deployment AND a real provider key. Like tests/.../test_bedrock_live_smoke.py
+// It is not run in deterministic offline workflows: it needs a live staging
+// deployment AND a real provider key. Like tests/.../test_bedrock_live_smoke.py
 // it is key-gated — with no ELSPETH_EVAL_API_KEY the whole describe is SKIPPED,
 // so the rest of the composer-capability-parity work stays deterministic and
-// offline. Task 6 supplies STAGING_* credentials (via the staging global-setup)
+// offline. The staging runner supplies STAGING_* credentials (via global setup)
 // and ELSPETH_EVAL_API_KEY, deploys the integrated revision, and runs:
 //
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //   STAGING_USERNAME=... STAGING_PASSWORD=... \
 //   ELSPETH_EVAL_API_KEY=... ELSPETH_EVAL_REVISION="$(git rev-parse HEAD)" \
 //   npx playwright test --config=playwright.staging.config.ts \
 //     tests/e2e/composer-capability-parity.staging.spec.ts --retries=0
 //
-// ── TASK 6 RECONCILIATION NOTES (do not silently paper over) ────────────────
+// ── LIVE-STAGING RECONCILIATION NOTES (do not silently paper over) ─────────
 //   1. Guided-staged stage sequence. This spec models the colour pipeline as a
 //      chat-driven guided planner: enter guided, send the outcome-only request,
 //      send an early reminder, then review the whole-graph ProposePipelineTurn.
 //      If the deployed guided-staged flow interposes source/sink SINGLE_SELECT
 //      stages before the planner chat (as composer-guided.spec.ts shows for the
-//      step wizard), Task 6 threads those with `advanceDeterministicStages`
+//      step wizard), this journey threads those with `advanceDeterministicStages`
 //      below — it is a documented seam, not a hidden assumption.
 //   2. Evidence collector endpoint. The oracle consumes six sanitized JSON
 //      documents (manifest/graph/run_llm_calls/run_accounting/business_output/
 //      input_identities). There is no single backend endpoint that emits them
 //      in the oracle's shape today; server-side assembly + redaction is where
 //      `redact_evidence` should live (live_acceptance.py). `collectStagedParityEvidence`
-//      calls the purpose-built export endpoint the Task-6 collector must expose
+//      calls the purpose-built export endpoint the staging collector must expose
 //      and FAILS LOUDLY, naming the contract, if it is absent — it never
 //      fabricates a passing document (that would defeat the oracle's whole point).
 // ============================================================================
@@ -58,6 +58,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
+import { switchToGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -73,6 +74,27 @@ const EVIDENCE_ROOT = resolve(REPO_ROOT, "output", "playwright", "composer-parit
 const SURFACE = "guided_staged";
 const BLOB_FILENAME = "two_llm_colour.csv";
 
+// The session's goal, stated on the "Switch to guided" card (goal-first,
+// elspeth-378cfa0e18). One sentence naming the same outcome the fixture request
+// (REQUEST_TXT) asks for — the request itself is still sent in full as the
+// guided chat message, so the guided surface reads exactly what the freeform
+// surface reads and the parity comparison is unchanged.
+//
+// NOT evidence for the step-3 outcome-goal clause. This sentence restates the
+// fixture request's STEPS (two independent LLMs, one merged row), so it reaches
+// the planner as a plain request for processing and is decided by rule 1's
+// pre-existing branch, never by "when the intent is an outcome goal". The
+// clause's processing half needs a goal that names an outcome and no step; that
+// case is fixed in the goal-first design's live trial, not here.
+//
+// Two re-baselining consequences of stating it at all: the guided brief now
+// carries this outcome twice (once as the root goal, once inside the full
+// request), which the freeform side does not receive, and the walk pays a
+// planner run rooted on it. Read a guided/freeform difference on this walk as
+// that, until the parity numbers are re-measured against the goal-first build.
+const GUIDED_GOAL =
+  "Assess every colour row with two independent LLMs and write one merged row per colour to a JSON file.";
+
 // The six sanitized documents the oracle loads (live_acceptance.EVIDENCE_FILES).
 const EVIDENCE_FILES = [
   "manifest.json",
@@ -85,8 +107,8 @@ const EVIDENCE_FILES = [
 type EvidenceBundle = Record<(typeof EVIDENCE_FILES)[number], unknown>;
 
 // Key-gate: absent a real provider key this journey cannot prove a live run, so
-// it is skipped rather than run against a fake. This keeps the Task 5 workflow
-// deterministic/offline; Task 6 supplies the key on staging.
+// it is skipped rather than run against a fake. This keeps offline verification
+// deterministic; the staging runner supplies the live key.
 const LIVE_KEY = process.env.ELSPETH_EVAL_API_KEY;
 
 test.describe("composer capability parity — guided_staged live acceptance (staging)", () => {
@@ -122,12 +144,18 @@ test.describe("composer capability parity — guided_staged live acceptance (sta
       await composer.waitForChatReady();
 
       // ── /guided/start ──────────────────────────────────────────────────────
-      // "Switch to guided" issues POST /api/sessions/{id}/guided/start and mounts
-      // the guided composer surface.
-      await page.getByRole("button", { name: "Switch to guided" }).click();
+      // "Switch to guided" collects the session's goal (goal-first,
+      // elspeth-378cfa0e18), then issues POST /api/sessions/{id}/guided/start
+      // with it and mounts the guided composer surface.
+      //
+      // The goal is the one-sentence outcome of the SAME fixture request; the
+      // full request still arrives as the chat message below, which is what the
+      // parity oracle measures. Parity is against the freeform surface reading
+      // that request, so the goal must not add or drop an outcome.
+      await switchToGuidedWithGoal(page, GUIDED_GOAL);
       await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
-      // Task-6 seam: interpose any deterministic source/sink stages the deployed
+      // Staging seam: interpose any deterministic source/sink stages the deployed
       // guided-staged flow requires before the planner chat.
       await advanceDeterministicStages(page);
 
@@ -168,10 +196,15 @@ test.describe("composer capability parity — guided_staged live acceptance (sta
       await expect(proposal.getByRole("heading", { name: "Review pipeline proposal" })).toBeVisible({
         timeout: 5 * 60_000,
       });
-      // The whole-DAG canvas and the two independent LLM assessment nodes. The
-      // planner names the two branches for blue and red; both must surface in
-      // the reviewed proposal (Components section / graph).
-      await expect(proposal.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
+      // The whole-DAG canvas is drawn in the Pipeline pane's Graph tab from
+      // the same proposal payload (elspeth-9f0873426a, IA-1/V-1) — the card
+      // itself only points at it. The two independent LLM assessment nodes:
+      // the planner names the two branches for blue and red; both must
+      // surface in the reviewed proposal (Components section).
+      await expect(proposal.getByRole("button", { name: "Show graph" })).toBeVisible();
+      await expect(
+        page.getByRole("tabpanel").getByRole("img", { name: /pipeline proposal graph/i }),
+      ).toBeVisible();
       await expect(proposal.getByText(/blue/i).first()).toBeVisible();
       await expect(proposal.getByText(/red/i).first()).toBeVisible();
       // A require-all coalesce shows a fan-in join over both branches.
@@ -254,12 +287,12 @@ async function waitForGuidedIdle(page: Page): Promise<void> {
 }
 
 /**
- * Task-6 seam: advance any deterministic source/sink stages the deployed
+ * Staging seam: advance any deterministic source/sink stages the deployed
  * guided-staged flow requires before the planner chat. With the colour CSV
  * already uploaded, a source SINGLE_SELECT binds it via the upload fast-path;
  * a sink stage may default. Left intentionally permissive: it clicks a stage's
  * Continue only when one is actually presented, and is a no-op for a purely
- * chat-driven planner. Task 6 tightens this against the real staging sequence
+ * chat-driven planner. Live validation tightens this against the staging sequence
  * rather than this spec guessing it blind.
  */
 async function advanceDeterministicStages(page: Page): Promise<void> {
@@ -276,7 +309,7 @@ async function advanceDeterministicStages(page: Page): Promise<void> {
 
 /**
  * Read the just-executed run id. The execution store exposes the active run id
- * to the DOM; Task 6 confirms the exact attribute on staging if this drifts.
+ * to the DOM; the staging run confirms the exact attribute if this drifts.
  */
 async function readActiveRunId(page: Page): Promise<string> {
   const region = page.getByRole("region", { name: "Pipeline run results" });
@@ -284,13 +317,13 @@ async function readActiveRunId(page: Page): Promise<string> {
   if (runId === null || runId.trim() === "") {
     throw new Error(
       "could not read the active run id from the run-results region " +
-        "(expected a data-run-id attribute) — Task 6: wire the run-id selector to staging",
+        "(expected a data-run-id attribute) — update the selector for the staging DOM contract",
     );
   }
   return runId;
 }
 
-// ── Evidence collection (Task-6 collector seam) ──────────────────────────────
+// ── Evidence collection (staging collector seam) ─────────────────────────────
 
 interface EvidenceRef {
   sessionId: string;
@@ -308,7 +341,7 @@ interface EvidenceRef {
  * `redact_evidence` runs before anything is retained — so this helper reads a
  * purpose-built export endpoint rather than scraping and re-shaping raw audit in
  * the browser. If that endpoint is absent, it FAILS LOUDLY with the exact
- * contract Task 6 must satisfy; it never returns a hand-built passing bundle.
+ * contract the staging deployment must satisfy; it never fabricates a bundle.
  */
 async function collectStagedParityEvidence(
   ctx: APIRequestContext,
@@ -319,7 +352,7 @@ async function collectStagedParityEvidence(
   if (resp.status() === 404) {
     throw new Error(
       "composer-parity evidence export endpoint is not wired on this deployment.\n" +
-        `  Task 6 must expose GET ${path.split("?")[0]} returning the six sanitized\n` +
+        `  The deployment must expose GET ${path.split("?")[0]} returning the six sanitized\n` +
         "  documents the oracle loads, already passed through live_acceptance.redact_evidence:\n" +
         `    ${EVIDENCE_FILES.join(", ")}\n` +
         "  It must strip every credential/cookie/authorization header/resolved secret/raw\n" +

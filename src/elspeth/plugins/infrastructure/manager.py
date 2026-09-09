@@ -4,7 +4,7 @@ Uses pluggy for hook-based plugin registration.
 """
 
 import threading
-from typing import Any
+from typing import Any, cast
 
 import pluggy
 import structlog
@@ -14,6 +14,8 @@ from elspeth.contracts import (
     SourceProtocol,
     TransformProtocol,
 )
+from elspeth.contracts.plugin_capabilities import ContentTrust
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.hookspecs import (
     PROJECT_NAME,
     ElspethSinkSpec,
@@ -32,6 +34,27 @@ _logger = structlog.get_logger(__name__)
 
 class PluginNotFoundError(ValueError):
     """Raised when a plugin name is not found in the registry."""
+
+
+def _registered_transform_classes() -> tuple[type[BaseTransform], ...]:
+    """Return registered transforms after enforcing the nominal base contract."""
+    transforms = cast("list[type[object]]", get_shared_plugin_manager().get_transforms())
+    invalid = [plugin_cls.__name__ for plugin_cls in transforms if not issubclass(plugin_cls, BaseTransform)]
+    if invalid:
+        raise TypeError(f"registered transform classes must inherit BaseTransform: {sorted(invalid)}")
+    return tuple(cast("type[BaseTransform]", plugin_cls) for plugin_cls in transforms)
+
+
+def http_fetch_transform_names() -> frozenset[str]:
+    """Return the canonical registered vocabulary for direct HTTP fetchers."""
+    return frozenset(plugin_cls.name for plugin_cls in _registered_transform_classes() if plugin_cls.fetches_http)
+
+
+def untrusted_content_transform_names() -> frozenset[str]:
+    """Return transforms whose produced content requires untrusted-input controls."""
+    return frozenset(
+        plugin_cls.name for plugin_cls in _registered_transform_classes() if plugin_cls.content_trust is ContentTrust.UNTRUSTED
+    )
 
 
 def _raise_if_invalid(errors: list[ValidationError], label: str, name: str) -> None:

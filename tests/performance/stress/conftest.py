@@ -38,6 +38,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from tests.fixtures.landscape import leader_coordination_token
 
 if TYPE_CHECKING:
     import httpx
@@ -1030,7 +1031,9 @@ def stress_test_context(
 
     from elspeth.contracts import RunStatus
 
-    stress_landscape_factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.COMPLETED)
+    stress_landscape_factory.run_lifecycle.complete_run(
+        status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(stress_landscape_factory, run.run_id)
+    )
 
 
 # ---------------------------------------------------------------------------

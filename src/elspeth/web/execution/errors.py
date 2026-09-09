@@ -20,7 +20,7 @@ from elspeth.web.composer.state import ValidationEntry
 from elspeth.web.interpretation_state import InterpretationReviewSite
 
 if TYPE_CHECKING:
-    from elspeth.web.execution.schemas import ValidationError, ValidationReadiness
+    from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationReadinessBlocker
 
 
 class SemanticContractViolationError(ValueError):
@@ -84,6 +84,29 @@ class PipelineValidationError(ValueError):
         super().__init__(f"Pipeline failed pre-run validation: {message}")
 
 
+class ExecutionReadinessError(Exception):
+    """Backend-owned execution readiness refused run admission.
+
+    This is distinct from :class:`PipelineValidationError`: deterministic
+    validation can be green while a runtime admission policy withholds
+    ``execution_ready`` without producing ``ValidationError`` records.
+    """
+
+    def __init__(self, *, blockers: tuple[ValidationReadinessBlocker, ...]) -> None:
+        blockers = tuple(blockers)
+        self.blockers = blockers
+        super().__init__("Pipeline is not ready for execution.")
+
+
+class CompletionGateIntegrityError(Exception):
+    """Persisted composer completion-gate facts failed owned-data parsing."""
+
+    def __init__(self, *, session_id: str, state_id: str) -> None:
+        self.session_id = session_id
+        self.state_id = state_id
+        super().__init__("Persisted completion-gate facts failed integrity validation.")
+
+
 class ExecuteRequestValidationError(ValueError):
     """Caller-authored /execute request data failed validation.
 
@@ -100,6 +123,19 @@ class PathAllowlistViolationError(ExecuteRequestValidationError):
 
 class MalformedBlobRefError(ExecuteRequestValidationError):
     """Raised when caller-supplied blob_ref is not a UUID."""
+
+
+class BlobRowsSourceAdmissionError(Exception):
+    """Persisted ``blob_rows`` source options failed run-admission re-resolution.
+
+    Raised when a ``blob_rows`` source's persisted entries are malformed or
+    diverge from the session's authoritative blob records on a metadata field
+    (``filename`` / ``mime_type`` / ``size_bytes``).  The rest of the
+    divergence taxonomy keeps its established types: content-hash divergence
+    raises ``BlobIntegrityError``, non-ready blobs raise ``BlobStateError``,
+    and cross-session blobs are indistinguishable from genuinely-missing ones
+    (``BlobNotFoundError``) so no foreign metadata is ever an oracle.
+    """
 
 
 class UnresolvedInterpretationPlaceholderError(Exception):

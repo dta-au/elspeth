@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Final, cast
+from typing import Annotated, Any, Final, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.core.config import RuntimeNodeName
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
     SpliceTransformArgumentsModel,
+    _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
     CoalesceBranches,
@@ -26,33 +28,47 @@ from elspeth.web.composer.state import (
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
     _validate_gate_route_parity,
+    composer_component_kind,
+    edge_lowering_error,
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
+    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+    _STEP_DESCRIPTION_DESCRIPTION,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
     _attach_post_call_hints,
+    _canonical_interpretation_requirement_error,
+    _canonicalize_authored_interpretation_requirements,
+    _composition_canonical_interpretation_requirement_error,
     _credential_wiring_contract_failure,
     _discovery_result,
+    _echoed_metadata_note,
     _failure_result,
     _mutation_result,
+    _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
+    _prohibited_section,
     _reserved_connection_names,
+    _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
     _validate_aggregation_trigger,
     _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
 from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
     composition_review_contract_error,
     reconcile_authoritative_reviews,
     serialize_authoring_review_options,
@@ -67,7 +83,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     input: str
     plugin: str | None = None
     on_success: str | None = None
-    on_error: str | None = None
+    on_error: Annotated[str, Field(min_length=1)] | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     condition: str | None = None
     routes: dict[str, str] | None = None
@@ -78,6 +94,11 @@ class _UpsertNodeArgumentsModel(BaseModel):
     trigger: dict[str, Any] | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: _StrictTimeoutSeconds | None = None
+    description: str | None = None
+    scope_name: str | None = None
+    scope_opener: str | None = None
+    scope_policy: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -116,14 +137,29 @@ def _handle_list_transforms(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    return _discovery_result(state, context.catalog.list_transforms())
+    return _discovery_result(
+        state,
+        {
+            "available": context.catalog.list_transforms(),
+            "prohibited": _prohibited_section(context.catalog.list_prohibited_transforms()),
+        },
+    )
 
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
-    description="List available transform plugins with name and summary.",
+    description=(
+        "List available transform plugins. Each entry carries its full `config_fields` "
+        "(name, type, required, description, default per option), usage guidance, "
+        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "The result's `prohibited` array names any transform categorically banned from "
+        "the web authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable. "
+        "Call get_plugin_schema only for enum values, nested option shapes, or the "
+        "raw JSON schema; this listing already answers ordinary configuration questions."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )
@@ -134,14 +170,29 @@ def _handle_list_sinks(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    return _discovery_result(state, context.catalog.list_sinks())
+    return _discovery_result(
+        state,
+        {
+            "available": context.catalog.list_sinks(),
+            "prohibited": _prohibited_section(context.catalog.list_prohibited_sinks()),
+        },
+    )
 
 
 _LIST_SINKS_DECLARATION = ToolDeclaration(
     name="list_sinks",
     handler=_handle_list_sinks,
     kind=ToolKind.DISCOVERY,
-    description="List available sink plugins with name and summary.",
+    description=(
+        "List available sink plugins. Each entry carries its full `config_fields` "
+        "(name, type, required, description, default per option), usage guidance, "
+        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "The result's `prohibited` array names any sink categorically banned from "
+        "the web authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable. "
+        "Call get_plugin_schema only for enum values, nested option shapes, or the "
+        "raw JSON schema; this listing already answers ordinary configuration questions."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )
@@ -153,41 +204,53 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "id": {"type": "string", "description": "Unique node identifier."},
         "node_type": {
             "type": "string",
-            "enum": ["transform", "gate", "aggregation", "coalesce", "queue"],
+            "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"],
         },
         "plugin": {
             "type": ["string", "null"],
-            "description": "Plugin name. Required for transform/aggregation. Null for gate/coalesce.",
+            "description": "Plugin name. Required for transform/aggregation/collector. Null for gate/coalesce/row_union/queue.",
         },
         "input": {
             "type": "string",
             "description": (
-                "Connection-name string this node CONSUMES. MUST equal the value of some "
-                "upstream's on_success (or routes value, or on_error) field. NOT the upstream "
-                "node's id — connections are matched by string, not by graph topology. "
-                "Example: if source.on_success='raw_url_rows', this node sets input='raw_url_rows'."
+                "Connection-name string this node CONSUMES: must equal an upstream's on_success "
+                "(or routes value, or on_error), NOT the upstream node's id — connections match "
+                "by string, not by graph topology."
             ),
-            "examples": ["raw_url_rows", "fetched_text", "scored_rows"],
         },
         "on_success": {
             "type": ["string", "null"],
             "description": (
-                "Output connection. Required for transform/aggregation/coalesce. Null for "
-                "gates (routing is via condition/routes). When set, this is the connection-name "
-                "string the node PUBLISHES — some downstream input/sink_name MUST equal this "
-                "value. The runtime matches strings, not topology."
+                "Output connection, consumed by a downstream input/sink_name (matched by string). "
+                "Required for transform/aggregation/row_union; null for gates (they route via "
+                "condition/routes). A row_union MUST publish to a processing connection, never "
+                "directly to a sink. A coalesce normally publishes under its own node id; its "
+                "optional on_success may name only a sink."
             ),
-            "examples": ["fetched_text", "scored_rows", "lines_out"],
         },
-        "on_error": {"type": ["string", "null"], "description": "Error output connection (transform/aggregation only)."},
-        "options": {"type": "object", "description": "Plugin-specific config (transform/aggregation only)."},
+        "on_error": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": (
+                "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink name. "
+                "For a gate it covers row expression-evaluation errors and is authored here, never as an "
+                "edge; omit it to preserve fail-fast behavior."
+            ),
+        },
+        "options": {
+            "type": "object",
+            "description": (
+                "Plugin-specific config (transform/aggregation only). The schema: block declares what "
+                "ARRIVES at the node, never its transformed result; declare arriving types on the "
+                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+            ),
+        },
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
         "routes": {
             "type": ["object", "null"],
             "description": (
-                "Route mapping {true: sink_or_connection_or_discard, false: sink_or_connection_or_discard} "
-                "(gate only, mutually exclusive with fork_to). Use 'discard' to drop that route with "
-                "an audited gate_discarded terminal outcome."
+                "Gate route mapping {true: ..., false: ...}; each value is a sink, a connection, or "
+                "'discard' for an audited gate_discarded terminal drop. Mutually exclusive with fork_to."
             ),
         },
         "fork_to": {
@@ -200,13 +263,19 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "additionalProperties": {"type": "string"},
             "description": (
-                "Branches to merge (coalesce only). Use list form when branch identity and input "
-                "connection are the same, or object form {branch_name: input_connection} when a "
-                "branch flows through transforms before coalescing."
+                "Branch inputs for coalesce or row_union — list form, or {branch_name: input_connection} "
+                "when a branch flows through transforms. A row_union consumes EVERY branches value as a "
+                "real input and releases the original rows without merging fields."
             ),
         },
-        "policy": {"type": ["string", "null"], "description": "Merge trigger policy (coalesce only)."},
-        "merge": {"type": ["string", "null"], "description": "Field merge strategy (coalesce only)."},
+        "policy": {
+            "type": ["string", "null"],
+            "description": "Arrival policy (coalesce only). Omitting it means 'require_all', the runtime default — every branch must arrive.",
+        },
+        "merge": {
+            "type": ["string", "null"],
+            "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default — union's schema rules are enforced either way.",
+        },
         "trigger": {
             "type": ["object", "null"],
             "description": "Optional early batch trigger config (aggregation only). Omit, null, or {} for end-of-source-only aggregation.",
@@ -235,7 +304,32 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "expected_output_count": {
             "type": ["integer", "null"],
-            "description": "Expected number of output rows from aggregation (aggregation only). Optional; omit when output count depends on group_by distinct values.",
+            "description": "Expected aggregation output row count; omit when output count depends on group_by distinct values.",
+        },
+        "timeout_seconds": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "description": "A finite positive structural-barrier timeout in seconds (coalesce/row_union only).",
+        },
+        "description": {
+            "type": ["string", "null"],
+            "description": _STEP_DESCRIPTION_DESCRIPTION,
+        },
+        "scope_name": {
+            "type": ["string", "null"],
+            "description": "Scope identifier for the EXPAND group this collector closes (collector only).",
+        },
+        "scope_opener": {
+            "type": ["string", "null"],
+            "description": "Node id of the multi-row transform that opens the collector's EXPAND group (collector only).",
+        },
+        "scope_policy": {
+            "type": ["string", "null"],
+            "enum": ["require_all", "best_effort", None],
+            "description": (
+                "Group arrival policy (collector only). REQUIRED for collectors — no default; the author "
+                "decides whether a lost member fails the group."
+            ),
         },
     },
     "required": ["id", "node_type", "input"],
@@ -284,13 +378,20 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "Add or update a pipeline node. "
         "Fields are node_type-dependent: "
         "transform/aggregation use plugin+options; "
-        "gate uses condition+routes (or fork_to); "
+        "gate uses condition+routes (or fork_to) and optional node-level on_error; "
         "coalesce uses branches+policy+merge; "
+        "row_union is a plugin-free require_all N-to-N barrier: provide at least "
+        "two ordered branches, set input to the first branch connection, set "
+        "on_success to a processing connection (never a sink), omit policy/merge/"
+        "options/routing fields, and optionally set a finite positive timeout_seconds; "
         "queue is a structural fan-in point — set id == input to the shared "
         "connection name, omit plugin and every routing field (on_success/"
         "on_error/routes/fork_to), and options accepts only an optional "
         "description. Multiple producers may publish that name precisely "
         "because the queue is declared. "
+        "collector closes a declared EXPAND scope with a batch-aware plugin: "
+        "set scope_name, scope_opener (the multi-row transform that opens the "
+        "group), and scope_policy ('require_all' or 'best_effort', no default). "
         "Omit fields that don't apply to your node_type."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
@@ -312,8 +413,10 @@ _UPSERT_EDGE_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Add or update a connection between nodes. When the edge targets a sink, "
-        "this also updates the source/node routing field used by runtime "
-        "(on_success, on_error, gate routes, or fork destinations)."
+        "this also updates the source/node routing field used by runtime. "
+        "edge_type='on_error' sink wiring is supported for transform/aggregation nodes only; "
+        "a gate's expression-error policy is node-level and must be set with upsert_node.on_error. "
+        "Gate success routing uses route_true, route_false, or fork."
     ),
     json_schema={
         "type": "object",
@@ -441,7 +544,9 @@ def _execute_upsert_queue_node(
     fork_to: tuple[str, ...] | None = tuple(validated.fork_to) if validated.fork_to is not None else None
     branches: CoalesceBranches | None = None
     if validated.branches is not None:
-        branches = dict(validated.branches) if isinstance(validated.branches, Mapping) else tuple(validated.branches)
+        # pydantic validated branches as exactly list[str] | dict[str, str]; dispatch on
+        # the concrete constructed type rather than re-checking shape via an ABC.
+        branches = dict(validated.branches) if type(validated.branches) is dict else tuple(validated.branches)
     node = NodeSpec(
         id=validated.id,
         node_type="queue",
@@ -459,6 +564,8 @@ def _execute_upsert_queue_node(
         trigger=validated.trigger,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
+        timeout_seconds=validated.timeout_seconds,
+        description=validated.description,
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:
@@ -482,31 +589,60 @@ def _execute_upsert_node(
     validated = cast(_UpsertNodeArgumentsModel, _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments"))
     node_id = validated.id
     node_type = validated.node_type
-    if node_type == "queue":
-        # A queue is a structural pass-through fan-in point with no plugin,
-        # no routing, and no plugin options — so the plugin/credential/review
-        # gates below do not apply. The ONLY intrinsic constraint is
-        # queue_node_contract_error (state.py), the single source of truth
-        # shared with state validation and YAML generation. Pipeline
-        # completeness (producers/downstream) stays validation telemetry, so an
-        # orphan queue inserted during incremental authoring still persists.
-        return _execute_upsert_queue_node(validated, state)
     plugin = validated.plugin
-    node_options = validated.options
+    node_options: Mapping[str, Any] = validated.options
+    existing_node = next((node for node in state.nodes if node.id == node_id), None)
+    # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
+    # from the stored node reduce to author shells; the reconciliation pass
+    # below restores the server rows. Non-matching values still reject.
+    node_options, requirement_echo = _normalize_echoed_interpretation_requirements(
+        node_options,
+        stored_options=existing_node.options if existing_node is not None else None,
+    )
     runtime_owned_error = _runtime_owned_llm_option_error(
         plugin,
         node_options,
         tool_name="upsert_node",
+        component_id=node_id,
     )
     if runtime_owned_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in node_options else None
+        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+    node_options = _canonicalize_authored_interpretation_requirements(
+        node_options,
+        component_id=node_id,
+        existing_options=existing_node.options if existing_node is not None else None,
+    )
+    review_options = _options_with_default_llm_reviews(
+        node_id=node_id,
+        plugin=plugin,
+        options=node_options,
+        existing_options=existing_node.options if existing_node is not None else None,
+    )
+    canonical_error = _canonical_interpretation_requirement_error(
+        review_options,
+        tool_name="upsert_node",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            f"Node '{node_id}': {canonical_error}",
+            error_code="interpretation_requirements_invalid",
+        )
+    if node_type == "queue":
+        # Canonical invariant B applies to structural queues too; the queue
+        # contract then decides whether those canonical options are permitted.
+        return _execute_upsert_queue_node(
+            validated.model_copy(update={"options": dict(review_options)}),
+            state,
+        )
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
         plugin_type="transform" if plugin is not None else None,
         plugin_name=plugin,
-        options=node_options,
+        options=review_options,
     )
     if credential_error is not None:
         return credential_error
@@ -515,7 +651,9 @@ def _execute_upsert_node(
     # Gates and coalesces intentionally have plugin=None (they're expression-based or
     # structural, not plugin-driven), so the "and plugin is not None" guard covers them.
     # NodeSpec documents this: "plugin: Plugin name. None for gates and coalesces."
-    if node_type in ("transform", "aggregation") and plugin is not None:
+    # Collectors reuse the batch-transform plugin contract, so their plugin
+    # runs the same policy/prevalidation gates (barrier-scopes spec §3).
+    if node_type in ("transform", "aggregation", "collector") and plugin is not None:
         plugin_error = _validate_plugin_name(context, "transform", plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error)
@@ -528,14 +666,14 @@ def _execute_upsert_node(
         if batch_required_error is not None:
             return _failure_result(state, batch_required_error)
 
-        review_options = _options_with_default_llm_reviews(
-            node_id=node_id,
-            plugin=plugin,
-            options=node_options,
-        )
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error)
+            return _failure_result(
+                state,
+                prevalidation_error,
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", plugin),
+            )
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
@@ -543,12 +681,12 @@ def _execute_upsert_node(
         # LOWERED executable. Running the raw provider-config policy on the
         # authored options would false-positive on the absent private retry
         # budget (see the fuller rationale at set_pipeline in sessions.py).
-        if "profile" not in node_options:
-            provider_policy_error = _validate_transform_provider_config_policy(node_options, plugin=plugin)
+        if "profile" not in review_options:
+            provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=plugin)
             if provider_policy_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
 
-        provider_path_error = _validate_transform_provider_config_path(node_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
         if provider_path_error is not None:
             return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
 
@@ -569,7 +707,9 @@ def _execute_upsert_node(
 
     branches: CoalesceBranches | None = None
     if validated.branches is not None:
-        branches = dict(validated.branches) if isinstance(validated.branches, Mapping) else tuple(validated.branches)
+        # pydantic validated branches as exactly list[str] | dict[str, str]; dispatch on
+        # the concrete constructed type rather than re-checking shape via an ABC.
+        branches = dict(validated.branches) if type(validated.branches) is dict else tuple(validated.branches)
 
     node = NodeSpec(
         id=node_id,
@@ -578,11 +718,7 @@ def _execute_upsert_node(
         input=validated.input,
         on_success=validated.on_success,
         on_error=validated.on_error or ("discard" if node_type in ("transform", "aggregation") else None),
-        options=_options_with_default_llm_reviews(
-            node_id=node_id,
-            plugin=plugin,
-            options=node_options,
-        ),
+        options=review_options,
         condition=validated.condition,
         routes=validated.routes,
         fork_to=fork_to,
@@ -592,9 +728,38 @@ def _execute_upsert_node(
         trigger=validated.trigger,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
+        timeout_seconds=validated.timeout_seconds,
+        description=validated.description,
+        scope_name=validated.scope_name,
+        scope_opener=validated.scope_opener,
+        scope_policy=validated.scope_policy,
     )
 
-    new_state = state.with_node(node)
+    row_union_contract_error = _row_union_node_contract_error(
+        node,
+        output_names=frozenset(output.name for output in state.outputs),
+    )
+    if row_union_contract_error is not None:
+        message, error_code = row_union_contract_error
+        return _failure_result(state, message, error_code=error_code)
+
+    proposed_state = state.with_node(node)
+    # Scalar routes committed here are the runtime authority; any visual edge
+    # that mirrored the node's previous sink routes must follow in the same
+    # commit or the graph keeps drawing the old route (elspeth-372e18e365).
+    proposed_state = _reconcile_node_sink_mirror_edges(proposed_state, node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
@@ -606,13 +771,15 @@ def _execute_upsert_node(
             affected.add(edge.from_node)
             affected.add(edge.to_node)
 
-    return _mutation_result(new_state, tuple(sorted(affected)))
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
+    return _mutation_result(
+        new_state,
+        tuple(sorted(affected)),
+        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
+    )
 
 
 def _splice_connection_name(node_id: str, state: CompositionState) -> str | None:
-    fragment = "".join(character if character.isalnum() or character in "_-" else "_" for character in node_id).strip("_-")
-    if not fragment:
-        fragment = "transform"
     reserved = (
         _reserved_connection_names(state)
         | set(state.sources)
@@ -622,7 +789,7 @@ def _splice_connection_name(node_id: str, state: CompositionState) -> str | None
     for attempt in range(1, _SPLICE_CONNECTION_ATTEMPTS + 1):
         suffix = "" if attempt == 1 else f"_{attempt}"
         stem_length = _SPLICE_CONNECTION_MAX_LENGTH - len("_out") - len(suffix)
-        candidate = f"{fragment[:stem_length]}_out{suffix}"
+        candidate = f"{node_id[:stem_length]}_out{suffix}"
         if candidate not in reserved:
             return candidate
     return None
@@ -643,6 +810,112 @@ def _normalized_splice_node_projection(node: NodeSpec) -> dict[str, Any]:
         "on_error": node.on_error or "discard",
         "options": serialize_authoring_review_options(node.options),
     }
+
+
+def _sink_route_still_expressed(state: CompositionState, edge: EdgeSpec) -> bool:
+    """Return whether another edge in ``state`` expresses the same sink route.
+
+    Legacy persisted states can carry semantic duplicates from before the
+    slot-uniqueness admission rule; clearing a scalar mirror while a surviving
+    duplicate still draws the route would desynchronise graph and runtime.
+    """
+    return any(
+        candidate.id != edge.id
+        and candidate.from_node == edge.from_node
+        and candidate.edge_type == edge.edge_type
+        and candidate.to_node == edge.to_node
+        for candidate in state.edges
+    )
+
+
+def _apply_sink_edge_route(state: CompositionState, edge: EdgeSpec) -> CompositionState:
+    """Write the scalar route a sink-targeting edge expresses.
+
+    Exact dual of :func:`_clear_removed_sink_edge_route`. Callers must have
+    admitted the edge through :func:`edge_lowering_error` first — this maps an
+    already-legal edge onto its scalar slot; it decides nothing. Edges whose
+    target is not a declared output are advisory and left unmirrored.
+    """
+    output_names = {output.name for output in state.outputs}
+    if edge.to_node not in output_names:
+        return state
+
+    if edge.from_node in state.sources:
+        source = state.sources[edge.from_node]
+        if source.on_success != edge.to_node:
+            return state.with_named_source(edge.from_node, replace(source, on_success=edge.to_node))
+        return state
+
+    node = next((candidate for candidate in state.nodes if candidate.id == edge.from_node), None)
+    if node is None:
+        return state
+    if edge.edge_type == "on_success":
+        if node.on_success != edge.to_node:
+            return state.with_node(replace(node, on_success=edge.to_node))
+        return state
+    if edge.edge_type == "on_error":
+        if node.on_error != edge.to_node:
+            return state.with_node(replace(node, on_error=edge.to_node))
+        return state
+    if edge.edge_type in ("route_true", "route_false"):
+        route_key = "true" if edge.edge_type == "route_true" else "false"
+        routes = dict(node.routes or {})
+        if route_key not in routes or routes[route_key] != edge.to_node:
+            routes[route_key] = edge.to_node
+            return state.with_node(replace(node, routes=routes))
+        return state
+    # fork
+    fork_targets = tuple(dict.fromkeys((*(node.fork_to or ()), edge.to_node)))
+    if node.fork_to != fork_targets:
+        return state.with_node(replace(node, fork_to=fork_targets))
+    return state
+
+
+def _reconcile_node_sink_mirror_edges(state: CompositionState, node: NodeSpec) -> CompositionState:
+    """Converge this node's sink-mirror edges onto its scalar routes.
+
+    upsert_node commits scalar routing directly; any visual edge that mirrored
+    the previous scalars would otherwise keep drawing the old route. Each
+    sink-targeting edge from the node is retargeted to the scalar's current
+    sink or removed when the slot no longer routes to a sink. Missing edges
+    are never invented — the graph view infers undrawn routes from the
+    scalars, so absence cannot lie the way a stale edge does.
+    """
+    output_names = {output.name for output in state.outputs}
+    routes = node.routes or {}
+
+    def _slot_sink(value: str | None) -> str | None:
+        return value if value is not None and value in output_names else None
+
+    slot_sinks: dict[str, str | None] = {
+        "on_success": _slot_sink(node.on_success),
+        "on_error": _slot_sink(node.on_error),
+        "route_true": _slot_sink(routes["true"] if "true" in routes else None),
+        "route_false": _slot_sink(routes["false"] if "false" in routes else None),
+    }
+    fork_sinks = {target for target in (node.fork_to or ()) if target in output_names}
+
+    claimed_slots: set[str] = set()
+    new_state = state
+    for edge in state.edges:
+        if edge.from_node != node.id or edge.to_node not in output_names:
+            continue
+        if edge.edge_type == "fork":
+            if edge.to_node not in fork_sinks:
+                without = new_state.without_edge(edge.id)
+                if without is not None:
+                    new_state = without
+            continue
+        desired = slot_sinks[edge.edge_type]
+        if desired is None or edge.edge_type in claimed_slots:
+            without = new_state.without_edge(edge.id)
+            if without is not None:
+                new_state = without
+            continue
+        claimed_slots.add(edge.edge_type)
+        if edge.to_node != desired:
+            new_state = new_state.with_edge(replace(edge, to_node=desired))
+    return new_state
 
 
 def _clear_removed_sink_edge_route(state: CompositionState, edge: EdgeSpec) -> CompositionState:
@@ -840,6 +1113,8 @@ def _execute_splice_transform(
             on_success=existing.on_success,
             on_error=node_args.on_error,
             options=node_args.options,
+            existing_options=existing.options,
+            description=node_args.description,
         )
         if type(prepared_replay) is ToolResult:
             return prepared_replay
@@ -850,6 +1125,16 @@ def _execute_splice_transform(
             return _failure_result(state, f"Node '{node_args.id}' already exists with a divergent splice definition.")
         if not identical:
             return _failure_result(state, f"Node '{node_args.id}' already exists with a divergent splice definition.")
+        canonical_error = _composition_canonical_interpretation_requirement_error(
+            state,
+            tool_name="splice_transform",
+        )
+        if canonical_error is not None:
+            return _failure_result(
+                state,
+                canonical_error,
+                error_code="interpretation_requirements_invalid",
+            )
         return _mutation_result(
             state,
             (predecessor_id, node_args.id, successor_id),
@@ -893,6 +1178,7 @@ def _execute_splice_transform(
         on_success=connection_name,
         on_error=node_args.on_error,
         options=node_args.options,
+        description=node_args.description,
     )
     if type(prepared) is ToolResult:
         return prepared
@@ -919,13 +1205,33 @@ def _execute_splice_transform(
         version=state.version,
         guided_session=state.guided_session,
     )
-    try:
-        reconciled = reconcile_authoritative_reviews(state, proposed)
-    except (KeyError, TypeError, ValueError):
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        proposed,
+        tool_name="splice_transform",
+    )
+    if canonical_error is not None:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
+    try:
+        reconciled = reconcile_authoritative_reviews(state, proposed)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+        )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        reconciled,
+        tool_name="splice_transform",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
         )
     review_contract_error = composition_review_contract_error(reconciled)
     if review_contract_error is not None:
@@ -977,48 +1283,59 @@ def _execute_upsert_edge(
         edge_type=edge_type,
         label=validated.label,
     )
+
+    # Admission: the shared lowering matrix decides whether this
+    # (component kind, edge type, target kind) combination has any runtime
+    # meaning — the same predicate Stage 1 applies to bulk entry paths.
+    from_kind = composer_component_kind(from_node, state.sources, state.nodes, state.outputs)
+    to_kind = composer_component_kind(to_node, state.sources, state.nodes, state.outputs)
+    lowering_error = edge_lowering_error(edge, from_kind=from_kind, to_kind=to_kind)
+    if lowering_error is not None:
+        return _failure_result(state, lowering_error, error_code="edge_not_lowerable")
+
+    # Slot uniqueness: one sink-routing slot, one edge. A second edge id
+    # claiming the same slot would make removal ambiguous and let the graph
+    # draw a route the scalar cannot carry.
+    if to_kind == "output":
+        output_names = {output.name for output in state.outputs}
+        for existing in state.edges:
+            if existing.id == edge.id or existing.from_node != from_node or existing.to_node not in output_names:
+                continue
+            if edge_type == "fork":
+                conflict = existing.edge_type == "fork" and existing.to_node == to_node
+            else:
+                conflict = existing.edge_type == edge_type
+            if conflict:
+                return _failure_result(
+                    state,
+                    f"Edge '{existing.id}' already expresses the '{edge_type}' sink route of '{from_node}'. "
+                    f"Update or remove edge '{existing.id}' instead of adding '{edge.id}'.",
+                    error_code="edge_route_conflict",
+                )
+
+    # Atomic commit: the visual edge and its scalar mirror derive from one
+    # model. Replacing an edge id first releases the route the old edge
+    # expressed (unless a legacy duplicate still draws it), then writes the
+    # route the new edge expresses — no ordering leaves a stale mirror.
+    old_edge = next((candidate for candidate in state.edges if candidate.id == edge.id), None)
     new_state = state.with_edge(edge)
+    if (
+        old_edge is not None
+        and (old_edge.from_node, old_edge.edge_type, old_edge.to_node)
+        != (
+            edge.from_node,
+            edge.edge_type,
+            edge.to_node,
+        )
+        and not _sink_route_still_expressed(new_state, old_edge)
+    ):
+        new_state = _clear_removed_sink_edge_route(new_state, old_edge)
+    new_state = _apply_sink_edge_route(new_state, edge)
 
-    # Synchronise connection field when the edge targets an output.
-    # generate_yaml() and the engine use on_success/on_error values
-    # (not edges) to route data to sinks, so the connection field
-    # must match the output name for the pipeline to work at runtime.
-    output_names = {o.name for o in new_state.outputs}
-    if to_node in output_names:
-        if from_node in new_state.sources:
-            if edge_type != "on_success":
-                return _failure_result(state, "Source sink edges must use 'on_success'.")
-            source = new_state.sources[from_node]
-            if source.on_success != to_node:
-                new_state = new_state.with_named_source(from_node, replace(source, on_success=to_node))
-        else:
-            node = next((n for n in new_state.nodes if n.id == from_node), None)
-            if node is not None:
-                if edge_type == "on_success":
-                    if node.node_type == "gate":
-                        return _failure_result(state, f"Gate '{from_node}' sink edges must use route_true, route_false, or fork.")
-                    if node.on_success != to_node:
-                        new_state = new_state.with_node(replace(node, on_success=to_node))
-                elif edge_type == "on_error":
-                    if node.node_type == "gate":
-                        return _failure_result(state, f"Gate '{from_node}' sink edges must use route_true, route_false, or fork.")
-                    if node.on_error != to_node:
-                        new_state = new_state.with_node(replace(node, on_error=to_node))
-                elif edge_type in ("route_true", "route_false"):
-                    if node.node_type != "gate":
-                        return _failure_result(state, f"Only gates can use '{edge_type}' edges to sinks.")
-                    route_key = "true" if edge_type == "route_true" else "false"
-                    routes = dict(node.routes or {})
-                    if route_key not in routes or routes[route_key] != to_node:
-                        routes[route_key] = to_node
-                        new_state = new_state.with_node(replace(node, routes=routes))
-                elif edge_type == "fork":
-                    if node.node_type != "gate":
-                        return _failure_result(state, "Only gates can use 'fork' edges to sinks.")
-                    fork_targets = tuple(dict.fromkeys((*(node.fork_to or ()), to_node)))
-                    if node.fork_to != fork_targets:
-                        new_state = new_state.with_node(replace(node, fork_to=fork_targets))
-
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     return _mutation_result(new_state, (from_node, to_node))
 
 
@@ -1065,7 +1382,8 @@ def _execute_remove_edge(
     new_state = state.without_edge(edge_id)
     if new_state is None:
         return _failure_result(state, f"Edge '{edge_id}' not found.")
-    new_state = _clear_removed_sink_edge_route(new_state, edge)
+    if not _sink_route_still_expressed(new_state, edge):
+        new_state = _clear_removed_sink_edge_route(new_state, edge)
 
     return _mutation_result(new_state, affected)
 
@@ -1084,7 +1402,7 @@ def _execute_set_metadata(
     return _mutation_result(new_state, ())
 
 
-def _node_routing_option_patch_error(patch: Mapping[str, Any]) -> str | None:
+def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: NodeType) -> str | None:
     """Return guidance when plugin-option patches contain node routing fields."""
     if not (_NODE_ROUTING_OPTION_PATCH_KEYS & patch.keys()):
         return None
@@ -1092,6 +1410,11 @@ def _node_routing_option_patch_error(patch: Mapping[str, Any]) -> str | None:
         if key not in patch:
             continue
         if key == "on_error":
+            if node_type == "gate":
+                return (
+                    "on_error is a node-level gate error policy, not a plugin option. "
+                    "Use upsert_node with on_error as a sibling of options; set it to 'discard' or a declared sink name."
+                )
             return (
                 "on_error is a node-level routing field, not a plugin option. "
                 "Use upsert_edge with edge_type='on_error' when routing failures to an existing sink, "
@@ -1149,26 +1472,51 @@ def _execute_patch_node_options(
             actual_type=type(exc).__name__,
         ) from exc
     node_id = validated.node_id
-    patch = validated.patch
+    patch: Mapping[str, Any] = validated.patch
     current = next((n for n in state.nodes if n.id == node_id), None)
     if current is None:
         return _failure_result(state, f"Node '{node_id}' not found.")
-    routing_patch_error = _node_routing_option_patch_error(patch)
+    routing_patch_error = _node_routing_option_patch_error(patch, node_type=current.node_type)
     if routing_patch_error is not None:
         return _failure_result(state, routing_patch_error)
+    # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
+    # from the stored node reduce to author shells; the reconciliation pass
+    # below restores the server rows. Non-matching values still reject.
+    patch, requirement_echo = _normalize_echoed_interpretation_requirements(
+        patch,
+        stored_options=current.options,
+    )
     runtime_owned_error = _runtime_owned_llm_option_error(
         current.plugin,
         patch,
         tool_name="patch_node_options",
+        component_id=node_id,
     )
     if runtime_owned_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
-    new_options: Mapping[str, Any] = _apply_merge_patch(current.options, patch)
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in patch else None
+        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+    patch = _canonicalize_authored_interpretation_requirements(
+        patch,
+        component_id=node_id,
+        existing_options=current.options,
+    )
+    new_options: Mapping[str, Any] = _apply_merge_patch(current.options, dict(patch))
     new_options = _options_with_default_llm_reviews(
         node_id=node_id,
         plugin=current.plugin,
         options=new_options,
+        existing_options=current.options,
     )
+    canonical_error = _canonical_interpretation_requirement_error(
+        new_options,
+        tool_name="patch_node_options",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            f"Node '{node_id}': {canonical_error}",
+            error_code="interpretation_requirements_invalid",
+        )
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=node_id,
@@ -1180,10 +1528,21 @@ def _execute_patch_node_options(
     if credential_error is not None:
         return credential_error
 
-    if current.node_type in ("transform", "aggregation") and current.plugin is not None:
+    if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+        # State-held plugin: resolve it through the request's policy view
+        # before prevalidation stamps it (see _execute_patch_source_options).
+        plugin_error = _validate_plugin_name(context, "transform", current.plugin)
+        if plugin_error is not None:
+            return _plugin_policy_failure(state, plugin_error)
+
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error)
+            return _failure_result(
+                state,
+                prevalidation_error,
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", current.plugin),
+            )
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
@@ -1210,11 +1569,28 @@ def _execute_patch_node_options(
     queue_contract_error = queue_node_contract_error(new_node)
     if queue_contract_error is not None:
         return _failure_result(state, queue_contract_error)
-    new_state = state.with_node(new_node)
+    proposed_state = state.with_node(new_node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
-    return _mutation_result(new_state, (node_id,))
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
+    return _mutation_result(
+        new_state,
+        (node_id,),
+        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
+    )
 
 
 def _handle_patch_node_options(
@@ -1257,7 +1633,7 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     "Keys in the patch overwrite existing keys. "
     "Keys set to null are deleted. Missing keys are unchanged. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
-    "use upsert_edge or upsert_node for routing edits.",
+    "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
     json_schema={
         "type": "object",
         "properties": {
@@ -1270,7 +1646,11 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                 "description": (
                     "Merge-patch to apply to plugin options only. "
                     "Node-level routing fields such as on_success, on_error, input, routes, "
-                    "and fork_to are siblings of options; edit them with upsert_edge or upsert_node."
+                    "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
+                    "For a gate, edit on_error only with upsert_node. "
+                    "A patched schema: block declares what ARRIVES at the node, never its transformed "
+                    "result; to change what arrives, declare the type on the SOURCE schema "
+                    "(patch_source_options) or insert a type_coerce upstream." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1298,23 +1678,52 @@ def _prepare_transform_candidate(
     on_success: str | None,
     on_error: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
     trigger: Mapping[str, Any] | None = None,
     output_mode: str | None = None,
     expected_output_count: int | None = None,
+    description: str | None = None,
 ) -> NodeSpec | ToolResult:
     """Validate and prepare one transform candidate without mutating state."""
     if plugin is None:
         return _failure_result(state, f"Node '{node_id}': transform plugin is required.")
-    runtime_owned_error = _runtime_owned_llm_option_error(plugin, options, tool_name=tool_name)
+    runtime_owned_error = _runtime_owned_llm_option_error(
+        plugin,
+        options,
+        tool_name=tool_name,
+        component_id=node_id,
+    )
     if runtime_owned_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in options else None
+        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+    options = _canonicalize_authored_interpretation_requirements(
+        options,
+        component_id=node_id,
+        existing_options=existing_options,
+    )
+    review_options = _options_with_default_llm_reviews(
+        node_id=node_id,
+        plugin=plugin,
+        options=options,
+        existing_options=existing_options,
+    )
+    canonical_error = _canonical_interpretation_requirement_error(
+        review_options,
+        tool_name=tool_name,
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            f"Node '{node_id}': {canonical_error}",
+            error_code="interpretation_requirements_invalid",
+        )
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=node_id,
         component_type="node",
         plugin_type="transform",
         plugin_name=plugin,
-        options=options,
+        options=review_options,
     )
     if credential_error is not None:
         return credential_error
@@ -1324,24 +1733,28 @@ def _prepare_transform_candidate(
     batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
     if batch_placement_error is not None:
         return _failure_result(state, batch_placement_error)
-    batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, options)
+    batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, review_options)
     if batch_required_error is not None:
         return _failure_result(state, batch_required_error)
 
-    review_options = _options_with_default_llm_reviews(node_id=node_id, plugin=plugin, options=options)
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("transform", plugin),
+        )
     # Operator-profiled nodes carry their private provider config (retry budget /
     # provider binding) in the profile, injected only at lowering; the
     # prevalidation above already validated the LOWERED executable. The raw
     # provider-config policy would false-positive on the absent private retry
     # budget (see set_pipeline in sessions.py for the full rationale).
-    if "profile" not in options:
-        provider_policy_error = _validate_transform_provider_config_policy(options, plugin=plugin)
+    if "profile" not in review_options:
+        provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=plugin)
         if provider_policy_error is not None:
             return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
-    provider_path_error = _validate_transform_provider_config_path(options, context.data_dir, session_id=context.session_id)
+    provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
     if provider_path_error is not None:
         return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
     if node_type == "aggregation":
@@ -1366,6 +1779,7 @@ def _prepare_transform_candidate(
         trigger=trigger,
         output_mode=output_mode,
         expected_output_count=expected_output_count,
+        description=description,
     )
 
 
@@ -1394,7 +1808,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
-        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs."
+        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
+        "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
+        "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
+        "with the node ids but no edge ids, instead of failing."
     ),
     json_schema={
         "type": "object",
@@ -1410,12 +1827,22 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
             "node": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Unique ID for the inserted transform."},
+                    "id": {
+                        **TypeAdapter(RuntimeNodeName).json_schema(),
+                        "description": "Unique ID for the inserted transform.",
+                    },
                     "plugin": {"type": "string", "description": "Transform plugin name."},
-                    "options": {"type": "object", "description": "Plugin-specific authored options."},
+                    "options": {
+                        "type": "object",
+                        "description": "Plugin-specific authored options." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                    },
                     "on_error": {
                         "type": ["string", "null"],
                         "description": "Optional error route; defaults to discard.",
+                    },
+                    "description": {
+                        "type": ["string", "null"],
+                        "description": _STEP_DESCRIPTION_DESCRIPTION,
                     },
                 },
                 "required": ["id", "plugin", "options"],

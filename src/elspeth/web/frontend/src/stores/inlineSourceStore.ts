@@ -27,6 +27,7 @@ import type {
   InlineSourceProvenance,
   InlineSourceSummary,
 } from "@/types/api";
+import { parseCsvRows } from "@/utils/contentStructure";
 
 const INLINE_SOURCE_PREVIEW_CHARS = 1024;
 const CONTENT_TYPE_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
@@ -94,10 +95,10 @@ export function deriveInlineSourceRowCount(
 ): number | null {
   const baseMimeType = parseContentType(mimeType);
   if (baseMimeType !== "text/csv") return null;
-  const trimmed = text.trim();
-  if (trimmed === "") return 0;
-  const lines = trimmed.split("\n").length;
-  return Math.max(0, lines - 1);
+  if (text.trim() === "") return 0;
+  const { rows, endedInQuotes } = parseCsvRows(text);
+  if (endedInQuotes) return null;
+  return Math.max(0, rows.length - 1);
 }
 
 export async function projectInlineSourceSummary({

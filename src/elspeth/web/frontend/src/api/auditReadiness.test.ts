@@ -19,6 +19,21 @@ const BLOCKED_READINESS = {
   blockers: [],
 };
 
+function readyBody(): Record<string, unknown> {
+  return {
+    session_id: SESSION_ID,
+    composition_version: 3,
+    checked_at: new Date().toISOString(),
+    rows: ["validation", "plugin_trust", "provenance", "retention", "llm_interpretations", "secrets"].map((id) => ({
+      id, label: id, status: "ok", summary: "Ready", detail: null, component_ids: [],
+    })),
+    validation_result: {
+      is_valid: true, checks: [], errors: [], warnings: [],
+      readiness: READY_READINESS, semantic_contracts: [],
+    },
+  };
+}
+
 describe("auditReadiness API client", () => {
   beforeEach(() => {
     globalThis.fetch = vi.fn();
@@ -147,6 +162,23 @@ describe("auditReadiness API client", () => {
       new Response("server error", { status: 500 }),
     );
     await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({ status: 500 });
+  });
+
+  it.each([
+    ["missing readiness row", (body: Record<string, unknown>) => { (body.rows as unknown[]).pop(); }],
+    ["duplicate readiness row", (body: Record<string, unknown>) => { (body.rows as unknown[]).push((body.rows as unknown[])[0]); }],
+    ["invalid validation semantics", (body: Record<string, unknown>) => {
+      (body.validation_result as Record<string, unknown>).is_valid = false;
+    }],
+  ])("rejects a 200 response with %s", async (_label, corrupt) => {
+    const body = readyBody();
+    corrupt(body);
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({
+      detail: "Unexpected response shape from audit-readiness endpoint",
+    });
   });
 
   it("fetchAuditReadiness propagates 404 (session missing or no state) as ApiError", async () => {

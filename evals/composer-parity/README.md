@@ -1,29 +1,29 @@
 # Composer Capability Parity — canonical fixture corpus
 
 This directory holds the deterministic fixture corpus that drives the composer
-capability-parity verification (Plan 05). It is authoring-surface agnostic: the
-same fixtures are replayed through the freeform, guided-full, and guided-staged
-adapters in later tasks and must derive equivalent committed graphs.
+capability-parity verification. It is authoring-surface agnostic: the same
+fixtures are replayed through the freeform, guided-full, and guided-staged
+adapters and must derive equivalent committed graphs.
 
 ## What is here
 
-- `fixtures/*.json` — nine canonical topology fixtures, one per capability
+- `fixtures/*.json` — ten canonical topology fixtures, one per capability
   class (linear transform, conditional gate, multi-output, fork/coalesce,
-  multi-source queue, aggregation, row expansion, error routing, structured
-  LLM). Each fixture records:
+  correlated row union, multi-source queue, aggregation, row expansion, error
+  routing, structured LLM). Each fixture records:
   - `intent` — a plain-language outcome request (no composer tool-call order).
   - `canonical_arguments` — a VALID `set_pipeline` payload that validates against
     `SetPipelineArgumentsModel` (`src/elspeth/web/composer/redaction.py`) and
     references only plugins available to a trained operator.
   - `semantic_expectations` — the node/edge/output shape each surface must
-    derive (preserve-vs-canonicalize split per design §8.1).
+    derive. Semantic attributes are preserved while surface-specific identifiers
+    and ordering are canonicalized for comparison.
   - `runtime_assertions` — behavioural claims the executed graph must satisfy.
 - `fixtures/two_llm_colour.csv` — the exact ten-row colour palette input for the
   two-LLM split/merge live-acceptance scenario.
 - `fixtures/two_llm_colour_request.txt` — the outcome-only request for that
   scenario (the in-prose upload filename is normalized to `two_llm_colour.csv`
-  per Ruling C; accepting the request is therefore no longer byte-verbatim with
-  the run sheet).
+  so the request is stable and independent of the historical run sheet).
 
 ## Validation scope
 
@@ -32,16 +32,16 @@ validates each `canonical_arguments` payload structurally with
 `SetPipelineArgumentsModel.model_validate` **plus** plugin availability against
 `PolicyCatalogView.for_trained_operator` and its availability lookups. Full
 committed-graph validation (`validate_composition_state`) is the costlier
-alternative and is deferred to Task 3's real-path matrix, where the
+alternative and belongs to the real-path matrix, where the
 args -> `CompositionState` conversion inside the session-bound
 `_execute_set_pipeline` handler is exercised end to end.
 
-## Real-path assumptions (Task 3)
+## Real-path assumptions
 
-The Task 3 matrix (`tests/integration/web/composer/parity/`) drives these
+The real-path matrix (`tests/integration/web/composer/parity/`) drives these
 fixtures through the real freeform + guided-full production paths (web plugin
 policy, operator-profile lowering, audited `set_pipeline`), which imposes two
-authoring-form requirements beyond the Task 2 argument shape:
+authoring-form requirements beyond structural argument validation:
 
 - **Imperative intents.** Every `intent` is phrased as a build request so the
   freeform empty-pipeline gate (`_user_request_expects_pipeline_mutation`)
@@ -50,8 +50,8 @@ authoring-form requirements beyond the Task 2 argument shape:
   authored with `profile: "task-role"` plus public safe options (`queries`,
   `prompt_template`, `schema`, `required_input_fields`, `temperature`) — the
   private `provider` / `model` / `api_key` / retry knobs are supplied by the
-  operator profile at lowering. The real-path harness (and any live run, Task 5/6)
-  must configure an LLM profile aliased `task-role`; the multi-query retry budget
+  operator profile at lowering. The real-path harness and any live run must
+  configure an LLM profile aliased `task-role`; the multi-query retry budget
   is injected by profile lowering (`_LLMProfileResolver.lower_options`). The
   source declares a fixed schema so the field contract to the LLM's declared
   `required_input_fields` is satisfiable at config time.
@@ -65,20 +65,14 @@ authoring-form requirements beyond the Task 2 argument shape:
   (`default` / `passthrough` / `transform`) rejects the `None` a bare
   `set_pipeline` commit would persist.
 
-### Guided-staged capability gaps (Task 3)
+### Guided-staged coverage
 
-The guided-staged column drives six fixtures; three cannot be authored through
-the guided stage protocol at HEAD and are reported as blockers (they commit
-identically on the freeform + guided-full surfaces, so the fixtures are not at
-fault). Each is documented with its exact mechanism and code location in
-`_GUIDED_STAGED_CAPABILITY_GAPS` in `test_fixture_matrix.py`: `multi_source_queue`
-(queue `input == id` self-loops the wire projection — likely a product bug in
-`canonical_connection_consumers`), `multi_output` (the structured sink review
-locks `on_write_failure` to `discard`, so a cross-sink fallback is unauthorable),
-and `fork_coalesce` (the consumer model keys on a single `node.input`, so a
-require-all coalesce's extra branch connection is orphaned).
+The guided-staged column drives all ten fixtures. Queue fan-in, require-all
+coalesce, correlated require-all row union, and cross-sink write-failure
+fallback remain explicit real-path regressions for their repaired
+stage-protocol boundaries.
 
-## Byte canonicalization (Ruling C)
+## Byte canonicalization
 
 Both colour files are pinned to **LF newlines, UTF-8 with no BOM, and exactly
 one trailing newline**. The SHA-256 values below are computed against that

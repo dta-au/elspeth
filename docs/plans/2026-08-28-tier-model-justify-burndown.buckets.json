@@ -1,0 +1,2457 @@
+[
+ {
+  "subsystem": "contracts",
+  "files": [
+   {
+    "file": "contracts/audit_export.py",
+    "loc": 1648,
+    "findings": 8,
+    "rules": {
+     "R5": 8
+    }
+   },
+   {
+    "file": "contracts/runtime_val_manifest.py",
+    "loc": 1566,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "contracts/sink_effects.py",
+    "loc": 1495,
+    "findings": 19,
+    "rules": {
+     "R5": 19
+    }
+   },
+   {
+    "file": "contracts/chat_parts.py",
+    "loc": 169,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   }
+  ],
+  "id": "B01",
+  "loc": 4878,
+  "findings": 36,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "contracts",
+  "files": [
+   {
+    "file": "contracts/emitted_option.py",
+    "loc": 160,
+    "findings": 5,
+    "rules": {
+     "R5": 5
+    }
+   }
+  ],
+  "id": "B02",
+  "loc": 160,
+  "findings": 5,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "core",
+  "files": [
+   {
+    "file": "core/config.py",
+    "loc": 3400,
+    "findings": 1,
+    "rules": {
+     "L1": 1
+    }
+   }
+  ],
+  "id": "B03",
+  "loc": 3400,
+  "findings": 1,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "core",
+  "files": [
+   {
+    "file": "core/schema_shape.py",
+    "loc": 2497,
+    "findings": 12,
+    "rules": {
+     "R5": 11,
+     "R6": 1
+    }
+   },
+   {
+    "file": "core/audit_export_content_store.py",
+    "loc": 408,
+    "findings": 2,
+    "rules": {
+     "R7": 2
+    }
+   },
+   {
+    "file": "core/llm_profiles.py",
+    "loc": 282,
+    "findings": 2,
+    "rules": {
+     "L1": 2
+    }
+   },
+   {
+    "file": "core/commencement_gate_expression.py",
+    "loc": 72,
+    "findings": 5,
+    "rules": {
+     "R5": 5
+    }
+   }
+  ],
+  "id": "B04",
+  "loc": 3259,
+  "findings": 21,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "core/dag",
+  "files": [
+   {
+    "file": "core/dag/builder.py",
+    "loc": 1977,
+    "findings": 4,
+    "rules": {
+     "R1": 4
+    }
+   },
+   {
+    "file": "core/dag/schema_validation.py",
+    "loc": 1685,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "core/dag/coalesce_warnings.py",
+    "loc": 307,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "core/dag/row_union_warnings.py",
+    "loc": 147,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ],
+  "id": "B05",
+  "loc": 4116,
+  "findings": 8,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "core/landscape",
+  "files": [
+   {
+    "file": "core/landscape/execution/node_states.py",
+    "loc": 1218,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   },
+   {
+    "file": "core/landscape/execution_repository.py",
+    "loc": 1206,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   },
+   {
+    "file": "core/landscape/exporter.py",
+    "loc": 1164,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   },
+   {
+    "file": "core/landscape/run_coordination_repository.py",
+    "loc": 1069,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B06",
+  "loc": 4657,
+  "findings": 4,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "core/landscape",
+  "files": [
+   {
+    "file": "core/landscape/scheduler/dispositions.py",
+    "loc": 932,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   },
+   {
+    "file": "core/landscape/execution/sink_effect_lifecycle.py",
+    "loc": 908,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "core/landscape/execution/sink_effect_finalization.py",
+    "loc": 826,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "core/landscape/execution/audit_export_snapshots.py",
+    "loc": 772,
+    "findings": 3,
+    "rules": {
+     "R5": 2,
+     "R6": 1
+    }
+   },
+   {
+    "file": "core/landscape/export_read_model.py",
+    "loc": 494,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "core/landscape/execution/sink_effect_identity.py",
+    "loc": 434,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "core/landscape/scheduler/group_losses.py",
+    "loc": 331,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "core/landscape/export_mappers.py",
+    "loc": 263,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B07",
+  "loc": 4960,
+  "findings": 17,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "core/landscape",
+  "files": [
+   {
+    "file": "core/landscape/execution/sink_effect_attempt_results.py",
+    "loc": 154,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B08",
+  "loc": 154,
+  "findings": 1,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "engine",
+  "files": [
+   {
+    "file": "engine/barrier_coordination.py",
+    "loc": 2684,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "engine/journal_restore.py",
+    "loc": 1000,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "engine/row_union_executor.py",
+    "loc": 751,
+    "findings": 3,
+    "rules": {
+     "R1": 2,
+     "R8": 1
+    }
+   }
+  ],
+  "id": "B09",
+  "loc": 4435,
+  "findings": 5,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "engine",
+  "files": [
+   {
+    "file": "engine/tokens.py",
+    "loc": 656,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ],
+  "id": "B10",
+  "loc": 656,
+  "findings": 1,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "engine/executors",
+  "files": [
+   {
+    "file": "engine/executors/sink_effects.py",
+    "loc": 1552,
+    "findings": 21,
+    "rules": {
+     "R1": 1,
+     "R4": 1,
+     "R5": 19
+    }
+   },
+   {
+    "file": "engine/executors/sink.py",
+    "loc": 1450,
+    "findings": 8,
+    "rules": {
+     "R4": 1,
+     "R5": 7
+    }
+   },
+   {
+    "file": "engine/executors/collector.py",
+    "loc": 1098,
+    "findings": 6,
+    "rules": {
+     "R1": 6
+    }
+   },
+   {
+    "file": "engine/executors/state_guard.py",
+    "loc": 492,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B11",
+  "loc": 4592,
+  "findings": 36,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "engine/orchestrator",
+  "files": [
+   {
+    "file": "engine/orchestrator/preflight.py",
+    "loc": 950,
+    "findings": 9,
+    "rules": {
+     "R5": 9
+    }
+   },
+   {
+    "file": "engine/orchestrator/audit_export_effects.py",
+    "loc": 490,
+    "findings": 4,
+    "rules": {
+     "R4": 1,
+     "R5": 3
+    }
+   },
+   {
+    "file": "engine/orchestrator/export.py",
+    "loc": 416,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   }
+  ],
+  "id": "B12",
+  "loc": 1856,
+  "findings": 15,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/infrastructure",
+  "files": [
+   {
+    "file": "plugins/infrastructure/base.py",
+    "loc": 2423,
+    "findings": 13,
+    "rules": {
+     "R1": 1,
+     "R2": 2,
+     "R3": 1,
+     "R5": 9
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/http.py",
+    "loc": 1126,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/llm.py",
+    "loc": 801,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/retrieval/chroma.py",
+    "loc": 508,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B13",
+  "loc": 4858,
+  "findings": 16,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/infrastructure",
+  "files": [
+   {
+    "file": "plugins/infrastructure/runtime_factory.py",
+    "loc": 495,
+    "findings": 10,
+    "rules": {
+     "R5": 10
+    }
+   },
+   {
+    "file": "plugins/infrastructure/discovery.py",
+    "loc": 398,
+    "findings": 3,
+    "rules": {
+     "R1": 3
+    }
+   },
+   {
+    "file": "plugins/infrastructure/validation.py",
+    "loc": 331,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "plugins/infrastructure/templates.py",
+    "loc": 183,
+    "findings": 17,
+    "rules": {
+     "R5": 17
+    }
+   },
+   {
+    "file": "plugins/infrastructure/rasterize/worker.py",
+    "loc": 161,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/infrastructure/telemetry.py",
+    "loc": 76,
+    "findings": 1,
+    "rules": {
+     "R4": 1
+    }
+   }
+  ],
+  "id": "B14",
+  "loc": 1644,
+  "findings": 34,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/llm",
+  "files": [
+   {
+    "file": "plugins/llm/model_catalog.py",
+    "loc": 394,
+    "findings": 13,
+    "rules": {
+     "R1": 2,
+     "R2": 1,
+     "R5": 6,
+     "R6": 3,
+     "R8": 1
+    }
+   },
+   {
+    "file": "plugins/llm/config_validation.py",
+    "loc": 314,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B15",
+  "loc": 708,
+  "findings": 14,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/sinks",
+  "files": [
+   {
+    "file": "plugins/sinks/_audit_export_bundle_effects.py",
+    "loc": 1317,
+    "findings": 25,
+    "rules": {
+     "R5": 5,
+     "R6": 19,
+     "R7": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/aws_s3_sink.py",
+    "loc": 1212,
+    "findings": 28,
+    "rules": {
+     "R1": 1,
+     "R5": 17,
+     "R6": 10
+    }
+   },
+   {
+    "file": "plugins/sinks/database_sink.py",
+    "loc": 1117,
+    "findings": 4,
+    "rules": {
+     "R1": 2,
+     "R6": 2
+    }
+   },
+   {
+    "file": "plugins/sinks/azure_blob_sink.py",
+    "loc": 936,
+    "findings": 6,
+    "rules": {
+     "R5": 5,
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B16",
+  "loc": 4582,
+  "findings": 63,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/sinks",
+  "files": [
+   {
+    "file": "plugins/sinks/_remote_object_effects.py",
+    "loc": 802,
+    "findings": 3,
+    "rules": {
+     "R6": 3
+    }
+   },
+   {
+    "file": "plugins/sinks/_local_file_effects.py",
+    "loc": 775,
+    "findings": 3,
+    "rules": {
+     "R6": 3
+    }
+   },
+   {
+    "file": "plugins/sinks/chroma_sink.py",
+    "loc": 724,
+    "findings": 7,
+    "rules": {
+     "R5": 6,
+     "R6": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/dataverse.py",
+    "loc": 718,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/json_sink.py",
+    "loc": 626,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/document_sink.py",
+    "loc": 463,
+    "findings": 3,
+    "rules": {
+     "R1": 2,
+     "R6": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/text_sink.py",
+    "loc": 386,
+    "findings": 3,
+    "rules": {
+     "R1": 2,
+     "R6": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/_diversion_attribution.py",
+    "loc": 88,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   }
+  ],
+  "id": "B17",
+  "loc": 4582,
+  "findings": 24,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/sources",
+  "files": [
+   {
+    "file": "plugins/sources/aws_s3_source.py",
+    "loc": 1481,
+    "findings": 15,
+    "rules": {
+     "R1": 2,
+     "R6": 10,
+     "R7": 3
+    }
+   },
+   {
+    "file": "plugins/sources/llm/source.py",
+    "loc": 705,
+    "findings": 4,
+    "rules": {
+     "R1": 1,
+     "R4": 3
+    }
+   },
+   {
+    "file": "plugins/sources/field_normalization.py",
+    "loc": 611,
+    "findings": 3,
+    "rules": {
+     "R6": 3
+    }
+   }
+  ],
+  "id": "B18",
+  "loc": 2797,
+  "findings": 22,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/transforms",
+  "files": [
+   {
+    "file": "plugins/transforms/llm/transform.py",
+    "loc": 1999,
+    "findings": 4,
+    "rules": {
+     "R1": 4
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/textract_document_analysis.py",
+    "loc": 1090,
+    "findings": 17,
+    "rules": {
+     "R1": 4,
+     "R5": 11,
+     "R8": 1,
+     "R9": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/blob_json_expand.py",
+    "loc": 943,
+    "findings": 2,
+    "rules": {
+     "R9": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/field_mapper.py",
+    "loc": 844,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B19",
+  "loc": 4876,
+  "findings": 24,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/transforms",
+  "files": [
+   {
+    "file": "plugins/transforms/llm/providers/gateway.py",
+    "loc": 823,
+    "findings": 18,
+    "rules": {
+     "R1": 15,
+     "R6": 1,
+     "R9": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/blob_csv_expand.py",
+    "loc": 798,
+    "findings": 2,
+    "rules": {
+     "R9": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/textract_client.py",
+    "loc": 784,
+    "findings": 30,
+    "rules": {
+     "R1": 14,
+     "R2": 2,
+     "R4": 1,
+     "R5": 7,
+     "R6": 6
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/textract_result.py",
+    "loc": 768,
+    "findings": 20,
+    "rules": {
+     "R1": 17,
+     "R5": 3
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/textract_inline_analysis.py",
+    "loc": 735,
+    "findings": 3,
+    "rules": {
+     "R1": 1,
+     "R5": 1,
+     "R9": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/pdf_rasterize.py",
+    "loc": 735,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   }
+  ],
+  "id": "B20",
+  "loc": 4643,
+  "findings": 75,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "plugins/transforms",
+  "files": [
+   {
+    "file": "plugins/transforms/llm/providers/openrouter.py",
+    "loc": 620,
+    "findings": 7,
+    "rules": {
+     "R1": 4,
+     "R6": 1,
+     "R9": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/guardrails_client.py",
+    "loc": 613,
+    "findings": 10,
+    "rules": {
+     "R4": 1,
+     "R5": 6,
+     "R6": 3
+    }
+   },
+   {
+    "file": "plugins/transforms/reference_join.py",
+    "loc": 550,
+    "findings": 9,
+    "rules": {
+     "R1": 1,
+     "R5": 7,
+     "R9": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/textract_bucket_region.py",
+    "loc": 411,
+    "findings": 19,
+    "rules": {
+     "R1": 9,
+     "R4": 1,
+     "R5": 4,
+     "R6": 3,
+     "R9": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/providers/azure.py",
+    "loc": 363,
+    "findings": 5,
+    "rules": {
+     "R1": 2,
+     "R6": 2,
+     "R9": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/provider.py",
+    "loc": 310,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/langfuse.py",
+    "loc": 280,
+    "findings": 3,
+    "rules": {
+     "R4": 3
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/providers/bedrock.py",
+    "loc": 251,
+    "findings": 6,
+    "rules": {
+     "R1": 2,
+     "R6": 2,
+     "R8": 1,
+     "R9": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/tracing.py",
+    "loc": 208,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/image_inputs.py",
+    "loc": 187,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/aws/guardrails_live_check.py",
+    "loc": 112,
+    "findings": 1,
+    "rules": {
+     "R7": 1
+    }
+   }
+  ],
+  "id": "B21",
+  "loc": 3905,
+  "findings": 63,
+  "model": "fable",
+  "wave": 1
+ },
+ {
+  "subsystem": "telemetry",
+  "files": [
+   {
+    "file": "telemetry/manager.py",
+    "loc": 875,
+    "findings": 4,
+    "rules": {
+     "R2": 1,
+     "R4": 1,
+     "R5": 2
+    }
+   }
+  ],
+  "id": "B22",
+  "loc": 875,
+  "findings": 4,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "tui/screens",
+  "files": [
+   {
+    "file": "tui/screens/explain_screen.py",
+    "loc": 666,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ],
+  "id": "B23",
+  "loc": 666,
+  "findings": 1,
+  "model": "opus",
+  "wave": 1
+ },
+ {
+  "subsystem": "web",
+  "files": [
+   {
+    "file": "web/interpretation_state.py",
+    "loc": 2356,
+    "findings": 60,
+    "rules": {
+     "R1": 36,
+     "R5": 24
+    }
+   },
+   {
+    "file": "web/app.py",
+    "loc": 1922,
+    "findings": 7,
+    "rules": {
+     "R4": 2,
+     "R6": 4,
+     "R7": 1
+    }
+   }
+  ],
+  "id": "B24",
+  "loc": 4278,
+  "findings": 67,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web",
+  "files": [
+   {
+    "file": "web/config.py",
+    "loc": 1327,
+    "findings": 8,
+    "rules": {
+     "R1": 4,
+     "R5": 4
+    }
+   },
+   {
+    "file": "web/aws_ecs_acceptance.py",
+    "loc": 806,
+    "findings": 1,
+    "rules": {
+     "R4": 1
+    }
+   },
+   {
+    "file": "web/doctor.py",
+    "loc": 675,
+    "findings": 16,
+    "rules": {
+     "R4": 16
+    }
+   },
+   {
+    "file": "web/operator_telemetry.py",
+    "loc": 592,
+    "findings": 8,
+    "rules": {
+     "R4": 1,
+     "R5": 2,
+     "R6": 5
+    }
+   },
+   {
+    "file": "web/readiness.py",
+    "loc": 544,
+    "findings": 17,
+    "rules": {
+     "R1": 4,
+     "R4": 9,
+     "R6": 1,
+     "R7": 3
+    }
+   },
+   {
+    "file": "web/schema_probe.py",
+    "loc": 332,
+    "findings": 9,
+    "rules": {
+     "R1": 1,
+     "R2": 2,
+     "R4": 4,
+     "R5": 2
+    }
+   },
+   {
+    "file": "web/paths.py",
+    "loc": 125,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B25",
+  "loc": 4401,
+  "findings": 60,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/audit_readiness",
+  "files": [
+   {
+    "file": "web/audit_readiness/service.py",
+    "loc": 1281,
+    "findings": 3,
+    "rules": {
+     "R1": 3
+    }
+   }
+  ],
+  "id": "B29",
+  "loc": 1281,
+  "findings": 3,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/auth",
+  "files": [
+   {
+    "file": "web/auth/local.py",
+    "loc": 1113,
+    "findings": 3,
+    "rules": {
+     "R2": 1,
+     "R6": 2
+    }
+   },
+   {
+    "file": "web/auth/urls.py",
+    "loc": 199,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B30",
+  "loc": 1312,
+  "findings": 4,
+  "model": "fable",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/blobs",
+  "files": [
+   {
+    "file": "web/blobs/service.py",
+    "loc": 3394,
+    "findings": 12,
+    "rules": {
+     "R1": 4,
+     "R6": 5,
+     "R7": 3
+    }
+   }
+  ],
+  "id": "B31",
+  "loc": 3394,
+  "findings": 12,
+  "model": "fable",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/catalog",
+  "files": [
+   {
+    "file": "web/catalog/knob_schema.py",
+    "loc": 647,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "web/catalog/policy_view.py",
+    "loc": 249,
+    "findings": 4,
+    "rules": {
+     "R1": 4
+    }
+   }
+  ],
+  "id": "B32",
+  "loc": 896,
+  "findings": 6,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/service.py",
+    "loc": 9503,
+    "findings": 23,
+    "rules": {
+     "R1": 7,
+     "R2": 4,
+     "R5": 10,
+     "R9": 2
+    }
+   }
+  ],
+  "id": "B33",
+  "loc": 9503,
+  "findings": 23,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/state.py",
+    "loc": 8295,
+    "findings": 47,
+    "rules": {
+     "R1": 9,
+     "R5": 16,
+     "R6": 20,
+     "R8": 2
+    }
+   }
+  ],
+  "id": "B34",
+  "loc": 8295,
+  "findings": 47,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/pipeline_planner.py",
+    "loc": 5036,
+    "findings": 42,
+    "rules": {
+     "R1": 21,
+     "R5": 11,
+     "R6": 4,
+     "R7": 4,
+     "R9": 2
+    }
+   }
+  ],
+  "id": "B35",
+  "loc": 5036,
+  "findings": 42,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/redaction.py",
+    "loc": 4353,
+    "findings": 18,
+    "rules": {
+     "R1": 14,
+     "R5": 4
+    }
+   }
+  ],
+  "id": "B36",
+  "loc": 4353,
+  "findings": 18,
+  "model": "fable",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/guided/chat_solver.py",
+    "loc": 3947,
+    "findings": 17,
+    "rules": {
+     "R1": 10,
+     "R2": 5,
+     "R6": 2
+    }
+   }
+  ],
+  "id": "B37",
+  "loc": 3947,
+  "findings": 17,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/guided/planning.py",
+    "loc": 3920,
+    "findings": 178,
+    "rules": {
+     "R1": 133,
+     "R5": 34,
+     "R8": 7,
+     "R9": 4
+    }
+   }
+  ],
+  "id": "B38",
+  "loc": 3920,
+  "findings": 178,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/tools/generation.py",
+    "loc": 3662,
+    "findings": 8,
+    "rules": {
+     "R5": 3,
+     "R6": 5
+    }
+   }
+  ],
+  "id": "B39",
+  "loc": 3662,
+  "findings": 8,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/tools/_common.py",
+    "loc": 3487,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B40",
+  "loc": 3487,
+  "findings": 1,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/tools/sessions.py",
+    "loc": 2830,
+    "findings": 14,
+    "rules": {
+     "R1": 1,
+     "R5": 12,
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B41",
+  "loc": 2830,
+  "findings": 14,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/planner_authoring_aids.py",
+    "loc": 2711,
+    "findings": 27,
+    "rules": {
+     "R1": 23,
+     "R5": 1,
+     "R6": 2,
+     "R9": 1
+    }
+   }
+  ],
+  "id": "B42",
+  "loc": 2711,
+  "findings": 27,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/guided/protocol.py",
+    "loc": 2413,
+    "findings": 84,
+    "rules": {
+     "R1": 35,
+     "R5": 49
+    }
+   },
+   {
+    "file": "web/composer/tool_batch.py",
+    "loc": 2321,
+    "findings": 4,
+    "rules": {
+     "R2": 4
+    }
+   }
+  ],
+  "id": "B43",
+  "loc": 4734,
+  "findings": 88,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/guided/deferred_intents.py",
+    "loc": 2307,
+    "findings": 62,
+    "rules": {
+     "R1": 35,
+     "R5": 16,
+     "R6": 2,
+     "R8": 9
+    }
+   },
+   {
+    "file": "web/composer/tools/blobs.py",
+    "loc": 2193,
+    "findings": 7,
+    "rules": {
+     "R1": 1,
+     "R5": 5,
+     "R7": 1
+    }
+   }
+  ],
+  "id": "B44",
+  "loc": 4500,
+  "findings": 69,
+  "model": "fable",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/tools/sources.py",
+    "loc": 1921,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/composer/tools/transforms.py",
+    "loc": 1840,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B45",
+  "loc": 3761,
+  "findings": 2,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/protocol.py",
+    "loc": 1386,
+    "findings": 2,
+    "rules": {
+     "R1": 1,
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/composer/guided/state_machine.py",
+    "loc": 1381,
+    "findings": 6,
+    "rules": {
+     "R1": 1,
+     "R5": 5
+    }
+   },
+   {
+    "file": "web/composer/guided/stage_transitions.py",
+    "loc": 1341,
+    "findings": 4,
+    "rules": {
+     "R1": 2,
+     "R5": 2
+    }
+   }
+  ],
+  "id": "B46",
+  "loc": 4108,
+  "findings": 12,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/audit.py",
+    "loc": 1328,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/composer/llm_response_parsing.py",
+    "loc": 994,
+    "findings": 26,
+    "rules": {
+     "R1": 12,
+     "R5": 10,
+     "R6": 4
+    }
+   },
+   {
+    "file": "web/composer/required_controls.py",
+    "loc": 991,
+    "findings": 44,
+    "rules": {
+     "R1": 36,
+     "R5": 6,
+     "R6": 2
+    }
+   },
+   {
+    "file": "web/composer/tools/_dispatch.py",
+    "loc": 921,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ],
+  "id": "B47",
+  "loc": 4234,
+  "findings": 72,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/guided/emitters.py",
+    "loc": 842,
+    "findings": 32,
+    "rules": {
+     "R1": 13,
+     "R4": 1,
+     "R5": 16,
+     "R6": 1,
+     "R8": 1
+    }
+   },
+   {
+    "file": "web/composer/pipeline_proposal.py",
+    "loc": 797,
+    "findings": 4,
+    "rules": {
+     "R1": 3,
+     "R9": 1
+    }
+   },
+   {
+    "file": "web/composer/guided/stage_subjects.py",
+    "loc": 726,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "web/composer/tutorial_service.py",
+    "loc": 725,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "web/composer/yaml_importer.py",
+    "loc": 715,
+    "findings": 13,
+    "rules": {
+     "R1": 4,
+     "R5": 9
+    }
+   },
+   {
+    "file": "web/composer/_semantic_validator.py",
+    "loc": 666,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ],
+  "id": "B48",
+  "loc": 4471,
+  "findings": 53,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/yaml_generator.py",
+    "loc": 663,
+    "findings": 6,
+    "rules": {
+     "R1": 2,
+     "R5": 4
+    }
+   },
+   {
+    "file": "web/composer/prompts.py",
+    "loc": 639,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   },
+   {
+    "file": "web/composer/progress.py",
+    "loc": 544,
+    "findings": 4,
+    "rules": {
+     "R1": 4
+    }
+   },
+   {
+    "file": "web/composer/_producer_resolver.py",
+    "loc": 399,
+    "findings": 3,
+    "rules": {
+     "R1": 2,
+     "R8": 1
+    }
+   },
+   {
+    "file": "web/composer/source_demand.py",
+    "loc": 374,
+    "findings": 9,
+    "rules": {
+     "R5": 5,
+     "R6": 4
+    }
+   },
+   {
+    "file": "web/composer/guided/resolved.py",
+    "loc": 367,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   },
+   {
+    "file": "web/composer/guided/intent_management.py",
+    "loc": 296,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/composer/audit_storage.py",
+    "loc": 271,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "web/composer/turn_audit.py",
+    "loc": 256,
+    "findings": 2,
+    "rules": {
+     "R5": 1,
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/composer/guided_blob_refs.py",
+    "loc": 239,
+    "findings": 6,
+    "rules": {
+     "R1": 2,
+     "R5": 4
+    }
+   },
+   {
+    "file": "web/composer/reviewed_source_authority.py",
+    "loc": 236,
+    "findings": 6,
+    "rules": {
+     "R1": 2,
+     "R5": 4
+    }
+   },
+   {
+    "file": "web/composer/provider_telemetry.py",
+    "loc": 228,
+    "findings": 10,
+    "rules": {
+     "R1": 5,
+     "R4": 3,
+     "R6": 2
+    }
+   },
+   {
+    "file": "web/composer/guided/prompts.py",
+    "loc": 211,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "web/composer/control_messages.py",
+    "loc": 101,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "web/composer/authority_hashing.py",
+    "loc": 98,
+    "findings": 6,
+    "rules": {
+     "R1": 6
+    }
+   }
+  ],
+  "id": "B49",
+  "loc": 4922,
+  "findings": 72,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/composer",
+  "files": [
+   {
+    "file": "web/composer/reasoning.py",
+    "loc": 83,
+    "findings": 1,
+    "rules": {
+     "R4": 1
+    }
+   },
+   {
+    "file": "web/composer/discovery_cache.py",
+    "loc": 74,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/composer/advisor_checkpoint_telemetry.py",
+    "loc": 47,
+    "findings": 2,
+    "rules": {
+     "R7": 2
+    }
+   },
+   {
+    "file": "web/composer/tutorial_telemetry.py",
+    "loc": 46,
+    "findings": 2,
+    "rules": {
+     "R4": 2
+    }
+   },
+   {
+    "file": "web/composer/guided/connection_consumers.py",
+    "loc": 43,
+    "findings": 2,
+    "rules": {
+     "R5": 1,
+     "R8": 1
+    }
+   }
+  ],
+  "id": "B50",
+  "loc": 293,
+  "findings": 8,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/execution",
+  "files": [
+   {
+    "file": "web/execution/service.py",
+    "loc": 3346,
+    "findings": 10,
+    "rules": {
+     "R1": 6,
+     "R5": 2,
+     "R6": 2
+    }
+   }
+  ],
+  "id": "B51",
+  "loc": 3346,
+  "findings": 10,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/execution",
+  "files": [
+   {
+    "file": "web/execution/routes.py",
+    "loc": 1852,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   },
+   {
+    "file": "web/execution/_validation_authoring.py",
+    "loc": 1097,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "web/execution/diagnostics.py",
+    "loc": 805,
+    "findings": 20,
+    "rules": {
+     "R1": 15,
+     "R5": 4,
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/execution/_validation_diagnostics.py",
+    "loc": 781,
+    "findings": 4,
+    "rules": {
+     "R1": 2,
+     "R5": 2
+    }
+   }
+  ],
+  "id": "B52",
+  "loc": 4535,
+  "findings": 27,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/execution",
+  "files": [
+   {
+    "file": "web/execution/preflight.py",
+    "loc": 724,
+    "findings": 5,
+    "rules": {
+     "R1": 3,
+     "R5": 2
+    }
+   },
+   {
+    "file": "web/execution/validation.py",
+    "loc": 694,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/execution/fanout_guard.py",
+    "loc": 615,
+    "findings": 3,
+    "rules": {
+     "R1": 2,
+     "R8": 1
+    }
+   },
+   {
+    "file": "web/execution/accounting.py",
+    "loc": 588,
+    "findings": 6,
+    "rules": {
+     "R1": 5,
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/execution/outputs.py",
+    "loc": 292,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/execution/completion_gates.py",
+    "loc": 288,
+    "findings": 5,
+    "rules": {
+     "R1": 3,
+     "R5": 2
+    }
+   }
+  ],
+  "id": "B53",
+  "loc": 3201,
+  "findings": 21,
+  "model": "opus",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/secrets",
+  "files": [
+   {
+    "file": "web/secrets/service.py",
+    "loc": 350,
+    "findings": 3,
+    "rules": {
+     "R6": 3
+    }
+   }
+  ],
+  "id": "B55",
+  "loc": 350,
+  "findings": 3,
+  "model": "fable",
+  "wave": 2
+ },
+ {
+  "subsystem": "web/plugin_policy",
+  "files": [
+   {
+    "file": "web/plugin_policy/profiles.py",
+    "loc": 1254,
+    "findings": 57,
+    "rules": {
+     "R1": 42,
+     "R5": 10,
+     "R6": 2,
+     "R8": 2,
+     "R9": 1
+    }
+   },
+   {
+    "file": "web/plugin_policy/coverage.py",
+    "loc": 897,
+    "findings": 38,
+    "rules": {
+     "R1": 20,
+     "R5": 9,
+     "R6": 4,
+     "R8": 5
+    }
+   },
+   {
+    "file": "web/plugin_policy/validation.py",
+    "loc": 777,
+    "findings": 17,
+    "rules": {
+     "R1": 11,
+     "R5": 2,
+     "R6": 2,
+     "R9": 2
+    }
+   },
+   {
+    "file": "web/plugin_policy/availability.py",
+    "loc": 271,
+    "findings": 4,
+    "rules": {
+     "R1": 2,
+     "R6": 2
+    }
+   },
+   {
+    "file": "web/plugin_policy/compiler.py",
+    "loc": 153,
+    "findings": 5,
+    "rules": {
+     "R5": 4,
+     "R6": 1
+    }
+   }
+  ],
+  "id": "B54",
+  "loc": 3352,
+  "findings": 121,
+  "model": "opus",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/sessions",
+  "files": [
+   {
+    "file": "web/sessions/service.py",
+    "loc": 13600,
+    "findings": 158,
+    "rules": {
+     "R1": 56,
+     "R4": 1,
+     "R5": 95,
+     "R6": 5,
+     "R9": 1
+    }
+   }
+  ],
+  "id": "B56",
+  "loc": 13600,
+  "findings": 158,
+  "model": "fable",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/sessions",
+  "files": [
+   {
+    "file": "web/sessions/routes/composer/guided.py",
+    "loc": 5291,
+    "findings": 37,
+    "rules": {
+     "R1": 16,
+     "R4": 2,
+     "R5": 12,
+     "R6": 5,
+     "R7": 2
+    }
+   }
+  ],
+  "id": "B57",
+  "loc": 5291,
+  "findings": 37,
+  "model": "opus",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/sessions",
+  "files": [
+   {
+    "file": "web/sessions/protocol.py",
+    "loc": 3448,
+    "findings": 10,
+    "rules": {
+     "R1": 5,
+     "R5": 5
+    }
+   }
+  ],
+  "id": "B58",
+  "loc": 3448,
+  "findings": 10,
+  "model": "opus",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/sessions",
+  "files": [
+   {
+    "file": "web/sessions/routes/_helpers.py",
+    "loc": 3404,
+    "findings": 20,
+    "rules": {
+     "R1": 11,
+     "R4": 1,
+     "R5": 5,
+     "R6": 1,
+     "R7": 2
+    }
+   }
+  ],
+  "id": "B59",
+  "loc": 3404,
+  "findings": 20,
+  "model": "opus",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/sessions",
+  "files": [
+   {
+    "file": "web/sessions/routes/composer/guided_chat_atomic.py",
+    "loc": 2030,
+    "findings": 31,
+    "rules": {
+     "R1": 5,
+     "R4": 1,
+     "R5": 15,
+     "R6": 7,
+     "R7": 3
+    }
+   },
+   {
+    "file": "web/sessions/routes/composer/state.py",
+    "loc": 1003,
+    "findings": 6,
+    "rules": {
+     "R1": 1,
+     "R5": 2,
+     "R6": 3
+    }
+   },
+   {
+    "file": "web/sessions/routes/composer/guided_chat_intent_management.py",
+    "loc": 944,
+    "findings": 1,
+    "rules": {
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/sessions/routes/sessions.py",
+    "loc": 752,
+    "findings": 10,
+    "rules": {
+     "R1": 5,
+     "R4": 1,
+     "R6": 4
+    }
+   }
+  ],
+  "id": "B60",
+  "loc": 4729,
+  "findings": 48,
+  "model": "opus",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/sessions",
+  "files": [
+   {
+    "file": "web/sessions/routes/composer/guided_plan.py",
+    "loc": 741,
+    "findings": 19,
+    "rules": {
+     "R1": 2,
+     "R4": 8,
+     "R5": 7,
+     "R6": 1,
+     "R7": 1
+    }
+   },
+   {
+    "file": "web/sessions/schema.py",
+    "loc": 506,
+    "findings": 5,
+    "rules": {
+     "R5": 4,
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/sessions/guided_replay.py",
+    "loc": 467,
+    "findings": 6,
+    "rules": {
+     "R1": 4,
+     "R5": 2
+    }
+   },
+   {
+    "file": "web/sessions/routes/composer/pipeline_settlement.py",
+    "loc": 443,
+    "findings": 2,
+    "rules": {
+     "R1": 1,
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/sessions/routes/guided_operations.py",
+    "loc": 364,
+    "findings": 9,
+    "rules": {
+     "R1": 4,
+     "R5": 5
+    }
+   },
+   {
+    "file": "web/sessions/guided_audit.py",
+    "loc": 340,
+    "findings": 7,
+    "rules": {
+     "R1": 4,
+     "R5": 1,
+     "R6": 2
+    }
+   },
+   {
+    "file": "web/sessions/_auto_title.py",
+    "loc": 320,
+    "findings": 4,
+    "rules": {
+     "R2": 4
+    }
+   },
+   {
+    "file": "web/sessions/guided_payloads.py",
+    "loc": 72,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "web/sessions/guided_operations.py",
+    "loc": 44,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   }
+  ],
+  "id": "B61",
+  "loc": 3297,
+  "findings": 57,
+  "model": "opus",
+  "wave": 3
+ },
+ {
+  "subsystem": "web/_aws_ecs_acceptance",
+  "files": [
+   {
+    "file": "web/_aws_ecs_acceptance/operator_telemetry.py",
+    "loc": 1167,
+    "findings": 35,
+    "rules": {
+     "R1": 16,
+     "R4": 2,
+     "R5": 17
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/scenario_inventory.py",
+    "loc": 1090,
+    "findings": 35,
+    "rules": {
+     "R1": 8,
+     "R5": 27
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/receipt_contracts.py",
+    "loc": 967,
+    "findings": 43,
+    "rules": {
+     "R1": 11,
+     "R5": 31,
+     "R6": 1
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/orphan_sweep.py",
+    "loc": 875,
+    "findings": 50,
+    "rules": {
+     "R1": 25,
+     "R4": 1,
+     "R5": 23,
+     "R7": 1
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/bedrock.py",
+    "loc": 764,
+    "findings": 35,
+    "rules": {
+     "R1": 18,
+     "R4": 2,
+     "R5": 7,
+     "R6": 1,
+     "R7": 7
+    }
+   }
+  ],
+  "id": "B26",
+  "loc": 4863,
+  "findings": 198,
+  "model": "opus",
+  "wave": 4
+ },
+ {
+  "subsystem": "web/_aws_ecs_acceptance",
+  "files": [
+   {
+    "file": "web/_aws_ecs_acceptance/capture.py",
+    "loc": 723,
+    "findings": 33,
+    "rules": {
+     "R1": 27,
+     "R5": 6
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/contracts.py",
+    "loc": 645,
+    "findings": 16,
+    "rules": {
+     "R1": 8,
+     "R2": 1,
+     "R5": 6,
+     "R7": 1
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/gate_ledger.py",
+    "loc": 529,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/task_definition.py",
+    "loc": 519,
+    "findings": 68,
+    "rules": {
+     "R1": 48,
+     "R5": 20
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/manifest.py",
+    "loc": 457,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/manifest_schema.py",
+    "loc": 421,
+    "findings": 16,
+    "rules": {
+     "R5": 16
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/evidence.py",
+    "loc": 371,
+    "findings": 36,
+    "rules": {
+     "R1": 18,
+     "R5": 16,
+     "R6": 2
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/s3.py",
+    "loc": 366,
+    "findings": 23,
+    "rules": {
+     "R1": 6,
+     "R4": 10,
+     "R5": 4,
+     "R6": 3
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/http_client.py",
+    "loc": 296,
+    "findings": 5,
+    "rules": {
+     "R1": 4,
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/state.py",
+    "loc": 286,
+    "findings": 6,
+    "rules": {
+     "R1": 3,
+     "R5": 1,
+     "R6": 1,
+     "R7": 1
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/approvals.py",
+    "loc": 248,
+    "findings": 4,
+    "rules": {
+     "R1": 2,
+     "R4": 1,
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B27",
+  "loc": 4861,
+  "findings": 215,
+  "model": "opus",
+  "wave": 4
+ },
+ {
+  "subsystem": "web/_aws_ecs_acceptance",
+  "files": [
+   {
+    "file": "web/_aws_ecs_acceptance/secure_documents.py",
+    "loc": 237,
+    "findings": 6,
+    "rules": {
+     "R5": 1,
+     "R6": 3,
+     "R7": 2
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/receipt_store.py",
+    "loc": 205,
+    "findings": 10,
+    "rules": {
+     "R1": 9,
+     "R5": 1
+    }
+   },
+   {
+    "file": "web/_aws_ecs_acceptance/textract.py",
+    "loc": 194,
+    "findings": 5,
+    "rules": {
+     "R1": 3,
+     "R4": 1,
+     "R5": 1
+    }
+   }
+  ],
+  "id": "B28",
+  "loc": 636,
+  "findings": 21,
+  "model": "fable",
+  "wave": 4
+ }
+]

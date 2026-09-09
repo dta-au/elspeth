@@ -1,11 +1,8 @@
 // E2E spec: guided-mode wizard source/output walk against the live local
 // backend. The local Playwright backend intentionally has no LLM provider, so
-// this stops at the transform step before any provider-dependent guided chat.
-// Wire-stage behavior is covered by tutorial.spec.ts with a deterministic
-// guided protocol fixture.
-
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+// this stops after output review, immediately before "Finish outputs" invokes
+// the provider-dependent guided planner. Later-stage behavior is covered by
+// tutorial.spec.ts with a deterministic guided protocol fixture.
 
 import { expect, test, type Page } from "@playwright/test";
 
@@ -16,6 +13,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
+import { switchToGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 const BLOB_FILENAME = "playwright-orders.csv";
@@ -24,19 +22,9 @@ const BLOB_FILENAME = "playwright-orders.csv";
 // satisfy the classify recipe's classifier-keyword required-field predicate.
 const SAMPLE_CSV = "id,name,category\n1,widget,a\n";
 
-// Frontend root: playwright.config.ts passes an absolute .e2e-data path
-// anchored to the frontend directory, and the backend stores uploaded blobs
-// relative to that data_dir.
-const FRONTEND_ROOT = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "../..",
-);
-const E2E_DATA_DIR = process.env.PLAYWRIGHT_E2E_DATA_DIR
-  ? resolve(process.env.PLAYWRIGHT_E2E_DATA_DIR)
-  : resolve(FRONTEND_ROOT, ".e2e-data");
-
-// Sink output path — must be under data_dir/outputs/ (paths.py:44).
-const SINK_OUTPUT_PATH = resolve(E2E_DATA_DIR, "outputs", "playwright-guided-output.jsonl");
+// Sink paths are deployment-relative and resolve inside the managed outputs
+// directory; absolute host paths are deliberately rejected.
+const SINK_OUTPUT_PATH = "playwright-guided-output.jsonl";
 
 async function isolateAuditReadinessSideRail(
   page: Page,
@@ -126,7 +114,75 @@ async function isolateAuditReadinessSideRail(
 
 test.describe("composer-guided — source/output live walk", () => {
   test(
-    "guided demo: CSV source → JSONL output → transform chat step",
+    "current decision settles at the bottom in the regular chat measure",
+    async ({ page }) => {
+      await page.setViewportSize({ width: 1600, height: 600 });
+
+      const storageState = await page.context().storageState();
+      const token = tokenFromStorageState(storageState);
+      const ctx = await authedContext(token);
+
+      let sessionId: string | undefined;
+      try {
+        const session = await createSession(ctx, "playwright-guided-current-decision");
+        sessionId = session.id;
+
+        const composer = new ComposerPage(page);
+        await composer.goto(sessionId);
+        await composer.waitForChatReady();
+        await switchToGuidedWithGoal(
+          page,
+          "Read a CSV of sample rows and save every row to a JSON file.",
+        );
+        await expect(page.getByRole("button", { name: "CSV", exact: true })).toBeVisible();
+        const authoringPane = page.getByRole("region", { name: "Authoring pane" });
+        await expect(authoringPane.getByRole("log", { name: "Guided wizard step" })).toBeVisible();
+        await expect(page.getByRole("tab", { name: "Graph" })).toBeVisible();
+        await expect(
+          page.getByRole("complementary", { name: "Pipeline summary" }),
+        ).toHaveCount(0);
+
+        const geometry = await page
+          .locator(".guided-authoring-scroll")
+          .evaluate((scroll) => {
+            const decision = scroll.querySelector(".guided-current-decision");
+            if (!(decision instanceof HTMLElement)) {
+              throw new Error("Current Decision panel is missing");
+            }
+
+            const scrollRect = scroll.getBoundingClientRect();
+            const decisionRect = decision.getBoundingClientRect();
+            const rootFontSize = Number.parseFloat(
+              getComputedStyle(document.documentElement).fontSize,
+            );
+            return {
+              remainingScroll:
+                scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight,
+              decisionWidth: decisionRect.width,
+              regularChatWidth: 56 * rootFontSize,
+              leftInset: decisionRect.left - scrollRect.left,
+              rightInset: scrollRect.right - decisionRect.right,
+            };
+          });
+
+        expect(geometry.remainingScroll).toBe(0);
+        expect(geometry.decisionWidth).toBeLessThanOrEqual(
+          geometry.regularChatWidth + 1,
+        );
+        expect(Math.abs(geometry.leftInset - geometry.rightInset)).toBeLessThanOrEqual(
+          1,
+        );
+      } finally {
+        if (sessionId !== undefined) {
+          await deleteSession(ctx, sessionId);
+        }
+        await ctx.dispose();
+      }
+    },
+  );
+
+  test(
+    "guided demo: CSV source → reviewed JSONL output",
     async ({ page }) => {
       // ── Out-of-band setup ──────────────────────────────────────────────────
       // Create session + upload CSV blob via REST before navigating the SPA.
@@ -143,11 +199,16 @@ test.describe("composer-guided — source/output live walk", () => {
         const blob = await uploadBlob(ctx, sessionId, BLOB_FILENAME, SAMPLE_CSV);
 
         // ── Navigate + enter guided mode ─────────────────────────────────────
-        // "Switch to guided" resolves to the live/empty profile via GET /guided.
+        // "Switch to guided" collects the goal, then resolves to the live/empty
+        // profile via GET /guided and starts the wizard with that goal. This
+        // walk is a pure pass-through, and the goal says so.
         const composer = new ComposerPage(page);
         await composer.goto(sessionId);
         await composer.waitForChatReady();
-        await page.getByRole("button", { name: "Switch to guided" }).click();
+        await switchToGuidedWithGoal(
+          page,
+          "Write every row of the uploaded CSV to a JSONL file, unchanged.",
+        );
         await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
         // ── Step 1 source: SINGLE_SELECT — pick "csv" ──────────────────────
@@ -168,6 +229,17 @@ test.describe("composer-guided — source/output live walk", () => {
           page.getByRole("button", { name: "Continue", exact: true }),
         ).toBeEnabled();
         await page.getByRole("button", { name: "Continue", exact: true }).click();
+
+        // Uploaded tabular sources are inspected before they are committed.
+        // Confirm the observed columns so the wizard can advance to output.
+        await expect(
+          page.getByRole("button", { name: "Looks right", exact: true }),
+        ).toBeVisible();
+        await page.getByRole("button", { name: "Looks right", exact: true }).click();
+        await expect(
+          page.getByRole("button", { name: "Finish sources", exact: true }),
+        ).toBeEnabled();
+        await page.getByRole("button", { name: "Finish sources", exact: true }).click();
 
         // ── Step 2 sink: SINGLE_SELECT — pick "json" ───────────────────────
         await expect(
@@ -190,26 +262,31 @@ test.describe("composer-guided — source/output live walk", () => {
         await page.getByRole("button", { name: "Continue", exact: true }).click();
 
         // ── Step 2 required fields: MULTI_SELECT_WITH_CUSTOM ──────────────
-        // "category" is already selected by default, so the required-field
-        // review can continue without adding a custom field.
-        await expect(page.getByText("category")).toBeVisible();
-        await page.getByRole("button", { name: "Continue", exact: true }).click();
-
-        // ── Step 3 transform chat: no provider call yet, controls visible ──
+        // Since be1dccc8d the turn pre-pins nothing and offers pass-through
+        // as the primary gesture ("Let source decide") next to "Pin these
+        // fields"; there is no generic Continue. This walk is a pure
+        // pass-through, so take the primary gesture.
+        await expect(page.getByRole("button", { name: "category", exact: true })).toBeVisible();
+        await page
+          .getByRole("button", { name: "Let source decide (pass all fields through)", exact: true })
+          .click();
         await expect(
-          page.getByRole("heading", {
-            name: "Review the transform chain that turns source data into the output.",
-          }),
-        ).toBeVisible();
+          page.getByRole("button", { name: "Finish outputs", exact: true }),
+        ).toBeEnabled();
+
+        // "Finish outputs" is the planner handoff and therefore requires an
+        // available provider. Verify the complete live source/output walk at
+        // that boundary; tutorial.spec.ts owns the deterministic later stages.
+        // Since 202f1700e the review rows drop the literal "reviewed" (the
+        // status is closed to that value) and name the plugin by its display
+        // name; each row is a listitem named "<name>, <display name>".
+        const outputReview = page.getByRole("region", { name: "Review outputs" });
+        await expect(outputReview).toBeVisible();
+        await expect(outputReview.getByRole("listitem", { name: "output, JSON" })).toBeVisible();
+        await expect(outputReview.getByRole("button", { name: "Edit output", exact: true })).toBeVisible();
         await expect(page.getByRole("textbox", { name: "Message input" })).toBeEnabled();
         await expect(
           page.getByRole("button", { name: "Exit to freeform", exact: true }),
-        ).toBeVisible();
-        await expect(
-          page.getByText("This pipeline will read your CSV and write a JSON file."),
-        ).toBeVisible();
-        await expect(
-          page.getByText("Required fields: id, name, category"),
         ).toBeVisible();
         await expect(
           page.getByText(/Source commit failed|Chat panel encountered an error/i),

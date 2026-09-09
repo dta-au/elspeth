@@ -19,12 +19,10 @@ GuidedSession persistence:
 
 from __future__ import annotations
 
-from typing import Any
-
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+from elspeth.web.composer.yaml_generator import LoweredPipelineDocument, generate_pipeline_dict
 from elspeth.web.sessions.protocol import CompositionStateRecord
 
 
@@ -78,7 +76,7 @@ def state_from_record(record: CompositionStateRecord) -> CompositionState:
     return state
 
 
-def pipeline_dict_from_record(record: CompositionStateRecord) -> dict[str, Any]:
+def pipeline_dict_from_record(record: CompositionStateRecord) -> LoweredPipelineDocument:
     """Return the canonical runtime/YAML-shape dict for a DB composition row.
 
     ``CompositionStateRecord`` is raw session storage shape: flat ``nodes`` and

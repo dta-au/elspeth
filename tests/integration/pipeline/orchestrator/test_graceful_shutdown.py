@@ -16,7 +16,8 @@ import pytest
 
 from elspeth.contracts import Determinism, PipelineRow, RunStatus
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
+from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -24,6 +25,7 @@ from elspeth.contracts.types import AggregationName
 from elspeth.core.canonical import canonical_json
 from elspeth.core.config import AggregationSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.models import GraphValidationError
 from elspeth.engine.orchestrator import PipelineConfig, prepare_for_run
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -543,8 +545,17 @@ class TestShutdownBreaksLoop:
 class TestInterruptAndResume:
     """Tests for interrupt → resume pipeline lifecycle."""
 
-    def test_interrupted_run_is_resumable(self, landscape_db: LandscapeDB, payload_store) -> None:
-        """Interrupt after N of M rows, verify checkpoint and resumability."""
+    def test_interrupted_mid_source_run_refuses_resume_honestly(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """Interrupt after N of M rows: checkpoint persists, gate refuses honestly.
+
+        The interrupt lands mid-source, so the source lifecycle is
+        ``interrupted`` and no current resume path can recover the unread
+        rows — ``resume()`` has always refused this run with
+        ``IncompleteSourceResumeError``. Pre-elspeth-1f5b83cd28 this test
+        asserted ``can_resume=True``, certifying resumability with the
+        advisory gate's false green; the honest contract is a clean refuse
+        naming the incomplete source.
+        """
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.config import CheckpointSettings
@@ -594,10 +605,14 @@ class TestInterruptAndResume:
         assert run is not None
         assert run.status == RunStatus.INTERRUPTED
 
-        # Verify the run IS resumable
+        # The checkpoint baseline exists, but the advisory gate refuses —
+        # matching the enforcing guard's IncompleteSourceResumeError verdict.
+        assert checkpoint_mgr.get_latest_checkpoint(run_id) is not None
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         check = recovery.can_resume(run_id, graph)
-        assert check.can_resume, f"Expected resumable, got: {check.reason}"
+        assert not check.can_resume
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
 
     def test_shutdown_creates_checkpoint(self, landscape_db: LandscapeDB, payload_store) -> None:
         """Checkpoint exists after graceful shutdown."""
@@ -638,8 +653,15 @@ class TestInterruptAndResume:
         checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
         assert checkpoint is not None
 
-    def test_buffered_aggregation_shutdown_remains_resumable(self, landscape_db: LandscapeDB, payload_store) -> None:
-        """Buffered aggregation shutdown must persist a recovery checkpoint."""
+    def test_buffered_aggregation_shutdown_persists_recovery_state(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """Buffered aggregation shutdown persists checkpoint + journal rows.
+
+        The durable recovery evidence (checkpoint baseline, BLOCKED journal
+        rows) must survive the shutdown. The run itself is NOT resumable —
+        the source was interrupted mid-load, and elspeth-1f5b83cd28 made the
+        advisory gate report that honestly instead of green-lighting a
+        resume the enforcing guard always refused.
+        """
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.config import CheckpointSettings
@@ -687,26 +709,60 @@ class TestInterruptAndResume:
             )
         assert blocked_barrier_rows, "Expected buffered aggregation tokens as BLOCKED journal rows"
 
+        # elspeth-1f5b83cd28: the buffered work is durably persisted, but the
+        # interrupted source makes the run non-resumable — the gate says so.
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         check = recovery.can_resume(run_id, graph)
-        assert check.can_resume, f"Expected resumable buffered shutdown, got: {check.reason}"
+        assert not check.can_resume
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
 
-    def test_buffered_coalesce_shutdown_refuses_completion_without_source_exhaustion(
-        self,
-        landscape_db: LandscapeDB,
-        payload_store,
-    ) -> None:
-        """Shutdown checkpoint persists pending coalesces but cannot complete an interrupted source."""
+    def test_buffered_aggregation_shutdown_refused_resume_advances_nothing(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """A refused resume must advance nothing (F3 fix round: restores a dropped invariant).
+
+        The now-collapsed
+        ``test_buffered_only_resume_refuses_interrupted_source_before_pre_set_
+        shutdown`` (superseded by rule 6, see
+        ``test_agg_branch_hold_coalesce_config_is_rejected_by_rule_6`` below)
+        also asserted that a REFUSED resume changes nothing: the checkpoint
+        sequence number and the BLOCKED journal rows stay byte-identical
+        across the refusal. That invariant is not coalesce-specific — it is
+        proven here by real end-to-end reproduction, restoring it as a real
+        run rather than leaving it as a documented gap. No mocking-boundary
+        compromise: this is the SAME legal, unaffected-by-rule-6 vehicle as
+        ``test_buffered_aggregation_shutdown_persists_recovery_state`` above
+        (``_build_interruptible_aggregation_config``), extended one step
+        further to attempt the resume and assert the refusal is a true no-op.
+
+        Verified the refusal path is barrier-type-agnostic before reusing
+        this vehicle for it: ``ResumeCoordinator.resume()``
+        (engine/orchestrator/resume.py:729-733) raises
+        ``IncompleteSourceResumeError`` from
+        ``check_source_lifecycle_resumable`` (core/checkpoint/recovery.py:212),
+        which reads ONLY ``run_sources`` (source name -> lifecycle state) —
+        no reference to ``token_work_items``, ``barrier_key``, or
+        ``coalesce_name`` anywhere in that path. The refusal fires purely on
+        source lifecycle, before any barrier-specific code runs, so an
+        aggregation-shaped BLOCKED row exercises the exact same refusal path
+        a coalesce-shaped one would; the coalesce-flavoured invariance is
+        covered here for that reason, same argument as the abandonment
+        query's barrier-type-agnostic read (see the pin test below).
+        """
+        from sqlalchemy import select
+
+        from elspeth.contracts import ResumePoint
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-        from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
+        from elspeth.contracts.errors import IncompleteSourceResumeError
+        from elspeth.core.checkpoint import CheckpointManager
         from elspeth.core.config import CheckpointSettings
+        from elspeth.core.landscape.schema import token_work_items_table
         from elspeth.engine.orchestrator import Orchestrator
 
         checkpoint_mgr = CheckpointManager(landscape_db)
         checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
 
         shutdown_event = threading.Event()
-        config, graph, settings, output_sink = _build_interruptible_coalesce_config(shutdown_event)
+        config, graph, output_sink = _build_interruptible_aggregation_config(shutdown_event)
 
         orchestrator = Orchestrator(
             db=landscape_db,
@@ -715,185 +771,303 @@ class TestInterruptAndResume:
         )
 
         with pytest.raises(GracefulShutdownError) as exc_info:
-            orchestrator.run(
-                config,
-                graph=graph,
-                settings=settings,
-                payload_store=payload_store,
-                shutdown_event=shutdown_event,
-            )
+            orchestrator.run(config, graph=graph, payload_store=payload_store, shutdown_event=shutdown_event)
 
         run_id = exc_info.value.run_id
         assert run_id is not None
         assert output_sink.results == []
 
-        checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
-        assert checkpoint is not None
-        # F1: pending aggregation/coalesce state persists as BLOCKED journal
-        # rows, asserted on pre_resume_work below — the checkpoint carries only
-        # scalar barrier metadata.
-
-        # NOTE (multi-source-token-scheduler): the orchestrator now writes the
-        # schema contract to ``run_sources`` on the first valid row (ADR-025 §3
-        # Decision 5). Earlier revisions of this test fabricated the contract
-        # here because the previous engine path skipped the in-loop
-        # ``_record_schema_contract`` call when an observed source already had
-        # a contract at ``_load_source_with_events`` time — leaving resume
-        # broken. The fabrication is removed; the engine itself supplies the
-        # contract.
-
-        from sqlalchemy import select
-
-        from elspeth.core.landscape.schema import token_work_items_table
-
-        with landscape_db.connection() as conn:
-            pre_resume_work = (
-                conn.execute(
-                    select(
-                        token_work_items_table.c.status,
-                        token_work_items_table.c.branch_name,
-                        token_work_items_table.c.fork_group_id,
-                        token_work_items_table.c.barrier_key,
-                        token_work_items_table.c.coalesce_name,
-                    ).where(token_work_items_table.c.run_id == run_id)
+        def _blocked_rows() -> list[Any]:
+            # The WHOLE row, not a chosen subset of columns — "byte-identical
+            # across the refusal" must mean every column, not just the ones
+            # this test happens to assert on.
+            with landscape_db.connection() as conn:
+                return sorted(
+                    (
+                        conn.execute(
+                            select(token_work_items_table).where(
+                                token_work_items_table.c.run_id == run_id,
+                                token_work_items_table.c.status == "blocked",
+                            )
+                        )
+                        .mappings()
+                        .all()
+                    ),
+                    key=lambda row: row["work_item_id"],
                 )
-                .mappings()
-                .all()
-            )
-        blocked_work = [row for row in pre_resume_work if row["status"] == "blocked"]
-        assert blocked_work
-        coalesce_blocked_work = [row for row in blocked_work if row["barrier_key"] == "merge_paths"]
-        assert coalesce_blocked_work
-        assert {row["branch_name"] for row in coalesce_blocked_work} == {"direct_branch"}
-        assert {row["coalesce_name"] for row in coalesce_blocked_work} == {"merge_paths"}
-        assert all(row["fork_group_id"] is not None for row in coalesce_blocked_work)
 
-        recovery = RecoveryManager(landscape_db, checkpoint_mgr)
-        assert recovery.get_unprocessed_rows(run_id) == []
+        first_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert first_checkpoint is not None
+        before = _blocked_rows()
+        assert before, "expected buffered aggregation tokens as BLOCKED journal rows"
 
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
-
-        with pytest.raises(IncompleteSourceResumeError, match=r"source.*primary.*interrupted"):
+        resume_point = ResumePoint(checkpoint=first_checkpoint, sequence_number=first_checkpoint.sequence_number)
+        with pytest.raises(IncompleteSourceResumeError, match=r"primary.*interrupted"):
             orchestrator.resume(
                 resume_point=resume_point,
                 config=config,
                 graph=graph,
                 payload_store=payload_store,
-                settings=settings,
             )
 
-        assert output_sink.results == []
-        with landscape_db.connection() as conn:
-            post_resume_work = (
-                conn.execute(
-                    select(token_work_items_table.c.status).where(
-                        token_work_items_table.c.run_id == run_id,
-                        token_work_items_table.c.barrier_key == "merge_paths",
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        assert post_resume_work
-        assert set(post_resume_work) == {"blocked"}
+        second_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert second_checkpoint is not None
+        assert second_checkpoint.sequence_number == first_checkpoint.sequence_number
 
-    def test_buffered_only_resume_refuses_interrupted_source_before_pre_set_shutdown(
-        self,
-        landscape_db: LandscapeDB,
-        payload_store,
-    ) -> None:
-        """Buffered-only resume must not turn interrupted source work into completed output."""
-        from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-        from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-        from elspeth.core.config import CheckpointSettings
-        from elspeth.engine.orchestrator import Orchestrator
+        after = _blocked_rows()
+        assert after == before
 
-        checkpoint_mgr = CheckpointManager(landscape_db)
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+    def test_agg_branch_hold_coalesce_config_is_rejected_by_rule_6(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """Reclassified under ruling 25 (spec §7 rule 6, Task 9, WS2 controller ruling 2026-08-23).
 
-        initial_shutdown = threading.Event()
-        config, graph, settings, output_sink = _build_interruptible_coalesce_config(initial_shutdown)
+        ``_build_interruptible_coalesce_config`` built its pending
+        ``merge_paths`` barrier by parking ``agg_branch``'s forked token in
+        an aggregation whose ``count=100`` trigger never fires — an
+        in-region aggregation, which `validate_no_aggregations_in_regions`
+        (core/dag/bound_regions.py) now rejects at build time regardless of
+        ``output_mode``. This single config used to feed BOTH
+        ``test_buffered_coalesce_shutdown_refuses_completion_without_
+        source_exhaustion`` and
+        ``test_buffered_only_resume_refuses_interrupted_source_before_pre_
+        set_shutdown``; both collapse into this one build-rejection pin.
 
-        orchestrator = Orchestrator(
-            db=landscape_db,
-            checkpoint_manager=checkpoint_mgr,
-            checkpoint_config=checkpoint_config,
-        )
+        A live end-to-end reproduction is ALSO unbuildable for a second,
+        independent reason (in single-worker mode): this engine's fork
+        drains all sibling branches inside one ``RowProcessor.process_row()``
+        call via ``SchedulerDrainCoordinator.drain_claims``
+        (``engine/scheduler_drain.py``), a ``while True`` loop that normally
+        exits only once every sibling work item reaches a terminal, BLOCKED,
+        or PENDING_SINK state (it also exits via a peer-relinquish break, an
+        ``OrchestrationInvariantError``, a ``MAX_WORK_QUEUE_ITERATIONS``
+        raise, or lease-lost/evicted returns — the peer-relinquish arm is
+        production-reachable with a follower attached via ``elspeth join``,
+        which is why this claim is scoped to single-worker mode, not stated
+        unconditionally). The main loop's ``shutdown_event`` check runs only
+        AFTER ``process_row()`` returns (``source_iteration.py``, "Graceful
+        shutdown — current row fully processed, safe to stop"). So without
+        an aggregation buffering ``agg_branch``'s token AND without a peer
+        worker to relinquish to, BOTH fork siblings would reach
+        ``merge_paths`` and merge successfully within the same row's
+        processing, before any shutdown check could interleave. Reason 1
+        (rule 6) alone makes the config unbuildable and is sufficient by
+        itself to justify collapsing both superseded tests into this one
+        pin; reason 2 is a supporting argument for the single-worker case.
 
-        with pytest.raises(GracefulShutdownError) as exc_info:
-            orchestrator.run(
-                config,
-                graph=graph,
-                settings=settings,
-                payload_store=payload_store,
-                shutdown_event=initial_shutdown,
-            )
+        Of the two superseded tests' assertion arms — all four genuinely
+        still covered elsewhere, cited rather than re-proven, since
+        ``_abandon_undecided_tokens_in``'s undecided-token query
+        (run_lifecycle_repository.py, statements at :832-847) reads only
+        ``tokens``/``token_outcomes`` (a correlated ``EXISTS``), never
+        ``token_work_items``/``barrier_key``/``coalesce_name``, making the
+        sweep itself barrier-type-agnostic:
 
-        run_id = exc_info.value.run_id
-        assert run_id is not None
-        assert output_sink.results == []
+        * ABANDONED token outcomes with the right context —
+          ``tests/unit/core/landscape/test_run_finalization_abandonment.py::
+          TestAbandonmentSweepFires`` (:125-146).
+        * ``can_resume`` refusing — ``test_buffered_aggregation_shutdown_
+          persists_recovery_state`` above (:715-718, this same file) and
+          ``tests/integration/audit/test_contract_violation_token_outcomes.py::
+          test_aggregation_count_flush_violation_abandons_tokens_at_finalization``
+          (:321-324).
+        * ``get_unprocessed_rows`` raising "ABANDONED is non-resumable" —
+          ``get_unprocessed_rows`` (core/checkpoint/recovery.py:956) is a
+          thin wrapper over ``get_resume_workset`` (:776), whose raise
+          (:834) is pinned directly by
+          ``tests/unit/core/landscape/test_state_engine_read_model_truth_tables.py``
+          (:493).
+        * ``resume()`` raising ``IncompleteSourceResumeError`` for the
+          INTERRUPTED lifecycle arm specifically —
+          ``tests/integration/pipeline/test_eof_resume_proof.py`` (:528,
+          ``match=r"primary.*interrupted"``) and
+          ``tests/e2e/recovery/test_crash_and_resume.py`` (:622, :631, :640,
+          :665). (``test_contract_violation_token_outcomes.py:328`` pins
+          only the bare LOADING arm, with no match regex — not this arm.)
 
-        recovery = RecoveryManager(landscape_db, checkpoint_mgr)
-        assert recovery.get_unprocessed_rows(run_id) == []
+        **Restored, not dropped**: the dropped
+        ``test_buffered_only_resume_refuses_interrupted_source_before_pre_
+        set_shutdown`` also asserted that a *refused resume advances
+        nothing* — the checkpoint sequence number and the BLOCKED coalesce
+        rows identical before and after the refused ``orchestrator.resume()``
+        call. That invariant is not coalesce-specific: ``ResumeCoordinator.
+        resume()``'s ``IncompleteSourceResumeError`` guard
+        (engine/orchestrator/resume.py:729-733) reads only ``run_sources``
+        via ``check_source_lifecycle_resumable``
+        (core/checkpoint/recovery.py:212) — no reference to
+        ``token_work_items``/``barrier_key``/``coalesce_name`` anywhere in
+        that path, so the refusal fires identically regardless of barrier
+        type. It is restored as a real end-to-end run using the SAME legal,
+        unaffected-by-rule-6 vehicle as
+        ``test_buffered_aggregation_shutdown_persists_recovery_state``
+        above, in
+        ``test_buffered_aggregation_shutdown_refused_resume_advances_
+        nothing`` (same class, above this pin) — zero mocking-boundary
+        compromise, and no need to reconstruct the now-unbuildable
+        coalesce+aggregation shape to prove it.
+        """
+        shutdown_event = threading.Event()
+        with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region"):
+            _build_interruptible_coalesce_config(shutdown_event)
 
-        first_resume_point = recovery.get_resume_point(run_id, graph)
-        assert first_resume_point is not None
-        # F1: pending coalesce state lives in BLOCKED journal rows, not on the
-        # resume point — assert the durable pending-coalesce evidence directly.
+    def test_pending_coalesce_barrier_survives_finalization_and_its_token_is_abandoned(self) -> None:
+        """Engine-level rebuild (maintainer ruling 2026-08-23, WS2 controller Task 9).
+
+        Hand-builds the durable shape a real fork+coalesce leaves behind
+        when one branch ("direct_branch") arrives at a ``merge_paths``
+        barrier and the sibling ("agg_branch") never does, via the REAL
+        low-level scheduler repository API a live run's fork/barrier-hold
+        path uses (``TokenSchedulerRepository.enqueue_ready_claimed`` to
+        create the sibling's continuation already claimed with
+        ``barrier_key``/``coalesce_name``/``coalesce_node_id``/
+        ``lineage_path`` stamped, then ``.mark_blocked()`` to transition it
+        LEASED -> BLOCKED) instead of driving a live ``Orchestrator.run()``
+        with a mid-fork shutdown interrupt — which the pin test above shows
+        is now unbuildable for two independent reasons (rule 6, and this
+        engine's synchronous single-worker fork draining).
+
+        Then calls the REAL ``RunLifecycleRepository.finalize_run(...,
+        RunStatus.INTERRUPTED, token=...)`` — the same production
+        finalization entry point a live crash/shutdown reaches — against a
+        source registered as ``INTERRUPTED`` (non-resumable), and asserts:
+
+        1. the BLOCKED barrier row's fields match what a live fork+coalesce
+           would have stamped (barrier_key, coalesce_name, branch_name via
+           its lineage path, and a non-null fork_group_id);
+        2. that row is UNCHANGED by finalize (finalization never touches
+           ``token_work_items`` — the journal is left intact for a future
+           resume attempt to inspect, per ``complete_run``'s own docstring);
+        3. the barrier-blocked token itself still gets one ABANDONED
+           ``token_outcomes`` row, proving the barrier-type-blind sweep
+           (see the pin test's docstring) genuinely covers a coalesce-shaped
+           BLOCKED token, not just an aggregation-shaped one.
+        """
+        import json
+
         from sqlalchemy import select
 
-        from elspeth.core.landscape.schema import token_work_items_table
+        from elspeth.contracts import NodeType
+        from elspeth.contracts.checkpoint import CheckpointDraft
+        from elspeth.contracts.identity import FrameKind, LineageFrame, lineage_path_from_json, path_branch_name, path_fork_group_id
+        from elspeth.contracts.scheduler import TokenWorkStatus
+        from elspeth.core.checkpoint import CheckpointManager
+        from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+        from elspeth.core.landscape.schema import RunSourceLifecycleState, token_outcomes_table, token_work_items_table
+        from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
-        with landscape_db.connection() as conn:
-            blocked_coalesce_rows = (
+        run_id = "run-shutdown-coalesce"
+        leader_worker_id = f"worker:{run_id}:leader"
+        setup = make_recorder_with_run(
+            run_id=run_id, source_node_id="source-0", source_plugin_name="json", leader_worker_id=leader_worker_id
+        )
+        coalesce_node_id = register_test_node(
+            setup.factory.data_flow, run_id, "coalesce-merge_paths", node_type=NodeType.COALESCE, plugin_name="coalesce"
+        )
+
+        # A checkpoint exists (as it would under every_row checkpointing) —
+        # the arm this test pins is "incomplete_sources", not "no_checkpoint".
+        CheckpointManager(setup.db).create_checkpoint(
+            draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash="a" * 64),
+            coordination_token=setup.coordination_token,
+        )
+
+        # The source lifecycle is INTERRUPTED — mirroring a shutdown mid-load
+        # — making this run structurally non-resumable (ADR-038).
+        setup.factory.run_lifecycle.record_run_source(
+            source_node_id=setup.source_node_id,
+            source_name="primary",
+            plugin_name="json",
+            config_hash="c" * 64,
+            lifecycle_state=RunSourceLifecycleState.INTERRUPTED,
+            coordination_token=leader_coordination_token(setup.factory, run_id),
+        )
+
+        row, token = setup.factory.data_flow.create_row_with_token(
+            run_id, setup.source_node_id, 0, {"value": 10}, source_row_index=0, ingest_sequence=0
+        )
+
+        datetime.now(UTC)
+        scheduler = TokenSchedulerRepository(setup.db.engine)
+        payload_contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
+        payload_json = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"value": 10}, payload_contract))
+        work_item = scheduler.enqueue_ready_claimed(
+            run_id=run_id,
+            token_id=token.token_id,
+            row_id=row.row_id,
+            node_id=coalesce_node_id,
+            step_index=1,
+            ingest_sequence=0,
+            row_payload_json=payload_json,
+            lease_owner=leader_worker_id,
+            lease_seconds=60,
+            barrier_key="merge_paths",
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name="merge_paths",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-shutdown-1", member_key="direct_branch"),),
+        )
+        scheduler.mark_blocked(
+            work_item_id=work_item.work_item_id,
+            queue_key=None,
+            barrier_key="merge_paths",
+            expected_lease_owner=leader_worker_id,
+        )
+
+        def _blocked_barrier_row() -> Any:
+            # The WHOLE row, not a chosen subset of columns: "unchanged by
+            # finalize" must mean every column (lease_owner, attempt,
+            # barrier_blocked_at, updated_at, ...), not just the four this
+            # test happens to assert on below.
+            with setup.db.connection() as conn:
+                return (
+                    conn.execute(
+                        select(token_work_items_table).where(
+                            token_work_items_table.c.run_id == run_id,
+                            token_work_items_table.c.work_item_id == work_item.work_item_id,
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+
+        before = _blocked_barrier_row()
+        assert before["status"] == TokenWorkStatus.BLOCKED.value
+        assert before["barrier_key"] == "merge_paths"
+        assert before["coalesce_name"] == "merge_paths"
+        lineage = lineage_path_from_json(before["lineage_path_json"])
+        assert path_branch_name(lineage) == "direct_branch"
+        assert path_fork_group_id(lineage) is not None
+
+        setup.factory.run_lifecycle.finalize_run(
+            RunStatus.INTERRUPTED,
+            coordination_token=leader_coordination_token(setup.factory, run_id),
+        )
+
+        # (2) finalize never touches token_work_items — the journal row is
+        # untouched, byte-for-byte, left intact for a future resume attempt.
+        after = _blocked_barrier_row()
+        assert dict(after) == dict(before)
+
+        # (3) the barrier-blocked token itself still gets swept: the
+        # abandonment predicate is barrier-type-blind (tokens/token_outcomes
+        # only), so a coalesce-shaped BLOCKED token is covered exactly like
+        # an aggregation-shaped one.
+        with setup.db.connection() as conn:
+            abandoned = (
                 conn.execute(
-                    select(token_work_items_table.c.coalesce_name).where(
-                        token_work_items_table.c.run_id == run_id,
-                        token_work_items_table.c.status == "blocked",
-                        token_work_items_table.c.coalesce_name.is_not(None),
+                    select(token_outcomes_table.c.outcome, token_outcomes_table.c.completed, token_outcomes_table.c.context_json).where(
+                        token_outcomes_table.c.run_id == run_id,
+                        token_outcomes_table.c.token_id == token.token_id,
+                        token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
                     )
                 )
-                .scalars()
+                .mappings()
                 .all()
             )
-        assert blocked_coalesce_rows, "Expected pending coalesce branches as BLOCKED journal rows"
-
-        resume_shutdown = threading.Event()
-        resume_shutdown.set()
-        with pytest.raises(IncompleteSourceResumeError, match=r"source.*primary.*interrupted"):
-            orchestrator.resume(
-                resume_point=first_resume_point,
-                config=config,
-                graph=graph,
-                payload_store=payload_store,
-                settings=settings,
-                shutdown_event=resume_shutdown,
-            )
-
-        assert output_sink.results == []
-
-        second_resume_point = recovery.get_resume_point(run_id, graph)
-        assert second_resume_point is not None
-        assert second_resume_point.sequence_number == first_resume_point.sequence_number
-        # F1: the pending coalesce branches must still be BLOCKED journal rows
-        # after the refused resume (nothing consumed them).
-        with landscape_db.connection() as conn:
-            post_refusal_blocked = (
-                conn.execute(
-                    select(token_work_items_table.c.coalesce_name).where(
-                        token_work_items_table.c.run_id == run_id,
-                        token_work_items_table.c.status == "blocked",
-                        token_work_items_table.c.coalesce_name.is_not(None),
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        # Sorted compare: the two SELECTs carry no ORDER BY, so raw list
-        # equality is a latent row-order flake.
-        assert sorted(post_refusal_blocked) == sorted(blocked_coalesce_rows)
-        assert recovery.get_unprocessed_rows(run_id) == []
+        assert len(abandoned) == 1, f"expected exactly one ABANDONED outcome for the barrier-blocked token, got {abandoned!r}"
+        abandoned_row = abandoned[0]
+        assert abandoned_row["outcome"] is None
+        assert abandoned_row["completed"] == 0
+        context = json.loads(abandoned_row["context_json"])
+        assert context["abandoned_by"] == "run_finalization"
+        assert "incomplete_sources" in context["non_resumable_arms"]
 
     def _setup_failed_run(
         self,
@@ -1275,12 +1449,15 @@ class TestInterruptAndResume:
         from sqlalchemy import select
 
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import runs_table
         from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
         from elspeth.plugins.sources.null_source import NullSource
         from elspeth.plugins.transforms.passthrough import PassThrough
+        from elspeth.telemetry import TelemetryManager
+        from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
 
         run_id = "resume-no-shutdown-test"
         total_rows = 10
@@ -1317,18 +1494,24 @@ class TestInterruptAndResume:
             sinks={"default": as_sink(resume_sink)},
         )
 
+        telemetry_exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[telemetry_exporter])
         orchestrator = Orchestrator(
             db=landscape_db,
             checkpoint_manager=checkpoint_mgr,
             checkpoint_config=checkpoint_config,
+            telemetry_manager=telemetry_manager,
         )
 
-        result = orchestrator.resume(
-            resume_point=resume_point,
-            config=resume_config,
-            graph=graph,
-            payload_store=payload_store,
-        )
+        try:
+            result = orchestrator.resume(
+                resume_point=resume_point,
+                config=resume_config,
+                graph=graph,
+                payload_store=payload_store,
+            )
+        finally:
+            telemetry_manager.close()
 
         remaining_rows = total_rows - processed_count
         # F2 (resume-fork-reemit): the resume RunResult now reports CUMULATIVE
@@ -1343,6 +1526,15 @@ class TestInterruptAndResume:
 
         # Run is COMPLETED in database
         with landscape_db.engine.connect() as conn:
-            run = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
+            run = conn.execute(select(runs_table.c.status, runs_table.c.started_at).where(runs_table.c.run_id == run_id)).fetchone()
         assert run is not None
         assert run.status == RunStatus.COMPLETED
+
+        engine_spans = [event for event in telemetry_exporter.events if isinstance(event, EngineSpanCompleted)]
+        assert EngineSpanName.RUN not in {event.name for event in engine_spans}
+        assert EngineSpanName.SOURCE not in {event.name for event in engine_spans}
+        assert {EngineSpanName.ROW, EngineSpanName.TRANSFORM, EngineSpanName.SINK} <= {event.name for event in engine_spans}
+        durable_started_at = run.started_at.replace(tzinfo=UTC) if run.started_at.tzinfo is None else run.started_at
+        assert all(event.trace_started_at == durable_started_at for event in engine_spans)
+        row_span_ids = {event.span_id for event in engine_spans if event.name is EngineSpanName.ROW}
+        assert all(event.parent_span_id in row_span_ids for event in engine_spans if event.name is EngineSpanName.TRANSFORM)

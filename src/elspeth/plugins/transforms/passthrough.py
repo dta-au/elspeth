@@ -41,12 +41,29 @@ class PassThrough(BaseTransform):
     name = "passthrough"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:994456034738fd4d"
+    source_file_hash: str | None = "sha256:4465297d3b60b81e"
     config_model = PassThroughConfig
+    usage_when_to_use: str = (
+        "Use as an explicit wiring, schema, or debugging boundary when a pipeline stage should emit an unchanged copy of every input row."
+    )
+    usage_when_not_to_use: str = (
+        "Not for a business transformation, filtering, or enrichment: choose the plugin that performs "
+        "the required data change instead of adding an inert stage."
+    )
+    example_use: str = """transform:
+  plugin: passthrough
+  options:
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("wiring", "schema", "debugging")
 
     # ADR-007: PassThrough emits a deep copy of the input row unchanged, so every
     # input field is present on every emitted row. Canonical pass-through exemplar.
     passes_through_input = True
+    # elspeth-e6e552ce34: the deep copy also means no forwarded VALUE is ever
+    # rewritten — canonical value-preservation exemplar too.
+    preserves_input_values = True
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

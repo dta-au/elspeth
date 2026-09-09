@@ -29,15 +29,17 @@ import { useMemo } from "react";
 
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import {
-  resolveNodePlugin,
-  stepLabelForPlugin,
-} from "../interpretationStepLabel";
+import { stepLabelForNodeId } from "../interpretationStepLabel";
 import {
   formatFindingBody,
   humaniseValidationMessage,
   makePhraseFor,
 } from "@/lib/validationHumaniser";
+
+/** Validation codes whose backend suggestion points at the Secrets panel.
+ *  Both are raised by web/execution/_validation_authoring.py; they are the
+ *  only producers whose suggestion names that panel. */
+const SECRETS_PANEL_SUGGESTION_CODES = new Set(["missing_secret_ref", "fabricated_secret"]);
 
 export interface PipelineValidationSummaryProps {
   /** Tutorial surface flag: the tutorial has no Secrets panel, so a
@@ -71,15 +73,14 @@ export function PipelineValidationSummary({
     );
   }
 
-  // Step labels for the pending-review headline reuse the acknowledgement
-  // cards' mapping (stepLabelForPlugin → "Summarise" / "Output" …) so the
-  // problems strip names the step exactly as the card it points at. Null when
-  // the component id cannot be resolved — the humaniser then uses a generic
-  // phrase instead of echoing the internal id.
-  const stepLabelFor = (componentId: string): string | null => {
-    const plugin = resolveNodePlugin(compositionState, componentId);
-    return plugin === null ? null : stepLabelForPlugin(plugin);
-  };
+  // Step labels for the pending-review headline reuse the SAME resolver the
+  // acknowledgement cards use (stepLabelForNodeId — the node's own name when
+  // it has one, else the plugin verb: "Summarise" / "Output" / …) so the
+  // problems strip names the step exactly as the card it points at (R2-F8b).
+  // Null when the component id cannot be resolved — the humaniser then uses a
+  // generic phrase instead of echoing the internal id.
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
 
   const errors = validationResult.errors ?? [];
   const warnings = validationResult.warnings ?? [];
@@ -88,17 +89,27 @@ export function PipelineValidationSummary({
   let glyph: string;
   let body: string;
   let suggestion: string | null = null;
+  let suggestionCode: string | null = null;
   let rawDetail: string | null = null;
 
   if (errors.length > 0) {
     const first = errors[0];
     tone = "error";
-    glyph = "✕";
+    // U+2717 BALLOT X, not U+2715 MULTIPLICATION X (elspeth-8c1d49dcf0). The
+    // status-glyph vocabulary is documented in audit.css ("Row status accents
+    // are a 3px left-edge stripe whose colour reinforces the glyph (✓ ⚠ ✗ —).
+    // The glyph stays the primary status channel") and is rendered from that
+    // vocabulary by AuditReadinessPanel and SharedAuditReadinessPanel. This
+    // surface already agreed on ✓ and ⚠; the error mark was the one outlier,
+    // so the single status a user most needs to recognise instantly was drawn
+    // at a heavier, more geometric weight here than everywhere else.
+    glyph = "✗";
     const label = errors.length === 1 ? "problem to fix" : "problems to fix";
     const finding = humaniseValidationMessage(first.message, phraseFor, stepLabelFor);
     rawDetail = finding.raw;
     body = formatFindingBody(errors.length, label, finding, first.component_id, first.component_type, phraseFor);
     suggestion = first.suggestion;
+    suggestionCode = first.error_code ?? null;
   } else if (warnings.length > 0) {
     const first = warnings[0];
     tone = "warning";
@@ -108,6 +119,9 @@ export function PipelineValidationSummary({
     rawDetail = finding.raw;
     body = formatFindingBody(warnings.length, label, finding, first.component_id, first.component_type, phraseFor);
     suggestion = first.suggestion;
+    // No code on this branch: ValidationWarning carries no error_code, and
+    // both Secrets-panel producers raise ERRORS (missing_secret_ref,
+    // fabricated_secret), so a warning can never want the note.
   } else {
     tone = "ok";
     glyph = "✓";
@@ -119,8 +133,16 @@ export function PipelineValidationSummary({
   // Secrets panel, so say so rather than pointing at an affordance that
   // isn't on screen. The suggestion string itself is UI-safe by design
   // (execution/validation.py never echoes secret values into it).
+  //
+  // Keyed on the finding's CLOSED error_code, never on its prose (systems seat
+  // SYS-R3-4). Exactly two producers reach validationResult with a
+  // Secrets-panel suggestion — _validation_authoring.py's missing_secret_ref
+  // and fabricated_secret — and they are the same two codes the backend's own
+  // copy of this question was re-keyed onto; a rewording there used to drop
+  // the note silently and point a tutorial user at a panel that is not on
+  // screen.
   const suggestionNote =
-    isTutorial && suggestion !== null && /secrets panel/i.test(suggestion)
+    isTutorial && suggestion !== null && SECRETS_PANEL_SUGGESTION_CODES.has(suggestionCode ?? "")
       ? " (The Secrets panel is part of the full composer, outside this tutorial.)"
       : "";
 

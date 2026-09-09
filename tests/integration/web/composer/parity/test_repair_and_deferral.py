@@ -1,4 +1,4 @@
-"""Negative / behavioural parity cases for the capability-parity matrix (Plan 05 Task 3).
+"""Negative / behavioural parity cases for the capability-parity matrix.
 
 The positive matrix (``test_fixture_matrix.py``) proves that every ordinary
 authoring surface derives the *same committed graph* for a well-behaved planner.
@@ -12,9 +12,10 @@ cannot express as a committed graph:
   same committed graph the reference derives, carrying ``repair_count == 1``.
 * **repair exhaustion** — every terminal proposal stays malformed; the planner
   exhausts its repair budget (2) and raises ``REPAIR_EXHAUSTED``, which the
-  freeform ``/messages`` route (Task 0) translates into a deliberate ``502`` and
-  one durable, redacted ``planner_failure_disposition`` audit row — NOT a guided
-  lease terminalization.
+  freeform ``/messages`` route translates into the deliberate coded
+  ``planner_repair_exhausted`` 500 (elspeth-5904b1683a) and one durable,
+  redacted ``planner_failure_disposition`` audit row — NOT a guided lease
+  terminalization.
 * **policy rejection** — a first terminal names a policy-denied plugin
   (installed but absent from this operator's allowlist); candidate validation
   rejects it and the planner is handed the *allowlisted structured* candidate
@@ -56,6 +57,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import replace
 from typing import Any
 from uuid import uuid4
@@ -117,9 +119,9 @@ _UNAVAILABLE_SOURCE = "aws_s3"
 # --------------------------------------------------------------------------- #
 
 
-def _valid_pipeline(env: ParityEnv, fixture: dict[str, Any]) -> dict[str, Any]:
+def _valid_pipeline(env: ParityEnv, fixture: dict[str, Any], session_id: str) -> dict[str, Any]:
     """The fixture's canonical pipeline with source paths bound under the S2 allowlist."""
-    return rewrite_source_paths(fixture["canonical_arguments"], env.data_dir)
+    return rewrite_source_paths(fixture["canonical_arguments"], env.data_dir, session_id)
 
 
 def _malformed_missing_edges(pipeline: dict[str, Any]) -> dict[str, Any]:
@@ -157,6 +159,7 @@ async def _drive_freeform_scripted(
     env: ParityEnv,
     fixture: dict[str, Any],
     completion: _ScriptedCompletion,
+    session: Any,
 ) -> tuple[Any, Any]:
     """Run the real freeform ``compose`` empty-build path under ``completion``, then accept.
 
@@ -165,7 +168,6 @@ async def _drive_freeform_scripted(
     ``CompositionState`` and the accepted proposal record.
     """
     env.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
-    session = await env.sessions.create_session("alice", "Alice", "local")
     await env.sessions.update_composer_preferences(
         session.id,
         trust_mode="explicit_approve",
@@ -214,9 +216,22 @@ def _assert_allowlisted_feedback_shape(feedback: dict[str, Any], *, error_class:
     # "guidance" rides candidate-rejection feedback only (not the canonical
     # schema projection) and is a STATIC usage line — never per-request data —
     # so it does not widen the redaction boundary this allowlist protects.
-    assert {"success", "validation"} <= set(feedback) <= {"success", "validation", "guidance"}, feedback
+    # "truncation_notice" rides a rejection the candidate builder capped
+    # (elspeth-4fad98a453). Its only variable part is the integer count of
+    # defective components the builder did not list — a number ELSPETH
+    # derived from its own gates, never candidate content — so the closed
+    # equality below is what keeps it at zero egress.
+    assert {"success", "validation"} <= set(feedback) <= {"success", "validation", "guidance", "truncation_notice"}, feedback
     if "guidance" in feedback:
         assert feedback["guidance"] == ("To expand any code, call explain_validation_error with the exact code string.")
+    if "truncation_notice" in feedback:
+        withheld_count = re.fullmatch(
+            r"(\d+) further component\(s\) of this candidate also failed validation and are not listed here\. "
+            r"Repair every component named above and re-emit; the remaining failures are reported on the next turn\.",
+            feedback["truncation_notice"],
+        )
+        assert withheld_count is not None, feedback["truncation_notice"]
+        assert int(withheld_count.group(1)) > 0, feedback["truncation_notice"]
     assert feedback["success"] is False
     validation = feedback["validation"]
     assert set(validation) == {"is_valid", "errors"}, validation
@@ -232,11 +247,29 @@ def _assert_allowlisted_feedback_shape(feedback: dict[str, Any], *, error_class:
         # (producer/consumer component ids + schema FIELD NAMES from validated
         # config — pipeline metadata, never row content; see
         # SchemaContractDetail in composer.state). Nothing else may ride.
+        # A canonical-schema rejection may additionally carry
+        # "schema_violations": the JSON path of each structural violation, the
+        # violated keyword, and a scalar constraint from the schema the SAME
+        # provider was advertised — location and rule only, never the rejected
+        # value (elspeth-4fad98a453). Nothing else may ride.
         assert {"component", "severity", "error_code", "error_class"} <= set(entry), entry
-        assert set(entry) <= {"component", "severity", "error_code", "error_class", "explanation", "suggested_fix", "contract"}, entry
+        assert set(entry) <= {
+            "component",
+            "severity",
+            "error_code",
+            "error_class",
+            "explanation",
+            "suggested_fix",
+            "contract",
+            "schema_violations",
+            "schema_violations_withheld",
+        }, entry
         assert ("explanation" in entry) == ("suggested_fix" in entry), entry
         if "contract" in entry:
             assert set(entry["contract"]) <= {"producer", "consumer", "missing_fields", "extra_fields"}, entry
+        for violation in entry["schema_violations"] if "schema_violations" in entry else ():
+            assert {"path", "rule"} <= set(violation), violation
+            assert set(violation) <= {"path", "rule", "constraint", "detail"}, violation
         assert entry["error_class"] == error_class
     # No provider prose, plugin name, option value, or raw message may ride
     # the feedback. The static catalogue enrichment legitimately mentions the
@@ -257,13 +290,14 @@ def _assert_allowlisted_feedback_shape(feedback: dict[str, Any], *, error_class:
 async def test_freeform_one_repair_converges_to_reference_graph(parity_env: ParityEnv) -> None:
     """A malformed terminal, then a valid one: converges with repair_count == 1."""
     reference = parity_env.reference_state(_LINEAR)
-    valid = _valid_pipeline(parity_env, _LINEAR)
+    session = await parity_env.sessions.create_session("alice", "Alice", "local")
+    valid = _valid_pipeline(parity_env, _LINEAR, str(session.id))
     completion = _ScriptedCompletion(
         emit_proposal_response(_malformed_missing_edges(valid)),
         emit_proposal_response(valid),
     )
 
-    committed, proposal = await _drive_freeform_scripted(parity_env, _LINEAR, completion)
+    committed, proposal = await _drive_freeform_scripted(parity_env, _LINEAR, completion, session)
 
     assert_isomorphic(committed, reference, left="freeform-one-repair:linear_transform", right="reference")
     assert proposal.pipeline_metadata.repair_count == 1
@@ -274,36 +308,35 @@ async def test_freeform_one_repair_converges_to_reference_graph(parity_env: Pari
 
 @pytest.mark.asyncio
 async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(parity_env: ParityEnv) -> None:
-    """Every terminal malformed: REPAIR_EXHAUSTED → 502 + one closed disposition row."""
-    valid = _valid_pipeline(parity_env, _LINEAR)
-    malformed = emit_proposal_response(_malformed_missing_edges(valid))
-    # Budget is 2 (parity settings inherit the WebSettings default); the third
-    # malformed terminal makes repair_count == 3 > 2, which now engages the
-    # escape-hatch overtime turn on the advisor model. A fourth malformed
-    # terminal spends the hatch, so the original REPAIR_EXHAUSTED stands.
-    completion = _ScriptedCompletion(malformed, malformed, malformed, malformed)
-    parity_env.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
-
+    """Every terminal malformed: REPAIR_EXHAUSTED → planner_repair_exhausted 500 + one closed disposition row."""
     async with parity_env._client() as client:
         created = await client.post("/api/sessions", json={"title": "freeform repair exhaustion"})
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
+        valid = _valid_pipeline(parity_env, _LINEAR, session_id)
+        malformed = emit_proposal_response(_malformed_missing_edges(valid))
+        # Budget is 2 (parity settings inherit the WebSettings default); the third
+        # malformed terminal makes repair_count == 3 > 2, which now engages the
+        # escape-hatch overtime turn on the advisor model. A fourth malformed
+        # terminal spends the hatch, so the original REPAIR_EXHAUSTED stands.
+        completion = _ScriptedCompletion(malformed, malformed, malformed, malformed)
+        parity_env.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
         response = await client.post(f"/api/sessions/{session_id}/messages", json={"content": _LINEAR["intent"]})
 
-    assert response.status_code == 502, response.text
+    assert response.status_code == 500, response.text
     detail = response.json()["detail"]
     assert detail["error_type"] == "composer_planner_failure"
-    assert detail["failure_code"] == "invalid_provider_response"
+    assert detail["failure_code"] == "planner_repair_exhausted"
     assert len(completion.requests) == 4, "repair_budget + 1 primary calls, then the spent escape-hatch turn"
     assert completion.requests[3]["model"] != completion.requests[0]["model"], "overtime turn runs on the advisor model"
 
     rows = _disposition_rows(parity_env.app.state.session_engine)
     assert len(rows) == 1, "exactly one durable closed failure-disposition audit row"
     envelope = rows[0].tool_calls[0]
-    assert envelope["failure_code"] == "invalid_provider_response"
+    assert envelope["failure_code"] == "planner_repair_exhausted"
     assert envelope["surface"] == "freeform"
     # The disposition names the wall: the last rejection's closed validation
-    # codes, so a live 502 is diagnosable from the DB alone.
+    # codes, so a live exhaustion 500 is diagnosable from the DB alone.
     assert envelope["rejection_codes"], "exhaustion disposition must carry the last rejection codes"
 
 
@@ -311,13 +344,14 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
 async def test_freeform_policy_denied_candidate_is_rejected_with_allowlisted_shape(parity_env: ParityEnv) -> None:
     """A policy-denied plugin is rejected with the allowlisted candidate feedback, then repaired."""
     reference = parity_env.reference_state(_LINEAR)
-    valid = _valid_pipeline(parity_env, _LINEAR)
+    session = await parity_env.sessions.create_session("alice", "Alice", "local")
+    valid = _valid_pipeline(parity_env, _LINEAR, str(session.id))
     completion = _ScriptedCompletion(
         emit_proposal_response(_policy_denied_variant(valid)),
         emit_proposal_response(valid),
     )
 
-    committed, proposal = await _drive_freeform_scripted(parity_env, _LINEAR, completion)
+    committed, proposal = await _drive_freeform_scripted(parity_env, _LINEAR, completion, session)
 
     assert_isomorphic(committed, reference, left="freeform-policy-rejection:linear_transform", right="reference")
     assert proposal.pipeline_metadata.repair_count == 1
@@ -387,10 +421,14 @@ async def test_tutorial_reaches_same_commit_as_staged_with_its_fixed_lesson(pari
     # Same commit as staged: the positive matrix proves live-staged ≅ reference for
     # this fixture, so tutorial ≅ reference proves tutorial ≅ staged transitively.
     assert_isomorphic(committed, reference, left="tutorial:linear_transform", right="reference")
-    # Its fixed lesson: the sole planner call ran on the tutorial surface/profile.
-    assert len(manifests) == 1, "guided-staged makes exactly one planner call (finish outputs)"
-    assert manifests[0].surface.value == "tutorial_profile"
-    assert manifests[0].profile == "tutorial"
+    # Its fixed lesson, in ONE provider-planned run: goal-first
+    # (elspeth-378cfa0e18) means the tutorial states its goal at start, so the
+    # step-2 finish plans the lesson graph directly. The second run this used
+    # to need — a synthetic prose revision buying the lesson after a
+    # pass-through entry — was choreography no learner performs.
+    assert len(manifests) == 1, "the tutorial walk plans exactly once, at the step-2 finish"
+    assert all(manifest.surface.value == "tutorial_profile" for manifest in manifests)
+    assert all(manifest.profile == "tutorial" for manifest in manifests)
 
 
 # --------------------------------------------------------------------------- #
@@ -527,7 +565,7 @@ def test_guided_completed_stage_edit_preserves_stable_id_and_rewinds_proposal(
         session_id,
         operation_id=str(uuid4()),
         turn_token=reviewed.json()["next_turn"]["turn_token"],
-        message="Revise the passed output instruction.",
+        message=f"Edit exact intent {retained.intent_id}: require two JSON outputs.",
     )
 
     assert edited.status_code == 200, edited.json()

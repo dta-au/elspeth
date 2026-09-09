@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from elspeth.contracts.probes import CollectionProbe
 from elspeth.core.dependency_config import CollectionProbeConfig
+from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.probe_factory import ChromaCollectionProbe, build_collection_probes
 
 
@@ -171,17 +172,36 @@ class TestChromaCollectionProbeBehavior:
         assert result.reachable is False
         assert "OSError" in result.message
 
-    def test_client_mode_uses_http_client(self) -> None:
-        """Client mode should use HttpClient instead of PersistentClient."""
-        probe = ChromaCollectionProbe("remote", {"mode": "client", "host": "localhost", "port": 8000, "ssl": True})
-
+    def test_client_mode_passes_validated_ip_not_original_hostname_to_sdk(self) -> None:
+        """Client mode must pin the validated address before calling the SDK."""
+        safe_target = SSRFSafeRequest(
+            original_url="http://localhost:8000/",
+            resolved_ip="127.0.0.1",
+            host_header="localhost:8000",
+            port=8000,
+            path="/",
+            scheme="http",
+            bare_hostname="localhost",
+        )
         fake_collection = _FakeChromaCollection(document_count=5)
         fake_client = _FakeChromaClient(collection=fake_collection)
 
-        with patch("chromadb.HttpClient", autospec=True, return_value=fake_client) as mock_http_cls:
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=safe_target,
+            ),
+            patch("chromadb.HttpClient", autospec=True, return_value=fake_client) as mock_http_cls,
+        ):
+            probe = ChromaCollectionProbe("remote", {"mode": "client", "host": "localhost", "port": 8000, "ssl": False})
             result = probe.probe()
 
-        mock_http_cls.assert_called_once_with(host="localhost", port=8000, ssl=True)
+        mock_http_cls.assert_called_once_with(
+            host="127.0.0.1",
+            port=8000,
+            ssl=False,
+            headers={"Host": "localhost:8000"},
+        )
         assert result.reachable is True
         assert result.count == 5
 

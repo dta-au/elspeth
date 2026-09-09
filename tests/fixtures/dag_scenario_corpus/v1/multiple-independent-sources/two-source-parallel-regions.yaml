@@ -1,0 +1,54 @@
+sources:
+  orders:
+    plugin: csv
+    on_success: orders_fork_input
+    options:
+      path: ${input_orders}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+  refunds:
+    plugin: csv
+    on_success: refunds_fork_input
+    options:
+      path: ${input_refunds}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+concurrency:
+  max_workers: 1
+gates:
+  - name: orders_fork
+    input: orders_fork_input
+    condition: "True"
+    routes: {"true": fork, "false": fork}
+    fork_to: [orders_a, orders_b]
+  - name: refunds_fork
+    input: refunds_fork_input
+    condition: "True"
+    routes: {"true": fork, "false": fork}
+    fork_to: [refunds_a, refunds_b]
+coalesce:
+  - name: merge_orders
+    branches: {orders_a: orders_a, orders_b: orders_b}
+    policy: require_all
+    merge: nested
+    on_success: orders_output
+  - name: merge_refunds
+    branches: {refunds_a: refunds_a, refunds_b: refunds_b}
+    policy: require_all
+    merge: nested
+    on_success: refunds_output
+sinks:
+  orders_output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_orders_output}
+      format: jsonl
+      schema: {mode: observed}
+  refunds_output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_refunds_output}
+      format: jsonl
+      schema: {mode: observed}

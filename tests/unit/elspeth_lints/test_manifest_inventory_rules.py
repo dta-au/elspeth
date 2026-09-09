@@ -6,6 +6,8 @@ import ast
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from elspeth_lints.core.protocols import RuleContext
 from elspeth_lints.rules.manifest.symbol_inventory import RULE as SYMBOL_INVENTORY_RULE
 from elspeth_lints.rules.manifest.symbol_inventory.rule import FindingKind as SymbolFindingKind
@@ -147,6 +149,138 @@ def test_test_to_source_mapping_ignores_migrated_assertions_and_unrelated_string
             assert note
             return payload, migrated_sql
         """,
+    )
+
+    assert scan_test_file(source, tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("SELECT outcome FROM {table} WHERE token_id = :token_id", id="select-from"),
+        pytest.param("SELECT t.id, o.outcome FROM tokens t JOIN {table} o ON o.token_id = t.id", id="join"),
+        pytest.param("INSERT INTO {table} (token_id, outcome) VALUES (:token_id, 'completed')", id="insert-into"),
+        pytest.param("UPDATE {table} SET outcome = 'failed' WHERE token_id = :token_id", id="update"),
+        pytest.param("DELETE FROM {table} WHERE outcome IS NULL", id="delete-from"),
+        pytest.param("SELECT count(*) FROM main.{table} WHERE outcome = 'completed'", id="schema-qualified"),
+        pytest.param("SELECT is_terminal, path FROM {table}", id="is-terminal-survives-path-axis"),
+        pytest.param("CREATE TABLE {table} (outcome TEXT)", id="create-table"),
+        pytest.param("ALTER TABLE {table} ADD COLUMN outcome TEXT", id="alter-table"),
+        pytest.param("REPLACE INTO {table} (outcome) VALUES ('completed')", id="replace-into"),
+        pytest.param("EXPLAIN SELECT outcome FROM {table}", id="explain-select"),
+        pytest.param("WITH recent AS (SELECT outcome FROM {table}) SELECT * FROM recent", id="with-select"),
+        pytest.param("WITH recent(outcome) AS (SELECT outcome FROM {table}) SELECT * FROM recent", id="with-columns"),
+        pytest.param('WITH "recent" AS (SELECT outcome FROM {table}) SELECT * FROM recent', id="with-quoted-name"),
+        pytest.param("EXPLAIN WITH recent AS (SELECT outcome FROM {table}) SELECT * FROM recent", id="explain-with"),
+        pytest.param("-- compatibility query\nSELECT outcome FROM {table}", id="line-comment-prefix"),
+        pytest.param("/* compatibility query */ SELECT outcome FROM {table}", id="block-comment-prefix"),
+        pytest.param('SELECT outcome FROM "{table}"', id="double-quoted-table"),
+        pytest.param("SELECT outcome FROM `{table}`", id="backtick-quoted-table"),
+        pytest.param("SELECT outcome FROM [{table}]", id="bracket-quoted-table"),
+        pytest.param('SELECT outcome FROM "main"."{table}"', id="quoted-schema-table"),
+        pytest.param("SELECT outcome FROM {table}, tokens", id="comma-join"),
+        pytest.param("INSERT OR REPLACE INTO {table} (outcome) VALUES ('completed')", id="sqlite-insert-or-replace"),
+        pytest.param("WITH one(x) AS (VALUES (1)) SELECT outcome FROM {table}", id="values-cte-outer-select"),
+        pytest.param(
+            "WITH one(x) AS (VALUES (1)), two(y) AS (VALUES (2)) SELECT outcome FROM {table}",
+            id="multiple-values-ctes-outer-select",
+        ),
+        pytest.param(
+            "WITH one(x) AS (VALUES (1)), two AS (SELECT outcome FROM {table}) SELECT * FROM two",
+            id="target-in-second-cte",
+        ),
+    ],
+)
+def test_raw_token_outcomes_sql_still_fires_on_genuine_statements(tmp_path: Path, statement: str) -> None:
+    """A hand-written SQL statement against the outcomes table stays caught.
+
+    The table name is assembled by concatenation so this fixture cannot itself
+    become a finding when the rule scans the real ``tests/`` tree.
+    """
+    token_table = "token_" + "outcomes"
+    source = _write(
+        tmp_path / "tests/unit/test_raw_sql.py",
+        f"""
+        def test_raw_sql(conn):
+            return conn.execute({statement.format(table=token_table)!r})
+        """,
+    )
+
+    kinds = {finding.kind for finding in scan_test_file(source, tmp_path)}
+
+    assert MappingFindingKind.RAW_TOKEN_OUTCOMES_SQL in kinds
+
+
+def test_prose_naming_the_outcomes_table_is_not_raw_sql(tmp_path: Path) -> None:
+    """A module docstring is English, not SQL (false-positive shape).
+
+    ``where``/``from``/``update`` are ordinary English words; co-presence with
+    the table name somewhere else in the same string is not a SQL statement.
+    """
+    token_table = "token_" + "outcomes"
+    source = _write(
+        tmp_path / "tests/unit/test_prose.py",
+        f'''
+        """A FAILED finalize must record an outcome for every token.
+
+        The end-to-end shape lives in ``test_contract_violation_{token_table}.py``,
+        where undecided tokens honestly stay pending for a future resume; these
+        tests pin the repository seam arm by arm.
+        """
+
+
+        def test_prose():
+            """The outcome discriminator is retired from {token_table}; the roster moved elsewhere."""
+            message = "The outcome discriminator is retired from {token_table}; the roster moved elsewhere"
+            return message
+        ''',
+    )
+
+    assert scan_test_file(source, tmp_path) == []
+
+
+def test_data_blob_of_test_names_is_not_raw_sql(tmp_path: Path) -> None:
+    """An assigned inventory blob is data, not SQL (false-positive shape).
+
+    A quoted attribute name such as ``'delete'`` hundreds of characters away
+    from a module path containing the table name must not read as a statement.
+    """
+    token_table = "token_" + "outcomes"
+    source = _write(
+        tmp_path / "tests/unit/test_blob.py",
+        f'''
+        REVIEWED = """
+        tests/unit/core/test_payload_store.py::hasattr(PayloadStore, 'delete')
+        tests/unit/core/landscape/test_journal.py::hasattr(Journal, '_parse_insert_statement')
+        tests/unit/core/test_{token_table}.py::hasattr(TokenOutcome, '__dataclass_fields__')
+        tests/unit/web/composer/test_carriers.py::not hasattr(outcome, 'assistant_message')
+        """
+
+
+        def test_blob():
+            return REVIEWED
+        ''',
+    )
+
+    assert scan_test_file(source, tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Update {table} outcome migration guidance in this document.",
+        "UPDATE {table} SET outcome expectations for this test.",
+        "Select outcome from {table} when explaining the retired schema.",
+        "WITH note AS (SELECT ') SELECT outcome FROM {table}; migration prose' AS note) SELECT 1",
+        "WITH one AS (SELECT 1 /* ) SELECT outcome FROM {table}; migration prose */) SELECT 1",
+    ],
+)
+def test_sql_like_imperative_prose_is_not_raw_sql(tmp_path: Path, message: str) -> None:
+    """Leading SQL-like verbs are insufficient without statement grammar."""
+    token_table = "token_" + "outcomes"
+    source = _write(
+        tmp_path / "tests/unit/test_imperative_prose.py",
+        f"MESSAGE = {message.format(table=token_table)!r}\n",
     )
 
     assert scan_test_file(source, tmp_path) == []

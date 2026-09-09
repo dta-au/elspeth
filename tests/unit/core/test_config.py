@@ -1,10 +1,13 @@
 # tests/core/test_config.py
 """Tests for configuration schema and loading."""
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import UnionType
+from typing import Any, Union, cast, get_args, get_origin
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 
 def _complete_audit_export_config(**overrides: object) -> dict[str, object]:
@@ -162,7 +165,7 @@ class TestLoadSettings:
     """Test Dynaconf-based settings loading."""
 
     def test_load_from_yaml_file(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -188,7 +191,7 @@ retry:
         assert settings.retry.max_attempts == 5
 
     def test_load_with_env_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -222,7 +225,7 @@ sinks:
         If _lowercase_schema_keys doesn't lowercase PLUGIN, Pydantic sees an unknown
         field and reports 'plugin' as missing.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -249,7 +252,7 @@ sinks:
         env vars (not merged with YAML), Dynaconf produces uppercase keys
         that must be lowercased for Pydantic validation.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -270,7 +273,7 @@ sources:
     def test_load_settings_rejects_report_assemble_title_placeholder_before_env_expansion(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("REPORT_SECRET", "expanded-host-secret")
         config_file = tmp_path / "settings.yaml"
@@ -306,7 +309,7 @@ sinks:
     def test_load_settings_from_yaml_string_rejects_report_assemble_join_with_placeholder_before_env_expansion(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("REPORT_JOINER", "expanded-host-secret")
 
@@ -345,7 +348,7 @@ sinks:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Environment overrides under options.schema must reach runtime schema config."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -372,7 +375,7 @@ sinks:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Environment overrides for options.schema fields must override YAML schema fields."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -403,7 +406,7 @@ sinks:
         assert "SCHEMA" not in settings.sources["primary"].options
 
     def test_load_validates_schema(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -423,7 +426,7 @@ concurrency:
             load_settings(config_file)
 
     def test_load_missing_required_field(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -435,7 +438,7 @@ retry:
             load_settings(config_file)
 
     def test_load_missing_file_raises_file_not_found(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         missing_file = tmp_path / "nonexistent.yaml"
         with pytest.raises(FileNotFoundError, match="Config file not found"):
@@ -703,7 +706,7 @@ class TestLoadSettingsArchitecture:
 
     def test_load_readme_example(self, tmp_path: Path) -> None:
         """Load config with config-driven gates."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -753,7 +756,7 @@ landscape:
 
     def test_load_minimal_config(self, tmp_path: Path) -> None:
         """Minimal valid configuration."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -778,7 +781,7 @@ sinks:
 
     def test_load_default_sink_in_yaml_rejected(self, tmp_path: Path) -> None:
         """default_sink in YAML is rejected as unknown key."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1176,7 +1179,38 @@ class TestGateSettings:
         assert gate.name == "quality_check"
         assert gate.condition == "row['confidence'] >= 0.85"
         assert gate.routes == {"true": "quality_ok", "false": "review_sink"}
+        assert gate.on_error is None
+        assert "on_error" not in gate.model_dump(mode="json")
         assert gate.fork_to is None
+
+    @pytest.mark.parametrize("on_error", ["discard", "gate_errors", "gate-errors"])
+    def test_gate_settings_accepts_row_error_policy(self, on_error: str) -> None:
+        """A gate may divert row-level expression failures or discard them."""
+        from elspeth.core.config import GateSettings
+
+        gate = GateSettings(
+            name="quality_check",
+            input="source_out",
+            condition="row['confidence'] >= 0.85",
+            routes={"true": "quality_ok", "false": "review_sink"},
+            on_error=f" {on_error} ",
+        )
+
+        assert gate.on_error == on_error
+        assert gate.model_dump(mode="json")["on_error"] == on_error
+
+    def test_gate_settings_rejects_blank_row_error_policy(self) -> None:
+        """A present policy must identify a sink or the discard sentinel."""
+        from elspeth.core.config import GateSettings
+
+        with pytest.raises(ValidationError, match="on_error must be"):
+            GateSettings(
+                name="quality_check",
+                input="source_out",
+                condition="row['confidence'] >= 0.85",
+                routes={"true": "quality_ok", "false": "review_sink"},
+                on_error="  ",
+            )
 
     def test_gate_settings_with_fork(self) -> None:
         """GateSettings with fork_to for parallel paths."""
@@ -1374,6 +1408,29 @@ class TestGateSettings:
                 fork_to=["path_a", "path_b"],  # No fork route
             )
         assert "fork_to is only valid" in str(exc_info.value)
+
+    def test_gate_settings_empty_fork_to_list_is_rejected_at_settings(self) -> None:
+        """``fork_to: []`` must be a settings rejection, not a builder crash.
+
+        elspeth-2ed41f0a4a census (2026-08-17). ``validate_fork_to_labels``
+        looped zero times over an empty list and ``validate_fork_consistency``
+        only fires when a ``fork`` route is present, so ``fork_to: []`` with
+        ordinary routes reached ``build_execution_graph``, where
+        ``_GateEntry.__post_init__`` raised a bare ``ValueError`` — which the
+        composer's graph phase does not catch, so the composer preflight
+        surfaced a 500 instead of a structured verdict.
+        """
+        from elspeth.core.config import GateSettings
+
+        with pytest.raises(ValidationError) as exc_info:
+            GateSettings(
+                name="bad_gate",
+                input="source_out",
+                condition="row['x'] > 0",
+                routes={"true": "next_step", "false": "discard"},
+                fork_to=[],
+            )
+        assert "fork_to must not be an empty list" in str(exc_info.value)
 
     def test_gate_settings_fork_to_max_length_enforced(self) -> None:
         """fork_to list is capped to prevent pathological branch explosions."""
@@ -1680,7 +1737,7 @@ class TestLoadSettingsWithGates:
 
     def test_load_settings_with_gates(self, tmp_path: Path) -> None:
         """Load YAML with gates section."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1716,7 +1773,7 @@ gates:
 
     def test_load_settings_with_fork_gate(self, tmp_path: Path) -> None:
         """Load YAML with fork gate."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1757,7 +1814,7 @@ gates:
         gate route labels, causing routing failures when gate conditions returned
         mixed-case strings like "High" but routes had been lowercased to "high".
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1800,7 +1857,7 @@ gates:
 
     def test_load_settings_preserves_schema_route_label(self, tmp_path: Path) -> None:
         """Route labels named SCHEMA are user data, not plugin schema options."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -2035,6 +2092,37 @@ class TestCoalesceSettings:
                 timeout_seconds=-1.0,
             )
 
+    def test_coalesce_settings_timeout_infinite_rejected(self) -> None:
+        """Infinite timeout values should be rejected.
+
+        `gt=0` lets `inf` through, and CoalesceExecutor.check_timeouts compares
+        `elapsed > timeout_seconds` — so an infinite timeout silently disables
+        the whole timeout sweep instead of bounding the wait.
+        """
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError, match="finite"):
+            CoalesceSettings(
+                name="test",
+                branches=["branch_a", "branch_b"],
+                policy="best_effort",
+                merge="union",
+                timeout_seconds=float("inf"),
+            )
+
+    def test_coalesce_settings_nan_timeout_rejected(self) -> None:
+        """NaN timeout values should be rejected."""
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError):
+            CoalesceSettings(
+                name="test",
+                branches=["branch_a", "branch_b"],
+                policy="best_effort",
+                merge="union",
+                timeout_seconds=float("nan"),
+            )
+
     def test_coalesce_settings_quorum_count_negative_rejected(self) -> None:
         """Negative quorum count should be rejected."""
         from elspeth.core.config import CoalesceSettings
@@ -2140,6 +2228,39 @@ class TestCoalesceSettings:
             merge="union",
         )
         assert settings.branches == {"path_a": "path_a", "path_b": "path_b"}
+
+    def test_coalesce_branches_dict_rejects_keys_that_collide_after_trim(self) -> None:
+        """Branch keys that collapse into one after trimming must be rejected.
+
+        min_length=2 is checked on the raw dict, so untrimmed keys could
+        silently shrink a 2-branch coalesce to 1 — the join contract changes
+        meaning (require_all over one branch) with no diagnostic.
+        """
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError, match="collide"):
+            CoalesceSettings(
+                name="merge",
+                branches={"path_a": "x", " path_a": "y"},
+                policy="require_all",
+                merge="union",
+            )
+
+    def test_coalesce_branches_list_rejects_entries_that_collide_after_trim(self) -> None:
+        """List entries differing only by whitespace must be rejected too.
+
+        The raw strings differ, so normalize_branches' duplicate check passes
+        and min_length=2 is satisfied — the collapse only happens at trim time.
+        """
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError, match="collide"):
+            CoalesceSettings(
+                name="merge",
+                branches=["path_a", " path_a"],
+                policy="require_all",
+                merge="union",
+            )
 
     def test_coalesce_branches_dict_validates_values(self) -> None:
         """Invalid connection names in dict values should be rejected.
@@ -2373,7 +2494,7 @@ class TestSecretFieldFingerprinting:
 
     def test_api_key_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """API keys in config should be preserved for runtime use."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2403,7 +2524,8 @@ sinks:
 
     def test_api_key_is_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """API keys should be fingerprinted when creating audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2438,7 +2560,8 @@ sinks:
 
     def test_named_source_api_keys_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every named source should fingerprint secret options in the audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2478,7 +2601,7 @@ sinks:
 
     def test_token_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Token fields should be preserved for runtime use."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2504,7 +2627,8 @@ sinks:
 
     def test_token_is_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Token fields should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2531,7 +2655,7 @@ sinks:
 
     def test_secret_suffix_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fields ending in _secret should be preserved for runtime."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2557,7 +2681,8 @@ sinks:
 
     def test_secret_suffix_is_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fields ending in _secret should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2584,7 +2709,7 @@ sinks:
 
     def test_sink_options_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in sink options should be preserved for runtime."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2610,7 +2735,8 @@ sinks:
 
     def test_sink_options_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in sink options should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2637,7 +2763,7 @@ sinks:
 
     def test_non_secret_fields_preserved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Non-secret fields should remain unchanged."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2671,7 +2797,7 @@ sinks:
         Regression test: _lowercase_schema_keys must not apply sink name
         handling to user data that happens to contain a 'sinks' key.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -2700,7 +2826,7 @@ sinks:
 
     def test_row_plugin_options_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in row_plugins options should be preserved for runtime."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2736,7 +2862,8 @@ transforms:
 
     def test_row_plugin_options_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in row_plugins options should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2772,7 +2899,8 @@ transforms:
 
     def test_telemetry_exporter_options_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Telemetry exporter secrets should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2943,7 +3071,7 @@ telemetry:
         fingerprint key is only required when calling resolve_config()
         to create the audit copy.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
@@ -2969,11 +3097,8 @@ sinks:
 
     def test_missing_key_raises_error_on_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """resolve_config should raise SecretFingerprintError when key missing."""
-        from elspeth.core.config import (
-            SecretFingerprintError,
-            load_settings,
-            resolve_config,
-        )
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import SecretFingerprintError, resolve_config
 
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
@@ -3017,7 +3142,7 @@ sinks:
 
     def test_dev_mode_allows_load_settings(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """ELSPETH_ALLOW_RAW_SECRETS=true should allow load and keep secrets as-is."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "true")
@@ -3445,6 +3570,692 @@ sinks:
         assert fingerprint is not None
 
 
+class TestAuditRedactionSectionCoverage:
+    """Reflection pin: EVERY free-form mapping in the settings tree is redacted.
+
+    A hand-listed test reproduces the exact defect it is meant to catch the
+    next time a section is added. That is not hypothetical: ``collectors``
+    was added to ``ElspethSettings`` and nothing told
+    ``_fingerprint_config_for_audit`` about it, so collector plugin options
+    reached the durable audit record in cleartext (elspeth-bc1b2c2959).
+
+    So the set is DISCOVERED from ``ElspethSettings.model_fields`` rather than
+    written down, and the assertion is BEHAVIOURAL: a sentinel secret is
+    planted under each discovered mapping and must not survive the redactor.
+    An inventory assertion — "the discovered set equals this literal set" —
+    would have passed with the defect present, because it checks the section
+    list rather than the redaction.
+
+    DISCOVERY IS BY TYPE, NOT BY NAME. This pin originally keyed on
+    ``"options" in element_model.model_fields``, which quietly encoded a second
+    hand-maintained fact: that free-form plugin config is always *called*
+    ``options``. That was true when written and already false —
+    ``collection_probes[*].provider_config`` is the same arbitrary
+    secret-bearing mapping under a different name, so the pin could not see the
+    field it most needed to (elspeth-fb8492c07b). The predicate now tests the
+    ANNOTATION (``dict[str, Any]`` / ``Mapping[str, Any]``), which no naming
+    convention can drift away from.
+
+    If a newly discovered mapping is genuinely not secret-bearing, record that
+    disposition here — do NOT narrow the predicate back toward a hand-shaped
+    scope, which is the defect this pin exists to prevent.
+
+    The walk is recursive because ``telemetry.exporters[*].options`` is not a
+    top-level section; a top-level-only walk would miss exactly the shape that
+    is missed next time.
+    """
+
+    # Not a credential: a marker string asserted absent from redactor output.
+    SENTINEL = "sentinel-value-must-not-survive-redaction"  # secret-scan: allow-this-line
+
+    # Depth cap: ElspethSettings nests three levels at most. The cap is a
+    # runaway guard for a future self-referential model, not a scoping choice.
+    MAX_DEPTH = 6
+
+    @staticmethod
+    def _classify(annotation: object) -> tuple[str, tuple[type[BaseModel], ...]]:
+        """Return the container shape and element models of one field annotation.
+
+        Shapes: ``"dict"`` (name -> entry), ``"list"`` (sequence of entries),
+        ``"single"`` (a nested model), ``""`` (carries no model).
+        Optionals are unwrapped; ``None`` is not a container.
+        """
+        candidates = [annotation]
+        if get_origin(annotation) in (Union, UnionType):
+            candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+
+        for candidate in candidates:
+            origin = get_origin(candidate)
+            args = get_args(candidate)
+            if origin is dict and len(args) == 2:
+                models = tuple(a for a in args[1:] if isinstance(a, type) and issubclass(a, BaseModel))
+                if models:
+                    return "dict", models
+            elif origin in (list, tuple, Sequence) and args:
+                models = tuple(a for a in args[:1] if isinstance(a, type) and issubclass(a, BaseModel))
+                if models:
+                    return "list", models
+            elif isinstance(candidate, type) and issubclass(candidate, BaseModel):
+                return "single", (candidate,)
+        return "", ()
+
+    @staticmethod
+    def _is_free_form_mapping(annotation: object) -> bool:
+        """Is this annotation an arbitrary-key config mapping?
+
+        ``dict[str, Any]`` and ``Mapping[str, Any]``, Optional-unwrapped. Both
+        forms are in use — plugin ``options`` is the former, ``provider_config``
+        the latter — and ``get_origin(Mapping[str, Any])`` is
+        ``collections.abc.Mapping``, not ``dict``. A predicate checking only
+        ``dict`` discovers the six fields that were already covered and misses
+        the one this pin was widened for, while every assertion still passes.
+
+        The value type must be ``Any``: a mapping with a concrete value type is
+        a declared structure, not free-form operator-supplied config.
+        """
+        candidates = [annotation]
+        if get_origin(annotation) in (Union, UnionType):
+            candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+
+        for candidate in candidates:
+            args = get_args(candidate)
+            if get_origin(candidate) in (dict, Mapping) and len(args) == 2 and args[0] is str and args[1] is Any:
+                return True
+        return False
+
+    @classmethod
+    def _free_form_mapping_paths(cls) -> list[tuple[tuple[str, str], ...]]:
+        """Discover every path in ElspethSettings reaching a free-form mapping.
+
+        Each path is a tuple of ``(field_name, container_shape)`` segments whose
+        LAST segment is the mapping field itself, shape ``"mapping"``, e.g.
+        ``(("transforms", "list"), ("options", "mapping"))`` or
+        ``(("collection_probes", "list"), ("provider_config", "mapping"))``.
+        Carrying the field name in the path is what lets this pin cover a
+        mapping that is not called ``options``.
+
+        Deduplication is on the PATH, not on the model class: if two sections
+        ever share an element model, dropping the second by class would
+        silently remove it from this pin's coverage.
+        """
+        from elspeth.core.config import ElspethSettings
+
+        found: list[tuple[tuple[str, str], ...]] = []
+        seen_paths: set[tuple[tuple[str, str], ...]] = set()
+
+        def walk(model: type[BaseModel], prefix: tuple[tuple[str, str], ...]) -> None:
+            if len(prefix) >= cls.MAX_DEPTH:
+                return
+            for name in model.model_fields:
+                annotation = model.model_fields[name].annotation
+                if cls._is_free_form_mapping(annotation):
+                    found.append((*prefix, (name, "mapping")))
+                shape, element_models = cls._classify(annotation)
+                if not element_models:
+                    continue
+                path = (*prefix, (name, shape))
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                for element_model in element_models:
+                    walk(element_model, path)
+
+        walk(ElspethSettings, ())
+        return found
+
+    @classmethod
+    def _plant(cls, path: tuple[tuple[str, str], ...]) -> dict[str, object]:
+        """Build the minimal config dict that puts SENTINEL under ``path``.
+
+        ``_fingerprint_config_for_audit`` takes a plain dict and reads it
+        structurally, so this deliberately does NOT construct real settings
+        models: doing so would drag in every required field and the
+        scopes/collectors cross-validator without making the pin stronger.
+        """
+        mapping_name, mapping_shape = path[-1]
+        assert mapping_shape == "mapping", f"path must end at the mapping field, got {path!r}"
+
+        payload: object = {mapping_name: {"api_key": cls.SENTINEL}}
+        for name, shape in reversed(path[:-1]):
+            if shape == "dict":
+                payload = {name: {"entry": payload}}
+            elif shape == "list":
+                payload = {name: [payload]}
+            else:
+                payload = {name: payload}
+        assert isinstance(payload, dict)
+        return payload
+
+    def test_walk_finds_the_known_free_form_mappings(self) -> None:
+        """Guard the probe itself: a broken walk must not report vacuous success.
+
+        This is the positive control. If the discovery walk silently returned
+        nothing — a changed annotation style, a pydantic upgrade — the
+        behavioural tests below would pass by testing nothing at all.
+
+        Asserted as EQUALITY, not containment. Containment cannot tell a
+        widened predicate from a broken one, and the whole point of moving off
+        the field name was to catch the mapping nobody thought to list. A new
+        entry here is a real event: adjudicate whether it is secret-bearing and
+        record the disposition in the class docstring.
+        """
+        paths = self._free_form_mapping_paths()
+        rendered = {".".join(name for name, _shape in path) for path in paths}
+
+        assert rendered == {
+            "sources.options",
+            "sinks.options",
+            "transforms.options",
+            "collectors.options",
+            "aggregations.options",
+            "telemetry.exporters.options",
+            "collection_probes.provider_config",
+        }, f"Free-form mappings in ElspethSettings changed; found {sorted(rendered)}"
+
+    def test_discovery_is_not_keyed_on_the_field_name_options(self) -> None:
+        """Mutation guard: the pin must still see a mapping that is not called ``options``.
+
+        Without this, someone restoring the name-keyed predicate gets a green
+        suite: the other tests iterate whatever the walk returns, so a walk that
+        silently stops returning ``provider_config`` simply stops testing it.
+        """
+        rendered = {".".join(name for name, _shape in path) for path in self._free_form_mapping_paths()}
+        not_named_options = {path for path in rendered if not path.endswith(".options")}
+
+        assert not_named_options, (
+            "Discovery found only fields named 'options'. The predicate has regressed to keying "
+            "on the field NAME, so a free-form mapping under any other name is invisible to this pin "
+            "(elspeth-fb8492c07b)."
+        )
+
+    def test_every_free_form_mapping_is_redacted_for_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No discovered mapping may carry a plaintext secret into the audit copy.
+
+        Fingerprint mode: the secret must be replaced by a fingerprint.
+        """
+        from elspeth.core.config import _fingerprint_config_for_audit
+
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
+
+        leaked = []
+        for path in self._free_form_mapping_paths():
+            result = _fingerprint_config_for_audit(self._plant(path))
+            if self.SENTINEL in repr(result):
+                leaked.append(".".join(name for name, _shape in path))
+
+        assert not leaked, (
+            f"Free-form mappings written to the audit record UNREDACTED: {sorted(leaked)}. "
+            f"Add each to _fingerprint_config_for_audit and to its docstring enumeration."
+        )
+
+    def test_every_free_form_mapping_fails_closed_without_a_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Absent a fingerprint key, a secret must abort rather than persist.
+
+        This is the asymmetry that made elspeth-bc1b2c2959 silent, and made
+        elspeth-fb8492c07b silent again a section later: a covered field
+        refuses to produce an audit copy at all, while the uncovered one
+        returns successfully with the secret intact. Nothing in the run
+        distinguishes "no secrets present" from "secrets present, not
+        redacted" — which is why coverage is asserted here rather than trusted.
+        """
+        from elspeth.contracts.security import SecretFingerprintError
+        from elspeth.core.config import _fingerprint_config_for_audit
+
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+
+        failed_open = []
+        for path in self._free_form_mapping_paths():
+            try:
+                _fingerprint_config_for_audit(self._plant(path))
+            except SecretFingerprintError:
+                continue
+            failed_open.append(".".join(name for name, _shape in path))
+
+        assert not failed_open, (
+            f"Mappings that FAIL OPEN on a secret with no fingerprint key: {sorted(failed_open)}. "
+            f"Every free-form mapping must reach _fingerprint_secrets."
+        )
+
+
+class TestEnvPlaceholderGuardIsDerived:
+    """The pre-expansion guard must enforce every plugin-side declaration.
+
+    ``_reject_sensitive_plugin_env_placeholders_before_expansion`` is the only
+    containment for an option whose VALUE is written into row data or artifact
+    bytes. The plugin's own validator cannot be that containment on the
+    CLI/YAML path: ``_expand_env_vars`` runs first, so the validator is handed a
+    clean expanded host value that no longer matches ``${...}``.
+
+    It used to hold a hand-maintained ``{plugin: {field, ...}}`` map with ONE
+    entry, making it a no-op for every other plugin — ``truncate.suffix`` and
+    ``csv.headers`` both reached artifact bytes through that gap, and
+    ``sources``/``sinks`` were not walked at all (elspeth-8f0a6b3391). The map
+    and the plugin-side validators agreed only by luck.
+
+    Both halves now derive from existing declarations: the sections from
+    ``ElspethSettings``; literal emitted values from ``EmittedToOutput``
+    markers on the plugin config models; and emitted row-key names from
+    ``BaseTransform.output_naming_config_keys``. These tests assert the
+    DERIVATION holds end to end — every declaration in the tree is enforced by
+    the loader — rather than checking a list of today's plugins, which is the
+    shape that reproduced the defect each time it was added to.
+    """
+
+    PLACEHOLDER = "${ELSPETH_TEST_HOST_VALUE}"
+
+    @staticmethod
+    def _registered_plugins() -> list[tuple[str, str, Any]]:
+        """Return ``(kind, name, plugin_class)`` for every registered plugin."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        return [
+            (kind, plugin_class.name, plugin_class)
+            for kind, plugin_classes in (
+                ("source", manager.get_sources()),
+                ("transform", manager.get_transforms()),
+                ("sink", manager.get_sinks()),
+            )
+            for plugin_class in plugin_classes
+        ]
+
+    def test_bare_get_config_model_never_raises_for_any_registered_plugin(self) -> None:
+        """Standing precondition of the union-across-registries lookup.
+
+        The guard has no plugin-name-to-kind lookup — the registries are three
+        disjoint maps and ``csv``, ``json``, ``aws_s3``, ``azure_blob``,
+        ``dataverse``, ``text`` and ``llm`` each name a plugin in more than one.
+        So it asks EVERY registry about a name, which means calling
+        ``get_config_model()`` on plugins that are not the one in use.
+
+        A plugin whose bare call raised would therefore break config load for a
+        section that has nothing to do with it. Nothing raises today; this pin
+        keeps that a property rather than a coincidence, because the plugin that
+        breaks it will be added by someone who never read this ticket.
+        """
+        plugins = self._registered_plugins()
+
+        assert len(plugins) > 20, (
+            f"Positive control: registry discovery returned only {len(plugins)} plugins. "
+            f"The registry is populated lazily, so an empty or partial walk would make every "
+            f"assertion in this class pass while testing nothing."
+        )
+
+        raised = []
+        for kind, name, plugin_class in plugins:
+            try:
+                plugin_class.get_config_model()
+            except Exception as exc:  # reporting the failure IS the assertion
+                raised.append(f"{kind}/{name}: {type(exc).__name__}: {exc}")
+
+        assert not raised, (
+            f"Plugins whose bare get_config_model() raises: {raised}. "
+            f"The pre-expansion env guard calls this on every registry that knows a name, so one "
+            f"raising plugin breaks config load for unrelated sections. Give it a bare-callable "
+            f"config model; do not make the guard swallow the error."
+        )
+
+    def test_guard_walks_every_plugin_bearing_section(self) -> None:
+        """Sections are discovered, and sources/sinks are no longer excluded.
+
+        This assertion previously pinned a deliberate sources/sinks exclusion,
+        justified on the registries being disjoint from the transform registry
+        the forbidden map was keyed on. That justification was false —
+        ``csv.headers`` writes its mapping values as the artifact's header row —
+        and with the map gone there is no registry to be disjoint from.
+        """
+        from elspeth.config_loading import _plugin_bearing_sections
+
+        sections = _plugin_bearing_sections()
+
+        assert set(sections) == {"sources", "sinks", "transforms", "collectors", "aggregations"}, (
+            f"Plugin-bearing sections changed: {sections}. The guard walks whatever this discovers, "
+            f"so a new section is covered automatically — but confirm its entries really do carry "
+            f"plugin options rather than merely resembling the shape."
+        )
+        assert sections["sources"] == "dict" and sections["sinks"] == "dict"
+        assert {name for name, shape in sections.items() if shape == "list"} == {
+            "transforms",
+            "collectors",
+            "aggregations",
+        }
+
+    def test_every_declared_emitted_option_is_rejected_by_the_loader(self) -> None:
+        """The end-to-end derivation pin: declaration in, rejection out.
+
+        Walks every registered plugin, takes whatever it declares
+        ``EmittedToOutput``, plants a placeholder in that option and requires
+        the loader to refuse it. Nothing here names a plugin or a field, so a
+        newly marked option is covered the moment it is declared — and a
+        declaration the guard cannot see fails loudly instead of silently
+        protecting nothing.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.contracts.emitted_option import emitted_option_fields
+
+        declarations = [
+            (kind, name, option)
+            for kind, name, plugin_class in self._registered_plugins()
+            for option in emitted_option_fields(plugin_class.get_config_model())
+        ]
+
+        assert declarations, (
+            "Positive control: no plugin declares an EmittedToOutput option, so this test would pass without exercising the guard at all."
+        )
+
+        failed_open = []
+        for kind, name, option in declarations:
+            raw_config = {"transforms": [{"name": "probe", "plugin": name, "options": {option: self.PLACEHOLDER}}]}
+            try:
+                _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+            except ValueError:
+                continue
+            failed_open.append(f"{kind}/{name}.{option}")
+
+        assert not failed_open, (
+            f"Options declared EmittedToOutput that the loader guard does NOT reject: {sorted(failed_open)}. "
+            f"The declaration and the guard have come apart, which is the exact failure the derivation "
+            f"exists to make impossible."
+        )
+
+    @pytest.mark.parametrize(
+        ("section_name", "plugin_name", "option_name"),
+        [
+            ("transforms", "rag_retrieval", "output_prefix"),
+            ("transforms", "rag_retrieval", "context_separator"),
+            ("transforms", "batch_classifier_metrics", "actual_field"),
+            ("transforms", "batch_classifier_metrics", "predicted_field"),
+            ("transforms", "batch_outlier_annotator", "value_field"),
+            ("transforms", "batch_outlier_annotator", "z_threshold"),
+            ("transforms", "batch_outlier_annotator", "robust_z_threshold"),
+            ("transforms", "pdf_rasterize", "page_blob_ref_field"),
+            ("transforms", "pdf_rasterize", "page_number_field"),
+            ("transforms", "pdf_rasterize", "document_id_field"),
+            ("transforms", "pdf_rasterize", "page_mime_type_field"),
+            ("transforms", "pdf_rasterize", "page_size_bytes_field"),
+            ("transforms", "pdf_rasterize", "page_width_field"),
+            ("transforms", "pdf_rasterize", "page_height_field"),
+            ("transforms", "web_scrape", "content_field"),
+            ("transforms", "web_scrape", "fingerprint_field"),
+            ("transforms", "report_assemble", "output_field"),
+            ("transforms", "blob_csv_expand", "columns"),
+            ("transforms", "blob_csv_expand", "field_mapping"),
+            ("transforms", "blob_json_expand", "field_mapping"),
+            ("transforms", "field_mapper", "mapping"),
+            ("sources", "csv", "columns"),
+            ("sources", "csv", "field_mapping"),
+            ("sources", "aws_s3", "columns"),
+            ("sources", "aws_s3", "field_mapping"),
+            ("sources", "azure_blob", "columns"),
+            ("sources", "azure_blob", "field_mapping"),
+            ("sources", "json", "field_mapping"),
+            ("sources", "dataverse", "field_mapping"),
+            ("sinks", "dataverse", "field_mapping"),
+            ("sources", "text", "column"),
+            ("sources", "llm", "response_field"),
+            ("sources", "blob_rows", "blobs"),
+        ],
+    )
+    def test_adjudicated_output_emitters_are_not_silently_undeclared(
+        self,
+        section_name: str,
+        plugin_name: str,
+        option_name: str,
+    ) -> None:
+        """Named pin for emitters the registry-derived sweep cannot discover.
+
+        ``test_every_declared_emitted_option_is_rejected_by_the_loader`` proves
+        that declarations are enforced, but deleting or forgetting a declaration
+        removes the case from that derived test. Each source/transform option
+        here has an execution path that writes its value into row data: directly
+        as a separator or metadata value, as a numeric value after config
+        coercion, or as a field name that becomes a row key and artifact column
+        after env expansion.
+
+        Dataverse deliberately pins one cross-kind consequence: its source
+        ``field_mapping`` declaration also protects the same-named sink option
+        because declarations are unioned by plugin name. Only sink ``lookups``
+        and the broader policy for outbound OData identity remain deferred.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        option_value: object
+        if option_name == "columns":
+            option_value = [self.PLACEHOLDER]
+        elif option_name in {"field_mapping", "mapping"}:
+            option_value = {"observed": self.PLACEHOLDER}
+        elif option_name == "blobs":
+            option_value = [
+                {
+                    "blob_id": "11111111-1111-1111-1111-111111111111",
+                    "payload_ref": "a" * 64,
+                    "filename": self.PLACEHOLDER,
+                    "mime_type": "application/pdf",
+                    "size_bytes": 1,
+                }
+            ]
+        else:
+            option_value = self.PLACEHOLDER
+
+        entry = {
+            "name": "probe",
+            "plugin": plugin_name,
+            "options": {option_name: option_value},
+        }
+        raw_config = {section_name: {"probe": entry} if section_name in {"sources", "sinks"} else [entry]}
+
+        with pytest.raises(ValueError, match="environment-variable placeholders"):
+            _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+    def test_dataverse_sink_cross_kind_guard_accepts_a_clean_field_mapping(self) -> None:
+        """The conservative cross-kind restriction targets placeholders, not mapping use.
+
+        Dataverse sink mapping values name outbound OData fields rather than
+        pipeline artifact columns. The same-named source declaration currently
+        protects them through the deliberate plugin-name union. This positive
+        control keeps that fail-closed consequence narrow: clean sink mappings
+        remain valid, while sink ``lookups`` and broader outbound-identity policy
+        are explicitly outside this bounded repair.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        raw_config = {
+            "sinks": {
+                "probe": {
+                    "name": "probe",
+                    "plugin": "dataverse",
+                    "options": {"field_mapping": {"observed": "destination"}},
+                }
+            }
+        }
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+    def test_every_output_naming_option_is_rejected_by_the_loader(self) -> None:
+        """Reuse the transform registry's truth-tested output-name authority.
+
+        ``BaseTransform.output_naming_config_keys`` already classifies options
+        whose value names a field the transform writes. The transform invariant
+        suite proves those declarations against the fields actually created, so
+        the env guard must derive from them rather than restating the same field
+        list as ``EmittedToOutput`` annotations on every config model.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.plugins.infrastructure.base import BaseTransform
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        declarations: list[tuple[str, str, object]] = []
+        for registered_class in manager.get_transforms():
+            plugin_class = cast(type[BaseTransform], registered_class)
+            config_model = plugin_class.get_config_model()
+            assert config_model is not None, f"{plugin_class.name} declares output naming options without a config model"
+            declarations.extend(
+                (plugin_class.name, option_name, config_model.model_fields[option_name].annotation)
+                for option_name in sorted(plugin_class.output_naming_config_keys)
+            )
+
+        assert len(declarations) > 20, (
+            f"Positive control: only {len(declarations)} output-naming options were discovered; "
+            "a partial registry walk would make the security sweep pass while testing little or nothing."
+        )
+
+        failed_open = []
+        for plugin_name, option_name, annotation in declarations:
+            value: object = [self.PLACEHOLDER] if get_origin(annotation) is list else self.PLACEHOLDER
+            raw_config = {"transforms": [{"name": "probe", "plugin": plugin_name, "options": {option_name: value}}]}
+            try:
+                _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+            except ValueError:
+                continue
+            failed_open.append(f"{plugin_name}.{option_name}")
+
+        assert not failed_open, (
+            f"Output-naming options that allow env expansion before plugin validation: {sorted(failed_open)}. "
+            "Their expanded values can become valid output row keys and artifact headers."
+        )
+
+    def test_the_guard_is_not_a_one_plugin_map_in_disguise(self) -> None:
+        """Mutation guard: enforcement must reach beyond the original entry.
+
+        The retired map held ``report_assemble`` alone. A regression that
+        rebuilds a narrow hand-map — or a derivation that silently resolves only
+        the plugin it was first tested against — would still pass a test that
+        checks ``report_assemble`` and nothing else.
+        """
+        from elspeth.config_loading import _declared_emitted_options
+
+        enforced = {
+            name
+            for kind, name, _option in [
+                (kind, name, option)
+                for kind, name, plugin_class in self._registered_plugins()
+                for option in _declared_emitted_options(name)
+            ]
+        }
+
+        assert "report_assemble" in enforced, "Positive control: the original declarer is no longer enforced."
+        assert enforced - {"report_assemble"}, (
+            f"Only report_assemble is enforced ({enforced}). The guard has regressed to the single-entry "
+            f"hand-map that let truncate.suffix and csv.headers reach artifact bytes."
+        )
+
+    def test_rejection_message_names_the_declaring_kind(self) -> None:
+        """A union across registries can refuse a source option on a sink's declaration.
+
+        The cost of having no name-to-kind lookup is a refusal that can look
+        arbitrary. It must not also be unexplained: the message carries the
+        declaring kind and the declared reason, so an operator can see why.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        raw_config = {
+            "sinks": {"out": {"plugin": "csv", "options": {"headers": {"body": self.PLACEHOLDER}}}},
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+
+        message = str(exc_info.value)
+        assert "as a sink plugin" in message, f"Message does not name the declaring kind: {message}"
+        assert "header row" in message, f"Message does not carry the declared reason: {message}"
+        assert "sinks['out']" in message and "'headers'" in message, message
+
+    def test_message_explains_a_restriction_imported_from_a_sibling_kind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The union's whole cost is a refusal that can look arbitrary.
+
+        With no plugin-name-to-kind lookup, a name registered as both a source
+        and a sink is refused on either one's declaration. Today no dual-kind
+        name declares the same emitted option in two kinds, so this branch has
+        no natural fixture — and an untested branch inside a security control is
+        exactly what "declaration tests pin existence, not truth" warns about.
+        So the two-kind declaration is injected rather than left unproven.
+        """
+        from elspeth import config_loading as config_module
+
+        def _two_kinds(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
+            return {
+                "shared_option": [
+                    ("source", "the source writes this into every emitted row"),
+                    ("sink", "the sink writes this into the artifact header"),
+                ]
+            }
+
+        monkeypatch.setattr(config_module, "_declared_emitted_options", _two_kinds)
+
+        with pytest.raises(ValueError) as exc_info:
+            config_module._reject_sensitive_plugin_env_placeholders_before_expansion(
+                {"sinks": {"out": {"plugin": "csv", "options": {"shared_option": self.PLACEHOLDER}}}}
+            )
+
+        message = str(exc_info.value)
+        assert "registered as more than one plugin kind" in message, (
+            f"An imported restriction must say so; an unexplained refusal is a support incident: {message}"
+        )
+        assert "sink, source" in message, f"Message does not list the declaring kinds: {message}"
+        assert "emitted row" in message and "artifact header" in message, (
+            f"Message must carry BOTH declared reasons so the operator can see which one applies: {message}"
+        )
+
+    def test_mapping_valued_options_are_scanned_not_just_strings(self) -> None:
+        """``csv.headers`` leaks through the MAPPING form, not the string form.
+
+        A top-level ``isinstance(value, str)`` check — what the guard did before
+        — walks straight past ``{field: display_name}``, which is exactly the
+        shape whose values are written as the artifact's header row.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        for label, headers in (
+            ("mapping value", {"body": self.PLACEHOLDER}),
+            ("mapping key", {self.PLACEHOLDER: "Body"}),
+            ("bare string", self.PLACEHOLDER),
+        ):
+            try:
+                _reject_sensitive_plugin_env_placeholders_before_expansion(
+                    {"sinks": {"out": {"plugin": "csv", "options": {"headers": headers}}}}
+                )
+            except ValueError:
+                continue
+            raise AssertionError(
+                f"The guard walked past a placeholder in the {label} of csv.headers. "
+                f"A top-level isinstance(value, str) check misses the mapping form, which is "
+                f"the shape whose values are written as the artifact's header row."
+            )
+
+    def test_clean_values_are_still_accepted(self) -> None:
+        """Negative control: the guard must reject placeholders, not the option."""
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(
+            {
+                "sinks": {"out": {"plugin": "csv", "options": {"headers": {"body": "Body"}}}},
+                "transforms": [
+                    {"name": "t", "plugin": "truncate", "options": {"suffix": "..."}},
+                    {
+                        "name": "report",
+                        "plugin": "report_assemble",
+                        "options": {"output_field": "report_body"},
+                    },
+                ],
+            }
+        )
+
+    def test_unregistered_plugin_names_are_left_to_the_plugin_factory(self) -> None:
+        """An unknown plugin is a different error, reported with better context.
+
+        The guard must not turn "no such plugin" into its own message, and must
+        not crash on the lookup either.
+        """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
+
+        _reject_sensitive_plugin_env_placeholders_before_expansion(
+            {"transforms": [{"name": "t", "plugin": "no_such_plugin", "options": {"title": self.PLACEHOLDER}}]}
+        )
+
+
 class TestRunModeSettings:
     """Tests for run_mode configuration."""
 
@@ -3597,6 +4408,7 @@ class TestExpandTemplateFiles:
         (prompts_dir / "template.j2").write_text("Hello {{ row.name }}")
         (prompts_dir / "lookup.yaml").write_text("categories:\n  - Clothing\n")
         (prompts_dir / "system.txt").write_text("Use concise labels.")
+        (prompts_dir / "products.csv").write_text("sku,description\nhats,A fine hat\n")
 
         materializer = TemplateOptionMaterializer(tmp_path / "settings.yaml")
         config = materializer.materialize_config(
@@ -3607,6 +4419,7 @@ class TestExpandTemplateFiles:
                         "options": {
                             "template_file": "prompts/template.j2",
                             "lookup_file": "prompts/lookup.yaml",
+                            "reference_file": "prompts/products.csv",
                         },
                     }
                 ],
@@ -3621,9 +4434,12 @@ class TestExpandTemplateFiles:
             }
         )
 
-        assert frozenset({"template_file", "lookup_file", "system_prompt_file"}) == FILE_BACKED_TEMPLATE_OPTION_KEYS
+        assert frozenset({"template_file", "lookup_file", "reference_file", "system_prompt_file"}) == FILE_BACKED_TEMPLATE_OPTION_KEYS
         assert config["transforms"][0]["options"]["prompt_template"] == "Hello {{ row.name }}"
         assert config["transforms"][0]["options"]["lookup"] == {"categories": ["Clothing"]}
+        # reference_file materializes as TEXT, unlike lookup_file's parsed YAML —
+        # reference_join parses the table itself so one field can serve CSV and JSON.
+        assert config["transforms"][0]["options"]["reference_content"] == "sku,description\nhats,A fine hat\n"
         assert config["aggregations"][0]["options"]["system_prompt"] == "Use concise labels."
 
     def test_expand_template_file_not_found(self, tmp_path: Path) -> None:
@@ -3925,8 +4741,8 @@ class TestLoadSettingsWithRunMode:
 
     def test_load_settings_with_live_mode(self, tmp_path: Path) -> None:
         """Load YAML with live mode (default)."""
+        from elspeth.config_loading import load_settings
         from elspeth.contracts.enums import RunMode
-        from elspeth.core.config import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -3950,8 +4766,8 @@ run_mode: live
 
     def test_load_settings_with_replay_mode(self, tmp_path: Path) -> None:
         """Load YAML with replay mode."""
+        from elspeth.config_loading import load_settings
         from elspeth.contracts.enums import RunMode
-        from elspeth.core.config import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -3976,8 +4792,8 @@ replay_from: run-abc123
 
     def test_load_settings_with_verify_mode(self, tmp_path: Path) -> None:
         """Load YAML with verify mode."""
+        from elspeth.config_loading import load_settings
         from elspeth.contracts.enums import RunMode
-        from elspeth.core.config import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4002,7 +4818,7 @@ replay_from: run-xyz789
 
     def test_load_settings_replay_without_source_run_id_fails(self, tmp_path: Path) -> None:
         """Loading replay mode without source_run_id should fail."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4030,7 +4846,7 @@ class TestLoadSettingsTemplateFileExpansion:
 
     def test_load_settings_expands_template_files(self, tmp_path: Path) -> None:
         """load_settings expands template_file in row_plugins."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # Create directory structure
         prompts_dir = tmp_path / "prompts"
@@ -4181,7 +4997,7 @@ class TestEnvVarExpansion:
 
     def test_load_settings_from_yaml_string_preserves_env_placeholders_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The in-memory loader treats ${VAR} as literal user data by default."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("INLINE_PROMPT_SECRET", "server-secret-value")
 
@@ -4205,7 +5021,7 @@ sinks:
 
     def test_load_settings_from_yaml_string_can_opt_into_env_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Trusted in-process callers can explicitly request host environment expansion."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("INLINE_PROMPT_SECRET", "server-secret-value")
 
@@ -4235,7 +5051,7 @@ sinks:
         secrets: the operator tree was already expanded, and attacker-supplied
         blob text like ${INLINE_PROMPT_SECRET} must stay data, not a host lookup.
         """
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("INLINE_PROMPT_SECRET", "server-secret-value")
 
@@ -4259,7 +5075,7 @@ sinks:
         assert settings.sources["primary"].options["prompt_template"] == "prefix-${INLINE_PROMPT_SECRET}-suffix"
 
     def test_load_settings_from_yaml_string_rejects_aggregation_file_backed_options(self) -> None:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         with pytest.raises(ValueError) as exc_info:
             load_settings_from_yaml_string(
@@ -4298,8 +5114,8 @@ class TestBoundedYamlStringLoader:
 
     def test_load_settings_from_yaml_string_accepts_inline_blob_aggregate_sized_content(self) -> None:
         """Resolved inline content up to the blob aggregate cap fits under the YAML cap."""
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP
-        from elspeth.core.config import load_settings_from_yaml_string
 
         inline_content = "x" * BLOB_INLINE_AGGREGATE_BYTE_CAP
         settings = load_settings_from_yaml_string(
@@ -4324,8 +5140,9 @@ sinks:
         """Resolved inline content is not serialized back through the YAML byte cap."""
         import yaml
 
+        from elspeth.config_loading import load_settings_from_config_dict
         from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP
-        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES, load_settings_from_config_dict
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
         inline_content = "\x00" * BLOB_INLINE_AGGREGATE_BYTE_CAP
         config_dict = {
@@ -4352,7 +5169,8 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_oversized_yaml_before_parse(self) -> None:
         """Web-facing YAML must be byte-capped before PyYAML parses it."""
-        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES, load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
         oversized = (
             """
@@ -4376,7 +5194,7 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_aliases_before_construction(self) -> None:
         """Aliases are rejected so small YAML cannot amplify during object construction."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         aliased = """
 sources:
@@ -4399,7 +5217,7 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_excessive_depth(self) -> None:
         """Deep but textually small YAML is rejected before recursive construction."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         lines = [
             "sources:",
@@ -4427,7 +5245,8 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_excessive_node_count(self) -> None:
         """Many small YAML nodes are rejected even when the byte cap is not reached."""
-        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES, load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
         option_lines = [f"      key_{index}: value" for index in range(5_100)]
         yaml_content = "\n".join(
@@ -4520,7 +5339,7 @@ class TestSinkNameCasing:
 
     def test_load_settings_rejects_mixed_case_sink_names(self, tmp_path: Path) -> None:
         """Mixed-case sink names from YAML are rejected with helpful error."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4601,7 +5420,7 @@ class TestUnknownKeyRejection:
 
     def test_typo_key_raises_value_error(self, tmp_path: Path) -> None:
         """A typo like 'trnasforms' instead of 'transforms' must be rejected."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4627,7 +5446,7 @@ trnasforms:
 
     def test_multiple_typo_keys_all_reported(self, tmp_path: Path) -> None:
         """Multiple unknown keys should all appear in the error message."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4650,7 +5469,7 @@ retrry:
 
     def test_valid_config_still_loads(self, tmp_path: Path) -> None:
         """A config with only valid keys must load without error (no regression)."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4686,7 +5505,7 @@ retry:
         Dynaconf injects keys like LOAD_DOTENV into the settings dict.
         These are filtered by the allowlist but must not be treated as user errors.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # A minimal valid config — Dynaconf will inject LOAD_DOTENV automatically
         config_file = tmp_path / "settings.yaml"
@@ -4711,7 +5530,7 @@ sinks:
         ELSPETH_LOG_LEVEL set in docker-compose) and injects them into raw_config.
         The unknown-key check must only flag keys from the YAML file, not env vars.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # Set an ELSPETH_* env var that is NOT an ElspethSettings field
         monkeypatch.setenv("ELSPETH_LOG_LEVEL", "DEBUG")
@@ -4738,7 +5557,7 @@ sinks:
         Regression test: env var filtering must not accidentally disable
         the typo check for actual YAML key typos.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # Set a legitimate env var
         monkeypatch.setenv("ELSPETH_LOG_LEVEL", "DEBUG")
@@ -4765,7 +5584,7 @@ trnasforms:
         It must not be rejected as an unknown key even though it's not in
         ElspethSettings.model_fields.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4897,7 +5716,7 @@ class TestLowercaseSchemaKeysBranchPreservation:
 
     def test_load_settings_preserves_coalesce_branch_names(self, tmp_path: Path) -> None:
         """Full config loading preserves mixed-case coalesce branch names."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4944,3 +5763,115 @@ coalesce:
         branches = settings.coalesce[0].branches
         assert "sentiment_path" in branches
         assert "entity_path" in branches
+
+
+class TestExpandEnvValueBoundary:
+    """Direct raising characterization for the ``_expand_env_value`` trust boundary."""
+
+    def test_missing_env_var_without_default_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ${VAR} reference to an unset variable with no default is refused."""
+        from elspeth.core.config import _expand_env_value
+
+        monkeypatch.delenv("ELSPETH_TEST_UNSET_ENV_VAR", raising=False)
+        with pytest.raises(ValueError, match="Required environment variable 'ELSPETH_TEST_UNSET_ENV_VAR' is not set"):
+            _expand_env_value({"api": ["${ELSPETH_TEST_UNSET_ENV_VAR}"]})
+
+    def test_default_and_passthrough_shapes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Defaults expand; unrecognized scalar shapes pass through unchanged."""
+        from elspeth.core.config import _expand_env_value
+
+        monkeypatch.delenv("ELSPETH_TEST_UNSET_ENV_VAR", raising=False)
+        assert _expand_env_value("${ELSPETH_TEST_UNSET_ENV_VAR:-fallback}") == "fallback"
+        assert _expand_env_value(7) == 7
+        assert _expand_env_value(None) is None
+
+
+class TestFingerprintSecretsBoundary:
+    """Direct raising characterization for the fingerprinting trust boundaries."""
+
+    def test_secret_without_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A string secret field with no fingerprint key is refused (fail-closed)."""
+        from elspeth.core.config import SecretFingerprintError, _fingerprint_process_value
+
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+        with pytest.raises(SecretFingerprintError, match="Secret field 'api_key' found"):
+            _fingerprint_process_value("api_key", value="raw-secret-value", have_key=False, fail_if_no_key=True)
+
+    def test_secret_without_key_dev_mode_passthrough(self) -> None:
+        """Dev mode (fail_if_no_key=False) keeps the original value, declared not silent."""
+        from elspeth.core.config import _fingerprint_process_value
+
+        key, value, was_secret = _fingerprint_process_value("api_key", value="raw-secret-value", have_key=False, fail_if_no_key=False)
+        assert (key, value, was_secret) == ("api_key", "raw-secret-value", False)
+
+    def test_fingerprint_collision_raises(self) -> None:
+        """A secret field plus its pre-supplied _fingerprint counterpart is refused."""
+        from elspeth.core.config import SecretFingerprintError, _recurse
+
+        d = {"api_key": "raw", "api_key_fingerprint": "attacker-supplied"}
+        with pytest.raises(SecretFingerprintError, match="Config contains both 'api_key' and 'api_key_fingerprint'"):
+            _recurse(d, have_key=True, fail_if_no_key=True)
+
+
+class TestSanitizeDsnOptionBoundary:
+    """Direct raising characterization for the ``_sanitize_dsn_option_for_audit`` boundary."""
+
+    def test_dsn_password_without_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A DSN option carrying a password with no fingerprint key is refused (fail-closed)."""
+        from elspeth.core.config import SecretFingerprintError, _sanitize_dsn_option_for_audit
+
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+        with pytest.raises(SecretFingerprintError, match="contains a password"):
+            _sanitize_dsn_option_for_audit(
+                options={"url": "postgresql://user:secretpass@host/db"},  # secret-scan: allow-this-line
+                option_name="url",
+                fingerprint_name="url_password_fingerprint",
+                redacted_name="url_password_redacted",
+                fail_if_no_key=True,
+            )
+
+    def test_non_string_dsn_option_is_left_for_plugin_validation(self) -> None:
+        """Absent or non-string DSN values are skipped, never coerced."""
+        from elspeth.core.config import _sanitize_dsn_option_for_audit
+
+        options: dict[str, Any] = {"url": 42}
+        _sanitize_dsn_option_for_audit(
+            options=options,
+            option_name="url",
+            fingerprint_name="url_password_fingerprint",
+            redacted_name="url_password_redacted",
+            fail_if_no_key=True,
+        )
+        assert options == {"url": 42}
+
+
+class TestLoadSettingsFromYamlStringBoundary:
+    """Direct raising characterization for the ``load_settings_from_yaml_string`` boundary."""
+
+    def test_non_mapping_yaml_document_raises(self) -> None:
+        """A YAML document that is not a mapping is refused, never coerced."""
+        from elspeth.config_loading import load_settings_from_yaml_string
+
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_settings_from_yaml_string("- just\n- a\n- list\n")
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_settings_from_yaml_string("just a scalar")
+
+
+class TestLoadSettingsYamlDocumentShape:
+    """Non-mapping YAML documents are rejected — falsy ones included.
+
+    Pins the elspeth-ca0a7e71b1 fix: ``yaml.safe_load(...) or {}`` silently
+    converted falsy non-mapping documents (false, 0, [], "") into a
+    valid-looking empty mapping; only an EMPTY document (None) may mean
+    "no keys".
+    """
+
+    @pytest.mark.parametrize("doc", ["false\n", "0\n", "[]\n"])
+    def test_falsy_non_mapping_yaml_file_rejected(self, tmp_path: Path, doc: str) -> None:
+        from elspeth.config_loading import load_settings
+
+        config_file = tmp_path / "settings.yaml"
+        config_file.write_text(doc)
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_settings(config_file)

@@ -8,17 +8,29 @@ from pathlib import Path
 GUIDED_ROUTES = Path(__file__).resolve().parents[5] / "src" / "elspeth" / "web" / "sessions" / "routes" / "composer" / "guided.py"
 
 
-def test_guided_convert_follows_start_and_respond() -> None:
-    """post_guided_convert is the last guided mode-transition route.
-
-    The signed AST layout requires post_guided_convert to be the final guided
-    handler (enforced by the signed-layout contract in
-    tests/unit/web/composer/guided/test_no_chain_authoring_path.py), so it is
-    defined after both post_guided_start and post_guided_respond — not grouped
-    between them, as an earlier revision assumed.
-    """
+def test_guided_convert_is_grouped_between_start_and_respond() -> None:
+    """The guided mode-transition routes stay in their logical lifecycle order."""
     module = ast.parse(GUIDED_ROUTES.read_text(encoding="utf-8"), filename=str(GUIDED_ROUTES))
     function_names = [node.name for node in module.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
 
     assert function_names.index("post_guided_start") < function_names.index("post_guided_convert")
-    assert function_names.index("post_guided_respond") < function_names.index("post_guided_convert")
+    assert function_names.index("post_guided_convert") < function_names.index("post_guided_respond")
+
+
+def test_get_guided_has_no_rejected_proposal_reconciliation_dml_path() -> None:
+    module = ast.parse(GUIDED_ROUTES.read_text(encoding="utf-8"), filename=str(GUIDED_ROUTES))
+    get_guided = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_guided")
+    called_attributes = {
+        node.func.attr for node in ast.walk(get_guided) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert "reconcile_rejected_guided_pipeline_proposal" not in called_attributes
+
+
+def test_get_guided_has_no_audit_recorder_or_drain_path() -> None:
+    """Read-only guided fetches must not create or drain audit recorders."""
+    module = ast.parse(GUIDED_ROUTES.read_text(encoding="utf-8"), filename=str(GUIDED_ROUTES))
+    get_guided = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_guided")
+    called_names = {node.func.id for node in ast.walk(get_guided) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+
+    assert called_names.isdisjoint({"BufferingRecorder", "_persist_tool_invocations", "_persist_llm_calls"})

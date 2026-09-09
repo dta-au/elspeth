@@ -10,10 +10,10 @@ signatures.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from elspeth.contracts.enums import NodeType
+from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.schema import get_raw_node_required_fields
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class EffectiveGuaranteeVote:
-    """Propagation result that preserves fields AND participation state.
+    """Propagation result that preserves fields, participation AND closedness.
 
     ``fields`` alone is not enough for sink validation, because an empty
     effective guarantee set can mean either:
@@ -36,10 +36,31 @@ class EffectiveGuaranteeVote:
 
     Carrying ``participated`` through the recursive walk keeps that contract
     mechanical for downstream validators.
+
+    ``participated`` and ``closed`` are INDEPENDENT axes, and conflating them
+    is what produced the elspeth-9c5ff8fa7d family of false rejections:
+
+    - ``participated`` — the vote has guarantees to contribute. ``fields`` is
+      a LOWER bound: every listed field is definitely present. Sound for the
+      INTERSECTION consumers (``validate_transform_output_field_collisions``,
+      the coalesce branch guarantees builder).
+    - ``closed`` — no row leaving this node can carry a field outside
+      ``fields``. An UPPER bound. Only a schema that forbids extras supplies
+      it, so it is derived from ``SchemaConfig.allows_extra_fields`` — the
+      extras-firewall authority the contract layer already owns — rather than
+      restated. Required by the DIFFERENCE consumers, which prove ABSENCE:
+      subtracting a lower bound reports a miss for every field the producer
+      simply never mentioned, including columns its rows genuinely carry.
+
+    An ``observed`` producer naming ``guaranteed_fields`` is the shape that
+    separates them: it participates (it guarantees those fields) and is open
+    (observed mode admits any other column). Both flags are needed to tell it
+    apart from a ``fixed`` schema listing the same fields.
     """
 
     fields: frozenset[str]
     participated: bool
+    closed: bool
 
 
 def get_schema_config_from_node(graph: ExecutionGraph, node_id: str) -> SchemaConfig | None:
@@ -123,9 +144,12 @@ def get_effective_guaranteed_fields(graph: ExecutionGraph, node_id: str) -> froz
     """Get effective output guarantees for a node (propagation-aware).
 
     Per ADR-007, this method is the propagation-aware implementation.
-    For a TRANSFORM node whose plugin declared ``passes_through_input=True``,
-    the effective guarantees are the intersection of its participating
-    predecessors' guarantees unioned with the node's own declared fields.
+    For a TRANSFORM node whose plugin declared ``passes_through_input=True`` or
+    ``forwards_input_fields=True``, the effective guarantees are the
+    intersection of its participating predecessors' guarantees unioned with
+    the node's own declared fields. A forwarding node first subtracts its
+    ``removed_input_fields`` from each predecessor vote; a fixed output
+    contract stops that forwarding as an extras firewall.
     For all other nodes, returns the node's own declarations (same as
     ``get_guaranteed_fields``).
 
@@ -157,11 +181,17 @@ def walk_effective_guarantee_vote(
     cache: dict[str, EffectiveGuaranteeVote],
     field_cache: dict[str, frozenset[str]] | None = None,
 ) -> EffectiveGuaranteeVote:
-    """Recursive implementation that preserves participation state.
+    """Recursive implementation that preserves participation and closedness.
 
     Pass-through propagation needs more than the final field set. A sink
     validator must be able to distinguish "nobody voted" from "the vote
     participated and collapsed to empty", so this helper carries both.
+
+    It carries CLOSEDNESS for the mirror-image reason: ``fields`` is a lower
+    bound, and a validator proving ABSENCE by set difference needs an upper
+    one. See ``EffectiveGuaranteeVote`` for why the two are independent. Each
+    branch below decides ``closed`` the way it already decides ``participated``
+    — from the same topology, never from a second hand-written rule.
     """
     if node_id in cache:
         return cache[node_id]
@@ -171,6 +201,13 @@ def walk_effective_guarantee_vote(
     own_fields = (
         node_info.output_schema_config.get_effective_guaranteed_fields() if node_info.output_schema_config is not None else frozenset()
     )
+    # An extras firewall (``mode: fixed``) is what makes a field set complete:
+    # a row carrying anything undeclared dies at this node's input model, so
+    # nothing downstream can see it. ``observed``/``flexible`` admit the
+    # undeclared, and a node with no schema config at all proves nothing —
+    # both are open. Derived from the contract layer's own predicate rather
+    # than restated here (ADR-032: nominally type what ELSPETH owns).
+    own_closed = node_info.output_schema_config is not None and not node_info.output_schema_config.allows_extra_fields
 
     # Gates are pure routing: rows pass through unchanged (Rule 0 in
     # validate_edge_schemas enforces input==output schema), so a gate's
@@ -186,32 +223,140 @@ def walk_effective_guarantee_vote(
     # compose_propagation unions the gate's own (raw-inherited) fields with
     # its predecessors' effective vote, so the set can only grow.
     is_transparent_gate = node_info.node_type is NodeType.GATE
-    if node_info.passes_through_input or is_transparent_gate:
+    if node_info.node_type is NodeType.QUEUE:
+        # Queues are pass-through coordination (builder assigns them a bare
+        # observed schema), but they are also the sanctioned fan-in point for
+        # ordinary nodes (graph invariant 7), so stopping at the queue's own
+        # empty declaration falsely rejected runnable source → queue →
+        # consumer pipelines with "(none - dynamic schema)"
+        # (elspeth-5a372d3267) — sibling of the transparent-gate walk below.
+        # Fan-in aggregation is NOT compose_propagation: its abstainer-skip is
+        # sound only when every predecessor delivers the same row. Queue rows
+        # arrive from exactly one arm, so a field is guaranteed only if EVERY
+        # arm vouches for it, and one abstaining (dynamic) arm collapses the
+        # whole vote to abstention — preserving sink deferral of dynamic
+        # upstreams to per-row enforcement (elspeth-3283f2eaec).
+        #
+        # Closedness follows the same one-arm-delivers-the-row rule: the
+        # released stream can only carry what some arm carried, so it is
+        # closed exactly when EVERY arm is. The queue's own bare observed
+        # declaration must not be consulted — it describes coordination, not a
+        # firewall, and reading it would report every queue open.
+        predecessors = list(graph._graph.predecessors(node_id))
+        if not predecessors:
+            # The builder rejects unwired queues at construction; hand-built
+            # test graphs fall back to the queue's own (empty, abstaining)
+            # declaration rather than crashing.
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates, closed=own_closed)
+        else:
+            arm_votes = [walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in predecessors]
+            if all(vote.participated for vote in arm_votes):
+                result = EffectiveGuaranteeVote(
+                    fields=frozenset.intersection(*[vote.fields for vote in arm_votes]),
+                    participated=True,
+                    closed=all(vote.closed for vote in arm_votes),
+                )
+            else:
+                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
+    elif node_info.node_type is NodeType.ROW_UNION:
+        # row_union is the correlated UNION ALL barrier: every released row
+        # is exactly one branch's payload, unchanged (elspeth-a5b86149d4).
+        # The builder stamps it observed ("no schema synthesis"), so stopping
+        # at the node's own declaration falsely rejected runnable
+        # fork → branches → row_union → consumer pipelines with
+        # "(none - dynamic schema)" (elspeth-41bcaa882e) — sibling of the
+        # queue fan-in walk above, governed by the same rule: a field is
+        # guaranteed on the released stream only if EVERY branch vouches for
+        # it, and one abstaining (dynamic) branch collapses the whole vote to
+        # abstention. compose_propagation's abstainer-skip stays unsound here
+        # for the same reason it is for queues: rows arrive from exactly one
+        # branch, so promoting a single branch's guarantee would over-claim.
+        #
+        # A DIVERT in-edge forces abstention rather than being skipped: a
+        # divert payload is an error envelope, not the producer's declared
+        # row, so a stream containing one cannot vouch for any field. The
+        # builder never wires DIVERT into a row_union today (error routing is
+        # terminal — see _live_predecessors in schema_validation.py); this
+        # guards the public add_edge surface.
+        #
+        # Closedness composes exactly as it does for a queue, and for the same
+        # reason: one branch delivers each released row, so the stream is
+        # closed only when every branch is. A DIVERT in-edge forces open along
+        # with abstention — an error envelope's shape is not the producer's.
+        in_edges = list(graph._graph.in_edges(node_id, data=True))
+        if not in_edges:
+            # The builder rejects unwired row_unions at construction;
+            # hand-built test graphs fall back to the node's own (empty,
+            # abstaining) declaration rather than crashing.
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates, closed=own_closed)
+        elif any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
+            result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
+        else:
+            branch_votes = [
+                walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in graph._graph.predecessors(node_id)
+            ]
+            if all(vote.participated for vote in branch_votes):
+                result = EffectiveGuaranteeVote(
+                    fields=frozenset.intersection(*[vote.fields for vote in branch_votes]),
+                    participated=True,
+                    closed=all(vote.closed for vote in branch_votes),
+                )
+            else:
+                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False, closed=False)
+    elif node_info.passes_through_input or (node_info.forwards_input_fields and not own_closed) or is_transparent_gate:
         predecessors = list(graph._graph.predecessors(node_id))
         if not predecessors and is_transparent_gate:
             # Hand-built test graphs may install a gate without wiring its
             # upstream edge; fall back to the gate's own (inherited)
             # declaration rather than crashing — the builder always wires
             # gates, so real graphs never take this branch.
-            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates)
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates, closed=own_closed)
         elif not predecessors:
             raise FrameworkBugError(
                 f"Pass-through transform {node_id!r} has no predecessors. Builder must wire transforms with at least one upstream edge."
             )
         else:
             predecessor_votes = [walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in predecessors]
+            removals = frozenset() if node_info.passes_through_input else node_info.removed_input_fields
             result_fields = compose_propagation(
                 own_fields,
-                [vote.fields if vote.participated else None for vote in predecessor_votes],
+                [vote.fields - removals if vote.participated else None for vote in predecessor_votes],
             )
+            # Closedness does NOT compose the way participation does, and this
+            # is the asymmetry that made the elspeth-9c5ff8fa7d family a false
+            # RED rather than a false green. ``participated`` is a disjunction
+            # — one voter is enough to have voted. Completeness is the node's
+            # own firewall and nothing else:
+            #
+            # - own schema CLOSED: rows arriving with an undeclared column die
+            #   at this node's ``extra='forbid'`` input model, so whatever the
+            #   upstream carried, what LEAVES is exactly the declared set.
+            #   (``result_fields`` may still name more than the firewall admits
+            #   — the un-gated union of elspeth-9c5ff8fa7d — which against set
+            #   difference only ever shrinks ``missing``, so it under-rejects
+            #   and never over-rejects.)
+            # - own schema OPEN: this node may itself add columns its observed
+            #   declaration never names, so the composed set is open however
+            #   closed every predecessor was.
+            #
+            # Reading ``any(predecessor closed)`` here — or inheriting the
+            # disjunction from ``participated`` — manufactures a completeness
+            # claim out of ignorance: a node that cannot see its predecessor's
+            # field set asserting that set is complete. (ADR-040 §Consequences
+            # supports this by extension of its principle, not by its letter:
+            # it names only the green direction, an abstention rendering as
+            # ``is_valid: true``. This is the opposite polarity — an abstention
+            # rendering as a false rejection.)
             result = EffectiveGuaranteeVote(
                 fields=result_fields,
                 participated=own_participates or any(vote.participated for vote in predecessor_votes),
+                closed=own_closed,
             )
     else:
         result = EffectiveGuaranteeVote(
             fields=own_fields,
             participated=own_participates,
+            closed=own_closed,
         )
 
     cache[node_id] = result
@@ -233,8 +378,8 @@ def walk_effective_guaranteed_fields(
     and re-walking. Public callers go through ``get_effective_guaranteed_fields``
     which allocates a fresh per-call cache.
 
-    For pass-through transforms, delegates the aggregation step to
-    ``compose_propagation`` (ADR-009 §Clause 1). Predecessor
+    For pass-through and forwarding transforms, delegates the aggregation step
+    to ``compose_propagation`` (ADR-009 §Clause 1). Predecessor
     participation is checked via ``SchemaConfig.participates_in_propagation``
     — the canonical predicate that both this walker and the composer's
     preview walker consult.
@@ -250,3 +395,375 @@ def walk_effective_guaranteed_fields(
     result = walk_effective_guarantee_vote(graph, node_id, {}, cache)
     cache[node_id] = result.fields
     return result.fields
+
+
+@dataclass(slots=True)
+class DefiniteEmitsCaches:
+    """Shared memoization for bulk definite-emits queries.
+
+    One instance per validation pass, threaded through the per-edge call
+    sites the way ``validate_edge_schemas`` threads its ``schema_cache`` —
+    both walks this query composes are path-independent on a built DAG
+    (the ``resolve_guaranteed_field_type`` cache states the same soundness
+    argument), so sharing across edges is a pure dedup. ``fields`` memoizes
+    the definite-emits answer per node; ``presence_votes`` memoizes the
+    presence votes the walk consumes at every visited node, which is what
+    keeps one walk linear instead of re-walking ancestry per node.
+    """
+
+    fields: dict[str, frozenset[str]] = field(default_factory=dict)
+    presence_votes: dict[str, EffectiveGuaranteeVote] = field(default_factory=dict)
+
+
+def walk_definite_emitted_fields(
+    graph: ExecutionGraph,
+    node_id: str,
+    cache: dict[str, frozenset[str]],
+    presence_cache: dict[str, EffectiveGuaranteeVote] | None = None,
+) -> frozenset[str]:
+    """Return fields that DEFINITELY arrive on ``node_id``'s output rows.
+
+    The extras-direction counterpart to ``walk_effective_guaranteed_fields``,
+    and deliberately a separate walk rather than a widening of it — the two
+    ask questions with opposite safety polarities, the distinction
+    ``_connection_definite_emits`` (``web/composer/state.py``) already draws on
+    the composer side. The presence direction asks "is every required field
+    guaranteed?", and its consumers read a wider answer as PERMISSION: sink
+    required-fields clearance, ``check_compatibility``'s missing-arm
+    forgiveness (elspeth-7d68b04878), ``validate_forgiven_field_ancestor_types``.
+    Adding fields there would loosen a gate. The extras direction asks "does
+    any field arrive that a locked consumer forbids?", where a wider answer
+    only ever REJECTS more.
+
+    Result = the node's own effective guarantees UNION, for a node declaring
+    ``forwards_input_fields``, its predecessors' definite emits minus its
+    ``removed_input_fields``. Strictly ADDITIVE over the presence walk's
+    answer at the same node, so no graph rejected today stops being rejected
+    and no error message relocates — this can only close the gap
+    elspeth-15c72686f2 reports, never open a new one.
+
+    Fan-in UNIONS rather than intersects, for the reason
+    ``_connection_definite_emits`` documents: a field carried by ONE arm
+    definitely arrives on that arm's rows, and a locked consumer forbidding it
+    is a definite runtime rejection. That is the opposite of
+    ``merge_guaranteed_fields``' intersection, which is correct for the
+    presence question and wrong for this one.
+
+    DIVERT in-edges are excluded: a divert payload is an error envelope, not
+    the producer's declared row, so it vouches for nothing. This mirrors the
+    exclusion ``validate_typed_producer_guaranteed_extras`` applies at its loop
+    head rather than re-deriving it.
+
+    The result is a LOWER BOUND — a node that forwards but cannot name its
+    removals declares nothing and contributes only its own guarantees. That
+    makes it sound to raise an error ON this set but never sound to clear a
+    graph WITH it, the same asymmetry the composer's walk carries.
+
+    PURE-ROUTING nodes are traversed, not stopped at: a GATE changes which
+    rows travel an edge, never which fields a row carries, and a ROW_UNION
+    releases each arm's rows unchanged — so both union their live
+    predecessors' definite emits on top of their own answer, exactly as the
+    composer walk does (gates recursed at ``_connection_definite_emits``,
+    arms unioned at ``_row_union_definite_emits``). ``forwards_input_fields``
+    is a transform-only declaration, so without this arm one interposed gate
+    re-opened the elspeth-15c72686f2 hole on the YAML/DAG surface. QUEUE
+    stays at the presence answer — the composer deliberately leaves queue
+    producers opaque ("left to the track that owns queue contract
+    semantics"), and this walk mirrors that boundary.
+    """
+    if node_id in cache:
+        return cache[node_id]
+    if presence_cache is None:
+        # One presence-vote cache per WALK, not per node: the walk consumes
+        # the presence answer at every node it visits, and votes are
+        # path-independent on a built DAG, so a fresh cache per node would
+        # re-walk shared ancestry quadratically (review finding on
+        # elspeth-15c72686f2's fix).
+        presence_cache = {}
+
+    node_info = graph.get_node_info(node_id)
+    own_fields = walk_effective_guarantee_vote(graph, node_id, presence_cache).fields
+
+    if node_info.node_type in (NodeType.GATE, NodeType.ROW_UNION):
+        # Seed before recursing — same cycle posture as the forwarding arm.
+        cache[node_id] = own_fields
+        arriving: frozenset[str] = frozenset()
+        for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
+            if edge_data["mode"] == RoutingMode.DIVERT:
+                continue
+            arriving |= walk_definite_emitted_fields(graph, from_id, cache, presence_cache)
+        result = own_fields | arriving
+        cache[node_id] = result
+        return result
+
+    # The node's own EXTRAS FIREWALL gates forwarding, mirroring the
+    # composer's ``propagates = forwards and not extras_firewall``
+    # (``_producer_emit_profile``): an output contract that forbids extras
+    # emits EXACTLY its declared fields — rows either match that set or die
+    # at the node's own preflight, never downstream — so upstream arrivals
+    # provably do not survive past it and unioning them here would predict
+    # phantom extras (and hand the two authoring surfaces opposite verdicts
+    # on the same graph).
+    firewalled = node_info.output_schema_config is not None and not node_info.output_schema_config.allows_extra_fields
+    if not node_info.forwards_input_fields or firewalled:
+        cache[node_id] = own_fields
+        return own_fields
+
+    # Seed the cache before recursing so a hand-built cyclic graph terminates
+    # with the node's own (forward-free) contribution rather than recursing
+    # forever. Built graphs are DAGs, so this is defensive only — the same
+    # posture resolve_guaranteed_field_type takes on its visited guard.
+    cache[node_id] = own_fields
+
+    forwarded: frozenset[str] = frozenset()
+    for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        forwarded |= walk_definite_emitted_fields(graph, from_id, cache, presence_cache)
+
+    result = own_fields | (forwarded - node_info.removed_input_fields)
+    cache[node_id] = result
+    return result
+
+
+def get_definite_emitted_fields(
+    graph: ExecutionGraph,
+    node_id: str,
+    caches: DefiniteEmitsCaches | None = None,
+) -> frozenset[str]:
+    """Public entry point for ``walk_definite_emitted_fields``.
+
+    ``caches`` follows the ``validate_edge_schemas`` ``schema_cache``
+    discipline: bulk callers create one per validation pass and thread it
+    through their edge loop; one-shot callers omit it and get fresh caches
+    scoped to this call.
+    """
+    if caches is None:
+        caches = DefiniteEmitsCaches()
+    return walk_definite_emitted_fields(graph, node_id, caches.fields, caches.presence_votes)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedGuaranteeType:
+    """Nearest ancestor declaration for a guarantee-carried field.
+
+    ``field_type`` is the SchemaConfig vocabulary (never ``"any"`` — an
+    ``any`` declaration abstains to ``None`` at the resolution site, because
+    it states no type to check). BASE TYPE ONLY, deliberately: the two
+    pydantic materializations disagree about nullability
+    (``build_coalesce_schema`` folds ``nullable or not required`` into
+    ``| None``; the plugin factory's ``_get_python_type`` reads ``required``
+    alone), so any nullability bit carried here would make the walk stricter
+    than one declared arm or the other and break monotonicity — declaring
+    the identical field must never flip a verdict (elspeth-85e8afa2f5 panel
+    review; the composer's ``_edge_field_type_conflict`` documents abandoning
+    model reconstruction for the same reason). None-at-runtime deaths stay
+    with the per-row preflight. ``declared_by`` names the declaring node(s) —
+    more than one when several branches independently declare the same type —
+    so a rejection can point at the declaration it is enforcing.
+    """
+
+    field_type: str
+    declared_by: frozenset[str]
+
+
+def resolve_guaranteed_field_type(
+    graph: ExecutionGraph,
+    node_id: str,
+    field_name: str,
+    *,
+    _visited: frozenset[str] = frozenset(),
+    cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None = None,
+) -> ResolvedGuaranteeType | None:
+    """Resolve the nearest ancestor DECLARED type of a guarantee-carried field.
+
+    The guarantee walk (``walk_effective_guarantee_vote``) proves presence and
+    deliberately strips types; this walk recovers the type where an ancestor
+    stated one, so build-time validation of a forgiven field
+    (elspeth-85e8afa2f5) can check what is knowable and keep forgiving what is
+    not. ``None`` is ABSTENTION — the type is not provable — and every
+    uncertain arm below collapses to it rather than guessing.
+
+    Nearest declaration wins: a node whose ``output_schema_config`` declares
+    the field settles it (the node may have rewritten or coerced the field —
+    a farther declaration describes a value that no longer flows), and the
+    walk recurses only through nodes that did NOT declare it, following the
+    same topology the guarantee walk traverses (transparent gates,
+    value-preserving pass-through/forwarding transforms, queue/row_union
+    fan-in, coalesce branches).
+
+    Two structural arms extend "declaration" beyond ``fields:`` entries
+    (elspeth-e6e552ce34): an OBSERVED source with a structural cell type
+    (``NodeInfo.observed_value_type`` — csv emits every cell as str) answers
+    that type for fields in its own guaranteed set and abstains for all
+    others; and an undeclaring pass-through transform that promised
+    ``preserves_input_values`` is recursed through rather than abstained at,
+    because its forwarded values are exactly its inputs. Both default off:
+    sources without the structural fact and pass-throughs without the promise
+    keep the historical abstention.
+
+    Soundness for the REJECTING caller is unanimity: every path a runtime
+    value can take must resolve to the same base ``field_type``.
+    The contributor sets below may over-include paths that cannot actually
+    supply the value (e.g. every coalesce branch, regardless of collision
+    policy); that is safe by construction — the true path is always among
+    those considered, so an extra path can only force abstention or agree,
+    never manufacture a wrong unanimous type. Any DIVERT in-edge on a
+    recursed node abstains outright (the row_union guarantee-walk posture):
+    a divert payload is an error envelope, so a stream carrying one has no
+    provable field types — unreachable on builder-produced graphs, where
+    error routing is terminal (see ``_live_predecessors``), and defensive on
+    the public ``add_edge`` surface.
+
+    ``cache`` memoizes on ``(node_id, field_name)`` — same discipline as
+    ``walk_effective_guaranteed_fields``'s cache parameter, and load-bearing
+    for the same reason: without it, nested fan-in re-resolves shared
+    ancestors once per path, which is exponential in fan-in depth (panel
+    F5). Sound to share across a validation pass because built graphs are
+    DAGs, so a resolution is path-independent; on a hand-built cyclic graph
+    the visited-guard's ``None`` is conservative (abstention) either way.
+    """
+    if node_id in _visited:
+        # A cycle-break is a fact about this PATH, not about the node —
+        # never cached.
+        return None
+    if cache is not None and (node_id, field_name) in cache:
+        return cache[(node_id, field_name)]
+    result = _resolve_guaranteed_field_type_uncached(graph, node_id, field_name, _visited=_visited, cache=cache)
+    if cache is not None:
+        cache[(node_id, field_name)] = result
+    return result
+
+
+def _resolve_guaranteed_field_type_uncached(
+    graph: ExecutionGraph,
+    node_id: str,
+    field_name: str,
+    *,
+    _visited: frozenset[str],
+    cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None,
+) -> ResolvedGuaranteeType | None:
+    """Worker for ``resolve_guaranteed_field_type`` — see its docstring."""
+    node_info = graph.get_node_info(node_id)
+    config = node_info.output_schema_config
+    # A gate's own config is its upstream producer's RAW config copied in by
+    # the builder (``_assign_schema(gate_id, _best_schema_config(producer_id))``),
+    # not a declaration the gate made. Recursing past it reaches the identical
+    # declaration at its true owner, so ``declared_by`` attributes the type to
+    # a node the author actually wrote a schema on.
+    if config is not None and config.fields is not None and node_info.node_type is not NodeType.GATE:
+        for field_def in config.fields:
+            if field_def.name == field_name:
+                if field_def.field_type == "any":
+                    return None
+                return ResolvedGuaranteeType(
+                    field_type=field_def.field_type,
+                    declared_by=frozenset({node_id}),
+                )
+
+    # Structural source arm (elspeth-e6e552ce34): an OBSERVED source that
+    # declares a structural cell type (csv: every parsed cell is str — no
+    # declared fields means no coercion targets) answers that type, but ONLY
+    # for fields in its own guaranteed set. The narrowness is load-bearing:
+    # recursion may over-include contributors (the walk's documented
+    # over-inclusion tolerance), and a field INTRODUCED mid-path — an llm
+    # response field, a blob_csv_expand data-derived column — must never be
+    # attributed to a source that does not vouch for it. Outside the
+    # guaranteed set the source abstains and the whole resolution collapses
+    # to None, which is the conservative posture. Declared-fields modes never
+    # reach this arm for a declared field (the own-declaration check above
+    # settles it with the type the source coerces into).
+    if node_info.node_type is NodeType.SOURCE and node_info.observed_value_type is not None and config is not None and config.is_observed:
+        if field_name in (config.guaranteed_fields or ()):
+            return ResolvedGuaranteeType(
+                field_type=node_info.observed_value_type,
+                declared_by=frozenset({node_id}),
+            )
+        return None
+
+    forwards_field_unchanged = (
+        node_info.forwards_input_fields
+        and node_info.preserves_input_values
+        and field_name not in node_info.removed_input_fields
+        and (config is None or config.allows_extra_fields)
+    )
+    recurses = (
+        node_info.node_type in (NodeType.GATE, NodeType.QUEUE, NodeType.ROW_UNION, NodeType.COALESCE)
+        or node_info.passes_through_input
+        or forwards_field_unchanged
+    )
+    if not recurses:
+        return None
+
+    # A pass-through TRANSFORM runs plugin code that may rewrite a field's
+    # type in place — recursion past it is sound only under the declaration
+    # discipline: a transform that rewrites a field declares it in its output
+    # config (``value_transform`` declares operation targets as ``any``;
+    # ``type_coerce`` declares conversion targets as their target type), so
+    # the own-declaration check above settles rewritten fields before this
+    # point. A pass-through with NO field declarations (observed mode, or no
+    # config at all) has opted out of that discipline and states nothing
+    # about its output — treating its silence as type-preservation readmitted
+    # elspeth-85e8afa2f5 through an observed-mode ``type_coerce`` (panel
+    # review), so it abstains. ``not config.fields`` rather than
+    # ``fields is None``: a declaring config with an EMPTY fields tuple has
+    # equally declared nothing — ``blob_csv_expand`` with ``columns: null``
+    # and ``include_row_index: false`` builds exactly that shape while
+    # merging data-derived CSV headers onto the row (panel sweep), so the
+    # empty tuple must abstain too. Gates, queues, row_unions, and coalesces
+    # stay recursable: they are pure routing/merge and run no row-rewriting
+    # code.
+    # elspeth-e6e552ce34 carve-out: a pass-through that PROMISED value
+    # preservation (preserves_input_values — llm, passthrough) cannot have
+    # rewritten the field in place, so its silence about the type is not
+    # opting out of the declaration discipline: the value that leaves is the
+    # value that arrived, and the nearest upstream declaration still
+    # describes it. Recursion is sound under exactly that promise; a field
+    # this transform ITSELF introduced (an llm response field) resolves only
+    # if some ancestor vouches for it, which the structural source arm's
+    # guaranteed-set narrowness prevents — introduced fields abstain.
+    if (
+        node_info.node_type is NodeType.TRANSFORM
+        and node_info.passes_through_input
+        and (config is None or not config.fields)
+        and not node_info.preserves_input_values
+    ):
+        return None
+    # AGGREGATION/COLLECTOR pass-throughs (the other two plugin-bearing kinds)
+    # run plugin code exactly like a transform pass-through does, so recursing
+    # past one is sound only under the same value-preservation promise
+    # (elspeth-48aeea6ad9 — previously they recursed UNGUARDED, benign only
+    # because batch_replicate, the sole shipped batch-aware pass-through,
+    # happens to preserve values). Deliberately NO ``config.fields`` escape
+    # hatch here, unlike the TRANSFORM arm above: aggregations have dynamic
+    # output by design (BatchStats produces count/sum/mean, not the input
+    # fields — see the builder's aggregation-loop comment), so a declaring
+    # config is not the rewrite-declaration discipline that makes the
+    # TRANSFORM hatch sound. Abstain purely on the missing promise.
+    if (
+        node_info.node_type in (NodeType.AGGREGATION, NodeType.COLLECTOR)
+        and node_info.passes_through_input
+        and not node_info.preserves_input_values
+    ):
+        return None
+
+    in_edges = list(graph._graph.in_edges(node_id, data=True))
+    if any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
+        return None
+    contributors = sorted({from_id for from_id, _to_id, _edge_data in in_edges})
+    if not contributors:
+        return None
+
+    visited = _visited | {node_id}
+    resolutions = [
+        resolve_guaranteed_field_type(graph, contributor, field_name, _visited=visited, cache=cache) for contributor in contributors
+    ]
+    if any(resolution is None for resolution in resolutions):
+        return None
+    first, *rest = [r for r in resolutions if r is not None]
+    if any(other.field_type != first.field_type for other in rest):
+        return None
+    return ResolvedGuaranteeType(
+        field_type=first.field_type,
+        declared_by=frozenset().union(*(resolution.declared_by for resolution in [first, *rest])),
+    )

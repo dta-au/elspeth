@@ -19,16 +19,25 @@
  * actionable buttons render as today.
  *
  * Gate legibility (elspeth-088bf83922 T-2, option (a)): every row also
- * renders a small "Blocks Run" / "Advisory" text badge next to its
- * heading, classified by `isRunGatingReadinessRow` (ExecuteButton.tsx —
- * the same file that owns `canExecute`, so this label can't drift from
- * what the button actually does). This is legibility only: it changes no
- * gating behaviour, and both the live panel and the read-only shared panel
- * get the same classification since both render through this component.
+ * renders a small "Blocks run" / "Advisory" text badge next to its
+ * heading. Parent panels prepare `blocksRun` from the same backend-readiness
+ * helper used by ExecuteButton, so this pure renderer never reconstructs
+ * admission from row status or summary text.
+ *
+ * Badge case (elspeth-1fbb371ac3): both values of this binary field are
+ * SENTENCE case, so the pair reads as two states of one field rather than
+ * two vocabularies. That is also the house register for badge text — every
+ * other badge in the tree ships its label lowercase or sentence-cased
+ * (`row union` in GraphView, `chat input` in InlineChatSourceEntry,
+ * `completed with failures` in StatusBadge) and lets CSS supply any
+ * upper-case badge register (shared.css `.status-badge`). Do not restore
+ * "Blocks Run": the panel headers quote this literal in prose
+ * (AuditReadinessPanel / SharedAuditReadinessPanel), so the label has to
+ * read as an ordinary phrase inside a sentence.
  */
 
+import { Button } from "@/components/ui";
 import { useReadOnly } from "../../contexts/ReadOnlyContext";
-import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
 import type { ReadinessRowId, ReadinessStatus } from "../../types/api";
 
 /**
@@ -48,6 +57,8 @@ export interface RowPresentation {
   glyph: string;
   /** Accessible status label, read by SRs before the heading. */
   ariaStatusLabel: string;
+  /** Backend-owned execution admission projected by the parent panel. */
+  blocksRun: boolean;
   /**
    * Optional extra CSS modifier appended to the row's class list (e.g.
    * "audit-readiness-row--llm-interpretations"). Optional — most rows
@@ -88,14 +99,14 @@ export function AuditReadinessRow({
     ? `${baseClassName} ${row.extraClassName}`
     : baseClassName;
 
-  // Gate legibility (elspeth-088bf83922 T-2): classify honestly against
-  // isRunGatingReadinessRow (ExecuteButton.tsx), not by local judgment.
+  // Gate legibility (elspeth-088bf83922 T-2): render the parent-prepared
+  // backend-readiness classification without local inference.
   // The heading text stays in its own leaf span (audit-readiness-row-label-
   // text) so existing exact-text queries against the heading keep working —
   // the badge is a sibling within the same audit-readiness-row-label cell,
   // not appended to the heading string.
-  const gateKind = isRunGatingReadinessRow(row.id) ? "blocks" : "advisory";
-  const gateLabel = gateKind === "blocks" ? "Blocks Run" : "Advisory";
+  const gateKind = row.blocksRun ? "blocks" : "advisory";
+  const gateLabel = gateKind === "blocks" ? "Blocks run" : "Advisory";
   const label = (
     <span className="audit-readiness-row-label">
       <span className="audit-readiness-row-label-text">{row.heading}</span>{" "}
@@ -115,7 +126,8 @@ export function AuditReadinessRow({
         data-testid={row.testId}
         data-gate={gateKind}
       >
-        <button
+        <Button
+          variant="bare"
           type="button"
           className="audit-readiness-row-btn"
           onClick={() => onSelect(row.id)}
@@ -126,7 +138,7 @@ export function AuditReadinessRow({
           <span className="sr-only">{row.ariaStatusLabel}.</span>
           {label}
           <span className="audit-readiness-row-summary">{row.summaryText}</span>
-        </button>
+        </Button>
       </li>
     );
   }

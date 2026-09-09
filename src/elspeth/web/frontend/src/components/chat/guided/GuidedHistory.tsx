@@ -3,7 +3,7 @@
 // Guided-mode decision summary. This is deliberately not a protocol log: the
 // operator needs a visible recap of choices made so far, while low-level
 // emitter/type/hash details stay out of the default workflow surface.
-import type { GuidedStep, TurnRecord } from "@/types/guided";
+import type { GuidedStep, TerminalState, TurnRecord } from "@/types/guided";
 import { GUIDED_STEP_LABELS } from "./stepLabels";
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -18,33 +18,45 @@ interface Props {
    * recorded a summary.
    */
   currentStep: GuidedStep;
+  /** Only a completed terminal includes the current (final) step. */
+  terminal?: TerminalState | null;
+}
+
+/**
+ * Select the visible decision recap rows from guided protocol history.
+ *
+ * This projection is the single availability rule for both the History tab
+ * and the rendered history card: only summarised records outside the current
+ * in-progress step are eligible, with the latest summary winning for each
+ * completed step.
+ */
+export function projectCompletedGuidedHistory(
+  history: readonly TurnRecord[],
+  currentStep: GuidedStep,
+  terminal: TerminalState | null = null,
+): TurnRecord[] {
+  const currentStepCompleted = terminal?.kind === "completed";
+  const latestByStep = new Map<GuidedStep, TurnRecord>();
+  for (const turn of history) {
+    if (!currentStepCompleted && turn.step === currentStep) continue;
+    if (turn.summary === null) continue;
+    latestByStep.set(turn.step, turn);
+  }
+  return [...latestByStep.values()];
 }
 
 /**
  * Read-only plain-language list of completed guided-mode decisions.
  *
- * Returns null when history is empty — the parent should not render this
- * widget unless there are completed steps to show.
+ * Returns null whenever the shared projection finds no completed, summarised
+ * prior-step rows, including current-step-only and summary-null history.
  */
-export function GuidedHistory({ history, currentStep }: Props): React.ReactElement | null {
-  // Empty history: nothing to show.
-  if (history.length === 0) {
-    return null;
-  }
-
-  // One row per COMPLETED step — a step the learner has moved PAST. The current
-  // step is in progress (its answered single_select may already carry a summary
-  // while a schema_form sub-turn is still pending), so it is never "decided" yet
-  // and is excluded outright. Among past steps, keep the most-recent summarised
-  // turn (Map.set on the chronological history wins last); a step that produced
-  // no summary at all contributes nothing. The Map preserves first-seen order.
-  const latestByStep = new Map<GuidedStep, TurnRecord>();
-  for (const turn of history) {
-    if (turn.step === currentStep) continue;
-    if (turn.summary === null) continue;
-    latestByStep.set(turn.step, turn);
-  }
-  const rows = [...latestByStep.values()];
+export function GuidedHistory({
+  history,
+  currentStep,
+  terminal = null,
+}: Props): React.ReactElement | null {
+  const rows = projectCompletedGuidedHistory(history, currentStep, terminal);
 
   // No completed decisions yet (e.g. still on the first step before any Send):
   // render nothing rather than an empty "Decisions so far" card.
@@ -66,9 +78,8 @@ export function GuidedHistory({ history, currentStep }: Props): React.ReactEleme
             <span className="guided-history-step-name">
               {GUIDED_STEP_LABELS[turn.step]}
             </span>
-            {/* Only past, summarised steps reach here (the current step and
-                summary-null turns are filtered above), so every row has a real
-                summary — no fallback needed. */}
+            {/* Only completed, summarised steps reach here, so every row has a
+                real summary — no fallback needed. */}
             <span className="guided-history-summary">
               {turn.summary}
             </span>

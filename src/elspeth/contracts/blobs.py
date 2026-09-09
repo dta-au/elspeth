@@ -11,15 +11,17 @@ down instead of importing upward from L3.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import ClassVar, Literal, Protocol, get_args, runtime_checkable
+from typing import ClassVar, Literal, Protocol, get_args
 from uuid import UUID, uuid5
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 
 AllowedMimeType = Literal[
     "text/csv",
@@ -29,10 +31,47 @@ AllowedMimeType = Literal[
     "application/jsonl",
     "text/jsonl",
 ]
-"""Closed set of MIME types accepted for data-oriented blob uploads."""
+"""Closed set of MIME types accepted for data-oriented blob uploads.
+
+Deliberately EXCLUDES the binary document set: every text consumer —
+decoders, the string-content ``create_blob``/``update_blob`` tools, inline
+content resolution — keeps rejecting binary MIME values by construction.
+Binary documents enter only through the authenticated upload/paste
+boundary (elspeth-0c6a343921)."""
 
 ALLOWED_MIME_TYPES: frozenset[str] = frozenset(get_args(AllowedMimeType))
 """Runtime view derived from ``AllowedMimeType`` to prevent drift."""
+
+BinaryDocumentMimeType = Literal[
+    "image/jpeg",
+    "image/png",
+    "application/pdf",
+]
+"""Closed set of MIME types for binary document blobs (Textract inline)."""
+
+BINARY_DOCUMENT_MIME_TYPES: frozenset[str] = frozenset(get_args(BinaryDocumentMimeType))
+"""Runtime view derived from ``BinaryDocumentMimeType`` to prevent drift."""
+
+StorageMimeType = Literal[
+    "text/csv",
+    "text/plain",
+    "application/json",
+    "application/x-jsonlines",
+    "application/jsonl",
+    "text/jsonl",
+    "image/jpeg",
+    "image/png",
+    "application/pdf",
+]
+"""Storage-level union: what a persisted managed blob may declare.
+
+Mirrors the blobs-table MIME CHECK constraint. Kept as an explicit Literal
+(rather than a type alias union) so ``get_args`` yields the flat member
+set; the derivation test pins it equal to the union of the two derived
+closed sets."""
+
+STORAGE_MIME_TYPES: frozenset[str] = frozenset(get_args(StorageMimeType))
+"""Runtime view derived from ``StorageMimeType`` to prevent drift."""
 
 BlobStatus = Literal["ready", "pending", "error"]
 FinalizeBlobStatus = Literal["ready", "error"]
@@ -144,7 +183,7 @@ class BlobRecord:
     id: UUID
     session_id: UUID
     filename: str
-    mime_type: AllowedMimeType
+    mime_type: StorageMimeType
     size_bytes: int
     content_hash: str | None
     storage_path: str
@@ -412,7 +451,6 @@ class BlobForkCleanupResult:
         freeze_fields(self, "deleted_ids", "errors")
 
 
-@runtime_checkable
 class BlobServiceProtocol(Protocol):
     """Protocol for blob persistence and lifecycle operations."""
 
@@ -421,14 +459,19 @@ class BlobServiceProtocol(Protocol):
         session_id: UUID,
         filename: str,
         content: bytes,
-        mime_type: AllowedMimeType,
+        mime_type: StorageMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Create a blob from content bytes.
 
         Writes content to storage, computes its hash, and persists
-        metadata.
+        metadata. ``session_operation_context`` is the caller's exact
+        session-operation fence (a CREATE or COMPOSE operation on
+        ``session_id``); the write is refused when the fence is stale or the
+        context does not own the session.
         """
         ...
 
@@ -441,33 +484,18 @@ class BlobServiceProtocol(Protocol):
         """Idempotently materialize one deterministic inline-source blob."""
         ...
 
-    async def create_pending_blob(
-        self,
-        session_id: UUID,
-        filename: str,
-        mime_type: AllowedMimeType,
-        created_by: BlobCreator = "pipeline",
-        source_description: str | None = None,
-    ) -> BlobRecord:
-        """Reserve a pending output blob.
-
-        The backing file does not exist yet; a pipeline sink writes it
-        before ``finalize_blob`` marks the record ready or error.
-        """
-        ...
-
-    async def finalize_blob(
+    async def get_blob(
         self,
         blob_id: UUID,
-        status: FinalizeBlobStatus,
-        size_bytes: int | None = None,
-        content_hash: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
-        """Update a pending blob to ready or error after execution."""
-        ...
+        """Get blob metadata under the caller's session-operation fence.
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
-        """Get blob metadata. Raises ``BlobNotFoundError`` if missing."""
+        Raises ``BlobNotFoundError`` if missing — or if the blob is not in
+        the custody of the fence's session, so a foreign blob is
+        indistinguishable from a missing one.
+        """
         ...
 
     async def list_blobs(
@@ -479,22 +507,75 @@ class BlobServiceProtocol(Protocol):
         """List blobs for a session, newest first."""
         ...
 
-    async def delete_blob(self, blob_id: UUID) -> None:
-        """Delete blob metadata and backing file.
+    async def delete_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Delete blob metadata and backing file under an ARCHIVE/COMPOSE fence.
 
         Raises ``BlobActiveRunError`` if linked to an active run,
         ``BlobPendingProposalError`` if a pending proposal retains the blob,
-        and ``BlobNotFoundError`` if the blob does not exist.
+        and ``BlobNotFoundError`` if the blob does not exist or is not in the
+        custody of the fence's session.
         """
         ...
 
-    async def read_blob_content(self, blob_id: UUID) -> bytes:
-        """Read the raw content of a ready blob.
+    async def read_blob_content(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bytes:
+        """Read the raw content of a ready blob under a read-capable fence.
 
         Only ready blobs are readable. The stored hash is verified before
         bytes are returned. Operational misses raise ``BlobNotFoundError``
         or ``BlobStateError``; integrity anomalies raise
-        ``BlobContentMissingError`` or ``BlobIntegrityError``.
+        ``BlobContentMissingError`` or ``BlobIntegrityError``. A stale fence
+        raises before any byte is read.
+        """
+        ...
+
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        """Stream a ready blob, verifying its full content hash incrementally.
+
+        Mirrors :meth:`read_blob_content`'s lifecycle and integrity guards
+        (only ready blobs readable; a missing backing file raises
+        ``BlobContentMissingError``; a hash mismatch raises
+        ``BlobIntegrityError``; a NULL stored hash raises
+        ``AuditIntegrityError``) but never materializes the full blob in
+        memory: content is read and hashed in bounded chunks, retaining
+        only the first ``prefix_bytes`` bytes. Memory use is O(chunk size +
+        ``prefix_bytes``) regardless of blob size.
+
+        Returns ``(prefix, verified_content_hash, total_size_bytes)`` where
+        ``prefix`` is at most ``prefix_bytes`` long and ``verified_content_hash``
+        is the sha256 hex digest already confirmed to match the blob's stored
+        ``content_hash``.
+        """
+        ...
+
+    async def read_blob_preview(
+        self,
+        blob_id: UUID,
+        *,
+        limit_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, bool]:
+        """Read at most ``limit_bytes`` of a ready blob for an inline preview.
+
+        Returns ``(prefix, truncated)``. Shares ``read_blob_content``'s
+        lifecycle, missing-file, and fence guards but does not verify the
+        full content hash, because that would require reading the whole
+        blob and defeat the preview's resource cap.
         """
         ...
 
@@ -503,8 +584,10 @@ class BlobServiceProtocol(Protocol):
         blob_id: UUID,
         run_id: UUID,
         direction: BlobRunLinkDirection,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
-        """Record a blob-to-run linkage.
+        """Record a blob-to-run linkage under the run's EXECUTE fence.
 
         Raises ``RuntimeError`` if direction is outside the declared
         closed set or the blob and run belong to different sessions.
@@ -539,18 +622,250 @@ class BlobServiceProtocol(Protocol):
         source_session_id: UUID,
         target_session_id: UUID,
         operation_id: str,
+        *,
+        live_write_fence: BlobForkWriteFence | None = None,
     ) -> BlobForkCleanupResult:
-        """Clean blobs from the named source's same-principal fork child."""
+        """Clean blobs from the named source's same-principal fork child.
+
+        By default the exact parent operation must already be failed. During
+        same-request compensation, ``live_write_fence`` instead authorizes
+        cleanup while the operation still owns its staged child, allowing the
+        caller to settle the final failure reason exactly once afterward.
+        """
         ...
 
     async def finalize_run_output_blobs(
         self,
         run_id: UUID,
         success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobFinalizationResult:
         """Finalize pending output blobs for a completed or failed run.
 
         Processes each blob independently and returns both successful
-        finalizations and per-blob error records.
+        finalizations and per-blob error records. Runs under the run's
+        EXECUTE fence; the run must be in the custody of the fence's session.
         """
         ...
+
+
+BlobDeletionPhase = Literal["intent", "staged", "purge_pending"]
+
+
+BlobReplacementPhase = Literal["intent", "swap_pending", "purge_pending"]
+
+
+@dataclass(frozen=True, slots=True)
+class BlobDeletionPlan:
+    """Durable, operation-qualified filesystem deletion obligation."""
+
+    blob_id: UUID
+    session_id: UUID
+    storage_path: str
+    tombstone_path: str
+    operation_id: str
+    operation_epoch: int
+    operation_kind: SessionOperationKind
+    phase: BlobDeletionPhase
+    blob_snapshot_hash: str
+    expected_file_present: bool
+    expected_file_size: int | None
+    expected_file_hash: str | None
+    created_at: datetime
+    updated_at: datetime
+    blob: BlobRecord | None
+
+    def __post_init__(self) -> None:
+        if type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
+            raise TypeError("BlobDeletionPlan identities must be exact UUID values")
+        if type(self.storage_path) is not str or not self.storage_path.strip():
+            raise ValueError("BlobDeletionPlan.storage_path must be nonblank")
+        if type(self.tombstone_path) is not str or not self.tombstone_path.strip():
+            raise ValueError("BlobDeletionPlan.tombstone_path must be nonblank")
+        if self.storage_path == self.tombstone_path:
+            raise ValueError("BlobDeletionPlan paths must differ")
+        if type(self.operation_id) is not str or not self.operation_id.strip():
+            raise ValueError("BlobDeletionPlan.operation_id must be nonblank")
+        if type(self.operation_epoch) is not int or self.operation_epoch < 1:
+            raise ValueError("BlobDeletionPlan.operation_epoch must be positive")
+        if type(self.operation_kind) is not SessionOperationKind or self.operation_kind not in {
+            SessionOperationKind.ARCHIVE,
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+            SessionOperationKind.SESSION_FORK,
+        }:
+            raise ValueError("BlobDeletionPlan.operation_kind is invalid")
+        if self.phase not in {"intent", "staged", "purge_pending"}:
+            raise ValueError("BlobDeletionPlan.phase is invalid")
+        if (
+            type(self.blob_snapshot_hash) is not str
+            or len(self.blob_snapshot_hash) != 64
+            or any(character not in "0123456789abcdef" for character in self.blob_snapshot_hash)
+        ):
+            raise ValueError("BlobDeletionPlan.blob_snapshot_hash must be lowercase SHA-256")
+        if type(self.expected_file_present) is not bool:
+            raise TypeError("BlobDeletionPlan.expected_file_present must be bool")
+        if self.expected_file_present:
+            if type(self.expected_file_size) is not int or self.expected_file_size < 0:
+                raise ValueError("BlobDeletionPlan.expected_file_size must be non-negative when bytes are present")
+            if (
+                type(self.expected_file_hash) is not str
+                or len(self.expected_file_hash) != 64
+                or any(character not in "0123456789abcdef" for character in self.expected_file_hash)
+            ):
+                raise ValueError("BlobDeletionPlan.expected_file_hash must be lowercase SHA-256 when bytes are present")
+        elif self.expected_file_size is not None or self.expected_file_hash is not None:
+            raise ValueError("BlobDeletionPlan absent-file evidence must not carry size or hash")
+        if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+            raise TypeError("BlobDeletionPlan timestamps must be exact datetimes")
+        if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+            raise ValueError("BlobDeletionPlan timestamps must be timezone-aware")
+        if self.updated_at < self.created_at:
+            raise ValueError("BlobDeletionPlan.updated_at must not precede created_at")
+        if self.blob is not None and (type(self.blob) is not BlobRecord or self.blob.id != self.blob_id):
+            raise ValueError("BlobDeletionPlan.blob must match blob_id")
+
+
+@dataclass(frozen=True, slots=True)
+class BlobReplacementPlan:
+    """Durable, invocation-qualified filesystem replacement obligation."""
+
+    replacement_id: UUID
+    blob_id: UUID
+    session_id: UUID
+    storage_path: str
+    staging_path: str
+    backup_path: str
+    operation_id: str
+    operation_epoch: int
+    operation_kind: SessionOperationKind
+    lease_token: str
+    owner_instance_id: str
+    phase: BlobReplacementPhase
+    old_blob_snapshot_hash: str
+    replacement_blob_snapshot_hash: str
+    created_at: datetime
+    updated_at: datetime
+    old_blob: BlobRecord
+    replacement_blob: BlobRecord
+
+    def __post_init__(self) -> None:
+        if type(self.replacement_id) is not UUID or type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
+            raise TypeError("BlobReplacementPlan identities must be exact UUID values")
+        # Every field is read directly: this is a type ELSPETH owns, so a
+        # reflective getattr would only hide a misspelt field name behind a
+        # confident AttributeError-free probe (ADR-032; masquerade gate).
+        for field_name, text in (
+            ("storage_path", self.storage_path),
+            ("staging_path", self.staging_path),
+            ("backup_path", self.backup_path),
+            ("operation_id", self.operation_id),
+            ("lease_token", self.lease_token),
+            ("owner_instance_id", self.owner_instance_id),
+        ):
+            if type(text) is not str or not text.strip():
+                raise ValueError(f"BlobReplacementPlan.{field_name} must be nonblank")
+        if len({self.storage_path, self.staging_path, self.backup_path}) != 3:
+            raise ValueError("BlobReplacementPlan paths must be distinct")
+        if type(self.operation_epoch) is not int or self.operation_epoch < 1:
+            raise ValueError("BlobReplacementPlan.operation_epoch must be positive")
+        if type(self.operation_kind) is not SessionOperationKind or self.operation_kind not in {
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+        }:
+            raise ValueError("BlobReplacementPlan.operation_kind must be COMPOSE or PROPOSAL")
+        if self.phase not in {"intent", "swap_pending", "purge_pending"}:
+            raise ValueError("BlobReplacementPlan.phase is invalid")
+        for field_name, digest in (
+            ("old_blob_snapshot_hash", self.old_blob_snapshot_hash),
+            ("replacement_blob_snapshot_hash", self.replacement_blob_snapshot_hash),
+        ):
+            if type(digest) is not str or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError(f"BlobReplacementPlan.{field_name} must be lowercase SHA-256")
+        if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+            raise TypeError("BlobReplacementPlan timestamps must be exact datetimes")
+        if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+            raise ValueError("BlobReplacementPlan timestamps must be timezone-aware")
+        if self.updated_at < self.created_at:
+            raise ValueError("BlobReplacementPlan.updated_at must not precede created_at")
+        if type(self.old_blob) is not BlobRecord or type(self.replacement_blob) is not BlobRecord:
+            raise TypeError("BlobReplacementPlan snapshots must be exact BlobRecord values")
+        if self.old_blob.id != self.blob_id or self.replacement_blob.id != self.blob_id:
+            raise ValueError("BlobReplacementPlan snapshots must match blob_id")
+        if self.old_blob.session_id != self.session_id or self.replacement_blob.session_id != self.session_id:
+            raise ValueError("BlobReplacementPlan snapshots must match session_id")
+        if self.old_blob.storage_path != self.storage_path or self.replacement_blob.storage_path != self.storage_path:
+            raise ValueError("BlobReplacementPlan snapshots must match storage_path")
+        if blob_record_snapshot_hash(self.old_blob) != self.old_blob_snapshot_hash:
+            raise ValueError("BlobReplacementPlan old snapshot hash does not match metadata")
+        if blob_record_snapshot_hash(self.replacement_blob) != self.replacement_blob_snapshot_hash:
+            raise ValueError("BlobReplacementPlan replacement snapshot hash does not match metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class BlobCreationObligation:
+    """Exact pending reservation left for a later current operation."""
+
+    record: BlobRecord
+    operation_id: str
+    operation_epoch: int
+    operation_kind: SessionOperationKind
+
+    def __post_init__(self) -> None:
+        if type(self.record) is not BlobRecord or self.record.status != "pending":
+            raise ValueError("BlobCreationObligation.record must be an exact pending blob")
+        if type(self.operation_id) is not str or not self.operation_id.strip():
+            raise ValueError("BlobCreationObligation.operation_id must be nonblank")
+        if type(self.operation_epoch) is not int or self.operation_epoch < 1:
+            raise ValueError("BlobCreationObligation.operation_epoch must be positive")
+        if type(self.operation_kind) is not SessionOperationKind or self.operation_kind not in {
+            SessionOperationKind.CREATE,
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+        }:
+            raise ValueError("BlobCreationObligation.operation_kind is invalid")
+
+
+def blob_record_snapshot_hash(record: BlobRecord) -> str:
+    """Hash every persisted blob field used by deletion admission."""
+    if type(record) is not BlobRecord:
+        raise TypeError("record must be an exact BlobRecord")
+    payload = {
+        "id": str(record.id),
+        "session_id": str(record.session_id),
+        "filename": record.filename,
+        "mime_type": record.mime_type,
+        "size_bytes": record.size_bytes,
+        "content_hash": record.content_hash,
+        "storage_path": record.storage_path,
+        "created_at": record.created_at.isoformat(),
+        "created_by": record.created_by,
+        "source_description": record.source_description,
+        "status": record.status,
+        "creation_modality": record.creation_modality.value,
+        "created_from_message_id": record.created_from_message_id,
+        "creating_model_identifier": record.creating_model_identifier,
+        "creating_model_version": record.creating_model_version,
+        "creating_provider": record.creating_provider,
+        "creating_composer_skill_hash": record.creating_composer_skill_hash,
+        "creating_arguments_hash": record.creating_arguments_hash,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def names_same_blob(value: str, blob_id: str) -> bool:
+    """Whether ``value`` names the blob ``blob_id``: the same UUID, in either hex case.
+
+    The binding path admits exactly one spelling variance — ``is_widened_blob_ref``
+    matches a ``blob_ref`` against the hyphenated UUID form with ``[0-9a-fA-F]``
+    digits and the runtime binds it through ``UUID(...)`` — so an upper-case
+    marker the LLM authored is the SAME bound blob as the lower-case id the
+    store records. A retention guard that compared spellings read such a
+    bound blob as unbound (elspeth-f123a7b3d2). Two hyphenated UUID texts
+    denote one UUID iff they are equal ignoring case, so that is the whole
+    comparison; a braced or unhyphenated spelling is rejected by the contract,
+    never bound, and therefore a non-match here — as is any non-UUID string,
+    which cannot name a blob at all. No parse, no exception path.
+    """
+    return value.lower() == blob_id.lower()

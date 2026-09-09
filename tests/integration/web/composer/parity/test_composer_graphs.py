@@ -5,8 +5,8 @@ every surface with the same scripted arguments, the committed graphs are
 near-identical and a vacuous comparator would pass. These tests prove the
 helper (1) treats a consistent wire-renaming as isomorphic (canonicalization is
 relabeling, not sensitivity), (2) treats same-names/different-topology as NOT
-isomorphic, and (3) detects every preserved-attribute mutation the design lists
-(gate route, merge mode, failure policy, plugin identity, topology).
+isomorphic, and (3) detects representative preserved-attribute mutations,
+including gate route, merge mode, failure policy, plugin identity, and topology.
 """
 
 from __future__ import annotations
@@ -169,7 +169,7 @@ def test_effective_options_drops_explicit_plugin_defaults() -> None:
 
     The guided stage protocol persists the full ``model_dump`` (every default
     explicit); ``set_pipeline`` persists authored-minimal options. Locking this
-    direction protects the comparator contract Task 4 inherits: csv
+    direction protects the comparator contract: csv
     ``delimiter``/``encoding`` and json ``encoding`` at their model defaults must
     not break isomorphism against a side that omits them.
     """

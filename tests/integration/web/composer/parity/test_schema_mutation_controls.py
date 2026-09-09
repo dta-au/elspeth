@@ -1,14 +1,13 @@
 """Schema-mutation controls: narrowing the advertised terminal schema is caught
-by the capability-manifest SCHEMA-IDENTITY gate, not by graph isomorphism (Plan
-05 Task 4).
+by the capability-manifest SCHEMA-IDENTITY gate, not by graph isomorphism.
 
 Why these controls exist (the false-green trap they defend against)
 -------------------------------------------------------------------
 The generated-DAG and fixture-matrix parity tests prove that three authoring
 surfaces derive the *same committed graph* by comparing each surface's committed
 ``CompositionState`` to a shared reference with ``assert_isomorphic``. That proof
-has a blind spot the plan calls out explicitly: the committed graph is a function
-of the pipeline the LLM *emits*, not of the schema the planner *advertises* to
+has an explicit blind spot: the committed graph is a function of the pipeline
+the LLM *emits*, not of the schema the planner *advertises* to
 the LLM in the ``emit_pipeline_proposal`` terminal tool. Under this suite's
 scripted completion — which emits the full canonical payload regardless of the
 advertised schema — narrowing the advertised terminal schema (dropping a
@@ -41,8 +40,8 @@ Two layers, deliberately:
   production advertised tools (``planner_tool_definitions()``) and the genuine
   canonical schema. The baseline proves the direction (un-narrowed → hashes
   match, manifest builds); each narrowing proves detection (hashes diverge →
-  ``AuditIntegrityError``). This is the "(or the manifest-identity assertion)"
-  path the task sanctions, and it pins each control to the schema-identity
+  ``AuditIntegrityError``). This is the manifest-identity assertion path, and it
+  pins each control to the schema-identity
   compare with zero ambiguity about which check fired.
 
 * ``test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_graph``
@@ -262,16 +261,16 @@ async def test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_
     """
     real_terminal = planner_module.planner_terminal_tool_definition
 
-    def _narrowed_terminal() -> dict[str, Any]:
-        definition = real_terminal()
+    def _narrowed_terminal(terminal_contract: Any = None) -> dict[str, Any]:
+        definition = real_terminal(terminal_contract)
         _remove_fork_to(definition["function"]["parameters"]["properties"]["pipeline"])
         return definition
 
     monkeypatch.setattr(planner_module, "planner_terminal_tool_definition", _narrowed_terminal)
 
     fixture = _fixture("fork_coalesce")
-    parity_env._script(fixture)
     session = await parity_env.sessions.create_session("alice", "Alice", "local")
+    parity_env._script(fixture, str(session.id))
     await parity_env.sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
     user_message = await parity_env.sessions.add_message(session.id, "user", fixture["intent"], writer_principal="route_user_message")
 

@@ -76,6 +76,7 @@ def test_non_empty_legacy_execution_refuses_before_publication() -> None:
             1,
             sink_name="legacy",
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
+            join_group_id_by_token={},
         )
 
     assert sink.publication_calls == 0
@@ -91,6 +92,7 @@ def test_empty_batch_is_a_noop_without_effect_mode() -> None:
         1,
         sink_name="legacy",
         pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
+        join_group_id_by_token={},
     )
 
     assert artifact is None
@@ -130,6 +132,7 @@ def test_effect_write_precondition_guards_fire_before_publication(
             sink_name="legacy",
             pending_outcome=pending_outcome,
             effect_mode="write",
+            join_group_id_by_token={},
         )
 
     assert sink.publication_calls == 0
@@ -181,6 +184,7 @@ def test_write_primary_effect_ownership_and_buffered_outcome_guards(
             all_states=[],
             sink_name="legacy",
             sink_node_id="node-legacy",
+            join_group_id_by_token={},
         )
 
 

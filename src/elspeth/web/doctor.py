@@ -1,4 +1,4 @@
-"""Safe, redacted AWS ECS deployment preflight checks.
+"""Safe, redacted deployment preflight checks.
 
 The default doctor path creates no persistent application state.  Its only
 filesystem write is an unlinked temporary probe operated through one file
@@ -19,10 +19,18 @@ from typing import Any, cast
 from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import make_url
 
+from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.web import aws_rds_trust
 from elspeth.web.config import WebSettings
-from elspeth.web.deployment_contract import ContractCheck, validate_aws_ecs_settings
-from elspeth.web.paths import allowed_source_directories
+from elspeth.web.deployment_contract import (
+    DEPLOYMENT_TARGET_AWS_ECS,
+    ContractCheck,
+    validate_aws_ecs_settings,
+    validate_external_postgresql_settings,
+)
+from elspeth.web.paths import managed_blob_directory
 from elspeth.web.schema_probe import (
     DatabaseTargetConflictError,
     SchemaInitBusyError,
@@ -47,7 +55,7 @@ def sanitize_error(context: str, exc: BaseException) -> str:
 
 
 def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
-    """Actively prove an existing directory is writable without a named residue."""
+    """Prove an existing private directory is safe and writable."""
     name = f"{label}_writable"
     if path is None:
         return ContractCheck(name, False, f"{label} directory is required and must already exist")
@@ -57,6 +65,9 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
             return ContractCheck(name, False, f"{label} directory must not be a symlink")
         if not stat.S_ISDIR(path_stat.st_mode):
             return ContractCheck(name, False, f"{label} directory is required and must already exist")
+        if path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return ContractCheck(name, False, f"{label} group/world-writable directory is not allowed")
+        directory = path.resolve(strict=True)
     except Exception as exc:
         return ContractCheck(name, False, sanitize_error(f"{label} directory validation failed", exc))
 
@@ -66,7 +77,7 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
     probe_error: Exception | None = None
     cleanup_error: Exception | None = None
     try:
-        fd, probe_name = tempfile.mkstemp(prefix=".doctor-probe-", dir=path)
+        fd, probe_name = tempfile.mkstemp(prefix=".doctor-probe-", dir=directory)
         os.unlink(probe_name)
         unlinked = True
         with os.fdopen(fd, "w+b") as probe:
@@ -87,9 +98,7 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
                 cleanup_error = exc
         if probe_name is not None and not unlinked:
             try:
-                os.unlink(probe_name)
-            except FileNotFoundError:
-                pass
+                Path(probe_name).unlink(missing_ok=True)
             except Exception as exc:
                 cleanup_error = cleanup_error or exc
 
@@ -101,22 +110,8 @@ def probe_directory_writable(label: str, path: Path | None) -> ContractCheck:
 
 
 def _probe_payload_store(path: Path | None) -> ContractCheck:
-    """Apply the payload-store root contract before the active write probe."""
-    name = "payload_store_writable"
-    if path is None:
-        return probe_directory_writable("payload_store", None)
-    try:
-        path_stat = path.lstat()
-        if stat.S_ISLNK(path_stat.st_mode):
-            return ContractCheck(name, False, "payload_store directory must not be a symlink")
-        if not stat.S_ISDIR(path_stat.st_mode):
-            return ContractCheck(name, False, "payload_store path must be an existing directory")
-        if path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            return ContractCheck(name, False, "payload_store group/world-writable directory is not allowed")
-        resolved = path.resolve(strict=True)
-    except Exception as exc:
-        return ContractCheck(name, False, sanitize_error("payload_store directory validation failed", exc))
-    return probe_directory_writable("payload_store", resolved)
+    """Apply the shared private-directory contract to the payload store."""
+    return probe_directory_writable("payload_store", path)
 
 
 def _aws_s3_plugin_check() -> ContractCheck:
@@ -134,6 +129,22 @@ def _aws_s3_plugin_check() -> ContractCheck:
         name,
         ok,
         "aws_s3 source and sink are registered" if ok else "aws_s3 source and sink must both be registered",
+    )
+
+
+def _aws_textract_plugin_check() -> ContractCheck:
+    name = "aws_textract_plugin"
+    try:
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        transforms = {plugin.name for plugin in get_shared_plugin_manager().get_transforms()}
+        ok = "aws_textract_document_analysis" in transforms
+    except Exception as exc:
+        return ContractCheck(name, False, sanitize_error("AWS Textract transform discovery failed", exc))
+    return ContractCheck(
+        name,
+        ok,
+        "aws_textract_document_analysis transform is registered" if ok else "aws_textract_document_analysis transform must be registered",
     )
 
 
@@ -182,7 +193,9 @@ def _aws_operator_telemetry_check(settings: WebSettings | None) -> ContractCheck
         ok = (
             settings.deployment_target == "aws-ecs"
             and settings.operator_telemetry == "aws-otlp"
-            and all(isinstance(value, str) and 0 < len(value) <= 128 for value in identity_values)
+            # ``WebSettings`` types every identity field ``str | None``; the
+            # doctor re-checks the length policy so this report stands alone.
+            and all(value is not None and 0 < len(value) <= 128 for value in identity_values)
             and effective.enabled is True
             and effective.granularity in ("lifecycle", "rows")
             and effective.granularity == settings.operator_pipeline_telemetry_granularity
@@ -201,10 +214,6 @@ def _aws_operator_telemetry_check(settings: WebSettings | None) -> ContractCheck
     )
 
 
-def _capability_value(value: object) -> object:
-    return getattr(value, "value", value)
-
-
 def _bedrock_guardrail_plugins_check() -> ContractCheck:
     name = "bedrock_guardrail_plugins"
     try:
@@ -217,14 +226,14 @@ def _bedrock_guardrail_plugins_check() -> ContractCheck:
         prompt_declarations = cast(Any, prompt).policy_capabilities
         content_declarations = cast(Any, content).policy_capabilities
         prompt_ok = any(
-            _capability_value(declaration.capability) == "prompt_shield"
-            and _capability_value(declaration.control_role) == "input"
+            declaration.capability is PluginCapability.PROMPT_SHIELD
+            and declaration.control_role is ControlRole.INPUT
             and declaration.blocks_positive_detection is True
             for declaration in prompt_declarations
         )
         content_ok = any(
-            _capability_value(declaration.capability) == "content_safety"
-            and _capability_value(declaration.control_role) == "output"
+            declaration.capability is PluginCapability.CONTENT_SAFETY
+            and declaration.control_role is ControlRole.OUTPUT
             and declaration.blocks_positive_detection is True
             for declaration in content_declarations
         )
@@ -248,17 +257,49 @@ def _dependency_check(module_name: str, check_name: str) -> ContractCheck:
     return ContractCheck(check_name, True, f"{module_name} dependency is importable")
 
 
-def plugin_and_dependency_checks(*, settings: WebSettings | None = None) -> list[ContractCheck]:
+def _aws_rds_trust_root_check() -> ContractCheck:
+    try:
+        report = aws_rds_trust.verify_aws_rds_trust_bundle()
+    except aws_rds_trust.AwsRdsTrustBundleError as exc:
+        actual = f", actual_sha256={exc.actual_sha256}" if exc.actual_sha256 is not None else ""
+        return ContractCheck(
+            "rds_trust_root",
+            False,
+            "immutable RDS trust root verification failed "
+            f"({exc.code}, path={aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH}, "
+            f"expected_sha256={aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256}"
+            f"{actual})",
+        )
+    return ContractCheck(
+        "rds_trust_root",
+        True,
+        f"immutable RDS trust root verified (path={report.path}, sha256={report.actual_sha256}, certificates={report.certificate_count})",
+    )
+
+
+def plugin_and_dependency_checks(
+    *,
+    settings: WebSettings | None = None,
+    include_aws_checks: bool = True,
+) -> list[ContractCheck]:
     """Return isolated capability checks in stable report order."""
+    shared_checks = [
+        _dependency_check("psycopg", "psycopg_dependency"),
+        _dependency_check("psycopg2", "psycopg2_dependency"),
+        _dependency_check("jinja2", "jinja2_dependency"),
+    ]
+    if not include_aws_checks:
+        return shared_checks
     return [
         _aws_s3_plugin_check(),
         _bedrock_provider_check(),
         _aws_operator_telemetry_check(settings),
         _bedrock_guardrail_plugins_check(),
-        _dependency_check("psycopg", "psycopg_dependency"),
+        _aws_textract_plugin_check(),
+        *shared_checks[:2],
         _dependency_check("boto3", "boto3_dependency"),
         _dependency_check("ijson", "ijson_dependency"),
-        _dependency_check("jinja2", "jinja2_dependency"),
+        shared_checks[-1],
     ]
 
 
@@ -303,41 +344,169 @@ def _build_engine(label: str, raw_url: str) -> Engine:
     raise ValueError("unknown doctor schema label")
 
 
+@observation_boundary(
+    tier=3,
+    source="live PostgreSQL server's pg_stat_ssl row for the doctor's own backend connection",
+    source_param="connection",
+    suppresses=("R5",),
+    invariant="returns a failed ContractCheck when TLS evidence is absent, malformed, or below policy; never raises on row content",
+)
+def postgres_tls_check(label: str, connection: Connection) -> ContractCheck:
+    """Prove the live PostgreSQL backend connection is authenticated over TLS."""
+    name = "session_tls" if label == "session_schema" else "landscape_tls"
+    row = connection.execute(text("SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()")).one_or_none()
+    if row is None:
+        return ContractCheck(name, False, "authenticated PostgreSQL TLS is not active")
+    version, bits = row[1], row[2]
+    ok = row[0] is True and isinstance(version, str) and version.startswith("TLSv") and isinstance(bits, int) and bits >= 128
+    if not ok:
+        return ContractCheck(name, False, "authenticated PostgreSQL TLS is not active")
+    return ContractCheck(
+        name,
+        True,
+        f"authenticated PostgreSQL TLS is active ({version}, {bits} bits)",
+    )
+
+
+def _inspect_via_engine(
+    label: str,
+    engine: Engine,
+    probe_fn: Callable[[Engine | Connection], SchemaState],
+    *,
+    require_authenticated_tls: bool,
+) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
+    """Connect and probe one schema; every outcome is an explicit return."""
+    tls_result: ContractCheck | None = None
+    try:
+        with engine.connect() as connection:
+            if require_authenticated_tls:
+                tls_result = postgres_tls_check(label, connection)
+                if not tls_result.ok:
+                    return (
+                        None,
+                        ContractCheck(
+                            label,
+                            False,
+                            f"{_human_schema_label(label)} inspection was blocked because authenticated PostgreSQL TLS was not active",
+                        ),
+                        tls_result,
+                    )
+                state = probe_fn(connection)
+                return (state, schema_check(label, state), tls_result)
+            connection.execute(text("SELECT 1"))
+            state = probe_fn(connection)
+            return (state, schema_check(label, state), None)
+    except (SessionSchemaError, SchemaCompatibilityError):
+        return (SchemaState.STALE, schema_check(label, SchemaState.STALE), tls_result)
+    except Exception as exc:
+        if require_authenticated_tls and tls_result is None:
+            # The exception precedes TLS capture (a connection-establishment
+            # failure); no TLS evidence was ever collected, so report a
+            # static failed check rather than silently omitting it.
+            tls_result = ContractCheck(
+                "session_tls" if label == "session_schema" else "landscape_tls",
+                False,
+                "authenticated PostgreSQL TLS is not active",
+            )
+        return (
+            None,
+            ContractCheck(label, False, sanitize_error(f"{_human_schema_label(label)} inspection failed", exc)),
+            tls_result,
+        )
+
+
 def _inspect_database(
     label: str,
     raw_url: str,
     probe_fn: Callable[[Engine | Connection], SchemaState],
-) -> tuple[SchemaState | None, ContractCheck]:
-    """Inspect connectivity and schema state through one one-shot engine."""
-    engine: Engine | None = None
-    result: tuple[SchemaState | None, ContractCheck]
+    *,
+    require_authenticated_tls: bool,
+) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
+    """Inspect connectivity, TLS transport, and schema state through one one-shot engine."""
     try:
         engine = _build_engine(label, raw_url)
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-            state = probe_fn(connection)
-        result = (state, schema_check(label, state))
-    except (SessionSchemaError, SchemaCompatibilityError):
-        result = (SchemaState.STALE, schema_check(label, SchemaState.STALE))
     except Exception as exc:
-        result = (
+        # No engine was ever constructed, so no connection or TLS evidence
+        # exists; report static failed checks.
+        tls_result = (
+            ContractCheck(
+                "session_tls" if label == "session_schema" else "landscape_tls",
+                False,
+                "authenticated PostgreSQL TLS is not active",
+            )
+            if require_authenticated_tls
+            else None
+        )
+        return (
             None,
             ContractCheck(label, False, sanitize_error(f"{_human_schema_label(label)} inspection failed", exc)),
+            tls_result,
         )
+    result: tuple[SchemaState | None, ContractCheck, ContractCheck | None] | None = None
+    try:
+        result = _inspect_via_engine(label, engine, probe_fn, require_authenticated_tls=require_authenticated_tls)
     finally:
-        if engine is not None:
-            try:
-                engine.dispose()
-            except Exception as exc:
-                result = (
-                    None,
-                    ContractCheck(
-                        label,
-                        False,
-                        sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
-                    ),
-                )
+        try:
+            engine.dispose()
+        except Exception as exc:
+            # Engine disposal failure downgrades the inspection result while
+            # preserving whatever TLS evidence was already collected.
+            result = (
+                None,
+                ContractCheck(
+                    label,
+                    False,
+                    sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
+                ),
+                result[2] if result is not None else None,
+            )
+    assert result is not None  # a BaseException would have propagated out of the finally
     return result
+
+
+def _initialize_via_engine(
+    label: str,
+    engine: Engine,
+    probe_fn: Callable[[Engine | Connection], SchemaState],
+    init_fn: Callable[[Engine], None],
+) -> ContractCheck:
+    """Initialize one schema and verify it; every outcome is an explicit return."""
+    try:
+        init_fn(engine)
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            final_state = probe_fn(connection)
+        if final_state is SchemaState.CURRENT:
+            return ContractCheck(
+                label,
+                True,
+                "current; initialization completed or was already completed",
+            )
+        return ContractCheck(
+            label,
+            False,
+            f"{_human_schema_label(label)} final verification did not report current",
+        )
+    except SchemaInitBusyError:
+        return ContractCheck(
+            label,
+            False,
+            "another schema initialization is in progress; wait for it to finish and rerun",
+        )
+    except SchemaLockCleanupError:
+        return ContractCheck(
+            label,
+            False,
+            "initialization may have completed but lock cleanup was not verified; investigate the database connection and rerun",
+        )
+    except (SessionSchemaError, SchemaCompatibilityError):
+        return schema_check(label, SchemaState.STALE)
+    except Exception as exc:
+        return ContractCheck(
+            label,
+            False,
+            sanitize_error(f"{_human_schema_label(label)} initialization failed", exc),
+        )
 
 
 def _initialize_database(
@@ -347,85 +516,75 @@ def _initialize_database(
     init_fn: Callable[[Engine], None],
 ) -> ContractCheck:
     """Initialize one eligible schema and independently verify it afterward."""
-    engine: Engine | None = None
-    result: ContractCheck
     try:
         engine = _build_engine(label, raw_url)
-        init_fn(engine)
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-            final_state = probe_fn(connection)
-        if final_state is SchemaState.CURRENT:
-            result = ContractCheck(
-                label,
-                True,
-                "current; initialization completed or was already completed",
-            )
-        else:
-            result = ContractCheck(
-                label,
-                False,
-                f"{_human_schema_label(label)} final verification did not report current",
-            )
-    except SchemaInitBusyError:
-        result = ContractCheck(
-            label,
-            False,
-            "another schema initialization is in progress; wait for it to finish and rerun",
-        )
-    except SchemaLockCleanupError:
-        result = ContractCheck(
-            label,
-            False,
-            "initialization may have completed but lock cleanup was not verified; investigate the database connection and rerun",
-        )
-    except (SessionSchemaError, SchemaCompatibilityError):
-        result = schema_check(label, SchemaState.STALE)
     except Exception as exc:
-        result = ContractCheck(
+        return ContractCheck(
             label,
             False,
             sanitize_error(f"{_human_schema_label(label)} initialization failed", exc),
         )
+    result: ContractCheck | None = None
+    try:
+        result = _initialize_via_engine(label, engine, probe_fn, init_fn)
     finally:
-        if engine is not None:
-            try:
-                engine.dispose()
-            except Exception as exc:
-                result = ContractCheck(
-                    label,
-                    False,
-                    sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
-                )
+        try:
+            engine.dispose()
+        except Exception as exc:
+            result = ContractCheck(
+                label,
+                False,
+                sanitize_error(f"{_human_schema_label(label)} engine disposal failed", exc),
+            )
+    assert result is not None  # a BaseException would have propagated out of the finally
     return result
 
 
-def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[ContractCheck]:
-    """Collect the ordered report and optionally initialize eligible schemas."""
-    checks = list(validate_aws_ecs_settings(settings))
+def _collect_deployment_checks(
+    settings: WebSettings,
+    *,
+    init_schema: bool,
+    include_aws_checks: bool,
+) -> list[ContractCheck]:
+    """Collect one external-PostgreSQL report with optional AWS-only checks."""
+    if include_aws_checks:
+        checks = list(validate_aws_ecs_settings(settings))
+    else:
+        checks = list(validate_external_postgresql_settings(settings))
     by_name = {check.name: check for check in checks}
     url_eligible = by_name["session_db_url"].ok and by_name["landscape_url"].ok
-    if url_eligible:
-        target_check = database_target_check(settings.session_db_url, settings.landscape_url)
-    else:
-        target_check = ContractCheck(
-            "separate_db_targets",
-            False,
-            "database target comparison was not attempted because the database URL contract failed",
-        )
-    checks.append(target_check)
+    target_check = by_name["separate_db_targets"]
     checks.extend(
         [
             probe_directory_writable("data_dir", settings.data_dir),
             _probe_payload_store(settings.payload_store_path),
-            probe_directory_writable("blob", allowed_source_directories(str(settings.data_dir))[0]),
+            probe_directory_writable("blob", managed_blob_directory(str(settings.data_dir))),
         ]
     )
-    checks.extend(plugin_and_dependency_checks(settings=settings))
+    if include_aws_checks:
+        checks.extend(plugin_and_dependency_checks(settings=settings))
+        checks.append(_aws_rds_trust_root_check())
+        by_name = {check.name: check for check in checks}
+    else:
+        checks.extend(plugin_and_dependency_checks(settings=settings, include_aws_checks=False))
 
-    database_prerequisites_pass = url_eligible and by_name["deployment_target"].ok and target_check.ok
+    database_prerequisites_pass = (
+        url_eligible
+        and by_name["deployment_target"].ok
+        and by_name["deployment_state_mode"].ok
+        and target_check.ok
+        and (not include_aws_checks or by_name["rds_trust_root"].ok)
+    )
     if not database_prerequisites_pass:
-        blocked_detail = "schema inspection was not attempted because the AWS ECS database prerequisites failed"
+        blocked_detail = "schema inspection was not attempted because the deployment database prerequisites failed"
+        if include_aws_checks:
+            blocked_tls_detail = "TLS was not verified because the deployment database prerequisites failed"
+            checks.extend(
+                [
+                    ContractCheck("session_tls", False, blocked_tls_detail),
+                    ContractCheck("landscape_tls", False, blocked_tls_detail),
+                ]
+            )
         checks.extend(
             [
                 ContractCheck("session_schema", False, blocked_detail),
@@ -436,8 +595,20 @@ def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[
 
     session_url = cast(str, settings.session_db_url)
     landscape_url = cast(str, settings.landscape_url)
-    session_state, session_result = _inspect_database("session_schema", session_url, probe_session_schema)
-    landscape_state, landscape_result = _inspect_database("landscape_schema", landscape_url, probe_landscape_schema)
+    session_state, session_result, session_tls_result = _inspect_database(
+        "session_schema",
+        session_url,
+        probe_session_schema,
+        require_authenticated_tls=include_aws_checks,
+    )
+    landscape_state, landscape_result, landscape_tls_result = _inspect_database(
+        "landscape_schema",
+        landscape_url,
+        probe_landscape_schema,
+        require_authenticated_tls=include_aws_checks,
+    )
+    if include_aws_checks:
+        checks.extend([cast(ContractCheck, session_tls_result), cast(ContractCheck, landscape_tls_result)])
 
     if not init_schema:
         checks.extend([session_result, landscape_result])
@@ -476,3 +647,29 @@ def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[
         )
     checks.extend([session_result, landscape_result])
     return checks
+
+
+def collect_deployment_checks(settings: WebSettings, *, init_schema: bool = False) -> list[ContractCheck]:
+    """Collect provider-neutral external PostgreSQL deployment checks."""
+    return _collect_deployment_checks(
+        settings,
+        init_schema=init_schema,
+        include_aws_checks=False,
+    )
+
+
+def collect_checks(settings: WebSettings, *, init_schema: bool = False) -> list[ContractCheck]:
+    """Collect AWS ECS checks through the shared deployment collector."""
+    if settings.deployment_target != DEPLOYMENT_TARGET_AWS_ECS:
+        return [
+            ContractCheck(
+                "deployment_target",
+                False,
+                "ELSPETH_WEB__DEPLOYMENT_TARGET must be aws-ecs",
+            )
+        ]
+    return _collect_deployment_checks(
+        settings,
+        init_schema=init_schema,
+        include_aws_checks=True,
+    )

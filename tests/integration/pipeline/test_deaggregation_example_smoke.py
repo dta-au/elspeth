@@ -87,6 +87,9 @@ sinks:
         - 'copy_index: int'
 landscape:
   url: sqlite:///{audit_db}
+payload_store:
+  backend: filesystem
+  base_path: {example_dst / "payloads"}
 """
     )
 
@@ -193,6 +196,9 @@ sinks:
         - 'copy_index: int'
 landscape:
   url: sqlite:///{audit_db}
+payload_store:
+  backend: filesystem
+  base_path: {example_dst / "payloads"}
 """
     )
 
@@ -205,7 +211,7 @@ class TestDeaggregationObservedAggregationPreservesInputContract:
     def test_observed_aggregation_plus_batch_replicate_is_accepted(self, observed_agg_example_dir: Path) -> None:
         """Observed-mode output combines the declared copy index with preserved input fields."""
         from elspeth.cli_helpers import instantiate_plugins_from_config
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
         from elspeth.core.dag import ExecutionGraph
 
         config = load_settings(observed_agg_example_dir / "settings.yaml")

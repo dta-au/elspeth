@@ -1,8 +1,8 @@
 # ELSPETH Composer Guide
 
-**Document date:** 23 July 2026
-**Release covered:** 0.7.1
-**Audience:** Evaluators, programme teams, operators, and technical reviewers
+**Document date:** 8 September 2026
+**Release covered:** 0.8.0
+**Audience:** Evaluators, program teams, operators, and technical reviewers
 **Register:** Public-facing / lightly technical
 **Status:** Current capability guide
 
@@ -33,6 +33,7 @@ from a blank YAML file.
 | Handle credentials safely | Reference secrets by name instead of placing secret values in pipeline configuration. |
 | Preserve work in progress | Resume after an interrupted authoring session with transcript, redacted tool rows, and state diffs. |
 | Finish in the right way | Save for review, run the pipeline, or export YAML depending on the user's workflow. |
+| Choose the level of detail | Keep the standard detail level, which is the default, or switch to technical for raw plugin settings, every validation check, advanced options, and YAML import. |
 
 ## The Authoring Experience
 
@@ -142,5 +143,3 @@ hand the result to the right next step.
   that apply once a pipeline runs.
 - Read [`platform-architecture.md`](platform-architecture.md) for the broader
   system shape.
-- Read [`assessment-mapping.md`](assessment-mapping.md) for the public-sector
-  evaluation map and caveats.

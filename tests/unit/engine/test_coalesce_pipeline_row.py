@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings
@@ -51,8 +53,7 @@ class _RecorderDouble:
         self.create_row = _CallRecorder(SimpleNamespace(row_id="row_001"))
         self.create_token = _CallRecorder(SimpleNamespace(token_id="token_001"))
         self.coalesce_tokens = _CallRecorder(SimpleNamespace(token_id="merged_001", join_group_id="join_001"))
-        self.has_completed_row_for_node = _CallRecorder(False)
-        self.get_completed_row_ids_for_nodes = _CallRecorder([])
+        self.has_completed_group_for_node = _CallRecorder(False)
         self.begin_node_state = _CallRecorder(SimpleNamespace(state_id="state_001"))
         self.complete_node_state = _CallRecorder()
 
@@ -84,20 +85,19 @@ def _coalesce_tokens_impl(
     node_id: NodeID,
     run_id: str,
     parent_completions: list[Any],
-) -> TokenInfo:
+) -> tuple[TokenInfo, str]:
     assert len(parent_completions) == len(parents)
-    return TokenInfo(
+    merged = TokenInfo(
         row_id=parents[0].row_id,
         token_id="merged_001",
         row_data=merged_data,
-        join_group_id="join_001",
     )
+    return merged, "join_001"
 
 
 def _restore_reads_from_execution_double(execution: _RecorderDouble) -> SimpleNamespace:
     return SimpleNamespace(
-        get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-        has_completed_row_for_node=execution.has_completed_row_for_node,
+        has_completed_group_for_node=execution.has_completed_group_for_node,
     )
 
 
@@ -203,15 +203,13 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100, "branch_a_field": "a"}, contract=contract_a),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=make_row({"amount": 100, "branch_b_field": "b"}, contract=contract_b),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         # Accept both tokens
@@ -270,16 +268,14 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100}, contract=contract),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
 
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=_BadPipelineRow(),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         # Accept first token
@@ -348,15 +344,13 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"value": 100}, contract=contract_a),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=make_row({"value": "text"}, contract=contract_b),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         executor.accept(token_a, "merge_point")
@@ -369,7 +363,6 @@ class TestCoalesceExecutorPipelineRow:
         assert "contract_type_conflict" in outcome.failure_reason
         assert outcome.held is False
         assert outcome.merged_token is None
-        assert outcome.outcomes_recorded is True  # Tokens properly terminated
 
     def test_first_policy_merges_immediately(self) -> None:
         """Coalesce with "first" policy should merge on first arrival.
@@ -407,8 +400,7 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100}, contract=contract),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
 
         # Accept first token - should merge immediately with "first" policy
@@ -451,15 +443,13 @@ class TestCoalesceExecutorPipelineRow:
             row_id="row_001",
             token_id="token_a",
             row_data=make_row({"amount": 100, "a_only": "a"}, contract=contract),
-            branch_name="branch_a",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_a"),),
         )
         token_b = TokenInfo(
             row_id="row_001",
             token_id="token_b",
             row_data=make_row({"amount": 200, "b_only": "b"}, contract=contract),
-            branch_name="branch_b",
-            fork_group_id="fork_001",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
         executor.accept(token_a, "merge_point")

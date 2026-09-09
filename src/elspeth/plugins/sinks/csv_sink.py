@@ -11,7 +11,7 @@ from __future__ import annotations
 import codecs
 import csv
 import io
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -59,6 +59,7 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 from elspeth.plugins.sinks._audit_export_bundle_effects import (
     commit_audit_export_bundle,
     inspect_audit_export_bundle,
+    preflight_audit_export_bundle,
     prepare_audit_export_bundle,
     reconcile_audit_export_bundle,
 )
@@ -144,13 +145,32 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a67f1d6397cb04ee"
+    source_file_hash: str | None = "sha256:57a234f1305bdeca"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"append", "write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS, SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
     supported_audit_export_formats = frozenset({AuditExportFormat.CSV})
+
+    usage_when_to_use: str = (
+        "Use for portable flat tabular output with controlled columns and headers, including append/resume workflows "
+        "whose first accepted row can lock an observed schema."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for nested or binary values, or when output columns may drift after the first accepted row; choose a "
+        "structured format instead."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: csv
+    options:
+      path: outputs/results.csv
+      collision_policy: auto_increment
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("csv", "file", "batch", "tabular")
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -175,6 +195,21 @@ class CSVSink(BaseSink):
             raise SinkEffectCapabilityError(
                 "CSV audit export requires mode='write' and create-only collision policy 'fail_if_exists' or null"
             )
+
+    def _resolve_audit_export_publication_preflight(
+        self,
+        export_format: AuditExportFormat,
+    ) -> Callable[[], None] | None:
+        if type(export_format) is not AuditExportFormat:
+            raise TypeError("audit export format must be an exact AuditExportFormat")
+        if export_format is not AuditExportFormat.CSV:
+            return None
+        target_path = self._requested_path
+
+        def run_preflight() -> None:
+            preflight_audit_export_bundle(target_path)
+
+        return run_preflight
 
     def _validate_sink_effect_capability_configuration(
         self,
@@ -403,7 +438,10 @@ class CSVSink(BaseSink):
                 yield encoder.encode(header_text())
             locked_fields = set(data_fields)
             for snapshot_member, row in zip(emitted_members, rows, strict=True):
-                current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+                if snapshot_member.member_effect_id in current_by_effect_id:
+                    current_member = current_by_effect_id[snapshot_member.member_effect_id]
+                else:
+                    current_member = None
                 extra_fields = set(row) - locked_fields
                 if extra_fields:
                     reason = "CSV row contains fields outside the established columns: " + ", ".join(

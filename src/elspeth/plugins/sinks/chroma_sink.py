@@ -31,6 +31,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
@@ -51,6 +52,8 @@ from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
+    ChromaConnectionMode,
+    _validated_chroma_http_client_args,
 )
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -102,7 +105,7 @@ class ChromaSinkConfig(DataPluginConfig):
     _plugin_component_type: ClassVar[str | None] = "sink"
 
     collection: str = Field(description="ChromaDB collection name")
-    mode: Literal["persistent", "client"] = Field(description="Connection mode")
+    mode: ChromaConnectionMode = Field(description="Connection mode")
     persist_directory: str | None = Field(default=None, description="Local persistence directory for persistent Chroma mode.")
     host: str | None = Field(default=None, description="Chroma server host for client mode.")
     port: int = Field(default=8000, ge=1, le=65535, description="Chroma server port for client mode.")
@@ -139,6 +142,20 @@ class ChromaSinkConfig(DataPluginConfig):
         For fixed/flexible schemas, validates that referenced fields exist and
         have compatible types. For observed schemas, fields are unknown at config
         time so validation defers to runtime.
+
+        The fixed/flexible scope is a CLOSED ADJUDICATION, not an oversight:
+        ``elspeth-a7345c7262`` (closed 2026-04-10) specifies it in those words.
+        Do not narrow it to ``fixed`` without a ruling, and note when asking
+        that the house rule for the identical question on the transform side
+        went the other way FOUR MONTHS LATER —
+        ``BaseTransform._reject_fixed_schema_omitting_consumed_fields``
+        (``plugins/infrastructure/base.py``, ``elspeth-d3958d90f5``,
+        2026-08-06) gates on ``mode != "fixed"`` because "Flexible schemas
+        admit the column as an extra ... odd configs, not incoherent ones".
+        Under ``flexible`` the runtime does admit the undeclared column, so
+        this rejects a config that would run. Tracked rather than fixed here:
+        the two rules disagree on purpose-built reasoning and reconciling them
+        is a ruling, not a lint.
         """
         if self.schema_config.is_observed:
             return self
@@ -151,8 +168,10 @@ class ChromaSinkConfig(DataPluginConfig):
         fm = self.field_mapping
 
         # document_field and id_field must exist and be str-compatible
-        for attr_name, label in [("document_field", "document_field"), ("id_field", "id_field")]:
-            field_name = getattr(fm, attr_name)
+        for field_name, label in (
+            (fm.document_field, "document_field"),
+            (fm.id_field, "id_field"),
+        ):
             if field_name not in field_types:
                 raise ValueError(
                     f"field_mapping.{label} references '{field_name}' which is not in the schema. Declared fields: {sorted(field_types)}"
@@ -177,7 +196,7 @@ class ChromaSinkConfig(DataPluginConfig):
         return self
 
 
-class ChromaSink(BaseSink):
+class ChromaSink(BaseSink, MemberSinkEffectCapability):
     """Write pipeline rows into a ChromaDB collection.
 
     Each row maps to a ChromaDB document via the configured field_mapping.
@@ -194,15 +213,44 @@ class ChromaSink(BaseSink):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:92218f2096f03f38"
+    source_file_hash: str | None = "sha256:0a6b845505e56554"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.VECTOR
     supported_effect_modes = frozenset({"overwrite"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
-    supports_member_effects = True
     effect_mode_remediation = "set on_duplicate=overwrite or choose a sink with a target-side effect marker"
+
+    usage_when_to_use: str = (
+        "Use when rows provide stable string IDs, string documents, and scalar metadata for semantic retrieval or RAG "
+        "in a Chroma collection."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use as an authoritative archive, for nested metadata or caller-supplied embeddings, for resume, or with "
+        "a duplicate policy other than recoverable overwrite."
+    )
+    example_use: str = """sinks:
+  semantic_index:
+    plugin: chroma_sink
+    options:
+      collection: customer_documents
+      mode: persistent
+      persist_directory: outputs/chroma/customer-documents
+      field_mapping:
+        id_field: document_id
+        document_field: body
+        metadata_fields:
+          - category
+      on_duplicate: overwrite
+      schema:
+        mode: fixed
+        fields:
+          - "document_id: str"
+          - "body: str"
+          - "category: str?"
+"""
+    capability_tags: tuple[str, ...] = ("chroma", "vector-store", "embedding", "rag")
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -214,8 +262,10 @@ class ChromaSink(BaseSink):
         del cls
         if purpose is SinkEffectExecutionPurpose.AUDIT_EXPORT:
             return None
-        mode = config.get("on_duplicate", "overwrite")
-        return ResolvedSinkEffectMode(mode) if isinstance(mode, str) else None
+        mode: object = "overwrite"
+        if "on_duplicate" in config:
+            mode = config["on_duplicate"]
+        return ResolvedSinkEffectMode(mode) if type(mode) is str else None
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -243,7 +293,23 @@ class ChromaSink(BaseSink):
             allow_coercion=False,
         )
         self.input_schema = self._schema_class
-        self.declared_required_fields = self._config.schema_config.get_effective_required_fields()
+        # The two fields this sink READS FROM are requirements, exactly as
+        # text_sink/document_sink treat their ``field:``. ``_extract_effect_member``
+        # raises on a row missing either, so a pipeline whose upstream cannot
+        # guarantee them fails per row at write time — after the run has already
+        # started, with rows already committed to other sinks. Declaring them
+        # here moves that to graph-build time, where
+        # ``validate_sink_required_fields`` compares the set against upstream
+        # guarantees, and the composer picks it up with no change of its own
+        # (it reads this same attribute off the constructed sink).
+        #
+        # ``metadata_fields`` are deliberately NOT included: the extractor skips
+        # an absent one (``if field_name not in row: continue``), so requiring
+        # them would reject pipelines the runtime accepts.
+        self.declared_required_fields = self._config.schema_config.get_effective_required_fields() | {
+            self._config.field_mapping.id_field,
+            self._config.field_mapping.document_field,
+        }
 
         self._client: chromadb.api.ClientAPI | None = None
         self._collection: chromadb.Collection | None = None
@@ -272,9 +338,11 @@ class ChromaSink(BaseSink):
                     "ChromaSinkConfig.host is None in 'client' mode — ChromaConnectionConfig validation should have rejected this"
                 )
             self._client = chromadb.HttpClient(
-                host=self._config.host,
-                port=self._config.port,
-                ssl=self._config.ssl,
+                **_validated_chroma_http_client_args(
+                    self._config.host,
+                    self._config.port,
+                    ssl=self._config.ssl,
+                )
             )
             self._client.heartbeat()
 
@@ -295,28 +363,30 @@ class ChromaSink(BaseSink):
         return hashlib.sha256(payload_bytes).hexdigest(), len(payload_bytes)
 
     def _extract_effect_member(self, member: SinkEffectMember) -> tuple[str, str, dict[str, object] | None]:
+        # SinkEffectMember.__post_init__ freezes row as a mapping, so the thaw
+        # is a dict by construction.
         row = deep_thaw(member.row)
-        if not isinstance(row, dict):  # pragma: no cover - member contract guarantees a mapping
-            raise FrameworkBugError("Chroma effect member row is not an object")
         fm = self._config.field_mapping
         try:
             raw_id = row[fm.id_field]
             raw_document = row[fm.document_field]
         except KeyError as exc:
             raise ValueError(f"Chroma effect member is missing required field {exc.args[0]!r}") from exc
-        if not isinstance(raw_id, str) or not isinstance(raw_document, str):
+        if type(raw_id) is not str or type(raw_document) is not str:
             raise ValueError("Chroma effect member id and document fields must be strings")
         metadata: dict[str, object] = {}
         for field_name in fm.metadata_fields:
             if field_name not in row:
                 continue
             value = row[field_name]
-            if value is not None and not isinstance(value, (str, int, float, bool)):
+            if value is not None and type(value) not in {str, int, float, bool}:
                 raise ValueError(f"Chroma effect member metadata field {field_name!r} is not a supported scalar")
-            if isinstance(value, float) and not math.isfinite(value):
+            if type(value) is float and not math.isfinite(value):
                 raise ValueError(f"Chroma effect member metadata field {field_name!r} must be finite")
             metadata[field_name] = value
-        return raw_id, raw_document, metadata or None
+        if not metadata:
+            return raw_id, raw_document, None
+        return raw_id, raw_document, metadata
 
     @property
     def _effect_target(self) -> str:
@@ -439,7 +509,6 @@ class ChromaSink(BaseSink):
         diversion_attribution = []
         for ordinal, reason in diversions:
             row = deep_thaw(member_by_ordinal[ordinal].row)
-            assert isinstance(row, dict)
             # Live diversion log BEFORE the plan binds: fails closed with
             # FrameworkBugError when no on_write_failure policy is configured.
             self._divert_row(row, row_index=ordinal, reason=reason)
@@ -520,11 +589,13 @@ class ChromaSink(BaseSink):
         }
 
     @staticmethod
-    def _normalize_metadata_for_comparison(metadata: object) -> object:
-        if not isinstance(metadata, Mapping):
-            return metadata
+    def _normalize_metadata_for_comparison(metadata: Mapping[str, object] | None) -> dict[str, object] | None:
+        if metadata is None:
+            return None
         normalized = {key: value for key, value in metadata.items() if value is not None}
-        return normalized or None
+        if normalized:
+            return normalized
+        return None
 
     def commit_member_effect(
         self,
@@ -571,18 +642,24 @@ class ChromaSink(BaseSink):
             result = self._collection.get(ids=[document_id], include=["documents", "metadatas"])
         except (chromadb.errors.ChromaError, ValueError):
             return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "unverifiable"))
-        ids = result.get("ids")
-        documents = result.get("documents")
-        metadatas = result.get("metadatas")
-        if ids == []:
-            return SinkEffectReconcileResult.not_applied(evidence=self._member_group_evidence(plan, "missing"))
+        if type(result) is not dict or any(field not in result for field in ("ids", "documents", "metadatas")):
+            return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "malformed"))
+        ids = result["ids"]
+        documents = result["documents"]
+        metadatas = result["metadatas"]
         if (
-            ids != [document_id]
-            or not isinstance(documents, list)
-            or len(documents) != 1
-            or not isinstance(metadatas, list)
-            or len(metadatas) != 1
+            type(ids) is not list
+            or type(documents) is not list
+            or type(metadatas) is not list
+            or not (len(ids) == len(documents) == len(metadatas))
+            or any(type(item) is not str or not item for item in ids)
+            or any(type(item) is not str for item in documents)
+            or any(item is not None and type(item) is not dict for item in metadatas)
         ):
+            return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "malformed"))
+        if len(ids) == 0:
+            return SinkEffectReconcileResult.not_applied(evidence=self._member_group_evidence(plan, "missing"))
+        if len(ids) != 1 or ids[0] != document_id:
             return SinkEffectReconcileResult.unknown(evidence=self._member_group_evidence(plan, "ambiguous"))
         actual_metadata = self._normalize_metadata_for_comparison(metadatas[0])
         expected_metadata = self._normalize_metadata_for_comparison(metadata)
@@ -639,7 +716,8 @@ class ChromaSink(BaseSink):
             )
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.clear_system_cache()
+        client = self._client
         self._client = None
         self._collection = None
+        if client is not None:
+            client.close()  # type: ignore[attr-defined]

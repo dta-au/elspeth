@@ -62,11 +62,14 @@ from typing import Any
 from elspeth_lints.core.allowlist import (
     AllowlistEntry,
     JudgeVerdict,
+    iter_allowlist_root_yaml_paths,
 )
 from elspeth_lints.core.allowlist_io import (
     AllowlistIOError,
     iter_allow_hits_from_directory,
 )
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock
+from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
 
 COUNTER_SNAPSHOT_SCHEMA_VERSION = 1
 COUNTER_SNAPSHOT_DIRNAME = ".judge-metrics"
@@ -242,19 +245,20 @@ def append_judge_decision_event(
     if write_disposition not in {"written", "blocked_without_override"}:
         raise OverrideRateError(f"unknown judge decision write_disposition {write_disposition!r}")
     event_path = judge_decision_events_path(allowlist_dir)
-    event_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": 1,
-        "source_file": source_file,
-        "entry_key": entry_key,
-        "rule_id": rule_id,
-        "effective_verdict": effective_verdict.value,
-        "model_verdict": model_verdict.value if model_verdict is not None else None,
-        "recorded_at": recorded_at.isoformat(),
-        "write_disposition": write_disposition,
-    }
-    with event_path.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(payload, sort_keys=True) + "\n")
+    with allowlist_mutation_lock(allowlist_dir):
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "source_file": source_file,
+            "entry_key": entry_key,
+            "rule_id": rule_id,
+            "effective_verdict": effective_verdict.value,
+            "model_verdict": model_verdict.value if model_verdict is not None else None,
+            "recorded_at": recorded_at.isoformat(),
+            "write_disposition": write_disposition,
+        }
+        with event_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, sort_keys=True) + "\n")
     return event_path
 
 
@@ -287,10 +291,10 @@ def write_override_rate_counter_snapshot(
 def load_override_rate_counter_snapshot(snapshot_path: Path) -> OverrideRateCounterSnapshot:
     """Load a counter snapshot from disk with structural validation."""
     try:
-        raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        raw = strict_json_loads(snapshot_path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise OverrideRateError(f"counter snapshot {snapshot_path} could not be read: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except StrictJSONError as exc:
         raise OverrideRateError(f"counter snapshot {snapshot_path} is not valid JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise OverrideRateError(f"counter snapshot {snapshot_path} must be a JSON object")
@@ -492,10 +496,10 @@ def _collect_counter_records_from_allowlists(allowlist_root: Path) -> list[Judge
 
 def _compute_allowlist_hash(allowlist_root: Path) -> str:
     hasher = hashlib.sha256()
-    candidates = list(allowlist_root.rglob("*.yaml")) + list(allowlist_root.rglob("*.yml"))
-    for path in sorted(candidates, key=lambda p: p.relative_to(allowlist_root).as_posix()):
-        if COUNTER_SNAPSHOT_DIRNAME in path.parts:
-            continue
+    # Shared root walker: skips COUNTER_SNAPSHOT_DIRNAME and every other
+    # dot-prefixed tool-state directory, including the sign-bundle staging
+    # area whose candidate allowlists would otherwise perturb the hash.
+    for path in iter_allowlist_root_yaml_paths(allowlist_root):
         rel = path.relative_to(allowlist_root).as_posix()
         hasher.update(rel.encode("utf-8"))
         hasher.update(b"\0")
@@ -520,8 +524,8 @@ def _load_judge_decision_events(allowlist_root: Path) -> list[dict[str, Any]]:
             if not line.strip():
                 continue
             try:
-                raw = json.loads(line)
-            except json.JSONDecodeError as exc:
+                raw = strict_json_loads(line)
+            except StrictJSONError as exc:
                 raise OverrideRateError(f"judge decision event {event_path}:{line_no} is not valid JSON: {exc}") from exc
             if not isinstance(raw, dict):
                 raise OverrideRateError(f"judge decision event {event_path}:{line_no} must be a JSON object")

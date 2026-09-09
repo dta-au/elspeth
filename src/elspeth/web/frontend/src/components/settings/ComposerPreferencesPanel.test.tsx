@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   ComposerPreferencesForm,
@@ -8,6 +8,7 @@ import {
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
+import { updateUserComposerPreferences } from "@/api/client";
 
 // API mock — the real preferencesStore module imports these helpers and
 // would receive undefined without the entries.
@@ -109,6 +110,39 @@ describe("ComposerPreferencesForm", () => {
     const alert = screen.getByRole("alert");
     expect(alert).toBeInTheDocument();
     expect(alert).toHaveTextContent(/503 Service Unavailable/);
+    // The affordance is the shared stylesheet rule, not a one-off inline
+    // style: the same class ships on DefaultModeChangedBanner and
+    // UserAdminDialog, and only this call site used to carry inline colour,
+    // so the same error rendered two different ways (elspeth-b9871d3648).
+    expect(alert).toHaveClass("composer-preferences-error");
+    expect(alert.getAttribute("style")).toBeNull();
+  });
+
+  it("puts real classes on every fieldset, legend and option (elspeth-03f43bdef0)", () => {
+    // With no classes at all these rendered Chrome's 2px groove fieldset
+    // bevel and ~5px UA sibling margins on --color-surface. The stylesheet
+    // side of the fix is pinned in settingsSurface.test.ts; this pins that
+    // the markup actually reaches those rules.
+    const { container } = render(<ComposerPreferencesForm />);
+
+    const groups = screen.getAllByRole("group");
+    expect(groups).toHaveLength(3);
+    for (const group of groups) {
+      expect(group).toHaveClass("composer-preferences-fieldset");
+      expect(group.getAttribute("style")).toBeNull();
+      const legend = group.querySelector("legend");
+      expect(legend).not.toBeNull();
+      expect(legend).toHaveClass("composer-preferences-legend");
+    }
+
+    const radios = screen.getAllByRole("radio");
+    expect(radios).toHaveLength(7);
+    for (const radio of radios) {
+      expect(radio.closest("label")).toHaveClass("composer-preferences-option");
+    }
+
+    // No element in the form falls back to an inline layout literal.
+    expect(container.querySelectorAll("[style]")).toHaveLength(0);
   });
 
   it("shows Reset tutorial after completion and calls resetTutorial", async () => {
@@ -173,6 +207,31 @@ describe("ComposerPreferencesForm", () => {
       screen.getByRole("button", { name: /reset tutorial/i }),
     ).toBeInTheDocument();
   });
+
+  it("offers a Detail level group and writes show_advanced", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateUserComposerPreferences).mockResolvedValueOnce({
+      default_mode: "guided",
+      banner_dismissed_at: null,
+      freeform_intro_dismissed_at: null,
+      tutorial_completed_at: null,
+      tutorial_stage: null,
+      tutorial_session_id: null,
+      tutorial_run_id: null,
+      tutorial_source_data_hash: null,
+      show_advanced: true,
+      updated_at: "2026-05-15T00:00:00Z",
+    });
+    render(<ComposerPreferencesForm />);
+    const group = screen.getByRole("group", { name: "Detail level" });
+    expect(within(group).getByRole("radio", { name: "Standard (recommended)" })).toBeChecked();
+    await user.click(within(group).getByRole("radio", { name: "Show technical detail" }));
+    expect(updateUserComposerPreferences).toHaveBeenCalledWith({ show_advanced: true });
+    expect(usePreferencesStore.getState().showAdvanced).toBe(true);
+    // Store → mounted control (the flag flips from elsewhere, e.g. another tab).
+    act(() => usePreferencesStore.setState({ showAdvanced: false }));
+    expect(within(group).getByRole("radio", { name: "Standard (recommended)" })).toBeChecked();
+  });
 });
 
 // ── Modal chrome (Panel test analyzer #2) ────────────────────────────────
@@ -212,6 +271,52 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     const title = document.getElementById(titleId!);
     expect(title).not.toBeNull();
     expect(title).toHaveTextContent(/composer preferences/i);
+  });
+
+  it("mounts the modal chrome on the app-dialog primitive (elspeth-e6fcd8d703)", () => {
+    render(<ComposerPreferencesPanel onClose={vi.fn()} />);
+    // The frame was a copy-pasted inline style object at literal z-index 101
+    // (the non-modal overlay band), and the close button carried a one-off
+    // 32×32 inline recipe below both control-size tokens. Both now compose
+    // the shared classes — the CSS side is gated in
+    // styles/overlayChrome.test.ts; this pins that the markup actually
+    // reaches those rules.
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("style")).toBeNull();
+    expect(dialog).toHaveClass("app-dialog", "settings-dialog");
+    expect(screen.getByRole("presentation")).toHaveClass("app-dialog-backdrop");
+    const close = screen.getByRole("button", {
+      name: "Close composer preferences panel",
+    });
+    expect(close).toHaveClass("dialog-close");
+    expect(close.getAttribute("style")).toBeNull();
+  });
+
+  it("renders the preference actions footer with a neutral tutorial reset and a non-persisting OK close", async () => {
+    const onClose = vi.fn();
+    render(<ComposerPreferencesPanel onClose={onClose} />);
+
+    const actions = document.querySelector<HTMLDivElement>(
+      ".composer-preferences-actions",
+    );
+    expect(actions).not.toBeNull();
+    if (actions === null) {
+      throw new Error("Composer preferences actions footer was not rendered");
+    }
+    expect(actions.getAttribute("style")).toBeNull();
+
+    const buttons = within(actions).getAllByRole("button");
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]).toHaveAccessibleName("OK");
+    expect(buttons[0]).toHaveClass("btn-primary");
+    expect(buttons[1]).toHaveAccessibleName("Reset tutorial");
+    expect(buttons[1]).not.toHaveClass("btn-primary");
+    expect(buttons[1]).not.toHaveClass("btn-danger");
+
+    await userEvent.click(buttons[0]);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(updateUserComposerPreferences).not.toHaveBeenCalled();
   });
 
   it("Escape calls onClose (modal dismissal contract)", async () => {

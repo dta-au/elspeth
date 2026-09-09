@@ -32,7 +32,7 @@ from elspeth.engine.orchestrator.types import RouteValidationError
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
     from elspeth.contracts.types import NodeID
-    from elspeth.core.config import GateSettings
+    from elspeth.core.config import AggregationSettings, GateSettings
     from elspeth.engine.orchestrator.plugin_types import RowPlugin
     from elspeth.engine.orchestrator.types import PipelineConfig
 
@@ -105,8 +105,22 @@ def validate_pipeline_route_targets(
     route_resolution_map: Mapping[tuple[NodeID, str], RouteDestination],
     transform_id_map: Mapping[int, NodeID],
     config_gate_id_map: Mapping[GateName, NodeID],
+    closer_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Run the full route-target preflight bundle for a pipeline config."""
+    """Run the full route-target preflight bundle for a pipeline config.
+
+    ``closer_names`` (spec §7 rule 9, WS3 Task 9b): legal ``on_error``
+    targets beyond a sink name — the error-routable closer names (coalesce,
+    row_union and, since the integration item-18 parity sweep, collector)
+    the graph's own builder already accepted (``ExecutionGraph.
+    get_error_routable_closer_names()``). The BUILDER is the
+    in-region/out-of-region validity authority (``core/dag/builder.py``'s
+    rule-9 resolution runs at graph construction, before this ever sees the
+    config): a closer name reaching this validator implies the builder
+    already accepted it, so this only needs to widen the "is this a legal
+    non-sink destination" membership test — it must NEVER re-derive region
+    membership.
+    """
 
     available_sinks = set(config.sinks.keys())
     validate_route_destinations(
@@ -119,6 +133,16 @@ def validate_pipeline_route_targets(
     )
     validate_transform_error_sinks(
         transforms=config.transforms,
+        available_sinks=available_sinks,
+        closer_names=closer_names,
+    )
+    validate_gate_error_sinks(
+        gates=config.gates,
+        available_sinks=available_sinks,
+        closer_names=closer_names,
+    )
+    validate_aggregation_error_sinks(
+        aggregation_settings=config.aggregation_settings,
         available_sinks=available_sinks,
     )
     for source in config.sources.values():
@@ -138,8 +162,10 @@ def validate_pipeline_route_targets(
 def validate_transform_error_sinks(
     transforms: Sequence[RowPlugin],
     available_sinks: set[str],
+    closer_names: frozenset[str] = frozenset(),
 ) -> None:
-    """Validate all transform on_error destinations reference existing sinks.
+    """Validate all transform on_error destinations reference an existing
+    sink OR a legal rule-9 closer.
 
     Called at pipeline initialization, BEFORE any rows are processed.
     This catches config errors early instead of failing mid-run with KeyError.
@@ -147,9 +173,16 @@ def validate_transform_error_sinks(
     Args:
         transforms: List of transform plugins
         available_sinks: Set of sink names from PipelineConfig
+        closer_names: Error-routable closer names (coalesce, row_union,
+            collector) the builder already accepted as this transform's own
+            enclosing-region target (spec
+            §7 rule 9, WS3 Task 9b) — see
+            ``validate_pipeline_route_targets``'s docstring for why this
+            widens membership only, never re-derives region validity.
 
     Raises:
-        RouteValidationError: If any transform on_error references a non-existent sink
+        RouteValidationError: If any transform on_error references neither
+            an existing sink nor a known closer.
     """
     for transform in transforms:
         on_error = transform.on_error
@@ -163,6 +196,9 @@ def validate_transform_error_sinks(
             # "discard" is a special value, not a sink name
             continue
 
+        if on_error in closer_names:
+            continue
+
         # on_error should reference an existing sink
         if on_error not in available_sinks:
             raise RouteValidationError(
@@ -170,6 +206,52 @@ def validate_transform_error_sinks(
                 f"but no sink named '{on_error}' exists. "
                 f"Available sinks: {sorted(available_sinks)}. "
                 f"Use 'discard' to drop error rows without routing."
+            )
+
+
+def validate_gate_error_sinks(
+    gates: Sequence[GateSettings],
+    available_sinks: set[str],
+    closer_names: frozenset[str] = frozenset(),
+) -> None:
+    """Validate optional config-gate row-error destinations reference an
+    existing sink OR a legal rule-9 closer (see ``validate_transform_error_sinks``)."""
+    for gate in gates:
+        on_error = gate.on_error
+        if on_error is None or on_error == "discard":
+            continue
+        if on_error in closer_names:
+            continue
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Gate '{gate.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                "Use 'discard' to drop gate-error rows or omit on_error to fail fast."
+            )
+
+
+def validate_aggregation_error_sinks(
+    aggregation_settings: Mapping[str, AggregationSettings],
+    available_sinks: set[str],
+) -> None:
+    """Validate aggregation on_error destinations reference existing sinks.
+
+    AggregationSettings.on_error is required ("sink name or 'discard'"), but a
+    ghost sink was only discovered when the first batch actually failed —
+    mid-run, after rows were consumed. Mirror the transform/gate checks and
+    fail at pipeline initialization instead (elspeth-eb4127fb49).
+    """
+    for settings in aggregation_settings.values():
+        on_error = settings.on_error
+        if on_error == "discard":
+            continue
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Aggregation '{settings.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                f"Use 'discard' to drop failed batches without routing."
             )
 
 

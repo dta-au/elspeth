@@ -1,10 +1,11 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SideRailValidationBanner } from "./SideRailValidationBanner";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { useExecutionStore } from "@/stores/executionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 import { makeComposition } from "@/test/composerFixtures";
@@ -125,6 +126,49 @@ describe("SideRailValidationBanner", () => {
     expect(onOpenGraph).toHaveBeenCalledTimes(1);
     expect(onSwitchTab).not.toHaveBeenCalled();
     window.removeEventListener("elspeth-switch-tab", onSwitchTab);
+    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+  });
+
+  it("uses workspace component navigation without selecting or opening the legacy modal", async () => {
+    const user = userEvent.setup();
+    const selectNode = vi.fn();
+    const onSelectComponent = vi.fn();
+    const onOpenGraph = vi.fn();
+    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+    useSessionStore.setState({
+      compositionState: makeComposition(1),
+      selectNode,
+    } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: false,
+        summary: "Validation failed",
+        checks: [],
+        errors: [
+          {
+            component_id: "select_columns",
+            component_type: "transform",
+            message: "Bad transform",
+            suggestion: null,
+          },
+        ],
+        warnings: [],
+        readiness: BLOCKED_READINESS,
+      },
+    });
+
+    render(
+      <SideRailValidationBanner onSelectComponent={onSelectComponent} />,
+    );
+    await user.click(
+      screen.getByRole("button", { name: /transform:select_columns/ }),
+    );
+
+    expect(onSelectComponent).toHaveBeenCalledExactlyOnceWith(
+      "select_columns",
+    );
+    expect(selectNode).not.toHaveBeenCalled();
+    expect(onOpenGraph).not.toHaveBeenCalled();
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
   });
 
@@ -483,5 +527,120 @@ describe("SideRailValidationBanner", () => {
 
       expect(header).toHaveAttribute("aria-expanded", "false");
     });
+  });
+
+  it("names the suggestion's component by its plain phrase, not the raw id, and reacts to a mounted flag flip", async () => {
+    const user = userEvent.setup();
+    // Suggestions live on compositionState.validation_suggestions (see the
+    // SUGGESTION-constant tests above), not on validationResult — the brief's
+    // illustrative snippet put them on the wrong store; corrected to match
+    // SideRailValidationBanner's actual `compositionState?.validation_suggestions`
+    // read.
+    resetStore(usePreferencesStore);
+    useSessionStore.setState({
+      compositionState: makeComposition(1, {
+        validation_suggestions: [
+          {
+            component: "select_columns",
+            message:
+              "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed",
+            severity: "info",
+          },
+        ],
+      }),
+    } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        summary: "Validation passed",
+        checks: [
+          { name: "graph_structure", passed: true, detail: "Graph structure is valid", affected_nodes: [], outcome_code: null },
+        ],
+        errors: [],
+        warnings: [],
+        readiness: { authoring_valid: true, execution_ready: true, completion_ready: true, blockers: [] },
+      } as never,
+    });
+
+    render(<SideRailValidationBanner />);
+
+    const list = screen.getByRole("list", { name: /suggestions/i });
+    expect(list.textContent).not.toMatch(/select_columns:/);
+    expect(list.textContent).not.toMatch(/Schema contract violation/);
+    expect(screen.getByText(/Schema contract violation/).closest("details")).not.toBeNull();
+
+    // The check list under the pass banner appears only once the flag flips
+    // ON A MOUNTED tree — the pass banner must also be expanded (its own
+    // independent Show-details toggle, ValidationResult.test.tsx's parallel
+    // "shows the check list..." case) since a collapsed banner renders
+    // nothing underneath regardless of show_advanced.
+    await user.click(
+      screen.getByRole("button", { name: "Validation passed. Show details." }),
+    );
+    expect(screen.queryByText("Graph structure is valid")).not.toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Graph structure is valid")).toBeInTheDocument();
+  });
+
+  // Review round 1, Important-2: the technical-details disclosures sit
+  // OUTSIDE the <ul> (required so list.textContent excludes the raw dumps —
+  // see the test above), which loses the DOM containment that would
+  // otherwise tie a row to its own disclosure. With 2+ suggestions each
+  // carrying raw text, every <summary> reading the same generic "Technical
+  // details" left no way to tell whose dump was whose.
+  it("associates each suggestion's Apply button with its OWN technical-details block, and gives each disclosure a distinguishing humanised summary", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(1, {
+        validation_suggestions: [
+          {
+            component: "select_columns",
+            message:
+              "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed",
+            severity: "info",
+          },
+          {
+            component: "sink_a",
+            message:
+              "Schema contract violation: 'select_columns' -> 'sink_a': required field 'total' is not guaranteed",
+            severity: "info",
+          },
+        ],
+      }),
+    } as never);
+
+    render(<SideRailValidationBanner />);
+
+    const applyButtons = screen.getAllByRole("button", { name: /^Apply$/ });
+    expect(applyButtons).toHaveLength(2);
+    const describedByIds = applyButtons.map((btn) =>
+      btn.getAttribute("aria-describedby"),
+    );
+    expect(describedByIds.every((id) => typeof id === "string" && id.length > 0)).toBe(
+      true,
+    );
+    // Each button points at its OWN disclosure, not a shared one.
+    expect(new Set(describedByIds).size).toBe(2);
+    for (const id of describedByIds) {
+      const details = document.getElementById(id as string);
+      expect(details).not.toBeNull();
+      expect(details?.tagName).toBe("DETAILS");
+    }
+
+    // Each summary carries a distinguishing, HUMANISED label — never the raw
+    // component id — so a reader encountering the second disclosure can tell
+    // which suggestion it belongs to without relying on DOM order alone.
+    const summaries = screen.getAllByText(/^Technical details —/);
+    expect(summaries).toHaveLength(2);
+    const summaryTexts = summaries.map((el) => el.textContent);
+    expect(new Set(summaryTexts).size).toBe(2);
+    for (const text of summaryTexts) {
+      expect(text).not.toMatch(/select_columns/);
+      expect(text).not.toMatch(/sink_a/);
+    }
+
+    // list.textContent still excludes both raw dumps (elspeth-27efd1e801) —
+    // the association fix must not reintroduce them into the list itself.
+    const list = screen.getByRole("list", { name: /suggestions/i });
+    expect(list.textContent).not.toMatch(/Schema contract violation/);
   });
 });

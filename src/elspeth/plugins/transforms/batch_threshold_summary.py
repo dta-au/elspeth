@@ -103,9 +103,38 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:93afacbaaa867db3"
+    source_file_hash: str | None = "sha256:0674b3782a36ee52"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use to emit named threshold summary rows containing finite-value match counts and rates for each flushed window."
+    )
+    usage_when_not_to_use: str = (
+        "Not for row filtering, routing, or annotation; it replaces the batch with summaries and does not preserve "
+        "per-row threshold decisions."
+    )
+    example_use: str = """aggregations:
+  - name: quality_thresholds
+    plugin: batch_threshold_summary
+    input: scored_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: quality_score
+      thresholds:
+        - name: production_ready
+          operator: ">="
+          value: 0.8
+        - name: needs_review
+          operator: "<"
+          value: 0.7
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "threshold", "summary")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

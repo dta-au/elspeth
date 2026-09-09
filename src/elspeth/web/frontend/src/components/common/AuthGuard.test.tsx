@@ -54,6 +54,43 @@ describe("AuthGuard", () => {
     expect(screen.queryByTestId("children")).not.toBeInTheDocument();
   });
 
+  it("shows the page-scale spinner while the auth check is in flight (elspeth-b2a677d661)", () => {
+    // Both full-viewport boot frames — this one and LoginPage's config-load
+    // frame — must compose the SAME `spinner spinner-page` pair, so the
+    // affordance cannot shrink 32px → 14px between two consecutive frames.
+    // The size itself lives on .spinner-page in animations.css; what this
+    // pins is that AuthGuard no longer hand-rolls an inline size of its own.
+    // Hold the auth check IN FLIGHT: useAuth calls loadFromStorage on mount,
+    // whose no-token path resolves isLoading synchronously inside render's
+    // act() — which would swap this frame for the LoginPage before the query
+    // runs. The subject here is the in-flight frame, so the check must stay
+    // in flight while it is inspected; the real action is restored after.
+    const realLoadFromStorage = useAuthStore.getState().loadFromStorage;
+    useAuthStore.setState({
+      token: null,
+      user: null,
+      isLoading: true,
+      loginError: null,
+      loadFromStorage: async () => {},
+    } as never);
+    try {
+      render(
+        <AuthGuard>
+          <div data-testid="children">protected</div>
+        </AuthGuard>,
+      );
+      const status = screen.getByRole("status", {
+        name: "Checking authentication",
+      });
+      const spinner = status.querySelector(".spinner");
+      expect(spinner).not.toBeNull();
+      expect(spinner).toHaveClass("spinner-page");
+      expect(spinner).not.toHaveAttribute("style");
+    } finally {
+      useAuthStore.setState({ loadFromStorage: realLoadFromStorage } as never);
+    }
+  });
+
   it("renders children when authenticated", () => {
     _seedAuthenticated();
     render(

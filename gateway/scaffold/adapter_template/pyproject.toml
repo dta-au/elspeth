@@ -1,0 +1,29 @@
+[project]
+name = "yourorg-adapter"
+# TEMPLATE: rename the package (this name, the entry-point table below, and
+# every "yourorg_adapter" directory/import) to your own organisation and
+# adapter before building or publishing anything from this scaffold.
+version = "0.1.0"
+description = "TEMPLATE: an ELSPETH LLM gateway adapter for <your agency>'s invoke API"
+requires-python = ">=3.12"
+dependencies = [
+    # TEMPLATE: 0.1.0 is a placeholder so this file parses as valid PEP 440
+    # -- pin the exact gateway runtime version this adapter is built and
+    # conformance-tested against before using this anywhere real.
+    "elspeth-llm-gateway==0.1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.entry-points."elspeth_llm_gateway.adapters"]
+# TEMPLATE: the key here is looked up by ELSPETH_LLM_GATEWAY_ADAPTER at
+# gateway startup; it must equal ADAPTER_NAME in descriptor.py.
+yourorg_adapter = "yourorg_adapter.adapter:YourOrgAdapter"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yourorg_adapter"]

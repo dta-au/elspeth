@@ -18,8 +18,8 @@
 // net.
 // ============================================================================
 
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ReactNode } from "react";
 
@@ -42,9 +42,7 @@ const AUDITED_COMPONENTS = [
   "AppHeader",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
-  "SideRail",
   "GraphMiniView",
-  "ExportYamlModal",
   "InlineSourceCreatedTurn",
   "InlineSourceDisambiguationTurn",
   "InlineSourceFallbackPrompt",
@@ -69,6 +67,7 @@ const AUDITED_COMPONENTS = [
   "ChatInput",
   "CommandPalette",
   "ConfirmDialog",
+  "WorkspaceSeparator",
   "GraphModal",
   "GraphView",
   "HelloWorldTutorial",
@@ -88,6 +87,29 @@ const AUDITED_COMPONENTS = [
   // itself (landmark structure, live-region siblinghood, the named scroll
   // group) had zero axe coverage.
   "ChatPanelTutorialWorkspace",
+  // A completed guided session keeps its conversation (elspeth-986801d218):
+  // the completed branch grew a live transcript log, an Explain control, the
+  // pending strip and the docked composer alongside the completion summary.
+  // That is a NEW landmark/live-region arrangement — summary + announcer as
+  // siblings of a role=log inside a named scroll group — and the tutorial
+  // workspace entry above audits the ACTIVE branch only.
+  "ChatPanelCompletedSurface",
+  // Run-lifecycle feedback (elspeth-3a7b7c7b37): the app-level terminal-run
+  // toast is the only completion surface mounted outside the Run panel.
+  "RunOutcomeNotice",
+  // Goal-first entry (elspeth-378cfa0e18): before a session has stated its
+  // goal the guided branch REPLACES the current-decision card with a goal
+  // card. That is a distinct arrangement from both audited ChatPanel entries
+  // — the decision card's role=log live region and its Explain control are
+  // absent, and a heading + hint sit where the turn widget was — so the
+  // either/or has to be audited on its own rather than assumed from the
+  // active-branch entry.
+  "ChatPanelGoalCard",
+  // Decision sheets (elspeth-f2a8550b3d): the read-only record a settled
+  // stepper tick opens. A disclosure whose panel takes focus, names itself,
+  // and replays a settled transcript — none of which the in-situ ChatPanel
+  // entries can cover for more than one stage at a time.
+  "GuidedDecisionSheet",
 ] as const;
 
 const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
@@ -96,6 +118,8 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "AppHeader",
   "AuditReadinessPanel",
   "ChatInput",
+  "ChatPanelCompletedSurface",
+  "ChatPanelGoalCard",
   "ChatPanelTutorialWorkspace",
   "CommandPalette",
   "ComposerPreferencesPanel",
@@ -103,11 +127,11 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "ConfirmDialog",
   "DefaultModeChangedBanner",
   "ExplainDialog",
-  "ExportYamlModal",
   "FilterChipStrip",
   "GraphMiniView",
   "GraphModal",
   "GraphView",
+  "GuidedDecisionSheet",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
   "HelloWorldTutorial",
@@ -123,9 +147,9 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "ProposePipelineTurn",
   "ReadinessRowDetail",
   "RecoveryPanel",
+  "RunOutcomeNotice",
   "RunsHistoryDrawer",
   "SchemaFormTurn",
-  "SideRail",
   "ShortcutsHelp",
   "FreeformIntroduction",
   "TutorialGuidedShell",
@@ -134,6 +158,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "TutorialTurn5AuditStory",
   "TutorialTurn7Graduation",
   "UserMenu",
+  "WorkspaceSeparator",
   "WireStageTurn",
 ];
 
@@ -148,7 +173,7 @@ describe("audit surface — coverage snapshot", () => {
 // --- Mocks -----------------------------------------------------------------
 //
 // AppHeader/UserMenu pull useTheme(); CompletionBar renders ExecuteButton +
-// ExportYamlButton which couple to additional stores; YamlView pulls in the
+// ImportYamlButton which couple to additional stores; YamlView pulls in the
 // full YAML rendering pipeline. Stub the heavy/coupled imports so the render
 // produces deterministic DOM for axe without exercising unrelated logic.
 
@@ -232,6 +257,12 @@ vi.mock("@xyflow/react", () => ({
   Background: () => <div data-testid="react-flow-background" />,
   Controls: () => <div data-testid="react-flow-controls" />,
   MiniMap: () => <div data-testid="minimap" />,
+  // GraphView reaches MarkerType at render time (withDirectionMarkers), so it
+  // must be mocked even though this file only exercises the accessible-name
+  // surface. Handle/Position/BaseEdge stay out: they are only touched inside
+  // the NODE_TYPES/EDGE_TYPES components, which the mocked ReactFlow above
+  // never invokes.
+  MarkerType: { ArrowClosed: "arrowclosed" },
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
 vi.mock("@dagrejs/dagre", () => ({
@@ -274,10 +305,7 @@ import { ExplainDialog } from "@/components/audit/ExplainDialog";
 import { AppHeader } from "@/components/common/AppHeader";
 import { HeaderSessionSwitcher } from "@/components/sessions/HeaderSessionSwitcher";
 import { HeaderVersionSelector } from "@/components/header/HeaderVersionSelector";
-import { SideRail } from "@/components/sidebar/SideRail";
 import { GraphMiniView } from "@/components/sidebar/GraphMiniView";
-import { ExportYamlModal } from "@/components/sidebar/ExportYamlModal";
-import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { InlineSourceCreatedTurn } from "@/components/chat/InlineSourceCreatedTurn";
 import { InlineSourceDisambiguationTurn } from "@/components/chat/InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "@/components/chat/InlineSourceFallbackPrompt";
@@ -292,6 +320,7 @@ import { ModeSwitchButton } from "@/components/chat/guided/ModeSwitchButton";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
 import { ProposePipelineTurn } from "@/components/chat/guided/ProposePipelineTurn";
+import { GuidedDecisionSheet } from "@/components/chat/guided/GuidedDecisionSheet";
 import { AcknowledgementCard } from "@/components/chat/AcknowledgementCard";
 import { AcknowledgementStack } from "@/components/chat/AcknowledgementStack";
 import { ChatInput } from "@/components/chat/ChatInput";
@@ -299,7 +328,9 @@ import { ChatPanel } from "@/components/chat/ChatPanel";
 import { LoginPage } from "@/components/auth/LoginPage";
 import { CommandPalette } from "@/components/common/CommandPalette";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { WorkspaceSeparator } from "@/components/workspace/WorkspaceSeparator";
 import { ProgressView } from "@/components/execution/ProgressView";
+import { RunOutcomeNotice } from "@/components/execution/RunOutcomeNotice";
 import { RunsHistoryDrawer } from "@/components/execution/RunsHistoryDrawer";
 import { GraphView } from "@/components/inspector/GraphView";
 import { GraphModal } from "@/components/sidebar/GraphModal";
@@ -328,6 +359,7 @@ import type {
   CompositionState,
   PluginSummary,
   Run,
+  ValidationReadiness,
 } from "@/types/index";
 import type { ReadinessRow, AuditReadinessSnapshot } from "@/types/api";
 import type {
@@ -339,9 +371,19 @@ import type {
   WireStageData,
 } from "@/types/guided";
 import type { InterpretationEvent } from "@/types/interpretation";
-import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import {
+  compositionStateAuthorityFields,
+  makeVersionHistory,
+} from "@/test/composerFixtures";
 
 // --- Shared store reset ----------------------------------------------------
+
+const READY_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} satisfies ValidationReadiness;
 
 function resetAllStores() {
   resetStore(usePreferencesStore);
@@ -365,11 +407,23 @@ function resetAllStores() {
       edges: [],
       outputs: [],
     } as never,
+    // R2-F5 (elspeth-139a345050): compositionState alone is ambiguous
+    // between "still loading" and "loaded, empty" — GraphMiniView now
+    // renders a "Loading pipeline…" skeleton instead of the populated
+    // graph unless this is set, which would have silently dropped the
+    // GraphMiniView a11y audit down to auditing a bare <span>.
+    compositionStateLoaded: true,
     stateVersions: [],
     isLoadingVersions: false,
   } as never);
   useExecutionStore.setState({
     validationResult: null,
+    // Run-lifecycle fields (elspeth-3a7b7c7b37). RunOutcomeNotice reads
+    // lastRunOutcome, so a test that seeds it and throws before its inline
+    // cleanup would otherwise leak a mounted toast into every later test in
+    // this large shared file. Baselines belong here, not at a test's tail.
+    lastRunOutcome: null,
+    activeRunSessionId: null,
   } as never);
   useAuditReadinessStore.setState(getAuditInitialState());
   resetStore(useInterpretationEventsStore);
@@ -475,6 +529,27 @@ describe("UserMenu", () => {
     );
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  // elspeth-312238838a: the open menu renders a non-focusable identity
+  // header (display name + username) when the auth store holds a user.
+  // Open the menu so the identity block is actually in the audited DOM.
+  it("has no axe violations with the signed-in identity header open", async () => {
+    useAuthStore.setState({
+      user: {
+        user_id: "user-a11y",
+        username: "jdoe",
+        display_name: "Jane Doe",
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+    });
+    const { container } = render(
+      <UserMenu onOpenSettings={() => {}} onSignOut={() => {}} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("WireStageTurn", () => {
@@ -513,6 +588,43 @@ describe("WireStageTurn", () => {
         onExitToFreeform={() => {}}
       />,
     );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations with an llm node's prompt summary and its Edit routed to the correction form", async () => {
+    // I-2: prompt block + expand toggle + Edit pre-selecting the node.
+    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
+    const nodeId = "00000000-0000-4000-8000-000000000015";
+    const { container } = render(
+      <WireStageTurn
+        data={{
+          ...wireBase,
+          nodes: [{
+            stable_id: nodeId,
+            label: "summarise",
+            node_type: "transform",
+            plugin: "llm",
+            behavior: { kind: "transform" },
+            required_fields: ["body"],
+            guaranteed_fields: ["summary"],
+            row_cardinality: { input: "one", output: "one", expected_output_count: null },
+            structured_output_fields: [],
+            node_options_summary: [
+              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+              { key: "prompt_template", value: longPrompt, tier: "common" },
+            ],
+          }],
+        }}
+        onConfirm={() => {}}
+        confirmDisabled={false}
+        onCorrect={() => {}}
+      />,
+    );
+    screen.getByText("Model: anthropic/claude-sonnet-4");
+    expect(await axe(container)).toHaveNoViolations();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
+    expect(screen.getByLabelText("Component")).toHaveValue(nodeId);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -582,7 +694,14 @@ describe("AuditReadinessPanel", () => {
         { id: "llm_interpretations", label: "LLM interpretations", status: "not_applicable", summary: "n/a", detail: null, component_ids: [] },
         { id: "secrets", label: "Secrets", status: "not_applicable", summary: "n/a", detail: null, component_ids: [] },
       ],
-      validation_result: { is_valid: true, checks: [], errors: [], warnings: [], semantic_contracts: [] } as never,
+      validation_result: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+        semantic_contracts: [],
+      },
     };
     vi.mocked(auditApi.fetchAuditReadiness).mockResolvedValue(snapshot);
     const { container } = render(<AuditReadinessPanel />);
@@ -662,19 +781,33 @@ describe("HeaderVersionSelector", () => {
     const { container } = render(<HeaderVersionSelector />);
     expect(await axe(container)).toHaveNoViolations();
   });
-});
 
-describe("SideRail", () => {
-  it("has no axe violations", async () => {
-    const { container } = render(
-      <SideRail
-        auditReadinessSlot={<div>readiness</div>}
-        validationBannerSlot={<div>banner</div>}
-        graphMiniSlot={<div>mini</div>}
-        catalogSlot={<div>catalog</div>}
-        completionBarSlot={<div>completion</div>}
-      />,
+  // The case above renders only the closed trigger — it audits none of the
+  // dropdown. Seed a history that GROUPS (elspeth-c8a402a9a4) and open it, so
+  // axe actually sees ul[role=tree] > li[role=treeitem] > ul[role=group] >
+  // li[role=treeitem] — the WAI-ARIA tree pattern this widget adopted when it
+  // stopped being a listbox (a collapsible group cannot be an `option`).
+  it("has no axe violations with the history tree open and a group expanded", async () => {
+    useSessionStore.setState({
+      compositionState: {
+        version: 19,
+        sources: {},
+        nodes: [],
+        edges: [],
+        outputs: [],
+      } as never,
+      stateVersions: makeVersionHistory(),
+      isLoadingVersions: false,
+    } as never);
+    const { container } = render(<HeaderVersionSelector />);
+    await userEvent.click(
+      screen.getByRole("button", { name: /Composition history/ }),
     );
+    const group = screen.getByRole("treeitem", { name: /Versions 11 to 18/ });
+    await userEvent.click(group);
+    // Guard against auditing a collapsed (or empty) tree by accident.
+    expect(group).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByRole("treeitem").length).toBeGreaterThan(2);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -682,16 +815,14 @@ describe("SideRail", () => {
 describe("GraphMiniView", () => {
   it("has no axe violations", async () => {
     const { container } = render(<GraphMiniView />);
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("ExportYamlModal", () => {
-  it("has no axe violations", async () => {
-    const { container, rerender } = render(<ExportYamlModal />);
-    // Modal only renders when the open event fires.
-    window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
-    rerender(<ExportYamlModal />);
+    // Guard against the fixture silently regressing to the "Loading
+    // pipeline…" skeleton (a bare <span> with no interactive markup, which
+    // would trivially pass axe without covering the real button/SVG/label
+    // this test exists to audit) — assert the populated graph actually
+    // rendered.
+    expect(
+      screen.getByRole("button", { name: /pipeline graph/i }),
+    ).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -749,7 +880,12 @@ describe("InlineSourceFallbackPrompt", () => {
 describe("CompletionBar", () => {
   it("has no axe violations", async () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [] } as never,
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        readiness: READY_READINESS,
+      },
     } as never);
     const { container } = render(<CompletionBar />);
     expect(await axe(container)).toHaveNoViolations();
@@ -831,6 +967,20 @@ describe("ModeSwitchButton", () => {
     );
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations on the guided confirm card's required goal field", async () => {
+    // Goal-first (elspeth-378cfa0e18) put a form control on this card. A
+    // placeholder is not an accessible name, so axe's `label` rule is the gate
+    // that keeps the question a real <label>.
+    const { container } = render(
+      <ModeSwitchButton target="guided" hasWork />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Switch to guided" }),
+    );
+    screen.getByRole("textbox", { name: "What should this pipeline produce?" });
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("PipelineGloss", () => {
@@ -861,6 +1011,7 @@ describe("PipelineValidationSummary", () => {
             suggestion: null,
           },
         ],
+        readiness: READY_READINESS,
       },
     } as never);
     const { container } = render(<PipelineValidationSummary />);
@@ -872,7 +1023,7 @@ describe("PipelineValidationSummary", () => {
 //
 // ProposePipelineTurn is the whole-DAG review turn the guided/freeform parity
 // work lands on: a read-only graph, the components/routes summary, blockers,
-// and the accept/reject/revise controls (Plan 05 Task 5). It carries a
+// and the accept/reject/revise controls. It carries a
 // live-region status/alert whose focus moves on stale/error transitions and a
 // tutorial read-only variant. Audit every branch of that surface — the plain
 // active controls, the blocker-gated revise-required state, the stale and
@@ -942,6 +1093,7 @@ describe("ProposePipelineTurn", () => {
           node_type: "transform",
           plugin: { kind: "transform", id: "llm" },
           behavior: { kind: "transform" },
+          node_options_summary: [],
         },
       ],
       outputs: [
@@ -965,11 +1117,47 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
     );
-    // Non-vacuous: the labelled graph, the accessible heading, and the enabled
-    // primary control must all be real.
-    screen.getByRole("img", { name: /pipeline proposal graph/i });
+    // Non-vacuous: the Graph-pane pointer (the DAG itself moved to the
+    // Pipeline pane — elspeth-9f0873426a), the accessible heading, and the
+    // enabled primary control must all be real.
+    screen.getByRole("button", { name: "Show graph" });
     screen.getByRole("heading", { name: "Review pipeline proposal" });
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations with the llm prompt summary collapsed, expanded, and its Edit opened", async () => {
+    // I-2: the prompt block (label, pre-wrapped text, expand toggle) and the
+    // Edit that pre-targets the node revise are new default-view controls.
+    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
+    const reviewState: GuidedProposalReviewState = {
+      status: "active",
+      proposal_id: PROPOSAL_ID,
+      draft_hash: DRAFT_HASH,
+    };
+    const base = proposalPayload();
+    const { container } = render(
+      <ProposePipelineTurn
+        payload={{
+          ...base,
+          nodes: [{
+            ...base.nodes[0],
+            node_options_summary: [
+              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+              { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
+              { key: "prompt_template", value: longPrompt, tier: "common" },
+            ],
+          }],
+        }}
+        reviewState={reviewState}
+        onSubmit={() => {}}
+      />,
+    );
+    screen.getByText("Model: anthropic/claude-sonnet-4");
+    expect(await axe(container)).toHaveNoViolations();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
+    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveFocus();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1028,7 +1216,11 @@ describe("ProposePipelineTurn", () => {
       draft_hash: DRAFT_HASH,
       message: "The response was not received. Retry the same action.",
       retryable: true,
-      retry_action: { kind: "revise", edit_target: { kind: "node", stable_id: NODE_ID } },
+      retry_action: {
+        kind: "revise",
+        edit_target: { kind: "node", stable_id: NODE_ID },
+        correction_feedback: "Change the selected node mapping.",
+      },
     };
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
@@ -1040,7 +1232,11 @@ describe("ProposePipelineTurn", () => {
     expect(alert).toHaveTextContent(/response was not received/i);
     expect(alert).toHaveFocus();
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /Revise summarise/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Revise summarise/ })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveValue(
+      "Change the selected node mapping.",
+    );
+    expect(screen.getByRole("button", { name: "Send revision request" })).toBeEnabled();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1060,9 +1256,8 @@ describe("ProposePipelineTurn", () => {
     );
     // Non-vacuous: the tutorial teaching note renders, the live "Review
     // wiring" primary stays actionable (the tutorial proposal is a REAL
-    // planner proposal the learner must accept to advance; the primary is
-    // live only once the frozen-prompt revision supersedes the pre-Send
-    // auto-proposal), and the off-script reject/revise controls are withheld.
+    // planner proposal the learner must accept to advance), and the off-script
+    // reject/revise controls are withheld.
     screen.getByText(/press Review wiring to continue/i);
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
@@ -1070,7 +1265,13 @@ describe("ProposePipelineTurn", () => {
     expect(await axe(container)).toHaveNoViolations();
   });
 
-  it("has no axe violations in the tutorial pre-Send auto-proposal render (primary withheld)", async () => {
+  it("has no axe violations on a tutorial FIRST proposal (null supersedes hash, same live primary)", async () => {
+    // The withheld-primary render this replaces is gone with the proposal it
+    // guarded (goal-first, elspeth-378cfa0e18): the frozen transforms prompt is
+    // the session's root intent now, so the step-2 finish plans once and its
+    // proposal — supersedes_draft_hash null — IS the one the learner reviews.
+    // Audited alongside the superseding case so the two hash states are pinned
+    // to render the same controls.
     const reviewState: GuidedProposalReviewState = {
       status: "active",
       proposal_id: PROPOSAL_ID,
@@ -1079,11 +1280,9 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} isTutorial />,
     );
-    // Non-vacuous: the pre-Send auto-proposal (supersedes_draft_hash null)
-    // withholds every action and directs the learner to Send the frozen
-    // transforms prompt instead (tutorial run 18 committed the passthrough).
-    screen.getByText(/press Send/i);
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
+    expect(proposalPayload().supersedes_draft_hash).toBeNull();
+    screen.getByText(/press Review wiring to continue/i);
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
     expect(await axe(container)).toHaveNoViolations();
@@ -1125,6 +1324,14 @@ describe("TutorialGuidedShell", () => {
     // whose guided internals are audited via their own components above.
     vi.mocked(apiClient.startGuidedSession).mockReturnValue(
       new Promise<never>(() => {}),
+    );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      },
     );
     const { container } = render(
       <TutorialGuidedShell
@@ -1171,6 +1378,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:00Z",
           assistant_message_kind: null,
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "assistant",
@@ -1180,6 +1388,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:01Z",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "user",
@@ -1189,6 +1398,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:02Z",
           assistant_message_kind: null,
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "assistant",
@@ -1198,9 +1408,11 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:03Z",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
       ],
       chat_turn_seq: 4,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     };
   }
@@ -1244,15 +1456,18 @@ describe("ChatPanelTutorialWorkspace", () => {
       />,
     );
 
-    // Guard against a vacuous pass: the named scroll group, the artifact
-    // rail, both role=log regions (transcript + wizard step), the rail's
-    // decision history, and the Sent composer state must all be mounted.
+    // Guard against a vacuous pass: the named authoring scroll group, both
+    // role=log regions (transcript + wizard step), and the Sent composer state
+    // must all be mounted. Artifact and history content belongs to the common
+    // workspace/Inspector, not this authoring component.
     screen.getByRole("group", { name: "Conversation" });
-    screen.getByRole("complementary", { name: "Pipeline summary" });
     screen.getByRole("log", { name: "Step chat history" });
     screen.getByRole("log", { name: "Guided wizard step" });
-    screen.getByRole("heading", { name: /decisions so far/i });
     screen.getByText(/your request is in the transcript above/i);
+    expect(
+      screen.queryByRole("complementary", { name: "Pipeline summary" }),
+    ).toBeNull();
+    expect(screen.queryByRole("heading", { name: /decisions so far/i })).toBeNull();
 
     expect(await axe(container)).toHaveNoViolations();
   });
@@ -1291,7 +1506,7 @@ describe("ChatPanelTutorialWorkspace", () => {
     // no longer swapped out from under the typing area).
     const strip = container.querySelector(".guided-pending-strip");
     expect(strip).not.toBeNull();
-    const scroll = container.querySelector(".guided-workspace-scroll");
+    const scroll = container.querySelector(".guided-authoring-scroll");
     expect(scroll).not.toBeNull();
     expect(scroll!.contains(strip)).toBe(true);
     screen.getByRole("button", { name: "Stop composing" });
@@ -1300,11 +1515,260 @@ describe("ChatPanelTutorialWorkspace", () => {
 
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations with a settled tick expanded into its decision sheet", async () => {
+    // Decision sheets (elspeth-f2a8550b3d): a settled stepper tick becomes a
+    // disclosure BUTTON inside its <li>, and the panel it controls mounts
+    // between the band and the conversation group. That is a new arrangement
+    // inside an already-audited surface — a listitem with an interactive
+    // child, an aria-controls IDREF that must resolve, and a replayed
+    // transcript that must not become a second live region.
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+    const session = makeTutorialGuidedSession();
+    session.reviewed_components = {
+      sources: [
+        {
+          stable_id: "00000000-0000-4000-8000-0000000009a1",
+          name: "pages",
+          plugin: "web_scrape",
+          status: "reviewed",
+        },
+      ],
+      outputs: [],
+    };
+    useSessionStore.setState({
+      compositionState: makeFullCompositionState(),
+      compositionProposals: [],
+      guidedSession: session,
+      guidedNextTurn: makeSchemaFormNextTurn(),
+    } as never);
+
+    const { container } = render(
+      <ChatPanel
+        isTutorial
+        lockedChatPrompt={{
+          step_1_source: "Summarise these pages:\nhttps://example.gov.au/page-1",
+          step_2_sink: "Write the results out as JSONL.",
+        }}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /^Source/ }));
+
+    // Non-vacuous: the disclosure is expanded, the panel it names is mounted
+    // and its aria-controls resolves, and the replayed turns are a static
+    // group rather than a second "Step chat history" log.
+    const tick = screen.getByRole("button", { name: "Source, completed" });
+    expect(tick).toHaveAttribute("aria-expanded", "true");
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(tick.getAttribute("aria-controls")).toBe(sheet.getAttribute("id"));
+    expect(
+      within(sheet).getByRole("group", { name: "Guided build conversation" }),
+    ).toBeInTheDocument();
+    expect(within(sheet).queryByRole("log")).toBeNull();
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("GuidedDecisionSheet", () => {
+  // The read-only record a settled stepper tick opens (elspeth-f2a8550b3d).
+  // Audited as a leaf too, not only in situ: it owns a named region that takes
+  // focus on open, a component list, and a replayed transcript, and the
+  // in-situ case above can only ever mount ONE stage's arrangement.
+  it("has no axe violations with components, a record and replayed turns", async () => {
+    const { container } = render(
+      <GuidedDecisionSheet
+        id="a11y-decision-sheet"
+        stage="step_4_wire"
+        rows={[
+          {
+            key: "00000000-0000-4000-8000-0000000009b1",
+            name: "pages",
+            plugin: "web_scrape",
+          },
+          { key: "fan_out", name: "Fan Out", plugin: null },
+        ]}
+        chatTurns={[
+          {
+            role: "user",
+            content: "does this wiring look right?",
+            seq: 1,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ]}
+        record="Guided pipeline wiring confirmed."
+        onClose={vi.fn()}
+      />,
+    );
+
+    screen.getByRole("region", { name: "Wire — decided" });
+    screen.getByRole("button", { name: "Close" });
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("ChatPanelCompletedSurface", () => {
+  // A completed guided session keeps its conversation (elspeth-986801d218).
+  // The arrangement this audits: the completion summary and the always-mounted
+  // acknowledgement announcer are SIBLINGS of the named "Conversation" scroll
+  // group, and the transcript's role=log lives INSIDE that group — one live
+  // region per event kind, never nested, with the docked composer below.
+  it("has no axe violations with a live transcript and the docked composer", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+    const confirmationHash = "c".repeat(64);
+    useSessionStore.setState({
+      compositionState: makeFullCompositionState(),
+      compositionProposals: [],
+      guidedSession: {
+        step: "step_4_wire",
+        history: [
+          {
+            step: "step_4_wire",
+            turn_type: "confirm_wiring",
+            payload_hash: "aabbcc001122",
+            response_hash: confirmationHash,
+            emitter: "server",
+            summary: "Wiring confirmed",
+          },
+        ],
+        terminal: {
+          kind: "completed",
+          reason: null,
+          pipeline_yaml: "source:\n  plugin: csv\n",
+        },
+        chat_history: [
+          {
+            role: "user",
+            content: "Write the results out as JSONL.",
+            seq: 1,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: "a".repeat(64),
+          },
+          {
+            role: "assistant",
+            content: "Done — the output writes JSONL.",
+            seq: 2,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:01Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+          {
+            role: "user",
+            content: "What does the transform step do?",
+            seq: 3,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:01:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: confirmationHash,
+          },
+        ],
+        chat_turn_seq: 4,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: null,
+    } as never);
+
+    const { container } = render(<ChatPanel />);
+
+    // Guard against a vacuous pass: the audited arrangement must be mounted.
+    const scroll = screen.getByRole("group", { name: "Conversation" });
+    const log = screen.getByRole("log", { name: "Step chat history" });
+    expect(scroll.contains(log)).toBe(true);
+    screen.getByRole("region", { name: "Describe what you want" });
+    screen.getByRole("button", { name: "Explain this pipeline" });
+    screen.getByText("After confirmation");
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("ChatPanelGoalCard", () => {
+  // Goal-first entry (elspeth-378cfa0e18). Before the session has a goal the
+  // store has adopted the lazy GET /guided stub — a first turn and NO
+  // composition state — and the panel replaces the current-decision card with
+  // the goal card. Audited on its own because that arrangement drops the
+  // decision card's role=log live region and its Explain control; the risk
+  // being pinned is a second live region (or a duplicated heading id) landing
+  // inside the named conversation group.
+  it("has no axe violations on the pre-goal guided surface", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    useSessionStore.setState({
+      activeSessionId: "sess-a11y-goal",
+      messages: [],
+      composeTimeoutReady: true,
+      compositionState: null,
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+        },
+      },
+    } as never);
+
+    const { container } = render(<ChatPanel />);
+
+    // Non-vacuous: the goal card is mounted inside the named conversation
+    // group, the composer landmark survives, and the decision card's log
+    // region and Explain control are BOTH absent — the goal card replaces
+    // that section rather than rendering beside it.
+    const scroll = screen.getByRole("group", { name: "Conversation" });
+    const heading = screen.getByRole("heading", {
+      name: "What should this pipeline produce?",
+    });
+    expect(scroll.contains(heading)).toBe(true);
+    screen.getByRole("region", { name: "Describe what you want" });
+    expect(screen.queryByRole("log", { name: "Guided wizard step" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Explain this step" })).toBeNull();
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("TutorialTurn4Run", () => {
   // The module-level run cache is keyed by sessionId — each test uses a
-  // distinct id so a cached promise never leaks across tests.
+  // distinct id so a cached promise never leaks across tests. The run never
+  // auto-fires (I-1): the executing/results states are reached by clicking
+  // the Run button on the pre-run card.
+  it("has no axe violations on the pre-run card", async () => {
+    const { container } = render(
+      <TutorialTurn4Run
+        sessionId="sess-a11y-run-ready"
+        onCompleted={() => {}}
+        onCancelled={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
   it("has no axe violations while the run is executing", async () => {
     vi.mocked(apiClient.runTutorialPipeline).mockReturnValue(
       new Promise<never>(() => {}),
@@ -1316,6 +1780,8 @@ describe("TutorialTurn4Run", () => {
         onCancelled={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByRole("status", { busy: true })).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1343,6 +1809,7 @@ describe("TutorialTurn4Run", () => {
         onBack={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText(/rows returned/);
     expect(await axe(container)).toHaveNoViolations();
   });
@@ -1413,7 +1880,7 @@ describe("AcknowledgementCard", () => {
     expect(await axe(container)).toHaveNoViolations();
   });
 
-  it("has no axe violations (llm_prompt_template with the two-stage View→Approve primary)", async () => {
+  it("has no axe violations (llm_prompt_template with the View/Approve controls, pre- and post-view)", async () => {
     const { container } = render(
       <AcknowledgementCard
         event={makeInterpretationEvent("evt-2", {
@@ -1424,6 +1891,71 @@ describe("AcknowledgementCard", () => {
         stepLabel="Summarise"
       />,
     );
+    // Pre-view: disabled Approve with the aria-describedby gate note.
+    expect(await axe(container)).toHaveNoViolations();
+    // Post-view: revealed prompt region + enabled Approve.
+    await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations on the resolved prompt with marked substitution slots", async () => {
+    // Without a composition state the prompt renders as one flat text
+    // segment, so the <mark> slots — and the visually-hidden
+    // "accepted value: " / "pending value: " status prefixes inside them —
+    // escape the audit entirely.  Supply the structured parts so both slot
+    // kinds and the pending note are actually in the audited DOM.
+    const state = makeFullCompositionState();
+    const { container } = render(
+      <AcknowledgementCard
+        event={makeInterpretationEvent("evt-3", {
+          kind: "llm_prompt_template",
+          llm_draft: "Summarise pending interpretation for pending interpretation.",
+        })}
+        sessionId="sess-a11y"
+        stepLabel="Summarise"
+        compositionState={{
+          ...state,
+          nodes: [
+            {
+              ...state.nodes[0],
+              options: {
+                prompt_template_parts: [
+                  { kind: "text", text: "Summarise " },
+                  { kind: "interpretation_ref", requirement_id: "req-1" },
+                  { kind: "text", text: " for " },
+                  { kind: "interpretation_ref", requirement_id: "req-2" },
+                  { kind: "text", text: "." },
+                ],
+                interpretation_requirements: [
+                  {
+                    id: "req-1",
+                    status: "resolved",
+                    draft: "briefly",
+                    accepted_value: "concise and neutral",
+                  },
+                  {
+                    id: "req-2",
+                    status: "pending",
+                    draft: "an auditor",
+                    accepted_value: null,
+                  },
+                ],
+              },
+            },
+          ],
+        }}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    // Guard against a vacuous pass: both slot kinds must be mounted, each
+    // carrying its visually-hidden status prefix.
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    expect(
+      region.querySelector("mark.ack-card-prompt-slot--resolved")?.textContent,
+    ).toBe("accepted value: concise and neutral");
+    expect(
+      region.querySelector("mark.ack-card-prompt-slot--pending")?.textContent,
+    ).toBe("pending value: an auditor");
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1461,9 +1993,7 @@ describe("LoginPage", () => {
     const config: AuthConfig = {
       provider: "local",
       registration_mode: "open",
-      oidc_issuer: null,
-      oidc_client_id: null,
-      authorization_endpoint: null,
+      sso_start_url: null,
     };
     vi.mocked(apiClient.fetchAuthConfig).mockResolvedValue(config);
   }
@@ -1508,13 +2038,35 @@ describe("ConfirmDialog", () => {
   });
 });
 
+describe("WorkspaceSeparator", () => {
+  it("has no axe violations while keyboard resizing is available", async () => {
+    const { container } = render(
+      <WorkspaceSeparator
+        value={448}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={() => {}}
+        onResizeEnd={() => {}}
+      />,
+    );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
 describe("CommandPalette", () => {
   it("has no axe violations when open", async () => {
     // jsdom does not implement Element.prototype.scrollIntoView (the
     // palette scrolls the selected row into view on mount) — same stub as
     // CommandPalette.test.tsx.
     Element.prototype.scrollIntoView = vi.fn();
-    const { container } = render(<CommandPalette isOpen onClose={() => {}} />);
+    const { container } = render(
+      <CommandPalette
+        isOpen
+        onClose={() => {}}
+        runAdmissionAvailable
+      />,
+    );
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1554,7 +2106,35 @@ describe("ProgressView", () => {
       },
     } as never);
     const { container } = render(<ProgressView />);
-    screen.getByText("Source Rows");
+    screen.getByText("Source rows");
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("RunOutcomeNotice", () => {
+  // resetAllStores() clears lastRunOutcome for the whole file; this is the
+  // per-describe belt so an assertion failure above cannot leak a mounted
+  // toast into the next test even within this block.
+  afterEach(() => {
+    useExecutionStore.setState({ lastRunOutcome: null } as never);
+  });
+
+  it("has no axe violations for a failed-run outcome toast", async () => {
+    useExecutionStore.setState({
+      lastRunOutcome: {
+        runId: "run-a11y",
+        status: "failed",
+        sessionId: "sess-a11y",
+      },
+    } as never);
+    const { container } = render(<RunOutcomeNotice />);
+    // Guard against a vacuous pass on the empty (acknowledged) state: the
+    // toast and both actions must actually be mounted. The notice announces
+    // every terminal outcome POLITELY — role="status", never role="alert" —
+    // so the live region, not an alert, is what proves it spoke.
+    expect(screen.getByRole("status")).toHaveTextContent("Pipeline failed.");
+    screen.getByRole("button", { name: "View run" });
+    screen.getByRole("button", { name: "Dismiss run outcome notice" });
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1601,9 +2181,8 @@ describe("GraphModal", () => {
       compositionProposals: [],
     } as never);
     const { container } = render(<GraphModal />);
-    // Modal only renders once the open event fires (the ExportYamlModal
-    // idiom above, with the dispatch act()-wrapped so the listener's
-    // setState commits before the assertion).
+    // The dispatch is act()-wrapped so the listener's setState commits before
+    // the assertion.
     act(() => {
       window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
     });

@@ -32,7 +32,9 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.web.composer.guided.protocol import GUIDED_GOAL_ACKNOWLEDGEMENT
 from elspeth.web.composer.guided.state_machine import TerminalReason, TerminalState
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,18 @@ class _ReturningLiteLLMCompletion:
 
 
 @dataclass
+class _SequencedLiteLLMCompletion:
+    """LiteLLM fake returning one scripted response per provider round."""
+
+    responses: list[object]
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def __call__(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+@dataclass
 class _RaisingLiteLLMCompletion:
     exception: BaseException
     calls: list[dict[str, object]] = field(default_factory=list)
@@ -60,6 +74,21 @@ class _RaisingLiteLLMCompletion:
     async def __call__(self, **kwargs: object) -> object:
         self.calls.append(kwargs)
         raise self.exception
+
+
+@dataclass
+class _MetricInstrument:
+    points: list[tuple[int | float, dict[str, str]]] = field(default_factory=list)
+
+    def record(self, value: int | float, attributes: dict[str, str]) -> None:
+        self.points.append((value, dict(attributes)))
+
+
+_SEED_INTENT = "Begin this guided chat session."
+# Goal-first (elspeth-378cfa0e18): a started session's transcript opens with
+# the author's goal and one server acknowledgement, so every chat these tests
+# send lands at seq 2 and beyond.
+_SEEDED_TURNS = 2
 
 
 def _create_session(client: TestClient) -> str:
@@ -70,7 +99,7 @@ def _create_session(client: TestClient) -> str:
         f"/api/sessions/{session_id}/guided/start",
         json={
             "profile": "live",
-            "intent": "Begin this guided chat session.",
+            "intent": _SEED_INTENT,
             "operation_id": str(uuid4()),
         },
     )
@@ -78,9 +107,39 @@ def _create_session(client: TestClient) -> str:
     return session_id
 
 
+def _chat_after_seed(chat_history: list[dict]) -> list[dict]:
+    """Return the turns this test's own chat produced, past the seeded goal pair.
+
+    Every rooted session opens on [goal, acknowledgement]; asserting on the
+    tail keeps each test below pinning the thing it is actually about. The
+    seeded pair itself is pinned exactly once, in
+    ``test_start_seeds_the_goal_pair_before_any_chat``.
+    """
+
+    assert [turn["content"] for turn in chat_history[:_SEEDED_TURNS]] == [
+        _SEED_INTENT,
+        GUIDED_GOAL_ACKNOWLEDGEMENT,
+    ]
+    return chat_history[_SEEDED_TURNS:]
+
+
 def _outputs_path(client: TestClient, filename: str) -> str:
     data_dir: Path = client.app.state.settings.data_dir
     outputs_dir = data_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    return str(outputs_dir / filename)
+
+
+def _session_outputs_path(client: TestClient, session_id: str, filename: str) -> str:
+    """Absolute path inside the session-owned outputs subtree.
+
+    The only absolute form the deployment sink admission accepts
+    (``allowed_sink_directories`` scopes writes to
+    ``data_dir/outputs/<session_id>``); the pool root returned by
+    ``_outputs_path`` is shared infrastructure and is rejected.
+    """
+    data_dir: Path = client.app.state.settings.data_dir
+    outputs_dir = data_dir / "outputs" / session_id
     outputs_dir.mkdir(parents=True, exist_ok=True)
     return str(outputs_dir / filename)
 
@@ -282,13 +341,39 @@ class TestStepChatSuccess:
 
         assert body["guided_session"]["history"] == history_before
 
+    def test_start_seeds_the_goal_pair_before_any_chat(self, composer_test_client: TestClient) -> None:
+        """Goal-first: the transcript already reads as a conversation at seq 0.
+
+        The single place the seeded pair itself is pinned in this module —
+        every other test asserts on the tail via ``_chat_after_seed``. The
+        acknowledgement is a server statement about what the SERVER will do,
+        never a claim to have read the goal: the step-1/2 chat solver is given
+        the step skill, the user's message and the current-build block, and
+        never ``chat_history``, so a "I read your goal" line would be false at
+        the very next turn.
+        """
+
+        session_id = _create_session(composer_test_client)
+
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["guided_session"]
+
+        assert [(turn["role"], turn["content"], turn["seq"], turn["step"]) for turn in guided["chat_history"]] == [
+            ("user", _SEED_INTENT, 0, "step_1_source"),
+            ("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+        ]
+        assert guided["chat_turn_seq"] == _SEEDED_TURNS
+        # The acknowledgement rides the ordinary assistant discriminator; the
+        # closed vocabulary is not widened for it.
+        assert guided["chat_history"][1]["assistant_message_kind"] == "assistant"
+        assert guided["chat_history"][1]["synthetic_failure_reason"] is None
+
     def test_appends_user_and_assistant_turns_to_chat_history(self, composer_test_client: TestClient) -> None:
         """Slice 5: a successful chat appends BOTH turns to chat_history atomically.
 
-        chat_turn_seq advances by 2 (user.seq=0, assistant.seq=1, next=2).
-        Both turns carry the same step and a server-recorded ts_iso; the
-        sequence guarantees deterministic ordering even when two turns
-        share a wall-clock second.
+        chat_turn_seq advances by 2 (user, then assistant), on top of the two
+        turns the goal-first start seeded. Both turns carry the same step and
+        a server-recorded ts_iso; the sequence guarantees deterministic
+        ordering even when two turns share a wall-clock second.
         """
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
@@ -304,25 +389,25 @@ class TestStepChatSuccess:
             )
 
         assert status == 200, body
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
 
         user_entry, assistant_entry = chat_history
         assert user_entry["role"] == "user"
         assert user_entry["content"] == "any nulls in col_a?"
-        assert user_entry["seq"] == 0
+        assert user_entry["seq"] == _SEEDED_TURNS
         assert user_entry["step"] == "step_1_source"
         assert user_entry["ts_iso"]  # non-empty ISO string
 
         assert assistant_entry["role"] == "assistant"
         assert assistant_entry["content"] == "rows look fine"
-        assert assistant_entry["seq"] == 1
+        assert assistant_entry["seq"] == _SEEDED_TURNS + 1
         assert assistant_entry["step"] == "step_1_source"
         # Both turns produced in the same request share a single ts_iso —
         # ordering must come from `seq`, not the timestamp.
         assert assistant_entry["ts_iso"] == user_entry["ts_iso"]
 
-        assert body["guided_session"]["chat_turn_seq"] == 2
+        assert body["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 2
 
     def test_chat_history_round_trips_through_persistence(self, composer_test_client: TestClient) -> None:
         """Slice 5 invariant: chat_history persists across a service reload.
@@ -349,10 +434,8 @@ class TestStepChatSuccess:
         assert resp.status_code == 200, resp.json()
         reloaded = resp.json()["guided_session"]
 
-        assert reloaded["chat_turn_seq"] == 2
-        assert len(reloaded["chat_history"]) == 2
-        assert reloaded["chat_history"][0]["content"] == "ping"
-        assert reloaded["chat_history"][1]["content"] == "ack"
+        assert reloaded["chat_turn_seq"] == _SEEDED_TURNS + 2
+        assert [turn["content"] for turn in _chat_after_seed(reloaded["chat_history"])] == ["ping", "ack"]
 
     def test_chat_turn_persists_audit_message(self, composer_test_client: TestClient) -> None:
         """Slice 5.1: each chat round-trip persists a ComposerChatTurn audit row.
@@ -366,6 +449,8 @@ class TestStepChatSuccess:
         """
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        submitted_token = guided.json()["next_turn"]["turn_token"]
 
         with patch(
             _CHAT_SOLVER_ACOMPLETION,
@@ -375,6 +460,7 @@ class TestStepChatSuccess:
                 composer_test_client,
                 session_id,
                 message="ping",
+                turn_token=submitted_token,
             )
 
         # The content carries the slim summary fields.
@@ -385,7 +471,11 @@ class TestStepChatSuccess:
         assert body["status"] == "success"
         assert body["step"] == "step_1_source"
         assert body["initiator"] == "user"
-        assert body["chat_turn_seq"] == 0
+        assert body["chat_turn_seq"] == _SEEDED_TURNS
+        # The audit row binds the occurrence the message answered — the
+        # token the request was submitted under, not merely "a" token
+        # (elspeth-ea80e34fdc).
+        assert body["turn_token"] == submitted_token
         # latency is captured but non-deterministic; assert presence only.
         assert isinstance(body["latency_ms"], int)
         assert body["latency_ms"] >= 0
@@ -429,6 +519,8 @@ class TestStepChatSuccess:
         """
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        submitted_token = guided.json()["next_turn"]["turn_token"]
 
         with patch(
             _CHAT_SOLVER_ACOMPLETION,
@@ -438,6 +530,7 @@ class TestStepChatSuccess:
                 composer_test_client,
                 session_id,
                 message="ping",
+                turn_token=submitted_token,
             )
 
         audit_bodies = _chat_turn_audit_bodies(composer_test_client, session_id)
@@ -445,7 +538,10 @@ class TestStepChatSuccess:
         body = audit_bodies[0]
         assert body["status"] == "synthetic_unavailable"
         assert body["error_class"] == "TimeoutError"
-        assert body["chat_turn_seq"] == 0
+        # The synthetic-failure row is exactly the one a later Retry answers:
+        # it must record which occurrence failed (elspeth-ea80e34fdc).
+        assert body["turn_token"] == submitted_token
+        assert body["chat_turn_seq"] == _SEEDED_TURNS
         llm_audits = _llm_call_audit_bodies(composer_test_client, session_id)
         assert len(llm_audits) == 1, llm_audits
         assert llm_audits[0]["status"] == "timeout"
@@ -470,11 +566,11 @@ class TestStepChatSuccess:
                 message="second",
             )
 
-        # After two chats: seq advances 0,1,2,3 then next=4.
-        chat_history = body["guided_session"]["chat_history"]
-        assert [entry["seq"] for entry in chat_history] == [0, 1, 2, 3]
+        # After two chats: seq advances by four past the seeded goal pair.
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
+        assert [entry["seq"] for entry in chat_history] == [_SEEDED_TURNS + offset for offset in (0, 1, 2, 3)]
         assert [entry["content"] for entry in chat_history] == ["first", "first reply", "second", "second reply"]
-        assert body["guided_session"]["chat_turn_seq"] == 4
+        assert body["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 4
 
 
 class TestStep1SourceResolution:
@@ -631,7 +727,7 @@ class TestStep1SourceResolution:
         source_slot = (body["composition_state"]["sources"] or {}).get("source")
         assert source_slot is None, f"expected no committed source, got {source_slot!r}"
         # (d) reply in chat_history (user+assistant), wizard history unchanged
-        assert len(body["guided_session"]["chat_history"]) == 2
+        assert len(_chat_after_seed(body["guided_session"]["chat_history"])) == 2
         assert body["guided_session"]["history"] == history_before
 
     def test_step_1_typed_description_salvages_declined_prose_without_second_call(self, composer_test_client) -> None:
@@ -733,7 +829,7 @@ class TestStep1SourceResolution:
         assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
         assert body["next_turn"]["type"] == "schema_form"
         assert not body["composition_state"]["sources"]
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["content"] == user_message
         assert chat_history[1]["content"] == body["assistant_message"]
@@ -840,7 +936,14 @@ class TestStepChatRejections:
             validation_errors=record.validation_errors,
             composer_meta=existing_meta,
         )
-        asyncio.run(service.save_composition_state(UUID(session_id), new_data, provenance="session_seed"))
+        asyncio.run(
+            _save_composition_state_with_compose_authority(
+                service,
+                UUID(session_id),
+                new_data,
+                provenance="session_seed",
+            )
+        )
 
         status, body = _post_chat(
             composer_test_client,
@@ -890,7 +993,14 @@ class TestStepChatRejections:
             validation_errors=record.validation_errors,
             composer_meta=existing_meta,
         )
-        asyncio.run(service.save_composition_state(UUID(session_id), new_data, provenance="session_seed"))
+        asyncio.run(
+            _save_composition_state_with_compose_authority(
+                service,
+                UUID(session_id),
+                new_data,
+                provenance="session_seed",
+            )
+        )
 
         status, body = _post_chat(
             composer_test_client,
@@ -900,6 +1010,41 @@ class TestStepChatRejections:
 
         assert status == 409, body
         assert "terminal" in body["detail"].lower()
+
+    def test_completed_session_keeps_its_chat_channel(self, composer_test_client: TestClient) -> None:
+        """The sibling of the refusal above: COMPLETED is admitted, EXITED is not.
+
+        The two terminal kinds now diverge on this endpoint. A confirmed build
+        answers questions about itself over the frozen wire record it settled
+        on; only an exit closes the channel (elspeth-986801d218). Bound to the
+        confirmation hash, not to a current unanswered turn — there is none.
+        """
+        from tests.integration.web.composer.guided.test_chat_schema8_atomic import (
+            _create_session as _create_guided_session,
+        )
+        from tests.integration.web.composer.guided.test_chat_schema8_atomic import (
+            _seed_completed_session,
+        )
+
+        session_id = _create_guided_session(composer_test_client)
+        token = _seed_completed_session(composer_test_client, session_id)
+        completion = _ReturningLiteLLMCompletion(_fake_llm_reply("It writes JSON rows to your output."))
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, completion):
+            response = composer_test_client.post(
+                f"/api/sessions/{session_id}/guided/chat",
+                json={"operation_id": str(uuid4()), "turn_token": token, "message": "What does this pipeline do?"},
+            )
+
+        assert response.status_code == 200, response.json()
+        body = response.json()
+        assert body["assistant_message"] == "It writes JSON rows to your output."
+        assert body["next_turn"] is None
+        assert body["terminal"]["kind"] == "completed"
+        # Exactly one provider round, advisory: no tools are offered on a
+        # settled build because there is nothing left to author.
+        assert len(completion.calls) == 1
+        assert completion.calls[0].get("tools") is None
 
 
 def _terminal_kind_exited():
@@ -984,7 +1129,7 @@ class TestStepChatTransientFailure:
         # SYNTHETIC_UNAVAILABLE in ComposerChatTurnStatus.  ChatTurnStatus
         # is the discriminator; on the wire (Phase A) the user sees the
         # synthetic content directly.
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["content"] == "anything"
         assert chat_history[1]["content"] == "I'm unavailable right now; you can still use the wizard controls."
@@ -1030,7 +1175,7 @@ class TestStepChatTransientFailure:
         assert "quality check" in body["assistant_message"]
         # The scaffolding never lands in chat_history — only the user turn and
         # the honest reply.
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert "<tool_call" not in chat_history[1]["content"]
         assert chat_history[1]["content"] == body["assistant_message"]
@@ -1194,7 +1339,7 @@ class TestStepChatTransientFailure:
         assert body["guided_session"]["step"] == "step_1_source"
         assert body["guided_session"]["terminal"] is None
         assert body["guided_session"]["history"] == seeded["guided_session"]["history"]
-        chat_history = body["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(body["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["content"] == "anything"
         assert chat_history[1]["content"] == "I'm unavailable right now; you can still use the wizard controls."
@@ -1338,12 +1483,17 @@ class TestStepChatServerInvariants:
         event = invariant_events[0]
         assert event["exc_class"] == "InvariantError"
         assert isinstance(event["frames"], tuple) and len(event["frames"]) > 0
+        # R2-F16b: the correlation field is always emitted (None here — this
+        # app carries no RequestIdMiddleware).
+        assert "request_id" in event
         assert all(f.startswith("frame=") for f in event["frames"])
         assert _chat_turn_audit_bodies(composer_test_client, session_id) == []
 
         reloaded = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["guided_session"]
-        assert reloaded["chat_history"] == []
-        assert reloaded["chat_turn_seq"] == 0
+        # Nothing was appended past the goal-first seed: the failed chat left
+        # no transcript trace at all.
+        assert _chat_after_seed(reloaded["chat_history"]) == []
+        assert reloaded["chat_turn_seq"] == _SEEDED_TURNS
 
     def test_terminal_failure_preserves_primary_error_if_slog_raises(
         self,
@@ -1356,11 +1506,10 @@ class TestStepChatServerInvariants:
         session_id = _create_session(composer_test_client)
         _seed_persisted_step1(composer_test_client, session_id)
 
-        monkeypatch.setattr(
-            guided_chat_atomic.slog,
-            "error",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated logger failure")),
-        )
+        def _raise_logger_failure(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated logger failure")
+
+        monkeypatch.setattr(guided_chat_atomic, "slog", SimpleNamespace(error=_raise_logger_failure))
 
         with patch(
             _CHAT_SOLVER_ACOMPLETION,
@@ -1395,8 +1544,10 @@ class TestStepChatServerInvariants:
         assert _chat_turn_audit_bodies(composer_test_client, session_id) == []
 
         reloaded = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["guided_session"]
-        assert reloaded["chat_history"] == []
-        assert reloaded["chat_turn_seq"] == 0
+        # Nothing was appended past the goal-first seed: the failed chat left
+        # no transcript trace at all.
+        assert _chat_after_seed(reloaded["chat_history"]) == []
+        assert reloaded["chat_turn_seq"] == _SEEDED_TURNS
 
 
 class TestStepChatCrossStep:
@@ -1497,18 +1648,93 @@ class TestStepChatCrossStep:
         #    cross-step invariant: a single chat_history list, monotonic
         #    seq, step values reflecting where each turn happened.
         final = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
-        chat_history = final["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(final["guided_session"]["chat_history"])
         assert len(chat_history) == 4, chat_history
         # Tuple-shaped assertion so a regression on any axis (step/seq/role/content)
         # surfaces in the failure message.
         observed = [(entry["role"], entry["step"], entry["seq"], entry["content"]) for entry in chat_history]
         assert observed == [
-            ("user", "step_1_source", 0, "how do I describe my CSV?"),
-            ("assistant", "step_1_source", 1, "step-1 advice"),
-            ("user", "step_2_sink", 2, "which sink for JSON output?"),
-            ("assistant", "step_2_sink", 3, "step-2 advice"),
+            ("user", "step_1_source", _SEEDED_TURNS + 0, "how do I describe my CSV?"),
+            ("assistant", "step_1_source", _SEEDED_TURNS + 1, "step-1 advice"),
+            ("user", "step_2_sink", _SEEDED_TURNS + 2, "which sink for JSON output?"),
+            ("assistant", "step_2_sink", _SEEDED_TURNS + 3, "step-2 advice"),
         ]
-        assert final["guided_session"]["chat_turn_seq"] == 4
+        assert final["guided_session"]["chat_turn_seq"] == _SEEDED_TURNS + 4
+
+
+def _fake_sink_schema_discovery_call(name: str) -> SimpleNamespace:
+    """LiteLLM-shaped response carrying one Step-2 get_plugin_schema call."""
+    tool_call = SimpleNamespace(
+        id="discovery-1",
+        function=SimpleNamespace(
+            name="get_plugin_schema",
+            arguments=json.dumps({"plugin_type": "sink", "name": name}),
+        ),
+    )
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+
+
+class TestStep2SchemaLoadMarking:
+    """F2 e2e: the route binds the composer service's per-session tracker.
+
+    Drives the REAL /guided/chat route at step_2_sink so the whole wiring
+    chain is under test — post_guided_chat_schema8's ``functools.partial``
+    binding, run_guided_chat_provider_attempt's pass-through,
+    resolve_step_2_sink_chat_with_auto_drop's pass-through, and the solver's
+    success-only marking. A success lands the (kind, plugin) pair in the
+    tracker the next planner request reads; a semantic failure never does.
+    """
+
+    def _advance_to_step_2(self, client: TestClient) -> str:
+        session_id = _create_session(client)
+        _seed_guided_session(client, session_id)
+        TestStepChatCrossStep._seed_csv_blob(client, session_id)
+        TestStepChatCrossStep._configure_csv_source(client, session_id)
+        guided = client.get(f"/api/sessions/{session_id}/guided").json()
+        assert guided["guided_session"]["step"] == "step_2_sink", guided
+        return session_id
+
+    def test_step_2_schema_success_marks_the_composer_tracker_through_the_route(self, composer_test_client: TestClient) -> None:
+        session_id = self._advance_to_step_2(composer_test_client)
+        completion = _SequencedLiteLLMCompletion(
+            [
+                _fake_sink_schema_discovery_call("json"),
+                _fake_llm_reply("The JSON Lines sink writes one object per row."),
+            ]
+        )
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, new=completion):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="what options does the json sink take?",
+            )
+
+        assert status == 200, body
+        assert len(completion.calls) == 2
+        tracker = composer_test_client.app.state.composer_service._schemas_loaded_for_session(session_id)
+        assert tracker == frozenset({("sink", "json")})
+
+    def test_step_2_schema_failure_never_marks_the_composer_tracker(self, composer_test_client: TestClient) -> None:
+        session_id = self._advance_to_step_2(composer_test_client)
+        completion = _SequencedLiteLLMCompletion(
+            [
+                _fake_sink_schema_discovery_call("not_a_sink"),
+                _fake_llm_reply("That sink is not available here."),
+            ]
+        )
+
+        with patch(_CHAT_SOLVER_ACOMPLETION, new=completion):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="what options does the imaginary sink take?",
+            )
+
+        assert status == 200, body
+        assert len(completion.calls) == 2
+        tracker = composer_test_client.app.state.composer_service._schemas_loaded_for_session(session_id)
+        assert tracker == frozenset()
 
 
 class TestGuidedChatWireDiscriminator:
@@ -1594,7 +1820,17 @@ class TestGuidedChatWireDiscriminator:
         assert status == 200, body
         assert body["assistant_message_kind"] == "synthetic_failure"
 
-    def test_provider_timeout_is_kind_synthetic_failure(self, composer_test_client: TestClient) -> None:
+    def test_provider_timeout_is_kind_synthetic_failure(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer import provider_telemetry
+
+        request_duration = _MetricInstrument()
+        request_calls = _MetricInstrument()
+        monkeypatch.setattr(provider_telemetry, "_REQUEST_DURATION", request_duration)
+        monkeypatch.setattr(provider_telemetry, "_REQUEST_PROVIDER_CALLS", request_calls)
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
 
@@ -1610,6 +1846,9 @@ class TestGuidedChatWireDiscriminator:
 
         assert status == 200, body
         assert body["assistant_message_kind"] == "synthetic_failure"
+        attributes = {"surface": "guided", "status": "timed_out"}
+        assert request_duration.points[-1][1] == attributes
+        assert request_calls.points[-1] == (1, attributes)
         # Provider unavailability uses distinct safe copy; the persisted turn
         # test below pins its required machine-readable reason.
         assert "quality check" not in body["assistant_message"]
@@ -1645,11 +1884,54 @@ class TestChatHistoryDiscriminatorPersistence:
         # from the persisted chat_history.
         get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
         assert get_resp.status_code == 200, get_resp.json()
-        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(get_resp.json()["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[0]["assistant_message_kind"] is None  # user turn: not applicable
         assert chat_history[1]["assistant_message_kind"] == "synthetic_failure"
         assert chat_history[1]["synthetic_failure_reason"] == "quality_guard"
+
+    def test_model_shape_defect_turn_persists_model_defect_reason(self, composer_test_client: TestClient) -> None:
+        """inv-f1 D4: a model reply that violates resolve_source's argument
+        contract is a MODEL-output defect — the provider answered. The wire
+        reason must say so (``model_defect``), never fold it into the
+        transient ``unavailable`` set: the turn's own copy invites Retry
+        ("Press Retry to have me redo this step") and the frontend keeps the
+        Retry affordance live for this reason.
+        """
+        session_id = _create_session(composer_test_client)
+        _seed_guided_session(composer_test_client, session_id)
+
+        empty_content_reply = _fake_source_resolution_tool_call(
+            {
+                "resolution": "source",
+                "plugin": "csv",
+                "filename": "inventory.csv",
+                "mime_type": "text/csv",
+                "content": "",
+                "options": {"schema": {"mode": "observed"}},
+                "observed_columns": ["sku"],
+                "sample_rows": [],
+                "assistant_message": "Bound the uploaded file.",
+            }
+        )
+        with patch(
+            _CHAT_SOLVER_ACOMPLETION,
+            new=_ReturningLiteLLMCompletion(empty_content_reply),
+        ):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="Create a CSV source from my inventory data.",
+            )
+
+        assert status == 200, body
+        assert body["assistant_message_kind"] == "synthetic_failure"
+
+        get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        assert get_resp.status_code == 200, get_resp.json()
+        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        assert chat_history[-1]["assistant_message_kind"] == "synthetic_failure"
+        assert chat_history[-1]["synthetic_failure_reason"] == "model_defect"
 
     def test_real_reply_turn_persists_kind_across_get(self, composer_test_client: TestClient) -> None:
         session_id = _create_session(composer_test_client)
@@ -1669,7 +1951,7 @@ class TestChatHistoryDiscriminatorPersistence:
 
         get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
         assert get_resp.status_code == 200, get_resp.json()
-        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        chat_history = _chat_after_seed(get_resp.json()["guided_session"]["chat_history"])
         assert len(chat_history) == 2
         assert chat_history[1]["assistant_message_kind"] == "assistant"
 
@@ -1707,7 +1989,14 @@ class TestChatHistoryDiscriminatorPersistence:
             validation_errors=None,
             composer_meta={"guided_session": guided_dict},
         )
-        asyncio.run(service.save_composition_state(session_uuid, state_data, provenance="session_seed"))
+        asyncio.run(
+            _save_composition_state_with_compose_authority(
+                service,
+                session_uuid,
+                state_data,
+                provenance="session_seed",
+            )
+        )
 
         with pytest.raises(InvariantError, match="missing keys"):
             composer_test_client.get(f"/api/sessions/{session_id}/guided")
@@ -1812,9 +2101,10 @@ class TestStepChatProgressWiring:
         guided = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
         assert guided["guided_session"]["step"] == "step_2_sink", guided
 
-        # The sink path must remain within the session outputs directory for
-        # the pure transition validator to accept the proposal.
-        out_path = _outputs_path(composer_test_client, "chat_out.jsonl")
+        # The sink path must lie within the session-owned outputs subtree —
+        # the chat-time deployment admission (and the manual form POST's)
+        # rejects any other absolute path.
+        out_path = _session_outputs_path(composer_test_client, session_id, "chat_out.jsonl")
         resolve_sink_response = SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -1881,3 +2171,113 @@ class TestStepChatProgressWiring:
 
         final_progress = self._progress(composer_test_client, session_id)
         assert final_progress["phase"] == "complete"
+
+
+class TestFormAuthoredSourceReachesChat:
+    """A source authored through the Step-1 FORM must reach the provider whole.
+
+    Chat had coverage for sources the model resolved through ``resolve_source``,
+    but none for a source the OPERATOR authored on the schema form — and that is
+    the path whose reviewed shape the provider projections had never been
+    updated for. A form-authored source binds its blob through the
+    ``blob:<id>`` path sentinel (never a ``blob_ref`` custody key) and carries
+    its field inventory in ``schema.fields``, so the projections reported it as
+    an unbound source with no fields, in the one surface where the operator can
+    repair it.
+
+    ``DECLARED_ONLY_FIELD`` is deliberately absent from the uploaded CSV header
+    and from the confirmed columns: an assertion on a declared field that also
+    appears as an observed column would pass off the observed-column projection
+    and prove nothing.
+    """
+
+    DECLARED_ONLY_FIELD = "ticket_id"
+    CSV_CONTENT = "text,note\nHello,world\n"
+
+    @staticmethod
+    def _respond(client: TestClient, session_id: str, **kwargs) -> dict:
+        return _post_respond(client, session_id, **kwargs)
+
+    @classmethod
+    def _author_source_on_the_form(cls, client: TestClient, session_id: str) -> str:
+        """Drive the real Step-1 turns, editing the schema on the form.
+
+        Returns the seeded blob's id — the custody value that must never appear
+        in provider-visible content.
+        """
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": "data.csv", "content": cls.CSV_CONTENT, "mime_type": "text/csv"},
+        )
+        assert resp.status_code == 201, resp.json()
+        blob_id = resp.json()["id"]
+
+        selected = cls._respond(client, session_id, chosen=["csv"])
+        prefilled = selected["next_turn"]["payload"]["prefilled"]
+        # Pin the prefill shape this fixture edits: the guided prefill for an
+        # inspected CSV is already an EXPLICIT schema with declared fields, so
+        # the declared-field projection is on the mainstream path, not an
+        # exotic one. The path is the server-held blob sentinel.
+        assert prefilled["schema"]["mode"] == "flexible", prefilled
+        assert prefilled["schema"]["fields"] == ["text: str", "note: str"], prefilled
+        assert prefilled["path"].startswith("blob:"), prefilled
+
+        options = {
+            **prefilled,
+            "schema": {
+                **prefilled["schema"],
+                "fields": [*prefilled["schema"]["fields"], f"{cls.DECLARED_ONLY_FIELD}: str"],
+            },
+        }
+        cls._respond(client, session_id, edited_values={"plugin": "csv", "options": options})
+        cls._respond(client, session_id, edited_values={"columns": ["text", "note"]})
+        cls._respond(
+            client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "source"},
+        )
+        return blob_id
+
+    def test_form_authored_source_names_its_fields_and_binding_to_the_provider(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        _seed_guided_session(composer_test_client, session_id)
+        blob_id = self._author_source_on_the_form(composer_test_client, session_id)
+
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
+        assert guided["guided_session"]["step"] == "step_2_sink", guided
+
+        completion = _ReturningLiteLLMCompletion(_fake_llm_reply("You can add that transform at the next step."))
+        with patch(_CHAT_SOLVER_ACOMPLETION, new=completion):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="after the output, uppercase the ticket id column",
+            )
+        assert status == 200, body
+
+        assert completion.calls, "the chat route made no provider call"
+        messages = [message for call in completion.calls for message in call["messages"]]
+        system_content = "\n".join(str(m["content"]) for m in messages if m["role"] == "system")
+        user_content = "\n".join(str(m["content"]) for m in messages if m["role"] != "system")
+
+        # The applied source names its declared fields (by alias) and reports
+        # that it reads server-held storage.
+        assert '"declared_fields":' in system_content
+        assert '"server_storage_bound": true' in system_content
+        # The exact declared label is available only as delimited user-role
+        # data — including the one that is NOT an observed column.
+        assert "<untrusted_source_field_labels>" in user_content
+        assert f'"uploaded_label": "{self.DECLARED_ONLY_FIELD}"' in user_content
+        declared_alias = json.loads(user_content.split("<untrusted_source_field_labels>")[1].split("</untrusted_source_field_labels>")[0])
+        alias_by_label = {record["uploaded_label"]: record["alias"] for record in declared_alias}
+        assert self.DECLARED_ONLY_FIELD in alias_by_label
+        assert (
+            f'"declared_fields": ["{alias_by_label["text"]}", "{alias_by_label["note"]}", "{alias_by_label[self.DECLARED_ONLY_FIELD]}"]'
+            in (system_content)
+        )
+        # Custody stays server-side: no sentinel, no blob id.
+        assert f"blob:{blob_id}" not in system_content
+        assert blob_id not in system_content

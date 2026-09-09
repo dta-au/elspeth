@@ -5,6 +5,7 @@ request/response is recorded to the Landscape audit trail for complete
 traceability.
 
 Example:
+    from elspeth.contracts.chat_parts import ChatMessage
     from elspeth.plugins.infrastructure.clients import AuditedLLMClient, AuditedHTTPClient
 
     # Create audited LLM client
@@ -20,7 +21,7 @@ Example:
     # All calls are automatically recorded
     response = llm_client.chat_completion(
         model="gpt-4",
-        messages=[{"role": "user", "content": "Hello"}],
+        messages=[ChatMessage(role="user", content="Hello")],
     )
 
 For replay mode, use CallReplayer to return recorded responses:

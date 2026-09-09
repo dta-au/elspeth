@@ -1,0 +1,12 @@
+[
+  {
+    "column": 0,
+    "file_path": "src/elspeth/core/landscape/plugin_audit_writer.py",
+    "fingerprint": "ratchet-slack:12",
+    "line": 4,
+    "message": "Ratchet has slack: PluginAuditWriterAdapter has 12 public methods but the ratchet allows 13.",
+    "rule_id": "contract_invariants.adapter_method_budget",
+    "severity": "error",
+    "suggestion": "Lower RATCHET in elspeth-lints/src/elspeth_lints/rules/contract_invariants/adapter_method_budget/rule.py to the current method count so the reduction is locked in."
+  }
+]

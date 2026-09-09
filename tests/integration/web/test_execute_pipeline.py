@@ -24,6 +24,8 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TEST_CSV = FIXTURES_DIR / "test_input.csv"
 
@@ -110,8 +112,11 @@ class TestEndToEndPipelineExecution:
             session_id = resp.json()["id"]  # SessionResponse.id, NOT session_id
 
             # 2. Save composition state programmatically
-            csv_path = str(work_dir / "blobs" / "input.csv")
-            output_path = str(work_dir / "outputs" / "result.csv")
+            session_blob_dir = work_dir / "blobs" / session_id
+            session_blob_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(work_dir / "blobs" / "input.csv", session_blob_dir / "input.csv")
+            csv_path = str(session_blob_dir / "input.csv")
+            output_path = str(work_dir / "outputs" / session_id / "result.csv")
 
             state = CompositionState(
                 source=SourceSpec(
@@ -161,7 +166,12 @@ class TestEndToEndPipelineExecution:
                 validation_errors=None,
             )
             session_service = app.state.session_service
-            await session_service.save_composition_state(UUID(session_id), state_data, provenance="session_seed")
+            await _save_composition_state_with_compose_authority(
+                session_service,
+                UUID(session_id),
+                state_data,
+                provenance="session_seed",
+            )
 
             # 3. Execute via REST
             resp = await client.post(
@@ -198,7 +208,7 @@ class TestEndToEndPipelineExecution:
             assert status["landscape_run_id"] is not None
 
             # 7. Verify output file was created
-            output_file = work_dir / "outputs" / "result.csv"
+            output_file = work_dir / "outputs" / session_id / "result.csv"
             assert output_file.exists()
 
             # 8. Verify audit database exists
@@ -258,11 +268,6 @@ class TestGateRoutedPipelineExecution:
         from elspeth.web.config import WebSettings
         from elspeth.web.sessions.protocol import CompositionStateData
 
-        # Overwrite the input.csv prepared by ``work_dir`` with the
-        # gate-routed reproducer schema (id, tier).
-        gate_csv = work_dir / "blobs" / "input.csv"
-        gate_csv.write_text(GATE_ROUTED_CSV_CONTENT)
-
         settings = WebSettings(
             data_dir=work_dir,
             landscape_url=f"sqlite:///{work_dir}/runs/audit.db",
@@ -297,9 +302,13 @@ class TestGateRoutedPipelineExecution:
             assert resp.status_code == 201, f"Session creation failed: {resp.text}"
             session_id = resp.json()["id"]
 
+            # Scope the source and sink fixtures to the newly created session.
+            gate_csv = work_dir / "blobs" / session_id / "input.csv"
+            gate_csv.parent.mkdir(parents=True, exist_ok=True)
+            gate_csv.write_text(GATE_ROUTED_CSV_CONTENT)
             csv_path = str(gate_csv)
-            high_path = str(work_dir / "outputs" / "high.csv")
-            low_path = str(work_dir / "outputs" / "low.csv")
+            high_path = str(work_dir / "outputs" / session_id / "high.csv")
+            low_path = str(work_dir / "outputs" / session_id / "low.csv")
             row_schema = {
                 "mode": "fixed",
                 "fields": ["id: int", "tier: str"],
@@ -384,7 +393,12 @@ class TestGateRoutedPipelineExecution:
                 validation_errors=None,
             )
             session_service = app.state.session_service
-            await session_service.save_composition_state(UUID(session_id), state_data, provenance="session_seed")
+            await _save_composition_state_with_compose_authority(
+                session_service,
+                UUID(session_id),
+                state_data,
+                provenance="session_seed",
+            )
 
             resp = await client.post(
                 f"/api/sessions/{session_id}/execute",
@@ -430,3 +444,265 @@ class TestGateRoutedPipelineExecution:
             assert accounting["routing"]["routed_success"] > 0
             assert accounting["routing"]["routed_failure"] == 0
             assert status["error"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_execute_fails_closed_for_uncovered_llm_source(
+    work_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REST execution boundary preserves source attribution pre-run."""
+    from asgi_lifespan import LifespanManager
+
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.plugins.sources.llm.source import LLMSource
+    from elspeth.web.app import create_app
+    from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    monkeypatch.setattr(LLMSource, "source_file_hash", "sha256:0123456789abcdef")
+    monkeypatch.setattr("elspeth.plugins.infrastructure.manager._shared_instance", manager)
+
+    settings = WebSettings(
+        data_dir=work_dir,
+        landscape_url=f"sqlite:///{work_dir}/runs/audit.db",
+        payload_store_path=work_dir / "payloads",
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        secret_key="x" * 32,
+        shareable_link_signing_key=b"\x00" * 32,
+        plugin_allowlist=("source:llm", "transform:azure_content_safety"),
+        plugin_preferences={
+            PluginCapability.LLM: ("transform:llm", "source:llm"),
+            PluginCapability.CONTENT_SAFETY: ("transform:azure_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode.RECOMMEND,
+            PluginCapability.CONTENT_SAFETY: ControlMode.REQUIRED,
+        },
+    )
+    app = create_app(settings=settings)
+    auth_provider = app.state.auth_provider
+    auth_provider.create_user("sourceuser", "testpass123", display_name="Source User")
+
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(app.state.catalog_service)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=unrestricted.policy_hash,
+        principal_scope=unrestricted.principal_scope,
+        available=unrestricted.available,
+        unavailable=unrestricted.unavailable,
+        selected=unrestricted.selected,
+        usable_profile_aliases=unrestricted.usable_profile_aliases,
+        selected_profile_aliases=unrestricted.selected_profile_aliases,
+        control_modes=((PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED),),
+        binding_generation_fingerprint=unrestricted.binding_generation_fingerprint,
+        authority=unrestricted.authority,
+    )
+    async with LifespanManager(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        monkeypatch.setattr(app.state.execution_service, "_plugin_snapshot_factory", lambda _user_id: snapshot)
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "sourceuser", "password": "testpass123"},
+        )
+        assert login.status_code == 200
+        auth_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+        created = await client.post(
+            "/api/sessions",
+            headers=auth_headers,
+            json={"title": "LLM source coverage integration"},
+        )
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                on_success="primary",
+                options={
+                    "provider": "bedrock",
+                    "model": "anthropic.claude-3-haiku-20240307-v1:0",
+                    "prompt_template": "Write one audit briefing.",
+                    "response_field": "briefing",
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="primary",
+                    plugin="json",
+                    options={
+                        "path": str(work_dir / "outputs" / session_id / "result.jsonl"),
+                        "schema": {"mode": "observed"},
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Uncovered LLM source"),
+            version=1,
+        )
+        state_data = state.to_dict()
+        await _save_composition_state_with_compose_authority(
+            app.state.session_service,
+            UUID(session_id),
+            CompositionStateData(
+                sources=state_data["sources"],
+                nodes=state_data["nodes"],
+                edges=state_data["edges"],
+                outputs=state_data["outputs"],
+                metadata_=state_data["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+
+        response = await client.post(
+            f"/api/sessions/{session_id}/execute",
+            headers=auth_headers,
+        )
+
+        # Exercise the next execution-policy gate with required-control modes
+        # disabled so content-safety coverage cannot mask the base-URL verdict.
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash=unrestricted.policy_hash,
+            principal_scope=unrestricted.principal_scope,
+            available=unrestricted.available,
+            unavailable=unrestricted.unavailable,
+            selected=unrestricted.selected,
+            usable_profile_aliases=unrestricted.usable_profile_aliases,
+            selected_profile_aliases=unrestricted.selected_profile_aliases,
+            control_modes=(),
+            binding_generation_fingerprint=unrestricted.binding_generation_fingerprint,
+            authority=unrestricted.authority,
+        )
+        base_url_created = await client.post(
+            "/api/sessions",
+            headers=auth_headers,
+            json={"title": "LLM source base URL policy"},
+        )
+        assert base_url_created.status_code == 201
+        base_url_session_id = base_url_created.json()["id"]
+        base_url_state = CompositionState(
+            sources={
+                "briefing": SourceSpec(
+                    plugin="llm",
+                    on_success="primary",
+                    options={
+                        "base_url": "https://credential-canary.attacker.invalid/v1",
+                        "prompt_template": "PROMPT_CANARY_DO_NOT_RENDER",
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="primary",
+                    plugin="json",
+                    options={
+                        "path": str(work_dir / "outputs" / base_url_session_id / "result.jsonl"),
+                        "schema": {"mode": "observed"},
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Unsafe LLM source base URL"),
+            version=1,
+        )
+        base_url_state_data = base_url_state.to_dict()
+        await _save_composition_state_with_compose_authority(
+            app.state.session_service,
+            UUID(base_url_session_id),
+            CompositionStateData(
+                sources=base_url_state_data["sources"],
+                nodes=base_url_state_data["nodes"],
+                edges=base_url_state_data["edges"],
+                outputs=base_url_state_data["outputs"],
+                metadata_=base_url_state_data["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+        base_url_response = await client.post(
+            f"/api/sessions/{base_url_session_id}/execute",
+            headers=auth_headers,
+        )
+
+        malformed_created = await client.post(
+            "/api/sessions",
+            headers=auth_headers,
+            json={"title": "Malformed persisted source"},
+        )
+        assert malformed_created.status_code == 201
+        malformed_session_id = malformed_created.json()["id"]
+        await _save_composition_state_with_compose_authority(
+            app.state.session_service,
+            UUID(malformed_session_id),
+            CompositionStateData(
+                sources={
+                    "source": {
+                        "plugin": [],
+                        "on_success": "primary",
+                        "options": {},
+                        "on_validation_failure": "discard",
+                    }
+                },
+                nodes=[],
+                edges=[],
+                outputs=[
+                    {
+                        "name": "primary",
+                        "plugin": "json",
+                        "options": {
+                            "path": str(work_dir / "outputs" / malformed_session_id / "result.jsonl"),
+                            "schema": {"mode": "observed"},
+                        },
+                        "on_write_failure": "discard",
+                    }
+                ],
+                metadata_={"name": "Malformed persisted source", "description": ""},
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+        malformed_response = await client.post(
+            f"/api/sessions/{malformed_session_id}/execute",
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["kind"] == "pipeline_validation_failure"
+    assert detail["errors"][0]["error_code"] == "required_control_coverage"
+    assert detail["errors"][0]["component_id"] == "source"
+    assert detail["errors"][0]["component_type"] == "source"
+    assert "run_id" not in response.json()
+    assert base_url_response.status_code == 422
+    base_url_detail = base_url_response.json()["detail"]
+    assert base_url_detail["kind"] == "pipeline_validation_failure"
+    assert base_url_detail["errors"][0]["error_code"] == "llm_base_url_not_allowed"
+    assert base_url_detail["errors"][0]["component_id"] == "source:briefing"
+    assert base_url_detail["errors"][0]["component_type"] == "source"
+    assert "credential-canary" not in str(base_url_detail)
+    assert "PROMPT_CANARY" not in str(base_url_detail)
+    assert "run_id" not in base_url_response.json()
+    assert malformed_response.status_code == 422
+    malformed_detail = malformed_response.json()["detail"]
+    assert malformed_detail["errors"][0]["error_code"] == "plugin_unavailable"
+    assert malformed_detail["errors"][0]["component_id"] == "source"
+    assert malformed_detail["errors"][0]["component_type"] == "source"

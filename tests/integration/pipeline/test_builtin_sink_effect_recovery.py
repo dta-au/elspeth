@@ -24,7 +24,7 @@ from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sinks.text_sink import TextSink
 from tests.fixtures.base_classes import create_observed_contract, inject_write_failure
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 
 
 def _tokens(
@@ -148,6 +148,7 @@ def _write(
         factory=factory,
         worker_id="worker-a",
         sink_effect_fault_hook=fault_hook,
+        coordination_token=leader_coordination_token(factory, run_id),
     ).write(
         sink,
         tokens,
@@ -156,6 +157,7 @@ def _write(
         sink_name=sink_name,
         pending_outcome=_pending_success(),
         effect_mode="write",
+        join_group_id_by_token={t.token_id: None for t in tokens},
     )
 
 
@@ -241,6 +243,7 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=lose_failsink_response,
+                coordination_token=leader_coordination_token(factory, run_id),
             ).write(
                 primary,
                 [accepted, diverted],
@@ -253,6 +256,7 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
                 failsink_name="quarantine",
                 failsink_effect_mode="write",
                 failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
             )
 
         first_effects = factory.execution.sink_effects.get_effects_for_run(run_id)
@@ -280,6 +284,7 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
             run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run_id),
         ).write(
             recovered_primary,
             [accepted, diverted],
@@ -292,6 +297,7 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
             failsink_name="quarantine",
             failsink_effect_mode="write",
             failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
         )
 
         assert artifact is not None

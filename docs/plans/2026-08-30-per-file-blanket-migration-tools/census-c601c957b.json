@@ -1,0 +1,1468 @@
+{
+ "raw_findings": 2094,
+ "blanket_rules": 85,
+ "standing_on_blankets": 974,
+ "unused_blankets": [
+  "contracts.yaml::contracts/identity.py::R5::max_hits=1",
+  "plugins.yaml::plugins/sinks/database_sink.py::R5::max_hits=1",
+  "web.yaml::web/composer/tools/_common.py::R1::max_hits=10"
+ ],
+ "by_blanket": {
+  "cli.yaml::cli.py::R1,R4,R6::max_hits=None": [
+   "cli.py:1261:R4",
+   "cli.py:168:R4",
+   "cli.py:173:R4",
+   "cli.py:1929:R1",
+   "cli.py:2358:R4",
+   "cli.py:2375:R4",
+   "cli.py:3793:R1",
+   "cli.py:3805:R6",
+   "cli.py:381:R6",
+   "cli.py:3821:R1",
+   "cli.py:3833:R4",
+   "cli.py:3899:R4",
+   "cli.py:3919:R1",
+   "cli.py:3923:R1",
+   "cli.py:3930:R1",
+   "cli.py:3945:R1",
+   "cli.py:3956:R6",
+   "cli.py:3962:R4",
+   "cli.py:405:R6",
+   "cli.py:408:R6",
+   "cli.py:420:R1",
+   "cli.py:430:R6",
+   "cli.py:455:R1",
+   "cli.py:461:R1",
+   "cli.py:516:R1"
+  ],
+  "cli.yaml::cli.py::R5::max_hits=5": [
+   "cli.py:126:R5",
+   "cli.py:2410:R5",
+   "cli.py:458:R5",
+   "cli.py:463:R5",
+   "cli.py:501:R5",
+   "cli.py:520:R5",
+   "cli.py:600:R5",
+   "cli.py:650:R5"
+  ],
+  "cli.yaml::cli_helpers.py::R1::max_hits=None": [
+   "cli_helpers.py:148:R1"
+  ],
+  "composer_mcp.yaml::composer_mcp/server.py::R5::max_hits=14": [
+   "composer_mcp/server.py:215:R5",
+   "composer_mcp/server.py:217:R5",
+   "composer_mcp/server.py:219:R5",
+   "composer_mcp/server.py:248:R5",
+   "composer_mcp/server.py:248:R5",
+   "composer_mcp/server.py:251:R5",
+   "composer_mcp/server.py:263:R5",
+   "composer_mcp/server.py:266:R5",
+   "composer_mcp/server.py:274:R5",
+   "composer_mcp/server.py:274:R5",
+   "composer_mcp/server.py:280:R5",
+   "composer_mcp/server.py:296:R5",
+   "composer_mcp/server.py:296:R5",
+   "composer_mcp/server.py:346:R5"
+  ],
+  "contracts.yaml::contracts/audit.py::R5::max_hits=2": [
+   "contracts/audit.py:110:R5",
+   "contracts/audit.py:118:R5",
+   "contracts/audit.py:126:R5",
+   "contracts/audit.py:97:R5"
+  ],
+  "contracts.yaml::contracts/call_data.py::R5::max_hits=9": [
+   "contracts/call_data.py:105:R5",
+   "contracts/call_data.py:114:R5",
+   "contracts/call_data.py:114:R5",
+   "contracts/call_data.py:123:R5",
+   "contracts/call_data.py:132:R5",
+   "contracts/call_data.py:358:R5",
+   "contracts/call_data.py:92:R5",
+   "contracts/call_data.py:92:R5",
+   "contracts/call_data.py:99:R5"
+  ],
+  "contracts.yaml::contracts/config/runtime.py::R5::max_hits=14": [
+   "contracts/config/runtime.py:104:R5",
+   "contracts/config/runtime.py:104:R5",
+   "contracts/config/runtime.py:108:R5",
+   "contracts/config/runtime.py:116:R5",
+   "contracts/config/runtime.py:145:R5",
+   "contracts/config/runtime.py:145:R5",
+   "contracts/config/runtime.py:151:R5",
+   "contracts/config/runtime.py:151:R5",
+   "contracts/config/runtime.py:155:R5",
+   "contracts/config/runtime.py:387:R5",
+   "contracts/config/runtime.py:42:R5",
+   "contracts/config/runtime.py:47:R5",
+   "contracts/config/runtime.py:49:R5",
+   "contracts/config/runtime.py:663:R5"
+  ],
+  "contracts.yaml::contracts/contract_records.py::R5::max_hits=12": [
+   "contracts/contract_records.py:165:R5",
+   "contracts/contract_records.py:167:R5",
+   "contracts/contract_records.py:170:R5",
+   "contracts/contract_records.py:184:R5",
+   "contracts/contract_records.py:206:R5",
+   "contracts/contract_records.py:210:R5",
+   "contracts/contract_records.py:256:R5",
+   "contracts/contract_records.py:272:R5",
+   "contracts/contract_records.py:276:R5",
+   "contracts/contract_records.py:345:R5",
+   "contracts/contract_records.py:353:R5",
+   "contracts/contract_records.py:361:R5"
+  ],
+  "contracts.yaml::contracts/diversion.py::R5::max_hits=1": [
+   "contracts/diversion.py:73:R5"
+  ],
+  "contracts.yaml::contracts/events.py::R5::max_hits=4": [
+   "contracts/events.py:446:R5",
+   "contracts/events.py:448:R5",
+   "contracts/events.py:450:R5",
+   "contracts/events.py:452:R5"
+  ],
+  "contracts.yaml::contracts/freeze.py::R5::max_hits=15": [
+   "contracts/freeze.py:143:R5",
+   "contracts/freeze.py:145:R5",
+   "contracts/freeze.py:147:R5",
+   "contracts/freeze.py:149:R5",
+   "contracts/freeze.py:151:R5",
+   "contracts/freeze.py:182:R5",
+   "contracts/freeze.py:182:R5",
+   "contracts/freeze.py:203:R5",
+   "contracts/freeze.py:55:R5",
+   "contracts/freeze.py:57:R5",
+   "contracts/freeze.py:62:R5",
+   "contracts/freeze.py:69:R5",
+   "contracts/freeze.py:74:R5",
+   "contracts/freeze.py:76:R5",
+   "contracts/freeze.py:86:R5"
+  ],
+  "contracts.yaml::contracts/hashing.py::R5::max_hits=9": [
+   "contracts/hashing.py:109:R5",
+   "contracts/hashing.py:112:R5",
+   "contracts/hashing.py:114:R5",
+   "contracts/hashing.py:116:R5",
+   "contracts/hashing.py:118:R5",
+   "contracts/hashing.py:32:R5",
+   "contracts/hashing.py:45:R5",
+   "contracts/hashing.py:51:R5",
+   "contracts/hashing.py:57:R5",
+   "contracts/hashing.py:59:R5"
+  ],
+  "contracts.yaml::contracts/header_modes.py::R5::max_hits=1": [
+   "contracts/header_modes.py:50:R5"
+  ],
+  "contracts.yaml::contracts/plugin_context.py::R5::max_hits=1": [
+   "contracts/plugin_context.py:463:R5",
+   "contracts/plugin_context.py:605:R5",
+   "contracts/plugin_context.py:607:R5",
+   "contracts/plugin_context.py:609:R5",
+   "contracts/plugin_context.py:611:R5",
+   "contracts/plugin_context.py:613:R5",
+   "contracts/plugin_context.py:615:R5",
+   "contracts/plugin_context.py:617:R5",
+   "contracts/plugin_context.py:623:R5",
+   "contracts/plugin_context.py:625:R5",
+   "contracts/plugin_context.py:627:R5",
+   "contracts/plugin_context.py:629:R5",
+   "contracts/plugin_context.py:631:R5",
+   "contracts/plugin_context.py:633:R5",
+   "contracts/plugin_context.py:635:R5"
+  ],
+  "contracts.yaml::contracts/results.py::R5::max_hits=6": [
+   "contracts/results.py:161:R5",
+   "contracts/results.py:166:R5",
+   "contracts/results.py:296:R5",
+   "contracts/results.py:46:R5",
+   "contracts/results.py:670:R5",
+   "contracts/results.py:704:R5"
+  ],
+  "contracts.yaml::contracts/runtime_val_manifest.py::R2,R5,R6::max_hits=35": [
+   "contracts/runtime_val_manifest.py:1023:R6",
+   "contracts/runtime_val_manifest.py:1032:R5",
+   "contracts/runtime_val_manifest.py:1037:R6",
+   "contracts/runtime_val_manifest.py:1050:R5",
+   "contracts/runtime_val_manifest.py:1060:R5",
+   "contracts/runtime_val_manifest.py:1070:R5",
+   "contracts/runtime_val_manifest.py:1077:R5",
+   "contracts/runtime_val_manifest.py:1079:R5",
+   "contracts/runtime_val_manifest.py:1091:R5",
+   "contracts/runtime_val_manifest.py:1093:R5",
+   "contracts/runtime_val_manifest.py:1122:R5",
+   "contracts/runtime_val_manifest.py:1186:R5",
+   "contracts/runtime_val_manifest.py:1187:R5",
+   "contracts/runtime_val_manifest.py:1198:R5",
+   "contracts/runtime_val_manifest.py:1202:R5",
+   "contracts/runtime_val_manifest.py:1212:R5",
+   "contracts/runtime_val_manifest.py:1224:R5",
+   "contracts/runtime_val_manifest.py:1226:R5",
+   "contracts/runtime_val_manifest.py:1280:R5",
+   "contracts/runtime_val_manifest.py:1331:R5",
+   "contracts/runtime_val_manifest.py:1340:R5",
+   "contracts/runtime_val_manifest.py:141:R5",
+   "contracts/runtime_val_manifest.py:1425:R5",
+   "contracts/runtime_val_manifest.py:146:R6",
+   "contracts/runtime_val_manifest.py:154:R5",
+   "contracts/runtime_val_manifest.py:156:R5",
+   "contracts/runtime_val_manifest.py:161:R5",
+   "contracts/runtime_val_manifest.py:166:R5",
+   "contracts/runtime_val_manifest.py:170:R5",
+   "contracts/runtime_val_manifest.py:172:R5",
+   "contracts/runtime_val_manifest.py:181:R5",
+   "contracts/runtime_val_manifest.py:183:R5",
+   "contracts/runtime_val_manifest.py:188:R5",
+   "contracts/runtime_val_manifest.py:199:R5",
+   "contracts/runtime_val_manifest.py:219:R5",
+   "contracts/runtime_val_manifest.py:223:R5",
+   "contracts/runtime_val_manifest.py:228:R5",
+   "contracts/runtime_val_manifest.py:414:R5",
+   "contracts/runtime_val_manifest.py:431:R5",
+   "contracts/runtime_val_manifest.py:434:R5",
+   "contracts/runtime_val_manifest.py:446:R5",
+   "contracts/runtime_val_manifest.py:598:R5",
+   "contracts/runtime_val_manifest.py:603:R5",
+   "contracts/runtime_val_manifest.py:606:R5",
+   "contracts/runtime_val_manifest.py:606:R5",
+   "contracts/runtime_val_manifest.py:626:R5",
+   "contracts/runtime_val_manifest.py:628:R5",
+   "contracts/runtime_val_manifest.py:745:R5",
+   "contracts/runtime_val_manifest.py:752:R5",
+   "contracts/runtime_val_manifest.py:754:R5",
+   "contracts/runtime_val_manifest.py:823:R5",
+   "contracts/runtime_val_manifest.py:828:R5",
+   "contracts/runtime_val_manifest.py:832:R6",
+   "contracts/runtime_val_manifest.py:846:R5",
+   "contracts/runtime_val_manifest.py:878:R5",
+   "contracts/runtime_val_manifest.py:942:R5",
+   "contracts/runtime_val_manifest.py:987:R5"
+  ],
+  "contracts.yaml::contracts/schema.py::R1::max_hits=None": [
+   "contracts/schema.py:382:R1",
+   "contracts/schema.py:389:R1",
+   "contracts/schema.py:511:R1",
+   "contracts/schema.py:512:R1",
+   "contracts/schema.py:513:R1",
+   "contracts/schema.py:524:R1",
+   "contracts/schema.py:932:R1",
+   "contracts/schema.py:946:R1",
+   "contracts/schema.py:947:R1"
+  ],
+  "contracts.yaml::contracts/schema.py::R5::max_hits=18": [
+   "contracts/schema.py:144:R5",
+   "contracts/schema.py:149:R5",
+   "contracts/schema.py:149:R5",
+   "contracts/schema.py:258:R5",
+   "contracts/schema.py:321:R5",
+   "contracts/schema.py:324:R5",
+   "contracts/schema.py:330:R5",
+   "contracts/schema.py:332:R5",
+   "contracts/schema.py:378:R5",
+   "contracts/schema.py:380:R5",
+   "contracts/schema.py:411:R5",
+   "contracts/schema.py:411:R5",
+   "contracts/schema.py:507:R5",
+   "contracts/schema.py:562:R5",
+   "contracts/schema.py:817:R5",
+   "contracts/schema.py:889:R5",
+   "contracts/schema.py:907:R5"
+  ],
+  "contracts.yaml::contracts/secret_scrub.py::R5::max_hits=4": [
+   "contracts/secret_scrub.py:153:R5",
+   "contracts/secret_scrub.py:155:R5",
+   "contracts/secret_scrub.py:163:R5",
+   "contracts/secret_scrub.py:165:R5"
+  ],
+  "contracts.yaml::contracts/token_usage.py::R1,R5::max_hits=22": [
+   "contracts/token_usage.py:219:R5",
+   "contracts/token_usage.py:231:R5",
+   "contracts/token_usage.py:231:R5",
+   "contracts/token_usage.py:233:R5",
+   "contracts/token_usage.py:233:R5",
+   "contracts/token_usage.py:235:R5",
+   "contracts/token_usage.py:235:R5",
+   "contracts/token_usage.py:243:R5",
+   "contracts/token_usage.py:252:R5",
+   "contracts/token_usage.py:276:R5",
+   "contracts/token_usage.py:276:R5"
+  ],
+  "contracts.yaml::contracts/type_normalization.py::R5::max_hits=14": [
+   "contracts/type_normalization.py:101:R5",
+   "contracts/type_normalization.py:105:R5",
+   "contracts/type_normalization.py:107:R5",
+   "contracts/type_normalization.py:109:R5",
+   "contracts/type_normalization.py:111:R5",
+   "contracts/type_normalization.py:113:R5",
+   "contracts/type_normalization.py:117:R5",
+   "contracts/type_normalization.py:186:R5",
+   "contracts/type_normalization.py:190:R5",
+   "contracts/type_normalization.py:192:R5",
+   "contracts/type_normalization.py:194:R5",
+   "contracts/type_normalization.py:196:R5",
+   "contracts/type_normalization.py:198:R5",
+   "contracts/type_normalization.py:202:R5"
+  ],
+  "core.yaml::core/canonical.py::R5::max_hits=23": [
+   "core/canonical.py:107:R5",
+   "core/canonical.py:117:R5",
+   "core/canonical.py:124:R5",
+   "core/canonical.py:128:R5",
+   "core/canonical.py:133:R5",
+   "core/canonical.py:136:R5",
+   "core/canonical.py:139:R5",
+   "core/canonical.py:142:R5",
+   "core/canonical.py:148:R5",
+   "core/canonical.py:172:R5",
+   "core/canonical.py:175:R5",
+   "core/canonical.py:189:R5",
+   "core/canonical.py:309:R5",
+   "core/canonical.py:311:R5",
+   "core/canonical.py:313:R5",
+   "core/canonical.py:315:R5",
+   "core/canonical.py:320:R5",
+   "core/canonical.py:66:R5",
+   "core/canonical.py:79:R5",
+   "core/canonical.py:85:R5",
+   "core/canonical.py:89:R5",
+   "core/canonical.py:91:R5",
+   "core/canonical.py:93:R5"
+  ],
+  "core.yaml::core/checkpoint/serialization.py::R5::max_hits=20": [
+   "core/checkpoint/serialization.py:116:R5",
+   "core/checkpoint/serialization.py:125:R5",
+   "core/checkpoint/serialization.py:136:R5",
+   "core/checkpoint/serialization.py:142:R5",
+   "core/checkpoint/serialization.py:148:R5",
+   "core/checkpoint/serialization.py:154:R5",
+   "core/checkpoint/serialization.py:163:R5",
+   "core/checkpoint/serialization.py:179:R5",
+   "core/checkpoint/serialization.py:181:R5",
+   "core/checkpoint/serialization.py:217:R5",
+   "core/checkpoint/serialization.py:220:R5",
+   "core/checkpoint/serialization.py:223:R5",
+   "core/checkpoint/serialization.py:241:R5",
+   "core/checkpoint/serialization.py:244:R5",
+   "core/checkpoint/serialization.py:252:R5",
+   "core/checkpoint/serialization.py:262:R5",
+   "core/checkpoint/serialization.py:315:R5",
+   "core/checkpoint/serialization.py:326:R5",
+   "core/checkpoint/serialization.py:388:R5",
+   "core/checkpoint/serialization.py:394:R5"
+  ],
+  "core.yaml::core/config.py::R1,R6::max_hits=None": [
+   "core/config.py:2465:R1",
+   "core/config.py:2569:R1",
+   "core/config.py:2577:R1",
+   "core/config.py:2582:R1",
+   "core/config.py:2584:R1",
+   "core/config.py:2614:R1",
+   "core/config.py:2650:R1",
+   "core/config.py:2655:R1",
+   "core/config.py:2833:R6",
+   "core/config.py:2982:R6",
+   "core/config.py:3061:R1",
+   "core/config.py:3095:R1",
+   "core/config.py:3159:R1",
+   "core/config.py:3191:R1",
+   "core/config.py:3226:R1"
+  ],
+  "core.yaml::core/config.py::R5::max_hits=38": [
+   "core/config.py:2484:R5",
+   "core/config.py:2486:R5",
+   "core/config.py:2488:R5",
+   "core/config.py:2571:R5",
+   "core/config.py:2573:R5",
+   "core/config.py:2582:R5",
+   "core/config.py:2585:R5",
+   "core/config.py:2594:R5",
+   "core/config.py:2615:R5",
+   "core/config.py:2651:R5",
+   "core/config.py:2656:R5",
+   "core/config.py:2686:R5",
+   "core/config.py:2779:R5",
+   "core/config.py:2838:R5",
+   "core/config.py:2840:R5",
+   "core/config.py:2842:R5",
+   "core/config.py:2865:R5",
+   "core/config.py:2944:R5",
+   "core/config.py:2950:R5",
+   "core/config.py:2963:R5",
+   "core/config.py:3062:R5",
+   "core/config.py:3166:R5",
+   "core/config.py:3181:R5",
+   "core/config.py:3183:R5",
+   "core/config.py:3187:R5",
+   "core/config.py:3189:R5",
+   "core/config.py:3189:R5",
+   "core/config.py:3204:R5",
+   "core/config.py:3206:R5",
+   "core/config.py:3206:R5",
+   "core/config.py:3212:R5",
+   "core/config.py:3214:R5",
+   "core/config.py:3214:R5",
+   "core/config.py:3218:R5",
+   "core/config.py:3220:R5",
+   "core/config.py:3220:R5",
+   "core/config.py:3224:R5",
+   "core/config.py:3227:R5",
+   "core/config.py:3229:R5",
+   "core/config.py:3229:R5",
+   "core/config.py:3238:R5",
+   "core/config.py:3240:R5",
+   "core/config.py:3240:R5",
+   "core/config.py:3292:R5",
+   "core/config.py:3392:R5",
+   "core/config.py:552:R5",
+   "core/config.py:552:R5",
+   "core/config.py:563:R5",
+   "core/config.py:563:R5",
+   "core/config.py:572:R5",
+   "core/config.py:573:R5",
+   "core/config.py:574:R5"
+  ],
+  "core.yaml::core/dag/graph.py::R5::max_hits=2": [
+   "core/dag/graph.py:257:R5",
+   "core/dag/graph.py:294:R5"
+  ],
+  "core.yaml::core/expression_parser.py::R5::max_hits=41": [
+   "core/expression_parser.py:1000:R5",
+   "core/expression_parser.py:1003:R5",
+   "core/expression_parser.py:1003:R5",
+   "core/expression_parser.py:197:R5",
+   "core/expression_parser.py:197:R5",
+   "core/expression_parser.py:205:R5",
+   "core/expression_parser.py:207:R5",
+   "core/expression_parser.py:211:R5",
+   "core/expression_parser.py:212:R5",
+   "core/expression_parser.py:213:R5",
+   "core/expression_parser.py:237:R5",
+   "core/expression_parser.py:255:R5",
+   "core/expression_parser.py:274:R5",
+   "core/expression_parser.py:275:R5",
+   "core/expression_parser.py:300:R5",
+   "core/expression_parser.py:326:R5",
+   "core/expression_parser.py:355:R5",
+   "core/expression_parser.py:358:R5",
+   "core/expression_parser.py:450:R5",
+   "core/expression_parser.py:502:R5",
+   "core/expression_parser.py:541:R5",
+   "core/expression_parser.py:562:R5",
+   "core/expression_parser.py:574:R5",
+   "core/expression_parser.py:576:R5",
+   "core/expression_parser.py:608:R5",
+   "core/expression_parser.py:614:R5",
+   "core/expression_parser.py:836:R5",
+   "core/expression_parser.py:842:R5",
+   "core/expression_parser.py:846:R5",
+   "core/expression_parser.py:846:R5",
+   "core/expression_parser.py:850:R5",
+   "core/expression_parser.py:850:R5",
+   "core/expression_parser.py:854:R5",
+   "core/expression_parser.py:858:R5",
+   "core/expression_parser.py:878:R5",
+   "core/expression_parser.py:878:R5",
+   "core/expression_parser.py:898:R5",
+   "core/expression_parser.py:898:R5",
+   "core/expression_parser.py:898:R5",
+   "core/expression_parser.py:907:R5",
+   "core/expression_parser.py:907:R5",
+   "core/expression_parser.py:912:R5",
+   "core/expression_parser.py:912:R5",
+   "core/expression_parser.py:915:R5",
+   "core/expression_parser.py:917:R5",
+   "core/expression_parser.py:923:R5",
+   "core/expression_parser.py:950:R5",
+   "core/expression_parser.py:951:R5",
+   "core/expression_parser.py:990:R5",
+   "core/expression_parser.py:990:R5",
+   "core/expression_parser.py:992:R5",
+   "core/expression_parser.py:992:R5",
+   "core/expression_parser.py:997:R5",
+   "core/expression_parser.py:998:R5"
+  ],
+  "core.yaml::core/landscape/database.py::R5::max_hits=4": [
+   "core/landscape/database.py:1228:R5",
+   "core/landscape/database.py:1482:R5",
+   "core/landscape/database.py:174:R5",
+   "core/landscape/database.py:176:R5",
+   "core/landscape/database.py:210:R5",
+   "core/landscape/database.py:793:R5",
+   "core/landscape/database.py:818:R5"
+  ],
+  "core.yaml::core/landscape/formatters.py::R5::max_hits=2": [
+   "core/landscape/formatters.py:42:R5",
+   "core/landscape/formatters.py:59:R5"
+  ],
+  "core.yaml::core/landscape/journal.py::R5::max_hits=5": [
+   "core/landscape/journal.py:726:R5",
+   "core/landscape/journal.py:728:R5",
+   "core/landscape/journal.py:730:R5",
+   "core/landscape/journal.py:756:R5",
+   "core/landscape/journal.py:841:R5"
+  ],
+  "core.yaml::core/landscape/run_lifecycle_repository.py::R5::max_hits=4": [
+   "core/landscape/run_lifecycle_repository.py:1361:R5",
+   "core/landscape/run_lifecycle_repository.py:1376:R5",
+   "core/landscape/run_lifecycle_repository.py:1386:R5",
+   "core/landscape/run_lifecycle_repository.py:1386:R5",
+   "core/landscape/run_lifecycle_repository.py:341:R5"
+  ],
+  "core.yaml::core/operations.py::R5::max_hits=1": [
+   "core/operations.py:209:R5"
+  ],
+  "core.yaml::core/secrets.py::R5::max_hits=15": [
+   "core/secrets.py:125:R5",
+   "core/secrets.py:131:R5",
+   "core/secrets.py:168:R5",
+   "core/secrets.py:174:R5",
+   "core/secrets.py:184:R5",
+   "core/secrets.py:215:R5",
+   "core/secrets.py:249:R5",
+   "core/secrets.py:253:R5",
+   "core/secrets.py:258:R5",
+   "core/secrets.py:263:R5",
+   "core/secrets.py:333:R5",
+   "core/secrets.py:335:R5",
+   "core/secrets.py:337:R5",
+   "core/secrets.py:356:R5",
+   "core/secrets.py:369:R5",
+   "core/secrets.py:394:R5"
+  ],
+  "core.yaml::core/security/*::R1::max_hits=None": [
+   "core/security/config_secrets.py:154:R1",
+   "core/security/config_secrets.py:87:R1",
+   "core/security/secret_loader.py:136:R1"
+  ],
+  "core.yaml::core/templates.py::R5::max_hits=142": [
+   "core/templates.py:1014:R5",
+   "core/templates.py:1016:R5",
+   "core/templates.py:1037:R5",
+   "core/templates.py:1064:R5",
+   "core/templates.py:1067:R5",
+   "core/templates.py:1072:R5",
+   "core/templates.py:1074:R5",
+   "core/templates.py:1077:R5",
+   "core/templates.py:1093:R5",
+   "core/templates.py:1102:R5",
+   "core/templates.py:1102:R5",
+   "core/templates.py:1140:R5",
+   "core/templates.py:1144:R5",
+   "core/templates.py:1146:R5",
+   "core/templates.py:1166:R5",
+   "core/templates.py:1171:R5",
+   "core/templates.py:1188:R5",
+   "core/templates.py:1194:R5",
+   "core/templates.py:1200:R5",
+   "core/templates.py:1202:R5",
+   "core/templates.py:1202:R5",
+   "core/templates.py:1208:R5",
+   "core/templates.py:1208:R5",
+   "core/templates.py:1220:R5",
+   "core/templates.py:1236:R5",
+   "core/templates.py:1250:R5",
+   "core/templates.py:1253:R5",
+   "core/templates.py:1253:R5",
+   "core/templates.py:1266:R5",
+   "core/templates.py:1280:R5",
+   "core/templates.py:1280:R5",
+   "core/templates.py:1302:R5",
+   "core/templates.py:1323:R5",
+   "core/templates.py:1325:R5",
+   "core/templates.py:1331:R5",
+   "core/templates.py:1331:R5",
+   "core/templates.py:1331:R5",
+   "core/templates.py:1341:R5",
+   "core/templates.py:1343:R5",
+   "core/templates.py:1349:R5",
+   "core/templates.py:1354:R5",
+   "core/templates.py:1354:R5",
+   "core/templates.py:1436:R5",
+   "core/templates.py:1443:R5",
+   "core/templates.py:1469:R5",
+   "core/templates.py:1487:R5",
+   "core/templates.py:1490:R5",
+   "core/templates.py:1490:R5",
+   "core/templates.py:1500:R5",
+   "core/templates.py:1511:R5",
+   "core/templates.py:1511:R5",
+   "core/templates.py:1552:R5",
+   "core/templates.py:1554:R5",
+   "core/templates.py:1556:R5",
+   "core/templates.py:1559:R5",
+   "core/templates.py:1560:R5",
+   "core/templates.py:1564:R5",
+   "core/templates.py:1584:R5",
+   "core/templates.py:1586:R5",
+   "core/templates.py:1588:R5",
+   "core/templates.py:1588:R5",
+   "core/templates.py:1590:R5",
+   "core/templates.py:1592:R5",
+   "core/templates.py:1594:R5",
+   "core/templates.py:1597:R5",
+   "core/templates.py:1598:R5",
+   "core/templates.py:1602:R5",
+   "core/templates.py:1621:R5",
+   "core/templates.py:1623:R5",
+   "core/templates.py:1625:R5",
+   "core/templates.py:1636:R5",
+   "core/templates.py:1638:R5",
+   "core/templates.py:1638:R5",
+   "core/templates.py:1640:R5",
+   "core/templates.py:1648:R5",
+   "core/templates.py:1656:R5",
+   "core/templates.py:1684:R5",
+   "core/templates.py:1735:R5",
+   "core/templates.py:1741:R5",
+   "core/templates.py:1742:R5",
+   "core/templates.py:1747:R5",
+   "core/templates.py:1747:R5",
+   "core/templates.py:1761:R5",
+   "core/templates.py:1762:R5",
+   "core/templates.py:1770:R5",
+   "core/templates.py:1777:R5",
+   "core/templates.py:1783:R5",
+   "core/templates.py:1784:R5",
+   "core/templates.py:1784:R5",
+   "core/templates.py:1790:R5",
+   "core/templates.py:1795:R5",
+   "core/templates.py:1795:R5",
+   "core/templates.py:1810:R5",
+   "core/templates.py:1827:R5",
+   "core/templates.py:1827:R5",
+   "core/templates.py:1834:R5",
+   "core/templates.py:1834:R5",
+   "core/templates.py:229:R5",
+   "core/templates.py:235:R5",
+   "core/templates.py:236:R5",
+   "core/templates.py:242:R5",
+   "core/templates.py:242:R5",
+   "core/templates.py:254:R5",
+   "core/templates.py:255:R5",
+   "core/templates.py:266:R5",
+   "core/templates.py:273:R5",
+   "core/templates.py:280:R5",
+   "core/templates.py:281:R5",
+   "core/templates.py:281:R5",
+   "core/templates.py:286:R5",
+   "core/templates.py:320:R5",
+   "core/templates.py:320:R5",
+   "core/templates.py:352:R5",
+   "core/templates.py:352:R5",
+   "core/templates.py:360:R5",
+   "core/templates.py:360:R5",
+   "core/templates.py:375:R5",
+   "core/templates.py:393:R5",
+   "core/templates.py:409:R5",
+   "core/templates.py:582:R5",
+   "core/templates.py:599:R5",
+   "core/templates.py:632:R5",
+   "core/templates.py:646:R5",
+   "core/templates.py:718:R5",
+   "core/templates.py:718:R5",
+   "core/templates.py:771:R5",
+   "core/templates.py:778:R5",
+   "core/templates.py:791:R5",
+   "core/templates.py:808:R5",
+   "core/templates.py:810:R5",
+   "core/templates.py:816:R5",
+   "core/templates.py:853:R5",
+   "core/templates.py:863:R5",
+   "core/templates.py:883:R5",
+   "core/templates.py:911:R5",
+   "core/templates.py:925:R5",
+   "core/templates.py:928:R5",
+   "core/templates.py:928:R5",
+   "core/templates.py:937:R5",
+   "core/templates.py:947:R5",
+   "core/templates.py:947:R5",
+   "core/templates.py:980:R5"
+  ],
+  "engine.yaml::engine/barrier_coordination.py::R5::max_hits=1": [
+   "engine/barrier_coordination.py:481:R5"
+  ],
+  "engine.yaml::engine/batch_adapter.py::R5::max_hits=1": [
+   "engine/batch_adapter.py:232:R5"
+  ],
+  "engine.yaml::engine/dag_navigator.py::R5::max_hits=3": [
+   "engine/dag_navigator.py:304:R5",
+   "engine/dag_navigator.py:80:R5"
+  ],
+  "engine.yaml::engine/executors/gate.py::R5::max_hits=3": [
+   "engine/executors/gate.py:395:R5",
+   "engine/executors/gate.py:397:R5",
+   "engine/executors/gate.py:76:R5"
+  ],
+  "engine.yaml::engine/executors/transform.py::R5::max_hits=2": [
+   "engine/executors/transform.py:754:R5",
+   "engine/executors/transform.py:843:R5"
+  ],
+  "engine.yaml::engine/processor.py::R5::max_hits=7": [
+   "engine/processor.py:1485:R5",
+   "engine/processor.py:2378:R5",
+   "engine/processor.py:2380:R5",
+   "engine/processor.py:2382:R5",
+   "engine/processor.py:2505:R5",
+   "engine/processor.py:2508:R5",
+   "engine/processor.py:4494:R5"
+  ],
+  "engine.yaml::engine/scheduler_drain.py::R5::max_hits=3": [
+   "engine/scheduler_drain.py:174:R5",
+   "engine/scheduler_drain.py:724:R5",
+   "engine/scheduler_drain.py:829:R5"
+  ],
+  "engine.yaml::engine/token_traversal.py::R5::max_hits=4": [
+   "engine/token_traversal.py:1172:R5",
+   "engine/token_traversal.py:1186:R5",
+   "engine/token_traversal.py:1194:R5",
+   "engine/token_traversal.py:1248:R5"
+  ],
+  "engine.yaml::engine/tokens.py::R5::max_hits=1": [
+   "engine/tokens.py:231:R5"
+  ],
+  "engine.yaml::engine/triggers.py::R5::max_hits=3": [
+   "engine/triggers.py:182:R5",
+   "engine/triggers.py:209:R5",
+   "engine/triggers.py:272:R5"
+  ],
+  "mcp.yaml::mcp/analyzers/*::R1::max_hits=None": [
+   "mcp/analyzers/diagnostics.py:465:R1",
+   "mcp/analyzers/diagnostics.py:466:R1",
+   "mcp/analyzers/diagnostics.py:472:R1",
+   "mcp/analyzers/queries.py:779:R1",
+   "mcp/analyzers/queries.py:781:R1",
+   "mcp/analyzers/queries.py:911:R1",
+   "mcp/analyzers/queries.py:912:R1",
+   "mcp/analyzers/queries.py:913:R1",
+   "mcp/analyzers/queries.py:948:R1",
+   "mcp/analyzers/queries.py:974:R1",
+   "mcp/analyzers/reports.py:339:R1"
+  ],
+  "mcp.yaml::mcp/server.py::R1::max_hits=None": [
+   "mcp/server.py:553:R1",
+   "mcp/server.py:561:R1",
+   "mcp/server.py:562:R1",
+   "mcp/server.py:581:R1",
+   "mcp/server.py:589:R1",
+   "mcp/server.py:597:R1",
+   "mcp/server.py:610:R1",
+   "mcp/server.py:616:R1",
+   "mcp/server.py:980:R1"
+  ],
+  "mcp.yaml::mcp/server.py::R5::max_hits=14": [
+   "mcp/server.py:565:R5",
+   "mcp/server.py:575:R5",
+   "mcp/server.py:582:R5",
+   "mcp/server.py:584:R5",
+   "mcp/server.py:590:R5",
+   "mcp/server.py:599:R5",
+   "mcp/server.py:601:R5",
+   "mcp/server.py:601:R5",
+   "mcp/server.py:611:R5",
+   "mcp/server.py:617:R5",
+   "mcp/server.py:71:R5",
+   "mcp/server.py:73:R5",
+   "mcp/server.py:80:R5",
+   "mcp/server.py:82:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/clients/dataverse.py::R1,R5,R6::max_hits=None": [
+   "plugins/infrastructure/clients/dataverse.py:393:R1",
+   "plugins/infrastructure/clients/dataverse.py:396:R6",
+   "plugins/infrastructure/clients/dataverse.py:586:R1",
+   "plugins/infrastructure/clients/dataverse.py:631:R5",
+   "plugins/infrastructure/clients/dataverse.py:645:R5",
+   "plugins/infrastructure/clients/dataverse.py:658:R5",
+   "plugins/infrastructure/clients/dataverse.py:673:R1",
+   "plugins/infrastructure/clients/dataverse.py:674:R5",
+   "plugins/infrastructure/clients/dataverse.py:685:R1",
+   "plugins/infrastructure/clients/dataverse.py:686:R5",
+   "plugins/infrastructure/clients/dataverse.py:696:R1",
+   "plugins/infrastructure/clients/dataverse.py:700:R5",
+   "plugins/infrastructure/clients/dataverse.py:702:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/clients/fingerprinting.py::R1,R6::max_hits=None": [
+   "plugins/infrastructure/clients/fingerprinting.py:148:R1",
+   "plugins/infrastructure/clients/fingerprinting.py:153:R6",
+   "plugins/infrastructure/clients/fingerprinting.py:202:R6",
+   "plugins/infrastructure/clients/fingerprinting.py:244:R1",
+   "plugins/infrastructure/clients/fingerprinting.py:249:R6",
+   "plugins/infrastructure/clients/fingerprinting.py:301:R1",
+   "plugins/infrastructure/clients/fingerprinting.py:306:R6"
+  ],
+  "plugins.yaml::plugins/infrastructure/clients/json_utils.py::R5::max_hits=None": [
+   "plugins/infrastructure/clients/json_utils.py:35:R5",
+   "plugins/infrastructure/clients/json_utils.py:37:R5",
+   "plugins/infrastructure/clients/json_utils.py:39:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/clients/llm.py::R5::max_hits=3": [
+   "plugins/infrastructure/clients/llm.py:231:R5",
+   "plugins/infrastructure/clients/llm.py:249:R5",
+   "plugins/infrastructure/clients/llm.py:749:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/clients/replayer.py::R5::max_hits=1": [
+   "plugins/infrastructure/clients/replayer.py:252:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/config_base.py::R5::max_hits=7": [
+   "plugins/infrastructure/config_base.py:212:R5",
+   "plugins/infrastructure/config_base.py:214:R5",
+   "plugins/infrastructure/config_base.py:327:R5",
+   "plugins/infrastructure/config_base.py:340:R5",
+   "plugins/infrastructure/config_base.py:593:R5",
+   "plugins/infrastructure/config_base.py:607:R5",
+   "plugins/infrastructure/config_base.py:688:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/schema_factory.py::R5::max_hits=5": [
+   "plugins/infrastructure/schema_factory.py:34:R5",
+   "plugins/infrastructure/schema_factory.py:37:R5",
+   "plugins/infrastructure/schema_factory.py:44:R5",
+   "plugins/infrastructure/schema_factory.py:54:R5",
+   "plugins/infrastructure/schema_factory.py:63:R5"
+  ],
+  "plugins.yaml::plugins/infrastructure/utils.py::R5::max_hits=1": [
+   "plugins/infrastructure/utils.py:54:R5"
+  ],
+  "plugins.yaml::plugins/sinks/chroma_sink.py::R4::max_hits=1": [
+   "plugins/sinks/chroma_sink.py:708:R4"
+  ],
+  "plugins.yaml::plugins/sinks/dataverse.py::R4,R5::max_hits=1": [
+   "plugins/sinks/dataverse.py:493:R5",
+   "plugins/sinks/dataverse.py:496:R5",
+   "plugins/sinks/dataverse.py:611:R5",
+   "plugins/sinks/dataverse.py:616:R5",
+   "plugins/sinks/dataverse.py:649:R5",
+   "plugins/sinks/dataverse.py:85:R5"
+  ],
+  "plugins.yaml::plugins/sinks/json_sink.py::R5::max_hits=1": [
+   "plugins/sinks/json_sink.py:304:R5"
+  ],
+  "plugins.yaml::plugins/sources/*::R5::max_hits=7": [
+   "plugins/sources/aws_s3_source.py:121:R5",
+   "plugins/sources/aws_s3_source.py:1321:R5",
+   "plugins/sources/aws_s3_source.py:393:R5",
+   "plugins/sources/aws_s3_source.py:393:R5",
+   "plugins/sources/aws_s3_source.py:409:R5",
+   "plugins/sources/aws_s3_source.py:429:R5",
+   "plugins/sources/aws_s3_source.py:448:R5",
+   "plugins/sources/aws_s3_source.py:454:R5",
+   "plugins/sources/aws_s3_source.py:456:R5",
+   "plugins/sources/aws_s3_source.py:659:R5",
+   "plugins/sources/aws_s3_source.py:666:R5",
+   "plugins/sources/aws_s3_source.py:713:R5",
+   "plugins/sources/aws_s3_source.py:814:R5",
+   "plugins/sources/aws_s3_source.py:947:R5",
+   "plugins/sources/azure_blob_source.py:564:R5",
+   "plugins/sources/azure_blob_source.py:916:R5",
+   "plugins/sources/azure_blob_source.py:926:R5",
+   "plugins/sources/csv_source.py:708:R5",
+   "plugins/sources/dataverse.py:461:R5",
+   "plugins/sources/dataverse.py:480:R5",
+   "plugins/sources/dataverse.py:62:R5",
+   "plugins/sources/dataverse.py:75:R5",
+   "plugins/sources/json_source.py:366:R5",
+   "plugins/sources/json_source.py:402:R5",
+   "plugins/sources/json_source.py:440:R5",
+   "plugins/sources/json_source.py:746:R5",
+   "plugins/sources/llm/source.py:247:R5",
+   "plugins/sources/llm/source.py:247:R5",
+   "plugins/sources/llm/source.py:269:R5",
+   "plugins/sources/llm/source.py:280:R5",
+   "plugins/sources/llm/source.py:282:R5",
+   "plugins/sources/llm/source.py:284:R5",
+   "plugins/sources/llm/source.py:291:R5",
+   "plugins/sources/llm/source.py:524:R5",
+   "plugins/sources/llm/source.py:532:R5",
+   "plugins/sources/llm/source.py:539:R5",
+   "plugins/sources/llm/source.py:541:R5",
+   "plugins/sources/llm/source.py:599:R5",
+   "plugins/sources/llm/source.py:601:R5",
+   "plugins/sources/llm/source.py:606:R5"
+  ],
+  "plugins.yaml::plugins/transforms/azure/*::R1,R2,R4,R6,R9::max_hits=None": [
+   "plugins/transforms/azure/base.py:294:R9",
+   "plugins/transforms/azure/base.py:320:R9",
+   "plugins/transforms/azure/content_safety.py:153:R1",
+   "plugins/transforms/azure/content_safety.py:156:R1",
+   "plugins/transforms/azure/content_safety.py:335:R1",
+   "plugins/transforms/azure/document_intelligence.py:471:R9",
+   "plugins/transforms/azure/document_intelligence.py:646:R1",
+   "plugins/transforms/azure/document_intelligence.py:657:R1",
+   "plugins/transforms/azure/document_intelligence.py:659:R1",
+   "plugins/transforms/azure/document_intelligence.py:664:R1",
+   "plugins/transforms/azure/document_intelligence.py:667:R1",
+   "plugins/transforms/azure/document_intelligence.py:703:R6",
+   "plugins/transforms/azure/document_intelligence.py:745:R1",
+   "plugins/transforms/azure/document_intelligence.py:817:R9",
+   "plugins/transforms/azure/document_intelligence_result.py:20:R1",
+   "plugins/transforms/azure/document_intelligence_result.py:30:R1",
+   "plugins/transforms/azure/document_intelligence_result.py:61:R6"
+  ],
+  "plugins.yaml::plugins/transforms/azure/*::R5::max_hits=14": [
+   "plugins/transforms/azure/base.py:160:R5",
+   "plugins/transforms/azure/base.py:354:R5",
+   "plugins/transforms/azure/content_safety.py:154:R5",
+   "plugins/transforms/azure/document_intelligence.py:487:R5",
+   "plugins/transforms/azure/document_intelligence.py:518:R5",
+   "plugins/transforms/azure/document_intelligence.py:530:R5",
+   "plugins/transforms/azure/document_intelligence.py:610:R5",
+   "plugins/transforms/azure/document_intelligence.py:651:R5",
+   "plugins/transforms/azure/document_intelligence.py:655:R5",
+   "plugins/transforms/azure/document_intelligence.py:657:R5",
+   "plugins/transforms/azure/document_intelligence.py:660:R5",
+   "plugins/transforms/azure/document_intelligence.py:666:R5",
+   "plugins/transforms/azure/document_intelligence.py:668:R5",
+   "plugins/transforms/azure/document_intelligence.py:752:R5",
+   "plugins/transforms/azure/document_intelligence_result.py:23:R5",
+   "plugins/transforms/azure/document_intelligence_result.py:33:R5"
+  ],
+  "plugins.yaml::plugins/transforms/batch_stats.py::R5::max_hits=2": [
+   "plugins/transforms/batch_stats.py:396:R5",
+   "plugins/transforms/batch_stats.py:442:R5"
+  ],
+  "plugins.yaml::plugins/transforms/json_explode.py::R5::max_hits=1": [
+   "plugins/transforms/json_explode.py:472:R5"
+  ],
+  "plugins.yaml::plugins/transforms/keyword_filter.py::R5::max_hits=1": [
+   "plugins/transforms/keyword_filter.py:271:R5",
+   "plugins/transforms/keyword_filter.py:337:R5"
+  ],
+  "plugins.yaml::plugins/transforms/llm/*::R5::max_hits=61": [
+   "plugins/transforms/llm/image_inputs.py:157:R5",
+   "plugins/transforms/llm/image_inputs.py:162:R5",
+   "plugins/transforms/llm/image_inputs.py:176:R5",
+   "plugins/transforms/llm/langfuse.py:270:R5",
+   "plugins/transforms/llm/multi_query.py:295:R5",
+   "plugins/transforms/llm/multi_query.py:300:R5",
+   "plugins/transforms/llm/multi_query.py:304:R5",
+   "plugins/transforms/llm/provider.py:208:R5",
+   "plugins/transforms/llm/providers/azure.py:312:R5",
+   "plugins/transforms/llm/providers/bedrock.py:103:R5",
+   "plugins/transforms/llm/providers/bedrock.py:105:R5",
+   "plugins/transforms/llm/providers/bedrock.py:107:R5",
+   "plugins/transforms/llm/providers/bedrock.py:109:R5",
+   "plugins/transforms/llm/providers/bedrock.py:111:R5",
+   "plugins/transforms/llm/providers/bedrock.py:181:R5",
+   "plugins/transforms/llm/templates.py:160:R5",
+   "plugins/transforms/llm/templates.py:227:R5",
+   "plugins/transforms/llm/transform.py:1052:R5",
+   "plugins/transforms/llm/transform.py:1227:R5",
+   "plugins/transforms/llm/transform.py:123:R5",
+   "plugins/transforms/llm/transform.py:125:R5",
+   "plugins/transforms/llm/transform.py:1477:R5",
+   "plugins/transforms/llm/transform.py:1477:R5",
+   "plugins/transforms/llm/transform.py:1656:R5",
+   "plugins/transforms/llm/transform.py:1708:R5",
+   "plugins/transforms/llm/transform.py:1710:R5",
+   "plugins/transforms/llm/transform.py:1712:R5",
+   "plugins/transforms/llm/transform.py:1722:R5",
+   "plugins/transforms/llm/transform.py:1750:R5",
+   "plugins/transforms/llm/transform.py:1762:R5",
+   "plugins/transforms/llm/transform.py:1773:R5",
+   "plugins/transforms/llm/transform.py:1782:R5",
+   "plugins/transforms/llm/transform.py:313:R5",
+   "plugins/transforms/llm/transform.py:652:R5",
+   "plugins/transforms/llm/transform.py:937:R5",
+   "plugins/transforms/llm/transform.py:949:R5",
+   "plugins/transforms/llm/validation.py:143:R5",
+   "plugins/transforms/llm/validation.py:253:R5",
+   "plugins/transforms/llm/validation.py:60:R5",
+   "plugins/transforms/llm/validation.py:65:R5",
+   "plugins/transforms/llm/validation.py:67:R5",
+   "plugins/transforms/llm/validation.py:69:R5",
+   "plugins/transforms/llm/validation.py:69:R5",
+   "plugins/transforms/llm/validation.py:75:R5",
+   "plugins/transforms/llm/validation.py:77:R5",
+   "plugins/transforms/llm/validation.py:79:R5",
+   "plugins/transforms/llm/validation.py:83:R5",
+   "plugins/transforms/llm/validation.py:87:R5"
+  ],
+  "plugins.yaml::plugins/transforms/safety_utils.py::R5::max_hits=4": [
+   "plugins/transforms/safety_utils.py:24:R5",
+   "plugins/transforms/safety_utils.py:25:R5",
+   "plugins/transforms/safety_utils.py:36:R5",
+   "plugins/transforms/safety_utils.py:43:R5"
+  ],
+  "plugins.yaml::plugins/transforms/type_coerce.py::R1::max_hits=2": [
+   "plugins/transforms/type_coerce.py:466:R1",
+   "plugins/transforms/type_coerce.py:501:R1"
+  ],
+  "telemetry.yaml::telemetry/exporters/*::R1,R2,R4,R6,R9::max_hits=None": [
+   "telemetry/exporters/azure_monitor.py:131:R1",
+   "telemetry/exporters/azure_monitor.py:160:R1",
+   "telemetry/exporters/azure_monitor.py:169:R1",
+   "telemetry/exporters/console.py:83:R1",
+   "telemetry/exporters/console.py:98:R1",
+   "telemetry/exporters/datadog.py:120:R1",
+   "telemetry/exporters/datadog.py:130:R1",
+   "telemetry/exporters/datadog.py:176:R1",
+   "telemetry/exporters/datadog.py:177:R1",
+   "telemetry/exporters/datadog.py:188:R9",
+   "telemetry/exporters/datadog.py:192:R9",
+   "telemetry/exporters/otlp.py:192:R1",
+   "telemetry/exporters/otlp.py:215:R1",
+   "telemetry/exporters/otlp.py:219:R1",
+   "telemetry/exporters/otlp.py:221:R1",
+   "telemetry/exporters/otlp.py:222:R1",
+   "telemetry/exporters/otlp.py:223:R1",
+   "telemetry/exporters/otlp.py:224:R1",
+   "telemetry/exporters/otlp.py:225:R1",
+   "telemetry/exporters/otlp.py:226:R1",
+   "telemetry/exporters/otlp.py:227:R1",
+   "telemetry/exporters/otlp.py:54:R6"
+  ],
+  "telemetry.yaml::telemetry/exporters/*::R5::max_hits=39": [
+   "telemetry/exporters/azure_monitor.py:123:R5",
+   "telemetry/exporters/azure_monitor.py:132:R5",
+   "telemetry/exporters/azure_monitor.py:152:R5",
+   "telemetry/exporters/azure_monitor.py:161:R5",
+   "telemetry/exporters/azure_monitor.py:170:R5",
+   "telemetry/exporters/azure_monitor.py:245:R5",
+   "telemetry/exporters/azure_monitor.py:290:R5",
+   "telemetry/exporters/azure_monitor.py:475:R5",
+   "telemetry/exporters/azure_monitor.py:496:R5",
+   "telemetry/exporters/console.py:138:R5",
+   "telemetry/exporters/console.py:168:R5",
+   "telemetry/exporters/console.py:170:R5",
+   "telemetry/exporters/console.py:216:R5",
+   "telemetry/exporters/console.py:218:R5",
+   "telemetry/exporters/console.py:220:R5",
+   "telemetry/exporters/console.py:236:R5",
+   "telemetry/exporters/console.py:84:R5",
+   "telemetry/exporters/console.py:99:R5",
+   "telemetry/exporters/datadog.py:112:R5",
+   "telemetry/exporters/datadog.py:121:R5",
+   "telemetry/exporters/datadog.py:146:R5",
+   "telemetry/exporters/datadog.py:159:R5",
+   "telemetry/exporters/datadog.py:237:R5",
+   "telemetry/exporters/datadog.py:365:R5",
+   "telemetry/exporters/datadog.py:367:R5",
+   "telemetry/exporters/datadog.py:369:R5",
+   "telemetry/exporters/datadog.py:377:R5",
+   "telemetry/exporters/datadog.py:398:R5",
+   "telemetry/exporters/datadog.py:421:R5",
+   "telemetry/exporters/datadog.py:97:R5",
+   "telemetry/exporters/otlp.py:195:R5",
+   "telemetry/exporters/otlp.py:203:R5",
+   "telemetry/exporters/otlp.py:208:R5",
+   "telemetry/exporters/otlp.py:323:R5",
+   "telemetry/exporters/otlp.py:375:R5",
+   "telemetry/exporters/otlp.py:578:R5",
+   "telemetry/exporters/otlp.py:598:R5",
+   "telemetry/exporters/otlp.py:616:R5",
+   "telemetry/exporters/otlp.py:618:R5"
+  ],
+  "telemetry.yaml::telemetry/factory.py::R5::max_hits=1": [
+   "telemetry/factory.py:118:R5"
+  ],
+  "telemetry.yaml::telemetry/serialization.py::R5::max_hits=4": [
+   "telemetry/serialization.py:100:R5",
+   "telemetry/serialization.py:102:R5",
+   "telemetry/serialization.py:154:R5",
+   "telemetry/serialization.py:168:R5",
+   "telemetry/serialization.py:170:R5",
+   "telemetry/serialization.py:48:R5",
+   "telemetry/serialization.py:96:R5",
+   "telemetry/serialization.py:98:R5"
+  ],
+  "telemetry.yaml::telemetry/serialization.py::R6::max_hits=1": [
+   "telemetry/serialization.py:188:R6"
+  ],
+  "testing.yaml::testing/__init__.py::R5::max_hits=7": [
+   "testing/__init__.py:243:R5",
+   "testing/__init__.py:276:R5",
+   "testing/__init__.py:280:R5",
+   "testing/__init__.py:300:R5",
+   "testing/__init__.py:326:R5",
+   "testing/__init__.py:346:R5",
+   "testing/__init__.py:366:R5"
+  ],
+  "tui.yaml::tui/screens/explain_screen.py::R5::max_hits=11": [
+   "tui/screens/explain_screen.py:356:R5",
+   "tui/screens/explain_screen.py:371:R5",
+   "tui/screens/explain_screen.py:383:R5",
+   "tui/screens/explain_screen.py:528:R5",
+   "tui/screens/explain_screen.py:547:R5",
+   "tui/screens/explain_screen.py:560:R5",
+   "tui/screens/explain_screen.py:566:R5",
+   "tui/screens/explain_screen.py:571:R5",
+   "tui/screens/explain_screen.py:594:R5",
+   "tui/screens/explain_screen.py:627:R5",
+   "tui/screens/explain_screen.py:650:R5"
+  ],
+  "tui.yaml::tui/widgets/lineage_tree.py::R5::max_hits=2": [
+   "tui/widgets/lineage_tree.py:30:R5",
+   "tui/widgets/lineage_tree.py:67:R5"
+  ],
+  "tui.yaml::tui/widgets/node_detail.py::R5::max_hits=5": [
+   "tui/widgets/node_detail.py:107:R5",
+   "tui/widgets/node_detail.py:110:R5",
+   "tui/widgets/node_detail.py:117:R5",
+   "tui/widgets/node_detail.py:119:R5",
+   "tui/widgets/node_detail.py:285:R5"
+  ],
+  "web.yaml::web/composer/guided/chat_solver.py::R5::max_hits=11": [
+   "web/composer/guided/chat_solver.py:1399:R5",
+   "web/composer/guided/chat_solver.py:1403:R5",
+   "web/composer/guided/chat_solver.py:1407:R5",
+   "web/composer/guided/chat_solver.py:1413:R5",
+   "web/composer/guided/chat_solver.py:1665:R5",
+   "web/composer/guided/chat_solver.py:1858:R5",
+   "web/composer/guided/chat_solver.py:1876:R5",
+   "web/composer/guided/chat_solver.py:1903:R5",
+   "web/composer/guided/chat_solver.py:229:R5",
+   "web/composer/guided/chat_solver.py:2509:R5",
+   "web/composer/guided/chat_solver.py:2509:R5",
+   "web/composer/guided/chat_solver.py:2765:R5",
+   "web/composer/guided/chat_solver.py:3673:R5"
+  ],
+  "web.yaml::web/composer/service.py::R6::max_hits=None": [
+   "web/composer/service.py:1936:R6",
+   "web/composer/service.py:3440:R6",
+   "web/composer/service.py:4239:R6",
+   "web/composer/service.py:6214:R6",
+   "web/composer/service.py:9127:R6"
+  ],
+  "web.yaml::web/composer/telemetry_phase8.py::R4::max_hits=10": [
+   "web/composer/telemetry_phase8.py:188:R4",
+   "web/composer/telemetry_phase8.py:200:R4",
+   "web/composer/telemetry_phase8.py:233:R4",
+   "web/composer/telemetry_phase8.py:249:R4",
+   "web/composer/telemetry_phase8.py:294:R4",
+   "web/composer/telemetry_phase8.py:306:R4",
+   "web/composer/telemetry_phase8.py:315:R4",
+   "web/composer/telemetry_phase8.py:329:R4",
+   "web/composer/telemetry_phase8.py:342:R4",
+   "web/composer/telemetry_phase8.py:358:R4"
+  ],
+  "web.yaml::web/composer/tool_batch.py::R6::max_hits=3": [
+   "web/composer/tool_batch.py:1093:R6",
+   "web/composer/tool_batch.py:1318:R6",
+   "web/composer/tool_batch.py:1628:R6",
+   "web/composer/tool_batch.py:2088:R6",
+   "web/composer/tool_batch.py:704:R6"
+  ],
+  "web.yaml::web/composer/tools/_common.py::R5::max_hits=13": [
+   "web/composer/tools/_common.py:1336:R5",
+   "web/composer/tools/_common.py:1904:R5",
+   "web/composer/tools/_common.py:2038:R5",
+   "web/composer/tools/_common.py:2055:R5",
+   "web/composer/tools/_common.py:2192:R5",
+   "web/composer/tools/_common.py:2604:R5"
+  ]
+ },
+ "by_file": {
+  "cli.py": {
+   "R1": 11,
+   "R4": 8,
+   "R5": 8,
+   "R6": 6
+  },
+  "cli_helpers.py": {
+   "R1": 1
+  },
+  "composer_mcp/server.py": {
+   "R5": 14
+  },
+  "contracts/audit.py": {
+   "R5": 4
+  },
+  "contracts/call_data.py": {
+   "R5": 9
+  },
+  "contracts/config/runtime.py": {
+   "R5": 14
+  },
+  "contracts/contract_records.py": {
+   "R5": 12
+  },
+  "contracts/diversion.py": {
+   "R5": 1
+  },
+  "contracts/events.py": {
+   "R5": 4
+  },
+  "contracts/freeze.py": {
+   "R5": 15
+  },
+  "contracts/hashing.py": {
+   "R5": 10
+  },
+  "contracts/header_modes.py": {
+   "R5": 1
+  },
+  "contracts/plugin_context.py": {
+   "R5": 15
+  },
+  "contracts/results.py": {
+   "R5": 6
+  },
+  "contracts/runtime_val_manifest.py": {
+   "R5": 53,
+   "R6": 4
+  },
+  "contracts/schema.py": {
+   "R1": 9,
+   "R5": 17
+  },
+  "contracts/secret_scrub.py": {
+   "R5": 4
+  },
+  "contracts/token_usage.py": {
+   "R5": 11
+  },
+  "contracts/type_normalization.py": {
+   "R5": 14
+  },
+  "core/canonical.py": {
+   "R5": 23
+  },
+  "core/checkpoint/serialization.py": {
+   "R5": 20
+  },
+  "core/config.py": {
+   "R1": 13,
+   "R5": 52,
+   "R6": 2
+  },
+  "core/dag/graph.py": {
+   "R5": 2
+  },
+  "core/expression_parser.py": {
+   "R5": 54
+  },
+  "core/landscape/database.py": {
+   "R5": 7
+  },
+  "core/landscape/formatters.py": {
+   "R5": 2
+  },
+  "core/landscape/journal.py": {
+   "R5": 5
+  },
+  "core/landscape/run_lifecycle_repository.py": {
+   "R5": 5
+  },
+  "core/operations.py": {
+   "R5": 1
+  },
+  "core/secrets.py": {
+   "R5": 16
+  },
+  "core/security/config_secrets.py": {
+   "R1": 2
+  },
+  "core/security/secret_loader.py": {
+   "R1": 1
+  },
+  "core/templates.py": {
+   "R5": 142
+  },
+  "engine/barrier_coordination.py": {
+   "R5": 1
+  },
+  "engine/batch_adapter.py": {
+   "R5": 1
+  },
+  "engine/dag_navigator.py": {
+   "R5": 2
+  },
+  "engine/executors/gate.py": {
+   "R5": 3
+  },
+  "engine/executors/transform.py": {
+   "R5": 2
+  },
+  "engine/processor.py": {
+   "R5": 7
+  },
+  "engine/scheduler_drain.py": {
+   "R5": 3
+  },
+  "engine/token_traversal.py": {
+   "R5": 4
+  },
+  "engine/tokens.py": {
+   "R5": 1
+  },
+  "engine/triggers.py": {
+   "R5": 3
+  },
+  "mcp/analyzers/diagnostics.py": {
+   "R1": 3
+  },
+  "mcp/analyzers/queries.py": {
+   "R1": 7
+  },
+  "mcp/analyzers/reports.py": {
+   "R1": 1
+  },
+  "mcp/server.py": {
+   "R1": 9,
+   "R5": 14
+  },
+  "plugins/infrastructure/clients/dataverse.py": {
+   "R1": 5,
+   "R5": 7,
+   "R6": 1
+  },
+  "plugins/infrastructure/clients/fingerprinting.py": {
+   "R1": 3,
+   "R6": 4
+  },
+  "plugins/infrastructure/clients/json_utils.py": {
+   "R5": 3
+  },
+  "plugins/infrastructure/clients/llm.py": {
+   "R5": 3
+  },
+  "plugins/infrastructure/clients/replayer.py": {
+   "R5": 1
+  },
+  "plugins/infrastructure/config_base.py": {
+   "R5": 7
+  },
+  "plugins/infrastructure/schema_factory.py": {
+   "R5": 5
+  },
+  "plugins/infrastructure/utils.py": {
+   "R5": 1
+  },
+  "plugins/sinks/chroma_sink.py": {
+   "R4": 1
+  },
+  "plugins/sinks/dataverse.py": {
+   "R5": 6
+  },
+  "plugins/sinks/json_sink.py": {
+   "R5": 1
+  },
+  "plugins/sources/aws_s3_source.py": {
+   "R5": 14
+  },
+  "plugins/sources/azure_blob_source.py": {
+   "R5": 3
+  },
+  "plugins/sources/csv_source.py": {
+   "R5": 1
+  },
+  "plugins/sources/dataverse.py": {
+   "R5": 4
+  },
+  "plugins/sources/json_source.py": {
+   "R5": 4
+  },
+  "plugins/sources/llm/source.py": {
+   "R5": 14
+  },
+  "plugins/transforms/azure/base.py": {
+   "R5": 2,
+   "R9": 2
+  },
+  "plugins/transforms/azure/content_safety.py": {
+   "R1": 3,
+   "R5": 1
+  },
+  "plugins/transforms/azure/document_intelligence.py": {
+   "R1": 6,
+   "R5": 11,
+   "R6": 1,
+   "R9": 2
+  },
+  "plugins/transforms/azure/document_intelligence_result.py": {
+   "R1": 2,
+   "R5": 2,
+   "R6": 1
+  },
+  "plugins/transforms/batch_stats.py": {
+   "R5": 2
+  },
+  "plugins/transforms/json_explode.py": {
+   "R5": 1
+  },
+  "plugins/transforms/keyword_filter.py": {
+   "R5": 2
+  },
+  "plugins/transforms/llm/image_inputs.py": {
+   "R5": 3
+  },
+  "plugins/transforms/llm/langfuse.py": {
+   "R5": 1
+  },
+  "plugins/transforms/llm/multi_query.py": {
+   "R5": 3
+  },
+  "plugins/transforms/llm/provider.py": {
+   "R5": 1
+  },
+  "plugins/transforms/llm/providers/azure.py": {
+   "R5": 1
+  },
+  "plugins/transforms/llm/providers/bedrock.py": {
+   "R5": 6
+  },
+  "plugins/transforms/llm/templates.py": {
+   "R5": 2
+  },
+  "plugins/transforms/llm/transform.py": {
+   "R5": 19
+  },
+  "plugins/transforms/llm/validation.py": {
+   "R5": 12
+  },
+  "plugins/transforms/safety_utils.py": {
+   "R5": 4
+  },
+  "plugins/transforms/type_coerce.py": {
+   "R1": 2
+  },
+  "telemetry/exporters/azure_monitor.py": {
+   "R1": 3,
+   "R5": 9
+  },
+  "telemetry/exporters/console.py": {
+   "R1": 2,
+   "R5": 9
+  },
+  "telemetry/exporters/datadog.py": {
+   "R1": 4,
+   "R5": 12,
+   "R9": 2
+  },
+  "telemetry/exporters/otlp.py": {
+   "R1": 10,
+   "R5": 9,
+   "R6": 1
+  },
+  "telemetry/factory.py": {
+   "R5": 1
+  },
+  "telemetry/serialization.py": {
+   "R5": 8,
+   "R6": 1
+  },
+  "testing/__init__.py": {
+   "R5": 7
+  },
+  "tui/screens/explain_screen.py": {
+   "R5": 11
+  },
+  "tui/widgets/lineage_tree.py": {
+   "R5": 2
+  },
+  "tui/widgets/node_detail.py": {
+   "R5": 5
+  },
+  "web/composer/guided/chat_solver.py": {
+   "R5": 13
+  },
+  "web/composer/service.py": {
+   "R6": 5
+  },
+  "web/composer/telemetry_phase8.py": {
+   "R4": 10
+  },
+  "web/composer/tool_batch.py": {
+   "R6": 5
+  },
+  "web/composer/tools/_common.py": {
+   "R5": 6
+  }
+ }
+}

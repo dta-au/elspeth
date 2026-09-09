@@ -150,7 +150,7 @@ class _ImportBindingVisitor(ast.NodeVisitor):
             self.visit(base)
         for keyword in node.keywords:
             self.visit(keyword)
-        for type_param in getattr(node, "type_params", ()):
+        for type_param in node.type_params:
             self.visit(type_param)
         self._visit_scope(node.body, kind="class")
 
@@ -165,7 +165,7 @@ class _ImportBindingVisitor(ast.NodeVisitor):
         self._visit_arguments(node.args)
         if node.returns is not None:
             self.visit(node.returns)
-        for type_param in getattr(node, "type_params", ()):
+        for type_param in node.type_params:
             self.visit(type_param)
         self._visit_scope(node.body, kind="function")
 
@@ -400,9 +400,9 @@ def _misbound_branch_finding(*, file_path: str, node: ast.Call, branch_dialect: 
     )
 
 
-def _node_finding(*, file_path: str, node: ast.AST, message: str) -> Finding:
-    lineno = getattr(node, "lineno", 0)
-    col_offset = getattr(node, "col_offset", 0)
+def _node_finding(*, file_path: str, node: ast.ImportFrom | ast.Call, message: str) -> Finding:
+    lineno = node.lineno
+    col_offset = node.col_offset
     payload = f"{RULE_ID}|{file_path}|{lineno}|{col_offset}|{ast.dump(node, include_attributes=False)}"
     return Finding(
         rule_id=RULE_ID,

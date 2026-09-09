@@ -1,6 +1,6 @@
 """Governance harness for ADR-009 §Clause 4 — pass-through annotation invariants.
 
-Three tests here:
+Core tests here:
 
 - **Forward invariant** (`test_annotated_transforms_preserve_input_fields`):
   For every registered ``passes_through_input=True`` transform, runs
@@ -18,6 +18,17 @@ Three tests here:
 - **Skip-rate budget** (``test_harness_skip_rate_budget``): asserts
   ``skip_rate ≤ 25%`` across the annotated plugin set. Track 2 additions
   that slip the budget must implement ``probe_config()`` per the contract.
+
+The ``forwards_input_fields`` axis (elspeth-15c72686f2) gets the same
+two-direction treatment inside a single branching test
+(``test_forwarding_declaration_is_truthful``): declarers get their removal
+set truth-tested, non-declarers get the under-declaration sentinel sweep —
+catching a transform that forwards a sentinel extra on every emission while
+declaring nothing. One test rather than a skip-partitioned pair: the
+declaration is an instance attribute (``FieldMapper``'s flips on
+``select_only``), so the split is only knowable post-instantiation, and
+skip-partitioning would let a future transform fall through both halves
+with a green summary.
 
 The harness uses ``pytest_generate_tests`` to parametrize over registered
 transforms at collection time — with a guard that crashes if the plugin
@@ -128,6 +139,15 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "_non_pass_through_cls" in metafunc.fixturenames:
         plugins = _non_pass_through_plugins()
         metafunc.parametrize("_non_pass_through_cls", plugins, ids=lambda c: c.__name__)
+
+    if "_preserving_cls" in metafunc.fixturenames:
+        preserving = [cls for cls in _registered_transform_classes() if cls.preserves_input_values]
+        assert preserving, (
+            "Expected at least 1 preserves_input_values=True transform "
+            "(passthrough and llm declare it); plugin registration may have "
+            "failed — the value-preservation harness would silently pass."
+        )
+        metafunc.parametrize("_preserving_cls", preserving, ids=lambda c: c.__name__)
 
 
 def _probe_context(transform: BaseTransform) -> Any:
@@ -242,6 +262,55 @@ def test_annotated_transforms_preserve_input_fields(
             f"but dropped fields {sorted(dropped)!r} from probe row "
             f"{row.to_dict()!r}. Either fix the implementation or remove "
             "the annotation."
+        )
+
+
+@given(row=probe_row())
+@settings(
+    max_examples=30,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+)
+def test_preserving_transforms_do_not_rewrite_values(
+    _preserving_cls: type[BaseTransform],
+    row: PipelineRow,
+) -> None:
+    """Value invariant — elspeth-e6e552ce34.
+
+    Every emitted row from a ``preserves_input_values=True`` transform must
+    carry each surviving input field with a value ``==`` to its input value.
+    This is the promise that lets the build-time type-resolution walk recurse
+    through the transform; a rewrite here means the annotation is a lie and
+    build verdicts built on it are unsound. Unprobeable declarers (no
+    ``probe_config()``, e.g. llm's provider dependency) skip, exactly like
+    the presence harness above — their truth rests on code review at the
+    declaration site.
+    """
+    try:
+        transform = _probe_instantiate(_preserving_cls)
+    except _UnprobeableTransform as exc:
+        pytest.skip(f"{_preserving_cls.__name__}: {exc.reason}")
+
+    probe_rows = transform.forward_invariant_probe_rows(row)
+    input_values = {name: probe.to_dict()[name] for probe in probe_rows for name in _observed_fields(probe) if name in probe.to_dict()}
+
+    result = transform.execute_forward_invariant_probe(
+        probe_rows,
+        _probe_context(transform),
+    )
+    if result.status != "success":
+        return
+
+    for emitted in _emitted_rows_from_result(result):
+        payload = emitted.to_dict()
+        rewritten = {
+            name: (input_values[name], payload[name]) for name in input_values if name in payload and payload[name] != input_values[name]
+        }
+        assert not rewritten, (
+            f"{_preserving_cls.__name__} is annotated preserves_input_values=True "
+            f"but rewrote {rewritten!r} on probe row {row.to_dict()!r}. Either "
+            "fix the implementation or remove the annotation — the type-"
+            "resolution walk recurses through this transform on that promise."
         )
 
 
@@ -366,3 +435,223 @@ def test_non_pass_through_transforms_do_drop_fields(
             f"{_non_pass_through_cls.__name__}.backward_invariant_probe_rows() "
             "to return a shape that triggers the field-dropping code path."
         )
+
+
+_FORWARDING_SENTINEL = "elspeth_probe_extra_ride_along"
+
+
+def _with_sentinel_field(probe: PipelineRow) -> PipelineRow:
+    """Return ``probe`` plus one unknown extra field no transform declares.
+
+    The sentinel models the elspeth-15c72686f2 defect vector: an upstream
+    producer's extra column (an llm's ``<response_field>_usage``) that the
+    transform under probe never heard of. A transform that forwards it is
+    forwarding unknown input fields.
+    """
+    from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+
+    payload = probe.to_dict().copy()
+    payload[_FORWARDING_SENTINEL] = "ride-along"
+    fields = (
+        *probe.contract.fields,
+        FieldContract(
+            normalized_name=_FORWARDING_SENTINEL,
+            original_name=_FORWARDING_SENTINEL,
+            python_type=str,
+            required=True,
+            source="inferred",
+            nullable=False,
+        ),
+    )
+    contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
+    return PipelineRow(payload, contract)
+
+
+def _assert_undeclared_transform_does_not_forward(
+    cls: type[BaseTransform],
+    transform: BaseTransform,
+) -> None:
+    """Under-declaration arm (elspeth-15c72686f2) — non-declaring transforms.
+
+    A transform that forwards the row while declaring nothing silently
+    recreates the original defect class: both definite-emits walks stop at
+    it, upstream extras become invisible to the build-time firewall, and the
+    graph is back to "build green, every row dies at the locked sink". The
+    commit that introduced the declaration relied on a one-time manual audit
+    of the non-declaring transforms; this arm makes that audit permanent.
+
+    Method: seed each probe row with a sentinel field no transform knows.
+    A fresh-dict transform (the batch_* family, report_assemble) never emits
+    it. If EVERY successful emission carries the sentinel, the transform
+    demonstrably forwards unknown input fields and must declare — either
+    ``forwards_input_fields=True`` (with its removals) or
+    ``passes_through_input=True`` if the stronger claim holds.
+    """
+    probe_count = 0
+    asserted_count = 0
+    sentinel_always_forwarded = True
+
+    @given(probe=probe_row())
+    @settings(
+        max_examples=_SWEEP_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    )
+    def _sweep(probe: PipelineRow) -> None:
+        nonlocal probe_count, asserted_count, sentinel_always_forwarded
+        probe_count += 1
+        probe_rows = transform.backward_invariant_probe_rows(_with_sentinel_field(probe))
+        # A probe hook that rebuilds its input rows without the sentinel
+        # cannot witness forwarding either way — do not count that emission.
+        if any(_FORWARDING_SENTINEL not in _observed_fields(input_row) for input_row in probe_rows):
+            return
+        result = transform.execute_backward_invariant_probe(probe_rows, _probe_context(transform))
+        if result.status != "success":
+            return
+        for emitted in _emitted_rows_from_result(result):
+            asserted_count += 1
+            if _FORWARDING_SENTINEL not in _observed_fields(emitted):
+                sentinel_always_forwarded = False
+                return
+
+    _sweep()
+
+    if probe_count < _SWEEP_MIN_PROBES:
+        pytest.fail(
+            f"{cls.__name__}: only {probe_count} probe rows "
+            f"exercised (expected >= {_SWEEP_MIN_PROBES}). Harness probe generation "
+            "is under-powered for this transform."
+        )
+
+    # No successful sentinel-carrying emission — no evidence either way. The
+    # all-probes-error case is already failed by the backward invariant above,
+    # so a silent pass here cannot hide a dead probe config.
+    if asserted_count == 0:
+        return
+
+    if sentinel_always_forwarded:
+        pytest.fail(
+            f"{cls.__name__} forwarded the unknown field "
+            f"{_FORWARDING_SENTINEL!r} on every successful emission "
+            f"({asserted_count} rows) but declares forwards_input_fields=False. "
+            "The definite-emits walks stop at undeclared transforms, so upstream "
+            "extras become invisible to the build-time firewall (elspeth-15c72686f2). "
+            "Declare forwards_input_fields=True with the removal set process() "
+            "actually removes — or passes_through_input=True if nothing is removed."
+        )
+
+
+def _assert_declared_removals_are_truthful(
+    cls: type[BaseTransform],
+    transform: BaseTransform,
+) -> None:
+    """Truth-test arm (elspeth-15c72686f2) — declaring transforms.
+
+    ``forwards_input_fields`` has no runtime cross-check, so without this arm
+    it would be a claim nothing verifies — and it is a claim the build-time
+    extras firewall REJECTS graphs on, so a wrong one produces a false
+    rejection of a working pipeline.
+
+    The assertion is per emitted row against the INTERSECTION of the probe's
+    input rows, not their union. The union is what the backward invariant
+    uses, and it is wrong here: batch_outlier_annotator's probe deliberately
+    feeds one row that gets skipped entirely, and a field carried only by that
+    row legitimately never reaches the output. The intersection asks the
+    question the declaration actually makes — a field present on EVERY input
+    row survives onto every emitted row, minus the declared removals.
+
+    Over-declaring removals is safe (it shrinks the predicted emit set, so the
+    firewall rejects less), which is why this checks only the ``⊇`` direction.
+    Under-declaring is the failure this catches.
+    """
+    removed = transform.removed_input_fields
+    probe_count = 0
+    asserted_count = 0
+    violations: list[str] = []
+
+    @given(probe=probe_row())
+    @settings(
+        max_examples=_SWEEP_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    )
+    def _sweep(probe: PipelineRow) -> None:
+        nonlocal probe_count, asserted_count
+        probe_count += 1
+        probe_rows = transform.backward_invariant_probe_rows(probe)
+        result = transform.execute_backward_invariant_probe(probe_rows, _probe_context(transform))
+        if result.status != "success":
+            return
+        emitted_rows = _emitted_rows_from_result(result)
+        if not emitted_rows:
+            return
+        surviving = frozenset.intersection(*[_observed_fields(input_row) for input_row in probe_rows]) - removed
+        for emitted in emitted_rows:
+            asserted_count += 1
+            dropped = surviving - _observed_fields(emitted)
+            if dropped:
+                violations.append(
+                    f"emitted row dropped {sorted(dropped)!r} that no declared removal accounts for "
+                    f"(removed_input_fields={sorted(removed)!r})"
+                )
+                return
+
+    _sweep()
+
+    if probe_count < _SWEEP_MIN_PROBES:
+        pytest.fail(
+            f"{cls.__name__}: only {probe_count} probe rows "
+            f"exercised (expected >= {_SWEEP_MIN_PROBES}). Harness probe generation "
+            "is under-powered for this transform."
+        )
+
+    # An emptiness-graded check scores "every probe errored" as a pass. A
+    # declaring transform that never reached the assertion has not been
+    # verified at all, and the declaration would ship unchecked.
+    if asserted_count == 0:
+        pytest.fail(
+            f"{cls.__name__} declares forwards_input_fields=True but no "
+            f"probe produced a success emission in {probe_count} rows, so the declaration "
+            "was never checked. Override backward_invariant_probe_rows() to return a shape "
+            "the transform can actually process."
+        )
+
+    if violations:
+        pytest.fail(
+            f"{cls.__name__} declares forwards_input_fields=True but "
+            f"{violations[0]}. Either widen removed_input_fields to name the field, or drop "
+            "the forwards_input_fields declaration — the build-time extras firewall rejects "
+            "graphs on this claim, so an under-stated removal set predicts fields that never arrive."
+        )
+
+
+def test_forwarding_declaration_is_truthful(
+    _non_pass_through_cls: type[BaseTransform],
+) -> None:
+    """Two-direction governance for ``forwards_input_fields``, one test.
+
+    ``forwards_input_fields`` is what a transform declares when it forwards
+    the whole row but cannot claim ``passes_through_input`` — because it
+    consumes a column (line_explode's ``source_field``, json_explode's
+    ``array_field``, field_mapper's rename sources) or because it drops whole
+    ROWS (batch_outlier_annotator). Declarers take the removal truth-test arm;
+    non-declarers take the sentinel forwarding arm.
+
+    One branching test, deliberately NOT a pair of tests that skip each
+    other's half. The declaration is an INSTANCE attribute —
+    ``FieldMapper``'s flips on ``select_only`` — so which direction applies
+    is only knowable after ``probe_config()`` instantiation, and with a
+    skip-partitioned pair nothing machine-checks the partition: a transform
+    falling through BOTH halves would read as a green summary plus two skip
+    lines nobody audits. Here every probeable transform takes exactly one
+    assertion-bearing arm, and falling through is structurally impossible.
+    """
+    try:
+        transform = _probe_instantiate(_non_pass_through_cls)
+    except _UnprobeableTransform as exc:
+        pytest.skip(f"{_non_pass_through_cls.__name__}: {exc.reason}")
+
+    if transform.forwards_input_fields:
+        _assert_declared_removals_are_truthful(_non_pass_through_cls, transform)
+    else:
+        _assert_undeclared_transform_does_not_forward(_non_pass_through_cls, transform)

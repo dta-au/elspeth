@@ -6,10 +6,41 @@ import asyncio
 import functools
 import threading
 from collections.abc import Callable
+from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Final
+
+#: Threads in the process-wide worker pool.
+MAX_WORKERS: Final[int] = 16
+#: Submissions allowed to sit queued behind busy threads. Together with
+#: ``MAX_WORKERS`` this bounds outstanding admissions (running + queued);
+#: everything past it is rejected fast rather than queued for nobody.
+MAX_QUEUED: Final[int] = 16
+ADMISSION_CAPACITY: Final[int] = MAX_WORKERS + MAX_QUEUED
+#: How long a caller waits for an admission slot before it is rejected.
+#: Healthy work is millisecond-scale, so this only bites once the pool is
+#: saturated by work that is not finishing — the case where waiting longer
+#: cannot help and hanging the caller hides the fault.
+ADMISSION_WAIT_SECONDS: Final[float] = 1.0
+_ADMISSION_POLL_SECONDS: Final[float] = 0.02
 
 _SHARED_EXECUTOR: ThreadPoolExecutor | None = None
 _EXECUTOR_LOCK = threading.Lock()
+# Outstanding admissions: submissions whose sync work has not yet finished
+# (queued or running). Guarded by ``_EXECUTOR_LOCK`` because it is released
+# from worker threads, and process-wide because the pool is process-wide.
+_OUTSTANDING_ADMISSIONS = 0
+
+
+class AsyncWorkerAdmissionTimeoutError(TimeoutError):
+    """The shared worker pool could not admit new work within the bounded wait.
+
+    Raised instead of queueing indefinitely once ``ADMISSION_CAPACITY``
+    submissions are outstanding — typically because earlier workers are hung
+    and their callers have already timed out (elspeth-5269b43bca). It is a
+    ``TimeoutError`` on purpose: every deadline-bounded caller already
+    classifies a bounded wait that expired as its own TIMEOUT outcome.
+    """
 
 
 def _get_shared_executor() -> ThreadPoolExecutor:
@@ -26,7 +57,7 @@ def _get_shared_executor() -> ThreadPoolExecutor:
         with _EXECUTOR_LOCK:
             if _SHARED_EXECUTOR is None:
                 _SHARED_EXECUTOR = ThreadPoolExecutor(
-                    max_workers=16,
+                    max_workers=MAX_WORKERS,
                     thread_name_prefix="async-worker",
                 )
     return _SHARED_EXECUTOR
@@ -42,45 +73,69 @@ async def shutdown_async_workers() -> None:
         await loop.run_in_executor(None, executor.shutdown, True)
 
 
-def _drain_future_exception[T](future: asyncio.Future[T]) -> None:
-    """Mark a future's exception as retrieved so asyncio's GC handler stays quiet.
+def outstanding_admissions() -> int:
+    """Return submissions whose sync work has not finished (queued + running)."""
+    with _EXECUTOR_LOCK:
+        return _OUTSTANDING_ADMISSIONS
 
-    Background — elspeth-e4949acbe1: when ``run_sync_in_worker``'s caller is
-    cancelled (outer ``asyncio.wait_for`` timeout, or a ``CancelledError``
-    raised on the request task), the future continues running on its worker
-    thread because ``asyncio.wait`` never cancels the awaitables it is
-    waiting on. If the underlying sync work eventually raises, the asyncio
-    future holds an unretrieved exception.
-    Python's GC then fires the loop's exception handler with the message
-    ``"Future exception was never retrieved"``, whose default handler logs
-    a traceback through ``logging.getLogger("asyncio")``. In production that
-    traceback's most recent in-stack frame is ``web/middleware/request_id.py``
-    line ``await call_next(request)`` — operators saw "the request-id
-    middleware crashed" when in fact the middleware did exactly its job
-    and a deeper worker thread completed-with-exception after its caller
-    had already given up. Calling ``.exception()`` here marks the
-    exception as retrieved and silences the misleading journal noise.
 
-    The exception itself is intentionally discarded: the only reason we
-    reach this drain path is that the caller's task has been cancelled
-    (so ``run_sync_in_worker`` exited via its ``finally`` while the future
-    was still running), so the abandoned work's outcome is no longer
-    load-bearing for the cancelled request. If the worker raised because of a real
-    infrastructure problem (DB down, disk full), other concurrent
-    requests will surface it through their own paths — this drain does
-    not hide such a failure mode, only its echo on a request that is
-    already on its way out.
+def _try_admit() -> bool:
+    global _OUTSTANDING_ADMISSIONS
+    with _EXECUTOR_LOCK:
+        if _OUTSTANDING_ADMISSIONS >= ADMISSION_CAPACITY:
+            return False
+        _OUTSTANDING_ADMISSIONS += 1
+        return True
+
+
+def _release_admission() -> None:
+    global _OUTSTANDING_ADMISSIONS
+    with _EXECUTOR_LOCK:
+        _OUTSTANDING_ADMISSIONS -= 1
+
+
+def _release_admission_when_finished(_finished: ConcurrentFuture[Any]) -> None:
+    """Free one admission slot when the sync work actually finishes.
+
+    Attached to the *concurrent* future so it fires on the worker thread at
+    completion — or immediately when a still-queued submission is cancelled —
+    regardless of whether the awaiting event loop is still alive. Admission
+    therefore follows the worker's lifetime, never the awaiter's.
     """
-    if future.cancelled():
+    _release_admission()
+
+
+async def _acquire_admission() -> None:
+    """Wait a bounded time for an admission slot, then reject.
+
+    Polls rather than binding an ``asyncio`` primitive to one loop: the
+    admission count is process-wide (the pool is process-wide, and slots are
+    released from worker threads), and this helper must stay usable from any
+    running loop.
+    """
+    if _try_admit():
         return
-    # ``Future.exception()`` is the documented way to "retrieve" the
-    # exception without re-raising it on the caller. The return value is
-    # the exception object; we deliberately drop it.
-    future.exception()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ADMISSION_WAIT_SECONDS
+    while True:
+        await asyncio.sleep(_ADMISSION_POLL_SECONDS)
+        if _try_admit():
+            return
+        if loop.time() >= deadline:
+            raise AsyncWorkerAdmissionTimeoutError(
+                f"async worker pool saturated: {ADMISSION_CAPACITY} submissions outstanding for {ADMISSION_WAIT_SECONDS}s"
+            )
 
 
 async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
     """Run synchronous work on the shared bounded worker pool without blocking the loop.
+
+    Admission is bounded through the WORKER's lifetime (elspeth-5269b43bca):
+    a caller that times out or is cancelled does not free the slot its sync
+    work still occupies, so a retry storm against hung workers stops at
+    ``ADMISSION_CAPACITY`` with a fast ``AsyncWorkerAdmissionTimeoutError``
+    instead of queueing behind them indefinitely and starving unrelated
+    worker-backed calls.
 
     The short wait loop keeps an explicit event-loop timer active while the
     worker runs.  This preserves the normal async-over-sync contract even in
@@ -89,7 +144,14 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
     """
     loop = asyncio.get_running_loop()
     executor = _get_shared_executor()
-    future = loop.run_in_executor(executor, functools.partial(func, *args, **kwargs))
+    await _acquire_admission()
+    try:
+        concurrent_future = executor.submit(functools.partial(func, *args, **kwargs))
+    except BaseException:
+        _release_admission()
+        raise
+    concurrent_future.add_done_callback(_release_admission_when_finished)
+    future: asyncio.Future[T] = asyncio.wrap_future(concurrent_future, loop=loop)
     try:
         # ``asyncio.wait`` returns ``(done, pending)`` on each 0.1s tick rather
         # than raising on timeout, so there is no error-shaped sentinel to
@@ -106,12 +168,23 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
                 # worker's exception on the awaited (non-cancelled) path.
                 return future.result()
     finally:
-        # If the await above was abandoned mid-flight (cancellation,
-        # outer timeout), the future may still be running. Make sure any
-        # exception it eventually raises is retrieved so the misleading
-        # request_id-middleware traceback never reaches the journal — see
-        # ``_drain_future_exception``'s docstring. The executor is the
-        # process-wide shared pool, so it is intentionally NOT shut down
-        # here — teardown happens once via shutdown_async_workers().
+        # The await above was abandoned mid-flight (cancellation, outer
+        # timeout) while the work is still outstanding. Cancel the wrapper:
+        #
+        # * still QUEUED — the concurrent future is cancelled too, so work
+        #   nobody will read never occupies a thread, and its admission slot
+        #   is released right away;
+        # * already RUNNING — the thread cannot be interrupted and keeps its
+        #   admission until it finishes, but the cancelled wrapper never
+        #   receives the eventual result or exception, so a late failure
+        #   cannot fire asyncio's "Future exception was never retrieved"
+        #   handler (elspeth-e4949acbe1: that traceback surfaced in the
+        #   journal as a bogus request-id-middleware crash).
+        #
+        # The abandoned outcome is intentionally discarded: the caller has
+        # already given up on it. A real infrastructure fault surfaces
+        # through concurrent requests' own paths, not this echo. The executor
+        # is the process-wide shared pool, so it is NOT shut down here —
+        # teardown happens once via ``shutdown_async_workers()``.
         if not future.done():
-            future.add_done_callback(_drain_future_exception)
+            future.cancel()

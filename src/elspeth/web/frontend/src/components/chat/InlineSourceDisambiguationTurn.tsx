@@ -47,6 +47,10 @@
 
 import { useEffect, useRef } from "react";
 
+import { Button } from "@/components/ui";
+
+import { plural } from "@/utils/plural";
+
 /**
  * Action surface for this widget.
  *
@@ -137,7 +141,7 @@ export function InlineSourceDisambiguationTurn({
   return (
     <section
       role="region"
-      aria-label={`Confirm row count interpretation (${rowCount} rows)`}
+      aria-label={`Confirm row count interpretation (${plural(rowCount, "row")})`}
       data-testid="inline-source-disambiguation-turn"
       className="inline-source-disambiguation-turn"
     >
@@ -178,46 +182,47 @@ export function InlineSourceDisambiguationTurn({
           Label "Yes — N rows" is load-bearing — the widget test
           and the ChatPanel wiring test both query by /yes.*N rows/i.
         */}
-        <button
+        <Button
           ref={primaryButtonRef}
-          type="button"
-          className="btn btn-primary inline-source-disambiguation-turn-confirm"
+          variant="primary"
+          className="inline-source-disambiguation-turn-confirm"
           onClick={() => onConfirmMultiRow(proposalId)}
         >
-          {`Yes — ${rowCount} ${rowCount === 1 ? "row" : "rows"}`}
-        </button>
-        <button
-          type="button"
-          className="btn inline-source-disambiguation-turn-single"
+          {`Yes — ${plural(rowCount, "row")}`}
+        </Button>
+        <Button
+          className="inline-source-disambiguation-turn-single"
           onClick={() => onTreatAsOneRow(proposalId)}
         >
           {"No — treat as 1 row"}
-        </button>
-        <button
-          type="button"
-          className="btn inline-source-disambiguation-turn-edit"
+        </Button>
+        <Button
+          className="inline-source-disambiguation-turn-edit"
           onClick={() => onEditRows(proposalId)}
         >
           Edit the rows
-        </button>
+        </Button>
       </div>
 
       {/*
-        Escape action (F-10) is rendered as a link-style button so it
-        reads as a less-emphasised "this is the wrong frame" exit,
-        distinct from the three in-frame disambiguation choices above.
+        Escape action (F-10) is rendered as a link-style button — the
+        shared .link-button recipe — so it reads as a less-emphasised
+        "this is the wrong frame" exit, distinct from the three in-frame
+        disambiguation choices above. (It previously carried only its
+        bespoke token, which no stylesheet defines, so this bare Button
+        rendered as a raw UA-default button — elspeth-729872658a.)
         The accessible name MUST contain the substring "this isn't
         source data" for both the widget test and the ChatPanel
         wiring test to find it; the surrounding wrapper is presentational.
       */}
       <div className="inline-source-disambiguation-turn-escape">
-        <button
-          type="button"
-          className="inline-source-disambiguation-turn-not-source"
+        <Button
+          variant="bare"
+          className="link-button inline-source-disambiguation-turn-not-source"
           onClick={() => onNotSourceData(messageId)}
         >
-          {"This isn’t source data"}
-        </button>
+          {"This isn't source data"}
+        </Button>
       </div>
     </section>
   );

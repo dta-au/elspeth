@@ -1,52 +1,45 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { CompletionBar } from "./CompletionBar";
-import { ExportYamlModal } from "@/components/sidebar/ExportYamlModal";
+import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import {
+  COMPLETION_BLOCKED_VALIDATION_READINESS,
+  INVALID_VALIDATION_READINESS,
+  makeComposition,
+  makeValidationResult,
+} from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
+import type { ValidationResult } from "@/types/index";
 
-// The Export-YAML dialog body renders YamlView, which pulls in session state
-// and YAML rendering machinery irrelevant to the assertions in this file.
-// Stub it so the dialog mounts deterministically and AC 7 can assert only the
-// dialog itself (plan 19b:232).
-vi.mock("@/components/inspector/YamlView", () => ({
-  YamlView: () => (
-    <button type="button" data-testid="yaml-view-stub">
-      stub
-    </button>
-  ),
-}));
-
-function _validValidation() {
-  return {
-    is_valid: true,
-    checks: [],
-    errors: [],
-  } as never;
+function _validValidation(): ValidationResult {
+  return makeValidationResult();
 }
 
-// Minimal composition with content: the Export-YAML button gates on
-// pipeline content (elspeth-bff8043d33), NOT on validation state, so
-// validation-axis tests must hold content constant.
+// Minimal composition with content, so the Import-YAML availability tests
+// can pin both extremes of the content axis (empty is the beforeEach
+// default).
 function _nonEmptyComposition() {
-  return {
+  return makeComposition(1, {
     id: "state-1",
-    version: 1,
     sources: { source: { plugin: "csv", options: {} } },
     nodes: [],
     edges: [],
     outputs: [],
     metadata: { name: null, description: null },
-  } as never;
+  });
 }
 
-function _invalidValidation() {
-  return {
+function _invalidValidation(): ValidationResult {
+  return makeValidationResult({
     is_valid: false,
-    checks: [],
     errors: [
       {
         component_id: "node1",
@@ -55,7 +48,8 @@ function _invalidValidation() {
         suggestion: null,
       },
     ],
-  } as never;
+    readiness: INVALID_VALIDATION_READINESS,
+  });
 }
 
 describe("CompletionBar", () => {
@@ -63,15 +57,40 @@ describe("CompletionBar", () => {
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
-    } as never);
+    });
     useExecutionStore.setState({
       validationResult: null,
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     useShareableReviewStore.getState().reset();
     resetStore(useInterpretationEventsStore);
+    resetStore(usePreferencesStore);
+  });
+
+  it("keeps the horizontal compact override scoped to the workspace action bar", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    // In the workspace action bar the group is a one-row GRID (Save | Import |
+    // reason | Run — elspeth-b4e88f0f8c) that overrides the rail's vertical
+    // flex column; the rail's own rule must stay a column, so the override is
+    // scoped to the bar. workspaceChrome.test.ts pins the full contract; this
+    // pin only keeps the override scoped.
+    expect(css).toMatch(
+      /\.workspace-action-bar\s+\.completion-bar\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*auto auto 1fr auto;[^}]*padding:\s*0;/s,
+    );
+    // Recut 2026-08-15: members are content-sized — sidebar.css's width: 100%
+    // is undone here, inside the bar only.
+    expect(css).toMatch(
+      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*width:\s*auto;/s,
+    );
+    expect(css).not.toMatch(
+      /(?:^|\n)\.completion-bar\s*\{[^}]*(?:flex-direction:\s*row|display:\s*grid);/s,
+    );
   });
 
   it("renders nothing without an active session", () => {
@@ -79,23 +98,53 @@ describe("CompletionBar", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("renders three co-equal buttons when a session is active and validation passes", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+  it("hides Import YAML with the default detail level — exactly two completion gestures", () => {
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
-    expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar-save-for-review")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar-run-pipeline")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar-export-yaml")).toBeInTheDocument();
+    const bar = screen.getByTestId("completion-bar");
+    expect(within(bar).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Save for review",
+      "Run pipeline",
+    ]);
+  });
+
+  it("renders the three verbs as DIRECT children with Run last (elspeth-929fc5d4a7; recut 2026-08-15)", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    useExecutionStore.setState({
+      validationResult: _validValidation(),
+      isExecuting: false,
+      progress: null,
+      execute: vi.fn(),
+    });
+    render(<CompletionBar />);
+    const bar = screen.getByTestId("completion-bar");
+    const buttons = within(bar).getAllByRole("button");
+    // Run pipeline is LAST because it renders right-isolated at the bar's
+    // edge and visual order must stay tab order (WCAG 2.4.3 — no CSS
+    // `order` on interactive controls).
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      "Save for review",
+      "Import YAML",
+      "Run pipeline",
+    ]);
+    // Structural symmetry contract: a wrapper <div> around any verb makes
+    // flexbox treat the three asymmetrically (the bare sibling stretches to
+    // the tallest wrapper — the 98px slab). All three must be direct flex
+    // children so the row's sizing rules reach the buttons themselves.
+    for (const button of buttons) {
+      expect(button.parentElement).toBe(bar);
+    }
   });
 
   it("disables Save for review when validation has not run", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     // validationResult: null — no validation has been run.
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
@@ -104,41 +153,95 @@ describe("CompletionBar", () => {
   });
 
   it("disables Save for review when validation is invalid", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _invalidValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(true);
   });
 
+  it("disables Save for review when a malformed validation response omits readiness", () => {
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures remain fully typed.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+      isExecuting: false,
+      progress: null,
+    });
+
+    render(<CompletionBar />);
+
+    expect(screen.getByTestId("completion-bar-save-for-review")).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Run pipeline" }),
+    ).toBeDisabled();
+  });
+
   it("enables Save for review when validation is valid", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(false);
   });
 
+  it("blocks Save on completion readiness while leaving Run admitted", () => {
+    const openAndMark = vi.fn();
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    useExecutionStore.setState({
+      validationResult: {
+        ..._validValidation(),
+        readiness: COMPLETION_BLOCKED_VALIDATION_READINESS,
+      },
+      isExecuting: false,
+      progress: null,
+    });
+    useShareableReviewStore.setState({ openAndMark });
+
+    render(<CompletionBar />);
+    const save = screen.getByTestId(
+      "completion-bar-save-for-review",
+    ) as HTMLButtonElement;
+    const run = screen.getByRole("button", {
+      name: "Run pipeline",
+    }) as HTMLButtonElement;
+
+    expect(save).toBeDisabled();
+    expect(save).toHaveAttribute(
+      "title",
+      "Advisor sign-off is required before sharing for review.",
+    );
+    fireEvent.click(save);
+    expect(openAndMark).not.toHaveBeenCalled();
+    expect(run).not.toBeDisabled();
+  });
+
   it("clicking Save for review invokes openAndMark with the active session id", () => {
-    useSessionStore.setState({ activeSessionId: "sess-XYZ" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-XYZ" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     const openAndMarkSpy = vi.fn();
-    useShareableReviewStore.setState({ openAndMark: openAndMarkSpy } as never);
+    useShareableReviewStore.setState({ openAndMark: openAndMarkSpy });
 
     render(<CompletionBar />);
     fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
@@ -146,68 +249,56 @@ describe("CompletionBar", () => {
   });
 
   it("disables Save for review while a mark request is in flight", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
-    useShareableReviewStore.setState({ inFlight: true } as never);
+    });
+    useShareableReviewStore.setState({ inFlight: true });
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(true);
   });
 
-  // Plan 19b:229 — AC 4: Export-YAML button is enabled regardless of
-  // VALIDATION state — it is the only completion-bar verb the design doc
-  // (09) marks "Available always — even with warning status". Both extremes
-  // are pinned with a content-bearing pipeline held constant: the button's
-  // only gate is pipeline content (elspeth-bff8043d33), never validation.
-  it("Export-YAML button ignores validation state on a non-empty pipeline (plan 19b:229, AC 4)", () => {
-    // Case 1: no validation run yet (validationResult === null).
+  // Import-YAML is the completion-bar verb with NO gate beyond an active
+  // session: importing into an EMPTY session is its primary use, and an
+  // invalid pipeline may be replaced wholesale, so neither the content axis
+  // nor the validation axis may disable it. Both extremes of each axis are
+  // pinned here.
+  it("Import-YAML button ignores validation and content state", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    // Case 1: empty pipeline (beforeEach leaves compositionState null), no
+    // validation run yet (validationResult === null).
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    const { unmount } = render(<CompletionBar />);
+    const importButtonEmpty = screen.getByRole("button", {
+      name: "Import YAML",
+    }) as HTMLButtonElement;
+    expect(importButtonEmpty.disabled).toBe(false);
+    expect(importButtonEmpty.getAttribute("aria-disabled")).toBeNull();
+    unmount();
+
+    // Case 2: content-bearing pipeline with an explicit invalid validation —
+    // Save-for-review and Run-pipeline both become disabled, but Import-YAML
+    // must remain enabled.
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
-    } as never);
-    // beforeEach already sets validationResult: null.
-    const { unmount } = render(<CompletionBar />);
-    const exportContainer = screen.getByTestId("completion-bar-export-yaml");
-    const exportButtonNull = exportContainer.querySelector("button") as HTMLButtonElement;
-    expect(exportButtonNull).not.toBeNull();
-    expect(exportButtonNull.disabled).toBe(false);
-    expect(exportButtonNull.getAttribute("aria-disabled")).toBeNull();
-    unmount();
-
-    // Case 2: explicit invalid validation — Save-for-review and Run-pipeline
-    // both become disabled, but Export-YAML must remain enabled.
+    });
     useExecutionStore.setState({
       validationResult: _invalidValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
-    const exportContainerInvalid = screen.getByTestId("completion-bar-export-yaml");
-    const exportButtonInvalid = exportContainerInvalid.querySelector("button") as HTMLButtonElement;
-    expect(exportButtonInvalid).not.toBeNull();
-    expect(exportButtonInvalid.disabled).toBe(false);
-    expect(exportButtonInvalid.getAttribute("aria-disabled")).toBeNull();
-  });
-
-  // elspeth-bff8043d33: on an EMPTY pipeline the three sibling completion
-  // verbs must agree — Export-YAML is disabled with a stated reason instead
-  // of opening a near-empty modal.
-  it("Export-YAML button is disabled with a reason on an empty pipeline", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
-    // beforeEach leaves compositionState null (no pipeline yet).
-    render(<CompletionBar />);
-    const exportContainer = screen.getByTestId("completion-bar-export-yaml");
-    const exportButton = exportContainer.querySelector("button") as HTMLButtonElement;
-    expect(exportButton).not.toBeNull();
-    expect(exportButton.disabled).toBe(true);
-    expect(exportButton.getAttribute("aria-disabled")).toBe("true");
-    expect(exportButton.getAttribute("title")).toMatch(/add pipeline components/i);
+    const importButtonInvalid = screen.getByRole("button", {
+      name: "Import YAML",
+    }) as HTMLButtonElement;
+    expect(importButtonInvalid.disabled).toBe(false);
+    expect(importButtonInvalid.getAttribute("aria-disabled")).toBeNull();
   });
 
   // Plan 19b:231 — AC 6: Clicking Run-pipeline calls the existing Execute
@@ -216,26 +307,26 @@ describe("CompletionBar", () => {
   // opens it and confirming fires `execute(activeSessionId)`.
   it("clicking Run-pipeline calls executionStore.execute with the active session id after the egress disclosure (plan 19b:231, AC 6)", () => {
     const executeSpy = vi.fn();
-    useSessionStore.setState({ activeSessionId: "sess-RUN" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-RUN" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: executeSpy,
       runDisclosureAckBySession: {},
-    } as never);
+    });
 
     render(<CompletionBar />);
-    const runContainer = screen.getByTestId("completion-bar-run-pipeline");
-    const runButton = runContainer.querySelector("button") as HTMLButtonElement;
-    expect(runButton).not.toBeNull();
+    const runButton = screen.getByRole("button", {
+      name: "Run pipeline",
+    }) as HTMLButtonElement;
     expect(runButton.disabled).toBe(false);
 
     fireEvent.click(runButton);
 
     // The disclosure gates execute(); confirming fires it.
     expect(executeSpy).not.toHaveBeenCalled();
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     fireEvent.click(
       within(dialog).getByRole("button", { name: /^run pipeline$/i }),
     );
@@ -244,38 +335,28 @@ describe("CompletionBar", () => {
     expect(executeSpy).toHaveBeenCalledWith("sess-RUN");
   });
 
-  // Plan 19b:232 — AC 7: Clicking Export-YAML opens the existing YamlView
-  // modal. ExportYamlButton dispatches a window CustomEvent
-  // (OPEN_YAML_MODAL_EVENT) that ExportYamlModal listens for; rendering both
-  // components together lets us assert the dialog becomes visible end-to-end.
-  it("clicking Export-YAML opens the ExportYamlModal dialog (plan 19b:232, AC 7)", async () => {
+  it("clicking Import-YAML dispatches the open-import-modal event", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
-    } as never);
+    });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
-
-    render(
-      <>
-        <CompletionBar />
-        <ExportYamlModal />
-      </>,
-    );
-
-    // Dialog should not be mounted before the click.
-    expect(screen.queryByRole("dialog")).toBeNull();
-
-    const exportContainer = screen.getByTestId("completion-bar-export-yaml");
-    const exportButton = exportContainer.querySelector("button") as HTMLButtonElement;
-    fireEvent.click(exportButton);
-
-    await waitFor(() => {
-      expect(screen.getByRole("dialog", { name: /export yaml/i })).toBeInTheDocument();
     });
+    const opened = vi.fn();
+    window.addEventListener(OPEN_IMPORT_YAML_MODAL_EVENT, opened);
+    try {
+      render(<CompletionBar />);
+      fireEvent.click(screen.getByRole("button", { name: "Import YAML" }));
+      // The modal itself is mounted at app-root level by ImportYamlModalHost;
+      // this trigger's whole contract is the event.
+      expect(opened).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener(OPEN_IMPORT_YAML_MODAL_EVENT, opened);
+    }
   });
 });

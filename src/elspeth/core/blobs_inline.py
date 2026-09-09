@@ -9,7 +9,6 @@ substitution phases. This first slice implements pure discovery only.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 from collections.abc import Callable, Mapping
@@ -23,7 +22,6 @@ from elspeth.contracts.blobs import (
     BlobIntegrityError,
     BlobNotFoundError,
     BlobRecord,
-    BlobServiceProtocol,
     BlobStateError,
 )
 from elspeth.contracts.blobs_inline import (
@@ -35,7 +33,32 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 
-_NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce")
+# Node-collection keys in the runtime pipeline dict whose entries can carry an
+# ``options`` mapping a blob reference could hide in.
+#
+# The AUTHORITY here is ``generate_pipeline_dict`` — the sole producer of the
+# shape this module walks (``pipeline_dict_from_record`` is
+# ``generate_pipeline_dict(state_from_record(record))``, and the YAML the
+# execution path loads is that same dict serialized). Asking it what it emits
+# gives: options-bearing sections are ``sources``, ``transforms``,
+# ``aggregations``, ``collectors`` and ``sinks``; ``gates`` and ``coalesce``
+# are emitted without options. The blob authoring tool also rejects every
+# plugin-free structural node before mutation, because no inline marker could
+# survive into runtime YAML. Both legacy keys below are kept as tolerant
+# defence-in-depth for a non-canonical persisted dict rather than removed for
+# tidiness.
+# ``collectors`` was the live gap (elspeth-ca79b2c63a).
+#
+# Do NOT replace this with ``core/config.py``'s ``_plugin_bearing_sections()``,
+# tempting though it looks — it is derived, it carries container shape, and it
+# returns these same names today. It requires ``plugin`` AND ``options`` on the
+# element model, and this walk cares about ``options`` ALONE: a section with
+# options but no plugin is exactly the case it would silently skip while
+# reporting success. (No such section exists today, so this is a latent
+# mismatch, not a live one.) ``outputs`` below has no settings-side name at
+# all. ``tests/unit/core/test_blobs_inline.py`` derives the coverage from the
+# emitter, so a new options-bearing kind fails there on the day it is emitted.
+_NODE_COLLECTION_KEYS: Final = ("transforms", "gates", "aggregations", "coalesce", "collectors")
 _OUTPUT_COLLECTION_KEYS: Final = ("outputs", "sinks")
 _VALIDATION_INLINE_CONTENT_PLACEHOLDER: Final = "validated blob-backed inline content placeholder"
 BLOB_INLINE_PER_REF_BYTE_CAP: Final = 256 * 1024
@@ -69,45 +92,6 @@ def _discover_blob_content_refs(config: dict[str, Any]) -> list[BlobInlineRef]:
     if malformed:
         raise BlobContentResolutionError(malformed=malformed)
     return refs
-
-
-async def _validate_blob_content_refs(
-    blob_service: BlobServiceProtocol,
-    config: dict[str, Any],
-    *,
-    session_id: UUID,
-    per_ref_byte_cap: int | None = None,
-    aggregate_byte_cap: int | None = None,
-) -> list[BlobInlineValidationViolation]:
-    """Return validate-path violations without raising recoverable errors."""
-    try:
-        refs = _discover_blob_content_refs(config)
-    except BlobContentResolutionError as exc:
-        return _malformed_validation_violations(exc)
-
-    records_by_blob_id: dict[UUID, BlobRecord] = {}
-    not_ready_by_blob_id: dict[UUID, str] = {}
-    for ref in refs:
-        try:
-            record = await blob_service.get_blob(ref.blob_id)
-        except BlobNotFoundError:
-            continue
-        except BlobStateError as exc:
-            not_ready_by_blob_id[ref.blob_id] = str(exc)
-            continue
-        if record.session_id != session_id:
-            continue
-        not_ready_by_blob_id.pop(ref.blob_id, None)
-        records_by_blob_id[ref.blob_id] = record
-
-    evaluation = _evaluate_blob_content_ref_metadata(
-        refs,
-        records_by_blob_id,
-        not_ready_by_blob_id=not_ready_by_blob_id,
-        per_ref_byte_cap=per_ref_byte_cap,
-        aggregate_byte_cap=aggregate_byte_cap,
-    )
-    return _metadata_evaluation_validation_violations(refs, evaluation)
 
 
 def _validate_blob_content_refs_sync(
@@ -304,16 +288,12 @@ def _short_hash(value: str | None) -> str:
     return f"{value[:16]}..."
 
 
-async def _fetch_blob_contents(
-    blob_service: BlobServiceProtocol,
+def _resolve_blob_content_results(
     refs: list[BlobInlineRef],
+    unique_blob_ids: list[UUID],
+    results: list[bytes | BaseException],
 ) -> dict[BlobInlineRef, bytes]:
-    """Fetch content bytes for discovered refs, deduped by blob id."""
-    unique_blob_ids = _unique_blob_ids(refs)
-    results = await asyncio.gather(
-        *(blob_service.read_blob_content(blob_id) for blob_id in unique_blob_ids),
-        return_exceptions=True,
-    )
+    """Classify one exact-context content-read batch into ref-keyed bytes."""
     refs_by_blob = _refs_by_blob_id(refs)
     bytes_by_blob: dict[UUID, bytes] = {}
     missing: list[str] = []

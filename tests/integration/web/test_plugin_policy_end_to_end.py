@@ -30,13 +30,10 @@ from elspeth.web.catalog import routes as catalog_routes
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginKind, PluginPolicyResponse, PluginSchemaInfo, PluginSummary
-from elspeth.web.composer.prompts import build_context_string
-from elspeth.web.composer.recipes import get_recipe
+from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools.generation import _execute_get_plugin_assistance, _handle_get_plugin_schema
-from elspeth.web.composer.tools.recipes import _execute_list_recipes
-from elspeth.web.composer.tools.sessions import _execute_apply_pipeline_recipe
 from elspeth.web.composer.tools.sources import _handle_list_sources
 from elspeth.web.composer.tools.transforms import _handle_list_sinks, _handle_list_transforms, _handle_upsert_node
 from elspeth.web.composer.yaml_generator import generate_public_yaml
@@ -52,6 +49,7 @@ from elspeth.web.plugin_policy.models import (
     PluginAvailability,
     PluginAvailabilitySnapshot,
     PluginId,
+    PluginSnapshotAuthority,
     PluginUnavailableReason,
     WebPluginPolicy,
 )
@@ -63,6 +61,7 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.tree_gate import iter_gate_files, iter_gate_sources
 
 _ROOT = Path(__file__).resolve().parents[3]
 _MATRIX_FIXTURE = _ROOT / "src/elspeth/web/frontend/src/stores/__fixtures__/pluginPolicyMatrix.json"
@@ -119,13 +118,13 @@ _MATRIX_CASES_BY_NAME = {raw["name"]: raw for raw in _MATRIX_CONTRACT["cases"]}
 
 _CONTROL_OPTIONS: dict[str, dict[str, object]] = {
     "azure_prompt_shield": {
-        "endpoint": "https://example.com",
+        "endpoint": "https://matrix.cognitiveservices.azure.com",
         "api_key": {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"},
         "fields": ["text"],
         "schema": {"mode": "observed", "fields": None},
     },
     "azure_content_safety": {
-        "endpoint": "https://example.com",
+        "endpoint": "https://matrix.cognitiveservices.azure.com",
         "api_key": {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"},
         "fields": ["text"],
         "thresholds": {"hate": 2, "violence": 2, "sexual": 2, "self_harm": 2},
@@ -254,7 +253,7 @@ def _profiles(policy: WebPluginPolicy) -> OperatorProfileRegistry:
                 "region_name": "ap-southeast-2",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
         bedrock_guardrail_profiles=[
             {
                 "alias": "prompt-matrix",
@@ -354,7 +353,7 @@ def _capability_contract(view: PolicyCatalogView) -> dict[str, tuple[str, ...]]:
     return {capability.value: tuple(map(str, plugin_ids)) for capability, plugin_ids in view.capability_groups().items()}
 
 
-def _seed_recipe_blob(tmp_path: Path) -> tuple[sa.engine.Engine, str, str]:
+def _seed_session_blob(tmp_path: Path) -> tuple[sa.engine.Engine, str, str]:
     engine = create_session_engine(
         "sqlite:///:memory:",
         poolclass=StaticPool,
@@ -408,7 +407,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     expected_selected = _selected_contract(case)
     expected_capabilities = _capability_contract(view)
     empty_state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    engine, session_id, blob_id = _seed_recipe_blob(tmp_path)
+    engine, session_id, _blob_id = _seed_session_blob(tmp_path)
     context = ToolContext(catalog=view, plugin_snapshot=snapshot, session_engine=engine, session_id=session_id)
 
     catalog_api, policy_wire = asyncio.run(_catalog_http_surfaces(snapshot=snapshot, policy=policy, profiles=profiles))
@@ -417,12 +416,13 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
         _handle_list_transforms({}, empty_state, context),
         _handle_list_sinks({}, empty_state, context),
     )
-    guided_discovery = frozenset(str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data)
-    prompt = build_context_string(empty_state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    guided_discovery = frozenset(
+        str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data["available"]
+    )
+    prompt = build_catalog_context_string(view, plugin_snapshot=snapshot)
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
     evidence = _build_web_plugin_policy_evidence(snapshot=snapshot, policy=policy)
-    recipe_result = _execute_list_recipes({}, empty_state, context)
     fixture_case = _MATRIX_CASES_BY_NAME[case.name]
     fixture_projection = {
         "principal_scope": fixture_case["principal_scope"],
@@ -453,7 +453,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     guided_capabilities: dict[str, set[str]] = {}
     for result in guided_results:
         assert result.success is True
-        for item in result.data:
+        for item in result.data["available"]:
             plugin_id = str(PluginId(item.plugin_type, item.name))
             for declaration in item.policy_capabilities:
                 guided_capabilities.setdefault(declaration.capability.value, set()).add(plugin_id)
@@ -494,31 +494,6 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             assert schema_result.data["error_code"] == expected_code
             assert assistance_result.data["error_code"] == expected_code
 
-    assert recipe_result.success is True
-    assert "web-scrape-llm-rate-jsonl" in {recipe["name"] for recipe in recipe_result.data["recipes"]}
-    for recipe_info in recipe_result.data["recipes"]:
-        recipe = get_recipe(recipe_info["name"])
-        assert recipe is not None
-        assert recipe.required_plugins <= snapshot.available
-        assert all(not alternatives.isdisjoint(snapshot.available) for alternatives in recipe.alternative_plugin_groups)
-
-    recipe_fast_path = _execute_apply_pipeline_recipe(
-        {
-            "recipe_name": "web-scrape-llm-rate-jsonl",
-            "slots": {
-                "source_blob_id": blob_id,
-                "source_plugin": "json",
-                "profile": "tutorial",
-                "abuse_contact": "matrix@example.invalid",
-                "scraping_reason": "five-configuration policy matrix",
-            },
-        },
-        empty_state,
-        context,
-    )
-    assert recipe_fast_path.success is True
-    assert [node.plugin for node in recipe_fast_path.updated_state.nodes] == ["web_scrape", "llm", "field_mapper"]
-
     for plugin_id in _ALL_CONTROLS:
         probe = _control_probe_state(plugin_id)
         validation = validate_plugin_policy(
@@ -550,6 +525,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             sources={},
             transforms=(SimpleNamespace(plugin=plugin_id.name),),
             aggregations=(),
+            collectors=(),
             sinks={},
         )
         if plugin_id in snapshot.available:
@@ -604,27 +580,108 @@ def test_policy_matrix_cases_are_five_distinct_authorization_and_availability_co
     assert len(contracts) == 5
 
 
+def test_trained_operator_user_id_stays_restricted_through_request_factory_and_catalog() -> None:
+    case = next(case for case in _CASES if case.name == "core_only")
+    policy = _policy(case)
+    profiles = _profiles(policy)
+    catalog = _MatrixCatalog()
+    engine: sa.engine.Engine = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(engine)
+    user_store = UserSecretStore(engine=engine, master_key="trained-operator-user-test-key")
+    server_store = ServerSecretStore(())
+    secret_service = WebSecretService(user_store=user_store, server_store=server_store)
+    factory = RequestPluginSnapshotFactory(
+        policy=policy,
+        catalog=catalog,
+        profiles=profiles,
+        auth_provider="local",
+        secret_service=secret_service,
+        server_store=server_store,
+        user_store=user_store,
+        generation_key=b"trained-operator-user-generation-key",
+    )
+    user = UserIdentity(user_id="trained-operator", username="trained-operator")
+    snapshot = factory(user)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            catalog_service=catalog,
+            plugin_snapshot_factory=factory,
+            operator_profile_registry=profiles,
+            web_plugin_policy=policy,
+        )
+    )
+    request = Request({"type": "http", "method": "GET", "path": "/api/catalog", "headers": [], "app": app})
+    transforms_response = Response()
+    transforms = asyncio.run(catalog_routes.list_transforms(request, transforms_response, user))
+    schema = asyncio.run(catalog_routes.get_schema("transforms", "llm", request, Response(), user))
+    policy_response = asyncio.run(catalog_routes.get_policy(request, Response(), user))
+
+    state = CompositionState(
+        source=None,
+        nodes=(
+            NodeSpec(
+                id="llm_profile_probe",
+                node_type="transform",
+                plugin="llm",
+                input="rows",
+                on_success="labelled",
+                on_error="discard",
+                options={
+                    "profile": "tutorial",
+                    "prompt_template": "{{ row }}",
+                    "schema": {"mode": "observed", "fields": None},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    validation = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=catalog)
+    executable_options = validation.executable_state.nodes[0].options
+
+    assert snapshot.principal_scope == "local:trained-operator"
+    assert snapshot.authority is PluginSnapshotAuthority.RESTRICTED
+    assert transforms_response.headers["X-ELSPETH-Plugin-Snapshot"] == snapshot.snapshot_hash
+    assert {item.name for item in transforms} == {"field_mapper", "llm", "web_scrape"}
+    assert frozenset(map(PluginId.parse, policy_response.available_plugin_ids)) == _CORE_IDS
+    assert "transform:azure_prompt_shield" not in policy_response.available_plugin_ids
+    assert '"tutorial"' in schema.model_dump_json()
+    assert '"api_key"' not in schema.model_dump_json()
+    assert validation.findings == ()
+    assert "profile" not in executable_options
+    assert executable_options["provider"] == "bedrock"
+    with pytest.raises(ValueError, match="trained_operator_snapshot_required"):
+        PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    engine.dispose()
+
+
 def test_every_web_tool_context_constructor_supplies_policy_context() -> None:
     missing: list[str] = []
-    for path in (_ROOT / "src/elspeth/web").rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(_ROOT / "src/elspeth/web"):
+        for node in ast.walk(parsed.tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolContext":
                 keywords = {keyword.arg for keyword in node.keywords}
                 if not {"catalog", "plugin_snapshot"} <= keywords:
-                    missing.append(f"{path.relative_to(_ROOT)}:{node.lineno}")
+                    missing.append(f"{parsed.path.relative_to(_ROOT)}:{node.lineno}")
     assert missing == []
 
 
 def test_web_preflight_is_the_only_runtime_factory_caller() -> None:
     callers: list[str] = []
-    for path in (_ROOT / "src/elspeth/web/execution").rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
+    for parsed in iter_gate_sources(_ROOT / "src/elspeth/web/execution"):
         if any(
             isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "instantiate_plugins_from_config"
-            for node in ast.walk(tree)
+            for node in ast.walk(parsed.tree)
         ):
-            callers.append(str(path.relative_to(_ROOT)))
+            callers.append(str(parsed.path.relative_to(_ROOT)))
     assert callers == ["src/elspeth/web/execution/preflight.py"]
 
 
@@ -637,7 +694,7 @@ def test_core_and_cli_layers_do_not_import_web_policy() -> None:
     for base in (_ROOT / "src/elspeth/core", _ROOT / "src/elspeth/cli"):
         if not base.exists():
             continue
-        paths = base.rglob("*.py") if base.is_dir() else (base,)
+        paths = iter_gate_files(base) if base.is_dir() else (base,)
         for path in paths:
             if "elspeth.web.plugin_policy" in path.read_text():
                 offenders.append(str(path.relative_to(_ROOT)))
@@ -645,10 +702,11 @@ def test_core_and_cli_layers_do_not_import_web_policy() -> None:
 
 
 def test_prompt_builder_has_no_environment_or_profile_binding_access() -> None:
-    source = inspect.getsource(build_context_string)
-    assert "os.environ" not in source
-    assert "credential_ref" not in source
-    assert "provider_options" not in source
+    for builder in (build_context_string, build_catalog_context_string):
+        source = inspect.getsource(builder)
+        assert "os.environ" not in source
+        assert "credential_ref" not in source
+        assert "provider_options" not in source
 
 
 def test_web_dispatch_policy_context_has_no_allow_all_defaults() -> None:
@@ -741,9 +799,10 @@ def test_web_tree_has_no_trained_operator_service_roots_or_calls() -> None:
     """HTTP composition roots must never opt into the named non-web mode."""
     offenders: list[str] = []
     request_root = _ROOT / "src/elspeth/web/sessions"
-    paths = [*request_root.rglob("*.py"), _ROOT / "src/elspeth/web/app.py"]
-    for path in paths:
-        tree = ast.parse(path.read_text(), filename=str(path))
+    app_path = _ROOT / "src/elspeth/web/app.py"
+    parsed_trees = [(parsed.path, parsed.tree) for parsed in iter_gate_sources(request_root)]
+    parsed_trees.append((app_path, ast.parse(app_path.read_text(), filename=str(app_path))))
+    for path, tree in parsed_trees:
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "for_trained_operator":
                 offenders.append(f"{path.relative_to(_ROOT)}:{node.lineno}")
@@ -781,6 +840,7 @@ def test_server_profile_scope_survives_lowering_and_same_name_user_shadow(
                 "credential_ref": "SHARED_LLM_KEY",
             }
         },
+        default_llm_profile="server-profile",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -839,6 +899,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
                 "credential_ref": "SHARED_LLM_KEY",
             }
         },
+        default_llm_profile="server-profile",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -858,7 +919,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     scoped_resolutions = []
     generic_resolution_names: list[str] = []
 
-    class _RecordingResolver:
+    class _RecordingResolver(ScopedSecretResolver):
         def list_refs(self, user_id: str):
             return delegate.list_refs(user_id)
 
@@ -876,7 +937,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
                 scoped_resolutions.append(resolved)
             return resolved
 
-    input_path = tmp_path / "blobs" / "input.csv"
+    input_path = tmp_path / "blobs" / "session-profile-validation" / "input.csv"
     input_path.parent.mkdir(parents=True)
     input_path.write_text("customer\nAlice\n")
     state = CompositionState(
@@ -957,7 +1018,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
         plugin_snapshot=snapshot,
         profile_registry=profiles,
         catalog=create_catalog_service(),
-        secret_service=_RecordingResolver(),
+        secret_service=_RecordingResolver(service, "local"),
         user_id="alice",
         session_id="session-profile-validation",
     )
@@ -970,3 +1031,192 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     assert {item.scope for item in scoped_resolutions} == {"server"}
     assert {item.value for item in scoped_resolutions} == {"server-value"}
     assert {item.fingerprint for item in scoped_resolutions} == {server_ref.fingerprint}
+
+
+def _required_control_posture(tmp_path: Path) -> tuple[WebSettings, PluginAvailabilitySnapshot, OperatorProfileRegistry, PolicyCatalogView]:
+    """Guardrail-REQUIRED deployment posture for the auto-wire acceptance test.
+
+    Mirrors ``tests.unit.web.composer.test_planner_authoring_aids.
+    _guardrail_profile_view`` but also returns the settings and profile
+    registry that ``web.execution.validation.validate_pipeline`` needs.
+    """
+    from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:aws_bedrock_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:aws_bedrock_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode.REQUIRED,
+            PluginCapability.CONTENT_SAFETY: ControlMode.REQUIRED,
+        },
+        bedrock_guardrail_profiles=(
+            BedrockGuardrailProfileSettings(
+                alias="prompt-approved",
+                plugin="aws_bedrock_prompt_shield",
+                guardrail_identifier="operatorpromptguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+            BedrockGuardrailProfileSettings(
+                alias="content-approved",
+                plugin="aws_bedrock_content_safety",
+                guardrail_identifier="operatorcontentguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+        ),
+        bedrock_guardrail_default_profiles={
+            "aws_bedrock_prompt_shield": "prompt-approved",
+            "aws_bedrock_content_safety": "content-approved",
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    class _ServerKeyInventory:
+        def has_server_ref(self, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name == "OPENROUTER_API_KEY" else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:autowire-e2e",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"autowire-e2e-key",
+    )
+    return settings, snapshot, profiles, PolicyCatalogView(create_catalog_service(), snapshot, profiles)
+
+
+def test_auto_wired_required_controls_clear_the_execution_required_control_gate(tmp_path: Path) -> None:
+    """R2-F10 end to end: a bare llm proposal is blocked at the execution
+    validator's required-control gate; after ``wire_required_controls`` the
+    same proposal builds, every required-control check passes, and the only
+    control-related residue is the ACKNOWLEDGEABLE disclosure review — the
+    pipeline is repaired, not wedged."""
+    from elspeth.web.composer import yaml_generator
+    from elspeth.web.composer.required_controls import wire_required_controls
+    from elspeth.web.composer.tools import build_set_pipeline_candidate
+    from elspeth.web.execution import validation as validation_module
+    from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+    from tests.unit.web.composer.test_planner_authoring_aids import _custody_context, _empty_state
+    from tests.unit.web.composer.test_required_control_autowire import _INLINE_CONTENT, _bare_llm_candidate
+
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    settings, snapshot, profiles, view = _required_control_posture(tmp_path)
+
+    def _validate(candidate: dict[str, Any]) -> Any:
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        built = build_set_pipeline_candidate(candidate, _empty_state(), context)
+        rejection = None if built.acceptable else (built.result.data or {}).get("error")
+        assert built.acceptable is True, f"candidate rejected: {rejection}"
+        return validation_module.validate_pipeline(
+            built.result.updated_state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            profile_registry=profiles,
+            catalog=create_catalog_service(),
+            secret_service=None,
+            user_id=None,
+            session_id=context.session_id,
+        )
+
+    bare = _bare_llm_candidate()
+    unwired = _validate(bare)
+    assert not unwired.is_valid
+    assert unwired.readiness.blockers
+    assert unwired.readiness.blockers[0].code == "required_control_coverage"
+
+    wired_result = _validate(wire_required_controls(bare, snapshot, view))
+    control_checks = {check.name: check.passed for check in wired_result.checks if "required_control" in check.name}
+    assert control_checks == {
+        "required_control_availability": True,
+        "required_control_coverage": True,
+    }
+    assert all("required_control" not in blocker.code for blocker in wired_result.readiness.blockers)
+    # The remaining gate is the acknowledgeable disclosure the pass staged.
+    pending = [error.message for error in wired_result.errors if error.error_code == "interpretation_review_pending"]
+    assert any(REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in message for message in pending), pending
+
+
+def test_configured_plugin_ids_cover_every_plugin_bearing_settings_section() -> None:
+    """Reflection guard: every plugin-bearing ElspethSettings section feeds the gate.
+
+    ``require_settings_plugins_available`` is the pre-construction admission
+    gate re-checking authored plugins against one frozen approval. The
+    collector section was silently missing from ``_configured_plugin_ids``
+    (2026-08-26 systems review): a policy-hidden batch plugin executed as an
+    EXPAND-group closer. This derives the plugin-bearing sections from the
+    settings model itself so the NEXT section cannot be forgotten silently.
+    """
+    import typing
+
+    from pydantic import BaseModel
+
+    from elspeth.core.config import ElspethSettings
+    from elspeth.web.execution.preflight import _configured_plugin_ids
+
+    def element_models(annotation: object) -> list[type]:
+        models: list[type] = []
+        for arg in typing.get_args(annotation) or ():
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                models.append(arg)
+            else:
+                models.extend(element_models(arg))
+        return models
+
+    plugin_bearing = {
+        name
+        for name, field in ElspethSettings.model_fields.items()
+        if any("plugin" in model.model_fields for model in element_models(field.annotation))
+    }
+    assert plugin_bearing == {"sources", "transforms", "aggregations", "collectors", "sinks"}, (
+        "A new plugin-bearing ElspethSettings section appeared (or one was removed). "
+        "Extend _configured_plugin_ids AND this pin together — the admission gate "
+        "silently ignores any section it does not enumerate."
+    )
+
+    settings = SimpleNamespace(
+        sources={"s": SimpleNamespace(plugin="csv")},
+        transforms=[SimpleNamespace(plugin="passthrough")],
+        aggregations=[SimpleNamespace(plugin="batch_stats")],
+        collectors=[SimpleNamespace(plugin="batch_stats_probe")],
+        sinks={"out": SimpleNamespace(plugin="json")},
+    )
+    ids = _configured_plugin_ids(settings)  # type: ignore[arg-type]
+    assert ("transform", "batch_stats_probe") in {(pid.kind, pid.name) for pid in ids}
+    assert len(ids) == 5

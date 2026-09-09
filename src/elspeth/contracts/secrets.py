@@ -5,6 +5,7 @@ Layer: L0 (contracts). No upward imports.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -192,6 +193,25 @@ class SecretRefPlacementViolation:
     secret_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class SecretRefMarkerSite:
+    """One wired deferred-secret use: which secret, at which option path.
+
+    Names and paths only — never values. Produced by
+    ``collect_secret_ref_marker_sites``, the single marker-walk authority:
+    the secret-wiring authorization gate (elspeth-f3c1aafd25) consumes every
+    site regardless of which entry path (wire tool, patch tool,
+    set_pipeline, YAML paste) introduced it, and the placement check derives
+    its violations from the same walk. ``field_name`` is the immediate
+    containing key (exact, not parsed back out of ``field_path`` — keys may
+    contain dots); empty for a root-level marker.
+    """
+
+    field_path: str
+    field_name: str
+    secret_name: str
+
+
 @runtime_checkable
 class WebSecretResolver(Protocol):
     """Protocol for web-facing secret resolution and inventory."""
@@ -221,4 +241,20 @@ class WebSecretResolver(Protocol):
 class ScopedWebSecretResolver(WebSecretResolver, Protocol):
     """Web resolver that can honour an operator-pinned credential scope."""
 
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None: ...
+
+
+class ScopedSecretResolverContract(ABC):
+    """Nominal admission anchor for scoped secret resolution (ADR-032).
+
+    ``isinstance`` against this class is the security control at the
+    scoped-marker resolution boundary (``core/secrets._resolve_marker``).
+    The ``runtime_checkable`` Protocols above remain typing surface only:
+    they are structural, so an impostor with a matching method name passes
+    them, and since Python 3.12 they silently reject dynamic-attribute
+    objects such as pydantic ``extra="allow"`` models. A real scoped
+    resolver must INHERIT this class; lookalikes are not admitted.
+    """
+
+    @abstractmethod
     def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None: ...

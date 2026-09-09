@@ -11,32 +11,53 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import event, func, select
 from sqlalchemy.sql.dml import Insert, Update
 
+from elspeth.contracts.composer_interpretation import InterpretationChoice
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import PlannerCapabilityManifest
+from elspeth.web.composer.guided.planning import guided_candidate_state, guided_private_reviewed_facts
+from elspeth.web.composer.guided.protocol import (
+    GUIDED_GOAL_ACKNOWLEDGEMENT,
+    GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT,
+    GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
+    GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT,
+)
+from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+from elspeth.web.execution.schemas import (
+    ValidationCheck,
+    ValidationError,
+    ValidationReadiness,
+    ValidationReadinessBlocker,
+    ValidationResult,
+)
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -47,16 +68,33 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     proposal_events_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationClaimed
+from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationClaimed, GuidedPipelineProposalBackEditCommand
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import create_blob_under_fence
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_compose_context_for(session_operation_context: object, session_id: str | UUID) -> SessionOperationContext:
+    """Pin the fence a widened settlement double received before it forwards it.
+
+    A double that accepts ``session_operation_context`` must prove it received
+    the route's exact, session-bound COMPOSE context -- not a default it made
+    up and not a stranger's. The production writers require the keyword; the
+    fail-open double class (elspeth-bb776978e3) is exactly a double that
+    silently supplies one.
+    """
+    assert type(session_operation_context) is SessionOperationContext
+    assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+    assert session_operation_context.fence.session_id == str(session_id)
+    return session_operation_context
 
 
 @dataclass
@@ -112,11 +150,65 @@ def _planner_terminal_response() -> _PlannerResponse:
     )
 
 
-def _create_session(client: TestClient) -> str:
-    """Create a session and return its string id."""
+def _source_validation_failure_edit_target(payload: Mapping[str, Any]) -> dict[str, str]:
+    graph = payload.get("graph")
+    connections = graph.get("edges") if type(graph) is dict else payload.get("connections")
+    assert type(connections) is list
+    matches = [
+        connection
+        for connection in connections
+        if type(connection) is dict
+        and type(connection.get("flow")) is dict
+        and connection["flow"].get("kind") == "source_validation_failure"
+    ]
+    assert len(matches) == 1
+    stable_id = matches[0].get("stable_id")
+    assert type(stable_id) is str
+    return {"kind": "edge", "stable_id": stable_id}
+
+
+def _node_error_edit_target(payload: Mapping[str, Any]) -> dict[str, str]:
+    graph = payload.get("graph")
+    connections = graph.get("edges") if type(graph) is dict else payload.get("connections")
+    assert type(connections) is list
+    matches = [
+        connection
+        for connection in connections
+        if type(connection) is dict and type(connection.get("flow")) is dict and connection["flow"].get("kind") == "node_error"
+    ]
+    assert len(matches) == 1
+    stable_id = matches[0].get("stable_id")
+    assert type(stable_id) is str
+    return {"kind": "edge", "stable_id": stable_id}
+
+
+_GOAL_FIRST_INTENT = "Summarize each row and save the summaries as JSON"
+
+
+def _create_session(client: TestClient, *, intent: str | None = _GOAL_FIRST_INTENT) -> str:
+    """Create a session, root it in a goal, and return its string id.
+
+    Goal-first (elspeth-378cfa0e18): a guided session is rooted the moment it
+    starts, so the shared helper roots it too. A rootless session cannot reach
+    the planner at all — the Step-2 finish refuses with
+    ``guided_planner_intent_required`` — so a helper that produced only
+    rootless sessions would make every walk below stop one gesture short of
+    the thing it is testing.
+
+    Pass ``intent=None`` for the narrow tests that must exercise a rootless
+    (respond-seeded) session, or that start guided themselves under a
+    non-default profile.
+    """
     resp = client.post("/api/sessions", json={"title": "respond-test"})
     assert resp.status_code == 201, resp.json()
-    return resp.json()["id"]
+    session_id = resp.json()["id"]
+    if intent is not None:
+        started = client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={"profile": "live", "intent": intent, "operation_id": str(uuid4())},
+        )
+        assert started.status_code == 200, started.json()
+    return session_id
 
 
 def _get_guided(client: TestClient, session_id: str) -> dict:
@@ -193,6 +285,179 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
+def _llm_prompt_template_planner(
+    prompt: str,
+    *,
+    extra_node_id: str | None = None,
+    route_errors_to_output: bool = False,
+):
+    """Plan llm node(s) carrying PENDING ``llm_prompt_template`` requirements.
+
+    Shared by the wire-confirm surfacing tests so the first-attempt arm and
+    the replay arm are provably driven by the identical committed pipeline; a
+    drifted fixture would make that comparison meaningless. ``extra_node_id``
+    chains a second interpretation site so partial multi-site repair can be
+    exercised.
+    """
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.core.canonical import stable_hash
+    from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+    from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
+
+    async def llm_planner(
+        *,
+        guided,
+        base,
+        supersedes_draft_hash,
+        recorder,
+        correction_target=None,
+        **_kwargs,
+    ):
+        del recorder, correction_target
+        source = guided.reviewed_sources[guided.source_order[0]]
+        output = guided.reviewed_outputs[guided.output_order[0]]
+        # Each chained node needs its OWN response_field. A downstream llm node
+        # reusing its upstream's field would declare an output the row already
+        # carries, which the engine rejects as a pipeline configuration error
+        # (elspeth-cfcd333f83) — the fixture would then be unrunnable and would
+        # fail authoring before reaching the surfacing behaviour under test.
+        if extra_node_id is None:
+            _chain = [("summarize_rows", "llm_rows", output.name, "summary")]
+        else:
+            _chain = [
+                ("summarize_rows", "llm_rows", f"{extra_node_id}_rows", "summary"),
+                (extra_node_id, f"{extra_node_id}_rows", output.name, f"{extra_node_id}_summary"),
+            ]
+        pipeline = {
+            "sources": {
+                source.name: {
+                    "plugin": source.plugin,
+                    "options": deep_thaw(source.options),
+                    "on_success": "llm_rows",
+                    "on_validation_failure": source.on_validation_failure,
+                }
+            },
+            "nodes": [
+                {
+                    "id": node_id,
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": node_input,
+                    "on_success": node_on_success,
+                    "on_error": output.name if route_errors_to_output else "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "profile": "task-role",
+                        "prompt_template": prompt,
+                        "response_field": node_response_field,
+                        "interpretation_requirements": [
+                            {
+                                "id": f"llm_prompt_template:{node_id}:{node_id}",
+                                "kind": "llm_prompt_template",
+                                "user_term": f"llm_prompt_template:{node_id}",
+                                "status": "pending",
+                                "draft": prompt,
+                            }
+                        ],
+                    },
+                }
+                for node_id, node_input, node_on_success, node_response_field in _chain
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": output.name,
+                    "plugin": output.plugin,
+                    "options": deep_thaw(output.options),
+                    "on_write_failure": output.on_write_failure,
+                }
+            ],
+        }
+        proposal = PipelineProposal.create(
+            pipeline=pipeline,
+            base=base,
+            reviewed_facts=guided_private_reviewed_facts(guided),
+            surface=PlannerSurface.GUIDED_STAGED,
+            repair_count=0,
+            skill_hash=stable_hash("llm-prompt-review-test-planner"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=supersedes_draft_hash,
+        )
+        return (
+            PipelinePlanResult(
+                proposal=proposal,
+                tool_call_id=f"guided-test-{proposal.draft_hash[:16]}",
+                custody_result="not_required",
+                model_identifier="llm-prompt-review-test-planner",
+                model_version="v1",
+                provider="test",
+            ),
+            {
+                "source": frozenset({source.plugin}),
+                "transform": frozenset({"llm"}),
+                "sink": frozenset({output.plugin}),
+            },
+        )
+
+    return llm_planner
+
+
+def _remove_durable_current_turn(client: TestClient, session_id: str) -> None:
+    """Persist the same guided head without its unanswered turn occurrence."""
+
+    service = client.app.state.session_service
+    record = asyncio.run(service.get_current_state(UUID(session_id)))
+    assert record is not None
+    state = state_from_record(record)
+    guided = state.guided_session
+    assert guided is not None
+    assert guided.history and guided.history[-1].response_hash is None
+    prospective_guided = replace(guided, history=guided.history[:-1])
+    prospective_state = replace(state, guided_session=prospective_guided)
+    state_dict = prospective_state.to_dict()
+    composer_meta = dict(record.composer_meta or {})
+    composer_meta["guided_session"] = prospective_guided.to_dict()
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            service,
+            UUID(session_id),
+            CompositionStateData(
+                sources=state_dict["sources"],
+                nodes=state_dict["nodes"],
+                edges=state_dict["edges"],
+                outputs=state_dict["outputs"],
+                metadata_=state_dict["metadata"],
+                is_valid=record.is_valid,
+                validation_errors=record.validation_errors,
+                composer_meta=composer_meta,
+            ),
+            provenance="convergence_persist",
+        )
+    )
+
+
+def _guided_audit_invocations(client: TestClient, session_id: str) -> list[tuple[str, dict[str, Any]]]:
+    service = client.app.state.session_service
+    messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+    guided_names = {
+        "guided_turn_emitted",
+        "guided_turn_answered",
+        "guided_step_advanced",
+        "guided_dropped_to_freeform",
+    }
+    invocations: list[tuple[str, dict[str, Any]]] = []
+    for message in messages:
+        # ``tool_calls`` is None on a plain chat row, and a rooted session now
+        # always has at least one — the start's root intent.
+        for envelope in message.tool_calls or ():
+            invocation = envelope.get("invocation", {})
+            tool_name = invocation.get("tool_name")
+            if tool_name in guided_names:
+                invocations.append((tool_name, json.loads(invocation["arguments_canonical"])))
+    return invocations
+
+
 @pytest.mark.parametrize(
     "stable_id",
     [
@@ -245,19 +510,19 @@ def _seed_blob(client: TestClient, session_id: str, *, content: str | None = Non
 
     # Retrieve storage_path from the blob service (not exposed by API).
     blob_service = client.app.state.blob_service
-    record = asyncio.run(blob_service.get_blob(UUID(blob_id)))
+    record = next(record for record in asyncio.run(blob_service.list_blobs(UUID(session_id), limit=None)) if record.id == UUID(blob_id))
     return blob_id, record.storage_path
 
 
-def _outputs_path(client: TestClient, filename: str) -> str:
-    """Return an absolute path under {data_dir}/outputs/ for use as a sink path.
+def _outputs_path(client: TestClient, session_id: str, filename: str) -> str:
+    """Return an absolute path under the session-owned outputs subtree.
 
-    Sink paths are validated by _validate_sink_path to be under {data_dir}/outputs/
-    or {data_dir}/blobs/.  Tests must use this helper instead of bare relative paths
-    like "out.jsonl" to pass the path allowlist check.
+    Sink paths are validated by _validate_sink_path to be under the caller's
+    ``{data_dir}/outputs/{session_id}/`` or ``{data_dir}/blobs/{session_id}/``
+    subtree.
     """
     data_dir: Path = client.app.state.settings.data_dir
-    outputs_dir = data_dir / "outputs"
+    outputs_dir = data_dir / "outputs" / session_id
     outputs_dir.mkdir(parents=True, exist_ok=True)
     return str(outputs_dir / filename)
 
@@ -269,6 +534,9 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
     engine = primary_app.state.session_engine
     data_dir = Path(primary_app.state.settings.data_dir)
     app = FastAPI()
+    # The peer is a second deployed worker: it answers an ownership race with
+    # the production handlers (fence lost -> 404, live lease -> 409).
+    register_session_operation_exception_handlers(app)
     identity = UserIdentity(user_id="alice", username="alice")
 
     async def mock_user() -> UserIdentity:
@@ -276,7 +544,7 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
 
     app.dependency_overrides[get_current_user] = mock_user
     app.state.session_engine = engine
-    app.state.session_service = SessionServiceImpl(
+    app.state.session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.independent-peer"),
@@ -349,6 +617,42 @@ class TestStep1IntraStep:
 
         assert body["next_turn"]["step_index"] == 0  # STEP_1_SOURCE is index 0
         assert body["guided_session"]["step"] == "step_1_source"
+
+    def test_llm_source_profile_form_persists_only_authored_options(self, composer_test_client: TestClient) -> None:
+        """The guided source form validates through its request-scoped profile authority."""
+        session_id = _create_session(composer_test_client)
+        initial = _get_guided(composer_test_client, session_id)
+        assert "llm" in {option["id"] for option in initial["next_turn"]["payload"]["options"]}
+
+        selected = _respond(composer_test_client, session_id, chosen=["llm"])
+        assert selected["next_turn"]["type"] == "schema_form"
+        assert selected["next_turn"]["payload"]["plugin"] == "llm"
+
+        reviewed = _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "llm",
+                "options": {
+                    "profile": "task-role",
+                    "prompt_template": "Write one concise audit briefing.",
+                    "response_field": "briefing",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            },
+        )
+
+        assert reviewed["next_turn"]["type"] == "review_components"
+        source = next(iter(_full_guided_session(reviewed)["reviewed_sources"].values()))
+        assert source["on_validation_failure"] == "discard"
+        assert source["options"] == {
+            "profile": "task-role",
+            "prompt_template": "Write one concise audit briefing.",
+            "response_field": "briefing",
+            "schema": {"mode": "observed"},
+        }
+        assert not ({"provider", "model", "api_key", "region_name"} & set(source["options"]))
 
     def test_uploaded_csv_prefills_blob_path_and_commits_observed_schema(self, composer_test_client: TestClient) -> None:
         """A Step-1 CSV pick after upload is deterministic without asking chat to infer the file."""
@@ -556,6 +860,10 @@ class TestStep2IntraStep:
         blob_content: str | None = None,
     ) -> dict:
         self._drive_to_step_2_single_select(client, session_id, blob_content=blob_content)
+        return self._stage_proposal_from_step_2(client, session_id, filename=filename)
+
+    def _stage_proposal_from_step_2(self, client: TestClient, session_id: str, *, filename: str) -> dict:
+        """Stage from the Step 2 SINGLE_SELECT state (after the source is bound)."""
         _respond(client, session_id, chosen=["json"])
         _respond(
             client,
@@ -563,7 +871,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(client, filename),
+                    "path": _outputs_path(client, session_id, filename),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -574,30 +882,35 @@ class TestStep2IntraStep:
         return _finish_review(client, session_id, "output")
 
     @pytest.mark.parametrize("profile", ("live", "tutorial"))
-    def test_rootless_step_3_entry_synthesizes_the_sketch_without_a_provider_call(
+    def test_rooted_step_3_entry_routes_through_the_provider_planner(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
         profile: str,
     ) -> None:
-        """The discarded starting sketch is server-synthesized, not planned.
+        """The step-2→3 entry is planned by the provider, like every transition.
 
-        The step-2→3 auto-proposal on a rootless walk (no root intent, no
-        deferred intents, one reviewed source and output) is always the same
-        passthrough sketch, withheld from acceptance (supersedes_draft_hash
-        null) and discarded by design once the transforms instruction lands.
-        Tutorial final3 spent 222s of provider time producing it (op
-        424021cd). It must now seal server-side through the same canonical
-        final gate (prepare_pipeline_plan) with zero provider calls.
+        elspeth-b4a286d517: this transition was server-synthesized
+        (provider="server", model "composer-guided-passthrough-synthesis",
+        zero provider calls, zero llm_call_audit rows) — banned by the
+        composer invariant (the LLM does the job) and by ADR-031 (the
+        tutorial exercises the same backend as every guided walk). The
+        pass-through answer itself is fine; its AUTHOR must be the planner.
+        This is the per-transition provenance pin: the walk-level harness
+        counts provider calls per WALK and cannot see one silent transition.
+
+        Goal-first (elspeth-378cfa0e18): BOTH profiles now start with a visible
+        intent, and the run this transition makes is planned from that intent —
+        pinned below against the actual provider request, so a brief that
+        dropped the goal cannot pass by merely calling the provider.
         """
         app = composer_test_client.app
-        session_id = _create_session(composer_test_client)
-        if profile == "tutorial":
-            started = composer_test_client.post(
-                f"/api/sessions/{session_id}/guided/start",
-                json={"profile": "tutorial", "operation_id": str(uuid4())},
-            )
-            assert started.status_code == 200, started.json()
+        session_id = _create_session(composer_test_client, intent=None)
+        started = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={"profile": profile, "intent": _GOAL_FIRST_INTENT, "operation_id": str(uuid4())},
+        )
+        assert started.status_code == 200, started.json()
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
         _respond(
@@ -606,14 +919,18 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, f"sketch-{profile}.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, f"sketch-{profile}.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
                 },
             },
         )
-        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        reviewed = _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        guided_facts = _full_guided_session(reviewed)
+        source_stable_id = next(iter(guided_facts["reviewed_sources"]))
+        output_stable_id = next(iter(guided_facts["reviewed_outputs"]))
+        reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
 
         monkeypatch.setattr(
             ComposerServiceImpl,
@@ -635,10 +952,37 @@ class TestStep2IntraStep:
             operator_profile_registry=app.state.operator_profile_registry,
         )
 
-        async def poisoned_completion(**_kwargs: Any) -> _PlannerResponse:
-            raise AssertionError("the rootless starting sketch must never call the provider")
+        planner_pipeline = {
+            "source_routes": [{"stable_id": source_stable_id, "on_success": reviewed_output_name}],
+            "nodes": [],
+            "edges": [],
+            "output_targets": [{"stable_id": output_stable_id}],
+        }
+        provider_calls: list[Mapping[str, Any]] = []
 
-        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", poisoned_completion)
+        async def terminal_completion(**kwargs: Any) -> _PlannerResponse:
+            provider_calls.append(kwargs)
+            return _PlannerResponse(
+                choices=[
+                    _PlannerChoice(
+                        message=_PlannerMessage(
+                            content=None,
+                            tool_calls=[
+                                _PlannerToolCall(
+                                    id="guided-terminal",
+                                    function=_PlannerFunction(
+                                        name="emit_pipeline_proposal",
+                                        arguments=json.dumps({"pipeline": planner_pipeline}),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", terminal_completion)
 
         settled = _post_current_response(
             composer_test_client,
@@ -647,8 +991,8 @@ class TestStep2IntraStep:
         )
 
         assert settled.status_code == 200, settled.json()
-        body = settled.json()
-        assert body["next_turn"]["type"] == "propose_pipeline"
+        assert settled.json()["next_turn"]["type"] == "propose_pipeline"
+        assert provider_calls, "the step-2→3 entry must be planned by the provider"
         with app.state.session_engine.connect() as conn:
             proposal = conn.execute(
                 select(
@@ -656,17 +1000,547 @@ class TestStep2IntraStep:
                     composition_proposals_table.c.composer_provider,
                 ).where(composition_proposals_table.c.session_id == session_id)
             ).one()
-        assert proposal.composer_model_identifier == "composer-guided-passthrough-synthesis"
-        assert proposal.composer_provider == "server"
+        # Pin truth, not just non-server: the stubbed availability records
+        # provider="test" and the configured composer model. If these ever read
+        # "server" / "composer-guided-passthrough-synthesis" again, the bypass
+        # is back (elspeth-b4a286d517).
+        assert proposal.composer_provider == "test"
+        assert proposal.composer_model_identifier == "test/guided-planner"
         audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
         llm_audits = [
             envelope for message in audit_messages for envelope in (message.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
         ]
-        assert llm_audits == []
+        assert llm_audits, "a planned transition must leave llm_call_audit evidence"
+        # The planner planned from the AUTHOR's goal. Before goal-first the
+        # tutorial reached here rootless and the server substituted its own
+        # sentence ("Build the complete pipeline from the reviewed guided
+        # components...") — an ELSPETH-authored brief the LLM then worked from.
+        assert _GOAL_FIRST_INTENT in json.dumps(provider_calls[0]["messages"])
+
+    def test_rootless_step_3_entry_is_refused_before_the_planner(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No planner run without an intent (elspeth-13579d1110).
+
+        A respond-seeded session never went through ``/guided/start``, so it
+        has no root intent; with no deferred intents either there is nothing to
+        plan FROM. The refusal happens in the respond preflight — before rate
+        admission and before any operation row is reserved — so the session is
+        left exactly where it was, on its unanswered ``review_components``
+        turn, with no proposal, no audit evidence and no provider call.
+
+        The polarity is the same as the rooted pin above: that one refuses a
+        server-authored PLAN, this one refuses a server-authored BRIEF.
+        """
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client, intent=None)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "rootless-refused.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        provider_calls: list[Mapping[str, Any]] = []
+
+        async def never_called(**kwargs: Any) -> None:
+            provider_calls.append(kwargs)
+            raise AssertionError("an intentless session must never reach the provider")
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", never_called)
+
+        settled = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert settled.status_code == 409, settled.json()
+        assert settled.json()["detail"]["code"] == "guided_planner_intent_required"
+        assert provider_calls == []
+        with app.state.session_engine.connect() as conn:
+            assert (
+                conn.execute(
+                    select(func.count())
+                    .select_from(composition_proposals_table)
+                    .where(composition_proposals_table.c.session_id == session_id)
+                ).scalar_one()
+                == 0
+            )
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        assert not [
+            envelope for message in audit_messages for envelope in (message.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
+        ]
+        # The session did not move: still Step 2, still on the same unanswered turn.
+        still_there = _get_guided(composer_test_client, session_id)
+        assert still_there["guided_session"]["step"] == "step_2_sink"
+        assert still_there["next_turn"]["type"] == "review_components"
+
+    def test_settlement_refuses_an_intentless_planner_run_when_the_preflight_is_bypassed(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Defence in depth: the brief is guarded where it is assembled, not only at the door.
+
+        Mutation-test the guard rather than the defect — the preflight
+        predicate is neutralised here, and the settlement must still refuse
+        rather than substitute a server-authored sentence for the author's
+        goal. The observable is NOT the preflight's coded 409: a settlement
+        failure runs through ``raise_guided_operation_failure`` after the
+        operation is reserved, so it surfaces as HTTP 500
+        ``guided_operation_terminal_failure`` / ``integrity_error`` with a
+        failed ``guided_operations`` row, no proposal, and no LLM audit.
+        """
+        from elspeth.web.sessions.routes.composer import guided as guided_route
+
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client, intent=None)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "settlement-refused.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        provider_calls: list[Mapping[str, Any]] = []
+
+        async def never_called(**kwargs: Any) -> None:
+            provider_calls.append(kwargs)
+            raise AssertionError("an intentless session must never reach the provider")
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", never_called)
+        monkeypatch.setattr(guided_route, "_has_planner_intent", lambda guided: True)
+
+        settled = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert settled.status_code == 500, settled.json()
+        assert settled.json()["detail"]["error_type"] == "guided_operation_terminal_failure"
+        assert settled.json()["detail"]["failure_code"] == "integrity_error"
+        assert provider_calls == []
+        with app.state.session_engine.connect() as conn:
+            assert (
+                conn.execute(
+                    select(func.count())
+                    .select_from(composition_proposals_table)
+                    .where(composition_proposals_table.c.session_id == session_id)
+                ).scalar_one()
+                == 0
+            )
+            failed = conn.execute(
+                select(guided_operations_table.c.status, guided_operations_table.c.failure_code).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.kind == "guided_respond",
+                    guided_operations_table.c.status == "failed",
+                )
+            ).all()
+        assert [(row.status, row.failure_code) for row in failed] == [("failed", "integrity_error")]
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        assert not [
+            envelope for message in audit_messages for envelope in (message.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
+        ]
+
+    def test_rootless_step_3_entry_plans_from_a_retained_deferred_intent(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deferred intent is an author-supplied intent too, so the run is admitted.
+
+        The predicate is the union of the root and the deferred intents, not
+        "has a root": a session that stated its transform wish in a step chat
+        has told the planner what to build, and refusing it would be a new
+        dead end rather than the fixed one.
+        """
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.composer.guided.state_machine import DeferredStageIntent
+        from elspeth.web.sessions.routes._helpers import _state_from_record
+
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client, intent=None)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "deferred-admitted.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        reviewed = _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        guided_facts = _full_guided_session(reviewed)
+        source_stable_id = next(iter(guided_facts["reviewed_sources"]))
+        output_stable_id = next(iter(guided_facts["reviewed_outputs"]))
+        reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
+
+        service = app.state.session_service
+        deferred_text = "Also translate the text column into French"
+        deferred_row = asyncio.run(service.add_message(UUID(session_id), "user", deferred_text, writer_principal="route_user_message"))
+        current = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert current is not None
+        state = _state_from_record(current)
+        assert state.guided_session is not None
+        with_deferred = replace(
+            state.guided_session,
+            deferred_intents=(
+                DeferredStageIntent.create(
+                    intent_id=str(uuid4()),
+                    receiving_stage="output",
+                    target_stage="topology",
+                    catalog_kind=None,
+                    catalog_name=None,
+                    redacted_summary="Translate the text column.",
+                    originating_message_id=str(deferred_row.id),
+                    message_content_hash=stable_hash(deferred_text),
+                    constraints=(),
+                ),
+            ),
+        )
+        state_dict = state.to_dict()
+        asyncio.run(
+            service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=state_dict["sources"],
+                    nodes=state_dict["nodes"],
+                    edges=state_dict["edges"],
+                    outputs=state_dict["outputs"],
+                    metadata_=state_dict["metadata"],
+                    is_valid=current.is_valid,
+                    validation_errors=current.validation_errors,
+                    composer_meta={"guided_session": with_deferred.to_dict()},
+                ),
+                provenance="session_seed",
+            )
+        )
+
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(update={"composer_model": "test/guided-planner"}),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+        planner_pipeline = {
+            "source_routes": [{"stable_id": source_stable_id, "on_success": reviewed_output_name}],
+            "nodes": [],
+            "edges": [],
+            "output_targets": [{"stable_id": output_stable_id}],
+        }
+        provider_calls: list[Mapping[str, Any]] = []
+
+        async def terminal_completion(**kwargs: Any) -> _PlannerResponse:
+            provider_calls.append(kwargs)
+            return _PlannerResponse(
+                choices=[
+                    _PlannerChoice(
+                        message=_PlannerMessage(
+                            content=None,
+                            tool_calls=[
+                                _PlannerToolCall(
+                                    id="guided-terminal",
+                                    function=_PlannerFunction(
+                                        name="emit_pipeline_proposal",
+                                        arguments=json.dumps({"pipeline": planner_pipeline}),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", terminal_completion)
+
+        settled = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert settled.status_code == 200, settled.json()
+        assert settled.json()["next_turn"]["type"] == "propose_pipeline"
+        assert provider_calls, "a deferred intent must still be planned by the provider"
+        assert deferred_text in json.dumps(provider_calls[0]["messages"])
+
+    @pytest.mark.parametrize("provider_closes_contract", (True, False))
+    def test_step_3_entry_with_unproducible_output_fields_names_the_gap_to_the_planner(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_closes_contract: bool,
+    ) -> None:
+        """R2-F4: an unsatisfiable zero-transform pipeline is never a complete answer.
+
+        The reviewed source observes ``order_id, region``; step-2 field review
+        requires ``client`` and ``amount_aud`` instead. A pass-through
+        has zero transforms, so nothing in it can ever produce those two
+        fields. The provider planner is the only planning path
+        (elspeth-b4a286d517 removed the server-synthesized sketch); what this
+        test pins is that the gap is named in the reviewed planner context and
+        that no zero-transform candidate seals while it stands.
+
+        Both parameters assert the same two invariants — no server-authored
+        pass-through proposal exists in the corpus (a cheap standing provenance
+        sweep), and the gap reaches the planner. They differ in what the
+        provider does with the named gap:
+
+        - ``True``: the planner adds a transform, and an ordinary provider
+          proposal is sealed.
+        - ``False``: the planner ignores the gap and re-proposes the same bare
+          zero-transform pass-through. A provider-authored candidate would
+          otherwise seal as a COMPLETE normal proposal and re-open R2-F4 one
+          layer down, so the planner loop must refuse every zero-transform
+          candidate while the gap stands
+          (``passthrough_cannot_produce_declared_fields``), and the resulting
+          exhaustion must hand the operator the missing field names rather
+          than a bare "retry the request".
+        """
+        import elspeth.web.composer.service as service_module
+
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client)
+        _seed_blob(composer_test_client, session_id, content="order_id,region\n1,north\n2,south\n")
+        _get_guided(composer_test_client, session_id)
+        selected = _respond(composer_test_client, session_id, chosen=["csv"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={"plugin": "csv", "options": selected["next_turn"]["payload"]["prefilled"]},
+        )
+        _respond(composer_test_client, session_id, edited_values={"columns": ["order_id", "region"]})
+        _finish_review(composer_test_client, session_id, "source")
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "unproducible.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        reviewed = _respond(
+            composer_test_client,
+            session_id,
+            chosen=[],
+            custom_inputs=["client", "amount_aud"],
+        )
+        guided_facts = _full_guided_session(reviewed)
+        assert next(iter(guided_facts["reviewed_outputs"].values()))["required_fields"] == [
+            "client",
+            "amount_aud",
+        ]
+
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(update={"composer_model": "test/guided-planner"}),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+
+        planner_contexts: list[Mapping[str, Any]] = []
+        real_plan_pipeline = service_module.plan_pipeline
+
+        def recording_plan_pipeline(**kwargs: Any):
+            planner_contexts.append(kwargs["reviewed_planner_context"])
+            return real_plan_pipeline(**kwargs)
+
+        monkeypatch.setattr(service_module, "plan_pipeline", recording_plan_pipeline)
+
+        gap_closing_nodes = [
+            {
+                "id": "derive_missing_fields",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "planner_rows",
+                "on_success": "planned_sink",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"order_id": "client", "region": "amount_aud"},
+                },
+            }
+        ]
+        source_stable_id = next(iter(guided_facts["reviewed_sources"]))
+        output_stable_id = next(iter(guided_facts["reviewed_outputs"]))
+        reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
+        gap_closing_nodes[0]["on_success"] = reviewed_output_name
+        planner_pipeline = {
+            "source_routes": [
+                {
+                    "stable_id": source_stable_id,
+                    "on_success": "planner_rows" if provider_closes_contract else reviewed_output_name,
+                }
+            ],
+            "nodes": gap_closing_nodes if provider_closes_contract else [],
+            "edges": [],
+            "output_targets": [{"stable_id": output_stable_id}],
+        }
+
+        async def terminal_completion(**_kwargs: Any) -> _PlannerResponse:
+            return _PlannerResponse(
+                choices=[
+                    _PlannerChoice(
+                        message=_PlannerMessage(
+                            content=None,
+                            tool_calls=[
+                                _PlannerToolCall(
+                                    id="guided-terminal",
+                                    function=_PlannerFunction(
+                                        name="emit_pipeline_proposal",
+                                        arguments=json.dumps({"pipeline": planner_pipeline}),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+
+        monkeypatch.setattr(service_module, "_litellm_acompletion", terminal_completion)
+
+        from structlog.testing import capture_logs
+
+        operation_id = str(uuid4())
+        with capture_logs() as planner_logs:
+            settled = _post_current_response(
+                composer_test_client,
+                session_id,
+                operation_id=operation_id,
+                component_action={"action": "finish", "component_kind": "output"},
+            )
+
+        if provider_closes_contract:
+            assert settled.status_code == 200, settled.json()
+            assert settled.json()["next_turn"]["type"] == "propose_pipeline"
+        else:
+            # Every zero-transform candidate is refused while the gap stands,
+            # so the planner burns its budget and the request terminates. The
+            # 500 is the planner loop's exhaustion SURFACE
+            # (planner_repair_exhausted, elspeth-5904b1683a), not the contract
+            # under test; what is pinned is that the operator is handed the
+            # missing field names instead of a bare retry instruction.
+            assert settled.status_code == 500, settled.json()
+            failure_detail = settled.json()["detail"]
+            assert failure_detail["failure_code"] == "planner_repair_exhausted"
+            assert failure_detail["unproducible_output_fields"] == ["amount_aud", "client"]
+            assert "amount_aud" in failure_detail["detail"] and "client" in failure_detail["detail"]
+            replayed = _post_current_response(
+                composer_test_client,
+                session_id,
+                operation_id=operation_id,
+                component_action={"action": "finish", "component_kind": "output"},
+            )
+            assert replayed.status_code == 500, replayed.json()
+            assert replayed.json() == settled.json()
+            # The guided surface records its planner disposition as a
+            # structured log rather than a durable audit row
+            # (``_log_guided_planner_failure``), so that is where the closed
+            # rejection code the loop actually hit is observable.
+            rejection_codes = {
+                code
+                for entry in planner_logs
+                if entry.get("event") == "composer.guided_planner_failure"
+                for code in entry.get("rejection_codes", ())
+            }
+            assert "passthrough_cannot_produce_declared_fields" in rejection_codes, planner_logs
+        with app.state.session_engine.connect() as conn:
+            proposals = conn.execute(
+                select(
+                    composition_proposals_table.c.composer_model_identifier,
+                    composition_proposals_table.c.composer_provider,
+                ).where(composition_proposals_table.c.session_id == session_id)
+            ).all()
+        assert all(row.composer_model_identifier != "composer-guided-passthrough-synthesis" for row in proposals), (
+            "an unsatisfiable pass-through sketch must never be sealed as the answer"
+        )
+        assert all(row.composer_provider != "server" for row in proposals)
+        assert len(planner_contexts) == 1, "the unsatisfiable sketch must route to the provider planner"
+        gap = planner_contexts[0]["unproducible_output_fields"]
+        assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
+        assert "preserve or produce every other reviewed output required field" in planner_contexts[0]["unproducible_output_fields_usage"]
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        planner_evidence_kinds = [
+            envelope.get("_kind")
+            for message in audit_messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+            and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
+        ]
+        assert planner_evidence_kinds
+        assert len(planner_evidence_kinds) % 2 == 0
+        assert all(
+            planner_evidence_kinds[index : index + 2] == ["llm_call_audit", "planner_attempt_audit"]
+            for index in range(0, len(planner_evidence_kinds), 2)
+        )
 
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),
-        (("live", "guided_staged"),),
+        (("live", "guided_staged"), ("tutorial", "tutorial_profile")),
     )
     @pytest.mark.parametrize(
         ("provider_outcome", "expected_status"),
@@ -687,17 +1561,10 @@ class TestStep2IntraStep:
     ) -> None:
         import elspeth.web.composer.pipeline_planner as planner_module
 
-        session_id = _create_session(composer_test_client)
-        # A ROOT INTENT keeps the step-2→3 entry on the provider planner path:
-        # a rootless walk now server-synthesizes the starting sketch without a
-        # provider call (see test_rootless_step_3_entry_synthesizes_the_sketch),
-        # which would make this provider-outcome matrix unreachable.
+        session_id = _create_session(composer_test_client, intent=None)
         started = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/start",
-            json={
-                "operation_id": str(uuid4()),
-                "intent": "Build a pipeline that annotates each row before saving.",
-            },
+            json={"profile": profile, "intent": _GOAL_FIRST_INTENT, "operation_id": str(uuid4())},
         )
         assert started.status_code == 200, started.json()
         self._drive_to_step_2_single_select(composer_test_client, session_id)
@@ -708,7 +1575,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, f"{profile}-{provider_outcome}.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, f"{profile}-{provider_outcome}.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -750,7 +1617,12 @@ class TestStep2IntraStep:
             kwargs["messages"][0]["content"] += "\nprovider-side mutation"
             requests.append(kwargs)
             if provider_outcome == "error":
-                raise RuntimeError("provider unavailable")
+                raise LiteLLMAPIError(
+                    status_code=503,
+                    message="provider unavailable",
+                    llm_provider="test-provider",
+                    model="test/guided-planner",
+                )
             if provider_outcome == "cancel":
                 raise asyncio.CancelledError()
             return _planner_terminal_response()
@@ -802,16 +1674,6 @@ class TestStep2IntraStep:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         session_id = _create_session(composer_test_client)
-        # Root intent keeps the step-2→3 entry on the provider planner path
-        # (rootless walks now server-synthesize the sketch without a call).
-        started = composer_test_client.post(
-            f"/api/sessions/{session_id}/guided/start",
-            json={
-                "operation_id": str(uuid4()),
-                "intent": "Build a pipeline that annotates each row before saving.",
-            },
-        )
-        assert started.status_code == 200, started.json()
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
         _respond(
@@ -820,7 +1682,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "matching-cancel.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "matching-cancel.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -961,7 +1823,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "request-cancelled-before-stage.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "request-cancelled-before-stage.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -1037,7 +1899,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "request-cancelled-during-stage.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "request-cancelled-during-stage.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -1116,7 +1978,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
-        output_path = _outputs_path(composer_test_client, "out.jsonl")
+        output_path = _outputs_path(composer_test_client, session_id, "out.jsonl")
 
         # The strict form echoes the selected plugin with its validated options.
         body = _respond(
@@ -1136,18 +1998,19 @@ class TestStep2IntraStep:
         assert body["next_turn"]["type"] == "multi_select_with_custom"
         payload = body["next_turn"]["payload"]
         assert "options" in payload
-        assert "default_chosen" in payload
-        # Observed columns from step 1 appear as options
+        # Observed columns from step 1 appear as options, none pre-pinned
+        # (I-3, design review 2026-09-02): pinning is a deliberate tick.
         option_ids = [o["id"] for o in payload["options"]]
         assert "text" in option_ids
         assert "category" in option_ids
+        assert payload["default_chosen"] == []
 
     def test_multi_select_response_atomically_stages_step_3_proposal(self, composer_test_client: TestClient) -> None:
         """Reviewed sink facts and the private proposal become durable together."""
         session_id = _create_session(composer_test_client)
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
-        output_path = _outputs_path(composer_test_client, "out.jsonl")
+        output_path = _outputs_path(composer_test_client, session_id, "out.jsonl")
         # Step-2 SCHEMA_FORM: structured shape with plugin + options.
         _respond(
             composer_test_client,
@@ -1182,7 +2045,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
-        output_path = _outputs_path(composer_test_client, "out_sink_commit.jsonl")
+        output_path = _outputs_path(composer_test_client, session_id, "out_sink_commit.jsonl")
         # Step-2 SCHEMA_FORM: structured shape with plugin + options.
         _respond(
             composer_test_client,
@@ -1230,7 +2093,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "reject.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "reject.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -1264,7 +2127,7 @@ class TestStep2IntraStep:
     def test_exact_reviewed_non_blob_source_path_can_stage_and_accept(self, composer_test_client: TestClient) -> None:
         session_id = _create_session(composer_test_client)
         data_dir = Path(composer_test_client.app.state.settings.data_dir)
-        source_path = data_dir / "blobs" / "operator-reviewed.csv"
+        source_path = data_dir / "blobs" / session_id / "operator-reviewed.csv"
         source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_text("text,category\nHello,greeting\n", encoding="utf-8")
 
@@ -1291,7 +2154,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "non-blob-accepted.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "non-blob-accepted.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -1431,6 +2294,154 @@ class TestStep2IntraStep:
         assert reviewed_after["plugin"] == reviewed_before["plugin"]
         assert reviewed_after[policy_key] == reviewed_before[policy_key]
 
+    @pytest.mark.parametrize("target_kind", ("source", "output"))
+    def test_wire_source_output_correction_rewinds_to_authoritative_form_without_planning(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        target_kind: str,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename=f"wire-{target_kind}-rewind.jsonl")
+        old_proposal = staged["next_turn"]["payload"]
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        collection = "sources" if target_kind == "source" else "outputs"
+        component = wire_payload[collection][0]
+        target = {"kind": target_kind, "stable_id": component["stable_id"]}
+        before = _full_guided_session(reviewed)
+        planner_calls = 0
+        back_edit_commands: list[GuidedPipelineProposalBackEditCommand] = []
+        session_service = composer_test_client.app.state.session_service
+        original_back_edit = session_service.back_edit_guided_pipeline_proposal
+
+        async def forbidden_planner(**_kwargs: object) -> object:
+            nonlocal planner_calls
+            planner_calls += 1
+            raise AssertionError("wire source/output back-edit must not call the planner")
+
+        async def capture_back_edit(
+            command: GuidedPipelineProposalBackEditCommand,
+            *,
+            payload_store: Any = None,
+            session_operation_context: SessionOperationContext,
+        ) -> object:
+            back_edit_commands.append(command)
+            return await original_back_edit(
+                command,
+                payload_store=payload_store,
+                session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            forbidden_planner,
+        )
+        monkeypatch.setattr(session_service, "back_edit_guided_pipeline_proposal", capture_back_edit)
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": wire_turn["turn_token"],
+            "proposal_id": wire_payload["proposal_id"],
+            "draft_hash": wire_payload["draft_hash"],
+            "edit_target": target,
+            "correction_feedback": f"Change the selected {target_kind} settings.",
+        }
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert revised.status_code == 200, revised.json()
+        body = revised.json()
+        assert planner_calls == 0
+        assert len(back_edit_commands) == 1
+        back_edit_command = back_edit_commands[0]
+        assert back_edit_command.origin == "wire_review"
+        assert back_edit_command.correction_feedback == request_payload["correction_feedback"]
+        prepared_response = next(payload for payload in back_edit_command.payloads if payload.purpose == "turn_response")
+        response_payload = prepared_response.payload
+        assert response_payload["action"] == "edit_reviewed_component"
+        assert response_payload["correction_feedback"] == request_payload["correction_feedback"]
+        audit_invocations = back_edit_command.audit_evidence.invocations
+        assert [invocation.tool_name for invocation in audit_invocations] == [
+            "guided_turn_answered",
+            "guided_turn_emitted",
+        ]
+        answered_audit = json.loads(audit_invocations[0].arguments_canonical)
+        assert answered_audit["step_index"] == "step_4_wire"
+        assert answered_audit["turn_type"] == "confirm_wiring"
+        assert answered_audit["response_payload_id"] == prepared_response.payload_id
+        edit_turn = body["next_turn"]
+        assert edit_turn["type"] == "schema_form"
+        assert edit_turn["step_index"] == (0 if target_kind == "source" else 1)
+        reviewed_key = "reviewed_sources" if target_kind == "source" else "reviewed_outputs"
+        assert edit_turn["payload"]["plugin"] == before[reviewed_key][component["stable_id"]]["plugin"]
+        guided = _full_guided_session(body)
+        assert guided["active_proposal"] is None
+        assert guided["active_edit_target"] == target
+        assert guided["reviewed_sources"] == before["reviewed_sources"]
+        assert guided["reviewed_outputs"] == before["reviewed_outputs"]
+
+        replayed = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == body
+        assert len(back_edit_commands) == 1
+        proposals = {
+            str(proposal.id): proposal
+            for proposal in asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
+        }
+        assert proposals[old_proposal["proposal_id"]].status == "rejected"
+        events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
+        proposal_events = [event for event in events if str(event.proposal_id) == old_proposal["proposal_id"]]
+        # elspeth-ed67eb9d0d: the wire-review advance carried this proposal
+        # across a new checkpoint and moved its anchor there, recorded as one
+        # non-terminal ``proposal.rebased`` event before the supersession.
+        assert [event.event_type for event in proposal_events] == ["proposal.created", "proposal.rebased", "proposal.rejected"]
+        assert proposal_events[-1].payload["reason_code"] == "superseded"
+
+        stale = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={**request_payload, "operation_id": str(uuid4())},
+        )
+        assert stale.status_code == 409, stale.json()
+
+    @pytest.mark.parametrize("target_kind", ("source", "output"))
+    def test_proposal_source_output_back_edit_rejects_planner_feedback_shape(
+        self,
+        composer_test_client: TestClient,
+        target_kind: str,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename=f"{target_kind}-feedback-shape.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == target_kind)
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": target,
+                "correction_feedback": "This path must use the reviewed settings form.",
+            },
+        )
+
+        assert rejected.status_code == 400, rejected.json()
+        assert rejected.json()["detail"] == (
+            "Guided source and output proposal revisions use the reviewed settings form without correction feedback."
+        )
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+
     def test_revision_rejects_non_null_edited_values_without_mutation(
         self,
         composer_test_client: TestClient,
@@ -1460,6 +2471,437 @@ class TestStep2IntraStep:
         assert len(proposals) == 1
         assert proposals[0].status == "pending"
 
+    def test_edge_revision_replans_from_authoritative_proposal_with_exact_custody(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="edge-custody.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        edge_target = _source_validation_failure_edit_target(payload)
+        reviewed_source_names = {source["name"] for source in _full_guided_session(staged)["reviewed_sources"].values()}
+        assert staged["composition_state"]["sources"] == {}
+
+        captured: dict[str, object] = {}
+        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await original_planner(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+
+        feedback = "Route high-value rows to the reviewed high-value output and all other rows to standard."
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": edge_target,
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert revised.status_code == 200, revised.json()
+        predecessor = captured["current_state"]
+        assert set(predecessor.sources) == reviewed_source_names
+        correction_target = captured["correction_target"]
+        assert correction_target.requested.kind == "edge"
+        assert correction_target.requested.stable_id == edge_target["stable_id"]
+        # The goal stays the planner's ROOT through revisions
+        # (elspeth-378cfa0e18) — carried as the NAMED ``root_goal`` fact, never
+        # folded into ``intent``, which means the request being made NOW. A
+        # correction that narrows or withdraws part of the goal must not have
+        # to argue against the goal inside the request field, and the
+        # deterministic guards that parse that field (stated threshold,
+        # selected schema keys) must not read the goal as this turn's words.
+        # ``originating_message`` still names the correction alone — one
+        # revision, one exact message custody.
+        assert captured["intent"] == feedback
+        assert captured["root_goal"] == _GOAL_FIRST_INTENT
+        originating_message = cast("PlannerOriginatingMessage", captured["originating_message"])
+        assert originating_message.content == feedback
+        assert originating_message.message_id is not None
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        matching = [message for message in messages if message.content == feedback]
+        assert len(matching) == 1
+        assert str(matching[0].id) == originating_message.message_id
+        assert matching[0].role == "user"
+        assert matching[0].writer_principal == "route_user_message"
+        guided = _full_guided_session(revised.json())
+        assert guided["correction_messages"][-1]["message_id"] == originating_message.message_id
+        assert [(entry["role"], entry["content"]) for entry in guided["chat_history"][-2:]] == [
+            ("user", feedback),
+            ("assistant", GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT),
+        ]
+
+    def test_node_revision_stages_changed_node_with_exact_message_custody(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        initial_prompt = "Summarise this row without changing its reviewed fields."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(initial_prompt),
+        )
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="node-custody.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        node_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "node")
+
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner(initial_prompt, route_errors_to_output=True)
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            spy_planner,
+        )
+        feedback = "Route failures from this node to the reviewed output instead of discarding them."
+
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": node_target,
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert response.status_code == 200, response.json()
+        predecessor = cast(CompositionState, captured["current_state"])
+        selected_before = next(node for node in predecessor.nodes if node.id == "summarize_rows")
+        correction_target = captured["correction_target"]
+        assert correction_target.requested.kind == "node"
+        assert correction_target.requested.stable_id == node_target["stable_id"]
+        # Root-first brief: the instruction IS the intent, the goal rides as
+        # the named ``root_goal`` fact — see the edge-revision pin.
+        assert captured["intent"] == feedback
+        assert captured["root_goal"] == _GOAL_FIRST_INTENT
+        originating_message = cast("PlannerOriginatingMessage", captured["originating_message"])
+        assert originating_message.content == feedback
+
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+        successor = guided_candidate_state(authority.proposal)
+        selected_after = next(node for node in successor.nodes if node.id == "summarize_rows")
+        assert selected_after.on_error == successor.outputs[0].name
+        assert selected_after.options == selected_before.options
+        messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+        matching = [message for message in messages if message.content == feedback]
+        assert len(matching) == 1
+        assert str(matching[0].id) == originating_message.message_id
+
+    def test_node_revision_carries_a_changed_prompt_to_the_successor_and_its_card(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """I-2 (design review 2026-09-02) end to end: the proposal card shows an
+        llm node's prompt before any approval; its Edit routes a node-scoped
+        correction; the planner answers with a changed prompt for that node;
+        the bound successor carries the new prompt with every withheld option
+        preserved, and the successor card publishes it. Until I-2 the llm
+        allowlist was empty, so the binder restored the predecessor's prompt
+        and a prompt revise could not land at all."""
+        initial_prompt = "Summarise this row in one short sentence."
+        revised_prompt = "Summarise this row in two sentences, keeping every number."
+        composer_service = composer_test_client.app.state.composer_service
+        monkeypatch.setattr(composer_service, "plan_guided_pipeline", _llm_prompt_template_planner(initial_prompt))
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="node-prompt-edit.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        node_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "node")
+        card_node = next(node for node in payload["nodes"] if node["plugin"] == {"kind": "transform", "id": "llm"})
+        assert card_node["stable_id"] == node_target["stable_id"]
+        assert {"key": "prompt_template", "value": initial_prompt, "tier": "common"} in card_node["node_options_summary"]
+
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner(revised_prompt)
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_service, "plan_guided_pipeline", spy_planner)
+        feedback = "Ask for two sentences and keep every number."
+
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": node_target,
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert response.status_code == 200, response.json()
+        correction_target = captured["correction_target"]
+        assert correction_target.requested.kind == "node"
+        assert correction_target.requested.stable_id == node_target["stable_id"]
+        # Root-first brief: the instruction IS the intent, the goal rides as
+        # the named ``root_goal`` fact — see the edge-revision pin.
+        assert captured["intent"] == feedback
+        assert captured["root_goal"] == _GOAL_FIRST_INTENT
+        predecessor = cast(CompositionState, captured["current_state"])
+        selected_before = next(node for node in predecessor.nodes if node.id == "summarize_rows")
+        assert selected_before.options["prompt_template"] == initial_prompt
+
+        successor_turn = response.json()["next_turn"]
+        assert successor_turn["type"] == "propose_pipeline"
+        successor_payload = successor_turn["payload"]
+        assert successor_payload["supersedes_draft_hash"] == payload["draft_hash"]
+        # Stable ids are proposal-scoped labels and are reissued on the
+        # successor; the one llm node is found by its plugin.
+        successor_card_node = next(node for node in successor_payload["nodes"] if node["plugin"] == {"kind": "transform", "id": "llm"})
+        assert {"key": "prompt_template", "value": revised_prompt, "tier": "common"} in successor_card_node["node_options_summary"]
+        assert initial_prompt not in str(successor_card_node["node_options_summary"])
+
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+        successor = guided_candidate_state(authority.proposal)
+        selected_after = next(node for node in successor.nodes if node.id == "summarize_rows")
+        assert selected_after.options["prompt_template"] == revised_prompt
+        # Only the published key moved among the authored options; the
+        # withheld profile, response field and schema are the predecessor's,
+        # whatever the candidate carried.
+        for key in ("profile", "response_field", "schema"):
+            assert selected_after.options[key] == selected_before.options[key]
+        # The prompt review requirement follows the live prompt, so the
+        # post-commit review sees the revised instruction, never the stale one.
+        (requirement,) = selected_after.options["interpretation_requirements"]
+        assert requirement["draft"] == revised_prompt
+        assert requirement["status"] == "pending"
+
+    def test_substituted_unchanged_planner_cannot_supersede_predecessor(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="unchanged-correction.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "edge")
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+
+        async def unchanged_planner(**kwargs: object) -> object:
+            proposal = PipelineProposal.create(
+                pipeline=deep_thaw(authority.proposal.pipeline),
+                base=kwargs["base"],
+                reviewed_facts=guided_private_reviewed_facts(kwargs["guided"]),
+                surface=authority.proposal.surface,
+                repair_count=0,
+                skill_hash=authority.proposal.skill_hash,
+                covered_deferred_intent_ids=authority.proposal.covered_deferred_intent_ids,
+                supersedes_draft_hash=authority.proposal.draft_hash,
+            )
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="unchanged-correction",
+                    custody_result="not_required",
+                    model_identifier="unchanged-model",
+                    model_version="unchanged-v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({"csv"}),
+                    "transform": frozenset(),
+                    "sink": frozenset({"json"}),
+                },
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            unchanged_planner,
+        )
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": target,
+                "correction_feedback": "Change this route to a different destination.",
+            },
+        )
+
+        # The production Composer service consumes this objection inside its
+        # repair budget. This double substitutes the entire service seam and
+        # violates that return contract, so the route's final fail-closed
+        # assertion classifies it as an integrity failure rather than staging
+        # an unchanged successor.
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+        proposals = asyncio.run(service.list_composition_proposals(UUID(session_id)))
+        assert len(proposals) == 1
+        assert proposals[0].status == "pending"
+
+    @pytest.mark.parametrize("target_kind", ("node", "edge"))
+    def test_node_edge_revision_requires_operator_feedback_before_planning(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        target_kind: str,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        if target_kind == "node":
+            monkeypatch.setattr(
+                composer_test_client.app.state.composer_service,
+                "plan_guided_pipeline",
+                _llm_prompt_template_planner("Summarise this row in one short sentence."),
+            )
+        staged = self._stage_proposal(composer_test_client, session_id, filename=f"{target_kind}-feedback-required.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == target_kind)
+        planner_calls = 0
+
+        async def forbidden_planner(**_kwargs: object) -> object:
+            nonlocal planner_calls
+            planner_calls += 1
+            raise AssertionError("a node/edge proposal revision without feedback must not reach the planner")
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            forbidden_planner,
+        )
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": target,
+            },
+        )
+
+        assert rejected.status_code == 400, rejected.json()
+        assert rejected.json()["detail"] == "Guided node and edge proposal revisions require non-empty correction feedback."
+        assert planner_calls == 0
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+        proposals = asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
+        assert len(proposals) == 1
+        assert proposals[0].status == "pending"
+
+    def test_node_revision_rejects_drifted_proposal_projection_before_target_binding(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.sessions.routes.composer import guided as guided_route
+
+        session_id = _create_session(composer_test_client)
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(
+                "Summarise this row in one short sentence.",
+                extra_node_id="second_summary",
+            ),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="node-projection-drift.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        node_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "node")
+        assert len(payload["nodes"]) == 2
+
+        occurrence_count = 0
+        original_occurrence = guided_route._schema8_prospective_occurrence
+
+        def drift_settlement_projection(*args: Any, **kwargs: Any) -> Any:
+            nonlocal occurrence_count
+            occurrence_count += 1
+            prospective, current_turn, prepared = original_occurrence(*args, **kwargs)
+            if occurrence_count != 2:
+                return prospective, current_turn, prepared
+            drifted_turn = json.loads(json.dumps(current_turn))
+            first, second = drifted_turn["payload"]["nodes"]
+            first["stable_id"], second["stable_id"] = second["stable_id"], first["stable_id"]
+            return prospective, drifted_turn, prepared
+
+        monkeypatch.setattr(guided_route, "_schema8_prospective_occurrence", drift_settlement_projection)
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": node_target,
+                "correction_feedback": "Change only the selected node's prompt while preserving the other step.",
+            },
+        )
+
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+
     def test_prose_revision_replans_full_pipeline_with_instruction_as_intent(
         self,
         composer_test_client: TestClient,
@@ -1469,9 +2911,10 @@ class TestStep2IntraStep:
 
         The proposal-review turn accepts a prose ``revision_instruction`` (no
         ``edit_target``). It supersedes the pending proposal and re-plans the
-        full pipeline with the instruction as the planner intent. With no root
-        intent (the tutorial / auto-proposal case), the planner originating
-        content is the instruction alone.
+        full pipeline from [root goal, instruction] — the goal stays the
+        planner's root through revisions (elspeth-378cfa0e18) — while the
+        planner ORIGINATING message stays the instruction alone, because one
+        revision owns exactly one message.
         """
         session_id = _create_session(composer_test_client)
         staged = self._stage_proposal(composer_test_client, session_id, filename="prose-revise.jsonl")
@@ -1481,11 +2924,11 @@ class TestStep2IntraStep:
         assert _full_guided_session(staged)["deferred_intents"] == []
 
         captured: dict[str, object] = {}
-        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+        replacement = _llm_prompt_template_planner("Deduplicate each row before writing it.")
 
         async def spy_planner(**kwargs: object) -> object:
             captured.update(kwargs)
-            return await original_planner(**kwargs)
+            return await replacement(**kwargs)
 
         monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
 
@@ -1509,9 +2952,8 @@ class TestStep2IntraStep:
         assert body["next_turn"]["type"] == "propose_pipeline"
         successor_id = body["next_turn"]["payload"]["proposal_id"]
         assert successor_id != old_proposal_id
-        # The instruction is the planner intent verbatim, and with no root intent
-        # the originating content is exactly the instruction (root-absent branch).
         assert captured["intent"] == instruction
+        assert captured["root_goal"] == _GOAL_FIRST_INTENT
         assert captured["originating_message"].content == instruction
 
         guided = _full_guided_session(body)
@@ -1535,6 +2977,759 @@ class TestStep2IntraStep:
         assert replay.status_code == 200, replay.json()
         assert replay.json() == body
         assert captured == {}
+
+    def test_prose_revision_defaults_to_amend_from_active_proposal_with_exact_message_custody(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Legacy/missing mode is a conservative amendment of the live draft.
+
+        The persisted composition checkpoint intentionally does not contain the
+        pending proposal.  Revision authority therefore has to come from the
+        proposal row, and the author's instruction must be staged as the exact
+        originating user message rather than borrowing the root intent.
+        """
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-amend-authority.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        assert staged["composition_state"]["sources"] == {}
+
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner("Normalize each row while preserving the reviewed pipeline.")
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+
+        instruction = "Insert a deduplication transform while preserving the reviewed gate and existing transforms."
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": instruction},
+            },
+        )
+
+        assert revised.status_code == 200, revised.json()
+        predecessor = cast(CompositionState, captured["current_state"])
+        reviewed_source_names = {source["name"] for source in _full_guided_session(staged)["reviewed_sources"].values()}
+        assert set(predecessor.sources) == reviewed_source_names
+        revision_authority = captured["revision_authority"]
+        assert revision_authority.mode == "amend"
+        assert revision_authority.predecessor == predecessor
+        originating_message = cast("PlannerOriginatingMessage", captured["originating_message"])
+        assert originating_message.content == instruction
+        assert originating_message.message_id is not None
+
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        matching = [message for message in messages if message.content == instruction]
+        assert len(matching) == 1
+        assert str(matching[0].id) == originating_message.message_id
+        assert matching[0].role == "user"
+        assert matching[0].writer_principal == "route_user_message"
+        guided = _full_guided_session(revised.json())
+        assert guided["correction_messages"][-1]["message_id"] == originating_message.message_id
+
+    def test_prose_revision_uses_explicit_replace_authority(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-replace-authority.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner("Pass each row through one audited processing step.")
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {
+                    "revision_instruction": "Replace the transform topology with one pass-through.",
+                    "revision_mode": "replace",
+                },
+            },
+        )
+
+        assert response.status_code == 200, response.json()
+        assert captured["revision_authority"].mode == "replace"
+
+    def test_consecutive_prose_revisions_accept_exact_retained_instruction_lineage(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two revisions in a row keep exact message lineage AND the goal.
+
+        The SECOND revision is the one that discriminates. On the first, the
+        superseded proposal's originating message IS the session root, so a
+        root lookup conditioned on that coincidence still finds it; from the
+        second onward the superseded proposal was authored by correction #1,
+        and only a lookup conditioned on "this session has a root" still
+        carries the goal to the planner. Without it the goal silently stops
+        being a constraint after the first proposal — the defect goal-first
+        (elspeth-378cfa0e18) exists to close — and no other test in this
+        module makes two consecutive revisions.
+        """
+
+        session_id = _create_session(composer_test_client)
+        current = self._stage_proposal(composer_test_client, session_id, filename="consecutive-prose-revisions.jsonl")
+
+        captured: dict[str, object] = {}
+
+        def spying(replacement: Callable[..., Awaitable[object]]) -> Callable[..., Awaitable[object]]:
+            """Record the kwargs of the one planner call this revision makes."""
+
+            async def spy_planner(**kwargs: object) -> object:
+                captured.clear()
+                captured.update(kwargs)
+                return await replacement(**kwargs)
+
+            return spy_planner
+
+        for index, instruction in enumerate(
+            (
+                "Replace the proposal with one summarization step.",
+                "Replace that proposal with a differently instructed summarization step.",
+            ),
+            start=1,
+        ):
+            monkeypatch.setattr(
+                composer_test_client.app.state.composer_service,
+                "plan_guided_pipeline",
+                spying(_llm_prompt_template_planner(f"Revision {index} prompt.")),
+            )
+            turn = current["next_turn"]
+            payload = turn["payload"]
+            revised = composer_test_client.post(
+                f"/api/sessions/{session_id}/guided/respond",
+                json={
+                    "operation_id": str(uuid4()),
+                    "turn_token": turn["turn_token"],
+                    "proposal_id": payload["proposal_id"],
+                    "draft_hash": payload["draft_hash"],
+                    "edited_values": {
+                        "revision_instruction": instruction,
+                        "revision_mode": "replace",
+                    },
+                },
+            )
+
+            assert revised.status_code == 200, revised.json()
+            # Every revision, not just the first: the request is the
+            # instruction alone and the session's goal rides beside it as the
+            # named ``root_goal`` fact.
+            assert captured["intent"] == instruction
+            assert captured["root_goal"] == _GOAL_FIRST_INTENT
+            current = revised.json()
+
+        guided = _full_guided_session(current)
+        assert len(guided["correction_messages"]) == 2
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        by_id = {str(message.id): message for message in messages}
+        for reference, instruction in zip(
+            guided["correction_messages"],
+            (
+                "Replace the proposal with one summarization step.",
+                "Replace that proposal with a differently instructed summarization step.",
+            ),
+            strict=True,
+        ):
+            message = by_id[reference["message_id"]]
+            assert message.content == instruction
+            assert message.role == "user"
+
+    def test_revision_intent_does_not_carry_a_threshold_stated_only_in_the_goal(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A comparison the revision WITHDREW must not reach the request guards.
+
+        ``_stated_threshold_for_planner_request`` reads ``intent`` as the
+        current user message, and on a rejected all-constant-gate candidate it
+        answers with ``gate_condition_ignores_stated_threshold`` — a rejection
+        whose own docstring calls this false positive "worse than a miss",
+        because under a repair budget of one it ends in REPAIR_EXHAUSTED with
+        no proposal at all. Folding the session goal into ``intent`` made that
+        happen for real: the goal's "over 8" resurrected on a revision that had
+        just said "no routing". The goal therefore rides as the named
+        ``root_goal`` fact and the guard sees only the words the author just
+        typed. Mechanism, not symptom: the guard is called here exactly as the
+        planner calls it.
+        """
+
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_for_planner_request
+
+        goal = "Route rows scoring over 8 to the review sink and everything else to the archive."
+        session_id = _create_session(composer_test_client, intent=goal)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="revision-threshold-boundary.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner("Summarize each row.")
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+
+        instruction = "Actually put everything in one sink; no routing."
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": instruction},
+            },
+        )
+
+        assert revised.status_code == 200, revised.json()
+        assert captured["intent"] == instruction
+        assert captured["root_goal"] == goal
+        # The guided surface passes no conversation_context, so this is the
+        # exact call the planner makes for this request.
+        assert _stated_threshold_for_planner_request(cast(str, captured["intent"]), None) is None
+        # ... and the goal on its own would have produced one, so the pin is
+        # measuring the boundary rather than an absence of thresholds.
+        assert _stated_threshold_for_planner_request(goal, None) == "over 8"
+
+    @pytest.mark.parametrize("revision_mode", ("amend", "replace"))
+    def test_substituted_unchanged_prose_planner_cannot_supersede_revision_predecessor(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        revision_mode: str,
+    ) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="unchanged-prose-amend.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+
+        async def unchanged_planner(**kwargs: object) -> object:
+            proposal = PipelineProposal.create(
+                pipeline=deep_thaw(authority.proposal.pipeline),
+                base=kwargs["base"],
+                reviewed_facts=guided_private_reviewed_facts(kwargs["guided"]),
+                surface=authority.proposal.surface,
+                repair_count=0,
+                skill_hash=authority.proposal.skill_hash,
+                covered_deferred_intent_ids=authority.proposal.covered_deferred_intent_ids,
+                supersedes_draft_hash=authority.proposal.draft_hash,
+            )
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="unchanged-prose-amend",
+                    custody_result="not_required",
+                    model_identifier="unchanged-model",
+                    model_version="unchanged-v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({"csv"}),
+                    "transform": frozenset(),
+                    "sink": frozenset({"json"}),
+                },
+            )
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", unchanged_planner)
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {
+                    "revision_instruction": "Add one transform without replacing anything.",
+                    "revision_mode": revision_mode,
+                },
+            },
+        )
+
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+
+    def test_substituted_prose_planner_cannot_change_amend_predecessor_private_fields(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+
+        session_id = _create_session(composer_test_client)
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner("Keep this exact reviewed prompt."),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="private-prose-amend.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+
+        async def private_field_changing_planner(**kwargs: object) -> object:
+            pipeline = deep_thaw(authority.proposal.pipeline)
+            pipeline["nodes"][0]["options"]["prompt_template"] = "Silently replaced private prompt."
+            proposal = PipelineProposal.create(
+                pipeline=pipeline,
+                base=kwargs["base"],
+                reviewed_facts=guided_private_reviewed_facts(kwargs["guided"]),
+                surface=authority.proposal.surface,
+                repair_count=0,
+                skill_hash=authority.proposal.skill_hash,
+                covered_deferred_intent_ids=authority.proposal.covered_deferred_intent_ids,
+                supersedes_draft_hash=authority.proposal.draft_hash,
+            )
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="private-field-changing-prose-amend",
+                    custody_result="not_required",
+                    model_identifier="unsafe-model",
+                    model_version="unsafe-v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({"csv"}),
+                    "transform": frozenset({"llm"}),
+                    "sink": frozenset({"json"}),
+                },
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            private_field_changing_planner,
+        )
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {
+                    "revision_instruction": "Insert another step without changing the reviewed prompt.",
+                    "revision_mode": "amend",
+                },
+            },
+        )
+
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+        assert _get_guided(composer_test_client, session_id)["next_turn"]["payload"] == payload
+
+    @pytest.mark.parametrize(
+        "edited_values",
+        (
+            {"revision_instruction": "Change it.", "revision_mode": "destroy"},
+            {"revision_instruction": "Change it.", "revision_mode": 1},
+            {"revision_instruction": "Change it.", "revision_mode": "amend", "unexpected": True},
+        ),
+    )
+    def test_prose_revision_rejects_invalid_mode_or_open_shape_without_mutation(
+        self,
+        composer_test_client: TestClient,
+        edited_values: dict[str, object],
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-invalid-mode.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": edited_values,
+            },
+        )
+
+        assert rejected.status_code == 400, rejected.json()
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+
+    def test_prose_revision_records_the_instruction_in_the_transcript(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: a transform-stage instruction is transcript evidence.
+
+        The docked-composer instruction drove a full re-plan but was recorded
+        only as a ``TurnRecord`` summary, so reloading the session showed a new
+        proposal with no trace of what the author asked for. The settlement now
+        appends the author's verbatim words plus one server-authored outcome
+        line to ``chat_history`` — the same channel ``/guided/chat`` writes and
+        the frontend renders — and the operation still replays byte-identically.
+        """
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-transcript.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        before = _full_guided_session(staged)
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner("Deduplicate each row before writing it."),
+        )
+        instruction = "Add a deduplication transform before the output."
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": payload["proposal_id"],
+            "draft_hash": payload["draft_hash"],
+            "edited_values": {"revision_instruction": instruction},
+        }
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert revised.status_code == 200, revised.json()
+        body = revised.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        user_turn, assistant_turn = history[-2], history[-1]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == instruction
+        assert user_turn["step"] == "step_3_transforms"
+        assert user_turn["assistant_message_kind"] is None
+        assert user_turn["synthetic_failure_reason"] is None
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+        assert assistant_turn["step"] == "step_3_transforms"
+        assert assistant_turn["assistant_message_kind"] == "assistant"
+        assert assistant_turn["synthetic_failure_reason"] is None
+        assert user_turn["seq"] == before["chat_turn_seq"]
+        assert assistant_turn["seq"] == before["chat_turn_seq"] + 1
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The narrow wire projection the frontend renders carries the same pair.
+        assert body["guided_session"]["chat_history"][-2:] == [user_turn, assistant_turn]
+
+        # Settlement/replay verification still holds: the same request replays
+        # the identical settled body, and a reload projects the same transcript.
+        replay = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == body
+        assert _get_guided(composer_test_client, session_id)["guided_session"]["chat_history"][-2:] == [user_turn, assistant_turn]
+
+    def test_declined_prose_revision_records_the_instruction_before_the_decline(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: a declined instruction is still transcript evidence.
+
+        The decline path already appends the advisor's words. Without the
+        instruction ahead of them the transcript reads as a refusal of nothing,
+        and the author's request is lost entirely because a decline stages no
+        proposal and persists no correction message.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not fit that instruction to the reviewed components."
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="declined-prose.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        before = _full_guided_session(staged)
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        instruction = "Add a transform that cannot exist."
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": instruction},
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        guided = _full_guided_session(declined.json())
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        assert [(entry["role"], entry["content"], entry["step"]) for entry in history[-2:]] == [
+            ("user", instruction, "step_3_transforms"),
+            ("assistant", decline_text, "step_3_transforms"),
+        ]
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The decline stages nothing: the pending proposal survives untouched.
+        assert guided["active_proposal"]["proposal_id"] == payload["proposal_id"]
+        assert guided["correction_messages"] == before["correction_messages"]
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        assert all(message.content != instruction for message in messages)
+        # elspeth-ed67eb9d0d: the POST body alone hid a permanently bricked
+        # session. The decline settles a new checkpoint while the proposal
+        # stays under review, and before the fix the proposal's anchor kept
+        # naming the previous row — so this same clean 200 was followed by
+        # a GET that raised "guided proposal base differs from current
+        # checkpoint" forever, which the frontend tolerates by silently
+        # reopening the session in freeform. Read it back.
+        read_back = _get_guided(composer_test_client, session_id)
+        assert read_back["guided_session"]["step"] == "step_3_transforms"
+        assert read_back["next_turn"]["type"] == "propose_pipeline"
+        assert read_back["next_turn"]["payload"]["proposal_id"] == payload["proposal_id"]
+        assert read_back["next_turn"]["payload"]["draft_hash"] == payload["draft_hash"]
+
+    def test_wire_correction_records_the_feedback_in_the_transcript(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """R2-F6: the wire-stage correction is the same transcript evidence.
+
+        ``correction_feedback`` is persisted as a chat_messages row and bound
+        into ``correction_messages`` custody, but never reached the rendered
+        transcript. It is the author's verbatim prose driving a full re-plan,
+        exactly like the transform-stage instruction, so it is recorded the
+        same way — at ``step_4_wire``.
+        """
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="wire-transcript.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        before = _full_guided_session(reviewed)
+        feedback = "Route the reviewed source through the requested processing before the output."
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": wire_turn["turn_token"],
+            "proposal_id": wire_payload["proposal_id"],
+            "draft_hash": wire_payload["draft_hash"],
+            "edit_target": _source_validation_failure_edit_target(wire_payload),
+            "correction_feedback": feedback,
+        }
+
+        corrected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert corrected.status_code == 200, corrected.json()
+        body = corrected.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        user_turn, assistant_turn = history[-2], history[-1]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == feedback
+        assert user_turn["step"] == "step_4_wire"
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT
+        assert assistant_turn["step"] == "step_4_wire"
+        assert assistant_turn["assistant_message_kind"] == "assistant"
+        assert assistant_turn["synthetic_failure_reason"] is None
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+
+        replay = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == body
+
+    def test_declined_proposal_component_correction_records_feedback_without_dangling_custody(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not safely make that selected-component change."
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="declined-proposal-correction.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "edge")
+        before = _full_guided_session(staged)
+        feedback = "Change only this route to the reviewed standard output."
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": target,
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        guided = _full_guided_session(declined.json())
+        assert guided["active_proposal"]["proposal_id"] == payload["proposal_id"]
+        assert guided["correction_messages"] == before["correction_messages"]
+        assert [(entry["role"], entry["content"]) for entry in guided["chat_history"][-2:]] == [
+            ("user", feedback),
+            ("assistant", decline_text),
+        ]
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        assert all(message.content != feedback for message in messages)
+
+    def test_declined_wire_correction_records_the_feedback_before_the_decline(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: the step-4 decline composes with the wire turn too.
+
+        The decline settles ``base_guided`` unmutated, so at step 4 the appended
+        pair lands on a session that still holds a live active proposal and an
+        unanswered confirm_wiring turn — a different shape from the step-3
+        decline. A declined correction persists no chat_messages row either, so
+        without this the feedback is lost outright.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not rewire the graph the way you asked."
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="declined-wire.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        before = _full_guided_session(reviewed)
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        feedback = "Rewire this through a component that does not exist."
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": wire_turn["turn_token"],
+                "proposal_id": wire_payload["proposal_id"],
+                "draft_hash": wire_payload["draft_hash"],
+                "edit_target": {
+                    "kind": "edge",
+                    "stable_id": wire_payload["connections"][0]["stable_id"],
+                },
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        body = declined.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        assert [(entry["role"], entry["content"], entry["step"]) for entry in history[-2:]] == [
+            ("user", feedback, "step_4_wire"),
+            ("assistant", decline_text, "step_4_wire"),
+        ]
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The decline stages nothing: the reviewed proposal and its unanswered
+        # wire turn survive, so the operator retries with a fresh operation_id.
+        assert guided["step"] == "step_4_wire"
+        assert guided["active_proposal"]["proposal_id"] == wire_payload["proposal_id"]
+        assert body["next_turn"]["type"] == "confirm_wiring"
+        assert _get_guided(composer_test_client, session_id)["next_turn"]["turn_token"] == wire_turn["turn_token"]
+        # elspeth-ed67eb9d0d: at Step 4 the amputation is the REFINE
+        # affordance, not the read. The Step-3 acceptance into wire review
+        # already spends the one-hop tolerance back_edit allows, so before
+        # the fix this second carrying settlement pushed the proposal's
+        # anchor out of allowed_base_state_ids and "edit this component"
+        # started failing closed on a proposal nothing had changed.
+        edited = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": body["next_turn"]["turn_token"],
+                "proposal_id": wire_payload["proposal_id"],
+                "draft_hash": wire_payload["draft_hash"],
+                "edit_target": {"kind": "source", "stable_id": wire_payload["sources"][0]["stable_id"]},
+                "correction_feedback": "Change the selected source settings.",
+            },
+        )
+        assert edited.status_code == 200, edited.json()
+        assert edited.json()["guided_session"]["step"] == "step_1_source"
 
     def test_competing_respond_answers_fast_coded_conflict_during_planner_settlement(
         self,
@@ -1622,10 +3817,11 @@ class TestStep2IntraStep:
         assert detail["code"] == "operation_in_progress"
         assert elapsed < 3, f"competing respond took {elapsed:.1f}s; must answer well under the planner runtime"
         # The in-flight owner is unaffected: it settles through its own path
-        # (coded planner-failure envelope from the stubbed exhaustion).
-        assert owner.status_code == 502, owner.text
+        # (coded planner-failure envelope from the stubbed exhaustion —
+        # planner_repair_exhausted 500, elspeth-5904b1683a).
+        assert owner.status_code == 500, owner.text
 
-    def test_prose_revision_planner_exhaustion_is_coded_502_not_500(
+    def test_prose_revision_planner_exhaustion_is_coded_not_generic(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
@@ -1636,9 +3832,11 @@ class TestStep2IntraStep:
         on the step-3 replan fell through post_guided_respond's failure-code
         selection to 'operation_failed' — the generic 500 banner — while the
         sibling /guided/plan route already maps PipelinePlannerError through
-        _guided_full_failure_code to 'invalid_provider_response' (502, with a
-        retry instruction). The respond route must answer the same closed
-        shape for the same failure class.
+        _guided_full_failure_code. The respond route must answer the same
+        closed shape for the same failure class: since elspeth-5904b1683a
+        that shape is ``planner_repair_exhausted`` (HTTP 500, retry offered),
+        distinguished from the generic banner by its closed failure_code and
+        actionable copy, not by the status number.
         """
         from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 
@@ -1671,23 +3869,88 @@ class TestStep2IntraStep:
             },
         )
 
-        assert response.status_code == 502, response.text
+        assert response.status_code == 500, response.text
         detail = response.json()["detail"]
         assert detail["error_type"] == "guided_operation_terminal_failure"
-        assert detail["failure_code"] == "invalid_provider_response"
+        assert detail["failure_code"] == "planner_repair_exhausted"
         assert "retry" in detail["detail"].lower()  # actionable, no planner internals
 
-    def test_prose_revision_appends_instruction_to_root_intent(
+    def test_policy_refusal_answers_422_policy_blocked_not_a_provider_fault(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With a live root intent, the instruction is appended after it.
+        """A deployment-policy refusal is permanent, and the copy must say so.
 
-        The planner originating content is the root intent first, then the
-        instruction on a new paragraph (root-present branch).
+        Guided S3 investigation (2026-07-31): a session whose reviewed source was
+        ``aws_s3`` had its server-synthesized pass-through pipeline refused by the
+        authoritative source gate with ZERO provider calls. The refusal reached
+        the user as ``invalid_provider_response`` — HTTP 502, "The provider
+        returned an invalid response. Retry with a new operation id." — blaming a
+        provider that was never called and instructing a retry that could not
+        possibly succeed.
+
+        The planner exception raised here matches what the guided planner
+        surfaces on a policy refusal: ``VALIDATION_FAILED`` carrying the
+        gate's own closed code (the model path's carriage is pinned by the
+        exhaustion coverage in ``test_pipeline_planner.py``). Stubbing the
+        planner keeps this test about the ROUTE's classification, which is the
+        seam that mis-answered.
         """
+        from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+
         session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="policy-refusal.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+
+        async def policy_refused_planner(**kwargs: object) -> object:
+            raise PipelinePlannerError(
+                "server-derived pipeline failed candidate validation",
+                code="VALIDATION_FAILED",
+                detail_codes=("aws_s3_source_not_allowed",),
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            policy_refused_planner,
+        )
+
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": "Read the archive from the S3 bucket."},
+            },
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "guided_operation_terminal_failure"
+        assert detail["failure_code"] == "policy_blocked"
+        copy = detail["detail"].lower()
+        assert "provider" not in copy
+        assert "operation id" not in copy
+        assert "deployment policy" in copy
+
+        # The durable operation row carries the permanent code, so a replay of the
+        # same operation id answers the same permanent envelope.
+        with composer_test_client.app.state.session_engine.connect() as conn:
+            row = conn.execute(select(guided_operations_table).where(guided_operations_table.c.session_id == session_id)).mappings().all()
+        failed = [item for item in row if item["status"] == "failed"]
+        assert failed and all(item["failure_code"] == "policy_blocked" for item in failed)
+
+    def test_prose_revision_keeps_exact_instruction_as_origin_when_root_exists(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A revision owns one exact message even when the session has a root."""
+        session_id = _create_session(composer_test_client, intent=None)
         intent = "Author a pipeline that ingests the CSV and writes JSON results."
         started = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/start",
@@ -1699,11 +3962,11 @@ class TestStep2IntraStep:
         payload = turn["payload"]
 
         captured: dict[str, object] = {}
-        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+        replacement = _llm_prompt_template_planner("Deduplicate each row before writing it.")
 
         async def spy_planner(**kwargs: object) -> object:
             captured.update(kwargs)
-            return await original_planner(**kwargs)
+            return await replacement(**kwargs)
 
         monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
 
@@ -1721,8 +3984,13 @@ class TestStep2IntraStep:
 
         assert revised.status_code == 200, revised.json()
         assert revised.json()["next_turn"]["type"] == "propose_pipeline"
+        # Root-first brief: the verified root rides as the named ``root_goal``
+        # fact and the instruction is the intent. The ORIGIN stays the
+        # instruction alone — that is what this test is about, and it is
+        # exactly what the root's presence must not change.
         assert captured["intent"] == instruction
-        assert captured["originating_message"].content == f"{intent}\n\n{instruction}"
+        assert captured["root_goal"] == intent
+        assert captured["originating_message"].content == instruction
 
     @pytest.mark.parametrize("instruction", ["", "   ", "x" * 8193, 123])
     def test_prose_revision_rejects_invalid_instruction_without_mutation(
@@ -1834,8 +4102,9 @@ class TestStep2IntraStep:
         original_back_edit = service.back_edit_guided_pipeline_proposal
         captured_commands = []
 
-        async def capture_without_settlement(command, *, payload_store=None):
+        async def capture_without_settlement(command, *, payload_store=None, session_operation_context):
             del payload_store
+            _assert_compose_context_for(session_operation_context, session_id)
             captured_commands.append(command)
             raise RuntimeError("capture command before settlement")
 
@@ -1857,7 +4126,8 @@ class TestStep2IntraStep:
         older_head = asyncio.run(service.get_current_state(session_uuid))
         assert older_head is not None
         later_head = asyncio.run(
-            service.save_composition_state(
+            _save_composition_state_with_compose_authority(
+                service,
                 session_uuid,
                 CompositionStateData(
                     sources=older_head.sources,
@@ -2017,9 +4287,13 @@ class TestStep2IntraStep:
         original = service.back_edit_guided_pipeline_proposal
         captured_commands = []
 
-        async def capture(command, *, payload_store=None):
+        async def capture(command, *, payload_store=None, session_operation_context):
             captured_commands.append(command)
-            return await original(command, payload_store=payload_store)
+            return await original(
+                command,
+                payload_store=payload_store,
+                session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+            )
 
         monkeypatch.setattr(service, "back_edit_guided_pipeline_proposal", capture)
         with engine.connect() as conn:
@@ -2037,7 +4311,7 @@ class TestStep2IntraStep:
                 return
             compiled = context.compiled
             statement = compiled.statement if compiled is not None else None
-            table_name = getattr(getattr(statement, "table", None), "name", None)
+            table_name = statement.table.name if isinstance(statement, Insert | Update) else None
             value_keys = set(compiled.params) if compiled is not None else set()
             operation: str | None = None
             if isinstance(statement, Insert):
@@ -2241,7 +4515,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "failed-plan.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "failed-plan.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -2308,7 +4582,7 @@ class TestStep2IntraStep:
         failed_calls = [
             envelope["call"]
             for message in audit_messages
-            for envelope in message.tool_calls
+            for envelope in (message.tool_calls or ())
             if envelope.get("_kind") == "llm_call_audit" and envelope.get("call", {}).get("status") == ComposerLLMCallStatus.API_ERROR.value
         ]
         failed_rows = [row for row in operation_rows if row["status"] == "failed"]
@@ -2322,6 +4596,290 @@ class TestStep2IntraStep:
         assert failed_calls[0]["thinking_blocks"] is None
         rendered = repr((failed.json(), restored, operation_rows, operation_events, audit_messages))
         assert all(canary not in rendered for canary in failure_canaries)
+
+    def test_escape_hatch_decline_is_an_ordinary_chat_turn_not_a_failure(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PlannerDeclined on the staged guided surface must not become operation_failed.
+
+        Mirrors test_failed_proposal_planning_retains_only_closed_failure_code's
+        drive-to-the-planner-call setup, but the escape-hatch advisor declines
+        instead of erroring. An honest decline is a conversational outcome
+        (mirrors the guided-full and freeform surfaces' identical
+        PlannerDeclined handling): the operation completes with the advisor's
+        own words appended to guided_session.chat_history — never routed
+        through GuidedOperationFailureCode — and the session stays at
+        STEP_2_SINK with the pending output review intact, so the operator
+        retries with a fresh operation_id.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not find a transform that fits this shape."
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "declined-plan.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+
+        async def decline_planner(**_kwargs):
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        _respond(
+            composer_test_client,
+            session_id,
+            chosen=["text"],
+            custom_inputs=[],
+        )
+        preserved_turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert preserved_turn is not None
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        body = declined.json()
+        assert body["next_turn"] == preserved_turn
+        assert _get_guided(composer_test_client, session_id)["next_turn"] == preserved_turn
+        assert body["guided_session"]["step"] == "step_2_sink"
+        chat_history = _full_guided_session(body)["chat_history"]
+        # The seeded goal acknowledgement is the transcript's first assistant
+        # line on every rooted session; the decline is appended after it.
+        assert [turn["content"] for turn in chat_history if turn["role"] == "assistant"] == [
+            GUIDED_GOAL_ACKNOWLEDGEMENT,
+            decline_text,
+        ]
+
+        with composer_test_client.app.state.session_engine.connect() as conn:
+            operation_rows = (
+                conn.execute(
+                    select(guided_operations_table)
+                    .where(guided_operations_table.c.session_id == session_id)
+                    .order_by(guided_operations_table.c.created_at)
+                )
+                .mappings()
+                .all()
+            )
+        assert all(row["status"] == "completed" for row in operation_rows)
+        last_operation = operation_rows[-1]
+        assert last_operation["failure_code"] is None
+        assert last_operation["result_kind"] == "composition_state"
+
+    def test_actual_escape_hatch_decline_persists_paired_planner_evidence(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ordinary decline settlement keeps both halves of planner evidence."""
+        session_id = _create_session(composer_test_client, intent=None)
+        started = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={
+                "operation_id": str(uuid4()),
+                "intent": "Build a pipeline that annotates each row before saving.",
+            },
+        )
+        assert started.status_code == 200, started.json()
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "actual-decline.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        app = composer_test_client.app
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(
+                update={
+                    "composer_model": "test/guided-planner",
+                    "composer_max_discovery_turns": 1,
+                }
+            ),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+
+        responses = iter(
+            (
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content=None,
+                                tool_calls=[
+                                    _PlannerToolCall(
+                                        id="discover-sources",
+                                        function=_PlannerFunction(name="list_sources", arguments="{}"),
+                                    )
+                                ],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                ),
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content=None,
+                                tool_calls=[
+                                    _PlannerToolCall(
+                                        id="discover-sinks",
+                                        function=_PlannerFunction(name="list_sinks", arguments="{}"),
+                                    )
+                                ],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                ),
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content="I cannot produce a safe proposal from the reviewed facts.",
+                                tool_calls=[],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                    model="anthropic/claude-sonnet-4-6",
+                    id="guided-advisor-decline",
+                ),
+            )
+        )
+
+        async def declining_completion(**_kwargs: Any) -> _PlannerResponse:
+            return next(responses)
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", declining_completion)
+
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        assert _full_guided_session(declined.json())["chat_history"][-1]["content"] == (
+            "I cannot produce a safe proposal from the reviewed facts."
+        )
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        planner_evidence_kinds = [
+            envelope.get("_kind")
+            for message in audit_messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+            and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
+        ]
+        assert planner_evidence_kinds == [
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+        ]
+
+    def test_escape_hatch_decline_materializes_a_prospective_current_turn(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "prospective-decline.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        _remove_durable_current_turn(composer_test_client, session_id)
+        preserved_turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert preserved_turn is not None
+        audit_before = _guided_audit_invocations(composer_test_client, session_id)
+
+        async def decline_planner(**_kwargs):
+            return GuidedPlannerDecline(decline_text="The prospective turn cannot be planned yet.")
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        assert declined.json()["next_turn"] == preserved_turn
+        assert _get_guided(composer_test_client, session_id)["next_turn"] == preserved_turn
+        audit_delta = _guided_audit_invocations(composer_test_client, session_id)[len(audit_before) :]
+        assert [name for name, _arguments in audit_delta] == ["guided_turn_emitted"]
+        payload_hash = _full_guided_session(declined.json())["history"][-1]["payload_hash"]
+        assert audit_delta[0][1] == {
+            "step_index": "step_2_sink",
+            "turn_type": "review_components",
+            "payload_hash": payload_hash,
+            "payload_payload_id": payload_hash,
+            "emitter": "server",
+        }
 
     @pytest.mark.parametrize(
         "composer_test_client",
@@ -2346,7 +4904,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "failed-plan-audit-rollback.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "failed-plan-audit-rollback.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -2419,11 +4977,35 @@ class TestStep2IntraStep:
                 .mappings()
                 .one()
             )
-        assert operation["status"] == "in_progress"
-        assert operation["failure_code"] is None
-        assert operation["settled_at"] is None
+            terminal_events = (
+                conn.execute(
+                    select(guided_operation_events_table)
+                    .where(guided_operation_events_table.c.session_id == session_id)
+                    .where(guided_operation_events_table.c.operation_id == operation_id)
+                    .where(guided_operation_events_table.c.event_kind == "failed")
+                )
+                .mappings()
+                .all()
+            )
+        # Audit primacy under the Q3 ruling: the failure's evidence could not
+        # be recorded, so the lease guard's audit-free arm terminalises the
+        # row as an integrity failure and commits an EMPTY evidence cohort --
+        # the row says, durably, that it failed and that no evidence row
+        # belongs to it. The invariant is "no evidence row without its state
+        # row", never "no state row without evidence": the chat transcript is
+        # untouched and the canary never leaks.
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
+        assert operation["settled_at"] is not None
+        (terminal_event,) = terminal_events
+        assert terminal_event["failure_audit_cohort"]["count"] == 0
+        assert terminal_event["failure_audit_cohort"]["rows"] == []
+        # The missing-evidence fact is recorded by WHO wrote the terminal
+        # event: the lease guard's audit-free arm, not the route's own
+        # evidence settlement (which is what failed here).
+        assert terminal_event["actor"] == "guided_operation_lease_guard"
         assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before
-        assert failure_canary not in repr((exc_info.value, operation))
+        assert failure_canary not in repr((exc_info.value, operation, terminal_event))
 
     @pytest.mark.parametrize(
         "composer_test_client",
@@ -2471,12 +5053,16 @@ class TestStep2IntraStep:
                 planner_calls += 1
                 raise AssertionError("source/output proposal back-edit must not call the planner")
 
-            async def blocking_back_edit(command, *, payload_store=None):
+            async def blocking_back_edit(command, *, payload_store=None, session_operation_context):
                 nonlocal back_edit_calls
                 back_edit_calls += 1
                 back_edit_entered.set()
                 await release_back_edit.wait()
-                return await original_back_edit(command, payload_store=payload_store)
+                return await original_back_edit(
+                    command,
+                    payload_store=payload_store,
+                    session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+                )
 
             monkeypatch.setattr(
                 composer_test_client.app.state.composer_service,
@@ -2584,7 +5170,7 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": proposal_payload["proposal_id"],
                 "draft_hash": proposal_payload["draft_hash"],
-                "edit_target": turn["payload"]["connections"][0]["from_endpoint"],
+                "edit_target": _source_validation_failure_edit_target(turn["payload"]),
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         }
@@ -2609,26 +5195,33 @@ class TestStep2IntraStep:
         prepare_calls = []
         execute_calls = []
 
-        async def gated_admit(command):
+        async def gated_admit(command, *, session_operation_context):
             admission_commands.append(command)
             entered["confirm"].set()
             await release.wait()
             if db_winner != "confirm":
                 await winner_settled.wait()
             try:
-                return await original_admit(command)
+                return await original_admit(
+                    command,
+                    session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+                )
             finally:
                 if db_winner == "confirm":
                     winner_settled.set()
 
-        async def gated_stage(command, *, payload_store=None):
+        async def gated_stage(command, *, payload_store=None, session_operation_context):
             stage_commands.append(command)
             entered["correct"].set()
             await release.wait()
             if db_winner != "correct":
                 await winner_settled.wait()
             try:
-                return await original_stage(command, payload_store=payload_store)
+                return await original_stage(
+                    command,
+                    payload_store=payload_store,
+                    session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+                )
             finally:
                 if db_winner == "correct":
                     winner_settled.set()
@@ -2652,52 +5245,56 @@ class TestStep2IntraStep:
                 select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
             )
 
+        loser = "correct" if db_winner == "confirm" else "confirm"
+
         async def race_and_replay():
             async with (
                 AsyncClient(transport=ASGITransport(app=primary_app), base_url="http://confirm-worker") as accept_client,
                 AsyncClient(transport=ASGITransport(app=peer_app), base_url="http://correct-worker") as revise_client,
             ):
-                tasks = {
-                    "confirm": asyncio.create_task(
-                        accept_client.post(f"/api/sessions/{session_id}/guided/respond", json=requests["confirm"])
-                    ),
-                    "correct": asyncio.create_task(
-                        revise_client.post(f"/api/sessions/{session_id}/guided/respond", json=requests["correct"])
-                    ),
-                }
-                await asyncio.wait_for(
-                    asyncio.gather(entered["confirm"].wait(), entered["correct"].wait()),
-                    timeout=10,
-                )
+                clients = {"confirm": accept_client, "correct": revise_client}
+                path = f"/api/sessions/{session_id}/guided/respond"
+                winner_task = asyncio.create_task(clients[db_winner].post(path, json=requests[db_winner]))
+                await asyncio.wait_for(entered[db_winner].wait(), timeout=10)
+                # Independent workers serialise at the session-operation
+                # lease, not at admission: the second worker is refused with
+                # the platform's 409 while the first holds the session, before
+                # any guided operation row or settlement double of its own.
+                refused = await asyncio.wait_for(clients[loser].post(path, json=requests[loser]), timeout=10)
+                assert not entered[loser].is_set()
                 release.set()
-                responses = dict(
-                    zip(
-                        ("confirm", "correct"),
-                        await asyncio.wait_for(asyncio.gather(tasks["confirm"], tasks["correct"]), timeout=20),
-                        strict=True,
-                    )
-                )
+                winner_response = await asyncio.wait_for(winner_task, timeout=20)
+                # The refused worker retries once the lease is free. The
+                # winner has already settled the turn, so the retry is
+                # refused at the guided turn contract before it reserves an
+                # operation of its own: it publishes nothing, on either try.
+                loser_response = await asyncio.wait_for(clients[loser].post(path, json=requests[loser]), timeout=20)
+                responses = {db_winner: winner_response, loser: loser_response}
                 replays = {
-                    "confirm": await revise_client.post(
-                        f"/api/sessions/{session_id}/guided/respond",
-                        json=requests["confirm"],
-                    ),
-                    "correct": await accept_client.post(
-                        f"/api/sessions/{session_id}/guided/respond",
-                        json=requests["correct"],
-                    ),
+                    "confirm": await revise_client.post(path, json=requests["confirm"]),
+                    "correct": await accept_client.post(path, json=requests["correct"]),
                 }
-                return responses, replays
+                return refused, responses, replays
 
-        responses, replays = asyncio.run(race_and_replay())
-        loser = "correct" if db_winner == "confirm" else "confirm"
+        refused, responses, replays = asyncio.run(race_and_replay())
+        assert refused.status_code == 409, refused.json()
+        assert refused.json() == {"detail": "Session operation is already active"}
         assert responses[db_winner].status_code == 200, responses[db_winner].json()
         assert responses[loser].status_code == 409, responses[loser].json()
-        assert responses[loser].json()["detail"]["failure_code"] == "stale_conflict"
+        assert responses[loser].json() == {
+            "detail": (
+                "Guided session is already terminal."
+                if db_winner == "confirm"
+                else "proposal_id and draft_hash do not identify the active guided proposal"
+            )
+        }
         for action in ("confirm", "correct"):
             assert replays[action].status_code == responses[action].status_code
             assert replays[action].json() == responses[action].json()
-        assert len(admission_commands) == len(stage_commands) == 1
+        # Only the winner ever reached its settlement double.
+        assert not entered[loser].is_set()
+        assert len(admission_commands if db_winner == "confirm" else stage_commands) == 1
+        assert len(stage_commands if db_winner == "confirm" else admission_commands) == 0
 
         service = primary_app.state.session_service
         proposals = {str(item.id): item for item in asyncio.run(service.list_composition_proposals(UUID(session_id)))}
@@ -2722,12 +5319,11 @@ class TestStep2IntraStep:
             state_count_after = conn.scalar(
                 select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
             )
-        assert len(operations) == 2
         winner_operation_id = accept_operation_id if db_winner == "confirm" else revise_operation_id
-        loser_operation_id = revise_operation_id if db_winner == "confirm" else accept_operation_id
+        # The refused worker never reserved an operation: the winner's row is
+        # the only publication of the race.
+        assert set(operations) == {winner_operation_id}
         assert operations[winner_operation_id]["status"] == "completed"
-        assert operations[loser_operation_id]["status"] == "failed"
-        assert operations[loser_operation_id]["failure_code"] == "stale_conflict"
         assert state_count_before is not None and state_count_after == state_count_before + 1
 
         original_id = proposal_payload["proposal_id"]
@@ -2737,7 +5333,7 @@ class TestStep2IntraStep:
             assert len(prepare_calls) == len(execute_calls) == 1
             assert set(proposals) == {original_id}
             assert proposals[original_id].status == "committed"
-            assert original_events == ["proposal.created", "proposal.accepted"]
+            assert original_events == ["proposal.created", "proposal.rebased", "proposal.accepted"]
             assert len(dispatches) == 1
             assert current["next_turn"] is None
         else:
@@ -2745,7 +5341,7 @@ class TestStep2IntraStep:
             assert len(proposals) == 2
             assert proposals[original_id].status == "rejected"
             assert proposals[original_id].committed_state_id is None
-            assert original_events == ["proposal.created", "proposal.rejected"]
+            assert original_events == ["proposal.created", "proposal.rebased", "proposal.rejected"]
             assert all(event.event_type != "proposal.accepted" for event in events)
             assert dispatches == []
             successor = next(item for proposal_id, item in proposals.items() if proposal_id != original_id)
@@ -2765,7 +5361,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "accepted.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "accepted.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -2821,6 +5417,94 @@ class TestStep2IntraStep:
             assert storage_path not in json.dumps(restored)
             assert all(storage_path not in repr(event.payload) for event in events)
 
+    def test_confirm_wiring_persists_authoritative_proof_failure_instead_of_prepared_green_result(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """Guided confirmation must use the same proof-enriched gate as execution."""
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(
+            composer_test_client,
+            session_id,
+            filename="proof-rejected.jsonl",
+            blob_content="amount\n250.00\n750.00\n",
+        )
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        reviewed = _review_wiring(composer_test_client, session_id)
+        assert reviewed["next_turn"]["type"] == "confirm_wiring"
+
+        class _ProofRejectingExecutionService:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str | None, UUID | None]] = []
+                self.proof_source_options: Mapping[str, object] | None = None
+                self.reviewed_source_options: Mapping[str, object] | None = None
+
+            async def validate_state(
+                self,
+                state,
+                *,
+                session_operation_context: SessionOperationContext,
+                user_id: str | None = None,
+                session_id: UUID | None = None,
+                completion_gates=None,
+            ) -> ValidationResult:
+                del completion_gates
+                assert isinstance(session_operation_context, SessionOperationContext)
+                self.calls.append((user_id, session_id))
+                proof_state = reattach_guided_blob_refs_for_public_export(state)
+                source = next(iter(proof_state.sources.values()))
+                self.proof_source_options = source.options
+                if state.guided_session is not None:
+                    self.reviewed_source_options = next(iter(state.guided_session.reviewed_sources.values())).options
+                return ValidationResult(
+                    is_valid=False,
+                    checks=[
+                        ValidationCheck(
+                            name="proof_diagnostics",
+                            passed=False,
+                            detail="Bounded source proof found 1 blocking diagnostic(s).",
+                            affected_nodes=("amount_gate",),
+                            outcome_code=None,
+                        )
+                    ],
+                    errors=[
+                        ValidationError(
+                            component_id="amount_gate",
+                            component_type="gate",
+                            message="Observed CSV strings cannot be compared to a numeric threshold.",
+                            suggestion="Declare amount as a numeric field.",
+                            error_code="gate_expression_type_mismatch_against_source_schema",
+                        )
+                    ],
+                    readiness=ValidationReadiness(
+                        authoring_valid=False,
+                        execution_ready=False,
+                        completion_ready=False,
+                        blockers=[
+                            ValidationReadinessBlocker(
+                                code="gate_expression_type_mismatch_against_source_schema",
+                                component_id="amount_gate",
+                                component_type="gate",
+                                detail="Bounded source proof blocked execution.",
+                            )
+                        ],
+                    ),
+                )
+
+        proof_authority = _ProofRejectingExecutionService()
+        composer_test_client.app.state.execution_service = proof_authority
+
+        accepted = _confirm_wiring(composer_test_client, session_id)
+
+        assert proof_authority.calls == [("alice", UUID(session_id))]
+        assert proof_authority.reviewed_source_options is not None
+        assert str(proof_authority.reviewed_source_options["path"]).startswith("blob:")
+        assert proof_authority.proof_source_options is not None
+        assert "blob_ref" in proof_authority.proof_source_options
+        assert accepted["terminal"]["kind"] == "completed"
+        assert accepted["composition_state"]["is_valid"] is False
+        assert accepted["composition_state"]["validation_errors"] == ["guided_composition_invalid"]
+
     def test_respond_planner_call_threads_a_live_progress_sink(
         self,
         composer_test_client: TestClient,
@@ -2861,6 +5545,134 @@ class TestStep2IntraStep:
         assert snapshot.phase == "calling_model"
         assert snapshot.headline == "Planning the pipeline against the reviewed components."
 
+    def test_planner_rate_rejection_is_retryable_and_exact_replay_bypasses_admission(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Fresh planner entries are admitted once; rejected work is not reserved.
+
+        Exact operation replay is a read of an already-settled result and must
+        remain available even after the successful planner call exhausts the
+        user's current budget.  A rejected fresh operation must remain
+        retryable with the same operation ID once capacity is available.
+        """
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
+
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="rate-admission.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        app = composer_test_client.app
+        planner_calls = 0
+
+        async def counting_planner(
+            *,
+            guided,
+            current_state,
+            base,
+            supersedes_draft_hash,
+            revision_authority,
+            **_kwargs: Any,
+        ):
+            nonlocal planner_calls
+            planner_calls += 1
+            assert revision_authority is not None
+            assert revision_authority.mode == "amend"
+            assert revision_authority.predecessor == current_state
+
+            pipeline = deep_thaw(current_state.to_dict())
+            pipeline.pop("version")
+            pipeline["outputs"] = [
+                {"sink_name": output["name"], **{key: value for key, value in output.items() if key != "name"}}
+                for output in pipeline["outputs"]
+            ]
+            source = pipeline["sources"][guided.reviewed_sources[guided.source_order[0]].name]
+            predecessor_success = source["on_success"]
+            insertion_input = "rate_admission_passthrough_rows"
+            source["on_success"] = insertion_input
+            pipeline["nodes"].insert(
+                0,
+                {
+                    "id": "requested_rate_admission_passthrough",
+                    "node_type": "transform",
+                    "plugin": "passthrough",
+                    "input": insertion_input,
+                    "on_success": predecessor_success,
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+            )
+            pipeline["edges"] = []
+            proposal = PipelineProposal.create(
+                pipeline=pipeline,
+                base=base,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+                surface=PlannerSurface.GUIDED_STAGED,
+                repair_count=0,
+                skill_hash=stable_hash("rate-admission-passthrough-test-planner"),
+                covered_deferred_intent_ids=(),
+                supersedes_draft_hash=supersedes_draft_hash,
+            )
+            source_plugin = guided.reviewed_sources[guided.source_order[0]].plugin
+            sink_plugin = guided.reviewed_outputs[guided.output_order[0]].plugin
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="rate-admission-passthrough",
+                    custody_result="not_required",
+                    model_identifier="rate-admission-test-planner",
+                    model_version="v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({source_plugin}),
+                    "transform": frozenset({"passthrough"}),
+                    "sink": frozenset({sink_plugin}),
+                },
+            )
+
+        monkeypatch.setattr(app.state.composer_service, "plan_guided_pipeline", counting_planner)
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": payload["proposal_id"],
+            "draft_hash": payload["draft_hash"],
+            "edited_values": {"revision_instruction": "Add a passthrough transform before saving."},
+        }
+
+        exhausted = ComposerRateLimiter(limit=1)
+        asyncio.run(exhausted.check("alice"))
+        app.state.rate_limiter = exhausted
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert rejected.status_code == 429, rejected.text
+        assert rejected.json()["detail"]["error_type"] == "rate_limited"
+        assert planner_calls == 0
+
+        app.state.rate_limiter = ComposerRateLimiter(limit=1)
+        retried = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert retried.status_code == 200, retried.text
+        assert planner_calls == 1
+
+        replayed = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json() == retried.json()
+        assert planner_calls == 1
+
     def test_confirm_wiring_surfaces_pending_interpretation_events_for_committed_llm_prompts(
         self,
         composer_test_client: TestClient,
@@ -2879,101 +5691,13 @@ class TestStep2IntraStep:
         the accepted durable state (the writer boundary validates the node
         against that state's row).
         """
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.core.canonical import stable_hash
-        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
-        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
-
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
-
-        async def llm_planner(
-            *,
-            guided,
-            base,
-            supersedes_draft_hash,
-            recorder,
-            correction_target=None,
-            **_kwargs,
-        ):
-            del recorder, correction_target
-            source = guided.reviewed_sources[guided.source_order[0]]
-            output = guided.reviewed_outputs[guided.output_order[0]]
-            pipeline = {
-                "sources": {
-                    source.name: {
-                        "plugin": source.plugin,
-                        "options": deep_thaw(source.options),
-                        "on_success": "llm_rows",
-                        "on_validation_failure": source.on_validation_failure,
-                    }
-                },
-                "nodes": [
-                    {
-                        "id": "summarize_rows",
-                        "node_type": "transform",
-                        "plugin": "llm",
-                        "input": "llm_rows",
-                        "on_success": output.name,
-                        "on_error": "discard",
-                        "options": {
-                            "schema": {"mode": "observed"},
-                            "profile": "task-role",
-                            "prompt_template": prompt,
-                            "response_field": "summary",
-                            "interpretation_requirements": [
-                                {
-                                    "id": "llm_prompt_template:summarize_rows:summarize_rows",
-                                    "kind": "llm_prompt_template",
-                                    "user_term": "llm_prompt_template:summarize_rows",
-                                    "status": "pending",
-                                    "draft": prompt,
-                                }
-                            ],
-                        },
-                    }
-                ],
-                "edges": [],
-                "outputs": [
-                    {
-                        "sink_name": output.name,
-                        "plugin": output.plugin,
-                        "options": deep_thaw(output.options),
-                        "on_write_failure": output.on_write_failure,
-                    }
-                ],
-            }
-            proposal = PipelineProposal.create(
-                pipeline=pipeline,
-                base=base,
-                reviewed_facts=guided_private_reviewed_facts(guided),
-                surface=PlannerSurface.GUIDED_STAGED,
-                repair_count=0,
-                skill_hash=stable_hash("llm-prompt-review-test-planner"),
-                covered_deferred_intent_ids=(),
-                supersedes_draft_hash=supersedes_draft_hash,
-            )
-            return (
-                PipelinePlanResult(
-                    proposal=proposal,
-                    tool_call_id=f"guided-test-{proposal.draft_hash[:16]}",
-                    custody_result="not_required",
-                    model_identifier="llm-prompt-review-test-planner",
-                    model_version="v1",
-                    provider="test",
-                ),
-                {
-                    "source": frozenset({source.plugin}),
-                    "transform": frozenset({"llm"}),
-                    "sink": frozenset({output.plugin}),
-                },
-            )
 
         monkeypatch.setattr(
             composer_test_client.app.state.composer_service,
             "plan_guided_pipeline",
-            llm_planner,
+            _llm_prompt_template_planner(prompt),
         )
         staged = self._stage_proposal(composer_test_client, session_id, filename="llm_reviewed.jsonl")
         assert staged["next_turn"]["type"] == "propose_pipeline"
@@ -2994,6 +5718,796 @@ class TestStep2IntraStep:
         current = asyncio.run(session_service.get_current_state(UUID(session_id)))
         assert current is not None
         assert str(event.composition_state_id) == str(current.id)
+
+    def test_confirm_wiring_replay_surfaces_interpretation_events_the_crashed_attempt_owed(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A replayed wire-confirm must still surface what its first attempt owed.
+
+        ``accept_guided_pipeline_proposal`` durably settles the proposal AND
+        terminalizes the guided operation; the post-commit surfacing pass runs
+        after it, outside that transaction. An attempt that dies in between
+        leaves the operation terminal, so every retry carrying the same
+        ``operation_id`` joins the terminal result through the replay arm —
+        which only projects the stored state. Without this the committed state
+        keeps pending interpretation_requirements with no event row: no Accept
+        card renders and /execute fails closed with
+        ``UnresolvedInterpretationPlaceholderError`` with nothing the user can
+        resolve, and the retry can never repair it. Sibling of the freeform
+        exact-committed replay defect fixed in 41680eb60.
+
+        Provenance must name the planner that authored the draft under review
+        — the proposal row's identity, not the composer service's.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_replayed.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+
+        session_service = composer_test_client.app.state.session_service
+        # The window is real: settled durably, nothing surfaced.
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending")) == []
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json()["terminal"]["kind"] == "completed"
+
+        events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        prompt_events = [event for event in events if event.affected_node_id == "summarize_rows"]
+        assert len(prompt_events) == 1, [(event.affected_node_id, str(event.kind), event.user_term) for event in events]
+        event = prompt_events[0]
+        assert event.kind is not None and event.kind.value == "llm_prompt_template"
+        assert event.llm_draft == prompt
+        current = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current is not None
+        assert str(event.composition_state_id) == str(current.id)
+        assert event.model_identifier == "llm-prompt-review-test-planner"
+        assert event.model_version == "v1"
+        assert event.provider == "test"
+
+    def test_confirm_wiring_ordinary_retry_replays_without_double_surfacing(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ordinary retry of a SUCCESSFUL settlement must not surface twice.
+
+        The crash window is rare; this is the common one — a client
+        double-submit, a proxy retry, a network blip after the settlement
+        already surfaced. The replay arm re-runs the surfacing pass on the
+        strength of it being idempotent, and the two arms feed it DIFFERENT
+        state objects: the settling attempt passes the in-memory planned
+        state, the replay passes the persisted record (which has been through
+        with_guided_response_descriptor and carries the guided-session
+        composer_meta). If the draft-aware dedup keyed on anything that
+        differs between them, one interpretation site would render two Accept
+        cards.
+        """
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_retried.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        def _pending_prompt_events() -> list:
+            session_service = composer_test_client.app.state.session_service
+            events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+            return [event for event in events if event.affected_node_id == "summarize_rows"]
+
+        settled = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert settled.status_code == 200, settled.json()
+        assert len(_pending_prompt_events()) == 1
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json()["terminal"]["kind"] == "completed"
+        after_replay = _pending_prompt_events()
+        assert len(after_replay) == 1, [(event.id, event.user_term, event.llm_draft) for event in after_replay]
+
+    def test_confirm_wiring_replay_repair_is_idempotent_across_a_lost_repair_lease(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The replay repair converges to one identical end state however often it runs.
+
+        ``_repair_replayed_surfacing_debt`` holds its own short COMPOSE lease
+        (the joiner released the operation lease before the after-verified
+        hook runs), so a replica can lose that lease mid-repair exactly as it
+        can lose any other. The debt is computed per site against durable
+        evidence, so: a repair that loses its lease writes nothing durable; the
+        next replay repairs the same single site; every further replay finds
+        nothing owed. Pinned end state: exactly one pending event for the
+        committed node, no extra composition-state version, identical event
+        identity across replays.
+        """
+        from elspeth.web.composer import service as composer_service_module
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_repair_idempotent.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+        session_service = composer_test_client.app.state.session_service
+
+        def _pending_prompt_events() -> list:
+            events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+            return [event for event in events if event.affected_node_id == "summarize_rows"]
+
+        def _state_versions() -> dict[str, int]:
+            return asyncio.run(session_service.get_state_version_numbers(UUID(session_id)))
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert _pending_prompt_events() == []
+        versions_after_settlement = _state_versions()
+
+        # First replay: the repair's own lease is lost mid-write. Nothing
+        # durable may survive that attempt.
+        async def _lose_repair_lease(*_args, **_kwargs):
+            raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+
+        monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", _lose_repair_lease)
+        # The leak-safe fence error is answered by the production handler
+        # (``create_app`` and this fixture register the same one): the
+        # nonleaking 404 absence, never a fabricated success. The client
+        # retries, exactly as after the crash above.
+        lost = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert lost.status_code == 404, lost.json()
+        assert lost.json() == {"detail": "Session not found"}
+        assert _pending_prompt_events() == []
+        assert _state_versions() == versions_after_settlement
+
+        # Second replay: the repair runs to completion and surfaces the one owed site.
+        monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", original_surface)
+        repaired = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert repaired.status_code == 200, repaired.json()
+        assert repaired.json()["terminal"]["kind"] == "completed"
+        after_repair = _pending_prompt_events()
+        assert len(after_repair) == 1, [(event.id, event.user_term, event.llm_draft) for event in after_repair]
+        assert _state_versions() == versions_after_settlement
+
+        # Third replay: nothing is owed; the end state is byte-identical.
+        again = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert again.status_code == 200, again.json()
+        assert again.json() == repaired.json()
+        after_again = _pending_prompt_events()
+        assert [(event.id, event.llm_draft, str(event.composition_state_id)) for event in after_again] == [
+            (event.id, event.llm_draft, str(event.composition_state_id)) for event in after_repair
+        ]
+        assert _state_versions() == versions_after_settlement
+
+    def test_guided_respond_replay_without_a_proposal_surfaces_nothing(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """A RESPOND that settles no proposal owes no surfacing on replay.
+
+        The replay arm derives identity from the operation's own result
+        locator, whose proposal_id is None for every ordinary guided turn.
+        Such a replay must write nothing at all — not an interpretation row,
+        not a state version.
+        """
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "chosen": ["json"],
+        }
+        session_service = composer_test_client.app.state.session_service
+        settled = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert settled.status_code == 200, settled.json()
+
+        events_before = asyncio.run(session_service.list_interpretation_events(UUID(session_id)))
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == settled.json()
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+
+    def test_confirm_wiring_replay_binds_its_own_proposal_when_others_share_the_state(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A state id is not a unique proposal locator; the operation's is.
+
+        More than one proposal can name one committed state, so resolving a
+        proposal BY committed state is ambiguous: it can select unrelated
+        provenance or find several rows. The replay must bind the exact
+        proposal its own result locator names.
+
+        On the platform the only facet through which a proposal comes to
+        name an EXISTING committed state is ordinary acceptance of an
+        approval-required blob-store-only proposal under a PROPOSAL lease
+        (``accept_pending_ordinary_proposal`` with ``state=None``): its
+        durable applied-effect receipt lets it bind the current state instead
+        of inserting one. A pipeline proposal always settles a state of its
+        own, so no pipeline rival can share the state through any facet, and
+        the pipeline-authority guard is exercised by generic rivals only.
+
+        Rivals are accepted on BOTH sides of the originating proposal in
+        creation order, so neither an oldest-row nor a newest-row state lookup
+        can coincide with the right answer. Provenance is asserted against the
+        originating proposal row field by field, not merely as "different from
+        the rival". The rivals are driven through the real accept route --
+        the blob effect is applied, its receipt recorded, and the acceptance
+        committed by production -- so the shared-state condition here is the
+        one production can actually produce.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        session_service = composer_test_client.app.state.session_service
+        blob_service = composer_test_client.app.state.blob_service
+
+        def _rival(label: str) -> UUID:
+            """One approval-required blob-only proposal that will later share the settled state."""
+            # Created the way the upload routes do: under a real CREATE context
+            # held only for the call, so the session is free for the next one.
+            blob = asyncio.run(
+                create_blob_under_fence(
+                    session_service,
+                    blob_service,
+                    UUID(session_id),
+                    f"{label}.csv",
+                    b"order_id,total\n1,10\n",
+                    "text/csv",
+                    created_by="user",
+                )
+            )
+            return asyncio.run(
+                session_service.create_composition_proposal(
+                    session_id=UUID(session_id),
+                    tool_call_id=f"{label}-{uuid4()}",
+                    tool_name="delete_blob",
+                    summary=f"{label} approval",
+                    rationale="shares the committed state",
+                    affects=[],
+                    arguments_json={"blob_id": str(blob.id)},
+                    arguments_redacted_json={"blob_id": str(blob.id)},
+                    base_state_id=None,
+                    actor="test",
+                    composer_model_identifier=f"{label}-model",
+                    composer_model_version=f"{label}-v9",
+                    composer_provider=f"{label}-provider",
+                    composer_skill_hash="f" * 64,
+                    tool_arguments_hash="a" * 64,
+                )
+            ).id
+
+        def _accept_rival(rival_id: UUID) -> None:
+            """Commit a rival through the production accept route (PROPOSAL lease, receipt, facet)."""
+            accepted = composer_test_client.post(f"/api/sessions/{session_id}/proposals/{rival_id}/accept")
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["status"] == "committed"
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        # Bind the source first: a second ready blob before Step 1 would change
+        # the step-1 turn (the upload inspection is no longer unambiguous).
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        # Created BEFORE the guided proposal, so it is the oldest row.
+        older_rival = _rival("older-rival")
+        staged = self._stage_proposal_from_step_2(composer_test_client, session_id, filename="llm_shared_state.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        # Rivals on BOTH sides of the originating proposal now name its state:
+        # each is accepted through the production route after the guided
+        # settlement, so its applied-effect receipt binds it to the settled
+        # state rather than inserting one. Both are generic rivals; the
+        # pipeline-authority guard rejects them and the provenance comparison
+        # below pins the originating proposal's own recorded identity.
+        committed_state = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert committed_state is not None
+        newer_rival = _rival("newer-rival")
+        for rival_id in (older_rival, newer_rival):
+            _accept_rival(rival_id)
+        for rival_id in (older_rival, newer_rival):
+            rival_row = asyncio.run(
+                session_service.get_authoritative_composition_proposal(
+                    session_id=UUID(session_id),
+                    proposal_id=rival_id,
+                    reviewed_facts=None,
+                )
+            ).row
+            assert rival_row.status == "committed"
+            assert rival_row.committed_state_id == committed_state.id
+
+        # The ambiguity this guards against is now real, and brackets the
+        # originating proposal in creation order.
+        engine = composer_test_client.app.state.session_engine
+        with engine.begin() as connection:
+            sharing = [
+                row.id
+                for row in connection.execute(
+                    select(composition_proposals_table)
+                    .where(composition_proposals_table.c.session_id == session_id)
+                    .where(composition_proposals_table.c.committed_state_id == str(committed_state.id))
+                    .order_by(composition_proposals_table.c.created_at)
+                )
+            ]
+        assert sharing == [str(older_rival), request_body["proposal_id"], str(newer_rival)], sharing
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json()["terminal"]["kind"] == "completed"
+
+        events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        prompt_events = [event for event in events if event.affected_node_id == "summarize_rows"]
+        assert len(prompt_events) == 1, [(event.affected_node_id, event.model_identifier) for event in events]
+        # Exactly the originating proposal's own recorded provenance.
+        origin = asyncio.run(
+            session_service.get_authoritative_composition_proposal(
+                session_id=UUID(session_id),
+                proposal_id=UUID(request_body["proposal_id"]),
+                reviewed_facts=None,
+            )
+        )
+        assert origin.pipeline is not None
+        expected = origin.pipeline.row
+        surfaced_event = prompt_events[0]
+        assert surfaced_event.model_identifier == expected.composer_model_identifier
+        assert surfaced_event.model_version == expected.composer_model_version
+        assert surfaced_event.provider == expected.composer_provider
+        assert surfaced_event.composer_skill_hash == expected.composer_skill_hash
+        assert expected.composer_skill_hash not in (None, "f" * 64)
+
+    def test_confirm_wiring_replay_after_resolution_returns_the_stored_response_unchanged(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Replay after the review was resolved must not touch anything.
+
+        Once the surfaced event is resolved the session state advances and the
+        historical committed state's placeholder is consumed. Re-running the
+        surfacing pass against that stale state raises
+        InterpretationPlaceholderConsumedError, so a pending-row-only
+        precheck is not enough: the resolved row is the durable evidence that
+        the debt was already discharged.
+        """
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_resolved.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+        settled = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert settled.status_code == 200, settled.json()
+
+        session_service = composer_test_client.app.state.session_service
+        pending = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        surfaced = [event for event in pending if event.affected_node_id == "summarize_rows"]
+        assert len(surfaced) == 1
+        asyncio.run(
+            session_service.resolve_interpretation_event(
+                session_id=UUID(session_id),
+                event_id=surfaced[0].id,
+                choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+                amended_value=None,
+                actor="test-user",
+            )
+        )
+
+        events_before = asyncio.run(session_service.list_interpretation_events(UUID(session_id)))
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+        current_before = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_before is not None
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == settled.json()
+
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+        current_after = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_after is not None and current_after.id == current_before.id
+
+    def test_confirm_wiring_replay_after_advancement_returns_the_stored_response(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Obsolete debt must not turn a verified replay into a 500.
+
+        The evidence read is not atomic with the surfacing write, so a site
+        can be superseded between them — and here NO event ever existed, so
+        no evidence check can cover it. The first attempt dies before
+        surfacing, the session then advances past the committed node, and the
+        replay's repair finds a node the writer boundary refuses
+        (InterpretationNodeMissingError / InterpretationPlaceholderConsumed
+        Error, both InterpretationResolveError). The writer is the authority
+        on whether the debt still exists; when it says no, the replay must
+        still return its stored response.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_advanced.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        session_service = composer_test_client.app.state.session_service
+        # No event was ever created, so the debt is outstanding and no
+        # evidence check can discharge it.
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == []
+
+        committed = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert committed is not None
+        asyncio.run(
+            session_service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=committed.sources or {},
+                    nodes=[],
+                    edges=[],
+                    outputs=committed.outputs or [],
+                    metadata_=committed.metadata_ or {},
+                    is_valid=False,
+                    validation_errors=["advanced past the surfaced node"],
+                    composer_meta=committed.composer_meta or {},
+                ),
+                provenance="tool_call",
+            )
+        )
+
+        events_before = asyncio.run(session_service.list_interpretation_events(UUID(session_id)))
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json()["terminal"]["kind"] == "completed"
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+
+    def test_confirm_wiring_replay_repairs_only_the_genuinely_missing_site(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Partial surfacing must be repaired per site, not wholesale.
+
+        An attempt that died midway through a multi-site pass leaves some
+        sites surfaced and others not. The replay must add exactly the
+        missing ones and leave the existing evidence untouched.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt, extra_node_id="second_summary"),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_partial.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_create = type(composer_test_client.app.state.session_service).create_pending_interpretation_event
+        created = 0
+
+        async def _crash_after_the_first_site(self, **kwargs):
+            nonlocal created
+            if created >= 1:
+                raise _SurfacingWorkerCrash("worker lost partway through a multi-site surfacing pass")
+            created += 1
+            return await original_create(self, **kwargs)
+
+        monkeypatch.setattr(
+            type(composer_test_client.app.state.session_service),
+            "create_pending_interpretation_event",
+            _crash_after_the_first_site,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            type(composer_test_client.app.state.session_service),
+            "create_pending_interpretation_event",
+            original_create,
+        )
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        session_service = composer_test_client.app.state.session_service
+
+        def _surfaced_nodes() -> list[str]:
+            events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+            return sorted(event.affected_node_id for event in events if event.affected_node_id is not None)
+
+        partial = _surfaced_nodes()
+        assert len(partial) == 1, partial
+        surviving_id = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))[0].id
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert _surfaced_nodes() == sorted(["summarize_rows", "second_summary"])
+        # The already-surfaced site was repaired, not recreated.
+        assert surviving_id in {
+            event.id for event in asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        }
+
+    def test_confirm_wiring_replay_writes_nothing_when_the_stored_response_hash_mismatches(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Response-hash verification must precede every replay write.
+
+        The replay arm repairs surfacing debt, so if that repair ran before
+        the projected response was proven identical to the stored one, a
+        corrupt projection could mutate audit-primary state and only then
+        fail integrity verification. The mismatch must abort with ZERO
+        interpretation and session writes.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_tampered.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        # The surfacing debt is real and outstanding — so if repair ran before
+        # verification, this replay is exactly when it would write.
+        session_service = composer_test_client.app.state.session_service
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == []
+
+        # Corrupt the PROJECTION, not the stored row: guided_operations
+        # terminal rows are immutable by database trigger, and a corrupt
+        # projection is the failure this ordering actually guards against.
+        from elspeth.web.sessions.routes.composer import guided as guided_route
+
+        original_project = guided_route.project_guided_response
+
+        def _corrupt_projection(record, *, payloads):
+            projected = original_project(record, payloads=payloads)
+            return projected.model_copy(update={"composition_state": None})
+
+        monkeypatch.setattr(guided_route, "project_guided_response", _corrupt_projection)
+
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+        current_before = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_before is not None
+
+        with pytest.raises(AuditIntegrityError):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == []
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+        current_after = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_after is not None and current_after.id == current_before.id
 
     def test_confirm_wiring_failure_after_dispatch_audit_insert_preserves_failure_evidence_only(
         self,
@@ -3039,6 +6553,9 @@ class TestStep2IntraStep:
         invocation = (new_messages[0].tool_calls or ())[0]["invocation"]
         assert invocation["tool_name"] == "set_pipeline"
         assert invocation["status"] == "success"
+        result_payload = json.loads(invocation["result_canonical"])
+        assert result_payload["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
+        assert len(result_payload["pipeline_content_hash"]) == 64
         assert "accept-audit-rollback.jsonl" not in repr(new_messages[0].tool_calls)
         assert asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id))) == events_before
         state_after = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
@@ -3046,45 +6563,101 @@ class TestStep2IntraStep:
         proposals = asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
         assert len(proposals) == 1 and proposals[0].status == "pending"
 
-    def test_confirm_wiring_prepare_failure_persists_its_dispatch_evidence_with_the_failed_operation(
+    def test_confirm_wiring_dispatch_record_failure_persists_bound_dispatch_for_retry(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from elspeth.contracts.freeze import deep_thaw
         from elspeth.web.composer import pipeline_commit
-        from elspeth.web.composer.audit import begin_dispatch, finish_success
-        from elspeth.web.composer.pipeline_commit import PipelineCommitError
+
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="confirm-record-audit.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        turn = reviewed["next_turn"]
+        service = composer_test_client.app.state.session_service
+        original_execute = pipeline_commit.execute_tool
+        executions = 0
+        record_attempts = 0
+
+        def count_executions(*args: Any, **kwargs: Any):
+            nonlocal executions
+            executions += 1
+            return original_execute(*args, **kwargs)
+
+        async def fail_first_record(_command: Any, *, session_operation_context: SessionOperationContext):
+            nonlocal record_attempts
+            _assert_compose_context_for(session_operation_context, session_id)
+            record_attempts += 1
+            raise RuntimeError("safe failure before durable dispatch record")
+
+        monkeypatch.setattr(pipeline_commit, "execute_tool", count_executions)
+        monkeypatch.setattr(service, "record_guided_pipeline_dispatch", fail_first_record)
+
+        failed = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": turn["payload"]["proposal_id"],
+                "draft_hash": turn["payload"]["draft_hash"],
+                "chosen": ["confirm_wiring"],
+            },
+        )
+
+        assert failed.status_code == 500, failed.json()
+        messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+        dispatches = [
+            envelope
+            for message in messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("invocation", {}).get("tool_name") == "set_pipeline"
+        ]
+        assert len(dispatches) == 1
+        persisted_result = json.loads(dispatches[0]["invocation"]["result_canonical"])
+        assert persisted_result["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
+        assert len(persisted_result["pipeline_content_hash"]) == 64
+
+        retried = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": turn["payload"]["proposal_id"],
+                "draft_hash": turn["payload"]["draft_hash"],
+                "chosen": ["confirm_wiring"],
+            },
+        )
+
+        assert retried.status_code == 200, retried.json()
+        assert executions == 1
+        assert record_attempts == 1
+        proposals = asyncio.run(service.list_composition_proposals(UUID(session_id)))
+        assert len(proposals) == 1 and proposals[0].status == "committed"
+
+    def test_confirm_wiring_prepare_failure_persists_bound_dispatch_for_retry(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer import pipeline_commit
 
         session_id = _create_session(composer_test_client)
         self._stage_proposal(composer_test_client, session_id, filename="confirm-prepare-audit.jsonl")
         reviewed = _review_wiring(composer_test_client, session_id)
         turn = reviewed["next_turn"]
         operation_id = str(uuid4())
+        original_execute = pipeline_commit.execute_tool
+        executions = 0
+        expected_executor_content_hash: str | None = None
 
-        async def fail_after_recording_dispatch(**kwargs: Any):
-            authority = kwargs["authority"]
-            recorder = kwargs["recorder"]
-            audit = begin_dispatch(
-                authority.row.tool_call_id,
-                "set_pipeline",
-                deep_thaw(authority.proposal.pipeline),
-                version_before=0,
-                actor=kwargs["actor"],
-            )
-            invocation = finish_success(
-                audit,
-                result_payload={"success": False, "failure_code": "validation_failed"},
-                version_after=0,
-            )
-            recorder.record(invocation)
-            raise PipelineCommitError(
-                "pipeline proposal failed current executor validation",
-                code="VALIDATION_FAILED",
-                invocation=invocation,
-            )
+        def fail_executor_validation(*args: Any, **kwargs: Any):
+            nonlocal executions, expected_executor_content_hash
+            executions += 1
+            result = original_execute(*args, **kwargs)
+            expected_executor_content_hash = composition_content_hash(result.updated_state)
+            return replace(result, success=False)
 
-        monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", fail_after_recording_dispatch)
+        monkeypatch.setattr(pipeline_commit, "execute_tool", fail_executor_validation)
 
         failed = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/respond",
@@ -3110,7 +6683,11 @@ class TestStep2IntraStep:
             if envelope.get("invocation", {}).get("tool_name") == "set_pipeline"
         ]
         assert len(dispatches) == 1
-        assert dispatches[0]["invocation"]["status"] == "success"
+        persisted_invocation = dispatches[0]["invocation"]
+        assert persisted_invocation["status"] == "success"
+        persisted_result = json.loads(persisted_invocation["result_canonical"])
+        assert persisted_result["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
+        assert persisted_result["pipeline_content_hash"] == expected_executor_content_hash
         with composer_test_client.app.state.session_engine.connect() as conn:
             operation = (
                 conn.execute(
@@ -3123,6 +6700,30 @@ class TestStep2IntraStep:
             )
         assert operation["status"] == "failed"
         assert operation["failure_code"] == "operation_failed"
+
+        retried = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": turn["payload"]["proposal_id"],
+                "draft_hash": turn["payload"]["draft_hash"],
+                "chosen": ["confirm_wiring"],
+            },
+        )
+
+        assert retried.status_code == 200, retried.json()
+        assert executions == 1
+        proposals = asyncio.run(service.list_composition_proposals(UUID(session_id)))
+        assert len(proposals) == 1 and proposals[0].status == "committed"
+        messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+        dispatches = [
+            envelope
+            for message in messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("invocation", {}).get("tool_name") == "set_pipeline"
+        ]
+        assert len(dispatches) == 1
 
     @pytest.mark.parametrize("revalidation", ("message", "mechanical"))
     def test_confirm_wiring_revalidates_deferred_authority_before_any_write(
@@ -3138,7 +6739,7 @@ class TestStep2IntraStep:
         from elspeth.web.sessions.routes.composer import guided as guided_route
         from tests.integration.web.composer.guided.test_wrong_stage_intent import _provider
 
-        session_id = _create_session(composer_test_client)
+        session_id = _create_session(composer_test_client, intent=None)
         started = composer_test_client.post(
             f"/api/sessions/{session_id}/guided/start",
             json={
@@ -3252,10 +6853,14 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        async def blocked_accept(command, *, payload_store=None):
+        async def blocked_accept(command, *, payload_store=None, session_operation_context):
             entered.set()
             await release.wait()
-            return await original_accept(command, payload_store=payload_store)
+            return await original_accept(
+                command,
+                payload_store=payload_store,
+                session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+            )
 
         monkeypatch.setattr(
             composer_test_client.app.state.session_service,
@@ -3288,7 +6893,7 @@ class TestStep2IntraStep:
 
         assert replayed.status_code == 200, replayed.json()
         events = asyncio.run(service.list_proposal_events(UUID(session_id)))
-        assert [event.event_type for event in events] == ["proposal.created", "proposal.accepted"]
+        assert [event.event_type for event in events] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
         proposals = asyncio.run(service.list_composition_proposals(UUID(session_id)))
         assert len(proposals) == 1 and proposals[0].status == "committed"
         messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
@@ -3370,7 +6975,9 @@ class TestStep2IntraStep:
         dispatches = [
             envelope
             for message in messages
-            for envelope in message.tool_calls
+            # ``tool_calls`` is None on a plain chat row — the rooted session's
+            # own goal is one.
+            for envelope in message.tool_calls or ()
             if envelope.get("invocation", {}).get("tool_name") == "set_pipeline"
             and envelope.get("invocation", {}).get("status") == "success"
         ]
@@ -3384,7 +6991,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
-        output_path = _outputs_path(composer_test_client, "out_passthrough.jsonl")
+        output_path = _outputs_path(composer_test_client, session_id, "out_passthrough.jsonl")
         _respond(
             composer_test_client,
             session_id,
@@ -3424,7 +7031,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
-        output_path = _outputs_path(composer_test_client, "out_bare_empty.jsonl")
+        output_path = _outputs_path(composer_test_client, session_id, "out_bare_empty.jsonl")
         _respond(
             composer_test_client,
             session_id,
@@ -3456,7 +7063,7 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         self._drive_to_step_2_single_select(composer_test_client, session_id)
         _respond(composer_test_client, session_id, chosen=["json"])
-        output_path = _outputs_path(composer_test_client, "out_contradiction.jsonl")
+        output_path = _outputs_path(composer_test_client, session_id, "out_contradiction.jsonl")
         _respond(
             composer_test_client,
             session_id,
@@ -3496,7 +7103,7 @@ class TestStep2IntraStep:
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _outputs_path(composer_test_client, "failed-settlement.jsonl"),
+                    "path": _outputs_path(composer_test_client, session_id, "failed-settlement.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -3536,6 +7143,216 @@ class TestStep2IntraStep:
         assert after["guided_session"]["step"] == "step_2_sink"
         assert _full_guided_session(after)["reviewed_outputs"] == before_reviewed_outputs
         assert after["composition_state"]["outputs"] == before_outputs
+
+    @pytest.mark.parametrize("surface_name", ("guided_staged", "tutorial_profile"))
+    def test_wire_correction_on_profile_bound_llm_proposal_stages_new_wire_turn(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        surface_name: str,
+    ) -> None:
+        """A wiring correction on a profile-bound llm proposal must settle.
+
+        inv-f6 F6: the correction route builds the successor wire review from
+        the profile-lowered executable view, but the settlement re-derivation
+        rebuilt it from the AUTHORED candidate — the un-lowered llm options
+        crashed the row-cardinality probe into a 500 operation_failed,
+        killing every wiring correction on LLM/guardrail pipelines (the
+        TUTORIAL_PROFILE surface is admitted by the same settlement branch).
+        """
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
+
+        surface = PlannerSurface.GUIDED_STAGED if surface_name == "guided_staged" else PlannerSurface.TUTORIAL_PROFILE
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+
+        async def llm_planner(
+            *,
+            guided,
+            base,
+            supersedes_draft_hash,
+            recorder,
+            correction_target=None,
+            **_kwargs,
+        ):
+            del recorder
+            source = guided.reviewed_sources[guided.source_order[0]]
+            output = guided.reviewed_outputs[guided.output_order[0]]
+            corrected_error_edge = (
+                correction_target is not None
+                and correction_target.requested.kind == "edge"
+                and correction_target.edge_routing is not None
+                and correction_target.edge_routing.field == "on_error"
+            )
+            pipeline = {
+                "sources": {
+                    source.name: {
+                        "plugin": source.plugin,
+                        "options": deep_thaw(source.options),
+                        "on_success": "llm_rows",
+                        "on_validation_failure": source.on_validation_failure,
+                    }
+                },
+                "nodes": [
+                    {
+                        "id": "summarize_rows",
+                        "node_type": "transform",
+                        "plugin": "llm",
+                        "input": "llm_rows",
+                        "on_success": output.name,
+                        "on_error": output.name if corrected_error_edge else "discard",
+                        "options": {
+                            "schema": {"mode": "observed"},
+                            "profile": "task-role",
+                            "prompt_template": prompt,
+                            "response_field": "summary",
+                        },
+                    },
+                ],
+                "edges": [],
+                "outputs": [
+                    {
+                        "sink_name": output.name,
+                        "plugin": output.plugin,
+                        "options": deep_thaw(output.options),
+                        "on_write_failure": output.on_write_failure,
+                    }
+                ],
+            }
+            proposal = PipelineProposal.create(
+                pipeline=pipeline,
+                base=base,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+                surface=surface,
+                repair_count=0,
+                skill_hash=stable_hash("profile-bound-correction-test-planner"),
+                covered_deferred_intent_ids=(),
+                supersedes_draft_hash=supersedes_draft_hash,
+            )
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id=f"guided-test-{proposal.draft_hash[:16]}",
+                    custody_result="not_required",
+                    model_identifier="profile-bound-correction-test-planner",
+                    model_version="v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({source.plugin}),
+                    "transform": frozenset({"llm", "passthrough"}),
+                    "sink": frozenset({output.plugin}),
+                },
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            llm_planner,
+        )
+        staged = self._stage_proposal(
+            composer_test_client,
+            session_id,
+            filename=f"profile-correction-{surface_name}.jsonl",
+        )
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        reviewed = _review_wiring(composer_test_client, session_id)
+        turn = reviewed["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+
+        corrected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": turn["payload"]["proposal_id"],
+                "draft_hash": turn["payload"]["draft_hash"],
+                "edit_target": _node_error_edit_target(turn["payload"]),
+                "correction_feedback": "Route this source through a corrected topology.",
+            },
+        )
+
+        assert corrected.status_code == 200, corrected.json()
+        corrected_turn = corrected.json()["next_turn"]
+        assert corrected_turn["type"] == "confirm_wiring"
+        assert corrected_turn["payload"]["draft_hash"] != turn["payload"]["draft_hash"]
+        llm_nodes = [node for node in corrected_turn["payload"]["nodes"] if node["plugin"] == "llm"]
+        assert len(llm_nodes) == 1
+        accepted = _confirm_wiring(composer_test_client, session_id)
+        assert accepted["terminal"]["kind"] == "completed"
+
+    def test_exit_to_freeform_at_step_3_with_active_proposal_clears_custody(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """inv-f6 F7: exit is the binding-exempt universal escape.
+
+        From the Step 3 proposal turn it must settle EXITED_TO_FREEFORM and
+        clear the active proposal reference — not trip GuidedSession's
+        terminal-custody invariant into a 500 during preflight.
+        """
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="exit-step3.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+
+        resp = _post_current_response(composer_test_client, session_id, control_signal="exit_to_freeform")
+
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert body["terminal"]["kind"] == "exited_to_freeform"
+        assert body["next_turn"] is None
+        record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+        assert record is not None
+        guided = state_from_record(record).guided_session
+        assert guided is not None
+        assert guided.terminal is not None and guided.terminal.kind.value == "exited_to_freeform"
+        assert guided.active_proposal is None
+        assert guided.active_edit_target is None
+        proposals = asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
+        assert len(proposals) == 1 and proposals[0].status == "rejected"
+        # The terminal event records the truthful cause: the author exited
+        # guided mode — no successor proposal displaced this one, so the
+        # reason must be "guided_exit", never "superseded".
+        events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
+        rejected_events = [event for event in events if event.event_type == "proposal.rejected"]
+        assert len(rejected_events) == 1
+        assert rejected_events[0].payload["reason_code"] == "guided_exit"
+        assert rejected_events[0].payload["outcome"] == "superseded"
+
+    def test_exit_to_freeform_at_step_4_wire_turn_clears_custody(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """inv-f6 F7: exit from the Step 4 wire review must also settle."""
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="exit-step4.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        reviewed = _review_wiring(composer_test_client, session_id)
+        assert reviewed["next_turn"]["type"] == "confirm_wiring"
+
+        resp = _post_current_response(composer_test_client, session_id, control_signal="exit_to_freeform")
+
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert body["terminal"]["kind"] == "exited_to_freeform"
+        assert body["next_turn"] is None
+        record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+        assert record is not None
+        guided = state_from_record(record).guided_session
+        assert guided is not None
+        assert guided.terminal is not None and guided.terminal.kind.value == "exited_to_freeform"
+        assert guided.active_proposal is None
+        assert guided.active_edit_target is None
+        proposals = asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
+        assert len(proposals) == 1 and proposals[0].status == "rejected"
+        events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
+        rejected_events = [event for event in events if event.event_type == "proposal.rejected"]
+        assert len(rejected_events) == 1
+        assert rejected_events[0].payload["reason_code"] == "guided_exit"
 
 
 # ---------------------------------------------------------------------------

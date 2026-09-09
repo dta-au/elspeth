@@ -10,7 +10,15 @@ from collections.abc import Collection, Mapping
 from copy import deepcopy
 from typing import Any
 
-from elspeth.contracts.secrets import ResolvedSecret, ScopedWebSecretResolver, SecretRefPlacementViolation, SecretScope, WebSecretResolver
+from elspeth.contracts.secrets import (
+    ResolvedSecret,
+    ScopedSecretResolverContract,
+    SecretRefMarkerSite,
+    SecretRefPlacementViolation,
+    SecretScope,
+    WebSecretResolver,
+)
+from elspeth.contracts.trust_boundary import trust_boundary
 
 _EXACT_ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
 
@@ -27,6 +35,7 @@ SECRET_FIELD_NAMES = frozenset(
     {
         "api_key",
         "api-key",
+        "aws_access_key_id",
         "authorization",
         "connection_string",
         "credential",
@@ -112,11 +121,25 @@ def resolve_secret_refs(
     return result, resolutions
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a web-authored or YAML-authored config tree — an untyped value ELSPETH does not own",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns the (name, scope) marker tuple only for an exact well-formed {'secret_ref': ...} "
+        "mapping; every other shape returns None; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def parse_secret_ref_marker(value: Any) -> tuple[str, SecretScope | None] | None:
     """Return the typed deferred-secret marker, if *value* is exactly one."""
     if isinstance(value, Mapping) and set(value) in ({"secret_ref"}, {"secret_ref", "secret_scope"}):
         ref = value["secret_ref"]
-        scope = value.get("secret_scope")
+        if "secret_scope" in value:
+            scope = value["secret_scope"]
+        else:
+            scope = None
         if isinstance(ref, str) and (scope is None or scope in ("user", "server", "org")):
             return ref, scope
     return None
@@ -148,6 +171,17 @@ def redact_secret_refs_for_validation(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a deep-copied web-authored config tree — an untyped value ELSPETH does not own",
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "replaces wired secret-ref markers with the validation placeholder inside recognized "
+        "Mapping/list shapes and leaves every other node untouched; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _walk_redact(obj: Any) -> None:
     """Recursively replace ``{secret_ref: NAME}`` markers with the placeholder.
 
@@ -168,6 +202,17 @@ def _walk_redact(obj: Any) -> None:
                 _walk_redact(item)
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a web-authored or YAML-authored config tree — an untyped value ELSPETH does not own",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns the declared secret name only for an exact ${NAME} string whose NAME is in the "
+        "caller-supplied inventory; every other value returns None; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _is_secret_env_ref(value: Any, env_ref_names: Collection[str]) -> str | None:
     """If value is an exact ${NAME} string for a declared secret, return NAME."""
     if not isinstance(value, str) or not env_ref_names:
@@ -191,6 +236,17 @@ def is_secret_ref_marker(value: Any) -> bool:
     return parse_secret_ref_marker(value) is not None
 
 
+@trust_boundary(
+    tier=3,
+    source="one node of a web-authored or YAML-authored config tree — an untyped value ELSPETH does not own",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only for an exact secret-ref marker mapping or a declared exact ${NAME} string; "
+        "every other shape returns False; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def is_wired_secret_value(value: Any, env_ref_names: Collection[str] = frozenset()) -> bool:
     """Return True when value uses an approved deferred-secret syntax.
 
@@ -229,6 +285,20 @@ def collect_credential_field_violations(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a raw plugin-options tree from a pipeline author's settings YAML or a web-authored config "
+        "dict — an untyped value ELSPETH does not own"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns the credential field names holding literal strings; unrecognized shapes and non-str "
+        "keys are skipped, never coerced; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _collect_credential_field_violations(
     options: Any,
     env_ref_names: Collection[str],
@@ -270,63 +340,88 @@ def collect_disallowed_secret_ref_markers(
     such as the database sink's whole-DSN ``url`` field.
     """
     allowed_exact = frozenset(field.lower() for field in additional_allowed_fields)
-    violations: list[SecretRefPlacementViolation] = []
-    _collect_disallowed_secret_ref_markers(
-        options,
-        env_ref_names,
-        allowed_exact,
-        path=(),
-        violations=violations,
-    )
-    return violations
+    # DERIVED from the single marker-walk authority; the placement decision
+    # is a filter over its sites, never a second traversal.
+    return [
+        SecretRefPlacementViolation(field_path=site.field_path, secret_name=site.secret_name)
+        for site in collect_secret_ref_marker_sites(options, env_ref_names)
+        if not _field_allows_secret_ref(site.field_name, allowed_exact)
+    ]
 
 
 def _field_allows_secret_ref(field_name: str, additional_allowed_fields: Collection[str]) -> bool:
     return is_secret_field(field_name) or field_name.lower() in additional_allowed_fields
 
 
-def _collect_disallowed_secret_ref_markers(
+def collect_secret_ref_marker_sites(
+    options: Any,
+    env_ref_names: Collection[str] = frozenset(),
+) -> list[SecretRefMarkerSite]:
+    """Return every wired deferred-secret use with its dotted option path.
+
+    Unlike ``collect_disallowed_secret_ref_markers`` this collects ALL
+    marker and exact-``${NAME}`` env-ref sites, not just misplaced ones —
+    it feeds the secret-wiring authorization gate (elspeth-f3c1aafd25),
+    which must adjudicate every secret→destination pairing however the
+    marker entered the composition. Names and paths only, never values.
+    """
+    sites: list[SecretRefMarkerSite] = []
+    _collect_secret_ref_marker_sites(options, env_ref_names, path=(), sites=sites)
+    return sites
+
+
+@trust_boundary(
+    tier=3,
+    source=("one node of a raw web-authored or YAML-authored config tree — an untyped value ELSPETH does not own"),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "appends a site record for every wired marker or declared env ref and recurses through "
+        "recognized Mapping/list/tuple shapes; unrecognized nodes are skipped; never raises on "
+        "malformed input"
+    ),
+    non_raising=True,
+)
+def _collect_secret_ref_marker_sites(
     obj: Any,
     env_ref_names: Collection[str],
-    additional_allowed_fields: Collection[str],
     *,
     path: tuple[str, ...],
-    violations: list[SecretRefPlacementViolation],
+    sites: list[SecretRefMarkerSite],
 ) -> None:
     marker = parse_secret_ref_marker(obj)
     ref_name = marker[0] if marker is not None else _is_secret_env_ref(obj, env_ref_names)
     if ref_name is not None:
-        field_name = path[-1] if path else ""
-        if not _field_allows_secret_ref(field_name, additional_allowed_fields):
-            violations.append(
-                SecretRefPlacementViolation(
-                    field_path=".".join(path) if path else "<root>",
-                    secret_name=ref_name,
-                )
+        sites.append(
+            SecretRefMarkerSite(
+                field_path=".".join(path) if path else "<root>",
+                field_name=path[-1] if path else "",
+                secret_name=ref_name,
             )
+        )
         return
 
     if isinstance(obj, Mapping):
         for key, value in obj.items():
             next_path = (*path, key) if isinstance(key, str) else (*path, f"<{type(key).__name__}>")
-            _collect_disallowed_secret_ref_markers(
-                value,
-                env_ref_names,
-                additional_allowed_fields,
-                path=next_path,
-                violations=violations,
-            )
+            _collect_secret_ref_marker_sites(value, env_ref_names, path=next_path, sites=sites)
     elif isinstance(obj, (list, tuple)):
         for index, item in enumerate(obj):
-            _collect_disallowed_secret_ref_markers(
-                item,
-                env_ref_names,
-                additional_allowed_fields,
-                path=(*path, f"[{index}]"),
-                violations=violations,
-            )
+            _collect_secret_ref_marker_sites(item, env_ref_names, path=(*path, f"[{index}]"), sites=sites)
 
 
+@trust_boundary(
+    tier=3,
+    source=("one node of a deep-copied web-authored config tree being resolved — an untyped value ELSPETH does not own"),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "resolves wired markers in-place inside recognized Mapping/list shapes; unresolvable refs are "
+        "accumulated in `missing` for the caller's SecretResolutionError; unrecognized nodes are left "
+        "untouched; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _walk(
     obj: Any,
     resolver: WebSecretResolver,
@@ -377,6 +472,8 @@ def _resolve_marker(
 ) -> ResolvedSecret | None:
     if scope is None:
         return resolver.resolve(user_id, name)
-    if not isinstance(resolver, ScopedWebSecretResolver):
-        raise TypeError("Scoped secret marker requires a ScopedWebSecretResolver")
+    # ADR-032: nominal admission against the owned ABC, never the
+    # runtime_checkable Protocol (structural — an impostor would pass).
+    if not isinstance(resolver, ScopedSecretResolverContract):
+        raise TypeError("Scoped secret marker requires a resolver inheriting ScopedSecretResolverContract")
     return resolver.resolve_scoped(user_id, name, scope)

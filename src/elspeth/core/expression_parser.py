@@ -18,10 +18,12 @@ from __future__ import annotations
 import ast
 import math
 import operator
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts import PipelineRow
@@ -96,11 +98,23 @@ _BOOL_OPS: MappingProxyType[type[ast.boolop], str] = MappingProxyType(
 # Safe built-in functions allowed in expressions (immutable to prevent runtime tampering).
 # Only non-coercive operations are permitted. Coercive builtins (str, int, float, bool)
 # are forbidden because they silently normalize Tier 2 data in gate expressions,
-# masking upstream contract bugs and weakening audit attributability.
+# masking upstream contract bugs and weakening audit attributability. str→str case
+# folding coerces nothing — the no-coercion rule targets TYPE coercion.
+#
+# The str callables MUST be the unbound str.* descriptors, never lambdas:
+# str.lower(5) raises TypeError, which visit_Call wraps into a clean
+# ExpressionEvaluationError; a lambda's AttributeError would ride evaluate()'s
+# crash-through tuple into the caller unwrapped. Do NOT add str-returning
+# entries to _ALWAYS_NUMERIC_BUILTINS, and stop at these four — no replace,
+# split, or format (format is a known sandbox-escape vector).
 _SAFE_BUILTINS: MappingProxyType[str, Any] = MappingProxyType(
     {
         "len": len,
         "abs": abs,
+        "lower": str.lower,
+        "upper": str.upper,
+        "strip": str.strip,
+        "casefold": str.casefold,
     }
 )
 
@@ -111,6 +125,59 @@ _SAFE_CONSTANTS: frozenset[str] = frozenset({"True", "False", "None"})
 # bool or str). Used by is_provably_non_routable() to reject gate conditions
 # that can never produce a route label.
 _ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs"})
+
+
+# Expression node types the grammar handles, split by disposition.  Adding a
+# new visit_* method to a visitor is NOT sufficient to admit a type — it must
+# also appear here.  This prevents brute-force bypass where defining a
+# handler silently whitelists a new AST construct.
+#
+# Allowed constructs: the validator validates their children recursively
+# (some arms via generic_visit, the stateful ones via explicit self.visit) and
+# _ExpressionEvaluator has a visit_* arm for every one of them (both enforced
+# at import time by _assert_visitor_coupling below).
+_ALLOWED_EXPR_TYPES: frozenset[type] = frozenset(
+    {
+        ast.Name,
+        ast.Subscript,
+        ast.Attribute,
+        ast.Call,
+        ast.Compare,
+        ast.BoolOp,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.List,
+        ast.Dict,
+        ast.Tuple,
+        ast.Set,
+        ast.IfExp,
+    }
+)
+
+# Explicitly forbidden constructs: the validator's visit_* handler for each
+# appends an error.  Slice belongs here — visit_Slice rejects slice syntax —
+# even though subscript access itself is allowed.
+_FORBIDDEN_EXPR_TYPES: frozenset[type] = frozenset(
+    {
+        ast.Slice,
+        ast.Lambda,
+        ast.ListComp,
+        ast.DictComp,
+        ast.SetComp,
+        ast.GeneratorExp,
+        ast.Await,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.NamedExpr,
+        ast.JoinedStr,
+        ast.FormattedValue,
+        ast.Starred,
+    }
+)
+
+# The validator's gate: every expression node type it recognises at all.
+_HANDLED_EXPR_TYPES: frozenset[type] = _ALLOWED_EXPR_TYPES | _FORBIDDEN_EXPR_TYPES
 
 
 class _ExpressionValidator(ast.NodeVisitor):
@@ -126,10 +193,35 @@ class _ExpressionValidator(ast.NodeVisitor):
         self._allow_allowed_name_reference = 0
         self._allow_safe_builtin_reference = 0
 
+    @trust_boundary(
+        tier=3,
+        source="one node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant="returns True only for an ast.Constant carrying None; every other node returns False; never raises",
+        non_raising=True,
+    )
     def _is_none_constant(self, node: ast.expr) -> bool:
-        """Check if node is a None literal (ast.Constant or ast.Name)."""
-        return (isinstance(node, ast.Constant) and node.value is None) or (isinstance(node, ast.Name) and node.id == "None")
+        """Check if node is a None literal.
 
+        Since Python 3.8 the grammar represents ``None`` in source only as
+        ``ast.Constant(value=None)`` — there is no ``ast.Name(id="None")``
+        form, so no second arm exists here (a dormant Name arm would ADMIT a
+        hypothetical future representation instead of rejecting it).
+        """
+        return isinstance(node, ast.Constant) and node.value is None
+
+    @trust_boundary(
+        tier=3,
+        source="one expression node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "returns True only for an allowed name, an allowed-name.get call, or a subscript chain "
+            "rooted in either; other syntax returns False; call arguments are validated separately by visit_Call; never raises"
+        ),
+        non_raising=True,
+    )
     def _is_allowed_derived(self, node: ast.expr) -> bool:
         """Check if node is an allowed name or derived from allowed name access.
 
@@ -165,6 +257,14 @@ class _ExpressionValidator(ast.NodeVisitor):
             return
         self.errors.append(f"Forbidden name: {node.id!r}")
 
+    @trust_boundary(
+        tier=3,
+        source="one Subscript node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant="records a validation error in self.errors for slice syntax and non-allowed receivers; never raises on malformed input",
+        non_raising=True,
+    )
     def visit_Subscript(self, node: ast.Subscript) -> None:
         """Allow subscript access on allowed-name-derived data only."""
         # Reject slice syntax (defense-in-depth, also caught by visit_Slice)
@@ -184,6 +284,17 @@ class _ExpressionValidator(ast.NodeVisitor):
         """Reject slice syntax."""
         self.errors.append("Slice syntax (e.g., [1:3]) is forbidden")
 
+    @trust_boundary(
+        tier=3,
+        source="one Attribute node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "records a validation error in self.errors unless the receiver is a bare allowed name "
+            "and the attribute is get in call-function context; visits the receiver; never raises on malformed syntax"
+        ),
+        non_raising=True,
+    )
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Allow only .get method access on allowed names when called."""
         if isinstance(node.value, ast.Name) and node.value.id in self._allowed_names:
@@ -257,7 +368,7 @@ class _ExpressionValidator(ast.NodeVisitor):
             if type(op) not in _COMPARISON_OPS:
                 self.errors.append(f"Forbidden comparison operator: {type(op).__name__}")
             # Restrict is/is not to None checks only
-            elif isinstance(op, ast.Is | ast.IsNot):
+            elif type(op) in (ast.Is, ast.IsNot):
                 left_operand = all_operands[i]
                 right_operand = all_operands[i + 1]
                 if not (self._is_none_constant(left_operand) or self._is_none_constant(right_operand)):
@@ -282,6 +393,17 @@ class _ExpressionValidator(ast.NodeVisitor):
             self.errors.append(f"Forbidden unary operator: {type(node.op).__name__}")
         self.generic_visit(node)
 
+    @trust_boundary(
+        tier=3,
+        source="one Constant node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "records a validation error in self.errors for non-finite float literals and non-primitive "
+            "constant types; permitted literals return silently; never raises on malformed input"
+        ),
+        non_raising=True,
+    )
     def visit_Constant(self, node: ast.Constant) -> None:
         """Allow literals: strings, numbers, booleans, None."""
         if node.value is None:
@@ -367,44 +489,6 @@ class _ExpressionValidator(ast.NodeVisitor):
         """Starred expressions (*x) are forbidden."""
         self.errors.append("Starred expressions (*) are forbidden")
 
-    # Explicit allowset of handled expression node types.  Adding a new
-    # visit_* method is NOT sufficient — the type must also appear here.
-    # This prevents brute-force bypass where defining a handler silently
-    # whitelists a new AST construct.
-    _HANDLED_EXPR_TYPES: frozenset[type] = frozenset(
-        {
-            # Allowed constructs (handlers recurse via generic_visit)
-            ast.Name,
-            ast.Subscript,
-            ast.Slice,
-            ast.Attribute,
-            ast.Call,
-            ast.Compare,
-            ast.BoolOp,
-            ast.BinOp,
-            ast.UnaryOp,
-            ast.Constant,
-            ast.List,
-            ast.Dict,
-            ast.Tuple,
-            ast.Set,
-            ast.IfExp,
-            # Explicitly forbidden constructs (handlers append errors)
-            ast.Lambda,
-            ast.ListComp,
-            ast.DictComp,
-            ast.SetComp,
-            ast.GeneratorExp,
-            ast.Await,
-            ast.Yield,
-            ast.YieldFrom,
-            ast.NamedExpr,
-            ast.JoinedStr,
-            ast.FormattedValue,
-            ast.Starred,
-        }
-    )
-
     def visit(self, node: ast.AST) -> None:
         """Dispatch with fail-closed default for unhandled expression nodes.
 
@@ -419,34 +503,37 @@ class _ExpressionValidator(ast.NodeVisitor):
         through because they are structural metadata, not executable
         constructs.
         """
-        if isinstance(node, ast.expr) and type(node) not in self._HANDLED_EXPR_TYPES:
+        if isinstance(node, ast.expr) and type(node) not in _HANDLED_EXPR_TYPES:
             self.errors.append(f"Unsupported expression construct: {type(node).__name__}")
             return
         super().visit(node)
 
 
 # ── Module-level coupling enforcement ─────────────────────────────────
-# Every type in _HANDLED_EXPR_TYPES must have a visit_* method, and every
-# visit_* method must have a corresponding type.  Without this check,
-# adding a type without a handler silently falls through to generic_visit,
-# bypassing security validation.
-_handler_type_names = {t.__name__ for t in _ExpressionValidator._HANDLED_EXPR_TYPES}
-_visitor_method_names = {
-    name.removeprefix("visit_") for name in vars(_ExpressionValidator) if name.startswith("visit_") and name != "visit"
-}
+# Every expected type must have a visit_* method, and every visit_* method
+# must have a corresponding type entry.  Without this check, adding a type
+# without a handler silently falls through to generic_visit — bypassing
+# security validation in the validator, and (before _ExpressionEvaluator
+# grew its fail-closed visit()) silently evaluating to None.
+def _assert_visitor_coupling(visitor_cls: type, expected_type_names: set[str], *, label: str) -> None:
+    """Raise TypeError unless visitor_cls's visit_* arms match expected_type_names exactly."""
+    visitor_method_names = {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_")}
+    missing_handlers = expected_type_names - visitor_method_names
+    orphan_visitors = visitor_method_names - expected_type_names
+    if missing_handlers or orphan_visitors:
+        parts: list[str] = []
+        if missing_handlers:
+            parts.append(f"types without visit_* handler: {sorted(missing_handlers)}")
+        if orphan_visitors:
+            parts.append(f"visit_* handlers without type entry: {sorted(orphan_visitors)}")
+        raise TypeError(f"{label} handler/type coupling violation: {'; '.join(parts)}")
 
-_missing_handlers = _handler_type_names - _visitor_method_names
-_orphan_visitors = _visitor_method_names - _handler_type_names
 
-if _missing_handlers or _orphan_visitors:
-    _parts: list[str] = []
-    if _missing_handlers:
-        _parts.append(f"types without visit_* handler: {sorted(_missing_handlers)}")
-    if _orphan_visitors:
-        _parts.append(f"visit_* handlers without type entry: {sorted(_orphan_visitors)}")
-    raise TypeError(f"_ExpressionValidator handler/type coupling violation: {'; '.join(_parts)}")
-
-del _handler_type_names, _visitor_method_names, _missing_handlers, _orphan_visitors
+_assert_visitor_coupling(
+    _ExpressionValidator,
+    {t.__name__ for t in _HANDLED_EXPR_TYPES},
+    label="_ExpressionValidator",
+)
 
 
 class _ExpressionEvaluator(ast.NodeVisitor):
@@ -654,6 +741,43 @@ class _ExpressionEvaluator(ast.NodeVisitor):
             return self.visit(node.body)
         return self.visit(node.orelse)
 
+    def visit(self, node: ast.AST) -> Any:
+        """Dispatch with a fail-closed guard for uncovered node types.
+
+        Deliberately stricter than the validator's guard: the validator
+        generic-visits structural children (ast.Load, operator nodes), so it
+        scopes its check to ast.expr.  The evaluator never visits structural
+        children — each arm consumes them as attributes (node.ops, node.op,
+        contexts) — so ANY node reaching visit() without an arm is a
+        framework bug.  Raising here replaces generic_visit's silent None
+        return, which would let a gate route on the falsy branch.
+        ast.Expression is admitted explicitly: the root wrapper is not an
+        ast.expr subclass, so it can never appear in _ALLOWED_EXPR_TYPES.
+        """
+        node_type = type(node)
+        if node_type is not ast.Expression and node_type not in _ALLOWED_EXPR_TYPES:
+            raise ExpressionSecurityError(f"Evaluator has no handler for {node_type.__name__} nodes")
+        return super().visit(node)
+
+
+_assert_visitor_coupling(
+    _ExpressionEvaluator,
+    {t.__name__ for t in _ALLOWED_EXPR_TYPES} | {"Expression"},
+    label="_ExpressionEvaluator",
+)
+
+
+@dataclass(frozen=True)
+class StaticFieldReads:
+    """Statically resolvable top-level field reads of one allowed name.
+
+    ``complete`` is False when the expression reads the name with a key that
+    is not a string literal, so ``fields`` understates the true read set.
+    """
+
+    fields: frozenset[str]
+    complete: bool
+
 
 class ExpressionParser:
     """Safe expression parser for gate conditions.
@@ -670,7 +794,9 @@ class ExpressionParser:
     Allowed operations:
     - Subscript access: name['field'], name['key1']['key2']
     - Method: name.get('field') (single-arg only — defaults are fabrication)
-    - Safe builtins: len(), abs()
+    - Safe builtins: len(), abs(), lower(), upper(), strip(), casefold()
+      (case folding is function-call form only — row['x'].lower() stays
+      forbidden; attribute access remains closed to name.get)
     - Comparisons: ==, !=, <, >, <=, >=
     - Boolean operators: and, or, not
     - Membership: in, not in
@@ -760,6 +886,17 @@ class ExpressionParser:
         """
         return self._is_boolean_node(self._ast.body)
 
+    @trust_boundary(
+        tier=3,
+        source="one expression node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "returns True for comparisons, unary not, boolean literals, boolean-only and/or operands, "
+            "and ternaries with two boolean branches; other syntax returns False without evaluation; never raises"
+        ),
+        non_raising=True,
+    )
     def _is_boolean_node(self, node: ast.expr) -> bool:
         """Recursively check if an AST node returns a boolean."""
         # Comparisons always return bool
@@ -780,16 +917,26 @@ class ExpressionParser:
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             return True
 
-        # Name references to True/False
-        if isinstance(node, ast.Name) and node.id in ("True", "False"):
-            return True
-
         # Ternary: boolean if both branches are boolean
         if isinstance(node, ast.IfExp):
             return self._is_boolean_node(node.body) and self._is_boolean_node(node.orelse)
 
         # Everything else (field access, arithmetic, etc.) is not guaranteed boolean
         return False
+
+    def is_constant_expression(self) -> bool:
+        """Check if the expression is a bare literal, so it reads no row data.
+
+        A gate condition that is a literal (``True``, ``False``, a string, a
+        number) takes the same branch for every row: it encodes no decision.
+        Used for diagnosis — a fan-out advisory and the planner's
+        stated-threshold fidelity guard — and NEVER as a security control or a
+        blocking gate: the constant-condition fork is ELSPETH's documented
+        fan-out idiom (``pipeline_composer.md``, "Dual independent outputs").
+        """
+        body = self._ast.body
+        # Every supported Python represents bare literals as ast.Constant.
+        return isinstance(body, ast.Constant)
 
     def is_provably_non_routable(self) -> bool:
         """Check if the expression's result is statically guaranteed to be neither bool nor str.
@@ -839,6 +986,86 @@ class ExpressionParser:
 
         # Field access, ambiguous ops, ternaries, str-returning calls: routable.
         return False
+
+    def has_string_amplification_risk(self) -> bool:
+        """Check if the expression contains a Mult/Mod whose operand can be a string.
+
+        THREAT-001 counterpart to is_provably_non_routable(): str repetition
+        (``s * n``) and printf-style formatting (``fmt % x``) allocate output
+        linear in their inputs, and the same property that keeps Mult/Mod
+        routable exempts them from the non-routable guard. Callers that
+        evaluate expressions against untrusted-size data (preview sampling)
+        use this to refuse evaluation up front.
+
+        CONSERVATIVE by polarity, not node shape: an operand "can be a
+        string" unless ``_is_non_routable_node`` proves it numeric, so
+        str-returning Call operands fire the moment such builtins exist in
+        ``_SAFE_BUILTINS``.
+        """
+        return self._node_has_string_amplification(self._ast.body)
+
+    def _node_has_string_amplification(self, node: ast.expr) -> bool:
+        """True if any Mult/Mod BinOp under ``node`` has a can-be-string operand."""
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.BinOp)
+                and isinstance(child.op, (ast.Mult, ast.Mod))
+                and (not self._is_non_routable_node(child.left) or not self._is_non_routable_node(child.right))
+            ):
+                return True
+        return False
+
+    def static_field_reads(self, name: str = "row") -> StaticFieldReads:
+        """Statically enumerate the top-level fields the expression reads from ``name``.
+
+        Walks the validated AST for direct reads of ``name``: subscripts
+        (``name['field']``) and presence probes (``name.get('field')``). Only
+        string-literal keys are resolvable; any other key shape (a computed
+        key, a non-string constant) marks the enumeration incomplete.
+
+        NEVER a security control. Beyond that, note what this result now feeds:
+        it is no longer diagnosis-only. ``ValueTransform`` uses it to decide
+        which operation targets are CREATED rather than read, and that set is
+        subtracted from the derived input model — the one
+        ``TransformExecutor`` and ``AggregationExecutor`` ``model_validate(...,
+        strict=True)`` every row against. So this is a VALIDATION-RELAXING
+        consumer, and the hazard has changed direction with it.
+
+        The old hazard was concluding something from a field's ABSENCE. The
+        live hazard is the opposite: a wrongly enumerated PRESENCE. If a field
+        is reported read when it is not, nothing breaks; if a target is treated
+        as created when the transform actually reads it, a genuine input
+        requirement is silently dropped and a contract violation stops being
+        caught at the transform boundary. Hence ``complete=False`` must make
+        callers ABSTAIN from demoting rather than guess. ValueTransform scopes
+        that abstention PER TARGET, and rejects at construction only where both
+        conditions hold: the non-literal subscript sits in the target's OWN
+        assigning expression, and the schema declares that target required on
+        input. Every other target an incomplete enumeration touches is left
+        UNPROVEN — neither demoted nor rejected, so it keeps the requirement
+        the author declared (elspeth-d6eeb3a71d, elspeth-f6ddcebbe3).
+        """
+        fields: set[str] = set()
+        complete = True
+        for node in ast.walk(self._ast):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == name:
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    fields.add(key.value)
+                else:
+                    complete = False
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == name
+            ):
+                if len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    fields.add(node.args[0].value)
+                else:
+                    complete = False
+        return StaticFieldReads(fields=frozenset(fields), complete=complete)
 
     def evaluate(self, context: dict[str, Any] | PipelineRow) -> Any:
         """Evaluate expression against context data.

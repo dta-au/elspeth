@@ -35,7 +35,7 @@ OPERATION_STATUS_VALUES: tuple[OperationStatusValue, ...] = ("open", "completed"
 CallTypeValue = Literal["llm", "http", "http_redirect", "sql", "vector", "filesystem"]
 CallStatusValue = Literal["success", "error"]
 NodeStateStatusValue = Literal["open", "pending", "completed", "failed"]
-NodeTypeValue = Literal["source", "transform", "gate", "aggregation", "coalesce", "queue", "sink"]
+NodeTypeValue = Literal["source", "transform", "gate", "aggregation", "coalesce", "row_union", "collector", "queue", "sink"]
 RoutingModeValue = Literal["move", "copy", "divert"]
 DAGFlowTypeValue = Literal["normal", "divert"]
 SchemaModeValue = Literal["fixed", "flexible", "observed", "parse"]
@@ -71,8 +71,25 @@ class RowRecord(TypedDict):
     created_at: str | None
 
 
+class LineageFrameEntry(TypedDict):
+    """One lineage-path frame (spec §4.1) as projected on an MCP read surface.
+
+    ``depth`` is the frame's position on the path, outermost first (0-indexed).
+    """
+
+    depth: int
+    kind: str
+    group_id: str
+    member_key: str
+
+
 class TokenRecord(TypedDict):
-    """A token record as returned by ``list_tokens``."""
+    """A token record as returned by ``list_tokens``.
+
+    ``branch_name``/``fork_group_id``/``expand_group_id`` are DERIVED from
+    ``lineage_path`` (ruling 21, ratified 2026-08-22) — never a stored-column
+    read. They stay on the wire for backward compatibility.
+    """
 
     token_id: str
     row_id: str
@@ -81,7 +98,42 @@ class TokenRecord(TypedDict):
     join_group_id: str | None
     step_in_pipeline: int | None
     expand_group_id: str | None
+    lineage_path: list[LineageFrameEntry]
     created_at: str | None
+
+
+class GroupRecordEntry(TypedDict):
+    """A group roster record as returned by ``list_group_records``.
+
+    Minted at the opening operation for EVERY expansion, empty ones
+    included (spec §4.3); deliberately binding-blind — boundness is a
+    config fact, never a durable column.
+    """
+
+    group_id: str
+    kind: str
+    opener_token_id: str
+    member_count: int
+    created_at: str | None
+
+
+class GroupLossEntry(TypedDict):
+    """A group-loss ledger row as returned by ``list_group_losses``.
+
+    The ledger is append-only; ``adopted_epoch`` is a leader replay
+    cursor, never a truth filter (spec §6.2) — the projection surfaces
+    adopted and unadopted rows alike.
+    """
+
+    loss_id: str
+    closer_name: str
+    group_id: str
+    member_key: str
+    token_id: str
+    reason: str
+    recorded_by: str
+    recorded_at: str | None
+    adopted_epoch: int | None
 
 
 class TokenChildRecord(TypedDict):
@@ -190,7 +242,7 @@ class NodeStateRecord(TypedDict, total=False):
 
 
 class CollisionValueFingerprint(TypedDict):
-    """Non-reversible summary of a branch value involved in a coalesce collision."""
+    """Historical summary of a branch value involved in a coalesce collision."""
 
     value_hash: str
     value_type: str
@@ -207,14 +259,17 @@ class CollisionFieldRecord(TypedDict):
     field: str
     """Field name where collision occurred."""
 
+    contributing_branches: list[str]
+    """Branches that supplied the field, in configured merge order."""
+
     winner_branch: str | None
     """Branch whose value was kept (last_wins or first_wins), or None if merge failed."""
 
     winner_value_fingerprint: CollisionValueFingerprint | None
-    """Fingerprint of the value that won, or None if merge failed."""
+    """Historical fingerprint of the winning value; None for current records or failed merges."""
 
     competing_value_fingerprints: list[tuple[str, CollisionValueFingerprint]]
-    """List of (branch_name, value fingerprint) entries in merge order."""
+    """Historical fingerprints in merge order; empty for current branch-only records."""
 
 
 class CollisionRecord(TypedDict):
@@ -236,8 +291,21 @@ class CollisionRecord(TypedDict):
     """Field name → originating branch for all union-merged fields."""
 
 
-# Dataclass mirror types: dict[str, Any] aliases for dataclass_to_dict()
-# conversions where the exact shape depends on the dataclass variant.
+# Dataclass mirror types: dict[str, Any] aliases for dataclass_to_dict() projections.
+#
+# These are NOT TypedDicts. Each is `dict[str, Any]` wearing a descriptive name, so an
+# annotation like `-> RunDetail | None` reads as typed while carrying no field contract
+# at all. Say so plainly rather than letting the name do the talking.
+#
+# Each alias projects exactly ONE owned dataclass — not a variant family (measured
+# 2026-09-04: run_lifecycle.get_run -> `Run | None`, data_flow.get_nodes -> `list[Node]`,
+# query.get_calls -> `list[Call]`; all three defined in contracts/audit.py). They stay
+# soft because `dataclass_to_dict` (core/landscape/serialization.py:56) builds a recursive
+# JSON projection, and a hand-written TypedDict would duplicate the dataclass's field list
+# with nothing pinning the copies equal. The fix is a DERIVED mirror or serializing at the
+# MCP boundary, not a second hand-maintained declaration.
+#
+# config/cicd/contracts-whitelist.yaml carries the six affected returns and this rationale.
 
 RunDetail = dict[str, Any]
 """Run detail dict from ``dataclass_to_dict(Run)``."""
@@ -433,6 +501,7 @@ class OutcomeSummary(TypedDict):
     non_terminal_tokens: int
     fork_operations: int
     join_operations: int
+    expand_operations: int
 
 
 class OutcomeAnalysisReport(TypedDict):

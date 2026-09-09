@@ -53,7 +53,6 @@ from elspeth.engine.spans import SpanFactory
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from datetime import datetime
 
     from elspeth.contracts import (
         ResumePoint,
@@ -61,7 +60,7 @@ if TYPE_CHECKING:
     )
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
     from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
     from elspeth.contracts.preflight import PreflightResult
@@ -118,7 +117,9 @@ class Orchestrator:
         self._db = db
         self._events = event_bus if event_bus is not None else NullEventBus()
         self._canonical_version = canonical_version
-        self._span_factory = SpanFactory()
+        self._span_factory = SpanFactory(
+            telemetry_emit=telemetry_manager.handle_event if telemetry_manager is not None else None,
+        )
         self._checkpoint_manager = checkpoint_manager
         self._clock = clock if clock is not None else DEFAULT_CLOCK
         self._rate_limit_registry = rate_limit_registry
@@ -144,6 +145,7 @@ class Orchestrator:
         self._sink_flush = SinkFlushCoordinator(
             span_factory=self._span_factory,
             checkpoints=self._checkpoints,
+            clock=self._clock,
         )
         self._resume_coordinator = ResumeCoordinator(
             db=self._db,
@@ -152,6 +154,7 @@ class Orchestrator:
             checkpoints=self._checkpoints,
             context_factory=self._context_factory,
             sink_flush=self._sink_flush,
+            span_factory=self._span_factory,
             checkpoint_manager=self._checkpoint_manager,
         )
         self._graph_registration = GraphRegistrationService(
@@ -220,6 +223,7 @@ class Orchestrator:
         openrouter_catalog_sha256: str | None = None,
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Execute a pipeline run.
 
@@ -274,6 +278,7 @@ class Orchestrator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            check_coordination_latch=check_coordination_latch,
             # Bound AT CALL TIME (not construction) so monkeypatch.setattr on
             # the class and patch.object on this instance keep intercepting.
             initialize_database_phase=self._initialize_database_phase,
@@ -286,9 +291,10 @@ class Orchestrator:
         run_id: str,
         config: PipelineConfig,
         graph: ExecutionGraph,
+        coordination_token: CoordinationToken,
     ) -> GraphArtifacts:
         """GRAPH-phase delegator (test seam — see GraphRegistrationService)."""
-        return self._graph_registration.register_graph_nodes_and_edges(factory, run_id, config, graph)
+        return self._graph_registration.register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
 
     def _execute_run(
         self,
@@ -300,7 +306,7 @@ class Orchestrator:
         *,
         payload_store: PayloadStore,
         shutdown_event: threading.Event | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Run-body delegator (test seam — see LeaderDrainCoordinator).
@@ -357,9 +363,8 @@ class Orchestrator:
         run_id: str,
         settings: ElspethSettings,
         *,
-        now: datetime | None = None,
         window_seconds: float | None = None,
-    ) -> str:
+    ) -> WorkerMembershipToken:
         """§B.1: atomic follower admission — public entry point (ADR-030).
 
         Delegates to :class:`JoinAdmissionService`, which owns the follower
@@ -370,6 +375,5 @@ class Orchestrator:
         return self._join_admission.join_run(
             run_id,
             settings,
-            now=now,
             window_seconds=window_seconds,
         )

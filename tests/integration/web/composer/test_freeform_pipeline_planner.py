@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
@@ -22,8 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.protocol import ComposerResult
-from elspeth.web.composer.recipe_intent_routing import FreeformRecipeIntentMatch, InlineRecipeBlob
+from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerResult
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
@@ -40,6 +40,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @dataclass
@@ -77,12 +78,15 @@ def _empty_state() -> CompositionState:
     return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
 
-def _pipeline(data_dir: Path) -> dict[str, Any]:
+def _pipeline(data_dir: Path, session_id: str) -> dict[str, Any]:
     return {
         "source": {
             "plugin": "csv",
             "on_success": "rows",
-            "options": {"path": str(data_dir / "blobs" / "input.csv"), "schema": {"mode": "observed"}},
+            "options": {
+                "path": str(data_dir / "blobs" / session_id / "input.csv"),
+                "schema": {"mode": "observed"},
+            },
             "on_validation_failure": "discard",
         },
         "nodes": [],
@@ -92,7 +96,7 @@ def _pipeline(data_dir: Path) -> dict[str, Any]:
                 "sink_name": "rows",
                 "plugin": "json",
                 "options": {
-                    "path": str(data_dir / "outputs" / "result.jsonl"),
+                    "path": str(data_dir / "outputs" / session_id / "result.jsonl"),
                     "schema": {"mode": "observed"},
                     "format": "jsonl",
                     "mode": "write",
@@ -104,7 +108,7 @@ def _pipeline(data_dir: Path) -> dict[str, Any]:
     }
 
 
-def _terminal_response(data_dir: Path) -> _Response:
+def _terminal_response(data_dir: Path, session_id: str) -> _Response:
     return _Response(
         choices=[
             _Choice(
@@ -115,7 +119,55 @@ def _terminal_response(data_dir: Path) -> _Response:
                             id="freeform-terminal",
                             function=_Function(
                                 name="emit_pipeline_proposal",
-                                arguments=json.dumps({"pipeline": _pipeline(data_dir)}),
+                                arguments=json.dumps({"pipeline": _pipeline(data_dir, session_id)}),
+                            ),
+                        )
+                    ],
+                )
+            )
+        ],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+    )
+
+
+def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: str) -> _Response:
+    pipeline = _pipeline(data_dir, session_id)
+    pipeline["nodes"] = [
+        {
+            "id": "route_amount",
+            "node_type": "gate",
+            "input": "rows",
+            "condition": condition,
+            "routes": ({"true": "fork", "false": "fork"} if condition == "True" else {"true": "high_value", "false": "standard"}),
+            **({"fork_to": ["high_value", "standard"]} if condition == "True" else {}),
+        }
+    ]
+    pipeline["outputs"] = [
+        {
+            "sink_name": sink_name,
+            "plugin": "json",
+            "options": {
+                "path": str(data_dir / "outputs" / session_id / f"{sink_name}.jsonl"),
+                "schema": {"mode": "observed"},
+                "format": "jsonl",
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+        for sink_name in ("high_value", "standard")
+    ]
+    return _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(
+                            id=f"freeform-routing-{condition}",
+                            function=_Function(
+                                name="emit_pipeline_proposal",
+                                arguments=json.dumps({"pipeline": pipeline}),
                             ),
                         )
                     ],
@@ -141,7 +193,7 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -194,7 +246,7 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
     async def completion(**kwargs: Any) -> _Response:
         requests.append(kwargs)
-        return _terminal_response(tmp_path)
+        return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
 
@@ -212,7 +264,7 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
     assert len(proposals) == 1
     proposal = proposals[0]
     assert proposal.tool_name == "set_pipeline"
-    assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path)
+    assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path, str(session.id))
     assert proposal.pipeline_metadata is not None
     assert proposal.pipeline_metadata.base["kind"] == ("present" if persisted_base else "absent")
     assert proposal.base_state_id == (current_state.id if current_state is not None else None)
@@ -232,9 +284,169 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
     with engine.connect() as conn:
         audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    assert any(role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" for role, calls in audit_rows)
+    planner_audit_kinds = [
+        calls[0].get("_kind")
+        for role, calls in audit_rows
+        if role == "audit" and calls and calls[0].get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+    ]
+    assert planner_audit_kinds == ["llm_call_audit", "planner_attempt_audit"]
     assert len(requests) == 1
     assert requests[0]["max_tokens"] == settings.composer_planner_max_completion_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_trust_mode", "flipped_trust_mode"),
+    [("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")],
+    ids=["downgrade-mid-plan", "upgrade-mid-plan"],
+)
+async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_trust_mode: str,
+    flipped_trust_mode: str,
+) -> None:
+    """A preference flip while the planner is in a provider call requires review.
+
+    Regression for elspeth-01d4c6e683: trust authority was snapshotted before
+    the provider call, so a user switching auto_commit -> explicit_approve
+    mid-plan still had the in-flight plan committed automatically. Auto-commit
+    now requires the pre-plan snapshot AND the preference at staging time to
+    both be auto_commit; any mismatch lands the proposal on the review path.
+    """
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    initialize_session_schema(engine)
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("planner-user", "Planner", "local")
+    await sessions.update_composer_preferences(
+        session.id,
+        trust_mode=initial_trust_mode,  # type: ignore[arg-type]
+        density_default="high",
+        actor="test",
+    )
+    user_message = await sessions.add_message(
+        session.id,
+        "user",
+        "Build a CSV to JSONL pipeline.",
+        writer_principal="route_user_message",
+    )
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_boot_probe_enabled=False,
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    monkeypatch.setattr(
+        ComposerServiceImpl,
+        "_compute_availability",
+        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(),
+        settings,
+        sessions_service=sessions,
+        session_engine=engine,
+    )
+
+    async def completion(**kwargs: Any) -> _Response:
+        # The preference flip lands while the provider call is in flight —
+        # after the planner snapshotted preferences, before staging.
+        await sessions.update_composer_preferences(
+            session.id,
+            trust_mode=flipped_trust_mode,  # type: ignore[arg-type]
+            density_default="high",
+            actor="test",
+        )
+        return _terminal_response(tmp_path, str(session.id))
+
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+
+    result = await composer.compose(
+        "Build a CSV to JSONL pipeline.",
+        [],
+        _empty_state(),
+        session_id=str(session.id),
+        current_state_id=None,
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    # Either direction of mismatch must land on the review path: the
+    # proposal is staged as pending and no commit intent is granted.
+    proposals = await sessions.list_composition_proposals(session.id, status="pending")
+    assert len(proposals) == 1
+    assert result.pipeline_commit_intent is None
+    assert "for your review" in result.message
+
+
+@pytest.mark.asyncio
+async def test_referential_empty_build_projects_authoritative_prior_user_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A referential build turn must not erase the request it refers to."""
+    message = "Build the requested pipeline."
+    _engine, sessions, session, user_message, composer = await _recipe_composer_context(
+        tmp_path,
+        monkeypatch,
+        message=message,
+    )
+    original_request = (
+        "Read transactions.csv, route rows where amount > 500 to high_value, route every other row to standard, and write both as JSONL."
+    )
+    refinement = "Keep an audit trace field in both outputs."
+    requests: list[dict[str, Any]] = []
+    responses = [
+        _routing_terminal_response(tmp_path, str(session.id), condition="True"),
+        _routing_terminal_response(tmp_path, str(session.id), condition="row['amount'] > 500"),
+    ]
+
+    async def completion(**kwargs: Any) -> _Response:
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+
+    await composer.compose(
+        message,
+        [
+            {"role": "user", "content": original_request, COMPOSER_HISTORY_USER_AUTHORED_KEY: True},
+            {"role": "assistant", "content": "I can prepare that pipeline."},
+            {"role": "user", "content": refinement, COMPOSER_HISTORY_USER_AUTHORED_KEY: True},
+            {"role": "assistant", "content": "Understood."},
+        ],
+        _empty_state(),
+        session_id=str(session.id),
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    assert len(requests) == 2
+    provider_user_message = requests[0]["messages"][1]["content"]
+    provider_payload = json.loads(provider_user_message)
+    assert provider_payload["intent"] == message
+    assert provider_payload["conversation_context"] == {
+        "prior_user_requests": [
+            {"history_index": 0, "content": original_request},
+            {"history_index": 2, "content": refinement},
+        ],
+        "additional_prior_user_requests_omitted": 0,
+    }
+    assert "I can prepare that pipeline." not in provider_user_message
+    assert "Understood." not in provider_user_message
+    repair_feedback = json.loads(requests[1]["messages"][-1]["content"])
+    assert [error["error_code"] for error in repair_feedback["validation"]["errors"]] == ["gate_condition_ignores_stated_threshold"]
+    proposals = await sessions.list_composition_proposals(session.id, status="pending")
+    assert len(proposals) == 1
+    assert deep_thaw(proposals[0].arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"
 
 
 @pytest.mark.asyncio
@@ -255,7 +467,7 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     """Cancelled auto mode terminalises; explicit review stays crash-resumable."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -292,7 +504,7 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     )
 
     async def completion(**_kwargs: Any) -> _Response:
-        return _terminal_response(tmp_path)
+        return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
 
@@ -395,7 +607,7 @@ async def test_auto_commit_cancellation_survives_rejection_failure_and_repeated_
     )
 
     async def completion(**_kwargs: Any) -> _Response:
-        return _terminal_response(tmp_path)
+        return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
 
@@ -495,7 +707,7 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -553,7 +765,7 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -584,13 +796,16 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
     )
 
     async def completion(**_kwargs: Any) -> _Response:
-        return _terminal_response(tmp_path)
+        return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    # The planner audit cohort settles via add_messages_atomic
+    # (elspeth-90231248dc); failing it is what must abort before any
+    # proposal/authority/state row exists.
     monkeypatch.setattr(
         sessions,
-        "add_message",
-        AsyncMock(spec=sessions.add_message, side_effect=SQLAlchemyError("audit write failed")),
+        "add_messages_atomic",
+        AsyncMock(spec=sessions.add_messages_atomic, side_effect=SQLAlchemyError("audit write failed")),
     )
 
     with pytest.raises(AuditIntegrityError, match="audit persistence failed before proposal creation"):
@@ -622,7 +837,7 @@ async def _recipe_composer_context(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -731,10 +946,15 @@ async def test_freeform_planner_manifest_mismatch_is_durable_before_failure(
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
         requests.append(kwargs)
         if provider_outcome == "error":
-            raise RuntimeError("provider unavailable")
+            raise LiteLLMAPIError(
+                status_code=503,
+                message="provider unavailable",
+                llm_provider="test-provider",
+                model="test/planner",
+            )
         if provider_outcome == "cancel":
             raise asyncio.CancelledError()
-        return _terminal_response(tmp_path)
+        return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
@@ -776,7 +996,7 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
 
     async def mutating_completion(**kwargs: Any) -> _Response:
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
-        return _terminal_response(tmp_path)
+        return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
 
@@ -839,29 +1059,27 @@ def _assert_no_pipeline_side_effects(engine: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_server_recipe_falls_back_before_custody_without_side_effects(
+async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Freeform compose has exactly one planning path: plan_pipeline.
+
+    This test formerly guarded the excised recipe router's fallback seam with
+    a prepare_pipeline_plan never-called sentinel. The router died in
+    9700470e2 and prepare_pipeline_plan itself was deleted with the guided
+    sketch bypass (elspeth-b4a286d517), so no server-derived branch exists to
+    sentinel against; what survives is the routing half — compose reaches the
+    provider planner, and a planner failure leaves zero pipeline side effects.
+    """
     message = "Build the requested pipeline."
     engine, _sessions, session, user_message, composer = await _recipe_composer_context(
         tmp_path,
         monkeypatch,
         message=message,
     )
-    invalid_match = FreeformRecipeIntentMatch(
-        recipe_name="fork-coalesce-truncate-jsonl",
-        inline_blob=InlineRecipeBlob(filename="rows.csv", mime_type="text/csv", content="name,description\na,hello"),
-        slots={"output_path": "outputs/result.jsonl"},
-    )
     from elspeth.web.composer import service as composer_service
 
-    monkeypatch.setattr("elspeth.web.composer.service.match_freeform_recipe_intent", lambda _message: invalid_match)
-    prepare = AsyncMock(
-        spec=composer_service.prepare_pipeline_plan,
-        side_effect=AssertionError("invalid recipe must not reach custody preparation"),
-    )
-    monkeypatch.setattr("elspeth.web.composer.service.prepare_pipeline_plan", prepare)
     fallback = AsyncMock(
         spec=composer_service.plan_pipeline,
         side_effect=PipelinePlannerError("fallback stopped", code="TEST_STOP"),
@@ -878,53 +1096,5 @@ async def test_invalid_server_recipe_falls_back_before_custody_without_side_effe
             user_message_id=str(user_message.id),
         )
 
-    prepare.assert_not_awaited()
     fallback.assert_awaited_once()
-    _assert_no_pipeline_side_effects(engine)
-
-
-@pytest.mark.asyncio
-async def test_recipe_custody_failure_cannot_publish_reviewable_authority(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    message = "Build the requested pipeline."
-    engine, _sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-    valid_match = FreeformRecipeIntentMatch(
-        recipe_name="fork-coalesce-truncate-jsonl",
-        inline_blob=InlineRecipeBlob(filename="rows.csv", mime_type="text/csv", content="name,description\na,hello"),
-        slots={
-            "truncate_field": "description",
-            "max_chars": 30,
-            "truncation_suffix": "...",
-            "output_path": "outputs/result.jsonl",
-            "key_a": "path_a",
-            "key_b": "path_b",
-        },
-    )
-    from elspeth.web.composer import pipeline_planner as pipeline_planner_module
-
-    monkeypatch.setattr("elspeth.web.composer.service.match_freeform_recipe_intent", lambda _message: valid_match)
-    monkeypatch.setattr(
-        "elspeth.web.composer.pipeline_planner.finalize_pipeline_custody",
-        AsyncMock(
-            spec=pipeline_planner_module.finalize_pipeline_custody,
-            side_effect=AuditIntegrityError("custody failed"),
-        ),
-    )
-
-    with pytest.raises(AuditIntegrityError, match="custody failed"):
-        await composer.compose(
-            message,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user_message.id),
-        )
-
     _assert_no_pipeline_side_effects(engine)

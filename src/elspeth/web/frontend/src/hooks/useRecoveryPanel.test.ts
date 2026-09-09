@@ -83,6 +83,48 @@ describe("useRecoveryPanel", () => {
     }
   });
 
+  it("opens for a wall-clock timeout 422 now that it carries failed_turn (R2-F9)", () => {
+    // The timeout raise used to omit failed_turn entirely, so the panel — and
+    // with it the failed-turn transcript and the salvaged draft — stayed shut
+    // on exactly the failure that produces the most salvage. Applying is a
+    // no-op when the store already folded the partial in, but the transcript
+    // is not: it is the only place the user can see what the turn attempted.
+    const onApplyState = vi.fn();
+    const partialState = makePartialState(6);
+    const { result } = renderHook(() =>
+      useRecoveryPanel({
+        currentCompositionVersion: 6,
+        recoveryStartedCompositionVersion: 6,
+        onApplyState,
+      }),
+    );
+
+    let opened = false;
+    act(() => {
+      opened = result.current.openFromError(
+        makeApiError({
+          status: 422,
+          error_type: "convergence",
+          reason: "convergence_wall_clock_timeout",
+          timeout_seconds: 240,
+          partial_state: partialState,
+          failed_turn: makeFailedTurn(),
+        }),
+      );
+    });
+
+    expect(opened).toBe(true);
+    expect(result.current.isOpen).toBe(true);
+
+    // The store baselines the gate on the folded-in partial, so Apply must
+    // not raise a false "someone else changed this" alarm.
+    act(() => {
+      result.current.requestApply();
+    });
+    expect(result.current.needsApplyConfirmation).toBe(false);
+    expect(onApplyState).toHaveBeenCalledWith(partialState);
+  });
+
   it("requires confirmation when the current composition version changed", () => {
     const onApplyState = vi.fn();
     let currentVersion: number | null = 7;

@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "elspeth-composer": {
+      "type": "stdio",
+      "command": ".venv/bin/elspeth-composer",
+      "args": ["--scratch-dir", ".scratch"]
+    },
+    "elspeth-judge": {
+      "type": "stdio",
+      "command": ".venv/bin/python",
+      "args": [
+        "-m", "elspeth_lints.mcp",
+        "--root", "src/elspeth",
+        "--allowlist-dir", "config/cicd/enforce_tier_model",
+        "--staged-dir", ".elspeth/staged-reviews"
+      ],
+      "env": { "PYTHONPATH": "elspeth-lints/src" }
+    },
+    "elspeth-landscape": {
+      "type": "stdio",
+      "command": ".venv/bin/elspeth-mcp",
+      "args": ["--database", "sqlite:///data/runs/audit.db"]
+    },
+    "filigree": { "type": "stdio", "command": "filigree-mcp", "args": [] },
+    "loomweave": { "type": "stdio", "command": "loomweave", "args": ["serve"] }
+  }
+}

@@ -22,20 +22,23 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import Column, delete, event, func, insert, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs import service as blob_service_module
 from elspeth.web.blobs.protocol import (
     BlobActiveRunError,
+    BlobContentMissingError,
     BlobForkCleanupError,
     BlobForkCleanupResult,
     BlobForkFenceLostError,
@@ -46,7 +49,9 @@ from elspeth.web.blobs.protocol import (
     BlobInProgressForkError,
     BlobIntegrityError,
     BlobNotFoundError,
+    BlobPendingProposalError,
     BlobQuotaExceededError,
+    BlobRecord,
     fork_blob_id,
 )
 from elspeth.web.blobs.service import (
@@ -63,8 +68,9 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
+from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -106,6 +112,183 @@ def session_id(db_engine) -> UUID:
 def blob_service(db_engine, tmp_path) -> BlobServiceImpl:
     """BlobServiceImpl backed by the shared engine and a temp directory."""
     return BlobServiceImpl(db_engine, tmp_path)
+
+
+@pytest.fixture()
+def compose_context(db_engine, session_id) -> SessionOperationContext:
+    """Live COMPOSE fence for the fixture session: admitted to create, read and delete.
+
+    Seeded through the real fence row so the service's authority CAS and
+    custody read pass honestly. A session holds one fence, so a test that
+    also needs an EXECUTE context (``execute_context``, or an inline
+    ``seed_live_operation_context``) must sequence: compose-fenced effects
+    first, then seed EXECUTE.
+    """
+    return seed_live_compose_context(db_engine, session_id)
+
+
+def _execute_context(db_engine, session_id) -> SessionOperationContext:
+    """Seed a live EXECUTE fence for ``session_id`` (replacing any COMPOSE fence) and return it."""
+    return seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+
+
+async def _seed_active_run(
+    db_engine,
+    session_id: UUID,
+    *,
+    session_operation_context: SessionOperationContext,
+    source: dict[str, Any],
+    nodes: list[dict[str, Any]] | None = None,
+    status: str = "pending",
+) -> str:
+    """Seed a composition state through the REAL writer, attach a run, return its id.
+
+    A direct ``composition_states_table.insert()`` must not be used to pin the
+    active-run retention guard. Since ``f0fd36087`` (2026-05) every production
+    writer folds ``source`` into ``sources`` and stores each JSON column wrapped
+    as ``{"_version": 1, "data": ...}``; a hand-seeded row with a populated,
+    bare ``source`` is a shape the database never contains. Pinning the guard
+    against that shape is exactly how ``elspeth-3db5745ba7`` stayed green while
+    production raised ``TypeError`` (500) on every blob delete or replace under
+    a pending or running run. Routing through ``save_composition_state`` keeps
+    these tests sensitive to the storage shape they exist to defend.
+    """
+    from elspeth.web.sessions.models import runs_table
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.service import SessionServiceImpl
+    from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+    sessions = SessionServiceImpl(
+        db_engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+    )
+    # The caller's live COMPOSE context drives the real writer. Seeding a fresh
+    # fence here would replace the session's one fence row and silently stale
+    # the context the test goes on to use for its blob effects.
+    context = session_operation_context
+    state = await sessions.save_composition_state(
+        session_id,
+        CompositionStateData(
+            source=source,
+            nodes=nodes if nodes is not None else [],
+            edges=[],
+            outputs=[],
+            metadata_={"name": "Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+        session_operation_context=context,
+    )
+
+    run_id = str(uuid4())
+    with db_engine.begin() as conn:
+        conn.execute(
+            runs_table.insert().values(
+                id=run_id,
+                session_id=str(session_id),
+                state_id=str(state.id),
+                status=status,
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                rows_processed=0,
+                rows_failed=0,
+            )
+        )
+    return run_id
+
+
+_RUN_SOURCE: dict[str, Any] = {
+    "plugin": "csv",
+    "on_success": "output",
+    "on_validation_failure": "quarantine",
+    "options": {"path": "/data/external/input.csv"},
+}
+
+
+def _pending_output_record(blob_service: BlobServiceImpl, session_id: UUID, filename: str) -> BlobRecord:
+    """The record a producer hands the facet to reserve a run output: pending, zero size, no hash."""
+    blob_id = uuid4()
+    storage = blob_service._storage_path(str(session_id), str(blob_id), filename)
+    storage.parent.mkdir(parents=True, exist_ok=True)
+    return BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename=filename,
+        mime_type="text/csv",
+        size_bytes=0,
+        content_hash=None,
+        storage_path=str(storage),
+        created_at=datetime.now(UTC),
+        created_by="pipeline",
+        source_description=None,
+        status="pending",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+
+
+def reserve_output_blob(
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    run_id: UUID,
+    execute_context: SessionOperationContext,
+    *,
+    filename: str = "output.csv",
+) -> BlobRecord:
+    """Reserve one pending output blob for ``run_id`` the way a producer would: through the facet, under the run's EXECUTE fence.
+
+    The facet binds the reservation to ``execute_context``'s operation, so
+    finalize it under the SAME context (a fresh ``_execute_context`` seed
+    is a different operation and the facet refuses it as an anomaly).
+    """
+    record = _pending_output_record(blob_service, session_id, filename)
+
+    def _reserve(transaction) -> BlobRecord:
+        reserved = transaction.blobs.reserve_pending_output_blob(record=record)
+        transaction.blobs.insert_blob_run_link(blob_id=record.id, run_id=run_id, direction="output")
+        return reserved
+
+    return blob_service._session_operation_authority.mutate(execute_context, _reserve)
+
+
+def _seed_pending_blob(db_engine, blob_service: BlobServiceImpl, session_id: UUID, filename: str = "output.csv") -> BlobRecord:
+    """Insert the row ``create_blob``'s reservation phase leaves before finalization.
+
+    Pending, zero size, no hash, no custody columns — the exact column set of
+    ``_insert_pending_blob_row`` — for tests of what a not-yet-ready row must
+    refuse (reads, copies). Run outputs are reserved through
+    :func:`reserve_output_blob` instead, as production would.
+    """
+    record = _pending_output_record(blob_service, session_id, filename)
+    with db_engine.begin() as conn:
+        conn.execute(
+            blobs_table.insert().values(
+                id=str(record.id),
+                session_id=str(session_id),
+                filename=record.filename,
+                mime_type=record.mime_type,
+                size_bytes=0,
+                content_hash=None,
+                storage_path=record.storage_path,
+                created_at=record.created_at,
+                created_by=record.created_by,
+                source_description=None,
+                status="pending",
+                creation_modality=record.creation_modality.value,
+                created_from_message_id=None,
+                creating_model_identifier=None,
+                creating_model_version=None,
+                creating_provider=None,
+                creating_composer_skill_hash=None,
+                creating_arguments_hash=None,
+            )
+        )
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +356,7 @@ class TestCreateAndRead:
     """Blob creation writes to filesystem and DB; read returns identical bytes."""
 
     @pytest.mark.asyncio
-    async def test_create_blob_and_read(self, blob_service, session_id, tmp_path) -> None:
+    async def test_create_blob_and_read(self, blob_service, session_id, tmp_path, compose_context) -> None:
         content = b"col1,col2\na,b\nc,d"
         record = await blob_service.create_blob(
             session_id=session_id,
@@ -181,6 +364,7 @@ class TestCreateAndRead:
             content=content,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         # Record fields
@@ -193,7 +377,7 @@ class TestCreateAndRead:
         assert record.created_by == "user"
 
         # Read back content
-        read_back = await blob_service.read_blob_content(record.id)
+        read_back = await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
         assert read_back == content
 
         # File exists on disk
@@ -206,6 +390,7 @@ class TestCreateAndRead:
         session_id: UUID,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
         """Blob storage paths are internal paths, not data-dir-relative source paths."""
         monkeypatch.chdir(tmp_path)
@@ -217,6 +402,7 @@ class TestCreateAndRead:
             content=b"ticket_id\nT-001\n",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         storage_path = Path(record.storage_path)
@@ -225,7 +411,7 @@ class TestCreateAndRead:
         assert storage_path.exists()
 
     @pytest.mark.asyncio
-    async def test_create_blob_stores_correct_hash(self, blob_service, session_id) -> None:
+    async def test_create_blob_stores_correct_hash(self, blob_service, session_id, compose_context) -> None:
         """AD-7: stored hash must match content_hash() for the same bytes."""
         content = b"audit-trail-integrity-check"
         record = await blob_service.create_blob(
@@ -234,6 +420,7 @@ class TestCreateAndRead:
             content=content,
             mime_type="text/plain",
             created_by="user",
+            session_operation_context=compose_context,
         )
         assert record.content_hash == content_hash(content)
 
@@ -247,7 +434,7 @@ class TestListBlobs:
     """Session scoping: blobs from one session must not leak into another."""
 
     @pytest.mark.asyncio
-    async def test_list_blobs_returns_session_scoped(self, blob_service, db_engine) -> None:
+    async def test_list_blobs_returns_session_scoped(self, blob_service, db_engine, compose_context) -> None:
         now = datetime.now(UTC)
         s1_id = UUID(str(uuid4()))
         s2_id = UUID(str(uuid4()))
@@ -268,12 +455,15 @@ class TestListBlobs:
                     )
                 )
 
+        # Each create runs under ITS OWN session's fence: a context for one
+        # session cannot create in another (the service refuses that outright).
         await blob_service.create_blob(
             session_id=s1_id,
             filename="s1.csv",
             content=b"session-1",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=seed_live_compose_context(db_engine, s1_id),
         )
         await blob_service.create_blob(
             session_id=s2_id,
@@ -281,6 +471,7 @@ class TestListBlobs:
             content=b"session-2",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=seed_live_compose_context(db_engine, s2_id),
         )
 
         s1_blobs = await blob_service.list_blobs(s1_id)
@@ -301,7 +492,7 @@ class TestDeleteBlob:
     """Deletion removes file and record; active-run guard prevents evidence destruction."""
 
     @pytest.mark.asyncio
-    async def test_delete_blob_removes_file_and_record(self, blob_service, session_id) -> None:
+    async def test_delete_blob_removes_file_and_record(self, blob_service, session_id, compose_context) -> None:
         from pathlib import Path
 
         record = await blob_service.create_blob(
@@ -310,16 +501,227 @@ class TestDeleteBlob:
             content=b"temporary",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         storage = Path(record.storage_path)
         assert storage.exists()
 
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         assert not storage.exists()
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_commit_failure_restores_file_and_row_after_restart(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        db_engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """A failed metadata commit must not strand a live row without bytes."""
+        content = b"commit-boundary-content"
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="commit-boundary.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        original_do_commit = db_engine.dialect.do_commit
+        fail_next_commit = True
+
+        def fail_delete_commit(dbapi_connection) -> None:
+            nonlocal fail_next_commit
+            if fail_next_commit:
+                fail_next_commit = False
+                raise RuntimeError("injected blob delete commit failure")
+            original_do_commit(dbapi_connection)
+
+        monkeypatch.setattr(db_engine.dialect, "do_commit", fail_delete_commit)
+
+        with pytest.raises(RuntimeError, match="injected blob delete commit failure"):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        restarted = BlobServiceImpl(db_engine, tmp_path)
+        restored = await restarted.get_blob(record.id, session_operation_context=compose_context)
+        assert restored.id == record.id
+        assert storage.read_bytes() == content
+        assert await restarted.read_blob_content(record.id, session_operation_context=compose_context) == content
+        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_sql_failure_restores_file_before_stage_escapes(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        db_engine,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        """A DELETE failure inside the helper restores its unreturned stage."""
+        content = b"delete-statement-boundary-content"
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="delete-statement-boundary.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+
+        def fail_blob_delete(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+            if statement.lstrip().upper().startswith("DELETE FROM BLOBS"):
+                raise RuntimeError("injected blob DELETE failure")
+
+        event.listen(db_engine, "before_cursor_execute", fail_blob_delete)
+        try:
+            with pytest.raises(RuntimeError, match="injected blob DELETE failure"):
+                await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        finally:
+            event.remove(db_engine, "before_cursor_execute", fail_blob_delete)
+
+        restarted = BlobServiceImpl(db_engine, tmp_path)
+        assert (await restarted.get_blob(record.id, session_operation_context=compose_context)).id == record.id
+        assert await restarted.read_blob_content(record.id, session_operation_context=compose_context) == content
+        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_staging_fsync_failure_restores_file_before_stage_escapes(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        db_engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """A staging fsync failure must not strand live metadata without bytes."""
+        content = b"staging-fsync-boundary-content"
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="staging-fsync-boundary.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        fsync_calls = 0
+
+        def fail_staging_fsync(_directory: Path) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 1:
+                raise OSError("injected staging directory fsync failure")
+
+        monkeypatch.setattr(blob_service_module, "_fsync_parent_directory", fail_staging_fsync)
+
+        with pytest.raises(OSError, match="injected staging directory fsync failure"):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        restarted = BlobServiceImpl(db_engine, tmp_path)
+        assert (await restarted.get_blob(record.id, session_operation_context=compose_context)).id == record.id
+        assert storage.read_bytes() == content
+        assert await restarted.read_blob_content(record.id, session_operation_context=compose_context) == content
+        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_tombstone_unlink_failure_is_retryable_after_restart(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        db_engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """A committed delete retains enough state to retry a failed unlink."""
+        content = b"retry-tombstone-unlink-content"
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="retry-tombstone-unlink.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        original_unlink = Path.unlink
+        fail_tombstone_unlink = True
+
+        def fail_first_tombstone_unlink(path: Path, missing_ok: bool = False) -> None:
+            nonlocal fail_tombstone_unlink
+            if fail_tombstone_unlink and ".delete-" in path.name:
+                fail_tombstone_unlink = False
+                raise OSError("injected tombstone unlink failure")
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", fail_first_tombstone_unlink)
+
+        with pytest.raises(OSError, match="injected tombstone unlink failure"):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        with pytest.raises(BlobNotFoundError):
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
+        tombstones = list(storage.parent.glob(f".{storage.name}.delete-*"))
+        assert len(tombstones) == 1
+        assert tombstones[0].read_bytes() == content
+
+        restarted = BlobServiceImpl(db_engine, tmp_path)
+        await restarted.delete_blob(record.id, session_operation_context=compose_context)
+
+        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_post_unlink_fsync_failure_is_retryable_after_restart(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        db_engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """A retry repeats directory fsync after unlink succeeded but fsync failed."""
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="retry-post-unlink-fsync.csv",
+            content=b"retry-post-unlink-fsync-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        fsync_calls = 0
+
+        def fail_first_purge_fsync(_directory: Path) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError("injected post-unlink directory fsync failure")
+
+        monkeypatch.setattr(blob_service_module, "_fsync_parent_directory", fail_first_purge_fsync)
+
+        with pytest.raises(OSError, match="injected post-unlink directory fsync failure"):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        with pytest.raises(BlobNotFoundError):
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
+        assert not storage.exists()
+        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+
+        restarted = BlobServiceImpl(db_engine, tmp_path)
+        await restarted.delete_blob(record.id, session_operation_context=compose_context)
+
+        assert fsync_calls == 3
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -338,6 +740,7 @@ class TestDeleteBlob:
         db_engine,
         tool_name,
         arguments,
+        compose_context,
     ) -> None:
         contracts = importlib.import_module("elspeth.contracts.blobs")
         pending_error = contracts.BlobPendingProposalError
@@ -347,6 +750,7 @@ class TestDeleteBlob:
             content=b"review me",
             mime_type="text/csv",
             created_by="assistant",
+            session_operation_context=compose_context,
         )
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
@@ -371,19 +775,22 @@ class TestDeleteBlob:
             )
 
         with pytest.raises(pending_error):
-            await blob_service.delete_blob(record.id)
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         assert Path(record.storage_path).exists()
-        assert await blob_service.get_blob(record.id) == record
+        assert await blob_service.get_blob(record.id, session_operation_context=compose_context) == record
 
     @pytest.mark.asyncio
-    async def test_delete_blob_allows_blob_only_referenced_by_rejected_proposal(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_allows_blob_only_referenced_by_rejected_proposal(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="rejected-review.csv",
             content=b"no longer retained",
             mime_type="text/csv",
             created_by="assistant",
+            session_operation_context=compose_context,
         )
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
@@ -407,19 +814,29 @@ class TestDeleteBlob:
                 )
             )
 
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_pending_delete_proposal_does_not_retain_its_own_target(self, blob_service, session_id, db_engine) -> None:
+    async def test_pending_delete_proposal_retains_its_target_from_a_direct_delete(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
+        """A staged delete_blob proposal is reviewed evidence over its target.
+
+        Until that proposal settles, a direct (non-proposal) delete of the same
+        blob is refused exactly like any other pending reference; only the
+        accepting tool path may exclude its own proposal, and it must name it
+        (``pending_proposal_reference_id(accepting_proposal_id=...)``).
+        """
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="delete-target.csv",
             content=b"delete me",
             mime_type="text/csv",
             created_by="assistant",
+            session_operation_context=compose_context,
         )
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
@@ -443,18 +860,21 @@ class TestDeleteBlob:
                 )
             )
 
-        await blob_service.delete_blob(record.id)
-        with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+        with pytest.raises(BlobPendingProposalError):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        assert (await blob_service.get_blob(record.id, session_operation_context=compose_context)).id == record.id
 
     @pytest.mark.asyncio
-    async def test_unrelated_nested_blob_id_does_not_create_pending_retention(self, blob_service, session_id, db_engine) -> None:
+    async def test_unrelated_nested_blob_id_does_not_create_pending_retention(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="unrelated.csv",
             content=b"not a source binding",
             mime_type="text/csv",
             created_by="assistant",
+            session_operation_context=compose_context,
         )
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
@@ -481,18 +901,19 @@ class TestDeleteBlob:
                 )
             )
 
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_pending_proposal_retention_does_not_block_blob_finalization(self, blob_service, session_id, db_engine) -> None:
-        record = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pending-output.csv",
-            mime_type="text/csv",
-            created_by="assistant",
+    async def test_pending_proposal_retention_does_not_block_blob_finalization(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
+        run_id = UUID(
+            await _seed_active_run(db_engine, session_id, session_operation_context=compose_context, source=_RUN_SOURCE, status="running")
         )
+        execute = _execute_context(db_engine, session_id)
+        record = reserve_output_blob(blob_service, session_id, run_id, execute, filename="pending-output.csv")
         content = b"ready\n1\n"
         Path(record.storage_path).write_bytes(content)
         now = datetime.now(UTC)
@@ -517,16 +938,12 @@ class TestDeleteBlob:
                 )
             )
 
-        finalized = await blob_service.finalize_blob(
-            record.id,
-            "ready",
-            size_bytes=len(content),
-            content_hash=content_hash(content),
-        )
-        assert finalized.status == "ready"
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        assert [(finalized.id, finalized.status) for finalized in result.finalized] == [(record.id, "ready")]
+        assert list(result.errors) == []
 
     @pytest.mark.asyncio
-    async def test_delete_blob_rejects_when_active_run_linked(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_rejects_when_active_run_linked(self, blob_service, session_id, db_engine, compose_context) -> None:
         """Active-run guard: cannot delete a blob that is evidence for a live run."""
         from elspeth.web.sessions.models import (
             blob_run_links_table,
@@ -540,6 +957,7 @@ class TestDeleteBlob:
             content=b"important",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         # Insert a composition state (runs FK to composition_states)
@@ -583,10 +1001,10 @@ class TestDeleteBlob:
             )
 
         with pytest.raises(BlobActiveRunError):
-            await blob_service.delete_blob(record.id)
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_allows_when_completed_run_linked(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_allows_when_completed_run_linked(self, blob_service, session_id, db_engine, compose_context) -> None:
         """Completed runs do not block deletion — evidence is already recorded."""
         from elspeth.web.sessions.models import (
             blob_run_links_table,
@@ -600,6 +1018,7 @@ class TestDeleteBlob:
             content=b"finished",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         state_id = str(uuid4())
@@ -642,13 +1061,15 @@ class TestDeleteBlob:
             )
 
         # Should succeed — completed run does not block deletion
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_preserves_completed_inline_resolution_audit_rows(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_preserves_completed_inline_resolution_audit_rows(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         """Completed inline-content audit rows must not turn blob deletion into a 500."""
         from elspeth.web.sessions.models import (
             blob_inline_resolutions_table,
@@ -663,6 +1084,7 @@ class TestDeleteBlob:
             content=b"finished prompt",
             mime_type="text/plain",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         state_id = str(uuid4())
@@ -713,7 +1135,7 @@ class TestDeleteBlob:
                 )
             )
 
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         with db_engine.connect() as conn:
             rows = conn.execute(select(blob_inline_resolutions_table)).fetchall()
@@ -721,10 +1143,12 @@ class TestDeleteBlob:
         assert len(rows) == 1
         assert rows[0].blob_id == str(record.id)
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_rejects_when_active_run_exists_without_link(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_rejects_when_active_run_exists_without_link(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         """Pre-link window: active run exists but blob_run_links row hasn't been created yet.
 
         _execute_locked() creates the run record before link_blob_to_run()
@@ -732,69 +1156,96 @@ class TestDeleteBlob:
         nothing.  The composition-state guard must block deletion because
         the run's source references this blob via blob_ref.
         """
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
-
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="pre-link.csv",
             content=b"important",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    # Source references this blob via blob_ref — the run is
-                    # about to link it once link_blob_to_run() fires.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
-            # Deliberately NO blob_run_links row — simulating the pre-link window
+        # Source references this blob via blob_ref — the run is about to link
+        # it once link_blob_to_run() fires. Deliberately NO blob_run_links row,
+        # so this pins the composition-state guard rather than the
+        # explicit-link guard that would short-circuit it.
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            session_operation_context=compose_context,
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
+            },
+        )
 
         with pytest.raises(BlobActiveRunError):
-            await blob_service.delete_blob(record.id)
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_allows_when_active_run_uses_different_source(self, blob_service, session_id, db_engine) -> None:
+    @pytest.mark.parametrize("key", ["blob_ref", "blob_id"])
+    async def test_delete_blob_rejects_when_active_run_references_blob_in_upper_case(
+        self, blob_service, session_id, db_engine, compose_context, key: str
+    ) -> None:
+        """The composition-state guard compares blob ids by UUID identity, not spelling.
+
+        The binding contract admits ``[0-9a-fA-F]`` hyphenated markers and binds
+        them through ``UUID(...)``, so an upper-case ``blob_ref`` (or a
+        ``blob_id`` custody key) names the SAME blob the store recorded in lower
+        case; a spelling comparison read it as unbound and let the delete through
+        (elspeth-f123a7b3d2).
+        """
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="upper.csv",
+            content=b"important",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        upper = str(record.id).upper()
+        assert upper != str(record.id)
+        # A top-level source ``blob_ref`` is a web-only option key the lowering
+        # strips before the guard walks the run's pipeline dict; the id the
+        # walker must recognise is the NESTED one — an inline-content marker
+        # under a transform option, or a ``blob_id`` custody key.
+        marker: dict[str, object] = (
+            {"blob_ref": upper, "mode": "inline_content", "sha256": record.content_hash} if key == "blob_ref" else {"blob_id": upper}
+        )
+
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            session_operation_context=compose_context,
+            source={
+                "plugin": "csv",
+                "on_success": "classify",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+            nodes=[
+                {
+                    "id": "classify",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_out",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {"system_prompt": marker},
+                }
+            ],
+        )
+
+        with pytest.raises(BlobActiveRunError):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        assert Path(record.storage_path).exists()
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_allows_when_active_run_uses_different_source(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         """Active run using source.path (no blob_ref) must not block unrelated blob deletion.
 
         Regression test: the original session-level guard blocked ALL blobs
@@ -802,76 +1253,40 @@ class TestDeleteBlob:
         with no blob_ref.  The scoped guard checks the composition state's
         source.options.blob_ref and only blocks if it matches this blob.
         """
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
-
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="unrelated.csv",
             content=b"not used by run",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    # Source uses file path, NOT blob_ref — run is unrelated
-                    # to the blob being deleted.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": "/data/external/other.csv"},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
+        # Source uses a file path, NOT blob_ref — the run is unrelated to the
+        # blob being deleted.
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            session_operation_context=compose_context,
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+        )
 
         # Should succeed — active run does not reference this blob
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_rejects_when_transform_option_references_blob(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_rejects_when_transform_option_references_blob(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         """Pre-link guard walks canonical pipeline sections beyond source.options."""
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
 
         record = await blob_service.create_blob(
             session_id=session_id,
@@ -879,133 +1294,80 @@ class TestDeleteBlob:
             content=b"Classify the row.",
             mime_type="text/plain",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    source={
-                        "plugin": "csv",
-                        "on_success": "classify",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": "/data/external/other.csv"},
-                    },
-                    nodes=[
-                        {
-                            "id": "classify",
-                            "node_type": "transform",
-                            "plugin": "llm",
-                            "input": "source_out",
-                            "on_success": "output",
-                            "on_error": "discard",
-                            "options": {
-                                "system_prompt": {
-                                    "blob_ref": str(record.id),
-                                    "mode": "inline_content",
-                                    "sha256": record.content_hash,
-                                }
-                            },
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            session_operation_context=compose_context,
+            source={
+                "plugin": "csv",
+                "on_success": "classify",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+            nodes=[
+                {
+                    "id": "classify",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_out",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {
+                        "system_prompt": {
+                            "blob_ref": str(record.id),
+                            "mode": "inline_content",
+                            "sha256": record.content_hash,
                         }
-                    ],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
+                    },
+                }
+            ],
+        )
 
         with pytest.raises(BlobActiveRunError):
-            await blob_service.delete_blob(record.id)
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_rejects_when_active_run_path_matches_storage(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_rejects_when_active_run_path_matches_storage(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         """Active run using source.path matching this blob's storage_path must block.
 
         A run can read a blob's backing file via plain set_source with
         options.path (no blob_ref).  The guard must check path/file matches
         in addition to blob_ref.
         """
-        from elspeth.web.sessions.models import (
-            composition_states_table,
-            runs_table,
-        )
-
         record = await blob_service.create_blob(
             session_id=session_id,
             filename="path-backed.csv",
             content=b"path match",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        state_id = str(uuid4())
-        session_id_str = str(session_id)
-        run_id = str(uuid4())
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    # Source references this blob via path, NOT blob_ref.
-                    source={
-                        "plugin": "csv",
-                        "on_success": "output",
-                        "on_validation_failure": "quarantine",
-                        "options": {"path": record.storage_path},
-                    },
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "Test", "description": ""},
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
-                )
-            )
-            conn.execute(
-                runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="pending",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
-                )
-            )
+        # Source references this blob via path, NOT blob_ref.
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            session_operation_context=compose_context,
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"path": record.storage_path},
+            },
+        )
 
         with pytest.raises(BlobActiveRunError):
-            await blob_service.delete_blob(record.id)
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_delete_blob_allows_when_completed_run_exists_without_link(self, blob_service, session_id, db_engine) -> None:
+    async def test_delete_blob_allows_when_completed_run_exists_without_link(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
         """Completed runs (without link row) must not block deletion."""
         from elspeth.web.sessions.models import (
             composition_states_table,
@@ -1018,6 +1380,7 @@ class TestDeleteBlob:
             content=b"done",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         state_id = str(uuid4())
@@ -1053,233 +1416,125 @@ class TestDeleteBlob:
             )
 
         # Should succeed — completed run does not block deletion
-        await blob_service.delete_blob(record.id)
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
         with pytest.raises(BlobNotFoundError):
-            await blob_service.get_blob(record.id)
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_delete_blob_rejects_a_blob_the_real_writer_referenced_from_a_source(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
+        """The active-run guard must read the shape production actually writes.
+
+        Every other test in this class hand-seeds ``composition_states`` with a
+        populated ``source`` column holding a bare (un-enveloped) mapping. No
+        production writer has emitted that shape since ``f0fd36087`` (2026-05):
+        ``save_composition_state`` folds ``source`` into ``sources`` and stores
+        every JSON column wrapped as ``{"_version": 1, "data": ...}``. Those
+        tests therefore pass against a row the database never contains, which
+        is how ``elspeth-3db5745ba7`` stayed green while production 500'd.
+
+        This test seeds through the real writer, so it is sensitive to both
+        halves of that defect, which fail in OPPOSITE directions:
+
+        * **Prong 1, fail-closed.** Passing the enveloped columns straight into
+          ``CompositionStateRecord`` makes ``pipeline_dict_from_record`` index a
+          ``{"_version": ...}`` dict — ``TypeError: string indices must be
+          integers``, surfacing as a 500 on every delete/replace under a
+          pending or running run.
+        * **Prong 2, fail-open.** ``_ACTIVE_RUN_COMPOSITION_COLUMNS`` selected
+          ``source`` (always NULL) and never selected ``sources`` (the real
+          payload), so once prong 1 stops raising, the guard walks a
+          source-less pipeline dict, ``_composition_references_blob`` returns
+          ``False``, and a blob referenced *only* from a source's options is
+          DELETED under an active run.
+
+        Repairing prong 1 alone therefore downgrades loud-wrong to
+        silently-wrong. This test fails in both of those states and passes only
+        when both are fixed: unrepaired it raises ``TypeError`` instead of
+        ``BlobActiveRunError``; prong-1-only it raises nothing at all and the
+        blob is gone.
+        """
+        from elspeth.web.sessions.models import composition_states_table, runs_table
+        from elspeth.web.sessions.protocol import CompositionStateData
+        from elspeth.web.sessions.service import SessionServiceImpl
+        from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="real-writer.csv",
+            content=b"important",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+
+        sessions = SessionServiceImpl(
+            db_engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test"),
+        )
+        # The ``session_id`` fixture hand-inserts its row, so seed the durable
+        # fence the returned context names rather than bypassing the writer's
+        # session-operation verification.
+        context = compose_context
+        state = await sessions.save_composition_state(
+            session_id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "output",
+                    "on_validation_failure": "quarantine",
+                    "options": {"blob_ref": str(record.id), "path": str(record.storage_path)},
+                },
+                nodes=[],
+                edges=[],
+                outputs=[],
+                metadata_={"name": "Test", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+
+        # NON-VACUITY PRECONDITION. Assert the writer really produced the shape
+        # this test exists to exercise, so the test cannot quietly degrade into
+        # yet another hand-seeded row that proves nothing.
+        with db_engine.begin() as conn:
+            stored = conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(state.id))).first()
+        assert stored is not None
+        assert stored.source is None, "production writes the legacy singular `source` column as NULL; the guard must not read it"
+        assert isinstance(stored.sources, dict) and stored.sources.get("_version") == 1, (
+            f"production wraps `sources` in a _version envelope; got {stored.sources!r}"
+        )
+        assert str(record.id) in json.dumps(stored.sources), "the blob_ref must live inside the enveloped `sources` payload"
+
+        with db_engine.begin() as conn:
+            conn.execute(
+                runs_table.insert().values(
+                    id=str(uuid4()),
+                    session_id=str(session_id),
+                    state_id=str(state.id),
+                    status="pending",
+                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    rows_processed=0,
+                    rows_failed=0,
+                )
+            )
+            # Deliberately NO blob_run_links row: this pins the composition-state
+            # guard, not the explicit-link guard that would short-circuit it.
+
+        with pytest.raises(BlobActiveRunError):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        # The fail-open half, stated as an outcome rather than inferred from the
+        # raise: a refused delete must leave the blob readable.
+        assert await blob_service.get_blob(record.id, session_operation_context=compose_context) is not None
 
 
 # ---------------------------------------------------------------------------
 # finalize_blob — pending lifecycle transitions
-# ---------------------------------------------------------------------------
-
-
-class TestCreatePendingBlob:
-    """Pending blob reservation must enforce the same literal guards as ready writes."""
-
-    @pytest.mark.asyncio
-    async def test_create_pending_blob_rejects_disallowed_mime_type(self, blob_service, session_id) -> None:
-        """Pending rows must not persist MIME values that read guards classify as corruption."""
-        with pytest.raises(RuntimeError, match="Invalid mime_type"):
-            await blob_service.create_pending_blob(
-                session_id=session_id,
-                filename="output.png",
-                mime_type="image/png",  # type: ignore[arg-type]
-                created_by="pipeline",
-            )
-
-
-class TestFinalizeBlob:
-    """Pending -> ready/error lifecycle: only valid transitions allowed."""
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_transitions_pending_to_ready(self, blob_service, session_id) -> None:
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-        assert pending.status == "pending"
-
-        # Valid SHA-256 hex is required when transitioning to 'ready' —
-        # see _validate_finalize_hash().  Using content_hash() here
-        # anchors the test to the same helper production code uses.
-        valid_hash = content_hash(b"pretend-output-bytes")
-        finalized = await blob_service.finalize_blob(
-            blob_id=pending.id,
-            status="ready",
-            size_bytes=42,
-            content_hash=valid_hash,
-        )
-        assert finalized.status == "ready"
-        assert finalized.size_bytes == 42
-        assert finalized.content_hash == valid_hash
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_missing_hash_for_ready(self, blob_service, session_id) -> None:
-        """Tier 1 invariant: finalizing as 'ready' without a hash is refused."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        with pytest.raises(BlobStateError, match="content_hash"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=42,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_non_sha256_hash(self, blob_service, session_id) -> None:
-        """Tier 1 invariant: content_hash must be 64 lowercase hex chars."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=42,
-                content_hash="abc123",  # too short, not SHA-256
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_uppercase_hex_hash(self, blob_service, session_id) -> None:
-        """Canonical form is lowercase — uppercase hex is a bifurcation risk.
-
-        FilesystemPayloadStore writes the lowercase form, and
-        read_blob_content compares via hmac.compare_digest byte-for-byte.
-        Admitting uppercase at the write side would silently create
-        blobs whose hash does not match the stored form anywhere else
-        in the audit trail.  Mirrors the same assertion on the sync
-        path (TestFinalizeBlobSyncHashValidation) so both entry points
-        are pinned.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        uppercase_hash = content_hash(b"real-bytes").upper()
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=10,
-                content_hash=uppercase_hash,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_trailing_newline_hash(self, blob_service, session_id) -> None:
-        """``^[a-f0-9]{64}$`` + ``re.match`` accepts trailing ``\\n``; fullmatch rejects it.
-
-        Python's ``$`` anchor matches either end-of-string OR just
-        before a final newline.  A 64-hex hash followed by a single
-        ``\\n`` therefore slipped through the service-layer pre-check
-        under the old regex and landed at the DB, where the CHECK
-        constraint rejected it as an IntegrityError — the wrong failure
-        surface (opaque DB error rather than the clean BlobStateError
-        this validator is supposed to raise, and coverage on the
-        DB-authoritative guard only).  The service pre-check uses
-        ``fullmatch`` so the error path is always the structured
-        BlobStateError, and the DB CHECK remains the belt for any
-        writer that bypasses the service entirely.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        trailing_newline_hash = content_hash(b"real-bytes") + "\n"
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=10,
-                content_hash=trailing_newline_hash,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_as_error_without_hash_succeeds(self, blob_service, session_id) -> None:
-        """The hash invariant applies only to 'ready' — 'error' needs no hash.
-
-        Pins the ``status != 'ready'`` exemption branch of
-        _validate_finalize_hash.  A regression that tightened the
-        invariant to require hashes for error blobs would break every
-        failed-run cleanup path, and the failure mode would be
-        non-obvious (pipeline-level errors finalizing per-blob errors).
-        This positive test keeps the exemption honest.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="failed-output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        record = await blob_service.finalize_blob(
-            blob_id=pending.id,
-            status="error",
-            # deliberately no content_hash, no size_bytes
-        )
-        assert record.status == "error"
-        assert record.content_hash is None
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_non_pending(self, blob_service, session_id) -> None:
-        """Cannot finalize a blob that is already ready — status rollback is forbidden."""
-        record = await blob_service.create_blob(
-            session_id=session_id,
-            filename="already-ready.csv",
-            content=b"done",
-            mime_type="text/csv",
-            created_by="user",
-        )
-        assert record.status == "ready"
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        with pytest.raises(BlobStateError, match="expected 'pending'"):
-            await blob_service.finalize_blob(
-                blob_id=record.id,
-                status="ready",
-                size_bytes=4,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_invalid_status(self, blob_service, session_id) -> None:
-        """Only 'ready' and 'error' are valid finalize targets."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        # Deliberate type-contract violation: we're exercising the
-        # runtime guard for dynamic callers that bypass static typing.
-        # `blob_service` is a pytest fixture whose type mypy treats as
-        # Any, so no `# type: ignore` is needed here to suppress the
-        # arg-type error.
-        with pytest.raises(RuntimeError, match="Invalid finalize status"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="deleted",
-            )
-
-
-# ---------------------------------------------------------------------------
-# Blob quota — per-session storage limit (AD-10)
 # ---------------------------------------------------------------------------
 
 
@@ -1297,7 +1552,7 @@ class TestBlobQuota:
         assert "FOR UPDATE" in compiled
 
     @pytest.mark.asyncio
-    async def test_create_blob_locks_session_before_quota_sum(self, db_engine, session_id, tmp_path, monkeypatch) -> None:
+    async def test_create_blob_locks_session_before_quota_sum(self, db_engine, session_id, tmp_path, monkeypatch, compose_context) -> None:
         """create_blob must serialize same-session quota writers before SUM+insert."""
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=200)
         locked_sessions: list[str] = []
@@ -1315,40 +1570,13 @@ class TestBlobQuota:
             content=b"x" * 50,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         assert locked_sessions == [str(session_id)]
 
     @pytest.mark.asyncio
-    async def test_finalize_blob_locks_session_before_quota_sum(self, db_engine, session_id, tmp_path, monkeypatch) -> None:
-        """finalize_blob must serialize same-session quota writers before SUM+update."""
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=200)
-        pending = await service.create_pending_blob(
-            session_id=session_id,
-            filename="serialized-output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-        locked_sessions: list[str] = []
-        original_lock = blob_service_module._lock_session_for_blob_quota
-
-        def recording_lock(conn, session_id_str: str) -> None:
-            locked_sessions.append(session_id_str)
-            original_lock(conn, session_id_str)
-
-        monkeypatch.setattr(blob_service_module, "_lock_session_for_blob_quota", recording_lock)
-
-        await service.finalize_blob(
-            blob_id=pending.id,
-            status="ready",
-            size_bytes=50,
-            content_hash=content_hash(b"finalized"),
-        )
-
-        assert locked_sessions == [str(session_id)]
-
-    @pytest.mark.asyncio
-    async def test_quota_rejects_when_exceeded(self, db_engine, session_id, tmp_path) -> None:
+    async def test_quota_rejects_when_exceeded(self, db_engine, session_id, tmp_path, compose_context) -> None:
         """Upload that would exceed the session quota returns BlobQuotaExceededError."""
         from elspeth.web.blobs.protocol import BlobQuotaExceededError
 
@@ -1362,6 +1590,7 @@ class TestBlobQuota:
             content=b"x" * 60,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         # Second blob: 60 bytes — total would be 120 > 100
@@ -1372,10 +1601,11 @@ class TestBlobQuota:
                 content=b"x" * 60,
                 mime_type="text/csv",
                 created_by="user",
+                session_operation_context=compose_context,
             )
 
     @pytest.mark.asyncio
-    async def test_quota_allows_within_limit(self, db_engine, session_id, tmp_path) -> None:
+    async def test_quota_allows_within_limit(self, db_engine, session_id, tmp_path, compose_context) -> None:
         """Uploads within the quota succeed."""
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=200)
 
@@ -1385,6 +1615,7 @@ class TestBlobQuota:
             content=b"x" * 90,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
         record = await service.create_blob(
             session_id=session_id,
@@ -1392,34 +1623,9 @@ class TestBlobQuota:
             content=b"x" * 90,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
         assert record.status == "ready"
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_ready_size_that_exceeds_quota(self, db_engine, session_id, tmp_path) -> None:
-        """Public finalize_blob must enforce quota when pending output size becomes known."""
-        from elspeth.web.blobs.protocol import BlobQuotaExceededError
-
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=10)
-        pending = await service.create_pending_blob(
-            session_id=session_id,
-            filename="oversized-output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(BlobQuotaExceededError):
-            await service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=100,
-                content_hash=content_hash(b"oversized-output"),
-            )
-
-        record = await service.get_blob(pending.id)
-        assert record.status == "pending"
-        assert record.size_bytes == 0
-        assert record.content_hash is None
 
 
 # ---------------------------------------------------------------------------
@@ -1497,6 +1703,365 @@ def _custody_process(
         result_queue.put(("error", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
     finally:
         engine.dispose()
+
+
+class TestInlineCustodyStartupReconciliation:
+    def test_startup_rejects_symbolic_link_custody_root(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+        outside_root = tmp_path / "outside-blobs"
+        outside_session = outside_root / str(session_id)
+        outside_session.mkdir(parents=True)
+        storage = outside_session / f"{uuid4()}_rolled-back.csv"
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        staging.write_bytes(b"external-inline-content\n")
+        (tmp_path / "blobs").symlink_to(outside_root, target_is_directory=True)
+
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert staging.read_bytes() == b"external-inline-content\n"
+
+    def test_startup_rejects_session_directory_swapped_to_symlink_after_listing(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        custody_root = tmp_path.resolve() / "blobs"
+        session_dir = custody_root / str(session_id)
+        session_dir.mkdir(parents=True)
+        parked_session = custody_root / f"{session_id}.parked"
+        outside_session = tmp_path / "outside-session"
+        outside_session.mkdir()
+        outside_storage = outside_session / f"{uuid4()}_rolled-back.csv"
+        outside_staging = blob_service_module.inline_custody_staging_path(outside_storage)
+        outside_temp = outside_staging.with_name(f".{outside_staging.name}.custody.tmp")
+        outside_temp.write_bytes(b"external-inline-content\n")
+        original_lock = blob_service_module._blob_custody_session_lock
+        swapped = False
+
+        @contextlib.contextmanager
+        def _swap_before_lock(engine, locked_session_id: str):
+            nonlocal swapped
+            if not swapped and locked_session_id == str(session_id):
+                swapped = True
+                session_dir.rename(parked_session)
+                session_dir.symlink_to(outside_session, target_is_directory=True)
+            with original_lock(engine, locked_session_id) as connection:
+                yield connection
+
+        monkeypatch.setattr(blob_service_module, "_blob_custody_session_lock", _swap_before_lock)
+
+        with pytest.raises(AuditIntegrityError, match="session directory is not stable"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert outside_temp.read_bytes() == b"external-inline-content\n"
+
+    @pytest.mark.asyncio
+    async def test_startup_promotes_committed_stage_and_removes_rowless_stage(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-before-inline-publication\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+
+        orphan_storage = storage.parent / f"{uuid4()}_rolled-back.csv"
+        orphan_staging = blob_service_module.inline_custody_staging_path(orphan_storage)
+        orphan_staging.write_bytes(b"rolled-back-inline-content\n")
+
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert storage.read_bytes() == content
+        assert not staging.exists()
+        assert not orphan_storage.exists()
+        assert not orphan_staging.exists()
+
+    @pytest.mark.asyncio
+    async def test_live_publication_rejects_symbolic_link_stage(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        storage.unlink()
+        outside = tmp_path / "outside-inline-content.csv"
+        outside.write_bytes(content)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        staging.symlink_to(outside)
+        publication = blob_service_module.InlineCustodyPublication(
+            session_id=str(session_id),
+            blob_id=str(record.id),
+            storage=storage,
+            staging=staging,
+            expected_hash=record.content_hash,
+            cleanup_after_rollback=False,
+        )
+
+        with pytest.raises(AuditIntegrityError, match="regular file"):
+            blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+        assert outside.read_bytes() == content
+        assert staging.is_symlink()
+        assert not storage.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_symbolic_link_canonical_storage(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        storage.unlink()
+        outside = tmp_path / "outside-canonical-content.csv"
+        outside.write_bytes(content)
+        storage.symlink_to(outside)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        staging.write_bytes(content)
+
+        with pytest.raises(AuditIntegrityError, match="regular file"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert outside.read_bytes() == content
+        assert storage.is_symlink()
+        assert staging.exists()
+
+    def test_startup_removes_rowless_atomic_stage_temp(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+        session_dir = tmp_path.resolve() / "blobs" / str(session_id)
+        session_dir.mkdir(parents=True)
+        storage = session_dir / f"{uuid4()}_rolled-back.csv"
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        atomic_temp = staging.with_name(f".{staging.name}.custody.tmp")
+        atomic_temp.write_bytes(b"partial-inline-content\n")
+
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert not atomic_temp.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_never_promotes_atomic_temp_for_ready_row(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        atomic_temp = staging.with_name(f".{staging.name}.custody.tmp")
+        storage.rename(atomic_temp)
+
+        with pytest.raises(BlobContentMissingError):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert not storage.exists()
+        assert not atomic_temp.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_row_storage_path_with_different_filename(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+        tampered_storage = storage.with_name(f"{record.id}_different.csv")
+        with db_engine.begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == str(record.id)).values(storage_path=str(tampered_storage)))
+
+        with pytest.raises(AuditIntegrityError, match="does not match its committed row"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert staging.read_bytes() == content
+        assert not storage.exists()
+        assert not tampered_storage.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_inspects_stage_only_while_holding_session_custody_lock(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=b"committed-inline-content\n",
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+        original_lock = blob_service_module._blob_custody_session_lock
+        held_by_thread: set[int] = set()
+
+        @contextlib.contextmanager
+        def _tracked_lock(engine, locked_session_id: str):
+            with original_lock(engine, locked_session_id) as connection:
+                thread_id = threading.get_ident()
+                held_by_thread.add(thread_id)
+                try:
+                    yield connection
+                finally:
+                    held_by_thread.remove(thread_id)
+
+        original_file_check = blob_service_module._regular_custody_file_exists
+
+        def _assert_locked_before_stage_inspection(path: Path, *, directory_fd: int | None = None) -> bool:
+            if path == staging and threading.get_ident() not in held_by_thread:
+                raise AssertionError("inline stage inspected outside the session custody lock")
+            return original_file_check(path, directory_fd=directory_fd)
+
+        monkeypatch.setattr(blob_service_module, "_blob_custody_session_lock", _tracked_lock)
+        monkeypatch.setattr(blob_service_module, "_regular_custody_file_exists", _assert_locked_before_stage_inspection)
+
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert storage.read_bytes() == b"committed-inline-content\n"
+        assert not staging.exists()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_startup_reconcilers_share_one_stage_outcome(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        compose_context,
+    ) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+            session_operation_context=compose_context,
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+        start = threading.Barrier(2)
+
+        def _reconcile() -> None:
+            start.wait(timeout=5)
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(_reconcile) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=10)
+
+        assert storage.read_bytes() == content
+        assert not staging.exists()
+
+    @pytest.mark.parametrize("raw_filename", ["a" * 200, "é" * 100])
+    def test_inline_stage_name_fits_for_maximum_valid_filename(self, tmp_path: Path, raw_filename: str) -> None:
+        filename = sanitize_filename(raw_filename)
+        storage = tmp_path / f"{uuid4()}_{filename}"
+        staging = blob_service_module.inline_custody_staging_path(storage)
+
+        blob_service_module._atomic_write_blob(staging, b"bounded-stage-name\n")
+
+        assert staging.read_bytes() == b"bounded-stage-name\n"
+        assert len(os.fsencode(staging.name)) <= os.pathconf(staging.parent, "PC_NAME_MAX")
+
+    def test_startup_rejects_malformed_inline_stage_identity(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+        session_dir = tmp_path.resolve() / "blobs" / str(session_id)
+        session_dir.mkdir(parents=True)
+        malformed = session_dir / ".not-a-uuid.inline-custody-staged"
+        malformed.write_bytes(b"unbound-inline-content\n")
+
+        with pytest.raises(AuditIntegrityError, match="invalid blob identity"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert malformed.exists()
+
+    def test_candidate_replacement_during_hashing_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        candidate = tmp_path / "candidate"
+        candidate.write_bytes(b"a" * 8192)
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"b" * 8192)
+        monkeypatch.setattr(blob_service_module, "_STREAM_CHUNK_BYTES", 4096)
+        real_read = blob_service_module.os.read
+        replaced = False
+
+        def _replace_after_first_read(descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            chunk = real_read(descriptor, size)
+            if not replaced:
+                replaced = True
+                os.replace(replacement, candidate)
+            return chunk
+
+        monkeypatch.setattr(blob_service_module.os, "read", _replace_after_first_read)
+
+        with pytest.raises(AuditIntegrityError, match="changed while hashing"):
+            blob_service_module._content_hash_from_file(candidate)
 
 
 class TestInlineCustody:
@@ -1631,6 +2196,7 @@ class TestInlineCustody:
         session_id: UUID,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
         fixed_blob_id = uuid4()
@@ -1641,6 +2207,7 @@ class TestInlineCustody:
             filename="winner.csv",
             content=b"value\n42\n",
             mime_type="text/csv",
+            session_operation_context=compose_context,
         )
 
         with pytest.raises(AuditIntegrityError, match="Unexpected duplicate blob id"):
@@ -1649,10 +2216,11 @@ class TestInlineCustody:
                 filename="winner.csv",
                 content=b"value\n42\n",
                 mime_type="text/csv",
+                session_operation_context=compose_context,
             )
 
         assert Path(winner.storage_path).read_bytes() == b"value\n42\n"
-        assert (await service.get_blob(fixed_blob_id)).status == "ready"
+        assert (await service.get_blob(fixed_blob_id, session_operation_context=compose_context)).status == "ready"
 
     @pytest.mark.asyncio
     async def test_nonidempotent_failure_preserves_preexisting_orphan_file(
@@ -1661,6 +2229,7 @@ class TestInlineCustody:
         session_id: UUID,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
         from elspeth.web.blobs.protocol import BlobIntegrityError
 
@@ -1677,6 +2246,7 @@ class TestInlineCustody:
                 filename="orphan.csv",
                 content=b"new bytes",
                 mime_type="text/csv",
+                session_operation_context=compose_context,
             )
 
         assert storage.read_bytes() == b"preexisting integrity evidence"
@@ -1877,19 +2447,20 @@ class TestInlineCustody:
         assert not legacy_temp.exists()
 
     @pytest.mark.asyncio
-    async def test_delete_removes_reconcilable_temp_artifacts(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+    async def test_delete_removes_reconcilable_temp_artifacts(self, db_engine, session_id: UUID, tmp_path: Path, compose_context) -> None:
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
         record = await service.create_blob(
             session_id=session_id,
             filename="candidate.csv",
             content=b"value\n42\n",
             mime_type="text/csv",
+            session_operation_context=compose_context,
         )
         storage = Path(record.storage_path)
         deterministic_temp = storage.with_name(f".{storage.name}.custody.tmp")
         deterministic_temp.write_bytes(b"partial")
 
-        await service.delete_blob(record.id)
+        await service.delete_blob(record.id, session_operation_context=compose_context)
 
         assert not storage.exists()
         assert not deterministic_temp.exists()
@@ -2002,6 +2573,236 @@ class TestInlineCustody:
                 select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == str(session_id))
             ).scalar_one()
         assert charged == len(request.content)
+
+    @pytest.mark.asyncio
+    async def test_caller_transaction_rollback_removes_stage_created_for_existing_pending_row(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
+        request = _custody_request(db_engine, session_id)
+        original_write = blob_service_module._atomic_write_blob
+
+        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+            raise RuntimeError("simulated interruption before file write")
+
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
+        with pytest.raises(RuntimeError, match="before file write"):
+            await service.reserve_inline_custody(request)
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
+
+        publication = None
+        with pytest.raises(RuntimeError, match="rollback caller-owned transaction"), db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+            raise RuntimeError("rollback caller-owned transaction")
+
+        assert publication is not None
+        assert publication.staging.exists()
+        blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+        assert not publication.staging.exists()
+        with db_engine.connect() as conn:
+            row = conn.execute(select(blobs_table)).one()
+        assert row.status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_startup_discards_stage_left_by_rollback_to_existing_pending_row(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
+        request = _custody_request(db_engine, session_id)
+        original_write = blob_service_module._atomic_write_blob
+
+        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+            raise RuntimeError("simulated interruption before file write")
+
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
+        with pytest.raises(RuntimeError, match="before file write"):
+            await service.reserve_inline_custody(request)
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
+
+        publication = None
+        with pytest.raises(RuntimeError, match="simulate process death"), db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+            raise RuntimeError("simulate process death")
+
+        assert publication is not None
+        assert publication.staging.exists()
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert not publication.staging.exists()
+        with db_engine.connect() as conn:
+            row = conn.execute(select(blobs_table)).one()
+        assert row.status == "pending"
+
+    def test_live_staging_rejects_symbolic_link_custody_root(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        outside_root = tmp_path / "outside-blobs"
+        outside_root.mkdir()
+        (tmp_path / "blobs").symlink_to(outside_root, target_is_directory=True)
+
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"), db_engine.begin() as conn:
+            blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        assert tuple(outside_root.rglob("*")) == ()
+
+    def test_live_publication_rejects_swapped_symbolic_link_custody_root(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        with db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+        custody_root = tmp_path / "blobs"
+        parked_root = tmp_path / "parked-blobs"
+        custody_root.rename(parked_root)
+        outside_root = tmp_path / "outside-blobs"
+        outside_session = outside_root / str(session_id)
+        outside_session.mkdir(parents=True)
+        outside_staging = outside_session / publication.staging.name
+        outside_staging.write_bytes(request.content)
+        custody_root.symlink_to(outside_root, target_is_directory=True)
+
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"):
+            blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+        assert outside_staging.read_bytes() == request.content
+        assert not (outside_session / publication.storage.name).exists()
+        assert (parked_root / str(session_id) / publication.staging.name).read_bytes() == request.content
+
+    def test_first_live_stage_durably_links_new_custody_directories_before_file(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        original_mkdir = blob_service_module.os.mkdir
+        original_fsync = blob_service_module.os.fsync
+        events: list[str] = []
+
+        def _tracked_mkdir(path, mode=0o777, *, dir_fd=None):
+            result = original_mkdir(path, mode=mode, dir_fd=dir_fd)
+            if Path(path).name == "blobs":
+                events.append("mkdir-root")
+            elif path == str(session_id):
+                events.append("mkdir-session")
+            return result
+
+        def _tracked_fsync(descriptor: int) -> None:
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if opened_path == tmp_path.resolve():
+                events.append("fsync-data-dir")
+            elif opened_path == tmp_path.resolve() / "blobs":
+                events.append("fsync-custody-root")
+            elif opened_path.name.endswith(".custody.tmp"):
+                events.append("fsync-stage-file")
+            original_fsync(descriptor)
+
+        monkeypatch.setattr(blob_service_module.os, "mkdir", _tracked_mkdir)
+        monkeypatch.setattr(blob_service_module.os, "fsync", _tracked_fsync)
+        with db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        assert events.index("mkdir-root") < events.index("fsync-data-dir")
+        assert events.index("fsync-data-dir") < events.index("mkdir-session")
+        assert events.index("mkdir-session") < events.index("fsync-custody-root")
+        assert events.index("fsync-custody-root") < events.index("fsync-stage-file")
+
+        blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+    @pytest.mark.parametrize("failure_target", ["data-dir", "custody-root"])
+    def test_live_stage_retries_unproven_parent_directory_fsync(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_target: str,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        original_fsync = blob_service_module.os.fsync
+        target_path = tmp_path.resolve() if failure_target == "data-dir" else tmp_path.resolve() / "blobs"
+        failed_once = False
+        target_events: list[str] = []
+
+        def _fail_target_once(descriptor: int) -> None:
+            nonlocal failed_once
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if opened_path == target_path:
+                if not failed_once:
+                    failed_once = True
+                    target_events.append("failed")
+                    raise OSError(f"simulated {failure_target} fsync failure")
+                target_events.append("succeeded")
+            original_fsync(descriptor)
+
+        monkeypatch.setattr(blob_service_module.os, "fsync", _fail_target_once)
+        with pytest.raises(OSError, match=f"simulated {failure_target} fsync failure"), db_engine.begin() as conn:
+            blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        with db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        assert target_events[:2] == ["failed", "succeeded"]
+        blob_service_module.publish_inline_custody_publication(db_engine, publication)
 
     @pytest.mark.asyncio
     async def test_failed_ready_transition_leaves_pending_row_and_file_for_retry(
@@ -2216,7 +3017,7 @@ class TestInlineCustody:
             def execute(self, statement, *args, **kwargs):
                 if statement.is_select and not self._missed_blob_lookup:
                     selected = tuple(statement.selected_columns)
-                    if selected and getattr(selected[0], "table", None) is blobs_table:
+                    if selected and isinstance(selected[0], Column) and selected[0].table is blobs_table:
                         self._missed_blob_lookup = True
                         return SimpleNamespace(first=lambda: None)
                 if statement.is_insert and statement.table is blobs_table:
@@ -2421,10 +3222,21 @@ class TestCopyBlobsForFork:
                 )
             ).one_or_none()
         if operation is None:
-            session_service = SessionServiceImpl(
+            session_service = DualFencedSessionServiceHarness(
                 service._engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.blob-fork-custody"),
+            )
+            # P4-D6 family A2b: the plan row is a fenced session write, and the
+            # fork CHILD it lands in is archived until settlement — so the
+            # production ``acquire`` path is closed to this scaffold exactly as
+            # it is to the settlement it stands in for. Seed the live fence and
+            # prove it, the same shape the fork settlement holds; the writer's
+            # database-side authority check runs for real against a durable row.
+            child_context = seed_live_compose_context(
+                service._engine,
+                target_session_id,
+                owner_instance_id=session_service.session_operation_owner_instance_id,
             )
             await session_service.add_message(
                 target_session_id,
@@ -2449,6 +3261,7 @@ class TestCopyBlobsForFork:
                     separators=(",", ":"),
                 ),
                 writer_principal="session_fork",
+                session_operation_context=child_context,
             )
         with service._engine.begin() as conn:
             conn.execute(sessions_table.update().where(sessions_table.c.id == str(target_session_id)).values(archived_at=now))
@@ -2606,9 +3419,10 @@ class TestCopyBlobsForFork:
         db_engine,
         session_id: UUID,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
         unrelated_target = self._insert_session(db_engine)
-        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         plan = (
             BlobForkPlanEntry(
                 source_blob_id=source.id,
@@ -2645,8 +3459,9 @@ class TestCopyBlobsForFork:
         self,
         blob_service: BlobServiceImpl,
         session_id: UUID,
+        compose_context,
     ) -> None:
-        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
 
         with pytest.raises(AuditIntegrityError, match=r"target session .* does not exist"):
             await self._copy(blob_service, session_id, uuid4())
@@ -2663,6 +3478,7 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         user_id: str,
         auth_provider_type: str,
+        compose_context,
     ) -> None:
         target = self._insert_session(
             db_engine,
@@ -2670,7 +3486,7 @@ class TestCopyBlobsForFork:
             auth_provider_type=auth_provider_type,
             forked_from_session_id=session_id,
         )
-        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
 
         with pytest.raises(AuditIntegrityError, match="principal does not match"):
             await self._copy(blob_service, session_id, target)
@@ -2683,6 +3499,7 @@ class TestCopyBlobsForFork:
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
         first = await blob_service.create_blob(
             session_id=session_id,
@@ -2690,6 +3507,7 @@ class TestCopyBlobsForFork:
             content=b"first",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
         second = await blob_service.create_blob(
             session_id=session_id,
@@ -2697,6 +3515,7 @@ class TestCopyBlobsForFork:
             content=b"second",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         first_result = await self._copy(blob_service, session_id, target_session_id)
@@ -2716,8 +3535,9 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
-        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         plan = await self._plan(blob_service, session_id, target_session_id)
 
         def _unexpected_custody(*_args, **_kwargs):
@@ -2738,15 +3558,172 @@ class TestCopyBlobsForFork:
         assert source.id not in {blob.id for blob in await blob_service.list_blobs(target_session_id, limit=None)}
 
     @pytest.mark.asyncio
+    async def test_copy_checkpoints_while_source_read_is_blocked(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """Slow source reads renew instead of consuming the whole fork lease."""
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        source_path = Path(source.storage_path)
+        read_entered = threading.Event()
+        release_read = threading.Event()
+        checkpoint_seen = threading.Event()
+        original_read_bytes = Path.read_bytes
+
+        monkeypatch.setattr(blob_service_module, "_FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS", 0.01)
+
+        def _blocked_source_read(path: Path) -> bytes:
+            if path == source_path and not read_entered.is_set():
+                read_entered.set()
+                if not release_read.wait(timeout=5):
+                    raise TimeoutError("test did not release blocked fork source read")
+            return original_read_bytes(path)
+
+        async def _checkpoint() -> None:
+            if read_entered.is_set():
+                checkpoint_seen.set()
+
+        monkeypatch.setattr(Path, "read_bytes", _blocked_source_read)
+        copy_task = asyncio.create_task(
+            blob_service.copy_blobs_for_fork(
+                session_id,
+                target_session_id,
+                plan,
+                fence,
+                checkpoint=_checkpoint,
+            )
+        )
+        assert await asyncio.to_thread(read_entered.wait, 5)
+        checkpoint_during_read = await asyncio.to_thread(checkpoint_seen.wait, 1)
+        release_read.set()
+        copied = await copy_task
+
+        assert checkpoint_during_read, "fork copy did not checkpoint while its source read was blocked"
+        assert copied[source.id].status == "ready"
+
+    @pytest.mark.asyncio
+    async def test_copy_aborts_blocked_fsync_when_periodic_checkpoint_loses_fence_and_takeover_retries(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """A lease loss during blocked fsync leaves no stale canonical bytes."""
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        stale_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        takeover_token = "takeover-lease"
+        fsync_entered = threading.Event()
+        release_fsync = threading.Event()
+        takeover_started = threading.Event()
+        checkpoint_calls = 0
+        original_fsync = blob_service_module.os.fsync
+
+        monkeypatch.setattr(
+            blob_service_module,
+            "_FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS",
+            0.01,
+            raising=False,
+        )
+
+        def _blocked_first_fsync(descriptor: int) -> None:
+            if not fsync_entered.is_set():
+                fsync_entered.set()
+                if not release_fsync.wait(timeout=5):
+                    raise TimeoutError("test did not release blocked fork fsync")
+            original_fsync(descriptor)
+
+        async def _checkpoint_then_takeover() -> None:
+            nonlocal checkpoint_calls
+            checkpoint_calls += 1
+            if not fsync_entered.is_set() or takeover_started.is_set():
+                return
+            now = datetime.now(UTC)
+            with db_engine.begin() as conn:
+                changed = conn.execute(
+                    guided_operations_table.update()
+                    .where(guided_operations_table.c.session_id == str(session_id))
+                    .where(guided_operations_table.c.operation_id == stale_fence.operation_id)
+                    .where(guided_operations_table.c.status == "in_progress")
+                    .where(guided_operations_table.c.lease_token == stale_fence.lease_token)
+                    .where(guided_operations_table.c.attempt == stale_fence.attempt)
+                    .values(
+                        lease_token=takeover_token,
+                        lease_expires_at=now + timedelta(hours=1),
+                        attempt=stale_fence.attempt + 1,
+                        updated_at=now,
+                    )
+                ).rowcount
+            assert changed == 1
+            takeover_started.set()
+            raise BlobForkFenceLostError(stale_fence.operation_id, attempt=stale_fence.attempt)
+
+        monkeypatch.setattr(blob_service_module.os, "fsync", _blocked_first_fsync)
+        stale_copy = asyncio.create_task(
+            blob_service.copy_blobs_for_fork(
+                session_id,
+                target_session_id,
+                plan,
+                stale_fence,
+                checkpoint=_checkpoint_then_takeover,
+            )
+        )
+        assert await asyncio.to_thread(fsync_entered.wait, 5)
+        takeover_during_fsync = await asyncio.to_thread(takeover_started.wait, 1)
+        release_fsync.set()
+
+        with pytest.raises(BlobForkFenceLostError):
+            await stale_copy
+        assert takeover_during_fsync, "fork copy did not checkpoint while fsync was blocked"
+        assert checkpoint_calls >= 3
+
+        target_storage = tmp_path.resolve() / "blobs" / str(target_session_id) / f"{plan[0].target_blob_id}_{source.filename}"
+        assert not target_storage.exists()
+        with db_engine.connect() as conn:
+            pending = conn.execute(select(blobs_table).where(blobs_table.c.id == str(plan[0].target_blob_id))).one()
+        assert pending.status == "pending"
+
+        winner_fence = replace(
+            stale_fence,
+            lease_token=takeover_token,
+            attempt=stale_fence.attempt + 1,
+        )
+        copied = await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            winner_fence,
+            checkpoint=self._checkpoint,
+        )
+
+        assert copied[source.id].status == "ready"
+        assert target_storage.read_bytes() == b"source"
+        with db_engine.connect() as conn:
+            rows = conn.execute(select(blobs_table).where(blobs_table.c.session_id == str(target_session_id))).all()
+        assert len(rows) == 1
+        assert rows[0].status == "ready"
+
+    @pytest.mark.asyncio
     async def test_copy_uses_frozen_plan_and_ignores_newly_finalized_parent_blob(
         self,
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
-        frozen = await blob_service.create_blob(session_id, "frozen.csv", b"frozen", "text/csv")
+        frozen = await blob_service.create_blob(session_id, "frozen.csv", b"frozen", "text/csv", session_operation_context=compose_context)
         plan = await self._plan(blob_service, session_id, target_session_id)
-        late = await blob_service.create_blob(session_id, "late.csv", b"late", "text/csv")
+        late = await blob_service.create_blob(session_id, "late.csv", b"late", "text/csv", session_operation_context=compose_context)
 
         copied = await blob_service.copy_blobs_for_fork(
             session_id,
@@ -2760,35 +3737,90 @@ class TestCopyBlobsForFork:
         assert late.id not in copied
 
     @pytest.mark.asyncio
-    async def test_delete_rejects_blob_frozen_by_in_progress_session_fork(
+    async def test_translates_source_deleted_between_exists_check_and_read(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch,
+        compose_context,
+    ) -> None:
+        """A source blob deleted mid-copy keeps the blob lifecycle error contract."""
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        write_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+
+        target = Path(source.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.copy_blobs_for_fork(
+                session_id,
+                target_session_id,
+                plan,
+                write_fence,
+                checkpoint=self._checkpoint,
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fork_status", ["in_progress", "completed", "failed"])
+    async def test_delete_enforces_session_fork_retention_lifecycle(
         self,
         blob_service: BlobServiceImpl,
         db_engine,
         session_id: UUID,
+        target_session_id: UUID,
+        fork_status: str,
+        compose_context,
     ) -> None:
-        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         now = datetime.now(UTC)
         operation_id = str(uuid4())
-        with db_engine.begin() as conn:
-            conn.execute(
-                guided_operations_table.insert().values(
-                    session_id=str(session_id),
-                    operation_id=operation_id,
-                    kind="session_fork",
-                    status="in_progress",
-                    request_hash="a" * 64,
-                    lease_token="lease",
-                    lease_expires_at=now.replace(year=now.year + 1),
-                    attempt=1,
-                    created_at=now,
-                    updated_at=now,
-                )
+        values: dict[str, object] = {
+            "session_id": str(session_id),
+            "operation_id": operation_id,
+            "kind": "session_fork",
+            "status": fork_status,
+            "request_hash": "a" * 64,
+            "attempt": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if fork_status == "in_progress":
+            values.update(lease_token="lease", lease_expires_at=now + timedelta(hours=1))
+        elif fork_status == "completed":
+            values.update(
+                settled_at=now,
+                result_kind="session",
+                result_session_id=str(target_session_id),
+                response_hash="b" * 64,
             )
+        else:
+            values.update(settled_at=now, failure_code="operation_failed")
+        with db_engine.begin() as conn:
+            conn.execute(guided_operations_table.insert().values(**values))
 
-        with pytest.raises(BlobInProgressForkError, match=operation_id):
-            await blob_service.delete_blob(source.id)
+        if fork_status == "in_progress":
+            with pytest.raises(BlobInProgressForkError, match=operation_id):
+                await blob_service.delete_blob(source.id, session_operation_context=compose_context)
 
-        assert await blob_service.read_blob_content(source.id) == b"source"
+            assert await blob_service.read_blob_content(source.id, session_operation_context=compose_context) == b"source"
+        else:
+            await blob_service.delete_blob(source.id, session_operation_context=compose_context)
+            with pytest.raises(BlobNotFoundError):
+                await blob_service.read_blob_content(source.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
     async def test_partial_prior_success_resumes_without_duplicate(
@@ -2796,10 +3828,11 @@ class TestCopyBlobsForFork:
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
-        first = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        first = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
         first_pass = await self._copy(blob_service, session_id, target_session_id)
-        second = await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv")
+        second = await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv", session_operation_context=compose_context)
 
         resumed = await self._copy(blob_service, session_id, target_session_id)
 
@@ -2815,11 +3848,12 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         tmp_path: Path,
+        compose_context,
     ) -> None:
-        first = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        first = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
         quota_service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=11)
         first_pass = await self._copy(quota_service, session_id, target_session_id)
-        second = await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv")
+        second = await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv", session_operation_context=compose_context)
 
         resumed = await self._copy(quota_service, session_id, target_session_id)
 
@@ -2834,9 +3868,10 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         tmp_path: Path,
+        compose_context,
     ) -> None:
         high_quota = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        source = await high_quota.create_blob(session_id, "source.csv", b"source", "text/csv")
+        source = await high_quota.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         first = await self._copy(high_quota, session_id, target_session_id)
         low_quota = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=1)
 
@@ -2851,9 +3886,12 @@ class TestCopyBlobsForFork:
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
         for index in range(51):
-            await blob_service.create_blob(session_id, f"item-{index}.csv", str(index).encode(), "text/csv")
+            await blob_service.create_blob(
+                session_id, f"item-{index}.csv", str(index).encode(), "text/csv", session_operation_context=compose_context
+            )
 
         result = await self._copy(blob_service, session_id, target_session_id)
 
@@ -2866,9 +3904,11 @@ class TestCopyBlobsForFork:
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
+        db_engine,
     ) -> None:
-        ready = await blob_service.create_blob(session_id, "ready.csv", b"ready", "text/csv")
-        await blob_service.create_pending_blob(session_id, "pending.csv", "text/csv")
+        ready = await blob_service.create_blob(session_id, "ready.csv", b"ready", "text/csv", session_operation_context=compose_context)
+        _seed_pending_blob(db_engine, blob_service, session_id, "pending.csv")
 
         result = await self._copy(blob_service, session_id, target_session_id)
 
@@ -2880,8 +3920,9 @@ class TestCopyBlobsForFork:
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
-        source = await blob_service.create_blob(session_id, "ready.csv", b"ready", "text/csv")
+        source = await blob_service.create_blob(session_id, "ready.csv", b"ready", "text/csv", session_operation_context=compose_context)
         Path(source.storage_path).write_bytes(b"tampered")
 
         with pytest.raises(BlobIntegrityError):
@@ -2908,6 +3949,7 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         tmp_path,
+        compose_context,
     ) -> None:
         """Quota check happens before copying — no partial writes."""
         await blob_service.create_blob(
@@ -2916,6 +3958,7 @@ class TestCopyBlobsForFork:
             content=b"x" * 100,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         small_quota = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=10)
@@ -2932,8 +3975,9 @@ class TestCopyBlobsForFork:
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
-        source = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        source = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
         copied = await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
 
@@ -2950,15 +3994,249 @@ class TestCopyBlobsForFork:
         assert await blob_service.list_blobs(target_session_id, limit=None) == []
 
     @pytest.mark.asyncio
+    async def test_live_fenced_cleanup_deletes_staged_child_before_terminal_settlement(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        compose_context,
+    ) -> None:
+        source = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        write_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        copied = await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            write_fence,
+            checkpoint=self._checkpoint,
+        )
+
+        result = await blob_service.cleanup_blobs_for_fork(
+            session_id,
+            target_session_id,
+            write_fence.operation_id,
+            live_write_fence=write_fence,
+        )
+
+        assert tuple(result.deleted_ids) == (copied[source.id].id,)
+        assert tuple(result.errors) == ()
+        assert await blob_service.list_blobs(target_session_id, limit=None) == []
+
+    @pytest.mark.asyncio
+    async def test_live_fenced_cleanup_rejects_stale_lease_without_deleting_child(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+        compose_context,
+    ) -> None:
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        write_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            write_fence,
+            checkpoint=self._checkpoint,
+        )
+        before = await blob_service.list_blobs(target_session_id, limit=None)
+        with db_engine.begin() as conn:
+            conn.execute(
+                guided_operations_table.update()
+                .where(
+                    guided_operations_table.c.session_id == str(session_id),
+                    guided_operations_table.c.operation_id == write_fence.operation_id,
+                )
+                .values(lease_token="replacement-lease", attempt=write_fence.attempt + 1)
+            )
+
+        with pytest.raises(BlobForkFenceLostError):
+            await blob_service.cleanup_blobs_for_fork(
+                session_id,
+                target_session_id,
+                write_fence.operation_id,
+                live_write_fence=write_fence,
+            )
+
+        assert await blob_service.list_blobs(target_session_id, limit=None) == before
+
+    @pytest.mark.asyncio
+    async def test_mid_cleanup_takeover_aborts_stale_worker_and_replays_exact_plan(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        sources = [
+            await blob_service.create_blob(
+                session_id, f"source-{index}.csv", f"value-{index}".encode(), "text/csv", session_operation_context=compose_context
+            )
+            for index in range(2)
+        ]
+        plan = await self._plan(blob_service, session_id, target_session_id)
+        stale_fence = await self._authorize_copy(blob_service, session_id, target_session_id, plan)
+        await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            stale_fence,
+            checkpoint=self._checkpoint,
+        )
+        original_finalize = blob_service._finalize_registered_blob_deletion
+        finalize_calls = 0
+        winner_lease_token = "takeover-lease"
+
+        def _take_over_after_committed_delete(*args, **kwargs):
+            nonlocal finalize_calls
+            finalize_calls += 1
+            if finalize_calls == 1:
+                with db_engine.begin() as conn:
+                    changed = conn.execute(
+                        guided_operations_table.update()
+                        .where(
+                            guided_operations_table.c.session_id == str(session_id),
+                            guided_operations_table.c.operation_id == stale_fence.operation_id,
+                            guided_operations_table.c.lease_token == stale_fence.lease_token,
+                            guided_operations_table.c.attempt == stale_fence.attempt,
+                        )
+                        .values(
+                            lease_token=winner_lease_token,
+                            attempt=stale_fence.attempt + 1,
+                            lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+                        )
+                    ).rowcount
+                assert changed == 1
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(blob_service, "_finalize_registered_blob_deletion", _take_over_after_committed_delete)
+
+        with pytest.raises(BlobForkFenceLostError):
+            await blob_service.cleanup_blobs_for_fork(
+                session_id,
+                target_session_id,
+                stale_fence.operation_id,
+                live_write_fence=stale_fence,
+            )
+
+        assert finalize_calls == 1
+        partial = await blob_service.list_blobs(target_session_id, limit=None)
+        assert len(partial) == 1
+        assert list((tmp_path.resolve() / "blobs" / str(target_session_id)).glob(".*.delete-*")) == []
+
+        winner_fence = BlobForkWriteFence(
+            source_session_id=session_id,
+            target_session_id=target_session_id,
+            operation_id=stale_fence.operation_id,
+            lease_token=winner_lease_token,
+            attempt=stale_fence.attempt + 1,
+        )
+        replayed = await blob_service.copy_blobs_for_fork(
+            session_id,
+            target_session_id,
+            plan,
+            winner_fence,
+            checkpoint=self._checkpoint,
+        )
+
+        assert set(replayed) == {source.id for source in sources}
+        assert {blob.id for blob in await blob_service.list_blobs(target_session_id, limit=None)} == {
+            entry.target_blob_id for entry in plan
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "integrity_failure",
+        (
+            BlobIntegrityError(str(uuid4()), expected="a" * 64, actual="b" * 64),
+            BlobContentMissingError(str(uuid4()), storage_path="/managed/blobs/missing"),
+        ),
+        ids=("hash_mismatch", "content_missing"),
+    )
+    async def test_cleanup_propagates_tier_one_blob_failure(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+        integrity_failure: BlobIntegrityError | BlobContentMissingError,
+        compose_context,
+    ) -> None:
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+
+        def _fail_delete(*_args, **_kwargs):
+            raise integrity_failure
+
+        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_delete)
+
+        with pytest.raises(type(integrity_failure)) as exc_info:
+            await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert exc_info.value is integrity_failure
+
+    @pytest.mark.asyncio
+    async def test_cleanup_retries_committed_tombstone_after_unlink_failure(
+        self,
+        blob_service: BlobServiceImpl,
+        db_engine,
+        session_id: UUID,
+        target_session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        source = await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        copied = await self._copy(blob_service, session_id, target_session_id)
+        target = copied[source.id]
+        storage = Path(target.storage_path)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        original_unlink = Path.unlink
+        fail_tombstone_unlink = True
+
+        def fail_first_tombstone_unlink(path: Path, missing_ok: bool = False) -> None:
+            nonlocal fail_tombstone_unlink
+            if fail_tombstone_unlink and ".delete-" in path.name:
+                fail_tombstone_unlink = False
+                raise OSError("injected fork tombstone unlink failure")
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", fail_first_tombstone_unlink)
+
+        first = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert tuple(first.deleted_ids) == ()
+        assert len(first.errors) == 1
+        assert first.errors[0].blob_id == target.id
+        assert first.errors[0].exc_type == "OSError"
+        assert "injected fork tombstone unlink failure" in first.errors[0].detail
+        assert len(list(storage.parent.glob(f".{storage.name}.delete-*"))) == 1
+
+        restarted = BlobServiceImpl(db_engine, tmp_path)
+        second = await restarted.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert tuple(second.deleted_ids) == (target.id,)
+        assert tuple(second.errors) == ()
+        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+
+    @pytest.mark.asyncio
     async def test_cleanup_rejects_wrong_parent_and_preserves_child_blobs(
         self,
         blob_service: BlobServiceImpl,
         db_engine,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
         wrong_parent = self._insert_session(db_engine)
-        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         copied = await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
 
@@ -2974,8 +4252,9 @@ class TestCopyBlobsForFork:
         db_engine,
         session_id: UUID,
         target_session_id: UUID,
+        compose_context,
     ) -> None:
-        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         before = await blob_service.list_blobs(target_session_id, limit=None)
@@ -2988,17 +4267,101 @@ class TestCopyBlobsForFork:
         assert await blob_service.list_blobs(target_session_id, limit=None) == before
 
     @pytest.mark.asyncio
+    async def test_cleanup_rejects_undecodable_session_fork_audit_row_and_preserves_blobs(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        compose_context,
+    ) -> None:
+        """A non-JSON role="audit" row by session_fork is a corrupt trail, not a skipped row."""
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        before = await blob_service.list_blobs(target_session_id, limit=None)
+        session_service = DualFencedSessionServiceHarness(
+            blob_service._engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.blob-fork-custody"),
+        )
+        # P4-D6 family A2b: the corrupt row still has to be WRITTEN under a
+        # proved operation — the archived fork child forecloses ``acquire``, so
+        # seed the live fence and prove it (see ``_authorize_copy``).
+        corrupt_row_context = seed_live_compose_context(
+            blob_service._engine, target_session_id, owner_instance_id=session_service.session_operation_owner_instance_id
+        )
+        await session_service.add_message(
+            target_session_id, "audit", "{not json", writer_principal="session_fork", session_operation_context=corrupt_row_context
+        )
+
+        with pytest.raises(AuditIntegrityError, match="undecodable session_fork audit row"):
+            await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert await blob_service.list_blobs(target_session_id, limit=None) == before
+
+    @pytest.mark.asyncio
+    async def test_cleanup_ignores_foreign_json_session_fork_audit_rows(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        compose_context,
+    ) -> None:
+        """Decodable session_fork audit rows that are not THIS plan are skipped, keys present or absent."""
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        session_service = DualFencedSessionServiceHarness(
+            blob_service._engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.blob-fork-custody"),
+        )
+        # P4-D6 family A2b: as above, the archived fork child forecloses
+        # ``acquire``, so these rows prove a seeded live fence.
+        foreign_row_context = seed_live_compose_context(
+            blob_service._engine, target_session_id, owner_instance_id=session_service.session_operation_owner_instance_id
+        )
+        for foreign in (
+            {"schema": "session-fork-blob-plan.v1"},
+            {"schema": "session-fork-blob-plan.v1", "source_session_id": str(session_id), "operation_id": "other"},
+            ["session-fork-blob-plan.v1"],
+        ):
+            await session_service.add_message(
+                target_session_id,
+                "audit",
+                json.dumps(foreign),
+                writer_principal="session_fork",
+                session_operation_context=foreign_row_context,
+            )
+
+        result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert result.errors == ()
+        assert len(result.deleted_ids) == 1
+        assert await blob_service.list_blobs(target_session_id, limit=None) == []
+
+    @pytest.mark.asyncio
     async def test_cleanup_treats_already_missing_snapshot_row_as_success(
         self,
         blob_service: BlobServiceImpl,
         session_id: UUID,
         target_session_id: UUID,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+        db_engine,
     ) -> None:
-        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
         await self._copy(blob_service, session_id, target_session_id)
         stale_snapshot = await blob_service.list_blobs(target_session_id, limit=None)
-        await blob_service.delete_blob(stale_snapshot[0].id)
+        # A staged fork child stays archived until adoption, so no session
+        # operation can hold a fence inside it and ``delete_blob`` is refused
+        # there by construction. The precondition this test exists for — the
+        # child's snapshot row is already gone when cleanup runs — is produced
+        # directly: the row and its bytes are removed.
+        stale = stale_snapshot[0]
+        with db_engine.begin() as conn:
+            conn.execute(delete(blobs_table).where(blobs_table.c.id == str(stale.id)))
+        Path(stale.storage_path).unlink()
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
 
@@ -3012,9 +4375,10 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
-        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
-        await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv")
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv", session_operation_context=compose_context)
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         target = await blob_service.list_blobs(target_session_id, limit=None)
@@ -3024,10 +4388,10 @@ class TestCopyBlobsForFork:
         monkeypatch.setattr(blob_service_module, "_BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER", orphan_counter)
         original_delete = blob_service._delete_blob_row_locked
 
-        def _fail_one(conn, *, row, blob_id_str: str) -> None:
+        def _fail_one(conn, *, row, blob_id_str: str):
             if blob_id_str == str(failing_id):
                 raise OSError(5, "cleanup failed")
-            original_delete(conn, row=row, blob_id_str=blob_id_str)
+            return original_delete(conn, row=row, blob_id_str=blob_id_str)
 
         monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_one)
         result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
@@ -3052,6 +4416,123 @@ class TestCopyBlobsForFork:
         assert context is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+    async def test_cleanup_propagates_integrity_failure_from_exception_text(
+        self, blob_service, session_id, target_session_id, monkeypatch, compose_context, error_class
+    ) -> None:
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        integrity_failure = error_class("cleanup error formatting failed")
+
+        class UnformattableCleanupError(OSError):
+            def __str__(self) -> str:
+                raise integrity_failure
+
+        def fail_delete(*args, **kwargs):
+            raise UnformattableCleanupError("primary cleanup failure")
+
+        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", fail_delete)
+        with pytest.raises(error_class) as caught:
+            await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+        assert caught.value is integrity_failure
+
+    @pytest.mark.asyncio
+    async def test_cleanup_preserves_commit_failure_and_failed_restore_evidence(
+        self, blob_service, session_id, target_session_id, db_engine, monkeypatch, compose_context
+    ) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        target = (await blob_service.list_blobs(target_session_id, limit=None))[0]
+        storage = Path(target.storage_path)
+        original_commit = db_engine.dialect.do_commit
+        original_replace = os.replace
+        commit_failed = False
+
+        def fail_delete_commit(connection) -> None:
+            nonlocal commit_failed
+            if not commit_failed and list(storage.parent.glob(f".{storage.name}.delete-*")):
+                commit_failed = True
+                raise OperationalError("COMMIT", {}, RuntimeError("injected cleanup commit failure"))
+            original_commit(connection)
+
+        def fail_restore(source, destination, **kwargs) -> None:
+            if Path(destination) == storage and ".delete-" in Path(source).name:
+                raise PermissionError("injected restore permission failure")
+            original_replace(source, destination, **kwargs)
+
+        monkeypatch.setattr(db_engine.dialect, "do_commit", fail_delete_commit)
+        monkeypatch.setattr(os, "replace", fail_restore)
+        result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert commit_failed
+        assert not result.deleted_ids
+        assert len(result.errors) == 1
+        failure = result.errors[0]
+        assert failure.blob_id == target.id
+        assert failure.exc_type == "OperationalError"
+        assert "injected cleanup commit failure" in failure.detail
+        assert "PermissionError: injected restore permission failure" in failure.detail
+        assert "manual reconciliation required" in failure.detail
+        assert str(storage) in failure.detail
+        tombstones = list(storage.parent.glob(f".{storage.name}.delete-*"))
+        assert len(tombstones) == 1
+        assert str(tombstones[0]) in failure.detail
+
+    @pytest.mark.asyncio
+    async def test_cleanup_records_recovery_failed_when_residual_check_cannot_run(
+        self,
+        blob_service: BlobServiceImpl,
+        session_id: UUID,
+        target_session_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+        compose_context,
+    ) -> None:
+        """A failed residual-row check after an item failure is an explicit RecoveryFailed error entry."""
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        failing_id = (await blob_service.list_blobs(target_session_id, limit=None))[0].id
+
+        orphan_counter = _FakeCounter()
+        monkeypatch.setattr(blob_service_module, "_BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER", orphan_counter)
+
+        delete_failed = False
+
+        def _fail_delete(conn, *, row, blob_id_str: str):
+            nonlocal delete_failed
+            delete_failed = True
+            raise OSError(5, "cleanup failed")
+
+        original_phase = blob_service_module._blob_phase_transaction
+
+        @contextlib.contextmanager
+        def _fail_residual_phase(engine, held_connection):
+            # The first phase opened after the item failure IS the residual-row check.
+            nonlocal delete_failed
+            if delete_failed:
+                delete_failed = False
+                raise OSError(5, "residual check unavailable")
+            with original_phase(engine, held_connection) as conn:
+                yield conn
+
+        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_delete)
+        monkeypatch.setattr(blob_service_module, "_blob_phase_transaction", _fail_residual_phase)
+        result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert tuple(result.deleted_ids) == ()
+        assert [(error.blob_id, error.exc_type) for error in result.errors] == [
+            (failing_id, "OSError"),
+            (failing_id, "RecoveryFailed[OSError]"),
+        ]
+        assert "residual check unavailable" in result.errors[1].detail
+        assert orphan_counter.calls == []
+        assert [blob.id for blob in await blob_service.list_blobs(target_session_id, limit=None)] == [failing_id]
+
+    @pytest.mark.asyncio
     async def test_mid_copy_failure_retains_partial_rows_for_exact_plan_takeover(
         self,
         blob_service: BlobServiceImpl,
@@ -3059,9 +4540,10 @@ class TestCopyBlobsForFork:
         target_session_id: UUID,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
-        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
-        await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv")
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv", session_operation_context=compose_context)
         original_persist = blob_service_module._persist_blob_content
         target_copy_calls = 0
 
@@ -3089,9 +4571,10 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
-        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv")
-        await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv")
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await blob_service.create_blob(session_id, "second.csv", b"second", "text/csv", session_operation_context=compose_context)
         original_persist = blob_service_module._persist_blob_content
         target_copy_calls = 0
 
@@ -3113,7 +4596,7 @@ class TestCopyBlobsForFork:
             await self._copy(blob_service, session_id, target_session_id)
 
         assert type(exc_info.value) is RuntimeError
-        assert getattr(exc_info.value, "__notes__", []) == []
+        assert vars(exc_info.value).get("__notes__", []) == []
         assert len(await blob_service.list_blobs(target_session_id, limit=None)) == 1
 
     @pytest.mark.asyncio
@@ -3123,8 +4606,9 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         monkeypatch: pytest.MonkeyPatch,
+        compose_context,
     ) -> None:
-        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv")
+        await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         reached_persist = threading.Event()
         release_persist = threading.Event()
         original_persist = blob_service_module._persist_blob_content
@@ -3146,6 +4630,91 @@ class TestCopyBlobsForFork:
         with pytest.raises(BlobForkFenceLostError):
             await copy_task
         assert await blob_service.list_blobs(target_session_id, limit=None) == []
+
+
+class TestBlobRollbackNotes:
+    """Rollback arms annotate and re-raise the primary failure; they never replace it."""
+
+    def test_atomic_write_rolls_back_blob_published_before_lease_loss(self, tmp_path: Path) -> None:
+        storage = tmp_path / "blob.bin"
+        primary = BlobForkFenceLostError("op", attempt=1)
+        guard_calls = 0
+
+        def _lose_after_publish() -> None:
+            nonlocal guard_calls
+            guard_calls += 1
+            if storage.exists():
+                raise primary
+
+        with pytest.raises(BlobForkFenceLostError) as exc_info:
+            blob_service_module._atomic_write_blob(storage, b"payload", write_guard=_lose_after_publish)
+
+        assert exc_info.value is primary
+        assert not storage.exists()
+        assert vars(primary).get("__notes__", []) == []
+        assert guard_calls > 1
+
+    def test_atomic_write_rollback_failure_annotates_lease_loss_and_reraises_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = tmp_path / "blob.bin"
+        primary = BlobForkFenceLostError("op", attempt=1)
+        original_fsync = blob_service_module._fsync_parent_directory
+        fsync_calls = 0
+
+        def _fail_rollback_fsync(directory: Path) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError(5, "rollback fsync failed")
+            original_fsync(directory)
+
+        def _lose_after_publish() -> None:
+            if storage.exists():
+                raise primary
+
+        monkeypatch.setattr(blob_service_module, "_fsync_parent_directory", _fail_rollback_fsync)
+        with pytest.raises(BlobForkFenceLostError) as exc_info:
+            blob_service_module._atomic_write_blob(storage, b"payload", write_guard=_lose_after_publish)
+
+        assert exc_info.value is primary
+        notes = primary.__notes__
+        assert len(notes) == 1
+        assert "Rollback failed: could not remove fork blob published after lease loss" in notes[0]
+        assert "OSError: [Errno 5] rollback fsync failed" in notes[0]
+
+    def test_restore_staged_deletion_restores_tombstone_without_note(self, tmp_path: Path) -> None:
+        storage = tmp_path / "blob.bin"
+        tombstone = tmp_path / ".blob.bin.delete-abc"
+        tombstone.write_bytes(b"original")
+        primary = RuntimeError("commit failed")
+
+        blob_service_module._restore_staged_blob_deletion(
+            blob_service_module._StagedBlobDeletion(storage=storage, tombstone=tombstone), primary
+        )
+
+        assert storage.read_bytes() == b"original"
+        assert not tombstone.exists()
+        assert vars(primary).get("__notes__", []) == []
+
+    def test_restore_staged_deletion_refuses_to_overwrite_replacement_and_annotates_primary(self, tmp_path: Path) -> None:
+        storage = tmp_path / "blob.bin"
+        tombstone = tmp_path / ".blob.bin.delete-abc"
+        tombstone.write_bytes(b"original")
+        storage.write_bytes(b"replacement")
+        primary = RuntimeError("commit failed")
+
+        blob_service_module._restore_staged_blob_deletion(
+            blob_service_module._StagedBlobDeletion(storage=storage, tombstone=tombstone), primary
+        )
+
+        assert storage.read_bytes() == b"replacement"
+        assert tombstone.read_bytes() == b"original"
+        notes = primary.__notes__
+        assert len(notes) == 1
+        assert "Rollback failed: could not restore deleted blob file" in notes[0]
+        assert "FileExistsError" in notes[0]
+        assert "manual reconciliation required" in notes[0]
 
 
 # ---------------------------------------------------------------------------
@@ -3200,16 +4769,10 @@ class TestFinalizeRunOutputBlobs:
     @pytest.mark.asyncio
     async def test_success_path_sets_ready_with_size_and_hash(self, blob_service, session_id, db_engine, run_env) -> None:
         """Pending blob with file written -> ready with size_bytes and content_hash."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="output.csv")
         assert pending.status == "pending"
 
         # Write content to the storage path (simulating sink output)
@@ -3219,16 +4782,8 @@ class TestFinalizeRunOutputBlobs:
         _Path(pending.storage_path).write_bytes(file_content)
 
         # Link blob to run as output
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
 
-        result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         assert len(result.finalized) == 1
         assert len(result.errors) == 0
         assert result.finalized[0].status == "ready"
@@ -3238,31 +4793,17 @@ class TestFinalizeRunOutputBlobs:
     @pytest.mark.asyncio
     async def test_file_not_written_sets_error(self, blob_service, session_id, db_engine, run_env) -> None:
         """Pending blob without file on disk -> error status on success=True."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="missing.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="missing.csv")
 
         # Do NOT write any file — simulate sink that didn't produce output
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         assert len(result.finalized) == 1
         assert len(result.errors) == 0
+        assert result.finalized[0].id == pending.id
         assert result.finalized[0].status == "error"
 
     @pytest.mark.asyncio
@@ -3270,30 +4811,15 @@ class TestFinalizeRunOutputBlobs:
         """Pending blob with success=False -> error regardless of file state."""
         from pathlib import Path as _Path
 
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="output.csv")
 
         # Write file — but the run failed, so it should still be marked error
         _Path(pending.storage_path).write_bytes(b"partial-output")
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(run_id, success=False)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=execute)
         assert len(result.finalized) == 1
         assert len(result.errors) == 0
         assert result.finalized[0].status == "error"
@@ -3302,6 +4828,37 @@ class TestFinalizeRunOutputBlobs:
 # ---------------------------------------------------------------------------
 # Partial-failure resilience — elspeth-9f31c32cce
 # ---------------------------------------------------------------------------
+
+
+class TestCleanupErrorDetail:
+    def test_missing_notes_preserves_exact_message(self) -> None:
+        assert blob_service_module._cleanup_error_detail(OSError("primary failure")) == "primary failure"
+
+    def test_notes_preserve_order_and_primary_message(self) -> None:
+        error = OSError("primary failure")
+        error.add_note("first rollback failure")
+        error.add_note("second rollback failure")
+        assert blob_service_module._cleanup_error_detail(error) == "primary failure\nfirst rollback failure\nsecond rollback failure"
+
+    @pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+    def test_notes_getter_integrity_failure_propagates(self, error_class) -> None:
+        integrity_failure = error_class("cleanup notes access failed")
+
+        class UnreadableNotesError(OSError):
+            @property
+            def __notes__(self) -> list[str]:
+                raise integrity_failure
+
+        with pytest.raises(error_class) as caught:
+            blob_service_module._cleanup_error_detail(UnreadableNotesError("primary failure"))
+        assert caught.value is integrity_failure
+
+    @pytest.mark.parametrize("notes", ["not a note list", None, ("tuple note",), [42]])
+    def test_malformed_notes_fail_loudly(self, notes) -> None:
+        error = OSError("primary failure")
+        error.__notes__ = notes
+        with pytest.raises(TypeError, match="exception __notes__ must be a list of strings"):
+            blob_service_module._cleanup_error_detail(error)
 
 
 class TestFinalizeRunOutputBlobsPartialFailure:
@@ -3357,32 +4914,14 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         blob_service,
         session_id: UUID,
         run_id: UUID,
-        db_engine,
+        execute: SessionOperationContext,
         filename: str,
         content: bytes | None = None,
     ):
-        """Create a pending blob, optionally write content, and link to run."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename=filename,
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        """Reserve a run output through the facet under ``execute`` and optionally write its content."""
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename=filename)
         if content is not None:
-            from pathlib import Path as _Path
-
-            _Path(pending.storage_path).write_bytes(content)
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
+            Path(pending.storage_path).write_bytes(content)
         return pending
 
     @staticmethod
@@ -3397,6 +4936,41 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         monkeypatch.setattr(Path, "read_bytes", _read_bytes_or_permission_error)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    async def test_quota_rejection_preserves_evidence_and_continues(
+        self, blob_service, session_id, db_engine, run_env, monkeypatch, cleanup_fails
+    ) -> None:
+        run_id, session_id_str = run_env
+        execute = _execute_context(db_engine, session_id)
+        rejected = await self._create_linked_blob(blob_service, session_id, run_id, execute, "large.csv", b"x" * 11)
+        accepted = await self._create_linked_blob(blob_service, session_id, run_id, execute, "small.csv", b"x")
+        monkeypatch.setattr(blob_service, "_max_storage_per_session", 10)
+        rejected_path = Path(rejected.storage_path)
+        if cleanup_fails:
+            original_unlink = Path.unlink
+
+            def fail_rejected_unlink(path: Path, missing_ok: bool = False) -> None:
+                if path == rejected_path:
+                    raise PermissionError("quota cleanup refused")
+                original_unlink(path, missing_ok=missing_ok)
+
+            monkeypatch.setattr(Path, "unlink", fail_rejected_unlink)
+
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+
+        assert [record.id for record in result.finalized] == [accepted.id]
+        assert result.errors[0].blob_id == rejected.id
+        assert result.errors[0].exc_type == "BlobQuotaExceededError"
+        assert result.errors[0].detail == str(BlobQuotaExceededError(session_id_str, current_bytes=0, limit_bytes=10))
+        assert [error.exc_type for error in result.errors] == (
+            ["BlobQuotaExceededError", "PermissionError"] if cleanup_fails else ["BlobQuotaExceededError"]
+        )
+        with db_engine.connect() as conn:
+            status = conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(rejected.id))).scalar_one()
+        assert status == "error"
+        assert rejected_path.exists() is cleanup_fails
+
+    @pytest.mark.asyncio
     async def test_continues_after_concurrent_deletion(
         self,
         blob_service,
@@ -3406,33 +4980,36 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """When blob 2 of 3 is concurrently deleted (between initial query
         and per-blob finalize), blobs 1 and 3 still finalize."""
-        from elspeth.web.blobs.protocol import BlobNotFoundError
+        from elspeth.web.sessions.models import blob_run_links_table
 
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        b1 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
-        b3 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b3.csv", b"data3")
+        b1 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
+        b3 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b3.csv", b"data3")
 
-        # Patch _finalize_blob_sync to simulate concurrent deletion of b2
-        # in the window between the initial SELECT and per-blob finalize.
-        original = blob_service._finalize_blob_sync
+        # Delete b2 for real in the window between the initial SELECT and its
+        # per-blob write, so the refusal is the facet's own custody error.
+        original = blob_service._mark_run_output_ready
 
-        def _patched(blob_id, *args, **kwargs):
+        def _patched(context, *, run_id, blob_id, size_bytes, content_hash_val):
             if blob_id == b2.id:
-                raise BlobNotFoundError(str(blob_id))
-            return original(blob_id, *args, **kwargs)
+                with db_engine.begin() as conn:
+                    conn.execute(delete(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(b2.id)))
+                    conn.execute(delete(blobs_table).where(blobs_table.c.id == str(b2.id)))
+            return original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
 
-        blob_service._finalize_blob_sync = _patched
+        blob_service._mark_run_output_ready = _patched
         try:
-            result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
         assert len(result.finalized) == 2, f"Expected 2 finalized, got {len(result.finalized)}"
         assert len(result.errors) == 1, f"Expected 1 error, got {len(result.errors)}"
         assert result.errors[0].blob_id == b2.id
-        assert result.errors[0].exc_type == "BlobNotFoundError"
+        assert result.errors[0].exc_type == "SessionDerivedCustodyError"
         finalized_ids = {r.id for r in result.finalized}
         assert b1.id in finalized_ids
         assert b3.id in finalized_ids
@@ -3446,27 +5023,27 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         run_env,
     ) -> None:
         """When blob 2 raises BlobStateError (already finalized), loop continues."""
-        from elspeth.web.blobs.protocol import BlobStateError
-
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b3.csv", b"data3")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b3.csv", b"data3")
 
-        # Patch _finalize_blob_sync to simulate b2 already finalized
-        original = blob_service._finalize_blob_sync
+        # Finalize b2 for real just before its own per-blob write, so the
+        # second write meets the facet's own "expected 'pending'" refusal.
+        original = blob_service._mark_run_output_ready
 
-        def _patched(blob_id, *args, **kwargs):
+        def _patched(context, *, run_id, blob_id, size_bytes, content_hash_val):
             if blob_id == b2.id:
-                raise BlobStateError(str(blob_id), message="Cannot finalize — status is 'ready', expected 'pending'")
-            return original(blob_id, *args, **kwargs)
+                original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
+            return original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
 
-        blob_service._finalize_blob_sync = _patched
+        blob_service._mark_run_output_ready = _patched
         try:
-            result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
         assert len(result.finalized) == 2
         assert len(result.errors) == 1
@@ -3484,12 +5061,13 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """When file read raises OSError, loop continues to next blob."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
 
         self._deny_read_bytes(monkeypatch, Path(b2.storage_path))
-        result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
         assert len(result.finalized) == 1
         assert len(result.errors) == 1
@@ -3506,21 +5084,22 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """Programmer bugs (TypeError) must crash, not be caught."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
 
-        # Inject a TypeError via patching _finalize_blob_sync
-        original = blob_service._finalize_blob_sync
+        # Inject a TypeError via patching the per-blob write seam
+        original = blob_service._mark_run_output_ready
 
         def _broken_finalize(*args, **kwargs):
             raise TypeError("unexpected keyword argument")
 
-        blob_service._finalize_blob_sync = _broken_finalize
+        blob_service._mark_run_output_ready = _broken_finalize
         try:
             with pytest.raises(TypeError, match="unexpected keyword argument"):
-                await blob_service.finalize_run_output_blobs(run_id, success=True)
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
     @pytest.mark.asyncio
     async def test_all_blobs_fail_returns_empty_finalized_with_errors(
@@ -3531,24 +5110,29 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         run_env,
     ) -> None:
         """When all blobs fail, result has empty finalized and N errors."""
-        from elspeth.web.blobs.protocol import BlobNotFoundError
+        from elspeth.web.sessions.models import blob_run_links_table
 
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
 
-        # Patch to simulate all blobs concurrently deleted
-        original = blob_service._finalize_blob_sync
+        # Delete every row for real before its per-blob write: all refusals
+        # are the facet's own custody error.
+        original = blob_service._mark_run_output_ready
 
-        def _all_missing(blob_id, *args, **kwargs):
-            raise BlobNotFoundError(str(blob_id))
+        def _all_missing(context, *, run_id, blob_id, size_bytes, content_hash_val):
+            with db_engine.begin() as conn:
+                conn.execute(delete(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(blob_id)))
+                conn.execute(delete(blobs_table).where(blobs_table.c.id == str(blob_id)))
+            return original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
 
-        blob_service._finalize_blob_sync = _all_missing
+        blob_service._mark_run_output_ready = _all_missing
         try:
-            result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
         assert len(result.finalized) == 0
         assert len(result.errors) == 2
@@ -3563,8 +5147,9 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """Run with no pending output blobs returns empty result."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
         assert len(result.finalized) == 0
         assert len(result.errors) == 0
@@ -3582,12 +5167,13 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         from elspeth.web.sessions.models import blobs_table as bt
 
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        b1 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
+        b1 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
 
         self._deny_read_bytes(monkeypatch, Path(b1.storage_path))
-        result = await blob_service.finalize_run_output_blobs(run_id, success=True)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
         # b1 should have been moved to "error" by the best-effort recovery
         with db_engine.connect() as conn:
@@ -3609,20 +5195,62 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """RuntimeError (Tier 1 anomaly: blob vanished mid-transaction) propagates."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
 
-        original = blob_service._finalize_blob_sync
+        original = blob_service._mark_run_output_ready
 
         def _vanishing_finalize(*args, **kwargs):
             raise RuntimeError("Blob abc vanished during finalize — concurrent deletion?")
 
-        blob_service._finalize_blob_sync = _vanishing_finalize
+        blob_service._mark_run_output_ready = _vanishing_finalize
         try:
             with pytest.raises(RuntimeError, match="vanished during finalize"):
-                await blob_service.finalize_run_output_blobs(run_id, success=True)
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
+
+    @pytest.mark.asyncio
+    async def test_custody_refusal_during_recovery_mark_propagates(
+        self,
+        blob_service,
+        session_id,
+        db_engine,
+        run_env,
+    ) -> None:
+        """A custody refusal while marking ``error`` after a DB fault is a Tier-1 anomaly, not a swallowed no-op.
+
+        The recovery mark runs only after an I/O or DB fault left the row
+        pending under this operation's EXECUTE fence; the facet refusing it
+        means the row changed under the fence, so the refusal propagates.
+        """
+        from sqlalchemy.exc import OperationalError
+
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
+
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+
+        original_ready = blob_service._mark_run_output_ready
+        original_error = blob_service._mark_run_output_error
+
+        def _db_fault(*args, **kwargs):
+            raise OperationalError("UPDATE blobs", {}, Exception("connection reset"))
+
+        def _refused(*args, **kwargs):
+            raise SessionDerivedCustodyError()
+
+        blob_service._mark_run_output_ready = _db_fault
+        blob_service._mark_run_output_error = _refused
+        try:
+            with pytest.raises(SessionDerivedCustodyError):
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        finally:
+            blob_service._mark_run_output_ready = original_ready
+            blob_service._mark_run_output_error = original_error
 
 
 # ---------------------------------------------------------------------------
@@ -3638,45 +5266,36 @@ class TestReadBlobContentLifecycleGuard:
     """
 
     @pytest.mark.asyncio
-    async def test_rejects_pending_blob(self, blob_service, session_id) -> None:
+    async def test_rejects_pending_blob(self, blob_service, session_id, compose_context, db_engine) -> None:
         """Pending blobs have no finalized content — reading must fail."""
         from pathlib import Path as _Path
 
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "output.csv")
         # Write a file so the only guard is status, not file existence
         _Path(pending.storage_path).write_bytes(b"partial-content")
 
         with pytest.raises(BlobStateError):
-            await blob_service.read_blob_content(pending.id)
+            await blob_service.read_blob_content(pending.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_rejects_error_blob(self, blob_service, session_id) -> None:
+    async def test_rejects_error_blob(self, blob_service, session_id, compose_context, db_engine) -> None:
         """Error blobs represent failed runs — content must not be served."""
         from pathlib import Path as _Path
 
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "output.csv")
         _Path(pending.storage_path).write_bytes(b"partial-content")
-        await blob_service.finalize_blob(pending.id, status="error")
+        with db_engine.begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == str(pending.id)).values(status="error"))
 
         with pytest.raises(BlobStateError):
-            await blob_service.read_blob_content(pending.id)
+            await blob_service.read_blob_content(pending.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_detects_content_hash_mismatch(self, blob_service, session_id) -> None:
+    async def test_detects_content_hash_mismatch(self, blob_service, session_id, compose_context) -> None:
         """Tier 1 integrity: if stored hash doesn't match file bytes, crash."""
         from pathlib import Path as _Path
 
@@ -3688,6 +5307,7 @@ class TestReadBlobContentLifecycleGuard:
             content=b"original-content",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
         assert record.status == "ready"
         assert record.content_hash is not None
@@ -3696,10 +5316,10 @@ class TestReadBlobContentLifecycleGuard:
         _Path(record.storage_path).write_bytes(b"tampered-content")
 
         with pytest.raises(BlobIntegrityError):
-            await blob_service.read_blob_content(record.id)
+            await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_rejects_ready_blob_with_missing_backing_file(self, blob_service, session_id) -> None:
+    async def test_rejects_ready_blob_with_missing_backing_file(self, blob_service, session_id, compose_context) -> None:
         """Ready metadata without backing bytes is an integrity failure, not 404."""
         from pathlib import Path as _Path
 
@@ -3711,14 +5331,54 @@ class TestReadBlobContentLifecycleGuard:
             content=b"original-content",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
         _Path(record.storage_path).unlink()
 
         with pytest.raises(BlobContentMissingError, match="backing file"):
-            await blob_service.read_blob_content(record.id)
+            await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_rejects_pending_blob_without_file(self, blob_service, session_id) -> None:
+    async def test_translates_file_deleted_between_exists_check_and_read(
+        self,
+        blob_service,
+        session_id,
+        monkeypatch,
+        compose_context,
+    ) -> None:
+        """Raced deletion after the existence guard keeps the lifecycle contract.
+
+        Parity with read_blob_content_prefix_verified, whose docstring
+        claims it mirrors this method's guards exactly.
+        """
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="raced-delete.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        target = Path(record.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_rejects_pending_blob_without_file(self, blob_service, session_id, compose_context, db_engine) -> None:
         """Pending blob with no file must raise BlobStateError, not BlobNotFoundError.
 
         Guards exception ordering: the status check must fire before
@@ -3727,19 +5387,14 @@ class TestReadBlobContentLifecycleGuard:
         """
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="no-file.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "no-file.csv")
         # Deliberately do NOT write a file
 
         with pytest.raises(BlobStateError, match="expected 'ready'"):
-            await blob_service.read_blob_content(pending.id)
+            await blob_service.read_blob_content(pending.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_ready_blob_with_valid_hash_succeeds(self, blob_service, session_id) -> None:
+    async def test_ready_blob_with_valid_hash_succeeds(self, blob_service, session_id, compose_context) -> None:
         """Ready blob with matching hash returns content normally."""
         content = b"valid-content"
         record = await blob_service.create_blob(
@@ -3748,10 +5403,268 @@ class TestReadBlobContentLifecycleGuard:
             content=content,
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        result = await blob_service.read_blob_content(record.id)
+        result = await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
         assert result == content
+
+
+# ---------------------------------------------------------------------------
+# read_blob_content_prefix_verified — bounded-memory streamed read + verify
+# ---------------------------------------------------------------------------
+
+
+class _ReadSizeSpyFile:
+    """Wraps a real file handle, recording every ``read(size)`` argument.
+
+    Lets a test prove a read path is genuinely chunked — never one big
+    slurp — without needing a multi-hundred-MiB fixture to make the
+    difference observable.
+    """
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+        self.requested_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.requested_sizes.append(size)
+        return self._handle.read(size)
+
+    def __enter__(self) -> _ReadSizeSpyFile:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._handle.__exit__(exc_type, exc, tb)
+
+
+class TestReadBlobContentPrefixVerifiedStreaming:
+    """read_blob_content_prefix_verified must stream + verify without holding
+    the full blob in memory, mirroring read_blob_content's guards exactly.
+
+    Finding B (memory half): a 100 MiB blob was fully materialized in RAM
+    per guided selection just to serve an 8 KiB bounded preview, because the
+    only way to verify the full-content hash was `storage.read_bytes()`.
+    This method reads and hashes in bounded chunks instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reads_in_bounded_chunks_not_one_full_read(self, blob_service, session_id, monkeypatch, compose_context) -> None:
+        # Shrink the chunk size so a modest fixture (20 KiB) still spans many
+        # chunks — proves chunking structurally without a huge fixture.
+        monkeypatch.setattr(blob_service_module, "_STREAM_CHUNK_BYTES", 4096)
+        content = bytes(range(256)) * 80  # 20480 bytes, > 4096 * 4
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="large.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+
+        spies: list[_ReadSizeSpyFile] = []
+        real_open = Path.open
+        target = str(Path(record.storage_path))
+
+        def spy_open(self: Path, *args: object, **kwargs: object) -> object:
+            handle = real_open(self, *args, **kwargs)
+            if str(self) == target:
+                spy = _ReadSizeSpyFile(handle)
+                spies.append(spy)
+                return spy
+            return handle
+
+        monkeypatch.setattr(Path, "open", spy_open)
+
+        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(
+            record.id, prefix_bytes=100, session_operation_context=compose_context
+        )
+
+        assert prefix == content[:100]
+        assert verified_hash == hashlib.sha256(content).hexdigest()
+        assert verified_hash == record.content_hash
+        assert total_size == len(content)
+
+        assert len(spies) == 1
+        sizes = spies[0].requested_sizes
+        # More than one chunk read (proves streaming, not a single slurp),
+        # and no single read() call requested more than the chunk bound.
+        assert len(sizes) > 1
+        assert all(size <= 4096 for size in sizes)
+
+    @pytest.mark.asyncio
+    async def test_rejects_pending_blob(self, blob_service, session_id, compose_context, db_engine) -> None:
+        from elspeth.web.blobs.protocol import BlobStateError
+
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "output.csv")
+        Path(pending.storage_path).write_bytes(b"partial-content")
+
+        with pytest.raises(BlobStateError):
+            await blob_service.read_blob_content_prefix_verified(pending.id, prefix_bytes=8, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_rejects_ready_blob_with_missing_backing_file(self, blob_service, session_id, compose_context) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="missing.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        Path(record.storage_path).unlink()
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_translates_file_deleted_between_exists_check_and_open(
+        self,
+        blob_service,
+        session_id,
+        monkeypatch,
+        compose_context,
+    ) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="raced-delete.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        target = Path(record.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_detects_content_hash_mismatch_fail_closed(self, blob_service, session_id, compose_context) -> None:
+        """Same Tier 1 fail-closed guarantee as read_blob_content: a tampered
+        file must never be served, even for a bounded preview."""
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="tampered.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        Path(record.storage_path).write_bytes(b"tampered-content")
+
+        with pytest.raises(BlobIntegrityError):
+            await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=8, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_prefix_shorter_than_content_still_verifies_full_hash(self, blob_service, session_id, compose_context) -> None:
+        """The verified hash covers the FULL blob even though only a short
+        prefix is retained — a partial digest could never validate the
+        stored full-content hash."""
+        content = b"0123456789" * 2000  # 20000 bytes
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="big.csv",
+            content=content,
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+
+        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(
+            record.id, prefix_bytes=8 * 1024, session_operation_context=compose_context
+        )
+
+        assert len(prefix) == 8 * 1024
+        assert prefix == content[: 8 * 1024]
+        assert total_size == len(content)
+        assert verified_hash == content_hash(content)
+
+
+class TestReadBlobPreviewLifecycleGuard:
+    """The bounded preview shares read_blob_content's missing-file contract."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_ready_blob_with_missing_backing_file(self, blob_service, session_id, compose_context) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="missing.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        Path(record.storage_path).unlink()
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_preview(record.id, limit_bytes=8, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_translates_file_deleted_between_exists_check_and_open(
+        self,
+        blob_service,
+        session_id,
+        monkeypatch,
+        compose_context,
+    ) -> None:
+        from elspeth.web.blobs.protocol import BlobContentMissingError
+
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="raced-delete.csv",
+            content=b"original-content",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        target = Path(record.storage_path)
+        real_open = Path.open
+        deleted = False
+
+        def delete_then_open(self: Path, *args: object, **kwargs: object) -> object:
+            nonlocal deleted
+            if self == target and not deleted:
+                deleted = True
+                self.unlink()
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", delete_then_open)
+
+        with pytest.raises(BlobContentMissingError, match="backing file"):
+            await blob_service.read_blob_preview(record.id, limit_bytes=8, session_operation_context=compose_context)
+
+    @pytest.mark.asyncio
+    async def test_previews_bounded_prefix_and_flags_truncation(self, blob_service, session_id, compose_context) -> None:
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="preview.csv",
+            content=b"0123456789",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+
+        data, truncated = await blob_service.read_blob_preview(record.id, limit_bytes=4, session_operation_context=compose_context)
+
+        assert data == b"0123"
+        assert truncated is True
 
 
 # ---------------------------------------------------------------------------
@@ -3812,32 +5725,17 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
         """When run fails, backing file must be deleted — not left orphaned."""
         from pathlib import Path as _Path
 
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="output.csv")
 
         # Simulate sink writing partial output before run failure
         storage = _Path(pending.storage_path)
         storage.write_bytes(b"partial-output-before-crash")
         assert storage.exists()
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(run_id, success=False)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=execute)
         assert len(result.finalized) == 1
         blob_result = result.finalized[0]
         assert blob_result.status == "error"
@@ -3853,28 +5751,14 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
     @pytest.mark.asyncio
     async def test_failure_without_file_still_sets_error(self, blob_service, session_id, db_engine, run_env) -> None:
         """When run fails and no file was written, status is still error (no crash)."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="never-written.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="never-written.csv")
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(run_id, success=False)
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=execute)
         assert len(result.finalized) == 1
+        assert result.finalized[0].id == pending.id
         assert result.finalized[0].status == "error"
 
 
@@ -3886,8 +5770,10 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
 class TestBlobsReadyHashDBConstraint:
     """The DB refuses status='ready' rows without a content_hash.
 
-    Service-level validation in _validate_finalize_hash is the first line
-    of defence, but the CHECK constraint in the current schema is the belt:
+    Service-level validation (``_finalize_reserved_blob`` on the upload path,
+    the authority facet's ``mark_run_output_blob_ready`` on the run-output
+    path) is the first line of defence, but the CHECK constraint in the
+    current schema is the belt:
     even raw SQL / direct ORM writes that bypass the service cannot
     commit a violating row.
     """
@@ -3941,7 +5827,7 @@ class TestBlobsReadyHashDBConstraint:
             )
 
     @pytest.mark.asyncio
-    async def test_update_ready_hash_to_null_rejected(self, blob_service, db_engine, session_id) -> None:
+    async def test_update_ready_hash_to_null_rejected(self, blob_service, db_engine, session_id, compose_context) -> None:
         """Can't bypass the guard by mutating an existing ready row."""
         from sqlalchemy import update
         from sqlalchemy.exc import IntegrityError
@@ -3954,6 +5840,7 @@ class TestBlobsReadyHashDBConstraint:
             content=b"a,b,c\n1,2,3\n",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         with pytest.raises(IntegrityError), db_engine.begin() as conn:
@@ -3973,11 +5860,14 @@ class TestBlobsReadyHashDBConstraint:
         ],
     )
     @pytest.mark.asyncio
-    async def test_update_ready_hash_to_malformed_rejected(self, blob_service, db_engine, session_id, bad_hash: str) -> None:
+    async def test_update_ready_hash_to_malformed_rejected(
+        self, blob_service, db_engine, session_id, bad_hash: str, compose_context
+    ) -> None:
         """Updating a ready row's hash to a malformed value is rejected.
 
-        The service-level write path goes through ``_validate_finalize_hash``
-        which rejects malformed hashes before SQL.  This test bypasses the
+        Both service-level write paths (``_finalize_reserved_blob`` and the
+        authority facet's ``mark_run_output_blob_ready``) reject a malformed
+        hash before SQL.  This test bypasses the
         service entirely and asserts the database CHECK is the second wall
         — so a future caller that builds an UPDATE statement directly (or
         a migration script that touches content_hash) cannot leave the row
@@ -3994,136 +5884,11 @@ class TestBlobsReadyHashDBConstraint:
             content=b"a,b,c\n1,2,3\n",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         with pytest.raises(IntegrityError), db_engine.begin() as conn:
             conn.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(content_hash=bad_hash))
-
-
-# ---------------------------------------------------------------------------
-# _finalize_blob_sync — mirrors finalize_blob's hash validation but on the
-# path actually used by the pipeline output finalizer.  Coverage asymmetry
-# between the two entry points would let a regression strip validation
-# from the pipeline path while the REST path stayed healthy — the worst
-# kind of bifurcation for audit integrity.
-# ---------------------------------------------------------------------------
-
-
-class TestFinalizeBlobSyncHashValidation:
-    """_validate_finalize_hash must engage on the sync pipeline path too."""
-
-    @pytest.mark.asyncio
-    async def test_sync_path_rejects_missing_hash_for_ready(self, blob_service, session_id) -> None:
-        """Invoking _finalize_blob_sync with ready+None hash raises BlobStateError."""
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(BlobStateError, match="content_hash"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "ready",
-                size_bytes=42,
-                content_hash_val=None,
-            )
-
-    @pytest.mark.asyncio
-    async def test_sync_path_rejects_non_sha256_hash(self, blob_service, session_id) -> None:
-        """Invoking _finalize_blob_sync with a malformed hash raises BlobStateError."""
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "ready",
-                size_bytes=42,
-                content_hash_val="abc123",  # too short
-            )
-
-    @pytest.mark.asyncio
-    async def test_sync_path_rejects_uppercase_hex_hash(self, blob_service, session_id) -> None:
-        """The canonical form is lowercase; uppercase hex is a bifurcation risk.
-
-        FilesystemPayloadStore writes lowercase, and read_blob_content
-        compares via hmac.compare_digest — byte-for-byte.  If the
-        write-side validator silently admitted uppercase, a pipeline
-        could commit a blob whose hash does not match the stored form
-        anywhere else in the audit trail.
-        """
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        uppercase_hash = content_hash(b"real-bytes").upper()
-
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "ready",
-                size_bytes=10,
-                content_hash_val=uppercase_hash,
-            )
-
-    @pytest.mark.asyncio
-    async def test_sync_path_allows_error_status_without_hash(self, blob_service, session_id) -> None:
-        """The hash invariant applies only to 'ready'; 'error' requires nothing."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        record = blob_service._finalize_blob_sync(
-            pending.id,
-            "error",
-            size_bytes=None,
-            content_hash_val=None,
-        )
-        assert record.status == "error"
-        assert record.content_hash is None
-
-    @pytest.mark.asyncio
-    async def test_sync_path_invalid_status_raises_runtime_error(self, blob_service, session_id) -> None:
-        """Invalid status on the sync path must propagate as RuntimeError.
-
-        _PER_BLOB_SUPPRESSED deliberately excludes RuntimeError so a
-        programmer bug (typo'd status literal) crashes the pipeline
-        finalization loop rather than being converted silently into a
-        per-blob 'error' record.  BlobStateError would have been
-        suppressed — so this test pins the crash-not-suppress contract.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(RuntimeError, match="Invalid finalize status"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "deleted",
-                size_bytes=None,
-                content_hash_val=None,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -4172,7 +5937,7 @@ class TestLinkBlobToRunDirectionGuard:
         return UUID(run_id)
 
     @pytest.mark.asyncio
-    async def test_rejects_invalid_direction(self, blob_service, session_id, db_engine) -> None:
+    async def test_rejects_invalid_direction(self, blob_service, session_id, db_engine, compose_context) -> None:
         """A typo'd direction must raise RuntimeError before touching the DB.
 
         Mirrors finalize_blob's invariant: the Literal alias narrows
@@ -4187,6 +5952,7 @@ class TestLinkBlobToRunDirectionGuard:
             content=b"a,b,c\n1,2,3\n",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         with pytest.raises(RuntimeError, match="Invalid link direction"):
@@ -4194,10 +5960,11 @@ class TestLinkBlobToRunDirectionGuard:
                 blob_id=blob.id,
                 run_id=run_id,
                 direction="inout",
+                session_operation_context=_execute_context(db_engine, session_id),
             )
 
     @pytest.mark.asyncio
-    async def test_accepts_input_and_output(self, blob_service, session_id, db_engine) -> None:
+    async def test_accepts_input_and_output(self, blob_service, session_id, db_engine, compose_context) -> None:
         """Positive control: both valid directions commit without error."""
         run_id = self._make_run(db_engine, session_id)
         blob = await blob_service.create_blob(
@@ -4206,17 +5973,18 @@ class TestLinkBlobToRunDirectionGuard:
             content=b"a,b,c\n1,2,3\n",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        await blob_service.link_blob_to_run(blob.id, run_id, "input")
-        await blob_service.link_blob_to_run(blob.id, run_id, "output")
+        await blob_service.link_blob_to_run(blob.id, run_id, "input", session_operation_context=_execute_context(db_engine, session_id))
+        await blob_service.link_blob_to_run(blob.id, run_id, "output", session_operation_context=_execute_context(db_engine, session_id))
 
         links = await blob_service.get_blob_run_links(blob.id)
         directions = sorted(link.direction for link in links)
         assert directions == ["input", "output"]
 
     @pytest.mark.asyncio
-    async def test_duplicate_same_direction_link_is_idempotent(self, blob_service, session_id, db_engine) -> None:
+    async def test_duplicate_same_direction_link_is_idempotent(self, blob_service, session_id, db_engine, compose_context) -> None:
         """A source bind and inline-content ref can share the same input blob."""
         run_id = self._make_run(db_engine, session_id)
         blob = await blob_service.create_blob(
@@ -4225,10 +5993,11 @@ class TestLinkBlobToRunDirectionGuard:
             content=b"prompt",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
-        await blob_service.link_blob_to_run(blob.id, run_id, "input")
-        await blob_service.link_blob_to_run(blob.id, run_id, "input")
+        await blob_service.link_blob_to_run(blob.id, run_id, "input", session_operation_context=_execute_context(db_engine, session_id))
+        await blob_service.link_blob_to_run(blob.id, run_id, "input", session_operation_context=_execute_context(db_engine, session_id))
 
         links = await blob_service.get_blob_run_links(blob.id)
         assert [(link.run_id, link.direction) for link in links] == [(run_id, "input")]
@@ -4238,7 +6007,7 @@ class TestLinkBlobToRunSessionGuard:
     """link_blob_to_run must reject cross-session references at the write boundary."""
 
     @pytest.mark.asyncio
-    async def test_rejects_cross_session_link(self, blob_service, session_id, db_engine) -> None:
+    async def test_rejects_cross_session_link(self, blob_service, session_id, db_engine, compose_context) -> None:
         """Blob and run from different sessions must not be linkable."""
         session_b = UUID(str(uuid4()))
         now = datetime.now(UTC)
@@ -4261,10 +6030,13 @@ class TestLinkBlobToRunSessionGuard:
             content=b"a,b,c\n1,2,3\n",
             mime_type="text/csv",
             created_by="user",
+            session_operation_context=compose_context,
         )
 
         with pytest.raises(RuntimeError, match="cross-session reference"):
-            await blob_service.link_blob_to_run(blob.id, foreign_run_id, "input")
+            await blob_service.link_blob_to_run(
+                blob.id, foreign_run_id, "input", session_operation_context=_execute_context(db_engine, session_id)
+            )
 
         assert await blob_service.get_blob_run_links(blob.id) == []
 
@@ -4461,3 +6233,103 @@ class TestRowToRecordTierOneGuards:
         row = self._fake_link_row(direction="inout", blob_id="not-a-uuid")
         with pytest.raises(AuditIntegrityError, match=r"Tier 1: blob_run_links\.direction"):
             blob_service._row_to_link_record(row)
+
+
+class TestReadBlobContentCustodyLock:
+    """Content reads must serialize with the same-session custody lock.
+
+    Blob mutation swaps/tombstones the storage file inside its custody
+    transaction before commit; an unlocked reader can pair one version's
+    row with another version's bytes and escalate a false-positive
+    ``BlobIntegrityError`` / ``BlobContentMissingError``
+    (elspeth-3d1d1fcb6c).  The observable contract: a content read must
+    block while the session custody lock is held.
+    """
+
+    def test_read_blob_content_waits_for_session_custody_lock(self, tmp_path) -> None:
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        initialize_session_schema(engine)
+        service = BlobServiceImpl(engine, tmp_path)
+
+        sid = str(uuid4())
+        blob_id = str(uuid4())
+        now = datetime.now(UTC)
+        content = b"custody-locked-bytes"
+        storage_dir = tmp_path / "blobs" / sid
+        storage_dir.mkdir(parents=True)
+        storage_path = storage_dir / f"{blob_id}_data.csv"
+        storage_path.write_bytes(content)
+        with engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=sid,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Custody lock",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=blob_id,
+                    session_id=sid,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(content),
+                    content_hash=hashlib.sha256(content).hexdigest(),
+                    storage_path=str(storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+        # The read runs under this engine's own session fence; the fixture
+        # context belongs to a different engine and would read as "missing".
+        compose_context = seed_live_compose_context(engine, sid)
+
+        lock_held = threading.Event()
+        release = threading.Event()
+        read_done = threading.Event()
+        results: list[bytes] = []
+        failures: list[BaseException] = []
+
+        def hold_custody_lock() -> None:
+            try:
+                with locked_session_transaction(engine, sid):
+                    lock_held.set()
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("custody lock holder was never released")
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+                lock_held.set()
+
+        def reader() -> None:
+            try:
+                results.append(asyncio.run(service.read_blob_content(UUID(blob_id), session_operation_context=compose_context)))
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+            finally:
+                read_done.set()
+
+        holder = threading.Thread(target=hold_custody_lock, name="custody-lock-holder")
+        holder.start()
+        assert lock_held.wait(timeout=5)
+        reader_thread = threading.Thread(target=reader, name="blob-reader")
+        reader_thread.start()
+        try:
+            assert not read_done.wait(timeout=1.0), (
+                "read_blob_content returned while the session custody lock was held; "
+                "an unlocked reader can pair one blob version's row with another version's bytes"
+            )
+        finally:
+            release.set()
+            holder.join(timeout=10)
+            reader_thread.join(timeout=10)
+
+        assert read_done.wait(timeout=10)
+        assert failures == []
+        assert results == [content]

@@ -14,12 +14,17 @@ Tests cover:
 """
 
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from elspeth.plugins.infrastructure.base import BaseSink
+from elspeth.plugins.sinks.csv_sink import CSVSink
+from elspeth.plugins.sinks.database_sink import DatabaseSink
+from elspeth.plugins.sinks.json_sink import JSONSink
 from tests.fixtures.base_classes import inject_write_failure
 
 # Schema configs for tests
@@ -27,16 +32,6 @@ from tests.fixtures.base_classes import inject_write_failure
 # JSON sink accepts dynamic schemas
 STRICT_SCHEMA = {"mode": "fixed", "fields": ["id: int", "name: str"]}
 DYNAMIC_SCHEMA = {"mode": "observed"}
-
-
-def _import_sink_class(class_path: str) -> type:
-    """Import a sink class from its fully qualified path."""
-    module_path, class_name = class_path.rsplit(".", 1)
-    import importlib
-
-    module = importlib.import_module(module_path)
-    cls: type = getattr(module, class_name)
-    return cls
 
 
 def _create_temp_path(suffix: str) -> Path:
@@ -49,7 +44,7 @@ def _create_temp_path(suffix: str) -> Path:
 
 
 # Sink configurations for parametrized testing
-# Each tuple: (class_path, config_factory, expected_name, file_suffix)
+# Each tuple: (sink_class, config_factory, expected_name)
 # Using factories instead of static configs so each test gets a fresh temp file
 def _csv_config() -> dict[str, Any]:
     return {"path": str(_create_temp_path(".csv")), "schema": STRICT_SCHEMA}
@@ -70,19 +65,19 @@ def _database_config() -> dict[str, Any]:
 # Parametrized test configs
 SINK_CONFIGS = [
     pytest.param(
-        "elspeth.plugins.sinks.csv_sink.CSVSink",
+        CSVSink,
         _csv_config,
         "csv",
         id="csv",
     ),
     pytest.param(
-        "elspeth.plugins.sinks.json_sink.JSONSink",
+        JSONSink,
         _json_config,
         "json",
         id="json",
     ),
     pytest.param(
-        "elspeth.plugins.sinks.database_sink.DatabaseSink",
+        DatabaseSink,
         _database_config,
         "database",
         id="database",
@@ -110,17 +105,25 @@ def _create_context() -> _SinkContextFake:
 class TestSinkProtocolCompliance:
     """Parametrized protocol compliance tests for all sink plugins."""
 
-    @pytest.mark.parametrize("class_path,config_factory,expected_name", SINK_CONFIGS)
-    def test_has_required_class_attributes(self, class_path: str, config_factory: Any, expected_name: str) -> None:
+    @pytest.mark.parametrize("sink_class,config_factory,expected_name", SINK_CONFIGS)
+    def test_has_required_class_attributes(
+        self,
+        sink_class: type[BaseSink],
+        config_factory: Callable[[], dict[str, Any]],
+        expected_name: str,
+    ) -> None:
         """All sinks must have name class attribute."""
-        sink_class = _import_sink_class(class_path)
         # Direct attribute access - crash on missing (our code, our bug)
-        assert sink_class.name == expected_name  # type: ignore[attr-defined]
+        assert sink_class.name == expected_name
 
-    @pytest.mark.parametrize("class_path,config_factory,expected_name", SINK_CONFIGS)
-    def test_has_required_instance_attributes(self, class_path: str, config_factory: Any, expected_name: str) -> None:
+    @pytest.mark.parametrize("sink_class,config_factory,expected_name", SINK_CONFIGS)
+    def test_has_required_instance_attributes(
+        self,
+        sink_class: type[BaseSink],
+        config_factory: Callable[[], dict[str, Any]],
+        expected_name: str,
+    ) -> None:
         """All sinks must have input_schema, idempotent, supports_resume attributes after instantiation."""
-        sink_class = _import_sink_class(class_path)
         sink = inject_write_failure(sink_class(config_factory()))
 
         # Direct attribute access - crash on missing (our code, our bug)
@@ -134,10 +137,14 @@ class TestSinkProtocolCompliance:
         # Clean up
         sink.close()
 
-    @pytest.mark.parametrize("class_path,config_factory,expected_name", SINK_CONFIGS)
-    def test_flush_method_callable(self, class_path: str, config_factory: Any, expected_name: str) -> None:
+    @pytest.mark.parametrize("sink_class,config_factory,expected_name", SINK_CONFIGS)
+    def test_flush_method_callable(
+        self,
+        sink_class: type[BaseSink],
+        config_factory: Callable[[], dict[str, Any]],
+        expected_name: str,
+    ) -> None:
         """All sinks must have callable flush() method."""
-        sink_class = _import_sink_class(class_path)
         sink = inject_write_failure(sink_class(config_factory()))
 
         # Direct method call - crash on missing (our code, our bug)
@@ -146,20 +153,28 @@ class TestSinkProtocolCompliance:
         # Clean up
         sink.close()
 
-    @pytest.mark.parametrize("class_path,config_factory,expected_name", SINK_CONFIGS)
-    def test_close_method_callable_and_idempotent(self, class_path: str, config_factory: Any, expected_name: str) -> None:
+    @pytest.mark.parametrize("sink_class,config_factory,expected_name", SINK_CONFIGS)
+    def test_close_method_callable_and_idempotent(
+        self,
+        sink_class: type[BaseSink],
+        config_factory: Callable[[], dict[str, Any]],
+        expected_name: str,
+    ) -> None:
         """All sinks must have callable close() method that is idempotent."""
-        sink_class = _import_sink_class(class_path)
         sink = inject_write_failure(sink_class(config_factory()))
 
         # Direct method call - crash on missing (our code, our bug)
         sink.close()  # First close
         sink.close()  # Second close - should not raise (idempotency)
 
-    @pytest.mark.parametrize("class_path,config_factory,expected_name", SINK_CONFIGS)
-    def test_lifecycle_hooks_exist(self, class_path: str, config_factory: Any, expected_name: str) -> None:
+    @pytest.mark.parametrize("sink_class,config_factory,expected_name", SINK_CONFIGS)
+    def test_lifecycle_hooks_exist(
+        self,
+        sink_class: type[BaseSink],
+        config_factory: Callable[[], dict[str, Any]],
+        expected_name: str,
+    ) -> None:
         """All sinks must have on_start() and on_complete() lifecycle hooks."""
-        sink_class = _import_sink_class(class_path)
         sink = inject_write_failure(sink_class(config_factory()))
 
         # Create mock context
@@ -172,10 +187,14 @@ class TestSinkProtocolCompliance:
         # Clean up
         sink.close()
 
-    @pytest.mark.parametrize("class_path,config_factory,expected_name", SINK_CONFIGS)
-    def test_resume_methods_exist(self, class_path: str, config_factory: Any, expected_name: str) -> None:
+    @pytest.mark.parametrize("sink_class,config_factory,expected_name", SINK_CONFIGS)
+    def test_resume_methods_exist(
+        self,
+        sink_class: type[BaseSink],
+        config_factory: Callable[[], dict[str, Any]],
+        expected_name: str,
+    ) -> None:
         """All sinks must have configure_for_resume() and validate_output_target() methods."""
-        sink_class = _import_sink_class(class_path)
         sink = inject_write_failure(sink_class(config_factory()))
 
         # Direct attribute access - crash on missing (our code, our bug)

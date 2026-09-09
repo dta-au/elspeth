@@ -54,6 +54,9 @@ class Finding:
     suggestion: str | None = None
     symbol_context: tuple[str, ...] = ()
     ast_path: str = ""
+    scope_fingerprint: str = ""
+    file_fingerprint: str = ""
+    scope_depth: int = 0
 
     def canonical_key(self, symbol_context: tuple[str, ...] | None = None) -> str:
         """Return the allowlist key used for exact finding suppression."""

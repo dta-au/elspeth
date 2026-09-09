@@ -155,6 +155,26 @@ class TestRetryManager:
 
         assert call_count == 1
 
+    def test_shutdown_before_backoff_does_not_emit_retry_callback(self) -> None:
+        """Cancellation at the backoff boundary must not audit a retry that cannot start."""
+        manager = RetryManager(RuntimeRetryConfig(max_attempts=3, base_delay=30.0, max_delay=30.0, jitter=0.0, exponential_base=2.0))
+        shutdown_event = threading.Event()
+        retries: list[int] = []
+
+        def cancelled_after_first_failure() -> None:
+            shutdown_event.set()
+            raise ValueError("transient provider failure")
+
+        with pytest.raises(InterruptedError, match="shutdown requested"):
+            manager.execute_with_retry(
+                cancelled_after_first_failure,
+                is_retryable=lambda e: isinstance(e, ValueError),
+                on_retry=lambda attempt, _error: retries.append(attempt),
+                shutdown_event=shutdown_event,
+            )
+
+        assert retries == []
+
     def test_from_policy_none_returns_no_retry(self) -> None:
         """Missing policy defaults to no-retry for safety."""
         config = RuntimeRetryConfig.from_policy(None)

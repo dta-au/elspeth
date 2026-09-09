@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
@@ -126,7 +124,6 @@ class SourceCompletionReconciler:
         *,
         run_id: str,
         coordination_token: CoordinationToken,
-        at: datetime,
     ) -> int:
         """Repair pre-fix TS-02 gaps atomically before any plugin can run.
 
@@ -139,7 +136,6 @@ class SourceCompletionReconciler:
         with fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
-            now=at,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="reconcile_source_completions_from_scheduler",
         ) as conn:

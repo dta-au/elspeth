@@ -25,6 +25,8 @@ from hypothesis import find, given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import PendingOutcome, RunStatus, TerminalOutcome, TerminalPath, TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.engine.orchestrator.outcomes import accumulate_row_outcomes
@@ -153,15 +155,21 @@ def completed_row_counter_shapes(draw: st.DrawFn) -> dict[str, int]:
     }
 
 
-def _make_token(*, branch_name: str | None = None, join_group_id: str | None = None) -> TokenInfo:
-    """Create a minimal TokenInfo for testing."""
+def _make_token(*, branch_name: str | None = None) -> TokenInfo:
+    """Create a minimal TokenInfo for testing.
+
+    ``branch_name`` is a read-only property derived from the innermost FORK
+    frame in ``lineage_path`` — passing it here builds that frame.
+    """
     row = PipelineRow({"field": "value"}, _TEST_CONTRACT)
+    lineage_path: tuple[LineageFrame, ...] = ()
+    if branch_name is not None:
+        lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key=branch_name),)
     return TokenInfo(
         row_id="row-1",
         token_id="tok-1",
         row_data=row,
-        branch_name=branch_name,
-        join_group_id=join_group_id,
+        lineage_path=lineage_path,
     )
 
 
@@ -189,9 +197,9 @@ def _make_row_result(
             from elspeth.contracts.results import FailureInfo
 
             error = FailureInfo(exception_type="TransformError", message="boom")
+    join_group_id = "join-1" if path == TerminalPath.COALESCED else None
     token = _make_token(
         branch_name=branch_name,
-        join_group_id="join-1" if path == TerminalPath.COALESCED else None,
     )
     return RowResult(
         token=token,
@@ -200,6 +208,7 @@ def _make_row_result(
         path=path,
         sink_name=sink_name,
         error=error,  # type: ignore[arg-type]
+        join_group_id=join_group_id,
     )
 
 
@@ -844,15 +853,36 @@ class TestRunResultFieldProperties:
         corresponding value from ExecutionCounters.
         """
         result = counters.to_run_result("run-1", status=RunStatus.RUNNING)
+        # Explicit (field, RunResult value, ExecutionCounters value) table: direct
+        # attribute access on both owned dataclasses, so a missing field raises
+        # AttributeError instead of being silently skipped.
+        counter_pairs: tuple[tuple[str, int, int], ...] = (
+            ("rows_processed", result.rows_processed, counters.rows_processed),
+            ("rows_succeeded", result.rows_succeeded, counters.rows_succeeded),
+            ("rows_failed", result.rows_failed, counters.rows_failed),
+            ("rows_routed_success", result.rows_routed_success, counters.rows_routed_success),
+            ("rows_routed_failure", result.rows_routed_failure, counters.rows_routed_failure),
+            ("rows_quarantined", result.rows_quarantined, counters.rows_quarantined),
+            ("rows_forked", result.rows_forked, counters.rows_forked),
+            ("rows_coalesced", result.rows_coalesced, counters.rows_coalesced),
+            ("rows_coalesce_failed", result.rows_coalesce_failed, counters.rows_coalesce_failed),
+            ("rows_expanded", result.rows_expanded, counters.rows_expanded),
+            ("rows_buffered", result.rows_buffered, counters.rows_buffered),
+            ("rows_diverted", result.rows_diverted, counters.rows_diverted),
+        )
+        # Coverage is still derived from the live dataclass: a new RunResult
+        # counter field fails here until it is added to the table above.
         run_result_fields = {f.name for f in fields(result)}
         # Non-counter fields
         meta_fields = {"run_id", "status", "routed_destinations"}
         counter_fields = run_result_fields - meta_fields
+        covered = {name for name, _, _ in counter_pairs}
+        assert covered == counter_fields, (
+            f"table drifted from RunResult: missing={counter_fields - covered}, extra={covered - counter_fields}"
+        )
 
-        for field_name in counter_fields:
+        for field_name, run_value, counter_value in counter_pairs:
             # Every counter field must have a matching value from ExecutionCounters
-            run_value = getattr(result, field_name)
-            counter_value = getattr(counters, field_name)
             assert run_value == counter_value, f"Field {field_name} mismatch: RunResult={run_value}, Counters={counter_value}"
 
 

@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import mermaid from "mermaid";
 import DOMPurify from "dompurify";
 import { Highlight, themes as prismThemes } from "prism-react-renderer";
+import { Button } from "@/components/ui";
 import { useTheme, type ResolvedTheme } from "@/hooks/useTheme";
 
 type MermaidConfig = NonNullable<Parameters<typeof mermaid.initialize>[0]>;
@@ -43,6 +44,19 @@ mermaid.initialize({ startOnLoad: false, theme: "dark" });
 
 interface MarkdownRendererProps {
   content: string;
+}
+
+/**
+ * Keep pipeline-shaped flowcharts readable inside the bounded authoring pane.
+ * Mermaid's LR/RL directions make even a modest pipeline wider than the
+ * Composer column. This changes only the flowchart declaration passed to the
+ * renderer; the audited assistant message remains byte-for-byte unchanged.
+ */
+export function verticalisePipelineFlowchart(chart: string): string {
+  return chart.replace(
+    /^(\s*(?:flowchart|graph))\s+(?:LR|RL)\b/im,
+    "$1 TB",
+  );
 }
 
 /**
@@ -164,14 +178,14 @@ function FencedCodeBlock({
 
   return (
     <div className="code-block-wrapper">
-      <button
-        type="button"
+      <Button
+        variant="bare"
         className="code-block-copy"
         onClick={handleCopy}
         aria-label={copied ? "Copied" : "Copy code"}
       >
         {copied ? "Copied" : "Copy"}
-      </button>
+      </Button>
       <Highlight code={code} language={language || "text"} theme={prismTheme}>
         {({ className: hClass, style, tokens, getLineProps, getTokenProps }) => (
           <pre className={`code-block ${hClass}`} style={style}>
@@ -204,6 +218,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
   // Counter forces a unique mermaid render ID when the theme changes,
   // since mermaid.render() caches by ID.
   const [renderCount, setRenderCount] = useState(0);
+  const renderedChart = verticalisePipelineFlowchart(chart);
 
   // Re-initialize mermaid when theme changes
   useEffect(() => {
@@ -218,7 +233,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
     let cancelled = false;
 
     mermaid
-      .render(`mermaid-${uniqueId}-${renderCount}`, chart)
+      .render(`mermaid-${uniqueId}-${renderCount}`, renderedChart)
       .then(({ svg }) => {
         if (!cancelled && container) {
           container.innerHTML = DOMPurify.sanitize(svg, {
@@ -228,7 +243,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
       })
       .catch(() => {
         if (!cancelled && container) {
-          container.textContent = chart;
+          container.textContent = renderedChart;
           container.classList.add("mermaid-fallback");
         }
       });
@@ -236,7 +251,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
     return () => {
       cancelled = true;
     };
-  }, [chart, uniqueId, renderCount]);
+  }, [renderedChart, uniqueId, renderCount]);
 
   return (
     <div

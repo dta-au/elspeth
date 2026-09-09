@@ -46,10 +46,7 @@ describe("api/client auth helpers", () => {
         JSON.stringify({
           provider: "oidc",
           registration_mode: "closed",
-          oidc_issuer: "https://issuer.example.com/pool",
-          oidc_client_id: "public-client",
-          authorization_endpoint: "https://auth.example.com/oauth2/authorize",
-          token_endpoint: "https://auth.example.com/oauth2/token",
+          sso_start_url: "https://elspeth.example.gov.au/api/auth/sso/start",
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       ),

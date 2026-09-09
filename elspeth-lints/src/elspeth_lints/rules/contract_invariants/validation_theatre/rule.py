@@ -75,7 +75,7 @@ class ValidationTheatreVisitor(ast.NodeVisitor):
         if not self.source_lines:
             return False
         start = max(1, node.lineno - 4)
-        end = min(len(self.source_lines), (getattr(node, "end_lineno", None) or node.lineno) + 1)
+        end = min(len(self.source_lines), (node.end_lineno or node.lineno) + 1)
         context = "\n".join(self.source_lines[start - 1 : end]).lower()
         return any(term in context for term in _DEFERRED_TERMS)
 

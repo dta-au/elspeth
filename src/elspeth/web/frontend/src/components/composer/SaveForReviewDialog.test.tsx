@@ -1,8 +1,16 @@
+import { readFileSync } from "node:fs";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { SaveForReviewDialog } from "./SaveForReviewDialog";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
+import { useExecutionStore } from "@/stores/executionStore";
+import {
+  COMPLETION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
+import type { ValidationResult } from "@/types/index";
 import * as api from "@/api/shareableReviews";
 
 expect.extend(toHaveNoViolations);
@@ -30,6 +38,9 @@ function _withOrigin(origin: string, fn: () => void) {
 describe("SaveForReviewDialog", () => {
   beforeEach(() => {
     useShareableReviewStore.getState().reset();
+    useExecutionStore.setState({
+      validationResult: makeValidationResult(),
+    });
   });
 
   it("renders nothing when dialogOpen is false", () => {
@@ -50,6 +61,16 @@ describe("SaveForReviewDialog", () => {
     const dialog = screen.getByRole("dialog", { name: "Share for review" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(dialog).toHaveAttribute("aria-labelledby", "save-for-review-dialog-title");
+  });
+
+  it("uses the dynamic viewport when bounding its scroll owner", () => {
+    const css = readFileSync("src/components/composer/composer.css", "utf8");
+    expect(css).toMatch(
+      /\.save-for-review-dialog\s*\{[^}]*max-height:\s*calc\(100dvh - 32px\);[^}]*overflow:\s*auto;/s,
+    );
+    expect(css).not.toMatch(
+      /\.save-for-review-dialog\s*\{[^}]*max-height:\s*calc\(100vh - 32px\);/s,
+    );
   });
 
   // M09 (WCAG 4.1.2): the dialog used to *announce* aria-modal="true" while
@@ -115,6 +136,51 @@ describe("SaveForReviewDialog", () => {
     );
   });
 
+  it("disables and suppresses Retry when completion readiness becomes false", async () => {
+    const apiSpy = vi.spyOn(api, "markReadyForReview");
+    apiSpy.mockRejectedValueOnce({
+      status: 409,
+      detail: "composition validation failed",
+    });
+    await useShareableReviewStore.getState().openAndMark("sess-retry");
+    render(<SaveForReviewDialog />);
+
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: makeValidationResult({
+          readiness: COMPLETION_BLOCKED_VALIDATION_READINESS,
+        }),
+      });
+    });
+
+    const retry = screen.getByTestId("save-for-review-retry");
+    const callsBeforeBlockedRetry = apiSpy.mock.calls.length;
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(apiSpy).toHaveBeenCalledTimes(callsBeforeBlockedRetry);
+  });
+
+  it("disables Retry when a malformed validation response omits readiness", () => {
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures use makeValidationResult.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+    });
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      error: "composition validation failed",
+    } as never);
+
+    render(<SaveForReviewDialog />);
+
+    expect(screen.getByTestId("save-for-review-retry")).toBeDisabled();
+  });
+
   it("shows the share URL and prepends location.origin on success", () => {
     _withOrigin("https://elspeth.example", () => {
       useShareableReviewStore.setState({
@@ -150,7 +216,12 @@ describe("SaveForReviewDialog", () => {
     );
   });
 
-  it("copy button surfaces failure when clipboard API is unavailable", async () => {
+  // elspeth-6eb60a33a9: the failure message must NOT land in the button label.
+  // Both .btn and .btn-compact declare white-space: nowrap, so a sentence-long
+  // label made the button grow and reflowed the URL row under the pointer that
+  // had just clicked it. The button keeps a two-state label and the message
+  // renders in a sibling live region that is mounted BEFORE it has any text.
+  it("copy failure renders beside the button, not inside its label", async () => {
     useShareableReviewStore.setState({
       dialogOpen: true,
       latestResponse: _validResponse,
@@ -160,10 +231,22 @@ describe("SaveForReviewDialog", () => {
     Object.assign(navigator, { clipboard: { writeText } });
 
     render(<SaveForReviewDialog />);
-    fireEvent.click(screen.getByTestId("save-for-review-copy"));
-    await waitFor(() =>
-      expect(screen.getByTestId("save-for-review-copy")).toHaveTextContent(/copy failed/i),
-    );
+    const copyButton = screen.getByTestId("save-for-review-copy");
+    const status = screen.getByTestId("save-for-review-copy-status");
+
+    // The live region pre-exists its content: mounted, addressable, empty.
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toBeEmptyDOMElement();
+    expect(copyButton).toHaveTextContent(/^copy$/i);
+
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(status).toHaveTextContent(/copy failed/i));
+    // Same node, so the region was updated rather than re-inserted.
+    expect(screen.getByTestId("save-for-review-copy-status")).toBe(status);
+    // The label never takes the message, and the button stays retryable.
+    expect(copyButton).toHaveTextContent(/^copy$/i);
+    expect(copyButton).not.toHaveTextContent(/copy failed/i);
   });
 
   it("Close button dispatches close()", () => {

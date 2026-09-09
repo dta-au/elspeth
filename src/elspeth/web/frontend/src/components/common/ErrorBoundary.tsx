@@ -7,6 +7,7 @@
  */
 
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Button } from "@/components/ui";
 
 interface ErrorBoundaryProps {
   /** Label shown in the fallback UI (e.g. "Graph view", "Chat panel") */
@@ -57,12 +58,9 @@ export class ErrorBoundary extends Component<
           <p className="error-boundary-detail">
             {this.state.error?.message ?? "An unexpected error occurred."}
           </p>
-          <button
-            onClick={this.handleRetry}
-            className="btn error-boundary-retry"
-          >
+          <Button onClick={this.handleRetry} className="error-boundary-retry">
             Retry
-          </button>
+          </Button>
         </div>
       );
     }

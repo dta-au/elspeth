@@ -25,7 +25,6 @@ This guide covers common errors and their solutions when running ELSPETH pipelin
   - [Guided chat did not advance the stage](#guided-chat-did-not-advance-the-stage)
   - [Wiring confirmation failed](#wiring-confirmation-failed)
   - [Guided source schema or blob interpretation looks wrong](#guided-source-schema-or-blob-interpretation-looks-wrong)
-  - [Recipe or transform suggestion was not offered](#recipe-or-transform-suggestion-was-not-offered)
 
 ---
 
@@ -41,12 +40,13 @@ This guide covers common errors and their solutions when running ELSPETH pipelin
 
 Option 1 - Set the fingerprint key (recommended for production):
 ```bash
-export ELSPETH_FINGERPRINT_KEY="your-secure-key-here"
+export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 ```
 
-Or add to your `.env` file:
+Persist the generated value in your approved secret store. For local
+development, an untracked `.env` can reference the locally generated value:
 ```bash
-ELSPETH_FINGERPRINT_KEY=your-secure-key-here
+ELSPETH_FINGERPRINT_KEY=fake_replace_with_generated_value_for_docs_only
 ```
 
 Option 2 - Allow raw secrets (development only):
@@ -57,8 +57,8 @@ export ELSPETH_ALLOW_RAW_SECRETS=true
 **Docker:**
 ```bash
 docker run --rm \
-  -e ELSPETH_FINGERPRINT_KEY="your-key" \
-  ghcr.io/johnm-dta/elspeth:v0.7.1 \
+  -e ELSPETH_FINGERPRINT_KEY="${ELSPETH_FINGERPRINT_KEY:?generate and export the fingerprint key}" \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
@@ -82,10 +82,10 @@ docker run --rm \
 3. Ensure you have the correct optional dependencies installed:
    ```bash
    # For LLM plugins
-   uv pip install -e ".[llm]"
+   uv sync --frozen --extra llm
 
    # For all plugins
-   uv pip install -e ".[all]"
+   uv sync --frozen --all-extras
    ```
 
 ---
@@ -100,9 +100,12 @@ docker run --rm \
 
 1. Check your `.env` file has the correct API key:
    ```bash
-   OPENROUTER_API_KEY=sk-or-...
-   AZURE_OPENAI_API_KEY=...
+   OPENROUTER_API_KEY=fake_openrouter_key_for_docs_only
+   AZURE_OPENAI_API_KEY=fake_azure_openai_key_for_docs_only
    ```
+
+   Replace the obvious documentation-only values from your approved secret
+   store; never commit the resulting `.env`.
 
 2. Verify the key is valid and not expired
 
@@ -120,8 +123,8 @@ docker run --rm \
      - plugin: llm
        options:
          provider: azure
-         endpoint: "https://your-resource.openai.azure.com"
-         deployment_name: "your-deployment"
+         endpoint: "https://example-resource.openai.azure.com"
+         deployment_name: "example-deployment"
    ```
 
 ---
@@ -169,7 +172,7 @@ docker run --rm \
 
 **Solution:**
 ```bash
-uv pip install 'elspeth[tracing-langfuse]'
+uv sync --frozen --extra tracing-langfuse
 ```
 
 ---
@@ -221,14 +224,14 @@ uv pip install 'elspeth[tracing-langfuse]'
 
 2. Look for quarantined rows:
    ```sql
-   SELECT * FROM node_states WHERE status = 'quarantined';
+   SELECT * FROM token_outcomes WHERE path = 'quarantined_at_source';
    ```
 
 3. Validate your source data matches the expected schema
 
 4. Use the MCP analysis server for detailed investigation:
    ```bash
-   elspeth-mcp --database ./runs/audit.db
+   elspeth-mcp --database sqlite:///./runs/audit.db
    ```
 
 ---
@@ -302,23 +305,27 @@ uv pip install 'elspeth[tracing-langfuse]'
    ```bash
    docker run --rm \
      -v $(pwd)/input:/app/input:ro \
-     ghcr.io/johnm-dta/elspeth:v0.7.1 \
+     ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an exact published tag} \
      ls /app/input
    ```
 
 2. Ensure pipeline config uses container paths, not host paths:
    ```yaml
    # CORRECT - container path
-   source:
-     plugin: csv
-     options:
-       path: /app/input/data.csv
+   sources:
+     primary:
+       plugin: csv
+       on_success: output
+       options:
+         path: /app/input/data.csv
 
    # WRONG - host path
-   source:
-     plugin: csv
-     options:
-       path: ./input/data.csv
+   sources:
+     primary:
+       plugin: csv
+       on_success: output
+       options:
+         path: ./input/data.csv
    ```
 
 ---
@@ -397,18 +404,19 @@ The readiness probe prevents traffic before the app is ready. The liveness probe
    - Missing colons after keys
    - Unquoted special characters
 
-3. Use a YAML linter:
+3. Parse the file independently with the already locked PyYAML dependency:
    ```bash
-   # Install yamllint
-   uv pip install yamllint
-   yamllint settings.yaml
+   uv run --frozen python -c \
+     'import pathlib, sys, yaml; yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())' \
+     settings.yaml
    ```
 
 ---
 
 ### Schema Validation Failures
 
-**Error:** `ValidationError: field required` or `ValidationError: value is not a valid...`
+**Error:** `ValidationError` with a per-field line such as `Field required` or
+`Input should be a valid integer, unable to parse string as an integer`
 
 **Cause:** Missing required configuration fields or wrong types.
 
@@ -422,7 +430,7 @@ The readiness probe prevents traffic before the app is ready. The liveness probe
 2. Check the configuration reference for required fields
 
 3. Common issues:
-   - Missing `source` section
+   - Missing `sources` section
    - Missing `sinks` section
    - Plugin options with wrong types
    - Undefined environment variables in `${VAR}` syntax
@@ -461,16 +469,13 @@ interpretation card must be reviewed first.
 
 **Cause:** The final guided stage (`STEP_4_WIRE`) accepts only a valid
 `CONFIRM_WIRING` payload. The wire turn is re-emitted when connection labels do
-not map to valid edges, when required/nested keys are missing, or when the
-advisor sign-off path returns `REQUEST_ADVISOR`.
+not map to valid edges or when required/nested keys are missing.
 
 **Solution:**
 
 1. Review the graph overlay and the listed source/sink/transform contracts.
 2. Correct the connection labels or ask the guided chat to revise the wiring
    using the exact node names shown in the overlay.
-3. If the response asks for advisor review, keep the pipeline in the wire stage
-   and follow the advisor guidance; do not treat the request as completion.
 
 ---
 
@@ -489,23 +494,6 @@ interpreted the source intent too broadly.
 3. If the source is actually a remote document workflow, model it as a manifest
    source followed by `blob_fetch` and a parser transform such as
    `blob_csv_expand`, not as a new source plugin.
-
----
-
-### Recipe or transform suggestion was not offered
-
-**Cause:** Guided mode may apply a registered recipe, but the recipe must match
-the actual source, sink, required fields, and safety constraints. A bare
-"CSV to JSON" shape is not enough.
-
-**Solution:**
-
-1. State the desired output fields and safety constraints explicitly in the
-   sink or transform stage.
-2. Use the plugin catalog to confirm the transform exists and that its required
-   options are available.
-3. If no recipe matches, ask guided chat for a direct transform-stage proposal
-   or switch to the YAML/freeform path for custom topology.
 
 ---
 

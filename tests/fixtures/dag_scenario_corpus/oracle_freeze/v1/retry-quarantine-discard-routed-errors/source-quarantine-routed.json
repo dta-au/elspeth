@@ -1,0 +1,37 @@
+{
+ "case_id": "source-quarantine-routed",
+ "expansions": [],
+ "rows": [
+  1,
+  0,
+  1
+ ],
+ "scenario_id": "retry-quarantine-discard-routed-errors",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"id\":\"not-an-int\",\"value\":\"10\"}"
+   ],
+   "sink_name": "quarantine"
+  }
+ ],
+ "status": "completed_with_failures",
+ "terminal_dispositions": [
+  {
+   "error_hash": "00616901a7f46051",
+   "key": "primary:0#0",
+   "outcome": "failure",
+   "path": "quarantined_at_source",
+   "sink_name": "quarantine",
+   "token_key": "primary:0#0"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  }
+ ]
+}

@@ -16,17 +16,31 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { requestValidate } from "@/stores/subscriptions";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { Input } from "@/components/ui";
 import { fuzzyMatch } from "@/utils/fuzzyScore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
-  OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
+  REQUEST_RUN_EVENT,
+  claimWorkspaceViewIntent,
+  dispatchClaimedAuthoringFocusIntent,
+  dispatchClaimedArtifactViewIntent,
 } from "@/lib/composer-events";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface Command {
   id: string;
+  /**
+   * User-visible command name, in the product's sentence-case register
+   * (elspeth-93897c03d1): first word capitalised, everything after it lower
+   * case unless it is an acronym (YAML). Where a command carries a `shortcut`
+   * that `ShortcutsHelp` also documents, the two labels must be the SAME
+   * string — the palette is where users learn a command's name, and the
+   * shortcuts sheet is where they look it up again seconds later.
+   * `commandRegister.test.tsx` pins both halves.
+   *
+   * Session commands are exempt: their title is user data, not product copy.
+   */
   title: string;
   category: "action" | "session" | "navigation";
   shortcut?: string;
@@ -38,6 +52,7 @@ interface Command {
 interface CommandPaletteProps {
   isOpen: boolean;
   onClose: () => void;
+  runAdmissionAvailable: boolean;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -45,6 +60,7 @@ interface CommandPaletteProps {
 export function CommandPalette({
   isOpen,
   onClose,
+  runAdmissionAvailable,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -62,8 +78,9 @@ export function CommandPalette({
   const guidedSession = useSessionStore((s) => s.guidedSession);
   const reenterGuided = useSessionStore((s) => s.reenterGuided);
 
-  const execute = useExecutionStore((s) => s.execute);
   const validationResult = useExecutionStore((s) => s.validationResult);
+  const isExecuting = useExecutionStore((s) => s.isExecuting);
+  const progress = useExecutionStore((s) => s.progress);
 
   // Build command list
   const commands = useMemo<Command[]>(() => {
@@ -72,7 +89,7 @@ export function CommandPalette({
     // Actions
     cmds.push({
       id: "new-session",
-      title: "New Session",
+      title: "New session",
       category: "action",
       shortcut: "Ctrl+N",
       action: () => {
@@ -83,7 +100,7 @@ export function CommandPalette({
 
     cmds.push({
       id: "validate",
-      title: "Validate Pipeline",
+      title: "Validate pipeline",
       category: "action",
       shortcut: "Ctrl+Shift+V",
       enabled: !!compositionState && !!activeSessionId,
@@ -97,13 +114,18 @@ export function CommandPalette({
 
     cmds.push({
       id: "execute",
-      title: "Execute Pipeline",
+      title: "Execute pipeline",
       category: "action",
       shortcut: "Ctrl+E",
-      enabled: validationResult?.is_valid === true && !!activeSessionId,
+      enabled:
+        runAdmissionAvailable &&
+        validationResult?.readiness?.execution_ready === true &&
+        !isExecuting &&
+        progress?.status !== "running" &&
+        !!activeSessionId,
       action: () => {
         if (activeSessionId) {
-          execute(activeSessionId);
+          window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT));
         }
         onClose();
       },
@@ -111,15 +133,21 @@ export function CommandPalette({
 
     cmds.push({
       id: "focus-chat",
-      title: "Focus Chat Input",
+      // The parenthetical is load-bearing: this chord ALSO un-collapses a
+      // collapsed authoring pane (dispatchAuthoringFocusIntent), and a user
+      // hunting for "how do I get the chat back" would never connect a bare
+      // "Focus chat input" with restoring the pane (2026-08-15 UX review).
+      // commandRegister.test.tsx pins word-for-word agreement with the
+      // shortcuts sheet's Ctrl+/ entry.
+      title: "Focus chat input (restores collapsed pane)",
       category: "action",
       shortcut: "Ctrl+/",
       action: () => {
-        const input = document.querySelector<HTMLTextAreaElement>(
-          "[data-chat-input]",
-        );
-        input?.focus();
+        const intent = claimWorkspaceViewIntent();
         onClose();
+        queueMicrotask(() => {
+          dispatchClaimedAuthoringFocusIntent(intent);
+        });
       },
     });
 
@@ -130,7 +158,7 @@ export function CommandPalette({
     ) {
       cmds.push({
         id: "reenter-guided",
-        title: "Re-enter Guided Mode",
+        title: "Re-enter guided mode",
         category: "action",
         action: () => {
           void reenterGuided();
@@ -140,13 +168,20 @@ export function CommandPalette({
     }
 
     cmds.push({
-      id: "open-graph-modal",
-      title: "Open graph view",
+      id: "show-graph",
+      title: "Show graph",
       category: "navigation",
       shortcut: "Ctrl+Shift+G",
       action: () => {
-        window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
+        const intent = claimWorkspaceViewIntent();
         onClose();
+        queueMicrotask(() => {
+          dispatchClaimedArtifactViewIntent(intent, {
+            tab: "graph",
+            focusMode: false,
+            sessionId: activeSessionId,
+          });
+        });
       },
     });
 
@@ -155,13 +190,21 @@ export function CommandPalette({
       title: "Export YAML",
       category: "navigation",
       shortcut: "Ctrl+Shift+Y",
-      // Same hasCompositionContent gate ExportYamlButton applies — an empty
-      // pipeline has nothing to export, and this command was a leftover
-      // path into the near-empty modal (elspeth-bff8043d33 residual).
+      // Same hasCompositionContent gate the Ctrl+Shift+Y shortcut applies —
+      // an empty pipeline has nothing to export, and this command was a
+      // leftover path into the near-empty modal (elspeth-bff8043d33
+      // residual).
       enabled: hasCompositionContent(compositionState),
       action: () => {
-        window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
+        const intent = claimWorkspaceViewIntent();
         onClose();
+        queueMicrotask(() => {
+          dispatchClaimedArtifactViewIntent(intent, {
+            tab: "yaml",
+            focusMode: false,
+            sessionId: activeSessionId,
+          });
+        });
       },
     });
 
@@ -189,10 +232,12 @@ export function CommandPalette({
     compositionState,
     guidedSession,
     validationResult,
+    runAdmissionAvailable,
+    isExecuting,
+    progress,
     createSession,
     selectSession,
     reenterGuided,
-    execute,
     onClose,
   ]);
 
@@ -296,9 +341,11 @@ export function CommandPalette({
         aria-label="Command palette"
         onKeyDown={handleKeyDown}
       >
-        {/* Search input */}
+        {/* bare: .command-palette-input is a complete bespoke recipe;
+            .input's chrome would restyle the palette. */}
         <div className="command-palette-input-wrapper">
-          <input
+          <Input
+            bare
             ref={inputRef}
             type="text"
             role="combobox"

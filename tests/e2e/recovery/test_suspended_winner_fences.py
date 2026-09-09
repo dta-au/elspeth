@@ -29,7 +29,7 @@ Common contract asserted for EVERY fenced verb:
       expiry moves forward (verify-AND-EXTEND, design :246-255).
 
 Slice scope: ``adopt_blocked_barrier_item`` and
-``adopt_coalesce_branch_losses`` joined this matrix in slice 3 (design :490);
+``adopt_group_losses`` joined this matrix in slice 3 (design :490);
 the membership-fence arms (``claim_ready`` / ``claim_pending_sink`` /
 ``enqueue_ready`` refusing ``RunWorkerEvictedError``) are slice 4.
 """
@@ -46,25 +46,27 @@ from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
     RunLeadershipLostError,
     RunWorkerEvictedError,
 )
-from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import (
     BatchMembershipSpec,
     BufferedOutcomeSpec,
     TokenSchedulerRepository,
-    record_coalesce_branch_loss,
+    record_group_loss,
 )
 from elspeth.core.landscape.schema import (
     batch_members_table,
     batches_table,
-    coalesce_branch_losses_table,
+    group_losses_table,
     run_coordination_table,
     run_workers_table,
     runs_table,
@@ -88,6 +90,7 @@ from tests.e2e.recovery.harness import (
     _run_workers,
     _usurp_seat,
 )
+from tests.fixtures.landscape import expire_leader_seat
 from tests.helpers.checkpoint import create_checkpoint
 
 WORKER_OLD = "worker-old"
@@ -107,7 +110,6 @@ def _takeover_image(tmp_path: Path) -> tuple[_CrashedRun, CoordinationToken]:
     token_old = _coord(crashed).acquire_run_leadership(
         run_id=crashed.run_id,
         worker_id=WORKER_OLD,
-        now=clock.now_utc(),
         window_seconds=80.0,
     )
     return crashed, token_old
@@ -143,13 +145,11 @@ def _seed_journal_row(crashed: _CrashedRun, *, ingest_sequence: int) -> tuple[st
         step_index=crashed.journal_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-        available_at=crashed.clock.now_utc(),
     )
     claimed = crashed.repo.claim_ready(
         run_id=crashed.run_id,
         lease_owner=WORKER_OLD,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
-        now=crashed.clock.now_utc(),
     )
     assert claimed is not None and claimed.token_id == token.token_id
     return token.token_id, row.row_id, claimed.work_item_id
@@ -168,7 +168,6 @@ def _parked_pending_sink(crashed: _CrashedRun, *, ingest_sequence: int, claim_ba
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=crashed.clock.now_utc(),
         expected_lease_owner=WORKER_OLD,
     )
     if claim_back:
@@ -176,7 +175,6 @@ def _parked_pending_sink(crashed: _CrashedRun, *, ingest_sequence: int, claim_ba
             run_id=crashed.run_id,
             lease_owner=WORKER_OLD,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=crashed.clock.now_utc(),
         )
         assert reclaimed is not None and reclaimed.token_id == token_id
     return token_id
@@ -193,7 +191,7 @@ def _seed_active_follower(crashed: _CrashedRun, *, worker_id: str = "worker-foll
                 role="follower",
                 status="active",
                 registered_at=now,
-                heartbeat_expires_at=now + timedelta(hours=1),
+                heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1),
                 entry_point="join",
             )
         )
@@ -261,7 +259,7 @@ class TestSuspendedWinnerFences:
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
-            crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=token_old)
+            crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token_old)
         assert not isinstance(exc_info.value, AuditIntegrityError)
 
         status, completed_at = _run_status_and_completed_at(crashed.db, crashed.run_id)
@@ -277,7 +275,7 @@ class TestSuspendedWinnerFences:
 
         # Positive control: the current leader finalizes; expiry extends;
         # the seeded follower is departed by the §D hygiene arm.
-        crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=current)
+        crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=current)
         status, _ = _run_status_and_completed_at(crashed.db, crashed.run_id)
         assert status == RunStatus.COMPLETED.value
         _assert_seat_extended(crashed, seat_before)
@@ -293,7 +291,7 @@ class TestSuspendedWinnerFences:
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
-            crashed.factory.run_lifecycle.update_run_status(crashed.run_id, RunStatus.FAILED, token=token_old)
+            crashed.factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=token_old)
         assert not isinstance(exc_info.value, AuditIntegrityError)
 
         status, _ = _run_status_and_completed_at(crashed.db, crashed.run_id)
@@ -301,7 +299,7 @@ class TestSuspendedWinnerFences:
         _assert_refusal_contract(crashed, verb="update_run_status", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
 
         # Positive control.
-        crashed.factory.run_lifecycle.update_run_status(crashed.run_id, RunStatus.FAILED, token=current)
+        crashed.factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=current)
         status, _ = _run_status_and_completed_at(crashed.db, crashed.run_id)
         assert status == RunStatus.FAILED.value
         _assert_seat_extended(crashed, seat_before)
@@ -355,7 +353,6 @@ class TestSuspendedWinnerFences:
             work_item_id=work_item_id,
             queue_key=None,
             barrier_key="barrier-1",
-            now=crashed.clock.now_utc(),
             expected_lease_owner=WORKER_OLD,
         )
         current = _usurp(crashed)
@@ -373,7 +370,6 @@ class TestSuspendedWinnerFences:
                 consumed_token_ids=(token_id,),
                 emitted_pending_sink=(),
                 emitted_ready=(),
-                now=crashed.clock.now_utc(),
                 coordination_token=token_old,
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
@@ -392,7 +388,6 @@ class TestSuspendedWinnerFences:
             consumed_token_ids=(token_id,),
             emitted_pending_sink=(),
             emitted_ready=(),
-            now=crashed.clock.now_utc(),
             coordination_token=current,
         )
         assert _work_item(crashed.db, token_id)["status"] == TokenWorkStatus.TERMINAL.value
@@ -413,7 +408,6 @@ class TestSuspendedWinnerFences:
             work_item_id=work_item_id,
             queue_key=None,
             barrier_key="agg-1",
-            now=crashed.clock.now_utc(),
             expected_lease_owner=WORKER_OLD,
         )
         batch = crashed.factory.execution.create_batch(crashed.run_id, crashed.journal_node_id)
@@ -433,7 +427,6 @@ class TestSuspendedWinnerFences:
                 barrier_key="agg-1",
                 membership=BatchMembershipSpec(batch_id=batch.batch_id, ordinal=0),
                 buffered_outcome=BufferedOutcomeSpec(batch_id=batch.batch_id),
-                now=crashed.clock.now_utc(),
                 coordination_token=coordination_token,
             )
 
@@ -478,54 +471,117 @@ class TestSuspendedWinnerFences:
         assert live_buffered == 1, "exactly one live non-terminal BUFFERED acceptance"
         crashed.db.close()
 
-    def test_stale_adopt_coalesce_branch_losses_refused(self, tmp_path: Path) -> None:
-        """Slice 3 (design §E.5): a deposed leader cannot move the branch-loss
+    def test_stale_adopt_group_losses_refused(self, tmp_path: Path) -> None:
+        """Slice 3 (spec §6.2): a deposed leader cannot move the group-loss
         replay cursor (``adopted_epoch`` stays NULL for the real leader's
         intake replay)."""
         crashed, token_old = _takeover_image(tmp_path)
+        row = crashed.factory.data_flow.create_row(
+            run_id=crashed.run_id,
+            source_node_id=crashed.source_node_id,
+            row_index=99,
+            data={"id": 99},
+            source_row_index=99,
+            ingest_sequence=99,
+        )
+        token = crashed.factory.data_flow.create_token(row_id=row.row_id, token_id="token-left")
         with begin_write(crashed.db.engine) as conn:
-            assert record_coalesce_branch_loss(
+            assert record_group_loss(
                 conn,
                 run_id=crashed.run_id,
-                coalesce_name="merge",
-                row_id="row-3",
-                branch_name="left",
-                token_id="token-left",
-                reason="failed",
+                spec=GroupLossSpec(
+                    closer_name="merge",
+                    group_id="fg_3",
+                    member_key="left",
+                    token_id=token.token_id,
+                    reason="failed",
+                ),
                 recorded_by=WORKER_OLD,
                 now=crashed.clock.now_utc(),
             )
-        (loss,) = crashed.repo.list_unadopted_coalesce_branch_losses(run_id=crashed.run_id)
+        (loss,) = crashed.repo.list_unadopted_group_losses(run_id=crashed.run_id)
         current = _usurp(crashed)
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
-            crashed.repo.adopt_coalesce_branch_losses(
+            crashed.repo.adopt_group_losses(
                 run_id=crashed.run_id,
                 loss_ids=(loss.loss_id,),
-                now=crashed.clock.now_utc(),
                 coordination_token=token_old,
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
 
         with crashed.db.engine.connect() as conn:
             adopted_epoch = conn.execute(
-                select(coalesce_branch_losses_table.c.adopted_epoch).where(coalesce_branch_losses_table.c.loss_id == loss.loss_id)
+                select(group_losses_table.c.adopted_epoch).where(group_losses_table.c.loss_id == loss.loss_id)
             ).scalar_one()
         assert adopted_epoch is None, "the replay cursor did not move"
-        _assert_refusal_contract(crashed, verb="adopt_coalesce_branch_losses", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
+        _assert_refusal_contract(crashed, verb="adopt_group_losses", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
 
         # Positive control: the current leader marks it under its own epoch.
-        marked = crashed.repo.adopt_coalesce_branch_losses(
+        marked = crashed.repo.adopt_group_losses(
             run_id=crashed.run_id,
             loss_ids=(loss.loss_id,),
-            now=crashed.clock.now_utc(),
             coordination_token=current,
         )
         assert marked == 1
-        assert crashed.repo.list_unadopted_coalesce_branch_losses(run_id=crashed.run_id) == []
-        full = crashed.repo.list_coalesce_branch_losses(run_id=crashed.run_id)
+        assert crashed.repo.list_unadopted_group_losses(run_id=crashed.run_id) == []
+        full = crashed.repo.list_group_losses(run_id=crashed.run_id)
         assert [loss_row.adopted_epoch for loss_row in full] == [current.leader_epoch]
+        _assert_seat_extended(crashed, seat_before)
+        crashed.db.close()
+
+    def test_stale_stage_escalation_loss_refused(self, tmp_path: Path) -> None:
+        """WS3 Task 8 (spec §6.3): a deposed leader cannot stage an escalated
+        group-loss row. ``stage_escalation_loss`` shares ``adopt_group_losses``'s
+        exact ``fenced_leader_transaction`` wrapper — there is no claimed
+        token at intake time for either verb, so both fence the same way."""
+        crashed, token_old = _takeover_image(tmp_path)
+        row = crashed.factory.data_flow.create_row(
+            run_id=crashed.run_id,
+            source_node_id=crashed.source_node_id,
+            row_index=98,
+            data={"id": 98},
+            source_row_index=98,
+            ingest_sequence=98,
+        )
+        token = crashed.factory.data_flow.create_token(row_id=row.row_id, token_id="token-outer-a")
+        current = _usurp(crashed)
+        seat_before = _coordination_row(crashed.db, crashed.run_id)
+
+        spec = GroupLossSpec(
+            closer_name="outer_closer",
+            group_id="fg_outer",
+            member_key="outer_a",
+            token_id=token.token_id,
+            reason="group_failed",
+        )
+
+        def _stage(coordination_token: CoordinationToken) -> bool:
+            return crashed.repo.stage_escalation_loss(
+                run_id=crashed.run_id,
+                spec=spec,
+                frame_kind=FrameKind.FORK,
+                declared_roster=("outer_a",),
+                recorded_by=WORKER_OLD,
+                coordination_token=coordination_token,
+            )
+
+        with pytest.raises(RunLeadershipLostError) as exc_info:
+            _stage(token_old)
+        assert not isinstance(exc_info.value, AuditIntegrityError)
+
+        assert crashed.repo.list_group_losses(run_id=crashed.run_id) == [], "no row staged under the stale token"
+        _assert_refusal_contract(crashed, verb="stage_escalation_loss", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
+
+        # Positive control: the current leader stages the same escalation.
+        inserted = _stage(current)
+        assert inserted is True
+        (loss,) = crashed.repo.list_group_losses(run_id=crashed.run_id)
+        assert loss.closer_name == "outer_closer"
+        assert loss.group_id == "fg_outer"
+        assert loss.member_key == "outer_a"
+        assert loss.adopted_epoch is None, "staging appends the loss row; a separate adopt_group_losses call moves the cursor"
         _assert_seat_extended(crashed, seat_before)
         crashed.db.close()
 
@@ -561,7 +617,6 @@ class TestSuspendedWinnerFences:
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.ingest_row_with_initial_claim(
                 coordination_token=token_old,
-                now=crashed.clock.now_utc(),
                 insert_row_and_token=_insert_for("row-stale", "token-stale"),
                 token_id="token-stale",
                 row_id="row-stale",
@@ -586,7 +641,6 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader ingests at the SAME slot.
         _row, _token, work_item = crashed.repo.ingest_row_with_initial_claim(
             coordination_token=current,
-            now=crashed.clock.now_utc(),
             insert_row_and_token=_insert_for("row-current", "token-current"),
             token_id="token-current",
             row_id="row-current",
@@ -618,7 +672,6 @@ class TestSuspendedWinnerFences:
         token_old = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=WORKER_OLD,
-            now=clock.now_utc(),
             window_seconds=80.0,
         )
         current = _usurp(crashed)
@@ -627,7 +680,6 @@ class TestSuspendedWinnerFences:
 
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.recover_expired_leases(
-                now=clock.now_utc(),
                 coordination_token=token_old,
             )
 
@@ -641,7 +693,6 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader's sweep recovers it.
         assert (
             crashed.repo.recover_expired_leases(
-                now=clock.now_utc(),
                 coordination_token=current,
             )
             == 1
@@ -674,7 +725,6 @@ class TestSuspendedWinnerFences:
             crashed.repo.mark_pending_sink_terminal_many(
                 run_id=crashed.run_id,
                 token_ids=(token_id,),
-                now=crashed.clock.now_utc(),
                 expected_lease_owner=WORKER_OLD,
                 coordination_token=token_old,
             )
@@ -691,7 +741,6 @@ class TestSuspendedWinnerFences:
         terminalized = crashed.repo.mark_pending_sink_terminal_many(
             run_id=crashed.run_id,
             token_ids=(token_id,),
-            now=crashed.clock.now_utc(),
             expected_lease_owner=WORKER_OLD,
             coordination_token=current,
         )
@@ -726,7 +775,6 @@ class TestSuspendedWinnerFences:
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.terminalize_pending_sinks_with_terminal_outcomes(
                 run_id=crashed.run_id,
-                now=crashed.clock.now_utc(),
                 caller_owner=WORKER_OLD,
                 coordination_token=token_old,
             )
@@ -742,7 +790,6 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader's sweep repairs it.
         repaired = crashed.repo.terminalize_pending_sinks_with_terminal_outcomes(
             run_id=crashed.run_id,
-            now=crashed.clock.now_utc(),
             caller_owner=USURPER,
             coordination_token=current,
         )
@@ -759,26 +806,25 @@ class TestSuspendedWinnerFences:
         no bulk follower eviction in the takeover transaction)."""
         crashed, token_old = _takeover_image(tmp_path)
         follower = _seed_active_follower(crashed)
-        clock = crashed.clock
 
-        # The fresh-heartbeat image: worker-old's REGISTRY clock far in the
-        # future; only the SEAT clock expires.
+        # The fresh-heartbeat image: worker-old's REGISTRY deadline far in the
+        # DATABASE clock's future; only the SEAT deadline is expired (ADR-047).
         with crashed.db.engine.begin() as conn:
+            database_now = read_landscape_transaction_time(conn)
             conn.execute(
                 update(run_workers_table)
                 .where(run_workers_table.c.worker_id == WORKER_OLD)
-                .values(heartbeat_expires_at=clock.now_utc() + timedelta(days=365))
+                .values(heartbeat_expires_at=database_now + timedelta(days=365))
             )
             conn.execute(
                 update(run_coordination_table)
                 .where(run_coordination_table.c.run_id == crashed.run_id)
-                .values(leader_heartbeat_expires_at=clock.now_utc() - timedelta(seconds=1))
+                .values(leader_heartbeat_expires_at=database_now - timedelta(seconds=1))
             )
 
         token_new = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id="worker-new",
-            now=clock.now_utc(),
             window_seconds=80.0,
         )
         assert token_new.leader_epoch == token_old.leader_epoch + 1, "epoch monotonic bump E -> E+1"
@@ -874,7 +920,6 @@ class TestSuspendedWinnerFences:
                 run_id=crashed.run_id,
                 lease_owner=evicted_id,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
-                now=clock.now_utc(),
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == evicted_id
@@ -890,7 +935,6 @@ class TestSuspendedWinnerFences:
             run_id=crashed.run_id,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
         assert claimed.lease_owner == USURPER
@@ -910,13 +954,13 @@ class TestSuspendedWinnerFences:
         crashed2, _token_old = _takeover_image(tmp_path)
         # Seed the PENDING_SINK row while WORKER_OLD is still ACTIVE.
         token_id = _parked_pending_sink(crashed2, ingest_sequence=6, claim_back=False)
-        # Now run a real takeover CAS: evicts WORKER_OLD in run_workers.
-        clock2 = crashed2.clock
-        clock2.advance(_DEFAULT_LEASE_SECONDS + 10)  # seat is expired for the takeover
+        # Now run a real takeover CAS: evicts WORKER_OLD in run_workers. The
+        # CAS judges the seat against the Landscape database clock (ADR-047),
+        # so the seat is lapsed through the database, not the MockClock.
+        expire_leader_seat(crashed2.db, crashed2.run_id)
         _coord(crashed2).acquire_run_leadership(
             run_id=crashed2.run_id,
             worker_id=USURPER,
-            now=clock2.now_utc(),
             window_seconds=80.0,
         )
         workers = {w["worker_id"]: w for w in _run_workers(crashed2.db, crashed2.run_id)}
@@ -932,7 +976,6 @@ class TestSuspendedWinnerFences:
                 run_id=crashed2.run_id,
                 lease_owner=WORKER_OLD,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
-                now=clock2.now_utc(),
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == WORKER_OLD
@@ -947,7 +990,6 @@ class TestSuspendedWinnerFences:
             run_id=crashed2.run_id,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock2.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
         crashed.db.close()
@@ -999,7 +1041,6 @@ class TestSuspendedWinnerFences:
                 step_index=crashed.journal_step_index,
                 ingest_sequence=seq,
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-                available_at=clock.now_utc(),
                 worker_id=worker_id,
             )
 

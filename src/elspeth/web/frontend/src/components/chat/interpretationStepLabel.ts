@@ -2,34 +2,75 @@
 // interpretationStepLabel.ts — humanise an interpretation event's
 // affected_node_id into an operator-facing step label.
 //
-// Internal node ids (e.g. `guided_xform_1`) must not leak into user-facing
-// copy.  We resolve the affected node's plugin from the CURRENT composition
-// state and map it to a humanised label ("Summarise", "Fetch", "Output", …),
-// falling back to a humanised plugin name for any other plugin, and to the
-// raw id when the node is absent from the composition.
+// Every node id in a composition is author/LLM-chosen — there is no
+// Composer-side id generator (`transforms.py` takes the caller's id
+// verbatim; the only synthesis anywhere is the unrelated `fork_<connection>`
+// naming on a different path). So the only id NOT worth title-casing as a
+// "name" is one that is trivially just the plugin name (`llm`, `llm_2`, …) —
+// those still resolve to the per-plugin label ("Summarise", "Fetch",
+// "Output", …). Anything else (e.g. `extract_invoice`, or a semantically
+// named id like `llm_rate_coolness`) is title-cased and used as the author's
+// own name for the step — that reads better than a generic plugin verb once
+// the pipeline has more than one node of the same plugin. The raw id is the
+// fallback when the node is absent from the composition entirely.
+//
+// All title-casing routes through catalog/pluginDisplayName.ts — the ONE
+// acronym-aware implementation (elspeth-d2de348437) — so "json_explode" reads
+// "JSON Explode" here exactly as on its catalog card. Do not reintroduce a
+// local titleCase().
 //
 // Presentational only — reads existing store state, never mutates.
 // ============================================================================
 
+import {
+  pluginDisplayName,
+  titleCaseLabel,
+} from "@/components/catalog/pluginDisplayName";
 import type { CompositionState } from "@/types/index";
 
 /**
  * Well-known plugin → step-label map.  Other plugins present in a composition
- * are humanised from the plugin name (see `humanisePlugin`).
+ * take their catalog display name (see `stepLabelForPlugin`). A Map (not a
+ * plain object) so a plugin hypothetically named "constructor" can never
+ * collide with Object.prototype — same discipline as DISPLAY_NAME_OVERRIDES
+ * in catalog/pluginDisplayName.ts.
  */
-const PLUGIN_STEP_LABELS: Record<string, string> = {
-  llm: "Summarise",
-  web_scrape: "Fetch",
-  field_mapper: "Output",
-};
+const PLUGIN_STEP_LABELS: ReadonlyMap<string, string> = new Map([
+  ["llm", "Summarise"],
+  ["web_scrape", "Fetch"],
+  ["field_mapper", "Output"],
+]);
 
-/** Title-case a snake/space-delimited plugin name ("field_mapper" → "Field Mapper"). */
-function humanisePlugin(plugin: string): string {
-  return plugin
-    .split(/[_\s]+/)
-    .filter((part) => part.length > 0)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
+/** Escape a string for literal use inside a RegExp source. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True when `id` is trivially just the plugin name (`llm`) or the plugin name
+ * plus a bare numeric suffix (`llm_2`) — the only shape that carries no
+ * author intent, since every id is author/LLM-chosen and there is no id
+ * generator to detect instead. Anything else is a real, author-given name.
+ *
+ * Exported for validationHumaniser (elspeth-9f21f3c57d), whose phrase ladder
+ * applies the same author-intent test before title-casing a node id.
+ */
+export function isPluginDerivedId(id: string, plugin: string): boolean {
+  if (id === plugin) return true;
+  return new RegExp(`^${escapeRegExp(plugin)}(_\\d+)?$`).test(id);
+}
+
+/**
+ * Normalise a composer-authored description into label register: trimmed,
+ * trailing full stops dropped (descriptions are one-sentence prose, while the
+ * label slots quote or possessive-prefix them mid-sentence). Null when there
+ * is no usable text.
+ */
+export function descriptionLabel(
+  description: string | null | undefined,
+): string | null {
+  const trimmed = (description ?? "").replace(/[.\s]+$/, "").trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 /**
@@ -39,9 +80,15 @@ function humanisePlugin(plugin: string): string {
  * composition node id. Keeping every surface on this one mapping means the
  * wiring list, the problems strip, and the acknowledge cards all name a step
  * identically.
+ *
+ * Plugins outside the verb map take `pluginDisplayName` — the catalog card's
+ * own derivation, curated overrides and acronym set included — so a plugin
+ * never has two display names in one session ("json_explode" reads
+ * "JSON Explode" here exactly as it does on its catalog card;
+ * elspeth-d2de348437).
  */
 export function stepLabelForPlugin(plugin: string): string {
-  return PLUGIN_STEP_LABELS[plugin] ?? humanisePlugin(plugin);
+  return PLUGIN_STEP_LABELS.get(plugin) ?? pluginDisplayName(plugin);
 }
 
 /**
@@ -64,18 +111,112 @@ export function resolveNodePlugin(
 }
 
 /**
- * Humanised step label for an affected_node_id.  Falls back to the raw id
- * when the node is absent, and to a generic phrase when there is no id at all.
+ * True when `nodeId` names a node, source or output of a LOADED composition.
+ * Distinguishes "absent" (the component was removed) from "present but
+ * unlabelable" (a plugin-less structural node with no description) — the
+ * two cases `humaniseStepLabel` words differently. Unloaded state is never
+ * "present".
+ */
+export function isComponentPresent(
+  state: CompositionState | null,
+  nodeId: string | null,
+): boolean {
+  if (state === null || nodeId === null) return false;
+  return (
+    state.nodes.some((candidate) => candidate.id === nodeId) ||
+    Object.prototype.hasOwnProperty.call(state.sources, nodeId) ||
+    state.outputs.some((candidate) => candidate.name === nodeId)
+  );
+}
+
+/**
+ * Step label for a composition node id, or null when the id does not resolve
+ * (component absent from the composition). THE single choke point for the
+ * node-name preference: an id that is trivially just its own plugin's name
+ * (`isPluginDerivedId`) falls back to `stepLabelForPlugin`; any other id is
+ * the author's own name for the step and is title-cased as-is.
+ *
+ * Returns null (not the raw id) on an unresolved id so callers can choose
+ * their own "unknown" phrasing. No caller renders the raw id any more
+ * (elspeth-93f5621f18): `humaniseStepLabel` below names an absent component
+ * "Removed" and title-cases a present-but-unlabelable one; the
+ * validationHumaniser callers (PipelineValidationSummary, ReadinessRowDetail,
+ * ValidationResult) fall back to a generic phrase. The raw id lives in
+ * `data-affected-node-id` / `title` for forensics, never in prose.
+ */
+export function stepLabelForNodeId(
+  state: CompositionState | null,
+  nodeId: string | null,
+): string | null {
+  const plugin = resolveNodePlugin(state, nodeId);
+  if (plugin === null || nodeId === null) {
+    // The plugin chain cannot label a structural node (gate/coalesce/queue/…
+    // carry plugin: null), but its authored description still can
+    // (elspeth-9f21f3c57d) — consult it before surrendering to the callers'
+    // raw-id / generic fallbacks. An id absent from the composition entirely
+    // still resolves to null.
+    const node = state?.nodes.find((candidate) => candidate.id === nodeId);
+    return descriptionLabel(node?.description);
+  }
+  if (isPluginDerivedId(nodeId, plugin)) {
+    return stepLabelForPlugin(plugin);
+  }
+  // Author-chosen name: acronym-aware casing via the shared title-caser, but
+  // NEVER the curated plugin-name overrides — those are plugin-id vocabulary,
+  // not a rewrite of the author's own words.
+  return titleCaseLabel(nodeId);
+}
+
+/**
+ * Humanised step label for an affected_node_id. NEVER the raw id
+ * (elspeth-93f5621f18): an id the loaded composition no longer has reads
+ * "Removed" (consumers append "step", giving "Removed step · prompt"); an
+ * id the composition has but cannot label, or any id before the
+ * composition has loaded, is title-cased as the author's own name — the same
+ * result a loaded state gives an author-chosen id. "this step" only when
+ * there is no id at all. See `stepLabelForNodeId` for the preference ladder.
  */
 export function humaniseStepLabel(
   state: CompositionState | null,
   nodeId: string | null,
 ): string {
-  const plugin = resolveNodePlugin(state, nodeId);
-  if (plugin !== null) {
-    return stepLabelForPlugin(plugin);
+  if (nodeId === null) return "this step";
+  const label = stepLabelForNodeId(state, nodeId);
+  if (label !== null) return label;
+  if (state !== null && !isComponentPresent(state, nodeId)) return "Removed";
+  return titleCaseLabel(nodeId);
+}
+
+/**
+ * The card-TITLE form of the same name: "Summarise step", and — for a node the
+ * loaded composition no longer has — "Removed step (was Extract Invoice)".
+ *
+ * Why this is not `${humaniseStepLabel(...)} step`: that produced the literal
+ * word "Removed" for EVERY deleted node, so two acknowledgement cards
+ * referencing two different removed steps carried identical titles with no
+ * visible or hoverable disambiguator at either detail level — the raw id lived
+ * only in `data-affected-node-id`, which the plan itself calls a forensic home
+ * invisible to every audience (ux M-2). Title-casing the ghost id is not an
+ * identifier leak under this wave's own rule: a node id is author/LLM-chosen,
+ * so it IS the author's own name for the step (see this module's header).
+ *
+ * The resolution ladder is `humaniseStepLabel`'s, structurally — never a
+ * comparison against the string "Removed", which a node genuinely named
+ * `removed` would satisfy while still being present.
+ *
+ * The no-id case is "this step", not "this step step".
+ */
+export function humaniseStepTitle(
+  state: CompositionState | null,
+  nodeId: string | null,
+): string {
+  if (nodeId === null) return "this step";
+  const label = stepLabelForNodeId(state, nodeId);
+  if (label !== null) return `${label} step`;
+  if (state !== null && !isComponentPresent(state, nodeId)) {
+    return `Removed step (was ${titleCaseLabel(nodeId)})`;
   }
-  return nodeId ?? "this step";
+  return `${titleCaseLabel(nodeId)} step`;
 }
 
 /**

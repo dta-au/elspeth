@@ -326,7 +326,6 @@ class TestI1aForkParentDeferred:
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
-            fork_group_id="fg_orphan_001",
         )
         return run_id, token_id
 

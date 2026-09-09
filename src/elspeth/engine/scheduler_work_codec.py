@@ -19,13 +19,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from dataclasses import fields as dataclass_fields
 from typing import Protocol
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.engine.work_items import WorkItem
 
 #: Legacy durable node-cursor marker for terminal-lane rows. Current writers
@@ -43,7 +43,10 @@ class WorkItemFactory(Protocol):
         current_node_id: NodeID | None,
         coalesce_name: CoalesceName | None = None,
         coalesce_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
         on_success_sink: str | None = None,
+        join_group_id: str | None = None,
     ) -> WorkItem: ...
 
 
@@ -65,12 +68,12 @@ class ScheduledWorkFields:
     queue_key: str | None
     barrier_key: str | None
     on_success_sink: str | None
-    branch_name: str | None
-    fork_group_id: str | None
     join_group_id: str | None
-    expand_group_id: str | None
+    lineage_path: tuple[LineageFrame, ...]
     coalesce_node_id: str | None
     coalesce_name: str | None
+    row_union_name: str | None
+    collector_name: str | None
 
 
 @dataclass(frozen=True)
@@ -104,18 +107,34 @@ class SchedulerWorkCodec:
             queue_key=self.queue_key_for_item(item),
             barrier_key=self.barrier_key_for_item(item),
             on_success_sink=item.on_success_sink,
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
-            join_group_id=token.join_group_id,
-            expand_group_id=token.expand_group_id,
+            join_group_id=item.join_group_id,
+            lineage_path=token.lineage_path,
             coalesce_node_id=str(item.coalesce_node_id) if item.coalesce_node_id is not None else None,
             coalesce_name=str(item.coalesce_name) if item.coalesce_name is not None else None,
+            row_union_name=str(item.row_union_name) if item.row_union_name is not None else None,
+            collector_name=str(item.collector_name) if item.collector_name is not None else None,
         )
 
     def ready_emission(self, item: WorkItem) -> BarrierEmission:
         """Build the READY continuation emission for an atomic barrier completion."""
         fields = self.ready_fields(item)
-        return BarrierEmission(**{field.name: getattr(fields, field.name) for field in dataclass_fields(ScheduledWorkFields)})
+        return BarrierEmission(
+            token_id=fields.token_id,
+            row_id=fields.row_id,
+            node_id=fields.node_id,
+            step_index=fields.step_index,
+            ingest_sequence=fields.ingest_sequence,
+            row_payload_json=fields.row_payload_json,
+            queue_key=fields.queue_key,
+            barrier_key=fields.barrier_key,
+            on_success_sink=fields.on_success_sink,
+            join_group_id=fields.join_group_id,
+            lineage_path=fields.lineage_path,
+            coalesce_node_id=fields.coalesce_node_id,
+            coalesce_name=fields.coalesce_name,
+            row_union_name=fields.row_union_name,
+            collector_name=fields.collector_name,
+        )
 
     def work_item_from_scheduler(self, scheduled: TokenWorkItem) -> WorkItem:
         """Rehydrate a scheduler work item from its durable payload snapshot."""
@@ -124,15 +143,15 @@ class SchedulerWorkCodec:
             row_id=scheduled.row_id,
             token_id=scheduled.token_id,
             row_data=self.deserialize_row_payload(scheduled.row_payload_json),
-            branch_name=scheduled.branch_name,
-            fork_group_id=scheduled.fork_group_id,
-            join_group_id=scheduled.join_group_id,
-            expand_group_id=scheduled.expand_group_id,
+            lineage_path=scheduled.lineage_path,
         )
         return self.create_work_item(
             token=token,
             current_node_id=current_node_id,
             coalesce_node_id=NodeID(scheduled.coalesce_node_id) if scheduled.coalesce_node_id is not None else None,
             coalesce_name=CoalesceName(scheduled.coalesce_name) if scheduled.coalesce_name is not None else None,
+            row_union_name=RowUnionName(scheduled.row_union_name) if scheduled.row_union_name is not None else None,
+            collector_name=CollectorName(scheduled.collector_name) if scheduled.collector_name is not None else None,
             on_success_sink=scheduled.on_success_sink,
+            join_group_id=scheduled.join_group_id,
         )

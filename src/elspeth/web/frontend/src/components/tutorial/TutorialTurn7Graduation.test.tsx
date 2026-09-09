@@ -62,6 +62,7 @@ describe("TutorialTurn7Graduation", () => {
         tutorial_session_id: null,
         tutorial_run_id: null,
         tutorial_source_data_hash: null,
+        show_advanced: false,
         updated_at: "2026-05-19T12:35:00Z",
       }),
     );
@@ -87,13 +88,14 @@ describe("TutorialTurn7Graduation", () => {
     expect(eventListener).toHaveBeenCalledTimes(1);
     expect(screen.getByText("What you built is AI-generated.")).toBeInTheDocument();
     expect(screen.getByText("Read before you run.")).toBeInTheDocument();
-    expect(screen.getByText("Ask Elspeth.")).toBeInTheDocument();
+    expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(screen.getByText("LLMs are confident even when they're wrong.")).toBeInTheDocument();
-    // Operator note (2026-07-23), folded into the existing "Ask Elspeth."
-    // guidance rather than a new item: particularly complex pipelines need
-    // freeform mode, built step by step.
+    // Guided and freeform differ only in interaction style, not capability.
     expect(
-      screen.getByText(/particularly complex pipelines.*freeform mode/i),
+      screen.getByText(/guided and freeform can build the same pipelines/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/interaction preference, not a capability limit/i),
     ).toBeInTheDocument();
 
     window.removeEventListener("tutorial_graduation_shown", eventListener);
@@ -287,11 +289,14 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
     expect(
       screen.getByText(/nothing executes without your say-so/i),
     ).toBeInTheDocument();
-    // Shared bullets (no just-ran claims) render on both paths — including
-    // the freeform-for-complex-pipelines note riding "Ask Elspeth.".
-    expect(screen.getByText("Ask Elspeth.")).toBeInTheDocument();
+    // Shared bullets (no just-ran claims) render on both paths, including
+    // the guided/freeform capability-parity guidance riding "Ask ELSPETH.".
+    expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(
-      screen.getByText(/particularly complex pipelines.*freeform mode/i),
+      screen.getByText(/guided and freeform can build the same pipelines/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/interaction preference, not a capability limit/i),
     ).toBeInTheDocument();
     expect(
       screen.getByText("LLMs are confident even when they're wrong."),
@@ -315,7 +320,7 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
     ).toBeNull();
   });
 
-  it("both variants point at the real 'Audit panel' — never a nonexistent 'Audit page' (elspeth-4f69b267dd)", () => {
+  it("both variants point at the real 'Checks tab' — never a nonexistent 'Audit page' or the retired Audit drawer (elspeth-4f69b267dd)", () => {
     const { unmount } = render(
       <TutorialTurn7Graduation
         sessionId="sess-new"
@@ -324,9 +329,10 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/Audit panel beside your pipeline/),
+      screen.getByText(/your pipeline's Checks tab/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Audit page/)).toBeNull();
+    expect(screen.queryByText(/Audit panel/)).toBeNull();
     unmount();
 
     render(
@@ -337,8 +343,9 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/Audit panel beside each pipeline/),
+      screen.getByText(/each pipeline's Checks tab/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Audit page/)).toBeNull();
+    expect(screen.queryByText(/Audit panel/)).toBeNull();
   });
 });

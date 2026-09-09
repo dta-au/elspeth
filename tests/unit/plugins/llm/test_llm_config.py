@@ -1211,12 +1211,17 @@ class TestRequiredInputFieldsAppearInTemplate:
         assert sorted(config.required_input_fields or []) == ["content", "url"]
 
     def test_declared_fields_with_partial_row_interpolation_accepted(self) -> None:
-        """Validator fires only on the empty-row-refs case, not on partial overlap.
+        """Validator fires only on the empty-row-refs case, not on a superset declaration.
 
-        Partial mismatch (declared fields not all interpolated, or extra row refs
-        not declared) is a softer signal; rejecting it would break legitimate
-        cases like "declared a field for downstream cleanup but not used in this
-        specific prompt body." The reciprocity guidance lives in the skill prompt.
+        A declaration WIDER than the template is legitimate — "declared a field
+        for downstream cleanup but not interpolated in this prompt body" is a
+        real presence assertion, and this validator must not reject it.
+
+        The converse is NOT symmetric and this docstring used to claim it was:
+        extra row refs the declaration does not cover are rejected by
+        ``_validate_template_variable_bindings`` (elspeth-a9ba80cb0b). A
+        reference outside the declaration escapes the node's input contract
+        entirely, so nothing obliges a producer to supply it.
         """
         config = LLMConfig(
             provider="openrouter",
@@ -1865,7 +1870,7 @@ class TestStructuredQueryProbeClassification:
     def test_malformed_query_draft_is_classified_as_config_probe(self) -> None:
         """The relocated failure is matched by the composer probe classifier."""
         from elspeth.plugins.infrastructure.config_base import PluginConfigError
-        from elspeth.web.composer._semantic_validator import _is_config_probe_exception
+        from elspeth.web.composer.state import _is_config_probe_exception
 
         bad = self._base_config(
             queries=[
@@ -1896,3 +1901,377 @@ class TestStructuredQueryProbeClassification:
         )
         config = LLMConfig.from_dict(good, plugin_name="llm")
         assert config.queries is not None
+
+
+# ---------------------------------------------------------------------------
+# Template variable bindings (config-time parity with the composer guards)
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateVariableBindings:
+    """Config-time rejection of templates whose interpolations can never bind.
+
+    ``PromptTemplate.render`` supplies exactly ``{row, lookup}`` under
+    StrictUndefined; in multi-query mode ``row`` carries the query's
+    ``input_fields`` variables plus ``source_row`` (``build_template_context``
+    → ``render`` wraps the synthetic context under ``row``). The former
+    ``validate_prompt_template`` only compile-checked syntax, so a bare-name
+    template passed config validation and crashed every row at render — the
+    YAML-authoring twin of the composer's ``prompt_template_unbound_variables``
+    / ``query_template_unbound_row_fields`` guards (elspeth-bea314a89b
+    follow-up).
+    """
+
+    def _single(self, template: str, **overrides: Any) -> LLMConfig:
+        kwargs: dict[str, Any] = {
+            "provider": "azure",
+            "prompt_template": template,
+            "schema_config": _OBSERVED_SCHEMA,
+            "required_input_fields": [],
+        }
+        kwargs.update(overrides)
+        return LLMConfig(**kwargs)
+
+    def _multi(self, queries: Any, template: str = "Assess: {{ row.input_1 }}") -> LLMConfig:
+        return LLMConfig(
+            provider="azure",
+            prompt_template=template,
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=[],
+            queries=queries,
+        )
+
+    # ── Single-prompt mode ──────────────────────────────────────────────
+
+    def test_single_prompt_bare_name_rejected(self) -> None:
+        """The acceptance-run defect shape, now caught at YAML/config time."""
+        with pytest.raises(ValidationError, match="prompt render context does not define") as exc_info:
+            self._single("Classify: {{ text }}")
+        message = str(exc_info.value)
+        assert "'text'" in message
+        assert "row." in message
+
+    def test_single_prompt_names_all_offenders_sorted(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            self._single("{{ zeta }} then {{ alpha }}")
+        message = str(exc_info.value)
+        assert message.index("'alpha'") < message.index("'zeta'")
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "Classify: {{ row.text }}",
+            'Classify: {{ row["Original Header"] }}',
+            "Instructions: {{ lookup.instructions }}",
+            "Static prompt with no interpolation at all.",
+            "{% set t = row.text %}Classify: {{ t }}",
+            "{{ range(3) | join(', ') }}",
+        ],
+    )
+    def test_single_prompt_bound_or_static_accepted(self, template: str) -> None:
+        assert self._single(template).prompt_template == template
+
+    def test_single_prompt_local_assigned_in_every_if_branch_is_accepted(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        assert self._single(template).prompt_template == template
+
+    def test_single_prompt_local_assigned_in_only_one_if_branch_is_rejected(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        with pytest.raises(ValidationError, match="prompt render context does not define") as exc_info:
+            self._single(template)
+
+        assert "'verdict'" in str(exc_info.value)
+
+    def test_dynamic_access_error_keeps_primacy(self) -> None:
+        """``{{ row.get(k) }}`` is both dynamic AND has an unbound ``k`` — the
+        dynamic-access validator is defined first and must keep firing, or its
+        opt-out guidance (required_input_fields: []) disappears behind the
+        binding error."""
+        with pytest.raises(ValidationError, match="dynamic row field access"):
+            self._single("Secret: {{ row.get(k) }}", required_input_fields=["text"])
+
+    # ── Single-prompt declaration agreement (elspeth-a9ba80cb0b) ────────
+
+    def test_single_prompt_row_field_outside_declaration_rejected(self) -> None:
+        """The reported defect: declare one field, reference another.
+
+        Both were accepted before, the edge contract was satisfied by the
+        DECLARATION, and every row then raised ``UndefinedError`` at render.
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single("Rate: {{ row.case_study }}", required_input_fields=["case_study_1"])
+        message = str(exc_info.value)
+        assert "'case_study'" in message
+        assert "'case_study_1'" in message
+
+    def test_single_prompt_declared_reference_accepted(self) -> None:
+        template = "Rate: {{ row.case_study }}"
+        assert self._single(template, required_input_fields=["case_study"]).prompt_template == template
+
+    def test_single_prompt_wider_declaration_accepted(self) -> None:
+        """A declaration wider than the template is a presence assertion, not a defect."""
+        template = "Rate: {{ row.case_study }}"
+        assert self._single(template, required_input_fields=["case_study", "audit_id"]).prompt_template == template
+
+    def test_single_prompt_partially_declared_rejected(self) -> None:
+        """Reads two fields, declares one — the shortfall names only the undeclared field."""
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single("{{ row.a }} {{ row.b }}", required_input_fields=["a"])
+        message = str(exc_info.value)
+        assert "reads 'b' under 'row'" in message
+        assert "reads 'a'" not in message and "'a', 'b'" not in message, "the declared field is not part of the shortfall"
+
+    def test_single_prompt_conditional_reference_is_not_a_guard(self) -> None:
+        """``{% if row.b %}`` forces ``__bool__`` on StrictUndefined and RAISES.
+
+        Measured, not assumed — it reads like an optional guard and is not one,
+        so it must be reported like any other unconditional read. (``is defined``
+        and ``| default()`` genuinely do tolerate absence; no in-tree template
+        pairs either with a non-empty declaration, and this rule deliberately
+        does not attempt guard analysis to tell them apart.)
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare"):
+            self._single("{% if row.b %}{{ row.b }}{% endif %}", required_input_fields=["a"])
+
+    def test_single_prompt_undeclared_reference_raises_at_render_today(self) -> None:
+        """Pins the runtime consequence the rejection claims, so the message cannot drift.
+
+        Without this the message's "fails the whole node at render" is an
+        unverified assertion, and an ``| default()``-style change to the
+        sandbox would silently make it false.
+        """
+        from elspeth.plugins.infrastructure.templates import TemplateError
+        from elspeth.plugins.transforms.llm.templates import PromptTemplate
+
+        with pytest.raises(TemplateError, match="Undefined variable"):
+            PromptTemplate("Rate: {{ row.case_study }}").render({"case_study_1": "x"})
+
+    def test_single_prompt_original_header_literal_accepted_against_normalized_declaration(self) -> None:
+        """``row["Original Header"]`` resolves through ``SchemaContract.find_name``.
+
+        The literal is not a declarable name at all (``validate_field_names``
+        requires an identifier), so it can only be an ``original_name`` and the
+        row key it stands for is its canonical form. Declaring that key covers
+        it — and is the ONLY thing that does.
+        """
+        template = 'Rate: {{ row["Original Header"] }}'
+        assert self._single(template, required_input_fields=["original_header"]).prompt_template == template
+
+    def test_single_prompt_uncovered_original_header_literal_rejected_naming_the_declarable_form(self) -> None:
+        """A bracket literal is not exempt — it is bridged, then checked.
+
+        Dropping it outright accepted a declaration that omitted the field
+        entirely and then raised at render for every row, while the sibling
+        declared-fields validator was already naming the right key. The message
+        must name that key: the literal itself is rejected on application.
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single('Rate: {{ row["Original Header"] }}', required_input_fields=["something_else"])
+        assert "declare as 'original_header'" in str(exc_info.value)
+
+    def test_single_prompt_case_variant_reference_rejected(self) -> None:
+        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident.
+
+        ``SchemaContract.find_name`` is an exact match on ``normalized_name`` OR
+        ``original_name``, and config time knows neither: the same YAML renders
+        or fails 100% of rows depending on a CSV header's capitalization that no
+        validator ever sees. An earlier version bridged this through
+        ``normalize_field_name`` and so also silenced plain typos of the
+        declared name (``a__b`` for ``a_b``) — the very class this check exists
+        for. The surviving advice is the message's first remedy: rewrite the
+        reference to ``row.name``.
+        """
+        with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
+            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
+        assert "'Name'" in str(exc_info.value)
+
+    def test_single_prompt_keyword_literal_accepted(self) -> None:
+        """``row["class"]`` cannot be declared — ``class`` is a Python keyword — so
+        it is bridged to the key it resolves to."""
+        template = 'Rate: {{ row["class"] }}'
+        assert self._single(template, required_input_fields=["class_"]).prompt_template == template
+
+    def test_remedy_ordering_leads_with_rewrite_not_declare(self) -> None:
+        """The ordering is a finding, not a style choice.
+
+        ``verify_declared_required_fields`` is a plain set difference over row
+        keys with NO dual-name limb, so declaring a read name the producer does
+        not guarantee is ACCEPTED here and then raises
+        ``DeclaredRequiredInputFieldsViolation`` on every row. Leading with
+        "add the name" would hand the planner a repair that clears this error
+        and breaks the run.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
+        message = str(exc_info.value)
+        assert message.index("Rewrite each reference") < message.index("Add a name to options.required_input_fields")
+        assert "ONLY if the upstream producer guarantees that exact name" in message
+        assert "fails every row at run time" in message
+
+    def test_declaring_an_unguaranteed_read_name_is_accepted_here_and_fails_at_run_time(self) -> None:
+        """Pins the fact the remedy ordering rests on, so it cannot drift silently."""
+        from elspeth.contracts.errors import DeclaredRequiredInputFieldsViolation
+        from elspeth.engine.executors.declared_required_fields import verify_declared_required_fields
+
+        # Config time accepts the "just declare what you read" repair...
+        self._single("Hello {{ row.Name }}", required_input_fields=["Name"])
+
+        # ...and the engine then rejects every row whose key is the normalized name.
+        with pytest.raises(DeclaredRequiredInputFieldsViolation):
+            verify_declared_required_fields(
+                declared_input_fields=frozenset({"Name"}),
+                effective_input_fields=frozenset({"name"}),
+                plugin_name="llm",
+                node_id="n1",
+                run_id="r1",
+                row_id="row1",
+                token_id="t1",
+            )
+
+    def test_single_prompt_declaration_opt_out_suppresses_the_check(self) -> None:
+        """``required_input_fields: []`` is the documented opt-out and must keep working."""
+        template = "Rate: {{ row.case_study }}"
+        assert self._single(template, required_input_fields=[]).prompt_template == template
+
+    def test_single_prompt_undeclared_check_does_not_fire_without_a_declaration(self) -> None:
+        """``None`` belongs to the sibling declared-validator, which owns the better message."""
+        with pytest.raises(ValidationError, match="is not declared") as exc_info:
+            self._single("Rate: {{ row.case_study }}", required_input_fields=None)
+        assert "does not declare" not in str(exc_info.value)
+
+    def test_undeclared_check_yields_to_the_dynamic_access_validator(self) -> None:
+        """Dynamic access is defined first and keeps its own opt-out guidance."""
+        with pytest.raises(ValidationError, match="dynamic row field access"):
+            self._single("Rate: {{ row[k] }} {{ row.case_study }}", required_input_fields=["case_study_1"])
+
+    def test_declared_validator_suggests_a_value_the_binding_check_then_accepts(self) -> None:
+        """Applying the suggested remedy must CLEAR the error, not return a new one.
+
+        The undeclared-fields message emits its suggestion verbatim; before this
+        it emitted raw bracket literals that ``validate_field_names`` rejects on
+        application, so the planner's only repair was itself invalid.
+        """
+        import json
+        import re
+
+        template = 'A {{ row["Original Header"] }} B {{ row.text }} C {{ row["!!!"] }}'
+        with pytest.raises(ValidationError) as exc_info:
+            self._single(template, required_input_fields=None)
+        suggestion = re.search(r"options\.required_input_fields: (\[[^\]]*\])  # Require", str(exc_info.value))
+        assert suggestion is not None, "no machine-applicable suggestion in the message"
+        suggested = json.loads(suggestion.group(1))
+
+        assert self._single(template, required_input_fields=suggested).required_input_fields == suggested
+
+    # ── Multi-query mode ────────────────────────────────────────────────
+
+    def test_query_override_bare_name_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"text": "body", "input_1": "body"}, "template": "Classify {{ text }}"}})
+        message = str(exc_info.value)
+        assert "'q1'" in message
+        assert "'text'" in message
+        assert "input_fields" in message
+
+    def test_query_override_unbound_row_field_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="input_fields binds only") as exc_info:
+            self._multi(
+                {"diagnosis": {"input_fields": {"input_1": "background"}, "template": "BG: {{ row.input_1 }} SYM: {{ row.input_2 }}"}}
+            )
+        message = str(exc_info.value)
+        assert "'diagnosis'" in message
+        assert "'input_2'" in message
+        assert "'input_1'" in message
+        assert "source_row" in message
+
+    def test_query_override_bound_row_fields_accepted(self) -> None:
+        config = self._multi(
+            {
+                "q1": {
+                    "input_fields": {"input_1": "background", "input-2": "symptoms"},
+                    "template": (
+                        "{{ row.input_1 }} / {{ row['input-2'] }} / {{ row.source_row.raw_column }}"
+                        " / {{ lookup.rubric }} / {{ range(3) | join(', ') }}"
+                    ),
+                }
+            }
+        )
+        assert config.queries is not None
+
+    def test_query_override_local_assigned_in_every_if_branch_is_accepted(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        config = self._multi({"q1": {"input_fields": {"flag": "source_flag"}, "template": template}})
+
+        assert config.queries is not None
+
+    def test_query_override_local_assigned_in_only_one_if_branch_is_rejected(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"flag": "source_flag"}, "template": template}})
+
+        message = str(exc_info.value)
+        assert "'q1'" in message
+        assert "'verdict'" in message
+
+    def test_node_template_bare_name_used_by_query_rejected(self) -> None:
+        """The legacy positional idiom ``{{ input_1 }}`` never binds — the
+        render context wraps input_fields variables under ``row``."""
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"input_1": "col_a"}}}, template="Assess: {{ input_1 }}")
+        assert "'input_1'" in str(exc_info.value)
+
+    def test_shared_node_template_local_assigned_in_every_if_branch_is_accepted(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        config = self._multi({"q1": {"input_fields": {"flag": "source_flag"}}}, template=template)
+
+        assert config.queries is not None
+
+    def test_shared_node_template_local_assigned_in_only_one_if_branch_is_rejected(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"flag": "source_flag"}}}, template=template)
+
+        assert "'verdict'" in str(exc_info.value)
+
+    def test_node_template_used_by_no_query_is_not_checked(self) -> None:
+        """Every query overrides the template, so the node-level slot never
+        renders — the shipped multi-query examples carry exactly this dead
+        template and must keep validating."""
+        config = self._multi(
+            {"q1": {"input_fields": {"text": "body"}, "template": "Classify {{ row.text }}"}},
+            template="Assess: {{ input_1 }}",
+        )
+        assert config.queries is not None
+
+    def test_shared_node_template_checked_against_each_querys_bindings(self) -> None:
+        with pytest.raises(ValidationError, match="input_fields binds only") as exc_info:
+            self._multi(
+                {
+                    "ok_query": {"input_fields": {"input_1": "col_a"}},
+                    "broken_query": {"input_fields": {"text": "col_b"}},
+                },
+                template="Assess: {{ row.input_1 }}",
+            )
+        message = str(exc_info.value)
+        assert "'broken_query'" in message
+
+    def test_from_dict_wraps_binding_error_as_plugin_config_error(self) -> None:
+        """The web/probe path must see the redacted-safe §5.3 category, not a
+        bare ValueError escaping as a 500."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        bad = {
+            "provider": "azure",
+            "prompt_template": "Assess: {{ row.input_1 }}",
+            "schema": {"mode": "observed"},
+            "required_input_fields": [],
+            "queries": {"q1": {"input_fields": {"input_1": "col"}, "template": "{{ row.nope }}"}},
+        }
+        with pytest.raises(PluginConfigError, match="input_fields binds only"):
+            LLMConfig.from_dict(bad, plugin_name="llm")

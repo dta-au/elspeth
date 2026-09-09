@@ -18,7 +18,7 @@ Argument vector:
 [".venv/bin/python", "-m", "pytest", "-p", "no:dotenv", "-q", "-n", "0", "--junitxml=docs/architecture/state_engine/assessments/2026-07-18-1631/artifacts/EV-001.junit.xml", "tests/unit/core/landscape/test_scheduler_fencing.py", "tests/unit/core/landscape/test_scheduler_pending_sink_claim.py"]
 ```
 
-- Working directory: `.` relative to captured repository root `/home/john/elspeth`
+- Working directory: `.` relative to the captured repository root (the main checkout)
 - Started: `2026-07-18T17:53:28+10:00`
 - Ended: `2026-07-18T17:53:34+10:00`
 - Shell-measured duration: 6.536 seconds
@@ -45,7 +45,7 @@ Argument vector:
 [".venv/bin/python", "-m", "pytest", "-p", "no:dotenv", "-q", "-n", "0", "--junitxml=docs/architecture/state_engine/assessments/2026-07-18-1631/artifacts/EV-002.junit.xml", "tests/integration/pipeline/test_builtin_sink_effect_recovery.py", "tests/unit/core/landscape/test_scheduler_repository_complete_barrier.py"]
 ```
 
-- Working directory: `.` relative to captured repository root `/home/john/elspeth`
+- Working directory: `.` relative to the captured repository root (the main checkout)
 - Started: `2026-07-18T17:56:18+10:00`
 - Ended: `2026-07-18T17:56:22+10:00`
 - Shell-measured duration: 3.966 seconds
@@ -74,7 +74,7 @@ Argument vector:
 [".venv/bin/python", "-m", "pytest", "-p", "no:dotenv", "-q", "-n", "0", "--junitxml=docs/architecture/state_engine/assessments/2026-07-18-1631/artifacts/EV-003.junit.xml", "tests/unit/core/landscape/test_scheduler_events.py::test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation", "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_commits_exact_row_event_and_branch_loss", "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_refuses_stale_owner_without_mutation", "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_refuses_departed_member_without_mutation", "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_rolls_back_when_event_insert_fails", "tests/unit/core/landscape/test_scheduler_events.py::test_branch_loss_failure_rolls_back_disposition_row_and_event", "tests/unit/core/landscape/test_scheduler_events.py::test_mark_blocked_refuses_missing_release_key_without_mutation", "tests/unit/core/landscape/test_scheduler_events.py::test_mark_pending_sink_rejects_incomplete_bundle_without_mutation"]
 ```
 
-- Working directory: `.` relative to captured repository root `/home/john/elspeth`
+- Working directory: `.` relative to the captured repository root (the main checkout)
 - Started: `2026-07-18T17:56:22+10:00`
 - Ended: `2026-07-18T17:56:25+10:00`
 - Shell-measured duration: 2.717 seconds
@@ -98,7 +98,7 @@ database profile, plugin lifecycle, or downstream read-model truth tables.
 
 | Fact | Captured value |
 | --- | --- |
-| Python | 3.13.1; `/home/john/elspeth/.venv/bin/python`; build `main`, 2024-12-19 |
+| Python | 3.13.1; `.venv/bin/python` under the repository root; build `main`, 2024-12-19 |
 | pytest | 9.0.3 |
 | uv | 0.10.2 |
 | Git | 2.43.0 |

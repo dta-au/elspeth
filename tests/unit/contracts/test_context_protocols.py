@@ -67,9 +67,18 @@ class TestPluginContextProtocolContracts:
         """Protocol methods must keep the same callable shape as PluginContext."""
         from elspeth.contracts.plugin_context import PluginContext
 
+        # Build PluginContext's public method table once, the same way the
+        # sibling test above does, and look the name up in it. The protocol
+        # member set is data; resolving it back off the class with ``getattr``
+        # would let a missing method read as a signature question (ADR-032).
+        plugin_context_methods = {
+            name: func for name, func in inspect.getmembers(PluginContext, predicate=inspect.isfunction) if not name.startswith("_")
+        }
+
         for protocol in PROTOCOLS:
             for method_name, protocol_method in _get_protocol_methods(protocol).items():
-                plugin_context_method = cast(Callable[..., Any], getattr(PluginContext, method_name))
+                assert method_name in plugin_context_methods, f"PluginContext has no method {method_name!r} for {protocol.__name__}"
+                plugin_context_method = cast(Callable[..., Any], plugin_context_methods[method_name])
                 assert _signature_shape(plugin_context_method) == _signature_shape(protocol_method), (
                     f"{protocol.__name__}.{method_name} signature drifted from PluginContext.{method_name}"
                 )

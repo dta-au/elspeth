@@ -16,8 +16,15 @@ source ─(source_out)─> llm ─┬─(output)─> results.csv
 Start the ChaosLLM server:
 
 ```bash
-chaosllm serve --port 8199 --config examples/chaosllm_endurance/chaos_config.yaml
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
+chaosllm serve --port 8199 --config examples/chaosllm_endurance/chaos_config.yaml --workers=1
 ```
+
+This key protects the audit fingerprint of the fake inline ChaosLLM token; it
+is not a provider credential. The convenience script generates a
+process-scoped value automatically. Manual runs need the export above.
 
 ## Running
 
@@ -41,6 +48,11 @@ The full default run is an endurance workload: 10,000 rows expand to 100,000
 mock LLM calls before retries. Do not use the full run as an ordinary examples
 dogfood gate. For release dogfood, run the bounded smoke form above or capture a
 few minutes of clean interruption/retry behavior against the ChaosLLM server.
+
+The configured faults deliberately include retry-exhausting responses. A
+bounded run may therefore end `PARTIAL` with process exit 1 after routing rows
+to `quarantined.json`; acceptance means all source rows reach either the result
+or quarantine sink with the failure reasons retained in Landscape.
 
 ## Output
 

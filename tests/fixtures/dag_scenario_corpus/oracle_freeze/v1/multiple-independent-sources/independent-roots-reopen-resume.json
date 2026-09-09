@@ -1,0 +1,106 @@
+{
+ "case_id": "independent-roots-reopen-resume",
+ "expansions": [],
+ "rows": [
+  6,
+  6,
+  0
+ ],
+ "scenario_id": "multiple-independent-sources",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"id\":1,\"value\":10}",
+    "{\"id\":2,\"value\":20}",
+    "{\"id\":3,\"value\":30}",
+    "{\"id\":101,\"value\":-5}",
+    "{\"id\":102,\"value\":-10}",
+    "{\"id\":103,\"value\":-15}"
+   ],
+   "sink_name": "output"
+  }
+ ],
+ "status": "completed",
+ "terminal_dispositions": [
+  {
+   "key": "orders:0#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "orders:0#0"
+  },
+  {
+   "key": "orders:1#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "orders:1#0"
+  },
+  {
+   "key": "orders:2#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "orders:2#0"
+  },
+  {
+   "key": "refunds:0#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "refunds:0#0"
+  },
+  {
+   "key": "refunds:1#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "refunds:1#0"
+  },
+  {
+   "key": "refunds:2#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "refunds:2#0"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "orders:0#0",
+   "parents": [],
+   "row_key": "orders:0"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:1#0",
+   "parents": [],
+   "row_key": "orders:1"
+  },
+  {
+   "branch_name": null,
+   "key": "orders:2#0",
+   "parents": [],
+   "row_key": "orders:2"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:0#0",
+   "parents": [],
+   "row_key": "refunds:0"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:1#0",
+   "parents": [],
+   "row_key": "refunds:1"
+  },
+  {
+   "branch_name": null,
+   "key": "refunds:2#0",
+   "parents": [],
+   "row_key": "refunds:2"
+  }
+ ]
+}

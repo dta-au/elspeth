@@ -7,6 +7,7 @@ from tests.fixtures.stores import MockPayloadStore
 
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import Determinism, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import path_branch_name, path_expand_group_id, path_fork_group_id
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
@@ -107,7 +108,7 @@ class TestRecorderFactoryTokens:
 
         assert token.token_id is not None
         assert token.row_id == row.row_id
-        assert token.fork_group_id is None  # Initial token
+        assert token.lineage_path == ()  # Initial token
 
     def test_fork_token(self) -> None:
         db = LandscapeDB.in_memory()
@@ -139,10 +140,10 @@ class TestRecorderFactoryTokens:
         )
 
         assert len(child_tokens) == 2
-        assert child_tokens[0].branch_name == "stats"
-        assert child_tokens[1].branch_name == "classifier"
+        assert path_branch_name(child_tokens[0].lineage_path) == "stats"
+        assert path_branch_name(child_tokens[1].lineage_path) == "classifier"
         # All children share same fork_group_id
-        assert child_tokens[0].fork_group_id == child_tokens[1].fork_group_id
+        assert path_fork_group_id(child_tokens[0].lineage_path) == path_fork_group_id(child_tokens[1].lineage_path)
 
     def test_fork_token_parent_lineage_verified(self) -> None:
         """P1: Verify fork creates parent relationships in token_parents table.
@@ -400,7 +401,7 @@ class TestExpandToken:
             assert child.token_id != parent_token.token_id
 
         # All children share same expand_group_id
-        expand_group_ids = {c.expand_group_id for c in children}
+        expand_group_ids = {path_expand_group_id(c.lineage_path) for c in children}
         assert len(expand_group_ids) == 1
         assert None not in expand_group_ids
 
@@ -520,8 +521,8 @@ class TestExpandToken:
         )
 
         assert len(children) == 1
-        assert children[0].expand_group_id is not None
-        assert children[0].expand_group_id == expand_group_id
+        assert path_expand_group_id(children[0].lineage_path) is not None
+        assert path_expand_group_id(children[0].lineage_path) == expand_group_id
 
         parents = factory.query.get_token_parents(children[0].token_id)
         assert len(parents) == 1
@@ -565,7 +566,7 @@ class TestExpandToken:
         for child in children:
             retrieved = factory.query.get_token(child.token_id)
             assert retrieved is not None
-            assert retrieved.expand_group_id == child.expand_group_id
+            assert path_expand_group_id(retrieved.lineage_path) == path_expand_group_id(child.lineage_path)
 
 
 class TestAtomicTokenOperations:
@@ -615,13 +616,18 @@ class TestAtomicTokenOperations:
         assert outcome is not None, "Parent token should have FORKED outcome"
         assert outcome.outcome == TerminalOutcome.TRANSIENT
         assert outcome.path == TerminalPath.FORK_PARENT
-        assert outcome.fork_group_id == fork_group_id
         assert outcome.completed is True
 
-    def test_fork_token_stores_expected_branches_contract(self) -> None:
-        """fork_token stores branch names in expected_branches_json for contract validation."""
-        import json
+        # D2 flip: the fork_group_id roster of record moved off the outcome
+        # row onto group_records + the children's own lineage_path frames,
+        # written in the SAME transaction as the outcome above.
+        group_records = {gr["group_id"]: gr for gr in factory.data_flow.get_group_records_for_run(run.run_id)}
+        assert group_records[fork_group_id]["kind"] == "fork"
+        assert group_records[fork_group_id]["opener_token_id"] == parent_token.token_id
+        assert group_records[fork_group_id]["member_count"] == 2
 
+    def test_fork_token_stores_expected_branches_contract(self) -> None:
+        """fork_token records the branch count in group_records.member_count for contract validation."""
         db = LandscapeDB.in_memory()
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
@@ -644,18 +650,18 @@ class TestAtomicTokenOperations:
         parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Fork to three branches
-        factory.data_flow.fork_token(
+        children, fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["alpha", "beta", "gamma"],
         )
 
-        # Verify expected_branches_json is stored correctly
-        outcome = factory.data_flow.get_token_outcome(parent_token.token_id)
-        assert outcome is not None
-        assert outcome.expected_branches_json is not None
-        expected = json.loads(outcome.expected_branches_json)
-        assert expected == ["alpha", "beta", "gamma"]
+        # D2 flip: expected_branches_json is retired from token_outcomes; the
+        # branch-count contract now lives in group_records.member_count, and
+        # the branch NAMES live in each child's own innermost FORK frame.
+        group_records = {gr["group_id"]: gr for gr in factory.data_flow.get_group_records_for_run(run.run_id)}
+        assert group_records[fork_group_id]["member_count"] == 3
+        assert [path_branch_name(c.lineage_path) for c in children] == ["alpha", "beta", "gamma"]
 
     def test_expand_token_records_parent_expanded_outcome(self) -> None:
         """expand_token atomically records EXPANDED outcome on parent token.
@@ -700,13 +706,18 @@ class TestAtomicTokenOperations:
         assert outcome is not None, "Parent token should have EXPANDED outcome"
         assert outcome.outcome == TerminalOutcome.TRANSIENT
         assert outcome.path == TerminalPath.EXPAND_PARENT
-        assert outcome.expand_group_id == expand_group_id
         assert outcome.completed is True
 
-    def test_expand_token_stores_expected_count_contract(self) -> None:
-        """expand_token stores count in expected_branches_json for contract validation."""
-        import json
+        # D2 flip: the expand_group_id roster of record moved off the outcome
+        # row onto group_records, written in the SAME transaction as the
+        # outcome above.
+        group_records = {gr["group_id"]: gr for gr in factory.data_flow.get_group_records_for_run(run.run_id)}
+        assert group_records[expand_group_id]["kind"] == "expand"
+        assert group_records[expand_group_id]["opener_token_id"] == parent_token.token_id
+        assert group_records[expand_group_id]["member_count"] == 3
 
+    def test_expand_token_stores_expected_count_contract(self) -> None:
+        """expand_token records the child count in group_records.member_count for contract validation."""
         db = LandscapeDB.in_memory()
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
@@ -730,7 +741,7 @@ class TestAtomicTokenOperations:
         parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Expand to 5 children
-        factory.data_flow.expand_token(
+        _children, expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             child_payloads=[{"item": i} for i in range(5)],
@@ -738,12 +749,10 @@ class TestAtomicTokenOperations:
             output_contract=_MINIMAL_CONTRACT,
         )
 
-        # Verify expected_branches_json stores count
-        outcome = factory.data_flow.get_token_outcome(parent_token.token_id)
-        assert outcome is not None
-        assert outcome.expected_branches_json is not None
-        expected = json.loads(outcome.expected_branches_json)
-        assert expected == {"count": 5}
+        # D2 flip: expected_branches_json is retired from token_outcomes; the
+        # expected-count contract now lives in group_records.member_count.
+        group_records = {gr["group_id"]: gr for gr in factory.data_flow.get_group_records_for_run(run.run_id)}
+        assert group_records[expand_group_id]["member_count"] == 5
 
     def test_coalesce_tokens_atomically_creates_merged_token_and_parent_links(self) -> None:
         """coalesce_tokens atomically creates merged token + parent links in one transaction.
@@ -840,22 +849,24 @@ class TestAtomicTokenOperations:
         )
 
         # Step 2: Record COALESCED outcomes on each parent (as CoalesceExecutor does)
+        # D2 flip: join_group_id is retired from token_outcomes — the (SUCCESS,
+        # COALESCED) pair forbids every discriminator field. join_group_id is
+        # the merged TOKEN's own column (ruling 20), not a per-parent outcome field.
+        assert merged.join_group_id is not None
         for child in children:
             factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=child.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.COALESCED,
-                join_group_id=merged.join_group_id,
             )
 
-        # Verify each parent has COALESCED outcome with correct join_group_id
+        # Verify each parent has a COALESCED outcome
         for child in children:
             outcome = factory.data_flow.get_token_outcome(child.token_id)
             assert outcome is not None, f"Parent {child.token_id} should have COALESCED outcome"
             assert outcome.outcome == TerminalOutcome.SUCCESS
             assert outcome.path == TerminalPath.COALESCED
             assert outcome.sink_name is None
-            assert outcome.join_group_id == merged.join_group_id
             assert outcome.completed is True
 
     def test_coalesce_tokens_creates_parent_links(self) -> None:

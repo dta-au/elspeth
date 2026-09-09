@@ -100,7 +100,17 @@ export interface ChatTurn {
   step: GuidedStep;
   ts_iso: string;
   assistant_message_kind: "assistant" | "synthetic_failure" | null;
-  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | null;
+  /** Closed persisted reason. "model_defect": the provider answered but the
+   *  reply violated a tool contract — retry is the designed remedy, unlike
+   *  the deterministic "not_applied" causes (Retry is suppressed there). */
+  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | "model_defect" | null;
+  /** Occurrence the user message was submitted under (elspeth-ea80e34fdc).
+   *  Retry must resend THIS token verbatim — never the current one — so a
+   *  stale retry draws the server's ordinary 409 instead of applying old
+   *  prose to newer session state. Non-null only on user turns recorded
+   *  through the chat submission path; assistant turns and transcript-only
+   *  user turns (respond-path revision instructions) carry null. */
+  turn_token: string | null;
 }
 
 /**
@@ -126,6 +136,15 @@ export interface GuidedSession {
   terminal: TerminalState | null;
   chat_history: ChatTurn[];
   chat_turn_seq: number;
+  /**
+   * Server-projected reviewed-component ledger (elspeth-f2a8550b3d): the
+   * components settled so far, in authored order. Present on EVERY guided
+   * response — including a completed session, whose `next_turn` is `null`.
+   * This replaced a client-side fold over `next_turn`, which necessarily saw
+   * an empty ledger after any reload and on every completed session, and
+   * which was reconstructed rather than authoritative.
+   */
+  reviewed_components: GuidedReviewedComponents;
   /** Server-owned WorkflowProfile, or `null` for the empty/live-guided profile. */
   profile: WorkflowProfile | null;
 }
@@ -161,6 +180,13 @@ export type GuidedOperationFailureCode =
   | "provider_unavailable"
   | "provider_timeout"
   | "invalid_provider_response"
+  /** Planner-owned non-convergence (elspeth-5904b1683a): the provider answered
+   *  every repair turn but the planner never converged on a valid pipeline.
+   *  Transient — a retry can win, so retry affordances stay enabled. */
+  | "planner_repair_exhausted"
+  /** Permanent by construction: a deployment policy refused this pipeline.
+   *  Retry affordances must not invite a retry — only a revision can clear it. */
+  | "policy_blocked"
   | "stale_conflict"
   | "integrity_error"
   | "custody_error"
@@ -177,6 +203,11 @@ export interface GuidedEditTarget {
   kind: "source" | "node" | "edge" | "output";
   stable_id: string;
 }
+
+type GuidedReviewedFormEditTarget = {
+  kind: "source" | "output";
+  stable_id: string;
+};
 
 interface UnboundProposalFields {
   proposal_id: null;
@@ -198,6 +229,16 @@ export interface GuidedComponentTarget {
   stable_id: string;
 }
 
+/** Ready upload identity displayed while selecting a Step-1 source plugin. */
+export interface GuidedSourceBlobCandidate {
+  id: string;
+  filename: string;
+  sizeBytes: number;
+  /** Upload time (BlobMetadata.created_at), the disambiguator two uploads of
+   *  the same filename are told apart by. Client-side only — never on the wire. */
+  createdAt: string;
+}
+
 export type GuidedComponentAction =
   | { action: "add"; component_kind: GuidedComponentKind }
   | { action: "edit"; target: GuidedComponentTarget }
@@ -209,10 +250,15 @@ export type GuidedComponentAction =
     }
   | { action: "finish"; component_kind: GuidedComponentKind };
 
+/** Explicit scope for a prose revision of the active proposal. */
+export type GuidedRevisionMode = "amend" | "replace";
+
 /** One exact legal response action before retry/turn identity is attached. */
 export type GuidedRespondAction =
   | (UnboundProposalFields & {
       chosen: NonEmptyStringArray;
+      /** Exact ready upload selected for a Step-1 source-plugin turn. */
+      source_blob_id?: string;
       edited_values: null;
       custom_inputs: null;
       control_signal: null;
@@ -259,15 +305,17 @@ export type GuidedRespondAction =
       chosen: null;
       edited_values: null;
       custom_inputs: null;
-      edit_target: GuidedEditTarget;
+      edit_target: GuidedReviewedFormEditTarget;
       control_signal: null;
     })
   | (BoundProposalFields & {
-      // Prose proposal revision: a free-text instruction (from the docked
-      // step-3 composer) that regenerates the whole pipeline. No edit_target —
-      // this is a full re-plan, not a component-scoped rewind.
+      // Prose proposal revision: a free-text instruction plus explicit scope
+      // from the docked step-3 composer. It is never combined with edit_target.
       chosen: null;
-      edited_values: { revision_instruction: string };
+      edited_values: {
+        revision_instruction: string;
+        revision_mode: GuidedRevisionMode;
+      };
       custom_inputs: null;
       edit_target: null;
       control_signal: null;
@@ -292,7 +340,21 @@ export type GuidedRespondAction =
 export type GuidedProposalRetryAction =
   | { kind: "review_wiring" | "confirm_wiring" }
   | { kind: "reject" }
-  | { kind: "revise"; edit_target: GuidedEditTarget };
+  | {
+      kind: "revise";
+      edit_target: GuidedReviewedFormEditTarget;
+      correction_feedback?: never;
+    }
+  | {
+      kind: "revise";
+      edit_target: GuidedEditTarget;
+      correction_feedback: string;
+    }
+  | {
+      kind: "revise_instruction";
+      revision_instruction: string;
+      revision_mode: GuidedRevisionMode;
+    };
 
 /**
  * Local review lifecycle for one exact durable guided proposal projection.
@@ -410,6 +472,8 @@ export interface SingleSelectPayload {
   question: string;
   options: Option[];
   allow_custom: boolean;
+  /** Server-owned subset of option IDs that may bind a ready session blob. */
+  source_blob_compatible_option_ids?: string[];
 }
 
 /** Wire: MultiSelectWithCustomPayload (protocol.py:46-50). */
@@ -463,6 +527,9 @@ export interface KnobField {
   name: string;
   label: string;
   description?: string;
+  /** Form-input shape hint for a free-text knob whose value has internal
+   *  structure (e.g. the schema knob's compact JSON example). */
+  placeholder?: string;
   kind: FieldKind;
   tier?: FieldTier;
   required: boolean;
@@ -471,6 +538,12 @@ export interface KnobField {
   enum?: string[];
   item_kind?: "text" | "number-int" | "number-float";
   visible_when?: VisibilityPredicate;
+  /** Conditional requiredness the plugin model itself cannot express: the field
+   *  is required when `required` is true OR this predicate holds against
+   *  current form state. Carries composer-owned rules such as "a local file
+   *  sink must choose a collision_policy under mode='write'" (R2-F2). Unlike
+   *  `visible_when` the target may appear LATER in `fields`. */
+  required_when?: VisibilityPredicate;
 }
 
 export interface KnobSchema {
@@ -497,6 +570,23 @@ export interface ComponentReviewPayload {
   component_kind: GuidedComponentKind;
   items: ComponentReviewItem[];
   allowed_actions: ComponentReviewAction[];
+}
+
+/**
+ * Wire: `GuidedSessionResponse.reviewed_components`
+ * (schemas.py `GuidedReviewedComponentsResponse`) — what the server says has
+ * been settled, per kind, in authored order.
+ *
+ * The entries are `ComponentReviewItem`s BY DESIGN, not by coincidence: the
+ * server projects this ledger and the `review_components` card from one
+ * derivation (`state_machine.reviewed_component_ledger`), so the field set is
+ * closed at identity + display. Reviewed option values, inspected columns and
+ * samples, storage paths and content anchors are deliberately absent — they
+ * stay in the schema-8 checkpoint under `composition_state.composer_meta`.
+ */
+export interface GuidedReviewedComponents {
+  readonly sources: readonly ComponentReviewItem[];
+  readonly outputs: readonly ComponentReviewItem[];
 }
 
 /**
@@ -544,13 +634,21 @@ export type ProposalFlow =
   | { kind: "gate_fork"; routes: string[]; branch: string }
   | { kind: "queue_continue"; branch: string | null }
   | { kind: "coalesce_success"; branch: string | null }
+  | { kind: "row_union_success"; branch: string | null }
   | { kind: "output_write_failure" };
 
 export type ProposalNodeBehavior =
   | { kind: "transform" }
   | {
       kind: "gate";
+      /** The authored predicate, verbatim (F11): without it the review
+       *  surfaces show only opaque route ordinals. */
+      condition: string;
       route_aliases: string[];
+      /** Binds each ordinal route alias to its author-visible route key
+       *  ("true"/"false" or an author label), bijective with route_aliases
+       *  in the same order (fork gates included). */
+      routes: Array<{ alias: string; key: string }>;
       fork_branches: Array<{ routes: string[]; branch: string }>;
     }
   | {
@@ -569,7 +667,35 @@ export type ProposalNodeBehavior =
       branch_aliases: string[];
       policy: "require_all" | "quorum" | "best_effort" | "first";
       merge: "union" | "nested" | "select";
+      timeout_seconds: number | null;
+    }
+  | {
+      kind: "row_union";
+      branch_aliases: string[];
+      policy: "require_all";
+      timeout_seconds: number | null;
+    }
+  | {
+      kind: "collector";
+      /** Stable id of the multi-row transform whose EXPAND group this
+       *  collector closes — the projection's own id for the opener node.
+       *  The authored scope_name stays private (server ordinals/stable ids
+       *  replace canonical component names on this surface). */
+      opener_stable_id: string;
+      policy: "require_all" | "best_effort";
     };
+
+/** Closed node-kind vocabulary of the proposal and wire-stage surfaces. The
+ *  strict wire decoder (guidedDecoder.ts decodeProposalNodeType) narrows BOTH
+ *  surfaces' `node_type` to this set at runtime; the type says so. */
+export type ProposalNodeType =
+  | "transform"
+  | "gate"
+  | "aggregation"
+  | "queue"
+  | "coalesce"
+  | "row_union"
+  | "collector";
 
 export interface ProposePipelinePayload {
   proposal_id: string;
@@ -607,9 +733,10 @@ export interface ProposePipelinePayload {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type: "transform" | "gate" | "aggregation" | "queue" | "coalesce";
+    node_type: ProposalNodeType;
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
+    node_options_summary: NodeOptionSummary[];
   }>;
   outputs: Array<{
     stable_id: string;
@@ -619,9 +746,26 @@ export interface ProposePipelinePayload {
   edit_targets: GuidedEditTarget[];
 }
 
+/** One allowlisted node option, pre-rendered server-side as display text.
+ *  The backend owns both the key vocabulary and the rendering (see
+ *  ``_NODE_OPTION_SUMMARY_ALLOWLIST``); the client only labels and prints. */
+export interface NodeOptionSummary {
+  key: string;
+  value: string;
+  /** Presentational catalog tier; absent on pre-tier durable payloads → "common". */
+  tier?: FieldTier;
+}
+
 export interface WireRowCardinality {
   input: "none" | "one" | "batch" | "branches" | "many_producers";
-  output: "one" | "zero_or_one" | "zero_or_many" | "one_per_item" | "one_per_branch_set" | "expected_count";
+  output:
+    | "one"
+    | "zero_or_one"
+    | "zero_or_many"
+    | "one_per_item"
+    | "one_per_branch"
+    | "one_per_branch_set"
+    | "expected_count";
   expected_output_count: string | null;
 }
 
@@ -666,13 +810,14 @@ export interface WireStageData {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type: string;
+    node_type: ProposalNodeType;
     plugin: string | null;
     behavior: ProposalNodeBehavior;
     required_fields: string[];
     guaranteed_fields: string[];
     row_cardinality: WireRowCardinality;
     structured_output_fields: WireStructuredOutputField[];
+    node_options_summary: NodeOptionSummary[];
   }>;
   outputs: Array<{
     stable_id: string;
@@ -700,16 +845,4 @@ export interface WireStageData {
   warnings: Array<Record<string, unknown>>;
   blockers: Array<Record<string, unknown>>;
   can_confirm: boolean;
-}
-
-/**
- * CI mirror for Python `SlotType` (`src/elspeth/web/composer/recipes.py`).
- * Not imported by application code — its members are read by the
- * cross-language drift check `scripts/cicd/check_slot_type_cross_language.py`
- * via regex. Removing this interface breaks the CI smoke test
- * `tests/unit/scripts/cicd/test_check_slot_type_cross_language.py`.
- * Recipe decisions render through `KnobSchema`.
- */
-export interface RecipeSlotInput {
-  slot_type: "blob_id" | "str" | "float" | "int" | "str_list";
 }

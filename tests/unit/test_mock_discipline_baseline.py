@@ -8,30 +8,15 @@ unspecced mock constructors hide interface drift and are not allowed.
 from __future__ import annotations
 
 import ast
-import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from elspeth_lints.core.ast_walker import iter_python_files
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_ROOT = REPO_ROOT
-PRUNE_DIRS = frozenset(
-    {
-        ".cache",
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".uv-cache",
-        ".venv",
-        ".worktrees",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-    }
-)
 MOCK_NAMES = frozenset(
     {
         "AsyncMock",
@@ -58,13 +43,10 @@ def _is_specced_mock_call(node: ast.Call) -> bool:
 
 
 def _iter_python_files(root: Path) -> list[Path]:
-    python_files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [dirname for dirname in dirnames if dirname not in PRUNE_DIRS]
-        for filename in sorted(filenames):
-            if filename.endswith(".py"):
-                python_files.append(Path(dirpath) / filename)
-    return sorted(python_files)
+    # Agent worktrees carry their own copy of this gate; the shared exclusion
+    # authority prunes only that nested subtree, so first-party Python tooling
+    # elsewhere under .claude remains governed by the main checkout's scan.
+    return list(iter_python_files(root))
 
 
 def _display_path(path: Path) -> str:
@@ -111,6 +93,25 @@ def test_unspecced_mock_gate_rejects_new_file_regressions(tmp_path: Path, monkey
 
     with pytest.raises(AssertionError, match=r"changed\.py"):
         test_no_unspecced_direct_mock_constructors()
+
+
+def test_claude_code_is_scanned_but_nested_agent_worktrees_are_pruned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tooling = tmp_path / ".claude" / "tooling.py"
+    tooling.parent.mkdir()
+    tooling.write_text("from unittest.mock import Mock\nMock()\n", encoding="utf-8")
+    worktree = tmp_path / ".claude" / "worktrees" / "agent" / "ignored.py"
+    worktree.parent.mkdir(parents=True)
+    worktree.write_text("from unittest.mock import Mock\nMock()\n", encoding="utf-8")
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "SCAN_ROOT", tmp_path)
+
+    calls = _unspecced_mock_calls_by_file()
+
+    assert set(calls) == {".claude/tooling.py"}
 
 
 def test_no_unspecced_direct_mock_constructors() -> None:

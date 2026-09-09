@@ -4,9 +4,9 @@ Construction logic lives in builder.py; this module contains the graph
 class with all runtime methods. The from_plugin_instances() classmethod
 is a thin facade that delegates to builder.build_execution_graph().
 Schema/contract validation policy lives in schema_validation.py,
-coalesce_warnings.py, guarantees.py and schema_factory.py; the
-corresponding ExecutionGraph methods are thin delegating facades
-(elspeth-b2c6ab6db8).
+coalesce_warnings.py, row_union_warnings.py, guarantees.py and
+schema_factory.py; the corresponding ExecutionGraph methods are thin
+delegating facades (elspeth-b2c6ab6db8).
 """
 
 from __future__ import annotations
@@ -32,11 +32,15 @@ from elspeth.contracts.types import (
     AggregationName,
     BranchName,
     CoalesceName,
+    CollectorName,
     GateName,
     NodeID,
+    RowUnionName,
     SinkName,
 )
-from elspeth.core.dag import coalesce_warnings, guarantees, schema_validation
+from elspeth.core.dag import coalesce_warnings, guarantees, row_union_warnings, schema_validation
+from elspeth.core.dag.bound_regions import BoundRegion
+from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote as _EffectiveGuaranteeVote
 from elspeth.core.dag.models import (
     BranchInfo,
@@ -55,8 +59,11 @@ if TYPE_CHECKING:
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
+        CollectorSettings,
         GateSettings,
         QueueSettings,
+        RowUnionSettings,
+        ScopeSettings,
         SourceSettings,
     )
     from elspeth.core.dag.wiring import WiredTransform
@@ -81,15 +88,34 @@ class ExecutionGraph:
         self._graph: MultiDiGraph[str] = nx.MultiDiGraph()
         self._sink_id_map: dict[SinkName, NodeID] = {}
         self._transform_id_map: dict[int, NodeID] = {}
+        self._transform_name_id_map: dict[str, NodeID] = {}  # settings name (composer node id) -> node_id
         self._config_gate_id_map: dict[GateName, NodeID] = {}  # gate_name -> node_id
         self._aggregation_id_map: dict[AggregationName, NodeID] = {}  # agg_name -> node_id
+        self._collector_id_map: dict[CollectorName, NodeID] = {}  # collector_name -> node_id
+        # collector_name -> the batch-transform instance the builder received
+        # (META-29): the runtime needs the instance to register the collector
+        # executor and to resolve plugin-backed audit metadata, and — unlike
+        # aggregations, which ride PipelineConfig — nothing else carries it.
+        self._collector_transform_map: dict[CollectorName, TransformProtocol] = {}
         self._coalesce_id_map: dict[CoalesceName, NodeID] = {}  # coalesce_name -> node_id
         self._branch_info: dict[BranchName, BranchInfo] = {}  # branch_name -> coalesce + gate info
+        # Unbound (no barrier) fork branches consumed by exactly one ordinary
+        # downstream transform/gate (spec §7 E2): branch_name -> that
+        # consumer's node id, the one-hop destination — no backward trace
+        # needed, since the edge IS the direct gate->consumer MOVE edge.
+        self._unbound_branch_first_nodes: dict[BranchName, NodeID] = {}
+        self._row_union_id_map: dict[RowUnionName, NodeID] = {}  # row_union_name -> node_id
+        self._branch_to_row_union: dict[BranchName, RowUnionName] = {}  # fork branch -> row_union
+        self._row_union_branch_gates: dict[BranchName, NodeID] = {}  # fork branch -> owning gate node
         self._route_label_map: dict[tuple[NodeID, SinkName], str] = {}  # (gate_node, sink_name) -> route_label
         self._route_resolution_map: dict[tuple[NodeID, str], RouteDestination] = {}
         self._pipeline_nodes: list[NodeID] | None = None  # Ordered processing nodes (no source/sinks); None = not yet populated
         self._node_step_map: dict[NodeID, int] = {}  # node_id -> audit step (source=0)
         self._validation_warnings: tuple[GraphValidationWarning, ...] = ()
+        self._group_bindings: GroupBindingRegistry = GroupBindingRegistry(bindings=())
+        self._bound_regions: tuple[BoundRegion, ...] = ()
+        self._max_bound_region_depth = 0
+        self._escalation_fixpoint_bound = 1_000
         self._build_metadata_frozen = False
 
     @property
@@ -130,7 +156,14 @@ class ExecutionGraph:
         input_schema_config: SchemaConfig | None = None,
         output_schema_config: SchemaConfig | None = None,
         declared_required_fields: frozenset[str] = _EMPTY_DECLARED_REQUIRED_FIELDS,
+        declared_output_fields: frozenset[str] = frozenset(),
+        declared_input_fields: frozenset[str] = frozenset(),
+        declared_string_input_fields: frozenset[str] = frozenset(),
         passes_through_input: bool = False,
+        forwards_input_fields: bool = False,
+        removed_input_fields: frozenset[str] = frozenset(),
+        preserves_input_values: bool = False,
+        observed_value_type: str | None = None,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -150,11 +183,61 @@ class ExecutionGraph:
                 SinkProtocol.declared_required_fields, or derived from direct
                 add_node() raw sink schema config when omitted. Empty frozenset
                 otherwise.
+            declared_output_fields: For TRANSFORM nodes only — the set of fields
+                the transform ADDS to each row. Populated by the builder from
+                TransformProtocol.declared_output_fields. Unlike
+                declared_required_fields there is deliberately no derivation
+                from output_schema_config when omitted: a pass-through
+                transform's guaranteed fields include the input fields it
+                forwards, so a derived value would report every pass-through
+                transform as colliding with its own upstream
+                (elspeth-cfcd333f83). Empty frozenset otherwise.
+            declared_input_fields: For TRANSFORM nodes only — the set of fields
+                the transform REQUIRES on each arriving row. Populated by the
+                builder from TransformProtocol.declared_input_fields. As with
+                declared_output_fields there is deliberately no derivation from
+                the node's schema config when omitted: six transform configs
+                compute this as a property over their own options and the
+                `schema:` block never carries those field names
+                (elspeth-ada5a60249). Empty frozenset otherwise.
+            declared_string_input_fields: For TRANSFORM nodes only — the set of
+                fields the transform requires to be present AND string-valued
+                on every arriving row, failing the row closed otherwise.
+                Populated by the builder from
+                TransformProtocol.declared_string_input_fields; no derivation
+                from schema config for the same reason as its siblings
+                (elspeth-b19dfe41fb). Empty frozenset otherwise.
             passes_through_input: For TRANSFORM nodes only — True iff the transform
                 unconditionally emits rows containing every input field
                 (ADR-007). Validator walk propagates predecessor guarantees
                 through nodes where this is True. Must be False for non-TRANSFORM
                 nodes; NodeInfo guards against misuse.
+            forwards_input_fields: For TRANSFORM/AGGREGATION nodes only — True
+                iff every SUCCESS row carries every input field EXCEPT
+                removed_input_fields. Weaker than passes_through_input, which
+                admits no removals and no dropped rows; read by both the
+                presence and extras-direction walks (elspeth-15c72686f2). No
+                derivation from schema config when
+                omitted, for the same reason its declaration siblings above
+                cite: the removal set is computed from plugin options
+                (line_explode's source_field, field_mapper's rename sources)
+                that the `schema:` block never carries.
+            removed_input_fields: The names forwards_input_fields subtracts.
+                Meaningless without that flag; NodeInfo guards the pairing.
+            preserves_input_values: For the plugin-bearing kinds — TRANSFORM,
+                AGGREGATION, COLLECTOR — True iff process() never changes the
+                VALUE of a surviving input field (adding new fields and
+                declared removals are fine). Lets
+                resolve_guaranteed_field_type recurse through an undeclaring
+                pass-through or forwarding node instead of abstaining
+                (elspeth-e6e552ce34; scope widened from TRANSFORM-only by
+                elspeth-48aeea6ad9). NodeInfo guards against misuse.
+            observed_value_type: For SOURCE nodes only — the structural
+                SchemaConfig base type of every cell the source emits under an
+                OBSERVED schema (csv: "str"), or None when no such structural
+                fact holds. Consumed by resolve_guaranteed_field_type's
+                structural source arm (elspeth-e6e552ce34). NodeInfo guards
+                against misuse.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -172,7 +255,7 @@ class ExecutionGraph:
                 raise GraphValidationError(
                     f"Invalid schema config: {exc}",
                     component_id=node_id,
-                    component_type=node_type.value if isinstance(node_type, NodeType) else str(node_type),
+                    component_type=node_type.value,
                 ) from exc
 
         if node_type == NodeType.SINK and declared_required_fields is _EMPTY_DECLARED_REQUIRED_FIELDS and output_schema_config is not None:
@@ -188,7 +271,14 @@ class ExecutionGraph:
             input_schema_config=input_schema_config,
             output_schema_config=output_schema_config,
             declared_required_fields=declared_required_fields,
+            declared_output_fields=declared_output_fields,
+            declared_input_fields=declared_input_fields,
+            declared_string_input_fields=declared_string_input_fields,
+            preserves_input_values=preserves_input_values,
+            observed_value_type=observed_value_type,
             passes_through_input=passes_through_input,
+            forwards_input_fields=forwards_input_fields,
+            removed_input_fields=removed_input_fields,
         )
         self._graph.add_node(node_id, info=info)
 
@@ -202,8 +292,7 @@ class ExecutionGraph:
         """Deep-freeze mutable node configs after construction is complete."""
         for node_id, attrs in self._graph.nodes(data=True):
             info = cast(NodeInfo, attrs["info"])
-            if isinstance(info.config, dict):
-                self._graph.nodes[node_id]["info"] = replace(info, config=deep_freeze(info.config))
+            self._graph.nodes[node_id]["info"] = replace(info, config=deep_freeze(info.config))
 
     def add_edge(
         self,
@@ -288,12 +377,12 @@ class ExecutionGraph:
 
         for node_id_str, node_attrs in self._graph.nodes(data=True):
             node_info = cast(NodeInfo, node_attrs["info"])
-            # QUEUE and COALESCE are structural join primitives. SINK is a
-            # terminal write boundary: ADR-025 Decision 9 allows direct
-            # multi-source fan-in here, with ingest_sequence as the ordering
-            # authority. Ordinary processing nodes must still route through
-            # an explicit QUEUE.
-            if node_info.node_type in {NodeType.QUEUE, NodeType.SINK, NodeType.COALESCE}:
+            # QUEUE, COALESCE, and ROW_UNION are structural join primitives.
+            # SINK is a terminal write boundary: ADR-025 Decision 9 allows
+            # direct multi-source fan-in here, with ingest_sequence as the
+            # ordering authority. Ordinary processing nodes must still route
+            # through an explicit QUEUE.
+            if node_info.node_type in {NodeType.QUEUE, NodeType.SINK, NodeType.COALESCE, NodeType.ROW_UNION}:
                 continue
             incoming_move_predecessors = {
                 from_id
@@ -636,6 +725,25 @@ class ExecutionGraph:
             for u, v, _key, data in self._graph.in_edges(node_id, data=True, keys=True)
         ]
 
+    def get_outgoing_edges(self, node_id: str) -> list[EdgeInfo]:
+        """Get all edges leaving this node.
+
+        Args:
+            node_id: The source node ID
+
+        Returns:
+            List of EdgeInfo for edges where from_node == node_id
+        """
+        return [
+            EdgeInfo(
+                from_node=NodeID(u),
+                to_node=NodeID(v),
+                label=data["label"],
+                mode=data["mode"],
+            )
+            for u, v, _key, data in self._graph.out_edges(node_id, data=True, keys=True)
+        ]
+
     @classmethod
     def from_plugin_instances(
         cls,
@@ -648,6 +756,10 @@ class ExecutionGraph:
         gates: Sequence[GateSettings] = (),
         coalesce_settings: Sequence[CoalesceSettings] | None = None,
         queues: Mapping[str, QueueSettings] | None = None,
+        row_union_settings: Sequence[RowUnionSettings] | None = None,
+        collectors: Mapping[str, tuple[TransformProtocol, CollectorSettings]] | None = None,
+        scope_settings: Sequence[ScopeSettings] | None = None,
+        max_bound_region_depth: int = 5,
     ) -> ExecutionGraph:
         """Build ExecutionGraph from plugin instances.
 
@@ -671,6 +783,11 @@ class ExecutionGraph:
             gates: Config-driven gate settings
             coalesce_settings: Coalesce configs for fork/join patterns
             queues: Declared pass-through scheduling queues
+            row_union_settings: row_union barrier configs (fork-branch UNION ALL)
+            collectors: Dict of collector_name -> (transform_instance, CollectorSettings) —
+                EXPAND-group closers (barrier-scopes spec §3)
+            scope_settings: Declared opener -> closer scope bindings
+            max_bound_region_depth: Maximum supported bound-region nesting depth
 
         Returns:
             ExecutionGraph with schemas populated
@@ -692,6 +809,10 @@ class ExecutionGraph:
             gates=gates,
             coalesce_settings=coalesce_settings,
             queues=queues,
+            row_union_settings=row_union_settings,
+            collectors=collectors,
+            scope_settings=scope_settings,
+            max_bound_region_depth=max_bound_region_depth,
         )
 
     # ===== PUBLIC SETTERS (construction-time) =====
@@ -705,6 +826,11 @@ class ExecutionGraph:
         """Set the transform sequence -> node_id mapping."""
         self._assert_build_metadata_mutable()
         self._transform_id_map = dict(mapping)
+
+    def set_transform_name_id_map(self, mapping: dict[str, NodeID]) -> None:
+        """Set the transform settings-name -> node_id mapping."""
+        self._assert_build_metadata_mutable()
+        self._transform_name_id_map = dict(mapping)
 
     def set_config_gate_id_map(self, mapping: dict[GateName, NodeID]) -> None:
         """Set the gate_name -> node_id mapping."""
@@ -721,15 +847,45 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._aggregation_id_map = dict(mapping)
 
+    def set_collector_id_map(self, mapping: dict[CollectorName, NodeID]) -> None:
+        """Set the collector_name -> node_id mapping."""
+        self._assert_build_metadata_mutable()
+        self._collector_id_map = dict(mapping)
+
+    def set_collector_transform_map(self, mapping: Mapping[CollectorName, TransformProtocol]) -> None:
+        """Set the collector_name -> transform-instance mapping (META-29)."""
+        self._assert_build_metadata_mutable()
+        self._collector_transform_map = dict(mapping)
+
     def set_coalesce_id_map(self, mapping: dict[CoalesceName, NodeID]) -> None:
         """Set the coalesce_name -> node_id mapping."""
         self._assert_build_metadata_mutable()
         self._coalesce_id_map = dict(mapping)
 
+    def set_row_union_id_map(self, mapping: dict[RowUnionName, NodeID]) -> None:
+        """Set the row_union_name -> node_id mapping."""
+        self._assert_build_metadata_mutable()
+        self._row_union_id_map = dict(mapping)
+
+    def set_branch_to_row_union_map(self, mapping: dict[BranchName, RowUnionName]) -> None:
+        """Set the fork branch_name -> row_union_name mapping."""
+        self._assert_build_metadata_mutable()
+        self._branch_to_row_union = dict(mapping)
+
+    def set_row_union_branch_gates(self, mapping: dict[BranchName, NodeID]) -> None:
+        """Set the row_union fork branch_name -> owning gate node mapping."""
+        self._assert_build_metadata_mutable()
+        self._row_union_branch_gates = dict(mapping)
+
     def set_branch_info(self, mapping: dict[BranchName, BranchInfo]) -> None:
         """Set the branch_name -> BranchInfo mapping (coalesce + gate)."""
         self._assert_build_metadata_mutable()
         self._branch_info = dict(mapping)
+
+    def set_unbound_branch_first_nodes(self, mapping: dict[BranchName, NodeID]) -> None:
+        """Set the unbound (no barrier) consumer-fed branch_name -> first-node mapping (spec §7 E2)."""
+        self._assert_build_metadata_mutable()
+        self._unbound_branch_first_nodes = dict(mapping)
 
     def set_route_label_map(self, mapping: dict[tuple[NodeID, SinkName], str]) -> None:
         """Set the (gate_node, sink_name) -> route_label mapping."""
@@ -750,6 +906,39 @@ class ExecutionGraph:
         """Set non-fatal graph construction warnings."""
         self._assert_build_metadata_mutable()
         self._validation_warnings = tuple(warnings)
+
+    def set_group_bindings(self, registry: GroupBindingRegistry) -> None:
+        """Set the unified FORK/EXPAND group-binding registry (spec §3).
+
+        The registry is stored by reference, not copied: `_freeze_build_metadata`
+        only flips a mutability flag (no MappingProxyType wrapping, no deep
+        copy), and the registry's own runtime `_expand_groups` index must stay
+        mutable after the freeze for `register_expand_group` (WS3's mint-path
+        call site) to keep working.
+        """
+        self._assert_build_metadata_mutable()
+        self._group_bindings = registry
+
+    def set_bound_regions(self, regions: Sequence[BoundRegion]) -> None:
+        """Set the computed SESE bound regions of this build (spec §7 rule 3)."""
+        self._assert_build_metadata_mutable()
+        self._bound_regions = tuple(regions)
+
+    def set_max_bound_region_depth(self, depth: int) -> None:
+        """Set the max OBSERVED bound-region nesting depth of this build.
+
+        0 when the build has no bound regions. This is NOT the configured
+        ``max_bound_region_depth`` cap passed to ``from_plugin_instances``
+        (same name by 2026-08-22 synthesis decision) — it is the deepest
+        region this specific build actually produced.
+        """
+        self._assert_build_metadata_mutable()
+        self._max_bound_region_depth = depth
+
+    def set_escalation_fixpoint_bound(self, bound: int) -> None:
+        """Set the derived EOF barrier-flush fixpoint bound (spec §6.3)."""
+        self._assert_build_metadata_mutable()
+        self._escalation_fixpoint_bound = bound
 
     def add_route_resolution_entry(self, gate_id: NodeID, label: str, dest: RouteDestination) -> None:
         """Add a single entry to the route resolution map."""
@@ -795,6 +984,18 @@ class ExecutionGraph:
         """
         return dict(self._transform_id_map)
 
+    def get_transform_name_id_map(self) -> dict[str, NodeID]:
+        """Get explicit settings-name -> node_id mapping for transforms.
+
+        The settings name IS the composer node id for composer-authored
+        pipelines (builder.py keys ``transform_ids_by_name`` on
+        ``wired.settings.name``), so this is the name-keyed sibling of
+        :meth:`get_config_gate_id_map` and the other five id maps —
+        diagnostics that attribute a DAG node back to its authored component
+        must use this, never the positional sequence map.
+        """
+        return dict(self._transform_name_id_map)
+
     def get_node_step_map(self) -> dict[NodeID, int]:
         """Get the builder-assigned node_id -> audit step mapping."""
         return dict(self._node_step_map)
@@ -815,6 +1016,27 @@ class ExecutionGraph:
         """
         return dict(self._aggregation_id_map)
 
+    def get_collector_id_map(self) -> dict[CollectorName, NodeID]:
+        """Get explicit collector_name -> node_id mapping for collectors.
+
+        Returns:
+            Dict mapping collector name to its graph node ID.
+        """
+        return dict(self._collector_id_map)
+
+    def get_collector_transform_map(self) -> dict[CollectorName, TransformProtocol]:
+        """Get the collector_name -> batch-transform instance mapping (META-29).
+
+        Internal runtime surface, sibling of :meth:`get_collector_id_map`:
+        the processor factory registers each collector on the executor with
+        this instance, and audit-metadata resolution reads its
+        ``plugin_version``/``determinism``/``source_file_hash`` from it. The
+        instances are the exact objects passed to ``from_plugin_instances``
+        (never copied — plugin identity is what ``on_start``/``on_complete``
+        lifecycles key on).
+        """
+        return dict(self._collector_transform_map)
+
     def get_coalesce_id_map(self) -> dict[CoalesceName, NodeID]:
         """Get explicit coalesce_name -> node_id mapping.
 
@@ -831,6 +1053,58 @@ class ExecutionGraph:
             Branches not in this map route to the output sink.
         """
         return {name: info.coalesce_name for name, info in self._branch_info.items()}
+
+    def get_row_union_id_map(self) -> dict[RowUnionName, NodeID]:
+        """Get explicit row_union_name -> node_id mapping."""
+        return dict(self._row_union_id_map)
+
+    def get_error_routable_closer_names(self) -> set[str]:
+        """Closer names an ``on_error`` target may legally name at RUNTIME
+        (spec §7 rule 9, WS3 Task 9b): coalesce, row_union and collector —
+        the same three kinds the builder's rule-9 acceptance
+        (``core/dag/builder.py``'s ``closer_name_to_node``) treats uniformly
+        as legal DIVERT targets (integration item 18 parity sweep).
+        """
+        return (
+            {str(name) for name in self._coalesce_id_map}
+            | {str(name) for name in self._row_union_id_map}
+            | {str(name) for name in self._collector_id_map}
+        )
+
+    def get_branch_to_row_union_map(self) -> dict[BranchName, RowUnionName]:
+        """Get fork branch_name -> row_union_name mapping.
+
+        Branches in this map release through a row_union barrier; branches in
+        neither this map nor the coalesce branch map route to a sink.
+        """
+        return dict(self._branch_to_row_union)
+
+    def get_group_bindings(self) -> GroupBindingRegistry:
+        """Get the unified FORK/EXPAND group-binding registry (spec §3).
+
+        Empty registry (`bindings=()`) for a build with no bound group.
+        """
+        return self._group_bindings
+
+    def get_bound_regions(self) -> tuple[BoundRegion, ...]:
+        """Get the computed SESE bound regions of this build (spec §7 rule 3).
+
+        Empty tuple for a build with no bound group.
+        """
+        return self._bound_regions
+
+    def get_max_bound_region_depth(self) -> int:
+        """Get the max OBSERVED bound-region nesting depth of this build.
+
+        0 when no bound regions exist. NOT the configured
+        ``max_bound_region_depth`` cap — see ``set_max_bound_region_depth``.
+        """
+        return self._max_bound_region_depth
+
+    @property
+    def escalation_fixpoint_bound(self) -> int:
+        """The derived non-convergence bound for the EOF barrier-flush fixpoint (spec §6.3)."""
+        return self._escalation_fixpoint_bound
 
     def get_branch_info_map(self) -> dict[BranchName, BranchInfo]:
         """Get immutable branch routing plans keyed by branch name."""
@@ -868,18 +1142,21 @@ class ExecutionGraph:
     def get_branch_first_nodes(self) -> dict[str, NodeID]:
         """Get mapping of branch names to their first processing node.
 
-        For every branch that routes to a coalesce node, returns the first
-        node the token should visit:
-        - Identity branches (COPY edge gate→coalesce): maps to coalesce node ID
-        - Transform branches (MOVE edge chain→coalesce): maps to the first
+        For every branch that routes to a correlated barrier — a coalesce node
+        or a row_union node — returns the first node the token should visit:
+        - Identity branches (COPY edge gate→barrier): maps to the barrier node ID
+        - Transform branches (MOVE edge chain→barrier): maps to the first
           transform's node ID in the branch chain
 
-        The mapping covers ALL coalesce branches, eliminating the need for
-        defensive .get() at runtime.
+        The mapping covers ALL coalesce branches AND all row_union branches,
+        eliminating the need for defensive .get() at runtime. Coalesce branches
+        resolve their fork gate through ``_branch_info``; row_union branches are
+        not in ``_branch_info``, so their gate comes from
+        ``_row_union_branch_gates`` and is passed to the trace explicitly.
 
         Returns:
             Dict mapping branch name (str) to the first processing NodeID.
-            Empty dict if no coalesce branches exist.
+            Empty dict if no barrier branches exist.
         """
         result: dict[str, NodeID] = {}
 
@@ -897,6 +1174,22 @@ class ExecutionGraph:
 
             if is_identity:
                 result[branch_name] = coalesce_nid
+            elif self._is_nested_barrier_branch(branch_info.input_connection):
+                # Nested branch (spec §7 rule 3/5): the declared branches:
+                # value names ANOTHER coalesce/row_union, not a literal
+                # transform. No transform chain exists between this gate and
+                # coalesce_nid — an inner bound region sits between them, and
+                # _trace_branch_endpoints's backward MOVE walk can never
+                # cross it (the inner barrier's own in-edges carry the inner
+                # region's labels, never this outer branch's). The roster
+                # fact (_branch_info binds this branch to coalesce_nid for
+                # require_all settlement) is correct and untouched; only the
+                # per-token dispatch fact changes: resolve the SAME way
+                # _unbound_branch_first_nodes does for a consumer-fed branch
+                # — the fork gate's own branch-labelled out-edge already
+                # points at the true first node (here, the inner region's
+                # opener), drawn by the ordinary producer/consumer match.
+                result[branch_name] = self._resolve_nested_branch_first_node(branch_info.gate_node_id, branch_name)
             else:
                 # Transform branch: trace backwards from coalesce through MOVE edges
                 # to find the first node in this branch's transform chain.
@@ -905,15 +1198,129 @@ class ExecutionGraph:
                 first_node, _last_node = self._trace_branch_endpoints(coalesce_nid, branch_name)
                 result[branch_name] = first_node
 
+        # row_union branches use the same identity-vs-chain shapes with the
+        # union node as the barrier endpoint.
+        for branch_name, row_union_name in self._branch_to_row_union.items():
+            union_nid = self._row_union_id_map[row_union_name]
+            is_identity = any(
+                data["mode"] == RoutingMode.COPY and data["label"] == branch_name
+                for _from_id, _to_id, _key, data in self._graph.in_edges(union_nid, keys=True, data=True)
+            )
+            if is_identity:
+                result[branch_name] = union_nid
+            else:
+                first_node, _last_node = self._trace_branch_endpoints(
+                    union_nid,
+                    branch_name,
+                    fork_gate_nid=self._row_union_branch_gates[branch_name],
+                )
+                result[branch_name] = first_node
+
+        # Unbound (no barrier) consumer-fed branches (spec §7 E2): the
+        # mapping is precomputed at build time as a direct fact (the one-hop
+        # gate->consumer MOVE edge), never derived via backward trace — there
+        # is no barrier to trace back FROM.
+        result.update({str(branch_name): node_id for branch_name, node_id in self._unbound_branch_first_nodes.items()})
+
         return result
 
-    def _trace_branch_endpoints(self, coalesce_nid: NodeID, branch_name: str) -> tuple[NodeID, NodeID]:
-        """Trace backwards from coalesce to find the first AND last transforms in a branch chain.
+    def _is_nested_barrier_branch(self, input_connection: str) -> bool:
+        """Whether a coalesce branch's declared value names ANOTHER coalesce.
 
-        Walks backwards through MOVE edges from the coalesce node to find both
-        endpoints of the transform chain for a given branch. The chain terminates
-        at the fork gate node (which produces the branch via a MOVE edge labelled
-        with the branch name).
+        True exactly when ``branches: {branch_name: input_connection}``
+        points at another coalesce's name rather than an ordinary
+        transform's connection — the coalesce-feeds-coalesce shape spec §7
+        rules 2/5 sanction but the legacy transform-chain walker was never
+        rewired to consume (WS2 Task 4/5's
+        ``BoundRegion``/``GroupBindingRegistry`` already model this
+        topology correctly; this predicate is the declarative disambiguator
+        the walker itself cannot supply).
+
+        Coalesce-feeds-row_union is deliberately NOT checked here: a
+        coalesce branch value can never equal a row_union's name (a
+        row_union has a required ``on_success`` connection and publishes
+        nothing under its own name, so no coalesce branch can point at it
+        that way), and the shape it would model — a row_union sitting
+        directly under an outer coalesce with no intervening sink — is
+        rejected at build. E1 review round 2 F5 (elspeth-0bd2cde19a,
+        2026-08-23) proved both authorable variants build-reject; a
+        row_union disjunct here would be dead code claiming coverage it
+        cannot exercise. The SYMMETRIC case — a row_union BRANCH fed by a
+        coalesce — is a live latent gap, tracked separately at
+        elspeth-a01889580f (``get_branch_first_nodes``'s row_union loop,
+        not this predicate).
+        """
+        return CoalesceName(input_connection) in self._coalesce_id_map
+
+    def _resolve_nested_branch_first_node(self, gate_node_id: NodeID, branch_name: str) -> NodeID:
+        """One-hop resolution for a nested coalesce branch's first node.
+
+        Mirrors ``get_unbound_branch_first_nodes``'s mechanism (spec §7 E2):
+        the fork gate's own branch-labelled out-edge — drawn once, by the
+        ordinary producer/consumer match, regardless of what the branch
+        ultimately feeds — already names the correct first node. For a
+        nested branch that is the inner region's own opener (or its
+        identity-copy target), treated opaquely; the walker never needs to
+        see past it.
+        """
+        matches: list[NodeID] = [
+            NodeID(to_id)
+            for _from_id, to_id, _key, data in self._graph.out_edges(gate_node_id, keys=True, data=True)
+            if data["label"] == branch_name
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise GraphValidationError(
+                f"Fork gate '{gate_node_id}' has no outgoing edge labelled '{branch_name}' for its "
+                "nested coalesce branch. This indicates a graph construction bug.",
+                component_id=str(gate_node_id),
+                component_type="gate",
+            )
+        raise GraphValidationError(
+            f"Fork gate '{gate_node_id}' has {len(matches)} outgoing edges labelled '{branch_name}' "
+            f"({sorted(matches)}) for its nested coalesce branch — disambiguation must be by branch "
+            "identity, not edge-insertion order (spec §7). This indicates a graph construction bug.",
+            component_id=str(gate_node_id),
+            component_type="gate",
+        )
+
+    def _resolve_branch_endpoints(self, coalesce_nid: NodeID, branch_name: str) -> tuple[NodeID, NodeID]:
+        """Resolve ``(first_node, last_node)`` for a coalesce branch, transparently
+        handling the nested case ``_trace_branch_endpoints``'s backward MOVE
+        walk cannot cross (spec §7 rules 3/5).
+
+        Shared by ``schema_validation.py``'s ``merge: select`` effective-
+        producer tracing and ``coalesce_warnings.py``'s DIVERT-branch
+        matching — both call sites need a branch's endpoints outside
+        ``get_branch_first_nodes``'s own dispatch map, and both hit the
+        identical eager pre-row ``GraphValidationError`` E1a fixed for
+        fork-child dispatch, one function over (elspeth-0bd2cde19a round-2
+        F2). For a nested branch the "last node" (the effective producer of
+        the declared connection) is simply the inner coalesce's own node —
+        a coalesce publishes its output under its own name, so there is no
+        backward walk to perform at all, only the same one-hop first-node
+        resolution ``get_branch_first_nodes`` already uses.
+        """
+        branch_info = self._branch_info[BranchName(branch_name)]
+        if self._is_nested_barrier_branch(branch_info.input_connection):
+            first_node = self._resolve_nested_branch_first_node(branch_info.gate_node_id, branch_name)
+            last_node = self._coalesce_id_map[CoalesceName(branch_info.input_connection)]
+            return first_node, last_node
+        return self._trace_branch_endpoints(coalesce_nid, branch_name)
+
+    def _trace_branch_endpoints(
+        self,
+        coalesce_nid: NodeID,
+        branch_name: str,
+        fork_gate_nid: NodeID | None = None,
+    ) -> tuple[NodeID, NodeID]:
+        """Trace backwards from a barrier to find the first AND last transforms in a branch chain.
+
+        Walks backwards through MOVE edges from the barrier node — a coalesce
+        node or a row_union node — to find both endpoints of the transform chain
+        for a given branch. The chain terminates at the fork gate node (which
+        produces the branch via a MOVE edge labelled with the branch name).
 
         The backward walk follows ANY MOVE edge, not just ``"continue"`` edges,
         because branch chains may include intermediate routing gates whose
@@ -924,19 +1331,29 @@ class ExecutionGraph:
         may produce MOVE edges whose labels collide with the branch name.
 
         Args:
-            coalesce_nid: The coalesce node to trace back from
+            coalesce_nid: The barrier node to trace back from (coalesce or
+                row_union; the parameter name predates row_union).
             branch_name: The branch name to trace
+            fork_gate_nid: The gate that originates this branch. Optional for
+                coalesce branches, which resolve their gate through
+                ``_branch_info``; REQUIRED for row_union branches, which are
+                not recorded in ``_branch_info`` and would otherwise KeyError.
 
         Returns:
             ``(first_node, last_node)`` — first_node is the first transform
             after the gate (receives the branch_name MOVE edge); last_node is
-            the immediate MOVE predecessor of the coalesce.
+            the immediate MOVE predecessor of the barrier.
 
         Raises:
-            GraphValidationError: If the branch chain cannot be traced
+            GraphValidationError: If the branch chain cannot be traced. The
+                diagnostic reports the barrier's actual node type, so a
+                row_union failure is not mislabelled as a coalesce failure.
         """
         # Resolve the fork gate that originates this specific branch.
-        fork_gate_nid = self._branch_info[BranchName(branch_name)].gate_node_id
+        # Coalesce branches resolve through _branch_info; row_union callers
+        # pass their gate explicitly (row_union branches are not in _branch_info).
+        if fork_gate_nid is None:
+            fork_gate_nid = self._branch_info[BranchName(branch_name)].gate_node_id
 
         visited: set[NodeID] = set()
         candidates: list[NodeID] = []
@@ -979,12 +1396,17 @@ class ExecutionGraph:
                     break  # No MOVE predecessor — try next candidate
                 current = predecessor
 
+        # Report the barrier's ACTUAL node type: this trace serves both coalesce
+        # and row_union, and a hardcoded "coalesce" mislabels row_union failures.
+        # NodeType.COALESCE.value == "coalesce", so the coalesce-path message and
+        # component_type are byte-identical to the pre-row_union behaviour.
+        barrier_kind = self.get_node_info(coalesce_nid).node_type.value
         raise GraphValidationError(
             f"Cannot trace first transform for branch '{branch_name}' leading to "
-            f"coalesce node '{coalesce_nid}'. This indicates a graph construction bug — "
-            f"transform branches must have MOVE edge chains from gate to coalesce.",
+            f"{barrier_kind} node '{coalesce_nid}'. This indicates a graph construction bug — "
+            f"transform branches must have MOVE edge chains from gate to {barrier_kind}.",
             component_id=str(coalesce_nid),
-            component_type="coalesce",
+            component_type=barrier_kind,
         )
 
     def get_branch_to_sink_map(self) -> dict[BranchName, SinkName]:
@@ -1004,6 +1426,15 @@ class ExecutionGraph:
             if data["mode"] == RoutingMode.COPY and NodeID(to_id) in sink_node_to_name:
                 result[BranchName(data["label"])] = sink_node_to_name[NodeID(to_id)]
         return result
+
+    def get_unbound_branch_first_nodes(self) -> dict[BranchName, NodeID]:
+        """Get unbound (no barrier) consumer-fed branch_name -> first-node mapping (spec §7 E2).
+
+        Disjoint from ``get_branch_to_sink_map`` (direct sink match) and the
+        coalesce/row_union branch maps — a fork branch is exactly one of
+        closer-bound, sink-bound, or consumer-fed.
+        """
+        return dict(self._unbound_branch_first_nodes)
 
     def get_branch_gate_map(self) -> dict[BranchName, NodeID]:
         """Get branch_name -> producing gate node ID mapping.
@@ -1089,6 +1520,16 @@ class ExecutionGraph:
         """
         return coalesce_warnings.warn_divert_coalesce_interactions(self, coalesce_configs)
 
+    def warn_divert_row_union_interactions(
+        self,
+        row_union_configs: dict[NodeID, RowUnionSettings],
+    ) -> list[GraphValidationWarning]:
+        """Detect DIVERT edges in branch chains feeding a row_union.
+
+        Delegates to ``dag.row_union_warnings.warn_divert_row_union_interactions``.
+        """
+        return row_union_warnings.warn_divert_row_union_interactions(self, row_union_configs)
+
     def _validate_single_edge(
         self,
         from_node_id: str,
@@ -1170,9 +1611,11 @@ class ExecutionGraph:
         cache: dict[str, _EffectiveGuaranteeVote],
         field_cache: dict[str, frozenset[str]] | None = None,
     ) -> _EffectiveGuaranteeVote:
-        """Recursive guarantee walk that preserves participation state.
+        """Recursive guarantee walk that preserves participation and closedness.
 
-        Delegates to ``dag.guarantees.walk_effective_guarantee_vote``.
+        Delegates to ``dag.guarantees.walk_effective_guarantee_vote``. The
+        vote's ``fields`` are a LOWER bound; ``closed`` is what licenses a
+        caller to prove a field ABSENT from it. See ``EffectiveGuaranteeVote``.
         """
         return guarantees.walk_effective_guarantee_vote(self, node_id, cache, field_cache)
 

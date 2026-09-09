@@ -6,12 +6,17 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 from uuid import UUID
 
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.completion_gates import CompletionGateFacts
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.protocol import RunRecord
@@ -29,6 +34,8 @@ class FrozenRunSettings:
     plugin_snapshot: PluginAvailabilitySnapshot
     executable_config: Mapping[str, Any]
     audit_safe_config: Mapping[str, Any]
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "executable_config", "audit_safe_config")
@@ -77,7 +84,6 @@ class YamlGenerator(Protocol):
     def generate_yaml(self, state: CompositionState) -> str: ...
 
 
-@runtime_checkable
 class ExecutionService(Protocol):
     """Protocol for pipeline execution operations.
 
@@ -85,7 +91,13 @@ class ExecutionService(Protocol):
     execute() returns immediately; the pipeline runs in a background thread.
     """
 
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> ValidationResult:
         """Async dry-run validation using real engine code paths.
 
         Loads the current CompositionState for the session, generates YAML,
@@ -104,8 +116,10 @@ class ExecutionService(Protocol):
         self,
         state: CompositionState,
         *,
+        session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ValidationResult:
         """Async dry-run validation for an already materialized composition state.
 
@@ -114,6 +128,11 @@ class ExecutionService(Protocol):
         composition version. When provided, ``session_id`` scopes inline blob
         metadata lookups to the same session boundary that execution enforces
         before linking blobs to runs.
+
+        ``completion_gates`` carries persisted composer completion-gate facts
+        parsed off the caller's ``composition_states`` record; the recompute
+        cannot rediscover those turn events, so the implementation merges them
+        into the returned readiness (withholding ``completion_ready`` only).
         """
         ...
 
@@ -122,9 +141,11 @@ class ExecutionService(Protocol):
         session_id: UUID,
         state_id: UUID | None = None,
         *,
+        session_operation_lease: SessionOperationLease,
         user_id: str | None = None,
         auth_provider_type: str | None = None,
         fanout_ack_token: str | None = None,
+        secret_ack_token: str | None = None,
     ) -> UUID:
         """Start a background pipeline run.
 
@@ -138,6 +159,8 @@ class ExecutionService(Protocol):
             auth_provider_type: Auth provider namespace for Landscape run attribution.
             fanout_ack_token: Optional launch acknowledgement for high-fanout
                 LLM/provider-call risk.
+            secret_ack_token: Optional out-of-band approval of the run's wired
+                secret→destination set (elspeth-f3c1aafd25).
 
         Note: async because it calls SessionService (async) for active-run
         check and run creation. The actual pipeline runs in a background

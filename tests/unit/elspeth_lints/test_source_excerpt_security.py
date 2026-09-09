@@ -42,6 +42,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from tests.helpers.tree_gate import iter_gate_files
 
 from elspeth_lints.core.allowlist import JudgeVerdict, compute_judge_metadata_signature
 from elspeth_lints.core.cli import main
@@ -706,7 +707,7 @@ def test_no_other_prompt_builder_constructs_judge_request_without_scrubber() -> 
     package_root = Path(__file__).resolve().parents[3] / "elspeth-lints" / "src" / "elspeth_lints"
     assert package_root.is_dir(), f"elspeth_lints package not found at {package_root}"
     offending_files: list[str] = []
-    for py_file in package_root.rglob("*.py"):
+    for py_file in iter_gate_files(package_root):
         text = py_file.read_text(encoding="utf-8")
         if "JudgeRequest(" not in text:
             continue
@@ -758,7 +759,7 @@ def test_bypass_resistance_grep_fires_when_injected_file_lacks_scrubber(tmp_path
     )
     # Apply the same grep logic the bypass-resistance test uses.
     offending_files: list[str] = []
-    for py_file in fake_pkg.rglob("*.py"):
+    for py_file in iter_gate_files(fake_pkg):
         text = py_file.read_text(encoding="utf-8")
         if "JudgeRequest(" not in text:
             continue

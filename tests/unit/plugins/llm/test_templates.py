@@ -1,6 +1,8 @@
 # tests/plugins/llm/test_templates.py
 """Tests for Jinja2 prompt template engine."""
 
+import hashlib
+
 import pytest
 
 from elspeth.contracts.schema_contract import SchemaContract
@@ -66,6 +68,43 @@ Analyze these entries:
         assert result.template_hash is not None
         assert result.variables_hash is not None
         assert result.rendered_hash is not None
+
+    def test_static_render_uses_lookup_without_row_binding(self) -> None:
+        """Static source prompts receive lookup data but never a synthetic row."""
+        template = PromptTemplate(
+            "Summarise {{ lookup.topic }}",
+            template_source="prompts/source.j2",
+            lookup_data={"topic": "audit"},
+            lookup_source="prompts/lookup.yaml",
+        )
+
+        result = template.render_static_with_metadata()
+
+        assert result.prompt == "Summarise audit"
+        assert result.variables_hash == hashlib.sha256(b"{}").hexdigest()
+        assert result.rendered_hash == hashlib.sha256(b"Summarise audit").hexdigest()
+        assert result.template_source == "prompts/source.j2"
+        assert result.lookup_hash == template.lookup_hash
+        assert result.lookup_source == "prompts/lookup.yaml"
+        assert result.contract_hash is None
+
+    def test_static_render_does_not_inject_empty_row(self) -> None:
+        template = PromptTemplate("{{ row.text | default('synthetic') }}")
+
+        with pytest.raises(TemplateError, match="row"):
+            template.render_static_with_metadata()
+
+    def test_static_render_wraps_arithmetic_failure(self) -> None:
+        template = PromptTemplate("{{ 1 / 0 }}")
+
+        with pytest.raises(TemplateError, match="Template rendering failed"):
+            template.render_static_with_metadata()
+
+    def test_row_render_wraps_arithmetic_failure(self) -> None:
+        template = PromptTemplate("{{ 1 / row.zero }}")
+
+        with pytest.raises(TemplateError, match="Template rendering failed"):
+            template.render({"zero": 0})
 
     def test_render_with_metadata_accepts_pipeline_row(self) -> None:
         """render_with_metadata() accepts PipelineRow inputs directly."""

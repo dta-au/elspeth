@@ -17,10 +17,17 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE
-from elspeth.web.composer.guided.protocol import ChatRole, GuidedStep, validate_current_turn
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.guided.protocol import ChatRole, GuidedStep, TurnType, validate_current_turn
+from elspeth.web.composer.guided.state_machine import (
+    GuidedSession,
+    TerminalKind,
+    TerminalState,
+    reviewed_component_ledger,
+)
+from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
 from elspeth.web.sessions.protocol import (
+    ChatMessageRecord,
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
@@ -29,12 +36,17 @@ from elspeth.web.sessions.protocol import (
     PreparedGuidedJsonPayload,
 )
 from elspeth.web.sessions.schemas import (
+    ChatMessageResponse,
+    ChatMessageSegmentResponse,
     ChatTurnResponse,
     CompositionProposalResponse,
     CompositionStateResponse,
     GetGuidedResponse,
     GuidedChatResponse,
+    GuidedPlanDeclinedResponse,
     GuidedRespondResponse,
+    GuidedReviewedComponentResponse,
+    GuidedReviewedComponentsResponse,
     GuidedSessionResponse,
     PipelineProposalMetadataResponse,
     PluginPolicyFindingResponse,
@@ -81,6 +93,40 @@ def project_composition_proposal(record: CompositionProposalRecord) -> Compositi
         ),
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def project_guided_full_decline(message: ChatMessageRecord) -> GuidedPlanDeclinedResponse:
+    """Project a persisted escape-hatch decline onto the guided-full response.
+
+    Sibling of ``project_composition_proposal`` for the guided-full planner's
+    other outcome: a decline creates no proposal, only the persisted
+    assistant chat message. Deliberately duplicates the small
+    ``ChatMessageRecord`` -> ``ChatMessageResponse`` projection that
+    ``routes/_helpers.py::_message_response`` also performs, rather than
+    importing it — routes depend on the service layer (which calls this
+    module), never the reverse.
+    """
+
+    return GuidedPlanDeclinedResponse(
+        outcome="declined",
+        message=ChatMessageResponse(
+            id=str(message.id),
+            session_id=str(message.session_id),
+            role=message.role,
+            content=message.content,
+            raw_content=None,
+            segments=[
+                ChatMessageSegmentResponse(kind=segment.kind, content=segment.content)
+                for segment in visible_message_segments(content=message.content, raw_content=None)
+            ],
+            tool_calls=None,
+            created_at=message.created_at,
+            composition_state_id=(str(message.composition_state_id) if message.composition_state_id is not None else None),
+            tool_call_id=message.tool_call_id,
+            parent_assistant_id=(str(message.parent_assistant_id) if message.parent_assistant_id is not None else None),
+            sequence_no=message.sequence_no,
+        ),
     )
 
 
@@ -139,16 +185,56 @@ def guided_turn_token(guided: GuidedSession) -> str:
     )
 
 
+def guided_completed_chat_token(guided: GuidedSession) -> str:
+    """Bind a completed session's advisory chat to its confirmation occurrence.
+
+    Sibling of :func:`guided_turn_token`, for the state that function refuses by
+    construction: a COMPLETED session has no current *unanswered* turn, so its
+    chat channel is bound to the record that closed the build instead — the
+    answered STEP_4 ``confirm_wiring`` occurrence. The token IS that record's
+    ``response_hash``, the content id of the confirmation response
+    ``{action, proposal_id, draft_hash}``, so it changes if and only if a
+    different confirmation settled, and no wire field or DTO has to change to
+    carry it.
+
+    Raises ``AuditIntegrityError`` for every non-completed or non-conforming
+    session; there is no token for a session that is still building, has exited
+    to freeform, or whose history does not end in an answered confirmation.
+    """
+
+    if type(guided) is not GuidedSession:
+        raise TypeError("guided must be an exact GuidedSession")
+    terminal = guided.terminal
+    if type(terminal) is not TerminalState or terminal.kind is not TerminalKind.COMPLETED:
+        raise AuditIntegrityError("Guided completed chat token requires a completed terminal state")
+    if not guided.history:
+        raise AuditIntegrityError("Guided completed chat token requires a persisted turn record")
+    if any(record.response_hash is None for record in guided.history):
+        raise AuditIntegrityError("Guided completed chat token requires every persisted turn answered")
+    record = guided.history[-1]
+    if record.step is not GuidedStep.STEP_4_WIRE or record.turn_type is not TurnType.CONFIRM_WIRING:
+        raise AuditIntegrityError("Guided completed chat token requires an answered wire confirmation")
+    response_hash = record.response_hash
+    if type(response_hash) is not str or len(response_hash) != 64 or any(char not in "0123456789abcdef" for char in response_hash):
+        raise AuditIntegrityError("Guided completed chat token confirmation hash is malformed")
+    return response_hash
+
+
 def load_guided_json_payload(
     payload_store: PayloadStore,
     *,
     payload_id: str,
     purpose: GuidedJsonPayloadPurpose,
 ) -> PreparedGuidedJsonPayload:
-    """Load and fully revalidate one canonical guided JSON payload for replay."""
+    """Load and fully revalidate one canonical guided JSON payload for replay.
 
-    if not isinstance(payload_store, PayloadStore):
-        raise TypeError("payload_store must implement PayloadStore")
+    ``payload_store`` carries no runtime type gate: ``PayloadStore`` is a
+    ``runtime_checkable`` Protocol, withdrawn as a control by ADR-032 (an
+    impostor with the method names passes it). The control here is the
+    content-address re-derivation below — the retrieved bytes must hash to
+    ``payload_id`` and re-canonicalise to themselves.
+    """
+
     if type(payload_id) is not str or len(payload_id) != 64 or any(char not in "0123456789abcdef" for char in payload_id):
         raise AuditIntegrityError("Guided replay payload id is malformed")
     if purpose not in {"turn", "turn_response"}:
@@ -200,8 +286,13 @@ def parse_guided_response_descriptor(record: CompositionStateRecord) -> GuidedRe
     if record.composer_meta is None:
         raise AuditIntegrityError("Guided result state has no composer metadata")
     composer_meta = deep_thaw(record.composer_meta)
-    raw = composer_meta.get(GUIDED_REPLAY_META_KEY)
-    if not isinstance(raw, Mapping):
+    if GUIDED_REPLAY_META_KEY not in composer_meta:
+        raise AuditIntegrityError("Guided result state has no valid replay descriptor")
+    raw = composer_meta[GUIDED_REPLAY_META_KEY]
+    # ``deep_thaw`` recursively rebuilds every mapping as an exact ``dict``,
+    # so the exact-type test is the house form here — the same one
+    # ``_guided_session`` below already uses on the sibling key.
+    if type(raw) is not dict:
         raise AuditIntegrityError("Guided result state has no valid replay descriptor")
     return GuidedResponseDescriptor.from_dict(raw)
 
@@ -209,7 +300,10 @@ def parse_guided_response_descriptor(record: CompositionStateRecord) -> GuidedRe
 def _guided_session(record: CompositionStateRecord) -> GuidedSession:
     if record.composer_meta is None:
         raise AuditIntegrityError("Guided result state has no composer metadata")
-    raw = deep_thaw(record.composer_meta).get("guided_session")
+    composer_meta = deep_thaw(record.composer_meta)
+    if "guided_session" not in composer_meta:
+        raise AuditIntegrityError("Guided result state has no guided checkpoint")
+    raw = composer_meta["guided_session"]
     if type(raw) is not dict:
         raise AuditIntegrityError("Guided result state has no guided checkpoint")
     return GuidedSession.from_dict(raw)
@@ -232,6 +326,40 @@ def _profile_response(guided: GuidedSession) -> WorkflowProfileResponse | None:
     return WorkflowProfileResponse(
         coaching=guided.profile.coaching,
         bookends=guided.profile.bookends,
+    )
+
+
+def project_reviewed_components(guided: GuidedSession) -> GuidedReviewedComponentsResponse:
+    """Project the settled components of both kinds onto the closed wire ledger.
+
+    The ONE redaction boundary for this field: every route that surfaces a
+    ``GuidedSessionResponse`` projects the ledger through here, and the closed
+    :class:`GuidedReviewedComponentResponse` field set is what keeps reviewed
+    option values, inspected samples, paths and anchors out of the top-level
+    response. Built entirely from types ELSPETH owns —
+    :class:`GuidedSession` custody through
+    :func:`reviewed_component_ledger` — so there is nothing here to parse.
+    """
+
+    return GuidedReviewedComponentsResponse(
+        sources=[
+            GuidedReviewedComponentResponse(
+                stable_id=entry.stable_id,
+                name=entry.name,
+                plugin=entry.plugin,
+                status=entry.status,
+            )
+            for entry in reviewed_component_ledger(guided, "source")
+        ],
+        outputs=[
+            GuidedReviewedComponentResponse(
+                stable_id=entry.stable_id,
+                name=entry.name,
+                plugin=entry.plugin,
+                status=entry.status,
+            )
+            for entry in reviewed_component_ledger(guided, "output")
+        ],
     )
 
 
@@ -259,10 +387,12 @@ def _guided_session_response(guided: GuidedSession) -> GuidedSessionResponse:
                 ts_iso=turn.ts_iso,
                 assistant_message_kind=turn.assistant_message_kind,
                 synthetic_failure_reason=turn.synthetic_failure_reason,
+                turn_token=turn.turn_token,
             )
             for turn in guided.chat_history
         ],
         chat_turn_seq=guided.chat_turn_seq,
+        reviewed_components=project_reviewed_components(guided),
         profile=_profile_response(guided),
     )
 
@@ -271,11 +401,12 @@ def _composition_state_response(
     state: CompositionStateRecord,
     descriptor: GuidedResponseDescriptor,
 ) -> CompositionStateResponse:
-    sources = deep_thaw(state.sources)
+    raw_sources = deep_thaw(state.sources)
+    sources = raw_sources
     if sources is not None:
         sources = redact_source_storage_path({"sources": sources})["sources"]
     composer_meta = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources, composer_meta = redact_guided_snapshot_storage_paths(sources, composer_meta)
+    sources, composer_meta = redact_guided_snapshot_storage_paths(sources, composer_meta, raw_sources=raw_sources)
     expected_errors = guided_validation_errors(is_valid=state.is_valid)
     if state.validation_errors != expected_errors:
         raise AuditIntegrityError("Guided result state has an invalid closed validation status")
@@ -399,7 +530,7 @@ def guided_response_projection_hash(response: BaseModel) -> str:
     """Hash one strictly revalidated guided response projection."""
 
     config = type(response).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
+    if "strict" not in config or config["strict"] is not True or "extra" not in config or config["extra"] != "forbid":
         raise AuditIntegrityError("Guided operation replay requires a strict, extra-forbid response DTO")
     strict_response = type(response).model_validate(response.model_dump(mode="python"), strict=True)
     return stable_hash(strict_response.model_dump(mode="json"))
@@ -413,12 +544,14 @@ def response_json(response: BaseModel) -> Mapping[str, Any]:
 
 __all__ = [
     "GUIDED_REPLAY_META_KEY",
+    "guided_completed_chat_token",
     "guided_response_projection_hash",
     "guided_turn_token",
     "guided_validation_errors",
     "load_guided_json_payload",
     "parse_guided_response_descriptor",
     "project_composition_proposal",
+    "project_guided_full_decline",
     "project_guided_response",
     "response_json",
     "validation_errors_for_composer_surface",

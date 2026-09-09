@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from threading import Lock
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import Field, field_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -19,8 +21,23 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
+from elspeth.plugins.llm.config_validation import (
+    BEDROCK_MODEL_MAX_LENGTH,
+    BEDROCK_MODEL_MIN_LENGTH,
+    BEDROCK_REGION_MAX_LENGTH,
+    BEDROCK_REGION_MIN_LENGTH,
+    BEDROCK_REGION_PATTERN,
+    BEDROCK_VALUE_SOURCES,
+    validate_bedrock_model,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult, UnrecognizedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import (
+    FinishReason,
+    LLMAuditParent,
+    LLMQueryResult,
+    UnrecognizedFinishReason,
+    finish_reason_from_raw_response,
+)
 
 if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
@@ -37,20 +54,20 @@ class BedrockConfig(LLMConfig):
     # unlike OpenRouter there is no authoritative local catalog to validate.
     # The LLM plugin is explicitly registered with the value-source walker, so
     # every provider variant must still declare its participation contract.
-    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = ()
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = BEDROCK_VALUE_SOURCES
 
     provider: Literal["bedrock"] = Field(default="bedrock", description="LLM provider")
     model: str = Field(
         ...,
-        min_length=9,
-        max_length=512,
+        min_length=BEDROCK_MODEL_MIN_LENGTH,
+        max_length=BEDROCK_MODEL_MAX_LENGTH,
         description="LiteLLM Bedrock model id in bedrock/<id> form",
     )
     region_name: str | None = Field(
         default=None,
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        min_length=BEDROCK_REGION_MIN_LENGTH,
+        max_length=BEDROCK_REGION_MAX_LENGTH,
+        pattern=BEDROCK_REGION_PATTERN,
         description="AWS region override; default AWS region resolution otherwise",
     )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing (langfuse only)")
@@ -58,11 +75,7 @@ class BedrockConfig(LLMConfig):
     @field_validator("model")
     @classmethod
     def _require_bedrock_prefix(cls, value: str) -> str:
-        if value != value.strip() or not value.startswith("bedrock/") or not value.removeprefix("bedrock/"):
-            raise ValueError("Bedrock model must be a non-empty LiteLLM 'bedrock/<model-id>' value without surrounding whitespace")
-        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
-            raise ValueError("Bedrock model must not contain control characters")
-        return value
+        return validate_bedrock_model(value)
 
 
 class _LiteLLMSDKAdapter:
@@ -75,8 +88,10 @@ class _LiteLLMSDKAdapter:
     def create(self, **kwargs: Any) -> Any:
         import litellm
 
-        if self._region_name is not None:
-            kwargs.setdefault("aws_region_name", self._region_name)
+        if self._region_name is not None and "aws_region_name" not in kwargs:
+            # Precedence is explicit: a caller's own aws_region_name wins, and
+            # the configured region fills in only when the call names none.
+            kwargs["aws_region_name"] = self._region_name
         return litellm.completion(**kwargs)
 
     def close(self) -> None:
@@ -124,21 +139,20 @@ class BedrockLLMProvider:
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
         """Execute one Bedrock request through the authoritative audit client."""
-        snapshot_state_id = state_id
+        cache_key = audit_parent.cache_key
         redacted_error: LLMClientError | None = None
         response = None
         try:
-            client = self._get_llm_client(snapshot_state_id, token_id=token_id)
+            client = self._get_llm_client(audit_parent)
             try:
                 response = client.chat_completion(
                     model=model,
@@ -152,20 +166,14 @@ class BedrockLLMProvider:
                 redacted_error = _redacted_bedrock_error(error)
         finally:
             with self._llm_clients_lock:
-                self._llm_clients.pop(snapshot_state_id, None)
+                self._llm_clients.pop(cache_key, None)
 
         if redacted_error is not None:
             raise redacted_error from None
         if response is None:
             raise RuntimeError("Bedrock response absent without a typed client error")
 
-        finish_reason = None
-        if response.raw_response is not None:
-            choices = response.raw_response.get("choices")
-            if choices:
-                raw_finish_reason = choices[0].get("finish_reason")
-                if raw_finish_reason is not None:
-                    finish_reason = parse_finish_reason(str(raw_finish_reason))
+        finish_reason = finish_reason_from_raw_response(response.raw_response)
 
         if not response.content or not response.content.strip():
             if finish_reason == FinishReason.TOOL_CALLS:
@@ -197,7 +205,7 @@ class BedrockLLMProvider:
             try:
                 client.chat_completion(
                     model=model,
-                    messages=[{"role": "user", "content": "This is a pre-flight smoke test. Please reply with ok."}],
+                    messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
                     temperature=0.0,
                     max_tokens=32,
                 )
@@ -214,20 +222,20 @@ class BedrockLLMProvider:
                 self._underlying_client = _LiteLLMSDKAdapter(region_name=self._region_name)
             return self._underlying_client
 
-    def _get_llm_client(self, state_id: str, *, token_id: str | None = None) -> AuditedLLMClient:
+    def _get_llm_client(self, audit_parent: LLMAuditParent) -> AuditedLLMClient:
+        cache_key = audit_parent.cache_key
         with self._llm_clients_lock:
-            if state_id not in self._llm_clients:
-                self._llm_clients[state_id] = AuditedLLMClient(
+            if cache_key not in self._llm_clients:
+                self._llm_clients[cache_key] = AuditedLLMClient(
                     execution=self._recorder,
-                    state_id=state_id,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
                     underlying_client=self._get_underlying_client(),
                     provider="bedrock",
                     limiter=self._limiter,
-                    token_id=token_id,
+                    **audit_parent.client_kwargs(),
                 )
-            return self._llm_clients[state_id]
+            return self._llm_clients[cache_key]
 
     def close(self) -> None:
         """Release cached audited clients and the stateless adapter."""

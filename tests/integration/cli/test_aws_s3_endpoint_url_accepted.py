@@ -6,7 +6,7 @@ import textwrap
 from pathlib import Path
 from unittest.mock import patch
 
-from elspeth.core.config import load_settings_from_yaml_string
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink
 from elspeth.plugins.sources.aws_s3_source import AWSS3Source

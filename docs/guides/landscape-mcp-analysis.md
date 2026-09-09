@@ -15,7 +15,8 @@ The authoritative tool registry is `_TOOLS` in
 Install with MCP support:
 
 ```bash
-uv pip install -e ".[mcp]"
+uv sync --frozen --extra mcp
+source .venv/bin/activate
 ```
 
 Run with database auto-discovery:

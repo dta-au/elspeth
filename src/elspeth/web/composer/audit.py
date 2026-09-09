@@ -40,6 +40,8 @@ Layer: L3 (application). Imports L0 (contracts.composer_audit), L1
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 import threading
 import time
@@ -61,8 +63,12 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerChatTurnRecorder,
     ComposerLLMCall,
     ComposerLLMCallRecorder,
+    ComposerLLMCallStatus,
 )
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt, ComposerPlannerAttemptRecorder
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 
 __all__ = [
@@ -76,11 +82,24 @@ __all__ = [
     "canonicalize_pydantic_cause",
     "dispatch_with_audit",
     "finish_arg_error",
+    "finish_cancelled",
     "finish_plugin_crash",
     "finish_success",
+    "interleave_planner_audit_records",
     "llm_call_audit_envelope",
+    "llm_call_audit_summary",
+    "planner_attempt_audit_envelope",
+    "planner_attempt_audit_summary",
     "rebind_dispatch_arguments",
 ]
+
+_CANCELLATION_REASON_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "cancelled",
+        "coordinator_cancelled",
+        "sibling_failure",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +202,22 @@ def build_canonicalization_sentinel(
     return sentinel
 
 
-class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerChatTurnRecorder):
+class BufferingRecorder(
+    ComposerToolRecorder,
+    ComposerLLMCallRecorder,
+    ComposerChatTurnRecorder,
+    ComposerPlannerAttemptRecorder,
+):
     """Append-only in-memory buffer for composer audit records.
 
     Used inside :meth:`ComposerServiceImpl._compose_loop`. After Phase 3,
     compose-loop tool rows are committed by
     ``SessionServiceProtocol.persist_compose_turn_async`` inside the loop;
     the route-layer ``tool_invocations`` drain is retained only for older
-    non-loop carriers. LLM call and guided chat-turn sidecars still use this
-    buffer as their route-persisted staging area.
+    non-loop carriers. LLM calls, their exact-once semantic planner attempts,
+    and guided chat-turn sidecars still use this buffer as their
+    route-persisted staging area. All four channels use the same locking
+    discipline, and each exposed tuple is an immutable point-in-time snapshot.
 
     Threading: ``record()`` is safe to call from any thread. The compose
     loop dispatches synchronously to a worker via ``run_sync_in_worker``
@@ -203,6 +229,7 @@ class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerC
         self._invocations: list[ComposerToolInvocation] = []
         self._llm_calls: list[ComposerLLMCall] = []
         self._chat_turns: list[ComposerChatTurn] = []
+        self._planner_attempts: list[ComposerPlannerAttempt] = []
         self._lock = threading.Lock()
 
     def record(self, invocation: ComposerToolInvocation) -> None:
@@ -223,6 +250,11 @@ class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerC
         with self._lock:
             self._chat_turns.append(turn)
 
+    def record_planner_attempt(self, attempt: ComposerPlannerAttempt) -> None:
+        """Append one semantic planner response disposition."""
+        with self._lock:
+            self._planner_attempts.append(attempt)
+
     @property
     def invocations(self) -> tuple[ComposerToolInvocation, ...]:
         """Snapshot the current buffer as an immutable tuple."""
@@ -240,6 +272,12 @@ class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerC
         """Snapshot the current chat-turn buffer as an immutable tuple."""
         with self._lock:
             return tuple(self._chat_turns)
+
+    @property
+    def planner_attempts(self) -> tuple[ComposerPlannerAttempt, ...]:
+        """Snapshot semantic planner attempts as an immutable tuple."""
+        with self._lock:
+            return tuple(self._planner_attempts)
 
     def resolve_session(self, session_id: str) -> None:
         """Protocol no-op — the in-memory buffer has nothing to flush.
@@ -279,6 +317,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "model_requested",
     "model_returned",
     "status",
+    "finish_reason",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
@@ -320,6 +359,150 @@ def llm_call_audit_envelope(call: ComposerLLMCall) -> dict[str, object]:
     """
 
     return {"_kind": "llm_call_audit", "call": _public_llm_call_audit_payload(call)}
+
+
+def planner_attempt_audit_envelope(attempt: ComposerPlannerAttempt) -> dict[str, object]:
+    """Wrap one value-free semantic planner attempt for durable storage."""
+    return {"_kind": "planner_attempt_audit", "attempt": attempt.to_dict()}
+
+
+def planner_attempt_audit_summary(attempt: ComposerPlannerAttempt) -> str:
+    """Render the bounded operator-facing projection of a planner attempt."""
+    return json.dumps(
+        {
+            "_kind": "planner_attempt_audit",
+            "ordinal": attempt.ordinal,
+            "planner_call_ordinal": attempt.planner_call_ordinal,
+            "phase": attempt.phase.value,
+            "outcome": attempt.outcome.value,
+            "planner_code": attempt.planner_code.value if attempt.planner_code is not None else None,
+            "led_to": attempt.led_to.value,
+        }
+    )
+
+
+def interleave_planner_audit_records(
+    llm_calls: tuple[ComposerLLMCall, ...],
+    planner_attempts: tuple[ComposerPlannerAttempt, ...],
+) -> tuple[ComposerLLMCall | ComposerPlannerAttempt, ...]:
+    """Validate and interleave one physical/logical planner evidence cohort.
+
+    Physical provider failures have no semantic attempt. Every provider
+    response, including a malformed response, has exactly one attempt placed
+    immediately after its matching LLM-call row. Physical ordinal gaps are
+    therefore expected while logical attempt ordinals remain contiguous.
+    """
+    if type(llm_calls) is not tuple or any(type(call) is not ComposerLLMCall for call in llm_calls):
+        raise AuditIntegrityError("planner LLM evidence must be an exact ComposerLLMCall tuple")
+    if type(planner_attempts) is not tuple or any(type(attempt) is not ComposerPlannerAttempt for attempt in planner_attempts):
+        raise AuditIntegrityError("planner attempt evidence must be an exact ComposerPlannerAttempt tuple")
+    if tuple(attempt.ordinal for attempt in planner_attempts) != tuple(range(1, len(planner_attempts) + 1)):
+        raise AuditIntegrityError("planner semantic attempt ordinals must be contiguous")
+    attempts_by_physical: dict[int, ComposerPlannerAttempt] = {}
+    for attempt in planner_attempts:
+        if attempt.planner_call_ordinal in attempts_by_physical:
+            raise AuditIntegrityError("planner physical call ordinal has multiple semantic attempts")
+        attempts_by_physical[attempt.planner_call_ordinal] = attempt
+    records: list[ComposerLLMCall | ComposerPlannerAttempt] = []
+    observed_physical: set[int] = set()
+    previous_physical_ordinal: int | None = None
+    expected_semantic_ordinal = 1
+    for call in llm_calls:
+        planner_call_ordinal = call.planner_call_ordinal
+        if planner_call_ordinal is None:
+            raise AuditIntegrityError("planner LLM call is missing its physical ordinal")
+        if planner_call_ordinal in observed_physical:
+            raise AuditIntegrityError("planner LLM physical ordinals must be unique")
+        if previous_physical_ordinal is not None and planner_call_ordinal <= previous_physical_ordinal:
+            raise AuditIntegrityError("planner LLM physical ordinals must be strictly increasing")
+        observed_physical.add(planner_call_ordinal)
+        previous_physical_ordinal = planner_call_ordinal
+        records.append(call)
+        matching_attempt: ComposerPlannerAttempt | None = None
+        if planner_call_ordinal in attempts_by_physical:
+            matching_attempt = attempts_by_physical[planner_call_ordinal]
+        response_received = call.status in {
+            ComposerLLMCallStatus.SUCCESS,
+            ComposerLLMCallStatus.MALFORMED_RESPONSE,
+        }
+        if response_received and matching_attempt is None:
+            raise AuditIntegrityError("planner semantic response has no planner attempt")
+        if not response_received and matching_attempt is not None:
+            raise AuditIntegrityError("provider transport failure cannot own a semantic planner attempt")
+        if matching_attempt is not None:
+            if matching_attempt.ordinal != expected_semantic_ordinal:
+                raise AuditIntegrityError("planner response order must match semantic attempt order")
+            records.append(matching_attempt)
+            expected_semantic_ordinal += 1
+    if set(attempts_by_physical) - observed_physical:
+        raise AuditIntegrityError("planner attempt references an absent physical call")
+    return tuple(records)
+
+
+# Terminal states that are simply "the turn ended normally". ``stop`` is a
+# completed answer; ``tool_calls`` is the ordinary terminal state of every
+# healthy iteration of a tool-using loop. Rendering either on the summary
+# line would put a badge on every row and train the reader to ignore it.
+_ROUTINE_FINISH_REASONS: Final[frozenset[str]] = frozenset({"stop", "tool_calls"})
+
+
+def llm_call_audit_summary(call: ComposerLLMCall) -> str:
+    """Build the human-facing ``content`` summary for an LLM-call audit row.
+
+    Sibling of :func:`llm_call_audit_envelope`. The envelope is the forensic
+    record — complete, but only visible to someone who opens the
+    ``tool_calls`` JSON column. This string is what the message-list view
+    actually renders, so it carries the short projection an operator reads
+    without digging.
+
+    Every drain site that persists an LLM-call audit row
+    (``sessions/routes/_helpers._persist_llm_calls``,
+    ``composer/service._persist_pipeline_planner_audit``,
+    ``sessions/guided_audit.prepare_guided_audit_rows``) builds its
+    ``content`` here, so the three rows are the same projection by
+    construction rather than by three hand-copies staying in sync.
+
+    Abnormal finish reasons
+    -----------------------
+    ``finish_reason`` is included **only** when it is present and is not a
+    routine terminal state. The gap this closes is operator-facing: a turn
+    truncated at the token ceiling (``length``) renders as a half-finished
+    answer with nothing saying so, which reads as model flakiness — an
+    operator tunes prompts or swaps models when the fix was raising
+    ``max_tokens``. ``content_filter`` has the same shape: a provider
+    refusal looks like an ELSPETH bug.
+
+    - ``stop`` / ``tool_calls`` are omitted — see
+      :data:`_ROUTINE_FINISH_REASONS`.
+    - Everything else surfaces, including values we do not recognise:
+      unknown is fail-visible, not fail-quiet, because an unrecognised
+      provider term is precisely the case nobody has triaged yet.
+    - The value is rendered verbatim as recorded — no normalisation, no
+      mapping onto a house vocabulary, so the summary and the envelope
+      never disagree about what the provider said.
+    - ``None`` omits the key entirely rather than emitting ``null``; the
+      envelope is where absence is recorded explicitly.
+
+    The key is appended last so a call with no finish reason — and one that
+    finished routinely — serialises byte-for-byte as it did before this
+    projection carried the field at all.
+
+    This is presentation only. An abnormal finish reason is now *visible*;
+    it is never fatal, and no control flow keys off it.
+    """
+    summary: dict[str, object] = {
+        "_kind": "llm_call_audit",
+        "status": call.status.value,
+        "model_requested": call.model_requested,
+        "model_returned": call.model_returned,
+        "total_tokens": call.total_tokens,
+        "reasoning_tokens": call.reasoning_tokens,
+        "provider_cost": call.provider_cost,
+    }
+    finish_reason = call.finish_reason
+    if finish_reason is not None and finish_reason not in _ROUTINE_FINISH_REASONS:
+        summary["finish_reason"] = finish_reason
+    return json.dumps(summary)
 
 
 def chat_turn_audit_envelope(turn: ComposerChatTurn) -> dict[str, object]:
@@ -367,6 +550,13 @@ class DispatchAudit:
     started_at: datetime
     started_ns: int
     actor: str
+    authority_arguments_canonical: str | None = None
+    authority_arguments_hash: str | None = None
+
+    @property
+    def binding_arguments_hash(self) -> str:
+        """Return the semantic binding when this dispatch defines one."""
+        return self.authority_arguments_hash or self.arguments_hash
 
 
 def begin_dispatch(
@@ -395,9 +585,13 @@ def begin_dispatch(
         truncated = arguments[:4096]
         canon = canonical_json({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
         h = stable_hash({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
+        authority_canon = None
+        authority_hash = None
     else:
         canon = canonical_json(arguments)
         h = stable_hash(arguments)
+        authority_canon = composer_authority_canonical_json(arguments) if tool_name == "set_pipeline" else None
+        authority_hash = composer_authority_hash(arguments) if tool_name == "set_pipeline" else None
     return DispatchAudit(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
@@ -407,6 +601,8 @@ def begin_dispatch(
         started_at=datetime.now(UTC),
         started_ns=time.monotonic_ns(),
         actor=actor,
+        authority_arguments_canonical=authority_canon,
+        authority_arguments_hash=authority_hash,
     )
 
 
@@ -477,6 +673,8 @@ def rebind_dispatch_arguments(
         audit,
         arguments_canonical=canonical_json(arguments),
         arguments_hash=stable_hash(arguments),
+        authority_arguments_canonical=(composer_authority_canonical_json(arguments) if audit.tool_name == "set_pipeline" else None),
+        authority_arguments_hash=composer_authority_hash(arguments) if audit.tool_name == "set_pipeline" else None,
     )
 
 
@@ -556,6 +754,8 @@ def finish_success(
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
         cache_hit=cache_hit,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -600,6 +800,44 @@ def finish_arg_error(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
+    )
+
+
+def finish_cancelled(
+    audit: DispatchAudit,
+    *,
+    exc: asyncio.CancelledError,
+) -> ComposerToolInvocation:
+    """Build a CANCELLED invocation with a closed, value-free reason code.
+
+    ``Task.cancel(message)`` carries its message through
+    :class:`asyncio.CancelledError`. The message is an external value at this
+    audit boundary, so only coordinator-authored codes from the closed set are
+    persisted; arbitrary text falls back to the generic ``cancelled`` code.
+    """
+    reason = "cancelled"
+    if len(exc.args) == 1 and type(exc.args[0]) is str and exc.args[0] in _CANCELLATION_REASON_CODES:
+        reason = exc.args[0]
+    return ComposerToolInvocation(
+        tool_call_id=audit.tool_call_id,
+        tool_name=audit.tool_name,
+        arguments_canonical=audit.arguments_canonical,
+        arguments_hash=audit.arguments_hash,
+        result_canonical=None,
+        result_hash=None,
+        status=ComposerToolStatus.CANCELLED,
+        error_class="CancelledError",
+        error_message=reason,
+        version_before=audit.version_before,
+        version_after=None,
+        started_at=audit.started_at,
+        finished_at=datetime.now(UTC),
+        latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
+        actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -642,6 +880,8 @@ def finish_plugin_crash(
         finished_at=datetime.now(UTC),
         latency_ms=(time.monotonic_ns() - audit.started_ns) // 1_000_000,
         actor=audit.actor,
+        authority_arguments_canonical=audit.authority_arguments_canonical,
+        authority_arguments_hash=audit.authority_arguments_hash,
     )
 
 
@@ -733,17 +973,14 @@ async def dispatch_with_audit(
         so the caller's ``except Exception`` block can wrap with
         :meth:`ComposerPluginCrashError.capture`.
 
-    PLUGIN_CRASH (BaseException)
+    CANCELLED / PLUGIN_CRASH (BaseException)
         ``do_dispatch`` raised an exception that does NOT inherit from
-        ``Exception`` — most importantly :class:`asyncio.CancelledError`,
-        which fires when an ASGI client disconnects mid-dispatch. The
-        typed except handlers above do not catch it (CancelledError
-        inherits ``BaseException`` directly). The ``finally`` clause
-        detects the propagating exception via :func:`sys.exc_info`,
-        records it as PLUGIN_CRASH (so the audit trail captures the
-        dispatch attempt the client cancelled), and lets the exception
-        continue propagating. This applies equally to ``SystemExit``,
-        ``KeyboardInterrupt``, and ``GeneratorExit``. The audit
+        ``Exception``. The ``finally`` clause detects the propagating
+        exception via :func:`sys.exc_info`. It records
+        :class:`asyncio.CancelledError` as CANCELLED with a bounded reason
+        code, because coordinator cancellation is not a plugin defect. It
+        records ``SystemExit``, ``KeyboardInterrupt``, and ``GeneratorExit``
+        as PLUGIN_CRASH. In both cases the exception keeps propagating. The audit
         invariant — "if it's not recorded, it didn't happen" — now
         holds even at interpreter-shutdown boundaries; the in-memory
         list append is safe even if the persistence layer never gets
@@ -772,10 +1009,11 @@ async def dispatch_with_audit(
         ``AssertionError``/``MemoryError``/``RecursionError``/``SystemError``:
             re-raised after recording PLUGIN_CRASH.
         ``Exception`` (other classes): re-raised after recording PLUGIN_CRASH.
-        ``asyncio.CancelledError`` and other ``BaseException`` subclasses
-            (``SystemExit``, ``KeyboardInterrupt``, ``GeneratorExit``):
-            propagate after the ``finally`` clause records PLUGIN_CRASH
-            via :func:`sys.exc_info`.
+        ``asyncio.CancelledError``: propagates after the ``finally`` clause
+            records CANCELLED via :func:`sys.exc_info`.
+        Other ``BaseException`` subclasses (``SystemExit``,
+            ``KeyboardInterrupt``, ``GeneratorExit``): propagate after the
+            ``finally`` clause records PLUGIN_CRASH.
     """
     # Outcome variables — populated by the success branch / except
     # blocks, consumed by the finally clause. The four-status discriminant
@@ -838,8 +1076,8 @@ async def dispatch_with_audit(
         # KeyboardInterrupt, GeneratorExit) that the typed except
         # handlers above do not catch. ``status`` is ``None`` exactly
         # when such an exception is propagating; we reconstruct it via
-        # sys.exc_info() and record PLUGIN_CRASH so the audit row lands
-        # before the exception leaves the helper.
+        # sys.exc_info() and record CANCELLED for coordinator cancellation
+        # or PLUGIN_CRASH for other BaseException subclasses before it leaves.
         if status is None:
             current_exc = sys.exc_info()[1]
             # Offensive guard: status==None with no propagating
@@ -852,7 +1090,10 @@ async def dispatch_with_audit(
                 raise RuntimeError(
                     "dispatch_with_audit: finally entered with status=None and no propagating exception — audit invariant violated"
                 )
-            recorder.record(finish_plugin_crash(audit, exc=current_exc))
+            if isinstance(current_exc, asyncio.CancelledError):
+                recorder.record(finish_cancelled(audit, exc=current_exc))
+            else:
+                recorder.record(finish_plugin_crash(audit, exc=current_exc))
         elif status is ComposerToolStatus.SUCCESS:
             # success_version_after was assigned alongside status.
             # Offensive guard: the dataclass requires ``int`` here, so
@@ -912,15 +1153,66 @@ def _result_to_audit_payload(result: Any) -> Mapping[str, Any]:
     return payload
 
 
-# ---------------------------------------------------------------------------
-# F2 (spec §4.2.6): Pydantic ``__cause__`` canonicalization for ARG_ERROR.
-#
-# Placed at module tail to keep the AST body-index ordering of the existing
-# functions stable — the tier-model enforcer fingerprints findings by AST
-# path (``body[N]``), so inserting a new module-level def in the middle of
-# the file would rotate every downstream fingerprint and force a churn of
-# allowlist re-keying that has nothing to do with this change.
-# ---------------------------------------------------------------------------
+# Pydantic ``__cause__`` canonicalization for ARG_ERROR (spec §4.2.6).
+
+
+_MAX_PYDANTIC_CAUSE_ERRORS = 8
+_MAX_PYDANTIC_CAUSE_LOC_DEPTH = 4
+_SAFE_PYDANTIC_CAUSE_LOC_FIELDS = frozenset(
+    {
+        "affected_node_id",
+        "blob_id",
+        "branches",
+        "condition",
+        "content",
+        "count",
+        "description",
+        "edge_type",
+        "edges",
+        "expected_output_count",
+        "filename",
+        "fork_to",
+        "from_node",
+        "id",
+        "inline_blob",
+        "input",
+        "kind",
+        "label",
+        "llm_draft",
+        "merge",
+        "metadata",
+        "mime_type",
+        "name",
+        "node",
+        "node_id",
+        "node_type",
+        "nodes",
+        "on_error",
+        "on_success",
+        "on_validation_failure",
+        "on_write_failure",
+        "option_key",
+        "options",
+        "output_mode",
+        "outputs",
+        "patch",
+        "plugin",
+        "policy",
+        "predecessor_id",
+        "routes",
+        "sink_name",
+        "source",
+        "source_name",
+        "sources",
+        "successor_id",
+        "target",
+        "target_id",
+        "timeout_seconds",
+        "to_node",
+        "trigger",
+        "user_term",
+    }
+)
 
 
 def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any]] | None:
@@ -936,11 +1228,13 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
     with no audit value, and ``ctx`` may carry the rejected value in
     its context dict.
 
-    This helper produces a leak-safe canonical projection: a fresh list
-    of dicts containing ONLY ``loc`` (stringified), ``msg`` (the
-    Pydantic-generated message — NOT user-supplied), and ``type`` (the
-    Pydantic error-type discriminator like ``"int_parsing"``,
-    ``"missing"``, ``"value_error"``).
+    This helper produces a closed, bounded projection. Raw Pydantic
+    locations, messages, and type strings are all Tier-3 values:
+    validators can embed rejected values in messages and typed mappings
+    can place user-controlled keys in locations. The projection therefore
+    emits only closed schema-owned field names or generic path tokens,
+    fixed error codes, and fixed messages. At most eight errors and four
+    location components per error survive.
 
     Behaviour
     ---------
@@ -952,27 +1246,16 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
       ValidationError but defensively) → ``None`` (recording
       ``validation_errors: []`` has no audit value; the absence of the
       key is the signal).
-    - Otherwise → ``list[dict[str, Any]]`` with one dict per error.
-
-    Loc-safety note
-    ---------------
-    The ``loc`` tuple contains field-path elements (model field names
-    for typed fields, list indices for sequence fields). For
-    ``dict[str, Any]`` fields, Pydantic only validates dict shape and
-    does NOT descend into values, so ``loc`` paths cannot contain
-    user-supplied dict keys under the current MANIFEST convention
-    (``dict[str, Any]`` for all unknown-shape fields). If a future
-    model introduces ``dict[str, TypedSubmodel]``, Pydantic WILL
-    descend and ``loc`` may then contain user-supplied keys — the
-    safety analysis here MUST be re-evaluated at that point.
+    - More than eight errors → one fixed ``truncated`` diagnostic,
+      selected via ``error_count()`` without materializing ``errors()``.
+    - Otherwise → at most eight closed diagnostic dictionaries.
 
     Tier discipline
     ---------------
-    Pydantic's ``__cause__`` is a Tier-3 boundary input (the LLM's
-    tool-call shape). This helper sits at the Tier-3 → Tier-1
-    audit-record boundary, so defensive handling (the ``isinstance``
-    check, the stringification of non-``str`` loc elements) is the
-    correct discipline. ``exc.errors()`` itself is NOT wrapped in a
+    Pydantic's ``__cause__`` is a Tier-3 boundary input. This helper sits
+    at the Tier-3 → Tier-1 audit-record boundary, so the defensive closed
+    projection is the correct discipline. ``exc.errors()`` itself is not
+    wrapped in a
     ``try/except`` — if Pydantic's own ``errors()`` raises, that is a
     Pydantic-internal bug and must propagate (offensive programming).
     """
@@ -980,21 +1263,66 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
         return None
     if not isinstance(exc, ValidationError):
         return None
+    error_count = exc.error_count()
+    if error_count == 0:
+        return None
+    if error_count > _MAX_PYDANTIC_CAUSE_ERRORS:
+        return [
+            {
+                "loc": [],
+                "msg": f"Validation produced more than {_MAX_PYDANTIC_CAUSE_ERRORS} errors",
+                "type": "truncated",
+            }
+        ]
     raw_errors = exc.errors()
     if not raw_errors:
         return None
+    type_messages = {
+        "invalid": "Validation failed",
+        "invalid_choice": "Value is not an allowed choice",
+        "invalid_type": "Value has invalid type",
+        "invalid_value": "Value is invalid",
+        "missing": "Required value is missing",
+        "out_of_bounds": "Value is outside allowed bounds",
+        "unexpected": "Unexpected value",
+    }
+
+    def error_code(raw_type: object) -> str:
+        value = raw_type if type(raw_type) is str and len(raw_type) <= 128 else ""
+        if value == "missing":
+            return "missing"
+        if value == "extra_forbidden":
+            return "unexpected"
+        if value in {"enum", "literal_error"}:
+            return "invalid_choice"
+        if any(marker in value for marker in ("greater_than", "less_than", "multiple_of", "too_long", "too_short")):
+            return "out_of_bounds"
+        if "parsing" in value or value.endswith("_type"):
+            return "invalid_type"
+        if value in {"assertion_error", "value_error"}:
+            return "invalid_value"
+        return "invalid"
+
     canonicalized: list[dict[str, Any]] = []
-    for err in raw_errors:
-        # Stringify every loc element. Pydantic produces ``tuple[int |
-        # str, ...]`` (ints for list-index errors); coerce to ``list[str]``
-        # so the recorded shape is uniform and downstream audit consumers
-        # don't have to branch on element type.
-        loc_stringified = [str(piece) for piece in err["loc"]]
+    for err in raw_errors[:_MAX_PYDANTIC_CAUSE_ERRORS]:
+        code = error_code(err["type"])
+        loc = [
+            (
+                "index"
+                if type(piece) is int
+                else piece
+                if type(piece) is str and piece in _SAFE_PYDANTIC_CAUSE_LOC_FIELDS
+                else "field"
+                if position == 0
+                else "item"
+            )
+            for position, piece in enumerate(err["loc"][:_MAX_PYDANTIC_CAUSE_LOC_DEPTH])
+        ]
         canonicalized.append(
             {
-                "loc": loc_stringified,
-                "msg": err["msg"],
-                "type": err["type"],
+                "loc": loc,
+                "msg": type_messages[code],
+                "type": code,
             }
         )
     return canonicalized

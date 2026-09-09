@@ -13,13 +13,23 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, final, get_args, runtime_checkable
 from uuid import UUID
 
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry
+from elspeth.contracts.blobs import (
+    BlobCreationObligation,
+    BlobDeletionPlan,
+    BlobForkPlanEntry,
+    BlobGuidedOperationWriteFence,
+    BlobRecord,
+    BlobReplacementPlan,
+    BlobRunLinkDirection,
+    BlobRunLinkRecord,
+)
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
@@ -29,9 +39,10 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentCancelAction,
     DeferredIntentEditAction,
@@ -39,13 +50,28 @@ from elspeth.web.composer.guided.deferred_intents import (
 )
 from elspeth.web.composer.guided.protocol import TurnType
 from elspeth.web.composer.guided.state_machine import GUIDED_MAX_CHAT_TURNS, ComponentTarget
+from elspeth.web.coordination.contracts import (
+    ArchiveDeleteReconciliation,
+    ArchiveManifestRelation,
+    CancellationSource,
+    CompatibilityKey,
+    InstanceState,
+    RecoveryRequiredReason,
+    RunOwnershipFence,
+    RunSagaState,
+    SessionOperationContext,
+    SessionOperationFence,
+    SessionOperationKind,
+    StartPermitState,
+)
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
 
 if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import PipelineProposal
+    from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBase
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 ChatMessageRole = Literal["user", "assistant", "system", "tool", "audit"]
 ComposerTrustMode = Literal["explicit_approve", "auto_commit"]
@@ -59,13 +85,72 @@ PipelineProposalRejectionReason = Literal[
     "base_conflict",
     "request_cancelled",
     "superseded",
+    "guided_exit",
 ]
+# The subset a guided state mutation may record when it atomically rejects
+# the pending proposal it is clearing: "superseded" for a real supersession
+# (a newer draft or a rewind displaces the pending one), "guided_exit" when
+# exit-to-freeform abandons custody — nothing displaced the proposal, so
+# recording "superseded" there would fabricate a successor that never existed.
+GuidedProposalInvalidationReason = Literal["superseded", "guided_exit"]
+_GUIDED_PROPOSAL_INVALIDATION_REASONS = frozenset({"superseded", "guided_exit"})
+# Which gesture moved a still-pending proposal's anchor. Sibling of the
+# rejection reason above, and needed for the same purpose: the four
+# settlements that carry a proposal across a new checkpoint
+# (elspeth-ed67eb9d0d) are otherwise indistinguishable in the proposal's own
+# event trail — two of them settle the SAME ``guided_respond`` operation
+# kind, so the settlement's identity cannot discriminate them either. Closed
+# vocabulary rather than free text: this value is persisted in an immutable
+# audit payload, so it must have bounded cardinality and no user content. The
+# frozenset below is the SINGLE authority — the settlement imports it rather
+# than restating the members, so widening the Literal cannot leave a writer
+# and its parser disagreeing about what is admissible.
+#   revision_declined    the planner declined a prose revision at Step 3/4
+#                        and the settlement records the turn
+#   wire_review_entry    a Step-3 proposal was accepted into wire review
+#   advisory_chat        an ordinary guided chat turn advanced the head
+#   guided_full_declined the guided-full escape hatch declined and settled
+#                        its checkpoint over the observed head
+GuidedProposalRebaseReason = Literal[
+    "revision_declined",
+    "wire_review_entry",
+    "advisory_chat",
+    "guided_full_declined",
+]
+GUIDED_PROPOSAL_REBASE_REASONS = frozenset(
+    {
+        "revision_declined",
+        "wire_review_entry",
+        "advisory_chat",
+        "guided_full_declined",
+    }
+)
 PipelineProposalSurface = Literal["freeform", "guided_full", "guided_staged", "tutorial_profile"]
 ProposalEventType = Literal[
     "proposal.created",
     "proposal.accepted",
     "proposal.rejected",
     "trust_mode.changed",
+    # Non-terminal: the proposal stays pending. Records an auto-commit
+    # blocked by the settlement-boundary trust-mode recheck
+    # (elspeth-01d4c6e683) — the dispatch tool row persists BEFORE the
+    # settlement transaction, so without this event a mid-turn trust-mode
+    # downgrade left the trail showing a successful dispatch against a
+    # still-pending proposal with nothing recording the block.
+    "auto_commit.revoked",
+    # Non-terminal: the proposal stays pending. Records one guided
+    # settlement moving a still-pending proposal's ANCHOR — its
+    # lifecycle-managed ``composition_proposals.base_state_id``, never the
+    # draft-hashed ``PipelineProposal.base`` — onto the checkpoint that
+    # settlement writes (elspeth-ed67eb9d0d). In guided mode a
+    # ``composition_states`` row is a SESSION checkpoint —
+    # ``chat_history`` lives inside ``composer_meta`` — so an ordinary chat
+    # or a declined revision mints a new version without touching the
+    # graph, and a proposal carried across it would otherwise stay anchored
+    # to the previous checkpoint forever. The move is admitted only when
+    # the new checkpoint's composition content hash is unchanged, so it can
+    # never launder a graph that actually moved.
+    "proposal.rebased",
 ]
 GuidedOperationKind = Literal[
     "guided_start",
@@ -77,10 +162,38 @@ GuidedOperationKind = Literal[
     "state_revert",
     "session_fork",
 ]
+# Closed enum mirroring the ``ck_guided_operations_failure_code`` CHECK
+# constraint in ``web/sessions/models.py``; the order here mirrors the CHECK
+# declaration for visual diff clarity. Same paired-contract posture as
+# ``ChatMessageWriterPrincipal`` below: extending one side only lets the Python
+# writer pass while the DB rejects the row (or vice versa), so both edits ship
+# together with a ``SESSION_SCHEMA_EPOCH`` bump.
+#
+# The vocabulary also carries a PERMANENT-vs-TRANSIENT split the client reads to
+# decide whether a retry can succeed. ``provider_unavailable`` /
+# ``provider_timeout`` / ``invalid_provider_response`` / ``stale_conflict`` are
+# transient (retry or reload can win); ``policy_blocked`` is permanent by
+# construction — a deployment policy refused the pipeline, so the identical
+# request will be refused identically no matter how many operation ids the
+# client mints.
 GuidedOperationFailureCode = Literal[
     "provider_unavailable",
     "provider_timeout",
     "invalid_provider_response",
+    # The planner ran out of repair budget (or short-circuited a blind repeat)
+    # without converging on a valid pipeline (elspeth-5904b1683a). Transient —
+    # the first candidate is model-stochastic, so a retry can win. Distinct
+    # from ``invalid_provider_response`` because the provider answered every
+    # turn; it was the planner loop that could not satisfy validation, and
+    # presenting that as a provider fault (502) blamed the wrong actor and
+    # hid a diagnosable planning failure.
+    "planner_repair_exhausted",
+    # Permanent refusal from a deployment security policy (e.g. a source plugin
+    # prohibited on the web authoring surface). Distinct from
+    # ``invalid_provider_response`` precisely because there is nothing to retry:
+    # collapsing the two blamed the provider for a policy decision and told the
+    # user to retry an operation that cannot ever succeed.
+    "policy_blocked",
     "stale_conflict",
     "integrity_error",
     "custody_error",
@@ -113,7 +226,7 @@ LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX = "[landscape-reconciliation:absent]"
 # constraint in ``web/sessions/models.py``. The Python Literal and the SQL
 # CHECK are paired contracts: extending one without the other lets the
 # dataclass validator pass while the DB rejects the row (or vice versa).
-# The order here mirrors the CHECK declaration (models.py L116) for visual
+# The order here mirrors the CHECK declaration in ``models.py`` for visual
 # diff clarity. Adding a value is a governance action — see the
 # closed-list-of-permitted-writers comment block at the
 # ``audit_access_log_table`` definition for the same posture.
@@ -123,6 +236,11 @@ ChatMessageWriterPrincipal = Literal[
     "route_system_message",
     "admin_tool",
     "session_fork",
+    # LLM audit rows persisted by POST /api/runs/{run_id}/diagnostics/
+    # evaluate. A distinct principal (elspeth-0fcf68d50f): these writes
+    # originate outside any compose turn, so attributing them to
+    # ``compose_loop`` misrepresented the audit trail's writer custody.
+    "run_diagnostics",
 ]
 
 # Closed enum mirroring the ``ck_composition_states_provenance`` CHECK
@@ -187,6 +305,62 @@ _RUN_COUNTER_FIELDS: tuple[str, ...] = (
 
 @final
 @dataclass(frozen=True, slots=True)
+class WebInstanceRecord:
+    """Persistent membership projection; database time owns lease validity."""
+
+    instance_id: str
+    deployment_target: str
+    deployment_generation: str
+    compatibility_key: CompatibilityKey
+    image_digest: str
+    revision_label: str
+    state: InstanceState
+    started_at: datetime
+    last_heartbeat_at: datetime
+    lease_expires_at: datetime
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionOperationFenceRecord:
+    """Persistent operation authority, including retained release evidence."""
+
+    fence: SessionOperationFence
+    operation_kind: SessionOperationKind
+    owner_instance_id: str
+    lease_expires_at: datetime
+    released_at: datetime | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunCoordinationRecord:
+    """Sessions-side run ownership and monotonic saga projection."""
+
+    ownership: RunOwnershipFence | None
+    owner_lease_expires_at: datetime | None
+    saga_state: RunSagaState
+    cancel_requested_at: datetime | None
+    cancellation_source: CancellationSource | None
+    recovery_required_reason: RecoveryRequiredReason | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunStartPermitRecord:
+    """Durable start-versus-cancel decision and immutable permit subject."""
+
+    run_id: str
+    state: StartPermitState
+    permit_id: str | None
+    permit_epoch: int | None
+    subject_hash: str | None
+    issued_at: datetime | None
+    cancelled_at: datetime | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedOperationFence:
     """Unforgeable lease identity required by every durable operation write."""
 
@@ -204,6 +378,104 @@ class GuidedOperationFence:
             raise AuditIntegrityError("GuidedOperationFence.lease_token must be a non-empty exact string")
         if type(self.attempt) is not int or self.attempt < 1:
             raise AuditIntegrityError("GuidedOperationFence.attempt must be a positive exact integer")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkParentAuthority:
+    """Exact parent session-operation and guided-operation authority pair."""
+
+    parent_context: SessionOperationContext
+    guided_fence: GuidedOperationFence
+
+    def __post_init__(self) -> None:
+        if type(self.parent_context) is not SessionOperationContext:
+            raise AuditIntegrityError("SessionForkParentAuthority.parent_context must be exact")
+        if type(self.guided_fence) is not GuidedOperationFence:
+            raise AuditIntegrityError("SessionForkParentAuthority.guided_fence must be exact")
+        if self.parent_context.operation_kind is not SessionOperationKind.SESSION_FORK:
+            raise AuditIntegrityError("SessionForkParentAuthority requires SESSION_FORK context")
+        if self.parent_context.fence.session_id != str(self.guided_fence.session_id):
+            raise AuditIntegrityError("Session fork authorities must name the same parent session")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkAuthority:
+    """Exact parent, child, and guided authority for one fork attempt."""
+
+    parent: SessionForkParentAuthority
+    child_context: SessionOperationContext
+
+    def __post_init__(self) -> None:
+        if type(self.parent) is not SessionForkParentAuthority:
+            raise AuditIntegrityError("SessionForkAuthority.parent must be exact")
+        if type(self.child_context) is not SessionOperationContext:
+            raise AuditIntegrityError("SessionForkAuthority.child_context must be exact")
+        if self.child_context.operation_kind is not SessionOperationKind.SESSION_FORK:
+            raise AuditIntegrityError("SessionForkAuthority child requires SESSION_FORK context")
+        parent_fence = self.parent.parent_context.fence
+        child_fence = self.child_context.fence
+        if parent_fence.session_id == child_fence.session_id:
+            raise AuditIntegrityError("Session fork parent and child must be different sessions")
+        if child_fence.operation_epoch < 2:
+            raise AuditIntegrityError("Session fork child authority begins at epoch 2")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkChildCreation:
+    """Caller-provided child contents with all authority identity omitted."""
+
+    user_id: str
+    auth_provider_type: AuthProviderType
+    title: str
+    created_at: datetime
+    archived_at: datetime
+    forked_from_message_id: UUID
+
+    def __post_init__(self) -> None:
+        if type(self.user_id) is not str or not self.user_id:
+            raise AuditIntegrityError("SessionForkChildCreation.user_id must be non-empty")
+        if self.auth_provider_type not in get_args(AuthProviderType):
+            raise AuditIntegrityError("SessionForkChildCreation.auth_provider_type is invalid")
+        if type(self.title) is not str:
+            raise AuditIntegrityError("SessionForkChildCreation.title must be exact")
+        if not isinstance(self.created_at, datetime) or not isinstance(self.archived_at, datetime):
+            raise AuditIntegrityError("SessionForkChildCreation timestamps must be datetimes")
+        if type(self.forked_from_message_id) is not UUID:
+            raise AuditIntegrityError("SessionForkChildCreation.forked_from_message_id must be UUID")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkChildMessageCreation:
+    """One child message whose custody and sequence are repository-owned."""
+
+    id: UUID
+    role: ChatMessageRole
+    content: str
+    raw_content: str | None
+    tool_calls: Sequence[Mapping[str, Any]] | None
+    tool_call_id: str | None
+    parent_assistant_id: UUID | None
+    writer_principal: ChatMessageWriterPrincipal
+    created_at: datetime
+    composition_state_id: UUID | None
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.id must be UUID")
+        if self.role not in CHAT_MESSAGE_ROLE_VALUES:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.role is invalid")
+        if self.writer_principal not in CHAT_MESSAGE_WRITER_PRINCIPAL_VALUES:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.writer_principal is invalid")
+        if type(self.content) is not str:
+            raise AuditIntegrityError("SessionForkChildMessageCreation.content must be exact")
+        if not isinstance(self.created_at, datetime):
+            raise AuditIntegrityError("SessionForkChildMessageCreation.created_at must be datetime")
+        if self.tool_calls is not None:
+            freeze_fields(self, "tool_calls")
 
 
 @final
@@ -232,7 +504,24 @@ class GuidedPipelineProposalResult:
     checkpoint_state_id: UUID
 
 
-type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedDeclinedResult:
+    """Replay locator for a guided-full operation whose escape-hatch advisor
+    declined instead of proposing a pipeline.
+
+    No proposal is created. ``checkpoint_state_id`` names the (content-
+    unchanged) checkpoint composition_states row inserted alongside the
+    persisted decline message. ``decline_message_id`` is the immutable replay
+    locator; the checkpoint association is intentionally not unique across
+    later conversational turns.
+    """
+
+    checkpoint_state_id: UUID
+    decline_message_id: UUID
+
+
+type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult | GuidedDeclinedResult
 
 
 @final
@@ -276,9 +565,16 @@ class GuidedOperationCompleted:
 @final
 @dataclass(frozen=True, slots=True)
 class GuidedOperationFailed:
-    """Immutable terminal failure containing only the closed safe code."""
+    """Immutable terminal failure containing only closed, replay-safe facts."""
 
     failure_code: GuidedOperationFailureCode
+    unproducible_output_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
+            raise AuditIntegrityError("guided operation failure code is outside the closed vocabulary")
+        if type(self.unproducible_output_fields) is not tuple or any(type(field) is not str for field in self.unproducible_output_fields):
+            raise AuditIntegrityError("guided operation failure output fields must be an exact string tuple")
 
 
 type GuidedOperationOutcome = (
@@ -322,6 +618,75 @@ class SessionGuidedOperationInProgressError(RuntimeError):
         self.session_id = session_id
         self.kind = kind
         super().__init__(f"Session has an in-progress {kind} operation")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunDiagnosticsAuditAuthority:
+    """Handle-free write authority for run-diagnostics LLM audit rows.
+
+    Run-diagnostics evaluation holds no operation lease, so unlike
+    :class:`GuidedOperationFence` there is no token to present. The
+    authority is instead the run row's own custody of its session/state
+    binding, and it MUST be re-proven durably — run row still exists with
+    exactly this binding, owning session present and not archived —
+    inside the same locked transaction that appends the audit row
+    (elspeth-0fcf68d50f).
+    """
+
+    run_id: UUID
+    session_id: UUID
+    state_id: UUID
+
+    def __post_init__(self) -> None:
+        if type(self.run_id) is not UUID:
+            raise AuditIntegrityError("RunDiagnosticsAuditAuthority.run_id must be a UUID")
+        if type(self.session_id) is not UUID:
+            raise AuditIntegrityError("RunDiagnosticsAuditAuthority.session_id must be a UUID")
+        if type(self.state_id) is not UUID:
+            raise AuditIntegrityError("RunDiagnosticsAuditAuthority.state_id must be a UUID")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RunDiagnosticsAuditDraft:
+    """One row of a run-diagnostics audit cohort.
+
+    Role (``audit``), ``writer_principal`` (``run_diagnostics``) and
+    ``composition_state_id`` (``authority.state_id``) are all derived
+    from the authority at write time, never carried per row — the only
+    per-row facts are the content and its audit envelope. The whole
+    cohort settles in one locked transaction under one custody proof
+    (elspeth-90231248dc), so a mid-cohort failure leaves zero rows
+    durable rather than a prefix that reads as a complete record.
+    """
+
+    content: str
+    tool_calls: tuple[Mapping[str, Any], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not str:
+            raise AuditIntegrityError("RunDiagnosticsAuditDraft.content must be an exact string")
+        if self.tool_calls is not None and type(self.tool_calls) is not tuple:
+            raise AuditIntegrityError("RunDiagnosticsAuditDraft.tool_calls must be a tuple or None")
+        if self.tool_calls is not None:
+            freeze_fields(self, "tool_calls")
+
+
+RUN_DIAGNOSTICS_AUTHORITY_LOSS_REASONS: frozenset[str] = frozenset({"session_missing", "session_archived", "run_missing", "run_rebound"})
+
+
+class RunDiagnosticsAuthorityLostError(RuntimeError):
+    """The run/session/state binding behind a diagnostics write no longer holds."""
+
+    def __init__(self, authority: RunDiagnosticsAuditAuthority, *, reason: str) -> None:
+        if reason not in RUN_DIAGNOSTICS_AUTHORITY_LOSS_REASONS:
+            raise AuditIntegrityError(f"RunDiagnosticsAuthorityLostError reason {reason!r} is outside the closed vocabulary")
+        self.run_id = authority.run_id
+        self.session_id = authority.session_id
+        self.state_id = authority.state_id
+        self.reason = reason
+        super().__init__(f"Run-diagnostics audit authority is no longer current: {reason}")
 
 
 # Legal run status transitions. Implementations MUST reject any
@@ -379,6 +744,24 @@ class RunEventRecord:
     timestamp: datetime
     event_type: SessionRunEventType
     data: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("RunEventRecord.id must be an exact UUID")
+        if type(self.run_id) is not UUID:
+            raise AuditIntegrityError("RunEventRecord.run_id must be an exact UUID")
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise AuditIntegrityError("RunEventRecord.sequence must be a positive exact integer")
+        if type(self.timestamp) is not datetime or self.timestamp.utcoffset() is None:
+            raise AuditIntegrityError("RunEventRecord.timestamp must be an aware exact datetime")
+        event_type: object = self.event_type
+        if type(event_type) is not str or event_type not in SESSION_RUN_EVENT_TYPE_VALUES:
+            raise AuditIntegrityError("RunEventRecord.event_type is invalid")
+        data: object = self.data
+        if not isinstance(data, Mapping):
+            raise AuditIntegrityError("RunEventRecord.data must be a mapping")
+        object.__setattr__(self, "timestamp", self.timestamp.astimezone(UTC))
+        freeze_fields(self, "data")
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,13 +918,32 @@ class ProposalEventRecord:
 
 @dataclass(frozen=True, slots=True)
 class AuthoritativePipelineProposal:
-    """Verified pipeline authority reconstructed from one row + creation event."""
+    """Verified pipeline authority reconstructed from one row + its events.
+
+    Two different bases, and reading the wrong one is a defect:
+
+    ``proposal.base`` is the IMMUTABLE reviewed identity. It is hashed into
+    ``draft_hash`` (``pipeline_draft_hash``), so it cannot move without
+    changing which plan this is. Use it for "the checkpoint this proposal
+    was created against".
+
+    ``current_base`` is the LIFECYCLE-MANAGED anchor: the creation base
+    moved forward by every appended ``proposal.rebased`` event, and the
+    value ``composition_proposals.base_state_id`` is kept equal to. Use it
+    for "is this proposal still anchored to the current head" — the
+    currency question the guided read and the wire-review back-edit ask.
+
+    Before rebases existed (elspeth-ed67eb9d0d) the two always coincided,
+    which is why the currency question used to be answerable from
+    ``proposal.base``. A rebase is exactly what separates them.
+    """
 
     row: CompositionProposalRecord
     proposal: PipelineProposal
     creation_event_id: UUID
     custody_result: Literal["not_required", "ready"]
     supersedes_proposal_id: UUID | None
+    current_base: ProposalBase
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,12 +954,28 @@ class AuthoritativeCompositionProposal:
     pipeline: AuthoritativePipelineProposal | None
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class TransitionAssistantDraft:
+    """Assistant content that must commit with transition consumption."""
+
+    content: str
+    raw_content: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not str:
+            raise AuditIntegrityError("TransitionAssistantDraft.content must be an exact string")
+        if self.raw_content is not None and type(self.raw_content) is not str:
+            raise AuditIntegrityError("TransitionAssistantDraft.raw_content must be an exact string or None")
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineProposalSettlementResult:
-    """Atomic accepted proposal + committed immutable state."""
+    """Atomic accepted proposal, immutable state, and optional response."""
 
     proposal: CompositionProposalRecord
     state: CompositionStateRecord
+    transition_message: ChatMessageRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +1091,51 @@ class CompositionStateData:
             freeze_fields(self, *non_none)
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class SessionCompositionStateCreation:
+    """One ordinary COMPOSE checkpoint with repository-owned versioning."""
+
+    id: UUID
+    data: CompositionStateData
+    provenance: CompositionStateProvenance
+    created_at: datetime
+    derived_from_state_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("SessionCompositionStateCreation.id must be UUID")
+        if type(self.data) is not CompositionStateData:
+            raise AuditIntegrityError("SessionCompositionStateCreation.data must be exact")
+        provenance: object = self.provenance
+        if type(provenance) is not str or provenance not in COMPOSITION_STATE_PROVENANCE_VALUES:
+            raise AuditIntegrityError("SessionCompositionStateCreation.provenance is invalid")
+        created_at: object = self.created_at
+        if type(created_at) is not datetime or created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise AuditIntegrityError("SessionCompositionStateCreation.created_at must be an aware exact datetime")
+        derived_from_state_id: object = self.derived_from_state_id
+        if derived_from_state_id is not None and type(derived_from_state_id) is not UUID:
+            raise AuditIntegrityError("SessionCompositionStateCreation.derived_from_state_id must be UUID or None")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionForkChildStateCreation:
+    """One fork child checkpoint with repository-owned version allocation."""
+
+    id: UUID
+    data: CompositionStateData
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("SessionForkChildStateCreation.id must be UUID")
+        if type(self.data) is not CompositionStateData:
+            raise AuditIntegrityError("SessionForkChildStateCreation.data must be exact")
+        if not isinstance(self.created_at, datetime):
+            raise AuditIntegrityError("SessionForkChildStateCreation.created_at must be datetime")
+
+
 @dataclass(frozen=True, slots=True)
 class CompositionStateRecord:
     """Represents a row from the composition_states table.
@@ -722,6 +1185,251 @@ class CompositionStateRecord:
 
 @final
 @dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationSiteSnapshot:
+    """One pending review site and its immutable surfacing-state snapshot."""
+
+    event: InterpretationEventRecord
+    surfacing_state: CompositionStateRecord | None
+
+    def __post_init__(self) -> None:
+        if type(self.event) is not InterpretationEventRecord:
+            raise AuditIntegrityError("pending interpretation snapshot event must be exact")
+        if self.surfacing_state is not None and type(self.surfacing_state) is not CompositionStateRecord:
+            raise AuditIntegrityError("pending interpretation surfacing state must be exact or None")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationSnapshot:
+    """Locked, handle-free inputs for one pending-review policy decision."""
+
+    anchor_state: CompositionStateRecord
+    live_state: CompositionStateRecord
+    pending_sites: tuple[SessionPendingInterpretationSiteSnapshot, ...]
+    review_disabled: bool
+    opt_out_marker_exists: bool
+    #: Already-SUPERSEDED user-approved rows for the same site, newest first.
+    #: The state-commit sweep (``dead_site_supersession``) can retire this
+    #: site's card in the commit that extinguished it, and a delayed surfacer
+    #: still owns reconciliation of that historical site: it must return the
+    #: terminal row rather than convert a successful state commit into an
+    #: error response.
+    superseded_events: tuple[InterpretationEventRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.anchor_state) is not CompositionStateRecord or type(self.live_state) is not CompositionStateRecord:
+            raise AuditIntegrityError("pending interpretation state snapshots must be exact")
+        if self.anchor_state.session_id != self.live_state.session_id:
+            raise AuditIntegrityError("pending interpretation state snapshots must belong to one session")
+        if type(self.pending_sites) is not tuple or any(
+            type(site) is not SessionPendingInterpretationSiteSnapshot for site in self.pending_sites
+        ):
+            raise AuditIntegrityError("pending interpretation sites must be an exact tuple")
+        if type(self.superseded_events) is not tuple or any(
+            type(event) is not InterpretationEventRecord for event in self.superseded_events
+        ):
+            raise AuditIntegrityError("superseded interpretation events must be an exact tuple")
+        if type(self.review_disabled) is not bool or type(self.opt_out_marker_exists) is not bool:
+            raise AuditIntegrityError("pending interpretation policy flags must be exact booleans")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationDecision:
+    """Exact DML decision returned by pure pending-review policy code."""
+
+    result_event_id: UUID
+    superseded_event_ids: tuple[UUID, ...] = ()
+    insert_event: bool = False
+    choice: InterpretationChoice | None = None
+    accepted_value: str | None = None
+    resolved_at: datetime | None = None
+    arguments_hash: str | None = None
+    hash_domain_version: str | None = None
+    interpretation_source: InterpretationSource | None = None
+    resolved_prompt_template_hash: str | None = None
+    ensure_opt_out_marker: bool = False
+    appended_state: SessionCompositionStateCreation | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.result_event_id) is not UUID:
+            raise AuditIntegrityError("pending interpretation result event id must be a UUID")
+        if type(self.superseded_event_ids) is not tuple or any(type(event_id) is not UUID for event_id in self.superseded_event_ids):
+            raise AuditIntegrityError("superseded interpretation ids must be an exact UUID tuple")
+        if len(set(self.superseded_event_ids)) != len(self.superseded_event_ids):
+            raise AuditIntegrityError("superseded interpretation ids must be unique")
+        if type(self.insert_event) is not bool or type(self.ensure_opt_out_marker) is not bool:
+            raise AuditIntegrityError("pending interpretation decision flags must be exact booleans")
+        if not self.insert_event:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.choice,
+                        self.accepted_value,
+                        self.resolved_at,
+                        self.arguments_hash,
+                        self.hash_domain_version,
+                        self.interpretation_source,
+                        self.resolved_prompt_template_hash,
+                        self.appended_state,
+                    )
+                )
+                or self.ensure_opt_out_marker
+            ):
+                raise AuditIntegrityError("reuse decisions cannot carry insertion fields")
+            return
+        if type(self.choice) is not InterpretationChoice or type(self.interpretation_source) is not InterpretationSource:
+            raise AuditIntegrityError("insert decisions require exact choice and source values")
+        if self.appended_state is not None and type(self.appended_state) is not SessionCompositionStateCreation:
+            raise AuditIntegrityError("pending interpretation appended state must be exact or None")
+        if self.choice is InterpretationChoice.PENDING and self.interpretation_source is InterpretationSource.USER_APPROVED:
+            if (
+                self.accepted_value is not None
+                or self.resolved_at is not None
+                or self.arguments_hash is not None
+                or self.hash_domain_version is not None
+                or self.resolved_prompt_template_hash is not None
+                or self.ensure_opt_out_marker
+                or self.appended_state is not None
+            ):
+                raise AuditIntegrityError("pending user-approved decisions cannot carry resolution or state fields")
+            return
+        if self.choice is InterpretationChoice.OPTED_OUT and self.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT:
+            if type(self.accepted_value) is not str:
+                raise AuditIntegrityError("automatic opt-out decisions require an exact accepted value")
+            if type(self.resolved_at) is not datetime or self.resolved_at.utcoffset() is None:
+                raise AuditIntegrityError("automatic opt-out decisions require an aware resolved_at")
+            if not is_lower_sha256_hex(self.arguments_hash) or self.hash_domain_version != "v2":
+                raise AuditIntegrityError("automatic opt-out decisions require the v2 lowercase SHA-256 argument binding")
+            if not self.ensure_opt_out_marker or self.appended_state is None:
+                raise AuditIntegrityError("automatic opt-out decisions require the marker and appended state")
+            if self.resolved_prompt_template_hash is not None and not is_lower_sha256_hex(self.resolved_prompt_template_hash):
+                raise AuditIntegrityError("resolved prompt-template hash must be lowercase SHA-256 or None")
+            return
+        raise AuditIntegrityError("pending interpretation decision choice/source pairing is invalid")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationValidationCandidate:
+    """Immutable candidate state offered to the validation-only seam."""
+
+    digest: str
+    base_state: CompositionStateRecord
+    data: CompositionStateData
+
+    def __post_init__(self) -> None:
+        if not is_lower_sha256_hex(self.digest):
+            raise AuditIntegrityError("pending interpretation validation candidate digest must be lowercase SHA-256")
+        if type(self.base_state) is not CompositionStateRecord or type(self.data) is not CompositionStateData:
+            raise AuditIntegrityError("pending interpretation validation candidate state must be exact")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationValidationResult:
+    """Digest-bound validation outcome with no authority to describe writes."""
+
+    candidate_digest: str
+    is_valid: bool
+    validation_errors: tuple[str, ...] | None
+
+    def __post_init__(self) -> None:
+        if not is_lower_sha256_hex(self.candidate_digest):
+            raise AuditIntegrityError("pending interpretation validation result digest must be lowercase SHA-256")
+        if type(self.is_valid) is not bool:
+            raise AuditIntegrityError("pending interpretation validation result is_valid must be exact")
+        if self.validation_errors is not None and (
+            type(self.validation_errors) is not tuple or any(type(message) is not str for message in self.validation_errors)
+        ):
+            raise AuditIntegrityError("pending interpretation validation errors must be an exact string tuple or None")
+
+
+SessionPendingInterpretationValidator = Callable[
+    [SessionPendingInterpretationValidationCandidate],
+    SessionPendingInterpretationValidationResult,
+]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationCommand:
+    """Immutable pending-review creation facts; policy and DML stay repository-owned."""
+
+    event_id: UUID
+    opt_out_marker_event_id: UUID
+    composition_state_id: UUID
+    affected_node_id: str
+    tool_call_id: str
+    user_term: str
+    kind: InterpretationKind
+    llm_draft: str
+    model_identifier: str
+    model_version: str
+    provider: str
+    composer_skill_hash: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        # Every field is read directly: this is a type ELSPETH owns, so a
+        # reflective getattr would only hide a misspelt field name behind a
+        # confident AttributeError-free probe (ADR-032; masquerade gate).
+        for field_name, identifier in (
+            ("event_id", self.event_id),
+            ("opt_out_marker_event_id", self.opt_out_marker_event_id),
+            ("composition_state_id", self.composition_state_id),
+        ):
+            if type(identifier) is not UUID:
+                raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be a UUID")
+        if self.event_id == self.opt_out_marker_event_id:
+            raise AuditIntegrityError("pending interpretation event ids must be distinct")
+        if type(self.kind) is not InterpretationKind:
+            raise AuditIntegrityError("SessionPendingInterpretationCommand.kind must be exact")
+        if type(self.created_at) is not datetime or self.created_at.utcoffset() is None:
+            raise AuditIntegrityError("SessionPendingInterpretationCommand.created_at must be timezone-aware")
+        nonblank_text_fields = (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+        )
+        text_fields = (
+            *nonblank_text_fields,
+            ("llm_draft", self.llm_draft),
+            ("composer_skill_hash", self.composer_skill_hash),
+        )
+        for field_name, text in text_fields:
+            if type(text) is not str:
+                raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be an exact string")
+        for field_name, text in nonblank_text_fields:
+            if not text.strip():
+                raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be nonblank")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class TransitionResponseSettlement:
+    """One transition-consumption state and its visible response."""
+
+    state: CompositionStateRecord
+    message: ChatMessageRecord
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not CompositionStateRecord:
+            raise AuditIntegrityError("TransitionResponseSettlement.state must be exact")
+        if type(self.message) is not ChatMessageRecord:
+            raise AuditIntegrityError("TransitionResponseSettlement.message must be exact")
+        if self.state.session_id != self.message.session_id:
+            raise AuditIntegrityError("TransitionResponseSettlement rows must belong to the same session")
+        if self.message.role != "assistant" or self.message.composition_state_id != self.state.id:
+            raise AuditIntegrityError("TransitionResponseSettlement message must be an assistant bound to its state")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class StagedForkSession:
     """Persisted child cohort returned by initial staging or takeover."""
 
@@ -729,10 +1437,15 @@ class StagedForkSession:
     messages: tuple[ChatMessageRecord, ...]
     state: CompositionStateRecord | None
     blob_plan: tuple[BlobForkPlanEntry, ...]
+    authority: SessionForkAuthority
 
     def __post_init__(self) -> None:
         if type(self.session) is not SessionRecord or self.session.archived_at is None:
             raise AuditIntegrityError("StagedForkSession.session must be an archived exact SessionRecord")
+        if type(self.authority) is not SessionForkAuthority:
+            raise AuditIntegrityError("StagedForkSession.authority must be exact")
+        if self.authority.child_context.fence.session_id != str(self.session.id):
+            raise AuditIntegrityError("StagedForkSession authority must name its child")
         if type(self.messages) is not tuple or any(type(message) is not ChatMessageRecord for message in self.messages):
             raise AuditIntegrityError("StagedForkSession.messages must be an exact ChatMessageRecord tuple")
         if type(self.blob_plan) is not tuple or any(type(entry) is not BlobForkPlanEntry for entry in self.blob_plan):
@@ -750,8 +1463,7 @@ class StagedForkSession:
 class GuidedForkSettlementCommand:
     """Atomic staged-child rewrite, activation, and operation completion."""
 
-    fence: GuidedOperationFence
-    child_session_id: UUID
+    authority: SessionForkAuthority
     expected_current_state_id: UUID | None
     edited_message_id: UUID
     rewritten_state_id: UUID | None
@@ -760,11 +1472,10 @@ class GuidedForkSettlementCommand:
     actor: str
 
     def __post_init__(self) -> None:
-        if type(self.fence) is not GuidedOperationFence:
-            raise AuditIntegrityError("GuidedForkSettlementCommand.fence must be exact")
-        for field_name in ("child_session_id", "edited_message_id"):
-            if type(getattr(self, field_name)) is not UUID:
-                raise AuditIntegrityError(f"GuidedForkSettlementCommand.{field_name} must be a UUID")
+        if type(self.authority) is not SessionForkAuthority:
+            raise AuditIntegrityError("GuidedForkSettlementCommand.authority must be exact")
+        if type(self.edited_message_id) is not UUID:
+            raise AuditIntegrityError("GuidedForkSettlementCommand.edited_message_id must be a UUID")
         if self.expected_current_state_id is not None and type(self.expected_current_state_id) is not UUID:
             raise AuditIntegrityError("GuidedForkSettlementCommand.expected_current_state_id must be a UUID or None")
         if (self.rewritten_state_id is None) != (self.rewritten_state is None):
@@ -779,9 +1490,17 @@ class GuidedForkSettlementCommand:
         if type(self.actor) is not str or not self.actor:
             raise AuditIntegrityError("GuidedForkSettlementCommand.actor must be non-empty")
 
+    @property
+    def fence(self) -> GuidedOperationFence:
+        return self.authority.parent.guided_fence
+
+    @property
+    def child_session_id(self) -> UUID:
+        return UUID(self.authority.child_context.fence.session_id)
+
 
 GuidedJsonPayloadPurpose = Literal["turn", "turn_response"]
-GuidedPreparedAuditKind = Literal["tool", "llm", "chat"]
+GuidedPreparedAuditKind = Literal["tool", "llm", "planner", "chat"]
 GuidedResponseKind = Literal["guided_respond", "guided_chat", "guided_reenter"]
 
 
@@ -819,8 +1538,8 @@ def guided_json_payload_id(
 
     if purpose not in {"turn", "turn_response"}:
         raise AuditIntegrityError("guided JSON payload purpose is outside the closed vocabulary")
-    if not isinstance(payload, Mapping):
-        raise AuditIntegrityError("guided JSON payload must be a mapping")
+    if type(payload) not in (dict, MappingProxyType):
+        raise AuditIntegrityError("guided JSON payload must be an exact mapping")
     return stable_hash(
         {
             "schema": "guided.json-payload.v1",
@@ -858,7 +1577,7 @@ class PreparedGuidedAuditRow:
     envelope: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if self.kind not in {"tool", "llm", "chat"}:
+        if self.kind not in {"tool", "llm", "planner", "chat"}:
             raise AuditIntegrityError("PreparedGuidedAuditRow kind is outside the closed vocabulary")
         if type(self.content) is not str or not self.content:
             raise AuditIntegrityError("PreparedGuidedAuditRow content must be a non-empty exact string")
@@ -867,9 +1586,10 @@ class PreparedGuidedAuditRow:
         expected_discriminator = {
             "tool": "audit",
             "llm": "llm_call_audit",
+            "planner": "planner_attempt_audit",
             "chat": "chat_turn_audit",
         }[self.kind]
-        if self.envelope.get("_kind") != expected_discriminator:
+        if "_kind" not in self.envelope or self.envelope["_kind"] != expected_discriminator:
             raise AuditIntegrityError("PreparedGuidedAuditRow envelope discriminator does not match kind")
         freeze_fields(self, "envelope")
 
@@ -878,9 +1598,9 @@ GUIDED_FAILURE_AUDIT_LINEAGE_KEY = "_guided_failure_lineage"
 GUIDED_FAILURE_AUDIT_LINEAGE_SCHEMA = "guided_failure_audit_lineage.v1"
 GUIDED_FAILURE_AUDIT_COHORT_SCHEMA = "guided_failure_audit_cohort.v1"
 # One guided session is already bounded to 4,096 chat turns. Allow a
-# conservative four evidence rows per turn so the commitment stays finite
+# conservative five evidence rows per turn so the commitment stays finite
 # without narrowing any normal composer execution.
-GUIDED_FAILURE_AUDIT_COHORT_MAX_ROWS = 4 * GUIDED_MAX_CHAT_TURNS
+GUIDED_FAILURE_AUDIT_COHORT_MAX_ROWS = 5 * GUIDED_MAX_CHAT_TURNS
 
 
 @final
@@ -1119,6 +1839,7 @@ class GuidedAuditEvidence:
 
     invocations: tuple[ComposerToolInvocation, ...] = ()
     llm_calls: tuple[ComposerLLMCall, ...] = ()
+    planner_attempts: tuple[ComposerPlannerAttempt, ...] = ()
     chat_turns: tuple[ComposerChatTurn, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1126,6 +1847,8 @@ class GuidedAuditEvidence:
             raise AuditIntegrityError("GuidedAuditEvidence.invocations must be an exact typed tuple")
         if type(self.llm_calls) is not tuple or any(type(item) is not ComposerLLMCall for item in self.llm_calls):
             raise AuditIntegrityError("GuidedAuditEvidence.llm_calls must be an exact typed tuple")
+        if type(self.planner_attempts) is not tuple or any(type(item) is not ComposerPlannerAttempt for item in self.planner_attempts):
+            raise AuditIntegrityError("GuidedAuditEvidence.planner_attempts must be an exact typed tuple")
         if type(self.chat_turns) is not tuple or any(type(item) is not ComposerChatTurn for item in self.chat_turns):
             raise AuditIntegrityError("GuidedAuditEvidence.chat_turns must be an exact typed tuple")
 
@@ -1139,6 +1862,7 @@ class GuidedOperationFailureCommand:
     failure_code: GuidedOperationFailureCode
     actor: str
     audit_evidence: GuidedAuditEvidence
+    unproducible_output_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -1149,6 +1873,8 @@ class GuidedOperationFailureCommand:
             raise AuditIntegrityError("guided operation failure actor must be non-empty")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided operation failure audit evidence must be exact")
+        if type(self.unproducible_output_fields) is not tuple or any(type(field) is not str for field in self.unproducible_output_fields):
+            raise AuditIntegrityError("guided operation failure output fields must be an exact string tuple")
 
 
 @final
@@ -1279,10 +2005,10 @@ class GuidedResponseDescriptor:
         if set(value) != expected_keys or value["schema"] != "guided.operation-replay.v1":
             raise AuditIntegrityError("GuidedResponseDescriptor persisted shape is malformed")
         raw_turn = value["next_turn"]
-        if raw_turn is not None and not isinstance(raw_turn, Mapping):
+        if raw_turn is not None and type(raw_turn) not in (dict, MappingProxyType):
             raise AuditIntegrityError("GuidedResponseDescriptor next_turn is malformed")
         raw_findings = value["plugin_policy_findings"]
-        if type(raw_findings) not in (list, tuple) or any(not isinstance(item, Mapping) for item in raw_findings):
+        if type(raw_findings) not in (list, tuple) or any(type(item) not in (dict, MappingProxyType) for item in raw_findings):
             raise AuditIntegrityError("GuidedResponseDescriptor plugin policy findings are malformed")
         return cls(
             kind=value["kind"],
@@ -1326,17 +2052,16 @@ class PreparedGuidedInterpretationDraft:
     def __post_init__(self) -> None:
         if type(self.event_id) is not UUID:
             raise AuditIntegrityError("PreparedGuidedInterpretationDraft.event_id must be a UUID")
-        for field_name in (
-            "affected_node_id",
-            "tool_call_id",
-            "user_term",
-            "llm_draft",
-            "model_identifier",
-            "model_version",
-            "provider",
-            "composer_skill_hash",
+        for field_name, value in (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("llm_draft", self.llm_draft),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+            ("composer_skill_hash", self.composer_skill_hash),
         ):
-            value = getattr(self, field_name)
             if type(value) is not str or not value:
                 raise AuditIntegrityError(f"PreparedGuidedInterpretationDraft.{field_name} must be a non-empty exact string")
         if type(self.kind) is not InterpretationKind:
@@ -1345,12 +2070,60 @@ class PreparedGuidedInterpretationDraft:
 
 @final
 @dataclass(frozen=True, slots=True)
+class PreparedInterpretationEventDraft:
+    """One fully attributed review event for atomic state settlement.
+
+    Unlike the guided command-specific draft above, this DTO is the narrow
+    state-producing-route contract: the state id is allocated by the service
+    and every draft is validated and inserted in that same transaction.
+    """
+
+    event_id: UUID
+    affected_node_id: str
+    tool_call_id: str
+    user_term: str
+    kind: InterpretationKind
+    llm_draft: str
+    model_identifier: str
+    model_version: str
+    provider: str
+    composer_skill_hash: str
+
+    def __post_init__(self) -> None:
+        if type(self.event_id) is not UUID:
+            raise AuditIntegrityError("PreparedInterpretationEventDraft.event_id must be a UUID")
+        for field_name, value in (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("llm_draft", self.llm_draft),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+            ("composer_skill_hash", self.composer_skill_hash),
+        ):
+            if type(value) is not str or not value:
+                raise AuditIntegrityError(f"PreparedInterpretationEventDraft.{field_name} must be a non-empty exact string")
+        if type(self.kind) is not InterpretationKind:
+            raise AuditIntegrityError("PreparedInterpretationEventDraft.kind must be an InterpretationKind")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedPendingProposalInvalidation:
-    """Exact pending proposal authority invalidated by a guided state mutation."""
+    """Exact pending proposal authority invalidated by a guided state mutation.
+
+    ``reason`` is the truthful rejection cause recorded on the terminal
+    ``proposal.rejected`` event (closed
+    :data:`GuidedProposalInvalidationReason` vocabulary) — the settlement
+    verifies the clear and terminalizes the row, but only the call site knows
+    WHY custody is being cleared.
+    """
 
     proposal_id: UUID
     draft_hash: str
     reviewed_facts: Mapping[str, Any]
+    reason: GuidedProposalInvalidationReason
 
     def __post_init__(self) -> None:
         if type(self.proposal_id) is not UUID:
@@ -1358,6 +2131,61 @@ class GuidedPendingProposalInvalidation:
         _require_guided_sha256(self.draft_hash, "Guided pending proposal invalidation draft_hash")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("Guided pending proposal invalidation reviewed_facts must be a mapping")
+        if self.reason not in _GUIDED_PROPOSAL_INVALIDATION_REASONS:
+            raise AuditIntegrityError("Guided pending proposal invalidation reason is outside the closed vocabulary")
+        freeze_fields(self, "reviewed_facts")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedPendingProposalRebase:
+    """Exact pending proposal anchor move carried by a guided settlement.
+
+    A guided settlement always mints a fresh ``composition_states`` row —
+    ``GuidedSession``, ``chat_history`` included, is persisted inside
+    ``composer_meta``, so an advisory chat or a declined revision is
+    structurally a new version even when the graph is untouched. A pending
+    proposal carried across such a settlement must move its anchor onto the
+    checkpoint being written, or every later currency check names a
+    checkpoint that is no longer current (elspeth-ed67eb9d0d).
+
+    The anchor is ``AuthoritativePipelineProposal.current_base`` and the
+    ``composition_proposals.base_state_id`` column, never
+    ``PipelineProposal.base`` — that one is hashed into ``draft_hash`` and
+    is the reviewed artifact's identity.
+
+    This sideband is the caller's assertion of one such move; the settlement
+    re-derives every field from the live tree before it writes.
+    ``from_state_id`` is the anchor the proposal held before this
+    settlement, and ``composition_content_hash`` is the anchor content hash
+    that must be UNCHANGED across the move — the load-bearing admission
+    that keeps a rebase from laundering a graph that actually changed.
+
+    ``reason`` names the gesture that moved the anchor. It has no default:
+    the persisted ``proposal.rebased`` event is otherwise identical across
+    every carrying settlement modulo ids, and the proposal's own trail could
+    then not say which gesture moved it — the same completeness the sibling
+    ``proposal.rejected`` payload's ``reason_code`` exists to provide.
+    """
+
+    proposal_id: UUID
+    draft_hash: str
+    reviewed_facts: Mapping[str, Any]
+    from_state_id: UUID
+    composition_content_hash: str
+    reason: GuidedProposalRebaseReason
+
+    def __post_init__(self) -> None:
+        if type(self.proposal_id) is not UUID:
+            raise AuditIntegrityError("Guided pending proposal rebase id must be a UUID")
+        _require_guided_sha256(self.draft_hash, "Guided pending proposal rebase draft_hash")
+        if type(self.reviewed_facts) not in {dict, MappingProxyType}:
+            raise AuditIntegrityError("Guided pending proposal rebase reviewed_facts must be a mapping")
+        if type(self.from_state_id) is not UUID:
+            raise AuditIntegrityError("Guided pending proposal rebase from_state_id must be a UUID")
+        _require_guided_sha256(self.composition_content_hash, "Guided pending proposal rebase composition_content_hash")
+        if self.reason not in GUIDED_PROPOSAL_REBASE_REASONS:
+            raise AuditIntegrityError("Guided pending proposal rebase reason is outside the closed vocabulary")
         freeze_fields(self, "reviewed_facts")
 
 
@@ -1378,15 +2206,22 @@ class GuidedStateOperationCommand:
     payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
     originating_message: GuidedOriginatingUserMessageDraft | None = None
-    retained_deferred_intent_id: UUID | None = None
+    # One id per deferred intent this settlement appends, in append order
+    # (elspeth-3a21f09f09: a Send naming N future stages appends up to N).
+    retained_deferred_intent_ids: tuple[UUID, ...] = ()
     deferred_intent_action: DeferredIntentManagementAction | None = None
     invalidated_pending_proposal: GuidedPendingProposalInvalidation | None = None
+    rebased_pending_proposal: GuidedPendingProposalRebase | None = None
     interpretations: tuple[PreparedGuidedInterpretationDraft, ...] = ()
 
     def _validate_deferred_intent_sidebands(self) -> None:
-        if self.retained_deferred_intent_id is not None and type(self.retained_deferred_intent_id) is not UUID:
-            raise AuditIntegrityError("GuidedStateOperationCommand.retained_deferred_intent_id must be a UUID or None")
-        if self.retained_deferred_intent_id is not None and self.originating_message is None:
+        if type(self.retained_deferred_intent_ids) is not tuple or any(
+            type(intent_id) is not UUID for intent_id in self.retained_deferred_intent_ids
+        ):
+            raise AuditIntegrityError("GuidedStateOperationCommand.retained_deferred_intent_ids must be a tuple of exact UUIDs")
+        if len(set(self.retained_deferred_intent_ids)) != len(self.retained_deferred_intent_ids):
+            raise AuditIntegrityError("GuidedStateOperationCommand.retained_deferred_intent_ids must not repeat an id")
+        if self.retained_deferred_intent_ids and self.originating_message is None:
             raise AuditIntegrityError("A retained deferred intent requires an originating user-message draft")
         if self.deferred_intent_action is not None and type(self.deferred_intent_action) not in {
             DeferredIntentCancelAction,
@@ -1395,7 +2230,7 @@ class GuidedStateOperationCommand:
             raise AuditIntegrityError("GuidedStateOperationCommand.deferred_intent_action must be exact or None")
         if self.deferred_intent_action is not None and self.originating_message is None:
             raise AuditIntegrityError("A deferred intent action requires an originating user-message draft")
-        if self.deferred_intent_action is not None and self.retained_deferred_intent_id is not None:
+        if self.deferred_intent_action is not None and self.retained_deferred_intent_ids:
             raise AuditIntegrityError("A guided settlement cannot retain and manage deferred intent together")
         if (
             self.invalidated_pending_proposal is not None
@@ -1403,7 +2238,28 @@ class GuidedStateOperationCommand:
         ):
             raise AuditIntegrityError("GuidedStateOperationCommand.invalidated_pending_proposal must be exact or None")
         if self.invalidated_pending_proposal is not None and self.deferred_intent_action is None:
-            raise AuditIntegrityError("Pending proposal invalidation requires an exact deferred intent action")
+            # Closed producer set for clearing pending proposal authority:
+            # deferred-intent management (rewind) or a terminal checkpoint
+            # (exit-to-freeform, the binding-exempt universal escape). The
+            # settlement re-verifies the exact transition either way.
+            composer_meta = self.state.composer_meta
+            if composer_meta is not None and type(composer_meta) not in (dict, MappingProxyType):
+                raise AuditIntegrityError("GuidedStateOperationCommand.state.composer_meta must be an exact mapping or None")
+            guided_meta = composer_meta["guided_session"] if composer_meta is not None and "guided_session" in composer_meta else None
+            if guided_meta is not None and type(guided_meta) not in (dict, MappingProxyType):
+                raise AuditIntegrityError("Guided session composer metadata must be an exact mapping")
+            terminal = guided_meta["terminal"] if guided_meta is not None and "terminal" in guided_meta else None
+            if terminal is None:
+                raise AuditIntegrityError("Pending proposal invalidation requires a deferred intent action or a terminal exit checkpoint")
+        if self.rebased_pending_proposal is not None and type(self.rebased_pending_proposal) is not GuidedPendingProposalRebase:
+            raise AuditIntegrityError("GuidedStateOperationCommand.rebased_pending_proposal must be exact or None")
+        if self.rebased_pending_proposal is not None and self.invalidated_pending_proposal is not None:
+            # A settlement either carries a pending proposal forward onto its
+            # new checkpoint or clears it. Doing both would rebind custody
+            # that the same transaction terminalizes.
+            raise AuditIntegrityError("A guided settlement cannot rebase and invalidate the same pending proposal")
+        if self.rebased_pending_proposal is not None and self.rebased_pending_proposal.from_state_id == self.state_id:
+            raise AuditIntegrityError("Guided pending proposal rebase must move the anchor off its previous checkpoint")
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -1436,8 +2292,8 @@ class GuidedStateOperationCommand:
             raise AuditIntegrityError("GuidedStateOperationCommand.payloads must not repeat a payload_id")
         payloads_by_id = {payload.payload_id: payload for payload in self.payloads}
         if self.response.next_turn is not None:
-            next_payload = payloads_by_id.get(self.response.next_turn.payload_id)
-            if next_payload is None or next_payload.purpose != "turn":
+            next_payload_id = self.response.next_turn.payload_id
+            if next_payload_id not in payloads_by_id or payloads_by_id[next_payload_id].purpose != "turn":
                 raise AuditIntegrityError("Guided response next-turn payload must be present with purpose=turn")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("GuidedStateOperationCommand.audit_evidence must be exact typed evidence")
@@ -1482,8 +2338,12 @@ class GuidedPipelineProposalStageCommand:
 
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("GuidedPipelineProposalStageCommand.fence must be exact")
-        for field_name in ("expected_current_state_id", "checkpoint_state_id", "proposal_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("checkpoint_state_id", self.checkpoint_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"GuidedPipelineProposalStageCommand.{field_name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("expected_current_state_version must be a positive exact integer")
@@ -1541,8 +2401,8 @@ class GuidedPipelineProposalStageCommand:
         if type(self.payloads) is not tuple or not self.payloads:
             raise AuditIntegrityError("Guided proposal stage requires prepared payloads")
         payloads_by_id = {payload.payload_id: payload for payload in self.payloads}
-        proposal_payload = payloads_by_id.get(self.response.next_turn.payload_id)
-        if proposal_payload is None or proposal_payload.purpose != "turn":
+        proposal_payload_id = self.response.next_turn.payload_id
+        if proposal_payload_id not in payloads_by_id or payloads_by_id[proposal_payload_id].purpose != "turn":
             raise AuditIntegrityError("Guided proposal stage payload does not bind the response")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("Guided proposal stage audit evidence must be exact")
@@ -1569,6 +2429,12 @@ class GuidedFullPipelineProposalStageCommand:
     actor: str
     originating_message: GuidedOriginatingUserMessageDraft
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
+    # Required exactly when plan.custody_preparation is present: the quota
+    # ceiling the deferred inline-custody settlement enforces when it
+    # materializes the blob inside the staging transaction
+    # (elspeth-1e3ad83d89). Must equal the ceiling stamped on the
+    # preparation at plan time — __post_init__ trips on divergence.
+    custody_max_storage_per_session: int | None = None
 
     def __post_init__(self) -> None:
         from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -1587,16 +2453,22 @@ class GuidedFullPipelineProposalStageCommand:
             raise AuditIntegrityError("guided-full expected state version must be positive or None")
         if self.expected_current_content_hash is not None:
             _require_guided_sha256(self.expected_current_content_hash, "guided-full expected content hash")
-        for field_name in ("checkpoint_state_id", "proposal_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, uuid_value in (
+            ("checkpoint_state_id", self.checkpoint_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(uuid_value) is not UUID:
                 raise AuditIntegrityError(f"guided-full {field_name} must be a UUID")
         if type(self.state) is not CompositionStateData:
             raise AuditIntegrityError("guided-full checkpoint state must be exact")
         if type(self.plan) is not PipelinePlanResult:
             raise AuditIntegrityError("guided-full plan must be exact")
-        for field_name in ("summary", "rationale", "actor"):
-            value = getattr(self, field_name)
-            if type(value) is not str or not value:
+        for field_name, text_value in (
+            ("summary", self.summary),
+            ("rationale", self.rationale),
+            ("actor", self.actor),
+        ):
+            if type(text_value) is not str or not text_value:
                 raise AuditIntegrityError(f"guided-full {field_name} must be non-empty")
         if type(self.affects) is not tuple or any(type(value) is not str or not value for value in self.affects):
             raise AuditIntegrityError("guided-full affects must be an exact non-empty-string tuple")
@@ -1606,6 +2478,20 @@ class GuidedFullPipelineProposalStageCommand:
             raise AuditIntegrityError("guided-full originating message must be exact")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided-full audit evidence must be exact")
+        if self.custody_max_storage_per_session is not None and (
+            type(self.custody_max_storage_per_session) is not int or self.custody_max_storage_per_session <= 0
+        ):
+            raise AuditIntegrityError("guided-full custody storage ceiling must be a positive int or None")
+        if self.plan.custody_preparation is not None:
+            if self.custody_max_storage_per_session is None:
+                raise AuditIntegrityError("guided-full deferred custody requires a storage ceiling")
+            # The settle-time ceiling and the plan-time ceiling are plumbed
+            # from independent sources (route settings read vs planner
+            # custody config); deferred settlement must enforce exactly the
+            # ceiling the plan authorized, so divergence trips here rather
+            # than silently enforcing whichever value arrived.
+            if self.custody_max_storage_per_session != self.plan.custody_preparation.max_storage_per_session:
+                raise AuditIntegrityError("guided-full custody storage ceiling diverges from the plan-time ceiling")
         freeze_fields(self, "affects", "arguments_redacted_json")
 
 
@@ -1668,6 +2554,87 @@ class GuidedFullPipelineProposalStageSettlement:
 
 @final
 @dataclass(frozen=True, slots=True)
+class GuidedFullPipelineDeclineCommand:
+    """Complete input for one atomic guided-full escape-hatch decline.
+
+    Sibling of GuidedFullPipelineProposalStageCommand for the other
+    guided-full planner outcome: no pipeline/proposal fields, because a
+    decline creates no proposal — only a checkpoint and the advisor's own
+    words as an ordinary assistant chat message.
+
+    It still writes a checkpoint over the observed head, ``composer_meta``
+    carried forward verbatim, so a guided walk holding a pending proposal
+    carries that proposal across this settlement exactly as a guided
+    RESPOND or CHAT settlement does — and must move its anchor the same way
+    (elspeth-ed67eb9d0d). ``rebased_pending_proposal`` is that assertion.
+    """
+
+    fence: GuidedOperationFence
+    expected_current_state_id: UUID | None
+    expected_current_state_version: int | None
+    expected_current_content_hash: str | None
+    checkpoint_state_id: UUID
+    state: CompositionStateData
+    decline_text: str
+    actor: str
+    originating_message: GuidedOriginatingUserMessageDraft
+    audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
+    rebased_pending_proposal: GuidedPendingProposalRebase | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.fence) is not GuidedOperationFence:
+            raise AuditIntegrityError("guided-full decline fence must be exact")
+        if (self.expected_current_state_id is None) != (self.expected_current_state_version is None):
+            raise AuditIntegrityError("guided-full decline expected state id/version must be paired")
+        if (self.expected_current_state_id is None) != (self.expected_current_content_hash is None):
+            raise AuditIntegrityError("guided-full decline expected state/hash must be paired")
+        if self.expected_current_state_id is not None and type(self.expected_current_state_id) is not UUID:
+            raise AuditIntegrityError("guided-full decline expected state id must be a UUID or None")
+        if self.expected_current_state_version is not None and (
+            type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1
+        ):
+            raise AuditIntegrityError("guided-full decline expected state version must be positive or None")
+        if self.expected_current_content_hash is not None:
+            _require_guided_sha256(self.expected_current_content_hash, "guided-full decline expected content hash")
+        if type(self.checkpoint_state_id) is not UUID:
+            raise AuditIntegrityError("guided-full decline checkpoint_state_id must be a UUID")
+        if type(self.state) is not CompositionStateData:
+            raise AuditIntegrityError("guided-full decline checkpoint state must be exact")
+        if type(self.decline_text) is not str:
+            raise AuditIntegrityError("guided-full decline text must be an exact str")
+        if type(self.actor) is not str or not self.actor:
+            raise AuditIntegrityError("guided-full decline actor must be non-empty")
+        if type(self.originating_message) is not GuidedOriginatingUserMessageDraft:
+            raise AuditIntegrityError("guided-full decline originating message must be exact")
+        if type(self.audit_evidence) is not GuidedAuditEvidence:
+            raise AuditIntegrityError("guided-full decline audit evidence must be exact")
+        if self.rebased_pending_proposal is not None and type(self.rebased_pending_proposal) is not GuidedPendingProposalRebase:
+            raise AuditIntegrityError("guided-full decline rebased_pending_proposal must be exact or None")
+        if self.rebased_pending_proposal is not None and self.rebased_pending_proposal.from_state_id == self.checkpoint_state_id:
+            raise AuditIntegrityError("guided-full decline rebase must move the anchor off its previous checkpoint")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedFullPipelineDeclineSettlement:
+    """Durable guided-full checkpoint, decline message, origin, and replay bytes."""
+
+    checkpoint_state: CompositionStateRecord
+    decline_message: ChatMessageRecord
+    originating_message: ChatMessageRecord
+    audit_messages: tuple[ChatMessageRecord, ...]
+    response_json: Mapping[str, Any]
+    response_hash: str
+
+    def __post_init__(self) -> None:
+        _require_guided_sha256(self.response_hash, "GuidedFullPipelineDeclineSettlement.response_hash")
+        freeze_fields(self, "audit_messages", "response_json")
+        if stable_hash(self.response_json) != self.response_hash:
+            raise AuditIntegrityError("guided-full decline response hash mismatch")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedPipelineProposalAcceptCommand:
     """Complete atomic guided acceptance cohort."""
 
@@ -1689,13 +2656,20 @@ class GuidedPipelineProposalAcceptCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided accept fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, uuid_value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(uuid_value) is not UUID:
                 raise AuditIntegrityError(f"guided accept {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided accept expected version must be positive")
-        for name in ("draft_hash", "candidate_content_hash", "executor_content_hash"):
-            _require_guided_sha256(getattr(self, name), f"guided accept {name}")
+        for name, hash_value in (
+            ("draft_hash", self.draft_hash),
+            ("candidate_content_hash", self.candidate_content_hash),
+            ("executor_content_hash", self.executor_content_hash),
+        ):
+            _require_guided_sha256(hash_value, f"guided accept {name}")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("guided accept reviewed facts must be a mapping")
         from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -1726,8 +2700,11 @@ class GuidedPipelineConfirmationAdmissionCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided confirmation admission fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided confirmation admission {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided confirmation admission expected version must be positive")
@@ -1753,8 +2730,11 @@ class GuidedPipelineDispatchRecordCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided dispatch record fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided dispatch record {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided dispatch record expected version must be positive")
@@ -1789,13 +2769,18 @@ class GuidedPipelineProposalBackEditCommand:
     actor: str
     response: GuidedResponseDescriptor
     payloads: tuple[PreparedGuidedJsonPayload, ...]
+    origin: Literal["proposal_review", "wire_review"]
+    correction_feedback: str | None = None
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided back-edit fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided back-edit {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided back-edit expected version must be positive")
@@ -1823,6 +2808,13 @@ class GuidedPipelineProposalBackEditCommand:
             raise AuditIntegrityError("guided back-edit payload purposes are malformed")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided back-edit audit evidence must be exact")
+        if self.origin not in {"proposal_review", "wire_review"}:
+            raise AuditIntegrityError("guided back-edit origin is outside the closed vocabulary")
+        if self.origin == "proposal_review":
+            if self.correction_feedback is not None:
+                raise AuditIntegrityError("guided proposal-review back-edit must not carry correction feedback")
+        elif type(self.correction_feedback) is not str or not self.correction_feedback.strip():
+            raise AuditIntegrityError("guided wire-review back-edit requires non-empty correction feedback")
         freeze_fields(self, "reviewed_facts", "payloads")
 
 
@@ -1843,8 +2835,11 @@ class GuidedPipelineProposalRejectCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided reject fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided reject {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided reject expected version must be positive")
@@ -1942,9 +2937,16 @@ class RunRecord:
             raise AuditIntegrityError("Tier 1: failed run is missing error")
 
     def _validate_counters(self) -> None:
-        for field_name in _RUN_COUNTER_FIELDS:
+        for field_name, value in (
+            ("rows_processed", self.rows_processed),
+            ("rows_succeeded", self.rows_succeeded),
+            ("rows_failed", self.rows_failed),
+            ("rows_routed_success", self.rows_routed_success),
+            ("rows_routed_failure", self.rows_routed_failure),
+            ("rows_quarantined", self.rows_quarantined),
+        ):
             try:
-                require_int(getattr(self, field_name), f"runs.{field_name}", min_value=0)
+                require_int(value, f"runs.{field_name}", min_value=0)
             except (TypeError, ValueError) as exc:
                 raise AuditIntegrityError(f"Tier 1: {exc}") from exc
 
@@ -2029,6 +3031,10 @@ class RunAlreadyActiveError(Exception):
         super().__init__(f"Session {session_id} already has an active run")
 
 
+class ProposalStateConflictError(ValueError):
+    """An ordinary proposal is no longer pending at the rejection CAS."""
+
+
 class StaleComposeStateError(RuntimeError):
     """Compose result was based on a no-longer-current composition state.
 
@@ -2044,6 +3050,92 @@ class StaleComposeStateError(RuntimeError):
     placement on the contracts layer: protocol-level error shapes belong
     on the abstraction, not on the concrete service module.
     """
+
+
+class TrustModeAutoCommitRevokedError(RuntimeError):
+    """Auto-commit authority was revoked before pipeline settlement.
+
+    Raised by ``SessionServiceProtocol.settle_pipeline_composition_proposal``
+    when the caller passed ``required_trust_mode`` and the session's durable
+    trust mode no longer matches at the moment of the pending->committed
+    transition. The check runs INSIDE the settlement write transaction,
+    under the same per-session write lock ``update_composer_preferences``
+    serialises on, so a preference downgrade is either visible here (and
+    the proposal lands on the review path) or became durable only after
+    the commit (and legitimately governs future turns) — there is no
+    interleaving in between (elspeth-01d4c6e683, commit-boundary half).
+
+    Not an integrity failure: the proposal remains pending and reviewable;
+    callers translate this into the ordinary review-path response.
+    """
+
+    def __init__(self, session_id: str, *, required: str, current: str) -> None:
+        self.session_id = session_id
+        self.required = required
+        self.current = current
+        super().__init__(
+            f"Session {session_id} trust mode is {current!r}; settlement required {required!r} — auto-commit authority revoked"
+        )
+
+
+class InterpretationResolveError(ValueError):
+    """Base class for expected interpretation-resolution failures."""
+
+
+class InterpretationEventNotFoundError(InterpretationResolveError):
+    """No event exists for the requested ``(session_id, event_id)`` pair."""
+
+
+class InterpretationEventAlreadyResolvedError(InterpretationResolveError):
+    """The event exists but is no longer pending."""
+
+
+class InterpretationNodeMissingError(InterpretationResolveError):
+    """The affected node disappeared from the live composition state."""
+
+
+class InterpretationNodePluginMutatedError(InterpretationResolveError):
+    """The affected node still exists but is no longer an LLM transform."""
+
+
+class InterpretationPlaceholderConsumedError(InterpretationResolveError):
+    """The affected LLM node no longer carries the expected placeholder."""
+
+
+class InterpretationSourceDataContractDriftError(InterpretationResolveError):
+    """The source demand changed after its data-contract card was shown."""
+
+    def __init__(
+        self,
+        *,
+        source_name: str,
+        reviewed_fields: tuple[str, ...],
+        current_fields: tuple[str, ...] | None,
+    ) -> None:
+        self.source_name = source_name
+        self.reviewed_fields = reviewed_fields
+        self.current_fields = current_fields
+        reviewed = f"[{', '.join(reviewed_fields)}]"
+        current = "no active demanded fields" if current_fields is None else f"[{', '.join(current_fields)}]"
+        super().__init__(
+            f"The demanded-field contract for source {source_name!r} changed from {reviewed} to {current} "
+            "after this review was shown. Reload the session and review the current source data contract."
+        )
+
+
+class InterpretationDraftMismatchError(InterpretationResolveError):
+    """The pending requirement exists but its draft is not the surfaced draft.
+
+    Raised by the ``create_pending_interpretation_event`` writer when the
+    under-lock re-read of the persisted head finds the review site's staged
+    draft differs from the ``llm_draft`` the caller asserted. The tool
+    handler converts it to ARG_ERROR (stale composition state or reviewed
+    content); it must never surface as a raw 500 (elspeth-9c01c943a5).
+    """
+
+
+class InterpretationUnsupportedChoiceError(InterpretationResolveError):
+    """The requested choice is valid generally but unsupported for this kind."""
 
 
 class AuditAccessLogWriteError(RuntimeError):
@@ -2094,9 +3186,552 @@ class ToolCallIDMismatchError(RuntimeError):
         )
 
 
+class SessionArchiveDisposition(StrEnum):
+    """Database disposition selected by the fenced archive decision."""
+
+    PHYSICAL_DELETE = "physical_delete"
+    SOFT_ARCHIVED = "soft_archived"
+
+
+class AuditAccessLogAuthority(Protocol):
+    """Handle-free authority for one audit-grade transcript access row."""
+
+    def record_audit_grade_view(
+        self,
+        *,
+        session_id: str,
+        requesting_principal: str,
+        auth_provider_type: AuthProviderType,
+        request_path: str,
+        query_args: Mapping[str, str],
+        ip_address: str | None,
+    ) -> AuditAccessLogRecord: ...
+
+
+class RunDiagnosticsAuditMutationAuthority(Protocol):
+    """Handle-free authority for run-diagnostics audit appends."""
+
+    def append_audit_message(
+        self,
+        *,
+        authority: RunDiagnosticsAuditAuthority,
+        content: str,
+        tool_calls: Sequence[Mapping[str, Any]] | None,
+    ) -> ChatMessageRecord: ...
+
+    def append_audit_messages(
+        self,
+        *,
+        authority: RunDiagnosticsAuditAuthority,
+        rows: Sequence[RunDiagnosticsAuditDraft],
+    ) -> tuple[ChatMessageRecord, ...]: ...
+
+
+class SessionOperationSessionMutations(Protocol):
+    """Session-row mutations available inside one exact operation fence."""
+
+    def record_plugin_crash_breadcrumb(self) -> None: ...
+
+    def mark_session_updated(self, *, updated_at: datetime) -> None: ...
+
+    def set_title(self, *, title: str, updated_at: datetime) -> None: ...
+
+    def record_composition_rejection(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        error_code: str | None,
+        message: str,
+        planner_payload: str,
+        composition_state_id: str | None,
+        created_at: datetime,
+    ) -> None: ...
+
+    def decide_and_soft_archive(
+        self,
+        *,
+        archived_at: datetime,
+    ) -> SessionArchiveDisposition: ...
+
+
+class SessionOperationCompositionMutations(Protocol):
+    """Composition-state mutations under one exact COMPOSE operation fence."""
+
+    def append_state(
+        self,
+        creation: SessionCompositionStateCreation,
+    ) -> CompositionStateRecord: ...
+
+
+class SessionOperationInterpretationMutations(Protocol):
+    """Interpretation audit mutations under one exact operation fence."""
+
+    def create_or_reconcile_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+    ) -> InterpretationEventRecord: ...
+
+    def record_session_opt_out(
+        self,
+        *,
+        event_id: UUID,
+        actor: str,
+        opted_out_at: datetime,
+    ) -> tuple[InterpretationEventRecord, bool]: ...
+
+    def record_auto_interpreted_no_surfaces_event(
+        self,
+        *,
+        event_id: UUID,
+        actor: str,
+        kind: InterpretationKind,
+        model_identifier: str,
+        model_version: str,
+        provider: str,
+        composer_skill_hash: str,
+        created_at: datetime,
+    ) -> InterpretationEventRecord: ...
+
+    def resolve_pending_event(
+        self,
+        *,
+        event_id: UUID,
+        choice: InterpretationChoice,
+        accepted_value: str | None,
+        resolved_at: datetime,
+        actor: str,
+        arguments_hash: str,
+        hash_domain_version: str,
+        runtime_model_identifier: str | None,
+        runtime_model_version: str | None,
+        resolved_prompt_template_hash: str | None,
+    ) -> None: ...
+
+
+class SessionOperationRunMutations(Protocol):
+    """Run mutations available inside one exact EXECUTE operation fence."""
+
+    def create_pending_run(
+        self,
+        *,
+        run_id: UUID,
+        state_id: UUID,
+        pipeline_yaml: str | None,
+        started_at: datetime,
+    ) -> RunRecord: ...
+
+    def transition_run_status(
+        self,
+        *,
+        run_id: UUID,
+        status: SessionRunStatus,
+        error: str | None,
+        landscape_run_id: str | None,
+        rows_processed: int | None,
+        rows_succeeded: int | None,
+        rows_failed: int | None,
+        rows_routed_success: int | None,
+        rows_routed_failure: int | None,
+        rows_quarantined: int | None,
+    ) -> None: ...
+
+    def append_run_event(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord: ...
+
+    def list_run_events_after(
+        self,
+        *,
+        run_id: UUID,
+        after_sequence: int,
+    ) -> tuple[RunEventRecord, ...]: ...
+
+
+class GlobalRunRecoveryAuthority(Protocol):
+    """Handle-free authority for cross-session run recovery writes.
+
+    Implementations own discovery, lock ordering, database-clock decisions,
+    and compare-and-swap mutations. Callers receive immutable run snapshots;
+    no database handle or connection-bearing callback crosses this boundary.
+    """
+
+    def cancel_orphaned_run_records(
+        self,
+        *,
+        max_age_seconds: int | None,
+        exclude_run_ids: frozenset[str],
+        reason: str | None,
+    ) -> tuple[RunRecord, ...]: ...
+
+    def mark_landscape_reconciliation_outcomes(
+        self,
+        *,
+        complete_run_ids: frozenset[UUID],
+        absent_run_ids: frozenset[UUID],
+    ) -> None: ...
+
+
+class SessionOperationBlobMutations(Protocol):
+    """Blob/run-custody mutations available inside one exact operation fence."""
+
+    def read_blob(self, *, blob_id: UUID) -> BlobRecord: ...
+
+    def prepare_blob_replacement(
+        self,
+        *,
+        replacement_id: UUID,
+        expected: BlobRecord,
+        replacement: BlobRecord,
+        staging_path: str,
+        backup_path: str,
+        max_storage_per_session: int,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobReplacementPlan: ...
+
+    def read_blob_replacement(self, *, blob_id: UUID) -> BlobReplacementPlan | None: ...
+
+    def list_blob_replacements(self) -> tuple[BlobReplacementPlan, ...]: ...
+
+    def mark_blob_replacement_staged(self, *, plan: BlobReplacementPlan) -> BlobReplacementPlan: ...
+
+    def commit_blob_replacement(
+        self,
+        *,
+        plan: BlobReplacementPlan,
+        max_storage_per_session: int,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobReplacementPlan: ...
+
+    def retire_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool: ...
+
+    def abort_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool: ...
+
+    def reserve_pending_output_blob(self, *, record: BlobRecord) -> BlobRecord: ...
+
+    def finalize_pending_output_blob(
+        self,
+        *,
+        blob_id: UUID,
+        status: Literal["ready", "error"],
+        size_bytes: int | None,
+        content_hash: str | None,
+        max_storage_per_session: int,
+    ) -> BlobRecord: ...
+
+    def reserve_blob(
+        self,
+        *,
+        record: BlobRecord,
+        max_storage_per_session: int,
+        idempotent: bool,
+        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    ) -> bool: ...
+
+    def mark_blob_ready(
+        self,
+        *,
+        blob_id: UUID,
+        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    ) -> BlobRecord: ...
+
+    def discard_pending_blob(
+        self,
+        *,
+        blob_id: UUID,
+        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
+    ) -> bool: ...
+
+    def list_abandoned_blob_reservations(self) -> tuple[BlobCreationObligation, ...]: ...
+
+    def retire_abandoned_blob_reservation(self, *, obligation: BlobCreationObligation) -> bool: ...
+
+    def prepare_blob_deletion(
+        self,
+        *,
+        blob_id: UUID,
+        tombstone_path: str,
+        blob_snapshot_hash: str,
+        expected_file_present: bool,
+        expected_file_size: int | None,
+        expected_file_hash: str | None,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobDeletionPlan: ...
+
+    def mark_blob_deletion_staged(self, *, plan: BlobDeletionPlan) -> BlobDeletionPlan: ...
+
+    def commit_blob_deletion(
+        self,
+        *,
+        plan: BlobDeletionPlan,
+        accepting_proposal_id: UUID | None,
+    ) -> BlobDeletionPlan: ...
+
+    def read_blob_deletion(self, *, blob_id: UUID) -> BlobDeletionPlan | None: ...
+
+    def list_blob_deletions(self) -> tuple[BlobDeletionPlan, ...]: ...
+
+    def retire_blob_deletion(self, *, plan: BlobDeletionPlan) -> bool: ...
+
+    def abort_blob_deletion(self, *, plan: BlobDeletionPlan) -> bool: ...
+
+    def insert_blob_run_link(
+        self,
+        *,
+        blob_id: UUID,
+        run_id: UUID,
+        direction: BlobRunLinkDirection,
+    ) -> bool: ...
+
+    def list_blob_run_links(self, *, blob_id: UUID) -> tuple[BlobRunLinkRecord, ...]: ...
+
+    def list_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]: ...
+
+    def list_pending_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]: ...
+
+    def mark_run_output_blob_ready(
+        self,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+        size_bytes: int,
+        content_hash: str,
+        max_storage_per_session: int,
+    ) -> BlobRecord: ...
+
+    def mark_run_output_blob_error(
+        self,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+    ) -> BlobRecord: ...
+
+    def insert_blob_inline_resolutions(
+        self,
+        *,
+        run_id: UUID,
+        attempt: int,
+        resolutions: Sequence[ResolvedBlobContent],
+        resolved_at: datetime,
+    ) -> None: ...
+
+
+class SessionOperationComposerCompletionMutations(Protocol):
+    """Completion-audit writes under one exact BLOB_READ operation fence."""
+
+    def mark_ready_for_review(
+        self,
+        *,
+        composition_state_id: UUID,
+        actor: str,
+        created_at: datetime,
+        payload_digest: str,
+        expires_at: datetime,
+    ) -> None: ...
+
+    def record_yaml_export(
+        self,
+        *,
+        composition_state_id: UUID,
+        actor: str,
+        created_at: datetime,
+    ) -> None: ...
+
+
+class SessionOperationMutationTransaction(Protocol):
+    """Read-only capability composition over one private fenced transaction."""
+
+    @property
+    def database_now(self) -> datetime: ...
+
+    @property
+    def session(self) -> SessionOperationSessionMutations: ...
+
+    @property
+    def composition_states(self) -> SessionOperationCompositionMutations: ...
+
+    @property
+    def interpretations(self) -> SessionOperationInterpretationMutations: ...
+
+    @property
+    def runs(self) -> SessionOperationRunMutations: ...
+
+    @property
+    def blobs(self) -> SessionOperationBlobMutations: ...
+
+    @property
+    def composer_completion(self) -> SessionOperationComposerCompletionMutations: ...
+
+
+class SessionForkChildMutations(Protocol):
+    """Child-session writes permitted during one atomic fork creation."""
+
+    def insert_child_state(self, creation: SessionForkChildStateCreation) -> None: ...
+
+    def append_child_messages(
+        self,
+        messages: tuple[SessionForkChildMessageCreation, ...],
+    ) -> None: ...
+
+
+class SessionForkParentGuidedMutations(Protocol):
+    """Exact parent-guided binding permitted during one atomic fork creation."""
+
+    def bind_guided_fork(
+        self,
+        *,
+        originating_message_id: UUID,
+    ) -> None: ...
+
+
 @runtime_checkable
+class SessionForkCreationTransaction(Protocol):
+    """Pair-session transaction restricted to the guided fork staging cohort."""
+
+    @property
+    def child_mutations(self) -> SessionForkChildMutations: ...
+
+    @property
+    def parent_guided_mutations(self) -> SessionForkParentGuidedMutations: ...
+
+    def require_parent_guided_operation(
+        self,
+        fence: GuidedOperationFence,
+    ) -> tuple[Mapping[str, Any], datetime]: ...
+
+    def read_parent_session(self) -> Any | None: ...
+
+    def read_parent_message(self, message_id: UUID) -> Any | None: ...
+
+    def read_parent_state(self, state_id: UUID) -> Any | None: ...
+
+    def read_parent_ready_blobs(self) -> tuple[Any, ...]: ...
+
+    def read_parent_blob_custody(self) -> tuple[Any, ...]: ...
+
+    def read_parent_proposal(self, proposal_id: UUID) -> Any | None: ...
+
+    def read_parent_proposal_creation_events(
+        self,
+        proposal_id: UUID,
+    ) -> tuple[Any, ...]: ...
+
+    def read_parent_proposal_rebase_events(
+        self,
+        proposal_id: UUID,
+    ) -> tuple[Any, ...]: ...
+
+    def count_parent_proposal_terminal_events(self, proposal_id: UUID) -> int: ...
+
+    def read_parent_guided_root_authority(
+        self,
+        message_id: UUID,
+    ) -> tuple[Any | None, tuple[Any, ...], Any | None]: ...
+
+    def read_child_snapshot(self) -> tuple[Any | None, tuple[Any, ...], Any | None]: ...
+
+
+@runtime_checkable
+class SessionOperationAuthority(Protocol):
+    """Persistent per-session operation authority without database-handle leakage.
+
+    Implementations own their transactions.  Callers receive only immutable
+    records/operation contexts; a raw SQLAlchemy engine or connection is never
+    part of the public authority surface.
+    """
+
+    def create_session_with_initial_fence(
+        self,
+        *,
+        user_id: str,
+        title: str,
+        auth_provider_type: AuthProviderType,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionRecord: ...
+
+    def acquire(
+        self,
+        *,
+        session_id: UUID,
+        operation_kind: SessionOperationKind,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionOperationContext: ...
+
+    def renew(
+        self,
+        context: SessionOperationContext,
+        *,
+        lease_seconds: int,
+    ) -> SessionOperationContext: ...
+
+    def compare_and_swap(self, context: SessionOperationContext) -> None: ...
+
+    def validate_fork_child_lease(
+        self,
+        authority: SessionForkAuthority,
+    ) -> SessionOperationContext: ...
+
+    def renew_fork_child_lease(
+        self,
+        authority: SessionForkAuthority,
+        *,
+        lease_seconds: int,
+    ) -> SessionOperationContext: ...
+
+    def reconcile_blob_reservation(
+        self,
+        context: SessionOperationContext,
+        *,
+        expected: BlobRecord,
+    ) -> BlobRecord | None: ...
+
+    def mutate[T](
+        self,
+        context: SessionOperationContext,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+    ) -> T: ...
+
+    def release(self, context: SessionOperationContext) -> None: ...
+
+    def archive_delete(self, context: SessionOperationContext) -> None: ...
+
+    def reconcile_archive_delete(self, context: SessionOperationContext) -> ArchiveDeleteReconciliation: ...
+
+    def classify_archive_manifest(
+        self,
+        current_context: SessionOperationContext,
+        *,
+        manifest_operation_id: UUID | str,
+        manifest_operation_epoch: int,
+    ) -> ArchiveManifestRelation: ...
+
+    def mutate_fork_creation[T](
+        self,
+        parent_authority: SessionForkParentAuthority,
+        child: SessionForkChildCreation,
+        mutation: Callable[[SessionForkCreationTransaction, SessionForkAuthority], T],
+    ) -> T: ...
+
+
 class SessionServiceProtocol(Protocol):
     """Protocol for session persistence operations."""
+
+    @property
+    def session_operation_authority(self) -> SessionOperationAuthority: ...
+
+    @property
+    def session_operation_owner_instance_id(self) -> str: ...
+
+    @property
+    def session_operation_lease_seconds(self) -> int: ...
 
     async def create_session(
         self,
@@ -2116,6 +3751,7 @@ class SessionServiceProtocol(Protocol):
         request_hash: str,
         actor: str,
         lease_seconds: int,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationOutcome: ...
 
     async def get_guided_operation(
@@ -2127,13 +3763,23 @@ class SessionServiceProtocol(Protocol):
         request_hash: str,
     ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None: ...
 
+    async def get_guided_start_reconciliation(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None: ...
+
     async def reconcile_guided_start_operation(
         self,
         *,
         session_id: UUID,
         operation_id: str,
+        observed_attempt: int | None,
         actor: str,
-    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed: ...
+        lease_seconds: int,
+        session_operation_context: SessionOperationContext,
+    ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None: ...
 
     async def renew_guided_operation(
         self,
@@ -2141,6 +3787,7 @@ class SessionServiceProtocol(Protocol):
         *,
         actor: str,
         lease_seconds: int,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFence: ...
 
     async def bind_guided_operation(
@@ -2151,6 +3798,7 @@ class SessionServiceProtocol(Protocol):
         proposal_id: UUID | None = None,
         result_state_id: UUID | None = None,
         result_session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> None: ...
 
     async def complete_guided_operation(
@@ -2160,6 +3808,7 @@ class SessionServiceProtocol(Protocol):
         result: GuidedOperationResult,
         response_hash: str,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationCompleted: ...
 
     async def fail_guided_operation(
@@ -2168,11 +3817,14 @@ class SessionServiceProtocol(Protocol):
         *,
         failure_code: GuidedOperationFailureCode,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFailed: ...
 
     async def fail_guided_operation_with_audit(
         self,
         command: GuidedOperationFailureCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedOperationFailed: ...
 
     async def revert_state_for_guided_operation(
@@ -2184,6 +3836,7 @@ class SessionServiceProtocol(Protocol):
         expected_current_state_version: int,
         actor: str,
         response_hash_factory: Callable[[CompositionStateRecord], str],
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
     async def save_state_for_guided_operation(
@@ -2199,7 +3852,9 @@ class SessionServiceProtocol(Protocol):
         system_message: str | None = None,
         payloads: tuple[PreparedGuidedJsonPayload, ...] = (),
         audit_evidence: GuidedAuditEvidence | None = None,
+        originating_message: GuidedOriginatingUserMessageDraft | None = None,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
     async def settle_guided_state_operation(
@@ -2207,6 +3862,7 @@ class SessionServiceProtocol(Protocol):
         command: GuidedStateOperationCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedStateOperationSettlement: ...
 
     async def stage_guided_pipeline_proposal(
@@ -2214,38 +3870,43 @@ class SessionServiceProtocol(Protocol):
         command: GuidedPipelineProposalStageCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def stage_guided_full_pipeline_proposal(
         self,
         command: GuidedFullPipelineProposalStageCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedFullPipelineProposalStageSettlement: ...
 
-    async def reconcile_rejected_guided_pipeline_proposal(
+    async def decline_guided_full_pipeline_proposal(
         self,
+        command: GuidedFullPipelineDeclineCommand,
         *,
-        session_id: UUID,
-        expected_current_state_id: UUID,
-        proposal_id: UUID,
-        draft_hash: str,
-        reviewed_facts: Mapping[str, Any],
-    ) -> CompositionStateRecord: ...
+        session_operation_context: SessionOperationContext,
+    ) -> GuidedFullPipelineDeclineSettlement: ...
 
     async def accept_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalAcceptCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def admit_guided_pipeline_confirmation(
         self,
         command: GuidedPipelineConfirmationAdmissionCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineDispatchRecovery | None: ...
 
     async def record_guided_pipeline_dispatch(
         self,
         command: GuidedPipelineDispatchRecordCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineDispatchRecovery: ...
 
     async def back_edit_guided_pipeline_proposal(
@@ -2253,11 +3914,14 @@ class SessionServiceProtocol(Protocol):
         command: GuidedPipelineProposalBackEditCommand,
         *,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def reject_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalRejectCommand,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedPipelineProposalStageSettlement: ...
 
     async def seed_or_complete_guided_start_operation(
@@ -2272,6 +3936,7 @@ class SessionServiceProtocol(Protocol):
         audit_evidence: GuidedAuditEvidence | None = None,
         originating_message: GuidedOriginatingUserMessageDraft | None = None,
         payload_store: PayloadStore | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> GuidedStartStateOutcome: ...
 
     async def complete_existing_state_guided_operation(
@@ -2283,9 +3948,16 @@ class SessionServiceProtocol(Protocol):
         expected_current_state_version: int,
         actor: str,
         response_hash_factory: Callable[[CompositionStateRecord], str],
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
-    async def update_session_title(self, session_id: UUID, title: str) -> SessionRecord: ...
+    async def update_session_title(
+        self,
+        session_id: UUID,
+        title: str,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> SessionRecord: ...
 
     async def list_sessions(
         self,
@@ -2331,6 +4003,7 @@ class SessionServiceProtocol(Protocol):
         composer_provider: str | None = None,
         composer_skill_hash: str | None = None,
         tool_arguments_hash: str | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
     async def create_pipeline_composition_proposal(
@@ -2348,6 +4021,7 @@ class SessionServiceProtocol(Protocol):
         composer_provider: str,
         user_message_id: UUID | None = None,
         supersedes_proposal_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
     async def get_authoritative_pipeline_proposal(
@@ -2379,7 +4053,21 @@ class SessionServiceProtocol(Protocol):
         final_composer_metadata: Mapping[str, Any] | None,
         dispatch: PipelineDispatchAuditBinding,
         actor: str,
+        transition_assistant: TransitionAssistantDraft | None = None,
+        required_trust_mode: ComposerTrustMode | None = None,
+        require_transition_consumed: bool = True,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineProposalSettlementResult: ...
+
+    async def record_auto_commit_revocation(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        required_trust_mode: str,
+        current_trust_mode: str,
+        actor: str,
+    ) -> ProposalEventRecord: ...
 
     async def get_pipeline_dispatch_recovery(
         self,
@@ -2397,6 +4085,7 @@ class SessionServiceProtocol(Protocol):
         reason: PipelineProposalRejectionReason,
         dispatch: PipelineDispatchAuditBinding | None,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
     async def list_composition_proposals(
@@ -2412,16 +4101,27 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
         proposal_id: UUID,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
-    async def mark_composition_proposal_committed(
+    async def accept_composition_proposal(
         self,
         *,
         session_id: UUID,
         proposal_id: UUID,
-        committed_state_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData | None,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
+
+    async def has_applied_blob_proposal_effect(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> bool: ...
 
     async def list_proposal_events(
         self,
@@ -2442,6 +4142,7 @@ class SessionServiceProtocol(Protocol):
         model_version: str,
         provider: str,
         composer_skill_hash: str,
+        session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
     ) -> InterpretationEventRecord:
         """Insert a PENDING interpretation event.
@@ -2470,6 +4171,7 @@ class SessionServiceProtocol(Protocol):
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution and update the affected interpretation surface.
 
@@ -2512,6 +4214,7 @@ class SessionServiceProtocol(Protocol):
         *,
         session_id: UUID,
         actor: str,
+        session_operation_context: SessionOperationContext,
         opted_out_at: datetime | None = None,
     ) -> InterpretationEventRecord:
         """Mark the session as 'don't surface interpretations any more'.
@@ -2530,7 +4233,6 @@ class SessionServiceProtocol(Protocol):
         skill_hash: str,
         filename: str,
         content: str,
-        first_seen_at: datetime | None = None,
     ) -> bool:
         """Best-effort INSERT-OR-IGNORE into ``skill_markdown_history`` (F-5c).
 
@@ -2556,6 +4258,7 @@ class SessionServiceProtocol(Protocol):
         model_version: str,
         provider: str,
         composer_skill_hash: str,
+        session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
     ) -> InterpretationEventRecord:
         """Write an AUTO_INTERPRETED_NO_SURFACES row (Phase 5b Task 5, F-6).
@@ -2596,7 +4299,69 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord: ...
+
+    async def add_messages_atomic(
+        self,
+        session_id: UUID,
+        drafts: Sequence[AuditMessageDraft],
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        composition_state_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+    ) -> None:
+        """Persist one audit cohort all-or-nothing (elspeth-90231248dc).
+
+        Implementations MUST commit every draft in a single transaction
+        under the session write lock with a contiguous sequence block —
+        a mid-cohort failure must leave zero rows durable, never a
+        prefix. A draft's ``composition_state_id`` overrides the
+        cohort-level value for that row (``None`` falls back to it), and
+        every distinct effective state id MUST be verified against the
+        session before any insert. An empty ``drafts`` sequence is a
+        no-op.
+        """
+        ...
+
+    async def add_run_diagnostics_audit_message(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        content: str,
+        *,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+    ) -> ChatMessageRecord:
+        """Append one ``role=audit`` row under run-diagnostics authority.
+
+        The row's ``writer_principal`` (``run_diagnostics``) and
+        ``composition_state_id`` (``authority.state_id``) are derived from
+        the authority, never caller-supplied. Implementations MUST
+        re-prove the authority durably inside the same locked
+        transaction as the insert — run row present with exactly the
+        authority's session/state binding, session present and not
+        archived — and MUST raise
+        :class:`RunDiagnosticsAuthorityLostError` without consuming a
+        chat sequence number when the proof fails.
+        """
+        ...
+
+    async def add_run_diagnostics_audit_messages_atomic(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        drafts: Sequence[RunDiagnosticsAuditDraft],
+    ) -> tuple[ChatMessageRecord, ...]:
+        """Append one run-diagnostics audit cohort all-or-nothing.
+
+        Cohort sibling of :meth:`add_run_diagnostics_audit_message`
+        (elspeth-90231248dc): implementations MUST prove the authority
+        once and commit every draft in the same locked transaction with
+        a contiguous sequence block — a mid-cohort failure or lost
+        authority must leave zero rows durable, never a prefix. An empty
+        ``drafts`` sequence is a no-op.
+        """
+        ...
 
     async def get_messages(
         self,
@@ -2604,6 +4369,35 @@ class SessionServiceProtocol(Protocol):
         limit: int | None = 100,
         offset: int = 0,
     ) -> list[ChatMessageRecord]: ...
+
+    async def add_message_with_transcript(
+        self,
+        session_id: UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        composition_state_id: UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        """Insert one message and return ``(record, full transcript)``.
+
+        The insert and the transcript read MUST happen inside one
+        write-locked transaction on one connection, so the returned
+        transcript ends at the inserted row by construction. Callers that
+        need "the transcript this write belongs to" (the freeform
+        send_message snapshot guard) MUST use this method instead of an
+        ``add_message`` + ``get_messages`` pair — the split pair reads on
+        a different pooled connection and a stale reader turns the Tier-1
+        snapshot guard into a false 500. Implementations MUST also apply
+        the same fail-closed guided-failure cohort verification as
+        ``get_messages`` over the same rows.
+        """
+        ...
 
     async def get_verified_guided_root_intent(
         self,
@@ -2628,6 +4422,7 @@ class SessionServiceProtocol(Protocol):
         *,
         session_id: str,
         requesting_principal: str,
+        auth_provider_type: AuthProviderType,
         request_path: str,
         query_args: Mapping[str, str],
         ip_address: str | None,
@@ -2641,8 +4436,12 @@ class SessionServiceProtocol(Protocol):
         state: CompositionStateData,
         *,
         provenance: CompositionStateProvenance,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
+
+        A live, exact COMPOSE ``SessionOperationContext`` is required and
+        must be validated transactionally before any state write.
 
         ``provenance`` MUST be one of the values enumerated by the
         ``ck_composition_states_provenance`` CHECK constraint and the
@@ -2652,6 +4451,57 @@ class SessionServiceProtocol(Protocol):
         MUST persist the value verbatim — no defaulting, no coercion: a
         confident wrong attribution is evidence-tampering-class harm under
         the auditability standard.
+        """
+        ...
+
+    async def save_composition_state_with_interpretations(
+        self,
+        session_id: UUID,
+        state: CompositionStateData,
+        *,
+        provenance: CompositionStateProvenance,
+        interpretations: tuple[PreparedInterpretationEventDraft, ...],
+        session_operation_context: SessionOperationContext,
+    ) -> CompositionStateRecord:
+        """Atomically save one state and all review events it requires.
+
+        Implementations must return the final session head because an opted-
+        out session may auto-resolve a prepared event and derive a newer state
+        inside the settlement transaction.
+        """
+        ...
+
+    async def commit_transition_response(
+        self,
+        *,
+        session_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData,
+        assistant_content: str,
+        raw_content: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> TransitionResponseSettlement:
+        """Atomically consume one guided transition and persist its response.
+
+        The state must carry ``guided_session.transition_consumed=true``.
+        Implementations must commit both rows or neither row.
+        """
+        ...
+
+    async def commit_composition_response(
+        self,
+        *,
+        session_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData,
+        assistant_content: str,
+        raw_content: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> TransitionResponseSettlement:
+        """Atomically persist one post-compose state and its response.
+
+        The exact live COMPOSE authority is validated in the same database
+        transaction as both rows, so takeover commits neither half.
         """
         ...
 
@@ -2696,15 +4546,16 @@ class SessionServiceProtocol(Protocol):
         offset: int = 0,
     ) -> list[CompositionStateRecord]: ...
 
-    async def set_active_state(
+    async def get_state_version_numbers(
         self,
         session_id: UUID,
-        state_id: UUID,
-    ) -> CompositionStateRecord:
-        """Set the active composition state for a session.
+    ) -> dict[str, int]:
+        """Map composition-state id → version for one session.
 
-        Creates a new state version derived from the specified state_id.
-        Sets derived_from_state_id on the new version to record lineage.
+        Lean projection (id/version columns only) for callers that need to
+        resolve state ids to version numbers without hydrating full state
+        rows — e.g. the messages route's per-tool-call outcome stamping
+        (elspeth-f5e6723133).
         """
         ...
 
@@ -2713,6 +4564,8 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
         state_id: UUID,
         pipeline_yaml: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> RunRecord: ...
 
     async def get_run(self, run_id: UUID) -> RunRecord: ...
@@ -2731,6 +4584,8 @@ class SessionServiceProtocol(Protocol):
         rows_routed_success: int | None = None,
         rows_routed_failure: int | None = None,
         rows_quarantined: int | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Update a run's status and metadata.
 
@@ -2750,6 +4605,7 @@ class SessionServiceProtocol(Protocol):
         timestamp: datetime,
         event_type: SessionRunEventType,
         data: Mapping[str, Any],
+        session_operation_context: SessionOperationContext,
     ) -> RunEventRecord:
         """Append a structured execution event for replay/audit."""
         ...
@@ -2764,6 +4620,7 @@ class SessionServiceProtocol(Protocol):
         run_id: UUID,
         resolutions: Sequence[ResolvedBlobContent],
         attempt: int = 1,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Write audit rows for inline-content blob refs before plugin construction."""
         ...
@@ -2773,22 +4630,9 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
     ) -> RunRecord | None: ...
 
-    async def prune_state_versions(
-        self,
-        session_id: UUID,
-        keep_latest: int = 50,
-    ) -> int:
-        """Delete old composition state versions beyond keep_latest.
-
-        Preserves the most recent `keep_latest` versions and any versions
-        referenced by a run (via runs.state_id). Returns the count of
-        deleted versions.
-        """
-        ...
-
     async def fork_session(
         self,
-        fence: GuidedOperationFence,
+        authority: SessionForkParentAuthority,
         *,
         fork_message_id: UUID,
         new_message_content: str,
@@ -2806,18 +4650,13 @@ class SessionServiceProtocol(Protocol):
         """Atomically rewrite, activate, and settle one staged fork child."""
         ...
 
-    async def cancel_orphaned_runs(
+    async def fail_guided_fork_operation(
         self,
-        session_id: UUID,
-        max_age_seconds: int = 3600,
-    ) -> list[RunRecord]:
-        """Force-cancel runs stuck in 'running' status beyond max_age_seconds.
-
-        Returns the list of cancelled RunRecords. Called by the execution
-        service on startup and periodically to prevent orphaned runs from
-        permanently blocking sessions.
-        """
-        ...
+        authority: SessionForkAuthority,
+        *,
+        failure_code: GuidedOperationFailureCode,
+        actor: str,
+    ) -> GuidedOperationFailed: ...
 
     async def cancel_all_orphaned_runs(
         self,
@@ -2875,10 +4714,12 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[Any, ...],
+        rejection_records: tuple[Any, ...] = (),
         parent_composition_state_id: str | None,
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,
         plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
     ) -> Any:
         """Persist one compose turn (assistant + tool rows + per-tool
         composition states) atomically.

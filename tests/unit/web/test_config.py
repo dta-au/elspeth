@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import types
 import typing
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -13,8 +15,30 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from elspeth.web import config as web_config
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import validate_aws_ecs_settings
+
+_REQUIRED_WEB_ENV = {
+    "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+    "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+    "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
+    "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+    "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+}
+
+
+@pytest.fixture
+def required_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The five no-default WebSettings fields, supplied by the test, not by an operator's .env.
+
+    `settings_from_env` reads only the process environment; locally
+    pytest-dotenv loads the maintainer's untracked `.env`, which carried these
+    five values, so every `settings_from_env` test passed here and failed in
+    CI with "5 validation errors ... Field required" (elspeth-bc97e06221 B2).
+    """
+    for name, value in _REQUIRED_WEB_ENV.items():
+        monkeypatch.setenv(name, value)
 
 
 def test_playwright_local_backend_secret_key_satisfies_non_pytest_guard() -> None:
@@ -219,6 +243,68 @@ class TestWebSettingsValidation:
 
         assert settings.composer_timeout_seconds == 300.0
 
+    def test_log_json_defaults_off_and_routes_to_configure_logging(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-cd98ea9d82 Tier 3: the JSON switch exists, defaults off
+        (local journald stays human-readable), and create_app's logging
+        helper routes it into the shared configure_logging."""
+        from elspeth.web import app as app_module
+
+        assert _settings().log_json is False
+
+        calls: dict[str, Any] = {}
+        monkeypatch.setattr(app_module, "configure_logging", lambda **kw: calls.update(kw))
+        app_module._configure_web_logging(_settings(log_json=True))
+        assert calls == {"json_output": True}
+
+    def test_underfunded_turn_budget_warns_with_fundable_estimate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-f159d2394b: a turn budget the wall clock cannot fund is
+        disclosed at config time. The acceptance deploy authorised 12+8
+        turns on a 120s clock that funded ~6 at the measured per-turn cost
+        — 'a budget the system cannot spend is not a budget'. Disclosure,
+        not rejection: per-turn cost is workload-dependent, and existing
+        configs (including test fixtures) are deliberately turn-generous.
+        """
+        from unittest.mock import MagicMock
+
+        import structlog
+
+        from elspeth.web import config as config_module
+
+        logger = MagicMock(spec=structlog.stdlib.BoundLogger)
+        monkeypatch.setattr(config_module, "_slog", logger)
+        settings = WebSettings(
+            composer_max_composition_turns=12,
+            composer_max_discovery_turns=8,
+            composer_timeout_seconds=120.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+        # Construction still succeeds — this is disclosure, not a gate.
+        assert settings.composer_timeout_seconds == 120.0
+        logger.warning.assert_called_once()
+        event, kwargs = logger.warning.call_args[0][0], logger.warning.call_args[1]
+        assert event == "composer_turn_budget_underfunded"
+        assert kwargs["configured_turns"] == 20
+        assert kwargs["fundable_turns_estimate"] == 8  # 120s // 15s planning floor
+
+    def test_fundable_turn_budget_does_not_warn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import MagicMock
+
+        import structlog
+
+        from elspeth.web import config as config_module
+
+        logger = MagicMock(spec=structlog.stdlib.BoundLogger)
+        monkeypatch.setattr(config_module, "_slog", logger)
+        WebSettings(
+            composer_max_composition_turns=3,
+            composer_max_discovery_turns=2,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+        logger.warning.assert_not_called()
+
     def test_composer_rate_limit_zero_rejected(self) -> None:
         with pytest.raises(ValueError):
             WebSettings(
@@ -314,8 +400,8 @@ class TestWebSettingsValidation:
             )
 
 
-class TestDeploymentTarget:
-    def test_defaults_to_default(self) -> None:
+class TestDeploymentSettings:
+    def test_defaults_to_default_target_and_auto_state_mode(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
             composer_max_discovery_turns=10,
@@ -325,12 +411,22 @@ class TestDeploymentTarget:
         )
 
         assert settings.deployment_target == "default"
+        assert settings.deployment_state_mode == "auto"
 
-    def test_accepts_aws_ecs(self) -> None:
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "default",
+            "docker-compose",
+            "linux-systemd",
+            "aws-ecs",
+            "azure-container-apps",
+            "kubernetes",
+        ],
+    )
+    def test_accepts_supported_deployment_targets(self, target: str) -> None:
         settings = WebSettings(
-            deployment_target="aws-ecs",
-            operator_telemetry="aws-otlp",
-            operator_telemetry_environment="production",
+            deployment_target=target,
             composer_max_composition_turns=15,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
@@ -338,7 +434,39 @@ class TestDeploymentTarget:
             shareable_link_signing_key=b"\x00" * 32,
         )
 
-        assert settings.deployment_target == "aws-ecs"
+        assert settings.deployment_target == target
+
+    @pytest.mark.parametrize("state_mode", ["auto", "sqlite-single", "external-postgresql"])
+    def test_accepts_supported_deployment_state_modes(self, state_mode: str) -> None:
+        settings = WebSettings(
+            deployment_state_mode=state_mode,
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+
+        assert settings.deployment_state_mode == state_mode
+
+    def test_deployment_literal_aliases_are_exact(self) -> None:
+        assert typing.get_args(web_config.DeploymentTarget) == (
+            "default",
+            "docker-compose",
+            "linux-systemd",
+            "aws-ecs",
+            "azure-container-apps",
+            "kubernetes",
+        )
+        assert typing.get_args(web_config.DeploymentStateMode) == ("auto", "sqlite-single", "external-postgresql")
+
+
+def _read_service_name(settings: WebSettings) -> str:
+    return settings.operator_telemetry_service_name
+
+
+def _read_environment(settings: WebSettings) -> str:
+    return settings.operator_telemetry_environment
 
 
 class TestOperatorTelemetrySettings:
@@ -361,6 +489,35 @@ class TestOperatorTelemetrySettings:
         assert settings.operator_telemetry_task_definition_revision is None
         assert settings.operator_telemetry_export_interval_seconds == 60
         assert settings.operator_pipeline_telemetry_granularity == "lifecycle"
+        assert settings.operator_metrics_bearer_token is None
+
+    def test_operator_metrics_bearer_token_is_masked(self) -> None:
+        raw_token = "operator-metrics-token-0123456789abcdef"
+
+        settings = WebSettings(
+            operator_metrics_bearer_token=raw_token,
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+
+        assert settings.operator_metrics_bearer_token is not None
+        assert settings.operator_metrics_bearer_token.get_secret_value() == raw_token
+        assert raw_token not in repr(settings)
+
+    @pytest.mark.parametrize("raw_token", ["short", "x" * 513, "x" * 31 + " ", "x" * 31 + "ñ"])
+    def test_operator_metrics_bearer_token_rejects_weak_or_non_header_safe_values(self, raw_token: str) -> None:
+        with pytest.raises(ValidationError, match="operator_metrics_bearer_token"):
+            WebSettings(
+                operator_metrics_bearer_token=raw_token,
+                composer_max_composition_turns=15,
+                composer_max_discovery_turns=10,
+                composer_timeout_seconds=85.0,
+                composer_rate_limit_per_minute=10,
+                shareable_link_signing_key=b"\x00" * 32,
+            )
 
     @pytest.mark.parametrize(
         ("field", "raw_value"),
@@ -392,17 +549,17 @@ class TestOperatorTelemetrySettings:
         assert raw_value not in str(caught.value)
 
     @pytest.mark.parametrize(
-        ("field", "value"),
+        ("field", "read", "value"),
         [
-            ("operator_telemetry_service_name", "elspeth-web"),
-            ("operator_telemetry_service_name", "orders.api_v2"),
-            pytest.param("operator_telemetry_service_name", "s" * 128, id="service-128-char-boundary"),
-            ("operator_telemetry_environment", "production"),
-            ("operator_telemetry_environment", "prod-blue"),
-            pytest.param("operator_telemetry_environment", "e" * 128, id="environment-128-char-boundary"),
+            pytest.param("operator_telemetry_service_name", _read_service_name, "elspeth-web", id="service-plain"),
+            pytest.param("operator_telemetry_service_name", _read_service_name, "orders.api_v2", id="service-dotted"),
+            pytest.param("operator_telemetry_service_name", _read_service_name, "s" * 128, id="service-128-char-boundary"),
+            pytest.param("operator_telemetry_environment", _read_environment, "production", id="environment-plain"),
+            pytest.param("operator_telemetry_environment", _read_environment, "prod-blue", id="environment-hyphenated"),
+            pytest.param("operator_telemetry_environment", _read_environment, "e" * 128, id="environment-128-char-boundary"),
         ],
     )
-    def test_aws_mode_accepts_safe_resource_labels(self, field: str, value: str) -> None:
+    def test_aws_mode_accepts_safe_resource_labels(self, field: str, read: Callable[[WebSettings], str], value: str) -> None:
         overrides = {
             "operator_telemetry": "aws-otlp",
             "operator_telemetry_environment": "production",
@@ -417,7 +574,7 @@ class TestOperatorTelemetrySettings:
             **overrides,  # type: ignore[arg-type]
         )
 
-        assert getattr(settings, field) == value
+        assert read(settings) == value
 
     def test_local_mode_preserves_generic_operator_resource_labels(self) -> None:
         settings = WebSettings(
@@ -557,7 +714,10 @@ class TestOperatorTelemetrySettings:
         assert "secret-remote-value" not in str(caught.value)
 
     def test_rejects_unknown_value(self) -> None:
-        with pytest.raises(ValidationError, match="'default' or 'aws-ecs'"):
+        with pytest.raises(
+            ValidationError,
+            match=("'default', 'docker-compose', 'linux-systemd', 'aws-ecs', 'azure-container-apps' or 'kubernetes'"),
+        ):
             WebSettings(
                 deployment_target="azure-aca",
                 composer_max_composition_turns=15,
@@ -774,6 +934,18 @@ class TestSecretKeyGuard:
                 shareable_link_signing_key=b"\xab\xcd" * 16,
             )
 
+    def test_uniform_byte_secret_key_rejected_on_non_local_host(self) -> None:
+        with pytest.raises(ValidationError, match="known-weak uniform-byte"):
+            WebSettings(
+                host="0.0.0.0",
+                secret_key="x" * 32,
+                composer_max_composition_turns=15,
+                composer_max_discovery_turns=10,
+                composer_timeout_seconds=85.0,
+                composer_rate_limit_per_minute=10,
+                shareable_link_signing_key=b"\xab\xcd" * 16,
+            )
+
     def test_short_secret_key_allowed_on_localhost(self) -> None:
         settings = WebSettings(
             host="127.0.0.1",
@@ -802,10 +974,10 @@ class TestSecretKeyGuard:
 
 
 class TestAuthFieldValidation:
-    """Tests for OIDC/Entra conditional field requirements."""
+    """Local auth's field rules, and the registry-driven rule for every IdP."""
 
-    def test_local_provider_no_oidc_fields_required(self) -> None:
-        """Local auth (default) should work without any OIDC fields."""
+    def test_local_provider_needs_no_idp_fields(self) -> None:
+        """Local auth (the default) must start with no IdP configuration at all."""
         settings = WebSettings(
             auth_provider="local",
             composer_max_composition_turns=15,
@@ -816,6 +988,26 @@ class TestAuthFieldValidation:
         )
         assert settings.auth_provider == "local"
 
+    def test_local_provider_rejects_entra_tenant_id(self) -> None:
+        """Local auth must not accept inert Entra configuration.
+
+        ``entra_tenant_id`` is the one provider-specific setting local auth
+        still refuses by name. The ``sso_*`` settings are deliberately NOT
+        refused under local: a deployment may carry its IdP wiring while
+        running local auth, and flipping ``auth_provider`` is then a
+        one-variable change rather than a re-plumbing.
+        """
+        with pytest.raises(ValidationError, match="Local auth does not use entra_tenant_id"):
+            WebSettings(
+                auth_provider="local",
+                entra_tenant_id="a-tenant",
+                composer_max_composition_turns=15,
+                composer_max_discovery_turns=10,
+                composer_timeout_seconds=85.0,
+                composer_rate_limit_per_minute=10,
+                shareable_link_signing_key=b"\x00" * 32,
+            )
+
     @pytest.mark.parametrize(
         "field_name",
         [
@@ -823,12 +1015,21 @@ class TestAuthFieldValidation:
             "oidc_audience",
             "oidc_client_id",
             "oidc_authorization_endpoint",
-            "entra_tenant_id",
+            "oidc_token_endpoint",
+            "oidc_audience_claim",
         ],
     )
-    def test_local_provider_rejects_oidc_entra_fields(self, field_name: str) -> None:
-        """Local auth must not accept inert OIDC/Entra configuration."""
-        with pytest.raises(ValidationError, match=field_name):
+    def test_retired_legacy_oidc_settings_fail_closed_rather_than_being_ignored(self, field_name: str) -> None:
+        """A stale task definition must fail at startup, not authenticate differently.
+
+        The legacy browser-bearer path and its six ``oidc_*`` settings were
+        deleted (identity sprint step E). An operator upgrading a running
+        deployment still has those variables in their task definition, and the
+        dangerous outcome is not a crash -- it is a container that starts,
+        ignores the issuer it was told to trust, and serves an IdP nobody
+        configured. Both the model and the environment reader refuse the name.
+        """
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             WebSettings(
                 auth_provider="local",
                 **{field_name: "https://issuer.example.com"},
@@ -839,9 +1040,22 @@ class TestAuthFieldValidation:
                 shareable_link_signing_key=b"\x00" * 32,
             )
 
-    def test_oidc_provider_missing_fields_raises(self) -> None:
-        """OIDC provider without required fields should raise."""
-        with pytest.raises(ValidationError, match="OIDC auth requires"):
+    @pytest.mark.usefixtures("required_web_env")
+    def test_retired_legacy_oidc_environment_variable_is_refused_by_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The upgrade failure an operator actually meets, named in their own vocabulary."""
+        monkeypatch.setenv("ELSPETH_WEB__OIDC_ISSUER", "https://issuer.example.com")
+
+        with pytest.raises(RuntimeError, match="Unknown ELSPETH_WEB__ setting: ELSPETH_WEB__OIDC_ISSUER"):
+            web_config.settings_from_env()
+
+    def test_idp_provider_missing_every_required_setting_names_them_all(self) -> None:
+        """An unconfigured IdP deployment is refused, and the refusal is a worklist.
+
+        The names come from the profile registry -- the common set every IdP
+        needs plus the profile's own -- so this message and readiness cannot
+        drift apart into two different answers about what is missing.
+        """
+        with pytest.raises(ValidationError, match=r"auth_provider='oidc' requires: .*sso_client_id.*sso_issuer"):
             WebSettings(
                 auth_provider="oidc",
                 composer_max_composition_turns=15,
@@ -952,6 +1166,17 @@ class TestPathFieldValidation:
 class TestServerSecretAllowlistValidation:
     """Tests for server_secret_allowlist field validation."""
 
+    def test_azure_content_safety_key_not_allowlisted_by_default(self) -> None:
+        settings = WebSettings(
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+
+        assert "AZURE_CONTENT_SAFETY_KEY" not in settings.server_secret_allowlist
+
     def test_reserved_elspeth_server_secret_names_rejected(self) -> None:
         with pytest.raises(ValidationError, match="ELSPETH_"):
             WebSettings(
@@ -964,369 +1189,220 @@ class TestServerSecretAllowlistValidation:
             )
 
 
+# What EVERY IdP deployment needs, whichever profile is selected: a
+# confidential client's credentials, a transaction secret, this container's
+# own public origin for the redirect URI, and the compartment and quota an
+# activated identity is created with. Stated once, exactly as
+# ``_COMMON_IDP_REQUIRED`` states it in the profile registry, so a test that
+# means "wired except for X" cannot drift into "wired except for X and two
+# things nobody noticed".
+_IDP_COMMON_REQUIRED: dict[str, Any] = {
+    "sso_client_id": "elspeth",
+    "sso_client_secret": "s" * 40,
+    "sso_transaction_secret": "t" * 40,
+    "public_base_url": "https://elspeth.example.gov.au",
+    "compartment_id": "example-compartment",
+    "quota_default_tokens_per_day": 100_000,
+    "quota_default_storage_bytes": 1_000_000,
+}
+
+
+def _wired_idp(provider: str, **overrides: Any) -> WebSettings:
+    """A deployment configured well enough for ``provider`` to complete a login."""
+    return _settings(auth_provider=provider, **{**_IDP_COMMON_REQUIRED, **overrides})
+
+
 class TestAuthFieldValidationContinued:
-    """Additional OIDC/Entra field requirement coverage."""
+    """The registry's required and forbidden rules, per profile."""
 
-    def test_oidc_provider_with_all_fields_valid(self) -> None:
-        """OIDC provider with all required fields should succeed."""
-        settings = WebSettings(
-            auth_provider="oidc",
-            oidc_issuer="https://issuer.example.com",
-            oidc_audience="my-audience",
-            oidc_client_id="my-client-id",
-            composer_max_composition_turns=15,
-            composer_max_discovery_turns=10,
-            composer_timeout_seconds=85.0,
-            composer_rate_limit_per_minute=10,
-            shareable_link_signing_key=b"\x00" * 32,
-        )
+    def test_oidc_provider_with_every_required_setting_is_accepted(self) -> None:
+        """The positive control: a rule that refused every oidc config would pass
+        every negative test below and ship a provider nobody can deploy."""
+        settings = _wired_idp("oidc", sso_issuer="https://issuer.example.com")
+
         assert settings.auth_provider == "oidc"
-        assert settings.oidc_issuer == "https://issuer.example.com"
+        assert settings.sso_issuer == "https://issuer.example.com"
 
-    def test_oidc_provider_partial_fields_raises(self) -> None:
-        """OIDC provider with only some fields should name the missing ones."""
-        with pytest.raises(ValidationError, match="oidc_audience"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=85.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_oidc_provider_with_only_its_issuer_names_the_common_settings_it_lacks(self) -> None:
+        """A profile-specific setting does not excuse the seven every IdP needs."""
+        with pytest.raises(ValidationError, match=r"auth_provider='oidc' requires: sso_client_id, .*quota_default_storage_bytes"):
+            _settings(auth_provider="oidc", sso_issuer="https://issuer.example.com")
 
-    def test_entra_provider_missing_fields_raises(self) -> None:
-        """Entra provider without required fields should raise."""
-        with pytest.raises(ValidationError, match="Entra auth requires"):
-            WebSettings(
-                auth_provider="entra",
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=85.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_entra_provider_missing_every_required_setting_raises(self) -> None:
+        with pytest.raises(ValidationError, match=r"auth_provider='entra' requires: .*entra_tenant_id"):
+            _settings(auth_provider="entra")
 
-    def test_entra_provider_missing_tenant_id_raises(self) -> None:
-        """Entra with OIDC fields but no tenant_id should raise."""
-        with pytest.raises(ValidationError, match="entra_tenant_id"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_issuer="https://login.microsoftonline.com/t/v2.0",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=85.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_entra_provider_missing_only_its_tenant_id_names_just_that(self) -> None:
+        """The refusal is the shortest true worklist, not the whole matrix again."""
+        with pytest.raises(ValidationError) as exc_info:
+            _wired_idp("entra")
 
-    def test_entra_provider_with_all_fields_valid(self) -> None:
-        """Entra provider with all required fields should succeed."""
-        settings = WebSettings(
-            auth_provider="entra",
-            oidc_issuer="https://login.microsoftonline.com/t/v2.0",
-            oidc_audience="my-audience",
-            oidc_client_id="my-client-id",
-            entra_tenant_id="my-tenant-id",
-            composer_max_composition_turns=15,
-            composer_max_discovery_turns=10,
-            composer_timeout_seconds=85.0,
-            composer_rate_limit_per_minute=10,
-            shareable_link_signing_key=b"\x00" * 32,
-        )
+        message = str(exc_info.value)
+        assert "auth_provider='entra' requires: entra_tenant_id" in message
+        assert "sso_client_id" not in message
+
+    def test_entra_provider_with_every_required_setting_is_accepted(self) -> None:
+        settings = _wired_idp("entra", entra_tenant_id="my-tenant-id")
+
         assert settings.auth_provider == "entra"
         assert settings.entra_tenant_id == "my-tenant-id"
 
+    def test_entra_provider_refuses_an_issuer_it_would_silently_ignore(self) -> None:
+        """Entra DERIVES its issuer from the tenant, so accepting ``sso_issuer``
+        as well would let two sources of truth disagree about who signs tokens.
+
+        The forbidden set is derived by subtracting what a profile uses from
+        the provider-specific settings, so this refusal is not a hand-written
+        list that a new setting could be left out of.
+        """
+        with pytest.raises(ValidationError, match="auth_provider='entra' does not use: sso_issuer"):
+            _wired_idp("entra", entra_tenant_id="my-tenant-id", sso_issuer="https://login.microsoftonline.com/t/v2.0")
+
 
 class TestOIDCIssuerValidation:
-    """OIDC issuer config must be safe before startup discovery can fetch it."""
+    """The issuer must be safe before anything fetches its discovery document.
 
-    _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
-        "composer_max_composition_turns": 15,
-        "composer_max_discovery_turns": 10,
-        "composer_timeout_seconds": 85.0,
-        "composer_rate_limit_per_minute": 10,
-        "shareable_link_signing_key": b"\x00" * 32,
+    ``sso_issuer`` reaches :func:`validate_oidc_issuer` through the profile's
+    ``resolve_issuer``, which the endpoint-override validator calls to compute
+    the expected origins. A deployment that supplies the break-glass overrides
+    therefore has its issuer parsed at config time, and each refusal below
+    names the check that failed.
+    """
+
+    _ENDPOINTS: typing.ClassVar[dict[str, object]] = {
+        "sso_authorization_endpoint": "https://issuer.example.com/oauth2/authorize",
+        "sso_token_endpoint": "https://issuer.example.com/oauth2/token",
+        "sso_jwks_uri": "https://issuer.example.com/oauth2/keys",
     }
 
     @pytest.mark.parametrize(
-        "issuer",
+        ("issuer", "check"),
         [
-            "http://issuer.example.com",
-            "https://user:pass@issuer.example.com",
-            "https://127.0.0.1",
-            "https://169.254.169.254",
-            "https://issuer.example.com?tenant=default",
-            "https://issuer.example.com#fragment",
+            ("http://issuer.example.com", "HTTPS"),
+            ("https://user:pass@issuer.example.com", "no-credentials"),
+            ("https://127.0.0.1", "public-literal-IP"),
+            ("https://169.254.169.254", "public-literal-IP"),
+            ("https://issuer.example.com?tenant=default", "no-query-or-fragment"),
+            ("https://issuer.example.com#fragment", "no-query-or-fragment"),
         ],
     )
-    def test_oidc_provider_rejects_unsafe_issuer(self, issuer: str) -> None:
-        with pytest.raises(ValidationError):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer=issuer,
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
+    def test_oidc_provider_rejects_unsafe_issuer(self, issuer: str, check: str) -> None:
+        with pytest.raises(ValidationError, match=f"issuer failed {check} check"):
+            _wired_idp("oidc", sso_issuer=issuer, **self._ENDPOINTS)
 
-    def test_oidc_provider_accepts_path_issuer_and_same_origin_authorization_endpoint(self) -> None:
-        settings = WebSettings(
-            auth_provider="oidc",
-            oidc_issuer="https://issuer.example.com/tenant/v2.0/",
-            oidc_audience="my-audience",
-            oidc_client_id="my-client-id",
-            oidc_authorization_endpoint="https://issuer.example.com/oauth2/authorize",
-            oidc_token_endpoint="https://issuer.example.com/oauth2/token",
-            **self._COMPOSER_DEFAULTS,
-        )
+    def test_oidc_provider_accepts_path_issuer_and_same_origin_endpoints(self) -> None:
+        """An issuer may carry a path -- Cognito pools and Keycloak realms do --
+        and its endpoints then sit at the origin, not under the path.
 
-        assert settings.oidc_issuer == "https://issuer.example.com/tenant/v2.0"
-        assert settings.oidc_authorization_endpoint == "https://issuer.example.com/oauth2/authorize"
-        assert settings.oidc_token_endpoint == "https://issuer.example.com/oauth2/token"
+        ``sso_issuer`` is stored as the operator typed it, trailing slash and
+        all: normalisation belongs to ``resolve_issuer``, which every consumer
+        of the issuer goes through, so the setting stays the operator's own
+        text rather than a second, silently rewritten answer.
+        """
+        settings = _wired_idp("oidc", sso_issuer="https://issuer.example.com/tenant/v2.0/", **self._ENDPOINTS)
+
+        assert settings.sso_issuer == "https://issuer.example.com/tenant/v2.0/"
+        assert settings.sso_authorization_endpoint == "https://issuer.example.com/oauth2/authorize"
+        assert settings.sso_token_endpoint == "https://issuer.example.com/oauth2/token"
 
 
 class TestOIDCBlankStringRejection:
-    """Blank/whitespace-only OIDC/Entra fields must be rejected at config time."""
+    """Blank/whitespace-only IdP fields must be rejected at config time.
 
-    _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
-        "composer_max_composition_turns": 15,
-        "composer_max_discovery_turns": 10,
-        "composer_timeout_seconds": 85.0,
-        "composer_rate_limit_per_minute": 10,
-        "shareable_link_signing_key": b"\x00" * 32,
-    }
+    A blank is worse than an omission: it satisfies every ``is not None``
+    check on the way to a deployment that cannot complete a login, and it is
+    exactly the shape an empty environment variable in a task definition
+    produces.
+    """
+
+    _COGNITO_ISSUER = "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id"
+    _COGNITO_HOSTED_DOMAIN = "https://example.auth.ap-southeast-2.amazoncognito.com"
 
     def test_oidc_empty_string_issuer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("oidc", sso_issuer="")
 
     def test_oidc_whitespace_issuer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="   ",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_oidc_empty_audience_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("oidc", sso_issuer="   ")
 
     def test_oidc_empty_client_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("oidc", sso_issuer="https://issuer.example.com", sso_client_id="")
 
     def test_entra_empty_tenant_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                entra_tenant_id="",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("entra", entra_tenant_id="")
 
     def test_entra_whitespace_tenant_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                entra_tenant_id="   ",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("entra", entra_tenant_id="   ")
 
     def test_oidc_empty_authorization_endpoint_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint="",
-                **self._COMPOSER_DEFAULTS,
+            _wired_idp(
+                "oidc",
+                sso_issuer="https://issuer.example.com",
+                sso_authorization_endpoint="",
+                sso_token_endpoint="https://issuer.example.com/oauth2/token",
+                sso_jwks_uri="https://issuer.example.com/oauth2/keys",
             )
 
-    def test_oidc_http_authorization_endpoint_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="HTTPS"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint="http://issuer.example.com/oauth2/authorize",
-                oidc_token_endpoint="https://issuer.example.com/oauth2/token",
-                **self._COMPOSER_DEFAULTS,
+    def test_oidc_cross_origin_endpoints_rejected_without_an_allowlist(self) -> None:
+        """The generic profile MAY widen beyond its issuer's origin, but only
+        where an operator said so. Silence is same-origin, not anything."""
+        with pytest.raises(ValidationError, match="authorization_endpoint failed expected-origin check"):
+            _wired_idp(
+                "oidc",
+                sso_issuer="https://issuer.example.com",
+                sso_authorization_endpoint="https://evil.example.com/oauth2/authorize",
+                sso_token_endpoint="https://evil.example.com/oauth2/token",
+                sso_jwks_uri="https://evil.example.com/oauth2/keys",
             )
 
-    def test_oidc_cross_origin_authorization_endpoint_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not allowed"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint="https://evil.example.com/oauth2/authorize",
-                oidc_token_endpoint="https://evil.example.com/oauth2/token",
-                **self._COMPOSER_DEFAULTS,
-            )
+    def test_cognito_cross_origin_endpoints_require_an_exact_allowlist(self) -> None:
+        """Cognito's hosted domain is genuinely not the pool issuer's origin.
 
-    def test_entra_cross_origin_authorization_endpoint_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not allowed"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                entra_tenant_id="test-tenant-id",
-                oidc_authorization_endpoint="https://evil.example.com/oauth2/authorize",
-                oidc_token_endpoint="https://evil.example.com/oauth2/token",
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_oidc_browser_fields_have_closed_defaults(self) -> None:
-        settings = WebSettings(**self._COMPOSER_DEFAULTS)
-        assert settings.oidc_authorization_allowed_origins == ()
-        assert settings.oidc_token_endpoint is None
-        assert settings.oidc_audience_claim == "aud"
-
-    def test_client_id_audience_claim_is_oidc_only(self) -> None:
-        settings = WebSettings(
-            auth_provider="oidc",
-            oidc_issuer="https://issuer.example.com",
-            oidc_audience="client",
-            oidc_client_id="client",
-            oidc_audience_claim="client_id",
-            **self._COMPOSER_DEFAULTS,
-        )
-        assert settings.oidc_audience_claim == "client_id"
-        for provider, fields in (
-            ("local", {}),
-            (
-                "entra",
-                {
-                    "oidc_audience": "client",
-                    "oidc_client_id": "client",
-                    "entra_tenant_id": "tenant",
-                },
-            ),
-        ):
-            with pytest.raises(ValidationError, match="audience claim"):
-                WebSettings(
-                    auth_provider=provider,  # type: ignore[arg-type]
-                    oidc_audience_claim="client_id",
-                    **fields,
-                    **self._COMPOSER_DEFAULTS,
-                )
-
-    def test_invalid_audience_claim_mode_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match=r"aud|client_id"):
-            WebSettings(
-                oidc_audience_claim="fallback",  # type: ignore[arg-type]
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    @pytest.mark.parametrize(
-        ("authorization_endpoint", "token_endpoint"),
-        [
-            ("https://issuer.example.com/oauth2/authorize", None),
-            (None, "https://issuer.example.com/oauth2/token"),
-        ],
-    )
-    def test_oidc_explicit_browser_endpoints_are_both_or_neither(
-        self,
-        authorization_endpoint: str | None,
-        token_endpoint: str | None,
-    ) -> None:
-        with pytest.raises(ValidationError, match="both or neither"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com/pool",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint=authorization_endpoint,
-                oidc_token_endpoint=token_endpoint,
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_cognito_cross_origin_pair_requires_exact_allowlist(self) -> None:
-        values = {
-            "auth_provider": "oidc",
-            "oidc_issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-            "oidc_audience": "client-id",
-            "oidc_client_id": "client-id",
-            "oidc_authorization_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/authorize",
-            "oidc_token_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
-            **self._COMPOSER_DEFAULTS,
+        This is why ``sso_endpoint_origins`` exists and why it is the generic
+        profile's alone: the widening is per-deployment operator knowledge, so
+        the same pair is refused without it and accepted with the exact origin
+        named. An allowlist that could be skipped would make the break-glass
+        path an unauthenticated redirect of the whole login walk.
+        """
+        endpoints: dict[str, Any] = {
+            "sso_issuer": self._COGNITO_ISSUER,
+            "sso_authorization_endpoint": f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/authorize",
+            "sso_token_endpoint": f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/token",
+            "sso_jwks_uri": f"{self._COGNITO_ISSUER}/.well-known/jwks.json",
         }
-        with pytest.raises(ValidationError, match="not allowed"):
-            WebSettings(**values)
-        settings = WebSettings(
-            **values,
-            oidc_authorization_allowed_origins=("https://example.auth.ap-southeast-2.amazoncognito.com",),
-        )
-        assert settings.oidc_authorization_endpoint is not None
-        assert settings.oidc_token_endpoint is not None
 
-    @pytest.mark.parametrize("provider", ["local", "entra"])
-    def test_allowlist_is_oidc_only(self, provider: str) -> None:
-        provider_fields: dict[str, object] = {}
-        if provider == "entra":
-            provider_fields = {
-                "oidc_audience": "audience",
-                "oidc_client_id": "client",
-                "entra_tenant_id": "tenant",
-            }
-        with pytest.raises(ValidationError, match="allowlist"):
-            WebSettings(
-                auth_provider=provider,  # type: ignore[arg-type]
-                oidc_authorization_allowed_origins=("https://login.example.com",),
-                **provider_fields,
-                **self._COMPOSER_DEFAULTS,
+        with pytest.raises(ValidationError, match="authorization_endpoint failed expected-origin check"):
+            _wired_idp("oidc", **endpoints)
+
+        allowed = _wired_idp("oidc", sso_endpoint_origins=(self._COGNITO_HOSTED_DOMAIN,), **endpoints)
+        assert allowed.sso_authorization_endpoint == f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/authorize"
+
+    def test_an_allowlist_authorizes_only_the_origin_it_names(self) -> None:
+        """Naming one extra origin is not a general amnesty for cross-origin endpoints."""
+        with pytest.raises(ValidationError, match="token_endpoint failed expected-origin check"):
+            _wired_idp(
+                "oidc",
+                sso_issuer=self._COGNITO_ISSUER,
+                sso_endpoint_origins=(self._COGNITO_HOSTED_DOMAIN,),
+                sso_authorization_endpoint=f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/authorize",
+                sso_token_endpoint="https://evil.example.com/oauth2/token",
+                sso_jwks_uri=f"{self._COGNITO_ISSUER}/.well-known/jwks.json",
             )
 
-    def test_allowlist_is_validated_without_explicit_endpoints(self) -> None:
-        with pytest.raises(ValidationError, match="bare-origin"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="audience",
-                oidc_client_id="client",
-                oidc_authorization_allowed_origins=("https://host.example.com/not-an-origin",),
-                **self._COMPOSER_DEFAULTS,
-            )
+    def test_local_auth_blank_sso_field_still_rejected(self) -> None:
+        """Field validator fires regardless of auth_provider — blank is always invalid.
 
-    def test_local_auth_blank_oidc_field_still_rejected(self) -> None:
-        """Field validator fires regardless of auth_provider — blank is always invalid."""
+        Local auth accepts ``sso_*`` settings (they are the wiring a deployment
+        keeps while running local auth), which is exactly why a blank one must
+        still be refused rather than read as "unset".
+        """
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="local",
-                oidc_issuer="",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _settings(auth_provider="local", sso_issuer="")
 
 
 class TestDBURLValidation:
@@ -1495,6 +1571,31 @@ class TestJWKSFailureRetryFloor:
             WebSettings(jwks_failure_retry_seconds=-1, **self._COMPOSER_DEFAULTS)
 
 
+class TestJWKSMaxStaleAge:
+    """The operator-configured JWKS hard lifetime must be finite and positive."""
+
+    _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
+        "composer_max_composition_turns": 15,
+        "composer_max_discovery_turns": 10,
+        "composer_timeout_seconds": 85.0,
+        "composer_rate_limit_per_minute": 10,
+        "shareable_link_signing_key": b"\x00" * 32,
+    }
+
+    def test_default_is_one_day(self) -> None:
+        settings = WebSettings(**self._COMPOSER_DEFAULTS)
+        assert settings.jwks_max_stale_seconds == 86_400
+
+    def test_positive_override_accepted(self) -> None:
+        settings = WebSettings(jwks_max_stale_seconds=1, **self._COMPOSER_DEFAULTS)
+        assert settings.jwks_max_stale_seconds == 1
+
+    @pytest.mark.parametrize("invalid", [0, -1])
+    def test_non_positive_rejected(self, invalid: int) -> None:
+        with pytest.raises(ValidationError):
+            WebSettings(jwks_max_stale_seconds=invalid, **self._COMPOSER_DEFAULTS)
+
+
 def _settings(**overrides: Any) -> WebSettings:
     """Construct WebSettings with required no-default fields + overrides.
 
@@ -1560,6 +1661,192 @@ class TestPublicBaseUrlValidation:
         assert settings.public_base_url == "https://composer.example.test"
 
 
+class TestComposerEndpointAffordance:
+    """Phase 3 Task 2: per-role settable OpenAI-compatible endpoint."""
+
+    def test_endpoint_settings_default_to_none(self) -> None:
+        settings = _settings()
+
+        assert settings.composer_endpoint_base_url is None
+        assert settings.composer_endpoint_api_key is None
+        assert settings.composer_advisor_endpoint_base_url is None
+        assert settings.composer_advisor_endpoint_api_key is None
+
+    def test_endpoint_accepts_https_url_and_key(self) -> None:
+        settings = _settings(
+            composer_endpoint_base_url="https://gateway.example.test/v1",
+            composer_endpoint_api_key="gateway-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "https://gateway.example.test/v1"
+        assert settings.composer_endpoint_api_key is not None
+        assert settings.composer_endpoint_api_key.get_secret_value() == "gateway-bearer-token"
+
+    def test_advisor_endpoint_accepts_https_url_and_key(self) -> None:
+        settings = _settings(
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            composer_advisor_endpoint_api_key="advisor-bearer-token",
+        )
+
+        assert settings.composer_advisor_endpoint_base_url == "https://advisor-gateway.example.test/v1"
+        assert settings.composer_advisor_endpoint_api_key is not None
+        assert settings.composer_advisor_endpoint_api_key.get_secret_value() == "advisor-bearer-token"
+
+    def test_endpoint_allows_http_loopback_with_path(self) -> None:
+        settings = _settings(
+            composer_endpoint_base_url="http://127.0.0.1:8787/v1",
+            composer_endpoint_api_key="loopback-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "http://127.0.0.1:8787/v1"
+
+    def test_endpoint_allows_http_ipv6_loopback(self) -> None:
+        """The numeric IPv6 loopback form named in the rejection message
+        (``[::1]``) must actually be accepted — locks in the claim made by
+        ``test_endpoint_rejects_name_based_localhost``'s error text."""
+        settings = _settings(
+            composer_endpoint_base_url="http://[::1]:8787/v1",
+            composer_endpoint_api_key="loopback-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "http://[::1]:8787/v1"
+
+    def test_endpoint_rejects_name_based_localhost(self) -> None:
+        """``localhost`` is resolver-dependent (/etc/hosts, NSS, container
+        DNS) and is not proof of on-box egress for a credential-bearing URL —
+        unlike the numeric 127.0.0.1/[::1] forms, which remain accepted."""
+        with pytest.raises(ValidationError, match="numeric loopback address"):
+            _settings(
+                composer_endpoint_base_url="http://localhost/v1",
+                composer_endpoint_api_key="loopback-bearer-token",
+            )
+
+    def test_advisor_endpoint_rejects_name_based_localhost(self) -> None:
+        with pytest.raises(ValidationError, match="numeric loopback address"):
+            _settings(
+                composer_advisor_endpoint_base_url="http://localhost/v1",
+                composer_advisor_endpoint_api_key="loopback-bearer-token",
+            )
+
+    def test_endpoint_rejects_non_loopback_http(self) -> None:
+        with pytest.raises(ValidationError):
+            _settings(composer_endpoint_base_url="http://gateway.example.test/v1")
+
+    def test_endpoint_rejects_query_string(self) -> None:
+        with pytest.raises(ValidationError, match="query string or fragment"):
+            _settings(composer_endpoint_base_url="https://gateway.example.test/v1?token=abc")
+
+    def test_endpoint_rejects_fragment(self) -> None:
+        with pytest.raises(ValidationError, match="query string or fragment"):
+            _settings(composer_endpoint_base_url="https://gateway.example.test/v1#frag")
+
+    def test_endpoint_rejects_embedded_userinfo(self) -> None:
+        with pytest.raises(ValidationError, match="embedded credentials"):
+            _settings(composer_endpoint_base_url="https://user:pass@gateway.example.test/v1")
+
+    def test_advisor_endpoint_url_validation_is_independent(self) -> None:
+        """The advisor endpoint field is validated the same way, separately."""
+        with pytest.raises(ValidationError, match="query string or fragment"):
+            _settings(composer_advisor_endpoint_base_url="https://advisor.example.test/v1?x=1")
+
+    def test_two_model_independence_rule_is_unaffected_by_endpoints(self) -> None:
+        """Per-role endpoints do not widen or narrow the exact-model-string rule.
+
+        Known residual gap (recorded, not fixed — out of this task's scope):
+        the rule compares model strings only, so it still rejects a
+        same-named model pinned at two different endpoints (arguably a
+        legitimate configuration), and it would not catch two differently
+        named models that happen to resolve to the same weights behind one
+        gateway. Endpoint-awareness was deliberately not added to this
+        validator.
+        """
+        with pytest.raises(ValidationError, match="composer_advisor_model must differ from composer_model"):
+            _settings(
+                composer_model="gpt-5.5",
+                composer_advisor_model="gpt-5.5",
+                composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+                composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            )
+
+
+class TestComposerEndpointCredentialPairing:
+    """Fix round 1: an endpoint with no key is a credential-egress trap.
+
+    LiteLLM does not require an explicit ``api_key`` — an unpaired
+    ``*_endpoint_base_url`` would silently fall back to whatever ambient
+    provider credential the process environment exposes (``OPENAI_API_KEY``
+    and friends) and send it to the operator-configured endpoint. Each role
+    (primary, advisor) is independently all-or-nothing.
+    """
+
+    def test_primary_base_url_without_key_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_endpoint_base_url="https://gateway.example.test/v1")
+        message = str(excinfo.value)
+        assert "composer_endpoint_base_url" in message
+        assert "composer_endpoint_api_key" in message
+
+    def test_primary_key_without_base_url_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_endpoint_api_key="orphaned-primary-key")
+        message = str(excinfo.value)
+        assert "composer_endpoint_base_url" in message
+        assert "composer_endpoint_api_key" in message
+
+    def test_advisor_base_url_without_key_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1")
+        message = str(excinfo.value)
+        assert "composer_advisor_endpoint_base_url" in message
+        assert "composer_advisor_endpoint_api_key" in message
+
+    def test_advisor_key_without_base_url_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_advisor_endpoint_api_key="orphaned-advisor-key")
+        message = str(excinfo.value)
+        assert "composer_advisor_endpoint_base_url" in message
+        assert "composer_advisor_endpoint_api_key" in message
+
+    def test_both_unset_is_valid(self) -> None:
+        settings = _settings()
+        assert settings.composer_endpoint_base_url is None
+        assert settings.composer_endpoint_api_key is None
+        assert settings.composer_advisor_endpoint_base_url is None
+        assert settings.composer_advisor_endpoint_api_key is None
+
+    def test_both_set_is_valid_for_each_role(self) -> None:
+        settings = _settings(
+            composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+            composer_endpoint_api_key="primary-secret",
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            composer_advisor_endpoint_api_key="advisor-secret",
+        )
+        assert settings.composer_endpoint_base_url == "https://primary-gateway.example.test/v1"
+        assert settings.composer_endpoint_api_key is not None
+        assert settings.composer_advisor_endpoint_base_url == "https://advisor-gateway.example.test/v1"
+        assert settings.composer_advisor_endpoint_api_key is not None
+
+    def test_roles_are_independent_primary_configured_advisor_unset(self) -> None:
+        """Primary fully paired + advisor fully unset is valid — the two
+        roles' pairing checks do not entangle each other."""
+        settings = _settings(
+            composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+            composer_endpoint_api_key="primary-secret",
+        )
+        assert settings.composer_endpoint_base_url == "https://primary-gateway.example.test/v1"
+        assert settings.composer_advisor_endpoint_base_url is None
+        assert settings.composer_advisor_endpoint_api_key is None
+
+    def test_roles_are_independent_advisor_configured_primary_unset(self) -> None:
+        settings = _settings(
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            composer_advisor_endpoint_api_key="advisor-secret",
+        )
+        assert settings.composer_advisor_endpoint_base_url == "https://advisor-gateway.example.test/v1"
+        assert settings.composer_endpoint_base_url is None
+        assert settings.composer_endpoint_api_key is None
+
+
 def test_advisor_must_differ_from_primary_exact() -> None:
     with pytest.raises(ValidationError, match="composer_advisor_model must differ from composer_model"):
         _settings(composer_model="gpt-5.5", composer_advisor_model="gpt-5.5")
@@ -1601,6 +1888,7 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
         "ELSPETH_WEB__COMPOSER_PLANNER_MAX_COMPLETION_TOKENS": "32768",
         "ELSPETH_WEB__COMPOSER_PLANNER_MAX_PROVIDER_CALLS": "80",
         "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": base64.b64encode(_secrets.token_bytes(32)).decode(),
+        "ELSPETH_WEB__OPERATOR_METRICS_BEARER_TOKEN": "operator-metrics-token-from-environment-0001",
     }.items():
         monkeypatch.setenv(key, value)
 
@@ -1610,3 +1898,362 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
     assert settings.composer_planner_max_provider_calls == 80
     assert settings.composer_max_composition_turns == 30
     assert settings.composer_timeout_seconds == 20.0
+    assert settings.operator_metrics_bearer_token is not None
+    assert settings.operator_metrics_bearer_token.get_secret_value() == "operator-metrics-token-from-environment-0001"
+
+
+def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    from elspeth.web.config import settings_from_env
+
+    for key, value in {
+        "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+        "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+        "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
+        "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+        "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": base64.b64encode(b"deployment-region-signing-key-01").decode(),
+        "AWS_REGION": "ap-southeast-1",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    settings = settings_from_env()
+
+    assert settings.deployment_aws_region == "ap-southeast-1"
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_parses_s3_source_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    private_prefix = "operator-private-prefix-marker"
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_S3_SOURCE_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "demo-input",
+                    "bucket": private_bucket,
+                    "prefix": private_prefix,
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.deployment_aws_region == "ap-southeast-1"
+    assert settings.aws_s3_source_profiles[0].alias == "demo-input"
+    assert settings.aws_s3_source_profiles[0].bucket == private_bucket
+    assert settings.aws_s3_source_profiles[0].prefix == private_prefix
+    assert private_bucket not in repr(settings.aws_s3_source_profiles[0])
+    assert private_prefix not in repr(settings.aws_s3_source_profiles[0])
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_parses_textract_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    private_prefix = "operator-private-prefix-marker"
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_TEXTRACT_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "acceptance-docs",
+                    "bucket": private_bucket,
+                    "key_prefix": private_prefix,
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.aws_textract_profiles[0].alias == "acceptance-docs"
+    assert settings.aws_textract_profiles[0].bucket == private_bucket
+    assert settings.aws_textract_profiles[0].key_prefix == private_prefix
+    assert private_bucket not in repr(settings.aws_textract_profiles[0])
+    assert private_prefix not in repr(settings.aws_textract_profiles[0])
+
+
+def test_settings_from_env_rejects_invalid_textract_profiles_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_TEXTRACT_PROFILES",
+        json.dumps(
+            [
+                {"alias": "acceptance-docs", "bucket": private_bucket},
+                {"alias": "acceptance-docs", "bucket": "other-private-bucket-marker"},
+            ]
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AWS_TEXTRACT_PROFILES" in str(exc_info.value).upper()
+    assert private_bucket not in str(exc_info.value)
+
+
+def test_settings_from_env_rejects_duplicate_s3_profile_aliases_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_S3_SOURCE_PROFILES",
+        json.dumps(
+            [
+                {"alias": "demo-input", "bucket": private_bucket},
+                {"alias": "demo-input", "bucket": "other-private-bucket-marker"},
+            ]
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AWS_S3_SOURCE_PROFILES" in str(exc_info.value).upper()
+    assert private_bucket not in str(exc_info.value)
+
+
+def test_settings_from_env_rejects_reserved_web_deployment_region_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__DEPLOYMENT_AWS_REGION", "us-east-1")
+
+    with pytest.raises(RuntimeError, match="reserved"):
+        web_config.settings_from_env()
+
+
+@pytest.mark.parametrize(
+    ("aws_region", "aws_default_region"),
+    [
+        ("ap-southeast-1", "us-east-1"),
+        (" ", None),
+        (None, "moon_east_1"),
+    ],
+)
+def test_settings_from_env_rejects_conflicting_blank_or_unsupported_ambient_region(
+    monkeypatch: pytest.MonkeyPatch,
+    aws_region: str | None,
+    aws_default_region: str | None,
+) -> None:
+    if aws_region is not None:
+        monkeypatch.setenv("AWS_REGION", aws_region)
+    if aws_default_region is not None:
+        monkeypatch.setenv("AWS_DEFAULT_REGION", aws_default_region)
+
+    with pytest.raises(RuntimeError, match=r"AWS.*REGION"):
+        web_config.settings_from_env()
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_retains_well_formed_unsupported_region_for_scoped_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "moon-east-1")
+
+    settings = web_config.settings_from_env()
+
+    assert settings.deployment_aws_region == "moon-east-1"
+
+
+def test_direct_web_settings_construction_may_inject_deployment_region() -> None:
+    assert _settings(deployment_aws_region="eu-west-1").deployment_aws_region == "eu-west-1"
+
+
+class TestDevAdminUser:
+    """dev_admin_user gates the short-term dev user-management surface."""
+
+    def test_defaults_to_disabled(self) -> None:
+        assert _settings().dev_admin_user is None
+
+    def test_accepts_a_local_auth_username(self) -> None:
+        assert _settings(dev_admin_user="john").dev_admin_user == "john"
+
+    def test_rejected_for_oidc_provider(self) -> None:
+        with pytest.raises(ValidationError, match="dev_admin_user requires auth_provider=local"):
+            _wired_idp("oidc", sso_issuer="https://issuer.example.com", dev_admin_user="john")
+
+    def test_rejected_for_entra_provider(self) -> None:
+        with pytest.raises(ValidationError, match="dev_admin_user requires auth_provider=local"):
+            _wired_idp("entra", entra_tenant_id="tenant", dev_admin_user="john")
+
+    def test_rejected_when_blank(self) -> None:
+        with pytest.raises(ValidationError, match="dev_admin_user"):
+            _settings(dev_admin_user="   ")
+
+    @pytest.mark.usefixtures("required_web_env")
+    def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__DEV_ADMIN_USER", "john")
+        assert web_config.settings_from_env().dev_admin_user == "john"
+
+
+# ==========================================================================
+# Break-glass SSO endpoint overrides.
+#
+# The four sso_* endpoint settings let an operator bypass discovery when an
+# IdP's document is wrong or unreachable. Until this landed they were accepted
+# unvalidated beyond a blank check, which made the break-glass path the
+# weakest way into a deployment: a typo — or an environment variable set by
+# something other than the operator — could point the token endpoint anywhere.
+# ==========================================================================
+
+_VANGUARD_ISSUER = "https://idp.example.gov.au"
+
+
+def _vanguard(**overrides: Any) -> WebSettings:
+    return _wired_idp("vanguard", sso_issuer=_VANGUARD_ISSUER, **overrides)
+
+
+def _all_four(origin: str = _VANGUARD_ISSUER, **overrides: Any) -> dict[str, Any]:
+    values = {
+        "sso_authorization_endpoint": f"{origin}/authorize",
+        "sso_token_endpoint": f"{origin}/token",
+        "sso_jwks_uri": f"{origin}/keys",
+        "sso_userinfo_endpoint": f"{origin}/userinfo",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_no_endpoint_overrides_is_the_ordinary_case() -> None:
+    """Positive control: discovery is the default and must stay unencumbered."""
+    settings = _vanguard()
+    assert settings.sso_authorization_endpoint is None
+
+
+def test_all_four_overrides_on_an_expected_origin_are_accepted() -> None:
+    """The other positive control — a break-glass path that refused everything
+    would pass every test below and be useless in the outage it exists for."""
+    settings = _vanguard(**_all_four())
+    assert settings.sso_token_endpoint == f"{_VANGUARD_ISSUER}/token"
+
+
+# entra and google put sso_issuer in their DERIVED forbidden set, so it is
+# always None on those profiles. A narrowing assert on it here refused a
+# correct break-glass configuration with a bare "Assertion failed" naming no
+# setting — and only when Python ran without -O, which made the recovery path
+# behave differently in production than under test. These two cases are
+# parametrized over the profiles that forbid the setting, because the ones
+# that require it could never have shown the defect.
+_ISSUERLESS_PROFILES = [
+    ("entra", {"entra_tenant_id": "11111111-2222-3333-4444-555555555555"}, "https://login.microsoftonline.com"),
+    ("google", {"google_hosted_domain": "example.gov.au"}, "https://accounts.google.com"),
+]
+
+
+@pytest.mark.parametrize(("provider", "profile_setting", "origin"), _ISSUERLESS_PROFILES)
+def test_break_glass_is_reachable_on_a_profile_that_forbids_an_issuer_setting(
+    provider: str, profile_setting: dict[str, Any], origin: str
+) -> None:
+    """The outage this path exists for does not skip the IdPs whose issuer is
+    derived. Both origins here are the profile's OWN expected origin, so the
+    policy below would have accepted them all along."""
+    settings = _wired_idp(provider, **profile_setting, **_all_four(origin))
+
+    assert settings.sso_token_endpoint == f"{origin}/token"
+
+
+@pytest.mark.parametrize(("provider", "profile_setting", "origin"), _ISSUERLESS_PROFILES)
+def test_an_off_origin_override_is_still_refused_on_those_profiles(provider: str, profile_setting: dict[str, Any], origin: str) -> None:
+    """The other half of the pair, and the reason the one above is not enough:
+    a 'fix' that merely deleted the origin check would satisfy it. Reaching
+    the policy is the point — being reachable is not the same as being open."""
+    values = _all_four(origin, sso_token_endpoint="https://attacker.example.net/token")
+    with pytest.raises(ValidationError, match="token_endpoint failed expected-origin check"):
+        _wired_idp(provider, **profile_setting, **values)
+
+
+@pytest.mark.parametrize("omitted", ["sso_authorization_endpoint", "sso_token_endpoint", "sso_jwks_uri"])
+def test_a_partial_override_is_refused(omitted: str) -> None:
+    """All-or-none. A partial override silently mixes operator-supplied and
+    discovered endpoints, so WHICH origin policy applied to WHICH URL would
+    depend on which variables happened to be set."""
+    values = _all_four()
+    values[omitted] = None
+    with pytest.raises(ValidationError, match="all-or-none"):
+        _vanguard(**values)
+
+
+def test_userinfo_alone_is_not_an_override() -> None:
+    """With no endpoints to pair it with there is nothing to bypass discovery
+    FOR, so a lone userinfo is a misconfiguration rather than a narrow override."""
+    with pytest.raises(ValidationError, match="sso_userinfo_endpoint requires"):
+        _vanguard(sso_userinfo_endpoint=f"{_VANGUARD_ISSUER}/userinfo")
+
+
+def test_omitting_only_userinfo_is_allowed() -> None:
+    """userinfo is the one genuinely optional endpoint; a provider that does
+    not publish one is not misconfigured."""
+    settings = _vanguard(**_all_four(sso_userinfo_endpoint=None))
+    assert settings.sso_userinfo_endpoint is None
+
+
+@pytest.mark.parametrize("field", ["sso_authorization_endpoint", "sso_token_endpoint", "sso_jwks_uri", "sso_userinfo_endpoint"])
+def test_an_override_may_not_leave_the_profiles_expected_origins(field: str) -> None:
+    """THE point of validating these at all.
+
+    An override names a DIFFERENT URL on an origin the IdP is expected to
+    serve from. It is not a way to leave that set — otherwise break-glass is
+    an unauthenticated redirect of the whole login walk, and jwks_uri is the
+    worst of the four because it supplies the keys every signature is checked
+    against.
+    """
+    with pytest.raises(ValidationError, match=f"{field.removeprefix('sso_')} failed expected-origin check"):
+        _vanguard(**_all_four(**{field: "https://attacker.example.net/path"}))
+
+
+def test_an_override_still_meets_every_ssrf_check() -> None:
+    """The overrides go through the same parse as a discovered endpoint —
+    being operator-supplied does not exempt them."""
+    with pytest.raises(ValidationError, match="failed HTTPS check"):
+        _vanguard(**_all_four(sso_token_endpoint="http://idp.example.gov.au/token"))
+
+
+class TestInstanceId:
+    """``instance_id`` (6b-3, elspeth-31878c9787): the process identity on the wire and in the fence rows.
+
+    The value is placed verbatim on every response header, so it is held to a
+    header-safe shape; ``None`` (the production setting) mints a fresh id at
+    startup so two replicas never share one.
+    """
+
+    def test_defaults_to_none_so_each_process_mints_its_own(self) -> None:
+        assert _settings().instance_id is None
+
+    @pytest.mark.parametrize("value", ["web-7f3a2c1e-9b4d-4f6a-8c2e-1d5b7a9c3e0f", "rA--replica.1_x", "a", "A" * 128])
+    def test_accepts_header_safe_ids(self, value: str) -> None:
+        assert _settings(instance_id=value).instance_id == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("", id="blank"),
+            pytest.param("   ", id="whitespace"),
+            pytest.param(" web", id="leading-space"),
+            pytest.param("-web", id="leading-dash"),
+            pytest.param("web\r\nX-Injected: 1", id="crlf"),
+            pytest.param("has space", id="space"),
+            pytest.param("wéb", id="non-ascii"),
+            pytest.param("A" * 129, id="too-long"),
+        ],
+    )
+    def test_rejects_unsafe_ids(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="instance_id"):
+            _settings(instance_id=value)
+
+    @pytest.mark.usefixtures("required_web_env")
+    def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "rA--pinned.01")
+        assert web_config.settings_from_env().instance_id == "rA--pinned.01"
+
+    def test_blank_environment_value_is_refused_not_treated_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "")
+        with pytest.raises(ValidationError, match="instance_id"):
+            web_config.settings_from_env()

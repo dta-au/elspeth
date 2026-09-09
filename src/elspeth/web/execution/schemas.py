@@ -37,6 +37,7 @@ ValidationCheckName = Literal[
     "required_control_coverage",
     "path_allowlist",
     "web_scrape_network_policy",
+    "web_fetch_resource_policy",
     "secret_refs",
     "semantic_contracts",
     "batch_transform_options",
@@ -47,6 +48,7 @@ ValidationCheckName = Literal[
     "llm_base_url_policy",
     "llm_tracing_policy",
     "aws_s3_endpoint_url_policy",
+    "aws_s3_source_policy",
     "settings_load",
     "plugin_instantiation",
     "value_source_compliance",
@@ -54,8 +56,11 @@ ValidationCheckName = Literal[
     "route_target_resolution",
     "schema_compatibility",
     "identity_node_advisory",
+    "gate_fan_out_advisory",
+    "static_llm_prompt_advisory",
     "state_exists",
     "advisor_signoff",
+    "proof_diagnostics",
 ]
 VALIDATION_CHECK_NAME_VALUES: frozenset[str] = frozenset(get_args(ValidationCheckName))
 
@@ -65,6 +70,7 @@ CHECK_REQUIRED_CONTROL_AVAILABILITY: Final[ValidationCheckName] = "required_cont
 CHECK_REQUIRED_CONTROL_COVERAGE: Final[ValidationCheckName] = "required_control_coverage"
 CHECK_PATH_ALLOWLIST: Final[ValidationCheckName] = "path_allowlist"
 CHECK_WEB_SCRAPE_NETWORK_POLICY: Final[ValidationCheckName] = "web_scrape_network_policy"
+CHECK_WEB_FETCH_RESOURCE_POLICY: Final[ValidationCheckName] = "web_fetch_resource_policy"
 CHECK_SECRET_REFS: Final[ValidationCheckName] = "secret_refs"
 CHECK_SEMANTIC_CONTRACTS: Final[ValidationCheckName] = "semantic_contracts"
 CHECK_BATCH_TRANSFORM_OPTIONS: Final[ValidationCheckName] = "batch_transform_options"
@@ -75,6 +81,7 @@ CHECK_LLM_RETRY_BUDGET_POLICY: Final[ValidationCheckName] = "llm_retry_budget_po
 CHECK_LLM_BASE_URL_POLICY: Final[ValidationCheckName] = "llm_base_url_policy"
 CHECK_LLM_TRACING_POLICY: Final[ValidationCheckName] = "llm_tracing_policy"
 CHECK_AWS_S3_ENDPOINT_URL_POLICY: Final[ValidationCheckName] = "aws_s3_endpoint_url_policy"
+CHECK_AWS_S3_SOURCE_POLICY: Final[ValidationCheckName] = "aws_s3_source_policy"
 CHECK_SETTINGS: Final[ValidationCheckName] = "settings_load"
 RUNTIME_CHECK_PLUGIN_INSTANTIATION: Final[ValidationCheckName] = "plugin_instantiation"
 CHECK_VALUE_SOURCE_COMPLIANCE: Final[ValidationCheckName] = "value_source_compliance"
@@ -82,8 +89,16 @@ RUNTIME_CHECK_GRAPH_STRUCTURE: Final[ValidationCheckName] = "graph_structure"
 CHECK_ROUTE_TARGETS: Final[ValidationCheckName] = "route_target_resolution"
 RUNTIME_CHECK_SCHEMA_COMPATIBILITY: Final[ValidationCheckName] = "schema_compatibility"
 CHECK_IDENTITY_NODE_ADVISORY: Final[ValidationCheckName] = "identity_node_advisory"
+CHECK_GATE_FAN_OUT_ADVISORY: Final[ValidationCheckName] = "gate_fan_out_advisory"
+CHECK_STATIC_LLM_PROMPT_ADVISORY: Final[ValidationCheckName] = "static_llm_prompt_advisory"
 CHECK_STATE_EXISTS: Final[ValidationCheckName] = "state_exists"
 CHECK_ADVISOR_SIGNOFF: Final[ValidationCheckName] = "advisor_signoff"
+# Readiness-blocker code for a withheld advisor sign-off. Single-sourced here
+# so the composer finalizer, the persisted gate-fact merge
+# (execution/completion_gates.py), and the frontend routing discriminant
+# cannot drift.
+ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = "advisor_signoff_blocked"
+CHECK_PROOF_DIAGNOSTICS: Final[ValidationCheckName] = "proof_diagnostics"
 
 VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_PLUGIN_ENABLEMENT,
@@ -92,6 +107,7 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_REQUIRED_CONTROL_COVERAGE,
     CHECK_PATH_ALLOWLIST,
     CHECK_WEB_SCRAPE_NETWORK_POLICY,
+    CHECK_WEB_FETCH_RESOURCE_POLICY,
     CHECK_SECRET_REFS,
     CHECK_SEMANTIC_CONTRACTS,
     CHECK_BATCH_TRANSFORM_OPTIONS,
@@ -102,6 +118,7 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_TRACING_POLICY,
     CHECK_AWS_S3_ENDPOINT_URL_POLICY,
+    CHECK_AWS_S3_SOURCE_POLICY,
     CHECK_SETTINGS,
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
     CHECK_VALUE_SOURCE_COMPLIANCE,
@@ -110,10 +127,13 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     RUNTIME_CHECK_SCHEMA_COMPATIBILITY,
     CHECK_STATE_EXISTS,
     CHECK_ADVISOR_SIGNOFF,
+    CHECK_PROOF_DIAGNOSTICS,
 )
 VALIDATION_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     *VALIDATION_BLOCKING_CHECK_NAMES,
     CHECK_IDENTITY_NODE_ADVISORY,
+    CHECK_GATE_FAN_OUT_ADVISORY,
+    CHECK_STATIC_LLM_PROMPT_ADVISORY,
 )
 if frozenset(VALIDATION_CHECK_NAMES) != VALIDATION_CHECK_NAME_VALUES:
     raise AssertionError("VALIDATION_CHECK_NAMES must match ValidationCheckName Literal values")
@@ -266,6 +286,7 @@ class ExecuteRequest(_StrictResponse):
     """Optional execution-launch acknowledgement payload."""
 
     fanout_ack_token: str | None = Field(default=None, min_length=1)
+    secret_ack_token: str | None = Field(default=None, min_length=1)
 
 
 class WebSocketTicketResponse(_StrictResponse):
@@ -322,9 +343,41 @@ class ErrorData(_StrictResponse):
 
 
 class RunAccountingSource(_StrictResponse):
-    """Source-ingestion counts for a run."""
+    """Source-ingestion counts for a run.  Every field counts ROWS, not tokens.
+
+    ``rows_processed`` — rows ADMITTED into the pipeline (they have a ``rows``
+    table entry).  A quarantined row IS admitted.  Semantics unchanged from
+    before ``rows_read``/``rows_rejected`` existed.
+
+    ``rows_rejected`` — rows the source DISCARDED at validation: recorded in
+    ``validation_errors`` with the ``destination='discard'`` sentinel and never
+    admitted, so no ``rows`` entry and no token exists for them.  Quarantined
+    rows are excluded (they are already inside ``rows_processed``; counting
+    their ``validation_errors`` entry too would report more rows read than the
+    input holds), and transform-validation discards are excluded for the same
+    reason (a row discarded at a transform was admitted).  This is exactly the
+    population ``DiscardSummary.validation_errors`` counts, which is what makes
+    the reconciliation invariant on the response carriers exact rather than
+    approximate (elspeth-43f52d69a4).
+
+    ``rows_read`` — rows the source actually read: admitted + rejected.  The
+    field an operator checks to answer "did it read my data?"; before it
+    existed, an all-rows-discarded run answered that question with
+    ``rows_processed == 0``.
+    """
 
     rows_processed: int = Field(ge=0)
+    rows_rejected: int = Field(ge=0)
+    rows_read: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_row_unit_identity(self) -> Self:
+        if self.rows_read != self.rows_processed + self.rows_rejected:
+            raise ValueError(
+                "rows_read must equal rows_processed + rows_rejected "
+                f"(got rows_read={self.rows_read}, rows_processed={self.rows_processed}, rows_rejected={self.rows_rejected})"
+            )
+        return self
 
 
 class RunAccountingTokens(_StrictResponse):
@@ -336,6 +389,10 @@ class RunAccountingTokens(_StrictResponse):
     failed: int = Field(ge=0)
     structural: int = Field(ge=0)
     pending: int = Field(ge=0)
+    # ADR-038: undecided tokens the audit trail explicitly marks as
+    # permanently undecidable — (NULL, ABANDONED) rows written at run
+    # finalization. Disjoint from ``pending`` (undecided, unexplained).
+    abandoned: int = Field(ge=0)
 
     @model_validator(mode="after")
     def _check_token_balance(self) -> Self:
@@ -345,10 +402,11 @@ class RunAccountingTokens(_StrictResponse):
                 f"(got terminal={self.terminal}, succeeded={self.succeeded}, "
                 f"failed={self.failed}, structural={self.structural})"
             )
-        if self.emitted != self.terminal + self.pending:
+        if self.emitted != self.terminal + self.pending + self.abandoned:
             raise ValueError(
-                "tokens.emitted must equal tokens.terminal + tokens.pending "
-                f"(got emitted={self.emitted}, terminal={self.terminal}, pending={self.pending})"
+                "tokens.emitted must equal tokens.terminal + tokens.pending + tokens.abandoned "
+                f"(got emitted={self.emitted}, terminal={self.terminal}, "
+                f"pending={self.pending}, abandoned={self.abandoned})"
             )
         return self
 
@@ -363,11 +421,37 @@ class RunAccountingRouting(_StrictResponse):
 
 
 class RunAccountingIntegrity(_StrictResponse):
-    """Closure integrity of the Landscape token ledger."""
+    """Closure integrity of the Landscape token ledger.
 
-    closure: Literal["closed", "open", "unknown"]
+    ``closure`` values: ``closed`` — every emitted token decided;
+    ``abandoned`` (ADR-038) — every emitted token decided or explicitly
+    abandoned, none unexplained; ``open`` — unexplained undecided tokens
+    remain (a resume may yet decide them, or the audit is incomplete);
+    ``unknown`` — no Landscape evidence available.
+    """
+
+    closure: Literal["closed", "open", "abandoned", "unknown"]
     missing_terminal_outcomes: int = Field(ge=0)
     duplicate_terminal_outcomes: int = Field(ge=0)
+
+
+class RunAccountingCorruption(_StrictResponse):
+    """Explicit per-run integrity failure for the accounting projection.
+
+    Carried INSTEAD of :class:`RunAccounting` when a run's recorded token
+    outcomes violate the canonical ADR-019 contract (unknown enum value,
+    illegal (outcome, path) pair, missing/forbidden pair evidence, duplicate
+    completed outcomes, or an ADR-038 decided-and-abandoned contradiction).
+    A corrupt run can never satisfy closure — it ships no accounting at all,
+    only this marker — and it must not hide accounting for healthy runs in
+    the same batch (elspeth-d5578ccd98).
+
+    ``violations`` is bounded, audit-safe text: enum member names, column
+    names, and counts only — never row payloads.
+    """
+
+    landscape_run_id: str
+    violations: list[str] = Field(min_length=1)
 
 
 class RunAccounting(_StrictResponse):
@@ -389,6 +473,16 @@ class RunAccounting(_StrictResponse):
                 raise ValueError(
                     "source.rows_processed must equal the sum of per-source rows "
                     f"(got source.rows_processed={self.source.rows_processed}, per_source_total={source_total})"
+                )
+            # Inequality, not equality: a validation_errors row with a NULL
+            # node_id cannot be attributed to a named source, so it counts in
+            # the aggregate only. Per-source attribution exceeding the
+            # aggregate is always projection drift.
+            rejected_total = sum(source.rows_rejected for source in self.sources.values())
+            if rejected_total > self.source.rows_rejected:
+                raise ValueError(
+                    "per-source rows_rejected must not exceed source.rows_rejected "
+                    f"(got source.rows_rejected={self.source.rows_rejected}, per_source_total={rejected_total})"
                 )
         if self.routing.routed_success > self.tokens.succeeded:
             raise ValueError(
@@ -468,8 +562,13 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
         assert accounting is not None
         if accounting.integrity.closure != "closed":
             raise ValueError("status='completed_with_failures' requires closed token accounting")
-        if accounting.tokens.succeeded <= 0:
-            raise ValueError("status='completed_with_failures' requires tokens.succeeded > 0")
+        # Mirrors terminal_clean_indicator in contracts/run_result.py:
+        # quarantine is a clean terminal outcome, so an all-quarantined run
+        # (succeeded == 0) is legal COMPLETED_WITH_FAILURES, not FAILED.
+        if accounting.tokens.succeeded <= 0 and accounting.routing.quarantined <= 0:
+            raise ValueError(
+                "status='completed_with_failures' requires a clean terminal indicator (tokens.succeeded > 0 or routing.quarantined > 0)"
+            )
         if accounting.tokens.failed <= 0:
             raise ValueError("status='completed_with_failures' requires tokens.failed > 0")
         return
@@ -606,8 +705,11 @@ class RunEvent(_StrictResponse):
         matching runs.
         """
         if isinstance(values, dict):
-            event_type = values.get("event_type")
-            data = values.get("data")
+            # Tier-3 pre-validation payload: membership-then-subscript keeps
+            # the absent->None decision visible. Anything unrecognized is
+            # left untouched for pydantic's own validators to reject.
+            event_type = values["event_type"] if "event_type" in values else None
+            data = values["data"] if "data" in values else None
             if isinstance(data, dict) and event_type in cls._EVENT_TYPE_TO_DATA_TYPE:
                 values = {**values, "data": cls._EVENT_TYPE_TO_DATA_TYPE[event_type](**data)}
         return values
@@ -641,7 +743,7 @@ del _event_type_literal, _mapping_keys, _literal_values
 class DiscardStageSummary(_StrictResponse):
     """Per-stage contribution to a virtual discard sink summary."""
 
-    stage: Literal["source_validation", "transform_validation", "sink_discard"]
+    stage: Literal["source_validation", "transform_validation", "gate_evaluation", "sink_discard"]
     node_id: str | None
     count: int = Field(ge=1)
 
@@ -649,9 +751,11 @@ class DiscardStageSummary(_StrictResponse):
 class DiscardSummary(_StrictResponse):
     """Counts routed to the virtual ``discard`` sink.
 
-    The backing records live in three audit surfaces:
+    The backing records live in four audit surfaces:
     ``validation_errors.destination='discard'``,
-    ``transform_errors.destination='discard'``, and terminal
+    ``transform_errors.destination='discard'``, terminal
+    ``token_outcomes.path='gate_error_discarded'`` rows attributed to their
+    failed gate node states, and terminal
     ``token_outcomes.sink_name='__discard__'`` rows for sink-write
     diversions.  ``total`` is stored explicitly in the response so clients
     can render the visible virtual sink without duplicating the arithmetic.
@@ -664,22 +768,25 @@ class DiscardSummary(_StrictResponse):
     validation_errors: int = Field(ge=0)
     transform_errors: int = Field(ge=0)
     sink_discards: int = Field(ge=0)
+    gate_errors: int = Field(default=0, ge=0)
     stages: tuple[DiscardStageSummary, ...] = Field(default_factory=tuple)
 
     @model_validator(mode="after")
     def _check_total(self) -> Self:
-        expected = self.validation_errors + self.transform_errors + self.sink_discards
+        expected = self.validation_errors + self.transform_errors + self.gate_errors + self.sink_discards
         if self.total != expected:
             raise ValueError(
                 f"Discard summary total mismatch: total={self.total} "
                 f"!= validation_errors({self.validation_errors}) "
                 f"+ transform_errors({self.transform_errors}) "
+                f"+ gate_errors({self.gate_errors}) "
                 f"+ sink_discards({self.sink_discards}) = {expected}"
             )
         if self.stages:
             stage_totals = {
                 "source_validation": 0,
                 "transform_validation": 0,
+                "gate_evaluation": 0,
                 "sink_discard": 0,
             }
             for stage in self.stages:
@@ -694,11 +801,46 @@ class DiscardSummary(_StrictResponse):
                     "Discard transform_validation stage count mismatch: "
                     f"{stage_totals['transform_validation']} != transform_errors({self.transform_errors})"
                 )
+            if stage_totals["gate_evaluation"] != self.gate_errors:
+                raise ValueError(
+                    f"Discard gate_evaluation stage count mismatch: {stage_totals['gate_evaluation']} != gate_errors({self.gate_errors})"
+                )
             if stage_totals["sink_discard"] != self.sink_discards:
                 raise ValueError(
                     f"Discard sink_discard stage count mismatch: {stage_totals['sink_discard']} != sink_discards({self.sink_discards})"
                 )
         return self
+
+
+def check_discard_summary_reconciliation(
+    accounting: RunAccounting | None,
+    discard_summary: DiscardSummary | None,
+) -> None:
+    """Reject a body whose two discard projections contradict each other.
+
+    ``accounting.source.rows_rejected`` and ``discard_summary.validation_errors``
+    count the identical population — ``validation_errors`` rows with
+    ``destination='discard'`` — so any carrier holding both must show one
+    number (elspeth-43f52d69a4: the g01 payload printed ``discarded=0`` beside
+    ``discard_summary.total=4`` because the two sites counted different,
+    unlabelled units).  Conditional by design: ``discard_summary`` is only
+    attached for terminal runs with at least one discard, and a carrier that
+    has not attached one yet is not in contradiction.
+
+    Shared by every carrier that holds both projections: ``RunStatusResponse``
+    and ``RunResultsResponse`` here, and ``RunResponse`` on the session-list
+    surface (``web/sessions/schemas.py``) — a validator on one carrier still
+    lets the contradiction out of the others.
+    """
+    if accounting is None or discard_summary is None:
+        return
+    if accounting.source.rows_rejected != discard_summary.validation_errors:
+        raise ValueError(
+            "accounting.source.rows_rejected must equal discard_summary.validation_errors "
+            f"(got rows_rejected={accounting.source.rows_rejected}, "
+            f"validation_errors={discard_summary.validation_errors}); both count "
+            "validation_errors rows with destination='discard'"
+        )
 
 
 type RunDiagnosticNodeStateStatus = Literal["open", "pending", "completed", "failed"]
@@ -759,16 +901,22 @@ class RunDiagnosticNodeState(_StrictResponse):
     success_reason: Any | None = None
 
 
+class RunDiagnosticLineageFrame(_StrictResponse):
+    """One lineage frame (outermost first) on a diagnostics token."""
+
+    kind: Literal["fork", "expand"]
+    group_id: str
+    member_key: str
+
+
 class RunDiagnosticToken(_StrictResponse):
     """One token in the bounded diagnostics preview."""
 
     token_id: str
     row_id: str
     row_index: int | None = Field(ge=0)
-    branch_name: str | None
-    fork_group_id: str | None
+    lineage: list[RunDiagnosticLineageFrame]
     join_group_id: str | None
-    expand_group_id: str | None
     step_in_pipeline: int | None = Field(ge=0)
     created_at: datetime
     terminal_outcome: RunDiagnosticTerminalOutcome | None
@@ -869,15 +1017,20 @@ class RunOutputArtifactPreview(_StrictResponse):
 
     Returned by ``GET /api/runs/{rid}/outputs/{aid}/preview``. Intended
     as a head-of-file render so an operator can decide whether to pull
-    the full file via the ``/content`` endpoint. Bounded to the lesser
-    of 256 KiB or 100 rows; ``truncated`` indicates the cap was hit.
+    the full file via the ``/content`` endpoint. Bounded to 256 KiB;
+    tabular previews are additionally capped at 100 complete logical
+    records. ``truncated`` indicates either cap was hit.
 
     ``content_type`` is the renderer hint:
     * ``csv`` / ``jsonl`` — UI may render as a parsed table.
     * ``json`` — UI may pretty-print.
     * ``text`` — UI renders as monospace pre-formatted block.
-    * ``binary`` — bytes are not text (or extension is unknown);
+    * ``binary`` — bytes are not valid previewable text;
       ``preview_text`` is empty and the UI suggests downloading.
+
+    ``row_count_preview`` counts complete logical tabular records included in
+    ``preview_text``. A CSV/TSV header counts as one record. It is ``None``
+    when no trustworthy logical count is available (including malformed CSV).
     """
 
     artifact_id: str
@@ -902,23 +1055,42 @@ class RunOutputsResponse(_StrictResponse):
 
 
 class RunDiagnosticSummary(_StrictResponse):
-    """Aggregate counts for a run diagnostics snapshot."""
+    """Aggregate counts for a run diagnostics snapshot.
+
+    ``discard_count`` counts ROWS discarded at source validation
+    (``validation_errors`` with ``destination='discard'``) — the total behind
+    the bounded ``discards`` preview, mirroring how ``token_count`` sizes the
+    bounded ``tokens`` preview so truncation is visible, not silent.
+    """
 
     token_count: int = Field(ge=0)
     preview_limit: int = Field(ge=1, le=100)
     preview_truncated: bool
+    discard_count: int = Field(ge=0)
     state_counts: dict[RunDiagnosticNodeStateStatus, RunDiagnosticCount]
     operation_counts: dict[RunDiagnosticOperationType, RunDiagnosticCount]
     latest_activity_at: datetime | None
 
 
 class RunDiagnosticFailureDetail(_StrictResponse):
-    """Focused pointer to the operation that caused a run to fail.
+    """Focused pointer to what caused a run to fail.
 
     A run with hundreds of successful operations and one failure can hide the
     cause in the (paged, limited) operations list. This model surfaces the
-    *latest* failed operation directly so the UI can render "what went wrong"
-    without scanning. None on the response when no failed operation exists.
+    failure directly so the UI can render "what went wrong" without scanning.
+    None on the response when no failed operation exists.
+
+    ``node_id`` names the node that raised — taken from the most recent FAILED
+    node_state whose recorded error is the one that failed the operation,
+    falling back to the failed operation's owner when no such state correlates
+    (elspeth-8e5cc5ced0). The correlation matters: a run can hold failed
+    node_states that never failed the run (rows diverted by ``on_error``), and
+    attributing an operation's crash to one of those names a node with no
+    causal relationship to the failure. ``operation_id``/``operation_type``
+    describe the latest failed *operation*, i.e. the operation in flight when
+    the failure surfaced; its scope may span other nodes' work (a
+    ``source_load`` scope covers the whole streaming row loop), so it can
+    legitimately differ from ``node_id``.
 
     ``error_message`` is the chain text persisted to ``operations.error_message``
     in Landscape — it carries the wrapper error plus its cause(s) including any
@@ -933,8 +1105,41 @@ class RunDiagnosticFailureDetail(_StrictResponse):
     failed_at: datetime
 
 
+class RunDiagnosticDiscard(_StrictResponse):
+    """One source-validation discard reason, projected from ``validation_errors``.
+
+    A row discarded at source validation is the one discard class with NO
+    token trail — it was never admitted, so the token-anchored projections in
+    this response cannot carry its reason (elspeth-43f52d69a4).  Every other
+    discard stage (transform validation, gate evaluation, sink discard) leaves
+    a token whose failed node state already discloses the reason through
+    ``tokens``.
+
+    ``error`` is already boundary-scrubbed at the recording site
+    (``plugins/sources/_safe_validation_errors.py``, elspeth-a300402c58):
+    loc/msg/type only, input echo dropped — so it is projected verbatim with
+    no second scrubber.  ``row_data_json`` is audit material and is never
+    projected (module rule, ``web/execution/diagnostics.py``).  The structured
+    violation columns (``violation_type`` etc.) are None on the
+    pydantic-ValidationError path, so the projection leans on ``error``.
+    """
+
+    stage: Literal["source_validation"]
+    node_id: str | None
+    schema_mode: str
+    error: str
+    created_at: datetime
+
+
 class RunDiagnosticsResponse(_StrictResponse):
-    """REST response for run diagnostics."""
+    """REST response for run diagnostics.
+
+    ``discards`` is required (no default) so every construction site must
+    state the live value explicitly: defaulting it to ``[]`` would let a
+    forgetful producer silently re-hide the discard reasons this section
+    exists to disclose.  Bounded by ``summary.preview_limit``;
+    ``summary.discard_count`` carries the unbounded total.
+    """
 
     run_id: str
     landscape_run_id: str
@@ -944,6 +1149,7 @@ class RunDiagnosticsResponse(_StrictResponse):
     tokens: list[RunDiagnosticToken]
     operations: list[RunDiagnosticOperation]
     artifacts: list[RunDiagnosticArtifact]
+    discards: list[RunDiagnosticDiscard]
     failure_detail: RunDiagnosticFailureDetail | None = None
 
 
@@ -997,6 +1203,7 @@ class RunStatusResponse(_StrictResponse):
                 landscape_run_id=self.landscape_run_id,
             )
         _check_status_accounting_invariant(self.status, self.accounting)
+        check_discard_summary_reconciliation(self.accounting, self.discard_summary)
         return self
 
 
@@ -1018,7 +1225,26 @@ class RunResultsResponse(_StrictResponse):
             landscape_run_id=self.landscape_run_id,
         )
         _check_status_accounting_invariant(self.status, self.accounting)
+        check_discard_summary_reconciliation(self.accounting, self.discard_summary)
         return self
+
+
+def revalidated_with_discard_summary(
+    status: RunStatusResponse,
+    discard_summary: DiscardSummary,
+) -> RunStatusResponse:
+    """Attach a discard summary to a run-status body and RE-RUN model validation.
+
+    ``model_copy(update=...)`` bypasses validators entirely, so attaching the
+    summary that way would let a body contradicting
+    :func:`check_discard_summary_reconciliation` out of exactly the carrier
+    the invariant exists for.  Rebuilding from the live field values re-runs
+    every model validator; iteration over the model yields field name/value
+    pairs with nested models intact, so strict mode is satisfied.
+    """
+    field_values = dict(status)
+    field_values["discard_summary"] = discard_summary
+    return RunStatusResponse(**field_values)
 
 
 # ── Status set derivation (Literal → frozenset) ────────────────────────

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -10,21 +11,116 @@ from typing import Any
 
 import yaml
 
+from elspeth.web._aws_ecs_acceptance import task_definition
 from elspeth.web.aws_ecs_acceptance import SCENARIO_ASSIGNMENT_NAMES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md"
+COLD_INSTALL_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md"
+REDEPLOY_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-existing-service-redeploy.md"
+BEDROCK_RUNBOOK = REPO_ROOT / "docs" / "runbooks" / "aws-ecs-bedrock-opus-sonnet.md"
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
 DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 OIDC_PLAYWRIGHT_CONFIG = REPO_ROOT / "src" / "elspeth" / "web" / "frontend" / "playwright.oidc.config.ts"
+TERRAFORM_README = REPO_ROOT / "deploy" / "aws-ecs" / "terraform" / "README.md"
+TRACKED_OTEL_CONFIG = (
+    REPO_ROOT / "deploy" / "aws-ecs" / "terraform" / "telemetry" / "elspeth.cloudwatch-agent.v1" / "elspeth.cloudwatch-agent.v1.otel.yaml"
+)
 
 
 def _text() -> str:
     return RUNBOOK.read_text(encoding="utf-8")
 
 
+def _bedrock_text() -> str:
+    return BEDROCK_RUNBOOK.read_text(encoding="utf-8")
+
+
 def _fences(language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", _text(), flags=re.DOTALL)
+
+
+def _markdown_link_targets(text: str) -> set[str]:
+    return set(re.findall(r"\[[^]]+\]\(([^)]+)\)", text))
+
+
+def _container_insights_cleanup_function() -> str:
+    text = _text()
+    start = text.index("cleanup_container_insights_log_group() {")
+    end = text.index('\nif ! cleanup_container_insights_log_group "$SCENARIO_A_INVENTORY"', start)
+    return text[start:end]
+
+
+def _run_container_insights_cleanup(
+    tmp_path: Path,
+    *,
+    present_at: int,
+    fail_describe_at: int = 0,
+    max_wait_seconds: int = 50,
+    quiet_seconds: int = 20,
+) -> subprocess.CompletedProcess[str]:
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text('{"values":{"ECS_CLUSTER":"acceptance-test-cluster"}}', encoding="utf-8")
+    describe_count = tmp_path / "describe-count"
+    describe_count.write_text("0", encoding="utf-8")
+    delete_count = tmp_path / "delete-count"
+    delete_count.write_text("0", encoding="utf-8")
+
+    script = f"""
+set -Eeuo pipefail
+# Bash's SECONDS is special: every read returns the assigned base plus real
+# wall-clock seconds since assignment, so a loaded test host would leak real
+# time into the runbook's elapsed/quiet arithmetic. Unsetting it strips the
+# special behavior for this shell (and its subshells), leaving an ordinary
+# variable that the mocked sleep below fully owns — a deterministic clock.
+unset SECONDS
+SECONDS=0
+sleep() {{ SECONDS=$((SECONDS + $1)); }}
+aws_capture() {{
+  case "$*" in
+    *"logs describe-log-groups"*)
+      count=$(<"$DESCRIBE_COUNT_FILE")
+      count=$((count + 1))
+      printf '%s' "$count" >"$DESCRIBE_COUNT_FILE"
+      if test "$MOCK_FAIL_DESCRIBE_AT" -gt 0 && test "$count" -eq "$MOCK_FAIL_DESCRIBE_AT"; then
+        printf '%s\n' 'aws_command_failed' >&2
+        return 254
+      fi
+      if test "$count" -eq "$MOCK_PRESENT_AT"; then
+        printf '{{"logGroups":[{{"logGroupName":"%s"}}]}}\n' "$log_group"
+      else
+        printf '%s\n' '{{"logGroups":[]}}'
+      fi
+      ;;
+    *"logs delete-log-group"*)
+      count=$(<"$DELETE_COUNT_FILE")
+      printf '%s' "$((count + 1))" >"$DELETE_COUNT_FILE"
+      ;;
+    *) return 64 ;;
+  esac
+}}
+{_container_insights_cleanup_function()}
+set +e
+cleanup_container_insights_log_group "$INVENTORY_PATH"
+status=$?
+set -e
+printf 'status=%s describe_calls=%s delete_calls=%s\n' \
+  "$status" "$(<"$DESCRIBE_COUNT_FILE")" "$(<"$DELETE_COUNT_FILE")"
+exit "$status"
+"""
+    env = {
+        **os.environ,
+        "AWS_REGION": "ap-southeast-1",
+        "DESCRIBE_COUNT_FILE": str(describe_count),
+        "DELETE_COUNT_FILE": str(delete_count),
+        "INVENTORY_PATH": str(inventory),
+        "MOCK_PRESENT_AT": str(present_at),
+        "MOCK_FAIL_DESCRIBE_AT": str(fail_describe_at),
+        "ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS": str(max_wait_seconds),
+        "ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS": "10",
+        "ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS": str(quiet_seconds),
+    }
+    return subprocess.run(["bash"], input=script, capture_output=True, text=True, check=False, env=env)
 
 
 def _json_documents() -> list[object]:
@@ -42,16 +138,17 @@ def test_runbook_preserves_task_local_nonessential_healthy_sidecar() -> None:
     app = containers["elspeth-web"]
 
     assert sidecar["essential"] is False
-    assert re.search(r"@sha256:\$\{CLOUDWATCH_AGENT_IMAGE_SHA256\}$", sidecar["image"])
+    assert sidecar["image"] == "${CLOUDWATCH_AGENT_IMAGE}"
     assert "portMappings" not in sidecar
     assert app["dependsOn"] == [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}]
+    assert app["command"] == ["web", "--host", "0.0.0.0", "--port", "8451"]
     environment = {entry["name"]: entry["value"] for entry in app["environment"]}
     assert environment == {
         "ELSPETH_WEB__PLUGIN_ALLOWLIST": "${ELSPETH_WEB__PLUGIN_ALLOWLIST}",
         "ELSPETH_WEB__PLUGIN_PREFERENCES": "${ELSPETH_WEB__PLUGIN_PREFERENCES}",
         "ELSPETH_WEB__PLUGIN_CONTROL_MODES": "${ELSPETH_WEB__PLUGIN_CONTROL_MODES}",
         "ELSPETH_WEB__LLM_PROFILES": "${ELSPETH_WEB__LLM_PROFILES}",
-        "ELSPETH_WEB__TUTORIAL_LLM_PROFILE": "${ELSPETH_WEB__TUTORIAL_LLM_PROFILE}",
+        "ELSPETH_WEB__DEFAULT_LLM_PROFILE": "${ELSPETH_WEB__DEFAULT_LLM_PROFILE}",
         "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES": "${ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES}",
         "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES": "${ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES}",
         "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256": "${ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256}",
@@ -81,7 +178,7 @@ def test_runbook_consumes_complete_web_plugin_policy_handoff() -> None:
         "ELSPETH_WEB__PLUGIN_PREFERENCES",
         "ELSPETH_WEB__PLUGIN_CONTROL_MODES",
         "ELSPETH_WEB__LLM_PROFILES",
-        "ELSPETH_WEB__TUTORIAL_LLM_PROFILE",
+        "ELSPETH_WEB__DEFAULT_LLM_PROFILE",
         "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES",
         "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES",
         "ELSPETH_BEDROCK_LIVE_TEST_MODEL",
@@ -114,6 +211,7 @@ def test_runbook_preserves_versioned_config_sidecar_startup() -> None:
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
     assert sidecar["entryPoint"] == ["/bin/sh", "-ceu"]
+    assert sidecar["command"] == [task_definition._CLOUDWATCH_AGENT_COMMAND]
     environment = {entry["name"]: entry["value"] for entry in sidecar["environment"]}
     assert environment == {
         "ELSPETH_CW_AGENT_CONFIG_JSON_B64": "${CLOUDWATCH_AGENT_CONFIG_JSON_B64}",
@@ -125,19 +223,20 @@ def test_runbook_preserves_versioned_config_sidecar_startup() -> None:
     script = sidecar["command"][0]
     json_path = "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json"
     otel_path = "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml"
+    toml_path = "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml"
     json_verify = f'"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  {json_path}" | sha256sum -c -'
     otel_verify = f'"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  {otel_path}" | sha256sum -c -'
-    fetch = f'-a fetch-config -m auto -c "file:{json_path}" -s'
-    append = f'-a append-config -m auto -c "file:{otel_path}" -s'
+    translate = f'-mode auto -os linux -input "{json_path}" -output "{toml_path}"'
+    exec_agent = f'exec "$AGENT" -config "{toml_path}" -otelconfig "{otel_path}"'
     assert f'base64 -d > "{json_path}"' in script
     assert f'base64 -d > "{otel_path}"' in script
     assert json_verify in script
     assert otel_verify in script
-    assert fetch in script
-    assert append in script
-    assert script.index(json_verify) < script.index(fetch)
-    assert script.index(otel_verify) < script.index(append)
-    assert script.index(fetch) < script.index(append)
+    assert translate in script
+    assert exec_agent in script
+    assert script.index(json_verify) < script.index(translate)
+    assert script.index(otel_verify) < script.index(exec_agent)
+    assert script.index(translate) < script.index(exec_agent)
 
 
 def test_runbook_preserves_supported_agent_health_mode() -> None:
@@ -145,9 +244,12 @@ def test_runbook_preserves_supported_agent_health_mode() -> None:
     sidecar = next(container for container in task["containerDefinitions"] if container["name"] == "cloudwatch-agent")
 
     assert sidecar["healthCheck"]["command"] == [
-        "CMD-SHELL",
-        '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
     ]
+    assert sidecar["healthCheck"] == task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
     assert "-m ecs" not in json.dumps(sidecar)
 
 
@@ -165,6 +267,8 @@ def test_runbook_preserves_versioned_hashed_bounded_agent_config() -> None:
         assert required in text
 
     otel = next(document for document in _yaml_documents() if isinstance(document, dict) and "receivers" in document)
+    tracked_otel = yaml.safe_load(TRACKED_OTEL_CONFIG.read_text(encoding="utf-8"))
+    assert otel == tracked_otel
     assert set(otel["receivers"]) == {"otlp/elspeth"}
     assert otel["receivers"]["otlp/elspeth"] == {"protocols": {"grpc": {"endpoint": "127.0.0.1:4317"}}}
     assert set(otel["processors"]) == {"memory_limiter/elspeth", "batch/elspeth"}
@@ -178,7 +282,12 @@ def test_runbook_preserves_versioned_hashed_bounded_agent_config() -> None:
         "resource_to_telemetry_conversion": {"enabled": True},
     }
     assert otel["exporters"]["awsxray/elspeth"] == {}
-    assert "OPERATOR_METRICS_LOG_GROUP" in SCENARIO_ASSIGNMENT_NAMES
+    assert {
+        "OPERATOR_METRICS_LOG_GROUP",
+        "CLOUDWATCH_AGENT_IMAGE",
+        "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256",
+        "CLOUDWATCH_AGENT_OTEL_YAML_SHA256",
+    } <= set(SCENARIO_ASSIGNMENT_NAMES)
     assert otel["service"]["pipelines"] == {
         "metrics/elspeth": {
             "receivers": ["otlp/elspeth"],
@@ -377,15 +486,12 @@ def test_runbook_pins_core_runtime_and_identity_contracts() -> None:
         "Cognito/OIDC",
         "auth.db",
         "DELETE",
-        "ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS",
-        "ELSPETH_WEB__OIDC_TOKEN_ENDPOINT",
-        "ELSPETH_WEB__OIDC_AUDIENCE_CLAIM",
-        "token_use=access",
+        "ELSPETH_WEB__SSO_ENDPOINT_ORIGINS",
         "AllowedOAuthFlowsUserPoolClient",
         "AllowedOAuthFlows",
         "AllowedOAuthScopes",
         "CallbackURLs",
-        "elspeth:ecs-0.7.1-closeout",
+        "elspeth:ecs-0.8.0-closeout",
         "TARGET_PLATFORM",
         "runtimePlatform",
         "linux/amd64",
@@ -494,7 +600,6 @@ def test_runbook_rejects_unsafe_probe_evidence_and_promotion_regressions() -> No
     text = _text()
     assert "curl -fsS" not in text
     assert "raw logs are never printed or persisted" in text
-    assert "Promotion is forbidden before Plan 12 final GO" in text
     assert "container healthCheck" in text
     assert "elspeth health" in text
     assert re.search(r"elspeth health.*not wired", text, flags=re.IGNORECASE | re.DOTALL)
@@ -524,6 +629,7 @@ def test_runbook_defines_every_packaged_lifecycle_wrapper_before_first_runtime_u
     text = _text()
     for helper in (
         "persist_sanitized_receipt",
+        "record_testcontainer_run",
         "require_signed_tf_plan_approval",
         "require_signed_tf_destroy_approval",
         "load_scenario",
@@ -543,6 +649,32 @@ def test_runbook_defines_every_packaged_lifecycle_wrapper_before_first_runtime_u
         assert command in text
 
 
+def test_runbook_records_the_testcontainer_run_before_deploy_and_binds_the_tests_stage() -> None:
+    """6b-4 option (b): the run is recorded with CI's exact selection, stored as a receipt, and bound to the ledger."""
+    from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_SELECTION
+
+    text = _text()
+    helper = text[text.index("record_testcontainer_run() {") : text.index("require_signed_tf_plan_approval() {")]
+    assert "uv run --frozen pytest " + " ".join(TESTCONTAINER_SELECTION) in helper
+    assert "python -m elspeth.web._acceptance_common.testcontainer_run" in helper
+    assert "--provider aws" in helper
+    # The run targets the provisioned RDS through the suites' one seam, and the
+    # helper refuses to run without it so the receipt never records a Docker run
+    # on the acceptance host as acceptance evidence (elspeth-0ec6918940).
+    assert "no external-DSN seam" not in helper
+    assert "tests/helpers/postgres_target.py" in helper and "`database`, `database_identity_sha256`" in helper
+    assert ': "${ELSPETH_TEST_POSTGRES_URL:?' in helper
+    assert helper.index(': "${ELSPETH_TEST_POSTGRES_URL:?') < helper.index("uv run --frozen pytest ")
+    assert 'persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" testcontainer-run' in helper
+    assert "gate-ledger record" in helper and "--check-id tests" in helper and '--receipt-hash "$receipt_hash"' in helper
+    assert 'return "$exit_status"' in helper
+    gate = text[text.index("### 3. Apply the schema compatibility gate") : text.index("### 4. Deploy exactly one candidate task")]
+    assert "\nrecord_testcontainer_run\n" in gate
+    for reason in ("testcontainer_run_missing", "testcontainer_run_failed", "testcontainer_run_ledger"):
+        assert reason in gate, reason
+    assert text.index("record_testcontainer_run() {") < text.index("\nrecord_testcontainer_run\n")
+
+
 def test_load_scenario_clears_every_closed_assignment_before_loading() -> None:
     text = _text()
     wrapper = text[text.index("load_scenario() {") : text.index("run_orphan_sweep() {")]
@@ -554,7 +686,15 @@ def test_load_scenario_clears_every_closed_assignment_before_loading() -> None:
 
 def test_runbook_pins_exact_oidc_redirect_phases_and_closed_evidence() -> None:
     text = _text()
-    assert 'OIDC_REDIRECT_URI="${ALB_BASE_URL}/"' in text
+    # The preflight must assert the CONFIDENTIAL client the Terraform builds.
+    # Both of these pins exist because the commit that made the client
+    # confidential updated the runbook's prose and left its executable jq
+    # asserting the public shape: hasClientSecret == false, and the load
+    # balancer root as the redirect. Prose review does not catch that and
+    # neither does a unit gate, because the jq only runs during live
+    # acceptance -- so the assertion itself is pinned here.
+    assert 'OIDC_REDIRECT_URI="${ALB_BASE_URL}/api/auth/sso/callback"' in text
+    assert "and .hasClientSecret == true" in text
     assert '--arg callback "$OIDC_REDIRECT_URI"' in text
     assert "STAGING_BASE_URL is the slashless origin" not in text
     for phase in (
@@ -657,6 +797,38 @@ def test_fresh_account_bootstrap_is_manifest_armed_backends_initialized_and_dest
     )
 
 
+def test_container_insights_cleanup_converges_after_full_already_absent_quiet_window(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=99)
+
+    assert result.returncode == 0, result.stderr
+    assert "container_insights_log_group_stable elapsed_seconds=20 quiet_seconds=20 samples=3 deletions=0" in result.stdout
+    assert "status=0 describe_calls=3 delete_calls=0" in result.stdout
+
+
+def test_container_insights_cleanup_restarts_full_quiet_window_after_delayed_recreation(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=3)
+
+    assert result.returncode == 0, result.stderr
+    assert "container_insights_log_group_stable elapsed_seconds=40 quiet_seconds=20 samples=5 deletions=1" in result.stdout
+    assert "status=0 describe_calls=5 delete_calls=1" in result.stdout
+
+
+def test_container_insights_cleanup_fails_when_recreation_leaves_no_full_quiet_window(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=3, max_wait_seconds=30)
+
+    assert result.returncode != 0
+    assert "status=1 describe_calls=4 delete_calls=1" in result.stdout
+    assert "container_insights_log_group_not_stabilized" in result.stderr
+
+
+def test_container_insights_cleanup_propagates_aws_errors_after_recreation(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=1, fail_describe_at=2)
+
+    assert result.returncode != 0
+    assert "status=1 describe_calls=2 delete_calls=1" in result.stdout
+    assert "aws_command_failed" in result.stderr
+
+
 def test_rollback_image_packages_baseline_source_with_candidate_docker_contract() -> None:
     text = _text()
     publication = text[text.index("### Temporary image publication") : text.index("### Saved-plan apply")]
@@ -666,6 +838,9 @@ def test_rollback_image_packages_baseline_source_with_candidate_docker_contract(
         'chmod 700 "$ROLLBACK_CONTEXT"',
         "trap 'rm -rf -- \"$ROLLBACK_CONTEXT\"' EXIT HUP INT TERM",
         'git archive "$ROLLBACK_BASELINE_SHA" | tar -x -C "$ROLLBACK_CONTEXT"',
+        'rm -rf -- "$ROLLBACK_CONTEXT/Dockerfile" "$ROLLBACK_CONTEXT/.dockerignore"',
+        'test ! -e "$ROLLBACK_CONTEXT/Dockerfile" && test ! -L "$ROLLBACK_CONTEXT/Dockerfile"',
+        'test ! -e "$ROLLBACK_CONTEXT/.dockerignore" && test ! -L "$ROLLBACK_CONTEXT/.dockerignore"',
         'git show "$CANDIDATE_SHA:Dockerfile" >"$ROLLBACK_CONTEXT/Dockerfile"',
         'git show "$CANDIDATE_SHA:.dockerignore" >"$ROLLBACK_CONTEXT/.dockerignore"',
         'chmod 600 "$ROLLBACK_CONTEXT/Dockerfile" "$ROLLBACK_CONTEXT/.dockerignore"',
@@ -772,7 +947,7 @@ def test_runbook_pins_replacement_then_persistence_role_and_drained_local_auth_o
     positions = [sequence.index(marker) for marker in ordered]
     assert positions == sorted(positions)
     assert sequence.index("require_compatibility_record_current") < sequence.index("PRE_REPLACEMENT_TASK_ARN")
-    assert 'task-level `user: "1000:1000"`' in text
+    assert 'task-level `user: "1654:1654"`' in text
     assert "root-running ECS Exec" in text
 
     phase = text[text.index("### 5. Perform candidate-aware acceptance") : text.index("### 6. Observe")]
@@ -867,6 +1042,21 @@ def test_runbook_starts_connection_observation_on_a_future_minute_boundary() -> 
     assert "ACCEPTANCE_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" not in observe
 
 
+def test_runbook_binds_terraform_receipts_to_plan_bytes_and_retains_connection_envelope() -> None:
+    text = _text()
+    assert text.count("sanitize-evidence --kind terraform-plan") == 3
+    assert text.count("sanitize-evidence --kind terraform-destroy-plan") == 2
+    assert text.count("--plan-sha256") == 5
+
+    connection = text[
+        text.index("run_connection_budget_check()") : text.index("run_candidate_role_check", text.index("run_connection_budget_check()"))
+    ]
+    assert "jq -e '.details'" not in connection
+    assert 'persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" connection-budget' in connection
+    assert '"$task_arn" "$envelope_file"' in connection
+    assert "details_file" not in connection
+
+
 def test_runbook_validates_task_definitions_and_compatibility_before_baseline_mutation() -> None:
     text = _text()
     for scenario, end_marker in (("A", "### Fresh Scenario B upgrade baseline"), ("B", "## ECS probe wiring")):
@@ -901,9 +1091,137 @@ def test_runbook_binds_bootstrap_approvals_and_terminal_receipt_lifecycle() -> N
 
 
 def test_runbook_is_linked_from_operator_indexes() -> None:
-    assert (
-        "| [AWS ECS Deployment](aws-ecs-deployment.md) | Deploying ELSPETH web to AWS ECS Fargate with Aurora PostgreSQL |"
-    ) in RUNBOOK_INDEX.read_text(encoding="utf-8")
-    assert (
-        "[AWS ECS Deployment Runbook](../runbooks/aws-ecs-deployment.md) - Production ECS/Fargate deployment contract"
-    ) in DOCKER_GUIDE.read_text(encoding="utf-8")
+    index = RUNBOOK_INDEX.read_text(encoding="utf-8")
+    guide = DOCKER_GUIDE.read_text(encoding="utf-8")
+
+    assert COLD_INSTALL_RUNBOOK.is_file()
+    assert REDEPLOY_RUNBOOK.is_file()
+    assert RUNBOOK.is_file()
+    assert {
+        "aws-ecs-cold-install.md",
+        "aws-ecs-existing-service-redeploy.md",
+        "aws-ecs-deployment.md",
+    } <= _markdown_link_targets(index)
+    assert {
+        "../runbooks/aws-ecs-cold-install.md",
+        "../runbooks/aws-ecs-existing-service-redeploy.md",
+        "../runbooks/aws-ecs-deployment.md",
+    } <= _markdown_link_targets(guide)
+
+
+def test_existing_service_redeploy_requires_immutable_scan_clean_identity() -> None:
+    text = REDEPLOY_RUNBOOK.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+
+    for phrase in (
+        'test -z "$(git status --porcelain)"',
+        '--build-arg INSTALL_EXTRAS="webui llm aws postgres"',
+        'CANDIDATE_IMAGE="$ECR_REPOSITORY_URI@$IMAGE_DIGEST"',
+        "describe-image-scan-findings",
+        'test "$SCAN_STATUS" = COMPLETE',
+        'setenv("ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE"; $sha)',
+        'setenv("ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION"; $revision)',
+        'command:["doctor","aws-ecs","--json"]',
+        '"minimumHealthyPercent":0,"maximumPercent":100',
+        'test "$RUNNING_DIGEST" = "$SCAN_DIGEST"',
+        "$ELSPETH_BASE_URL/api/health",
+        "$ELSPETH_BASE_URL/api/ready",
+        "ELSPETH_ACCEPTANCE_BASE_URL",
+    ):
+        assert phrase in text
+
+    assert "Do not interpret an unavailable parent-index scan as a clean platform image." in normalized
+    assert "direct ECS Exec inherits the task definition's static environment" in normalized
+
+
+def test_existing_service_redeploy_disables_automatic_rollback() -> None:
+    text = REDEPLOY_RUNBOOK.read_text(encoding="utf-8")
+    deploy = text[text.index("## 6. Deploy with zero overlap") : text.index("## 7. Prove public behavior")]
+
+    assert '"deploymentCircuitBreaker":{"enable":true,"rollback":false}' in deploy
+    assert '"rollback":true' not in deploy
+
+
+def test_bedrock_runbook_removes_openrouter_secret_for_all_bedrock_composer() -> None:
+    text = _bedrock_text()
+    candidate = text[text.index("Create a registrable task-definition document") : text.index("Before registration")]
+    assert '.secrets = ((.secrets // []) | map(select(.name != "OPENROUTER_API_KEY")))' in candidate
+
+    assertion = text[text.index("normalize_bedrock_candidate()") : text.index("Register the revision")]
+    assert 'map(select(.name != "OPENROUTER_API_KEY"))' in assertion
+
+
+def test_bedrock_runbook_normalizes_and_asserts_composer_model_switch() -> None:
+    text = _bedrock_text()
+    verification = text[text.index("normalize_bedrock_candidate()") : text.index("Register the revision")]
+    for name in (
+        "ELSPETH_WEB__COMPOSER_MODEL",
+        "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL",
+    ):
+        assert f'.name != "{name}"' in verification
+    assert ".ELSPETH_WEB__COMPOSER_MODEL == $composer_model" in verification
+    assert ".ELSPETH_WEB__COMPOSER_ADVISOR_MODEL == $composer_advisor_model" in verification
+
+
+def test_runbook_requires_immutable_rds_trust_before_release_promotion() -> None:
+    text = _text()
+    assert "/etc/elspeth/rds/global-bundle.pem" in text
+    assert "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3" in text
+    assert "rds-ca-rsa2048-g1" in text
+    assert "readonlyRootFilesystem" in text
+    assert "session_tls" in text
+    assert "landscape_tls" in text
+    assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text
+    assert text.index("session_tls") < text.index("0.8.0-RC-290726")
+    assert text.index("landscape_tls") < text.index("0.8.0-RC-290726")
+
+
+def test_terraform_readme_one_shot_verifier_fails_closed_per_step() -> None:
+    """run_one_shot() must never print its ok line after a failed step: each
+    of run-task, wait tasks-stopped, and the exit-code test reports a
+    distinguishable stderr failure and returns nonzero on its own.
+    """
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    helper = text[text.index("run_one_shot() {") : text.index("run_one_shot \\")]
+
+    assert helper.count("|| {") == 3
+    assert helper.count("return 1") == 3
+    assert helper.count(">&2") == 3
+    ordered = (
+        "aws ecs run-task",
+        "FAILED (run-task)",
+        "aws ecs wait tasks-stopped",
+        "FAILED (wait tasks-stopped)",
+        "aws ecs describe-tasks",
+        "FAILED (nonzero container exit code)",
+        "printf '%s: ok\\n' \"$expected_command\"",
+    )
+    positions = [helper.index(marker) for marker in ordered]
+    assert positions == sorted(positions)
+    assert helper.rindex("return 1") < helper.index("printf '%s: ok")
+    result = subprocess.run(["sh", "-n"], input=helper, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_terraform_readme_acceptance_env_carries_the_server_data_dir_from_inventory() -> None:
+    """capture/verify-api derive the expected sink node id from the server's
+    canonical data dir, so acceptance.env must project the inventory's
+    ELSPETH_WEB__DATA_DIR alongside the tutorial profile.
+    """
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    env_block = text[text.index("umask 077") : text.index('>"$acceptance_dir/acceptance.env"')]
+
+    assert "printf 'ELSPETH_WEB__DATA_DIR=%s\\n' \\" in env_block
+    assert "jq -er '.values.ELSPETH_WEB__DATA_DIR'" in env_block
+    assert env_block.index("ELSPETH_WEB__DEFAULT_LLM_PROFILE=") < env_block.index("ELSPETH_WEB__DATA_DIR=")
+
+
+def test_terraform_readme_requires_immutable_rds_trust_before_release_promotion() -> None:
+    text = TERRAFORM_README.read_text(encoding="utf-8")
+    assert "/etc/elspeth/rds/global-bundle.pem" in text
+    assert "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3" in text
+    assert "rds-ca-rsa2048-g1" in text
+    assert "readonlyRootFilesystem" in text
+    assert "session_tls" in text
+    assert "landscape_tls" in text
+    assert "c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700" in text

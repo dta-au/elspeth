@@ -1,0 +1,113 @@
+{
+ "case_id": "best-effort-select-lost-c",
+ "expansions": [],
+ "rows": [
+  1,
+  1,
+  1
+ ],
+ "scenario_id": "fork-coalesce-policies",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"branch_marker\":\"a\",\"id\":1,\"value\":10}"
+   ],
+   "sink_name": "output"
+  }
+ ],
+ "status": "completed_with_failures",
+ "terminal_dispositions": [
+  {
+   "key": "primary:0#0",
+   "outcome": "transient",
+   "path": "fork_parent",
+   "sink_name": null,
+   "token_key": "primary:0#0"
+  },
+  {
+   "key": "primary:0#1",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": "output",
+   "token_key": "primary:0#1"
+  },
+  {
+   "key": "primary:0#2",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "primary:0#2"
+  },
+  {
+   "key": "primary:0#3",
+   "outcome": "success",
+   "path": "coalesced",
+   "sink_name": null,
+   "token_key": "primary:0#3"
+  },
+  {
+   "error_hash": "cad87c260c5ae329",
+   "key": "primary:0#4",
+   "outcome": "failure",
+   "path": "quarantined_at_source",
+   "sink_name": null,
+   "token_key": "primary:0#4"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:0#1",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#2"
+    },
+    {
+     "ordinal": 1,
+     "parent_key": "primary:0#3"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "path_a",
+   "key": "primary:0#2",
+   "parents": [
+    {
+     "ordinal": 0,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "path_b",
+   "key": "primary:0#3",
+   "parents": [
+    {
+     "ordinal": 2,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": "path_c",
+   "key": "primary:0#4",
+   "parents": [
+    {
+     "ordinal": 1,
+     "parent_key": "primary:0#0"
+    }
+   ],
+   "row_key": "primary:0"
+  }
+ ]
+}

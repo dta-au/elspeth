@@ -18,8 +18,8 @@ Thread Safety:
     TelemetryManager uses a background export thread for async export.
     - handle_event() is called from the pipeline thread (non-blocking)
     - _export_loop() runs in the background export thread
-    - _events_dropped and _queue_drops are protected by _dropped_lock
-      (accessed from both threads)
+    - _events_dropped, _queue_drops and _observer_failures are protected by
+      _dropped_lock (accessed from both threads)
     - All other metrics are only modified by the export thread
     - health_metrics reads are approximately consistent
 """
@@ -27,20 +27,55 @@ Thread Safety:
 import queue
 import threading
 from collections import defaultdict
-from typing import TypedDict
+from collections.abc import Callable, Sequence
+from typing import Literal, TypedDict
 
 import structlog
 
 from elspeth.contracts.config import RuntimeTelemetryProtocol
 from elspeth.contracts.config.defaults import INTERNAL_DEFAULTS
 from elspeth.contracts.enums import BackpressureMode
-from elspeth.contracts.events import TelemetryEvent
+from elspeth.contracts.events import RowCreated, TelemetryEvent, TransformCompleted
 from elspeth.telemetry.circuit_breaker import CircuitBreaker
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.filtering import should_emit
-from elspeth.telemetry.protocols import ExporterProtocol
+from elspeth.telemetry.protocols import (
+    ExporterDeliveryMetrics,
+    ExporterProtocol,
+)
 
 logger = structlog.get_logger(__name__)
+
+
+def _project_event_for_egress(event: TelemetryEvent) -> TelemetryEvent:
+    """Remove row-derived fingerprints before any telemetry consumer sees them.
+
+    Nominal subclasses are collapsed to the exact owned base contract. This
+    fails closed if a subclass adds hash-bearing metadata: only explicitly
+    copied, bounded base fields can reach observers or exporters.
+    """
+    if isinstance(event, RowCreated):
+        return RowCreated(
+            timestamp=event.timestamp,
+            run_id=event.run_id,
+            row_id=event.row_id,
+            token_id=event.token_id,
+            content_hash=None,
+        )
+    if isinstance(event, TransformCompleted):
+        return TransformCompleted(
+            timestamp=event.timestamp,
+            run_id=event.run_id,
+            row_id=event.row_id,
+            token_id=event.token_id,
+            node_id=event.node_id,
+            plugin_name=event.plugin_name,
+            status=event.status,
+            duration_ms=event.duration_ms,
+            input_hash=None,
+            output_hash=None,
+        )
+    return event
 
 
 class HealthMetrics(TypedDict):
@@ -56,12 +91,13 @@ class HealthMetrics(TypedDict):
     events_emitted: int
     events_dropped: int
     queue_drops: int
+    observer_failures: int
     exporter_failures: dict[str, int]
     consecutive_total_failures: int
     queue_depth: int
     queue_maxsize: int
     circuit_breakers: dict[str, dict[str, int | str]]
-    exporter_delivery: dict[str, dict[str, int | None]]
+    exporter_delivery: dict[str, ExporterDeliveryMetrics]
 
 
 class TelemetryManager:
@@ -102,6 +138,8 @@ class TelemetryManager:
         self,
         config: RuntimeTelemetryProtocol,
         exporters: list[ExporterProtocol],
+        *,
+        event_observers: Sequence[Callable[[TelemetryEvent], None]] = (),
     ) -> None:
         """Initialize the TelemetryManager.
 
@@ -110,9 +148,12 @@ class TelemetryManager:
                 backpressure_mode, and fail_on_total_exporter_failure settings
             exporters: List of configured exporter instances. May be empty
                 (telemetry will be a no-op).
+            event_observers: Best-effort projections that receive already-audited
+                events before exporter granularity filtering.
         """
         self._config = config
         self._exporters = exporters
+        self._event_observers = tuple(event_observers)
         self._consecutive_total_failures = 0
         self._max_consecutive_failures = config.max_consecutive_failures
 
@@ -139,6 +180,7 @@ class TelemetryManager:
         self._pending_deferred_events = 0
         self._events_dropped = 0
         self._queue_drops = 0
+        self._observer_failures = 0
         self._exporter_failures: defaultdict[str, int] = defaultdict(int)
         self._last_logged_drop_count: int = 0
 
@@ -194,8 +236,17 @@ class TelemetryManager:
                 logger.error("Export loop failed unexpectedly", error_type=type(e).__name__)
                 self._stored_exception = e
             except TELEMETRY_TRANSPORT_ERRORS as e:
-                # Transport failure — log but don't crash
-                logger.error("Export loop failed unexpectedly", error_type=type(e).__name__)
+                # Transport failure escaping per-exporter isolation: the event
+                # is lost, so record it in the declared drop accounting
+                # (health_metrics events_dropped) — never a silent discard — and
+                # keep consuming; the loop itself is healthy.
+                with self._dropped_lock:
+                    self._events_dropped += 1
+                logger.error(
+                    "Telemetry export transport failure — event dropped",
+                    error_type=type(e).__name__,
+                    dropped_total=self._events_dropped,
+                )
             except Exception as e:
                 # Programming error — store for re-raise on flush()/close().
                 # Background thread can't raise to main thread directly.
@@ -373,6 +424,33 @@ class TelemetryManager:
         if self._shutdown_event.is_set():
             return
 
+        export_event = _project_event_for_egress(event)
+
+        # Operator metrics project bounded facts from already-audited events.
+        # This intentionally precedes exporter granularity filtering: the AWS
+        # lifecycle policy must not enable content-bearing FULL spans merely to
+        # retain aggregate external-call metrics.
+        for observer in self._event_observers:
+            try:
+                observer(export_event)
+            except Exception as exc:
+                # Isolation, not silence: an operator-supplied observer must
+                # never break the row, so the failure is contained here — but
+                # it is COUNTED into health_metrics["observer_failures"] as
+                # well as logged, so a permanently broken observer is visible
+                # on the operational surface rather than only in the log
+                # stream. Exporter failures are already counted this way; a
+                # swallowed observer failure that nothing counted would be the
+                # only unrecorded loss in this class.
+                with self._dropped_lock:
+                    self._observer_failures += 1
+                logger.error(
+                    "Telemetry event observer failed",
+                    observer_type=type(observer).__name__,
+                    event_type=type(export_event).__name__,
+                    error_type=type(exc).__name__,
+                )
+
         # Skip if telemetry was disabled due to repeated failures
         if self._disabled:
             return
@@ -382,7 +460,7 @@ class TelemetryManager:
             return
 
         # Filter by granularity
-        if not should_emit(event, self._config.granularity):
+        if not should_emit(export_event, self._config.granularity):
             return
 
         self._events_attempted += 1
@@ -403,13 +481,13 @@ class TelemetryManager:
         # Queue event based on backpressure mode
         if self._config.backpressure_mode == BackpressureMode.DROP:
             try:
-                self._queue.put_nowait(event)
+                self._queue.put_nowait(export_event)
             except queue.Full:
-                self._drop_oldest_and_enqueue_newest(event)
+                self._drop_oldest_and_enqueue_newest(export_event)
         else:  # BLOCK (default)
             # Timeout prevents permanent deadlock if export thread dies
             try:
-                self._queue.put(event, timeout=30.0)
+                self._queue.put(export_event, timeout=30.0)
             except queue.Full:
                 # Timeout hit - thread may be dead or stuck
                 logger.error("BLOCK mode put() timed out - export thread may be stuck")
@@ -523,6 +601,8 @@ class TelemetryManager:
         - events_emitted: Successfully delivered to at least one exporter
         - events_dropped: Failed to deliver (queue full or all exporters failed)
         - queue_drops: Enqueue/backpressure losses only; excludes exporter failures
+        - observer_failures: Event-observer callbacks that raised; the raise is
+          contained so it cannot break a row, and counted here so it is not silent
         - exporter_failures: Per-exporter failure counts
         - consecutive_total_failures: Current streak of total failures
         - queue_depth: Current number of events in queue
@@ -541,6 +621,7 @@ class TelemetryManager:
         with self._dropped_lock:
             events_dropped = self._events_dropped
             queue_drops = self._queue_drops
+            observer_failures = self._observer_failures
         return {
             "events_attempted": self._events_attempted,
             "events_delivered": self._events_delivered,
@@ -548,6 +629,7 @@ class TelemetryManager:
             "events_emitted": self._events_emitted,
             "events_dropped": events_dropped,
             "queue_drops": queue_drops,
+            "observer_failures": observer_failures,
             "exporter_failures": dict(self._exporter_failures),
             "consecutive_total_failures": self._consecutive_total_failures,
             "queue_depth": self._queue.qsize(),
@@ -723,23 +805,96 @@ class TelemetryManager:
         self._reconcile_deferred_delivery(delivered=delivered_on_close, failed=failed_on_close, dropped=dropped_on_close)
 
 
-def _exporter_delivery_metrics(exporter: ExporterProtocol) -> dict[str, int | None] | None:
-    """Read optional exporter-native delivery facts without widening protocol."""
-    metrics = getattr(exporter, "delivery_metrics", None)
-    if not isinstance(metrics, dict):
+_DELIVERY_METRICS_ABSENT = object()
+
+
+def _exporter_delivery_metrics(exporter: ExporterProtocol) -> ExporterDeliveryMetrics | None:
+    """Read and validate the optional exporter-native delivery capability.
+
+    The capability is probed with ``getattr(..., _DELIVERY_METRICS_ABSENT)``
+    and NEVER with a ``runtime_checkable`` ``Protocol`` ``isinstance()``
+    check. Exporters reach here from third-party pluggy plugins via
+    ``elspeth_get_exporters`` with no type gate in front of them, and since
+    Python 3.12 a runtime-checkable Protocol's ``__instancecheck__`` resolves
+    members through ``inspect.getattr_static``, which deliberately bypasses
+    ``__getattr__``. A perfectly valid third-party exporter that forwards
+    ``delivery_metrics`` from a wrapped implementation therefore failed the
+    check and its delivery accounting vanished silently — no error, no log
+    (ADR-032, same defect class as elspeth-9ea866438b). Do not "harden" this
+    back into a Protocol check.
+
+    Absence stays a legitimate answer: this is an OPTIONAL capability and
+    ``None`` means "this exporter does not report delivery metrics", which
+    every caller already handles. Malformed metrics that ARE present remain a
+    hard raise, so a broken exporter is loud rather than silently ignored: in
+    the export thread ``_export_loop`` stores such an exception and re-raises
+    it from ``flush()``.
+
+    ``getattr`` absorbs only ``AttributeError``. An exporter whose
+    ``delivery_metrics`` raises anything else propagates that exception rather
+    than being downgraded to "capability absent".
+    """
+    metrics = getattr(exporter, "delivery_metrics", _DELIVERY_METRICS_ABSENT)
+    if metrics is _DELIVERY_METRICS_ABSENT:
         return None
-    return {str(key): value for key, value in metrics.items() if isinstance(value, int) or value is None}
+
+    if type(metrics) is not dict:
+        raise TypeError("delivery_metrics must be a dict")
+
+    attempted = metrics["attempted"]
+    delivered = metrics["delivered"]
+    failed = metrics["failed"]
+    dropped = metrics["dropped"]
+    pending = metrics["pending"]
+    consecutive_failures = metrics["consecutive_failures"]
+    last_success_unix_nano = metrics["last_success_unix_nano"]
+    lifecycle_failures = metrics["lifecycle_failures"]
+
+    counters = (
+        ("attempted", attempted),
+        ("delivered", delivered),
+        ("failed", failed),
+        ("dropped", dropped),
+        ("pending", pending),
+        ("consecutive_failures", consecutive_failures),
+        ("lifecycle_failures", lifecycle_failures),
+    )
+    for key, value in counters:
+        if type(value) is not int:
+            raise TypeError(f"delivery_metrics[{key!r}] must be an int")
+        if value < 0:
+            raise ValueError(f"delivery_metrics[{key!r}] must be non-negative")
+    if last_success_unix_nano is not None and type(last_success_unix_nano) is not int:
+        raise TypeError("delivery_metrics['last_success_unix_nano'] must be an int or None")
+    if last_success_unix_nano is not None and last_success_unix_nano < 0:
+        raise ValueError("delivery_metrics['last_success_unix_nano'] must be non-negative")
+
+    return {
+        "attempted": attempted,
+        "delivered": delivered,
+        "failed": failed,
+        "dropped": dropped,
+        "pending": pending,
+        "consecutive_failures": consecutive_failures,
+        "last_success_unix_nano": last_success_unix_nano,
+        "lifecycle_failures": lifecycle_failures,
+    }
 
 
 def _metric_delta(
-    before: dict[str, int | None] | None,
-    after: dict[str, int | None] | None,
-    key: str,
+    before: ExporterDeliveryMetrics | None,
+    after: ExporterDeliveryMetrics | None,
+    key: Literal["delivered", "failed", "dropped", "lifecycle_failures"],
 ) -> int:
     if before is None or after is None:
         return 0
-    old = before.get(key)
-    new = after.get(key)
-    if not isinstance(old, int) or not isinstance(new, int):
-        return 0
-    return max(0, new - old)
+    old = before[key]
+    new = after[key]
+    if type(old) is not int:
+        raise TypeError(f"delivery_metrics[{key!r}] before value must be an int")
+    if type(new) is not int:
+        raise TypeError(f"delivery_metrics[{key!r}] after value must be an int")
+    delta = new - old
+    if delta < 0:
+        raise ValueError(f"delivery_metrics[{key!r}] regressed from {old} to {new}")
+    return delta

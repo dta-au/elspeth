@@ -52,6 +52,8 @@ class _TwoContractViolatingTransform(BaseTransform):
     plugin_version = "1.0.0"
     source_file_hash: str | None = None
     passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
     declared_output_fields = frozenset({"new_a", "new_b"})
     on_success = "default"
     on_error = "discard"
@@ -89,7 +91,11 @@ def test_aggregate_declaration_contract_violation_reaches_orchestrator(payload_s
         sinks={"default": as_sink(sinks["default"])},
     )
 
-    orchestrator = Orchestrator(LandscapeDB("sqlite:///:memory:"))
+    # ``in_memory()`` (StaticPool, one shared DBAPI connection): a plain
+    # ``sqlite:///:memory:`` URL gives every connection its own empty database,
+    # so the heartbeat thread's connection saw no ``run_workers`` table and its
+    # beats silently never landed until the heartbeat started failing closed.
+    orchestrator = Orchestrator(LandscapeDB.in_memory())
     with pytest.raises(AggregateDeclarationContractViolation) as exc_info:
         orchestrator.run(config, graph=graph, payload_store=payload_store)
 

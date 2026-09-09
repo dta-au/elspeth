@@ -1,0 +1,50 @@
+"""TEMPLATE: rename this file to ``test_adapter.py`` once you've copied this
+whole scaffold directory into your own adapter project.
+
+The ``.template`` suffix is deliberate and load-bearing while this file
+lives inside the gateway's own ``gateway/scaffold/`` tree: it keeps this
+skeleton outside pytest's default ``test_*.py`` collection glob, so it is
+never imported or collected by the gateway repository's own test run
+(``pytest tests conformance``, or a bare ``pytest`` from ``gateway/``) --
+which would otherwise fail immediately, since the ``yourorg_adapter``
+package this file imports is never installed there. Drop the suffix only
+after copying this directory somewhere ``yourorg_adapter`` (renamed to your
+own package) is actually installed.
+
+Fill in real assertions against your agency's own sanitized fixtures
+(onboarding step 3: "implement mappings against locally supplied sanitized
+fixtures") -- this file is a skeleton, not a working test suite. The real
+acceptance gate for a derived adapter is the gateway's conformance kit
+(``pytest conformance`` against your derived image via
+``GATEWAY_CONFORMANCE_URL``) -- these unit tests are your own fast, local
+iteration loop underneath that, not a replacement for it.
+"""
+
+import pytest
+from yourorg_adapter.adapter import YourOrgAdapter
+from yourorg_adapter.descriptor import ADAPTER_NAME, DECLARED_CAPABILITIES
+
+
+def test_descriptor_declares_only_capabilities_the_upstream_really_supports():
+    built = YourOrgAdapter().descriptor()
+    assert built.name == ADAPTER_NAME
+    assert built.capabilities == DECLARED_CAPABILITIES
+
+
+def test_validate_configuration_accepts_empty_options():
+    YourOrgAdapter().validate_configuration({})
+
+
+@pytest.mark.skip(reason="TEMPLATE: replace with a real CanonicalRequest -> InvokePlan assertion against a sanitized fixture")
+def test_build_invoke_maps_a_minimal_text_request():
+    raise NotImplementedError
+
+
+@pytest.mark.skip(reason="TEMPLATE: replace with a real upstream success body -> CanonicalResponse assertion")
+def test_parse_success_maps_a_minimal_text_response():
+    raise NotImplementedError
+
+
+@pytest.mark.skip(reason="TEMPLATE: replace with a real upstream failure body -> ErrorClassification assertion")
+def test_classify_error_maps_a_known_fault_shape():
+    raise NotImplementedError

@@ -41,9 +41,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from elspeth.contracts import RowResult, TokenInfo, TransformResult
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts import FailureInfo, RowResult, TokenInfo, TransformResult
+from elspeth.contracts.enums import FrameKind, RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
@@ -113,7 +114,7 @@ class TestProcessSingleTokenOrchestration:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         result, _child_items = processor._process_single_token(
@@ -172,22 +173,46 @@ class TestProcessSingleTokenOrchestration:
         with pytest.raises(OrchestrationInvariantError, match="Inner traversal exceeded"):
             processor._process_single_token(token=token, ctx=ctx, current_node_id=looping)
 
-    def test_unknown_plugin_type_raises_type_error(self) -> None:
-        """A node plugin that is neither TransformProtocol nor GateSettings is rejected."""
+    def test_non_gate_plugin_dispatches_as_transform(self) -> None:
+        """Every non-GateSettings plugin takes the transform arm (negative nominal dispatch).
+
+        elspeth-8783933d99: node_to_plugin is closed by construction
+        (graph_wiring), so dispatch keys nominally on GateSettings and treats
+        everything else as a transform — protocol conformance is not
+        re-measured. A transform-shaped object missing a TransformProtocol
+        member must reach the transform handler, not die in dispatch with
+        ``TypeError: Unknown transform type`` (the ef5e6e593 regression).
+        """
+        from elspeth.contracts import TransformProtocol
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
         _db, factory = _make_factory()
         ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
-        weird = NodeID("weird-1")
+        node = NodeID("nonconforming-1")
+        transform = NonConformingTransform(node_id=str(node), on_success="terminal_sink")
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
         processor = _make_processor(
             factory,
-            node_step_map={source_node: 0, weird: 1},
-            node_to_next={source_node: weird, weird: None},
-            node_to_plugin={weird: object()},  # not a transform, not a gate
+            source_on_success="terminal_sink",
+            node_step_map={source_node: 0, node: 1},
+            node_to_next={source_node: node, node: None},
+            node_to_plugin={node: transform},
         )
         token = make_token_info(data={"value": 1})
+        dispatched: list[object] = []
+        success = TransformResult.success(make_row({"value": 2}), success_reason={"action": "mapped"})
 
-        with pytest.raises(TypeError, match="Unknown transform type"):
-            processor._process_single_token(token=token, ctx=ctx, current_node_id=weird)
+        def _exec(transform, token, ctx, attempt_offset=0):
+            dispatched.append(transform)
+            return success, token, None
+
+        processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
+        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=node)
+
+        assert dispatched == [transform], "dispatch must hand the non-conforming plugin to the transform arm"
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
 
     def test_gate_route_to_sink_returns_gate_routed_terminal(self) -> None:
         """A gate that routes to a sink terminates the token with GATE_ROUTED."""
@@ -248,6 +273,184 @@ class TestProcessSingleTokenOrchestration:
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
         assert result.sink_name == "terminal_sink"
+
+    def test_gate_error_discard_records_and_emits_gate_specific_failure_path(self) -> None:
+        """A gate-error discard owns a distinct audit and telemetry provenance path."""
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        gate_config = GateSettings(
+            name="threshold",
+            input="default",
+            condition="row['amount'] > 500",
+            routes={"true": "high", "false": "standard"},
+            on_error="discard",
+        )
+        processor = _make_processor(
+            factory,
+            node_step_map={source_node: 0, gate_node: 1},
+            node_to_next={source_node: gate_node, gate_node: None},
+            node_to_plugin={gate_node: gate_config},
+        )
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"amount": "bad"})
+        failure = FailureInfo(exception_type="ExpressionEvaluationError", message="cannot compare str and int")
+        gate_outcome = GateOutcome(
+            result=GateResult(
+                row={"amount": "bad"},
+                action=RoutingAction.route(
+                    "__error_threshold__",
+                    mode=RoutingMode.DIVERT,
+                    reason={
+                        "condition": "row['amount'] > 500",
+                        "error_type": "ExpressionEvaluationError",
+                        "error": "cannot compare str and int",
+                    },
+                ),
+                contract=_make_contract(),
+            ),
+            updated_token=token,
+            discarded=True,
+            error=failure,
+        )
+        recorded: list[dict[str, object]] = []
+        emitted: list[tuple[TerminalOutcome, TerminalPath]] = []
+
+        def _discard(gate_config, node_id, token, ctx, token_manager=None):
+            return gate_outcome
+
+        processor._gate_executor.execute_config_gate = _discard  # type: ignore[method-assign]
+        processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
+        processor._emit_token_completed = (  # type: ignore[method-assign]
+            lambda _token, *, outcome, path: emitted.append((outcome, path))
+        )
+
+        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)
+        assert recorded[0]["outcome"] == TerminalOutcome.FAILURE
+        assert recorded[0]["path"] == TerminalPath.GATE_ERROR_DISCARDED
+        assert recorded[0]["error_hash"] is not None
+        assert emitted == [(TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)]
+
+    def test_gate_error_discard_telemetry_failure_does_not_replace_handled_row_result(self) -> None:
+        """Telemetry is best-effort after the durable gate-error outcome exists."""
+        _db, factory = _make_factory()
+        processor = _make_processor(factory)
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"amount": "bad"})
+        failure = FailureInfo(exception_type="ExpressionEvaluationError", message="gate expression evaluation failed")
+        gate_outcome = GateOutcome(
+            result=GateResult(
+                row={"amount": "bad"},
+                action=RoutingAction.route(
+                    "__error_threshold__",
+                    mode=RoutingMode.DIVERT,
+                    reason={
+                        "condition": "row['amount'] > 500",
+                        "error_type": "ExpressionEvaluationError",
+                        "error": "gate expression evaluation failed",
+                    },
+                ),
+                contract=_make_contract(),
+            ),
+            updated_token=token,
+            discarded=True,
+            error=failure,
+        )
+        recorded: list[dict[str, object]] = []
+        processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
+
+        def _telemetry_failure(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("telemetry exporter unavailable")
+
+        processor._emit_token_completed = _telemetry_failure  # type: ignore[method-assign]
+
+        terminal = processor._token_traversal.handle_gate_error_outcome(gate_outcome, token, [])
+
+        assert isinstance(terminal.result, RowResult)
+        assert (terminal.result.outcome, terminal.result.path) == (
+            TerminalOutcome.FAILURE,
+            TerminalPath.GATE_ERROR_DISCARDED,
+        )
+        assert recorded[0]["path"] == TerminalPath.GATE_ERROR_DISCARDED
+
+    @pytest.mark.parametrize(
+        ("on_error", "discarded", "sink_name", "expected_path"),
+        [
+            ("discard", True, None, TerminalPath.GATE_ERROR_DISCARDED),
+            ("gate_errors", False, "gate_errors", TerminalPath.ON_ERROR_ROUTED),
+        ],
+    )
+    def test_gate_error_outcome_survives_gate_evaluated_telemetry_failure_at_process_call_site(
+        self,
+        on_error: str,
+        discarded: bool,
+        sink_name: str | None,
+        expected_path: TerminalPath,
+    ) -> None:
+        """GateEvaluated export cannot replace either handled row-error outcome."""
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        gate_config = GateSettings(
+            name="threshold",
+            input="default",
+            condition="row['amount'] > 500",
+            routes={"true": "high", "false": "standard"},
+            on_error=on_error,
+        )
+        processor = _make_processor(
+            factory,
+            node_step_map={source_node: 0, gate_node: 1},
+            node_to_next={source_node: gate_node, gate_node: None},
+            node_to_plugin={gate_node: gate_config},
+        )
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"amount": "bad"})
+        failure = FailureInfo(
+            exception_type="ExpressionEvaluationError",
+            message="gate expression evaluation failed: incompatible runtime types",
+        )
+        gate_outcome = GateOutcome(
+            result=GateResult(
+                row={"amount": "bad"},
+                action=RoutingAction.route(
+                    "__error_threshold__",
+                    mode=RoutingMode.DIVERT,
+                    reason={
+                        "condition": "row['amount'] > 500",
+                        "error_type": "ExpressionEvaluationError",
+                        "error": failure.message,
+                    },
+                ),
+                contract=_make_contract(),
+            ),
+            updated_token=token,
+            sink_name=sink_name,
+            discarded=discarded,
+            error=failure,
+        )
+        recorded: list[dict[str, object]] = []
+
+        def _gate_error(gate_config, node_id, token, ctx, token_manager=None):
+            return gate_outcome
+
+        def _telemetry_failure(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("gate telemetry exporter unavailable")
+
+        processor._gate_executor.execute_config_gate = _gate_error  # type: ignore[method-assign]
+        processor._emit_gate_evaluated = _telemetry_failure  # type: ignore[method-assign]
+        processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
+
+        result, child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, expected_path)
+        assert result.sink_name == sink_name
+        assert result.error == (None if discarded else failure)
+        assert child_items == []
+        assert [entry["path"] for entry in recorded] == ([TerminalPath.GATE_ERROR_DISCARDED] if discarded else [])
 
     def test_gate_jump_to_node_absent_from_step_map_raises(self) -> None:
         """A gate jump to a node not in the DAG step map is an invariant violation."""
@@ -371,6 +574,65 @@ class TestHandleTransformNode:
         assert isinstance(outcome.result, RowResult)
         assert (outcome.result.outcome, outcome.result.path) == (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED)
 
+        # Spec §4.3 (2026-08-22 synthesis correction): the empty-expansion
+        # group_records mint is GATED on creates_tokens — the transform here
+        # is a plain filter (creates_tokens=False, the _make_mock_transform
+        # default), so no group_records row is minted for the dropped token.
+        from sqlalchemy import select
+
+        from elspeth.core.landscape.schema import group_records_table
+
+        with _db.engine.connect() as conn:
+            rows = conn.execute(select(group_records_table).where(group_records_table.c.run_id == "test-run")).all()
+        assert rows == []
+
+    def test_multi_row_empty_with_creates_tokens_mints_empty_group_record(self) -> None:
+        """Spec §4.3: an empty expansion from a token-creating (creates_tokens=True)
+        transform mints a durable member_count=0 group_records row — the referent a
+        bound require_all empty-group failure needs. The GATE is the contract, not
+        just the mint: this is the twin of
+        test_multi_row_empty_returns_filter_dropped_terminal's creates_tokens=False
+        no-mint assertion above."""
+        db, factory = _make_factory()
+        factory.data_flow.create_row("test-run", "source-0", 0, {"value": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token("row-1", token_id="tok-1")
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        processor = _make_processor(factory)
+        transform = _make_mock_transform(node_id="t-1", name="multi-row-filter", creates_tokens=True)
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
+        empty = TransformResult.success_empty(success_reason={"action": "filtered"})
+
+        def _exec(transform, token, ctx, attempt_offset=0):
+            return empty, token, None
+
+        processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
+        outcome = processor._handle_transform_node(
+            transform=transform,
+            current_token=token,
+            ctx=ctx,
+            node_id=NodeID("t-1"),
+            child_items=[],
+            coalesce_node_id=None,
+            coalesce_name=None,
+            current_on_success_sink="default",
+        )
+
+        assert isinstance(outcome, _TransformTerminal)
+        assert isinstance(outcome.result, RowResult)
+        assert (outcome.result.outcome, outcome.result.path) == (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED)
+
+        from sqlalchemy import select
+
+        from elspeth.core.landscape.schema import group_records_table
+
+        with db.engine.connect() as conn:
+            rows = conn.execute(
+                select(group_records_table.c.kind, group_records_table.c.opener_token_id, group_records_table.c.member_count).where(
+                    group_records_table.c.run_id == "test-run"
+                )
+            ).all()
+        assert [(r.kind, r.opener_token_id, r.member_count) for r in rows] == [("expand", "tok-1", 0)]
+
     def test_max_retries_exceeded_returns_unrouted_failure(self) -> None:
         """Exhausted retries terminate the token as an UNROUTED FAILURE."""
         _db, factory = _make_factory()
@@ -406,7 +668,9 @@ class TestHandleTransformNode:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Secret-bearing retry failures must not reach branch-loss audit text."""
-        from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
+        from dataclasses import replace
+
+        from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 
         db, factory = _make_factory()
         coalesce_name = CoalesceName("merge")
@@ -420,7 +684,7 @@ class TestHandleTransformNode:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         _persist_token_for_scheduler(factory, token)
         ctx = make_context(landscape=factory.plugin_audit_writer())
@@ -444,36 +708,28 @@ class TestHandleTransformNode:
         assert isinstance(outcome, _TransformTerminal)
         assert isinstance(outcome.result, RowResult)
         assert outcome.result.error is not None
-        branch_loss = processor._pending_branch_losses.pop()
+        group_loss = processor._pending_group_losses.pop()
         with db.write_connection() as conn:
-            assert record_coalesce_branch_loss(
+            assert record_group_loss(
                 conn,
                 run_id="test-run",
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason=branch_loss.reason,
-                recorded_by=branch_loss.recorded_by,
+                spec=group_loss,
+                recorded_by="worker-1",
                 now=datetime.now(UTC),
             )
         with (
-            caplog.at_level(logging.WARNING, logger="elspeth.core.landscape.scheduler.branch_losses"),
+            caplog.at_level(logging.WARNING, logger="elspeth.core.landscape.scheduler.group_losses"),
             db.write_connection() as conn,
         ):
-            assert not record_coalesce_branch_loss(
+            assert not record_group_loss(
                 conn,
                 run_id="test-run",
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason="max_retries_exceeded_replay",
-                recorded_by=branch_loss.recorded_by,
+                spec=replace(group_loss, reason="max_retries_exceeded_replay"),
+                recorded_by="worker-1",
                 now=datetime.now(UTC),
             )
 
-        [durable_loss] = factory.scheduler.list_coalesce_branch_losses(run_id="test-run")
+        [durable_loss] = factory.scheduler.list_group_losses(run_id="test-run")
         assert outcome.result.error.message == "<redacted-secret>"
         assert outcome.result.error.last_error == "<redacted-secret>"
         assert durable_loss.reason == "max_retries_exceeded"
@@ -534,6 +790,111 @@ class TestHandleTransformErrorStatus:
         )
         assert outcome.result.sink_name == "error_sink"
         assert outcome.result.error is not None
+
+    def test_quarantine_branch_loss_reason_is_bounded_category_token(self) -> None:
+        """A quarantined branch records the bare 'quarantined' token, not the reason dict.
+
+        Regression for elspeth-74b795208f (battery round 7, Aurora): the
+        quarantine arm inlined the full reason-dict repr into the durable
+        branch-loss reason (``quarantined:{'reason': 'type_mismatch', ...}``,
+        150 chars), overflowing the String(64) category column. SQLite does
+        not enforce VARCHAR lengths, so only real PostgreSQL rejected the
+        INSERT — and the audit write killed the run it existed to explain.
+        The detail travels via compute_error_hash on the token outcome; the
+        column carries only the category token.
+        """
+        from elspeth.core.landscape.scheduler.group_losses import record_group_loss
+
+        db, factory = _make_factory()
+        coalesce_name = CoalesceName("merge")
+        processor = _make_processor(
+            factory,
+            coalesce_node_ids={coalesce_name: NodeID("coalesce::merge")},
+            branch_to_coalesce={BranchName("path_a"): coalesce_name},
+        )
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({"value": 1}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
+        )
+        _persist_token_for_scheduler(factory, token)
+        # The observed battery-round-7 payload: 138 chars of dict repr.
+        battery_reason = {
+            "reason": "type_mismatch",
+            "field": "price",
+            "expected": "int",
+            "actual": "float",
+            "message": "float 29.99 has fractional part",
+        }
+        transform_result = TransformResult.error(reason=battery_reason)
+
+        outcome = processor._handle_transform_error_status(
+            transform_result=transform_result,
+            current_token=token,
+            error_sink="discard",
+            child_items=[],
+        )
+
+        assert isinstance(outcome, _TransformTerminal)
+        group_loss = processor._pending_group_losses.pop()
+        assert group_loss.reason == "quarantined"
+        with db.write_connection() as conn:
+            assert record_group_loss(
+                conn,
+                run_id="test-run",
+                spec=group_loss,
+                recorded_by="worker-1",
+                now=datetime.now(UTC),
+            )
+        [durable_loss] = factory.scheduler.list_group_losses(run_id="test-run")
+        assert durable_loss.reason == "quarantined"
+
+    def test_error_routed_branch_loss_reason_is_bounded_category_token(self) -> None:
+        """A routed error branch records the bare 'error_routed' token (elspeth-74b795208f).
+
+        Same defect class as the quarantine arm: the routed arm inlined the
+        reason-dict repr as ``error_routed:{...}``. The detail already rides
+        the RowResult's FailureInfo (hashed by the accumulator); the durable
+        branch-loss column carries only the category token.
+        """
+        _db, factory = _make_factory()
+        coalesce_name = CoalesceName("merge")
+        processor = _make_processor(
+            factory,
+            coalesce_node_ids={coalesce_name: NodeID("coalesce::merge")},
+            branch_to_coalesce={BranchName("path_a"): coalesce_name},
+        )
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({"value": 1}),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
+        )
+        _persist_token_for_scheduler(factory, token)
+        battery_reason = {
+            "reason": "type_mismatch",
+            "field": "price",
+            "expected": "int",
+            "actual": "float",
+            "message": "float 29.99 has fractional part",
+        }
+        transform_result = TransformResult.error(reason=battery_reason)
+
+        outcome = processor._handle_transform_error_status(
+            transform_result=transform_result,
+            current_token=token,
+            error_sink="error_sink",
+            child_items=[],
+        )
+
+        assert isinstance(outcome, _TransformTerminal)
+        group_loss = processor._pending_group_losses.pop()
+        assert group_loss.reason == "error_routed"
+        # The detail is preserved on the routed result, not in the reason column.
+        assert isinstance(outcome.result, RowResult)
+        assert outcome.result.error is not None
+        assert "type_mismatch" in outcome.result.error.message
 
     def test_route_without_reason_refuses_to_fabricate_audit_data(self) -> None:
         """A routed error with a falsy reason is refused rather than fabricating an error hash."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -11,6 +12,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.deferred_intents import (
+    DEFERRED_INTENT_EDIT_COMMAND,
     DeferredIntentAccepted,
     DeferredIntentCancelAction,
     DeferredIntentEditAction,
@@ -20,7 +22,17 @@ from elspeth.web.composer.guided.deferred_intents import (
     validate_deferred_intent_action,
 )
 from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.stage_subjects import OptionValueConstraint, StageName
+from elspeth.web.composer.guided.stage_subjects import (
+    ComponentCountConstraint,
+    DeferredConstraint,
+    EdgeRouteConstraint,
+    FailureRouteConstraint,
+    OptionValueConstraint,
+    StageName,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
+    SubjectPresenceConstraint,
+)
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 
 
@@ -36,7 +48,7 @@ class DeferredIntentManagementBindingMismatch:
 
 @dataclass(frozen=True, slots=True)
 class DeferredIntentManagementAmbiguous:
-    """The private request did not name one exact current UUID when required."""
+    """The private request did not explicitly authorize the exact mutation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,8 +80,22 @@ class DeferredIntentManagementOption:
         }
 
 
-def _provider_safe_constraint(constraint: object) -> dict[str, object]:
-    if not hasattr(constraint, "to_dict"):
+def _provider_safe_constraint(constraint: DeferredConstraint) -> dict[str, object]:
+    # CLOSED UNION: DeferredConstraint is a seven-member alias over concrete
+    # dataclasses this module owns, and constraint_from_dict is their only
+    # constructor — so exact-type membership is the honest discrimination and
+    # matches the `type(constraint) is OptionValueConstraint` test below. A new
+    # constraint kind must be added here in the same change that declares it;
+    # a SUBCLASS of any member is deliberately not admitted.
+    if type(constraint) not in {
+        SubjectPresenceConstraint,
+        OptionValueConstraint,
+        ComponentCountConstraint,
+        StatedGateRoutingConstraint,
+        StatedPredicateConstraint,
+        EdgeRouteConstraint,
+        FailureRouteConstraint,
+    }:
         raise AuditIntegrityError("deferred intent contains a constraint without a closed projection")
     projected = cast(dict[str, Any], constraint.to_dict())
     if type(constraint) is OptionValueConstraint:
@@ -127,19 +153,28 @@ def deferred_intent_management_user_authority_matches(
     deferred_intents: Sequence[DeferredStageIntent],
     originating_message_content: str,
 ) -> bool:
-    """Require one explicit current UUID when destructive selection is plural.
+    """Require an exact action-specific command for every destructive mutation.
 
-    A single pending intent remains addressable in natural language. Once the
-    current checkpoint contains multiple intents, the private user message
-    must name exactly one of their UUIDs, and it must equal the model-emitted
-    action ID. The provider's server-bound selection token remains a separate
-    integrity check; it cannot substitute for user authority.
+    The provider action and its server-bound selection token identify a
+    proposed mutation; neither grants user authority. Cancellation requires
+    ``Cancel exact intent <UUID>.`` as the whole private request. Editing
+    requires ``Edit exact intent <UUID>: <new instruction>`` so the request
+    explicitly supplies both the operation and replacement directive.
     """
 
-    if len(deferred_intents) <= 1:
-        return True
-    named_current_ids = tuple(intent.intent_id for intent in deferred_intents if intent.intent_id in originating_message_content)
-    return named_current_ids == (action.intent_id,)
+    matching_current_ids = tuple(intent.intent_id for intent in deferred_intents if intent.intent_id == action.intent_id)
+    if matching_current_ids != (action.intent_id,):
+        return False
+    if type(action) is DeferredIntentCancelAction:
+        pattern = rf"\s*cancel\s+exact\s+intent\s+{re.escape(action.intent_id)}\.?\s*"
+        return re.fullmatch(pattern, originating_message_content, flags=re.IGNORECASE) is not None
+    if type(action) is DeferredIntentEditAction:
+        # The same regex ``deferred_intent_instruction_text`` reads the
+        # replacement instruction from: authority and extraction cannot
+        # disagree about what the command is.
+        command = DEFERRED_INTENT_EDIT_COMMAND.fullmatch(originating_message_content)
+        return command is not None and command.group("intent_id").casefold() == action.intent_id.casefold()
+    return False  # pragma: no cover - the closed action union owns this guard
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +232,8 @@ def resolve_deferred_intent_management(
             receiving_stage=existing.receiving_stage,
             catalog=catalog,
             guided=guided,
+            originating_message_content=originating_message_content,
+            replacing_intent_id=existing.intent_id,
         )
         if type(disposition) is not DeferredIntentAccepted:
             return disposition
@@ -206,6 +243,7 @@ def resolve_deferred_intent_management(
             intent_id=existing.intent_id,
             originating_message_id=originating_message_id,
             originating_message_content=originating_message_content,
+            guided=guided,
         )
         return DeferredIntentManagementApplied(
             prior_intent=existing,

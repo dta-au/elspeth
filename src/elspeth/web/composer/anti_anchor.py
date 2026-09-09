@@ -74,9 +74,9 @@ def should_inject_drift_hint(failures: FailureDeque) -> bool:
 def build_anti_anchor_hint(failures: FailureDeque) -> str:
     """Compose the hint string for the current anchor.
 
-    Always ends with a chain-of-thought scaffold: enumerate validator-named
-    fields, the values you sent, the shapes the schema expects, then change at
-    least one. Generic-by-design — works for connection-naming AND
+    Always ends with a safe structural scaffold: identify validator-named
+    fields, mismatch categories, and expected schema shapes without restating
+    prior literal values. Generic-by-design — works for connection-naming AND
     options-validation failures (the diagnosed RED was the latter, not the
     former, so the hint cannot be connection-name-specific).
     """
@@ -89,12 +89,14 @@ def build_anti_anchor_hint(failures: FailureDeque) -> str:
         f"[ELSPETH-SYSTEM-HINT] Your last {_RETRY_THRESHOLD} calls to `{tool_name}` "
         "all failed with byte-identical arguments and the same error. "
         "Retrying with the same payload will keep failing. "
-        "Before the next attempt, list explicitly: "
-        "(a) which fields the validator named in the error, "
-        "(b) what value you sent for each, "
-        "(c) what shape each field expects "
+        "Before the next attempt, reason only about redacted structure. "
+        "Do not repeat, quote, summarize, or otherwise reproduce any literal values from prior arguments or errors "
+        "in assistant prose. Identify only: "
+        "(a) which field names the validator named in the error, "
+        "(b) each field's structural mismatch category (for example missing, type, shape, allowed-key, or cardinality), "
+        "(c) what schema shape each field expects "
         "(re-read the relevant `get_plugin_schema` result if you have not already), "
-        "then change AT LEAST ONE of those field values."
+        "then submit a tool call that changes at least one structural choice."
     )
 
 
@@ -108,7 +110,9 @@ def build_drift_hint(failures: FailureDeque) -> str:
         "all failed while sending different arguments. This is drift without convergence: "
         "small payload variations are not escaping the validator failure. "
         "Before the next attempt, stop varying fields opportunistically and choose a new repair strategy: "
-        "(a) compare the last failed payloads against the validator-named fields, "
+        "reason only about field names, types, shapes, allowed keys, and cardinality; "
+        "do not repeat, quote, summarize, or otherwise reproduce literal values from the failed payloads in assistant prose; "
+        "(a) compare the last failed payloads structurally against the validator-named fields, "
         "(b) re-read the relevant schema or assistance result if the expected shape is unclear, "
         "(c) rebuild the complete requested topology in one coherent payload, or "
         "(d) surface a named gap if the requested shape is unsupported by the available tools. "
@@ -137,15 +141,43 @@ class AntiAnchorTracker:
         """Clear the deque. Any tool success means we have made progress."""
         self._failures.clear()
 
-    def should_fire(self) -> bool:
-        return should_inject_hint(self._failures) or should_inject_drift_hint(self._failures)
+    def next_hint(self) -> str | None:
+        """Return the hint the current failure window earns, or ``None``.
 
-    def build_hint(self) -> str:
+        This is the single authority for hint text: a hint exists only when
+        one of the two trigger predicates holds, and the predicate that
+        holds chooses the text. There is no fallback. The prior
+        ``build_hint`` fell through to ``build_anti_anchor_hint`` when
+        neither predicate matched, and that helper rejects only a SHORT
+        window — so a mixed, non-triggering window of three failures
+        across different tools produced a confident "byte-identical
+        arguments" hint for a pattern that never occurred
+        (elspeth-aa459b4dd0). A hint is control text the model acts on;
+        prose for a state that did not happen is worse than no prose.
+        """
         if should_inject_hint(self._failures):
             return build_anti_anchor_hint(self._failures)
         if should_inject_drift_hint(self._failures):
             return build_drift_hint(self._failures)
-        return build_anti_anchor_hint(self._failures)
+        return None
+
+    def should_fire(self) -> bool:
+        return self.next_hint() is not None
+
+    def build_hint(self) -> str:
+        """Return the hint for a firing window; refuse to manufacture one otherwise.
+
+        Kept for the ``should_fire()`` / ``build_hint()`` caller protocol.
+        Callers that want a single call should use :meth:`next_hint`.
+        """
+        hint = self.next_hint()
+        if hint is None:
+            raise ValueError(
+                "build_hint() called on a failure window that fires no anti-anchor predicate "
+                f"({len(self._failures)} recorded failure(s), not identical and not same-tool drift); "
+                "check should_fire() first or use next_hint()"
+            )
+        return hint
 
     def consume_fire(self) -> None:
         """Reset after a hint is injected to prevent immediate re-fire.

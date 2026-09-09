@@ -8,7 +8,9 @@ import { useAuditReadinessStore, getInitialState } from "../../stores/auditReadi
 import { useExecutionStore } from "../../stores/executionStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import * as api from "../../api/auditReadiness";
 import type { AuditReadinessSnapshot, ValidationResult } from "../../types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
@@ -163,6 +165,7 @@ describe("AuditReadinessPanel", () => {
     useExecutionStore.setState({ validationResult: null } as never);
     resetStore(useInlineSourceStore);
     resetStore(useInterpretationEventsStore);
+    resetStore(usePreferencesStore);
     vi.clearAllMocks();
   });
 
@@ -193,6 +196,9 @@ describe("AuditReadinessPanel", () => {
     // collapsed, so pointing at a missing id would be incorrect.
     const summary = screen.getByRole("button", { name: /Audit ready/i });
     expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(
+      summary.querySelector(".audit-readiness-summary-status"),
+    ).toHaveTextContent("✓Audit ready");
   });
 
   it("expands to all rows when the summary is clicked", async () => {
@@ -209,20 +215,17 @@ describe("AuditReadinessPanel", () => {
     expect(screen.getByText("Retention")).toBeInTheDocument();
   });
 
-  it("names the panel 'Audit' with a visible heading in collapsed AND expanded states (elspeth-4f69b267dd)", async () => {
-    // The graduation card directs users to "the Audit panel" — the destination
-    // must exist by that name in every rendered state, not only when expanded.
+  it("uses the compact ready status as the collapsed label and keeps the Audit heading when expanded", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
     );
     const user = userEvent.setup();
     render(<AuditReadinessPanel />);
-    // Collapsed (all-green) state: heading present above the summary button.
+    // Collapsed (all-green) state: the status is the visible label, without a
+    // redundant heading consuming a third line in the compact card.
     await screen.findByRole("button", { name: /Audit ready/i });
-    expect(
-      screen.getByRole("heading", { name: "Audit" }),
-    ).toBeInTheDocument();
-    // Expanded state: same visible name.
+    expect(screen.queryByRole("heading", { name: "Audit" })).not.toBeInTheDocument();
+    // Expanded state keeps the heading to name the detailed panel.
     await user.click(screen.getByRole("button", { name: /Audit ready/i }));
     expect(
       screen.getByRole("heading", { name: "Audit" }),
@@ -325,6 +328,93 @@ describe("AuditReadinessPanel", () => {
     expect(screen.queryByRole("button", { name: /Audit ready/i })).not.toBeInTheDocument();
   });
 
+  it("refetches and recovers from a version-matching cache entry belonging to another session", async () => {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: {
+        [SESSION_ID]: {
+          ...allGreenSnapshot(1),
+          session_id: OTHER_SESSION_ID,
+        },
+      },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
+    );
+    render(<AuditReadinessPanel />);
+
+    expect(screen.getByText(/Checking audit readiness/i)).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: /Audit ready/i }),
+    ).toBeInTheDocument();
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a mismatched response as retryable and recovers on Retry", async () => {
+    vi.mocked(api.fetchAuditReadiness)
+      .mockImplementationOnce((_sid, signal) =>
+        makeAbortablePromise(
+          { ...allGreenSnapshot(1), session_id: OTHER_SESSION_ID },
+          { signal },
+        ),
+      )
+      .mockImplementationOnce((_sid, signal) =>
+        makeAbortablePromise(allGreenSnapshot(1), { signal }),
+      );
+    const user = userEvent.setup();
+
+    render(<AuditReadinessPanel />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Audit readiness response did not match the requested composition.",
+    );
+    const retry = screen.getByRole("button", {
+      name: "Retry audit readiness check",
+    });
+    expect(retry).toBeEnabled();
+    await user.click(retry);
+    expect(
+      await screen.findByRole("button", { name: /Audit ready/i }),
+    ).toBeInTheDocument();
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces cached ready content with a retryable error after a forced refresh identity failure", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: allGreenSnapshot(1) },
+    });
+    vi.mocked(api.fetchAuditReadiness)
+      .mockImplementationOnce((_sid, signal) =>
+        makeAbortablePromise(
+          { ...allGreenSnapshot(1), session_id: OTHER_SESSION_ID },
+          { signal },
+        ),
+      )
+      .mockImplementationOnce((_sid, signal) =>
+        makeAbortablePromise(allGreenSnapshot(1), { signal }),
+      );
+    const user = userEvent.setup();
+
+    render(<AuditReadinessPanel />);
+    await user.click(screen.getByRole("button", { name: /Audit ready/i }));
+    await user.click(screen.getByRole("button", { name: "Refresh audit check now" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Audit readiness response did not match the requested composition.",
+    );
+    expect(
+      screen.queryByRole("button", { name: /Audit ready/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Complete lineage")).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "Retry audit readiness check" }),
+    );
+    expect(await screen.findByText("Complete lineage")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(2);
+  });
+
   it("projects an OK validation row into the execution validation state", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
@@ -406,6 +496,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("force-refreshes the current composition version when Refresh is clicked", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: { [SESSION_ID]: snapshotWithProvenanceWarning(1) },
     });
@@ -429,6 +520,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("projects a forced-refresh validation row into the execution validation state", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: { [SESSION_ID]: allGreenSnapshot(1) },
     });
@@ -469,6 +561,7 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("does not project a forced refresh after the active session changes", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useAuditReadinessStore.setState({
       snapshotsBySession: {
         [SESSION_ID]: allGreenSnapshot(1),
@@ -577,14 +670,14 @@ describe("AuditReadinessPanel", () => {
 
   // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ───────────────────
   //
-  // canExecute (ExecuteButton.tsx) only reads the `validation` row's
-  // is_valid and interpretation-pending state (which the `llm_interpretations`
-  // row mirrors) — plugin_trust/provenance/retention/secrets never gate Run.
+  // canExecute (ExecuteButton.tsx) reads backend execution readiness and
+  // interpretation-pending state (which the `llm_interpretations` row
+  // mirrors) — plugin_trust/provenance/retention/secrets never gate Run.
   // These two tests pin that the panel's per-row badges classify honestly
   // against that real predicate, and that the header carries a one-line
   // explanation — without touching any gating behaviour.
 
-  it("labels validation and llm_interpretations rows 'Blocks Run' and the other four rows 'Advisory' (elspeth-088bf83922 T-2)", async () => {
+  it("labels validation and llm_interpretations rows 'Blocks run' and the other four rows 'Advisory' (elspeth-088bf83922 T-2)", async () => {
     const everyRowActionable: AuditReadinessSnapshot = {
       session_id: SESSION_ID,
       composition_version: 1,
@@ -633,18 +726,96 @@ describe("AuditReadinessPanel", () => {
 
     // Both labels are visible text, present exactly twice each (one per
     // gating/advisory row count) — not colour-only.
-    expect(screen.getAllByText("Blocks Run")).toHaveLength(2);
+    expect(screen.getAllByText("Blocks run")).toHaveLength(2);
     expect(screen.getAllByText("Advisory")).toHaveLength(4);
   });
 
-  it("explains the 'Blocks Run' / 'Advisory' classification in the expanded header", async () => {
+  it("labels an execution-ready advisor-pending validation row Advisory", async () => {
+    const base = allGreenSnapshot(1);
+    const advisorPending: AuditReadinessSnapshot = {
+      ...base,
+      rows: base.rows.map((row) =>
+        row.id === "validation"
+          ? {
+              ...row,
+              status: "warning" as const,
+              summary: "Advisor sign-off pending",
+            }
+          : row,
+      ),
+      validation_result: {
+        ...base.validation_result,
+        checks: [
+          {
+            name: "advisor_signoff",
+            passed: false,
+            detail: "Advisor sign-off pending.",
+            affected_nodes: [],
+            outcome_code: null,
+          },
+        ],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: false,
+          blockers: [],
+        },
+      },
+    };
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) => makeAbortablePromise(advisorPending, { signal }),
+    );
+
+    render(<AuditReadinessPanel />);
+
+    const validation = await screen.findByText("Validation");
+    expect(validation.closest("li")).toHaveAttribute("data-gate", "advisory");
+    expect(validation.closest("li")).toHaveTextContent("Advisory");
+  });
+
+  it("explains the 'Blocks run' / 'Advisory' classification in the expanded header", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(snapshotWithProvenanceWarning(1), { signal }),
     );
     render(<AuditReadinessPanel />);
     expect(
-      await screen.findByText(/Rows marked "Blocks Run" must be clear/i),
+      await screen.findByText(/Rows marked "Blocks run" must be clear/),
     ).toBeInTheDocument();
+  });
+
+  it("quotes the gate badge in the header using the badge's own literal, case included", async () => {
+    // elspeth-1fbb371ac3. Not two independently-pinned strings: this reads
+    // the quoted label OUT of the rendered header sentence and requires a
+    // badge rendering that exact text to exist on the same screen. It fails
+    // if either side drifts — including a case-only drift, which is what
+    // shipped ("Blocks Run" in the badge, "advisory" in the prose). The
+    // second assertion below pins that the pair is ONE case register, so
+    // "Blocks Run" cannot come back by changing both sides together.
+    //
+    // A blocked snapshot, so at least one row actually renders the gating
+    // badge the header sentence quotes.
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) =>
+        makeAbortablePromise(snapshotWithValidationErrorAndProvenanceWarning(1), {
+          signal,
+        }),
+    );
+    render(<AuditReadinessPanel />);
+
+    const explanation = await screen.findByText(/^Rows marked "/);
+    const quoted = /"([^"]+)"/.exec(explanation.textContent ?? "")?.[1];
+    expect(quoted, "the header must quote a gate label").toBeDefined();
+    expect(screen.getAllByText(quoted!).length).toBeGreaterThan(0);
+
+    // One case register across the binary pair: neither value may carry an
+    // interior capital, so "Blocks Run" (Title Case against a single-word
+    // "Advisory") cannot reappear. Matches the house badge register —
+    // GraphView's "row union", StatusBadge's "completed with failures".
+    for (const label of [quoted!, "Advisory"]) {
+      expect(label.slice(1), `${label} must be sentence case, not Title Case`).toBe(
+        label.slice(1).toLowerCase(),
+      );
+    }
   });
 
   it("refetches when compositionState.version advances", async () => {
@@ -735,7 +906,7 @@ describe("AuditReadinessPanel", () => {
     });
   });
 
-  it("mounts the Explain dialog when Explain → is clicked", async () => {
+  it("mounts the Explain dialog when Explain is clicked", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
     );
@@ -1041,6 +1212,91 @@ describe("AuditReadinessPanel", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("renders the backend interpretation narrative for a source-only LLM composition", async () => {
+    useSessionStore.setState({
+      activeSessionId: SESSION_ID,
+      compositionState: makeComposition(1, {
+        sources: {
+          generated: {
+            plugin: "llm",
+            options: { api_key: "do-not-render-private-key" },
+          },
+        },
+        nodes: [],
+      }),
+    });
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) =>
+        makeAbortablePromise(
+          snapshotWithLlmRow(1, {
+            status: "not_applicable",
+            summary: "LLM source prompts do not use interpretation review",
+            detail:
+              "The rowless LLM source issues one authored prompt without incoming row data, so it creates no row interpretation events.",
+          }),
+          { signal },
+        ),
+    );
+
+    const user = userEvent.setup();
+    render(<AuditReadinessPanel />);
+    await user.click(await screen.findByRole("button", { name: /Audit ready/i }));
+
+    const row = screen.getByTestId(
+      "audit-readiness-row-llm-interpretations",
+    );
+    expect(row).toHaveTextContent(
+      "LLM source prompts do not use interpretation review",
+    );
+    expect(row).toHaveTextContent("Not applicable");
+    expect(
+      screen.queryByText(/do-not-render-private-key/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the session opt-out override authoritative for a source-only LLM composition", async () => {
+    useSessionStore.setState({
+      activeSessionId: SESSION_ID,
+      compositionState: makeComposition(1, {
+        sources: {
+          generated: { plugin: "llm", options: {} },
+        },
+        nodes: [],
+      }),
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [SESSION_ID]: {} },
+      resolvedCountBySession: {
+        [SESSION_ID]: { accepted_as_drafted: 0, amended: 0, opted_out: 2 },
+      },
+      optedOutBySession: { [SESSION_ID]: true },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) =>
+        makeAbortablePromise(
+          snapshotWithLlmRow(1, {
+            status: "not_applicable",
+            summary: "LLM source prompts do not use interpretation review",
+          }),
+          { signal },
+        ),
+    );
+
+    const user = userEvent.setup();
+    render(<AuditReadinessPanel />);
+    await user.click(await screen.findByRole("button", { name: /Audit ready/i }));
+
+    const row = screen.getByTestId(
+      "audit-readiness-row-llm-interpretations",
+    );
+    expect(row).toHaveTextContent(
+      "Opted out for this session (2 drafted, not reviewed)",
+    );
+    expect(row).not.toHaveTextContent(
+      "LLM source prompts do not use interpretation review",
+    );
+  });
+
   it("renders 'all N resolved' when status=ok and only resolved events exist (Phase 5b.18b.7 §2)", async () => {
     useSessionStore.setState({
       activeSessionId: SESSION_ID,
@@ -1227,5 +1483,35 @@ describe("AuditReadinessPanel", () => {
       "audit-readiness-row-llm-interpretations",
     );
     expect(row.textContent).toMatch(/not yet surfaced/i);
+  });
+
+  it("hides Refresh with the flag off — the panel already refetches per composition version — and keeps Explain (elspeth-f1394307e3)", async () => {
+    useAuditReadinessStore.setState({ snapshotsBySession: { [SESSION_ID]: allGreenSnapshot(1) } });
+    useSessionStore.setState({ activeSessionId: SESSION_ID, compositionState: makeComposition(1) });
+    const user = userEvent.setup();
+    const { container } = render(<AuditReadinessPanel />);
+    await user.click(screen.getByRole("button", { name: /Audit ready/i }));
+    expect(screen.queryByRole("button", { name: "Refresh audit check now" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Explain what this pipeline will record" })).toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("still refetches on a composition-version change with the flag off (elspeth-f1394307e3 cadence guarantee)", async () => {
+    // The ticket's acceptance has TWO halves: "each control absent from the
+    // default DOM and present with the flag; AND no change to the
+    // audit-readiness fetch cadence". Hiding Refresh is only honest because
+    // the panel refetches itself, so that refetch IS the plain summary
+    // standing in for the hidden control — and an unpinned plain summary is
+    // exactly what the epic doctrine warns about. This is the pin.
+    vi.mocked(api.fetchAuditReadiness)
+      .mockResolvedValueOnce(allGreenSnapshot(1))
+      .mockResolvedValueOnce(allGreenSnapshot(2));
+    useSessionStore.setState({ activeSessionId: SESSION_ID, compositionState: makeComposition(1) });
+    render(<AuditReadinessPanel />);
+    await waitFor(() => expect(vi.mocked(api.fetchAuditReadiness)).toHaveBeenCalledTimes(1));
+    act(() => {
+      useSessionStore.setState({ compositionState: makeComposition(2) });
+    });
+    await waitFor(() => expect(vi.mocked(api.fetchAuditReadiness)).toHaveBeenCalledTimes(2));
   });
 });

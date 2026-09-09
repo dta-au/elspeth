@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TutorialGuidedShell } from "./TutorialGuidedShell";
@@ -53,6 +53,7 @@ function guidedSessionPayload(terminalKind: TerminalKind | null): unknown {
     terminal: terminalKind === null ? null : { kind: terminalKind, reason: null },
     chat_history: [],
     chat_turn_seq: 0,
+    reviewed_components: { sources: [], outputs: [] },
     profile: null,
   };
 }
@@ -89,6 +90,94 @@ vi.mock("@/components/chat/ChatPanel", () => ({
   },
 }));
 
+vi.mock("@/components/workspace/ComposerWorkspace", () => ({
+  ComposerWorkspace: (props: {
+    authoring: ReactNode;
+    artifact: ReactNode;
+    inspector: ReactNode;
+    actionBar: ReactNode;
+  }) => (
+    <div data-testid="composer-workspace-stub">
+      <div data-testid="workspace-authoring">{props.authoring}</div>
+      <div data-testid="workspace-artifact">{props.artifact}</div>
+      <div data-testid="workspace-inspector">{props.inspector}</div>
+      <div data-testid="workspace-action-bar">{props.actionBar}</div>
+    </div>
+  ),
+}));
+
+vi.mock("@/components/workspace/ArtifactWorkspace", () => ({
+  // Captures runAvailable: the tutorial shell mounts NO REQUEST_RUN_EVENT
+  // owner (capabilities.completion is false), so it must never enable the
+  // Run-tab empty-state affordance (elspeth-553a6fb81d).
+  //
+  // The RAW prop is rendered, deliberately un-defaulted: `?? false` would
+  // collapse "prop absent" and "prop explicitly false" into the same
+  // "false", so the assertion could not fail unless the shell affirmatively
+  // passed true — and deleting the prop pass-through entirely would go
+  // unnoticed. "undefined" is a distinguishable, and a failing, value.
+  ArtifactWorkspace: (props: {
+    runAvailable?: boolean;
+    checksValidationContent?: ReactNode;
+  }) => (
+    <div data-run-available={String(props.runAvailable)}>
+      Artifact workspace
+      {props.checksValidationContent}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/workspace/WorkspaceInspector", () => ({
+  WorkspaceInspector: () => <div>Inspector workspace</div>,
+}));
+
+vi.mock("@/components/workspace/WorkspaceActionBar", () => ({
+  WorkspaceActionBar: ({
+    capabilities,
+  }: {
+    capabilities: { completion: boolean };
+  }) => (
+    <div data-testid="tutorial-workspace-capabilities">
+      {JSON.stringify(capabilities)}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/guided/PipelineValidationSummary", () => ({
+  PipelineValidationSummary: ({ isTutorial }: { isTutorial?: boolean }) => (
+    <div data-testid="tutorial-validation-summary">
+      {String(isTutorial)}
+    </div>
+  ),
+}));
+
+// The checkpoint a started guided session ALWAYS carries. `/guided/start`
+// persists a composition state and returns it, so a started session with
+// `composition_state: null` is a shape the backend cannot emit — and since
+// goal-first (elspeth-378cfa0e18) it is a load-bearing one: a null composition
+// state means "nothing persisted yet, the panel is on the goal card", which is
+// what suppresses the pre-start decision card and makes an exit a purely local
+// drop of the stub instead of a respond. The tutorial is never in that state:
+// its start is programmatic, so the shell's exit is a real server transition.
+const STARTED_COMPOSITION_STATE = {
+  id: "00000000-0000-4000-8000-0000000009c1",
+  session_id: "00000000-0000-4000-8000-000000000700",
+  version: 1,
+  sources: {},
+  nodes: [],
+  edges: [],
+  outputs: [],
+  metadata: { name: null, description: null },
+  is_valid: true,
+  validation_errors: [],
+  validation_warnings: [],
+  validation_suggestions: [],
+  derived_from_state_id: null,
+  created_at: "2026-09-03T12:00:00Z",
+  composer_meta: null,
+  plugin_policy_findings: [],
+};
+
 describe("TutorialGuidedShell", () => {
   beforeEach(() => {
     window.sessionStorage.clear();
@@ -103,7 +192,7 @@ describe("TutorialGuidedShell", () => {
         payload: {},
       },
       terminal: null,
-      composition_state: null,
+      composition_state: STARTED_COMPOSITION_STATE,
     };
     startGuidedSessionMock.mockReset().mockResolvedValue(activeGuidedResponse);
     getGuidedMock.mockReset().mockResolvedValue(activeGuidedResponse);
@@ -146,12 +235,22 @@ describe("TutorialGuidedShell", () => {
     } as never);
   });
 
-  it("posts the TUTORIAL profile and enters guided on mount", async () => {
+  it("posts the TUTORIAL profile AND the frozen lesson prompt as the root intent on mount", async () => {
+    // Goal-first (elspeth-378cfa0e18): the tutorial states its goal at
+    // /guided/start exactly as a live session does. Not a tutorial-special
+    // path — the server requires an intent for every profile — and it is what
+    // lets the step-2 finish plan ONCE, from the lesson prompt, instead of
+    // planning from a fallback sentence and being re-planned by a step-3 Send.
+    // The prompt TEXT is the frozen constant, unchanged (ADR-031).
     render(
       <TutorialGuidedShell sessionId="sess-1" onCompleted={vi.fn()} />,
     );
     await waitFor(() =>
-      expect(seedGuidedMock).toHaveBeenCalledWith("sess-1", "tutorial"),
+      expect(seedGuidedMock).toHaveBeenCalledWith(
+        "sess-1",
+        "tutorial",
+        TUTORIAL_TRANSFORMS_PROMPT,
+      ),
     );
     // The shell must have bound the store's activeSessionId; otherwise
     // seedGuided discards its payload and ChatPanel renders the empty surface.
@@ -190,6 +289,34 @@ describe("TutorialGuidedShell", () => {
     const stub = await screen.findByTestId("chat-panel-stub");
     expect(stub).toBeInTheDocument();
     expect(stub.dataset.isTutorial).toBe("true");
+  });
+
+  it("uses the common workspace with tutorial-safe actions and Checks-tab validation", async () => {
+    render(<TutorialGuidedShell sessionId="sess-1" onCompleted={vi.fn()} />);
+
+    expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();
+    expect(screen.getByText("Artifact workspace")).toBeInTheDocument();
+    expect(screen.getByText("Inspector workspace")).toBeInTheDocument();
+    expect(screen.getByTestId("tutorial-validation-summary")).toHaveTextContent(
+      "true",
+    );
+    expect(screen.getByTestId("tutorial-workspace-capabilities")).toHaveTextContent(
+      '{"completion":false}',
+    );
+    expect(screen.queryByText("Run pipeline")).toBeNull();
+    // The Run-tab empty state must stay affordance-free in the tutorial:
+    // no run owner is mounted, so runAvailable must not be enabled
+    // (elspeth-553a6fb81d). The shell passes the prop NOWHERE — the raw
+    // "undefined" is the honest reading, and the guard that turns it into
+    // "off" is ArtifactWorkspace's own `runAvailable = false` default, pinned
+    // by ArtifactWorkspace.test.tsx's omitted-prop case. Asserting "false"
+    // here (via a `?? false` in the stub) hid that seam: it read the same
+    // whether the shell passed false or passed nothing at all, so deleting
+    // the prop wiring would not have failed anything.
+    expect(screen.getByText("Artifact workspace")).toHaveAttribute(
+      "data-run-available",
+      "undefined",
+    );
   });
 
   it("passes the same closed proposal and exact review binding to the passive tutorial surface", async () => {
@@ -245,6 +372,7 @@ describe("TutorialGuidedShell", () => {
           terminal: null,
           chat_history: [],
           chat_turn_seq: 0,
+          reviewed_components: { sources: [], outputs: [] },
           profile: null,
         },
         guidedNextTurn: closedProposalTurn,
@@ -286,10 +414,16 @@ describe("TutorialGuidedShell", () => {
     expect(lockedSource.indexOf(SAMPLE_URLS[0])).toBeGreaterThan(
       lockedSource.indexOf(TUTORIAL_SOURCE_PROMPT),
     );
-    // Sink and transforms stages carry their own focused prompts, no URLs.
+    // The sink stage carries its own focused prompt, no URLs.
     expect(stub.dataset.lockedSink).toBe(TUTORIAL_SINK_PROMPT);
-    expect(stub.dataset.lockedTransforms).toBe(TUTORIAL_TRANSFORMS_PROMPT);
-    expect(stub.dataset.lockedTransforms).not.toContain(SAMPLE_URLS[0]);
+    // TRANSFORMS has NO locked prompt any more (goal-first,
+    // elspeth-378cfa0e18): the frozen transforms prompt is the session's root
+    // intent, stated once at /guided/start and read by the single planner run
+    // at the step-2 finish. Re-Sending it at step 3 would ask the planner a
+    // second time for what the first run was already given — the gesture and
+    // the planner run this change removes. Step 3 joins step 4 as confirm-only
+    // (an absent entry is the existing empty read-only box).
+    expect(stub.dataset.lockedTransforms).toBeUndefined();
   });
 
   it("gates the chat panel until the sample URLs resolve (never an editable box)", async () => {
@@ -335,7 +469,11 @@ describe("TutorialGuidedShell", () => {
       />,
     );
     await waitFor(() =>
-      expect(seedGuidedMock).toHaveBeenCalledWith(sessionId, "tutorial"),
+      expect(seedGuidedMock).toHaveBeenCalledWith(
+        sessionId,
+        "tutorial",
+        TUTORIAL_TRANSFORMS_PROMPT,
+      ),
     );
 
     exitRequestedRef.current = true;
@@ -598,6 +736,7 @@ describe("TutorialGuidedShell", () => {
         terminal: { kind: "completed", reason: null },
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -608,7 +747,11 @@ describe("TutorialGuidedShell", () => {
     );
 
     await waitFor(() =>
-      expect(seedGuidedMock).toHaveBeenCalledWith("sess-2", "tutorial"),
+      expect(seedGuidedMock).toHaveBeenCalledWith(
+        "sess-2",
+        "tutorial",
+        TUTORIAL_TRANSFORMS_PROMPT,
+      ),
     );
     expect(useSessionStore.getState().activeSessionId).toBe("sess-2");
     expect(useSessionStore.getState().guidedSession).toBeNull();

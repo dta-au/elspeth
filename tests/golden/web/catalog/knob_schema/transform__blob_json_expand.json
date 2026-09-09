@@ -1,0 +1,167 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Required Input Fields",
+        "name": "required_input_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "blob",
+        "description": "Where the JSON text comes from: 'blob' reads the payload store via blob_ref_field, 'field' reads text_field.",
+        "enum": [
+          "blob",
+          "field"
+        ],
+        "kind": "enum",
+        "label": "Source",
+        "name": "source",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Input field containing a payload-store content hash. Defaults to 'blob_ref'.",
+        "kind": "text",
+        "label": "Blob Ref Field",
+        "name": "blob_ref_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Input field containing the blob's normalized Content-Type, used to select the parse format. Defaults to 'blob_content_type'.",
+        "kind": "text",
+        "label": "Content Type Field",
+        "name": "content_type_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Input row field holding the text to parse, when source is 'field'. Defaults to 'content'.",
+        "kind": "text",
+        "label": "Text Field",
+        "name": "text_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Parse format. Required when source is 'field'. When source is 'blob' and this is omitted, the format is inferred fail-closed from the blob's stored content type.",
+        "enum": [
+          "json",
+          "jsonl"
+        ],
+        "kind": "enum",
+        "label": "Format",
+        "name": "format",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional top-level object key containing the array of records. Omitted means the document's top level is the array.",
+        "kind": "text",
+        "label": "Data Key",
+        "name": "data_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Record keys this transform emits as row fields, each typed 'any'. Required: JSON records carry no header row, so nothing else can tell downstream validation which fields the emitted rows will have.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Fields",
+        "name": "fields",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional mapping from normalized JSON record keys to final pipeline field names.",
+        "kind": "json-object",
+        "label": "Field Mapping",
+        "name": "field_mapping",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "utf-8",
+        "description": "Encoding used to decode the JSON blob.",
+        "kind": "text",
+        "label": "Encoding",
+        "name": "encoding",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": true,
+        "description": "Whether to emit the record index within the parsed JSON document.",
+        "kind": "checkbox",
+        "label": "Include Record Index",
+        "name": "include_record_index",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "json_record_index",
+        "description": "Output field receiving the zero-based JSON record index.",
+        "kind": "text",
+        "label": "Record Index Field",
+        "name": "record_index_field",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 100000,
+        "description": "Maximum rows emitted for one input document.",
+        "kind": "number-int",
+        "label": "Max Output Rows",
+        "name": "max_output_rows",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 104857600,
+        "description": "Maximum payload size accepted from the blob store. Applies to source='blob' only \u2014 a source='field' document is already resident in the row, so max_output_rows is its bound.",
+        "kind": "number-int",
+        "label": "Max Blob Bytes",
+        "name": "max_blob_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      }
+    ]
+  },
+  "plugin_kind": "transform",
+  "plugin_name": "blob_json_expand"
+}

@@ -1,0 +1,15 @@
+title: "ELSPETH – Implementation RAID register"
+author: "John Morrissey"
+date: "7 September 2026"
+version: "1.0.0"
+status: "DRAFT"
+compact-control: true
+running-title: "Implementation RAID register"
+doc-id: "ELS-RAID"
+document-category: "Delivery control"
+document-type: "RAID register"
+classification: "OFFICIAL"
+revisions:
+  - version: "1.0.0"
+    date: "7 September 2026"
+    changes: "Draft."

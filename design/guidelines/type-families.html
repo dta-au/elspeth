@@ -1,0 +1,30 @@
+<!-- @dsCard group="Type" viewport="700x180" name="Typefaces" subtitle="Inter for UI · JetBrains Mono for the audit/forensic register" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 16px; background: var(--color-bg); font-family: var(--font-sans); display: flex; gap: 12px; }
+  .col { flex: 1; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 14px 16px; }
+  .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--color-text-muted); font-weight: 600; }
+  .big { font-size: 30px; color: var(--color-text); margin: 8px 0 4px; }
+  .specimen { color: var(--color-text-secondary); font-size: 13px; }
+  .meta { font-family: var(--font-mono); font-size: 10px; color: var(--color-text-muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+  <div class="col">
+    <div class="lbl">Body / UI</div>
+    <div class="big" style="font-family:var(--font-sans)">Inter</div>
+    <div class="specimen" style="font-family:var(--font-sans)">Validate, then run. Every edge is named.</div>
+    <div class="meta">400 · 500 · 600 · 700</div>
+  </div>
+  <div class="col">
+    <div class="lbl">Audit / forensic</div>
+    <div class="big" style="font-family:var(--font-mono)">JetBrains Mono</div>
+    <div class="specimen" style="font-family:var(--font-mono)">sha256:9f2c… token_4821 completed</div>
+    <div class="meta">wordmark · code · YAML · hashes · badges</div>
+  </div>
+</body>
+</html>

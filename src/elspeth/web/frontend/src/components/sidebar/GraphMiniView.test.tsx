@@ -21,6 +21,7 @@ describe("GraphMiniView", () => {
         edges: [],
         outputs: [{ name: "out-1", plugin: "stdout", options: {} } as never],
       } as never,
+      compositionStateLoaded: true,
       selectedNodeId: null,
     } as never);
   });
@@ -32,10 +33,41 @@ describe("GraphMiniView", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders an empty state when no composition exists", () => {
-    useSessionStore.setState({ compositionState: null } as never);
+  it("renders an empty state when no composition exists and the load has settled", () => {
+    useSessionStore.setState({
+      compositionState: null,
+      compositionStateLoaded: true,
+    } as never);
     render(<GraphMiniView />);
     expect(screen.getByText(/no pipeline yet/i)).toBeInTheDocument();
+  });
+
+  // R2-F5 (elspeth-139a345050): an in-flight session fetch and a genuinely
+  // empty pipeline both present as `compositionState === null` — without a
+  // loading discriminator the mini view claimed "No pipeline yet" while the
+  // session was still loading, which read as a false defect during
+  // acceptance review.
+  it("renders a loading state instead of the empty state while the session load is in flight", () => {
+    useSessionStore.setState({
+      compositionState: null,
+      compositionStateLoaded: false,
+    } as never);
+    render(<GraphMiniView />);
+    expect(screen.getByText(/loading pipeline/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no pipeline yet/i)).not.toBeInTheDocument();
+  });
+
+  // The SharedInspectView path supplies a frozen snapshot via
+  // compositionStateOverride and never subscribes to session-load state —
+  // an unloaded store must not leak "Loading pipeline…" onto that surface.
+  it("ignores the store's loading state when a compositionStateOverride is supplied", () => {
+    useSessionStore.setState({
+      compositionState: null,
+      compositionStateLoaded: false,
+    } as never);
+    render(<GraphMiniView compositionStateOverride={null} />);
+    expect(screen.getByText(/no pipeline yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/loading pipeline/i)).not.toBeInTheDocument();
   });
 
   it("dispatches OPEN_GRAPH_MODAL_EVENT when clicked", () => {

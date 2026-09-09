@@ -128,9 +128,35 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4d34e4ed27a76ddf"
+    source_file_hash: str | None = "sha256:5be275066a3063c5"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use to compare baseline and comparison cohorts that coexist in the same flushed window, producing "
+        "numeric or categorical distribution-difference summaries."
+    )
+    usage_when_not_to_use: str = (
+        "Not for historical drift detection: it does not retain history, does not compute p-values, does not "
+        "apply an alert threshold, and does not provide cross-run monitoring."
+    )
+    example_use: str = """aggregations:
+  - name: score_drift
+    plugin: batch_drift_compare
+    input: cohort_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      cohort_field: cohort
+      value_field: score
+      value_type: numeric
+      baseline_cohort: baseline
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "drift", "comparison")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

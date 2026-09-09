@@ -104,10 +104,484 @@ where the architectural fix landed:
   multiple producers without a queue"). Pinned by
   ``TestComposerRuntimeQueueAgreement`` with a manual negative control proving
   the queue-free topology still reproduces the runtime rejection.
+* Shape 12 — queue-to-coalesce consumer accounting
+  (``elspeth-3f4e63900f``). Runtime connection registration treats only mapped
+  coalesce branches (branch name differs from input connection) as ordinary
+  consumers; list-form/identity branches are direct gate-to-coalesce COPY
+  edges. Composer previously omitted mapped branches from duplicate-consumer
+  accounting and inferred queue liveness from the coalesce node's first
+  compatibility ``input`` field. Pinned in both directions by
+  ``TestComposerRuntimeQueueAgreement``.
+* Shape 13 — row_union YAML import/export agreement. Composer import preserves
+  both branch forms and structural timeout, export emits the runtime-only
+  ``row_unions`` shape without a synthetic input, and regenerated settings
+  rebuild the same production graph as the shipped A/B example. Pinned by
+  ``TestComposerRuntimeRowUnionAgreement``.
+* Shape 14 — queue effective-guarantee propagation (battery-2026-08-04 g08,
+  ``elspeth-5a372d3267``). A queue node carried a hardcoded observed/no-fields
+  schema and ``walk_effective_guarantee_vote`` stopped there, so a
+  source-guaranteed field never reached a queue consumer's
+  ``required_input_fields`` check: runtime graph build rejected the runnable
+  source → queue → consumer topology with ``GraphValidationError``
+  "guarantees: (none - dynamic schema)" while composer Stage-1 abstained with
+  a medium warning (validate green / runtime red at the /validate boundary).
+  Fixed in ``core/dag/guarantees.py``: the walk now propagates through QUEUE
+  nodes — intersection of arm guarantees when every arm participates, total
+  abstention when any arm abstains (fan-in soundness; ``compose_propagation``'s
+  abstainer-skip applies only to same-row pass-throughs). The composer Stage-1
+  preview walker mirrors the same fan-in vote (elspeth-3619b8774f), so both
+  surfaces accept AND reject identically — composer-level pinning in
+  ``tests/unit/web/composer/test_state.py::TestCompositionStateQueueGuaranteePropagation``,
+  engine-level in ``tests/unit/core/test_dag_queue_guarantee_propagation.py``;
+  this suite pins the cross-surface agreement via
+  ``TestComposerRuntimeQueueGuaranteeAgreement``.
+* Shape 15 — row_union locked-input extras (battery-2026-08-04 g02b, run
+  ``f6bbca45``, ``elspeth-9d13900064``). The composer's Rule A/Rule B extras
+  checks were skipped whenever the producer walk-back hit a row_union
+  (medium-warning abstention), so llm x2 → row_union → fixed-mode consumer
+  validated green and failed at the executor input preflight with
+  ``PluginContractViolation`` (``extra_forbidden`` on the llm provenance
+  side-fields). Fixed in ``web/composer/state.py`` by a dedicated
+  extras-polarity walker (union of arm emit sets — a lower bound: sound to
+  error on, never to clear with); presence-direction abstention untouched.
+  The runtime half of this shape is the executor-level per-row input
+  validation, not a graph-build check, so the pin lives at the composer unit
+  layer: ``tests/unit/web/composer/test_state.py::TestCompositionStateRowUnion``
+  (7 tests incl. the ticket's literal graph and the Rule B gate→sink
+  topology), per the Shape 6 precedent for coverage housed outside this file.
+* Shape 16 — pending-review handoff announce truncation (battery-2026-08-04
+  g08, ``elspeth-5a372d3267``). ``review_interpretations`` fails the strict
+  ledger at canonical index 10 asserting ``completion_ready=True``, stamping
+  every later stage — ``graph_structure`` at 21 included —
+  ``SKIPPED_AFTER_FAILURE``; the composer then announced "ready for the
+  required review" from that truncated result. Fixed in
+  ``web/composer/service.py``: announce sites verify the handoff with an
+  authoring-masked re-validation (``allow_pending_interpretation_placeholders``,
+  previously zero production callers) and qualify the published message when
+  it is red; the self-repair loop is deliberately not engaged (staged-review
+  no-extra-turns contract). Pinned at the unit layer:
+  ``tests/unit/web/composer/test_runtime_preflight_pending_review_verification.py``,
+  per the Shape 4 precedent that this suite carries no LLM-loop scaffolding.
+
+* Shape 17 — transform output-field collision with an already-present row field
+  (battery-2026-08-05 round 3, graph g05, run
+  ``adf0b6c6-bdcb-4e29-ba23-b953bae5366c``, ``elspeth-cfcd333f83``). A text
+  source emitting ``headline`` fed an llm node authored with
+  ``response_field: headline`` — the obvious authoring for a rewrite-in-place
+  transform. Compose succeeded, ``POST /validate`` returned ``is_valid=true``,
+  and the run died on row 1 with ``PluginContractViolation`` "would overwrite
+  existing input fields ['headline']" from
+  ``TransformExecutor._run_preflight`` — an error the engine's own message
+  calls a *pipeline configuration error*.
+
+  Root cause was an information gap, not a missing predicate: ``NodeInfo``
+  carried ``declared_required_fields`` (sinks) but nothing for transform
+  outputs, and ``core/dag/builder.py`` read ``transform.declared_output_fields``
+  for a self-consistency check and then discarded it, so the build-time surface
+  structurally could not see what the executor enforced per row. Closed on both
+  surfaces: ``core/dag/schema_validation.py::validate_transform_output_field_collisions``
+  (runtime graph, the output-side twin of ``validate_sink_required_fields``,
+  reached by both ``elspeth run`` and ``POST /validate`` because
+  ``build_execution_graph`` ends by calling ``validate_edge_compatibility``),
+  and Rule D in ``web/composer/state.py::_check_schema_contracts`` (authoring).
+
+  The fork the ticket posed — legalise the overwrite, or reject at compose — is
+  answered by rejection: ``contracts/field_collision.py`` states the no-silent-
+  overwrite policy ("silent overwrites are data loss") for a lineage system, and
+  rewrite-in-place is doubly blocked because the transform must also READ the
+  field it rewrites (see ``elspeth-39118dd24f``). Rewrite-in-place is simply not
+  an expressible shape today; first-class support would be an explicit opt-in
+  feature, not this fix.
+
+  Two coverage boundaries are DELIBERATELY left open and are part of this shape
+  rather than separate defects, because closing either means changing fan-in
+  guarantee/emit semantics:
+    - ROW_UNION upstream: composer Rule D rejects, the graph check abstains
+      (``walk_effective_guarantee_vote`` has no ROW_UNION branch). Runtime
+      under-rejects, so it is sound; the composer is the stronger surface.
+    - QUEUE upstream: the graph check rejects (correctly — the walk propagates
+      through QUEUE as the intersection of arm votes, Shape 14), composer Rule D
+      abstains. The authoring loop therefore gets no repair signal and the
+      failure lands at deploy/preflight rather than in the compose turn.
+
+  Pinned at the unit layer per the Shape 6 / Shape 15 precedent that this suite
+  carries no LLM-loop scaffolding: ``tests/unit/core/dag/test_graph_validation.py``
+  (``TestTransformOutputFieldCollisions``, incl. the DIVERT-only and
+  string-mode negative controls), ``tests/unit/core/dag/test_builder_validation.py``
+  (``TestTransformOutputFieldCollisionRejectedAtBuild`` — the ticket's literal
+  g05 topology through the real ``text`` source and real ``llm`` plugin), and
+  ``tests/unit/web/composer/test_state.py`` for Rule D.
+
+  Bug verification protocol, performed 2026-08-05 and recorded verbatim as this
+  file requires:
+    - Neutering the body of ``validate_transform_output_field_collisions``
+      (inserting ``return`` before its node loop) failed 5 tests:
+      ``test_reached_through_validate_edge_compatibility``,
+      ``test_multi_hop_guarantee_through_pass_through_transform_is_rejected``,
+      ``test_live_edge_alongside_divert_edge_is_still_rejected``,
+      ``test_upstream_guaranteed_field_is_rejected``, and
+      ``test_response_field_reusing_source_column_is_rejected``, each with
+      ``Failed: DID NOT RAISE <class 'elspeth.core.dag.models.GraphValidationError'>``.
+    - Neutering only the CALL SITE in ``validate_edge_compatibility`` failed 2
+      of those 5 — the two that go through the public entry point — confirming
+      the other three exercise the validator directly.
+    - Deleting the ``mode == RoutingMode.DIVERT`` skip in ``_live_predecessors``
+      failed ``test_divert_only_predecessor_is_not_rejected`` and
+      ``test_divert_mode_stored_as_plain_string_is_still_skipped``. The skip is
+      pinned.
+
+      METHOD NOTE, because a first pass got this wrong and the wrong answer is
+      the seductive one: the identical string
+      ``if edge_data["mode"] == RoutingMode.DIVERT:`` appears THREE times in
+      this module (``validate_edge_compatibility``'s edge loop,
+      ``get_effective_producer_schema_config``, and ``_live_predecessors``). A
+      naive first-occurrence substitution patches the edge loop and reports
+      "nothing failed", which reads as a coverage hole in ``_live_predecessors``
+      and is not one — the skip IS pinned. When mutating a line for this
+      protocol, assert the match is unique before editing and fail closed if it
+      is not; a mutation applied to the wrong site produces a confident,
+      completely wrong coverage claim.
+
+    - Flipping that same comparison from ``==`` to ``is`` failed exactly one
+      test, ``test_divert_mode_stored_as_plain_string_is_still_skipped``.
+      ``RoutingMode`` is a ``StrEnum`` and ``add_edge`` stores ``mode``
+      uncoerced, so an edge carrying the plain string ``"divert"`` compares
+      equal but is not identical; identity would treat it as live and reject a
+      runnable pipeline.
+
+      Reachability, stated so the guard is not over-read: every DIVERT edge
+      ``build_execution_graph`` creates targets a SINK (source quarantine,
+      transform/gate ``on_error``, sink failsink), and a transform's
+      ``on_error`` is rejected unless it names a sink (builder.py:1139). A
+      TRANSFORM therefore cannot be a divert target on today's production path,
+      so this filter is defence-in-depth for the public ``add_edge`` surface
+      rather than a guard on a live route.
+
+* Shape 18 — union-coalesce shared-field type compatibility (battery-2026-08-07
+  round 6, graph g03, session ``5190564b-abcc-450a-9a65-225411b3ce66``, pin
+  ``69c6ad4b5``, ``elspeth-85f3cc3022``). The composer authored a fork/coalesce
+  whose two branches declared ``price`` as ``int`` and ``str`` and merged them
+  with ``merge: union``. Stage 1 returned ``is_valid=True``, so ``set_pipeline``
+  reported the mutation clean; the DAG build rejected it with
+  ``GraphValidationError`` "receives incompatible types for field 'price' in
+  union merge". Validate green / runtime red, and the compose loop had no
+  signal to repair from: it stopped in the skill's pending-review terminal
+  state believing it was done. The ticket's proposed fix ("preview before
+  declaring done") treated the symptom — nothing in the mutation envelope gave
+  the model a reason to preview.
+
+  This was a missing member of an existing mirror family, not a new class:
+  ``state.py`` already mirrored the coalesce observed/explicit MODE rule
+  (``coalesce_schema_mode_mixed``) and the row_union TYPE rule
+  (``row_union_schema_incompatible``); union coalesce had the mode mirror but
+  never got the type mirror. Closed in
+  ``web/composer/state.py::validate`` by reusing the canonical shared algorithm
+  ``contracts/union_merge.py::merge_union_field_flags`` — the same function the
+  runtime reaches through ``merge_coalesce_schema`` — rather than
+  re-implementing type comparison, so the two surfaces cannot drift on the
+  rule. Emits ``coalesce_union_type_incompatible``. The mode entry short-
+  circuits the type check because the runtime raises the mode conflict first.
+
+  Parity is exact for every coalesce that REACHES the check, verified across a
+  9-case matrix (fixed/flexible/observed against conflicting/identical/``any``/
+  disjoint): Stage 1 and the runtime graph build agree on all nine. Two known
+  boundaries keep that from being a claim about the whole rule, and both are
+  permissive (they miss a rejection; neither blocks a runnable pipeline):
+    - ``merge=None``. CLOSED FOR NODESPEC-CONSTRUCTED STATE by ``aa963bafe``
+      (``elspeth-11334b382c``); the injected-``state_dict`` route remains open
+      (``elspeth-5581fcb76f``). Both union mirrors gate on ``merge != "union"``
+      (``state.py``) while ``CoalesceSettings.merge`` DEFAULTS to ``"union"``
+      (``core/config.py``), so a coalesce that left merge unset was skipped by
+      BOTH the mode mirror and the type mirror while the runtime enforced each
+      as a union. ``NodeSpec.__post_init__`` now normalises it at the one
+      construction boundary ``from_dict``, ``upsert_node``, ``set_pipeline``
+      and ``replace`` all route through, so a third union rule cannot inherit
+      the hole. It DEFAULTS the field rather than requiring it: the runtime
+      accepts an unset merge, so rejecting here would be the opposite
+      divergence.
+
+      THE REACHABILITY ARGUMENT THIS ENTRY ORIGINALLY CARRIED WAS FALSE, and
+      naming that is the point of amending rather than deleting it. The claim
+      — "``yaml_generator`` always emits the key, so ``None`` becomes
+      ``merge: null`` and pydantic rejects" — was disproved by execution:
+      ``to_dict`` writes ``merge`` CONDITIONALLY (``state.py:4374``) so the key
+      is ABSENT, and ``yaml_generator.py:290`` reads ``c["merge"]``
+      unconditionally, raising ``KeyError`` — an internal crash on the
+      ``preview_pipeline -> runtime_preflight -> validate_pipeline ->
+      generate_yaml`` path, never a pydantic error and never a repair signal a
+      model could act on. That wrong argument is why ``af62478df`` shipped with
+      the gap ``aa963bafe`` had to close. A PERMISSIVE finding that is ALSO
+      load-bearing for an unreachability argument gets neither half
+      scrutinised: one half removes the incentive to test it, the other
+      supplies a reason not to. Retiring a finding on reachability therefore
+      requires an EXECUTED check, not a code reading.
+    - ALL-OBSERVED branches. ``merge_union_fields`` early-returns observed mode
+      without a type check, and Stage 1 abstains by the same rule, so two
+      observed branches whose INFERRED types diverge reach the coalesce
+      executor and fail there with ``ContractMergeError`` ("Cannot merge
+      contracts"). That is data-dependent, so no static surface can close it;
+      it is deliberately NOT routed to this shape's error code, because the
+      repair ("your rows carry mixed types") is not this code's repair
+      ("declare the same type on every branch").
+
+  Two results are counterintuitive and are pinned deliberately:
+    - ``any`` is NOT a wildcard here. ``price: any`` against ``price: int``
+      conflicts, because ``merge_union_field_flags`` compares type keys with
+      ``!=`` on opaque hashables. This differs from
+      ``row_union_schema_configs_compatible``, which DOES treat ``any`` as a
+      wildcard for flexible row_union branches — the two node kinds genuinely
+      have different rules and the mirrors must not be cross-copied.
+    - A branch that never declares the shared field can still conflict, because
+      a plugin adds its own output fields to the computed schema (e.g.
+      ``value_transform`` adds an operation target as ``any``). Stage 1 sees
+      this because ``_known_producer_schema_config`` probes the plugin for its
+      COMPUTED output schema, exactly as the DAG builder does — which is why
+      the mirror can be exact instead of authored-schema-only.
+
+  Pinned by ``TestComposerRuntimeCoalesceUnionTypeAgreement`` here, with
+  composer-level coverage in ``tests/unit/web/composer/test_state.py``
+  (``TestSchemaContractValidation``: rejection, compatible-types negative
+  control, unresolved-branch abstention, mode-mixed precedence, and nested-merge
+  exemption).
+
+* Shape 19 — a producer's GUARANTEE channel against a locked consumer, most
+  visibly at a union coalesce (``elspeth-1451ff385f`` for the runtime half,
+  ``elspeth-ae83a6b60c`` for the composer half; both filed off the same
+  composer audit). A fork gate fed a
+  pass-through transform on each branch, each declaring only the field it
+  rewrites, merging at ``merge: union`` into a ``mode: fixed`` sink admitting
+  that one field. The build was GREEN and every row died at the sink's input
+  preflight.
+
+  Root cause is a decoupling that is correct by design and was simply never
+  checked on one of its two channels. ``check_compatibility`` compares schema
+  against schema and never reads ``guaranteed_fields``; ``validate_single_edge``
+  mirrored composer Rule A only on its two bypass paths (dynamic producer,
+  observed producer), so an edge whose producer has real ``model_fields`` took
+  the ``check_compatibility`` path and its guarantees went unexamined. A union
+  coalesce is exactly that shape: the builder types its ``fields`` from each
+  branch's CONSTRUCTION-time schema but walks its ``guaranteed_fields``
+  separately (``elspeth-0b14977817``), so the merged schema guaranteed
+  category/id/price/product while declaring description alone. The two channels
+  are decoupled deliberately — ``fields`` is what the node typed,
+  ``guaranteed_fields`` is what the graph proves will be present, and the walk
+  yields names without types — so the fix checks the second channel rather than
+  collapsing it into the first. Closed in
+  ``core/dag/schema_validation.py::validate_typed_producer_guaranteed_extras``
+  (commit ``5d0c54522``), run as a final pass of ``validate_edge_compatibility``
+  so a graph tripping this AND a pre-existing check keeps reporting the
+  pre-existing error — the same ordering discipline Shape 17 cites. Raises
+  ``EdgeContractError`` carrying ``extra_fields``.
+
+  The rejection's REMEDIES needed a second pass (``df50ea3c3``) and that is
+  part of this shape, not an aside. Reporting extras alone proposed "insert a
+  field_mapper with select_only: true to drop the extras" — which for a sink
+  consumer can leave the sink still requiring a field nothing provides, a false
+  repair signal to an LLM authoring loop — so the raise site now accumulates
+  the sink required-fields verdict instead of pre-empting it. The advertised
+  repair "declare the extras on the consumer" USED to be incomplete on its
+  own — widening the SINK alone failed the same edge with "Missing fields",
+  because the coalesce types its ``fields`` from the branches — until
+  ``elspeth-7d68b04878`` made the missing arm guarantee-aware; the sink-only
+  widening now builds, trading build-time type checks on the widened fields
+  for per-row preflight checks. The repairs are pinned as executable controls
+  below, so the advice cannot rot.
+
+  A third pass (``48873f8dc``) was needed for SOUNDNESS, and it is the same
+  lesson as the scope note below. The check rests on "a guarantee means every
+  row WILL carry the field", which holds only for a guarantee about OUTPUT: a
+  REDUCTIVE producer's guarantee channel can describe what it CONSUMES
+  (``batch_stats`` declares ``value`` while emitting count/sum), so the pass
+  false-rejected a correct pipeline. The discriminator is the producer's own
+  EXTRAS FIREWALL — a producer whose output contract forbids extras emits
+  exactly its declared fields, so a guaranteed name outside that set provably
+  never reaches the consumer. Note where that discriminator already existed:
+  composer ``_producer_emit_profile`` had modelled ``extras_firewall`` all
+  along and the runtime did not mirror it. The population this check exists for
+  is precisely the extras-ALLOWING producer — a union coalesce's merged schema
+  is ``mode: flexible``, as is an under-declaring pass-through's. Found only by
+  the full ``pytest tests/``: the false reject lived in
+  ``tests/unit/core/test_dag.py``, a different file from ``tests/unit/core/dag/``,
+  so neither the DAG-scoped run nor the example sweep could reach it.
+
+  SCOPE, which the ticket, both candidate fixes and ``5d0c54522``'s own commit
+  message all got wrong, and which is therefore recorded here explicitly: the
+  RUNTIME defect is NOT coalesce-specific. The failing ingredient is only "a
+  producer whose guarantees exceed its own declared fields, feeding a locked
+  consumer", and any ``passes_through_input=True`` transform declaring a
+  narrower schema than it forwards has that shape. A plain three-node linear
+  pipeline reproduces it with no fork, no branches and no coalesce, verified by
+  A/B on that exact pipeline (``cf550d674``). The coalesce is merely where it
+  is most LIKELY, because the builder decouples the two channels structurally
+  there rather than leaving it to an author's under-declaration.
+
+  The COMPOSER gap had the OPPOSITE scope, and conflating the two would have
+  misdirected its fix. Stage 1 already rejected the linear shape via Rule B
+  (``sink_locked_extras``): ``_producer_emit_profile`` resolves a pass-through
+  transform and unions in its upstream definite arrivals. It abstained ONLY at a
+  coalesce, at three separate sites in ``web/composer/state.py`` — the
+  walk-back's unconditional coalesce stop (which, unlike its ``queue`` and
+  ``row_union`` siblings, never received a participation-vote escape hatch),
+  ``_producer_emit_profile`` having no coalesce branch, and
+  ``_connection_definite_emits`` returning the empty set for coalesce, a marked
+  extension point rather than an oversight. Measured, not inferred: the
+  identical graph with a ``row_union`` substituted for the coalesce DID report
+  ``locked_input_extras`` naming the same phantom set.
+
+  The composer half is now CLOSED (``elspeth-ae83a6b60c``), so this is a
+  first-category agreement shape rather than a runtime-only gap. All three
+  sites consult ONE new seam, ``_mirrored_coalesce_merged_guarantees``, which
+  returns the guarantee vote's existing
+  ``merge_guaranteed_fields`` merge — the same function the builder
+  stamps the coalesce with, so the two surfaces read one implementation instead
+  of two mirrors free to drift. Two scope decisions are load-bearing. The seam
+  was originally gated on ``merge == "union"``; it is now gated on
+  ``_MIRRORED_COALESCE_MERGES`` = {union, nested}, because the vote learned the
+  runtime's strategy dispatch and derives a nested merge's guarantees from
+  ``merge_coalesce_schema`` itself (branch names, required iff ``require_all``)
+  rather than misapplying the union math. ``select`` still abstains with the
+  "runtime validator will check this edge" advisory: it forwards ONE branch's
+  raw schema keyed by a ``select_branch`` a composer ``NodeSpec`` cannot carry,
+  so there is nothing to mirror. And the ticket's own prescription — compose the
+  emit set from the branches as ``_row_union_definite_emits`` does — was
+  REFUTED: a branch-emit union over-claims under non-``require_all`` policies
+  and over-predicts against the runtime gate under ``require_all``. The
+  guarantee channel, not the emit channel, is the mirror.
+  ``_producer_entry_row_union_boundary`` needed no coalesce sibling: a
+  participating union coalesce now resolves through the ordinary path, and an
+  abstaining one has an empty guarantee merge on the runtime side too.
+
+  Landing it also forced a latent recursion guard. The guarantee vote's
+  coalesce and row_union arms recursed on branch connections with no
+  visited-node set (only queues had one), and resolving a union coalesce at the
+  walk-back widened the trigger surface — a draft cycle through a barrier is a
+  ``RecursionError`` out of /validate, not a rejection. ``visited_queue_ids``
+  is now ``visited_fan_in_ids`` and all three fan-in kinds share it; ids are
+  unique across kinds, so the guard fires on cycles alone.
+
+  Pinned by ``TestComposerRuntimeCoalesceGuaranteedExtrasAgreement`` here (the
+  value-to-value cross-surface agreement, both repair controls, and the
+  no-coalesce scope boundary), with composer-layer coverage in
+  ``tests/unit/web/composer/test_state.py``
+  (``TestUnionCoalesceGuaranteeExtras``: per-site mutation isolation, the
+  ``require_all``/``best_effort`` discriminator, the nested/select scope gate,
+  and the cyclic-draft guard) and runtime-layer coverage in
+  ``tests/unit/core/dag/test_graph_validation.py``
+  (``TestUnionCoalesceGuaranteedExtras`` and ``TestTypedPassThroughGuaranteedExtras``).
+
+* Shape 20 — unset coalesce policy (validate RED / runtime GREEN, the INVERSE
+  divergence category; ``elspeth-deb2f5ed93``). ``CoalesceSettings.policy``
+  DEFAULTS to ``"require_all"`` (``core/config.py:963``) and the production
+  loader accepts a policy-less coalesce, while Stage 1 rejected the same state
+  with ``coalesce_missing_policy`` — the one violation in the 10-rule
+  required-field sweep against the placement rule (Stage 1 models the runtime's
+  treatment; it never invents one). Closed by extending
+  ``NodeSpec.__post_init__`` normalisation (the ``aa963bafe`` merge precedent)
+  to ``policy``, reading ``CoalesceSettings.model_fields["policy"].default`` so
+  the surfaces cannot drift, and RETIRING ``coalesce_missing_policy`` from the
+  emitted and closed-code vocabularies.
+
+  What is actually closed: the over-rejection for NodeSpec-constructed state;
+  the require_all-keyed Stage-1 consumers misreading ``None`` (the union-flag
+  and guarantee-merge call sites); the latent ``KeyError('policy')`` at
+  ``yaml_generator.py:289`` on the ``to_dict`` route. The injected
+  ``state_dict`` route bypasses ``NodeSpec`` and remains open, as for ``merge``
+  (``elspeth-5581fcb76f``).
+
+  NOT a menu-drift closure: the retired code's repair hint prescribed exactly
+  ``policy='require_all'`` — the runtime default — so the ticket's substitution
+  mechanism was refuted at source; the four-policy menu belongs to
+  ``coalesce_policy_invalid``, which still guards the closed vocabulary. No
+  advisory replaces the error: the normalised value is disclosed in the
+  exported YAML and the ``upsert_node`` tool schema, mirroring merge's
+  disclosure. Pinned by
+  ``TestComposerRuntimeCoalescePolicyDefaultAgreement``.
+* Shapes 21-25 — the 2026-08-17 CENSUS closures (``elspeth-2ed41f0a4a``).
+  Found by direct probing rather than by an eval: the panel review's census
+  named the unmirrored graph-build predicates and a probe run over each
+  (Stage 1 ``state.validate()`` vs the real Stage 2, with a type-agreeing /
+  valid control per shape) confirmed six live validate-green / runtime-red
+  predicates needing no special topology. Closed for NodeSpec-/OutputSpec-
+  constructed state; every closure is a Stage-1 mirror in
+  ``web/composer/state.py`` and each is pinned both-reject WITH its control
+  by the class named. The inflow is now gated: every raise site under
+  ``core/dag/`` and ``core/config.py`` carries a reviewed disposition in
+  ``config/cicd/runtime_rejection_parity.yaml``
+  (``tests/unit/scripts/cicd/test_runtime_rejection_parity_gate.py``).
+  - **Shape 21** — producer -> SINK field-type conflict (``csv(value: str)
+    -> sink(value: int)``). The node-consumer mirror (elspeth-f2eb8fef9f)
+    stopped at nodes; ``_edge_field_type_conflict`` now takes
+    ``NodeSpec | OutputSpec`` under the same typed-source gate. Pinned by
+    ``test_both_reject_sink_field_type_mismatch`` — the test that previously
+    PINNED the divergence, amended per ADR-040 §6.
+  - **Shape 22** — processing-node CYCLE (``t1.input=b, on_success=c; t2.input
+    =c, on_success=b``). Stage 1 had no cycle detection; every node of a
+    cycle passes the per-node reachability check. ``_node_topology_cycle``
+    mirrors ``ExecutionGraph.validate()``. Pinned by
+    ``TestComposerRuntimeCensusAgreement`` (diamond control in
+    ``test_state.py``).
+  - **Shape 23** — node id outside the runtime NAME rule (max 38, leading
+    letter, node-name character class, not a reserved edge label; queues
+    lowercase). Stage 1 mirrored these for SOURCE names only.
+    ``_composer_node_id_validation_message`` mirrors
+    ``validate_runtime_node_name``. Pinned by ``TestComposerRuntimeCensusAgreement``.
+  - **Shape 24** — coalesce menu items inside the runtime vocabulary that
+    cannot run as authored: ``merge: select`` (needs ``select_branch``) and
+    ``policy: quorum`` (needs ``quorum_count``) — neither field exists on
+    ``NodeSpec`` and the importer lists both unsupported, so they are rejected
+    outright as unauthorable; ``policy: best_effort`` without
+    ``timeout_seconds`` (which NodeSpec CAN carry) is a coupling check. The
+    advertised vocabulary in ``pipeline_capabilities.md`` and the repair hint
+    were narrowed to match. Pinned by ``TestComposerRuntimeCensusAgreement``
+    with all four runnable menu combinations as controls.
+  - **Shape 25** — a transform's explicit string-typed scan fields
+    (``keyword_filter`` ``fields``, document-intelligence ``source_field``)
+    against a typed SOURCE that declares one non-string
+    (``validate_transform_string_typed_input_fields``). Stage 1 reads
+    ``declared_string_input_fields`` off the same probe instance as
+    ``declared_input_fields`` and checks the typed-source producer only —
+    transform producers are a documented abstention (their runtime output
+    schema may be computed, not the raw block). Pinned by
+    ``TestComposerRuntimeCensusAgreement``.
+  - **Shape 26** — routing LABELS: every connection/route/branch label and
+    sink name the settings model validates (``_validate_connection_or_sink_name``,
+    ``validate_sink_name``: non-empty, <=64/38, character class, reserved
+    edge labels, ``__`` prefix, lowercase sinks). Stage 1 saw a bad label only
+    through the dangling-reference rules, which go silent when the bad label
+    is CONSISTENT on both ends; sink names were unvalidated on the freeform
+    path (elspeth-88a4db09f9). ``_routing_label_errors`` calls the runtime's
+    own validator per field so the wording is identical by construction.
+  - **Shape 27** — declarative ``Field(...)`` constraints, invisible to a raise
+    census: single-branch coalesce (``branches: min_length=2``) and the
+    collection caps (50 sources/sinks, 500 transforms, 100 gates/queues/
+    coalesce/row_unions/aggregations, 32 routes/fork_to). The parity scanner
+    now enumerates ``Field`` constraints as sites.
+  - **Shape 28** — ``fork_to: []`` (both surfaces: the settings model now
+    rejects it where the builder used to CRASH with a bare ``ValueError`` the
+    composer's graph phase does not catch), a node id equal to a sink/source
+    name (``validate_globally_unique_node_names``), a fork branch declared by
+    two gates when the branch names are sink names, and a coalesce branch
+    KEY no gate forks (the row_union twin already existed).
+  Still open from the same census, deliberately: an unreferenced sink is a
+  Stage-1 WARNING (state.py "W1"), because a sink is a passive target that
+  is routinely added before it is wired; the terminal Stage-2 gate and the
+  guided accept path catch it. Recorded as ``abstains`` in the parity baseline.
+  Ten sites remain ``unmirrored`` under the gate's ratchet
+  (elspeth-96e2dd023f).
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
 session/run id, the closing issue, and the test class that pins it.
+
+Amending on close (mandatory — ADR-040 §6): a fix that closes a shape must
+rewrite that shape's entry to record what is ACTUALLY closed, never a bare
+"closed". Name the construction paths the fix covers and the routes that
+remain open (e.g. "closed for NodeSpec-constructed state; the injected
+``state_dict`` route remains open"), and the test class that pins the
+closure. The same applies when a later change partially invalidates an
+entry: amend it in the commit that lands the change — a stale entry misreads
+as an open divergence, and Shape 18 was stale two ways before 97e2e3416.
+Shape 20 is the worked example of a closing amendment.
 
 Bug verification protocol (mandatory for new shapes):
 ``test_agreement_aggregation_run_counts_construct_completed_data`` (Shape 7)
@@ -150,6 +624,7 @@ from elspeth.contracts.secrets import (
     SecretInventoryItem,
     SecretUnavailabilityReason,
 )
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -161,6 +636,7 @@ from elspeth.core.config import (
     TriggerConfig,
 )
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
+from elspeth.core.dag.models import EdgeContractError
 from elspeth.core.landscape import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
@@ -193,6 +669,8 @@ from tests.fixtures.plugins import (
     ListSource,
     PassTransform,
 )
+
+_AGREEMENT_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class TestComposerRuntimeAgreement:
@@ -303,7 +781,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -402,7 +880,7 @@ class TestComposerRuntimeAgreement:
                     "column": "text",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -498,7 +976,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema_config": {"mode": "observed", "guaranteed_fields": ["text"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -594,7 +1072,7 @@ class TestComposerRuntimeAgreement:
                     "column": "class",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -693,7 +1171,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_output(
@@ -729,6 +1207,55 @@ class TestComposerRuntimeAgreement:
             graph.validate_edge_compatibility()
         assert "requires" in str(exc_info.value).lower()
 
+    def test_runtime_states_both_sink_verdicts_when_one_edge_violates_both_rules(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A doubly-violating sink edge must state BOTH verdicts, not whichever raises first.
+
+        The authored defect below is simultaneously a missing-required-field
+        AND an extra-undeclared-field violation, and the composer reports both.
+        The runtime raises from inside the per-edge loop, which aborts before
+        ``validate_sink_required_fields`` — called strictly after that loop —
+        ever runs. Reporting the extras half alone proposed dropping the extras
+        as the repair, which would leave the sink still requiring ``text`` that
+        nothing guarantees: a false repair signal to an LLM authoring loop
+        (elspeth-9615d6c75a).
+
+        This pins the MECHANISM — both verdicts present, and both field sets
+        populated on the structured error the composer preflight formatter
+        reads — deliberately NOT an ordering between the two checks. Ordering
+        is what accumulating the verdicts makes irrelevant.
+        """
+        text_path = tmp_path / "input.txt"
+        text_path.write_text("hello\n", encoding="utf-8")
+        output_path = tmp_path / "out.csv"
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            graph = self._build_runtime_graph(
+                source_plugin="text",
+                source_options={
+                    "path": str(text_path),
+                    "column": "line",
+                    "schema": {"mode": "observed"},
+                },
+                transform_plugin=None,
+                sink_options={
+                    "path": str(output_path),
+                    "schema": {"mode": "fixed", "fields": ["text: str"]},
+                },
+            )
+            graph.validate_edge_compatibility()
+
+        message = str(exc_info.value)
+        assert "requires fields ['text']" in message, "The missing-required-field verdict must survive the extras rejection."
+        assert "Extra fields rejected by consumer input contract: ['line']" in message, "The extras verdict must survive too."
+
+        error = exc_info.value
+        assert isinstance(error, EdgeContractError), "The combined verdict keeps the structured subclass the formatter reads."
+        assert error.compatibility_result.missing_fields == ("text",)
+        assert error.compatibility_result.extra_fields == ("line",)
+
     def test_both_reject_aggregation_nested_required_input_fields_without_upstream_guarantee(
         self,
         tmp_path: Path,
@@ -747,7 +1274,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["line: str"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -835,7 +1362,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["line: str"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -925,7 +1452,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1042,7 +1569,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["id: int", "value: int"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1077,6 +1604,11 @@ class TestComposerRuntimeAgreement:
                 branches=("path_a", "path_b"),
                 policy="best_effort",
                 merge="union",
+                # The runtime half below sets timeout_seconds=1; best_effort
+                # REQUIRES it (CoalesceSettings.validate_policy_requirements)
+                # and Stage 1 now mirrors that coupling (elspeth-2ed41f0a4a),
+                # so the composer half must author the same pipeline.
+                timeout_seconds=1,
             )
         )
         state = state.with_node(
@@ -1198,11 +1730,11 @@ class TestComposerRuntimeAgreement:
         graph = self._build_runtime_graph_from_settings(config)
         graph.validate_edge_compatibility()
 
-    def test_composer_warns_but_runtime_rejects_mixed_coalesce_branch_schemas(
+    def test_both_reject_mixed_coalesce_branch_schemas(
         self,
         tmp_path: Path,
     ) -> None:
-        """Coalesce merge semantics stay runtime-authoritative beyond composer preview."""
+        """Composer mirrors runtime rejection of mixed observed/explicit union branches."""
         csv_path = tmp_path / "input.csv"
         csv_path.write_text("id,value\n1,2\n", encoding="utf-8")
         output_path = tmp_path / "out.csv"
@@ -1216,7 +1748,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["id: int", "value: int"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1273,7 +1805,7 @@ class TestComposerRuntimeAgreement:
                 condition=None,
                 routes=None,
                 fork_to=None,
-                branches=("path_a", "path_b_done"),
+                branches={"path_a": "path_a", "path_b": "path_b_done"},
                 policy="require_all",
                 merge="union",
             )
@@ -1327,9 +1859,25 @@ class TestComposerRuntimeAgreement:
         )
 
         composer_result = state.validate()
-        assert composer_result.is_valid, composer_result.errors
-        assert any("coalesce node" in warning.message.lower() for warning in composer_result.warnings)
-        assert not any(contract.to_id == "output:main" for contract in composer_result.edge_contracts)
+        assert not composer_result.is_valid
+        composer_errors = [error for error in composer_result.errors if error.error_code == "coalesce_schema_mode_mixed"]
+        assert len(composer_errors) == 1, composer_result.errors
+        assert "observed" in composer_errors[0].message.lower()
+        assert "explicit" in composer_errors[0].message.lower()
+        # A contract row for the coalesce-fed sink is now EXPECTED: the
+        # guarantee walk resolves a union coalesce (elspeth-ae83a6b60c) rather
+        # than abstaining, so the row is COMPUTED from the branch votes, not
+        # fabricated. The mode-mixed rejection above is the verdict and is
+        # unaffected — the row is disclosure alongside it, and the pipeline is
+        # red either way.
+        #
+        # The alternative was considered and rejected: gating the walk-back
+        # escape on the branches not being mode-mixed (via
+        # ``_known_connection_schema_mode``) would suppress the row, at the cost
+        # of a second mode-mixed predicate in the guarantee walk, and buys no
+        # parity — ``coalesce_schema_mode_mixed`` already reds this pipeline.
+        contract = next(contract for contract in composer_result.edge_contracts if contract.to_id == "output:main")
+        assert contract.from_id == "merge_results"
 
         config = ElspethSettings(
             sources={
@@ -1399,11 +1947,25 @@ class TestComposerRuntimeAgreement:
         assert "observed" in message
         assert "explicit" in message
 
-    def test_composer_accepts_field_names_but_runtime_rejects_type_mismatch(
+    def test_both_reject_sink_field_type_mismatch(
         self,
         tmp_path: Path,
     ) -> None:
-        """Type compatibility remains runtime-only even when contract fields line up."""
+        """Shape 21 — a typed source into a sink declaring a conflicting field type is rejected by BOTH surfaces.
+
+        Until 2026-08-17 this test was named
+        ``test_composer_accepts_field_names_but_runtime_rejects_type_mismatch``
+        and PINNED the divergence ("type compatibility remains runtime-only"):
+        the node-consumer mirror (elspeth-f2eb8fef9f) had left the sink
+        consumer uncovered. Now ``_edge_field_type_conflict`` runs on the
+        producer -> sink edge under the same typed-source gate.
+
+        Bug verification protocol: revert the ``_producer_is_typed_source``-
+        gated call in the sink loop of ``_check_schema_contracts``
+        (``state.py``, "Field-TYPE conflict on the producer -> sink edge") and
+        this test fails at ``assert not composer_result.is_valid`` with
+        ``is_valid=True, errors=()`` — the exact pre-fix shape.
+        """
         csv_path = tmp_path / "input.csv"
         csv_path.write_text("value\nhello\n", encoding="utf-8")
         output_path = tmp_path / "out.csv"
@@ -1417,7 +1979,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["value: str"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_output(
@@ -1433,7 +1995,12 @@ class TestComposerRuntimeAgreement:
         )
 
         composer_result = state.validate()
-        assert composer_result.is_valid, composer_result.errors
+        assert not composer_result.is_valid
+        [type_error] = [e for e in composer_result.errors if e.error_code == "edge_field_type_incompatible"]
+        assert type_error.component == "output:main"
+        assert "value" in type_error.message
+        # Field NAMES still line up — the contract row is satisfied; only the
+        # TYPE direction is reported, and only once.
         sink_contract = next(contract for contract in composer_result.edge_contracts if contract.to_id == "output:main")
         assert sink_contract.satisfied is True
         assert sink_contract.producer_guarantees == ("value",)
@@ -1501,7 +2068,7 @@ class TestComposerRuntimeAgreement:
                         "fields": ["customer_tier: str", "amount: float"],
                     },
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1666,6 +2233,7 @@ class TestComposerRuntimeRouteTargetAgreement:
             state,
             TestComposerRuntimeRouteTargetAgreement._validation_settings(data_dir),
             composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
         )
         assert result.is_valid is False, "Composer should reject pipelines with dangling route targets"
         check_by_name = {check.name: check for check in result.checks}
@@ -1706,7 +2274,7 @@ class TestComposerRuntimeRouteTargetAgreement:
     @staticmethod
     def _csv_input(tmp_path: Path) -> Path:
         # Sources must live under data_dir/blobs/ for the path allowlist.
-        path = tmp_path / "blobs" / "input.csv"
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "input.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("value\n1\n", encoding="utf-8")
         return path
@@ -1714,7 +2282,7 @@ class TestComposerRuntimeRouteTargetAgreement:
     @staticmethod
     def _csv_output(tmp_path: Path, name: str = "out.csv") -> Path:
         # Sinks must live under data_dir/outputs/ (or blobs/) for the allowlist.
-        out_dir = tmp_path / "outputs"
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir / name
 
@@ -1855,7 +2423,12 @@ class TestComposerRuntimeRouteTargetAgreement:
             metadata=PipelineMetadata(),
             version=1,
         )
-        composer_result = validate_pipeline_for_trained_operator(state, self._validation_settings(tmp_path), composer_yaml_generator)
+        composer_result = validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
         assert composer_result.is_valid is False
         composer_messages = " | ".join(err.message for err in composer_result.errors)
         assert "missing_error_sink" in composer_messages
@@ -1982,7 +2555,12 @@ class TestComposerRuntimeRouteTargetAgreement:
             metadata=PipelineMetadata(),
             version=1,
         )
-        composer_result = validate_pipeline_for_trained_operator(state, self._validation_settings(tmp_path), composer_yaml_generator)
+        composer_result = validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
         assert composer_result.is_valid is False
         composer_messages = " | ".join(err.message for err in composer_result.errors)
         assert "missing_failsink" in composer_messages
@@ -2070,7 +2648,12 @@ class TestComposerRuntimeRouteTargetAgreement:
             metadata=PipelineMetadata(),
             version=1,
         )
-        composer_result = validate_pipeline_for_trained_operator(state, self._validation_settings(tmp_path), composer_yaml_generator)
+        composer_result = validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
         assert composer_result.is_valid is False
         composer_messages = " | ".join(err.message for err in composer_result.errors)
         assert "missing_route_sink" in composer_messages
@@ -2164,6 +2747,7 @@ class TestComposerRuntimeRouteTargetAgreement:
             state,
             self._validation_settings(tmp_path),
             composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
         )
         assert result.is_valid, "\n".join(err.message for err in result.errors)
         rt_check = next(c for c in result.checks if c.name == "route_target_resolution")
@@ -2322,8 +2906,8 @@ class TestComposerRuntimeSecretRefAgreement:
         # ``secret_refs`` predicate fires before the path check, but build a
         # legitimate source so the failure is unambiguously the credential
         # check rather than a parallel rejection.
-        blobs = tmp_path / "blobs"
-        blobs.mkdir()
+        blobs = tmp_path / "blobs" / _AGREEMENT_SESSION_ID
+        blobs.mkdir(parents=True)
         csv_path = blobs / "tickets.csv"
         csv_path.write_text("subject\nticket-1\n", encoding="utf-8")
 
@@ -2363,7 +2947,10 @@ class TestComposerRuntimeSecretRefAgreement:
                 OutputSpec(
                     name="main",
                     plugin="csv",
-                    options={"path": str(tmp_path / "outputs" / "out.csv"), "schema": {"mode": "observed"}},
+                    options={
+                        "path": str(tmp_path / "outputs" / _AGREEMENT_SESSION_ID / "out.csv"),
+                        "schema": {"mode": "observed"},
+                    },
                     on_write_failure="discard",
                 ),
             ),
@@ -2377,6 +2964,7 @@ class TestComposerRuntimeSecretRefAgreement:
             composer_yaml_generator,
             secret_service=_AgreementSecretService(),
             user_id="agreement-suite-user",
+            session_id=_AGREEMENT_SESSION_ID,
         )
 
         # The agreement gate: /validate must reject this shape so /execute
@@ -2990,7 +3578,7 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
 
     @staticmethod
     def _csv_input(tmp_path: Path) -> Path:
-        path = tmp_path / "blobs" / "input.csv"
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "input.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("ticket_id,customer_tier\n1,enterprise\n", encoding="utf-8")
         return path
@@ -3039,7 +3627,7 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
         # Pre-create the sink target. Runtime execution with fail_if_exists
         # must still reject this, but composer preflight must not observe
         # local filesystem collision state during plugin construction.
-        sink_path = tmp_path / "outputs" / "all.jsonl"
+        sink_path = tmp_path / "outputs" / _AGREEMENT_SESSION_ID / "all.jsonl"
         sink_path.parent.mkdir(parents=True, exist_ok=True)
         sink_path.write_text("", encoding="utf-8")  # any pre-existing content
         assert sink_path.exists()
@@ -3050,6 +3638,7 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
             state,
             self._validation_settings(tmp_path),
             composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
         )
 
         assert result.is_valid is True
@@ -3066,7 +3655,7 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
         firing on the actual fs-collision condition, not converting all
         plugin-init failures into the same shape."""
         csv_path = self._csv_input(tmp_path)
-        sink_path = tmp_path / "outputs" / "fresh.jsonl"
+        sink_path = tmp_path / "outputs" / _AGREEMENT_SESSION_ID / "fresh.jsonl"
         sink_path.parent.mkdir(parents=True, exist_ok=True)
         # Deliberately do NOT create the sink_path file.
         assert not sink_path.exists()
@@ -3076,6 +3665,7 @@ class TestComposerRuntimeFileSinkCollisionAgreement:
             state,
             self._validation_settings(tmp_path),
             composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
         )
 
         check_by_name = {check.name: check for check in result.checks}
@@ -3089,6 +3679,9 @@ class _RuntimeSettingsFake:
     data_dir: str
     payload_store_path: Path
     landscape_passphrase: str | None = None
+    # Secret wiring is deny-by-default (elspeth-f3c1aafd25); these tests
+    # exercise blob custody, not wired secrets.
+    secret_wiring_allowlist: tuple[Any, ...] = ()
 
     def get_landscape_url(self) -> str:
         return "sqlite:///:memory:"
@@ -3102,6 +3695,27 @@ class _RunSnapshot:
     session_id: UUID
     status: str = "running"
     error: str | None = None
+
+
+def _execute_lease(loop: asyncio.AbstractEventLoop, session_id: Any) -> Any:
+    """Mint the EXECUTE lease the /execute route transfers into _run_pipeline.
+
+    The recording authority mints exact contexts without a database; the
+    lease's renewal task lives on ``loop`` for the test's lifetime.
+    """
+    from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
+    from tests.helpers.session_fences import RecordingSessionOperationAuthority
+
+    return loop.run_until_complete(
+        SessionOperationLease.acquire(
+            RecordingSessionOperationAuthority(),
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id="test-execute-owner",
+            lease_seconds=60,
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -3129,6 +3743,7 @@ class _FakeSessionService:
         timestamp: datetime,
         event_type: str,
         data: dict[str, Any],
+        session_operation_context: Any = None,
     ) -> SimpleNamespace:
         self.next_event_sequence += 1
         self.appended_run_events.append(
@@ -3147,6 +3762,7 @@ class _FakeSessionService:
         run_id: UUID,
         resolutions: Any,
         attempt: int = 1,
+        session_operation_context: Any = None,
     ) -> None:
         if self.record_blob_inline_resolutions_hook is not None:
             await self.record_blob_inline_resolutions_hook(
@@ -3185,18 +3801,35 @@ class _FakeBlobService:
     get_blob_calls: list[UUID] = field(default_factory=list)
     finalize_run_output_blobs_calls: list[tuple[UUID, bool]] = field(default_factory=list)
 
-    async def link_blob_to_run(self, blob_id: UUID, run_id: UUID, direction: str) -> None:
+    async def link_blob_to_run(
+        self,
+        blob_id: UUID,
+        run_id: UUID,
+        direction: str,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        assert type(session_operation_context) is SessionOperationContext
         self.link_blob_to_run_calls.append((blob_id, run_id, direction))
 
-    async def read_blob_content(self, blob_id: UUID) -> bytes:
+    async def read_blob_content(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
+        assert type(session_operation_context) is SessionOperationContext
         self.read_blob_content_calls.append(blob_id)
         return self.content
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
+    async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+        assert type(session_operation_context) is SessionOperationContext
         self.get_blob_calls.append(blob_id)
         return self.blob_record
 
-    async def finalize_run_output_blobs(self, run_id: UUID, success: bool) -> BlobFinalizationResult:
+    async def finalize_run_output_blobs(
+        self,
+        run_id: UUID,
+        success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobFinalizationResult:
+        assert type(session_operation_context) is SessionOperationContext
         self.finalize_run_output_blobs_calls.append((run_id, success))
         return BlobFinalizationResult(finalized=(), errors=())
 
@@ -3244,8 +3877,8 @@ class TestComposerRuntimeBlobInlineAgreement:
 
     @staticmethod
     def _state_with_inline_prompt(tmp_path: Path, blob_id: UUID, sha256: str) -> CompositionState:
-        blobs_dir = tmp_path / "blobs"
-        outputs_dir = tmp_path / "outputs"
+        blobs_dir = tmp_path / "blobs" / _AGREEMENT_SESSION_ID
+        outputs_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
         blobs_dir.mkdir(parents=True, exist_ok=True)
         outputs_dir.mkdir(parents=True, exist_ok=True)
         return CompositionState(
@@ -3392,6 +4025,7 @@ sinks:
             self._validation_settings(tmp_path),
             composer_yaml_generator,
             blob_get_metadata=lambda _blob_id: None,
+            session_id=_AGREEMENT_SESSION_ID,
         )
 
         assert result.is_valid is False
@@ -3427,9 +4061,16 @@ sinks:
         cast(Any, service)._blob_service = blob_service
 
         try:
+            lease = _execute_lease(loop, _session_service.run.session_id)
             with pytest.raises(BlobIntegrityError):
-                service._run_pipeline(str(run_id), self._pipeline_yaml(blob_id, "b" * 64), threading.Event())
+                service._run_pipeline(
+                    str(run_id),
+                    self._pipeline_yaml(blob_id, "b" * 64),
+                    threading.Event(),
+                    session_operation_lease=lease,
+                )
         finally:
+            loop.run_until_complete(lease.close())
             loop.close()
 
         mock_load.assert_not_called()
@@ -3484,9 +4125,16 @@ sinks:
         mock_load.side_effect = stop_after_audit
 
         try:
+            lease = _execute_lease(loop, session_service.run.session_id)
             with pytest.raises(RuntimeError, match="stop after inline audit"):
-                service._run_pipeline(str(run_id), self._pipeline_yaml(blob_id, sha256), threading.Event())
+                service._run_pipeline(
+                    str(run_id),
+                    self._pipeline_yaml(blob_id, sha256),
+                    threading.Event(),
+                    session_operation_lease=lease,
+                )
         finally:
+            loop.run_until_complete(lease.close())
             loop.close()
 
         assert len(session_service.recorded_blob_inline_resolutions) == 1
@@ -3553,7 +4201,7 @@ class TestComposerRuntimeFixedModeImplicitRequiredAgreement:
                 plugin="csv",
                 on_success="t1",
                 options=source_options,
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             ),
         )
         state = state.with_node(
@@ -3816,7 +4464,7 @@ class TestComposerRuntimeFixedModeImplicitRequiredAgreement:
                     "column": "color",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -4138,6 +4786,16 @@ class TestComposerRuntimeQueueAgreement:
     ``GraphValidationError("Duplicate producer for connection 'inbound' ...")``,
     which the negative control below asserts directly by deleting the emitted
     ``queues:`` section.
+
+    Shape 12 is pinned on
+    ``web/composer/state._coalesce_mapped_branch_connections`` and its use in
+    connection/queue consumer accounting. Reverting those call sites to exclude
+    mapped branch claims and to count only ``node.input`` makes the mapped-only
+    test fail with ``queue_no_consumer``, the mapped-plus-ordinary test fail to
+    report ``duplicate_connection_consumer``, and the list-form test fail to
+    report ``queue_no_consumer``. Verified by manually reverting both call
+    sites on 2026-07-28; the three focused tests failed in exactly those ways,
+    then passed after restoration.
     """
 
     def _example_yaml(self) -> str:
@@ -4153,12 +4811,125 @@ class TestComposerRuntimeQueueAgreement:
             sinks=bundle.sinks,
             aggregations=bundle.aggregations,
             gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce),
             queues=settings.queues,
         )
 
+    def _queue_to_coalesce_yaml(self, *, branch_form: str, ordinary_consumer: bool = False) -> str:
+        import yaml
+
+        if branch_form == "mapping":
+            fork_to = ["queued_path", "other_path"]
+            transforms: list[dict[str, Any]] = [
+                {
+                    "name": "queued_leg",
+                    "plugin": "passthrough",
+                    "input": "queued_path",
+                    "on_success": "inbound",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+                {
+                    "name": "other_leg",
+                    "plugin": "passthrough",
+                    "input": "other_path",
+                    "on_success": "other_done",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+            ]
+            branches: list[str] | dict[str, str] = {
+                "other_path": "other_done",
+                "queued_path": "inbound",
+            }
+        elif branch_form == "list":
+            fork_to = ["inbound", "other_done"]
+            transforms = []
+            branches = ["inbound", "other_done"]
+        else:
+            raise AssertionError(f"unknown branch form: {branch_form}")
+
+        if ordinary_consumer:
+            transforms.append(
+                {
+                    "name": "duplicate_consumer",
+                    "plugin": "passthrough",
+                    "input": "inbound",
+                    "on_success": "duplicate_out",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                }
+            )
+
+        def source(path: str, on_success: str) -> dict[str, Any]:
+            return {
+                "plugin": "csv",
+                "on_success": on_success,
+                "options": {
+                    "path": path,
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            }
+
+        sinks: dict[str, Any] = {
+            "combined": {
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "options": {
+                    "path": "examples/multi_source_queue/output/combined.jsonl",
+                    "format": "jsonl",
+                    "collision_policy": "auto_increment",
+                    "schema": {"mode": "observed"},
+                },
+            }
+        }
+        if ordinary_consumer:
+            sinks["duplicate_out"] = {
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "options": {
+                    "path": "examples/multi_source_queue/output/duplicate.jsonl",
+                    "format": "jsonl",
+                    "collision_policy": "auto_increment",
+                    "schema": {"mode": "observed"},
+                },
+            }
+
+        doc = {
+            "sources": {
+                "orders": source("examples/multi_source_queue/input/orders.csv", "inbound"),
+                "refunds": source("examples/multi_source_queue/input/refunds.csv", "inbound"),
+                "fork_root": source("examples/multi_source_queue/input/orders.csv", "fork_input"),
+            },
+            "queues": {"inbound": {}},
+            "transforms": transforms,
+            "gates": [
+                {
+                    "name": "fork_rows",
+                    "input": "fork_input",
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "discard"},
+                    "fork_to": fork_to,
+                }
+            ],
+            "coalesce": [
+                {
+                    "name": "merged",
+                    "branches": branches,
+                    "policy": "require_all",
+                    "merge": "nested",
+                    "on_success": "combined",
+                }
+            ],
+            "sinks": sinks,
+            "landscape": {"url": "sqlite:///examples/multi_source_queue/runs/audit.db"},
+        }
+        return yaml.safe_dump(doc, sort_keys=False)
+
     def test_queue_round_trips_composer_import_export_and_runtime_graph(self) -> None:
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.contracts import NodeType
-        from elspeth.core.config import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._example_yaml())
@@ -4201,7 +4972,7 @@ class TestComposerRuntimeQueueAgreement:
         fan-in is exactly the topology the runtime rejects."""
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._example_yaml())
@@ -4219,3 +4990,2246 @@ class TestComposerRuntimeQueueAgreement:
         # duplicate producer; the runtime rejects this at graph build time.
         with pytest.raises(GraphValidationError, match="Duplicate producer for connection 'inbound'"):
             self._build_runtime_graph_for_settings(settings)
+
+    def test_mapped_coalesce_branch_into_a_multi_producer_queue_is_rejected_by_the_runtime(self) -> None:
+        """Runtime-rejects, Composer-abstains: a KNOWN, adjudicated parity gap, not agreement.
+
+        This fixture's queue 'inbound' has THREE producers: two ordinary,
+        unrelated sources (orders/refunds) plus the fork's own 'queued_path'
+        branch, whose output the 'merged' coalesce then reads as one of its
+        two required branches. Spec §7 rule 4's backward walk (WS2 Task 7)
+        now rejects this at build time: the two source->queue edges
+        originate outside the bound region the fork/coalesce pair opens, and
+        rule 4 has no queue exemption (maintainer ruling 2026-08-23,
+        deliberate — see below). Composer Stage 1 mirrors rule 4's
+        sink-inside limb only and deliberately ABSTAINS on the backward walk
+        (`config/cicd/runtime_rejection_parity.yaml` key `072048ad48f5a8fa`),
+        so it still reports this exact same YAML `is_valid: true` — this
+        test used to assert composer/runtime AGREEMENT on this shape; it no
+        longer holds, and the class name is otherwise still accurate for its
+        siblings. Pinning the runtime rejection (the load-bearing half) and
+        naming the composer-side gap explicitly is more honest than forcing
+        a false agreement claim.
+
+        Why the runtime rejection is correct to keep, not an over-strict
+        queue-exemption gap to add: the E1 review's residual-risk note
+        (WS2 controller ledger, 2026-08-23) flagged that a queue node
+        admitted inside a bound region could adopt a barrier prematurely and
+        settle SILENTLY rather than crash — precisely the failure class this
+        rejection forecloses by refusing to build the topology at all.
+        """
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.core.dag import GraphValidationError
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="mapping"))
+        composer_result = state.validate()
+        assert composer_result.is_valid, [e.message for e in composer_result.errors]
+
+        generated_yaml = composer_yaml_generator.generate_yaml(state)
+        settings = load_settings_from_yaml_string(generated_yaml)
+        with pytest.raises(GraphValidationError, match="originates outside the bound region"):
+            self._build_runtime_graph_for_settings(settings)
+
+    def test_single_producer_queue_inside_bound_region_round_trips_in_both_layers(self) -> None:
+        """Positive control (review F11): the shape the 2026-08-23 ruling does
+        NOT touch. A queue with exactly ONE producer — the fork branch
+        itself, no unrelated external source — round-trips green in both
+        layers, same as before the ruling. Only the MULTI-producer shape
+        (this class's other tests) is rejected; a legal in-region queue with
+        a single producer had no vehicle left in this class after the
+        rename/inversion above.
+        """
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        yaml_text = """
+sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: examples/multi_source_queue/input/orders.csv
+      schema: {mode: observed}
+      on_validation_failure: discard
+queues:
+  inbound: {}
+transforms:
+  - name: queued_leg
+    plugin: passthrough
+    input: queued_path
+    on_success: inbound
+    on_error: discard
+    options: {schema: {mode: observed}}
+  - name: other_leg
+    plugin: passthrough
+    input: other_path
+    on_success: other_done
+    on_error: discard
+    options: {schema: {mode: observed}}
+gates:
+  - name: fork_rows
+    input: fork_input
+    condition: "True"
+    routes: {'true': fork, 'false': discard}
+    fork_to: [queued_path, other_path]
+coalesce:
+  - name: merged
+    branches: {queued_path: inbound, other_path: other_done}
+    policy: require_all
+    merge: nested
+    on_success: combined
+sinks:
+  combined:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/multi_source_queue/output/combined.jsonl
+      format: jsonl
+      schema: {mode: observed}
+"""
+        state = composition_state_from_runtime_yaml(yaml_text)
+        composer_result = state.validate()
+        assert composer_result.is_valid, [e.message for e in composer_result.errors]
+
+        generated_yaml = composer_yaml_generator.generate_yaml(state)
+        settings = load_settings_from_yaml_string(generated_yaml)
+        graph = self._build_runtime_graph_for_settings(settings)
+        graph.validate()
+
+    def test_mapped_coalesce_and_ordinary_queue_consumers_are_rejected_in_both_layers(self) -> None:
+        """A mapped branch plus an ordinary node is forbidden queue fan-out."""
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="mapping", ordinary_consumer=True))
+        composer_result = state.validate()
+        assert any(error.error_code == "duplicate_connection_consumer" for error in composer_result.errors)
+
+        settings = load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
+        with pytest.raises(GraphValidationError, match="Duplicate consumers"):
+            self._build_runtime_graph_for_settings(settings)
+
+    def test_list_form_identity_branch_is_not_a_queue_consumer_in_either_layer(self) -> None:
+        """List-form branches are gate identity edges, not queue connection consumers."""
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="list"))
+        composer_result = state.validate()
+        assert any(error.error_code == "queue_no_consumer" for error in composer_result.errors)
+
+        settings = load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
+        with pytest.raises(GraphValidationError, match="queue 'inbound' with no downstream consumer"):
+            self._build_runtime_graph_for_settings(settings)
+
+
+class TestComposerRuntimeRowUnionAgreement:
+    """Shape 13 — shipped row_union YAML round-trips composer <-> runtime.
+
+    Bug-verification protocol: before the row_union lowering existed,
+    ``test_row_union_example_round_trips_semantics_and_runtime_graph`` failed
+    during Composer import with ``RuntimeYamlImportError: row_unions are not
+    supported by Composer import``. With importer support but the generator's
+    ``doc["row_unions"]`` assignment removed, the same test fails its
+    semantic-section equality because regenerated YAML has no ``row_unions``
+    key. Those are the exact production seams this class pins.
+    """
+
+    _SEMANTIC_SECTIONS = ("sources", "transforms", "gates", "row_unions", "aggregations", "sinks")
+
+    def _example_yaml(self) -> str:
+        example = Path(__file__).resolve().parents[3] / "examples" / "row_union_ab_experiment" / "settings.yaml"
+        return example.read_text(encoding="utf-8")
+
+    def _build_runtime_graph_for_settings(self, settings: ElspethSettings) -> ExecutionGraph:
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce) if settings.coalesce else None,
+            queues=settings.queues,
+            row_union_settings=list(settings.row_unions),
+        )
+
+    def _semantic_pipeline(self, doc: dict[str, Any]) -> dict[str, Any]:
+        return {section: doc[section] for section in self._SEMANTIC_SECTIONS if section in doc}
+
+    def _graph_signature(
+        self,
+        graph: ExecutionGraph,
+    ) -> tuple[dict[str, tuple[Any, ...]], set[tuple[str, str, str, str]]]:
+        nodes: dict[str, tuple[Any, ...]] = {
+            str(node.node_id): (
+                node.node_type,
+                node.plugin_name,
+                node.config,
+                node.input_schema_config,
+                node.output_schema_config,
+            )
+            for node in graph.get_nodes()
+        }
+        edges = {(str(edge.from_node), str(edge.to_node), edge.label, edge.mode.value) for edge in graph.get_edges()}
+        return nodes, edges
+
+    def test_row_union_example_round_trips_semantics_and_runtime_graph(self) -> None:
+        import yaml
+
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        original_yaml = self._example_yaml()
+        original_doc = yaml.safe_load(original_yaml)
+        state = composition_state_from_runtime_yaml(original_yaml)
+        composer_result = state.validate()
+        assert composer_result.is_valid, [error.message for error in composer_result.errors]
+
+        regenerated_yaml = composer_yaml_generator.generate_yaml(state)
+        regenerated_doc = yaml.safe_load(regenerated_yaml)
+        assert self._semantic_pipeline(regenerated_doc) == self._semantic_pipeline(original_doc)
+
+        original_settings = load_settings_from_yaml_string(original_yaml)
+        regenerated_settings = load_settings_from_yaml_string(regenerated_yaml)
+        assert regenerated_settings.row_unions == original_settings.row_unions
+
+        original_graph = self._build_runtime_graph_for_settings(original_settings)
+        regenerated_graph = self._build_runtime_graph_for_settings(regenerated_settings)
+        original_graph.validate()
+        regenerated_graph.validate()
+        assert self._graph_signature(regenerated_graph) == self._graph_signature(original_graph)
+
+    def test_regenerated_row_union_keeps_early_trigger_guard_actionable(self) -> None:
+        import yaml
+
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        state = composition_state_from_runtime_yaml(self._example_yaml())
+        regenerated_doc = yaml.safe_load(composer_yaml_generator.generate_yaml(state))
+        regenerated_doc["aggregations"][0]["trigger"] = {"count": 2}
+        invalid_yaml = yaml.safe_dump(regenerated_doc, sort_keys=False)
+
+        composer_state = composition_state_from_runtime_yaml(invalid_yaml)
+        composer_result = composer_state.validate()
+        composer_error = next(
+            error
+            for error in composer_result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "indivisible" in error.message
+        )
+        assert "count/timeout/condition trigger" in composer_error.message
+
+        settings = load_settings_from_yaml_string(invalid_yaml)
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph_for_settings(settings)
+
+        message = str(exc_info.value)
+        assert "downstream of row_union 'variant_union'" in message
+        assert "count/timeout/condition trigger" in message
+        assert "Use the implicit end_of_source trigger" in message
+
+    def test_transform_mode_branch_aggregation_is_rejected_by_both_layers(self) -> None:
+        """Composer mirrors the runtime branch-aggregation identity guard.
+
+        Bug-verification protocol: before the Composer backward branch walk,
+        ``CompositionState.validate()`` accepted this candidate while
+        ``_build_runtime_graph_for_settings`` raised ``GraphValidationError``
+        naming ``control_batch`` and its transform-mode row_id hazard.
+        """
+        import yaml
+
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = yaml.safe_load(self._example_yaml())
+        control = doc["transforms"].pop(0)
+        doc["aggregations"].insert(
+            0,
+            {
+                "name": "control_batch",
+                "plugin": "batch_replicate",
+                "input": control["input"],
+                "on_success": control["on_success"],
+                "on_error": "discard",
+                "trigger": {},
+                "output_mode": "transform",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "copies_field": "baseline_quality",
+                    "default_copies": 1,
+                    "include_copy_index": False,
+                },
+            },
+        )
+        invalid_yaml = yaml.safe_dump(doc, sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
+        composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_branch_aggregation_invalid")
+        assert "control_batch" in composer_error.message
+        # 2026-08-23 remedy enrichment (Task 9 ruling): the message no longer
+        # recommends output_mode: passthrough — rule 6 (ruling 25) bans
+        # aggregators inside every bound region regardless of mode, so that
+        # remedy would land the author straight in a NEW rejection.
+        assert "passthrough" not in composer_error.message
+        assert "banned inside every bound region" in composer_error.message
+
+        settings = load_settings_from_yaml_string(invalid_yaml)
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph_for_settings(settings)
+        assert "control_batch" in str(exc_info.value)
+        assert "row_id" in str(exc_info.value)
+
+    def test_nested_branch_fork_is_rejected_by_both_layers(self, tmp_path: Path) -> None:
+        """Composer mirrors the runtime nested-fork branch-identity guard.
+
+        Bug-verification protocol: before the Composer backward branch walk,
+        ``CompositionState.validate()`` accepted this candidate while
+        ``_build_runtime_graph_for_settings`` raised ``GraphValidationError``
+        naming ``nested_fork`` and ``variant_union``.
+        """
+        import yaml
+
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = yaml.safe_load(self._example_yaml())
+        doc["transforms"][0]["on_success"] = "control_staged"
+        doc["gates"].append(
+            {
+                "name": "nested_fork",
+                "input": "control_staged",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "control_scored"},
+                "fork_to": ["inner_left", "inner_right"],
+            }
+        )
+        for branch_name in ("inner_left", "inner_right"):
+            doc["sinks"][branch_name] = {
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "options": {
+                    "path": str(tmp_path / f"{branch_name}.jsonl"),
+                    "format": "jsonl",
+                    "schema": {"mode": "observed"},
+                },
+            }
+        invalid_yaml = yaml.safe_dump(doc, sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
+        composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_nested_fork_invalid")
+        assert "nested_fork" in composer_error.message
+        assert "variant_union" in composer_error.message
+
+        settings = load_settings_from_yaml_string(invalid_yaml)
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph_for_settings(settings)
+        assert "nested_fork" in str(exc_info.value)
+        assert "variant_union" in str(exc_info.value)
+
+    def test_invalid_row_union_name_is_rejected_by_both_layers(self) -> None:
+        """Composer mirrors the runtime RowUnionSettings name validators.
+
+        Bug-verification protocol: before the row_union name check in
+        ``CompositionState.validate()``, Composer imported and accepted
+        ``name: bad name`` while ``load_settings_from_yaml_string`` raised a
+        Pydantic ``ValidationError`` for the invalid identifier.
+        """
+        import yaml
+
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = yaml.safe_load(self._example_yaml())
+        doc["row_unions"][0]["name"] = "bad name"
+        invalid_yaml = yaml.safe_dump(doc, sort_keys=False)
+
+        composer_result = composition_state_from_runtime_yaml(invalid_yaml).validate()
+        composer_error = next(error for error in composer_result.errors if error.error_code == "row_union_name_invalid")
+        assert "bad name" in composer_error.message
+
+        with pytest.raises(ValidationError):
+            load_settings_from_yaml_string(invalid_yaml)
+
+
+class TestComposerRuntimeCoalesceUnionTypeAgreement:
+    """Shape 18 — a union coalesce's shared-field types agree on both surfaces.
+
+    Battery round-6 g03 (``elspeth-85f3cc3022``) in plugin-neutral form: a fork
+    gate feeds a transform on each branch, each declaring its own explicit
+    schema, and both branches merge at ``merge: union``. When the two branches
+    declare the same field with different types the runtime graph build rejects
+    it; before this shape closed, composer Stage 1 accepted it, so the mutation
+    envelope told the compose loop the pipeline was clean.
+
+    The positive control (identical declared types) must stay green on both
+    surfaces — the risk of mirroring a runtime rule into authoring is a mirror
+    that is STRICTER than the runtime, which would block runnable pipelines, a
+    strictly worse failure than the permissiveness it replaces.
+
+    Bug-verification protocol (mandatory per this file's header): the shape is
+    pinned on the ``UnionTypeConflictError`` handler around the
+    ``merge_union_field_flags`` call in ``web/composer/state.py::validate``'s
+    union-coalesce loop. Neutering that handler (swallowing the exception so no
+    entry is appended) restores the pre-fix behaviour and fails exactly two of
+    these three tests, both at their COMPOSER assertion while their runtime half
+    still raises — which is precisely the validate-green/runtime-red divergence
+    this shape records:
+      - ``test_both_reject_incompatible_shared_field_types`` fails with
+        ``assert not True`` where the summary is
+        ``ValidationSummary(is_valid=True, errors=(), …)``;
+      - ``test_both_reject_any_against_a_concrete_type`` fails with
+        ``assert False`` on the ``coalesce_union_type_incompatible`` search.
+    ``test_both_accept_compatible_shared_field_types`` still passes under the
+    mutation, as a positive control must. Verified by manual revert on
+    2026-08-07; restored. Per this file's METHOD NOTE the marker was asserted
+    unique before editing.
+    """
+
+    def _empty_state(self) -> CompositionState:
+        return CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _composer_state(
+        self,
+        *,
+        csv_path: Path,
+        output_path: Path,
+        label_schema: dict[str, Any],
+        price_schema: dict[str, Any],
+    ) -> CompositionState:
+        state = self._empty_state()
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="gate_in",
+                options={
+                    "path": str(csv_path),
+                    "schema": {"mode": "fixed", "fields": ["id: int", "price: int"]},
+                },
+                on_validation_failure="discard",
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_label", "branch_price"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        for node_id, branch_connection, done_connection, schema in (
+            ("t_label", "branch_label", "label_done", label_schema),
+            ("t_price", "branch_price", "price_done", price_schema),
+        ):
+            state = state.with_node(
+                NodeSpec(
+                    id=node_id,
+                    node_type="transform",
+                    plugin="value_transform",
+                    input=branch_connection,
+                    on_success=done_connection,
+                    on_error="discard",
+                    options={
+                        "schema": schema,
+                        "operations": [{"target": "price", "expression": "row['price']"}],
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+        state = state.with_node(
+            NodeSpec(
+                id="merge_results",
+                node_type="coalesce",
+                plugin=None,
+                input="label_done",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"branch_label": "label_done", "branch_price": "price_done"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": str(output_path), "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+        )
+        for edge_id, from_node, to_node, edge_type, label in (
+            ("e1", "source", "fork_gate", "on_success", None),
+            ("e2", "fork_gate", "t_label", "fork", "branch_label"),
+            ("e3", "fork_gate", "t_price", "fork", "branch_price"),
+            ("e4", "t_label", "merge_results", "on_success", None),
+            ("e5", "t_price", "merge_results", "on_success", None),
+        ):
+            state = state.with_edge(
+                EdgeSpec(
+                    id=edge_id,
+                    from_node=from_node,
+                    to_node=to_node,
+                    edge_type=edge_type,
+                    label=label,
+                )
+            )
+        return state
+
+    def _runtime_settings(
+        self,
+        *,
+        csv_path: Path,
+        output_path: Path,
+        label_schema: dict[str, Any],
+        price_schema: dict[str, Any],
+    ) -> ElspethSettings:
+        return ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="gate_in",
+                    options={
+                        "path": str(csv_path),
+                        "schema": {"mode": "fixed", "fields": ["id: int", "price: int"]},
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="t_label",
+                    plugin="value_transform",
+                    input="branch_label",
+                    on_success="label_done",
+                    on_error="discard",
+                    options={
+                        "schema": label_schema,
+                        "operations": [{"target": "price", "expression": "row['price']"}],
+                    },
+                ),
+                TransformSettings(
+                    name="t_price",
+                    plugin="value_transform",
+                    input="branch_price",
+                    on_success="price_done",
+                    on_error="discard",
+                    options={
+                        "schema": price_schema,
+                        "operations": [{"target": "price", "expression": "row['price']"}],
+                    },
+                ),
+            ],
+            gates=[
+                GateSettings(
+                    name="fork_gate",
+                    input="gate_in",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["branch_label", "branch_price"],
+                )
+            ],
+            coalesce=[
+                CoalesceSettings(
+                    name="merge_results",
+                    branches={"branch_label": "label_done", "branch_price": "price_done"},
+                    policy="require_all",
+                    merge="union",
+                    on_success="main",
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv",
+                    on_write_failure="discard",
+                    options={"path": str(output_path), "schema": {"mode": "observed"}},
+                )
+            },
+        )
+
+    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("id,price\n1,2\n", encoding="utf-8")
+        return csv_path, tmp_path / "out.csv"
+
+    def _build_runtime_graph_from_settings(self, config: ElspethSettings) -> ExecutionGraph:
+        plugins = instantiate_plugins_from_config(config)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=list(config.coalesce) if config.coalesce else None,
+        )
+
+    def test_both_reject_incompatible_shared_field_types(self, tmp_path: Path) -> None:
+        """The g03 shape: ``price`` declared ``int`` on one branch, ``str`` on the other."""
+        csv_path, output_path = self._paths(tmp_path)
+        label_schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        price_schema = {"mode": "fixed", "fields": ["id: int", "price: str"]}
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=label_schema,
+            price_schema=price_schema,
+        ).validate()
+
+        assert not composer_result.is_valid
+        entries = [error for error in composer_result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, composer_result.errors
+        assert entries[0].component == "node:merge_results"
+        assert "price" in entries[0].message
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            graph = self._build_runtime_graph_from_settings(
+                self._runtime_settings(
+                    csv_path=csv_path,
+                    output_path=output_path,
+                    label_schema=label_schema,
+                    price_schema=price_schema,
+                )
+            )
+            graph.validate_edge_compatibility()
+        message = str(exc_info.value).lower()
+        assert "incompatible" in message
+        assert "price" in message
+
+    def test_both_accept_compatible_shared_field_types(self, tmp_path: Path) -> None:
+        """Positive control: the mirror must not be stricter than the runtime."""
+        csv_path, output_path = self._paths(tmp_path)
+        schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=schema,
+            price_schema=schema,
+        ).validate()
+        assert composer_result.is_valid, composer_result.errors
+
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                label_schema=schema,
+                price_schema=schema,
+            )
+        )
+        graph.validate_edge_compatibility()
+
+    def test_both_reject_any_against_a_concrete_type(self, tmp_path: Path) -> None:
+        """``any`` is a declared type here, not a wildcard — unlike row_union.
+
+        ``row_union_schema_configs_compatible`` skips ``any`` on flexible
+        branches; ``merge_union_field_flags`` compares type keys with ``!=``.
+        The two node kinds have genuinely different rules, so this pins that
+        the coalesce mirror follows the coalesce rule.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+        label_schema = {"mode": "fixed", "fields": ["id: int", "price: any"]}
+        price_schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=label_schema,
+            price_schema=price_schema,
+        ).validate()
+        assert any(error.error_code == "coalesce_union_type_incompatible" for error in composer_result.errors)
+
+        with pytest.raises(GraphValidationError):
+            graph = self._build_runtime_graph_from_settings(
+                self._runtime_settings(
+                    csv_path=csv_path,
+                    output_path=output_path,
+                    label_schema=label_schema,
+                    price_schema=price_schema,
+                )
+            )
+            graph.validate_edge_compatibility()
+
+
+class TestComposerRuntimeCoalescePolicyDefaultAgreement:
+    """Shape 20 — an omitted coalesce policy means ``require_all`` on both surfaces.
+
+    The INVERSE of every other shape in this registry: the runtime was the
+    permissive surface and composer Stage 1 the over-strict one, rejecting a
+    policy-less coalesce with ``coalesce_missing_policy`` while
+    ``CoalesceSettings.policy`` defaults it to ``"require_all"`` and the
+    production loader runs it. Stage 1's job is to model the runtime's
+    treatment of an authored pipeline, so a rule that blocks a RUNNABLE
+    pipeline is worse than the permissiveness the mirrors usually replace.
+
+    The discriminating assertion is the STRIPPED yaml, not the composer's
+    normalised value: comparing that value against
+    ``CoalesceSettings.model_fields["policy"].default`` would be tautological,
+    since the normalisation reads the same introspection. Feeding the loader a
+    document with no ``policy`` key exercises pydantic's default APPLICATION,
+    which is the only half that catches "the runtime default changed and the
+    composer did not follow".
+
+    Bug-verification protocol (mandatory per this file's header): the shape is
+    pinned on the policy arm of ``NodeSpec.__post_init__`` in
+    ``web/composer/state.py``. The normalisation cannot be deleted line-by-line
+    (that leaves an empty ``if`` body), so per the Shape 14 precedent its
+    condition was mutated to ``if False:``. Per this file's METHOD NOTE the
+    marker was asserted unique first: the file holds two near-identical
+    normalisation conditions, one per coalesce field, and ``grep -c 'if
+    self.node_type == "coalesce" and self.policy is None:'`` returned exactly
+    1. Under that mutation ``test_both_accept_unset_policy_as_require_all``
+    fails at its COMPOSER half with ``AssertionError: assert False`` on
+    ``composer_result.is_valid``, the summary carrying
+    ``ValidationEntry(component='node:merge_results', message="Coalesce
+    'merge_results' policy None is not a valid policy. …",
+    error_code='coalesce_policy_invalid')``. That code, rather than the retired
+    ``coalesce_missing_policy``, is the post-fix shape of the same divergence
+    and is worth recording: the ``elif`` that used to shield the vocabulary
+    guard from ``None`` is now a plain ``if``, so an un-normalised policy does
+    not slip through silently — it is rejected by the surviving guard, and the
+    runtime half of this test still parses the stripped YAML green.
+    ``test_both_reject_a_policy_outside_the_closed_vocabulary`` PASSES under the
+    mutation, as a negative control on an explicitly-set policy must — it does
+    not depend on the normalisation and is not evidence for it. The composer
+    unit pins fail under the same mutation:
+    ``test_unset_coalesce_policy_normalizes_to_the_runtime_default`` (``assert
+    None == 'require_all'``), ``test_unset_coalesce_policy_stays_valid``, and
+    ``test_unset_coalesce_policy_survives_yaml_generation``
+    (``KeyError: 'policy'``). Verified by manual revert on 2026-08-07;
+    restored.
+    """
+
+    def _empty_state(self) -> CompositionState:
+        return CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("id,price\n1,2\n", encoding="utf-8")
+        return csv_path, tmp_path / "out.csv"
+
+    def _composer_state(self, *, csv_path: Path, output_path: Path, policy: str | None) -> CompositionState:
+        schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        state = self._empty_state()
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="gate_in",
+                options={"path": str(csv_path), "schema": schema},
+                on_validation_failure="discard",
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_label", "branch_price"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        for node_id, branch_connection, done_connection in (
+            ("t_label", "branch_label", "label_done"),
+            ("t_price", "branch_price", "price_done"),
+        ):
+            state = state.with_node(
+                NodeSpec(
+                    id=node_id,
+                    node_type="transform",
+                    plugin="value_transform",
+                    input=branch_connection,
+                    on_success=done_connection,
+                    on_error="discard",
+                    options={"schema": schema, "operations": [{"target": "price", "expression": "row['price']"}]},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+        state = state.with_node(
+            NodeSpec(
+                id="merge_results",
+                node_type="coalesce",
+                plugin=None,
+                input="label_done",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"branch_label": "label_done", "branch_price": "price_done"},
+                policy=policy,
+                merge="union",
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": str(output_path), "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+        )
+        for edge_id, from_node, to_node, edge_type, label in (
+            ("e1", "source", "fork_gate", "on_success", None),
+            ("e2", "fork_gate", "t_label", "fork", "branch_label"),
+            ("e3", "fork_gate", "t_price", "fork", "branch_price"),
+            ("e4", "t_label", "merge_results", "on_success", None),
+            ("e5", "t_price", "merge_results", "on_success", None),
+        ):
+            state = state.with_edge(EdgeSpec(id=edge_id, from_node=from_node, to_node=to_node, edge_type=edge_type, label=label))
+        return state
+
+    def _build_runtime_graph_for_settings(self, settings: ElspethSettings) -> ExecutionGraph:
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce),
+        )
+
+    def _strip_policy_line(self, generated_yaml: str) -> str:
+        """Drop the emitted ``policy:`` line so the loader must apply its own default."""
+        lines = generated_yaml.splitlines()
+        kept = [line for line in lines if line.strip() != "policy: require_all"]
+        assert len(kept) == len(lines) - 1, generated_yaml
+        return "\n".join(kept) + "\n"
+
+    def test_both_accept_unset_policy_as_require_all(self, tmp_path: Path) -> None:
+        """Composer green on an unset policy, and the loader parses the same value."""
+        from elspeth.config_loading import load_settings_from_yaml_string
+
+        csv_path, output_path = self._paths(tmp_path)
+        state = self._composer_state(csv_path=csv_path, output_path=output_path, policy=None)
+
+        composer_result = state.validate()
+        assert composer_result.is_valid, composer_result.errors
+        coalesce_node = next(node for node in state.nodes if node.id == "merge_results")
+
+        generated_yaml = composer_yaml_generator.generate_yaml(state)
+        # The disclosure channel that replaces the retired error: the author
+        # reads the arrival semantics they got off the exported settings.
+        assert "policy: require_all" in generated_yaml
+
+        settings = load_settings_from_yaml_string(self._strip_policy_line(generated_yaml))
+        assert settings.coalesce is not None
+        assert settings.coalesce[0].policy == coalesce_node.policy
+
+        graph = self._build_runtime_graph_for_settings(settings)
+        graph.validate_edge_compatibility()
+
+    def test_both_reject_a_policy_outside_the_closed_vocabulary(self, tmp_path: Path) -> None:
+        """Negative control: retiring the missing-policy code did not open the vocabulary."""
+        from elspeth.config_loading import load_settings_from_yaml_string
+
+        csv_path, output_path = self._paths(tmp_path)
+        state = self._composer_state(csv_path=csv_path, output_path=output_path, policy="require_all_branches")
+
+        composer_result = state.validate()
+        assert not composer_result.is_valid
+        assert any(error.error_code == "coalesce_policy_invalid" for error in composer_result.errors)
+
+        with pytest.raises(ValidationError):
+            load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
+
+
+class TestComposerRuntimeQueueGuaranteeAgreement:
+    """Shape 14 — queue consumers see upstream guarantees on both surfaces.
+
+    The battery g08 topology in plugin-neutral form: a source explicitly
+    guaranteeing ``llm_response`` feeds a declared queue, and the queue's
+    consumer names ``required_input_fields: [llm_response]``. Runtime graph
+    build must accept it (the guarantee propagates through the queue), and the
+    composer must import and validate the same YAML green. The negative
+    control proves fail-closed retention: requiring a field NO arm guarantees
+    is still rejected at graph build with the same actionable message.
+
+    Bug-verification protocol (mandatory per this file's header): the shape is
+    pinned on the ``NodeType.QUEUE`` branch of
+    ``core/dag/guarantees.walk_effective_guarantee_vote``. Manually replacing
+    that branch's condition with ``if False:`` restores the pre-fix walk (the
+    queue reports its own empty observed schema) and
+    ``test_both_accept_queue_consumer_requiring_arm_guaranteed_field`` fails at
+    graph build with ``GraphValidationError: Schema contract violation: edge
+    'queue_inbound_…' → 'transform_consumer_…' … Producer (queue:inbound)
+    guarantees: (none - dynamic schema)``. Verified by manual revert on
+    2026-08-05; restored. The negative control pins that neither surface fails
+    open: the runtime rejects at graph build, and since elspeth-3619b8774f the
+    composer Stage-1 fan-in mirror rejects the same YAML at /validate.
+    """
+
+    def _yaml(self, *, required_field: str) -> str:
+        import yaml
+
+        doc = {
+            "sources": {
+                "responses": {
+                    "plugin": "csv",
+                    "on_success": "inbound",
+                    "options": {
+                        "path": "examples/multi_source_queue/input/orders.csv",
+                        "schema": {"mode": "observed", "guaranteed_fields": ["llm_response"]},
+                        "on_validation_failure": "discard",
+                    },
+                },
+            },
+            "queues": {"inbound": {}},
+            "transforms": [
+                {
+                    "name": "consumer",
+                    "plugin": "passthrough",
+                    "input": "inbound",
+                    "on_success": "combined",
+                    "on_error": "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "required_input_fields": [required_field],
+                    },
+                }
+            ],
+            "sinks": {
+                "combined": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": "examples/multi_source_queue/output/combined.jsonl",
+                        "format": "jsonl",
+                        "collision_policy": "auto_increment",
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            },
+            "landscape": {"url": "sqlite:///examples/multi_source_queue/runs/audit.db"},
+        }
+        return yaml.safe_dump(doc, sort_keys=False)
+
+    def _build_runtime_graph(self, settings_yaml: str) -> ExecutionGraph:
+        from elspeth.config_loading import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(settings_yaml)
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce),
+            queues=settings.queues,
+        )
+
+    def test_both_accept_queue_consumer_requiring_arm_guaranteed_field(self) -> None:
+        from elspeth.contracts import NodeType
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        settings_yaml = self._yaml(required_field="llm_response")
+
+        graph = self._build_runtime_graph(settings_yaml)
+        queue_nodes = [n for n in graph.get_nodes() if n.node_type == NodeType.QUEUE]
+        assert len(queue_nodes) == 1
+        assert "llm_response" in graph.get_effective_guaranteed_fields(queue_nodes[0].node_id)
+
+        composer_result = composition_state_from_runtime_yaml(settings_yaml).validate()
+        assert composer_result.is_valid, [error.message for error in composer_result.errors]
+        # Strict walker parity (elspeth-3619b8774f): the composer resolves the
+        # contract through the queue fan-in vote — no abstention warning where
+        # the engine renders a definitive verdict.
+        assert not [
+            warning.message
+            for warning in composer_result.warnings
+            if "Contract check skipped" in warning.message and "queue" in warning.message
+        ]
+
+    def test_both_reject_queue_consumer_requiring_unguaranteed_field(self) -> None:
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        settings_yaml = self._yaml(required_field="never_guaranteed")
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph(settings_yaml)
+        assert "never_guaranteed" in str(exc_info.value)
+
+        # Red-parity (elspeth-3619b8774f): Stage 1 mirrors the engine's queue
+        # fan-in vote, so the composer rejects at /validate rather than
+        # abstaining green and letting the runtime preflight surface it.
+        composer_result = composition_state_from_runtime_yaml(settings_yaml).validate()
+        assert not composer_result.is_valid
+        assert any("never_guaranteed" in error.message for error in composer_result.errors)
+
+
+_SHAPE19_SOURCE_SCHEMA = {
+    "mode": "fixed",
+    "fields": ["id: str", "product: str", "price: float", "category: str", "description: str"],
+    "guaranteed_fields": ["id", "product", "price", "category", "description"],
+}
+# The ticket's branch shape: a pass-through arm declaring ONLY the field it
+# rewrites. Its guarantees still carry the whole arriving row.
+_SHAPE19_BRANCH_SCHEMA = {"mode": "flexible", "fields": ["description: str"]}
+_SHAPE19_LOCKED_SINK_SCHEMA = {"mode": "fixed", "fields": ["description: str"]}
+# Repair 1 from the rejection's own remedy list: declare the extras on the
+# consumer, ideally also on the branches that type the coalesce. Declaring
+# them on the sink alone USED to fail the same edge with "Missing fields" —
+# the dead end df50ea3c3 rewrote the remedy text to name — until
+# elspeth-7d68b04878 made the missing arm guarantee-aware; now the sink-only
+# widening builds too (pinned below), with build-time TYPE checking of the
+# widened fields available only when the branches declare them.
+_SHAPE19_FULL_SCHEMA = {
+    "mode": "fixed",
+    "fields": ["id: str", "product: str", "price: float", "category: str", "description: str"],
+}
+# Repair 2: relax the consumer to flexible WITHOUT declaring the extras.
+_SHAPE19_FLEXIBLE_SINK_SCHEMA = {"mode": "flexible", "fields": ["description: str"]}
+
+
+class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
+    """Shape 19 — a coalesce's GUARANTEES vs a locked consumer: both surfaces.
+
+    ``elspeth-1451ff385f`` in plugin-neutral form: a fork gate feeds a
+    pass-through transform on each branch, each declaring ONLY the field it
+    rewrites, and both branches merge at ``merge: union`` into a ``mode:
+    fixed`` sink admitting that one field. The DAG builder types the coalesce's
+    ``fields`` from each branch's construction-time schema but walks its
+    ``guaranteed_fields`` separately (``elspeth-0b14977817``), so the merged
+    schema GUARANTEES category/id/price/product while DECLARING description
+    alone — and every row dies at the sink's input preflight.
+
+    This shape was a documented runtime-only gap (the second category in this
+    file's header) until ``elspeth-ae83a6b60c`` closed the composer half; it is
+    now a first-category AGREEMENT shape and the first test asserts the two
+    surfaces' rejected field sets EQUAL rather than asserting the divergence.
+    The runtime rejects at build via
+    ``validate_typed_producer_guaranteed_extras`` (landed across ``5d0c54522``
+    → ``df50ea3c3`` remedies → ``48873f8dc`` extras-firewall soundness), and
+    composer Stage 1 now rejects the same edge because its walk-back,
+    emit-profile and definite-arrivals sites consult the guarantee vote's
+    ``merge_guaranteed_fields`` merge — the same function the builder stamps.
+
+    The last test is the scope boundary and is the reason this shape is
+    recorded as coalesce-shaped on the composer side. The RUNTIME defect is
+    broader than the coalesce (any ``passes_through_input=True`` transform
+    under-declaring its schema — pinned by ``TestTypedPassThroughGuaranteedExtras``
+    in ``tests/unit/core/dag/test_graph_validation.py``, commit ``cf550d674``),
+    but the COMPOSER gap is not: Rule B already rejects the identical
+    under-declaring shape on a linear pipeline, because
+    ``_producer_emit_profile`` resolves a pass-through transform and unions in
+    its upstream definite arrivals. Only at a coalesce does the composer
+    abstain. Asserting that here keeps a future fix honest — if someone
+    "generalises" the composer rule, this test says the general case already
+    worked and the coalesce was the hole.
+
+    Bug-verification protocol, RUNTIME half (mandatory per this file's header):
+    the runtime leg is pinned on
+    ``core/dag/schema_validation.py::validate_typed_producer_guaranteed_extras``,
+    called as the final pass of ``validate_edge_compatibility``. Neutering it
+    (equivalent to a ``return`` before its edge loop) restores the pre-fix
+    behaviour and fails exactly ONE of these four tests,
+    ``test_composer_and_runtime_reject_the_same_guaranteed_extras``, with
+    ``Failed: DID NOT RAISE <class 'elspeth.core.dag.models.EdgeContractError'>``.
+    The COMPOSER half of that same test still passes under the mutation, which
+    is now the evidence that the two legs are INDEPENDENT — the composer
+    rejection is not derived from the runtime's, so the equality assertion at
+    the end compares two separately-computed sets. The two repair controls and
+    the no-coalesce boundary test also still pass, as they must: none of them
+    depends on the runtime pass.
+
+    Re-verified 2026-08-07 after the composer half landed, by
+    ``monkeypatch``-equivalent assignment to the module attribute rather than by
+    editing the file (a concurrent session held the working tree). The call site
+    is a module-global reference inside ``validate_edge_compatibility`` in
+    ``schema_validation.py`` — NOT in ``graph.py``, where the same-named method
+    merely delegates; patching ``graph.py``'s namespace silently no-ops and all
+    four tests pass, which is a false clean. Per this file's METHOD NOTE the
+    marker ``validate_typed_producer_guaranteed_extras(graph)`` was asserted
+    unique (``grep -c`` = 1 in ``schema_validation.py``) before mutating.
+
+    Bug-verification protocol, COMPOSER half (elspeth-ae83a6b60c): the composer
+    leg is pinned on the walk-back escape in
+    ``web/composer/state.py::_walk_producer_entry_to_real_producer``'s coalesce
+    branch (``if _mirrored_coalesce_merged_guarantees(current_producer) is not
+    None: return current_producer``). Deleting those two lines restores the
+    unconditional abstention and fails exactly ONE of these four tests, the
+    same ``test_composer_and_runtime_reject_the_same_guaranteed_extras``, at
+    ``assert not composer_result.is_valid`` with::
+
+        E       assert not True
+        E        +  where True = ValidationSummary(is_valid=True, errors=(),
+                    warnings=(ValidationEntry(component='node:fork_gate',
+                    message="Contract ch...)).is_valid
+
+    Verified 2026-08-07 by editing the file and restoring it within a single
+    scoped test invocation: the site is a closure-local branch, so no module
+    attribute exists to patch. The other three tests still passed under the
+    mutation, and the RUNTIME leg of the failing test was never reached.
+    Composer-side unit coverage of the same fix — including per-site mutations
+    proving each of the three sites is independently necessary — lives in
+    ``tests/unit/web/composer/test_state.py::TestUnionCoalesceGuaranteeExtras``.
+    """
+
+    def _empty_state(self) -> CompositionState:
+        return CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _composer_state(
+        self,
+        *,
+        csv_path: Path,
+        output_path: Path,
+        sink_schema: dict[str, Any],
+        branch_schema: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        state = self._empty_state()
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="gate_in",
+                options={"path": str(csv_path), "schema": _SHAPE19_SOURCE_SCHEMA},
+                on_validation_failure="discard",
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_a", "branch_b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        for node_id, branch_connection, done_connection in (
+            ("arm_a", "branch_a", "done_a"),
+            ("arm_b", "branch_b", "done_b"),
+        ):
+            state = state.with_node(
+                NodeSpec(
+                    id=node_id,
+                    node_type="transform",
+                    plugin="passthrough",
+                    input=branch_connection,
+                    on_success=done_connection,
+                    on_error="discard",
+                    options={"schema": branch_schema or _SHAPE19_BRANCH_SCHEMA},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+        state = state.with_node(
+            NodeSpec(
+                id="merge_results",
+                node_type="coalesce",
+                plugin=None,
+                input="done_a",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"branch_a": "done_a", "branch_b": "done_b"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": str(output_path), "schema": sink_schema},
+                on_write_failure="discard",
+            )
+        )
+        for edge_id, from_node, to_node, edge_type, label in (
+            ("e1", "source", "fork_gate", "on_success", None),
+            ("e2", "fork_gate", "arm_a", "fork", "branch_a"),
+            ("e3", "fork_gate", "arm_b", "fork", "branch_b"),
+            ("e4", "arm_a", "merge_results", "on_success", None),
+            ("e5", "arm_b", "merge_results", "on_success", None),
+        ):
+            state = state.with_edge(
+                EdgeSpec(
+                    id=edge_id,
+                    from_node=from_node,
+                    to_node=to_node,
+                    edge_type=edge_type,
+                    label=label,
+                )
+            )
+        return state
+
+    def _runtime_settings(
+        self,
+        *,
+        csv_path: Path,
+        output_path: Path,
+        sink_schema: dict[str, Any],
+        branch_schema: dict[str, Any] | None = None,
+    ) -> ElspethSettings:
+        return ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="gate_in",
+                    options={
+                        "path": str(csv_path),
+                        "schema": _SHAPE19_SOURCE_SCHEMA,
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name=node_id,
+                    plugin="passthrough",
+                    input=branch_connection,
+                    on_success=done_connection,
+                    on_error="discard",
+                    options={"schema": branch_schema or _SHAPE19_BRANCH_SCHEMA},
+                )
+                for node_id, branch_connection, done_connection in (
+                    ("arm_a", "branch_a", "done_a"),
+                    ("arm_b", "branch_b", "done_b"),
+                )
+            ],
+            gates=[
+                GateSettings(
+                    name="fork_gate",
+                    input="gate_in",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["branch_a", "branch_b"],
+                )
+            ],
+            coalesce=[
+                CoalesceSettings(
+                    name="merge_results",
+                    branches={"branch_a": "done_a", "branch_b": "done_b"},
+                    policy="require_all",
+                    merge="union",
+                    on_success="main",
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv",
+                    on_write_failure="discard",
+                    options={"path": str(output_path), "schema": sink_schema},
+                )
+            },
+        )
+
+    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text(
+            "id,product,price,category,description\n1,widget,2.0,tools,a short blurb\n",
+            encoding="utf-8",
+        )
+        return csv_path, tmp_path / "out.csv"
+
+    def _build_runtime_graph_from_settings(self, config: ElspethSettings) -> ExecutionGraph:
+        plugins = instantiate_plugins_from_config(config)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=list(config.coalesce) if config.coalesce else None,
+        )
+
+    def test_composer_and_runtime_reject_the_same_guaranteed_extras(self, tmp_path: Path) -> None:
+        """Both surfaces red, on the SAME phantom set, compared value-to-value.
+
+        The rewrite of ``test_runtime_rejects_coalesce_guaranteed_extras_while_
+        composer_stays_permissive``, which pinned the divergence itself: Stage 1
+        abstaining with its "runtime validator will check this edge" advisory
+        while the runtime rejected. That gap closed in ``elspeth-ae83a6b60c``,
+        so the assertion that recorded it would now pin the defect.
+
+        The comparison is deliberately value-to-value rather than two
+        independent literals. Composer's ``sink_locked_extras`` extras tuple is
+        asserted EQUAL to the runtime ``EdgeContractError``'s
+        ``compatibility_result.extra_fields`` computed from the identical
+        pipeline in this same test, so the two cannot drift apart silently:
+        no-oping any of the three composer coalesce sites leaves composer green
+        against a red runtime, and changing ``merge_guaranteed_fields``
+        semantics on one surface without the other mismatches the sets. The
+        literal is asserted too, so a change that moves BOTH surfaces the same
+        wrong way is still caught.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            sink_schema=_SHAPE19_LOCKED_SINK_SCHEMA,
+        ).validate()
+
+        assert not composer_result.is_valid
+        composer_entry = next(error for error in composer_result.errors if error.error_code == "sink_locked_extras")
+        assert composer_entry.component == "output:main"
+        composer_contract = composer_entry.contract
+        assert composer_contract is not None
+        assert composer_contract.producer == "merge_results"
+        # The deferral advisory must be GONE: a resolved coalesce that also
+        # raises an error cannot keep telling the authoring loop the edge was
+        # left to the runtime.
+        assert not [
+            warning.message
+            for warning in composer_result.warnings
+            if "Contract check skipped" in warning.message and "coalesce" in warning.message
+        ]
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            graph = self._build_runtime_graph_from_settings(
+                self._runtime_settings(
+                    csv_path=csv_path,
+                    output_path=output_path,
+                    sink_schema=_SHAPE19_LOCKED_SINK_SCHEMA,
+                )
+            )
+            graph.validate_edge_compatibility()
+
+        error = exc_info.value
+        # The phantom set: guaranteed by the graph walk, absent from the
+        # coalesce's own typed fields, forbidden by the locked sink.
+        assert error.compatibility_result.extra_fields == ("category", "id", "price", "product")
+        assert error.from_component_type == "coalesce"
+        assert error.component_type == "sink"
+        message = str(error)
+        assert "locked (mode: fixed)" in message
+        assert "description" in message
+
+        # The agreement itself. Composer reaches this set through
+        # ``_producer_entry_propagation_vote``'s ``merge_guaranteed_fields``
+        # call; the runtime reaches it through the builder's stamp of the same
+        # function, enforced by ``validate_typed_producer_guaranteed_extras``.
+        # One implementation, two surfaces, asserted equal.
+        assert composer_contract.extra_fields == error.compatibility_result.extra_fields
+
+    def test_repair_one_declaring_the_extras_on_branches_and_sink_builds_green(self, tmp_path: Path) -> None:
+        """Positive control AND remedy 1: the check must not block a runnable pipeline.
+
+        Identical topology; the branches and the sink both declare the full
+        set. This is the STRONG form of remedy 1: with the branches declaring
+        the fields, the merged schema types them and the sink edge gets full
+        build-time type checking. The sink-only widening (next test) builds
+        since ``elspeth-7d68b04878``, but leaves those fields' types checked
+        only per-row at the sink preflight.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            sink_schema=_SHAPE19_FULL_SCHEMA,
+            branch_schema=_SHAPE19_FULL_SCHEMA,
+        ).validate()
+        assert composer_result.is_valid, composer_result.errors
+
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                sink_schema=_SHAPE19_FULL_SCHEMA,
+                branch_schema=_SHAPE19_FULL_SCHEMA,
+            )
+        )
+        graph.validate_edge_compatibility()
+
+    def test_widening_the_sink_alone_builds_green_on_both_surfaces(self, tmp_path: Path) -> None:
+        """The sink-only widening: FULL sink, branches still under-declared.
+
+        Until ``elspeth-7d68b04878`` this exact combination was the dead end
+        the remedy text warned about — the runtime rejected it with "Missing
+        fields" while the composer validated it green, a live disagreement in
+        the runtime's false-reject direction. The guarantee-aware missing arm
+        closed it: presence of the widened fields is proven by the guarantee
+        walk (the source types them and the pass-through branches forward
+        them), so BOTH surfaces now build. Pinned per this file's discipline:
+        the combination the fix made green is the combination a regression
+        would silently flip back.
+
+        Scope note: this pins the runnable, type-matching population (the sink
+        redeclares the source's own types). What it deliberately does NOT
+        claim is build-time type checking of the widened fields — those types
+        are checked per-row at the sink preflight, the known type-axis residue
+        tracked as the guarantee-typed-ancestor follow-up to
+        elspeth-7d68b04878.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            sink_schema=_SHAPE19_FULL_SCHEMA,
+            branch_schema=_SHAPE19_BRANCH_SCHEMA,
+        ).validate()
+        assert composer_result.is_valid, composer_result.errors
+
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                sink_schema=_SHAPE19_FULL_SCHEMA,
+                branch_schema=_SHAPE19_BRANCH_SCHEMA,
+            )
+        )
+        graph.validate_edge_compatibility()
+
+    def test_repair_two_relaxing_the_sink_to_flexible_builds_green(self, tmp_path: Path) -> None:
+        """Remedy 2: a flexible sink admits the guaranteed extras undeclared.
+
+        This is also the guard-condition control for the new pass, which
+        declines unless the consumer's model forbids extras. Branch schemas
+        stay under-declared, so the ONLY thing that changes versus the rejected
+        case is the sink's extras policy.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            sink_schema=_SHAPE19_FLEXIBLE_SINK_SCHEMA,
+        ).validate()
+        assert composer_result.is_valid, composer_result.errors
+
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                sink_schema=_SHAPE19_FLEXIBLE_SINK_SCHEMA,
+            )
+        )
+        graph.validate_edge_compatibility()
+
+    def test_composer_rejects_the_same_defect_without_a_coalesce(self) -> None:
+        """Scope boundary: the COMPOSER gap is coalesce-shaped, the runtime one is not.
+
+        The same ingredient — a ``passes_through_input=True`` transform
+        declaring a narrower schema than it forwards, feeding a locked
+        consumer — on a linear pipeline. The runtime defect was identical here
+        (pinned by ``TestTypedPassThroughGuaranteedExtras``, ``cf550d674``),
+        but the composer ALREADY rejected this shape via Rule B, because
+        ``_producer_emit_profile`` resolves the pass-through and unions in its
+        upstream definite arrivals. So Shape 19's composer half was never "Rule
+        B is missing", it was "Rule B abstains at a coalesce" — three abstention
+        sites in ``web/composer/state.py`` (the walk-back's unconditional
+        coalesce stop, ``_producer_emit_profile`` having no coalesce branch, and
+        ``_connection_definite_emits`` returning the empty set for coalesce),
+        all three closed in ``elspeth-ae83a6b60c``. This test keeps that
+        diagnosis honest: it passed BEFORE the composer fix and must keep
+        passing after, so a future "generalisation" of the composer rule cannot
+        claim credit for the linear case, which always worked.
+        """
+        import yaml
+
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        doc = {
+            "sources": {
+                "primary": {
+                    "plugin": "csv",
+                    "on_success": "raw",
+                    "options": {
+                        "path": "examples/fork_coalesce/input.csv",
+                        "schema": {
+                            "mode": "fixed",
+                            "fields": ["id: int", "product: str", "description: str"],
+                        },
+                        "on_validation_failure": "discard",
+                    },
+                }
+            },
+            "transforms": [
+                {
+                    "name": "shorten",
+                    "plugin": "truncate",
+                    "input": "raw",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {
+                        "fields": {"description": 20},
+                        "suffix": "...",
+                        "schema": {"mode": "flexible", "fields": ["description: str"]},
+                    },
+                }
+            ],
+            "sinks": {
+                "output": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": "out.jsonl",
+                        "format": "jsonl",
+                        "schema": {"mode": "fixed", "fields": ["description: str"]},
+                    },
+                }
+            },
+        }
+
+        composer_result = composition_state_from_runtime_yaml(yaml.safe_dump(doc, sort_keys=False)).validate()
+
+        assert not composer_result.is_valid
+        entries = [error for error in composer_result.errors if error.error_code == "sink_locked_extras"]
+        assert len(entries) == 1, composer_result.errors
+        assert entries[0].contract is not None
+        assert entries[0].contract.extra_fields == ("id", "product")
+
+
+class TestComposerRuntimeCensusAgreement:
+    """Shapes 21-25 — the 2026-08-17 census closures (elspeth-2ed41f0a4a).
+
+    Each test runs the SAME composer state through both surfaces — Stage 1
+    (``state.validate()``) and the real Stage 2 (``validate_pipeline`` via the
+    trained-operator root) — and asserts both reject, with a control that
+    differs only in the predicate under test and is accepted by both. That is
+    the clean-probe rule from the module docstring, and it is what makes each
+    rejection falsifiable: a blanket red would fail its own control.
+
+    Bug verification protocol, per shape (each Stage-1 mirror named here was
+    reverted in turn and the corresponding ``assert not composer.is_valid``
+    failed with ``is_valid=True, errors=()``):
+
+    * Shape 22 cycle — ``_node_topology_cycle`` call in ``validate()``.
+    * Shape 23 node id — ``_composer_node_id_validation_message`` call in
+      ``validate()`` check 4.
+    * Shape 24 coalesce menu — the ``quorum``/``select``/``best_effort``
+      arms in the coalesce block of ``validate()``.
+    * Shape 25 string scan — the ``declared_string_input`` branch under
+      ``producer_is_typed_source`` in ``_check_schema_contracts``.
+    """
+
+    @staticmethod
+    def _settings(tmp_path: Path) -> SimpleNamespace:
+        return SimpleNamespace(data_dir=tmp_path)
+
+    @staticmethod
+    def _csv_input(tmp_path: Path) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "input.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("value\n1\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _output_path(tmp_path: Path, name: str = "out.jsonl") -> Path:
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / name
+
+    def _source(self, tmp_path: Path, on_success: str, *, fields: tuple[str, ...] = ("value: str",)) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"path": str(self._csv_input(tmp_path)), "schema": {"mode": "fixed", "fields": list(fields)}},
+            on_validation_failure="discard",
+        )
+
+    def _output(self, tmp_path: Path, name: str = "main") -> OutputSpec:
+        return OutputSpec(
+            name=name,
+            plugin="json",
+            options={"path": str(self._output_path(tmp_path)), "format": "jsonl", "schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    @staticmethod
+    def _transform(
+        node_id: str, input_name: str, on_success: str, plugin: str = "value_transform", options: dict[str, Any] | None = None
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin=plugin,
+            input=input_name,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}, "operations": [{"target": "value", "expression": "row['value']"}]},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    @staticmethod
+    def _gate(node_id: str, input_name: str, fork_to: tuple[str, ...]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="gate",
+            plugin=None,
+            input=input_name,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "discard"},
+            fork_to=fork_to,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    @staticmethod
+    def _coalesce(
+        node_id: str,
+        branches: dict[str, str],
+        on_success: str,
+        *,
+        policy: str = "require_all",
+        merge: str = "union",
+        timeout_seconds: float | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="coalesce",
+            plugin=None,
+            input=next(iter(branches.values())),
+            on_success=on_success,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=branches,
+            policy=policy,
+            merge=merge,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _both(self, state: CompositionState, tmp_path: Path) -> tuple[Any, Any]:
+        composer = state.validate()
+        runtime = validate_pipeline_for_trained_operator(
+            state,
+            self._settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+        return composer, runtime
+
+    def _fork_coalesce_state(self, tmp_path: Path, **coalesce_kwargs: Any) -> CompositionState:
+        return CompositionState(
+            source=self._source(tmp_path, "g_in"),
+            nodes=(
+                self._gate("g", "g_in", ("x", "y")),
+                self._transform("tx", "x", "cx"),
+                self._transform("ty", "y", "cy"),
+                self._coalesce("c", {"x": "cx", "y": "cy"}, "main", **coalesce_kwargs),
+            ),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+
+    def test_both_reject_transform_cycle(self, tmp_path: Path) -> None:
+        """Shape 22 — t1 -> t2 -> t1, both fed: Stage 1 had no cycle detection at all."""
+        state = CompositionState(
+            source=self._source(tmp_path, "main"),
+            nodes=(self._transform("t1", "b", "c"), self._transform("t2", "c", "b")),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "pipeline_cycle" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("cycle" in e.message.lower() for e in runtime.errors), runtime.errors
+
+    def test_both_reject_overlong_node_id(self, tmp_path: Path) -> None:
+        """Shape 23 — a 60-char transform id: runtime max is 38 (``_MAX_NODE_NAME_LENGTH``)."""
+        long_id = "t" * 60
+        state = CompositionState(
+            source=self._source(tmp_path, "a"),
+            nodes=(self._transform(long_id, "a", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        [entry] = [e for e in composer.errors if e.error_code == "node_id_invalid"]
+        assert "exceeds max length 38" in entry.message
+        assert not runtime.is_valid
+        assert any("exceeds max length 38" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_accept_node_id_at_the_runtime_limit(self, tmp_path: Path) -> None:
+        """Shape 23 control — 38 chars is accepted by both surfaces."""
+        node_id = "t" * 38
+        state = CompositionState(
+            source=self._source(tmp_path, "a"),
+            nodes=(self._transform(node_id, "a", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    @pytest.mark.parametrize(
+        ("coalesce_kwargs", "composer_code", "runtime_fragment"),
+        [
+            pytest.param({"merge": "select"}, "coalesce_merge_select_unsupported", "requires select_branch", id="merge-select"),
+            pytest.param({"policy": "quorum"}, "coalesce_policy_quorum_unsupported", "requires quorum_count", id="policy-quorum"),
+            pytest.param(
+                {"policy": "best_effort"}, "coalesce_best_effort_requires_timeout", "requires timeout_seconds", id="best-effort-no-timeout"
+            ),
+        ],
+    )
+    def test_both_reject_unrunnable_coalesce_menu_items(
+        self, tmp_path: Path, coalesce_kwargs: dict[str, Any], composer_code: str, runtime_fragment: str
+    ) -> None:
+        """Shape 24 — values inside the runtime vocabulary that cannot run as authored."""
+        composer, runtime = self._both(self._fork_coalesce_state(tmp_path, **coalesce_kwargs), tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == composer_code for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any(runtime_fragment in e.message for e in runtime.errors), runtime.errors
+
+    @pytest.mark.parametrize(
+        "coalesce_kwargs",
+        [
+            pytest.param({}, id="require_all-union"),
+            pytest.param({"merge": "nested"}, id="nested"),
+            pytest.param({"policy": "best_effort", "timeout_seconds": 5.0}, id="best-effort-with-timeout"),
+            pytest.param({"policy": "first"}, id="first"),
+        ],
+    )
+    def test_both_accept_runnable_coalesce_menu_items(self, tmp_path: Path, coalesce_kwargs: dict[str, Any]) -> None:
+        """Shape 24 control — every advertised policy/merge value is runnable as authored."""
+        composer, runtime = self._both(self._fork_coalesce_state(tmp_path, **coalesce_kwargs), tmp_path)
+
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    def _string_scan_state(self, tmp_path: Path, upstream_type: str) -> CompositionState:
+        return CompositionState(
+            source=self._source(tmp_path, "kf_in", fields=(f"value: {upstream_type}",)),
+            nodes=(
+                self._transform(
+                    "kf",
+                    "kf_in",
+                    "main",
+                    plugin="keyword_filter",
+                    options={"schema": {"mode": "observed"}, "fields": ["value"], "blocked_patterns": ["forbidden"]},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+
+    def test_both_reject_string_scan_over_non_string_upstream(self, tmp_path: Path) -> None:
+        """Shape 25 — keyword_filter scanning an ``int``-typed source field."""
+        composer, runtime = self._both(self._string_scan_state(tmp_path, "int"), tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "transform_string_input_field_type_incompatible" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("must be text" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_accept_string_scan_over_string_upstream(self, tmp_path: Path) -> None:
+        """Shape 25 control."""
+        composer, runtime = self._both(self._string_scan_state(tmp_path, "str"), tmp_path)
+
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    def test_both_reject_consistent_blank_connection_label(self, tmp_path: Path) -> None:
+        """Shape 26 — a blank label on BOTH ends of an edge: dangling rules are satisfied, the settings model is not."""
+        state = CompositionState(
+            source=self._source(tmp_path, ""),
+            nodes=(self._transform("t1", "", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "connection_label_invalid" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("must not be empty" in e.message or "must be a connection name" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_uppercase_sink_name(self, tmp_path: Path) -> None:
+        """Shape 26 — sink names were unvalidated on the freeform path (elspeth-88a4db09f9)."""
+        state = CompositionState(
+            source=self._source(tmp_path, "Main"),
+            nodes=(),
+            edges=(),
+            outputs=(self._output(tmp_path, "Main"),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "output_name_invalid" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("must be lowercase" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_single_branch_coalesce(self, tmp_path: Path) -> None:
+        """Shape 27 — ``CoalesceSettings.branches`` is ``Field(min_length=2)``: declarative, no raise site."""
+        state = CompositionState(
+            source=self._source(tmp_path, "g_in"),
+            nodes=(
+                self._gate("g", "g_in", ("x",)),
+                self._transform("tx", "x", "cx"),
+                self._coalesce("c", {"x": "cx"}, "main"),
+            ),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "coalesce_branches_invalid" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("at least 2 items" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_empty_fork_to(self, tmp_path: Path) -> None:
+        """Shape 28 — ``fork_to: []`` used to CRASH Stage 2 (bare ValueError from ``_GateEntry``); now both reject structurally."""
+        gate = NodeSpec(
+            id="g",
+            node_type="gate",
+            plugin=None,
+            input="g_in",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="row['value'] == 'x'",
+            routes={"true": "main", "false": "discard"},
+            fork_to=(),
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=self._source(tmp_path, "g_in"),
+            nodes=(gate,),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "gate_fork_to_empty" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("fork_to must not be an empty list" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_reject_node_id_equal_to_sink_name(self, tmp_path: Path) -> None:
+        """Shape 28 — one namespace across nodes, sources and sinks."""
+        state = CompositionState(
+            source=self._source(tmp_path, "a"),
+            nodes=(self._transform("main", "a", "main"),),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="census"),
+            version=1,
+        )
+        composer, runtime = self._both(state, tmp_path)
+
+        assert not composer.is_valid
+        assert any(e.error_code == "node_id_collides_with_source_or_sink" for e in composer.errors), composer.errors
+        assert not runtime.is_valid
+        assert any("used by both" in e.message for e in runtime.errors), runtime.errors
+
+
+class TestComposerEnvPlaceholderAgreement:
+    """Stage 1 must reject a ``${VAR}`` in an emitted option, not merely the runtime.
+
+    THIS IS THE PIN FOR THE BOTH-LOADER-PATHS RULING (C4 on elspeth-8f0a6b3391).
+
+    ``_reject_sensitive_plugin_env_placeholders_before_expansion`` deliberately
+    runs on BOTH loader paths — the CLI's expanding path and the web's
+    non-expanding one — because a security control that runs on one of two paths
+    is a control with a documented bypass. Nothing in the tree proved the web
+    half kept working; a later change could gate the guard on
+    ``expand_env_vars=True`` and every other test would stay green while the
+    composer silently accepted a host-value leak.
+
+    The distinction this class exists to close: "the loader raises" and "Stage 1
+    returns ``is_valid=False`` for a composer-authored shape" are different
+    claims. An earlier validation phase could fail first, or the composer could
+    normalise the option away before materialisation, and a loader-level probe
+    would not notice either. So these go through
+    ``validate_pipeline_for_trained_operator`` end to end on a real
+    ``CompositionState``.
+
+    The parity baseline records this site as ``unmirrored`` (a known
+    validate-green / runtime-red gap) on evidence that predates the guard
+    inversion. If these tests pass, that disposition is contradicted and should
+    be re-adjudicated to ``mirrored`` — see the note on key ``19d4370762325eae``
+    in ``config/cicd/runtime_rejection_parity.yaml``.
+    """
+
+    PLACEHOLDER = "${ELSPETH_AGREEMENT_HOST_VALUE}"
+
+    @staticmethod
+    def _validation_settings(data_dir: Path) -> SimpleNamespace:
+        return SimpleNamespace(data_dir=data_dir)
+
+    @staticmethod
+    def _csv_input(tmp_path: Path) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "input.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("value\n1\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _sink_path(tmp_path: Path, name: str) -> Path:
+        out_dir = tmp_path / "outputs" / _AGREEMENT_SESSION_ID
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / name
+
+    def _state(self, tmp_path: Path, *, headers: object) -> CompositionState:
+        """A minimal csv -> csv pipeline whose sink carries a CUSTOM header mapping.
+
+        ``headers`` is the option under test: its mapping VALUES are written as
+        the artifact's header row, so a ``${VAR}`` there reaches output bytes as
+        a host environment value.
+        """
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="default",
+                options={"path": str(self._csv_input(tmp_path)), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(
+                EdgeSpec(
+                    id="source_to_default",
+                    from_node="source",
+                    to_node="default",
+                    edge_type="on_success",
+                    label="rows to sink",
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="default",
+                    plugin="csv",
+                    options={
+                        "path": str(self._sink_path(tmp_path, "out.csv")),
+                        "mode": "write",
+                        "collision_policy": "fail_if_exists",
+                        "schema": {"mode": "observed"},
+                        "headers": headers,
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="env placeholder agreement", description=""),
+            version=1,
+        )
+
+    def _validate(self, state: CompositionState, tmp_path: Path):  # type: ignore[no-untyped-def]
+        return validate_pipeline_for_trained_operator(
+            state,
+            self._validation_settings(tmp_path),
+            composer_yaml_generator,
+            session_id=_AGREEMENT_SESSION_ID,
+        )
+
+    def test_stage1_rejects_env_placeholder_in_a_sink_header_mapping(self, tmp_path: Path) -> None:
+        """The composer must not return is_valid=True for a shape the runtime refuses."""
+        result = self._validate(self._state(tmp_path, headers={"value": self.PLACEHOLDER}), tmp_path)
+
+        assert result.is_valid is False, (
+            "Stage 1 accepted a ${VAR} in csv.headers. The mapping's values are written as the "
+            "artifact's header row, so on the CLI path env expansion would replace it with a host "
+            "environment value and write that to the output bytes (elspeth-8f0a6b3391)."
+        )
+
+        rendered = " ".join(error.message for error in result.errors)
+        assert "environment-variable placeholders" in rendered, (
+            f"Rejected, but not for the placeholder — the agreement is on the PREDICATE, not merely "
+            f"on is_valid being False. Errors: {[e.message for e in result.errors]}"
+        )
+
+    def test_stage1_accepts_the_same_shape_with_a_clean_header_mapping(self, tmp_path: Path) -> None:
+        """Positive control: the option is not what is refused, the placeholder is.
+
+        Without this, a Stage 1 that rejected every custom header mapping — or
+        that failed on an unrelated earlier phase — would satisfy the test above
+        while proving nothing about the guard.
+        """
+        result = self._validate(self._state(tmp_path, headers={"value": "Value"}), tmp_path)
+
+        assert result.is_valid is True, (
+            f"Positive control failed: a clean CUSTOM header mapping must validate, otherwise the "
+            f"rejection above is not attributable to the placeholder. Errors: "
+            f"{[e.message for e in result.errors]}"
+        )
+
+
+# ── Shape 10 — bind-time CSV guarantee x llm required_input_fields ────────────
+# elspeth-da68332faf x elspeth-d39ec0c4d9: a source guarantees what it knows.
+# Binding a CSV blob stamps schema.guaranteed_fields from the header at BIND
+# time, so by the time an llm node's required_input_fields is forced (the
+# LLMConfig template-binding remedy), the edge contract is already satisfied —
+# the session-2e0c8ea3 contradiction (validator demands the declaration, edge
+# check rejects it) is structurally unreachable for the bound-blob case.
+
+
+class TestCsvBindGuaranteeRuntimeAgreement:
+    def _bind_csv_blob_state(self, tmp_path: Path) -> CompositionState:
+        """Drive the REAL bind tool so the stamp comes from production code."""
+        from datetime import datetime as _datetime
+        from unittest.mock import MagicMock
+
+        from sqlalchemy import insert as _insert
+        from sqlalchemy.pool import StaticPool
+
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.catalog.protocol import CatalogService as _CatalogService
+        from elspeth.web.catalog.schemas import PluginSummary
+        from elspeth.web.composer.tools import _execute_create_blob, _execute_set_source_from_blob
+        from elspeth.web.composer.tools._common import ToolContext
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import chat_messages_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(engine)
+        now = _datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                _insert(sessions_table).values(
+                    id=_AGREEMENT_SESSION_ID,
+                    user_id="agreement-suite-user",
+                    auth_provider_type="local",
+                    title="csv guarantee agreement",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        # The content stays OUT of the user message so provenance classifies
+        # the blob LLM_GENERATED — auto-declare is scoped to that evidence
+        # class (John's ruling 2026-08-27): an uploaded/verbatim header is a
+        # sample and never silently stamps guarantees.
+        content = "colour\nred\nblue\n"
+        user_message_content = "Generate a small colour CSV for the pipeline."
+        user_message_id = str(uuid4())
+        with engine.begin() as conn:
+            conn.execute(
+                _insert(chat_messages_table).values(
+                    id=user_message_id,
+                    session_id=_AGREEMENT_SESSION_ID,
+                    role="user",
+                    content=user_message_content,
+                    raw_content=None,
+                    tool_calls=None,
+                    tool_call_id=None,
+                    sequence_no=1,
+                    writer_principal="route_user_message",
+                    created_at=now,
+                    composition_state_id=None,
+                    parent_assistant_id=None,
+                )
+            )
+        catalog = MagicMock(spec=_CatalogService)
+        catalog.list_sources.return_value = [
+            PluginSummary(name=name, description=name, plugin_type="source", config_fields=[]) for name in ("csv", "json", "text")
+        ]
+        catalog.get_schema.return_value = {"properties": {}}
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        ctx = ToolContext(
+            catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=_AGREEMENT_SESSION_ID,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
+        )
+        empty = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        create_result = _execute_create_blob(
+            {"filename": "colours.csv", "mime_type": "text/csv", "content": content},
+            empty,
+            ctx,
+        )
+        assert create_result.success is True, create_result.data
+        bind_result = _execute_set_source_from_blob(
+            {
+                "blob_id": create_result.data["blob_id"],
+                "on_success": "classify",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            empty,
+            ctx,
+        )
+        assert bind_result.success is True, bind_result.data
+        return bind_result.updated_state
+
+    def _runtime_graph_for_source_schema(self, tmp_path: Path, schema: dict[str, Any]) -> ExecutionGraph:
+        csv_path = tmp_path / "in.csv"
+        csv_path.write_text("colour\nred\nblue\n", encoding="utf-8")
+        config = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="t1",
+                    options={"path": str(csv_path), "schema": schema, "on_validation_failure": "discard"},
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="t1",
+                    plugin="llm",
+                    input="t1",
+                    on_success="main",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4.1-nano",
+                        "api_key": "sk-test-key",
+                        "prompt_template": "Classify {{ row.colour }}.",
+                        "required_input_fields": ["colour"],
+                        "schema": {"mode": "observed"},
+                    },
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv",
+                    on_write_failure="discard",
+                    options={"path": str(tmp_path / "out.csv"), "schema": {"mode": "observed"}},
+                )
+            },
+        )
+        plugins = instantiate_plugins_from_config(config)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=None,
+        )
+
+    def test_bound_csv_blob_stamps_header_guarantee(self, tmp_path: Path) -> None:
+        state = self._bind_csv_blob_state(tmp_path)
+        source = state.sources["source"]
+        schema = source.options["schema"]
+        assert schema["mode"] == "observed"
+        assert list(schema["guaranteed_fields"]) == ["colour"]
+
+    def test_bound_guarantee_satisfies_llm_required_input_fields_at_runtime(self, tmp_path: Path) -> None:
+        """The stamped schema block, fed through the runtime path, builds the
+        exact edge session 2e0c8ea3 could never validate."""
+        state = self._bind_csv_blob_state(tmp_path)
+        from elspeth.contracts.freeze import deep_thaw
+
+        stamped_schema = cast(dict[str, Any], deep_thaw(state.sources["source"].options["schema"]))
+
+        graph = self._runtime_graph_for_source_schema(tmp_path, stamped_schema)
+        graph.validate_edge_compatibility()  # green: no EdgeContractError
+
+    def test_unstamped_observed_source_still_rejects_the_same_edge(self, tmp_path: Path) -> None:
+        """Control: without the stamp the contradiction is still real, which is
+        what makes the bind-time stamp load-bearing rather than decorative."""
+        with pytest.raises(EdgeContractError) as exc_info:
+            graph = self._runtime_graph_for_source_schema(tmp_path, {"mode": "observed"})
+            graph.validate_edge_compatibility()
+        assert "colour" in str(exc_info.value)
+        assert exc_info.value.from_component_type == "source"

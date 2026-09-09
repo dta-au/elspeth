@@ -17,9 +17,10 @@ construction contract:
    exit path.
 
 Heartbeat is driven synchronously via ``_StubHeartbeat`` (no real threads).
-All sleeps are suppressed via injected ``wait_fn``.  Injected ``now_fn``
-fixes the clock.  ``live_leader`` and ``_run_is_terminal`` are controlled
-via the stub coordination repo and stub factory.
+All sleeps are suppressed via injected ``wait_fn``.  The follower carries no
+clock (ADR-047: seat liveness is the Landscape database's verdict).
+``live_leader`` and ``_run_is_terminal`` are controlled via the stub
+coordination repo and stub factory.
 
 Disposition arm note
 --------------------
@@ -40,6 +41,7 @@ FollowerProcessor correctly:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -47,13 +49,15 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
+from sqlalchemy.exc import OperationalError as SQLAOperationalError
 
 from elspeth.contracts.coordination import (
-    CoordinationToken,
     LeaderInfo,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.follower import FollowerProcessor, _SeatDeadError
@@ -84,7 +88,13 @@ class _FollowerDrainResult:
 
 
 class _UnusedScheduler:
-    """Scheduler surface required for RowProcessor construction in focused tests."""
+    """Scheduler surface required for RowProcessor construction in focused tests.
+
+    Only the two payload codec staticmethods are defined, because they are the
+    only scheduler members these focused tests reach. Any other member raises
+    ``AttributeError`` at the call site, which is the same failure a catch-all
+    ``__getattr__`` tripwire produced — without the forwarding hook.
+    """
 
     @staticmethod
     def serialize_row_payload(row: Any) -> str:
@@ -97,9 +107,6 @@ class _UnusedScheduler:
         from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
         return TokenSchedulerRepository.deserialize_row_payload(row_payload_json)
-
-    def __getattr__(self, name: str) -> Any:
-        raise AssertionError(f"scheduler method {name!r} should not be used in this focused processor test")
 
 
 class _UncalledBatchTransform:
@@ -128,9 +135,16 @@ class _UncalledBatchTransform:
         self.supports_row_mode_when_batch_aware = False
         self.creates_tokens = False
         self.passes_through_input = False
+        self.forwards_input_fields = False
+        # elspeth-e6e552ce34: the VALUE promise sibling of passes_through_input.
+        # Required for TransformProtocol conformance — token_traversal's
+        # isinstance check rejects the fake outright without it.
+        self.preserves_input_values = False
+        self.removed_input_fields: frozenset[str] = frozenset()
         self.can_drop_rows = False
         self.declared_output_fields = frozenset()
         self.declared_input_fields = frozenset()
+        self.declared_string_input_fields = frozenset()
         self.requires_runtime_preflight = False
         self._output_schema_config = None
         self.on_error = "discard"
@@ -180,17 +194,23 @@ class _StubHeartbeat:
     start() and stop() are no-ops.
     """
 
-    def __init__(self, *, evicted: bool = False) -> None:
+    def __init__(self, *, evicted: bool = False, lifecycle_events: list[str] | None = None) -> None:
         self._evicted = evicted
+        self._lifecycle_events = lifecycle_events
         self.start_called = False
         self.stop_called = False
+        self.stop_final_beats: list[bool] = []
         self.check_calls = 0
+        self.fatal_error: BaseException | None = None
 
     def start(self) -> None:
         self.start_called = True
 
-    def stop(self) -> None:
+    def stop(self, *, final_beat: bool = True) -> None:
         self.stop_called = True
+        self.stop_final_beats.append(final_beat)
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("heartbeat_stop")
 
     @property
     def coordination_lost(self) -> bool:
@@ -205,6 +225,10 @@ class _StubHeartbeat:
     def set_evicted(self) -> None:
         self._evicted = True
 
+    def raise_fatal_failure(self) -> None:
+        if self.fatal_error is not None:
+            raise self.fatal_error
+
 
 class _StubRunCoordRepo:
     """Stub of RunCoordinationRepository for FollowerProcessor tests.
@@ -212,9 +236,16 @@ class _StubRunCoordRepo:
     Controls what live_leader() returns and records depart_worker() calls.
     """
 
-    def __init__(self, *, seat_live: bool = True, seat_present: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        seat_live: bool = True,
+        seat_present: bool = True,
+        lifecycle_events: list[str] | None = None,
+    ) -> None:
         self._seat_live = seat_live
         self._seat_present = seat_present
+        self._lifecycle_events = lifecycle_events
         self.depart_calls: list[dict[str, Any]] = []
         self.live_leader_calls: list[dict[str, Any]] = []
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
@@ -222,8 +253,8 @@ class _StubRunCoordRepo:
         # Override per-call via a list (pops first element each call)
         self.live_leader_results: list[LeaderInfo | None] = []
 
-    def live_leader(self, *, run_id: str, now: datetime) -> LeaderInfo | None:
-        self.live_leader_calls.append({"run_id": run_id, "now": now})
+    def live_leader(self, *, run_id: str) -> LeaderInfo | None:
+        self.live_leader_calls.append({"run_id": run_id})
         if self.live_leader_results:
             return self.live_leader_results.pop(0)
         if not self._seat_present:
@@ -232,17 +263,19 @@ class _StubRunCoordRepo:
             run_id=run_id,
             leader_worker_id=f"worker:{run_id}:leader",
             leader_epoch=1,
-            leader_heartbeat_expires_at=now + timedelta(seconds=LIVENESS_WINDOW),
+            leader_heartbeat_expires_at=NOW + timedelta(seconds=LIVENESS_WINDOW),
             seat_live=self._seat_live,
         )
 
-    def depart_worker(self, *, worker_id: str, now: datetime) -> None:
-        self.depart_calls.append({"worker_id": worker_id, "now": now})
+    def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+        self.depart_calls.append({"worker_id": member_token.worker_id})
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("worker_depart")
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> Any:
+    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> Any:
         from elspeth.contracts.coordination import CoordinationSnapshot
 
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "now": now})
+        self.worker_heartbeat_calls.append({"worker_id": member_token.worker_id, "window_seconds": window_seconds})
         return CoordinationSnapshot(
             leader_worker_id=f"worker:{RUN_ID}:leader",
             leader_epoch=1,
@@ -338,14 +371,13 @@ def _make_follower(
         # Also trip the terminal flag so the loop exits
         factory.run_lifecycle._running = False
 
-    token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+    member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
 
     follower = FollowerProcessor(
         processor=processor,
-        token=token,
+        member_token=member_token,
         run_coordination=coord_repo,  # type: ignore[arg-type]
         factory=factory,  # type: ignore[arg-type]
-        now_fn=lambda: NOW,
         wait_fn=_wait,
     )
 
@@ -402,14 +434,13 @@ class TestFollowerTerminalRun:
             # Transition to terminal AFTER the first idle sleep
             factory.run_lifecycle._running = False
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -448,13 +479,12 @@ class TestFollowerSeatDead:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -477,13 +507,12 @@ class TestFollowerSeatDead:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -502,13 +531,12 @@ class TestFollowerSeatDead:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -542,13 +570,12 @@ class TestFollowerSeatDead:
         run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
         factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -601,13 +628,12 @@ class TestFollowerSeatDead:
         run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
         factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -658,13 +684,12 @@ class TestFollowerSeatDead:
         ]
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -695,13 +720,12 @@ class TestFollowerEvicted:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)  # check_and_raise() raises immediately
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -727,13 +751,12 @@ class TestFollowerEvicted:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -799,13 +822,12 @@ class TestFollowerEvictionFinalizeDepartureRace:
         run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
         factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -844,13 +866,12 @@ class TestFollowerEvictionFinalizeDepartureRace:
         # Run stays RUNNING for ALL get_run calls → true eviction.
         factory = _StubFactory(running=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -885,14 +906,13 @@ class TestFollowerSIGINT:
         def _raising_wait(seconds: float) -> None:
             raise KeyboardInterrupt
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_raising_wait,
         )
 
@@ -918,13 +938,12 @@ class TestFollowerSIGINT:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -956,15 +975,14 @@ class TestFollowerIdleBehavior:
             waits.append(seconds)
             factory.run_lifecycle._running = False  # exit after first idle
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         idle_seconds = 3.5
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
             idle_poll_seconds=idle_seconds,
         )
@@ -996,14 +1014,13 @@ class TestFollowerIdleBehavior:
             if call_count >= 2:
                 factory.run_lifecycle._running = False
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -1040,14 +1057,13 @@ class TestFollowerDrainedBehavior:
             waits.append(seconds)
             factory.run_lifecycle._running = False  # exit after first idle
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -1077,14 +1093,13 @@ class TestFollowerDrainedBehavior:
             waits.append(seconds)
             factory.run_lifecycle._running = False
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -1124,13 +1139,12 @@ class TestFollowerDepartHygiene:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1147,17 +1161,16 @@ class TestFollowerDepartHygiene:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
 
         def _raising_wait(seconds: float) -> None:
             raise KeyboardInterrupt
 
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_raising_wait,
         )
 
@@ -1169,24 +1182,24 @@ class TestFollowerDepartHygiene:
 
         assert len(coord_repo.depart_calls) == 1
 
-    def test_depart_failure_does_not_mask_run_result(self) -> None:
-        """If depart_worker raises, the exception is swallowed (best-effort)."""
+    def test_transient_depart_failure_does_not_mask_run_result(self) -> None:
+        """A transient DB failure in depart_worker is contained (best-effort);
+        anything else propagates — see TestBestEffortDepartContainment."""
         processor = _CountingDrainProcessor()
         factory = _StubFactory(running=False)
 
         class _ExplodingCoordRepo(_StubRunCoordRepo):
-            def depart_worker(self, *, worker_id: str, now: datetime) -> None:
-                raise RuntimeError("DB unavailable")
+            def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+                raise SQLAOperationalError("stmt", None, Exception("DB unavailable"))
 
         coord_repo = _ExplodingCoordRepo()
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1203,6 +1216,32 @@ class TestFollowerDepartHygiene:
 class TestFollowerHeartbeatLifecycle:
     """Heartbeat is always stopped in the finally block."""
 
+    @pytest.mark.parametrize("at_claim", [False, True])
+    def test_fatal_heartbeat_stops_work_without_eviction_latch(self, at_claim: bool) -> None:
+        failure = AuditIntegrityError("heartbeat corruption")
+        heartbeat = _StubHeartbeat()
+        heartbeat.fatal_error = None if at_claim else failure
+
+        class ClaimingProcessor(_CountingDrainProcessor):
+            def drain_follower_ready_work(self, ctx: Any, *, before_claim: Any = None) -> list[Any]:
+                self.drain_calls.append({"ctx": ctx})
+                heartbeat.fatal_error = failure
+                before_claim()
+                raise AssertionError("a fatal heartbeat must stop the next claim")
+
+        processor = ClaimingProcessor()
+        follower, _, repo, _, _ = _make_follower(processor=processor)
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(AuditIntegrityError) as raised,
+        ):
+            follower.run(ctx=_ctx())
+        assert raised.value is failure
+        assert heartbeat.coordination_lost is False
+        assert len(processor.drain_calls) == int(at_claim)
+        assert heartbeat.stop_called
+        assert len(repo.depart_calls) == 1
+
     def test_heartbeat_stopped_on_clean_exit(self) -> None:
         follower, _, _, _, heartbeat = _make_follower(factory=_StubFactory(running=False))
         with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat):
@@ -1210,18 +1249,33 @@ class TestFollowerHeartbeatLifecycle:
         assert heartbeat.start_called
         assert heartbeat.stop_called
 
+    def test_terminal_exit_stops_without_final_beat_before_departure(self) -> None:
+        """A known-terminal follower must not beat its already-departed row."""
+        lifecycle_events: list[str] = []
+        coord_repo = _StubRunCoordRepo(lifecycle_events=lifecycle_events)
+        heartbeat = _StubHeartbeat(lifecycle_events=lifecycle_events)
+        follower, _, _, _, _ = _make_follower(
+            coord_repo=coord_repo,
+            factory=_StubFactory(running=False),
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat):
+            follower.run(ctx=_ctx())
+
+        assert heartbeat.stop_final_beats == [False]
+        assert lifecycle_events == ["heartbeat_stop", "worker_depart"]
+
     def test_heartbeat_stopped_on_eviction(self) -> None:
         processor = _CountingDrainProcessor()
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
         with (
@@ -1236,17 +1290,16 @@ class TestFollowerHeartbeatLifecycle:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
 
         def _raising_wait(seconds: float) -> None:
             raise KeyboardInterrupt
 
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_raising_wait,
         )
         with (
@@ -1255,6 +1308,34 @@ class TestFollowerHeartbeatLifecycle:
         ):
             follower.run(ctx=_ctx())
         assert heartbeat.stop_called
+
+    def test_unexpected_drain_failure_stops_heartbeat_then_departs(self) -> None:
+        """Exceptional traversal teardown must not leave an ACTIVE worker."""
+        lifecycle_events: list[str] = []
+        coord_repo = _StubRunCoordRepo(lifecycle_events=lifecycle_events)
+        heartbeat = _StubHeartbeat(lifecycle_events=lifecycle_events)
+
+        class _ExplodingDrain:
+            def drain_follower_ready_work(self, ctx: Any, *, before_claim: Any = None) -> list[Any]:
+                del ctx, before_claim
+                raise RuntimeError("unexpected traversal failure")
+
+        follower = FollowerProcessor(
+            processor=_ExplodingDrain(),  # type: ignore[arg-type]
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,  # type: ignore[arg-type]
+            factory=_StubFactory(running=True),  # type: ignore[arg-type]
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(RuntimeError, match="unexpected traversal failure"),
+        ):
+            follower.run(ctx=_ctx())
+
+        assert heartbeat.stop_final_beats == [True]
+        assert lifecycle_events == ["heartbeat_stop", "worker_depart"]
 
 
 # ---------------------------------------------------------------------------
@@ -1286,13 +1367,12 @@ class TestFollowerFinalizeFlipCleanExit:
         # Heartbeat latch is already set (simulates worker_active=False).
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1312,13 +1392,12 @@ class TestFollowerFinalizeFlipCleanExit:
         coord_repo = _StubRunCoordRepo()
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1340,13 +1419,12 @@ class TestFollowerFinalizeFlipCleanExit:
         coord_repo = _StubRunCoordRepo()
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1364,13 +1442,12 @@ class TestFollowerFinalizeFlipCleanExit:
         coord_repo = _StubRunCoordRepo()
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1611,3 +1688,59 @@ class TestFollowerBarrierNodeIds:
             f"Expected barrier_key={str(agg_node_id)!r} for follower barrier node, got {barrier_key!r}. "
             "Without this, _mark_claimed_scheduler_work_blocked raises OrchestrationInvariantError."
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _best_effort_depart containment is typed, recorded, and narrow
+# ---------------------------------------------------------------------------
+
+
+class _RaisingDepartRepo(_StubRunCoordRepo):
+    """Stub whose depart_worker raises a configured exception."""
+
+    def __init__(self, exc: BaseException, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._depart_exc = exc
+
+    def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+        self.depart_calls.append({"worker_id": member_token.worker_id})
+        raise self._depart_exc
+
+
+class TestBestEffortDepartContainment:
+    """Depart contains ONLY transient DB failures — recorded at WARNING —
+    and every other exception (plugin bug, Tier-1 audit error) propagates."""
+
+    def test_operational_error_is_contained_and_recorded(self, caplog: pytest.LogCaptureFixture) -> None:
+        repo = _RaisingDepartRepo(SQLAOperationalError("stmt", None, Exception("locked")))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with caplog.at_level(logging.WARNING, logger="elspeth.engine.orchestrator.follower"):
+            follower._best_effort_depart()
+
+        assert len(repo.depart_calls) == 1
+        assert any("operational DB failure" in record.getMessage() for record in caplog.records)
+
+    def test_integrity_error_propagates(self) -> None:
+        """depart_worker's CAS and audit-event insert share one transaction:
+        a constraint failure there is corruption evidence, not an established
+        transient race, so it must never be relabelled best-effort."""
+        repo = _RaisingDepartRepo(SQLAIntegrityError("stmt", None, Exception("dup")))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with pytest.raises(SQLAIntegrityError):
+            follower._best_effort_depart()
+
+    def test_unexpected_exception_propagates(self) -> None:
+        repo = _RaisingDepartRepo(RuntimeError("depart bug"))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with pytest.raises(RuntimeError, match="depart bug"):
+            follower._best_effort_depart()
+
+    def test_audit_integrity_error_propagates(self) -> None:
+        repo = _RaisingDepartRepo(AuditIntegrityError("coordination ledger corrupt"))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with pytest.raises(AuditIntegrityError):
+            follower._best_effort_depart()

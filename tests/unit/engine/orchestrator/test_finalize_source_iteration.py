@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID
 from elspeth.engine.orchestrator.core import Orchestrator
@@ -19,6 +20,8 @@ from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
 )
 from tests.fixtures.landscape import make_landscape_db
+
+_TOKEN = CoordinationToken(run_id="test-run", worker_id="worker:test-run:test", leader_epoch=1)
 
 
 def _make_orchestrator() -> Orchestrator:
@@ -76,10 +79,13 @@ class _ConfigDouble:
     def __init__(self) -> None:
         self.aggregation_settings: dict[str, Any] = {}
         self.sinks: dict[str, Any] = {}
+        self.escalation_fixpoint_bound = 1_000
 
 
 class _ProcessorDouble:
     run_id = "test-run"
+    row_union_executor = None
+    collector_executor = None
 
     def __init__(self) -> None:
         self.get_aggregation_buffer_count = _CallRecorder(0)
@@ -101,6 +107,10 @@ class _RecorderFactoryDouble:
 
 
 class _CoalesceExecutorSentinel:
+    pass
+
+
+class _RowUnionExecutorSentinel:
     pass
 
 
@@ -179,6 +189,7 @@ class TestFinalizeFieldResolutionRerecord:
             interrupted_by_shutdown=False,
             flush_end_of_input=False,
             active_source=source,
+            coordination_token=_TOKEN,
         )
         return factory
 
@@ -190,9 +201,9 @@ class TestFinalizeFieldResolutionRerecord:
         factory = self._finalize(source, recorded=({"id": "id"}, "v1"))
 
         factory.run_lifecycle.record_source_field_resolution.assert_called_once_with(
-            run_id="test-run",
             resolution_mapping=union,
             normalization_version="v1",
+            coordination_token=_TOKEN,
         )
 
     def test_unchanged_mapping_is_not_rewritten(self) -> None:
@@ -251,6 +262,7 @@ class TestFinalizeSourceIterationContext:
             interrupted_by_shutdown=True,
             flush_end_of_input=False,
             active_source=_make_active_source(),
+            coordination_token=_TOKEN,
         )
 
         assert ctx.node_id == source_id, (
@@ -286,6 +298,7 @@ class TestFinalizeSourceIterationContext:
             interrupted_by_shutdown=False,
             flush_end_of_input=True,
             active_source=_make_active_source(),
+            coordination_token=_TOKEN,
         )
 
         assert ctx.node_id == source_id
@@ -319,6 +332,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=False,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_coalesce.assert_not_called()
@@ -351,9 +365,49 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=True,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_coalesce.assert_called_once()
+
+    def test_row_union_flush_runs_at_true_end_of_input_without_other_barriers(self) -> None:
+        """A row_union-only pipeline must enter the EOF barrier flush."""
+        ctx = PluginContext(
+            run_id="test-run",
+            config={},
+            node_id="transform-residue",
+            operation_id=None,
+        )
+        orchestrator = _make_orchestrator()
+        loop_ctx = _make_loop_ctx(ctx)
+        row_union_executor = _RowUnionExecutorSentinel()
+        loop_ctx.processor.row_union_executor = row_union_executor
+
+        with patch("elspeth.engine.orchestrator.leader_drain.flush_row_union_pending") as flush_row_union:
+            orchestrator._source_driver.finalize_source_iteration(
+                loop_ctx,
+                factory=_RecorderFactoryDouble(),
+                run_id="test-run",
+                source_id=NodeID("source-refunds"),
+                active_source_name="refunds",
+                source_operation_id="op-source-load-refunds",
+                recorded_field_resolution=None,
+                schema_contract_recorded=True,
+                source_exhausted=True,
+                interrupted_by_shutdown=False,
+                flush_end_of_input=True,
+                active_source=_make_active_source(),
+                coordination_token=_TOKEN,
+            )
+
+        flush_row_union.assert_called_once()
+        call = flush_row_union.call_args.kwargs
+        assert call["row_union_executor"] is row_union_executor
+        assert call["processor"] is loop_ctx.processor
+        assert call["counters"] is loop_ctx.counters
+        assert call["ctx"].run_id == "test-run"
+        assert call["ctx"].node_id == "source-refunds"
+        assert call["ctx"].operation_id == "op-source-load-refunds"
 
     def test_aggregation_flush_is_skipped_for_source_local_finalization(self) -> None:
         """Multi-source source completion must not flush shared aggregations."""
@@ -383,6 +437,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=False,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_aggregation.assert_not_called()
@@ -416,6 +471,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=True,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_aggregation.assert_called_once()

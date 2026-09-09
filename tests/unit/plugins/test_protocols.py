@@ -179,8 +179,15 @@ class TestTransformProtocol:
             requires_runtime_preflight = False  # Optional engine-time readiness check
             creates_tokens = False  # Deaggregation (multi-row output)
             passes_through_input = False  # ADR-007: pass-through contract flag
+            forwards_input_fields = False
+            # elspeth-e6e552ce34: the VALUE promise. passes_through_input above
+            # says only that the FIELD survives; this says its value is never
+            # rewritten. Fail-closed default, mirroring BaseTransform.
+            preserves_input_values = False
+            removed_input_fields = frozenset()
             can_drop_rows = False  # ADR-012: empty-emission governance flag
             declared_input_fields: frozenset[str] = frozenset()
+            declared_string_input_fields: frozenset[str] = frozenset()  # elspeth-b19dfe41fb string-scan surface
             declared_output_fields: frozenset[str] = frozenset()  # Collision detection
             _output_schema_config: SchemaConfig | None = None  # Set by BaseTransform
             on_error: str | None = None  # Error routing (WP-11.99b)

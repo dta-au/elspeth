@@ -10,9 +10,12 @@ Responsibilities:
 
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from hypothesis import Phase, Verbosity, settings
@@ -70,6 +73,10 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "slow: long-running tests (>10s)")
     config.addinivalue_line(
         "markers",
+        "live_provider: protected tests that cross a real remote-provider boundary",
+    )
+    config.addinivalue_line(
+        "markers",
         "composer_llm_eval: characterization/replay tests for the 2026-04-28 composer LLM evaluation scenarios",
     )
     config.addinivalue_line(
@@ -79,15 +86,42 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the operator-only live-provider execution gate."""
+    group = parser.getgroup("live-provider")
+    group.addoption(
+        "--run-live-provider",
+        action="store_true",
+        default=False,
+        help="Authorize execution of tests marked live_provider (credentials alone never authorize execution).",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auto-Marking by Directory
 # ---------------------------------------------------------------------------
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Auto-apply markers based on test file location."""
+def _is_declared_remote_service_node(item: pytest.Item) -> bool:
+    """Return whether repository placement or a legacy marker declares remote I/O."""
+    path = item.path.as_posix()
+    return (
+        item.get_closest_marker("live_aws") is not None
+        or item.get_closest_marker("live_azure") is not None
+        or item.get_closest_marker("live_dataverse") is not None
+        or item.get_closest_marker("live_chroma") is not None
+        or ("/tests/integration/plugins/" in path and path.endswith("_live.py"))
+        or path.endswith("/tests/integration/web/composer/test_bedrock_live_smoke.py")
+        or path.endswith("/tests/e2e/recovery/test_run_lifecycle_aws_live.py")
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Auto-mark test tiers and reject uncontained remote-service tests."""
+    uncontained_remote_nodes: list[str] = []
     for item in items:
-        path = str(item.fspath)
+        path = item.path.as_posix()
         if "/e2e/" in path:
             item.add_marker(pytest.mark.e2e)
         elif "/performance/" in path and "/stress/" in path:
@@ -96,6 +130,23 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         elif "/performance/" in path:
             item.add_marker(pytest.mark.performance)
         # integration/ tests get marker from their conftest
+        if _is_declared_remote_service_node(item) and item.get_closest_marker("live_provider") is None:
+            uncontained_remote_nodes.append(item.nodeid)
+    if uncontained_remote_nodes:
+        joined = "\n".join(f"- {node_id}" for node_id in sorted(uncontained_remote_nodes))
+        raise pytest.UsageError("remote-service test nodes must carry @pytest.mark.live_provider:\n" + joined)
+    selected_live_nodes = [item.nodeid for item in items if item.get_closest_marker("live_provider") is not None]
+    if selected_live_nodes and not config.getoption("run_live_provider") and not config.getoption("collectonly"):
+        # Collection-only inventory (the selector-manifest validator's exact
+        # node accounting) is authority-free; execution stays double-gated by
+        # this check and pytest_runtest_setup below.
+        raise pytest.UsageError("--run-live-provider is required to select @pytest.mark.live_provider nodes")
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Require explicit CLI authority independently of dotenv credentials."""
+    if item.get_closest_marker("live_provider") is not None and not item.config.getoption("run_live_provider"):
+        raise pytest.UsageError("--run-live-provider is required to execute @pytest.mark.live_provider nodes")
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +187,33 @@ def _allow_raw_secrets_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "true")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_planner_authoring_aids_memo() -> Iterator[None]:
+    """Clear the process-global authoring-aids memo between tests.
+
+    ``build_planner_authoring_aids`` memoizes on ``snapshot_hash`` alone
+    (``planner_authoring_aids._AIDS_MEMO``). That key is sound in production —
+    one plugin registry per process, so equal availability implies equal
+    catalog CONTENT — but tests violate the premise. ``StubCatalog`` in
+    ``test_prompts.py`` and ``_mock_catalog`` in
+    ``tests/unit/web/composer/conftest.py`` expose the identical plugin id set
+    (csv / passthrough / csv) and therefore hash identically, while carrying
+    different ``composer_hints``. Whichever built first won, and the other
+    silently received its aids.
+
+    That surfaced as ``test_context_includes_discovery_time_composer_hints``
+    failing only under the full suite, at whatever xdist distribution put both
+    on one worker — invisible to any scoped run. Isolate the memo rather than
+    weaken the production key, which is a measured cost optimisation
+    (elspeth-a79f1b2e6b).
+    """
+    from elspeth.web.composer.planner_authoring_aids import _AIDS_MEMO
+
+    _AIDS_MEMO.clear()
+    yield
+    _AIDS_MEMO.clear()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _sink_effect_spool_outside_repo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """Keep the default sink-effect spool out of the repository tree.
@@ -150,6 +228,191 @@ def _sink_effect_spool_outside_repo(tmp_path_factory: pytest.TempPathFactory) ->
     patch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path_factory.mktemp("sink-effect-spool")))
     yield
     patch.undo()
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ELSPETH = _REPO_ROOT / ".elspeth"
+_WRITE_OPEN_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+
+
+def _in_elspeth_root(candidate: object, root: Path) -> Path | None:
+    """Return the resolved path when ``candidate`` targets ``root``, else None."""
+    if not isinstance(candidate, (str, bytes, os.PathLike)):
+        return None
+    raw_candidate = os.fspath(candidate)
+    if isinstance(raw_candidate, bytes):
+        raw_candidate = raw_candidate.decode(errors="replace")
+
+    resolved = Path(raw_candidate).expanduser().resolve()
+    if resolved == root or root in resolved.parents:
+        return resolved
+    return None
+
+
+def _in_repo_elspeth(candidate: object) -> Path | None:
+    """Return the resolved path when it targets ``<repo>/.elspeth``, else None."""
+    return _in_elspeth_root(candidate, _REPO_ELSPETH)
+
+
+def _write_open_requested(mode: object, flags: object) -> bool:
+    """Return whether an ``open`` audit event requests write authority."""
+    if isinstance(mode, str) and any(marker in mode for marker in ("w", "a", "x", "+")):
+        return True
+    return isinstance(flags, int) and bool(flags & _WRITE_OPEN_FLAGS)
+
+
+def _elspeth_tree_snapshot(root: Path) -> bytes:
+    """Return a compact fingerprint of path and inode metadata beneath ``root``."""
+    digest = hashlib.sha256()
+
+    def add_entry(relative_path: Path, entry_stat: os.stat_result) -> None:
+        path_bytes = os.fsencode(relative_path.as_posix())
+        metadata = (
+            entry_stat.st_dev,
+            entry_stat.st_ino,
+            entry_stat.st_mode,
+            entry_stat.st_nlink,
+            entry_stat.st_uid,
+            entry_stat.st_gid,
+            entry_stat.st_size,
+            entry_stat.st_mtime_ns,
+            entry_stat.st_ctime_ns,
+        )
+        record = path_bytes + b"\0" + b"\0".join(str(value).encode("ascii") for value in metadata)
+        digest.update(len(record).to_bytes(8, byteorder="big"))
+        digest.update(record)
+
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return digest.digest()
+
+    add_entry(Path("."), root_stat)
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return digest.digest()
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=raise_walk_error):
+        dirnames.sort(key=os.fsencode)
+        filenames.sort(key=os.fsencode)
+        directory = Path(dirpath)
+        for name in (*dirnames, *filenames):
+            entry = directory / name
+            add_entry(entry.relative_to(root), entry.lstat())
+
+    return digest.digest()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
+    """Fail closed when the suite writes into the checkout's ``.elspeth/``.
+
+    Several settings default to CWD-relative ``.elspeth/`` paths and pytest
+    runs with the checkout as CWD, so a test that drives a real run without
+    redirecting them silently accumulates state in the developer's tree. It is
+    gitignored, so ``git status`` never surfaces it. Two defaults have already
+    done this: ``payload_store.base_path`` (~800K per full run) and the
+    sign-bundle rotation log.
+
+    Three layers, because no single one covers every write:
+
+    * Python's ``open`` audit event covers built-in, ``pathlib``, and
+      ``os.open`` write modes. Refusing there catches writes beneath an
+      existing directory as well as overwrites of an existing file.
+    * ``os.mkdir`` is the choke point for ``Path.mkdir`` and ``os.makedirs``.
+      Refusing there names the offending test and, by raising before the call,
+      keeps the directory from being created at all.
+    * The fd-relative walk in ``core.audit_export_content_store`` passes bare
+      component names against a parent descriptor. The ``os.mkdir`` patch
+      resolves ``dir_fd`` through ``/proc/self/fd`` (Linux), so directory
+      creation there is attributed to the running test; fd-relative file
+      writes beneath pre-existing directories, subprocess writes, and
+      native-extension writes fall to the recursive session-end fingerprint.
+
+    Fix a firing guard at the test, never by relaxing this fixture:
+
+    * ``payload_store.base_path`` is user-configurable — declare it under
+      ``tmp_path`` in the test's settings.
+    * ``landscape.export`` ``spool_root`` / ``content_store.root`` are
+      code-owned and reject absolute paths, so CWD is the only lever —
+      use ``monkeypatch.chdir(tmp_path)``.
+    """
+    before = _elspeth_tree_snapshot(_REPO_ELSPETH)
+    guarded_root = _REPO_ELSPETH
+    audit_active = True
+
+    def guard_write_open(event: str, args: tuple[object, ...]) -> None:
+        if not audit_active or event != "open" or len(args) < 3:
+            return
+        candidate, mode, flags = args[:3]
+        if not _write_open_requested(mode, flags):
+            return
+        resolved = _in_elspeth_root(candidate, guarded_root)
+        if resolved is not None:
+            pytest.fail(
+                f"Test wrote into the repository checkout: {resolved}\n"
+                f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+                f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                pytrace=True,
+            )
+
+    sys.addaudithook(guard_write_open)
+
+    original_mkdir = os.mkdir
+
+    def guarded_mkdir(path: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        candidate = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
+        if isinstance(candidate, bytes):
+            candidate = candidate.decode(errors="replace")
+        if dir_fd is not None and candidate is not None:
+            # dir_fd calls carry a bare component name; on Linux the parent
+            # directory is recoverable from the descriptor, which lets this
+            # layer name the offending test instead of deferring to the
+            # anonymous session-end sweep.
+            try:
+                parent = os.readlink(f"/proc/self/fd/{dir_fd}")
+            except OSError:
+                parent = None
+            candidate = os.path.join(parent, candidate) if parent is not None else None
+        # Cheap pre-filter: almost no mkdir in the suite mentions .elspeth,
+        # and resolve() is a syscall we should not pay on every call.
+        if candidate is not None and ".elspeth" in candidate:
+            resolved = _in_repo_elspeth(candidate)
+            if resolved is not None:
+                # BaseException-derived (pytest.fail), so the `except OSError`
+                # and `suppress(FileExistsError)` guards around production
+                # mkdir calls cannot swallow it.
+                pytest.fail(
+                    f"Test wrote into the repository checkout: {resolved}\n"
+                    f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+                    f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                    pytrace=True,
+                )
+        return original_mkdir(path, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(os, "mkdir", guarded_mkdir)
+    try:
+        yield
+    finally:
+        audit_active = False
+        patch.undo()
+
+        after = _elspeth_tree_snapshot(_REPO_ELSPETH)
+        if after != before:
+            pytest.fail(
+                f"Contents under {_REPO_ELSPETH} changed while this worker ran.\n"
+                f"This is the anonymous end-of-session sweep: the writer was NOT the test "
+                f"named above (the per-write hooks would have failed it directly). Either a "
+                f"test wrote through a channel the hooks cannot see (subprocess, fd-relative "
+                f"file write), or a concurrent process outside pytest wrote into the checkout "
+                f"— e.g. an `elspeth run` of an example, or a signing/staging tool. Compare "
+                f"mtimes under {_REPO_ELSPETH} against the suite window before hunting in the "
+                f"suite — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                pytrace=False,
+            )
 
 
 @pytest.fixture(autouse=True)
@@ -218,6 +481,7 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
 
         from elspeth.contracts import (
             ResolvedSinkEffectMode,
+            SinkEffectContract,
             SinkEffectExecutionPurpose,
             SinkEffectInputKind,
         )
@@ -238,10 +502,15 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
         modes: dict[str, str] = dict(config.sink_effect_modes)
         if not modes:
             for sink_name, sink in config.sinks.items():
-                resolver = getattr(type(sink), "_resolve_sink_effect_mode", None)
-                if resolver is None:
+                # Nominal, not structural: production admission
+                # (``preflight._resolved_modes_for_sinks``) gates on this exact
+                # marker class before calling the adapter-owned resolver, and
+                # ``BaseSink`` declares it, so every sink that owns a mode
+                # resolver is a ``SinkEffectContract``. A legacy sink that
+                # declares nothing simply has no mode to contribute.
+                if not isinstance(sink, SinkEffectContract):
                     continue
-                resolved = resolver(dict(sink.config), purpose=SinkEffectExecutionPurpose.FRESH)
+                resolved = type(sink)._resolve_sink_effect_mode(dict(sink.config), purpose=SinkEffectExecutionPurpose.FRESH)
                 if resolved is None:
                     continue
                 if not isinstance(resolved, ResolvedSinkEffectMode):

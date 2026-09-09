@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -595,7 +594,6 @@ class TestExporterRowBatchStreaming:
             node_id=seed.node_id,
             step_index=1,
             ingest_sequence=10_000,
-            available_at=datetime.now(UTC),
             row_payload_json=payload,
         )
         return run_id

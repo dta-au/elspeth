@@ -72,8 +72,12 @@ def verify_can_drop_rows(
     """Raise when a pass-through transform emitted zero rows without opt-in."""
     if emitted_count != 0:
         return
-    passes_through_input = _require_bool_flag(plugin, attr_name="passes_through_input")
-    can_drop_rows = _require_bool_flag(plugin, attr_name="can_drop_rows")
+    passes_through_input = _require_bool_flag(
+        plugin,
+        attr_name="passes_through_input",
+        value=plugin.passes_through_input,
+    )
+    can_drop_rows = _require_bool_flag(plugin, attr_name="can_drop_rows", value=plugin.can_drop_rows)
 
     raise UnexpectedEmptyEmissionViolation(
         plugin=plugin_name,
@@ -102,8 +106,12 @@ class CanDropRowsContract(DeclarationContract):
     violation_class: ClassVar[type[UnexpectedEmptyEmissionViolation]] = UnexpectedEmptyEmissionViolation
 
     def applies_to(self, plugin: Any) -> bool:
-        passes_through_input = _require_bool_flag(plugin, attr_name="passes_through_input")
-        can_drop_rows = _require_bool_flag(plugin, attr_name="can_drop_rows")
+        passes_through_input = _require_bool_flag(
+            plugin,
+            attr_name="passes_through_input",
+            value=plugin.passes_through_input,
+        )
+        can_drop_rows = _require_bool_flag(plugin, attr_name="can_drop_rows", value=plugin.can_drop_rows)
         return (not passes_through_input) or (passes_through_input and not can_drop_rows)
 
     @staticmethod
@@ -123,8 +131,12 @@ class CanDropRowsContract(DeclarationContract):
             return
         if emitted_count != 0:
             return
-        passes_through_input = _require_bool_flag(plugin, attr_name="passes_through_input")
-        can_drop_rows = _require_bool_flag(plugin, attr_name="can_drop_rows")
+        passes_through_input = _require_bool_flag(
+            plugin,
+            attr_name="passes_through_input",
+            value=plugin.passes_through_input,
+        )
+        can_drop_rows = _require_bool_flag(plugin, attr_name="can_drop_rows", value=plugin.can_drop_rows)
         if passes_through_input:
             return
 
@@ -168,8 +180,16 @@ class CanDropRowsContract(DeclarationContract):
             used_success_empty=outputs.used_success_empty,
         )
         if not (
-            _require_bool_flag(inputs.plugin, attr_name="passes_through_input")
-            and not _require_bool_flag(inputs.plugin, attr_name="can_drop_rows")
+            _require_bool_flag(
+                inputs.plugin,
+                attr_name="passes_through_input",
+                value=inputs.plugin.passes_through_input,
+            )
+            and not _require_bool_flag(
+                inputs.plugin,
+                attr_name="can_drop_rows",
+                value=inputs.plugin.can_drop_rows,
+            )
         ):
             return
         verify_can_drop_rows(
@@ -207,8 +227,16 @@ class CanDropRowsContract(DeclarationContract):
             used_success_empty=outputs.used_success_empty,
         )
         if not (
-            _require_bool_flag(inputs.plugin, attr_name="passes_through_input")
-            and not _require_bool_flag(inputs.plugin, attr_name="can_drop_rows")
+            _require_bool_flag(
+                inputs.plugin,
+                attr_name="passes_through_input",
+                value=inputs.plugin.passes_through_input,
+            )
+            and not _require_bool_flag(
+                inputs.plugin,
+                attr_name="can_drop_rows",
+                value=inputs.plugin.can_drop_rows,
+            )
         ):
             return
         verify_can_drop_rows(

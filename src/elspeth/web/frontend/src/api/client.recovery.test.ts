@@ -150,6 +150,76 @@ describe("api/client recovery contracts", () => {
     });
   });
 
+  it("preserves the convergence taxonomy and elapsed budget from a timeout 422 (R2-F9)", async () => {
+    const partialState = makePartialState();
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: {
+          detail: "Composer did not converge within 6 turns (budget exhausted: timeout).",
+          error_type: "convergence",
+          reason: "convergence_wall_clock_timeout",
+          recovery_text: "Retry once the provider responds faster.",
+          timeout_seconds: 240,
+          turns_used: 6,
+          partial_state: partialState,
+          failed_turn: {
+            assistant_message_id: "assistant-9",
+            tool_calls_attempted: 3,
+            tool_responses_persisted: 3,
+            transcript_url: null,
+          },
+        },
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await sendMessage("session-timeout", "build me a pipeline");
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    // Without these three the SPA cannot tell a timeout from a turn-budget
+    // exhaustion, and cannot name the budget that actually elapsed.
+    expect(error).toMatchObject({
+      status: 422,
+      error_type: "convergence",
+      reason: "convergence_wall_clock_timeout",
+      recovery_text: "Retry once the provider responds faster.",
+      timeout_seconds: 240,
+      partial_state: partialState,
+    });
+  });
+
+  it("drops a non-numeric timeout_seconds rather than rendering it", async () => {
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: {
+          detail: "timed out",
+          error_type: "convergence",
+          reason: "convergence_wall_clock_timeout",
+          timeout_seconds: "two hundred forty",
+        },
+      }),
+    } as Response);
+
+    let error: ApiError | undefined;
+    try {
+      await sendMessage("session-timeout-bad", "build me a pipeline");
+    } catch (err) {
+      error = err as ApiError;
+    }
+
+    expect(error?.reason).toBe("convergence_wall_clock_timeout");
+    expect(error?.timeout_seconds).toBeUndefined();
+  });
+
   it("keeps existing provider validation and fanout error parsing", async () => {
     const validationErrors = [
       { component: "source", message: "missing path", severity: "error" },

@@ -203,7 +203,126 @@ describe("RunOutputsPanel", () => {
     expect(screen.queryByText(/no longer available on disk/i)).not.toBeInTheDocument();
   });
 
-  it("lazy-fetches preview when Preview is clicked and shows truncation footer", async () => {
+  // Auto-expansion (elspeth-3a7b7c7b37): the single-previewable-artifact
+  // common case expands and fetches its preview through the SAME
+  // togglePreview path a manual click uses — exactly once — while
+  // multi-artifact manifests keep the original opt-in behaviour.
+
+  // row_count_preview === 1 is reachable and is the only count that exposes a
+  // hardcoded plural: the backend reports complete logical records (including
+  // a CSV header), so a byte-capped CSV may return only its complete header.
+  // A dropped final record must SAY it was dropped. Both tests below feed a
+  // preview whose text stops inside a quoted field — the parser reports
+  // endedInQuotes and the fragment is discarded — and assert the operator is
+  // told which of the two reasons applies. Before this, the record vanished
+  // in silence: buildTabularPreviewModel justified the drop by citing the
+  // "Preview truncated" footer, a footer it was never given the flag to see,
+  // and which does not render at all on the malformed-artifact path.
+
+  it("says the final record was cut off when a TRUNCATED preview ends mid-quote", async () => {
+    // Defensive wire handling: the current backend withholds byte-cut record
+    // fragments, but a stale server or captured response may still carry one.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: true,
+        row_count_preview: 3,
+        preview_text: 'id,answer\n1,ok\n2,"a half-written ans',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/cut off by the preview limit/i),
+    ).toBeInTheDocument();
+    // The complete record still renders; only the fragment is withheld.
+    expect(screen.getByText("ok")).toBeInTheDocument();
+    expect(screen.queryByText(/a half-written ans/)).not.toBeInTheDocument();
+  });
+
+  it("reports an unterminated quoted field when an UNtruncated preview ends mid-quote", async () => {
+    // A partially-written or malformed artifact that did not hit either cap,
+    // so the backend reports truncated=false and NO footer renders.
+    // Without a caveat here the record disappears with nothing on screen.
+    // summarizeCsv (utils/contentStructure.ts) has always reported exactly
+    // this condition; this is the same rule reaching the second consumer.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: false,
+        row_count_preview: 3,
+        preview_text: 'id,answer\n1,ok\n2,"a half-written ans',
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/unterminated quoted field/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/preview truncated/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the malformed CSV caveat even when no complete row can render", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: false,
+        row_count_preview: null,
+        preview_text: '"unfinished header',
+      }),
+    );
+
+    const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/unterminated quoted field/i),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".structured-preview-table")).toBeNull();
+  });
+
+  it("says a singular row count and discloses that CSV counts include the header", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({ truncated: true, row_count_preview: 1 }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const footer = await screen.findByText(/preview truncated/i);
+    expect(footer.textContent).toContain("to 1 row including header");
+    expect(footer.textContent).not.toContain("to 1 rows");
+  });
+
+  it("does not claim a header was included when the byte cap captured zero CSV rows", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: true,
+        row_count_preview: 0,
+        preview_text: "",
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const footer = await screen.findByText(/preview truncated/i);
+    expect(footer.textContent).toContain("to 0 rows");
+    expect(footer.textContent).not.toContain("including header");
+  });
+
+  it("auto-expands the single previewable artifact, fetching its preview once, and shows the truncation footer", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
     );
@@ -213,13 +332,14 @@ describe("RunOutputsPanel", () => {
 
     render(<RunOutputsPanel runId={RUN_ID} />);
 
-    const previewBtn = await screen.findByRole("button", { name: /^Preview$/ });
-    expect(fetchRunOutputPreview).not.toHaveBeenCalled();
-    fireEvent.click(previewBtn);
-
+    // No click: the sole previewable artifact expands itself.
     await waitFor(() =>
       expect(fetchRunOutputPreview).toHaveBeenCalledWith(RUN_ID, "art-1"),
     );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByRole("button", { name: /Hide preview/ }),
+    ).toBeInTheDocument();
     // CSV renders as a table — assert on cell content.
     await waitFor(() => expect(screen.getByText("col1")).toBeInTheDocument());
     expect(screen.getByText("col2")).toBeInTheDocument();
@@ -235,6 +355,57 @@ describe("RunOutputsPanel", () => {
     expect(fullFileLink.hasAttribute("href")).toBe(false);
   });
 
+  it("keeps a multi-artifact manifest collapsed until Preview is clicked", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact(),
+        fileArtifact({
+          artifact_id: "art-2",
+          path_or_uri: "file:///data/outputs/errors.csv",
+        }),
+      ]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const previewButtons = await screen.findAllByRole("button", {
+      name: /^Preview$/,
+    });
+    expect(previewButtons).toHaveLength(2);
+    expect(fetchRunOutputPreview).not.toHaveBeenCalled();
+
+    fireEvent.click(previewButtons[0]);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith(RUN_ID, "art-1"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-expand after a manual collapse, even across Refresh of the same run", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+
+    // The refreshed manifest must not override the operator's collapse:
+    // auto-expansion is once per run.
+    await waitFor(() => expect(fetchRunOutputs).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByRole("button", { name: /^Preview$/ }),
+    ).toBeInTheDocument();
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
   it("does not refetch preview when the row is collapsed and re-expanded", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
@@ -243,11 +414,10 @@ describe("RunOutputsPanel", () => {
 
     render(<RunOutputsPanel runId={RUN_ID} />);
 
-    const previewBtn = await screen.findByRole("button", { name: /^Preview$/ });
-    fireEvent.click(previewBtn);
+    // Auto-expansion performs the first (and only) fetch.
     await waitFor(() => expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole("button", { name: /Hide preview/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Preview$/ }));
 
     // Cached — no second fetch.
@@ -267,8 +437,8 @@ describe("RunOutputsPanel", () => {
     );
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
+    // Sole previewable artifact — auto-expanded, no click needed.
     await waitFor(() =>
       expect(screen.getByText(/no inline preview available/i)).toBeInTheDocument(),
     );
@@ -290,7 +460,6 @@ describe("RunOutputsPanel", () => {
     );
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     // The full JSON object is present in the rendered output rather than
     // any of its fragments. If the comma-split bug had survived,
@@ -309,6 +478,25 @@ describe("RunOutputsPanel", () => {
     expect(header.getAttribute("scope")).toBe("col");
   });
 
+  it("does not render CRLF blank JSONL frames that the backend does not count", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.jsonl" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "jsonl",
+        preview_text: '{"a":1}\r\n\r\n{"a":2}\r\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText('{"a":1}')).toBeInTheDocument());
+    expect(screen.getByText('{"a":2}')).toBeInTheDocument();
+    expect(screen.getAllByRole("row")).toHaveLength(3); // header plus two JSONL records
+  });
+
   it("renders nothing for an empty csv/jsonl preview body instead of an empty table shell", async () => {
     // buildTabularPreviewModel returns null for zero data lines; TabularPreview
     // must render nothing rather than an empty PreviewTable — this empty
@@ -321,7 +509,6 @@ describe("RunOutputsPanel", () => {
     );
 
     const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /Hide preview/ })).toBeInTheDocument(),
@@ -341,7 +528,6 @@ describe("RunOutputsPanel", () => {
     (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(csvPreview());
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     const headerCells = await screen.findAllByRole("columnheader");
     expect(headerCells.map((el) => el.textContent)).toEqual(["col1", "col2"]);
@@ -369,7 +555,6 @@ describe("RunOutputsPanel", () => {
     );
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     // Each header and data cell is its own queryable element. Before the
     // fix, "id\tname\tvalue" rendered as a single cell.
@@ -378,6 +563,191 @@ describe("RunOutputsPanel", () => {
     expect(screen.getByText("value")).toBeInTheDocument();
     expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.getByText("19.95")).toBeInTheDocument();
+  });
+
+  it("keeps a quoted comma-bearing value in one cell and leaves no blank column headers", async () => {
+    // Regression for elspeth-7f1e148ed6. Every transform:llm emits
+    // `<response_field>_usage` as a dict repr full of commas, so the sink
+    // quotes it and `line.split(delimiter)` shredded it into five cells.
+    // Body rows then parsed wider than the header, `columnCount` grew to
+    // the body width, and the header was right-padded with empty strings —
+    // so the operator read real values under nameless columns. Live shape:
+    // session 75cec2b2, run 6f32968e.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text:
+          'colour,pairing,pairing_usage\n'
+          + 'Crimson,Teal,"{\'completion_tokens\': 6, \'total_tokens\': 51}"\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    // Exactly the three declared columns — no padding.
+    expect(headerCells.map((el) => el.textContent)).toEqual([
+      "colour",
+      "pairing",
+      "pairing_usage",
+    ]);
+    // The quoted field survives whole, in its own cell.
+    expect(
+      screen.getByText("{'completion_tokens': 6, 'total_tokens': 51}"),
+    ).toBeInTheDocument();
+    // And the value after it did not slide under the wrong heading.
+    const bodyCells = screen.getAllByRole("cell").map((el) => el.textContent);
+    expect(bodyCells).toEqual([
+      "Crimson",
+      "Teal",
+      "{'completion_tokens': 6, 'total_tokens': 51}",
+    ]);
+  });
+
+  it("labels genuinely over-wide CSV rows and explains the header mismatch", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: "id,name\n1,Alice,unexpected\n",
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    expect(headerCells.map((cell) => cell.textContent)).toEqual([
+      "id",
+      "name",
+      "Unnamed column 3",
+    ]);
+    expect(
+      screen.getByText(/some rows contain more fields than the header/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("unexpected")).toBeInTheDocument();
+  });
+
+  it("keeps a quoted multi-line value in one cell instead of starting a new row", async () => {
+    // The shape elspeth-7f1e148ed6 was originally filed on: an
+    // llm_response holding formatted JSON. `text.split("\n")` turned each
+    // embedded newline into a table row.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,llm_response\n1,"line one\nline two"\n2,plain\n',
+        row_count_preview: 3,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    const rows = screen.getAllByRole("row");
+    // header + exactly two data rows
+    expect(rows).toHaveLength(3);
+    expect(screen.getByText("line one line two")).toBeInTheDocument();
+  });
+
+  it("renders a final quoted empty CSV record without a terminal newline", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'value\n""',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("value")).toBeInTheDocument());
+    expect(screen.getAllByRole("row")).toHaveLength(2); // header plus empty record
+  });
+
+  it("renders five complete 120-line records from a record-bounded backend preview", async () => {
+    const answers = Array.from({ length: 5 }, (_, recordIndex) =>
+      Array.from(
+        { length: 120 },
+        (_, lineIndex) => `record ${recordIndex} line ${lineIndex}`,
+      ).join("\n"),
+    );
+    const previewText =
+      "id,answer\n" +
+      answers
+        .map((answer, recordIndex) => `${recordIndex},"${answer}"\n`)
+        .join("");
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: previewText,
+        row_count_preview: 6,
+        truncated: false,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    const renderedRows = screen.getAllByRole("row");
+    expect(renderedRows).toHaveLength(6); // one header plus five body records
+    expect(renderedRows[1]?.querySelectorAll("td")[1]?.textContent).toContain(
+      "record 0 line 0\nrecord 0 line 1",
+    );
+    expect(renderedRows[5]?.querySelectorAll("td")[1]?.textContent).toContain(
+      "record 4 line 118\nrecord 4 line 119",
+    );
+  });
+
+  it("escaped double quotes inside a quoted field collapse to one quote", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,quote\n1,"she said ""hi"", then left"\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() =>
+      expect(screen.getByText('she said "hi", then left')).toBeInTheDocument(),
+    );
+  });
+
+  it("drops the trailing row of a preview cut off inside a quoted field", async () => {
+    // A truncated preview can end mid-quote. Rendering the partial field as
+    // a row would show the operator a record that does not exist; the
+    // "Preview truncated" notice already explains the omission.
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'id,note\n1,complete\n2,"cut off mid fie',
+        truncated: true,
+        row_count_preview: 3,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("complete")).toBeInTheDocument());
+    const rows = screen.getAllByRole("row");
+    // header + the one complete data row
+    expect(rows).toHaveLength(2);
+    expect(screen.queryByText(/cut off mid fie/)).not.toBeInTheDocument();
   });
 
   it("pretty-prints JSON previews and offers a table view for record arrays", async () => {
@@ -393,7 +763,6 @@ describe("RunOutputsPanel", () => {
     );
 
     const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     await waitFor(() =>
       expect(container.querySelector('[data-codeblock-format="json"]')?.textContent).toContain(
@@ -414,7 +783,7 @@ describe("RunOutputsPanel", () => {
         fileArtifact({
           sink_node_id: "final_report",
           path_or_uri:
-            "/home/john/.local/share/elspeth/data/blobs/session-1/blob-abc_report.json",
+            "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json",
           storage_kind: "blob",
         }),
       ]),
@@ -427,7 +796,7 @@ describe("RunOutputsPanel", () => {
     );
     expect(
       screen.queryByText(
-        "/home/john/.local/share/elspeth/data/blobs/session-1/blob-abc_report.json",
+        "/var/lib/elspeth/data/blobs/session-1/blob-abc_report.json",
       ),
     ).not.toBeInTheDocument();
   });
@@ -438,7 +807,7 @@ describe("RunOutputsPanel", () => {
         fileArtifact({
           sink_node_id: "final_report",
           path_or_uri:
-            "/home/john/.local/share/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            "/var/lib/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
           storage_kind: "payload",
         }),
       ]),
@@ -451,7 +820,7 @@ describe("RunOutputsPanel", () => {
     );
     expect(
       screen.queryByText(
-        "/home/john/.local/share/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+        "/var/lib/elspeth/data/payloads/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
       ),
     ).not.toBeInTheDocument();
   });
@@ -523,8 +892,8 @@ describe("RunOutputsPanel", () => {
     (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
+    // The auto-expanded preview fetch hits the purge race directly.
     await waitFor(() =>
       expect(
         screen.getByText(
@@ -542,7 +911,6 @@ describe("RunOutputsPanel", () => {
     (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByText(/server boom/)).toBeInTheDocument();
@@ -569,7 +937,7 @@ describe("RunOutputsPanel", () => {
     );
 
     const { rerender } = render(<RunOutputsPanel runId="run-a" />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
+    // Sole previewable artifact — auto-expanded, no click needed.
     await waitFor(() =>
       expect(screen.getByText("old-run-preview")).toBeInTheDocument(),
     );
@@ -640,7 +1008,7 @@ describe("RunOutputsPanel", () => {
     );
 
     const { rerender } = render(<RunOutputsPanel runId="run-a" />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
+    // Auto-expansion fires the run-a preview fetch.
     await waitFor(() =>
       expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-a", "art-1"),
     );
@@ -658,6 +1026,108 @@ describe("RunOutputsPanel", () => {
       expect(fetchRunOutputs).toHaveBeenCalledWith("run-b"),
     );
     expect(screen.queryByText("stale-run-a-preview")).not.toBeInTheDocument();
+  });
+
+  // The auto-expand effect fires in the SAME commit as the runId prop change,
+  // while `manifest` state is still the previous run's. Acting on that pair
+  // would fetch run A's artifact ids against run B's /preview endpoint AND
+  // burn run B's once-per-run auto-expand budget, leaving B's real output
+  // collapsed. The manifest-ownership guard must make both impossible.
+  it("never auto-expands run B using run A's manifest", async () => {
+    const runBLoad = deferred<RunOutputsResponse>();
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockImplementation(
+      (targetRunId: string) =>
+        targetRunId === "run-a"
+          ? Promise.resolve(
+              manifest([
+                fileArtifact({
+                  artifact_id: "art-a",
+                  path_or_uri: "file:///data/outputs/run-a.csv",
+                }),
+              ]),
+            )
+          : runBLoad.promise,
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-a", "art-a"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(fetchRunOutputs).toHaveBeenCalledWith("run-b"),
+    );
+    // No cross-run preview fetch while run B's own manifest is still in
+    // flight — run A's artifact id does not exist under run B.
+    expect(fetchRunOutputPreview).not.toHaveBeenCalledWith("run-b", "art-a");
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+
+    runBLoad.resolve(
+      manifest([
+        fileArtifact({
+          artifact_id: "art-b",
+          path_or_uri: "file:///data/outputs/run-b.csv",
+        }),
+      ]),
+    );
+
+    // Run B's budget was never spent on run A's artifact, so B's own sole
+    // output still auto-expands.
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-b", "art-b"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not re-expand a manually collapsed artifact when navigating run A → B → A", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockImplementation(
+      (targetRunId: string) =>
+        Promise.resolve(
+          manifest([
+            targetRunId === "run-a"
+              ? fileArtifact({
+                  artifact_id: "art-a",
+                  path_or_uri: "file:///data/outputs/run-a.csv",
+                })
+              : fileArtifact({
+                  artifact_id: "art-b",
+                  path_or_uri: "file:///data/outputs/run-b.csv",
+                }),
+          ]),
+        ),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    // Run A auto-expands, then the operator deliberately collapses it.
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+    expect(screen.getByRole("button", { name: /^Preview$/ })).toBeInTheDocument();
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-b", "art-b"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-a" />);
+    await waitFor(() => expect(screen.getByText("run-a.csv")).toBeInTheDocument());
+
+    // Returning to run A must honour the collapse: auto-expansion is
+    // remembered per run in a SET, so run B's visit cannot re-arm run A.
+    expect(
+      await screen.findByRole("button", { name: /^Preview$/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Hide preview/ }),
+    ).not.toBeInTheDocument();
+    // Exactly the two intentional expansions: run A's original auto-expand
+    // and run B's. Returning to A adds no third fetch.
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
   });
 
   it("download button calls downloadRunOutputContent with auth (not a plain anchor)", async () => {
@@ -695,5 +1165,118 @@ describe("RunOutputsPanel", () => {
 
     createSpy.mockRestore();
     revokeSpy.mockRestore();
+  });
+
+  // Every other loading state in the app spins (LoginPage, AuthGuard,
+  // ExecuteButton, PluginCard); static text cannot tell an operator whether the
+  // panel is working or stalled. The spacing around the preview block was also
+  // a raw `6` at five sites, invisible to the token system even though
+  // --space-1-5 IS exactly 6px (elspeth-cda90fbb49).
+  describe("loading affordance and spacing tokens (elspeth-cda90fbb49)", () => {
+    it("spins the shared .spinner while the manifest is loading", async () => {
+      const pending = deferred<RunOutputsResponse>();
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockReturnValue(
+        pending.promise,
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      const loading = await screen.findByText(/Loading outputs/);
+      expect(container.querySelector(".spinner")).not.toBeNull();
+      // The spinner is decoration; the text is the announcement.
+      expect(container.querySelector(".spinner")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+      expect(loading).toBeInTheDocument();
+
+      pending.resolve(manifest([]));
+      await waitFor(() =>
+        expect(container.querySelector(".spinner")).toBeNull(),
+      );
+    });
+
+    it("spins the shared .spinner while a preview is in flight", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      const pending = deferred<RunOutputArtifactPreview>();
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValue(
+        pending.promise,
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await screen.findByText(/Loading preview/);
+      expect(container.querySelector(".spinner")).not.toBeNull();
+
+      pending.resolve(csvPreview());
+      await waitFor(() =>
+        expect(screen.queryByText(/Loading preview/)).toBeNull(),
+      );
+      expect(container.querySelector(".spinner")).toBeNull();
+    });
+
+    // purged / error / binary are TERMINAL outcomes, not work in progress. A
+    // spinner on one of them would claim activity that is not happening — the
+    // filed remediation counted them among "four loading states"; they are not.
+    it("shows no spinner on the terminal purged / error / binary states", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+        csvPreview({ content_type: "binary", preview_text: "" }),
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await screen.findByText(/Binary file/);
+      expect(container.querySelector(".spinner")).toBeNull();
+    });
+
+    it("spaces the preview block with --space-1-5, never a raw 6", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+        csvPreview({ truncated: true, row_count_preview: 1 }),
+      );
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+
+      const footer = await screen.findByText(/download for full file/i);
+      // The preview container and the truncation footer both read from the
+      // spacing scale.
+      const previewBlock = footer.closest("div")?.parentElement as HTMLElement;
+      expect(previewBlock.style.marginTop).toBe("var(--space-1-5)");
+      expect((footer.closest("div") as HTMLElement).style.marginTop).toBe(
+        "var(--space-xs)",
+      );
+    });
+  });
+
+  // R11 (elspeth-fa96173e32) filed RunOutputsPanel.tsx:502 as an ASCII "..."
+  // against BlobRow's U+2026. It is not: this panel is already all-U+2026, and
+  // the only "..." in the file are JS spread operators. Pinned so a later edit
+  // cannot reintroduce the split this panel does not currently have.
+  it("terminates every user-visible loading string with U+2026, never '...'", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const pending = deferred<RunOutputArtifactPreview>();
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValue(
+      pending.promise,
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // Scoped to the copy, not to the whole rendered subtree: artifact names,
+    // hashes and server error strings are DATA and may legitimately contain
+    // three dots.
+    const loading = await screen.findByText(/Loading preview/);
+    expect(loading.textContent).toContain("Loading preview…");
+    expect(loading.textContent).not.toContain("...");
+
+    pending.resolve(csvPreview());
   });
 });

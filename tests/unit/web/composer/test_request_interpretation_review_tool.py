@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
@@ -43,6 +44,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
@@ -51,6 +53,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.composer.tool_error_payloads import arg_error_payload
 from elspeth.web.composer.tools import (
     _BLOB_DISCOVERY_TOOLS,
     _BLOB_MUTATION_TOOLS,
@@ -69,6 +72,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools.sessions import (
     DUPLICATE_RESOLVED_INTERPRETATION_CODE,
     _assert_affected_component,
+    _find_node_or_raise,
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -77,11 +81,17 @@ from elspeth.web.interpretation_state import (
     SOURCE_COMPONENT_ID,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.models import session_operation_fences_table, sessions_table
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateRecord,
+    InterpretationDraftMismatchError,
+    InterpretationPlaceholderConsumedError,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -101,10 +111,79 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
+    )
+
+
+def _insert_test_session_with_released_create_fence(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    *,
+    title: str,
+) -> None:
+    """Seed a fixed test UUID with the released CREATE fence production leaves."""
+    created_at = datetime.now(UTC)
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title=title,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(session_id),
+                operation_id=f"create-{session_id}",
+                lease_token=f"create-token-{session_id}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                operation_epoch=1,
+                lease_expires_at=created_at,
+                released_at=created_at,
+            )
+        )
+
+
+async def _save_composition_state_with_compose_authority(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+) -> CompositionStateRecord:
+    """Persist test state under an authority-issued live COMPOSE context."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _acquire_compose_context(service: SessionServiceImpl, session_id: UUID) -> SessionOperationContext:
+    return await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
     )
 
 
@@ -314,7 +393,11 @@ def _state_with_source(source: SourceSpec) -> CompositionState:
     )
 
 
-def _llm_generated_source(*, draft: str = "https://example.gov.au") -> SourceSpec:
+def _llm_generated_source(
+    *,
+    draft: str = "https://example.gov.au",
+    content_hash: str = "0" * 64,
+) -> SourceSpec:
     return SourceSpec(
         plugin="csv",
         on_success="rows",
@@ -322,7 +405,7 @@ def _llm_generated_source(*, draft: str = "https://example.gov.au") -> SourceSpe
             "path": "/tmp/generated.csv",
             SOURCE_AUTHORING_KEY: {
                 "modality": CreationModality.LLM_GENERATED.value,
-                "content_hash": "0" * 64,
+                "content_hash": content_hash,
                 "review_event_id": None,
                 "resolved_kind": None,
             },
@@ -378,73 +461,54 @@ async def _fake_create_pending_interpretation_event(**kwargs: Any) -> Interpreta
 
 async def _seed_session(service: SessionServiceImpl, session_id: UUID) -> UUID:
     """Seed a session row + a composition_states row; return the state id."""
-    from datetime import UTC, datetime
-
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Test",
+    )
     # Persist a production-shaped composition_states row that the writer's
     # affected_node_id boundary check can read against.
     state_dict = _state_with(_llm_node()).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
 
 async def _seed_node_session(service: SessionServiceImpl, session_id: UUID, *, node: NodeSpec) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Node Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Node Test",
+    )
     state_dict = _state_with(node).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
 
 async def _seed_source_session(service: SessionServiceImpl, session_id: UUID, *, source: SourceSpec | None = None) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Source Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Source Test",
+    )
     state_dict = _state_with_source(source if source is not None else _llm_generated_source()).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             sources=state_dict["sources"],
@@ -452,7 +516,6 @@ async def _seed_source_session(service: SessionServiceImpl, session_id: UUID, *,
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
@@ -471,6 +534,808 @@ def _now() -> datetime:
     return datetime(2026, 5, 18, 12, 0, 0, tzinfo=UTC)
 
 
+def _canonical_pending_requirement(
+    *,
+    requirement_id: str,
+    kind: InterpretationKind,
+    user_term: str,
+    draft: str,
+) -> dict[str, object]:
+    return {
+        "id": requirement_id,
+        "kind": kind.value,
+        "user_term": user_term,
+        "status": "pending",
+        "draft": draft,
+        "event_id": None,
+        "accepted_value": None,
+        "accepted_artifact_hash": None,
+        "resolved_prompt_template_hash": None,
+    }
+
+
+def _event_liveness_state(
+    kind: InterpretationKind,
+    *,
+    draft: str,
+    identity_variant: str = "a",
+) -> tuple[CompositionState, str, str]:
+    """Build one canonical pending review site for stale-event race tests."""
+    if kind is InterpretationKind.INVENTED_SOURCE:
+        content_hash = ("0" if identity_variant == "a" else "1") * 64
+        return (
+            _state_with_source(_llm_generated_source(draft=draft, content_hash=content_hash)),
+            SOURCE_COMPONENT_ID,
+            "inline_source_url_list",
+        )
+
+    if kind is InterpretationKind.PIPELINE_DECISION:
+        user_term = "web_scrape_http_identity"
+        node = NodeSpec(
+            id="fetch_pages",
+            node_type="transform",
+            plugin="web_scrape",
+            input="rows",
+            on_success="out",
+            on_error="discard",
+            options={
+                "url_field": "url",
+                "content_field": "content",
+                "fingerprint_field": "content_fingerprint",
+                "http": {
+                    "abuse_contact": "review@example.com",
+                    "scraping_reason": f"event liveness test {identity_variant}",
+                    "allowed_hosts": "public_only",
+                },
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    _canonical_pending_requirement(
+                        requirement_id=f"{user_term}:fetch_pages",
+                        kind=kind,
+                        user_term=user_term,
+                        draft=draft,
+                    )
+                ],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return _state_with(node), node.id, user_term
+
+    node_id = "reviewed_llm"
+    if kind is InterpretationKind.VAGUE_TERM:
+        user_term = "cool"
+        requirement_id = f"{user_term}:{node_id}:{identity_variant}"
+        options: dict[str, object] = {
+            "prompt_template": "Rate pending interpretation: {{ row.text }}",
+            PROMPT_TEMPLATE_PARTS_KEY: [
+                {"kind": "text", "text": "Rate "},
+                {"kind": "interpretation_ref", "requirement_id": requirement_id},
+                {"kind": "text", "text": ": {{ row.text }}"},
+            ],
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                _canonical_pending_requirement(
+                    requirement_id=requirement_id,
+                    kind=kind,
+                    user_term=user_term,
+                    draft=draft,
+                )
+            ],
+        }
+    elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        user_term = f"llm_prompt_template:{node_id}"
+        split_at = max(1, len(draft) // 2)
+        prompt_parts = (
+            [{"kind": "text", "text": draft}]
+            if identity_variant == "a"
+            else [
+                {"kind": "text", "text": draft[:split_at]},
+                {"kind": "text", "text": draft[split_at:]},
+            ]
+        )
+        options = {
+            "prompt_template": draft,
+            PROMPT_TEMPLATE_PARTS_KEY: prompt_parts,
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                _canonical_pending_requirement(
+                    requirement_id=f"prompt_template_review:{node_id}",
+                    kind=kind,
+                    user_term=user_term,
+                    draft=draft,
+                )
+            ],
+        }
+    elif kind is InterpretationKind.LLM_MODEL_CHOICE:
+        user_term = f"llm_model_choice:{node_id}"
+        options = {
+            "model": draft,
+            "prompt_template": "Summarise {{ row.text }}.",
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                _canonical_pending_requirement(
+                    requirement_id=f"model_choice_review:{node_id}:{identity_variant}",
+                    kind=kind,
+                    user_term=user_term,
+                    draft=draft,
+                )
+            ],
+        }
+    else:
+        raise AssertionError(f"unhandled InterpretationKind {kind!r}")
+    node = NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="llm",
+        input="rows",
+        on_success="out",
+        on_error="discard",
+        options=options,
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    return _state_with(node), node.id, user_term
+
+
+async def _save_event_liveness_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionState,
+) -> UUID:
+    state_dict = state.to_dict()
+    record = await _save_composition_state_with_compose_authority(
+        service,
+        session_id,
+        CompositionStateData(
+            sources=state_dict["sources"],
+            nodes=state_dict["nodes"],
+            edges=state_dict["edges"],
+            outputs=state_dict["outputs"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+    )
+    return record.id
+
+
+async def _seed_event_liveness_session(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionState,
+) -> UUID:
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Interpretation event liveness test",
+    )
+    return await _save_event_liveness_state(service, session_id, state)
+
+
+# --------------------------------------------------------------------------- #
+# Review-event liveness — only the exact current draft may settle
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "old_draft", "current_draft"),
+    [
+        (InterpretationKind.VAGUE_TERM, "visually appealing", "aesthetically pleasing"),
+        (InterpretationKind.INVENTED_SOURCE, "https://old.example", "https://current.example"),
+        (
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            "Summarise {{ row.text }}.",
+            "Classify {{ row.text }}.",
+        ),
+        (
+            InterpretationKind.PIPELINE_DECISION,
+            "Approve the original scraping identity.",
+            "Approve the current scraping identity.",
+        ),
+        (
+            InterpretationKind.LLM_MODEL_CHOICE,
+            "anthropic/claude-haiku-4.5",
+            "anthropic/claude-sonnet-4.5",
+        ),
+    ],
+    # source_data_contract is deliberately excluded: its card carries no
+    # staged draft to go stale — the liveness gate is the server-recomputed
+    # demand identity, pinned by
+    # tests/unit/web/sessions/test_source_data_contract_service.py.
+    ids=[kind.value for kind in InterpretationKind if kind is not InterpretationKind.SOURCE_DATA_CONTRACT],
+)
+async def test_only_event_for_exact_current_draft_can_settle(
+    service: SessionServiceImpl,
+    kind: InterpretationKind,
+    old_draft: str,
+    current_draft: str,
+) -> None:
+    old_state, affected_node_id, user_term = _event_liveness_state(kind, draft=old_draft)
+    session_id = uuid4()
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+    old_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"old-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=old_draft,
+        **_provenance_kwargs(),
+    )
+
+    current_state, current_component_id, current_user_term = _event_liveness_state(kind, draft=current_draft)
+    assert current_component_id == affected_node_id
+    assert current_user_term == user_term
+    current_state_id = await _save_event_liveness_state(service, session_id, current_state)
+
+    # The older card is still an immutable audit row, but it is no longer live
+    # authority for the same site after that site's draft changes.
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=old_event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+    pending_rows = await service.list_interpretation_events(session_id, status="pending")
+    assert [row.id for row in pending_rows] == [old_event.id]
+
+    current_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"current-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=current_draft,
+        **_provenance_kwargs(),
+    )
+    all_rows = await service.list_interpretation_events(session_id, status="all")
+    by_id = {row.id: row for row in all_rows}
+    assert by_id[old_event.id].choice is InterpretationChoice.SUPERSEDED
+    assert by_id[old_event.id].resolved_at is not None
+    assert by_id[current_event.id].choice is InterpretationChoice.PENDING
+    resolved_event, resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=current_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert resolved_event.accepted_value == current_draft
+    if kind is InterpretationKind.INVENTED_SOURCE:
+        assert resolved_state.sources is not None
+        options = resolved_state.sources["source"]["options"]
+    else:
+        assert resolved_state.nodes is not None
+        options = next(node["options"] for node in resolved_state.nodes if node["id"] == affected_node_id)
+    requirement = next(
+        requirement
+        for requirement in options[INTERPRETATION_REQUIREMENTS_KEY]
+        if requirement["kind"] == kind.value and requirement["user_term"] == user_term
+    )
+    assert requirement["status"] == "resolved"
+    assert requirement["event_id"] == str(current_event.id)
+    assert requirement["accepted_value"] == current_draft
+
+
+@pytest.mark.asyncio
+async def test_delayed_older_surface_cannot_displace_current_pending_review(
+    service: SessionServiceImpl,
+) -> None:
+    """A worker delayed behind a newer surface cannot reverse review authority."""
+    kind = InterpretationKind.VAGUE_TERM
+    old_state, affected_node_id, user_term = _event_liveness_state(
+        kind,
+        draft="the older interpretation",
+        identity_variant="a",
+    )
+    session_id = uuid4()
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+
+    current_state, current_component_id, current_user_term = _event_liveness_state(
+        kind,
+        draft="the current interpretation",
+        identity_variant="b",
+    )
+    assert current_component_id == affected_node_id
+    assert current_user_term == user_term
+    current_state_id = await _save_event_liveness_state(service, session_id, current_state)
+    current_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="current-surface",
+        user_term=user_term,
+        kind=kind,
+        llm_draft="the current interpretation",
+        **_provenance_kwargs(),
+    )
+
+    # This older invocation was prepared from the historical state but did not
+    # reach the session writer until after the current state and card committed.
+    delayed_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="delayed-older-surface",
+        user_term=user_term,
+        kind=kind,
+        llm_draft="the older interpretation",
+        **_provenance_kwargs(),
+    )
+
+    rows = await service.list_interpretation_events(session_id, status="all")
+    assert {row.llm_draft: row.choice for row in rows} == {
+        "the current interpretation": InterpretationChoice.PENDING,
+    }
+    assert delayed_event.id == current_event.id
+
+    resolved, _ = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=current_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert resolved.accepted_value == "the current interpretation"
+
+
+@pytest.mark.asyncio
+async def test_delayed_older_surface_without_current_card_fails_closed(
+    service: SessionServiceImpl,
+) -> None:
+    """Historical reviewed content cannot mint a card for a different live head."""
+    kind = InterpretationKind.VAGUE_TERM
+    old_state, affected_node_id, user_term = _event_liveness_state(
+        kind,
+        draft="the older interpretation",
+        identity_variant="a",
+    )
+    session_id = uuid4()
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+
+    current_state, _, _ = _event_liveness_state(
+        kind,
+        draft="the current interpretation",
+        identity_variant="b",
+    )
+    await _save_event_liveness_state(service, session_id, current_state)
+
+    with pytest.raises(InterpretationPlaceholderConsumedError, match="current composition state"):
+        await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=old_state_id,
+            affected_node_id=affected_node_id,
+            tool_call_id="delayed-older-surface-without-current-card",
+            user_term=user_term,
+            kind=kind,
+            llm_draft="the older interpretation",
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
+
+
+@pytest.mark.asyncio
+async def test_delayed_surface_after_review_site_removal_receives_the_superseded_card(
+    service: SessionServiceImpl,
+) -> None:
+    """A post-commit stale surfacer must not leave an impossible card pending.
+
+    The commit that removes the review site now retires the card itself
+    (the state-commit supersession sweep, elspeth-d73139155a), so the
+    delayed surfacer finds no pending row and is handed the SUPERSEDED
+    terminal row instead of erroring — the same successful-commit contract
+    the old abandon fallback provided."""
+    kind = InterpretationKind.VAGUE_TERM
+    old_state, affected_node_id, user_term = _event_liveness_state(
+        kind,
+        draft="the reviewed interpretation",
+    )
+    session_id = uuid4()
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+    previous_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="original-surface",
+        user_term=user_term,
+        kind=kind,
+        llm_draft="the reviewed interpretation",
+        **_provenance_kwargs(),
+    )
+
+    # A different worker commits a state that removes this review site before
+    # the delayed surfacer reaches the session lock.
+    await _save_event_liveness_state(
+        service,
+        session_id,
+        _state_with(_llm_node(node_id="replacement-node", term="other")),
+    )
+
+    reconciled = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="delayed-after-removal",
+        user_term=user_term,
+        kind=kind,
+        llm_draft="the reviewed interpretation",
+        **_provenance_kwargs(),
+    )
+
+    rows = await service.list_interpretation_events(session_id, status="all")
+    assert reconciled.id == previous_event.id
+    assert reconciled.choice is InterpretationChoice.SUPERSEDED
+    assert [(row.id, row.choice) for row in rows] == [
+        (previous_event.id, InterpretationChoice.SUPERSEDED),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "draft"),
+    [
+        (InterpretationKind.VAGUE_TERM, "visually appealing"),
+        (InterpretationKind.INVENTED_SOURCE, "https://same.example"),
+        (InterpretationKind.LLM_PROMPT_TEMPLATE, "Classify {{ row.text }}."),
+        (InterpretationKind.PIPELINE_DECISION, "Approve the configured scraping identity."),
+        (InterpretationKind.LLM_MODEL_CHOICE, "anthropic/claude-haiku-4.5"),
+    ],
+    # source_data_contract excluded for the same reason as the settle matrix
+    # above: no staged draft — its identity is the server-recomputed demand,
+    # pinned in tests/unit/web/sessions/test_source_data_contract_service.py.
+    ids=[kind.value for kind in InterpretationKind if kind is not InterpretationKind.SOURCE_DATA_CONTRACT],
+)
+async def test_review_event_identity_supersedes_same_text_changed_artifact(
+    service: SessionServiceImpl,
+    kind: InterpretationKind,
+    draft: str,
+) -> None:
+    """Authority follows reviewed content, while unrelated state versions stay idempotent."""
+    state_a, affected_node_id, user_term = _event_liveness_state(
+        kind,
+        draft=draft,
+        identity_variant="a",
+    )
+    session_id = uuid4()
+    state_a_id = await _seed_event_liveness_session(service, session_id, state_a)
+    event_a = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_a_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"artifact-a-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+
+    state_b, current_component_id, current_user_term = _event_liveness_state(
+        kind,
+        draft=draft,
+        identity_variant="b",
+    )
+    assert current_component_id == affected_node_id
+    assert current_user_term == user_term
+    state_b_id = await _save_event_liveness_state(service, session_id, state_b)
+
+    # Independent resolution liveness: even before a replacement event exists,
+    # the older card cannot settle a different live artifact with identical text.
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event_a.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+    assert [row.id for row in await service.list_interpretation_events(session_id, status="pending")] == [event_a.id]
+
+    event_b = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_b_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"artifact-b-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b.id != event_a.id
+    rows_after_supersession = await service.list_interpretation_events(session_id, status="all")
+    by_id = {row.id: row for row in rows_after_supersession}
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
+    assert by_id[event_a.id].resolved_at is not None
+    assert by_id[event_b.id].choice is InterpretationChoice.PENDING
+
+    # A new composition-state version whose reviewed projection is unchanged
+    # reuses the current event instead of producing another card.
+    unrelated_state = replace(
+        state_b,
+        metadata=PipelineMetadata(name="Unrelated metadata edit"),
+    )
+    unrelated_state_id = await _save_event_liveness_state(service, session_id, unrelated_state)
+    event_b_again = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=unrelated_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=f"artifact-b-unrelated-{kind.value}",
+        user_term=user_term,
+        kind=kind,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b_again.id == event_b.id
+    assert [row.id for row in await service.list_interpretation_events(session_id, status="pending")] == [event_b.id]
+
+    resolved_event, _resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event_b.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert resolved_event.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+    assert resolved_event.accepted_value == draft
+    assert await service.list_interpretation_events(session_id, status="pending") == []
+
+
+@pytest.mark.asyncio
+async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
+    service: SessionServiceImpl,
+) -> None:
+    """An unchanged requirement cannot carry authority into a different slot skeleton."""
+    draft = "visually appealing"
+    state_a, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.VAGUE_TERM,
+        draft=draft,
+        identity_variant="a",
+    )
+    session_id = uuid4()
+    state_a_id = await _seed_event_liveness_session(service, session_id, state_a)
+    event_a = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_a_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="vague-structure-a",
+        user_term=user_term,
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+
+    node_a = state_a.nodes[0]
+    requirement_id = node_a.options[INTERPRETATION_REQUIREMENTS_KEY][0]["id"]
+    options_b = dict(node_a.options)
+    options_b["prompt_template"] = "Explain pending interpretation: {{ row.text }}"
+    options_b[PROMPT_TEMPLATE_PARTS_KEY] = [
+        {"kind": "text", "text": "Explain "},
+        {"kind": "interpretation_ref", "requirement_id": requirement_id},
+        {"kind": "text", "text": ": {{ row.text }}"},
+    ]
+    state_b = replace(
+        state_a,
+        nodes=(replace(node_a, options=options_b),),
+    )
+    state_b_id = await _save_event_liveness_state(service, session_id, state_b)
+
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event_a.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+
+    event_b = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_b_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="vague-structure-b",
+        user_term=user_term,
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b.id != event_a.id
+    all_rows = await service.list_interpretation_events(session_id, status="all")
+    by_id = {row.id: row for row in all_rows}
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
+    assert by_id[event_b.id].choice is InterpretationChoice.PENDING
+
+    event_b_again = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_b_id,
+        affected_node_id=affected_node_id,
+        tool_call_id="vague-structure-b-again",
+        user_term=user_term,
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft=draft,
+        **_provenance_kwargs(),
+    )
+    assert event_b_again.id == event_b.id
+
+    resolved_event, resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event_b.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert resolved_event.choice is InterpretationChoice.ACCEPTED_AS_DRAFTED
+    assert resolved_state.nodes is not None
+    [resolved_node] = [node for node in resolved_state.nodes if node["id"] == affected_node_id]
+    assert resolved_node["options"]["prompt_template"] == "Explain visually appealing: {{ row.text }}"
+
+
+@pytest.mark.asyncio
+async def test_legacy_vague_term_event_is_bound_to_its_surfacing_prompt(
+    service: SessionServiceImpl,
+) -> None:
+    """Legacy placeholder rows lack a stored requirement draft, so bind to the prompt."""
+    session_id = uuid4()
+    old_state = _state_with(
+        _llm_node(
+            node_id="legacy_llm",
+            term="cool",
+            prompt_template="Rate {{interpretation:cool}} using the original rubric.",
+        )
+    )
+    old_state_id = await _seed_event_liveness_session(service, session_id, old_state)
+    old_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=old_state_id,
+        affected_node_id="legacy_llm",
+        tool_call_id="old-legacy-vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="visually appealing",
+        **_provenance_kwargs(),
+    )
+    current_state = _state_with(
+        _llm_node(
+            node_id="legacy_llm",
+            term="cool",
+            prompt_template="Rate {{interpretation:cool}} using the current rubric.",
+        )
+    )
+    current_state_id = await _save_event_liveness_state(service, session_id, current_state)
+
+    with pytest.raises(ValueError):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=old_event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+
+    current_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        affected_node_id="legacy_llm",
+        tool_call_id="current-legacy-vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="aesthetically pleasing",
+        **_provenance_kwargs(),
+    )
+    resolved, resolved_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=current_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert resolved.accepted_value == "aesthetically pleasing"
+    assert resolved_state.nodes is not None
+    prompt = next(node["options"]["prompt_template"] for node in resolved_state.nodes if node["id"] == "legacy_llm")
+    assert prompt == "Rate aesthetically pleasing using the current rubric."
+
+
+@pytest.mark.asyncio
+async def test_structured_vague_term_writer_rejects_noncurrent_draft(
+    service: SessionServiceImpl,
+) -> None:
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.VAGUE_TERM,
+        draft="the current definition",
+    )
+    session_id = uuid4()
+    state_id = await _seed_event_liveness_session(service, session_id, state)
+
+    with pytest.raises(ValueError, match="event draft"):
+        await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state_id,
+            affected_node_id=affected_node_id,
+            tool_call_id="stale-at-create",
+            user_term=user_term,
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="an older definition",
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
+
+
+def test_structured_vague_term_boundary_rejects_noncurrent_draft() -> None:
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.VAGUE_TERM,
+        draft="the current definition",
+    )
+
+    with pytest.raises(ToolArgumentError, match="stale vague-term draft"):
+        _assert_affected_component(
+            state,
+            affected_node_id,
+            InterpretationKind.VAGUE_TERM,
+            user_term,
+            "an older definition",
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_writer_rejects_noncurrent_draft_as_typed_resolve_error(
+    service: SessionServiceImpl,
+) -> None:
+    """elspeth-9c01c943a5: the writer's under-lock draft re-check must raise the
+    typed stale-content error the tool handler converts to ARG_ERROR. A bare
+    ``ValueError`` here escaped the compose route as an uncoded 500."""
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.PIPELINE_DECISION,
+        draft="the staged disclosure",
+    )
+    session_id = uuid4()
+    state_id = await _seed_event_liveness_session(service, session_id, state)
+
+    with pytest.raises(InterpretationDraftMismatchError, match="event draft"):
+        await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state_id,
+            affected_node_id=affected_node_id,
+            tool_call_id="stale-at-create",
+            user_term=user_term,
+            kind=InterpretationKind.PIPELINE_DECISION,
+            llm_draft="a paraphrased disclosure",
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
+
+
+def test_pipeline_decision_boundary_rejects_noncurrent_draft() -> None:
+    """elspeth-9c01c943a5 defect 1: ``pipeline_decision`` was the only reviewable
+    kind whose Tier-3 boundary never compared the LLM-echoed draft against the
+    staged requirement draft, so an echo error crashed at the writer instead of
+    returning a recoverable ARG_ERROR."""
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.PIPELINE_DECISION,
+        draft="the staged disclosure",
+    )
+
+    with pytest.raises(ToolArgumentError, match="does not match the node review requirement draft"):
+        _assert_affected_component(
+            state,
+            affected_node_id,
+            InterpretationKind.PIPELINE_DECISION,
+            user_term,
+            "a paraphrased disclosure",
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Tests 01 — tool registration
 # --------------------------------------------------------------------------- #
@@ -485,18 +1350,79 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
     params = tool["parameters"]
     assert params["type"] == "object"
     assert params["additionalProperties"] is False
-    assert set(params["required"]) == {"affected_node_id", "kind", "user_term", "llm_draft"}
+    # llm_draft is deliberately NOT required (elspeth-9d59c33480): omitting it
+    # resolves the staged requirement draft server-side instead of forcing the
+    # LLM to re-emit staged bytes through tool-call JSON.
+    assert set(params["required"]) == {"affected_node_id", "kind", "user_term"}
     assert set(params["properties"]) == {"affected_node_id", "kind", "user_term", "llm_draft"}
     assert all(params["properties"][k]["type"] == "string" for k in params["properties"])
     assert params["properties"]["kind"]["enum"] == [
         "vague_term",
         "invented_source",
-        "llm_prompt_template",
         "pipeline_decision",
         "llm_model_choice",
+        "source_data_contract",
     ]
     assert "Do not ask the user in assistant prose" in tool["description"]
     assert "review surface" in tool["description"]
+
+
+def test_pipeline_decision_tool_schema_advertises_public_vocabulary_through_supported_provider_adapters() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _bedrock_tools_pt
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    definition = next(item for item in get_tool_definitions() if item["name"] == "request_interpretation_review")
+    validator = Draft202012Validator(definition["parameters"])
+    base = {
+        "affected_node_id": "cleanup",
+        "llm_draft": "Review this decision.",
+    }
+
+    assert validator.is_valid(
+        {
+            **base,
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_html_fields",
+        }
+    )
+    # Provider adapters discard root conditional schemas. The server-owned
+    # admission boundary closes this vocabulary; the surviving property prose
+    # makes its public values discoverable to every supported model provider.
+    assert validator.is_valid(
+        {
+            **base,
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_extracted_fields",
+        }
+    )
+    assert validator.is_valid(
+        {
+            **base,
+            "kind": "vague_term",
+            "user_term": "customer-specific risk band",
+        }
+    )
+
+    expected_public_terms = {
+        "drop_raw_html_fields",
+        "prompt_injection_shield_recommendation",
+        "web_scrape_http_identity",
+    }
+    raw_description = definition["parameters"]["properties"]["user_term"]["description"]
+    wrapped_definition: Any = {"type": "function", "function": definition}
+    anthropic_tool: Any
+    anthropic_tool, _ = AnthropicConfig()._map_tool_helper(wrapped_definition)
+    anthropic_description = anthropic_tool["input_schema"]["properties"]["user_term"]["description"]
+    bedrock_tools: Any = _bedrock_tools_pt(
+        [wrapped_definition],
+        model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+    )
+    bedrock_tool: Any = bedrock_tools[0]
+    bedrock_description = bedrock_tool["toolSpec"]["inputSchema"]["json"]["properties"]["user_term"]["description"]
+
+    for description in (raw_description, anthropic_description, bedrock_description):
+        assert all(term in description for term in expected_public_terms)
+        assert "required_control_auto_wired" not in description
 
 
 # --------------------------------------------------------------------------- #
@@ -533,7 +1459,7 @@ async def test_02_happy_path_produces_success_and_db_row(service: SessionService
     )
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -556,7 +1482,15 @@ async def test_02b_opted_out_session_does_not_return_pending_payload(service: Se
     """After session opt-out, the tool reports suppression and writes no PENDING row."""
     session_id = uuid4()
     state_id = await _seed_session(service, session_id)
-    await service.record_session_interpretation_opt_out(session_id=session_id, actor="user:alice")
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     state = _state_with(_llm_node())
 
     result = await _handle_request_interpretation_review(
@@ -605,7 +1539,7 @@ async def test_02c_structured_pending_requirement_happy_path(service: SessionSer
             "affected_node_id": "rate_node",
             "kind": "vague_term",
             "user_term": "cool",
-            "llm_draft": "Visually appealing.",
+            "llm_draft": "visually appealing",
         },
         state=state,
         session_id=session_id,
@@ -621,7 +1555,7 @@ async def test_02c_structured_pending_requirement_happy_path(service: SessionSer
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -637,6 +1571,19 @@ def test_03_missing_affected_node_id_raises() -> None:
     state = _state_with(_llm_node(node_id="present_node"))
     with pytest.raises(ToolArgumentError, match=r"unknown id"):
         _assert_affected_component(state, "absent_node", InterpretationKind.VAGUE_TERM, "cool")
+
+
+def test_03b_missing_affected_node_canary_is_absent_from_payload_and_args() -> None:
+    """A real dynamic producer cannot copy its model-supplied id downstream."""
+    canary = "TOOL_ARGUMENT_NODE_CANARY_sk_live_6Nz2"
+    state = _state_with(_llm_node(node_id="present_node"))
+
+    with pytest.raises(ToolArgumentError) as exc_info:
+        _find_node_or_raise(state, canary)
+
+    payload = arg_error_payload(exc_info.value, "request_interpretation_review")
+    serialized = repr({"args": exc_info.value.args, "payload": payload})
+    assert canary not in serialized
 
 
 def test_04_wrong_kind_node_raises() -> None:
@@ -692,7 +1639,7 @@ def test_05d_structured_pending_requirement_for_different_term_still_fails() -> 
 
 def test_05e_legacy_structured_pending_requirement_without_kind_defaults_to_vague_term() -> None:
     node = _structured_llm_node()
-    requirement = dict(node.options[INTERPRETATION_REQUIREMENTS_KEY][0])  # type: ignore[index]
+    requirement = dict(node.options[INTERPRETATION_REQUIREMENTS_KEY][0])
     del requirement["kind"]
     options = dict(node.options)
     options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
@@ -759,7 +1706,7 @@ def test_pipeline_decision_boundary_rejects_raw_html_mapping_preservation() -> N
     }
     state = _state_with(replace(node, options=options))
 
-    with pytest.raises(ToolArgumentError, match=r"preserves raw HTML/fingerprint field"):
+    with pytest.raises(ToolArgumentError, match=r"without preserved raw HTML/fingerprint fields"):
         _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
 
 
@@ -778,7 +1725,7 @@ def test_pipeline_decision_boundary_rejects_custom_raw_field_preservation() -> N
         fingerprint_field="page_hash",
     )
 
-    with pytest.raises(ToolArgumentError, match=r"page_body|page_hash"):
+    with pytest.raises(ToolArgumentError, match=r"without preserved raw HTML/fingerprint fields"):
         _assert_affected_component(state, "drop_raw_html", InterpretationKind.PIPELINE_DECISION, "drop_raw_html_fields")
 
 
@@ -888,7 +1835,42 @@ async def test_request_interpretation_review_accepts_source_component_for_invent
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
+    assert result.data["kind"] == "invented_source"
+
+
+@pytest.mark.asyncio
+async def test_request_interpretation_review_accepts_named_source_component_for_invented_source() -> None:
+    state = CompositionState(
+        sources={"orders": _llm_generated_source()},
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": "source:orders",
+            "kind": "invented_source",
+            "user_term": "inline_source_url_list",
+            "llm_draft": "https://example.gov.au",
+        },
+        state,
+        session_id=uuid4(),
+        composition_state_id=uuid4(),
+        tool_call_id="call_named_source_review",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=_fake_create_pending_interpretation_event,
+        list_interpretation_events=_empty_list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    assert result.affected_nodes == ("source:orders",)
     assert result.data["kind"] == "invented_source"
 
 
@@ -1044,7 +2026,7 @@ async def test_request_interpretation_review_invented_source_persists_with_real_
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -1079,7 +2061,7 @@ async def test_request_interpretation_review_accepts_pipeline_decision_kind(serv
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "drop_raw_html"
+    assert result.affected_nodes == ("drop_raw_html",)
     assert result.data["kind"] == "pipeline_decision"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -1221,17 +2203,11 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
     # reads composition_states.nodes inside its locked transaction and validates
     # each affected_node_id; all four must be present from the outset because
     # ``composition_state_id`` is fixed across the iterations.
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Per-term rate cap test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Per-term rate cap test",
+    )
     multi_node_state = CompositionState(
         source=None,
         nodes=tuple(_llm_node(node_id=f"rate_node_{i}", term=sensitive_term) for i in range(4)),
@@ -1241,14 +2217,14 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
         version=1,
     )
     state_dict = multi_node_state.to_dict()
-    persisted = await service.save_composition_state(
+    persisted = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     state_id = persisted.id
 
@@ -1297,6 +2273,448 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
         )
     assert sensitive_term not in str(exc_info.value)
     assert sensitive_term not in exc_info.value.actual_type
+
+
+def _required_control_disclosure_node(node_id: str, *, draft: str) -> NodeSpec:
+    """An auto-wired control node carrying its server-staged disclosure card.
+
+    Mirrors ``required_controls._control_options``: every such node shares the
+    constant ``required_control_auto_wired`` user_term with a node-specific
+    disclosure draft (elspeth-558fa5a321).
+    """
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="content_safety",
+        input=f"{node_id}_in",
+        on_success=f"{node_id}_out",
+        on_error=None,
+        options={
+            "fields": ["content"],
+            "schema": {"mode": "observed"},
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": f"{node_id}_disclosure",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": "required_control_auto_wired",
+                    "status": "pending",
+                    "draft": draft,
+                    "event_id": None,
+                    "accepted_value": None,
+                    "accepted_artifact_hash": None,
+                    "resolved_prompt_template_hash": None,
+                }
+            ],
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+async def _seed_required_control_fleet(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    node_count: int,
+) -> tuple[CompositionState, UUID]:
+    """Persist a state carrying ``node_count`` auto-wired disclosure nodes."""
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Required-control cap exemption test",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    state = CompositionState(
+        source=None,
+        nodes=tuple(
+            _required_control_disclosure_node(f"content_safety_auto_{i}", draft=f"Auto-wired control disclosure {i}.")
+            for i in range(node_count)
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_dict = state.to_dict()
+    persisted = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_dict["nodes"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    return state, persisted.id
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_disclosures_exempt_from_per_term_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321: every auto-wired control disclosure shares the constant
+    ``required_control_auto_wired`` user_term, so the per-term cap (default 3)
+    made graphs with more than three such cards structurally unsurfaceable —
+    the 4th+ card became a terminal AUTO_INTERPRETED_NO_SURFACES row while its
+    node requirement stayed pending, wedging validation forever. pipeline_decision
+    reviews are bounded by the closed term registry and the per-site dedup gate,
+    and have no bake-into-the-prompt fallback, so the caps must not apply."""
+    session_id = uuid4()
+    state, state_id = await _seed_required_control_fleet(service, session_id, 6)
+
+    for i in range(6):
+        result = await _handle_request_interpretation_review(
+            arguments={
+                "affected_node_id": f"content_safety_auto_{i}",
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "llm_draft": f"Auto-wired control disclosure {i}.",
+            },
+            state=state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=f"call_disclosure_{i}",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+        assert result.success is True, f"disclosure {i} must surface despite the per-term cap"
+        assert result.data["_kind"] == "interpretation_review_pending"
+
+    pending = await service.list_interpretation_events(session_id, status="pending")
+    assert len(pending) == 6
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_disclosures_exempt_from_per_session_day_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321: same wedge via the per-session-day cap — a correction
+    whose graph carries more disclosure cards than the remaining day budget
+    permanently strands the overflow. pipeline_decision surfacing must not
+    consume or be blocked by the day budget."""
+    session_id = uuid4()
+    state, state_id = await _seed_required_control_fleet(service, session_id, 4)
+
+    for i in range(4):
+        result = await _handle_request_interpretation_review(
+            arguments={
+                "affected_node_id": f"content_safety_auto_{i}",
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "llm_draft": f"Auto-wired control disclosure {i}.",
+            },
+            state=state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=f"call_disclosure_{i}",
+            now=_now(),
+            per_term_cap=10,
+            per_session_day_cap=3,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+        assert result.success is True, f"disclosure {i} must surface despite the per-day cap"
+
+    pending = await service.list_interpretation_events(session_id, status="pending")
+    assert len(pending) == 4
+
+
+@pytest.mark.asyncio
+async def test_exempt_pipeline_decision_events_do_not_consume_the_day_budget(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 review finding 2: exempting pipeline_decision from the
+    cap CHECK is not enough — its events must also skip the day COUNTER, or an
+    uncapped control fleet starves the shared per-day budget and the non-exempt
+    kinds wedge the same way."""
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Day-budget exemption test",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    vague_node = _llm_node(node_id="rate_node", term="cool")
+    state = CompositionState(
+        source=None,
+        nodes=(
+            *(_required_control_disclosure_node(f"content_safety_auto_{i}", draft=f"Auto-wired control disclosure {i}.") for i in range(4)),
+            vague_node,
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_dict = state.to_dict()
+    persisted = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_dict["nodes"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    state_id = persisted.id
+
+    # Four exempt disclosure surfacings mint four events with populated user_term.
+    for i in range(4):
+        result = await _handle_request_interpretation_review(
+            arguments={
+                "affected_node_id": f"content_safety_auto_{i}",
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "llm_draft": f"Auto-wired control disclosure {i}.",
+            },
+            state=state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=f"call_disclosure_{i}",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=3,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+        assert result.success is True
+
+    # The vague_term surfacing is the FIRST capped-kind invocation of the day;
+    # the four exempt events above must not count against its budget of 3.
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": "rate_node",
+            "kind": "vague_term",
+            "user_term": "cool",
+            "llm_draft": "Visually appealing and well-organized.",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_vague",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=3,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "exempt pipeline_decision events must not consume the vague_term day budget"
+
+
+async def _seed_bare_session(service: SessionServiceImpl, session_id: UUID, *, title: str) -> None:
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title=title,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+
+async def _persist_state(service: SessionServiceImpl, session_id: UUID, state: CompositionState) -> UUID:
+    state_dict = state.to_dict()
+    persisted = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_dict["nodes"],
+            sources=state_dict["sources"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    return persisted.id
+
+
+@pytest.mark.asyncio
+async def test_model_choice_review_not_blocked_by_day_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 (cap-coherence allow-list): llm_model_choice reviews are
+    server-shaped obligations — the user never authored the term and the LLM has
+    no bake fallback; an unresolvable pending requirement blocks execution
+    (freeform session 0c59fbca). The caps must not throttle them."""
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Model-choice cap allow-list test")
+    vague_node = _llm_node(node_id="rate_node", term="cool")
+    mc_state, mc_node_id, mc_term = _event_liveness_state(
+        InterpretationKind.LLM_MODEL_CHOICE,
+        draft="openai/gpt-4o-mini",
+    )
+    state = CompositionState(
+        source=None,
+        nodes=(vague_node, *mc_state.nodes),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_id = await _persist_state(service, session_id, state)
+
+    # One prior LLM-authored vague_term row exhausts the day budget of 1.
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id="rate_node",
+        tool_call_id="tooluse_prior_vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Visually appealing.",
+        **_provenance_kwargs(),
+    )
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": mc_node_id,
+            "kind": "llm_model_choice",
+            "user_term": mc_term,
+            "llm_draft": "openai/gpt-4o-mini",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_model_choice",
+        now=_now(),
+        per_term_cap=1,
+        per_session_day_cap=1,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "llm_model_choice must surface despite an exhausted day budget"
+
+
+@pytest.mark.asyncio
+async def test_invented_source_review_not_blocked_by_day_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 (cap-coherence allow-list): invented_source reviews ride
+    on source options, block validation, and have nothing to bake the fallback
+    into — capping them wedges the session the same way as pipeline_decision."""
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Invented-source cap allow-list test")
+    src_state, src_component_id, src_term = _event_liveness_state(
+        InterpretationKind.INVENTED_SOURCE,
+        draft="https://example.com/a\nhttps://example.com/b",
+    )
+    vague_node = _llm_node(node_id="rate_node", term="cool")
+    state = replace(src_state, nodes=(vague_node,))
+    state_id = await _persist_state(service, session_id, state)
+
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id="rate_node",
+        tool_call_id="tooluse_prior_vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Visually appealing.",
+        **_provenance_kwargs(),
+    )
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": src_component_id,
+            "kind": "invented_source",
+            "user_term": src_term,
+            "llm_draft": "https://example.com/a\nhttps://example.com/b",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_invented_source",
+        now=_now(),
+        per_term_cap=1,
+        per_session_day_cap=1,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "invented_source must surface despite an exhausted day budget"
+
+
+@pytest.mark.asyncio
+async def test_backend_and_non_vague_rows_do_not_consume_the_day_budget(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 (comment 2311): the counters must measure what the cap
+    docstring claims — LLM surfacing invocations of the capped kind. A
+    backend-surfaced vague_term row (tool_call_id 'backend_auto_surface:*') and
+    an LLM-authored llm_model_choice row are server obligations / uncapped
+    kinds; neither may drain the vague_term day budget."""
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Counter provenance test")
+    mc_state, mc_node_id, mc_term = _event_liveness_state(
+        InterpretationKind.LLM_MODEL_CHOICE,
+        draft="openai/gpt-4o-mini",
+    )
+    state = CompositionState(
+        source=None,
+        nodes=(
+            _llm_node(node_id="rate_node", term="cool"),
+            _llm_node(node_id="rate_node_2", term="fresh"),
+            *mc_state.nodes,
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_id = await _persist_state(service, session_id, state)
+
+    # Backend-surfaced vague_term row + LLM-authored model_choice row.
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id="rate_node",
+        tool_call_id="backend_auto_surface:00000000-0000-0000-0000-000000000000",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Visually appealing.",
+        **_provenance_kwargs(),
+    )
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id=mc_node_id,
+        tool_call_id="tooluse_model_choice",
+        user_term=mc_term,
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        llm_draft="openai/gpt-4o-mini",
+        **_provenance_kwargs(),
+    )
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": "rate_node_2",
+            "kind": "vague_term",
+            "user_term": "fresh",
+            "llm_draft": "Recently updated content.",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_fresh",
+        now=_now(),
+        per_term_cap=2,
+        per_session_day_cap=2,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "backend-surfaced and uncapped-kind rows must not drain the vague_term day budget"
 
 
 @pytest.mark.asyncio
@@ -1375,7 +2793,8 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
     for i in range(10):
         # Persist a composition_states row with an LLM node carrying the
         # iteration's placeholder so the writer's boundary check passes.
-        per_iter_state_record = await service.save_composition_state(
+        per_iter_state_record = await _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 nodes=_state_with(
@@ -1386,7 +2805,6 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
                 ).to_dict()["nodes"],
                 is_valid=True,
             ),
-            provenance="tool_call",
         )
         await service.create_pending_interpretation_event(
             session_id=session_id,
@@ -1544,7 +2962,7 @@ async def test_dedup_second_pending_restage_is_idempotent(service: SessionServic
     # Affected node + kind flow through for frontend correlation. Raw review
     # text stays in the scoped interpretation-events API, not the ToolResult
     # sent back to the LLM or persisted in chat-message audit payloads.
-    assert second.data["affected_node_id"] == "rate_node"
+    assert second.affected_nodes == ("rate_node",)
     assert second.data["kind"] == "vague_term"
     assert "user_term" not in second.data
     assert "llm_draft" not in second.data
@@ -1732,8 +3150,8 @@ def test_13_dual_registry_invariant() -> None:
     for tool_name, handler in _SESSION_AWARE_TOOL_HANDLERS.items():
         assert asyncio.iscoroutinefunction(handler), f"_SESSION_AWARE_TOOL_HANDLERS[{tool_name!r}] is not a coroutine function"
     for registry_name, registry in sync_registries.items():
-        for tool_name, handler in registry.items():
-            assert not asyncio.iscoroutinefunction(handler), (
+        for tool_name, sync_handler in registry.items():
+            assert not asyncio.iscoroutinefunction(sync_handler), (
                 f"{registry_name}[{tool_name!r}] is async; belongs in _SESSION_AWARE_TOOL_HANDLERS"
             )
 
@@ -2005,17 +3423,11 @@ async def test_16_rate_cap_breach_writes_no_audit_row(service: SessionServiceImp
     """
     session_id = uuid4()
 
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Rate-cap breach test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Rate-cap breach test",
+    )
     multi_node_state = CompositionState(
         source=None,
         nodes=tuple(_llm_node(node_id=f"rate_node_{i}") for i in range(4)),
@@ -2025,14 +3437,14 @@ async def test_16_rate_cap_breach_writes_no_audit_row(service: SessionServiceImp
         version=1,
     )
     state_dict = multi_node_state.to_dict()
-    persisted = await service.save_composition_state(
+    persisted = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     state_id = persisted.id
 
@@ -2095,12 +3507,17 @@ async def test_17_auto_interpreted_no_surfaces_writer(service: SessionServiceImp
     session_id = uuid4()
     await _seed_session(service, session_id)
 
-    event = await service.record_auto_interpreted_no_surfaces_event(
-        session_id=session_id,
-        actor="composer-llm",
-        kind=InterpretationKind.VAGUE_TERM,
-        **_provenance_kwargs(),
-    )
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        event = await service.record_auto_interpreted_no_surfaces_event(
+            session_id=session_id,
+            actor="composer-llm",
+            kind=InterpretationKind.VAGUE_TERM,
+            session_operation_context=context,
+            **_provenance_kwargs(),
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES
     assert event.choice is InterpretationChoice.OPTED_OUT
     # Surface fields NULL.
@@ -2115,3 +3532,232 @@ async def test_17_auto_interpreted_no_surfaces_writer(service: SessionServiceImp
     assert event.composer_skill_hash == "a" * 64
     # Resolved at creation time.
     assert event.resolved_at == event.created_at
+
+
+# --------------------------------------------------------------------------- #
+# elspeth-9d59c33480 — omitted llm_draft resolves the staged requirement
+# draft server-side. The LLM must never need to re-emit staged draft bytes
+# through tool-call JSON (real-newline vs escape-sequence round-trips made
+# byte-identical re-emission deterministically fail in battery r5 g04).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_staged_invented_source_draft(
+    service: SessionServiceImpl,
+) -> None:
+    """Omitting llm_draft surfaces the staged multiline source artifact verbatim."""
+    session_id = uuid4()
+    draft = 'url,label\nhttps://example.gov.au/a,"first, quoted"\nhttps://example.gov.au/b,plain\n'
+    source = _llm_generated_source(draft=draft)
+    state_id = await _seed_source_session(service, session_id, source=source)
+    state = _state_with_source(source)
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": SOURCE_COMPONENT_ID,
+            "kind": "invented_source",
+            "user_term": "inline_source_url_list",
+        },
+        state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_source_review_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == draft
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_staged_pipeline_decision_draft(
+    service: SessionServiceImpl,
+) -> None:
+    session_id = uuid4()
+    state_id = await _seed_node_session(service, session_id, node=_pipeline_decision_review_node())
+    state = _state_with(_pipeline_decision_review_node())
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": "drop_raw_html",
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_html_fields",
+        },
+        state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_pipeline_decision_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == ("Drop the scraped raw HTML and fingerprint fields before saving the JSON output.")
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_staged_structured_vague_term_draft(
+    service: SessionServiceImpl,
+) -> None:
+    session_id = uuid4()
+    node = _structured_llm_node()
+    state_id = await _seed_node_session(service, session_id, node=node)
+    state = _state_with(node)
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": "rate_node",
+            "kind": "vague_term",
+            "user_term": "cool",
+        },
+        state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_vague_term_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == "visually appealing"
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_current_model_for_llm_model_choice(
+    service: SessionServiceImpl,
+) -> None:
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Model-choice omitted-draft test")
+    state, node_id, user_term = _event_liveness_state(
+        InterpretationKind.LLM_MODEL_CHOICE,
+        draft="openai/gpt-4o-mini",
+    )
+    state_id = await _persist_state(service, session_id, state)
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": node_id,
+            "kind": "llm_model_choice",
+            "user_term": user_term,
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_model_choice_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_without_staged_draft_is_arg_error() -> None:
+    """Legacy placeholder vague-term sites have no staged draft; llm_draft stays required there."""
+    state = _state_with(_llm_node())
+
+    with pytest.raises(ToolArgumentError, match=r"llm_draft"):
+        await _handle_request_interpretation_review(
+            {
+                "affected_node_id": "rate_node",
+                "kind": "vague_term",
+                "user_term": "cool",
+            },
+            state,
+            session_id=uuid4(),
+            composition_state_id=uuid4(),
+            tool_call_id="call_legacy_omitted_draft",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=_fake_create_pending_interpretation_event,
+            list_interpretation_events=_empty_list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_still_validates_resolved_content() -> None:
+    """A staged draft that fails the content validators must not ride past them
+    just because it was resolved server-side rather than submitted."""
+    source = _llm_generated_source(draft="url\n{{ jinja_metacharacters }}\n")
+    state = _state_with_source(source)
+
+    with pytest.raises(ToolArgumentError, match=r"llm_draft"):
+        await _handle_request_interpretation_review(
+            {
+                "affected_node_id": SOURCE_COMPONENT_ID,
+                "kind": "invented_source",
+                "user_term": "inline_source_url_list",
+            },
+            state,
+            session_id=uuid4(),
+            composition_state_id=uuid4(),
+            tool_call_id="call_source_review_bad_staged_draft",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=_fake_create_pending_interpretation_event,
+            list_interpretation_events=_empty_list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_provided_draft_must_still_match_staged_draft(
+    service: SessionServiceImpl,
+) -> None:
+    """The provided-draft path keeps the strict byte-match (back-compat guard)."""
+    session_id = uuid4()
+    source = _llm_generated_source(draft="url\nhttps://example.gov.au/a\n")
+    state_id = await _seed_source_session(service, session_id, source=source)
+    state = _state_with_source(source)
+
+    with pytest.raises(ToolArgumentError, match=r"llm_draft|source review requirement draft"):
+        await _handle_request_interpretation_review(
+            {
+                "affected_node_id": SOURCE_COMPONENT_ID,
+                "kind": "invented_source",
+                "user_term": "inline_source_url_list",
+                "llm_draft": "url\\nhttps://example.gov.au/a\\n",
+            },
+            state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id="call_source_review_escaped_bytes",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="pending") == []

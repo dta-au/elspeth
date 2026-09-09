@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 from unittest.mock import create_autospec, patch
@@ -12,6 +13,7 @@ from unittest.mock import create_autospec, patch
 import pytest
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as SDKOTLPSpanExporter
 from opentelemetry.sdk.trace.export import SpanExportResult
+from structlog.testing import capture_logs
 
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.config.defaults import INTERNAL_DEFAULTS
@@ -19,6 +21,7 @@ from elspeth.contracts.enums import (
     BackpressureMode,
     CallStatus,
     CallType,
+    NodeStateStatus,
     RunStatus,
     TelemetryGranularity,
 )
@@ -30,6 +33,8 @@ from elspeth.contracts.events import (
     RowCreated,
     RunFinished,
     RunStarted,
+    TelemetryEvent,
+    TransformCompleted,
 )
 from elspeth.telemetry.errors import TelemetryExporterError
 from elspeth.telemetry.exporters.otlp import OTLPExporter
@@ -78,6 +83,31 @@ def _row_event() -> RowCreated:
         token_id="t1",
         content_hash="ch",
     )
+
+
+def _transform_event() -> TransformCompleted:
+    return TransformCompleted(
+        timestamp=_NOW,
+        run_id="run-1",
+        row_id="r1",
+        token_id="t1",
+        node_id="transform-1",
+        plugin_name="test-transform",
+        status=NodeStateStatus.COMPLETED,
+        duration_ms=1.5,
+        input_hash="input-content-fingerprint",
+        output_hash="output-content-fingerprint",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedRowCreated(RowCreated):
+    alternate_content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedTransformCompleted(TransformCompleted):
+    alternate_content_hash: str
 
 
 def _external_call_event() -> ExternalCallCompleted:
@@ -172,6 +202,7 @@ class TestInitialization:
             assert metrics["events_emitted"] == 0
             assert metrics["events_dropped"] == 0
             assert metrics["queue_drops"] == 0
+            assert metrics["observer_failures"] == 0
             assert metrics["consecutive_total_failures"] == 0
         finally:
             manager.close()
@@ -223,7 +254,11 @@ class TestHandleEventBasic:
             _wait_for_processing(manager)
             assert len(exporter.events) == 3
             assert exporter.events[0] is e1
-            assert exporter.events[1] is e2
+            exported_row = exporter.events[1]
+            assert isinstance(exported_row, RowCreated)
+            assert exported_row is not e2
+            assert exported_row.content_hash is None
+            assert e2.content_hash == "ch"
             assert exporter.events[2] is e3
         finally:
             manager.close()
@@ -239,6 +274,143 @@ class TestHandleEventBasic:
             _wait_for_processing(manager)
             assert len(e1.events) == 1
             assert len(e2.events) == 1
+        finally:
+            manager.close()
+
+    def test_observer_failure_does_not_skip_later_observers_or_exporters(self) -> None:
+        config = MockTelemetryConfig()
+        exporter = TelemetryTestExporter()
+        event = _lifecycle_event()
+        observed: list[tuple[str, object]] = []
+
+        def failing_observer(received: object) -> None:
+            observed.append(("failing", received))
+            raise RuntimeError("SENSITIVE_OBSERVER_FAILURE")
+
+        def later_observer(received: object) -> None:
+            observed.append(("later", received))
+
+        manager = TelemetryManager(
+            config,
+            exporters=[exporter],
+            event_observers=[failing_observer, later_observer],
+        )
+        try:
+            with capture_logs() as logs:
+                manager.handle_event(event)
+                _wait_for_processing(manager)
+
+            assert observed == [("failing", event), ("later", event)]
+            assert exporter.events == [event]
+            [failure_log] = [entry for entry in logs if entry["event"] == "Telemetry event observer failed"]
+            assert failure_log["observer_type"] == "function"
+            assert failure_log["event_type"] == "RunStarted"
+            assert failure_log["error_type"] == "RuntimeError"
+            assert failure_log["log_level"] == "error"
+            assert "SENSITIVE_OBSERVER_FAILURE" not in repr(logs)
+            assert event.run_id not in repr(logs)
+            # The containment is recorded, not silent: one raising observer
+            # counts once on the operational health surface.
+            assert manager.health_metrics["observer_failures"] == 1
+        finally:
+            manager.close()
+
+    def test_observer_failures_accumulate_on_the_health_surface(self) -> None:
+        config = MockTelemetryConfig()
+        exporter = TelemetryTestExporter()
+
+        def failing_observer(received: object) -> None:
+            raise RuntimeError("SENSITIVE_OBSERVER_FAILURE")
+
+        manager = TelemetryManager(
+            config,
+            exporters=[exporter],
+            event_observers=[failing_observer],
+        )
+        try:
+            assert manager.health_metrics["observer_failures"] == 0
+            for _ in range(3):
+                manager.handle_event(_lifecycle_event())
+            _wait_for_processing(manager)
+
+            assert manager.health_metrics["observer_failures"] == 3
+            # Observer failure is isolated from delivery: the exporter still
+            # received every event.
+            assert len(exporter.events) == 3
+        finally:
+            manager.close()
+
+    def test_observers_and_exporters_receive_hash_free_row_event_projections(self) -> None:
+        config = MockTelemetryConfig(granularity=TelemetryGranularity.ROWS)
+        exporter = TelemetryTestExporter()
+        observed: list[TelemetryEvent] = []
+        row_event = _row_event()
+        transform_event = _transform_event()
+        manager = TelemetryManager(config, exporters=[exporter], event_observers=[observed.append])
+        try:
+            manager.handle_event(row_event)
+            manager.handle_event(transform_event)
+            _wait_for_processing(manager)
+
+            assert len(observed) == 2
+            assert len(exporter.events) == 2
+            observed_row = observed[0]
+            observed_transform = observed[1]
+            assert type(observed_row) is RowCreated
+            assert observed_row.content_hash is None
+            assert type(observed_transform) is TransformCompleted
+            assert observed_transform.input_hash is None
+            assert observed_transform.output_hash is None
+            assert exporter.events[0] is observed_row
+            assert exporter.events[1] is observed_transform
+            assert row_event.content_hash == "ch"
+            assert transform_event.input_hash == "input-content-fingerprint"
+            assert transform_event.output_hash == "output-content-fingerprint"
+        finally:
+            manager.close()
+
+    def test_hash_bearing_subclasses_collapse_to_owned_egress_contracts(self) -> None:
+        config = MockTelemetryConfig(granularity=TelemetryGranularity.ROWS)
+        exporter = TelemetryTestExporter()
+        observed: list[TelemetryEvent] = []
+        row_event = _DerivedRowCreated(
+            timestamp=_NOW,
+            run_id="run-1",
+            row_id="r1",
+            token_id="t1",
+            content_hash="row-content-fingerprint",
+            alternate_content_hash="subclass-row-fingerprint",
+        )
+        transform_event = _DerivedTransformCompleted(
+            timestamp=_NOW,
+            run_id="run-1",
+            row_id="r1",
+            token_id="t1",
+            node_id="transform-1",
+            plugin_name="test-transform",
+            status=NodeStateStatus.COMPLETED,
+            duration_ms=1.5,
+            input_hash="input-content-fingerprint",
+            output_hash="output-content-fingerprint",
+            alternate_content_hash="subclass-transform-fingerprint",
+        )
+        manager = TelemetryManager(config, exporters=[exporter], event_observers=[observed.append])
+        try:
+            manager.handle_event(row_event)
+            manager.handle_event(transform_event)
+            _wait_for_processing(manager)
+
+            projected_row = observed[0]
+            projected_transform = observed[1]
+            assert type(projected_row) is RowCreated
+            assert projected_row.content_hash is None
+            assert not hasattr(projected_row, "alternate_content_hash")
+            assert type(projected_transform) is TransformCompleted
+            assert projected_transform.input_hash is None
+            assert projected_transform.output_hash is None
+            assert not hasattr(projected_transform, "alternate_content_hash")
+            assert exporter.events[0] is projected_row
+            assert exporter.events[1] is projected_transform
         finally:
             manager.close()
 
@@ -976,6 +1148,7 @@ class TestHealthMetrics:
                 "events_emitted",
                 "events_dropped",
                 "queue_drops",
+                "observer_failures",
                 "exporter_failures",
                 "consecutive_total_failures",
                 "queue_depth",
@@ -1454,5 +1627,36 @@ class TestCircuitBreakerCorrectness:
             )
             # All 10 events emitted successfully
             assert manager.health_metrics["events_emitted"] == 10, "Expected 10 emitted events (healthy exporter succeeded)"
+        finally:
+            manager.close()
+
+
+# =============================================================================
+# Export loop: transport failure escaping dispatch is recorded, never silent
+# =============================================================================
+
+
+class TestExportLoopTransportFailureAccounting:
+    def test_transport_failure_is_counted_dropped_and_loop_survives(self) -> None:
+        """A TELEMETRY_TRANSPORT_ERRORS member escaping _dispatch_to_exporters
+        must land in the declared drop accounting (health_metrics events_dropped)
+        and leave the export loop consuming — recorded loss, not silent discard
+        and not a stored crash."""
+        config = MockTelemetryConfig()
+        manager = TelemetryManager(config, exporters=[TelemetryTestExporter()])
+        try:
+            with patch.object(
+                manager,
+                "_dispatch_to_exporters",
+                side_effect=ConnectionError("collector unreachable"),
+            ):
+                manager.handle_event(_lifecycle_event())
+                _wait_until(lambda: manager.health_metrics["events_dropped"] >= 1)
+
+            assert manager._export_thread.is_alive()
+            assert manager._stored_exception is None
+            # Loop still consumes: a post-failure event drains normally.
+            manager.handle_event(_lifecycle_event())
+            manager.flush()
         finally:
             manager.close()

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from types import MappingProxyType
 
 import pytest
 
-from elspeth.contracts.scheduler import BufferedOutcomeSpec, SchedulerEvent, SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.scheduler import (
+    BufferedOutcomeSpec,
+    GroupLossSpec,
+    SchedulerEvent,
+    SchedulerEventType,
+    TokenWorkStatus,
+)
 
 
 def test_buffered_outcome_context_is_frozen_after_construction() -> None:
@@ -27,6 +34,7 @@ def test_buffered_outcome_context_is_frozen_after_construction() -> None:
 def test_scheduler_event_rejects_missing_required_event_type() -> None:
     with pytest.raises(TypeError, match="event_type must be SchedulerEventType"):
         SchedulerEvent(
+            seq=1,
             event_id="event-1",
             run_id="run-1",
             token_id="token-1",
@@ -41,6 +49,7 @@ def test_scheduler_event_rejects_missing_required_event_type() -> None:
 def test_scheduler_event_rejects_missing_required_to_status() -> None:
     with pytest.raises(TypeError, match="to_status must be TokenWorkStatus"):
         SchedulerEvent(
+            seq=1,
             event_id="event-1",
             run_id="run-1",
             token_id="token-1",
@@ -54,6 +63,7 @@ def test_scheduler_event_rejects_missing_required_to_status() -> None:
 
 def test_scheduler_event_allows_missing_optional_from_status() -> None:
     event = SchedulerEvent(
+        seq=1,
         event_id="event-1",
         run_id="run-1",
         token_id="token-1",
@@ -66,3 +76,26 @@ def test_scheduler_event_allows_missing_optional_from_status() -> None:
     )
 
     assert event.from_status is None
+
+
+class TestGroupLossSpec:
+    def test_construction_and_field_order(self) -> None:
+        spec = GroupLossSpec(
+            closer_name="merge_paths",
+            group_id="fg-1",
+            member_key="path_c",
+            token_id="tok-3",
+            reason="dropped_by_filter",
+        )
+        assert (spec.closer_name, spec.group_id, spec.member_key, spec.token_id, spec.reason) == (
+            "merge_paths",
+            "fg-1",
+            "path_c",
+            "tok-3",
+            "dropped_by_filter",
+        )
+
+    def test_frozen(self) -> None:
+        spec = GroupLossSpec(closer_name="c", group_id="g", member_key="m", token_id="t", reason="r")
+        with pytest.raises(FrozenInstanceError):
+            spec.reason = "other"  # type: ignore[misc]

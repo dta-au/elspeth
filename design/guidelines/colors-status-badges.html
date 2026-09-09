@@ -1,0 +1,23 @@
+<!-- @dsCard group="Colors" viewport="700x120" name="Status badges" subtitle="Run lifecycle — pending → running → completed / failed / empty" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 18px 16px; background: var(--color-bg); font-family: var(--font-sans); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <span class="status-badge status-badge-pending">pending</span>
+    <span class="status-badge status-badge-running">running</span>
+    <span class="status-badge status-badge-completed">completed</span>
+    <span class="status-badge status-badge-completed">⚠ completed_with_failures</span>
+    <span class="status-badge status-badge-failed">failed</span>
+    <span class="status-badge status-badge-empty">∅ empty</span>
+    <span class="status-badge status-badge-cancelled">cancelled</span>
+  </div>
+</body>
+</html>

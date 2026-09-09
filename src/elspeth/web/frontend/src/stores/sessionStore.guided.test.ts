@@ -21,6 +21,14 @@ const MockGuidedResponseReceiptError = vi.hoisted(() => class extends Error {
   }
 });
 
+const blobStoreMocks = vi.hoisted(() => ({
+  activeSessionId: null as string | null,
+  activationEpoch: 0,
+  activateSession: vi.fn(),
+  invalidateBlobForEpoch: vi.fn(),
+  loadBlobs: vi.fn(),
+}));
+
 // Mock the API client — store tests verify state logic, not HTTP calls.
 // Must include all exports used by sessionStore (not just guided ones).
 vi.mock("@/api/client", () => ({
@@ -65,7 +73,7 @@ vi.mock("./executionStore", () => ({
 // Without this, the real blobStore makes HTTP calls against jsdom.
 vi.mock("./blobStore", () => ({
   useBlobStore: {
-    getState: () => ({ loadBlobs: vi.fn() }),
+    getState: () => blobStoreMocks,
   },
 }));
 
@@ -77,6 +85,7 @@ const sampleGuidedSession: GuidedSession = {
   terminal: null,
   chat_history: [],
   chat_turn_seq: 0,
+  reviewed_components: { sources: [], outputs: [] },
   profile: null,
 };
 
@@ -167,11 +176,33 @@ const sampleCompositionState = {
 const RETRY_SESSION_ID = "00000000-0000-4000-8000-000000000101";
 const RETRY_SESSION_B = "00000000-0000-4000-8000-000000000102";
 
+// Every guided start carries a visible root intent (goal-first,
+// elspeth-378cfa0e18) — the seed's caller supplies it and retry custody is
+// keyed on it. The custody tests below care about the OPERATION ID, not the
+// wording, so they share one constant.
+const SEED_INTENT = "Summarise each page and save the results as JSON.";
+// The goal a user types into the mode-switch card before converting a worked
+// freeform session, or into the goal card before starting an empty one.
+const SWITCH_GOAL = "Turn each row into a one-line summary saved as JSON.";
+
 const sampleGetGuidedResponse: GetGuidedResponse = {
   guided_session: sampleGuidedSession,
   next_turn: sampleNextTurn,
   terminal: null,
   composition_state: sampleCompositionState,
+};
+
+/**
+ * The lazy in-memory stub GET /guided returns for a session with no persisted
+ * guided state: the first step-1 turn and `composition_state: null` (see
+ * get_guided's docstring). Nothing has been written for this session, which is
+ * exactly what a guided-default session looks like before its goal.
+ */
+const stubGetGuidedResponse: GetGuidedResponse = {
+  guided_session: { ...sampleGuidedSession, chat_history: [] },
+  next_turn: sampleNextTurn,
+  terminal: null,
+  composition_state: null,
 };
 
 const sampleRespondResponse: GuidedRespondResponse = {
@@ -200,6 +231,7 @@ const sampleChatResponse: GuidedChatResponse = {
         ts_iso: "2026-05-13T00:00:00+00:00",
         assistant_message_kind: null,
         synthetic_failure_reason: null,
+        turn_token: null,
       },
       {
         role: "assistant",
@@ -209,6 +241,7 @@ const sampleChatResponse: GuidedChatResponse = {
         ts_iso: "2026-05-13T00:00:00+00:00",
         assistant_message_kind: "assistant",
         synthetic_failure_reason: null,
+        turn_token: null,
       },
     ],
     chat_turn_seq: 2,
@@ -255,6 +288,8 @@ const sampleExitedGuidedSession: GuidedSession = {
 describe("sessionStore — guided-mode fields and actions", () => {
   beforeEach(async () => {
     vi.resetAllMocks();
+    blobStoreMocks.activeSessionId = null;
+    blobStoreMocks.activationEpoch = 0;
     window.sessionStorage.clear();
     resetStore(useSessionStore);
     // Phase 5b — reseed the listInterpretationEvents mock that
@@ -359,9 +394,9 @@ describe("sessionStore — guided-mode fields and actions", () => {
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
 
     await expect(
-      useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial"),
+      useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT),
     ).rejects.toThrow("network response lost");
-    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial");
+    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT);
 
     expect(start).toHaveBeenCalledTimes(2);
     expect(start.mock.calls[0]?.[1].operationId).toBe(
@@ -388,9 +423,9 @@ describe("sessionStore — guided-mode fields and actions", () => {
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_B });
 
     await expect(
-      useSessionStore.getState().seedGuided(RETRY_SESSION_B, "tutorial"),
+      useSessionStore.getState().seedGuided(RETRY_SESSION_B, "tutorial", SEED_INTENT),
     ).rejects.toMatchObject({ error_type: "guided_operation_terminal_failure" });
-    await useSessionStore.getState().seedGuided(RETRY_SESSION_B, "tutorial");
+    await useSessionStore.getState().seedGuided(RETRY_SESSION_B, "tutorial", SEED_INTENT);
 
     expect(start.mock.calls[0]?.[1].operationId).not.toBe(
       start.mock.calls[1]?.[1].operationId,
@@ -409,9 +444,9 @@ describe("sessionStore — guided-mode fields and actions", () => {
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
 
     await expect(
-      useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial"),
+      useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT),
     ).rejects.toThrow("interpretation refresh failed");
-    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial");
+    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT);
 
     expect(start.mock.calls[0]?.[1].operationId).toBe(
       start.mock.calls[1]?.[1].operationId,
@@ -433,7 +468,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
 
     const stale = useSessionStore
       .getState()
-      .seedGuided(RETRY_SESSION_ID, "tutorial");
+      .seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT);
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_B });
     resolveFirst(sampleGetGuidedResponse);
     await stale;
@@ -441,7 +476,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(useSessionStore.getState().guidedSession).toBeNull();
 
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
-    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial");
+    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT);
 
     expect(start.mock.calls[0]?.[1].operationId).not.toBe(
       start.mock.calls[1]?.[1].operationId,
@@ -567,7 +602,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(useSessionStore.getState().guidedProposalReview?.status).toBe("submitting");
 
     await expect(
-      useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial"),
+      useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT),
     ).rejects.toThrow("interleaved seed failed");
 
     resolveRespond(sampleRespondResponse);
@@ -638,6 +673,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
     const action: GuidedRespondAction = {
       chosen: ["csv"],
+      source_blob_id: "00000000-0000-4000-8000-000000000821",
       edited_values: null,
       custom_inputs: null,
       proposal_id: null,
@@ -659,6 +695,8 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(retryRequest.operation_id).toBe(firstRequest.operation_id);
     expect(retryRequest.turn_token).toBe(firstRequest.turn_token);
     expect(retryRequest.turn_token).toBe(sampleNextTurn.turn_token);
+    expect(retryRequest.source_blob_id).toBe(action.source_blob_id);
+    expect(retryRequest).toEqual(firstRequest);
   });
 
   it("respondGuided: suppresses a concurrent duplicate component action", async () => {
@@ -808,6 +846,56 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(respondMock.mock.calls[1]?.[1]).toEqual(originalRequest);
   });
 
+  it("respondGuided: a server_invariant_violated 500 releases custody so a different action still fires (F7b)", async () => {
+    // inv-f6 F7b: a deterministic pre-reservation invariant 500 used to be
+    // indistinguishable from transport ambiguity (bare 5xx), so the client
+    // retained retry custody and every DIFFERENT follow-up action conflicted
+    // for the rest of the page load — a permanent per-pageload wedge. The
+    // structured envelope must settle custody: the next different-body
+    // respond goes out over HTTP instead of dying on a custody conflict.
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    respondMock
+      .mockRejectedValueOnce({
+        status: 500,
+        detail: "The server refused this request before staging it.",
+        error_type: "server_invariant_violated",
+      })
+      .mockResolvedValueOnce(sampleRespondResponse);
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: sampleGuidedSession,
+      guidedNextTurn: sampleNextTurn,
+    });
+    const original: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: null,
+      draft_hash: null,
+      edit_target: null,
+      control_signal: null,
+      component_action: { action: "add", component_kind: "source" },
+    };
+    const different: GuidedRespondAction = {
+      ...original,
+      component_action: { action: "finish", component_kind: "source" },
+    };
+
+    const first = await useSessionStore.getState().respondGuided(original);
+    expect(first).toMatchObject({ status: "not_applied", reason: "rejected" });
+
+    const second = await useSessionStore.getState().respondGuided(different);
+
+    expect(second).toMatchObject({ status: "applied" });
+    expect(respondMock).toHaveBeenCalledTimes(2);
+    // A new operation id was allocated: the failed operation settled instead
+    // of being retained for replay.
+    const firstRequest = respondMock.mock.calls[0]?.[1] as { operation_id: string };
+    const secondRequest = respondMock.mock.calls[1]?.[1] as { operation_id: string };
+    expect(secondRequest.operation_id).not.toBe(firstRequest.operation_id);
+  });
+
   it("respondGuided: reconciles a reload-orphaned descriptor instead of blocking every different action", async () => {
     // Session 09cde460: Send on the step-3 prompt (2-min respond in flight),
     // reload mid-flight. The descriptor survives in sessionStorage by design,
@@ -929,7 +1017,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     (startGuidedSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce(sampleGetGuidedResponse);
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
 
-    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial");
+    await useSessionStore.getState().seedGuided(RETRY_SESSION_ID, "tutorial", SEED_INTENT);
 
     // The surface loaded: start fired, no conflict copy, state applied.
     expect(startGuidedSession).toHaveBeenCalledTimes(1);
@@ -1134,6 +1222,13 @@ describe("sessionStore — guided-mode fields and actions", () => {
         guidedNextTurn: sampleNextTurn,
         guidedTerminal: null,
         compositionState: sampleCompositionState,
+        // A reviewed source is in the ledger when the failure lands; the
+        // refresh-required state must drop it with the turn, or the pane keeps
+        // drawing the pre-failure node beside the reload banner.
+        guidedReviewedComponents: {
+          sources: [{ stable_id: "src-stale" } as never],
+          outputs: [],
+        },
       });
       const action: GuidedRespondAction = {
         chosen: ["csv"],
@@ -1151,6 +1246,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
       expect(respondMock).toHaveBeenCalledTimes(1);
       expect(getMock).toHaveBeenCalledWith(RETRY_SESSION_ID);
       expect(useSessionStore.getState().guidedNextTurn).toBeNull();
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({ sources: [], outputs: [] });
       expect(useSessionStore.getState().guidedResponsePending).toBe(false);
       expect(useSessionStore.getState().error).toMatch(/accepted.*refresh.*re-enter/i);
       await expect(useSessionStore.getState().respondGuided(action)).resolves.toMatchObject({
@@ -1463,6 +1559,209 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
   });
 
+  it("respondGuided: retains exact proposal correction feedback across an ambiguous retry", async () => {
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    const successful = {
+      ...sampleRespondResponse,
+      guided_session: { ...sampleGuidedSession, step: "step_3_transforms" },
+      next_turn: sampleProposalTurn,
+    };
+    respondMock
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(successful);
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: { kind: "node", stable_id: "00000000-0000-4000-8000-000000000506" },
+      correction_feedback: "Keep the threshold and change only the true destination.",
+      control_signal: null,
+    };
+
+    await useSessionStore.getState().respondGuided(action);
+    expect(useSessionStore.getState().guidedProposalReview).toMatchObject({
+      status: "error",
+      retryable: true,
+      retry_action: {
+        kind: "revise",
+        edit_target: action.edit_target,
+        correction_feedback: action.correction_feedback,
+      },
+    });
+    await useSessionStore.getState().respondGuided(action);
+
+    expect(respondMock.mock.calls[1]?.[1].operation_id).toBe(
+      respondMock.mock.calls[0]?.[1].operation_id,
+    );
+  });
+
+  it("respondGuided: retains exact prose instruction and mode across an ambiguous retry", async () => {
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    respondMock
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: { ...sampleGuidedSession, step: "step_3_transforms" },
+        next_turn: sampleProposalTurn,
+      });
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: null,
+      edited_values: {
+        revision_instruction: "Replace the topology with one audited transform.",
+        revision_mode: "replace",
+      },
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: null,
+      control_signal: null,
+    };
+
+    await useSessionStore.getState().respondGuided(action);
+    expect(useSessionStore.getState().guidedProposalReview).toMatchObject({
+      status: "error",
+      retryable: true,
+      retry_action: {
+        kind: "revise_instruction",
+        revision_instruction: action.edited_values.revision_instruction,
+        revision_mode: "replace",
+      },
+    });
+    await useSessionStore.getState().respondGuided(action);
+
+    expect(respondMock.mock.calls[1]?.[1].operation_id).toBe(
+      respondMock.mock.calls[0]?.[1].operation_id,
+    );
+  });
+
+  it("respondGuided: refuses changed proposal correction feedback while retry custody is retained", async () => {
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    respondMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: { kind: "edge", stable_id: "00000000-0000-4000-8000-000000000503" },
+      correction_feedback: "Route this edge to output-1.",
+      control_signal: null,
+    };
+
+    await useSessionStore.getState().respondGuided(action);
+    const changed = await useSessionStore.getState().respondGuided({
+      ...action,
+      correction_feedback: "Route this edge to discard instead.",
+    });
+
+    expect(changed).toMatchObject({ status: "not_applied", reason: "custody_conflict" });
+    expect(respondMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("respondGuided: a policy_blocked terminal failure settles custody and keeps the proposal controls live (F13-D)", async () => {
+    // ``policy_blocked`` is permanent by construction: the copy says "Change
+    // the highlighted component — retrying will fail the same way". The
+    // review must NOT lock into a non-retryable error (that disables the very
+    // revise controls the copy directs the user to), and no retry invitation
+    // may be retained — the next action allocates a fresh operation id.
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    const policyDetail =
+      "This pipeline is blocked by a deployment policy and cannot be built as configured. " +
+      "Change the highlighted component — retrying will fail the same way.";
+    respondMock
+      .mockRejectedValueOnce({
+        status: 422,
+        error_type: "guided_operation_terminal_failure",
+        failure_code: "policy_blocked",
+        detail: policyDetail,
+      })
+      .mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: { ...sampleGuidedSession, step: "step_3_transforms" },
+        next_turn: sampleProposalTurn,
+      });
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: ["review_wiring"],
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: null,
+      control_signal: null,
+    };
+
+    const outcome = await useSessionStore.getState().respondGuided(action);
+
+    expect(outcome).toMatchObject({ status: "not_applied", reason: "rejected" });
+    expect(useSessionStore.getState().error).toContain("blocked by a deployment policy");
+    // Controls stay live: the review returns to active, never a locked error.
+    expect(useSessionStore.getState().guidedProposalReview).toEqual({
+      status: "active",
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+    });
+
+    // Custody settled: a follow-up revise goes out with a NEW operation id.
+    const revise: GuidedRespondAction = {
+      ...action,
+      chosen: null,
+      edit_target: { kind: "node", stable_id: "00000000-0000-4000-8000-00000000aaaa" },
+      correction_feedback: "Change the selected node mapping.",
+    };
+    const second = await useSessionStore.getState().respondGuided(revise);
+    expect(second).toMatchObject({ status: "applied" });
+    expect(respondMock).toHaveBeenCalledTimes(2);
+    expect(respondMock.mock.calls[1]?.[1].operation_id).not.toBe(
+      respondMock.mock.calls[0]?.[1].operation_id,
+    );
+  });
+
   it("respondGuided: resyncs a decoded proposal operation when local apply fails", async () => {
     const { getGuided, respondGuided } = await import("@/api/client");
     const respondMock = respondGuided as ReturnType<typeof vi.fn>;
@@ -1655,6 +1954,9 @@ describe("sessionStore — guided-mode fields and actions", () => {
       activeSessionId: RETRY_SESSION_ID,
       guidedSession: sampleGuidedSession,
       guidedNextTurn: sampleNextTurn,
+      // A started session — the only kind whose exit is a server-side
+      // transition. The pre-goal case has its own test below.
+      compositionState: sampleCompositionState,
     });
     const outcome = await useSessionStore.getState().exitToFreeform();
 
@@ -1663,6 +1965,88 @@ describe("sessionStore — guided-mode fields and actions", () => {
       RETRY_SESSION_ID,
       expect.objectContaining({ control_signal: "exit_to_freeform" }),
     );
+  });
+
+  it("exitToFreeform: before the goal, drops the stub locally and writes NOTHING", async () => {
+    // Goal-first (elspeth-378cfa0e18): while `compositionState` is null the
+    // panel is showing the adopted GET /guided stub and the session has no
+    // persisted guided state at all. A respond here would settle the rootless
+    // wizard the change exists to prevent, and permanently: the checkpoint
+    // carries an `exited_to_freeform` terminal, so `compositionState` is
+    // non-null from then on, the goal card can never render again, and a later
+    // "Finish outputs" answers the 409 asking for a goal the session now has
+    // no affordance to state. Nothing is written before the goal, in either
+    // direction.
+    const { respondGuided } = await import("@/api/client");
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: sampleGuidedSession,
+      guidedNextTurn: sampleNextTurn,
+      compositionState: null,
+    });
+    const outcome = await useSessionStore.getState().exitToFreeform();
+
+    expect(outcome).toEqual({ status: "applied" });
+    expect(respondGuided).not.toHaveBeenCalled();
+    const state = useSessionStore.getState();
+    expect(state.guidedSession).toBeNull();
+    expect(state.guidedNextTurn).toBeNull();
+    expect(state.guidedTerminal).toBeNull();
+    expect(state.compositionState).toBeNull();
+  });
+
+  it("exitToFreeform: refuses the pre-goal stub drop while the goal's start is in flight", async () => {
+    // The pre-goal exit is a LOCAL mutation, and that is exactly why it needs
+    // the single in-flight-mutation gate every sibling carries. Without it the
+    // store answered "applied" while the goal's cold start was still in the
+    // air — a lie: nothing had stopped the start, so it settled through
+    // `guidedPublicationIsCurrent` (the local drop advances no publication
+    // generation) and republished the guided session, checkpoint and all, over
+    // a surface the user had just been told was cleared. A real window: the
+    // start is a server round trip on the goal card's Send.
+    const { startGuidedSession, respondGuided } = await import("@/api/client");
+    const start = startGuidedSession as ReturnType<typeof vi.fn>;
+    let releaseStart!: () => void;
+    start.mockReturnValueOnce(
+      new Promise<GetGuidedResponse>((resolve) => {
+        releaseStart = () => resolve(sampleGetGuidedResponse);
+      }),
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: sampleGuidedSession,
+      guidedNextTurn: null,
+      compositionState: null,
+    });
+
+    const starting = useSessionStore.getState().chatGuided("Summarize each page as JSON");
+    await vi.waitFor(() =>
+      expect(useSessionStore.getState().guidedChatPending).toBe(true),
+    );
+
+    const outcome = await useSessionStore.getState().exitToFreeform();
+
+    expect(outcome).toEqual({
+      status: "not_applied",
+      reason: "pending",
+      message: "A guided response is already pending.",
+    });
+    // Refused, so the surface it would have dropped is untouched and no
+    // server-side exit was attempted either.
+    expect(useSessionStore.getState().guidedSession).not.toBeNull();
+    expect(respondGuided).not.toHaveBeenCalled();
+
+    releaseStart();
+    await starting;
+
+    // The start settles onto the session it started: the user is still in
+    // guided, which is the honest outcome of a refused exit.
+    const settled = useSessionStore.getState();
+    expect(settled.guidedSession).toEqual(sampleGetGuidedResponse.guided_session);
+    expect(settled.compositionState).toEqual(sampleCompositionState);
+    expect(settled.guidedChatPending).toBe(false);
   });
 
   it("reenterGuided: calls backend and atomically restores active guided fields", async () => {
@@ -1759,21 +2143,206 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(state.error).toBeNull();
   });
 
-  // ── enterGuided unified entry point (default-freeform switch button) ──────
+  // ── enterGuided unified entry point (GET-first, goal-first) ──────────────
   //
-  // The "Switch to guided" affordance in the freeform ChatPanel header
-  // binds to enterGuided().  It branches on the current guidedSession
-  // terminal so callers always have a single action regardless of whether
-  // the session is fresh or has previously exited.
+  // The "Switch to guided" affordance in the freeform ChatPanel header and
+  // createSession's guided-default arm both bind to enterGuided(). It used to
+  // route every non-exited session through convertToGuided, which looked safe
+  // because convert is idempotent — but convert's "no persisted state" branch
+  // WRITES a fresh wizard checkpoint, so a brand-new guided-default session was
+  // persisted rootless and could never reach the goal card. It is GET-first
+  // now: the probe decides, and nothing is written before there is a goal.
 
-  it("enterGuided: calls convertToGuided when guidedSession is null (fresh / worked freeform)", async () => {
-    // Routing changed with elspeth-e2c3dba6b5: the non-terminal branch now goes
-    // through convertToGuided (POST /guided/convert) instead of startGuided
-    // (GET /guided). GET 400s for a worked freeform session; convert is the
-    // idempotent superset that also does the fresh-wizard conversion. The GET
-    // path must NOT be taken.
-    const { convertToGuided, getGuided } = await import("@/api/client");
+  it("enterGuided: adopts the stub with NO write when there is no goal yet", async () => {
+    const { getGuided, convertToGuided, startGuidedSession } = await import(
+      "@/api/client"
+    );
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      stubGetGuidedResponse,
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided();
+
+    expect(getGuided).toHaveBeenCalledWith(RETRY_SESSION_ID);
+    // The two writing routes must BOTH stay untouched: convert persists a
+    // rootless wizard, start persists a rooted one, and neither is authorised
+    // by a user who has not yet said what they want.
+    expect(convertToGuided).not.toHaveBeenCalled();
+    expect(startGuidedSession).not.toHaveBeenCalled();
+    const state = useSessionStore.getState();
+    expect(state.guidedSession).toEqual(stubGetGuidedResponse.guided_session);
+    expect(state.guidedNextTurn).toEqual(stubGetGuidedResponse.next_turn);
+    // Null composition state IS the goal card's condition in ChatPanel.
+    expect(state.compositionState).toBeNull();
+  });
+
+  it("enterGuided: starts an empty session directly from the goal, skipping the goal card", async () => {
+    const { getGuided, startGuidedSession, convertToGuided } = await import(
+      "@/api/client"
+    );
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      stubGetGuidedResponse,
+    );
+    (startGuidedSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      sampleGetGuidedResponse,
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided(SWITCH_GOAL);
+
+    // The stub said the session is empty, so there is nothing to convert: the
+    // goal starts it. Routed through the store's ONE live-start branch, so the
+    // POST carries profile "live" and the goal verbatim.
+    expect(convertToGuided).not.toHaveBeenCalled();
+    expect(startGuidedSession).toHaveBeenCalledTimes(1);
+    const [, command] = (startGuidedSession as ReturnType<typeof vi.fn>).mock
+      .calls[0] as [string, { profile: string; intent: string }];
+    expect(command.profile).toBe("live");
+    expect(command.intent).toBe(SWITCH_GOAL);
+    expect(useSessionStore.getState().guidedSession).toEqual(
+      sampleGetGuidedResponse.guided_session,
+    );
+  });
+
+  // The stub+intent branch runs the goal through chatGuided's cold-start
+  // branch, which FIRST reconciles any unsettled guided_start descriptor for
+  // this session. That is the point of routing through it — a second start
+  // must never be fired over one whose outcome is unknown — but it means a
+  // switch carrying a goal does not always post. Both landings are pinned so
+  // the behaviour is a decision rather than a discovery.
+
+  it("enterGuided: a settled-failed earlier start is cleared and the NEW goal is posted", async () => {
+    const { getGuided, startGuidedSession, reconcileGuidedStartOperation } =
+      await import("@/api/client");
+    // An earlier attempt whose transport outcome was ambiguous left a live
+    // descriptor behind; the server says it failed.
+    acquireGuidedRetry("guided_start", RETRY_SESSION_ID, [
+      "live",
+      "an earlier goal",
+    ]);
+    (
+      reconcileGuidedStartOperation as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({ status: "failed", failure_code: "request_cancelled" });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      stubGetGuidedResponse,
+    );
+    (startGuidedSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      sampleGetGuidedResponse,
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided(SWITCH_GOAL);
+
+    expect(startGuidedSession).toHaveBeenCalledTimes(1);
+    const [, command] = (startGuidedSession as ReturnType<typeof vi.fn>).mock
+      .calls[0] as [string, { intent: string }];
+    expect(command.intent).toBe(SWITCH_GOAL);
+  });
+
+  it("enterGuided: an UNSETTLED earlier start blocks the post and leaves the user on the goal card", async () => {
+    // The alternative — firing a second start over an operation still running
+    // server-side — is the duplicate-root hazard the descriptor exists to
+    // prevent. The goal the user typed into the mode-switch card is therefore
+    // not posted, so the landing has to be somewhere they can state it again:
+    // the adopted stub IS the goal card (guidedSession set, composition state
+    // null) and the composer below it is the same Send that starts a session.
+    const { getGuided, startGuidedSession, reconcileGuidedStartOperation } =
+      await import("@/api/client");
+    acquireGuidedRetry("guided_start", RETRY_SESSION_ID, [
+      "live",
+      "an earlier goal",
+    ]);
+    (
+      reconcileGuidedStartOperation as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({ status: "in_progress" });
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      stubGetGuidedResponse,
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided(SWITCH_GOAL);
+
+    expect(startGuidedSession).not.toHaveBeenCalled();
+    const state = useSessionStore.getState();
+    expect(state.guidedSession).toEqual(stubGetGuidedResponse.guided_session);
+    expect(state.compositionState).toBeNull();
+    expect(state.guidedChatPending).toBe(false);
+    expect(state.error).toBe(
+      "Guided setup is still running. Wait for it to settle, then reload to recover the result.",
+    );
+  });
+
+  it("enterGuided: converts a WORKED freeform session (GET 400) with the goal", async () => {
+    const { getGuided, convertToGuided } = await import("@/api/client");
+    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 400,
+      detail: "Session is not in guided mode.",
+    });
     (convertToGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      sampleGetGuidedResponse,
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided(SWITCH_GOAL);
+
+    expect(convertToGuided).toHaveBeenCalledWith(
+      RETRY_SESSION_ID,
+      SWITCH_GOAL,
+      expect.any(String),
+    );
+    expect(useSessionStore.getState().guidedSession).toEqual(
+      sampleGetGuidedResponse.guided_session,
+    );
+  });
+
+  it("enterGuided: refuses a goal-less conversion instead of posting a rootless one", async () => {
+    // Unreachable from the UI (the mode-switch card disables Confirm until a
+    // goal is typed), so this is the store's own guard: a dead button and a
+    // server-rejected rootless convert are both worse than saying why.
+    const { getGuided, convertToGuided } = await import("@/api/client");
+    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 400,
+      detail: "Session is not in guided mode.",
+    });
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided();
+
+    expect(convertToGuided).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().error).toContain("goal is required");
+    expect(useSessionStore.getState().guidedSession).toBeNull();
+  });
+
+  it("enterGuided: adopts an already-persisted guided session unchanged", async () => {
+    const { getGuided, convertToGuided, startGuidedSession } = await import(
+      "@/api/client"
+    );
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       sampleGetGuidedResponse,
     );
 
@@ -1784,10 +2353,60 @@ describe("sessionStore — guided-mode fields and actions", () => {
 
     await useSessionStore.getState().enterGuided();
 
-    expect(convertToGuided).toHaveBeenCalledWith(RETRY_SESSION_ID, expect.any(String));
-    expect(getGuided).not.toHaveBeenCalled();
+    expect(convertToGuided).not.toHaveBeenCalled();
+    expect(startGuidedSession).not.toHaveBeenCalled();
     const state = useSessionStore.getState();
     expect(state.guidedSession).toEqual(sampleGetGuidedResponse.guided_session);
+    expect(state.compositionState).toEqual(
+      sampleGetGuidedResponse.composition_state,
+    );
+  });
+
+  it("enterGuided: surfaces a non-400 probe failure instead of converting on it", async () => {
+    // Only the documented 400 means "no guided_session here". A 500 on corrupt
+    // state or a 502 during a restart is a failure to report — converting on it
+    // would set the user's freeform pipeline aside on the strength of a blip.
+    const { getGuided, convertToGuided } = await import("@/api/client");
+    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 500,
+      detail: "Guided state could not be read.",
+    });
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: null,
+    });
+
+    await useSessionStore.getState().enterGuided(SWITCH_GOAL);
+
+    expect(convertToGuided).not.toHaveBeenCalled();
+    expect(useSessionStore.getState().error).toBe(
+      "Guided state could not be read.",
+    );
+  });
+
+  it("enterGuided: still re-enters an exited session without probing", async () => {
+    const { getGuided, reenterGuided } = await import("@/api/client");
+    (reenterGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      sampleGetGuidedResponse,
+    );
+
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: {
+        ...sampleGuidedSession,
+        terminal: {
+          kind: "exited_to_freeform",
+          reason: "user_pressed_exit",
+          pipeline_yaml: null,
+        },
+      },
+    });
+
+    await useSessionStore.getState().enterGuided();
+
+    expect(reenterGuided).toHaveBeenCalledTimes(1);
+    expect(getGuided).not.toHaveBeenCalled();
   });
 
   it("convertToGuided: populates all 4 wire fields atomically on success", async () => {
@@ -1797,7 +2416,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     );
 
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
 
     const state = useSessionStore.getState();
     expect(state.guidedSession).toEqual(sampleGetGuidedResponse.guided_session);
@@ -1809,6 +2428,54 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(state.error).toBeNull();
   });
 
+  it("convertToGuided: sends the goal that roots the fresh wizard", async () => {
+    const { convertToGuided } = await import("@/api/client");
+    (convertToGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      sampleGetGuidedResponse,
+    );
+
+    useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
+
+    expect(convertToGuided).toHaveBeenCalledWith(
+      RETRY_SESSION_ID,
+      SWITCH_GOAL,
+      expect.any(String),
+    );
+  });
+
+  it("convertToGuided: keys retry custody on the goal, so a different goal cannot ride the retained descriptor", async () => {
+    // The custody descriptor exists so a transport-uncertain retry re-fires the
+    // SAME conversion. The goal is now part of that request identity: under the
+    // old empty key, a descriptor retained for goal A was replayable by ANY
+    // later convert, so a second attempt carrying goal B would have gone out
+    // under A's operation id and the server would have replayed A's root. With
+    // the intent in the key the mismatch is a live-custody conflict instead —
+    // named copy, and no second POST.
+    const { convertToGuided } = await import("@/api/client");
+    const convertMock = convertToGuided as ReturnType<typeof vi.fn>;
+    convertMock
+      .mockRejectedValueOnce({ status: 503 })
+      .mockResolvedValueOnce(sampleGetGuidedResponse);
+    useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
+
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
+    expect(convertMock).toHaveBeenCalledTimes(1);
+
+    await useSessionStore
+      .getState()
+      .convertToGuided(RETRY_SESSION_ID, "A different goal entirely.");
+
+    expect(convertMock).toHaveBeenCalledTimes(1);
+    expect(useSessionStore.getState().error).toContain("conversion request");
+
+    // The retained descriptor still belongs to the ORIGINAL goal and replays
+    // under its own operation id.
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
+    expect(convertMock).toHaveBeenCalledTimes(2);
+    expect(convertMock.mock.calls[1]?.[2]).toBe(convertMock.mock.calls[0]?.[2]);
+  });
+
   it("convertToGuided: surfaces the backend's typed detail on failure", async () => {
     const { convertToGuided } = await import("@/api/client");
     (convertToGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
@@ -1817,7 +2484,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
 
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
 
     expect(useSessionStore.getState().error).toBe(
       "You do not own this session.",
@@ -1833,13 +2500,13 @@ describe("sessionStore — guided-mode fields and actions", () => {
       .mockResolvedValueOnce(sampleGetGuidedResponse);
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
 
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
 
-    const firstOperationId = convertMock.mock.calls[0]?.[1];
-    const retryOperationId = convertMock.mock.calls[1]?.[1];
-    const nextActionOperationId = convertMock.mock.calls[2]?.[1];
+    const firstOperationId = convertMock.mock.calls[0]?.[2];
+    const retryOperationId = convertMock.mock.calls[1]?.[2];
+    const nextActionOperationId = convertMock.mock.calls[2]?.[2];
     expect(firstOperationId).toEqual(expect.any(String));
     expect(retryOperationId).toBe(firstOperationId);
     expect(nextActionOperationId).not.toBe(firstOperationId);
@@ -1857,12 +2524,12 @@ describe("sessionStore — guided-mode fields and actions", () => {
       .mockResolvedValueOnce(sampleGetGuidedResponse);
     useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
 
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
-    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
+    await useSessionStore.getState().convertToGuided(RETRY_SESSION_ID, SWITCH_GOAL);
 
-    expect(convertMock.mock.calls[0]?.[1]).toEqual(expect.any(String));
-    expect(convertMock.mock.calls[1]?.[1]).toEqual(expect.any(String));
-    expect(convertMock.mock.calls[1]?.[1]).not.toBe(convertMock.mock.calls[0]?.[1]);
+    expect(convertMock.mock.calls[0]?.[2]).toEqual(expect.any(String));
+    expect(convertMock.mock.calls[1]?.[2]).toEqual(expect.any(String));
+    expect(convertMock.mock.calls[1]?.[2]).not.toBe(convertMock.mock.calls[0]?.[2]);
   });
 
   it("startGuided: surfaces the backend's typed detail instead of the generic banner", async () => {
@@ -1924,6 +2591,22 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(state.guidedNextTurn).toBeNull();
     expect(state.guidedTerminal).toBeNull();
     expect(state.compositionState?.version).toBe(3);
+  });
+
+  it("revertToVersion: refreshes review cards surfaced for the restored state", async () => {
+    const { revertToVersion, getGuided } = await import("@/api/client");
+    const refreshAll = vi.fn(async () => {});
+    useInterpretationEventsStore.setState({ refreshAll } as never);
+    (revertToVersion as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...sampleCompositionState,
+      version: 3,
+    });
+    (getGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({ status: 400 });
+    useSessionStore.setState({ activeSessionId: RETRY_SESSION_ID });
+
+    await useSessionStore.getState().revertToVersion("state-with-review-debt");
+
+    expect(refreshAll).toHaveBeenCalledWith(RETRY_SESSION_ID);
   });
 
   it("revertToVersion: reuses the operation id after an ambiguous network failure and clears it after success", async () => {
@@ -3042,12 +3725,40 @@ describe("sessionStore — guided-mode fields and actions", () => {
           chosen: null,
           edited_values: {
             revision_instruction: "Add a deduplication transform before the output.",
+            revision_mode: "amend",
           },
           custom_inputs: null,
           edit_target: null,
           control_signal: null,
           turn_token: sampleProposalTurn.turn_token,
           operation_id: expect.any(String),
+        }),
+      );
+    });
+
+    it("threads an explicit replace choice without inferring it from prose", async () => {
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        sampleRespondResponse,
+      );
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+        guidedNextTurn: sampleProposalTurn,
+        compositionState: sampleCompositionState,
+      });
+
+      await useSessionStore
+        .getState()
+        .chatGuided("Keep every current step.", undefined, "replace");
+
+      expect(respondGuided).toHaveBeenCalledWith(
+        RETRY_SESSION_ID,
+        expect.objectContaining({
+          edited_values: {
+            revision_instruction: "Keep every current step.",
+            revision_mode: "replace",
+          },
         }),
       );
     });
@@ -3316,6 +4027,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
             ts_iso: "2026-07-11T00:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
           {
             role: "assistant",
@@ -3325,6 +4037,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
             ts_iso: "2026-07-11T00:00:01Z",
             assistant_message_kind: "assistant",
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       };
@@ -3549,6 +4262,276 @@ describe("sessionStore — guided-mode fields and actions", () => {
   });
 
   describe("respondGuided rejection surfacing (elspeth-3b35abf148 variant 3)", () => {
+    it("keeps a newer same-session submit authoritative when an old A-to-B-to-A rejection arrives", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+      let rejectFirst!: (reason?: unknown) => void;
+      let resolveSecond!: (response: GuidedRespondResponse) => void;
+      respondMock
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+        )
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((resolve) => {
+            resolveSecond = resolve;
+          }),
+        );
+      const action: GuidedRespondAction = {
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      };
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+      blobStoreMocks.activationEpoch = 17;
+
+      const first = useSessionStore.getState().respondGuided(action);
+
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_B);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_ID);
+      useSessionStore.setState({
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+      blobStoreMocks.activationEpoch = 23;
+      const second = useSessionStore.getState().respondGuided(action);
+
+      expect(respondMock).toHaveBeenCalledTimes(2);
+      expect(useSessionStore.getState().guidedResponsePending).toBe(true);
+
+      rejectFirst({
+        status: 400,
+        detail: "Selected source blob is no longer a ready upload for this session.",
+      });
+      await expect(first).resolves.toMatchObject({
+        status: "not_applied",
+        reason: "stale",
+      });
+
+      expect(blobStoreMocks.invalidateBlobForEpoch).not.toHaveBeenCalled();
+      expect(blobStoreMocks.loadBlobs).not.toHaveBeenCalled();
+      expect(useSessionStore.getState()).toMatchObject({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+        guidedResponsePending: true,
+        error: null,
+      });
+
+      resolveSecond(sampleRespondResponse);
+      await expect(second).resolves.toEqual({ status: "applied" });
+      expect(useSessionStore.getState().guidedResponsePending).toBe(false);
+    });
+
+    it("releases definitive stale retry custody when no newer submit adopted it", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+      let rejectFirst!: (reason?: unknown) => void;
+      respondMock
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+        )
+        .mockResolvedValueOnce(sampleRespondResponse);
+      const firstAction: GuidedRespondAction = {
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      };
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      const first = useSessionStore.getState().respondGuided(firstAction);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_B);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_ID);
+      useSessionStore.setState({
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      rejectFirst({
+        status: 400,
+        detail: "Selected source blob is no longer a ready upload for this session.",
+      });
+      await expect(first).resolves.toMatchObject({
+        status: "not_applied",
+        reason: "stale",
+      });
+
+      const second = await useSessionStore.getState().respondGuided({
+        ...firstAction,
+        source_blob_id: "00000000-0000-4000-8000-000000000902",
+      });
+
+      expect(second).toEqual({ status: "applied" });
+      expect(respondMock).toHaveBeenCalledTimes(2);
+      expect(respondMock.mock.calls[1]?.[1].operation_id).not.toBe(
+        respondMock.mock.calls[0]?.[1].operation_id,
+      );
+    });
+
+    it("does not clear retry custody re-adopted by a newer same-action submit", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+      let rejectFirst!: (reason?: unknown) => void;
+      let rejectSecond!: (reason?: unknown) => void;
+      respondMock
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+        )
+        .mockReturnValueOnce(
+          new Promise<GuidedRespondResponse>((_resolve, reject) => {
+            rejectSecond = reject;
+          }),
+        )
+        .mockResolvedValueOnce(sampleRespondResponse);
+      const action: GuidedRespondAction = {
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      };
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      const first = useSessionStore.getState().respondGuided(action);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_B);
+      useSessionStore.getState().resetForTutorialSession(RETRY_SESSION_ID);
+      useSessionStore.setState({
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      const second = useSessionStore.getState().respondGuided(action);
+
+      rejectFirst({
+        status: 400,
+        detail: "Selected source blob is no longer a ready upload for this session.",
+      });
+      await expect(first).resolves.toMatchObject({ reason: "stale" });
+
+      rejectSecond(new TypeError("response lost"));
+      await expect(second).resolves.toMatchObject({ reason: "unsettled" });
+      const retry = await useSessionStore.getState().respondGuided(action);
+
+      expect(retry).toEqual({ status: "applied" });
+      expect(respondMock).toHaveBeenCalledTimes(3);
+      expect(respondMock.mock.calls.map((call) => call[1].operation_id)).toEqual([
+        respondMock.mock.calls[0]?.[1].operation_id,
+        respondMock.mock.calls[0]?.[1].operation_id,
+        respondMock.mock.calls[0]?.[1].operation_id,
+      ]);
+    });
+
+    it.each([
+      "Selected source blob is no longer a ready upload for this session.",
+      "Selected source blob is not a ready upload for this session.",
+    ])(
+      "refreshes source candidates while preserving lifecycle rejection: %s",
+      async (detail) => {
+        const { respondGuided } = await import("@/api/client");
+        (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+          status: 400,
+          detail,
+        });
+        useSessionStore.setState({
+          activeSessionId: RETRY_SESSION_ID,
+          guidedSession: sampleGuidedSession,
+          guidedNextTurn: sampleNextTurn,
+        });
+        blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+        blobStoreMocks.activationEpoch = 17;
+
+        const outcome = await useSessionStore.getState().respondGuided({
+          chosen: ["csv"],
+          source_blob_id: "00000000-0000-4000-8000-000000000901",
+          edited_values: null,
+          custom_inputs: null,
+          proposal_id: null,
+          draft_hash: null,
+          edit_target: null,
+          control_signal: null,
+        });
+
+        expect(blobStoreMocks.invalidateBlobForEpoch).toHaveBeenCalledWith(
+          RETRY_SESSION_ID,
+          17,
+          "00000000-0000-4000-8000-000000000901",
+        );
+        expect(blobStoreMocks.loadBlobs).toHaveBeenCalledWith(RETRY_SESSION_ID);
+        expect(
+          blobStoreMocks.invalidateBlobForEpoch.mock.invocationCallOrder[0],
+        ).toBeLessThan(blobStoreMocks.loadBlobs.mock.invocationCallOrder[0]);
+        expect(outcome).toEqual({
+          status: "not_applied",
+          reason: "rejected",
+          message: detail,
+        });
+        expect(useSessionStore.getState().error).toBe(detail);
+        expect(useSessionStore.getState().guidedResponsePending).toBe(false);
+      },
+    );
+
+    it("does not refresh blobs for an unrelated guided 400", async () => {
+      const detail = "A different guided validation failed.";
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 400,
+        detail,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+      blobStoreMocks.activeSessionId = RETRY_SESSION_ID;
+      blobStoreMocks.activationEpoch = 23;
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        source_blob_id: "00000000-0000-4000-8000-000000000901",
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(blobStoreMocks.invalidateBlobForEpoch).not.toHaveBeenCalled();
+      expect(blobStoreMocks.loadBlobs).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().error).toBe(detail);
+    });
+
     it("surfaces a structured wire_confirm_rejected 409 as error + errorDetails", async () => {
       const { getGuided, respondGuided } = await import("@/api/client");
       (respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
@@ -3804,5 +4787,635 @@ describe("sessionStore — guided-mode fields and actions", () => {
       await useSessionStore.getState().chatGuided("What columns are available?");
       expect(useSessionStore.getState().guidedSelfHealNotice).toBeNull();
     });
+  });
+
+  // ── approveWiring: the two-dispatch shortcut past the wire review ────────
+  //
+  // The server rejects a confirm_wiring from step 3 outright, so approving
+  // without opening the review is necessarily review_wiring THEN
+  // confirm_wiring, with the second built from the wire turn the first
+  // produced. The stop rule between them is the whole safety of the feature.
+  describe("approveWiring", () => {
+    const WIRE_TOKEN = "f".repeat(64);
+
+    function wireTurn(
+      overrides: Partial<{
+        can_confirm: boolean;
+        warnings: Array<Record<string, unknown>>;
+        blockers: Array<Record<string, unknown>>;
+      }> = {},
+    ): TurnPayload {
+      return {
+        type: "confirm_wiring",
+        step_index: 3,
+        turn_token: WIRE_TOKEN,
+        payload: {
+          proposal_id: PROPOSAL_ID,
+          draft_hash: PROPOSAL_HASH,
+          sources: [],
+          nodes: [],
+          outputs: [],
+          connections: [],
+          semantic_contracts: [],
+          warnings: [],
+          blockers: [],
+          can_confirm: true,
+          ...overrides,
+        },
+      };
+    }
+
+    function wireResponse(turn: TurnPayload): GuidedRespondResponse {
+      return {
+        guided_session: { ...sampleGuidedSession, step: "step_4_wire" },
+        next_turn: turn,
+        terminal: null,
+        composition_state: { ...sampleCompositionState, version: 2 },
+      };
+    }
+
+    const reviewBody: GuidedRespondAction = {
+      chosen: ["review_wiring"],
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: null,
+      control_signal: null,
+    };
+
+    const noClientBlockers = () => ({
+      pendingAcknowledgements: 0,
+      validationIssues: 0,
+    });
+
+    function seedProposalTurn(): void {
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+        guidedNextTurn: sampleProposalTurn,
+      });
+    }
+
+    it("confirms clean wiring with a confirm built from the wire turn the review produced", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond
+        .mockResolvedValueOnce(wireResponse(wireTurn()))
+        .mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome).toEqual({ status: "confirmed" });
+      expect(respond).toHaveBeenCalledTimes(2);
+      // The confirm carries the WIRE turn's own identity and token — never
+      // the proposal turn's stale token, which the server 409s.
+      const confirmRequest = respond.mock.calls[1]?.[1];
+      expect(confirmRequest.chosen).toEqual(["confirm_wiring"]);
+      expect(confirmRequest.proposal_id).toBe(PROPOSAL_ID);
+      expect(confirmRequest.draft_hash).toBe(PROPOSAL_HASH);
+      expect(confirmRequest.turn_token).toBe(WIRE_TOKEN);
+    });
+
+    it("does not confirm when the wiring came back with warnings, and says why", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(
+        wireResponse(wireTurn({ warnings: [{ message: "never receives data" }] })),
+      );
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("stopped");
+      expect(respond).toHaveBeenCalledTimes(1);
+      // The user is left ON the wire review, which the first dispatch already
+      // rendered — with an explanation, not a silently dead button.
+      expect(useSessionStore.getState().guidedNextTurn?.type).toBe("confirm_wiring");
+      expect(useSessionStore.getState().guidedApprovalNotice).toContain("1 warning");
+    });
+
+    it("does not confirm when the wiring came back with blockers", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(
+        wireResponse(wireTurn({ can_confirm: false, blockers: [{ code: "x" }] })),
+      );
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("stopped");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not confirm when the transition surfaced a pending acknowledgement", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+
+      // Read AFTER the review dispatch: the transition itself can create the
+      // acknowledgement, so a snapshot taken before it would miss exactly the
+      // case this guards.
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, () => ({
+          pendingAcknowledgements: 1,
+          validationIssues: 0,
+        }));
+
+      expect(outcome.status).toBe("stopped");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("reads the client blockers only after the review dispatch has landed", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+      const callsWhenRead: number[] = [];
+
+      await useSessionStore.getState().approveWiring(reviewBody, () => {
+        callsWhenRead.push(respond.mock.calls.length);
+        return { pendingAcknowledgements: 0, validationIssues: 0 };
+      });
+
+      expect(callsWhenRead).toEqual([1]);
+    });
+
+    it("abandons the chain when the review dispatch itself did not apply", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond.mockRejectedValueOnce(new Error("network"));
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("not_applied");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("never confirms a turn that is not the wire review", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      // A re-plan or self-heal can legitimately land somewhere else.
+      respond.mockResolvedValueOnce(sampleRespondResponse);
+      seedProposalTurn();
+
+      const outcome = await useSessionStore
+        .getState()
+        .approveWiring(reviewBody, noClientBlockers);
+
+      expect(outcome.status).toBe("not_applied");
+      expect(respond).toHaveBeenCalledTimes(1);
+    });
+
+    it("clears a stale approval notice when the next approval starts", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond
+        .mockResolvedValueOnce(
+          wireResponse(wireTurn({ warnings: [{ message: "advisory" }] })),
+        )
+        .mockResolvedValueOnce(wireResponse(wireTurn()))
+        .mockResolvedValueOnce(wireResponse(wireTurn()));
+      seedProposalTurn();
+
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).not.toBeNull();
+
+      seedProposalTurn();
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+
+    // The refusal describes ONE wiring. Once the user acts on the review it
+    // refused — confirming it by hand, or asking a question — the line is
+    // about a decision already taken and must not stay pinned above the next
+    // turn. Same lifecycle guidedSelfHealNotice has.
+    it("clears the approval notice when the user responds to the turn by hand", async () => {
+      const { respondGuided } = await import("@/api/client");
+      const respond = respondGuided as ReturnType<typeof vi.fn>;
+      respond
+        .mockResolvedValueOnce(
+          wireResponse(wireTurn({ warnings: [{ message: "advisory" }] })),
+        )
+        .mockResolvedValueOnce(sampleRespondResponse);
+      seedProposalTurn();
+
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).not.toBeNull();
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["confirm_wiring"],
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+
+    it("clears the approval notice when the user asks a question instead", async () => {
+      const { respondGuided, chatGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        wireResponse(wireTurn({ warnings: [{ message: "advisory" }] })),
+      );
+      (chatGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        sampleChatResponse,
+      );
+      seedProposalTurn();
+
+      await useSessionStore.getState().approveWiring(reviewBody, noClientBlockers);
+      expect(useSessionStore.getState().guidedApprovalNotice).not.toBeNull();
+
+      await useSessionStore.getState().chatGuided("Why is that a warning?");
+
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+
+    it("clears the approval notice when the user dismisses notices", () => {
+      useSessionStore.setState({
+        guidedApprovalNotice: "Approval stopped: the wiring came back with 1 warning.",
+      } as never);
+
+      useSessionStore.getState().clearError();
+
+      expect(useSessionStore.getState().guidedApprovalNotice).toBeNull();
+    });
+  });
+
+  // The ledger names the reviewed source/output the pane draws
+  // (elspeth-9f0873426a). It is no longer folded from published turns: the
+  // server projects it on `guided_session.reviewed_components`
+  // (elspeth-f2a8550b3d), so the store reads it wherever it publishes a
+  // guided session, and it resets with the guided context.
+  describe("guidedReviewedComponents ledger (elspeth-9f0873426a)", () => {
+    const reviewedSource = {
+      stable_id: "00000000-0000-4000-8000-000000000602",
+      name: "source-1",
+      plugin: "csv",
+      status: "reviewed" as const,
+    };
+    const sourceReviewTurn: TurnPayload = {
+      type: "review_components",
+      step_index: 0,
+      turn_token: "f".repeat(64),
+      payload: {
+        component_kind: "source",
+        items: [reviewedSource],
+        allowed_actions: ["finish"],
+      },
+    };
+
+    it("starts empty and is reset with the rest of the guided context on session switch", async () => {
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [],
+        outputs: [],
+      });
+      const {
+        fetchMessages,
+        fetchCompositionState,
+        fetchCompositionProposals,
+        fetchComposerPreferences,
+      } = await import("@/api/client");
+      (fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      (fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+      (fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+      (fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+      useSessionStore.setState({
+        activeSessionId: "sess-1",
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sourceReviewTurn,
+        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
+      });
+
+      await useSessionStore.getState().selectSession("sess-2");
+
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [],
+        outputs: [],
+      });
+    });
+
+    it("respondGuided: publishes the server ledger and keeps it through the next turn", async () => {
+      const reviewedSession: GuidedSession = {
+        ...sampleGuidedSession,
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      };
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: reviewedSession,
+        next_turn: sourceReviewTurn,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [reviewedSource],
+        outputs: [],
+      });
+
+      // The sink single_select turn replaces the review turn on the wire, and
+      // the SERVER's ledger is what still names the source: the reviewed
+      // custody rides on the session, not on the turn that displayed it.
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: reviewedSession,
+      });
+      await useSessionStore.getState().respondGuided({
+        chosen: null,
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+        component_action: { action: "finish", component_kind: "source" },
+      });
+      expect(useSessionStore.getState().guidedNextTurn?.type).toBe("single_select");
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+        sources: [reviewedSource],
+        outputs: [],
+      });
+    });
+
+    it("respondGuided: a reload-shaped response with no review turn still names the ledger", async () => {
+      // The retired fold's defect, pinned at the store level: the wire's
+      // current turn is a proposal, so there was nothing to fold and the pane
+      // forgot both components. The projection carries them regardless.
+      const midBuildSession: GuidedSession = {
+        ...sampleGuidedSession,
+        step: "step_3_transforms",
+        reviewed_components: {
+          sources: [reviewedSource],
+          outputs: [
+            {
+              stable_id: "00000000-0000-4000-8000-000000000604",
+              name: "output-1",
+              plugin: "json",
+              status: "reviewed" as const,
+            },
+          ],
+        },
+      };
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: midBuildSession,
+        next_turn: null,
+      });
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: sampleGuidedSession,
+        guidedNextTurn: sampleNextTurn,
+      });
+
+      await useSessionStore.getState().respondGuided({
+        chosen: ["csv"],
+        edited_values: null,
+        custom_inputs: null,
+        proposal_id: null,
+        draft_hash: null,
+        edit_target: null,
+        control_signal: null,
+      });
+
+      expect(useSessionStore.getState().guidedNextTurn).toBeNull();
+      expect(useSessionStore.getState().guidedReviewedComponents).toEqual(
+        midBuildSession.reviewed_components,
+      );
+    });
+  });
+});
+
+// ── Completed-session chat (elspeth-986801d218 / IA-6) ───────────────────────
+//
+// After Confirm wiring the session is terminal and there is no unanswered
+// turn, but the chat channel stays open. The backend admits the request only
+// when `turn_token` equals the confirmation hash —
+// `guided_session.history[-1].response_hash` — so the store must post THAT,
+// not throw and not invent one.
+describe("sessionStore — chatGuided on a COMPLETED session", () => {
+  const CONFIRMATION_HASH = "c".repeat(64);
+
+  const completedGuidedSession: GuidedSession = {
+    ...sampleGuidedSession,
+    step: "step_4_wire",
+    history: [
+      {
+        step: "step_4_wire",
+        turn_type: "confirm_wiring",
+        payload_hash: "p".repeat(64),
+        response_hash: CONFIRMATION_HASH,
+        summary: "Wiring confirmed",
+        emitter: "server",
+      },
+    ],
+    terminal: sampleTerminal,
+  };
+
+  /** The server's answer to a completed chat: terminal held, next_turn null. */
+  const completedChatResponse: GuidedChatResponse = {
+    assistant_message: "node-2 calls the model once per row.",
+    assistant_message_kind: "assistant",
+    guided_session: {
+      ...completedGuidedSession,
+      chat_history: [
+        {
+          role: "user",
+          content: "what does node-2 do?",
+          seq: 0,
+          step: "step_4_wire",
+          ts_iso: "2026-09-03T00:00:00+00:00",
+          assistant_message_kind: null,
+          synthetic_failure_reason: null,
+          turn_token: CONFIRMATION_HASH,
+        },
+        {
+          role: "assistant",
+          content: "node-2 calls the model once per row.",
+          seq: 1,
+          step: "step_4_wire",
+          ts_iso: "2026-09-03T00:00:00+00:00",
+          assistant_message_kind: "assistant",
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+      ],
+      chat_turn_seq: 2,
+    },
+    next_turn: null,
+    terminal: sampleTerminal,
+    composition_state: { ...sampleCompositionState, version: 2 },
+  };
+
+  beforeEach(async () => {
+    vi.resetAllMocks();
+    window.sessionStorage.clear();
+    resetStore(useSessionStore);
+    const apiMod = await import("@/api/client");
+    (apiMod.listInterpretationEvents as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: completedGuidedSession,
+      guidedNextTurn: null,
+      guidedTerminal: sampleTerminal,
+      compositionState: sampleCompositionState,
+    });
+  });
+
+  it("posts the confirmation hash as turn_token and applies the reply", async () => {
+    const { chatGuided } = await import("@/api/client");
+    (chatGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      completedChatResponse,
+    );
+
+    await useSessionStore.getState().chatGuided("what does node-2 do?");
+
+    const [sessionId, body] = (chatGuided as ReturnType<typeof vi.fn>).mock
+      .calls[0];
+    expect(sessionId).toBe(RETRY_SESSION_ID);
+    expect(body.turn_token).toBe(CONFIRMATION_HASH);
+    expect(body.message).toBe("what does node-2 do?");
+
+    const state = useSessionStore.getState();
+    expect(state.guidedSession?.chat_history).toHaveLength(2);
+    // The reply must NOT re-open the wizard or clear the terminal.
+    expect(state.guidedNextTurn).toBeNull();
+    expect(state.guidedTerminal).toEqual(sampleTerminal);
+    expect(state.guidedChatPending).toBe(false);
+  });
+
+  it("keys retry custody on the confirmation hash", async () => {
+    const { chatGuided } = await import("@/api/client");
+    // Never resolves: custody is held for the LIFE of the request, so the
+    // slot can be read while it is in flight (a settled chat clears it).
+    (chatGuided as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise(() => undefined),
+    );
+
+    void useSessionStore.getState().chatGuided("what does node-2 do?");
+    await Promise.resolve();
+    expect(window.sessionStorage.getItem(GUIDED_RETRY_STORAGE_KEY)).not.toBeNull();
+
+    // Custody is keyed [turn_token, message] through an opaque fingerprint,
+    // so the token is not literally in the slot — re-deriving the key is how
+    // you read it. Re-acquiring with the SAME identity recovers the same
+    // operation ("acquired"); any other token collides with the held slot
+    // ("conflict"). A completed chat that claimed its slot under some other
+    // token would invert both.
+    const sameIdentity = acquireGuidedRetry("guided_chat", RETRY_SESSION_ID, [
+      CONFIRMATION_HASH,
+      "what does node-2 do?",
+    ]);
+    expect(sameIdentity.status).toBe("acquired");
+    const otherToken = acquireGuidedRetry("guided_chat", RETRY_SESSION_ID, [
+      "e".repeat(64),
+      "what does node-2 do?",
+    ]);
+    expect(otherToken.status).toBe("conflict");
+  });
+
+  it("resyncs on a 409 and leaves guidedNextTurn null", async () => {
+    const { chatGuided, getGuided } = await import("@/api/client");
+    (chatGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 409,
+      detail: "The committed pipeline was changed outside guided mode.",
+    });
+    // GET /guided on a completed session returns next_turn null.
+    (getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      guided_session: completedGuidedSession,
+      next_turn: null,
+      terminal: sampleTerminal,
+      composition_state: sampleCompositionState,
+    });
+
+    await useSessionStore.getState().chatGuided("confirm the wiring");
+
+    const state = useSessionStore.getState();
+    expect(state.guidedNextTurn).toBeNull();
+    expect(state.guidedTerminal).toEqual(sampleTerminal);
+    expect(state.error).toBe(
+      "The committed pipeline was changed outside guided mode.",
+    );
+    expect(state.guidedChatPending).toBe(false);
+  });
+
+  it("still throws on an EXITED terminal — that channel is closed", async () => {
+    // Discrimination against a "any terminal chats" implementation: the route
+    // refuses an exited session verbatim, so the client must not post at all.
+    const { chatGuided } = await import("@/api/client");
+    useSessionStore.setState({
+      guidedSession: sampleExitedGuidedSession,
+      guidedNextTurn: null,
+      guidedTerminal: sampleExitedGuidedSession.terminal,
+    });
+
+    await expect(
+      useSessionStore.getState().chatGuided("what does node-2 do?"),
+    ).rejects.toThrow("chatGuided called without a current unanswered turn");
+    expect(chatGuided).not.toHaveBeenCalled();
+  });
+
+  it("still throws when a completed session's last record is unanswered", async () => {
+    const { chatGuided } = await import("@/api/client");
+    useSessionStore.setState({
+      guidedSession: {
+        ...completedGuidedSession,
+        history: [
+          { ...completedGuidedSession.history[0], response_hash: null },
+        ],
+      },
+    });
+
+    await expect(
+      useSessionStore.getState().chatGuided("what does node-2 do?"),
+    ).rejects.toThrow("chatGuided called without a current unanswered turn");
+    expect(chatGuided).not.toHaveBeenCalled();
+  });
+
+  it("a Retry token still wins over the completed token", async () => {
+    // Occurrence binding is unchanged: a retry submits the token its message
+    // was originally submitted under, and the server decides.
+    const { chatGuided } = await import("@/api/client");
+    (chatGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      completedChatResponse,
+    );
+    const retryToken = "d".repeat(64);
+
+    await useSessionStore
+      .getState()
+      .chatGuided("what does node-2 do?", undefined, "amend", retryToken);
+
+    expect(
+      (chatGuided as ReturnType<typeof vi.fn>).mock.calls[0][1].turn_token,
+    ).toBe(retryToken);
   });
 });

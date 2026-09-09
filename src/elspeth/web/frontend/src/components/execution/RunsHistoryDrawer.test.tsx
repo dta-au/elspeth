@@ -1,10 +1,22 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { RunsHistoryDrawer } from "./RunsHistoryDrawer";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { makeComposition } from "@/test/composerFixtures";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import type { RunDiagnostics } from "@/types/index";
+
+const TEXTRACT_S3_UNREADABLE_HINT =
+  "Amazon Textract could not read the S3 object. Most commonly the object is outside the " +
+  "S3 read scope granted to the pipeline's AWS role (check the role's s3:GetObject prefix " +
+  "against the document's bucket/key and, when version_field is configured, its " +
+  "s3:GetObjectVersion permission); it can also mean the object does not exist or is stored " +
+  "in a different region than the Textract endpoint. Verify access scope before suspecting " +
+  "a corrupt or unsupported file.";
 
 vi.mock("@/components/inspector/RunOutputsPanel", () => ({
   RunOutputsPanel: ({ runId }: { runId: string }) => (
@@ -22,6 +34,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
       token_count: 1,
       preview_limit: 50,
       preview_truncated: false,
+      discard_count: 0,
       state_counts: { failed: 1 },
       operation_counts: { runtime_preflight: 1 },
       latest_activity_at: "2026-05-17T00:00:00Z",
@@ -31,10 +44,8 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
         token_id: "token-1",
         row_id: "row-1",
         row_index: 0,
-        branch_name: null,
-        fork_group_id: null,
+        lineage: [],
         join_group_id: null,
-        expand_group_id: null,
         step_in_pipeline: null,
         created_at: "2026-05-17T00:00:00Z",
         terminal_outcome: "failed",
@@ -71,6 +82,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
       },
     ],
     artifacts: [],
+    discards: [],
     failure_detail: {
       operation_id: "op-1",
       node_id: "rate_colours",
@@ -82,8 +94,14 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
   };
 }
 
+// File-level, not per-describe: the drawer is a sessionStore reader on two
+// counts — the empty-state session title and the curated failure row's node
+// naming — so compositionState must not leak between tests in either block.
+beforeEach(() => resetStore(useSessionStore));
+
 describe("RunsHistoryDrawer", () => {
   beforeEach(() => {
+    resetStore(usePreferencesStore);
     useExecutionStore.setState({
       runs: [
         { id: "r1", status: "completed" } as never,
@@ -105,9 +123,42 @@ describe("RunsHistoryDrawer", () => {
   });
 
   it("lists every run from the store", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
     expect(screen.getByText(/r1/)).toBeInTheDocument();
     expect(screen.getByText(/r2/)).toBeInTheDocument();
+  });
+
+  it("marks a run whose accounting failed audit validation, without hiding its siblings", () => {
+    // elspeth-d5578ccd98: the backend ships accounting_corruption INSTEAD of
+    // accounting for a corrupt run; the list must render the run with an
+    // explicit marker while healthy runs stay ordinary.
+    usePreferencesStore.setState({ showAdvanced: true });
+    useExecutionStore.setState({
+      runs: [
+        { id: "r1", status: "completed" } as never,
+        {
+          id: "r2",
+          status: "completed",
+          accounting: null,
+          accounting_corruption: {
+            landscape_run_id: "land-r2",
+            violations: ["2 token(s) with duplicate completed terminal outcomes"],
+          },
+        } as never,
+      ],
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+
+    const marker = screen.getByText("⚠ audit accounting corrupt");
+    expect(marker).toBeInTheDocument();
+    expect(marker).toHaveAttribute(
+      "title",
+      "2 token(s) with duplicate completed terminal outcomes",
+    );
+    expect(screen.getAllByText("⚠ audit accounting corrupt")).toHaveLength(1);
+    expect(screen.getByText(/r1/)).toBeInTheDocument();
   });
 
   it("labels runs by stable ordinal and local start time, newest first", () => {
@@ -129,6 +180,7 @@ describe("RunsHistoryDrawer", () => {
         } as never,
       ],
     } as never);
+    usePreferencesStore.setState({ showAdvanced: true });
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
@@ -167,7 +219,12 @@ describe("RunsHistoryDrawer", () => {
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
     const withFailures = screen.getByText("completed with failures");
-    expect(withFailures).toHaveClass("status-badge", "status-badge-completed");
+    // Not aliased to -completed (elspeth-cd885f4c4d): a partial failure keeps
+    // its own warning-family class rather than the unqualified success tint.
+    expect(withFailures).toHaveClass(
+      "status-badge",
+      "status-badge-completed_with_failures",
+    );
     expect(withFailures).toHaveTextContent("⚠");
 
     const empty = screen.getByText("empty");
@@ -242,13 +299,13 @@ describe("RunsHistoryDrawer", () => {
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
     expect(
-      screen.queryByRole("button", { name: /cancel run r1/i }),
+      screen.queryByRole("button", { name: /^Cancel Run 1 · /i }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run r2/i }),
+      screen.getByRole("button", { name: /^Cancel Run 2 · /i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run r3/i }),
+      screen.getByRole("button", { name: /^Cancel Run 3 · /i }),
     ).toBeInTheDocument();
   });
 
@@ -260,7 +317,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /cancel run r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Cancel Run 1 · /i }));
 
     // Confirm gates the REST call.
     expect(cancel).not.toHaveBeenCalled();
@@ -278,7 +335,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /cancel run r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Cancel Run 1 · /i }));
     await userEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
 
     expect(cancel).not.toHaveBeenCalled();
@@ -294,12 +351,13 @@ describe("RunsHistoryDrawer", () => {
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
-    const button = screen.getByRole("button", { name: /cancel run r2/i });
+    const button = screen.getByRole("button", { name: /^Cancel Run 1 · /i });
     expect(button).toBeDisabled();
     expect(button).toHaveTextContent(/cancelling/i);
   });
 
   it("loads and renders diagnostics detail for a selected run", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const loadRunDiagnostics = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({
       loadRunDiagnostics,
@@ -307,7 +365,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     expect(loadRunDiagnostics).toHaveBeenCalledWith("r2");
     expect(screen.getByTestId("run-failure-detail")).toHaveTextContent(
@@ -317,7 +375,182 @@ describe("RunsHistoryDrawer", () => {
     expect(screen.getByTestId("run-outputs-panel")).toHaveAttribute("data-run-id", "r2");
   });
 
+  it("surfaces structured transform failure provenance from the node state", async () => {
+    const diagnostics = makeDiagnostics({
+      failure_detail: null,
+      run_status: "completed_with_failures",
+    });
+    diagnostics.tokens[0].terminal_outcome = "routed_failure";
+    diagnostics.tokens[0].states[0].node_id = "transform_textract_93c6c46b8b72";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "submit_failed",
+      error_type: "service_error",
+      code: "InvalidS3ObjectException",
+      cause: "s3_object_unreadable",
+      error: TEXTRACT_S3_UNREADABLE_HINT,
+    };
+    useExecutionStore.setState({
+      runs: [{ id: "r2", status: "completed_with_failures" } as never],
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent("failed - InvalidS3ObjectException");
+    expect(failure.querySelector("[title]")).toHaveAttribute(
+      "title",
+      "transform_textract_93c6c46b8b72",
+    );
+    expect(failure).toHaveTextContent("Reason: the request could not be submitted");
+    expect(failure).toHaveTextContent("Cause: the S3 object could not be read");
+    // Known enums read as prose with the raw value recoverable from `title`.
+    expect(
+      within(failure).getByText("the request could not be submitted"),
+    ).toHaveAttribute("title", "submit_failed");
+    expect(failure).toHaveTextContent(TEXTRACT_S3_UNREADABLE_HINT);
+    expect(failure).not.toHaveTextContent("service_error");
+  });
+
+  it("puts the raw diagnostic enum beside its phrase with Advanced on (elspeth-f49e1611ab)", async () => {
+    // A run-failure reason or cause is exactly what a user pastes into a
+    // support search. Before this it lived in `title` at both detail levels,
+    // so a keyboard-only or touch user had no route to it. The phrase stays
+    // and the raw enum joins it in <code>, the same register an UNPHRASED
+    // value already uses — never dressed up as prose.
+    const diagnostics = makeDiagnostics({
+      failure_detail: null,
+      run_status: "completed_with_failures",
+    });
+    diagnostics.tokens[0].terminal_outcome = "routed_failure";
+    diagnostics.tokens[0].states[0].node_id = "transform_textract_93c6c46b8b72";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "submit_failed",
+      error_type: "service_error",
+      code: "InvalidS3ObjectException",
+      cause: "s3_object_unreadable",
+      error: TEXTRACT_S3_UNREADABLE_HINT,
+    };
+    useExecutionStore.setState({
+      runs: [{ id: "r2", status: "completed_with_failures" } as never],
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+    usePreferencesStore.setState({ showAdvanced: true });
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent("Reason: the request could not be submitted");
+    expect(within(failure).getByText("submit_failed").tagName).toBe("CODE");
+    expect(within(failure).getByText("s3_object_unreadable").tagName).toBe("CODE");
+    // The phrase and its `title` are unchanged — the raw value is an addition,
+    // not a replacement.
+    expect(
+      within(failure).getByText("the request could not be submitted"),
+    ).toHaveAttribute("title", "submit_failed");
+  });
+
+  it("rejects malformed diagnostic identifiers and falls back to the next valid field", async () => {
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "content_safety";
+    diagnostics.tokens[0].states[0].error = {
+      code: "Invalid S3 Object<script>",
+      error_type: "guardrail_service_error",
+      reason: "api_error\nforged",
+      cause: "provider_rejected",
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent(
+      "content_safety failed - guardrail_service_error",
+    );
+    expect(failure).toHaveTextContent("Cause: the provider rejected the request");
+    expect(failure).not.toHaveTextContent("Invalid S3 Object");
+    expect(failure).not.toHaveTextContent("forged");
+  });
+
+  it("rejects oversized identifiers before selecting a fallback label", async () => {
+    const oversizedCode = "A".repeat(129);
+    const oversizedErrorType = "b".repeat(129);
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "transform_textract";
+    diagnostics.tokens[0].states[0].error = {
+      code: oversizedCode,
+      error_type: oversizedErrorType,
+      reason: "submit_failed",
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent("failed - submit_failed");
+    expect(failure.querySelector("[title]")).toHaveAttribute("title", "transform_textract");
+    expect(failure).not.toHaveTextContent(oversizedCode);
+    expect(failure).not.toHaveTextContent(oversizedErrorType);
+  });
+
+  it("rejects a forged S3-unreadable tuple with arbitrary free text", async () => {
+    const forgedHint =
+      "Amazon Textract could not read the S3 object. Most commonly the object is outside the arbitrary provider text.";
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "transform_textract";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "submit_failed",
+      error_type: "service_error",
+      code: "InvalidS3ObjectException",
+      cause: "s3_object_unreadable",
+      error: forgedHint,
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent("failed - InvalidS3ObjectException");
+    expect(failure.querySelector("[title]")).toHaveAttribute("title", "transform_textract");
+    expect(failure).not.toHaveTextContent("arbitrary provider text");
+  });
+
+  it("names the failed node and falls back to error_type without a provider code", async () => {
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "content_safety";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "api_error",
+      error_type: "guardrail_service_error",
+      error: "unclassified provider response text must stay audit-only",
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent(
+      "content_safety failed - guardrail_service_error",
+    );
+    expect(failure).toHaveTextContent("Reason: api_error");
+    expect(failure).not.toHaveTextContent("unclassified provider response text");
+  });
+
   it("shows the stored run failure cause immediately before diagnostics load", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const loadRunDiagnostics = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({
       runs: [
@@ -332,7 +565,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
 
     expect(screen.getByTestId("run-stored-failure-detail")).toHaveTextContent(
       "max_output_tokens below minimum value",
@@ -340,6 +573,7 @@ describe("RunsHistoryDrawer", () => {
   });
 
   it("keeps the stored run failure cause visible when diagnostics have no failure_detail", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       runs: [
         {
@@ -352,7 +586,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1 · /i }));
 
     expect(screen.queryByTestId("run-failure-detail")).not.toBeInTheDocument();
     expect(screen.getByTestId("run-stored-failure-detail")).toHaveTextContent(
@@ -367,7 +601,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
 
     expect(screen.getByText("Reading current run evidence")).toBeInTheDocument();
     expect(screen.getByText("1 token is visible in the runtime trace.")).toBeInTheDocument();
@@ -381,7 +615,7 @@ describe("RunsHistoryDrawer", () => {
     } as never);
 
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
-    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 2 · /i }));
     await userEvent.click(screen.getByRole("button", { name: /explain/i }));
 
     expect(evaluateRunDiagnostics).toHaveBeenCalledWith("r2");
@@ -395,7 +629,7 @@ describe("RunsHistoryDrawer", () => {
   it("traps Tab and Shift+Tab inside the drawer", async () => {
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
     const closeBtn = screen.getByRole("button", { name: /close/i });
-    const firstDetail = screen.getByRole("button", { name: /show detail for r1/i });
+    const firstDetail = screen.getByRole("button", { name: /^Show detail for Run 1 · /i });
     closeBtn.focus();
     await userEvent.tab();
     expect(firstDetail).toHaveFocus();
@@ -439,5 +673,104 @@ describe("RunsHistoryDrawer", () => {
     expect(opener).toHaveFocus();
 
     opener.remove();
+  });
+});
+
+describe("detail level (elspeth-34e810312c)", () => {
+  const UUID_RUN_ID = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
+  const uuidRun = (status: string, extra: Record<string, unknown> = {}) =>
+    ({ id: UUID_RUN_ID, status, started_at: "2026-08-29T10:00:00Z", ...extra }) as never;
+
+  beforeEach(() => resetStore(usePreferencesStore));
+
+  it("keeps the UUID out of visible text and aria-labels with the flag off, but in the label title", () => {
+    const { container } = render(
+      <RunsHistoryDrawer onClose={vi.fn()} runsOverride={[uuidRun("running")]} />,
+    );
+    expectNoIdentifiersInDefaultDom(container);
+    expect(screen.getByText(/^Run 1 · /)).toHaveAttribute("title", UUID_RUN_ID);
+    expect(screen.getByRole("button", { name: /^Cancel Run 1 · / })).toBeInTheDocument();
+  });
+
+  it("shows the UUID span when show_advanced is on", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<RunsHistoryDrawer onClose={vi.fn()} runsOverride={[uuidRun("completed")]} />);
+    expect(screen.getByText(UUID_RUN_ID)).toBeInTheDocument();
+  });
+
+  it("gates the token/operation lists and raw failure <pre> behind the flag; keeps count, Explain, and the curated failure detail", async () => {
+    // The curated row is the only diagnostics content left visible with the
+    // flag off, so it is held to the whole default-DOM acceptance pin — not a
+    // hand-rolled negative over two ids. Its node id and all three diagnostic
+    // identifiers (code, reason, cause) are seeded so the pin actually
+    // exercises every raw value the row can render.
+    useSessionStore.setState({
+      compositionState: makeComposition(2, {
+        nodes: [
+          {
+            id: "rate_colours",
+            node_type: "transform",
+            plugin: "llm",
+            input: "source",
+            on_success: null,
+            on_error: null,
+            options: {},
+          },
+        ],
+      }),
+    } as never);
+    useExecutionStore.setState({
+      loadRunDiagnostics: vi.fn().mockResolvedValue(undefined),
+      diagnosticsByRunId: {
+        [UUID_RUN_ID]: makeDiagnostics({
+          run_id: UUID_RUN_ID,
+          tokens: [
+            {
+              ...makeDiagnostics().tokens[0],
+              states: [
+                {
+                  ...makeDiagnostics().tokens[0].states[0],
+                  error: {
+                    code: "some_code",
+                    reason: "submit_failed",
+                    cause: "s3_object_unreadable",
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    } as never);
+    render(<RunsHistoryDrawer onClose={vi.fn()} runsOverride={[uuidRun("failed")]} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Show detail for Run 1/ }));
+    expect(screen.getByText(/1 token/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Explain" })).toBeInTheDocument();
+    const drawer = screen.getByRole("dialog", { name: "Pipeline runs" });
+    expect(drawer.querySelector(".run-diagnostics-tokens")).toBeNull();
+    expect(drawer.querySelector(".run-diagnostics-operations")).toBeNull();
+    expect(screen.queryByTestId("run-failure-detail")).not.toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(drawer);
+    // Curated authored surface stays (closed identifiers + authored hint), with
+    // the node NAMED from the composition — the same phrase map ProgressView
+    // uses — and the raw id recoverable from the row's title.
+    const stateFailure = screen.getByTestId("run-state-failure-state-1");
+    expect(stateFailure).toHaveTextContent("Rate Colours failed - some_code");
+    expect(stateFailure.querySelector("[title]")).toHaveAttribute("title", "rate_colours");
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(drawer.querySelector(".run-diagnostics-tokens")).not.toBeNull();
+    expect(screen.getByTestId("run-failure-detail")).toBeInTheDocument();
+    // One render site: still exactly one curated failure row with the flag on.
+    expect(screen.getAllByTestId("run-state-failure-state-1")).toHaveLength(1);
+  });
+
+  it("keeps the accounting-corruption badge regardless of the flag", () => {
+    render(
+      <RunsHistoryDrawer
+        onClose={vi.fn()}
+        runsOverride={[uuidRun("completed", { accounting_corruption: { violations: ["duplicate terminal outcome"] } })]}
+      />,
+    );
+    expect(screen.getByText("⚠ audit accounting corrupt")).toBeInTheDocument();
   });
 });

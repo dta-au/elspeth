@@ -47,6 +47,8 @@ from elspeth.contracts.export_records import (
     CallExportRecord,
     EdgeExportRecord,
     ExportRecord,
+    GroupLossExportRecord,
+    GroupRecordExportRecord,
     NodeExportRecord,
     OperationExportRecord,
     RoutingEventExportRecord,
@@ -62,6 +64,7 @@ from elspeth.contracts.export_records import (
     WebPluginPolicyExportRecord,
 )
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.identity import LineageFrame
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.export_mappers import (
@@ -102,6 +105,12 @@ class ExportReadModel(Protocol):
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]: ...
 
     def get_tokens_for_rows(self, run_id: str, row_ids: list[str]) -> list[Any]: ...
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: list[str]) -> dict[str, tuple[LineageFrame, ...]]: ...
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]: ...
 
@@ -171,6 +180,15 @@ class RecorderFactoryExportReadModel:
 
     def get_tokens_for_rows(self, run_id: str, row_ids: list[str]) -> list[Any]:
         return self._factory.query.get_tokens_for_rows(run_id, row_ids)
+
+    def get_lineage_paths_for_tokens(self, run_id: str, token_ids: list[str]) -> dict[str, tuple[LineageFrame, ...]]:
+        return self._factory.data_flow.load_lineage_paths(run_id, token_ids)
+
+    def get_group_records_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_group_records_for_run(run_id)
+
+    def get_group_losses_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.data_flow.get_group_losses_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]:
         return self._factory.query.get_token_parents_for_tokens(token_ids)
@@ -251,9 +269,11 @@ class LandscapeExporter:
     - validation_error: Source validation failures
     - transform_error: Transform processing failures
     - row: Source rows
-    - token: Row instances
+    - token: Row instances (carries lineage_path — typed frame stack)
     - token_parent: Token lineage for forks/joins
     - token_outcome: Terminal state for tokens
+    - group_record: Roster record for one fork/expand opener (spec §4.3)
+    - group_loss: Unified group-loss ledger entry (spec §6.2, WS3 writes it)
     - scheduler_event: Durable scheduler state transitions and lease attribution
     - node_state: Processing records
     - routing_event: Routing decisions
@@ -805,29 +825,53 @@ class LandscapeExporter:
         for row_batch in self._read_model.iter_rows_for_run(run_id, batch_size=self._row_batch_size):
             yield from self._iter_row_batch_records(run_id, row_batch)
 
+        # Unified lineage roster + loss ledger (spec §4.3/§6.2): every
+        # fork/expand opener mints a group_records row (empty expansions
+        # included); group_losses is empty until WS3 writes the ledger, but
+        # the table enters the portable export surface at this flip.
+        for group_record in self._read_model.get_group_records_for_run(run_id):
+            group_record_record: GroupRecordExportRecord = {
+                "record_type": "group_record",
+                "run_id": run_id,
+                "group_id": group_record.group_id,
+                "kind": group_record.kind,
+                "opener_token_id": group_record.opener_token_id,
+                "member_count": group_record.member_count,
+                "created_at": group_record.created_at.isoformat(),
+                "closes_group_id": group_record.closes_group_id,
+            }
+            yield group_record_record
+
+        for group_loss in self._read_model.get_group_losses_for_run(run_id):
+            group_loss_record: GroupLossExportRecord = {
+                "record_type": "group_loss",
+                "loss_id": group_loss.loss_id,
+                "run_id": run_id,
+                "closer_name": group_loss.closer_name,
+                "group_id": group_loss.group_id,
+                "member_key": group_loss.member_key,
+                "token_id": group_loss.token_id,
+                "reason": group_loss.reason,
+                "recorded_by": group_loss.recorded_by,
+                "recorded_at": group_loss.recorded_at.isoformat(),
+                "adopted_epoch": group_loss.adopted_epoch,
+            }
+            yield group_loss_record
+
         yield from self._iter_batch_and_artifact_records(run_id)
 
     def _iter_sink_effect_records(self, run_id: str) -> Iterator[ExportRecord]:
         """Yield complete safe recovery history in deterministic family order."""
-        # Preserve compatibility for narrow test/custom read models that
-        # predate epoch 26 and therefore cannot contain sink-effect rows.
-        stream_getter = getattr(self._read_model, "get_sink_effect_streams_for_run", None)
-        effect_getter = getattr(self._read_model, "get_sink_effects_for_run", None)
-        member_getter = getattr(self._read_model, "get_sink_effect_members_for_run", None)
-        attempt_getter = getattr(self._read_model, "get_sink_effect_attempts_for_run", None)
-        if stream_getter is None or effect_getter is None or member_getter is None or attempt_getter is None:
-            return
-
-        for stream in stream_getter(run_id):
+        for stream in self._read_model.get_sink_effect_streams_for_run(run_id):
             yield sink_effect_stream_to_export_record(stream)
-        for effect in effect_getter(run_id):
+        for effect in self._read_model.get_sink_effects_for_run(run_id):
             yield sink_effect_to_export_record(effect)
-        for member in member_getter(run_id):
+        for member in self._read_model.get_sink_effect_members_for_run(run_id):
             yield sink_effect_member_to_export_record(member)
 
         current_effect_id: str | None = None
         attempt_index = 0
-        for attempt in attempt_getter(run_id):
+        for attempt in self._read_model.get_sink_effect_attempts_for_run(run_id):
             if attempt.effect_id != current_effect_id:
                 current_effect_id = attempt.effect_id
                 attempt_index = 0
@@ -854,6 +898,7 @@ class LandscapeExporter:
             tokens_by_row[token.row_id].append(token)
 
         token_ids = [token.token_id for token in batch_tokens]
+        lineage_paths_by_token = self._read_model.get_lineage_paths_for_tokens(run_id, token_ids)
         parents_by_token: defaultdict[str, list[TokenParent]] = defaultdict(list)
         for parent in self._read_model.get_token_parents_for_tokens(token_ids):
             parents_by_token[parent.token_id].append(parent)
@@ -918,10 +963,10 @@ class LandscapeExporter:
                     "token_id": token.token_id,
                     "row_id": token.row_id,
                     "step_in_pipeline": token.step_in_pipeline,
-                    "branch_name": token.branch_name,
-                    "fork_group_id": token.fork_group_id,
+                    "lineage_path": [
+                        [frame.kind.value, frame.group_id, frame.member_key] for frame in lineage_paths_by_token[token.token_id]
+                    ],
                     "join_group_id": token.join_group_id,
-                    "expand_group_id": token.expand_group_id,
                     "created_at": token.created_at.isoformat(),
                 }
                 yield token_record
@@ -956,12 +1001,8 @@ class LandscapeExporter:
                         "recorded_at": outcome.recorded_at.isoformat(),
                         "sink_name": outcome.sink_name,
                         "batch_id": outcome.batch_id,
-                        "fork_group_id": outcome.fork_group_id,
-                        "join_group_id": outcome.join_group_id,
-                        "expand_group_id": outcome.expand_group_id,
                         "error_hash": outcome.error_hash,
                         "context_json": outcome.context_json,
-                        "expected_branches_json": outcome.expected_branches_json,
                     }
                     yield token_outcome_record
 
@@ -973,6 +1014,7 @@ class LandscapeExporter:
                     scheduler_event_record: SchedulerEventExportRecord = {
                         "record_type": "scheduler_event",
                         "run_id": run_id,
+                        "seq": event.seq,
                         "event_id": event.event_id,
                         "token_id": event.token_id,
                         "work_item_id": event.work_item_id,

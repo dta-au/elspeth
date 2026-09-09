@@ -14,12 +14,14 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict
 
 from elspeth.contracts.freeze import freeze_fields, require_int
+from elspeth.contracts.identity import LineageFrame
 
 if TYPE_CHECKING:
     pass  # Placeholder for future type-only imports
 
 from elspeth.contracts.enums import (
     _LEGAL_TERMINAL_PAIRS,
+    _NON_TERMINAL_PATHS,
     BatchStatus,
     CallStatus,
     CallType,
@@ -252,10 +254,8 @@ class Token:
     row_id: str
     created_at: datetime
     run_id: str
-    fork_group_id: str | None = None
-    join_group_id: str | None = None
-    expand_group_id: str | None = None  # For deaggregation grouping
-    branch_name: str | None = None
+    join_group_id: str | None = None  # merge event — the KEPT tokens column
+    lineage_path: tuple[LineageFrame, ...] = ()  # loaded from token_lineage_frames
     step_in_pipeline: int | None = None  # Step where token was created (fork/coalesce/expand)
     token_data_ref: str | None = None  # Content-addressable ref for per-token payload (expand/coalesce writers)
 
@@ -643,25 +643,25 @@ class SinkEffect:
     finalized_at: datetime | None
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "effect_id",
-            "config_hash",
-            "membership_or_manifest_hash",
-            "group_payload_hash",
-            "artifact_id",
+        for field_name, required_hash_value in (
+            ("effect_id", self.effect_id),
+            ("config_hash", self.config_hash),
+            ("membership_or_manifest_hash", self.membership_or_manifest_hash),
+            ("group_payload_hash", self.group_payload_hash),
+            ("artifact_id", self.artifact_id),
         ):
-            _validate_hash(getattr(self, field_name), field_name)
-        for field_name in (
-            "plan_hash",
-            "expected_descriptor_hash",
-            "precondition_hash",
-            "reconcile_evidence_hash",
-            "result_descriptor_hash",
-            "primary_effect_id",
-            "stream_id",
-            "predecessor_effect_id",
+            _validate_hash(required_hash_value, field_name)
+        for field_name, optional_hash_value in (
+            ("plan_hash", self.plan_hash),
+            ("expected_descriptor_hash", self.expected_descriptor_hash),
+            ("precondition_hash", self.precondition_hash),
+            ("reconcile_evidence_hash", self.reconcile_evidence_hash),
+            ("result_descriptor_hash", self.result_descriptor_hash),
+            ("primary_effect_id", self.primary_effect_id),
+            ("stream_id", self.stream_id),
+            ("predecessor_effect_id", self.predecessor_effect_id),
         ):
-            _validate_hash(getattr(self, field_name), field_name, optional=True)
+            _validate_hash(optional_hash_value, field_name, optional=True)
         _validate_nonempty_string(self.protocol_version, "protocol_version")
         _validate_nonempty_string(self.artifact_idempotency_key, "artifact_idempotency_key")
         _validate_nonempty_string(self.target_json, "target_json")
@@ -798,10 +798,19 @@ class SinkEffectMemberRecord:
         require_int(self.ordinal, "ordinal", min_value=0)
         require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
         _validate_nonempty_string(self.lineage_json, "lineage_json")
-        for field_name in ("lineage_hash", "payload_hash"):
-            _validate_hash(getattr(self, field_name), field_name)
-        for field_name in ("primary_effect_id", "reason_hash", "member_effect_id", "descriptor_hash", "evidence_hash"):
-            _validate_hash(getattr(self, field_name), field_name, optional=True)
+        for field_name, required_hash_value in (
+            ("lineage_hash", self.lineage_hash),
+            ("payload_hash", self.payload_hash),
+        ):
+            _validate_hash(required_hash_value, field_name)
+        for field_name, optional_hash_value in (
+            ("primary_effect_id", self.primary_effect_id),
+            ("reason_hash", self.reason_hash),
+            ("member_effect_id", self.member_effect_id),
+            ("descriptor_hash", self.descriptor_hash),
+            ("evidence_hash", self.evidence_hash),
+        ):
+            _validate_hash(optional_hash_value, field_name, optional=True)
         if (self.role is SinkEffectRole.PRIMARY) != (self.primary_effect_id is None):
             raise ValueError("sink effect member primary linkage must match its role")
         if self.prepared_disposition not in (None, "accepted", "diverted"):
@@ -891,38 +900,38 @@ class AuditExportSnapshot:
             raise ValueError("audit export snapshot requires an immutable export-terminal run")
         _validate_enum(self.export_format, AuditExportFormat, "export_format")
         _validate_enum(self.signing_mode, AuditExportSigningMode, "signing_mode")
-        for field_name in (
-            "snapshot_id",
-            "registry_key_hash",
-            "public_export_config_hash",
-            "manifest_hash",
-            "last_chunk_seal_hash",
-            "snapshot_hash",
-            "snapshot_seal_hash",
-            "final_hash",
-            "signed_manifest_hash",
+        for field_name, hash_value in (
+            ("snapshot_id", self.snapshot_id),
+            ("registry_key_hash", self.registry_key_hash),
+            ("public_export_config_hash", self.public_export_config_hash),
+            ("manifest_hash", self.manifest_hash),
+            ("last_chunk_seal_hash", self.last_chunk_seal_hash),
+            ("snapshot_hash", self.snapshot_hash),
+            ("snapshot_seal_hash", self.snapshot_seal_hash),
+            ("final_hash", self.final_hash),
+            ("signed_manifest_hash", self.signed_manifest_hash),
         ):
-            _validate_hash(getattr(self, field_name), field_name)
+            _validate_hash(hash_value, field_name)
         _validate_hash(self.signature_hex, "signature_hex", optional=True)
-        for field_name in (
-            "exporter_version",
-            "serialization_version",
-            "signer_key_id",
-            "derivation_version",
-            "chunking_algorithm_version",
-            "content_store_id",
-            "record_chain_algorithm",
+        for field_name, string_value in (
+            ("exporter_version", self.exporter_version),
+            ("serialization_version", self.serialization_version),
+            ("signer_key_id", self.signer_key_id),
+            ("derivation_version", self.derivation_version),
+            ("chunking_algorithm_version", self.chunking_algorithm_version),
+            ("content_store_id", self.content_store_id),
+            ("record_chain_algorithm", self.record_chain_algorithm),
         ):
-            _validate_nonempty_string(getattr(self, field_name), field_name)
-        for field_name in (
-            "per_chunk_record_limit",
-            "per_chunk_byte_limit",
-            "record_count",
-            "total_bytes",
-            "chunk_count",
-            "signed_manifest_size_bytes",
+            _validate_nonempty_string(string_value, field_name)
+        for field_name, integer_value in (
+            ("per_chunk_record_limit", self.per_chunk_record_limit),
+            ("per_chunk_byte_limit", self.per_chunk_byte_limit),
+            ("record_count", self.record_count),
+            ("total_bytes", self.total_bytes),
+            ("chunk_count", self.chunk_count),
+            ("signed_manifest_size_bytes", self.signed_manifest_size_bytes),
         ):
-            require_int(getattr(self, field_name), field_name, min_value=1)
+            require_int(integer_value, field_name, min_value=1)
         require_int(self.terminal_chunk_ordinal, "terminal_chunk_ordinal", min_value=0)
         if self.terminal_chunk_ordinal != self.chunk_count - 1:
             raise ValueError("terminal_chunk_ordinal must equal chunk_count - 1")
@@ -1045,8 +1054,10 @@ class Artifact:
             "inherited": False,
             "virtual": False,
         }
-        expected = evidence_performed.get(self.publication_evidence_kind)
-        if expected is None or self.publication_performed is not expected:
+        if self.publication_evidence_kind not in evidence_performed:
+            raise ValueError("effect artifact publication evidence is invalid or contradicts publication_performed")
+        expected = evidence_performed[self.publication_evidence_kind]
+        if self.publication_performed is not expected:
             raise ValueError("effect artifact publication evidence is invalid or contradicts publication_performed")
 
     @property
@@ -1384,12 +1395,8 @@ class TokenOutcome:
     # Outcome-specific fields (nullable based on (outcome, path) pair)
     sink_name: str | None = None
     batch_id: str | None = None
-    fork_group_id: str | None = None
-    join_group_id: str | None = None
-    expand_group_id: str | None = None
     error_hash: str | None = None
     context_json: str | None = None
-    expected_branches_json: str | None = None  # Branch contract for FORK_PARENT/EXPAND_PARENT
 
     def __post_init__(self) -> None:
         """Validate two-axis invariants — Tier 1 crash on invalid combinations."""
@@ -1414,8 +1421,11 @@ class TokenOutcome:
                     f"TokenOutcome {self.outcome_id}: ({self.outcome!r}, {self.path!r}) "
                     "is not in _LEGAL_TERMINAL_PAIRS — see ADR-019 mapping table."
                 )
-        elif self.path != TerminalPath.BUFFERED:
-            raise ValueError(f"TokenOutcome {self.outcome_id}: completed=False requires path=BUFFERED (got path={self.path!r})")
+        elif self.path not in _NON_TERMINAL_PATHS:
+            raise ValueError(
+                f"TokenOutcome {self.outcome_id}: completed=False requires a non-terminal "
+                f"path (BUFFERED or ABANDONED — ADR-038), got path={self.path!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1442,9 +1452,6 @@ class TerminalPairFieldConstraints:
 _DISCRIMINATOR_FIELDS = (
     "sink_name",
     "batch_id",
-    "fork_group_id",
-    "join_group_id",
-    "expand_group_id",
     "error_hash",
 )
 
@@ -1468,6 +1475,10 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
     (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED): TerminalPairFieldConstraints(
         forbidden=_DISCRIMINATOR_FIELDS,
     ),
+    (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED): TerminalPairFieldConstraints(
+        required=("error_hash",),
+        forbidden=_forbid_except("error_hash"),
+    ),
     (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED): TerminalPairFieldConstraints(
         required=("sink_name", "error_hash"),
         forbidden=_forbid_except("sink_name", "error_hash"),
@@ -1475,9 +1486,14 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
     (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED): TerminalPairFieldConstraints(
         forbidden=_DISCRIMINATOR_FIELDS,
     ),
+    # join_group_id retired from token_outcomes (D2): the merge-event identity
+    # lives only on the result token's tokens.join_group_id column (kept). A
+    # COALESCED outcome carries no discriminator beyond sink_name. Collector
+    # members consumed into a release reuse this pair (META-32): sink_name
+    # None, the consumed-input shape is_counted_coalesced_output leaves
+    # uncounted — no collector-specific pair exists.
     (TerminalOutcome.SUCCESS, TerminalPath.COALESCED): TerminalPairFieldConstraints(
-        required=("join_group_id",),
-        forbidden=_forbid_except("sink_name", "join_group_id"),
+        forbidden=_forbid_except("sink_name"),
     ),
     (TerminalOutcome.FAILURE, TerminalPath.UNROUTED): TerminalPairFieldConstraints(
         required=("error_hash",),
@@ -1496,13 +1512,17 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
         exact={"sink_name": DISCARD_SINK_NAME},
         forbidden=_forbid_except("sink_name", "error_hash"),
     ),
+    # fork_group_id/expand_group_id retired from token_outcomes (D2): the
+    # roster of record is now the children's persisted token_lineage_frames
+    # rows plus group_records (WS1a Task 4), never a stored discriminator
+    # column here — see the Task 10 replay predicates (_reconcile_fork_replay
+    # / _reconcile_expansion_replay), which derive the group id from the
+    # children's frames instead of reading it back off this outcome.
     (TerminalOutcome.TRANSIENT, TerminalPath.FORK_PARENT): TerminalPairFieldConstraints(
-        required=("fork_group_id",),
-        forbidden=_forbid_except("fork_group_id"),
+        forbidden=_DISCRIMINATOR_FIELDS,
     ),
     (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT): TerminalPairFieldConstraints(
-        required=("expand_group_id",),
-        forbidden=_forbid_except("expand_group_id"),
+        forbidden=_DISCRIMINATOR_FIELDS,
     ),
     (TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED): TerminalPairFieldConstraints(
         required=("batch_id",),
@@ -1511,6 +1531,12 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
     (None, TerminalPath.BUFFERED): TerminalPairFieldConstraints(
         required=("batch_id",),
         forbidden=_forbid_except("batch_id"),
+    ),
+    # ADR-038: an abandonment is not attributable to a sink, batch, or error
+    # site — the reason (run status, non-resumability arm, incomplete source
+    # states) travels in context_json, never in discriminator columns.
+    (None, TerminalPath.ABANDONED): TerminalPairFieldConstraints(
+        forbidden=_DISCRIMINATOR_FIELDS,
     ),
 }
 
@@ -1523,9 +1549,6 @@ def validate_token_outcome_persisted_fields(
     *,
     sink_name: str | None,
     batch_id: str | None,
-    fork_group_id: str | None,
-    join_group_id: str | None,
-    expand_group_id: str | None,
     error_hash: str | None,
 ) -> None:
     """Validate ADR-019 persisted discriminator fields for a token outcome."""
@@ -1539,17 +1562,17 @@ def validate_token_outcome_persisted_fields(
         assert outcome is not None
         if (outcome, path) not in _LEGAL_TERMINAL_PAIRS:
             raise ValueError(f"TokenOutcome {outcome_id}: ({outcome!r}, {path!r}) not in _LEGAL_TERMINAL_PAIRS — audit integrity violation")
-    elif path != TerminalPath.BUFFERED:
-        raise ValueError(f"TokenOutcome {outcome_id}: completed=False requires path=BUFFERED, got {path!r} — audit integrity violation")
+    elif path not in _NON_TERMINAL_PATHS:
+        raise ValueError(
+            f"TokenOutcome {outcome_id}: completed=False requires a non-terminal path "
+            f"(BUFFERED or ABANDONED — ADR-038), got {path!r} — audit integrity violation"
+        )
 
     pair: tuple[TerminalOutcome | None, TerminalPath] = (outcome, path)
     constraints = _TERMINAL_PAIR_FIELD_CONSTRAINTS[pair]
     field_values = {
         "sink_name": sink_name,
         "batch_id": batch_id,
-        "fork_group_id": fork_group_id,
-        "join_group_id": join_group_id,
-        "expand_group_id": expand_group_id,
         "error_hash": error_hash,
     }
     for field_name in constraints.required:

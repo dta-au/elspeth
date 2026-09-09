@@ -20,7 +20,7 @@
           "profile": "task-role",
           "temperature": 0.0,
           "required_input_fields": ["color_name", "hex"],
-          "prompt_template": "Assess the perceptible amount of blue in the colour {{ color_name }} ({{ hex }}).",
+          "prompt_template": "Assess the perceptible amount of blue in the colour {{ row.color_name }} ({{ row.hex }}).",
           "queries": {
             "blue": {
               "input_fields": {"color_name": "color_name", "hex": "hex"},

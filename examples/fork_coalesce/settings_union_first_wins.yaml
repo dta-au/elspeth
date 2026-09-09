@@ -10,9 +10,8 @@
 #                                                            (merged)──> [route_output] ─> output
 #
 # With `first_wins`, path_a's 20-char truncation appears in the merged
-# output. The audit trail still records both branches' values in
-# `union_field_collision_values` so reviewers can inspect what was
-# suppressed.
+# output. The audit trail records both contributing branch names in
+# `union_field_collisions` without persisting value-derived hashes or types.
 #
 # NOTE: `union_collision_policy` is orthogonal to the arrival `policy`
 # (require_all / quorum / best_effort / first). They are separate axes:

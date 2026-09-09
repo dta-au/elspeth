@@ -8,7 +8,7 @@ Covers:
   * JSON inspection — array, single object, wrapped data_key, JSONL
     auto-detection from .json content shape.
   * JSONL inspection — multi-line objects, partial parse failures.
-  * Text inspection — single URL → web_scrape hint, multi-line text,
+  * Text inspection — single URL → HTTP-fetch hint, multi-line text,
     URL detection.
   * Bounded reads (8 KiB / 100 rows).
   * Redacted identity surfacing without leaking raw content / full hash.
@@ -18,12 +18,20 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+from datetime import UTC, datetime
 from types import MappingProxyType
-from uuid import uuid4
+from typing import Any, cast
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord
+from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer import source_inspection
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     _declared_field_is_required,
@@ -33,7 +41,9 @@ from elspeth.web.composer.source_inspection import (
     facts_to_dict,
     inspect_blob_content,
     inspect_csv_source_content,
+    inspect_selected_ready_session_blob,
 )
+from tests.helpers.session_fences import make_blob_read_context
 
 
 class TestDeclaredFieldIsRequiredBoundary:
@@ -191,6 +201,31 @@ class TestCsvInspection:
             "active": "bool",
         }
 
+    def test_lexical_types_advisory_when_numeric_types_inferred(self) -> None:
+        """int/float/bool inferences carry the runtime framing: CSV delivers str
+        unless the SOURCE schema declares the type (elspeth-e6e552ce34 —
+        planners transcribed the lexical hint into a downstream declared type)."""
+        f = inspect_blob_content(
+            content=b"id,name,price,active\n1,Alice,9.99,true\n2,Bob,19.95,false\n",
+            filename="x.csv",
+            mime_type="text/csv",
+        )
+        advisories = [w for w in f.warnings if w.startswith("csv_lexical_types_advisory:")]
+        assert len(advisories) == 1, f.warnings
+        assert "3 column(s)" in advisories[0]
+        assert "arrives as str" in advisories[0]
+        # Column names are withheld — headerless CSV can make data look like
+        # headers, and warnings mirror into model-visible diagnostics.
+        assert "[" not in advisories[0] and "'price'" not in advisories[0]
+
+    def test_no_lexical_types_advisory_for_all_str_columns(self) -> None:
+        f = inspect_blob_content(
+            content=b"name,city\nAlice,Sydney\nBob,Perth\n",
+            filename="x.csv",
+            mime_type="text/csv",
+        )
+        assert not any(w.startswith("csv_lexical_types_advisory:") for w in f.warnings), f.warnings
+
     def test_int_then_float_promotes_to_float(self) -> None:
         f = inspect_blob_content(
             content=b"v\n1\n2\n3.5\n",
@@ -258,6 +293,13 @@ class TestCsvInspection:
         assert "reset-password" not in blob  # path segment
         assert "alice@corp.example" not in blob  # PII in path
 
+    @pytest.mark.parametrize("url", ["https://[broken.example/private", "https://host\uff0fprivate.example/secret"])
+    def test_url_candidates_malformed_authority_retains_redaction_marker(self, url: str) -> None:
+        facts = inspect_blob_content(content=f"url\n{url}\n".encode(), filename="links.csv", mime_type="text/csv")
+        assert facts.sample_row_count == 1
+        assert facts.observed_headers == ("url",)
+        assert facts.url_candidates == ("<redacted>",)
+
     def test_url_candidates_malformed_port_does_not_raise(self) -> None:
         """A malformed/out-of-range port must not break the never-raise contract.
 
@@ -296,15 +338,24 @@ class TestCsvInspection:
         f = inspect_blob_content(content=body, filename="x.csv", mime_type="text/csv")
         assert f.sample_row_count <= 100
 
-    def test_duplicate_headers_emits_warning(self) -> None:
-        """Duplicate CSV headers silently collapse downstream — surface the
-        duplication so the operator can rename or use field_mapping."""
-        body = b"id,name,name,city\n1,Alice,Smith,NYC\n"
+    def test_duplicate_headers_warning_exposes_only_structural_facts(self) -> None:
+        """Duplicate values may be row content, so warnings must redact them."""
+        sentinel = "ELSPETH_DUPLICATE_HEADER_SENTINEL_7F3A"
+        body = f"id,{sentinel},{sentinel},city\n1,Alice,Smith,NYC\n".encode()
         f = inspect_blob_content(content=body, filename="x.csv", mime_type="text/csv")
         msgs = [w for w in f.warnings if "csv_duplicate_headers" in w]
         assert msgs, f.warnings
-        # Duplicate name surfaced; the warning lists the offending header.
-        assert any("'name'" in w for w in msgs), msgs
+        durable_warnings = json.dumps(facts_to_dict(f)["warnings"])
+        assert sentinel not in durable_warnings
+        assert "1 duplicate header value class(es)" in durable_warnings
+        assert "2 column position(s) [2, 3] of 4" in durable_warnings
+        assert "header values redacted" in durable_warnings
+        assert "field_mapping" not in durable_warnings
+        assert "quarantine" not in durable_warnings
+        assert "correct" in durable_warnings
+        assert "re-upload" in durable_warnings
+        assert "headerless" in durable_warnings
+        assert "explicit unique columns" in durable_warnings
 
     def test_jagged_rows_emits_warning(self) -> None:
         """Rows with cell counts that don't match the header length must
@@ -509,10 +560,11 @@ class TestJsonInspection:
 
 
 class TestTextInspection:
-    def test_single_url_emits_web_scrape_hint(self) -> None:
+    def test_single_url_emits_capability_neutral_http_fetch_hint(self) -> None:
         f = inspect_blob_content(content=b"https://example.com\n", filename="input.txt", mime_type="text/plain")
         assert f.url_candidates == ("https://example.com",)
-        assert any("web_scrape" in w for w in f.warnings)
+        assert any("compatible HTTP fetch transform" in w for w in f.warnings)
+        assert all("web_scrape" not in w for w in f.warnings)
 
     def test_multi_line_text_with_urls(self) -> None:
         f = inspect_blob_content(
@@ -593,6 +645,263 @@ class TestBoundedReads:
         assert f.byte_range_inspected[1] <= 8 * 1024
         # byte_size in identity reflects the *real* size, not the truncated one.
         assert int(f.redacted_identity["byte_size"]) == len(big)
+
+
+class TestSelectedBlobIdentity:
+    def test_explicit_selection_wins_over_newer_ready_blob(self) -> None:
+        earlier = uuid4()
+        newer = uuid4()
+
+        selected = source_inspection.resolve_source_inspection_blob_id(
+            selected_blob_id=earlier,
+            ready_blob_ids=(newer, earlier),
+        )
+
+        assert selected == earlier
+
+    def test_multiple_ready_blobs_without_selection_are_ambiguous(self) -> None:
+        assert (
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=None,
+                ready_blob_ids=(uuid4(), uuid4()),
+            )
+            is None
+        )
+
+    def test_one_ready_blob_resolves_without_temporal_choice(self) -> None:
+        only = uuid4()
+
+        assert (
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=None,
+                ready_blob_ids=(only,),
+            )
+            == only
+        )
+
+    def test_explicit_selection_must_name_a_ready_session_blob(self) -> None:
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            source_inspection.resolve_source_inspection_blob_id(
+                selected_blob_id=uuid4(),
+                ready_blob_ids=(uuid4(),),
+            )
+
+
+def _blob_record_stub(
+    *,
+    blob_id: UUID | None = None,
+    session_id: UUID | None = None,
+    filename: str = "blob.csv",
+    mime_type: str = "text/csv",
+    size_bytes: int = 0,
+    content_hash: str | None = None,
+    storage_path: str = "/tmp/data/blobs/blob.csv",
+    status: str = "ready",
+) -> BlobRecord:
+    return BlobRecord(
+        id=blob_id or uuid4(),
+        session_id=session_id or uuid4(),
+        filename=filename,
+        mime_type=cast(Any, mime_type),
+        size_bytes=size_bytes,
+        content_hash=content_hash,
+        storage_path=storage_path,
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status=cast(Any, status),
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+
+
+class _NoListingBlobService:
+    """Spy blob service that fails the test if a full-session listing occurs.
+
+    Stands in for ``BlobServiceProtocol`` in a shape narrow enough for
+    ``inspect_selected_ready_session_blob``: an explicit ``selected_blob_id``
+    must resolve via ``get_blob`` (session-qualified single-row lookup), never
+    via ``list_blobs`` — a session can hold an unbounded number of blobs, and
+    materializing all of them just to find one explicitly-named blob is
+    exactly the cost Finding A flags.
+
+    Deliberately has **no** ``read_blob_content`` method: a large blob is
+    represented only through ``read_blob_content_prefix_verified``, so a
+    regression that reintroduces a full-content read (Finding B) fails loudly
+    with ``AttributeError`` instead of silently passing.
+    """
+
+    def __init__(self, record: BlobRecord, content: bytes) -> None:
+        self._record = record
+        self._content = content
+
+    async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+        assert type(session_operation_context) is SessionOperationContext
+        if blob_id != self._record.id:
+            raise BlobNotFoundError(str(blob_id))
+        return self._record
+
+    async def list_blobs(self, session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[BlobRecord]:
+        del session_id, limit, offset
+        raise AssertionError("explicit selection must not list session blobs")
+
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        assert type(session_operation_context) is SessionOperationContext
+        assert blob_id == self._record.id
+        verified_hash = hashlib.sha256(self._content).hexdigest()
+        return self._content[:prefix_bytes], verified_hash, len(self._content)
+
+
+class TestExplicitSelectionResolvesDirectly:
+    """Finding A: an explicit ``selected_blob_id`` must resolve with a direct,
+    session-qualified ``get_blob`` lookup — not ``list_blobs(limit=None)`` +
+    a Python filter over every blob in the session.
+    """
+
+    def test_explicit_selection_never_lists_session_blobs(self) -> None:
+        session_id = uuid4()
+        content = b"id\n1\n"
+        record = _blob_record_stub(
+            session_id=session_id,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+        service = _NoListingBlobService(record, content)
+
+        facts = asyncio.run(
+            inspect_selected_ready_session_blob(
+                cast(Any, service),
+                session_id,
+                selected_blob_id=record.id,
+                session_operation_context=make_blob_read_context(session_id),
+            )
+        )
+
+        assert facts is not None
+        assert facts.source_kind == "csv"
+
+    def test_explicit_selection_rejects_blob_from_other_session(self) -> None:
+        session_id = uuid4()
+        content = b"id\n1\n"
+        record = _blob_record_stub(
+            session_id=uuid4(),  # a different session
+            content_hash=hashlib.sha256(content).hexdigest(),
+        )
+        service = _NoListingBlobService(record, content)
+
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            asyncio.run(
+                inspect_selected_ready_session_blob(
+                    cast(Any, service),
+                    session_id,
+                    selected_blob_id=record.id,
+                    session_operation_context=make_blob_read_context(session_id),
+                )
+            )
+
+    def test_explicit_selection_rejects_non_ready_blob(self) -> None:
+        session_id = uuid4()
+        content = b"id\n1\n"
+        record = _blob_record_stub(
+            session_id=session_id,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            status="pending",
+        )
+        service = _NoListingBlobService(record, content)
+
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            asyncio.run(
+                inspect_selected_ready_session_blob(
+                    cast(Any, service),
+                    session_id,
+                    selected_blob_id=record.id,
+                    session_operation_context=make_blob_read_context(session_id),
+                )
+            )
+
+    def test_explicit_selection_rejects_unknown_blob_id(self) -> None:
+        session_id = uuid4()
+        record = _blob_record_stub(session_id=session_id)
+        service = _NoListingBlobService(record, b"")
+
+        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
+            asyncio.run(
+                inspect_selected_ready_session_blob(
+                    cast(Any, service),
+                    session_id,
+                    selected_blob_id=uuid4(),
+                    session_operation_context=make_blob_read_context(session_id),
+                )
+            )
+
+    def test_large_blob_never_requires_full_content_bytes(self) -> None:
+        """Finding B (memory): the module must never need — or be handed —
+        a full-content bytes object for a large blob. It only ever accepts a
+        bounded prefix plus a size/hash the store already verified.
+
+        The fake blob service below declares a 100 MiB blob but never
+        constructs 100 MiB of Python bytes anywhere (here or in
+        ``inspect_selected_ready_session_blob``/``inspect_blob_content``) —
+        only an ``int`` size and a bounded prefix cross the boundary.
+        """
+        session_id = uuid4()
+        total_size = 100 * 1024 * 1024  # 100 MiB — never materialized.
+        prefix = b"id,name\n1,a\n"
+        verified_hash = "a" * 64  # opaque digest the fake store "verified"
+        record = _blob_record_stub(
+            session_id=session_id,
+            content_hash=verified_hash,
+            size_bytes=total_size,
+            filename="huge.csv",
+        )
+
+        class _HugeBlobService:
+            async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+                assert type(session_operation_context) is SessionOperationContext
+                assert blob_id == record.id
+                return record
+
+            async def list_blobs(self, *args: object, **kwargs: object) -> list[BlobRecord]:
+                raise AssertionError("explicit selection must not list session blobs")
+
+            async def read_blob_content_prefix_verified(
+                self,
+                blob_id: UUID,
+                *,
+                prefix_bytes: int,
+                session_operation_context: SessionOperationContext,
+            ) -> tuple[bytes, str, int]:
+                assert type(session_operation_context) is SessionOperationContext
+                assert blob_id == record.id
+                # A real streaming store hashes chunk-by-chunk; this fake
+                # need only prove the module is satisfied by a small prefix
+                # + an already-verified hash + a total size — never the
+                # full 100 MiB.
+                return prefix[:prefix_bytes], verified_hash, total_size
+
+        facts = asyncio.run(
+            inspect_selected_ready_session_blob(
+                cast(Any, _HugeBlobService()),
+                session_id,
+                selected_blob_id=record.id,
+                session_operation_context=make_blob_read_context(session_id),
+            )
+        )
+
+        assert facts is not None
+        assert int(facts.redacted_identity["byte_size"]) == total_size
+        assert facts.byte_range_inspected[1] <= source_inspection._MAX_BYTES
 
 
 # --------------------------------------------------------------------------
@@ -743,7 +1052,11 @@ class TestDeriveExtraColumnRisk:
         declared = ("id: int", "name: str", "price: float")
         assert derive_extra_column_risk(f, declared) == ("extra",)
 
-    def test_case_insensitive_match(self) -> None:
+    def test_normalized_headers_match_declared_names_exactly(self) -> None:
+        # "ID"/"Name" resolve through source-boundary normalization to
+        # "id"/"name" and then match the declared names EXACTLY. The match
+        # comes from resolution, not case-insensitive comparison — the
+        # runtime never folds case (elspeth-3664e213c4).
         f = self._facts_with_headers(("ID", "Name"))
         declared = ("id: int", "name: str")
         assert derive_extra_column_risk(f, declared) == ()
@@ -989,50 +1302,63 @@ class TestObservedColumnsFromContent:
         assert cols == ()
 
 
-class TestObservedColumnsFromPath:
-    """``observed_columns_from_path`` — the bounded-read, path-taking variant.
-
-    ``inspect_blob_content`` already truncates to ``_MAX_BYTES``, so reading the
-    whole file at the call site (a guided commit's column backfill) is wasted
-    I/O — a multi-hundred-MB blob would be slurped just to recover a header.
-    This entry point reads at most ``_MAX_BYTES`` and degrades an unreadable
-    file to ``()`` per its contract (the bound stays private to the inspector).
+class TestRiskChecksCompareInRuntimeNameSpace:
+    """The preview hazard gates must compare in the SAME name space the runtime
+    uses (elspeth-3664e213c4): resolved observed headers against declared names,
+    exactly. The runtime never case-folds — a declared 'TicketID' can never
+    match a row keyed 'ticketid' — so a case-folding preview comparison is
+    blind to the one hazard these gates exist to flag.
     """
 
-    def test_reads_at_most_max_bytes(self, tmp_path, monkeypatch) -> None:
-        import elspeth.web.composer.source_inspection as si
+    def _mixed_case_facts(self) -> SourceInspectionFacts:
+        body = b"TicketID,CustomerName,Priority,Summary\nT-1,Alice,high,Broken\n"
+        return inspect_blob_content(content=body, filename="tickets.csv", mime_type="text/csv")
 
-        # A file FAR larger than the inspector's read bound.
-        big = tmp_path / "big.csv"
-        big.write_bytes(b"id,name,score\n" + b"x,y,z\n" * si._MAX_BYTES)
-        assert big.stat().st_size > si._MAX_BYTES
+    def test_required_mismatch_flags_mixed_case_declared_fields(self) -> None:
+        facts = self._mixed_case_facts()
+        declared = ("TicketID: str", "CustomerName: str", "Priority: str", "Summary: str")
 
-        seen: dict[str, int] = {}
-        real = si.observed_columns_from_content
+        assert derive_required_header_mismatch_risk(facts, declared) == (
+            "TicketID",
+            "CustomerName",
+            "Priority",
+            "Summary",
+        )
 
-        def _spy(*, content: bytes, filename: str, mime_type: str) -> tuple[str, ...]:
-            seen["len"] = len(content)
-            return real(content=content, filename=filename, mime_type=mime_type)
+    def test_extra_column_flags_headers_unmatched_by_mixed_case_declared_fields(self) -> None:
+        facts = self._mixed_case_facts()
+        declared = ("TicketID: str", "CustomerName: str", "Priority: str", "Summary: str")
 
-        monkeypatch.setattr(si, "observed_columns_from_content", _spy)
-        cols = si.observed_columns_from_path(path=big, filename="big.csv", mime_type="text/csv")
+        assert derive_extra_column_risk(facts, declared) == (
+            "ticketid",
+            "customername",
+            "priority",
+            "summary",
+        )
 
-        # The fix: the call site hands the inspector a bounded prefix, not the
-        # whole file. Without it, ``seen["len"]`` is the full file size.
-        assert seen["len"] <= si._MAX_BYTES
-        # Behaviour preserved: columns are still detected from the prefix.
-        assert cols == ("id", "name", "score")
+    def _mixed_case_json_facts(self) -> SourceInspectionFacts:
+        body = b'[{"TicketID": "T-1", "CustomerName": "Alice"}]'
+        return inspect_blob_content(content=body, filename="tickets.json", mime_type="application/json")
 
-    def test_unreadable_path_degrades_to_empty(self, tmp_path) -> None:
-        from elspeth.web.composer.source_inspection import observed_columns_from_path
+    def test_json_extra_column_resolves_keys_like_the_runtime(self) -> None:
+        """JSON object keys are normalized at the source boundary exactly like
+        CSV headers, so declared normalized names must match — comparing the
+        RAW keys against declared names would falsely flag a pipeline the
+        runtime accepts (json source resolves TicketID -> ticketid)."""
+        facts = self._mixed_case_json_facts()
+        assert facts.source_kind == "json"
+        declared = ("ticketid: str", "customername: str")
 
-        # A directory exists() but cannot be opened/read as a file -> OSError -> ().
-        d = tmp_path / "adir"
-        d.mkdir()
-        assert observed_columns_from_path(path=d, filename="x.csv", mime_type="text/csv") == ()
+        assert derive_extra_column_risk(facts, declared) == ()
 
-    def test_missing_path_degrades_to_empty(self, tmp_path) -> None:
-        from elspeth.web.composer.source_inspection import observed_columns_from_path
+    def test_json_extra_column_flags_undeclared_key_in_resolved_form(self) -> None:
+        facts = self._mixed_case_json_facts()
+        declared = ("ticketid: str",)
 
-        missing = tmp_path / "nope.csv"
-        assert observed_columns_from_path(path=missing, filename="x.csv", mime_type="text/csv") == ()
+        assert derive_extra_column_risk(facts, declared) == ("customername",)
+
+    def test_json_required_mismatch_resolves_keys_like_the_runtime(self) -> None:
+        facts = self._mixed_case_json_facts()
+        declared = ("ticketid: str", "customername: str")
+
+        assert derive_required_header_mismatch_risk(facts, declared) == ()

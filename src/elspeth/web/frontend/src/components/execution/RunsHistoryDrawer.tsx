@@ -6,12 +6,16 @@
 // runs after the inspector Runs tab is removed.
 // ============================================================================
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { makePhraseFor } from "@/lib/validationHumaniser";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
+import { DIAGNOSTIC_CAUSE_PHRASES, DIAGNOSTIC_REASON_PHRASES } from "./diagnosticPhrases";
 import { Button, StatusBadge } from "@/components/ui";
 import { isTerminalRunStatus } from "@/types/index";
 import type { Run, RunDiagnostics, RunDiagnosticsWorkingView } from "@/types/index";
@@ -109,6 +113,193 @@ function buildPendingWorkingView(diagnostics: RunDiagnostics): RunDiagnosticsWor
   };
 }
 
+interface VisibleStateFailure {
+  /** Null when no closed diagnostic identifier survived the parse — the row
+      then names the step and lets Cause/hint carry the detail, rather than
+      dressing the prose fallback "recorded failure" up as an error code. */
+  label: string | null;
+  reason: string | null;
+  cause: string | null;
+  hint: string | null;
+}
+
+// Mirrors the repository's audit-export identifier boundary: one ASCII
+// alphanumeric followed by at most 127 ASCII alphanumeric/code punctuation
+// characters. Diagnostic identifiers are rendered verbatim, so whitespace,
+// markup, control characters, and unbounded provider text are never admitted.
+const DIAGNOSTIC_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TEXTRACT_S3_UNREADABLE_HINT_MAX_CHARS = 512;
+const TEXTRACT_S3_UNREADABLE_HINT_PREFIX =
+  "Amazon Textract could not read the S3 object. Most commonly the object is outside the ";
+const TEXTRACT_S3_UNREADABLE_HINT =
+  TEXTRACT_S3_UNREADABLE_HINT_PREFIX +
+  "S3 read scope granted to the pipeline's AWS role (check the role's s3:GetObject prefix " +
+  "against the document's bucket/key and, when version_field is configured, its " +
+  "s3:GetObjectVersion permission); it can also mean the object does not exist or is stored " +
+  "in a different region than the Textract endpoint. Verify access scope before suspecting " +
+  "a corrupt or unsupported file.";
+
+function safeDiagnosticIdentifier(value: unknown): string | null {
+  return typeof value === "string" && DIAGNOSTIC_IDENTIFIER_PATTERN.test(value)
+    ? value
+    : null;
+}
+
+function safeTextractS3UnreadableHint({
+  code,
+  errorType,
+  reason,
+  cause,
+  error,
+}: {
+  code: string | null;
+  errorType: string | null;
+  reason: string | null;
+  cause: string | null;
+  error: unknown;
+}): string | null {
+  if (
+    code !== "InvalidS3ObjectException" ||
+    errorType !== "service_error" ||
+    reason !== "submit_failed" ||
+    cause !== "s3_object_unreadable" ||
+    typeof error !== "string" ||
+    error.length > TEXTRACT_S3_UNREADABLE_HINT_MAX_CHARS ||
+    !error.startsWith(TEXTRACT_S3_UNREADABLE_HINT_PREFIX) ||
+    error !== TEXTRACT_S3_UNREADABLE_HINT
+  ) {
+    return null;
+  }
+  return error;
+}
+
+function visibleStateFailure(error: unknown): VisibleStateFailure | null {
+  if (error === null || typeof error !== "object" || Array.isArray(error)) {
+    return null;
+  }
+
+  const record = error as Record<string, unknown>;
+  const code = safeDiagnosticIdentifier(record.code);
+  const errorType = safeDiagnosticIdentifier(record.error_type);
+  const reason = safeDiagnosticIdentifier(record.reason);
+  const cause = safeDiagnosticIdentifier(record.cause);
+  const hint = safeTextractS3UnreadableHint({
+    code,
+    errorType,
+    reason,
+    cause,
+    error: record.error,
+  });
+
+  if (code === null && errorType === null && reason === null && cause === null && hint === null) {
+    return null;
+  }
+
+  // State error objects can contain audit-only raw response previews,
+  // offending values, and free-text provider detail. Render only the closed,
+  // scalar identifiers needed by an operator. The one longer hint admitted
+  // here is authored by ELSPETH for its exact S3-unreadable classification.
+  return {
+    label: code ?? errorType ?? reason,
+    reason,
+    cause,
+    hint,
+  };
+}
+
+/** One diagnostic enum value: prose when this wave has phrased it (raw value
+ *  in `title`), otherwise the identifier register. An unphrased value is never
+ *  dressed up as a sentence (elspeth-d74ab492dd). */
+/**
+ * One diagnostic enum. A value nobody has phrased stays in <code> — an
+ * unknown identifier is never dressed up as a sentence (diagnosticPhrases.ts).
+ * A phrased one reads as prose, and with the Advanced detail level on it
+ * carries the raw enum beside it in the same <code> register
+ * (elspeth-f49e1611ab): a run-failure reason or cause is exactly what gets
+ * pasted into a support search, and `title` alone leaves a keyboard-only or
+ * touch user no route to it. `title` stays as the mouse convenience.
+ */
+function DiagnosticValue({
+  value,
+  phrases,
+}: {
+  value: string;
+  phrases: ReadonlyMap<string, string>;
+}): JSX.Element {
+  const showAdvanced = useShowAdvanced();
+  const phrase = phrases.get(value);
+  if (phrase === undefined) return <code>{value}</code>;
+  return (
+    <span title={value}>
+      {phrase}
+      {showAdvanced && (
+        <>
+          {" "}
+          <code>{value}</code>
+        </>
+      )}
+    </span>
+  );
+}
+
+function RunStateFailureDetail({
+  error,
+  nodeId,
+  stateId,
+}: {
+  error: unknown;
+  nodeId: string;
+  stateId: string;
+}): JSX.Element | null {
+  // This row is the ONE diagnostics surface that stays visible with
+  // show_advanced off (curated failures are audit-required), so it carries the
+  // default-view copy register: the step is NAMED, and every raw diagnostic
+  // identifier is demoted to <code> with the node id recoverable from `title`.
+  // Naming goes through the same phrase map ProgressView uses for
+  // `err.node_id` (ProgressView.tsx) so the two execution surfaces agree on
+  // what a node is called.
+  const compositionState = useSessionStore((s) => s.compositionState);
+  const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
+  const failure = visibleStateFailure(error);
+  if (failure === null) return null;
+
+  // A run in the HISTORY drawer may name a node the current composition no
+  // longer has, and "this step" would then say less than the id itself. Same
+  // discrimination ReadinessRowDetail makes; the id falls back to the
+  // identifier register rather than into bare prose.
+  const phrase = phraseFor(nodeId);
+  const stepName =
+    phrase === UNKNOWN_COMPONENT_PHRASE ? <code>{nodeId}</code> : phrase;
+
+  return (
+    <div
+      className="run-diagnostics-state-failure"
+      data-testid={`run-state-failure-${stateId}`}
+    >
+      <div title={nodeId}>
+        {stepName} failed
+        {failure.label === null ? null : (
+          <>
+            {" - "}
+            <code>{failure.label}</code>
+          </>
+        )}
+      </div>
+      {failure.reason && (
+        <div>
+          Reason: <DiagnosticValue value={failure.reason} phrases={DIAGNOSTIC_REASON_PHRASES} />
+        </div>
+      )}
+      {failure.cause && (
+        <div>
+          Cause: <DiagnosticValue value={failure.cause} phrases={DIAGNOSTIC_CAUSE_PHRASES} />
+        </div>
+      )}
+      {failure.hint && <div>{failure.hint}</div>}
+    </div>
+  );
+}
+
 export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerProps): JSX.Element {
   const storeRuns = useExecutionStore((s) => s.runs);
   const runs = runsOverride ?? storeRuns;
@@ -121,6 +312,7 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
   const loadRunDiagnostics = useExecutionStore((s) => s.loadRunDiagnostics);
   const evaluateRunDiagnostics = useExecutionStore((s) => s.evaluateRunDiagnostics);
   const cancel = useExecutionStore((s) => s.cancel);
+  const showAdvanced = useShowAdvanced();
   // Title-first convention (HeaderSessionSwitcher): never surface the raw
   // session UUID in user-facing chrome (elspeth-ef8c18a6cb).
   const activeSessionTitle = useSessionStore(
@@ -151,6 +343,16 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
   }, [onClose]);
 
   return (
+    <>
+      {/* Page scrim behind the aria-modal drawer (elspeth-61330c82fc). The
+          CatalogDrawer pattern: a sibling backdrop consuming --color-scrim
+          blocks pointer interaction with the "inert" page and closes on
+          click, matching the focus trap's keyboard containment. */}
+      <div
+        data-testid="runs-history-backdrop"
+        className="runs-history-backdrop"
+        onClick={onClose}
+      />
     <div
       ref={drawerRef}
       role="dialog"
@@ -184,8 +386,12 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
               <li key={run.id} className="runs-history-item">
                 <div className="runs-history-item-summary">
                   <span className="runs-history-item-identity">
-                    <span className="runs-history-item-label">{runLabel}</span>
-                    <span className="runs-history-item-id">{run.id}</span>
+                    <span className="runs-history-item-label" title={run.id}>
+                      {runLabel}
+                    </span>
+                    {showAdvanced && (
+                      <span className="runs-history-item-id">{run.id}</span>
+                    )}
                   </span>
                   <span className="runs-history-item-actions">
                   {/* ui/StatusBadge carries the a11y glyph map (⚠ / ∅) so
@@ -194,6 +400,20 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
                   <StatusBadge status={run.status}>
                     {run.status.replace(/_/g, " ")}
                   </StatusBadge>
+                  {/* Explicit per-run audit-integrity failure
+                      (elspeth-d5578ccd98): the backend ships this marker
+                      INSTEAD of accounting when the run's recorded token
+                      outcomes fail canonical validation. Text marker, not
+                      colour-only, matching the a11y stance above. */}
+                  {run.accounting_corruption ? (
+                    <span
+                      className="runs-history-item-corruption"
+                      role="alert"
+                      title={run.accounting_corruption.violations.join("\n")}
+                    >
+                      ⚠ audit accounting corrupt
+                    </span>
+                  ) : null}
                   {/* REST-backed Cancel for live runs (elspeth-90db33baac):
                       works without the in-memory activeRunId/WebSocket that
                       gates ProgressView's Cancel, so a run stays cancellable
@@ -202,7 +422,7 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
                     <Button
                       variant="danger"
                       className="btn-small"
-                      aria-label={`Cancel run ${run.id}: ${runLabel}`}
+                      aria-label={`Cancel ${runLabel}`}
                       disabled={run.cancel_requested === true}
                       onClick={() => setCancelTargetRunId(run.id)}
                     >
@@ -214,8 +434,8 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
                     aria-controls={`run-history-diagnostics-${run.id}`}
                     aria-label={
                       expandedRunId === run.id
-                        ? `Hide detail for ${run.id}: ${runLabel}`
-                        : `Show detail for ${run.id}: ${runLabel}`
+                        ? `Hide detail for ${runLabel}`
+                        : `Show detail for ${runLabel}`
                     }
                     className="btn-small"
                     onClick={() => {
@@ -272,6 +492,7 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
         />
       )}
     </div>
+    </>
   );
 }
 
@@ -298,6 +519,7 @@ function RunDiagnosticsPanel({
   onExplain,
   onRefresh,
 }: RunDiagnosticsPanelProps): JSX.Element {
+  const showAdvanced = useShowAdvanced();
   const visibleWorkingView =
     workingView ?? (isEvaluating && diagnostics ? buildPendingWorkingView(diagnostics) : null);
 
@@ -328,7 +550,7 @@ function RunDiagnosticsPanel({
 
       {error && <div role="alert">{error}</div>}
 
-      {diagnostics?.failure_detail && (
+      {showAdvanced && diagnostics?.failure_detail && (
         <div role="alert" data-testid="run-failure-detail" className="run-failure-detail">
           <div>
             {diagnostics.failure_detail.operation_type} failed - {diagnostics.failure_detail.node_id}
@@ -337,14 +559,27 @@ function RunDiagnosticsPanel({
         </div>
       )}
 
-      {runError !== null && runError.trim().length > 0 && !diagnostics?.failure_detail && (
+      {showAdvanced && runError !== null && runError.trim().length > 0 && !diagnostics?.failure_detail && (
         <div role="alert" data-testid="run-stored-failure-detail" className="run-failure-detail">
           <div>Stored failure cause</div>
           <pre>{runError}</pre>
         </div>
       )}
 
-      {diagnostics && (
+      {diagnostics?.tokens.flatMap((token) =>
+        token.states
+          .filter((state) => state.status === "failed")
+          .map((state) => (
+            <RunStateFailureDetail
+              key={`${state.state_id}-failure`}
+              error={state.error}
+              nodeId={state.node_id}
+              stateId={state.state_id}
+            />
+          )),
+      )}
+
+      {diagnostics && showAdvanced && (
         <>
           {diagnostics.operations.length > 0 && (
             <div className="run-diagnostics-operations">

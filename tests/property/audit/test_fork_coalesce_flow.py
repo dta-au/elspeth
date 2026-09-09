@@ -75,15 +75,15 @@ def get_fork_coalesce_stats(db: LandscapeDB, run_id: str) -> dict[str, Any]:
     outcome_counts = get_outcome_counts(db, run_id)
 
     with db.connection() as conn:
-        # Count unique fork groups
+        # Count unique fork groups (group_records is the roster-of-record for
+        # fork/expand parent group membership; one row per opened group).
         fork_groups = (
             conn.execute(
                 text("""
-                SELECT COUNT(DISTINCT fork_group_id)
-                FROM token_outcomes
+                SELECT COUNT(*)
+                FROM group_records
                 WHERE run_id = :run_id
-                  AND outcome = 'transient'
-                  AND path = 'fork_parent'
+                  AND kind = 'fork'
             """),
                 {"run_id": run_id},
             ).scalar()

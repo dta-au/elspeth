@@ -29,6 +29,37 @@ def _make_observed_schema() -> dict[str, str]:
 # ── Invalid configs that both paths must reject ─────────────────────────
 
 _TRANSFORM_REJECTION_CASES = [
+    # ── aws_textract_document_analysis ──────────────────────────────────
+    pytest.param(
+        "aws_textract_document_analysis",
+        {
+            "schema": _make_observed_schema(),
+            "region": "ap-southeast-2",
+            "auth_mode": "default_chain",
+            "bucket_field": "document_bucket",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "duplicate_output",
+            "extract": {"forms": "duplicate_output"},
+        },
+        "Duplicate output field names",
+        id="aws_textract_document_analysis-duplicate-output-fields",
+    ),
+    # ── aws_textract_inline_analysis ─────────────────────────────────────
+    pytest.param(
+        "aws_textract_inline_analysis",
+        {
+            "schema": _make_observed_schema(),
+            "region": "ap-southeast-2",
+            "auth_mode": "default_chain",
+            "document_format": "png",
+            "feature_types": ["FORMS"],
+            "text_field": "duplicate_output",
+            "extract": {"forms": "duplicate_output"},
+        },
+        "Duplicate output field names",
+        id="aws_textract_inline_analysis-duplicate-output-fields",
+    ),
     # ── azure_document_intelligence ──────────────────────────────────────
     pytest.param(
         "azure_document_intelligence",
@@ -315,6 +346,51 @@ _TRANSFORM_REJECTION_CASES = [
         "row_index_field.*collides",
         id="blob_csv_expand-row-index-blob-ref-collision",
     ),
+    # ── batch_replicate ──────────────────────────────────────────────────
+    pytest.param(
+        "batch_replicate",
+        {
+            "schema": _make_observed_schema(),
+            "copies_field": "copy_index",  # names the field batch_replicate creates
+            "include_copy_index": True,
+        },
+        "copies_field",
+        id="batch_replicate-copies-field-names-created-field",
+    ),
+    # ── blob_json_expand ─────────────────────────────────────────────────
+    pytest.param(
+        "blob_json_expand",
+        {
+            "schema": _make_observed_schema(),
+            "blob_ref_field": "blob_ref",
+            "format": "json",
+            "fields": ["title", "body"],
+            "record_index_field": "blob_ref",  # collides with input blob reference
+        },
+        "record_index_field.*collides",
+        id="blob_json_expand-record-index-blob-ref-collision",
+    ),
+    # ── blob_text_expand ─────────────────────────────────────────────────
+    pytest.param(
+        "blob_text_expand",
+        {
+            "schema": _make_observed_schema(),
+            "blob_ref_field": "blob_ref",
+            "output_field": "blob_ref",  # collides with input blob reference
+        },
+        "output_field.*collides",
+        id="blob_text_expand-output-field-blob-ref-collision",
+    ),
+    # ── pdf_rasterize ────────────────────────────────────────────────────
+    pytest.param(
+        "pdf_rasterize",
+        {
+            "schema": _make_observed_schema(),
+            "page_number_field": "document_id",  # collides with document_id_field output name
+        },
+        "distinct",
+        id="pdf_rasterize-emitted-field-collision",
+    ),
     # ── report_assemble ───────────────────────────────────────────────────
     pytest.param(
         "report_assemble",
@@ -325,6 +401,46 @@ _TRANSFORM_REJECTION_CASES = [
         },
         "collides with a reserved report metadata field",
         id="report_assemble-output_field-metadata-collision",
+    ),
+    # ── reference_join ────────────────────────────────────────────────────
+    pytest.param(
+        "reference_join",
+        {
+            "schema": _make_observed_schema(),
+            "reference_content": "sku,description\nhats,A fine hat\n",
+            "reference_format": "csv",
+            "key_field": "product",
+            "reference_key_name": "sku",
+            "output": {"product": "ref['description']"},  # overwrites the column it joins on
+        },
+        "key_field",
+        id="reference_join-key_field-in-output",
+    ),
+    pytest.param(
+        "reference_join",
+        {
+            "schema": {"mode": "flexible", "fields": ["product_description: int"]},
+            "reference_content": "sku,description\nhats,A fine hat\n",
+            "reference_format": "csv",
+            "key_field": "product",
+            "reference_key_name": "sku",
+            "output": {"product_description": "ref['description']"},  # csv emits str; the declaration is provably wrong
+        },
+        "never silently overwritten",
+        id="reference_join-declared-type-refuted-by-table",
+    ),
+    pytest.param(
+        "reference_join",
+        {
+            "schema": {"mode": "flexible", "fields": ["code: str"]},
+            "reference_content": '[{"sku":"hats","code":1},{"sku":"coats","code":"X"}]',
+            "reference_format": "json",
+            "key_field": "product",
+            "reference_key_name": "sku",
+            "output": {"code": "ref['code']"},
+        },
+        "never silently overwritten",
+        id="reference_join-declared-type-refuted-by-heterogeneous-table",
     ),
 ]
 
@@ -436,6 +552,19 @@ _SINK_REJECTION_CASES = [
         "alternate_key.*not found in field_mapping",
         id="dataverse-alternate_key-missing",
     ),
+    # ── document sink ─────────────────────────────────────────────────────
+    pytest.param(
+        "document",
+        {
+            "path": "/tmp/announcement.txt",
+            "field": "announcement_text",
+            # append_or_create is meaningless for a sink that only ever writes.
+            "collision_policy": "append_or_create",
+            "schema": _make_observed_schema(),
+        },
+        "collision_policy='append_or_create' requires mode='append'",
+        id="document-append-collision-policy",
+    ),
     # ── json sink ─────────────────────────────────────────────────────────
     pytest.param(
         "json",
@@ -447,6 +576,26 @@ _SINK_REJECTION_CASES = [
         },
         "does not support.*append",
         id="json_sink-json-format-append",
+    ),
+    pytest.param(
+        "json",
+        {
+            "path": "/tmp/output.json",
+            "schema": _make_observed_schema(),
+            "encoding": "definitely-not-a-real-codec",
+        },
+        "unknown encoding",
+        id="json_sink-invalid-encoding",
+    ),
+    pytest.param(
+        "json",
+        {
+            "path": "/tmp/output.json",
+            "schema": _make_observed_schema(),
+            "encoding": "rot_13",
+        },
+        "not a supported text codec",
+        id="json_sink-non-text-codec",
     ),
     # ── csv sink ──────────────────────────────────────────────────────────
     pytest.param(

@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 import pytest
 
+import elspeth.contracts as contracts
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_protocols import SinkEffectProtocol
 from elspeth.contracts.results import ArtifactDescriptor
@@ -21,6 +22,8 @@ from elspeth.contracts.sink_effects import (
     AuditExportSignedManifestInput,
     AuditExportSigningMode,
     AuditExportSnapshotChunkInput,
+    MemberSinkEffectCapability,
+    RestagingSinkEffectCapability,
     RestrictedAuditExportSnapshotReader,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
@@ -42,7 +45,12 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
     SinkEffectRole,
     SinkEffectState,
+    _AuditExportReaderBinding,
     _create_restricted_audit_export_snapshot_reader,
+    _freeze_bounded_evidence,
+    _freeze_canonical_row_value,
+    _verify_content_bytes,
+    _verify_signed_manifest_bytes,
 )
 
 EXACT_DESCRIPTOR = ArtifactDescriptor(
@@ -66,6 +74,13 @@ def _member(ordinal: int = 0) -> SinkEffectMember:
         payload_hash=sha256(canonical_json(row).encode("utf-8")).hexdigest(),
         row=row,
     )
+
+
+def test_nominal_sink_effect_capabilities_are_public_contracts() -> None:
+    assert contracts.MemberSinkEffectCapability is MemberSinkEffectCapability
+    assert contracts.RestagingSinkEffectCapability is RestagingSinkEffectCapability
+    assert "MemberSinkEffectCapability" in contracts.__all__
+    assert "RestagingSinkEffectCapability" in contracts.__all__
 
 
 def _inspection(
@@ -280,11 +295,13 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
     assert "effect_call_type" in annotations
     assert "supported_effect_modes" in annotations
     assert "supported_effect_input_kinds" in annotations
-    assert {
-        name
-        for name in ("inspect_effect", "prepare_effect", "commit_effect", "reconcile_effect")
-        if callable(getattr(SinkEffectProtocol, name, None))
-    } == {
+    protocol_methods = {
+        "inspect_effect": SinkEffectProtocol.inspect_effect,
+        "prepare_effect": SinkEffectProtocol.prepare_effect,
+        "commit_effect": SinkEffectProtocol.commit_effect,
+        "reconcile_effect": SinkEffectProtocol.reconcile_effect,
+    }
+    assert {name for name, member in protocol_methods.items() if callable(member)} == {
         "inspect_effect",
         "prepare_effect",
         "commit_effect",
@@ -332,7 +349,7 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
         ),
         (SinkEffectInspectionRequest, ("effect_id", "target", "predecessor_descriptor", "input_kind")),
         (SinkEffectInspection, ("mode", "reference", "evidence")),
-        (SinkEffectPipelineMembersInput, ("members", "target_snapshot_members")),
+        (SinkEffectPipelineMembersInput, ("members", "target_snapshot_members", "target_delivered_member_count")),
         (AuditExportSnapshotChunkInput, ("ordinal", "content_ref", "content_hash", "size_bytes", "record_count")),
         (
             AuditExportSignedManifestInput,
@@ -473,6 +490,68 @@ def test_member_row_rejects_non_string_keys_and_nested_reader_smuggling() -> Non
         replace(_member(), row={"nested": [{"reader": _export_input().reader}]})
 
 
+def test_freeze_canonical_row_value_rejects_unsupported_type() -> None:
+    """Direct trust-boundary characterization for ``_freeze_canonical_row_value``.
+
+    ``SinkEffectMember``/``SinkEffectMemberCandidate`` delegate row canonicalization
+    to this function via ``self.row`` (see ``test_member_row_rejects_noncanonical_or_
+    authority_values`` above for the indirect coverage); this test instead calls the
+    boundary function itself through its ``value`` parameter, which the trust-boundary
+    honesty gate requires.
+    """
+    with pytest.raises(TypeError, match="unsupported non-canonical value"):
+        _freeze_canonical_row_value(object(), "row")
+
+
+def test_freeze_bounded_evidence_rejects_non_mapping() -> None:
+    """Direct trust-boundary characterization for ``_freeze_bounded_evidence``."""
+    with pytest.raises(TypeError, match="must be a mapping"):
+        _freeze_bounded_evidence(object(), "evidence")  # type: ignore[arg-type]
+
+
+def test_verify_content_bytes_rejects_non_bytes_content() -> None:
+    """Direct trust-boundary characterization for ``_verify_content_bytes``."""
+    with pytest.raises(TypeError, match="resolver must return bytes"):
+        _verify_content_bytes("not-bytes", _sha256(b"x"), 1, "chunk")
+
+
+def test_verify_signed_manifest_bytes_rejects_non_dict_json() -> None:
+    """Direct trust-boundary characterization for ``_verify_signed_manifest_bytes``."""
+    binding = _AuditExportReaderBinding(
+        snapshot_id="1" * 64,
+        source_run_id="source-run-1",
+        registry_key_hash="2" * 64,
+        manifest_hash="3" * 64,
+        snapshot_hash="4" * 64,
+        export_format=AuditExportFormat.JSON,
+        signing_mode=AuditExportSigningMode.UNSIGNED,
+        signer_key_id="UNSIGNED",
+        record_count=1,
+        total_bytes=10,
+        serialization_version="audit-export-v2",
+        exported_at="2026-07-16T01:02:03.456789Z",
+        source_completed_at="2026-07-16T01:02:03.456789Z",
+        source_status="completed",
+        last_chunk_seal_hash="7" * 64,
+        snapshot_seal_hash="8" * 64,
+    )
+    descriptor = AuditExportSignedManifestInput(
+        content_ref=f"sha256:{'9' * 64}",
+        content_hash="9" * 64,
+        size_bytes=2,
+        manifest_schema="elspeth.audit-export-manifest.v2",
+        derivation_version="audit-export-derivation-v1",
+        signature_algorithm=AuditExportSigningMode.UNSIGNED,
+        signature_key_id="UNSIGNED",
+        record_chain_algorithm="sha256_concat_record_sha256_v1",
+        final_hash="6" * 64,
+        signature=None,
+    )
+
+    with pytest.raises(ValueError, match="exact canonical JSON bytes"):
+        _verify_signed_manifest_bytes(b"[]", binding, descriptor, 1)
+
+
 def test_all_evidence_fields_enforce_the_64_kib_canonical_json_bound() -> None:
     oversized = {"payload": "x" * (64 * 1024)}
 
@@ -564,6 +643,15 @@ def test_plan_protocol_descriptor_and_inspection_modes_validate_exactly() -> Non
         ).expected_descriptor
         == EXACT_DESCRIPTOR
     )
+    assert (
+        _plan(
+            descriptor_mode=SinkEffectDescriptorMode.NO_PUBLICATION,
+            inspection_mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
+            expected_descriptor=EXACT_DESCRIPTOR,
+            safe_evidence={"publication_kind": "reaffirmed"},
+        ).expected_descriptor
+        == EXACT_DESCRIPTOR
+    )
 
     with pytest.raises(ValueError, match="protocol_version"):
         _plan().__class__(
@@ -641,6 +729,7 @@ def test_prepare_and_commit_ordinals_are_immutable_unique_and_disjoint() -> None
     pipeline_input = SinkEffectPipelineMembersInput(
         members=[_member(0), _member(1)],
         target_snapshot_members=[_member(0), _member(1)],
+        target_delivered_member_count=2,
     )
     request = SinkEffectPrepareRequest(
         effect_id="effect-1",
@@ -665,6 +754,7 @@ def test_prepare_and_commit_ordinals_are_immutable_unique_and_disjoint() -> None
         SinkEffectPipelineMembersInput(
             members=(_member(0), _member(0)),
             target_snapshot_members=(),
+            target_delivered_member_count=2,
         )
     with pytest.raises(ValueError, match="non-negative"):
         SinkEffectCommitResult(
@@ -694,21 +784,50 @@ def test_prepare_member_ordinals_must_be_dense_and_ordered(
         SinkEffectPipelineMembersInput(
             members=members,
             target_snapshot_members=(),
+            target_delivered_member_count=2,
         )
 
 
 def test_pipeline_input_requires_nonempty_current_members_and_dense_snapshot_members() -> None:
     with pytest.raises(ValueError, match="members must be non-empty"):
-        SinkEffectPipelineMembersInput(members=(), target_snapshot_members=())
+        SinkEffectPipelineMembersInput(members=(), target_snapshot_members=(), target_delivered_member_count=0)
     with pytest.raises(ValueError, match="dense and ordered"):
         SinkEffectPipelineMembersInput(
             members=(_member(0),),
             target_snapshot_members=(_member(0), _member(2)),
+            target_delivered_member_count=2,
         )
 
 
+def test_pipeline_input_delivered_count_is_int_and_covers_the_snapshot() -> None:
+    """The delivered count is the durable superset of the snapshot: the
+    snapshot is the delivered set minus diverted members, so a count below
+    the snapshot length is a construction bug, not a data state
+    (elspeth-694f771c69)."""
+    with pytest.raises(TypeError, match="target_delivered_member_count must be int"):
+        SinkEffectPipelineMembersInput(
+            members=(_member(0),),
+            target_snapshot_members=(_member(0),),
+            target_delivered_member_count=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="target_delivered_member_count must be >="):
+        SinkEffectPipelineMembersInput(
+            members=(_member(0),),
+            target_snapshot_members=(_member(0),),
+            target_delivered_member_count=0,
+        )
+    accepted = SinkEffectPipelineMembersInput(
+        members=(_member(0),),
+        target_snapshot_members=(_member(0),),
+        # Larger than the snapshot is the load-bearing case: diverted stream
+        # members are counted but never appear in the snapshot.
+        target_delivered_member_count=3,
+    )
+    assert accepted.target_delivered_member_count == 3
+
+
 def test_prepare_request_is_a_single_closed_union_with_derived_kind_and_plan_match() -> None:
-    pipeline = SinkEffectPipelineMembersInput(members=(_member(0),), target_snapshot_members=())
+    pipeline = SinkEffectPipelineMembersInput(members=(_member(0),), target_snapshot_members=(), target_delivered_member_count=1)
     request = SinkEffectPrepareRequest(effect_id="effect-1", effect_input=pipeline, inspection=_inspection())
     assert request.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS
     assert "input_kind" not in {field.name for field in fields(request)}
@@ -723,10 +842,16 @@ def test_export_input_is_dense_bounded_exact_and_has_no_pipeline_fields() -> Non
     export_input = _export_input()
     assert export_input.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT
     assert isinstance(export_input.chunks, tuple)
-    missing = object()
-    assert inspect.getattr_static(export_input, "members", missing) is missing
-    assert inspect.getattr_static(export_input, "target_snapshot_members", missing) is missing
-    assert inspect.getattr_static(export_input, "token_id", missing) is missing
+    # The export input must not carry the pipeline-members carriers at all.
+    # Direct access is a strictly stronger statement than a static probe: it
+    # proves the name does not resolve by ANY route — no field, no descriptor,
+    # no forwarding ``__getattr__`` (ADR-032).
+    with pytest.raises(AttributeError):
+        export_input.members  # noqa: B018
+    with pytest.raises(AttributeError):
+        export_input.target_snapshot_members  # noqa: B018
+    with pytest.raises(AttributeError):
+        export_input.token_id  # noqa: B018
     assert list(export_input.reader.iter_verified_chunks()) == [b'{"record":1}\n']
 
     chunk = export_input.chunks[0]
@@ -815,8 +940,25 @@ def test_restricted_reader_keeps_manifest_separate_and_exposes_no_arbitrary_read
     assert not manifest_bytes.endswith(b"\n")
     assert b'"record":1' not in manifest_bytes
     assert inspect.signature(reader.read_verified_signed_manifest).parameters == {}
-    for forbidden in ("read", "read_ref", "resolve", "query", "landscape", "credentials", "signer", "secret"):
-        assert inspect.getattr_static(reader, forbidden, None) is None
+    # Same reasoning as the export-input carriers above: each arbitrary-read
+    # name must fail to resolve outright, which direct access proves and a
+    # static probe with a None default does not.
+    with pytest.raises(AttributeError):
+        reader.read  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.read_ref  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.resolve  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.query  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.landscape  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.credentials  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.signer  # noqa: B018
+    with pytest.raises(AttributeError):
+        reader.secret  # noqa: B018
     with pytest.raises(TypeError):
         reader.read_verified_signed_manifest("sha256:" + "0" * 64)  # type: ignore[call-arg]
 
@@ -1108,3 +1250,38 @@ def test_member_refuses_noncanonical_or_divergent_lineage_and_payload_hashes() -
             operation_id="operation-1",
             sink_node_id="sink-1",
         )
+
+
+class TestSinkEffectIdentityMemberIdTypes:
+    """member_ids is Tier-1 owned data: a wrong-type element crashes as TypeError.
+
+    Pins the elspeth-ca0a7e71b1 fix: the defensive ``isinstance(member_id, str)``
+    that converted a wrong-type contract violation into the malformed-digest
+    ValueError is gone — the natural TypeError from ``fullmatch`` surfaces the
+    bug class honestly, while malformed string digests still raise ValueError.
+    """
+
+    @staticmethod
+    def _identity_kwargs() -> dict:
+        return {
+            "effect_id": "a" * 64,
+            "artifact_id": "b" * 64,
+            "artifact_idempotency_key": "c" * 64,
+            "stream_id": "d" * 64,
+            "config_hash": "e" * 64,
+            "requested_target_hash": "f" * 64,
+            "membership_or_manifest_hash": "0" * 64,
+            "group_payload_hash": "1" * 64,
+            "input_kind": SinkEffectInputKind.PIPELINE_MEMBERS,
+            "members": (),
+            "snapshot_hash": None,
+            "final_manifest_identity_hash": None,
+        }
+
+    def test_non_str_member_id_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            SinkEffectIdentity(member_ids=(42,), **self._identity_kwargs())  # type: ignore[arg-type]
+
+    def test_malformed_string_digest_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="lowercase SHA-256 digests"):
+            SinkEffectIdentity(member_ids=("NOT-A-DIGEST",), **self._identity_kwargs())

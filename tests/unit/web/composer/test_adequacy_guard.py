@@ -581,6 +581,13 @@ def test_redaction_policy_snapshot_matches_live_manifest() -> None:
     Bootstrap the snapshot via:
         .venv/bin/python scripts/cicd/bootstrap_redaction_snapshot.py --write
 
+    IN A WORKTREE, prefix that with ``PYTHONPATH=<worktree>/src``. The venv is
+    symlinked to the main checkout and ``elspeth`` is installed editable there,
+    so a bare interpreter regenerates the snapshot from the MAIN checkout's
+    manifest and writes a file identical to the one already committed. The
+    symptom is an empty ``git diff`` while this test keeps failing -- a
+    confidently wrong result rather than an error.
+
     Whenever a manifest entry changes (Tasks 13-16 add new entries; Task 19
     is the gate), this test will fail until the snapshot is regenerated and
     the diff is reviewed.

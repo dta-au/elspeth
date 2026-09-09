@@ -39,6 +39,7 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
 from elspeth.web.composer.redaction import (
+    REDACTED_UNKNOWN_RESPONSE_FIELD,
     REDACTED_UNKNOWN_RESPONSE_KEY,
     redact_tool_call_arguments,
 )
@@ -64,6 +65,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.fixtures.factories import make_context
+from tests.helpers.session_fences import acquire_compose_context, seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 
 pytestmark = pytest.mark.composer_llm_eval
@@ -208,6 +210,7 @@ def _web_settings(data_dir: Path, **overrides: Any) -> WebSettings:
     defaults: dict[str, Any] = {
         "data_dir": data_dir,
         "composer_model": EVAL_MODEL,
+        "composer_advisor_model": "openrouter/openai/gpt-4.1-mini",
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 180.0,
@@ -237,6 +240,11 @@ def _session_service_for_characterization(
     )
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
+        # Production sessions are born with their released epoch-1 fence;
+        # a hand-inserted row needs the same so the compose lease can be
+        # acquired without a repair write (which the commit-failure
+        # characterizations below would otherwise trip on).
+        seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
         conn.execute(text("UPDATE sessions SET trust_mode = 'auto_commit' WHERE id = :session_id"), {"session_id": session_id})
     return service
 
@@ -268,13 +276,16 @@ async def _run_one_turn_for_characterization(
     llm: _ReplayLLM,
     session_id: str,
     initial_state: CompositionState | None = None,
+    session_operation_context: Any = None,
 ) -> Any:
     driver = cast(Any, service)
-    return await driver._run_one_turn_for_test(
-        llm=llm,
-        session_id=session_id,
-        initial_state=initial_state,
-    )
+    kwargs: dict[str, Any] = {"llm": llm, "session_id": session_id, "initial_state": initial_state}
+    if session_operation_context is not None:
+        # Tests that arm a commit failure acquire their COMPOSE lease first so
+        # the failure lands on the compose-loop commit under test, not on the
+        # lease acquisition the autouse adapter would otherwise perform.
+        kwargs["session_operation_context"] = session_operation_context
+    return await driver._run_one_turn_for_test(**kwargs)
 
 
 def _chat_rows(sessions_service: SessionServiceImpl, *, session_id: str) -> list[Any]:
@@ -417,7 +428,7 @@ def _aggregation_state(
 def _scenario_2_files(tmp_path: Path) -> tuple[Path, Path, Path]:
     data_dir = tmp_path / "data"
     source_path = data_dir / "blobs" / SCENARIO_2_SESSION_ID / "tickets.csv"
-    output_path = data_dir / "outputs" / "tier_summary.jsonl"
+    output_path = data_dir / "outputs" / SCENARIO_2_SESSION_ID / "tier_summary.jsonl"
     _write_scenario_csv(source_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return data_dir, source_path, output_path
@@ -502,11 +513,17 @@ async def test_cl_pp_10a_commit_failure_without_plugin_crash_raises_audit_integr
         )
     )
 
-    with (
-        _force_commit_failure(sessions_service._engine),
-        pytest.raises(AuditIntegrityError) as exc_info,
-    ):
-        await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    async with acquire_compose_context(sessions_service, session_id) as compose_context:
+        with (
+            _force_commit_failure(sessions_service._engine),
+            pytest.raises(AuditIntegrityError) as exc_info,
+        ):
+            await _run_one_turn_for_characterization(
+                service,
+                llm=llm,
+                session_id=session_id,
+                session_operation_context=compose_context,
+            )
 
     assert isinstance(exc_info.value.__cause__, OperationalError)
     assert observed_value(telemetry.tool_row_tier1_violation_total) == 1
@@ -566,12 +583,18 @@ async def test_cl_pp_10b_commit_failure_during_plugin_crash_preserves_plugin_err
         )
     )
 
-    with (
-        _force_commit_failure(sessions_service._engine),
-        capture_logs() as cap_logs,
-        pytest.raises(ComposerPluginCrashError) as exc_info,
-    ):
-        await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    async with acquire_compose_context(sessions_service, session_id) as compose_context:
+        with (
+            _force_commit_failure(sessions_service._engine),
+            capture_logs() as cap_logs,
+            pytest.raises(ComposerPluginCrashError) as exc_info,
+        ):
+            await _run_one_turn_for_characterization(
+                service,
+                llm=llm,
+                session_id=session_id,
+                session_operation_context=compose_context,
+            )
 
     assert isinstance(exc_info.value.__cause__, RuntimeError)
     assert exc_info.value.failed_turn is not None
@@ -820,8 +843,9 @@ async def test_cl_pp_13_unknown_response_key_redacted_in_persisted_tool_row(
     result = await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
 
     persisted_tool_row = json.loads(result.persisted_tool_row_content[0])
-    assert persisted_tool_row["stray_provider_field"] == REDACTED_UNKNOWN_RESPONSE_KEY
-    assert persisted_tool_row["stray_provider_field"] == "<redacted-unknown-response-key>"
+    assert "stray_provider_field" not in persisted_tool_row
+    assert persisted_tool_row[REDACTED_UNKNOWN_RESPONSE_FIELD] == REDACTED_UNKNOWN_RESPONSE_KEY
+    assert persisted_tool_row[REDACTED_UNKNOWN_RESPONSE_FIELD] == "<redacted-unknown-response-key>"
     assert "do-not-persist" not in result.persisted_tool_row_content[0]
     assert redaction_telemetry.unknown_response_key_calls == [{"tool_name": "set_metadata"}]
 
@@ -864,7 +888,7 @@ def test_scenario_1b_blob_service_storage_path_validates_through_runtime_path_al
 
     state = _direct_source_state(
         str(canonical_storage_path),
-        str(data_dir / "outputs" / "scenario_1b_summary.jsonl"),
+        str(data_dir / "outputs" / SCENARIO_1B_SESSION_ID / "scenario_1b_summary.jsonl"),
         blob_ref=blob_id,
     )
 
@@ -875,6 +899,7 @@ def test_scenario_1b_blob_service_storage_path_validates_through_runtime_path_al
         state,
         _web_settings(data_dir),
         composer_yaml_generator,
+        session_id=SCENARIO_1B_SESSION_ID,
     )
 
     assert runtime_result.is_valid, _format_validation_errors(runtime_result)
@@ -890,7 +915,12 @@ def test_scenario_2_end_of_source_condition_rejected_before_runtime_settings_loa
         aggregation_options={"schema": {"mode": "observed"}, "value_field": "amount"},
     )
 
-    runtime_result = validate_pipeline_for_trained_operator(state, _web_settings(data_dir), composer_yaml_generator)
+    runtime_result = validate_pipeline_for_trained_operator(
+        state,
+        _web_settings(data_dir),
+        composer_yaml_generator,
+        session_id=SCENARIO_2_SESSION_ID,
+    )
     assert not runtime_result.is_valid
     assert "end_of_source" in _format_validation_errors(runtime_result)
 
@@ -915,7 +945,12 @@ def test_scenario_2_omitted_trigger_is_end_of_source_only_contract(tmp_path: Pat
     yaml_doc = yaml.safe_load(composer_yaml_generator.generate_yaml(state))
     assert "trigger" not in yaml_doc["aggregations"][0]
 
-    runtime_result = validate_pipeline_for_trained_operator(state, _web_settings(data_dir), composer_yaml_generator)
+    runtime_result = validate_pipeline_for_trained_operator(
+        state,
+        _web_settings(data_dir),
+        composer_yaml_generator,
+        session_id=SCENARIO_2_SESSION_ID,
+    )
     assert runtime_result.is_valid, _format_validation_errors(runtime_result)
 
 
@@ -933,7 +968,12 @@ def test_scenario_2_batch_stats_required_input_fields_returns_pre_execution_vali
         },
     )
 
-    runtime_result = validate_pipeline_for_trained_operator(state, _web_settings(data_dir), composer_yaml_generator)
+    runtime_result = validate_pipeline_for_trained_operator(
+        state,
+        _web_settings(data_dir),
+        composer_yaml_generator,
+        session_id=SCENARIO_2_SESSION_ID,
+    )
     assert not runtime_result.is_valid
     assert "batch-aware" in _format_validation_errors(runtime_result)
 
@@ -1223,7 +1263,12 @@ def test_runtime_preflight_preview_blocks_scenario_2_invalid_trigger(tmp_path: P
     catalog = _trained_operator_catalog()
 
     def runtime_preflight(candidate: CompositionState) -> ValidationResult:
-        return validate_pipeline_for_trained_operator(candidate, settings, composer_yaml_generator)
+        return validate_pipeline_for_trained_operator(
+            candidate,
+            settings,
+            composer_yaml_generator,
+            session_id=SCENARIO_2_SESSION_ID,
+        )
 
     preview = execute_tool(
         "preview_pipeline",
@@ -1235,11 +1280,12 @@ def test_runtime_preflight_preview_blocks_scenario_2_invalid_trigger(tmp_path: P
         runtime_preflight=runtime_preflight,
     )
 
-    preview_data = preview.to_dict()["data"]
+    preview_envelope = preview.to_dict()
     assert preview.success is True
-    assert preview_data["is_valid"] is False
-    assert preview_data["runtime_preflight"]["is_valid"] is False
-    assert "end_of_source" in json.dumps(preview_data["runtime_preflight"])
+    assert preview_envelope["data"]["preview_is_valid"] is False
+    assert "runtime_preflight" not in preview_envelope["data"]
+    assert preview_envelope["runtime_preflight"]["is_valid"] is False
+    assert "end_of_source" in json.dumps(preview_envelope["runtime_preflight"])
 
 
 @pytest.mark.asyncio
@@ -1267,7 +1313,7 @@ async def test_final_completion_claim_is_augmented_with_runtime_preflight_failur
         state=changed_state,
         initial_version=state.version,
         user_id=EVAL_USER_ID,
-        session_id=None,
+        session_id=SCENARIO_2_SESSION_ID,
         last_runtime_preflight=None,
         runtime_preflight_cache=composer._new_runtime_preflight_cache(),
         session_scope="session:eval",

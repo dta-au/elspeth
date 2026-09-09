@@ -11,7 +11,17 @@ builder applies — otherwise a schema-legal plan dies as
 
 from __future__ import annotations
 
+from types import MappingProxyType
+from typing import cast
+
+import pytest
+from pydantic import JsonValue
+
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.planning import _canonical_state_from_private_pipeline
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
 
 
 def _ab_private_pipeline() -> dict[str, object]:
@@ -166,3 +176,38 @@ def test_node_on_error_defaults_follow_the_candidate_builder_by_node_type() -> N
         "reconcile": None,
         "cleanup": "discard",
     }
+
+
+def test_frozen_proposal_pipeline_is_refused_as_an_audit_integrity_failure() -> None:
+    """The adapter mutates ``raw`` in place, so it requires a THAWED mapping.
+
+    ``PipelineProposal.__post_init__`` deep-freezes ``pipeline``; the sole
+    production caller, ``_state_from_proposal``, is the control that supplies a
+    mutable copy via ``deep_thaw``. Build the frozen form through that real
+    producer rather than ``deep_freeze`` on a literal — a literal would keep
+    passing if the proposal authority ever stopped freezing.
+
+    Without the guard the mutations escape as a bare ``AttributeError``
+    (``mappingproxy`` has no ``pop``) or ``TypeError`` (no item assignment)
+    raised OUTSIDE the canonicalisation ``try``, so a malformed-authority
+    failure reaches the caller as an unclassified builtin instead of this
+    path's ``AuditIntegrityError``.
+    """
+    proposal = PipelineProposal.create(
+        pipeline=_ab_private_pipeline(),
+        base=AbsentBase(),
+        reviewed_facts={},
+        surface=PlannerSurface.GUIDED_FULL,
+        repair_count=0,
+        skill_hash=stable_hash("planner-skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+    assert type(proposal.pipeline) is MappingProxyType
+
+    with pytest.raises(AuditIntegrityError, match="thawed mapping"):
+        _canonical_state_from_private_pipeline(cast(dict[str, JsonValue], proposal.pipeline))
+
+    # The untouched arm: the control's own thaw still canonicalises normally.
+    thawed = cast(dict[str, JsonValue], deep_thaw(proposal.pipeline))
+    assert _canonical_state_from_private_pipeline(thawed).sources["source"].on_validation_failure == "discard"

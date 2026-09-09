@@ -80,6 +80,27 @@ def test_writer_principal_check_rejects_unknown(engine):
             )
 
 
+def test_writer_principal_check_accepts_run_diagnostics(engine):
+    """elspeth-0fcf68d50f: run-diagnostics LLM audit rows persist under
+    their own closed writer principal, and the live SQLite CHECK accepts
+    the value the Python Literal declares (paired-contract parity)."""
+    with engine.begin() as conn:
+        _make_session(conn, session_id="s1")
+        conn.execute(
+            insert(models.chat_messages_table).values(
+                id="diag1",
+                session_id="s1",
+                role="audit",
+                content='{"_kind": "llm_call_audit"}',
+                sequence_no=1,
+                writer_principal="run_diagnostics",
+                tool_call_id=None,
+                parent_assistant_id=None,
+                created_at=datetime(2026, 4, 30, tzinfo=UTC),
+            )
+        )
+
+
 def test_audit_role_allows_unparented_internal_breadcrumb(engine):
     """Internal composer audit breadcrumbs that have no assistant parent
     are stored as role='audit', not role='tool'. This is the

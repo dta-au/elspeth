@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from elspeth.contracts import NodeType
+from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.schema import transform_errors_table, validation_errors_table
@@ -10,7 +10,13 @@ from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
 
 
-def test_discard_summary_counts_completed_discard_path() -> None:
+def test_discard_summary_counts_discard_path_with_no_sink_state_unattributed() -> None:
+    """A discard outcome with no failed sink state still counts, unattributed.
+
+    Attribution is an outer join precisely so a discard the engine recorded
+    without its primary anchor cannot vanish from the total, which the
+    ``DiscardSummary`` stage/category balance check would then reject.
+    """
     setup = make_recorder_with_run(run_id="discard-summary-run", source_node_id="source-0")
     row = setup.data_flow.create_row(
         run_id=setup.run_id,
@@ -37,6 +43,168 @@ def test_discard_summary_counts_completed_discard_path() -> None:
         {
             "stage": "sink_discard",
             "node_id": None,
+            "count": 1,
+        }
+    ]
+
+
+def test_discard_summary_names_the_sink_node_that_discarded() -> None:
+    """The sink_discard stage names its node, as every other stage does."""
+    setup = make_recorder_with_run(run_id="sink-discard-attribution-run", source_node_id="source-0")
+    sink_id = register_test_node(
+        setup.data_flow,
+        setup.run_id,
+        "sink_announcement_safe",
+        node_type=NodeType.SINK,
+        plugin_name="text",
+    )
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        data={"llm_response": "line one\nline two"},
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    token = setup.data_flow.create_token(row.row_id)
+    node_state = setup.execution.begin_node_state(
+        token.token_id,
+        sink_id,
+        setup.run_id,
+        0,
+        {"llm_response": "line one\nline two"},
+    )
+    setup.execution.complete_node_state(
+        node_state.state_id,
+        NodeStateStatus.FAILED,
+        duration_ms=1.0,
+        error=ExecutionError(
+            exception="Text values cannot contain CR or LF record separators",
+            exception_type="SinkDiscard",
+            phase="write",
+        ),
+    )
+    setup.data_flow.record_token_outcome(
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.SINK_DISCARDED,
+        sink_name=DISCARD_SINK_NAME,
+        error_hash="c" * 64,
+    )
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    assert summary.total == 1
+    assert summary.sink_discards == 1
+    assert [stage.model_dump() for stage in summary.stages] == [
+        {
+            "stage": "sink_discard",
+            "node_id": "sink_announcement_safe",
+            "count": 1,
+        }
+    ]
+
+
+def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> None:
+    """One discarded token counts once however many failed sink states it has.
+
+    This is the whole reason attribution uses a correlated scalar subquery
+    rather than a join: a join emits one row per failed sink state, which would
+    push the sink_discard stage total past ``sink_discards`` and trip
+    ``DiscardSummary``'s balance check.
+    """
+    setup = make_recorder_with_run(run_id="sink-discard-fanout-run", source_node_id="source-0")
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        data={"payload": "x"},
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    token = setup.data_flow.create_token(row.row_id)
+    for step_index, sink_name in enumerate(("sink_first", "sink_second")):
+        sink_id = register_test_node(
+            setup.data_flow,
+            setup.run_id,
+            sink_name,
+            node_type=NodeType.SINK,
+            plugin_name="text",
+        )
+        node_state = setup.execution.begin_node_state(token.token_id, sink_id, setup.run_id, step_index, {"payload": "x"})
+        setup.execution.complete_node_state(
+            node_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=1.0,
+            error=ExecutionError(exception="sink refused the row", exception_type="SinkDiscard", phase="write"),
+        )
+    setup.data_flow.record_token_outcome(
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.SINK_DISCARDED,
+        sink_name=DISCARD_SINK_NAME,
+        error_hash="d" * 64,
+    )
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    # The balance check inside DiscardSummary would already have rejected an
+    # inflated stage total, so reaching this assertion is itself the evidence.
+    assert summary.total == 1
+    assert summary.sink_discards == 1
+    assert sum(stage.count for stage in summary.stages if stage.stage == "sink_discard") == 1
+
+
+def test_discard_summary_counts_gate_evaluation_error_discard_by_gate_node() -> None:
+    setup = make_recorder_with_run(run_id="gate-error-discard-summary-run", source_node_id="source-0")
+    gate_id = register_test_node(
+        setup.data_flow,
+        setup.run_id,
+        "threshold",
+        node_type=NodeType.GATE,
+        plugin_name="config_gate",
+    )
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        data={"amount": "250.00"},
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    token = setup.data_flow.create_token(row.row_id)
+    node_state = setup.execution.begin_node_state(
+        token.token_id,
+        gate_id,
+        setup.run_id,
+        0,
+        {"amount": "250.00"},
+    )
+    setup.execution.complete_node_state(
+        node_state.state_id,
+        NodeStateStatus.FAILED,
+        duration_ms=1.0,
+        error=ExecutionError(
+            exception="gate expression evaluation failed: incompatible runtime types",
+            exception_type="ExpressionEvaluationError",
+        ),
+    )
+    setup.data_flow.record_token_outcome(
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.GATE_ERROR_DISCARDED,
+        error_hash="b" * 64,
+    )
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    assert summary.total == 1
+    assert summary.gate_errors == 1
+    assert summary.sink_discards == 0
+    assert [stage.model_dump() for stage in summary.stages] == [
+        {
+            "stage": "gate_evaluation",
+            "node_id": "threshold",
             "count": 1,
         }
     ]

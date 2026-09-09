@@ -1,0 +1,9 @@
+input/*
+!input/README.md
+settings.generated.yaml
+output/*
+!output/.gitkeep
+runs/*
+!runs/.gitkeep
+payloads/*
+!payloads/.gitkeep

@@ -96,7 +96,26 @@ def test_run_ceremony_emits_partial_summary_from_run_result(monkeypatch: pytest.
         routed_destinations={"default": 2, "quarantine": 1},
     )
 
-    monkeypatch.setattr("elspeth.engine.orchestrator.ceremony.time.perf_counter", lambda: 42.5)
+    class _FrozenClockTime:
+        """Stand-in for the ``time`` name as seen from inside
+        ``elspeth.engine.orchestrator.ceremony``, scoped to that module only.
+
+        ``monkeypatch.setattr("...ceremony.time.perf_counter", ...)`` would
+        resolve ``...ceremony.time`` to the *real* ``time`` module (Python
+        modules are process-wide singletons; the ceremony module merely
+        imports the same object everyone else does) and replace
+        ``time.perf_counter`` for the whole process during the test.
+        Rebinding the ``time`` *name inside the ceremony module's own
+        namespace* keeps the freeze local to the code path under test;
+        ``perf_counter`` is the only member the ceremony module reads from
+        ``time``, so it is the only member this stand-in defines: any other
+        name raises ``AttributeError`` and fails the test loudly rather than
+        being forwarded to the real module behind the test's back.
+        """
+
+        perf_counter = staticmethod(lambda: 42.5)
+
+    monkeypatch.setattr("elspeth.engine.orchestrator.ceremony.time", _FrozenClockTime())
 
     ceremony.emit_partial_summary(
         run_id=result.run_id,

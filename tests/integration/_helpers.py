@@ -8,8 +8,9 @@ import pytest
 import yaml
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.run_result import RunResult
-from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore

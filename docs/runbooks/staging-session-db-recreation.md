@@ -2,10 +2,71 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: Composer parity (session epoch 35 and Landscape epoch 29)
+## Current Cutover: 0.8.0 blob cleanup, guided decline, aggregation recovery, the identity substrate, and read admissions (session epoch 53 and Landscape epoch 38)
 
-0.7.1 advances `SESSION_SCHEMA_EPOCH` from 26 to 27 so
-`user_preferences.freeform_intro_dismissed_at` can persist the account-wide
+0.8.0 advances `SESSION_SCHEMA_EPOCH` from 35 to 53. Epoch 36 ensures a committed
+blob deletion whose tombstone unlink or directory fsync fails remains retryable
+after restart. Epoch 37 adds the completed `guided_plan` `declined`
+result kind and its state-only result locator. Epoch 38 additionally retains the
+exact assistant message ID a completed decline replays; epoch 37 cannot
+distinguish the original decline from later assistant messages sharing an
+unchanged state. Epoch 39 adds `policy_blocked` to the closed
+`guided_operations.failure_code` CHECK so a deployment-policy refusal settles as
+a permanent failure with its own HTTP 422 envelope instead of replaying as a
+retryable provider fault; epoch 38 rejects that row outright. Epoch 40 requires
+the explicit coalesce `timeout_seconds` key, including `null`, in persisted
+guided proposal payloads. Epoch 39 sessions may still reference older payloads
+without that key and are rejected at startup instead of failing during replay.
+Epoch 41 requires the `node_options_summary` key the review cards render, on
+both the proposal and wiring node projections, for the same reason. Epoch 42
+adds the reviewed output-field gap to failed guided operations so the initial
+and replayed HTTP failures remain equivalent. Epoch 43 adds the
+`run_diagnostics` chat writer principal so run-diagnostics LLM audit rows are
+attributed to their real writer instead of the compose loop. Epoch 44 adds
+`planner_repair_exhausted` to the closed `guided_operations.failure_code`
+CHECK so planner repair exhaustion settles under its own honest coded failure
+(HTTP 500 with a retry offer) instead of the provider-blaming
+`invalid_provider_response` 502 (elspeth-5904b1683a). Epoch 45 moves web
+Textract authoring to operator document profiles (ADR-036): sessions authored
+against the old public schema (`bucket_field` / the `deployment` alias) can no
+longer validate or replay. Epoch 46 is the lockstep cut for guided schema 11:
+persisted chat-history turns gain the occurrence-binding `turn_token` key so
+guided Retry is occurrence-bound instead of content-based
+(elspeth-ea80e34fdc). Epoch 47 adds `auto_commit.revoked` to the closed
+`proposal_events.event_type` CHECK so an auto-commit blocked by the
+settlement-boundary trust-mode recheck (elspeth-01d4c6e683) leaves a durable
+proposal event instead of silently falling back to the review path.
+Epoch 48 adds `superseded` to the closed `interpretation_events.choice`
+CHECK so a composition-state commit that extinguishes a reviewed
+interpretation site terminally retires the persisted pending review in the
+same transaction (elspeth-d73139155a / elspeth-dbc39dd367) instead of
+leaving a zombie card that gates Run.
+Epoch 49 adds the `composition_rejection_events` table: a composer
+mutation-tool rejection's reason — the exact payload the planner saw —
+persists durably as session data (elspeth-3e28029d2f).
+Epoch 50 carries the pluggable-SSO identity substrate (elspeth-07cd19ba73):
+the auth provider discriminator widens from three values to five on both
+`sessions` and `user_secrets`, and the identity, org-tree and
+workflow-governance tables land in the same epoch so the whole sprint costs
+exactly one cutover window rather than two. Landscape advances to epoch 37 in
+the same window for the matching widened CHECKs on `auth_events` and
+`run_attributions`.
+Epoch 53 adds the `session_read_admissions` table (elspeth-f98e0ae8b2): one
+row per live shareable blob-read admission, so a released or expired read
+context is refused on its next proof instead of keeping read authority until
+the session is archived or deleted. Landscape advances to epoch 38:
+`scheduler_events` gains an auto-incrementing `seq` primary key that is the
+authoritative replay order, and `event_id` becomes a non-unique content digest
+of the transition, because database-stamped events tie on `recorded_at`
+inside one SQLite second or one PostgreSQL transaction.
+An epoch-35 through epoch-52 database cannot represent
+the complete current contract and must be recreated. Only `sessions.db` is
+recreated — `data/auth.db` and the content-addressed payload store are never
+deleted by this procedure; recreating the session DB severs stale payload
+references. Guided checkpoint schema advances to 11.
+
+0.7.1 advances the session store from epoch 26 through epoch 35. Epoch 27 lets
+`user_preferences.freeform_intro_dismissed_at` persist the account-wide
 freeform-primer preference, then to 28 so SQLite and PostgreSQL session stores
 carry the same application/store/epoch identity proof. Composer parity then
 advances the session store to epoch 29 for guided schema 8 and durable fenced
@@ -14,9 +75,14 @@ guided operations, and to epoch 30 because the closed
 boundary makes a fork quota failure settle and replay as a stable HTTP 413.
 Later hard cuts add guided pipeline-proposal replay (31), exact failed-operation
 audit cohorts (32), guided-start negative admission (33), guided schema 10 (34),
-and exclusive guided-confirmation proposal admission (35). An epoch-34 database
-cannot enforce the current dispatch boundary and must be recreated. The universal web
-plugin-policy work also advances
+exclusive guided-confirmation proposal admission (35), retryable blob-deletion
+cleanup (36), ordinary guided-plan decline settlement (37), exact decline
+replay message identity (38), the permanent `policy_blocked` guided-operation
+failure code (39), explicit persisted coalesce timeout metadata (40), the
+guided `node_options_summary` projection the review cards render (41),
+operation failure output-field replay enrichment (42), and the
+`run_diagnostics` chat writer principal (43). The
+universal web plugin-policy work in 0.7.1 also advances
 `SQLITE_SCHEMA_EPOCH` from 22 to 23 and adds `run_web_plugin_policy`. This
 table is optional per run but required in the schema: web runs receive one
 policy-evidence row atomically with the run, attribution, and leader records;
@@ -28,18 +94,40 @@ Landscape to epoch 26, durable coalesce effects advance it to epoch 27, and
 per-member failsink-to-primary provenance advances it to epoch 28. Epoch 29
 adds canonical node output-contract hashes, run-scoped token ancestry and
 validation-error links, durable batch-expansion claims, and the
-transaction-owned sidecar-journal outbox.
+transaction-owned sidecar-journal outbox. Epoch 30 adds
+`token_work_items.row_union_name` so a recovered scheduler can attribute a
+blocked work item to its declared row_union barrier.
+Epoch 31 constrains `token_work_items.status` to the six public scheduler
+states, preventing removed states such as `waiting` from being persisted.
+Epoch 32 adds normalized aggregation result receipts so any committed successful
+batch can resume after process death without plugin replay: transform outputs
+resume expansion, passthrough outputs retain their input token identities, and
+empty outputs finish their member outcomes at the atomic scheduler barrier.
+Epoch 33 gives token outcomes a composite (run_id, token_id) access path. Epoch
+34 adds the unified-lineage groundwork tables (`token_lineage_frames`,
+`group_records`, `group_losses`) and `token_work_items.lineage_path_json`.
+Epoch 35 flips lineage onto that groundwork: the tri-column
+`fork_group_id`/`expand_group_id`/`branch_name` discriminators are retired
+from `tokens`, `token_outcomes`, and `token_work_items` (plus
+`token_outcomes.expected_branches_json`), and `token_lineage_frames`/
+`lineage_path_json` become the sole lineage truth. `join_group_id` stays.
+Epoch 36 binds every coalesce effect to its non-null lineage group.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 34. Landscape epoch 29
-is the current release boundary; recreate a Landscape database only when
-its own sentinel is stale. Any stale PostgreSQL session shape is recreated by
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 38
+is the current release boundary, so a Landscape database left at epoch 37 or
+below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
 Validate-only startup and doctor must leave stale databases unchanged. Do not
 use `create_all`, `--init-schema`, an old migrator, or code rollback as an improvised repair
-mechanism. `auth.db` is a separate file and is not reset.
+mechanism. `auth.db` is a separate file and is not reset. Credentials therefore
+survive this cutover — but from 0.8.0, access does not follow them. Admission
+moved into the recreated session DB, so every local account is refused at login
+until an operator activates it. Clearing that is
+[Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset)
+below, and it belongs to this window rather than the morning after.
 
 The release/schema compatibility record for every candidate using this shape
 must state: candidate git SHA and immutable image/task-definition identity;
@@ -49,13 +137,149 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-35 release forward,
-recreate fresh state, and retry. Plans 10 and 12 must cite the
-session-epoch-35/Landscape-epoch-29 record when binding candidate and rollback
+unsupported: keep the service drained, repair the epoch-53 release forward,
+recreate fresh state, and retry. The release acceptance record must cite the
+session-epoch-53/Landscape-epoch-38 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
 for the historical epoch-21 to epoch-22 Landscape reset described below.
+
+### Every local account lands `pending` after this reset
+
+Recreating `sessions.db` recreates the new `identities` table with it, and
+`data/auth.db` is deliberately not touched — so on the far side of this cutover
+every pre-existing local account has a credential and no identity. Admission is
+a property of issuance in 0.8.0: `LocalAuthProvider` verifies the password,
+then resolves the identity row whose `identity_id` becomes the session token's
+`sub`, and `_build_local_auth_provider` creates that row `active` only when
+`registration_mode` is `open`. On a deployment running `closed` or
+`email_verified`, every returning user therefore authenticates with the correct
+password and is refused at issuance with HTTP 401 `Account is pending —
+awaiting administrator approval`. The account named by `dev_admin_user` is
+refused identically, and the dev-admin surface could not clear it even if it
+were reachable: it manages `auth.db` credentials, not identities.
+
+0.8.0 ships no activation route and no activation command — `elspeth composer
+users add` / `remove` write `auth.db`, and the bootstrap CLI the SSO design
+assumes for cohort re-admission belongs to a later phase. Until it lands, the
+operator clears the wall with direct SQL against the recreated session DB,
+inside the same window, before handing the deployment back. Do not reach for
+`registration_mode=open` as the shortcut: it admits every stranger who can
+reach the service for as long as it is set, which is the opposite of what a
+`closed` deployment is configured for.
+
+**Pre-provision the cohort before the users come back.** A pending row does
+not exist until an account's first login creates it, and only a *correct*
+credential gets that far — `_login_sync` refuses a bad password, and an
+unverified email, before reaching the admission wall. So the operator cannot
+activate a row that does not exist yet, and cannot make it exist without the
+user's password. Waiting for each person to hit a 401 first would mean handing
+the deployment back before the window can close.
+
+Insert the rows instead. `identities.pre_provisioned_at` exists for exactly
+this: an administrator may create an `active` row by `(provider, subject)`
+before anyone logs in, and that person's first login BINDS to it rather than
+creating a second identity. It needs only the usernames, which `auth.db`
+already has. Resolve `$DB_PATH` first — the assignment lives in the Procedure
+script below, so set it explicitly if you are running this section on its own:
+
+```bash
+DB_PATH="${ELSPETH_DATA_DIR:-data}/sessions.db"
+
+# The cohort to admit, read from the credential store that survived the reset.
+sqlite3 "${ELSPETH_DATA_DIR:-data}/auth.db" \
+  "SELECT user_id FROM users WHERE email_verified = 1 ORDER BY user_id;"
+
+# One statement per account. Repeat for each username from the list above.
+sqlite3 "$DB_PATH" "
+  INSERT INTO identities (identity_id, provider, kind, subject, username,
+                          first_seen_at, access_state, pre_provisioned_at, activated_at)
+  VALUES (lower(hex(randomblob(4))||'-'||hex(randomblob(2))||'-4'||substr(hex(randomblob(2)),2)
+          ||'-'||substr('89ab',abs(random())%4+1,1)||substr(hex(randomblob(2)),2)||'-'||hex(randomblob(6))),
+          'local', 'human', 'THE_USERNAME', 'THE_USERNAME',
+          datetime('now'), 'active', datetime('now'), datetime('now'));"
+```
+
+For the local provider the `subject` **is** the username, so both columns take
+the same value. The `identity_id` expression generates a v4 UUID, matching what
+`ensure_identity` writes; the column has no format constraint, but a value
+shaped like every other id is what makes the table readable later.
+`datetime('now')` is UTC at second precision, which the typed columns read back
+unchanged.
+
+**Mop-up, for anyone missed.** Someone left off the list meets the 401 and
+creates their own `pending` row. Activate those by name once they appear:
+
+```bash
+sqlite3 "$DB_PATH" \
+  "SELECT username, access_state, first_seen_at FROM identities WHERE provider = 'local' ORDER BY first_seen_at;"
+
+sqlite3 "$DB_PATH" \
+  "UPDATE identities SET access_state = 'active', activated_at = datetime('now')
+   WHERE provider = 'local' AND subject = 'THE_USERNAME' AND access_state = 'pending';"
+```
+
+Both predicates on that UPDATE are load-bearing. Without `access_state =
+'pending'` a recovery sweep resurrects any identity an administrator
+deliberately `disabled`; without the `subject` predicate the sweep admits
+everyone holding a pending row, which under `email_verified` includes anyone
+who self-registered and verified an address since the reset — exactly the
+population that mode exists to gate.
+
+Two consequences of activating this way, both of which the deploy record must
+carry because the audit trail cannot:
+
+- **No `identity_activated` event is written.** That event and its `quota_set`
+  partner are emitted by the admission callback inside `ensure_identity`, and
+  that callback runs only when `ensure_identity` CREATES an activated row. It
+  is unreachable for any row that already exists, whatever its state — a later
+  login on a still-`pending` row does not emit it either. The Landscape trail will
+  show these identities acting as admitted principals with no activating
+  actor — an admission with no activation event, which is precisely the shape
+  the normal path is built to make impossible. Record the operator, the window,
+  and the activated usernames in the deploy record.
+- **No `quota_policies` row is written.** Activation normally writes one from
+  the container defaults, but only when both `quota_default_tokens_per_day` and
+  `quota_default_storage_bytes` are configured. If this deployment configures
+  them, the identities activated by SQL will need those rows backfilled when
+  quota enforcement lands; nothing reads them in this phase.
+
+Verify by having one activated account log in again: the same credential now
+returns a token instead of the 401.
+
+### What the derived keys change across this boundary
+
+0.8.0 stops handing the operator's `secret_key` to three unrelated jobs raw.
+`src/elspeth/web/key_derivation.py` HKDF-derives one independent key per job,
+so a disclosure of one is no longer a disclosure of all three. Two of the three
+change a value that is compared against something already at rest, which is why
+this delivery is bound to a window that recreates the stores:
+
+- **`derive_session_token_key`** signs and verifies session tokens. Every token
+  minted before the cutover fails verification after it, and its `sub` carries
+  a username where the new code expects an `identity_id`, so every browser
+  session logs in again. That re-login is what surfaces the `pending` wall
+  above.
+- **`derive_user_secret_master_key`** is the master key `UserSecretStore`
+  stretches per secret. Rows written under the raw key cannot be decrypted
+  under the derived one. This confirms an outcome the reset already guarantees
+  rather than adding a hazard — `user_secrets` lives in the session DB being
+  recreated, and users re-enter their secrets either way.
+- **`derive_binding_generation_key`** tags plugin-binding evidence. The
+  fingerprint persisted in the Landscape `run_web_plugin_policy` table and
+  embedded in exported bundles takes a **different value for unchanged policy
+  state**, for two independent reasons: the HMAC key changed, and so did the
+  hashed payload, because `principal_scope` is `{provider}:{user_id}` and
+  `user_id` is now the opaque `identity_id` rather than the username. A
+  fingerprint compared across this boundary is therefore meaningless: a
+  difference is not evidence that a binding rotated, and a match would not be
+  evidence that nothing changed. Compare fingerprints only within one side of
+  the window, and treat a pre-cutover bundle as uninterpretable against a
+  post-cutover one.
+
+`shareable_link_signing_key` is deliberately not derived — it keeps its own
+independent Secrets Manager binding — and is unaffected by this boundary.
 
 ## Historical Cutover: 0.7.0 (two-DB reset)
 
@@ -363,9 +587,14 @@ sudo systemctl restart elspeth-web.service
 
 After restart, verify by composing a new session and confirming the new guidance is reflected in the assistant's behaviour (for Phase 5b.8: the LLM offers `request_interpretation_review` when the composition includes a non-trivial interpretive choice; for Phase 5a.8: simple chat-typed source data prefers `inline_blob` over CSV upload).
 
-## Staging Reset For `elspeth.foundryside.dev`
+## Staging Reset For `elspeth.example.gov.au`
 
-The staging site is a source-checkout systemd/Caddy deployment from `/home/john/elspeth`, not the generic VM/Docker flow. When a pre-release plan changes the session DB schema (e.g. composer-progress-persistence Phase 1A and later schema-changing phases), the schema validator at startup will refuse a stale DB; the only accepted cutover path is archive + delete + recreate. Row-level `DELETE FROM chat_messages` / `DELETE FROM composition_states` is incorrect: it leaves the old table shape behind and startup rejects the stale DB.
+The staging site is a source-checkout systemd/Caddy deployment from `/srv/elspeth`, not the generic VM/Docker flow. When a pre-release plan changes the session DB schema (e.g. composer-progress-persistence Phase 1A and later schema-changing phases), the schema validator at startup will refuse a stale DB; the only accepted cutover path is archive + delete + recreate. Row-level `DELETE FROM chat_messages` / `DELETE FROM composition_states` is incorrect: it leaves the old table shape behind and startup rejects the stale DB.
+
+For an ordinary frontend rebuild and backend restart that does not require a
+schema reset, use
+[Caddy development install refresh](caddy-development-refresh.md). Do not run
+this destructive reset procedure merely to refresh application code or assets.
 
 This procedure destroys staging session rows, chat history, composition states, audit access log rows, runs, run events, blob/blob-link database records, and encrypted `user_secrets` stored in the web session DB. It does not delete blob payload files under the data directory, payload storage, Filigree state, or source files. **If the deploy changes only the session DB schema, do not touch a current Landscape audit DB. If the Landscape schema is stale, archive/export required evidence and recreate it with the current release; no predecessor schema is transformed in place.** **Do not run any of this outside staging.**
 
@@ -373,21 +602,25 @@ For SQLite, `sessions.db`, `sessions.db-wal`, `sessions.db-shm`, and `sessions.d
 
 ### Preconditions
 
-1. The host is the staging host for `elspeth.foundryside.dev`.
+1. The host is the staging host for `elspeth.example.gov.au`.
 2. No human operator is mid-session.
-3. The source checkout at `/home/john/elspeth` is on the commit being deployed.
+3. The source checkout at `/srv/elspeth` is on the commit being deployed.
 4. `deploy/elspeth-web.env` has been inspected directly for session DB settings without printing secret values.
 5. The Stop/Go Gates above have been run: Landscape code/schema must not reference web-session identifiers.
 6. The candidate source ref has been recorded. Archived predecessor databases
    are evidence only and are never opened by the current release.
-7. The live SQLite deployment is single-worker: `deploy/elspeth-web.service` has no `--workers` flag, `WEB_CONCURRENCY` is unset or `1`, and the startup multi-worker guard in `src/elspeth/web/app.py` remains enabled.
+7. The live SQLite deployment is single-worker: the operator-local `deploy/elspeth-web.service` has no `--workers` flag, `WEB_CONCURRENCY` is unset or `1`, and the startup multi-worker guard in `src/elspeth/web/app.py` remains enabled.
 8. The operator has explicitly signed off on the `user_secrets` blast radius and
    has a documented re-entry/reseed procedure before users resume Composer work.
    **Any archive is a long-lived copy of live encrypted secret material and is
-   retained as evidence, not as a recovery database.** The `user_secrets` rows
-   are encrypted with `settings.secret_key`; if the key is reused, the archive
-   remains decryptable. Decide the key-rotation and archive-retention outcomes
-   up front and record them in the deploy plan.
+   retained as evidence, not as a recovery database.** From 0.8.0 the
+   `user_secrets` rows are encrypted under a key HKDF-derived from
+   `settings.secret_key` (`derive_user_secret_master_key`); rows in an archive
+   taken from an earlier store were encrypted under the raw key. Derivation
+   does not narrow the blast radius here — anyone holding `settings.secret_key`
+   can produce either key — so if the key is reused, the archive remains
+   decryptable exactly as before. Decide the key-rotation and archive-retention
+   outcomes up front and record them in the deploy plan.
 9. No other host-side process is writing the SQLite DB. The procedure stops `elspeth-web.service` and checks open handles before copying; if another process still has the main DB or a sidecar open, stop and identify it before continuing.
 
 ### Procedure
@@ -397,7 +630,7 @@ Use a host shell with `systemctl` and `sudo` access. The Codex sandbox cannot ru
 ```bash
 set -euo pipefail
 
-PROJECT_ROOT="/home/john/elspeth"
+PROJECT_ROOT="/srv/elspeth"
 ENV_FILE="$PROJECT_ROOT/deploy/elspeth-web.env"
 SERVICE="elspeth-web.service"
 PROJECT_ROOT_CANON="$(realpath -m "$PROJECT_ROOT")"
@@ -416,7 +649,7 @@ fi
 # live in the same file. Precedence:
 #   1. ELSPETH_WEB__SESSION_DB_URL=file-or-sqlite-url
 #   2. ELSPETH_WEB__DATA_DIR/sessions.db
-#   3. /home/john/elspeth/data/sessions.db
+#   3. /srv/elspeth/data/sessions.db
 SESSION_DB_URL="$(grep -E '^ELSPETH_WEB__SESSION_DB_URL=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
 DATA_DIR="$(grep -E '^ELSPETH_WEB__DATA_DIR=' "$ENV_FILE" | tail -n1 | cut -d= -f2- || true)"
 
@@ -472,7 +705,8 @@ fi
 # Checkpoint the WAL into the main DB FIRST so the archive captures a
 # self-contained copy. The session DB also stores the encrypted
 # UserSecretStore (constructed on the session engine in app.py:
-# `UserSecretStore(session_engine, settings.secret_key)`), so the -wal
+# `UserSecretStore(session_engine,
+# derive_user_secret_master_key(settings.secret_key))`), so the -wal
 # sidecar can hold uncheckpointed encrypted secret material. Folding the
 # WAL into the main file means the long-lived archive does not depend on a
 # matched -wal/-shm sidecar set to be readable, and no secret rows are
@@ -507,22 +741,24 @@ done
 sudo systemctl start "$SERVICE"
 
 curl --unix-socket /run/elspeth/uvicorn.sock -fsS http://localhost/api/health
-curl -fsS https://elspeth.foundryside.dev/api/health
+curl -fsS https://elspeth.example.gov.au/api/health
 sudo systemctl status "$SERVICE" --no-pager --lines=20
 ```
 
 `initialize_session_schema()` recreates the file on service startup. If either health check fails, inspect `journalctl -u elspeth-web.service --no-pager -n 80` before retrying.
 
-After health checks pass, prove the recreated session store carries the current
-hard-cut sentinel before creating any session:
+After health checks pass, prove both recreated stores carry the current hard-cut
+sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
+resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 35 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 53 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 38 (== SQLITE_SCHEMA_EPOCH)
 ```
 
-An epoch-34 result is not repairable in place: keep the service drained,
-recreate the session database with the current release, and rerun the probe.
-Then create a new session through the API or UI and confirm no
+Any predecessor session or Landscape epoch is not repairable in place: keep the
+service drained, recreate both stores with the current release, and rerun the
+probes. Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.
 
 #### 0.7.0 epoch + smoke verification
@@ -559,9 +795,9 @@ B1 interpretation-surfacing fix is in the deployed build). Any of these in
 the journal means the deploy is not clean — stop and inspect before
 handing staging back to users.
 
-Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release.
+Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release. On the 0.8.0 cutover, also settle the identity lockout at this point: every local account is `pending` until an operator activates it, per [Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset).
 
-At the **end of the deploy window**, destroy or secure the archive directories created above. Each is a long-lived copy of live encrypted secret material. It is only inert if `settings.secret_key` was **rotated** during this deploy; if the key was reused, the archive is decryptable with the running app's key, so an unattended snapshot directory is equivalent to leaving a readable copy of every staging secret on disk. If evidence retention requires keeping an archive, rotate `settings.secret_key` or move the archive to access-controlled storage.
+At the **end of the deploy window**, destroy or secure the archive directories created above. Each is a long-lived copy of live encrypted secret material. It is only inert if `settings.secret_key` was **rotated** during this deploy; if the key was reused, the archive is decryptable with the running app's key, so an unattended snapshot directory is equivalent to leaving a readable copy of every staging secret on disk. Deriving the encryption key from `settings.secret_key` rather than using it raw does not change that conclusion: the derivation is deterministic and unsalted, so holding `settings.secret_key` still yields the key the archived rows were written under. If evidence retention requires keeping an archive, rotate `settings.secret_key` or move the archive to access-controlled storage.
 
 ### Failed Cutover
 

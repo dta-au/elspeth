@@ -1,6 +1,6 @@
 # Token Outcome Gap Investigation Playbook
 
-Current as of 2026-05-20.
+Current as of 2026-08-03.
 
 Use this playbook when token outcomes are missing, illegal, duplicated, or
 inconsistent with node/batch/artifact evidence.
@@ -71,8 +71,11 @@ current source before editing; do not rely on old line-number references.
 Create the smallest reproduction that exercises the producer path:
 
 - one source row for source quarantine or default sink success
-- one gate for gate-route and gate-discard paths
-- one transform returning failure for `on_error_routed`
+- one gate for gate-route and intentional gate-discard paths
+- one gate whose row has an incompatible runtime type, exercised with a named
+  `on_error` sink, `on_error: discard`, and omitted `on_error`
+- one transform or config gate returning a row-scoped failure for
+  `on_error_routed`
 - one filter/drop transform for `filter_dropped`
 - one fork plus coalesce for parent/child lineage
 - one batch-aware transform for `buffered` and `batch_consumed`

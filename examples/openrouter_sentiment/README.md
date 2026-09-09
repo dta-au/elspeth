@@ -7,7 +7,7 @@ This example demonstrates using ELSPETH with the unified `llm` transform (provid
 1. Reads customer feedback text from `input.csv`
 2. Sends each text through OpenRouter (using GPT-4o-mini by default)
 3. Gets sentiment classification (positive/negative/neutral) with confidence scores
-4. Writes enriched results to `output/results.csv`
+4. Writes enriched results as JSON Lines to `output/results.json`
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ uv run elspeth run -s examples/openrouter_sentiment/settings_pooled.yaml --execu
 - `pool_size: 3` - Processes 3 rows concurrently instead of sequentially
 - **AIMD throttling** - Automatically backs off on rate limits (HTTP 429), then gradually increases concurrency
 - **Order preservation** - Results maintain submission order despite concurrent processing
-- Separate output: `output/results_pooled.csv` and audit: `runs/audit_pooled.db`
+- Separate output: `output/results_pooled.json` and audit: `runs/audit_pooled.db`
 
 **When to use pooled execution:**
 - Large datasets (100+ rows) where sequential processing is slow
@@ -52,7 +52,7 @@ max_capacity_retry_seconds: 60    # Timeout for rate limit retries (optional)
 
 ## Output
 
-The output CSV will contain the original columns plus:
+Each JSON Lines output record contains the original columns plus:
 - `sentiment_analysis` - The LLM's JSON response
 - `sentiment_analysis_usage` - Token usage metadata
 - `sentiment_analysis_template_hash` - Hash of the prompt template (for audit)

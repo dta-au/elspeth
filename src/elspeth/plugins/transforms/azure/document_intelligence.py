@@ -7,7 +7,7 @@ poll), and enriches the row with extracted content and structured facets.
 All HTTP flows through AuditedHTTPClient (full request/response audit, header
 fingerprinting so the api-key is never stored raw, telemetry, rate limiting).
 GA api-version 2024-11-30. See
-docs/superpowers/specs/2026-06-30-azure-document-intelligence-transform-design.md.
+docs/specs/2026-06-30-azure-document-intelligence-transform-design.md.
 
 SECURITY:
 - A SAS token embedded in a ``urlSource`` value is forwarded to Azure and
@@ -40,6 +40,7 @@ from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError, PluginRetryableError, is_capacity_error
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
@@ -84,6 +85,35 @@ _KNOWN_FEATURES: frozenset[str] = frozenset(
 
 _MODEL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._~-]{1,63}$")
 _PAGES_PATTERN = re.compile(r"^(\d+(-\d+)?)(,\s*(\d+(-\d+)?))*$")
+_AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES: tuple[str, ...] = (
+    ".cognitiveservices.azure.com",
+    ".api.cognitive.microsoft.com",
+    ".cognitiveservices.azure.us",
+    ".api.cognitive.microsoft.us",
+    ".cognitiveservices.azure.cn",
+    ".api.cognitive.azure.cn",
+)
+
+
+def _validate_azure_document_intelligence_endpoint(value: str) -> str:
+    """Validate that a credential-bearing endpoint targets Azure Document Intelligence."""
+    from elspeth.core.url_validation import validate_credential_safe_https_url
+
+    endpoint = validate_credential_safe_https_url(value, field_name="endpoint")
+    parsed = urlparse(endpoint)
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    if not any(hostname.endswith(suffix) and bool(hostname.removesuffix(suffix)) for suffix in _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES):
+        allowed = ", ".join(f"*{suffix}" for suffix in _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES)
+        raise ValueError(f"endpoint must be an Azure Document Intelligence resource endpoint ({allowed})")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("endpoint must use a valid HTTPS port") from exc
+    if port not in (None, 443):
+        raise ValueError("endpoint must use the standard HTTPS port 443")
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("endpoint must be an origin URL without a path, parameters, query, or fragment")
+    return endpoint
 
 
 class ExtractFields(BaseModel):
@@ -109,7 +139,7 @@ class ExtractFields(BaseModel):
 class AzureDocumentIntelligenceConfig(TransformDataConfig):
     """Configuration for the azure_document_intelligence transform."""
 
-    endpoint: str = Field(..., description="Azure Document Intelligence endpoint URL (HTTPS).")
+    endpoint: str = Field(..., description="Azure Document Intelligence resource endpoint URL (HTTPS, Azure host only).")
     api_key: str = Field(..., repr=False, description="Document Intelligence API key (Ocp-Apim-Subscription-Key).")
     api_version: str = Field("2024-11-30", description="REST api-version (GA 2024-11-30 only in v1).")
     model_id: str = Field(..., description="Prebuilt or custom model id, e.g. prebuilt-layout, prebuilt-invoice.")
@@ -155,9 +185,7 @@ class AzureDocumentIntelligenceConfig(TransformDataConfig):
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint(cls, v: str) -> str:
-        from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
-
-        return validate_credential_safe_https_url(v, field_name="endpoint")
+        return _validate_azure_document_intelligence_endpoint(v)
 
     @field_validator("api_key")
     @classmethod
@@ -243,7 +271,10 @@ class AzureDocumentIntelligenceConfig(TransformDataConfig):
     @property
     def declared_input_fields(self) -> frozenset[str]:
         """Declare ``source_field`` as required input so a missing reference is caught at
-        DAG/compose validation, not per-row at runtime (mirrors web_scrape's url_field)."""
+        DAG/compose validation rather than per-row at runtime (mirrors web_scrape's
+        url_field). That holds only where the upstream contract PARTICIPATES in the
+        guarantee vote: against an observed producer both static surfaces abstain by
+        design and the executor's per-row check stays the only enforcement."""
         return super().declared_input_fields | frozenset({self.source_field})
 
 
@@ -256,13 +287,17 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     multiple rows are in flight concurrently with FIFO output ordering.
     """
 
+    # source_field is the INPUT column (holds the document URL/base64); these
+    # three name the row fields the analysis result is WRITTEN to.
+    output_naming_config_keys = frozenset({"content_field", "page_count_field", "result_field"})
     name = "azure_document_intelligence"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:a1208f244b0a1522"
+    source_file_hash: str | None = "sha256:24c7e149d5bd98a5"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     creates_tokens = False
     discovery_secret_requirements: Mapping[str, tuple[str, ...]] = {
         "api_key": ("AZURE_DOCUMENT_INTELLIGENCE_KEY",),
@@ -271,26 +306,27 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     capability_tags = ("azure", "document", "ocr", "enrichment", "http")
 
     usage_when_to_use = (
-        "Use to turn documents (PDFs, images, office files) referenced per row "
-        "into structured data — text/markdown content, tables, key-value pairs, "
-        "and the typed fields of prebuilt or custom Document Intelligence models."
+        "Use URL or base64 mode to extract text, tables, key-value pairs, and typed fields from documents. "
+        "Request audit retains the submitted URL or encoded body; extracted remote content is untrusted "
+        "before LLM consumption."
     )
     usage_when_not_to_use = (
-        "Not for moderation or injection screening (use azure_content_safety / "
-        "azure_prompt_shield), and not for plain web pages (use web_scrape). "
-        "Documents must be reachable by a URL or supplied as a base64 string."
+        "Not for plain web pages or safety screening. Never embed a credential in a document URL, and "
+        "account for the request audit's credential-exposure and data-retention implications; use web_scrape "
+        "for public HTML pages."
     )
     example_use = (
         "transform:\n"
         "  plugin: azure_document_intelligence\n"
         "  options:\n"
-        "    endpoint: https://my-di.cognitiveservices.azure.com\n"
-        "    api_key: ${AZURE_DOCUMENT_INTELLIGENCE_KEY}\n"
+        "    endpoint: https://catalogue-di.cognitiveservices.azure.com\n"
+        "    api_key: {secret_ref: AZURE_DOCUMENT_INTELLIGENCE_KEY}\n"
         "    model_id: prebuilt-layout\n"
         "    source_mode: url\n"
         "    source_field: document_url\n"
         "    content_field: di_content\n"
         "    output_content_format: markdown\n"
+        "    features: [keyValuePairs]\n"
         "    extract: {tables: di_tables, key_value_pairs: di_kv}\n"
         "    schema: {mode: observed}"
     )
@@ -323,6 +359,10 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         self._model_id = cfg.model_id
         self._source_mode = cfg.source_mode
         self._source_field = cfg.source_field
+        # The document reference must arrive as a non-empty string or the row
+        # fails closed — declare the string-type half of that contract so the
+        # DAG rejects a provably non-string producer (elspeth-b19dfe41fb).
+        self.declared_string_input_fields = frozenset({cfg.source_field})
         self._max_base64_chars = cfg.max_base64_chars
         self._content_field = cfg.content_field
         self._output_content_format = cfg.output_content_format
@@ -343,6 +383,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._reject_input_options_naming_created_fields({"source_field": cfg.source_field})
 
         schema_config = cfg.schema_config
         self.input_schema = create_schema_from_config(schema_config, "AzureDocumentIntelligenceInput", allow_coercion=False)

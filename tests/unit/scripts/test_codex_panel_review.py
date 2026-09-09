@@ -74,8 +74,14 @@ def test_load_persona_reads_and_errors(tmp_path):
 
 def test_route_lenses_default_and_override():
     py = Path("src/elspeth/web/foo.py")
-    routed = cpr.route_lenses(py)
-    assert "solution-architect" in routed and "security-architect" in routed
+    expected = [
+        "solution-architect",
+        "systems-thinker",
+        "quality-engineer",
+        "security-architect",
+    ]
+    assert cpr.route_lenses(py) == expected
+    assert cpr.route_lenses(Path("src/elspeth/web/frontend/foo.tsx")) == expected
     # explicit override is returned verbatim
     assert cpr.route_lenses(py, override=["security-architect"]) == ["security-architect"]
 

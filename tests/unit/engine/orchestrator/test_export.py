@@ -26,12 +26,14 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from elspeth.contracts import CallType
+from elspeth.contracts import CallType, Determinism, NodeType
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, AuditExportFormat, SinkEffectInputKind
+from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.sink_effects import SINK_EFFECT_PROTOCOL_VERSION, AuditExportFormat, SinkEffectContract, SinkEffectInputKind
 from elspeth.core.landscape.factory import RecorderFactory as _RealRecorderFactory
 from elspeth.engine.orchestrator.export import (
     export_landscape as _production_export_landscape,
@@ -81,7 +83,7 @@ class _CallRecorder:
         assert self.calls == []
 
 
-class _SinkDouble:
+class _SinkDouble(SinkEffectContract):
     effect_call_type = CallType.FILESYSTEM
     name = "export_sink"
     plugin_version = "test"
@@ -89,6 +91,7 @@ class _SinkDouble:
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
+    effect_mode_remediation: str | None = None
     supported_audit_export_formats = frozenset({AuditExportFormat.JSON, AuditExportFormat.CSV})
 
     @classmethod
@@ -100,6 +103,14 @@ class _SinkDouble:
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def __init__(self, *, config: dict[str, Any] | None = None, **overrides: Any) -> None:
         self.config = config or {}
@@ -150,12 +161,28 @@ _TEST_AUDIT_CONTENT_STORE_RESOLVER = AuditExportContentStoreResolver()
 _TEST_AUDIT_CONTENT_STORE_RESOLVER.register(_TEST_AUDIT_CONTENT_STORE)
 
 
+def _export_seat_token(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CoordinationToken:
+    """The export seat these scenarios act under (ADR-048 §4).
+
+    Constructed rather than read back from the seat, deliberately: this module
+    drives ``export_landscape`` against resource doubles with no Landscape
+    behind them — several scenarios pass ``object()`` as the database — so
+    there is no ``run_coordination`` row a read-back could return. The real
+    seat is covered where a real one exists, by
+    ``tests/integration/pipeline/test_audit_export_effect_recovery.py`` and the
+    e2e export suites.
+    """
+    run_id = kwargs["run_id"] if "run_id" in kwargs else args[1]
+    return CoordinationToken(run_id=run_id, worker_id=kwargs["worker_id"], leader_epoch=1)
+
+
 def export_landscape(*args: Any, **kwargs: Any) -> None:
     """Keep existing unit scenarios explicit without repeating resource doubles."""
     kwargs.setdefault("payload_store", _TEST_PAYLOAD_STORE)
     kwargs.setdefault("audit_export_content_store", _TEST_AUDIT_CONTENT_STORE)
     kwargs.setdefault("audit_export_content_store_resolver", _TEST_AUDIT_CONTENT_STORE_RESOLVER)
     kwargs.setdefault("worker_id", "runtime-worker")
+    kwargs.setdefault("coordination_token", _export_seat_token(args, kwargs))
     _production_export_landscape(*args, **kwargs)
 
 
@@ -253,6 +280,11 @@ def test_csv_export_runs_bundle_capability_probe_before_snapshot_reservation(tmp
     settings = _make_settings(fmt="csv")
     settings.sinks["output"].options = options
     sink = CSVSink(options)
+    observed: list[str] = []
+
+    def publication_preflight() -> None:
+        observed.append(f"probe:{target}")
+
     binding = SinkEffectRuntimeBinding(
         sink_name="output",
         sink=sink,
@@ -260,17 +292,13 @@ def test_csv_export_runs_bundle_capability_probe_before_snapshot_reservation(tmp
         config_fingerprint=stable_hash(options),
         purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
         effect_mode=ResolvedSinkEffectMode("write"),
+        audit_export_publication_preflight=publication_preflight,
     )
     binding, admission = prepare_audit_export_binding(settings, lambda _name: binding)
-    observed: list[str] = []
     factory = SimpleNamespace(data_flow=SimpleNamespace(register_node=_CallRecorder(), get_node=lambda *_a, **_k: None))
 
     with (
         patch("elspeth.core.landscape.factory.RecorderFactory", return_value=factory),
-        patch(
-            "elspeth.plugins.sinks._audit_export_bundle_effects.preflight_audit_export_bundle",
-            side_effect=lambda path: observed.append(f"probe:{path}"),
-        ),
         patch(
             "elspeth.engine.orchestrator.audit_export_effects.prepare_audit_export_snapshot",
             side_effect=lambda *_args, **_kwargs: observed.append("snapshot") or object(),
@@ -287,6 +315,39 @@ def test_csv_export_runs_bundle_capability_probe_before_snapshot_reservation(tmp
         )
 
     assert observed == [f"probe:{target}", "snapshot"]
+
+
+def test_csv_export_requires_runtime_bound_publication_preflight(tmp_path: Path) -> None:
+    from elspeth.plugins.sinks.csv_sink import CSVSink
+
+    options = {"path": str(tmp_path / "audit-bundle"), "schema": {"mode": "observed"}}
+    settings = _make_settings(fmt="csv")
+    settings.sinks["output"].options = options
+    sink = CSVSink(options)
+    binding = SinkEffectRuntimeBinding(
+        sink_name="output",
+        sink=sink,
+        sink_type=type(sink),
+        config_fingerprint=stable_hash(options),
+        purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
+        effect_mode=ResolvedSinkEffectMode("write"),
+    )
+    binding, admission = prepare_audit_export_binding(settings, lambda _name: binding)
+
+    with (
+        patch("elspeth.engine.orchestrator.audit_export_effects.prepare_audit_export_snapshot") as prepare_snapshot,
+        pytest.raises(SinkEffectCapabilityError, match="publication preflight"),
+    ):
+        export_landscape(
+            object(),
+            "run-1",
+            settings,
+            lambda _name: binding,
+            prepared_binding=binding,
+            sink_effect_admission=admission,
+        )
+
+    prepare_snapshot.assert_not_called()
 
 
 # =============================================================================
@@ -327,11 +388,35 @@ class _LegacyExportLandscapeJSON:
                 audit_export_content_store=audit_content_store,
                 audit_export_content_store_resolver=audit_content_store_resolver,
                 worker_id="runtime-worker",
+                coordination_token=CoordinationToken(run_id="run-1", worker_id="runtime-worker", leader_epoch=1),
             )
 
         recorder_factory.assert_called_once_with(exporter.call_args.args[0], payload_store=payload_store)
         assert exporter.call_args.kwargs["read_model"] is not None
         assert sink.node_id is None
+
+    def test_export_landscape_refuses_a_token_for_another_run(self) -> None:
+        """ADR-048 §2: the export writes are fenced against the token's seat.
+
+        A ``run_id`` that is not the token's run would fence one run's seat and
+        register another run's snapshot. This refusal is what stops the unit
+        wrapper's minted default from papering over a real wiring mismatch —
+        it fires before any export effect, so nothing needs patching.
+        """
+        _sink, factory = _make_sink_and_factory()
+
+        with pytest.raises(ValueError, match="under a leader token for run 'other-run'"):
+            _production_export_landscape(
+                object(),
+                "run-1",
+                self._make_settings(),
+                factory,
+                payload_store=object(),
+                audit_export_content_store=_AuditContentStoreDouble(),
+                audit_export_content_store_resolver=AuditExportContentStoreResolver(),
+                worker_id="runtime-worker",
+                coordination_token=CoordinationToken(run_id="other-run", worker_id="worker:runtime-worker", leader_epoch=1),
+            )
 
     def test_export_preflight_passes_explicit_audit_snapshot_kind(self) -> None:
         sink, factory = _make_sink_and_factory()
@@ -774,6 +859,25 @@ def test_export_module_does_not_define_resume_schema_reconstruction_helpers() ->
 class TestReconstructSchemaBasic:
     """Tests for reconstruct_schema_from_json with basic types."""
 
+    def test_canonical_unconstrained_field_restores_fixed_any_type(self) -> None:
+        """Pydantic's canonical schema for a fixed ``any`` field restores as object."""
+        schema = {
+            "properties": {
+                "items": {"title": "Items"},
+                "order_id": {"title": "Order Id", "type": "integer"},
+            },
+            "required": ["items", "order_id"],
+            "title": "SourceRow",
+            "type": "object",
+        }
+
+        model = reconstruct_schema_from_json(schema)
+
+        assert model.model_fields["items"].annotation is object
+        assert model.model_json_schema()["properties"]["items"] == {"title": "Items"}
+        for value in ([{"sku": "A1"}], {"sku": "A1"}, "A1", 1, None):
+            assert model(items=value, order_id=1).items == value
+
     def test_string_field(self) -> None:
         """String type maps correctly."""
         schema = {
@@ -987,6 +1091,24 @@ class TestReconstructSchemaFormats:
 class TestReconstructSchemaAnyOf:
     """Tests for anyOf patterns (Decimal, nullable)."""
 
+    def test_nullable_fixed_any_pattern(self) -> None:
+        """Pydantic's canonical ``Any | None`` schema restores without broad fallback."""
+        schema = {
+            "properties": {
+                "metadata": {
+                    "anyOf": [{}, {"type": "null"}],
+                    "default": None,
+                    "title": "Metadata",
+                },
+            },
+        }
+
+        model = reconstruct_schema_from_json(schema)
+
+        assert model(metadata={"source": "api"}).metadata == {"source": "api"}
+        assert model(metadata=["arbitrary"]).metadata == ["arbitrary"]
+        assert model(metadata=None).metadata is None
+
     def test_decimal_anyof_pattern(self) -> None:
         """anyOf with number+string maps to Decimal."""
         schema = {
@@ -1131,6 +1253,24 @@ class TestReconstructSchemaErrors:
             "properties": {"x": {"description": "no type here"}},
             "required": ["x"],
         }
+        with pytest.raises(AuditIntegrityError, match="no 'type'"):
+            reconstruct_schema_from_json(schema)
+
+    @pytest.mark.parametrize(
+        "field_info",
+        (
+            {"title": 7},
+            {"title": "Constrained", "minimum": 0},
+        ),
+        ids=("malformed-title", "unsupported-constraint"),
+    )
+    def test_noncanonical_typeless_field_still_fails_closed(self, field_info: dict[str, object]) -> None:
+        """Only the exact producer form for fixed ``any`` may omit ``type``."""
+        schema = {
+            "properties": {"x": field_info},
+            "required": ["x"],
+        }
+
         with pytest.raises(AuditIntegrityError, match="no 'type'"):
             reconstruct_schema_from_json(schema)
 
@@ -1345,7 +1485,7 @@ class TestExportNodeRegistrationIdempotence:
                 plugin_name="imposter",
             )
             settings = _make_settings()
-            _sink, sink_factory = _make_sink_and_factory(source_file_hash="sha256:" + "0" * 16)
+            sink, sink_factory = _make_sink_and_factory(source_file_hash="sha256:" + "0" * 16)
 
             with (
                 patch("elspeth.core.landscape.factory.RecorderFactory", _RealRecorderFactory),
@@ -1359,5 +1499,58 @@ class TestExportNodeRegistrationIdempotence:
                 export_landscape(db, run_id, settings, sink_factory)
 
             execute.assert_not_called()
+            sink.close.assert_called_once()
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        ("registered_overrides", "retry_overrides", "divergent_field"),
+        [
+            ({"config": {"path": "/old"}}, {"config": {"path": "/new"}}, "config_hash"),
+            ({"plugin_version": "old"}, {"plugin_version": "new"}, "plugin_version"),
+            (
+                {"source_file_hash": "sha256:" + "a" * 16},
+                {"source_file_hash": "sha256:" + "b" * 16},
+                "source_file_hash",
+            ),
+        ],
+    )
+    def test_export_refuses_to_reuse_node_with_stale_provenance(
+        self,
+        registered_overrides: dict[str, Any],
+        retry_overrides: dict[str, Any],
+        divergent_field: str,
+    ) -> None:
+        db, real_factory, run_id = self._real_db_setup()
+        try:
+            valid_source_hash = "sha256:" + "0" * 16
+            registered_sink, _ = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **registered_overrides})
+            real_factory.data_flow.register_node(
+                run_id=run_id,
+                node_id="export:output",
+                plugin_name=registered_sink.name,
+                node_type=NodeType.SINK,
+                plugin_version=registered_sink.plugin_version,
+                config=dict(registered_sink.config),
+                schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+                determinism=Determinism.IO_WRITE,
+                source_file_hash=registered_sink.source_file_hash,
+            )
+            settings = _make_settings()
+            retry_sink, sink_factory = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **retry_overrides})
+
+            with (
+                patch("elspeth.core.landscape.factory.RecorderFactory", _RealRecorderFactory),
+                patch(
+                    "elspeth.engine.orchestrator.audit_export_effects.prepare_audit_export_snapshot",
+                    return_value=object(),
+                ),
+                patch("elspeth.engine.orchestrator.audit_export_effects.execute_audit_export_effect") as execute,
+                pytest.raises(AuditIntegrityError, match=divergent_field),
+            ):
+                export_landscape(db, run_id, settings, sink_factory)
+
+            execute.assert_not_called()
+            retry_sink.close.assert_called_once()
         finally:
             db.close()

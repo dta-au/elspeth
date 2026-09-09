@@ -5,9 +5,9 @@
    sidebar, and inspector). */
 
 /* ---------------------------------------------------------------------------
-   Audit Readiness panel (right-rail slot)
+   Audit Readiness panel (Inspector Audit tab)
    TSX: src/components/audit/AuditReadinessPanel.tsx + AuditReadinessRow.tsx.
-   Mounted into the .side-rail's audit-readiness slot.
+   Mounted into WorkspaceInspector's persistent Audit tab panel.
 
    Two visible variants:
      1. Collapsed "Audit ready" pill — single button shown when no rows are
@@ -17,7 +17,7 @@
         operator-visible "weirdly wide and full of text" symptom from the
         shipped-without-CSS state.
      2. Expanded panel — header (title + freshness) and an action cluster
-        (Refresh, Explain →, Collapse), followed by six readiness rows.
+        (Refresh, Explain, Collapse), followed by six readiness rows.
 
    Row status accents are a 3px left-edge stripe whose colour reinforces the
    glyph (✓ ⚠ ✗ —). The glyph stays the primary status channel; the colour
@@ -83,6 +83,12 @@
   background-color: var(--color-surface-hover);
 }
 
+.audit-readiness-summary-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
 .audit-readiness-summary-meta {
   display: block;
   font-size: var(--font-size-xs);
@@ -108,9 +114,7 @@
   color: var(--color-text);
 }
 
-/* Panel name outside the expanded header (loading / error / collapsed states)
-   — the destination the graduation copy points at must exist by name in every
-   state (elspeth-4f69b267dd). */
+/* Panel name outside the expanded header (loading / error states). */
 .audit-readiness-title--standalone {
   margin-bottom: var(--space-2xs);
 }
@@ -216,7 +220,7 @@
   font-weight: 600;
 }
 
-/* Gate legibility (elspeth-088bf83922 T-2): "Blocks Run" / "Advisory" text
+/* Gate legibility (elspeth-088bf83922 T-2): "Blocks run" / "Advisory" text
    badge next to each row heading, classified by isRunGatingReadinessRow
    (ExecuteButton.tsx). Plain text, not colour-coded — the row's existing
    status-glyph/left-edge-stripe treatment already carries the ok/warning/
@@ -225,10 +229,21 @@
    status rows already surface. --color-text-muted is the same token
    .audit-readiness-row-summary already renders on every row background
    (including the warning/error tints), so no new contrast surface is
-   introduced. */
+   introduced.
+
+   ONE BOX FOR BOTH VARIANTS (elspeth-7fb1633b86). The border and the padding
+   belong to the BASE rule, so a `--blocks` chip and an `--advisory` chip
+   occupy identical geometry and only the border COLOUR distinguishes them.
+   Previously the border lived on `--blocks` alone and `--advisory` had no
+   rule at all, so the pair rendered as a bordered chip beside a bare run of
+   muted text — two unrelated marks rather than two states of one field, and
+   2px apart in both axes. Both variants now declare a border-color and
+   neither declares padding or border-width; the auditChrome.test.ts box
+   invariant fails if a future edit puts either back on one variant only. */
 .audit-readiness-row-gate {
   display: inline-block;
-  padding: 0 var(--space-2xs);
+  padding: var(--space-2xs) var(--space-xs);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   font-size: var(--font-size-xs);
   font-weight: 400;
@@ -237,7 +252,15 @@
 }
 
 .audit-readiness-row-gate--blocks {
-  border: 1px solid var(--color-border-strong);
+  border-color: var(--color-border-strong);
+}
+
+/* The quieter half of the same pair: same box, same text colour, a lighter
+   edge. Advisory rows outnumber gating ones five to one on a typical
+   snapshot, so this edge stays at --color-border rather than competing with
+   the row's own status stripe. */
+.audit-readiness-row-gate--advisory {
+  border-color: var(--color-border);
 }
 
 .audit-readiness-row-summary {
@@ -257,7 +280,8 @@
 .explain-dialog-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  /* Backdrops consume --color-scrim, never a literal (elspeth-e6fcd8d703). */
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
@@ -269,7 +293,9 @@
   flex-direction: column;
   background-color: var(--color-surface-paper);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* Modal radius, not the button radius — the same correction .graph-modal /
+     .yaml-modal already took (elspeth-03492be50b, elspeth-e6fcd8d703). */
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
   overflow: hidden;
 }
@@ -295,20 +321,10 @@
   font-size: var(--font-size-lg);
 }
 
-.explain-dialog-close {
-  min-width: 36px;
-  min-height: var(--size-control-compact);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface-elevated);
-  color: var(--color-text);
-  cursor: pointer;
-  transition: background-color var(--transition-fast);
-}
-
-.explain-dialog-close:hover {
-  background-color: var(--color-surface-hover);
-}
+/* .explain-dialog-close is styled by the shared .dialog-close group in
+   common.css (elspeth-e6fcd8d703). The class stays in the TSX because it is
+   ExplainDialog's focus-trap initial-focus selector; no declarations live
+   here so the recipe has exactly one home. */
 
 .explain-dialog-loading,
 .explain-dialog-error,
@@ -328,12 +344,41 @@
   color: var(--color-text);
 }
 
+/* Narrative prose rendered through MarkdownRenderer (elspeth-d74ab492dd). It
+   was a `<pre>`; the producer (`src/elspeth/web/audit_readiness/explain.py`)
+   emits an intro line, a blank line, then consecutive `- `-prefixed sentences
+   — i.e. a markdown LIST — so the renderer now gives screen-reader users a
+   list role, an item count and list navigation that a `<pre>` cannot provide.
+
+   The measure cap is the same 74ch the chat bubbles settled on
+   (chat.css:1131-1142) — this dialog is `inset: 32px`, i.e. full-bleed, and
+   uncapped prose ran to roughly 150 characters per line, about twice the
+   comfortable measure, so the eye lost its line on every return sweep.
+   `white-space: pre-wrap` is gone: the renderer now owns block structure, so
+   paragraphs and list items carry the line breaks that the declaration used
+   to preserve.
+
+   The family/size no longer have to out-rank base.css's bare-`pre` mono rule,
+   since there is no `<pre>` left to inherit it. But MarkdownRenderer nests a
+   `.markdown-body` (common.css:72) whose own `font-size: var(--font-size-sm)`
+   and `line-height: 1.5` would otherwise win over the md/relaxed pair set
+   here, silently shrinking this narrative one size step AND making the 74ch
+   cap above a false claim — `ch` resolves against the wrapper's md size, so a
+   smaller inner face means a measure of roughly 80+ characters, not 74. The
+   inherit pair below is what keeps both this rule and that paragraph true. */
 .explain-dialog-narrative {
   flex: 1 1 auto;
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  line-height: var(--line-height-normal);
-  white-space: pre-wrap;
+  max-width: 74ch;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-relaxed);
+}
+
+/* The narrative's own typography wins over the generic markdown body, so the
+   measure cap above stays honest (see the block comment). */
+.explain-dialog-narrative .markdown-body {
+  font-size: inherit;
+  line-height: inherit;
 }
 
 /* ---------------------------------------------------------------------------
@@ -402,6 +447,49 @@
 .readiness-row-detail-summary {
   font-weight: 600;
   border-bottom: 1px solid var(--color-border);
+}
+
+/* Humanised validation findings (elspeth-459950731c).
+   ReadinessRowDetail renders these as a <ul> of <li class="…-body">. The
+   class shipped undefined, so the list kept the UA `padding-inline-start:
+   40px` and disc markers on top of each item's own --space-md padding: the
+   finding text started 52px into a 420px drawer while the summary directly
+   above it started at 12px, and the drawer showed three different left
+   edges. base.css has no global list reset (deliberately — it resets only
+   box-sizing and the code faces), so a list that must not look like a
+   document list resets here.
+
+   ONE LEFT EDGE: this rule contributes no inline padding of its own, so the
+   findings inherit the SAME --space-md inset that .readiness-row-detail-body
+   already gives the summary and the non-validation prose. auditChrome.test.ts
+   pins that equality rather than the 12px literal. */
+.readiness-row-detail-findings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Raw engine text behind the "Technical details" disclosure. The <details>
+   itself was flush at x=0 against the 12px prose edge above it; this aligns
+   it and separates it from the plain-language findings it qualifies. */
+.readiness-row-detail-raw {
+  margin: 0;
+  padding: var(--space-md);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-sm);
+}
+
+/* Unlike the narrative prose, this half genuinely IS machine output —
+   pydantic traces and schema-contract violations — so the mono face here
+   carries information. base.css already supplies the family, size and
+   pre-wrap for a bare <pre>; this adds the quoted-block surface that marks
+   it as the engineer's read rather than the novice's. */
+.readiness-row-detail-raw-text {
+  margin: var(--space-sm) 0 0 0;
+  padding: var(--space-sm);
+  background-color: var(--color-surface);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
 }
 
 .readiness-row-detail-components {

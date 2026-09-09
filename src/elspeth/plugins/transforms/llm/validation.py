@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+from elspeth.contracts.errors import TransformErrorReason
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType, ResponseFormat
 
 
 def reject_nonfinite_constant(value: str) -> None:
@@ -174,3 +175,102 @@ def strip_markdown_fences(content: str) -> str:
         stripped = stripped.rstrip()
         stripped = stripped[:-3].strip()
     return stripped
+
+
+def build_structured_response_directive(
+    *,
+    schema_name: str,
+    output_fields: tuple[OutputFieldConfig, ...],
+    response_format: ResponseFormat,
+    prompt: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Build the provider response constraint and exact prompt for a query.
+
+    Shared by every LLM plugin surface that declares ``output_fields`` (the
+    multi-query per-query pair, the single-prompt top-level pair, and the LLM
+    source). Structured mode sends the schema through the API-native
+    ``response_format`` contract. Standard JSON mode guarantees only a JSON
+    object at the API boundary, so the declared field contract must also be
+    present in the prompt before runtime validation can reasonably enforce
+    it. Canonical JSON keeps field names and enum values escaped and
+    deterministic rather than interpolating them as free-form prose.
+
+    Args:
+        schema_name: json_schema name advertised to the API (e.g. "q1_output").
+        output_fields: Declared typed output fields (empty = no constraint).
+        response_format: STRUCTURED (API-enforced json_schema) or STANDARD.
+        prompt: The rendered prompt before any contract suffix.
+
+    Returns:
+        (response_format dict or None, provider prompt actually sent).
+    """
+    from elspeth.contracts.hashing import canonical_json
+
+    if not output_fields:
+        return None, prompt
+    properties = {field.suffix: field.to_json_schema() for field in output_fields}
+    output_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+    }
+    if response_format == ResponseFormat.STRUCTURED:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "schema": output_schema,
+            },
+        }, prompt
+    return {"type": "json_object"}, (
+        f"{prompt}\n\nReturn exactly one JSON object matching this required output contract (JSON Schema):\n{canonical_json(output_schema)}"
+    )
+
+
+def extract_structured_fields(
+    content: str,
+    output_fields: tuple[OutputFieldConfig, ...],
+) -> tuple[dict[str, Any], TransformErrorReason | None]:
+    """Parse and validate an LLM JSON response against declared output fields.
+
+    Tier 3 boundary: the response is external data — parse immediately,
+    reject non-object payloads, missing declared fields, and type
+    mismatches instead of coercing. Callers wrap the returned error reason
+    with their own context (query name/index where one exists).
+
+    Returns:
+        (fields keyed by suffix, None) on success;
+        ({}, error reason dict carrying at least "reason") on failure.
+    """
+    try:
+        parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
+    except (json.JSONDecodeError, ValueError) as e:
+        return {}, {
+            "reason": "json_parse_failed",
+            "error": str(e),
+            "raw_response_preview": content[:500],
+        }
+    if not isinstance(parsed, dict):
+        return {}, {
+            "reason": "invalid_json_type",
+            "expected": "object",
+            "actual": type(parsed).__name__,
+        }
+    extracted: dict[str, Any] = {}
+    for field in output_fields:
+        if field.suffix not in parsed:
+            return {}, {
+                "reason": "missing_output_field",
+                "field": field.suffix,
+                "available_fields": list(parsed.keys()),
+            }
+        type_error = validate_field_value(parsed[field.suffix], field)
+        if type_error is not None:
+            return {}, {
+                "reason": "field_type_mismatch",
+                "field": field.suffix,
+                "error": type_error,
+                "value": repr(parsed[field.suffix])[:200],
+            }
+        extracted[field.suffix] = parsed[field.suffix]
+    return extracted, None

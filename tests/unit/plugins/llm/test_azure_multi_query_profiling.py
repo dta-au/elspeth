@@ -22,7 +22,7 @@ import pytest
 from elspeth.contracts import TransformResult
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
-from elspeth.plugins.transforms.llm.provider import LLMQueryResult
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -97,8 +97,7 @@ class _QueryExecutor(Protocol):
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, object] | None = None,
     ) -> LLMQueryResult: ...
 
@@ -115,8 +114,7 @@ class _ProviderDouble:
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, object] | None = None,
     ) -> LLMQueryResult:
         return self._execute_query(
@@ -124,8 +122,7 @@ class _ProviderDouble:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
-            state_id=state_id,
-            token_id=token_id,
+            audit_parent=audit_parent,
             response_format=response_format,
         )
 
@@ -380,8 +377,7 @@ class TestLoadScenarios:
             model: str,
             temperature: float,
             max_tokens: int | None,
-            state_id: str,
-            token_id: str,
+            audit_parent: LLMAuditParent,
             response_format: dict[str, object] | None = None,
         ) -> LLMQueryResult:
             query_call_count[0] += 1
@@ -508,11 +504,12 @@ class TestRowAtomicity:
             model: str,
             temperature: float,
             max_tokens: int | None,
-            state_id: str,
-            token_id: str,
+            audit_parent: LLMAuditParent,
             response_format: dict[str, object] | None = None,
         ) -> LLMQueryResult:
             llm_call_count[0] += 1
+            state_id = audit_parent.state_id
+            assert state_id is not None
             row_idx = int(state_id.rsplit("-", 1)[1])
             if row_idx in failing_rows:
                 raise RateLimitError("Rate limit exceeded")
@@ -612,12 +609,13 @@ class TestRowAtomicity:
             model: str,
             temperature: float,
             max_tokens: int | None,
-            state_id: str,
-            token_id: str,
+            audit_parent: LLMAuditParent,
             response_format: dict[str, object] | None = None,
         ) -> LLMQueryResult:
             """Simulate an 80% per-row persistent failure rate."""
             llm_call_count[0] += 1
+            state_id = audit_parent.state_id
+            assert state_id is not None
             row_idx = int(state_id.rsplit("-", 1)[1])
             if row_idx in failing_rows:
                 raise RateLimitError("Rate limit exceeded")
@@ -708,8 +706,7 @@ class TestRowAtomicity:
             model: str,
             temperature: float,
             max_tokens: int | None,
-            state_id: str,
-            token_id: str,
+            audit_parent: LLMAuditParent,
             response_format: dict[str, object] | None = None,
         ) -> LLMQueryResult:
             """Simulate failures in a pattern that affects different rows."""

@@ -1,7 +1,7 @@
 """
-Configuration schema and loading for Elspeth pipelines.
+Configuration schemas and pure transformations for Elspeth pipelines.
 
-Uses Pydantic for validation and Dynaconf for multi-source loading.
+Uses Pydantic for validation. Plugin-aware loading lives in elspeth.config_loading.
 
 Immutability model (see elspeth-c9a2397270): Pydantic ``frozen=True`` blocks
 attribute *reassignment* after construction, but nested containers (option
@@ -20,11 +20,11 @@ import re
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_MAX_CHUNK_BYTES,
@@ -35,12 +35,24 @@ from elspeth.contracts.audit_export import (
     validate_content_namespace,
     validate_credential_free_identifier,
 )
-from elspeth.contracts.enums import OutputMode, RunMode
+from elspeth.contracts.emitted_option import ENV_VAR_REFERENCE_PATTERN
+from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode, RunMode
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.security import SecretFingerprintError as SecretFingerprintError
 from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core import dynaconf_normalization, template_materialization
 from elspeth.core.dependency_config import CollectionProbeConfig, CommencementGateConfig, DependencyConfig
+from elspeth.core.llm_profiles import (
+    LLM_PROFILE_PRIVATE_FIELDS,
+    LLMProfileSettings,
+    LoweredLLMProfileAlias,
+    RuntimeLLMProfile,
+    lower_llm_profile_options,
+    make_lowered_llm_profile_alias,
+    require_lowered_llm_profile_alias,
+    validate_profile_alias,
+)
 from elspeth.core.secrets import is_secret_field
 
 DynaconfKeyNormalizer = dynaconf_normalization.DynaconfKeyNormalizer
@@ -181,6 +193,17 @@ _VALID_NODE_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 # underscore (checked separately).
 _VALID_CONNECTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$")
 
+RuntimeNodeName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=_MAX_NODE_NAME_LENGTH,
+        pattern=_VALID_NODE_NAME_RE.pattern,
+    ),
+]
+"""Runtime-owned processing-node identifier shape shared by authoring boundaries."""
+
 
 def _validate_node_name_chars(value: str, *, field_label: str) -> None:
     """Enforce character-class restriction on processing node names.
@@ -194,6 +217,20 @@ def _validate_node_name_chars(value: str, *, field_label: str) -> None:
             f"{field_label} '{value}' contains invalid characters. "
             "Node names must start with a letter and contain only letters, digits, underscores, and hyphens."
         )
+
+
+def validate_runtime_node_name(value: str, *, field_label: str) -> str:
+    """Validate and normalize a processing-node name against runtime settings."""
+    if not value or not value.strip():
+        raise ValueError(f"{field_label} must not be empty")
+    normalized = value.strip()
+    _validate_max_length(normalized, field_label=field_label, max_length=_MAX_NODE_NAME_LENGTH)
+    _validate_node_name_chars(normalized, field_label=field_label)
+    if normalized in _RESERVED_EDGE_LABELS:
+        raise ValueError(f"{field_label} '{normalized}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+    if normalized.startswith("__"):
+        raise ValueError(f"{field_label} '{normalized}' starts with '__', which is reserved for system edges")
+    return normalized
 
 
 def _validate_connection_name_chars(value: str, *, field_label: str) -> None:
@@ -212,6 +249,20 @@ def _validate_connection_name_chars(value: str, *, field_label: str) -> None:
 def _validate_connection_or_sink_name(value: str, *, field_label: str) -> str:
     """Validate user-supplied connection/sink identifiers used for routing."""
     _validate_max_length(value, field_label=field_label, max_length=_MAX_CONNECTION_NAME_LENGTH)
+    _validate_connection_name_chars(value, field_label=field_label)
+    if value in _RESERVED_EDGE_LABELS:
+        raise ValueError(f"{field_label} '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+    if value.startswith("__"):
+        raise ValueError(f"{field_label} '{value}' starts with '__', which is reserved for system edges")
+    return value
+
+
+def validate_sink_name(value: str, *, field_label: str = "Sink name") -> str:
+    """Validate one sink name against the exact runtime settings contract."""
+
+    if value != value.lower():
+        raise ValueError(f"{field_label} '{value}' must be lowercase. Suggested fix: '{value.lower()}'.")
+    _validate_max_length(value, field_label=field_label, max_length=_MAX_NODE_NAME_LENGTH)
     _validate_connection_name_chars(value, field_label=field_label)
     if value in _RESERVED_EDGE_LABELS:
         raise ValueError(f"{field_label} '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
@@ -688,6 +739,14 @@ class GateSettings(BaseModel):
         max_length=32,
         description="Maps route labels to destinations (connection name, sink name, 'fork', or virtual 'discard')",
     )
+    on_error: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Optional per-row expression-evaluation failure policy: a sink name "
+            "to divert the row, or 'discard'. Omission preserves fail-fast execution."
+        ),
+    )
     fork_to: list[str] | None = Field(
         default=None,
         max_length=32,
@@ -772,6 +831,27 @@ class GateSettings(BaseModel):
             )
         return v
 
+    @field_validator("on_error")
+    @classmethod
+    def validate_on_error(cls, v: str | None) -> str | None:
+        """Validate the optional row-error policy: a sink name, 'discard', or omitted.
+
+        Shape-only at parse time — this validator accepts any reasonably-shaped
+        identifier, so a name that turns out to be neither a sink nor omitted
+        also passes here when it names a bound region's closer (coalesce/
+        row_union/collector; spec §7 rule 9), from inside that region. Whether
+        the name resolves to a sink or a legal in-region closer is a build-time
+        (DAG compilation) concern, not this parser's.
+        """
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("on_error must be a sink name, 'discard', or omitted")
+        value = v.strip()
+        if value == "discard":
+            return value
+        return _validate_connection_or_sink_name(value, field_label="Gate on_error sink name")
+
     @field_validator("fork_to")
     @classmethod
     def validate_fork_to_labels(cls, v: list[str] | None) -> list[str] | None:
@@ -782,6 +862,12 @@ class GateSettings(BaseModel):
         """
         if v is None:
             return v
+        if not v:
+            # An empty list is not "no fork": ``_GateEntry.__post_init__``
+            # rejects an empty tuple, and it must never get that far — a
+            # settings-level rejection is a structured verdict; the builder's
+            # is a crash (elspeth-2ed41f0a4a).
+            raise ValueError("fork_to must not be an empty list; omit it (or use null) for no fork")
 
         stripped = []
         for branch in v:
@@ -940,6 +1026,13 @@ class CoalesceSettings(BaseModel):
     timeout_seconds: float | None = Field(
         default=None,
         gt=0,
+        # allow_inf_nan=False closes the `inf` hole that `gt=0` leaves open:
+        # CoalesceExecutor.check_timeouts compares `elapsed > timeout_seconds`,
+        # so an infinite timeout silently disables the sweep instead of
+        # bounding the wait — and best_effort/quorum, which require a timeout to
+        # resolve, are left without a working one. NaN is already rejected by
+        # gt=0 (nan > 0 is False).
+        allow_inf_nan=False,
         description="Max wait time (required for best_effort, optional for quorum)",
     )
     quorum_count: int | None = Field(
@@ -985,6 +1078,12 @@ class CoalesceSettings(BaseModel):
             val = input_connection.strip()
             _validate_connection_or_sink_name(key, field_label="Coalesce branch name")
             _validate_connection_or_sink_name(val, field_label=f"Coalesce branch '{key}' input connection")
+            # min_length=2 is enforced on the raw mapping, so trimming must not
+            # be allowed to collapse two declared branches into one — branch
+            # count is the join contract (require_all/quorum arity), not a
+            # cosmetic detail.
+            if key in validated:
+                raise ValueError(f"Coalesce branch names collide after trimming whitespace: '{key}' is declared twice")
             validated[key] = val
         return validated
 
@@ -1082,6 +1181,248 @@ class SourceSettings(BaseModel):
         return _validate_connection_or_sink_name(value, field_label="Source on_success connection name")
 
 
+class RowUnionSettings(BaseModel):
+    """Configuration for row_union (fork-branch UNION ALL) barriers.
+
+    row_union is a correlated, same-row_id, N->N barrier over declared fork
+    branches (elspeth-a5b86149d4 product decision, 2026-07-16). It waits for
+    every declared branch of a row's fork group, then releases the original
+    branch tokens as one indivisible group in declared branch order. It does
+    NOT merge fields, deduplicate rows, or synthesize a wide row — payloads
+    pass through untouched. v1 arrival policy is require_all only; lost,
+    duplicate, or late branches fail the whole group closed with no partial
+    release.
+
+    Contrast with its siblings:
+    - coalesce: correlated N->1 FIELD merge of fork siblings.
+    - queue: UNcorrelated stream interleave with no group semantics.
+
+    Example YAML:
+        row_unions:
+          - name: variant_union
+            branches:
+              control_branch: control_scored
+              treatment_branch: treatment_scored
+            on_success: experiment_in
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    name: str = Field(description="Unique identifier for this row_union barrier")
+    branches: dict[str, str] = Field(
+        min_length=2,
+        description="Branch identity → input connection mapping. List format normalized to identity dict. Declared order is the group release order.",
+    )
+
+    @field_validator("branches", mode="before")
+    @classmethod
+    def normalize_branches(cls, v: Any) -> dict[str, str]:
+        """Normalize list format to identity dict, rejecting duplicates.
+
+        branches: [a, b] becomes branches: {a: a, b: b}. Duplicate branch
+        names in list form are rejected — a dict comprehension would
+        silently discard them, hiding a config error.
+        """
+        if isinstance(v, list):
+            if len(v) != len(set(v)):
+                dupes = sorted({b for b in v if v.count(b) > 1})
+                raise ValueError(f"Duplicate branch names in list: {dupes}")
+            return {b: b for b in v}
+        return v  # type: ignore[no-any-return]  # Pydantic validates dict[str, str]
+
+    on_success: str = Field(
+        description="Connection the released group continues on (one output contract for all branches)",
+    )
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        # allow_inf_nan=False closes the `inf` hole that `gt=0` leaves open:
+        # RowUnionExecutor.check_timeouts compares `elapsed > timeout_seconds`,
+        # so an infinite timeout silently disables the sweep instead of
+        # bounding the wait. NaN is already rejected by gt=0 (nan > 0 is False).
+        allow_inf_nan=False,
+        description="Max wait for the full group; on timeout the whole group fails closed. None = wait until end-of-source flush.",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate row_union name is not empty, reserved, or system-prefixed."""
+        if not v or not v.strip():
+            raise ValueError("row_union name must not be empty")
+        value = v.strip()
+        _validate_max_length(value, field_label="row_union name", max_length=_MAX_NODE_NAME_LENGTH)
+        _validate_node_name_chars(value, field_label="row_union name")
+        if value in _RESERVED_EDGE_LABELS:
+            raise ValueError(f"row_union name '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        if value.startswith("__"):
+            raise ValueError(f"row_union name '{value}' starts with '__', which is reserved for system edges")
+        return value
+
+    @field_validator("branches")
+    @classmethod
+    def validate_branch_names(cls, v: dict[str, str]) -> dict[str, str]:
+        """Ensure row_union branch names (keys) and input connections (values) are valid."""
+        validated: dict[str, str] = {}
+        for branch_name, input_connection in v.items():
+            if not branch_name or not branch_name.strip():
+                raise ValueError("row_union branch names must not be empty")
+            if not input_connection or not input_connection.strip():
+                raise ValueError(f"row_union branch '{branch_name}' input connection must not be empty")
+            key = branch_name.strip()
+            val = input_connection.strip()
+            _validate_connection_or_sink_name(key, field_label="row_union branch name")
+            _validate_connection_or_sink_name(val, field_label=f"row_union branch '{key}' input connection")
+            # min_length=2 is enforced on the raw mapping, so trimming must not
+            # be allowed to collapse two declared branches into one — group size
+            # is the barrier's release contract, not a cosmetic detail.
+            if key in validated:
+                raise ValueError(f"row_union branch names collide after trimming whitespace: '{key}' is declared twice")
+            validated[key] = val
+        return validated
+
+    @field_validator("on_success")
+    @classmethod
+    def validate_on_success(cls, v: str) -> str:
+        """Ensure on_success names a usable connection.
+
+        Unlike coalesce, on_success is required and must name a processing
+        connection: the DAG builder rejects a row_union whose on_success names
+        a sink (terminal group release is not supported in v1).
+        """
+        if not v or not v.strip():
+            raise ValueError("row_union on_success must not be empty")
+        value = v.strip()
+        return _validate_connection_or_sink_name(value, field_label="row_union on_success connection name")
+
+
+class CollectorSettings(BaseModel):
+    """Configuration for a collector — the EXPAND-group closer (barrier-scopes spec §2/§3).
+
+    A collector is a barrier, not an aggregation: it buffers every member of
+    ONE bound EXPAND group and flushes on end_of_group ONLY. It reuses the
+    batch-transform plugin contract (the same plugins aggregations use) but
+    deliberately has NO trigger config — count/timeout/condition are
+    inexpressible on a closer (a timeout on a closer converts a liveness bug
+    into a silently short group; spec §5). Flush order is the opener's
+    expansion ordinal, never arrival order. It also has no ``on_error`` route:
+    plugin failure is a whole-group verdict settled through scope policy and
+    nesting.
+
+    Example YAML:
+        collectors:
+          - name: page_stitcher
+            plugin: stitch_pages
+            input: pages
+            on_success: assembled_out
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    name: str = Field(description="Unique identifier for this collector (drives node IDs and audit records)")
+    plugin: str = Field(description="Batch-transform plugin name (same plugin contract as aggregations)")
+    input: str = Field(description="Named input connection the bound region's members arrive on")
+    on_success: str = Field(description="Connection name or sink name for the flushed group output")
+    options: dict[str, Any] = Field(default_factory=dict, description="Plugin-specific configuration options")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_on_error(cls, data: Any) -> Any:
+        """Reject the deleted collector route with its structural replacement."""
+        if type(data) is not dict or "on_error" not in data:
+            return data
+        raw_name = data["name"] if "name" in data else None
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else "<unnamed>"
+        raise ValueError(
+            f"Collector '{name}' does not accept on_error. Collector failures are whole-group "
+            "verdicts settled through scope policy and nesting. Remove on_error."
+        )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate collector name is not empty or reserved."""
+        if not v or not v.strip():
+            raise ValueError("Collector name must not be empty")
+        value = v.strip()
+        _validate_max_length(value, field_label="Collector name", max_length=_MAX_NODE_NAME_LENGTH)
+        _validate_node_name_chars(value, field_label="Collector name")
+        if value in _RESERVED_EDGE_LABELS:
+            raise ValueError(f"Collector name '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        if value.startswith("__"):
+            raise ValueError(f"Collector name '{value}' starts with '__', which is reserved for system edges")
+        return value
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, v: str) -> str:
+        """Validate input connection name is not empty."""
+        if not v or not v.strip():
+            raise ValueError("Collector input connection must not be empty")
+        value = v.strip()
+        return _validate_connection_or_sink_name(value, field_label="Collector input connection name")
+
+    @field_validator("on_success")
+    @classmethod
+    def validate_on_success(cls, v: str) -> str:
+        """Ensure on_success is a valid connection or sink name."""
+        if not v.strip():
+            raise ValueError("Collector on_success must be a connection name or sink name")
+        value = v.strip()
+        return _validate_connection_or_sink_name(value, field_label="Collector on_success connection name")
+
+
+class ScopeSettings(BaseModel):
+    """A declared EXPAND-group binding: opener (multi-row transform) → closer (collector).
+
+    The scope is the build-time closer binding for a multi-row expansion
+    (barrier-scopes spec §2/§3). The opener must be a multi-row transform
+    (creates_tokens=True — builder-enforced, since config time cannot see
+    plugin attributes); the closer MUST be a collectors: entry. policy is
+    REQUIRED with no default (spec §3): the author decides whether a lost
+    member fails the group.
+
+    Example YAML:
+        scopes:
+          - name: document_pages
+            opener: pdf_explode
+            closer: page_stitcher
+            policy: require_all
+    """
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    name: str = Field(description="Scope identifier (scope_id in audit vocabulary)")
+    opener: str = Field(description="Multi-row transform (creates_tokens=True) that opens the group")
+    closer: str = Field(description="Collector that closes the group; MUST name a collectors: entry")
+    policy: Literal["require_all", "best_effort"] = Field(
+        description="Group arrival policy. REQUIRED — no default (spec §3). quorum/first are deferred (spec decision 15).",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate scope name is not empty or reserved."""
+        if not v or not v.strip():
+            raise ValueError("Scope name must not be empty")
+        value = v.strip()
+        _validate_max_length(value, field_label="Scope name", max_length=_MAX_NODE_NAME_LENGTH)
+        _validate_node_name_chars(value, field_label="Scope name")
+        if value in _RESERVED_EDGE_LABELS:
+            raise ValueError(f"Scope name '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+        return value
+
+    @field_validator("opener", "closer")
+    @classmethod
+    def validate_endpoint_names(cls, v: str) -> str:
+        """Scope endpoints must be non-empty node names."""
+        if not v or not v.strip():
+            raise ValueError("Scope opener/closer must not be empty")
+        value = v.strip()
+        _validate_node_name_chars(value, field_label="Scope endpoint name")
+        return value
+
+
 class QueueSettings(BaseModel):
     """Pass-through scheduling queue declared as a DAG fan-in node.
 
@@ -1124,7 +1465,8 @@ class TransformSettings(BaseModel):
         description="Connection name or sink name for successfully processed rows",
     )
     on_error: str = Field(
-        description="Sink name for rows that cannot be processed, or 'discard'",
+        description="A sink name, 'discard', or — from inside a bound region — that region's closer "
+        "(coalesce/row_union/collector name; spec §7 rule 9) for rows that cannot be processed",
     )
     options: dict[str, Any] = Field(
         default_factory=dict,
@@ -1135,16 +1477,7 @@ class TransformSettings(BaseModel):
     @classmethod
     def validate_name(cls, v: str) -> str:
         """Validate transform name is not empty or reserved."""
-        if not v or not v.strip():
-            raise ValueError("Transform name must not be empty")
-        v = v.strip()
-        _validate_max_length(v, field_label="Transform name", max_length=_MAX_NODE_NAME_LENGTH)
-        _validate_node_name_chars(v, field_label="Transform name")
-        if v in _RESERVED_EDGE_LABELS:
-            raise ValueError(f"Transform name '{v}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
-        if v.startswith("__"):
-            raise ValueError(f"Transform name '{v}' starts with '__', which is reserved for system edges")
-        return v
+        return validate_runtime_node_name(v, field_label="Transform name")
 
     @field_validator("input")
     @classmethod
@@ -1314,19 +1647,19 @@ class LandscapeExportSettings(BaseModel):
                 raise ValueError("hmac_sha256 signing requires a signing secret reference")
 
         required = (
-            "total_record_limit",
-            "total_byte_limit",
-            "chunk_limit",
-            "per_chunk_record_limit",
-            "per_chunk_byte_limit",
-            "spool_root",
-            "content_store",
+            ("total_record_limit", self.total_record_limit),
+            ("total_byte_limit", self.total_byte_limit),
+            ("chunk_limit", self.chunk_limit),
+            ("per_chunk_record_limit", self.per_chunk_record_limit),
+            ("per_chunk_byte_limit", self.per_chunk_byte_limit),
+            ("spool_root", self.spool_root),
+            ("content_store", self.content_store),
         )
         if self.enabled:
-            missing = [name for name in required if getattr(self, name) is None]
+            missing = [name for name, value in required if value is None]
             if missing:
                 raise ValueError(f"enabled audit export requires explicit fields: {', '.join(missing)}")
-        if all(getattr(self, name) is not None for name in required):
+        if all(value is not None for _name, value in required):
             assert self.total_record_limit is not None
             assert self.total_byte_limit is not None
             assert self.chunk_limit is not None
@@ -1699,6 +2032,19 @@ class ElspethSettings(BaseModel):
         description="Named pass-through scheduling queues for explicit fan-in.",
     )
 
+    # Optional - operator-owned LLM profile catalog for batch/CLI runs.
+    # Mirrors WebSettings.llm_profiles/default_llm_profile (web/config.py) so
+    # an `llm` transform node can select a profile alias instead of carrying
+    # raw provider config, on both authoring surfaces.
+    llm_profiles: Mapping[str, LLMProfileSettings] = Field(
+        default_factory=dict,
+        description="Operator-owned LLM provider profiles, keyed by opaque alias.",
+    )
+    default_llm_profile: str | None = Field(
+        default=None,
+        description="Preferred LLM profile alias; must name a configured llm_profiles entry.",
+    )
+
     # Run mode configuration
     run_mode: RunMode = Field(
         default=RunMode.LIVE,
@@ -1751,6 +2097,53 @@ class ElspethSettings(BaseModel):
         description="Coalesce configurations for merging forked paths",
     )
 
+    # Optional - row_union barriers (fork-branch UNION ALL, elspeth-a5b86149d4)
+    row_unions: list[RowUnionSettings] = Field(
+        default_factory=list,
+        max_length=100,
+        description="row_union barrier configurations for releasing fork branches as indivisible groups",
+    )
+
+    # Optional - collectors (EXPAND-group closers; barrier-scopes spec §3)
+    collectors: list[CollectorSettings] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Collector (EXPAND-group closer) configurations",
+    )
+
+    # Optional - scope bindings (opener multi-row transform → collector closer)
+    scopes: list[ScopeSettings] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Declared scope bindings pairing a multi-row transform opener with its collector closer",
+    )
+
+    # Supported bound-region nesting depth (spec §6.3 maintainer ruling): the
+    # builder rejects deeper bound nesting fail-closed. Raise this ONLY if you
+    # knowingly accept the per-insert audit churn of deeper nesting — the
+    # model stays correct at any depth; the SUPPORT guarantee is 5.
+    max_bound_region_depth: int = Field(
+        default=5,
+        ge=1,
+        le=64,
+        description="Maximum supported bound-region nesting depth (builder-enforced, spec §6.3)",
+    )
+
+    # Width twin of the depth fence above (elspeth-258bd49d81): expand/batch
+    # fan-out is DATA-dependent, so it cannot be fenced at build — the engine
+    # refuses an over-wide expansion at the opener, before the eager mint
+    # transaction, and the row leaves through the transform error channel
+    # (on_error / quarantine) with reason expand_width_exceeded — fully
+    # audited, never an OOM. Raise this ONLY if you knowingly accept the
+    # memory and audit-DB cost of wider groups; the model stays correct at
+    # any width.
+    max_expand_group_width: int = Field(
+        default=100_000,
+        ge=1,
+        le=10_000_000,
+        description="Maximum members one expansion may mint (engine-enforced at the opener, before the mint transaction)",
+    )
+
     # Optional - aggregations (config-driven batching)
     aggregations: list[AggregationSettings] = Field(
         default_factory=list,
@@ -1787,6 +2180,69 @@ class ElspethSettings(BaseModel):
         default_factory=TelemetrySettings,
         description="Telemetry and observability configuration",
     )
+
+    @field_validator("llm_profiles")
+    @classmethod
+    def _validate_llm_profile_aliases(cls, value: Mapping[str, LLMProfileSettings]) -> Mapping[str, LLMProfileSettings]:
+        for alias in value:
+            validate_profile_alias(alias)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_default_llm_profile_alias(self) -> "ElspethSettings":
+        """Validate a designated default without turning its absence into a config error.
+
+        Mirrors WebSettings._validate_default_llm_profile_alias: a missing
+        default is a supported state (explicit provider config on `llm`
+        nodes, or an explicit `profile` reference, remain fully usable).
+        """
+        if self.default_llm_profile is not None:
+            validate_profile_alias(self.default_llm_profile)
+            if self.default_llm_profile not in self.llm_profiles:
+                raise ValueError("default_llm_profile must name a configured llm profile")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_scope_bindings(self) -> "ElspethSettings":
+        """Cross-check collectors: and scopes: (barrier-scopes spec §7 rule 1, parse-time half).
+
+        The builder re-verifies with plugin instances in hand (opener
+        multi-row-ness is only visible there); these are the pure
+        name-reference checks that need no instances.
+        """
+        collector_names = {c.name for c in self.collectors}
+        transform_names = {t.name for t in self.transforms}
+        seen_scope_names: set[str] = set()
+        seen_openers: set[str] = set()
+        seen_closers: set[str] = set()
+        for scope in self.scopes:
+            if scope.name in seen_scope_names:
+                raise ValueError(f"Scope name '{scope.name}' is declared twice")
+            seen_scope_names.add(scope.name)
+            if scope.closer not in collector_names:
+                raise ValueError(
+                    f"Scope '{scope.name}' closer '{scope.closer}' must name a collectors: entry. "
+                    f"Declared collectors: {sorted(collector_names) or '(none)'}"
+                )
+            if scope.opener not in transform_names:
+                raise ValueError(
+                    f"Scope '{scope.name}' opener '{scope.opener}' must name a transforms: entry. "
+                    f"A scope opener is a multi-row transform declared in transforms:."
+                )
+            if scope.closer in seen_closers:
+                raise ValueError(f"Collector '{scope.closer}' is already bound — one scope per closer")
+            seen_closers.add(scope.closer)
+            if scope.opener in seen_openers:
+                raise ValueError(f"Transform '{scope.opener}' opens two scopes — one scope per opener")
+            seen_openers.add(scope.opener)
+        unbound = collector_names - seen_closers
+        if unbound:
+            raise ValueError(
+                f"Collector(s) {sorted(unbound)}: no scopes: entry binds them. A collector is an "
+                f"EXPAND-group closer and requires a scope (spec §7 rule 1); an unbound collector "
+                f"has no group to close. Add a scopes: entry naming it as closer."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -1838,6 +2294,10 @@ class ElspethSettings(BaseModel):
             all_names.append((a.name, "aggregation"))
         for c in self.coalesce:
             all_names.append((c.name, "coalesce"))
+        for u in self.row_unions:
+            all_names.append((u.name, "row_union"))
+        for col in self.collectors:
+            all_names.append((col.name, "collector"))
         for source_name in self.sources:
             all_names.append((source_name, "source"))
         for queue_name in self.queues:
@@ -1848,11 +2308,7 @@ class ElspethSettings(BaseModel):
         seen: dict[str, str] = {}
         for name, node_type in all_names:
             if name in seen:
-                raise ValueError(
-                    f"Node name '{name}' is used by both {seen[name]} and {node_type}. "
-                    f"All node names must be unique across transforms, gates, "
-                    f"aggregations, coalesce nodes, sources, queues, and sinks."
-                )
+                raise ValueError(f"Node name '{name}' is used by both {seen[name]} and {node_type}. {UNIQUE_NODE_NAMES_RULE}")
             seen[name] = node_type
         return self
 
@@ -1961,27 +2417,67 @@ class ElspethSettings(BaseModel):
         2. Avoid case mismatches between keys and references
         3. Ensure consistency with environment variable overrides (which are uppercased by Dynaconf)
         """
-        non_lowercase = [name for name in v if name != name.lower()]
-        if non_lowercase:
-            # Provide helpful suggestions
-            suggestions = [f"'{name}' -> '{name.lower()}'" for name in non_lowercase]
-            raise ValueError(f"Sink names must be lowercase. Found: {non_lowercase}. Suggested fixes: {', '.join(suggestions)}")
-
         for sink_name in v:
-            _validate_max_length(sink_name, field_label="Sink name", max_length=_MAX_NODE_NAME_LENGTH)
-            _validate_connection_name_chars(sink_name, field_label="Sink name")
-            if sink_name in _RESERVED_EDGE_LABELS:
-                raise ValueError(f"Sink name '{sink_name}' is reserved. Reserved sink/edge labels: {sorted(_RESERVED_EDGE_LABELS)}")
-            if sink_name.startswith("__"):
-                raise ValueError(f"Sink name '{sink_name}' starts with '__', which is reserved for system edges")
+            validate_sink_name(sink_name)
         return v
 
 
 # Regex pattern for ${VAR} or ${VAR:-default} syntax
-_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-_ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS = {
-    "report_assemble": frozenset({"join_with", "title"}),
-}
+# The expansion authority, shared with every check that exists to pre-empt it.
+# Defined once in contracts so the guard cannot guard a different language than
+# the one _expand_env_vars actually substitutes.
+_ENV_VAR_PATTERN = ENV_VAR_REFERENCE_PATTERN
+
+
+def _expand_env_string(value: str) -> str:
+    """Expand ${VAR} patterns in a string."""
+    import os
+
+    def replacer(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        default = match.group(2)  # None if no default specified
+        if var_name in os.environ:
+            return os.environ[var_name]
+        if default is not None:
+            return default
+        # No env var and no default - fail fast with clear error
+        raise ValueError(
+            f"Required environment variable '{var_name}' is not set. "
+            f"Either set the variable or use ${{{{var_name}}:-default}} syntax for optional values."
+        )
+
+    return _ENV_VAR_PATTERN.sub(replacer, value)
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one value of the raw, not-yet-validated configuration tree — operator YAML or a web-authored "
+        "dict — during ${VAR} expansion before ElspethSettings validation"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when a ${VAR} reference names an unset environment variable with no default; "
+        "unrecognized scalar shapes pass through unchanged, never coerced or fabricated"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestExpandEnvValueBoundary::test_missing_env_var_without_default_raises",
+    test_fingerprint="bca4e57aab8ee1e94e9cfb9b5e03625eae52368d2598c06ae9cbd93fcbd2a3a5",
+)
+def _expand_env_value(value: Any) -> Any:
+    """Expand env vars in a single raw-config value (recursive)."""
+    if type(value) is LoweredLLMProfileAlias:
+        # Preserve only the exact nominal proof produced by the trusted
+        # profile-lowering pass immediately before environment expansion.
+        return value
+    if isinstance(value, str):
+        return _expand_env_string(value)
+    elif isinstance(value, dict):
+        return {k: _expand_env_value(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_expand_env_value(item) for item in value]
+    else:
+        return value
 
 
 def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
@@ -1993,75 +2489,310 @@ def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
     Returns:
         New dict with environment variables expanded
     """
-    import os
-
-    def _expand_string(value: str) -> str:
-        """Expand ${VAR} patterns in a string."""
-
-        def replacer(match: re.Match[str]) -> str:
-            var_name = match.group(1)
-            default = match.group(2)  # None if no default specified
-            env_value = os.environ.get(var_name)
-            if env_value is not None:
-                return env_value
-            if default is not None:
-                return default
-            # No env var and no default - fail fast with clear error
-            raise ValueError(
-                f"Required environment variable '{var_name}' is not set. "
-                f"Either set the variable or use ${{{{var_name}}:-default}} syntax for optional values."
-            )
-
-        return _ENV_VAR_PATTERN.sub(replacer, value)
-
-    def _expand_value(value: Any) -> Any:
-        """Expand env vars in a single value."""
-        if isinstance(value, str):
-            return _expand_string(value)
-        elif isinstance(value, dict):
-            return {k: _expand_value(v) for k, v in value.items()}
-        elif isinstance(value, list):
-            return [_expand_value(item) for item in value]
-        else:
-            return value
-
-    return {k: _expand_value(v) for k, v in config.items()}
+    return {k: _expand_env_value(v) for k, v in config.items()}
 
 
-def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mapping[str, object]) -> None:
-    """Reject env placeholders in plugin options that render into artifacts.
+def _lower_llm_profile_node_options(
+    alias: str,
+    profile_settings: LLMProfileSettings,
+    options: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Return ``(executable_options, audit_safe_options)`` for one ``llm``
+    component's profile selection, BEFORE batch's credential-materialization
+    rewrite (the ``api_key`` value is still the ``{"secret_ref": ...}``
+    marker, exactly as :meth:`_LLMProfileResolver.lower_options` (web)
+    returns it for the same profile+options — both call
+    :func:`elspeth.core.llm_profiles.lower_llm_profile_options`).
 
-    Some plugin options are user-visible presentation fields rather than secret
-    references. Reject their raw ``${VAR}`` syntax before the loader expands it,
-    so later plugin validation cannot be bypassed by replacing the marker with
-    a host secret value.
+    Split out of :func:`_lower_llm_profile_nodes` so the batch/CLI catalog
+    lowering pass and its own unit tests share the exact call this function
+    makes, rather than a test re-deriving the same computation separately.
     """
-    for collection_name in ("transforms", "aggregations"):
-        collection = raw_config[collection_name] if collection_name in raw_config else None
-        if type(collection) is not list:
-            continue
-        for index, plugin_config in enumerate(collection):
-            if type(plugin_config) is not dict:
-                continue
-            plugin_name = plugin_config["plugin"] if "plugin" in plugin_config else None
-            if not isinstance(plugin_name, str):
-                continue
-            forbidden_fields = _ENV_EXPANSION_FORBIDDEN_PLUGIN_OPTION_FIELDS.get(plugin_name.lower())
-            if not forbidden_fields:
-                continue
-            options = plugin_config["options"] if "options" in plugin_config else None
-            if type(options) is not dict:
-                continue
-            for option_name in sorted(forbidden_fields):
-                value = options[option_name] if option_name in options else None
-                if not isinstance(value, str) or not _ENV_VAR_PATTERN.search(value):
-                    continue
-                raw_name = plugin_config["name"] if "name" in plugin_config else index
-                raise ValueError(
-                    f"{collection_name}[{raw_name!r}] {plugin_name} option {option_name!r} "
-                    "must not contain environment-variable placeholders before env expansion; "
-                    f"{plugin_name} emits this option in user-visible report output"
+    runtime_profile = RuntimeLLMProfile.from_settings(alias, profile_settings)
+    safe_options = {k: v for k, v in options.items() if k != "profile"}
+    return lower_llm_profile_options(
+        alias,
+        runtime_profile,
+        safe_options,
+        private_fields=LLM_PROFILE_PRIVATE_FIELDS,
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one raw plugin-bearing component entry (sources/transforms) from operator YAML or a "
+        "web-authored dict — an untyped object before ElspethSettings validation"
+    ),
+    source_param="component",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ValueError when an llm component's 'profile' option is not a string alias, names both "
+        "'profile' and 'provider', references an unknown profile, or references a non-server credential "
+        "scope; non-dict components and non-llm plugins are deliberately skipped for ElspethSettings "
+        "validation to classify"
+    ),
+    test_ref="tests/unit/core/test_llm_profile_catalog.py::TestBatchProfileNodeLowering::test_lower_llm_component_rejects_non_string_profile_alias",
+    test_fingerprint="2767eb57220ffddb010c79cf95a0f89dec059e52c2a263017ff782bfcda768dc",
+)
+def _lower_llm_component(
+    component: object,
+    *,
+    location: str,
+    profiles: dict[str, LLMProfileSettings],
+    materialize: bool,
+) -> None:
+    if not isinstance(component, dict) or component.get("plugin") != "llm":
+        return
+    options = component.get("options")
+    if not isinstance(options, dict):
+        return
+    # Exact nominal validation makes a second in-memory pass idempotent,
+    # while raw YAML/JSON/dict replay cannot forge audit attribution with
+    # an ordinary string under this reserved key.
+    require_lowered_llm_profile_alias(options)
+    if "profile" not in options:
+        return
+    alias = options["profile"]
+    if not isinstance(alias, str):
+        raise ValueError(f"{location} llm component 'profile' option must be a string alias")
+    if "provider" in options:
+        raise ValueError(
+            f"{location} llm component specifies both 'profile' and 'provider' — "
+            "choose exactly one: an operator profile alias, or explicit provider config"
+        )
+    try:
+        profile_settings = profiles[alias]
+    except KeyError:
+        raise ValueError(f"{location} llm component references unknown llm profile {alias!r}") from None
+    if profile_settings.credential_scope not in (None, "server"):
+        raise ValueError(
+            f"{location} llm component references profile {alias!r} with "
+            f"credential_scope {profile_settings.credential_scope!r}; batch/CLI runs have no per-user "
+            "secret store and can only use credential_scope 'server' (or scope-less, e.g. Bedrock) profiles"
+        )
+    if not materialize:
+        return
+    executable, _audit_safe = _lower_llm_profile_node_options(alias, profile_settings, options)
+    if "api_key" in executable:
+        # ``lower_llm_profile_options`` is the only writer of this key and
+        # always writes the ``{"secret_ref", "secret_scope"}`` marker:
+        # ``api_key`` is a private profile field, so an authored value
+        # never reaches ``executable``. Anything else here is a lowering
+        # bug in owned data, not an input shape to tolerate.
+        api_key_marker = executable["api_key"]
+        if type(api_key_marker) is not dict:
+            raise TypeError(f"{location} llm profile {alias!r} lowered a non-marker api_key: {type(api_key_marker).__name__}")
+        # Batch/CLI never gains the web secret-store resolver; it
+        # materializes the profile's credential the same way an
+        # explicitly-authored `api_key: ${VAR}` node always has, via the
+        # existing _expand_env_vars pass run right after this one.
+        executable["api_key"] = f"${{{api_key_marker['secret_ref']}}}"
+    # Retain the ALIAS ONLY (never endpoint/credential_ref) in the
+    # executable options so it survives into ElspethSettings and is
+    # therefore recoverable from the run's audit trail — both
+    # resolve_config()'s settings_json snapshot (core/config.py) and the
+    # DAG's per-node audit config (core/landscape/data_flow/graph.py's
+    # sanitize_node_config_for_audit) derive from exactly this dict via
+    # BaseSource.config / BaseTransform.config. Web's parallel answer to
+    # "which profile did this component use" lives in
+    # run_web_plugin_policy.selected_profile_aliases_json
+    # (a web-only Landscape table); batch has no such table, so the
+    # alias must travel inside the node's own options.
+    #
+    # Deliberately NOT keyed as "profile" (the authored selector key):
+    # A second pass over this same owned in-memory dict must be inert. If
+    # the alias rode under "profile" ALONGSIDE the now-also-present
+    # "provider" key, that pass would look identical to a genuinely
+    # ambiguous authored node and trip the "specifies both 'profile' and
+    # 'provider'" rejection above — an accidental self-collision, not a
+    # real conflict. "profile_alias" is a distinct key the ambiguity check
+    # never inspects and no provider config model or authoring surface
+    # uses, so this pass is safe to run twice over its own owned output.
+    # Serialization intentionally erases the nominal ownership proof;
+    # loading persisted YAML/JSON with a plain ``profile_alias`` is rejected
+    # rather than re-trusted. Both LLM plugin constructors consume this key
+    # before strict provider config validation — no provider model declares
+    # it — and retain only the plain opaque alias in Base*.config for audit.
+    executable["profile_alias"] = make_lowered_llm_profile_alias(alias)
+    component["options"] = executable
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "raw pipeline configuration mapping — operator YAML via Dynaconf (load_settings) or a "
+        "web-authored dict (load_settings_from_config_dict) — before ElspethSettings validation"
+    ),
+    source_param="raw_config",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ValueError when an llm_profiles entry is not a mapping or default_llm_profile names "
+        "no configured profile; absent or non-mapping/list llm_profiles, sources and transforms "
+        "sections are left for ElspethSettings validation to classify, never coerced"
+    ),
+    test_ref="tests/unit/core/test_llm_profile_catalog.py::TestBatchProfileNodeLowering::test_lowering_rejects_malformed_raw_config_shapes",
+    test_fingerprint="638e36b28984450aad0ac42ea13c76dc64a775f1870c800fe2c7d31529f6ab9c",
+)
+def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -> dict[str, Any]:
+    """Rewrite ``llm`` source and transform components that select an operator profile.
+
+    Mirrors the web plugin-policy resolver's ``lower_options`` lowering seam
+    so a batch/CLI ``llm`` component written as ``options: {"profile": "alias",
+    ...}`` (no ``provider`` key) resolves to the SAME private executable
+    options a web author's identical profile selection would produce — both
+    call :func:`elspeth.core.llm_profiles.lower_llm_profile_options` via
+    :func:`_lower_llm_profile_node_options`.
+
+    Runs on the raw config dict, before :func:`_expand_env_vars`, mirroring
+    that function's own placement (a pre-pydantic rewrite of the raw dict,
+    not a ``model_validator`` — source and transform ``options`` are untyped
+    ``dict[str, Any]`` values and ``ElspethSettings`` is frozen, so there is
+    nowhere to write a lowered value back onto validated settings).
+
+    Structural checks (unknown alias; ``profile`` supplied together with
+    ``provider``; a non-``server`` ``credential_scope``) run whenever a
+    profile-selecting component is found and require no secret material — but the
+    ENTIRE lowering, not just the credential step, is gated on
+    ``materialize``: when it is ``False`` these checks still run (an unknown
+    alias or ambiguous component is rejected immediately regardless), but a component
+    naming a VALID alias is left completely un-lowered — ``options`` still
+    has ``"profile"`` and no ``"provider"``. That is not itself an error at
+    this layer; both real callers (below) only ever pass ``materialize=True``
+    for a caller trusted to expand host environment variables, so the
+    un-lowered state is unreachable in production. It is not silently
+    swallowed either: an un-lowered component still fails closed later, at
+    its plugin constructor's "missing required 'provider' key" check, when the
+    pipeline is actually built.
+
+    When ``materialize`` IS set, the rewrite injects a secret REFERENCE
+    marker for the profile's credential, then converts it to a ``${VAR}``
+    template so it actually gets resolved by the ``_expand_env_vars`` pass
+    that follows. This is not a new secret mechanism: it hands the SAME
+    ``${VAR}`` syntax an operator would write by hand on an explicit
+    Azure/OpenRouter node to the SAME env-var-expansion pass that already
+    resolves it, so a missing server secret fails closed at config-load time
+    with the existing "Required environment variable ... is not set" error.
+
+    Batch/CLI has no per-user secret store — only ``credential_scope:
+    server`` profiles (or scope-less ones, e.g. Bedrock's keyless AWS
+    credential chain) can be materialized from the host environment. A
+    ``user``-scoped profile referenced from a batch node fails closed rather
+    than silently reading a would-be per-user secret out of the shared
+    process environment.
+    """
+    raw_profiles = raw_config.get("llm_profiles")
+    profiles: dict[str, LLMProfileSettings] = {}
+    if isinstance(raw_profiles, dict):
+        for alias, profile_dict in raw_profiles.items():
+            if not isinstance(profile_dict, dict):
+                raise ValueError(f"llm_profiles[{alias!r}] must be a mapping")
+            profiles[alias] = LLMProfileSettings(**profile_dict)
+
+    default_alias = raw_config.get("default_llm_profile")
+    if default_alias is not None and default_alias not in profiles:
+        raise ValueError(f"default_llm_profile {default_alias!r} does not name a configured llm_profiles entry")
+
+    sources = raw_config.get("sources")
+    if isinstance(sources, dict):
+        for source_name, source in sources.items():
+            _lower_llm_component(source, location=f"sources[{source_name!r}]", profiles=profiles, materialize=materialize)
+
+    transforms = raw_config.get("transforms")
+    if isinstance(transforms, list):
+        for index, node in enumerate(transforms):
+            _lower_llm_component(node, location=f"transforms[{index}]", profiles=profiles, materialize=materialize)
+    return raw_config
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one value of a raw plugin-options tree — operator YAML or a web-authored dict — during "
+        "secret fingerprinting before audit persistence"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises SecretFingerprintError when a string secret field is present but no fingerprint key is "
+        "available (and dev mode is not enabled); non-secret and unrecognized shapes pass through "
+        "unchanged, never coerced"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestFingerprintSecretsBoundary::test_secret_without_key_raises",
+    test_fingerprint="8e15f3d155fb930f7cd07d1256a25e599c6a47ced4e71a8c0b92bbdbc4f2d26c",
+)
+def _fingerprint_process_value(
+    key: str,
+    value: Any,
+    *,
+    have_key: bool,
+    fail_if_no_key: bool,
+) -> tuple[str, Any, bool]:
+    """Process a single raw-options value, returning (new_key, new_value, was_secret)."""
+    from elspeth.core.security import secret_fingerprint
+
+    if isinstance(value, dict):
+        return key, _recurse(value, have_key=have_key, fail_if_no_key=fail_if_no_key), False
+    elif isinstance(value, list):
+        return (
+            key,
+            [_fingerprint_process_value("", item, have_key=have_key, fail_if_no_key=fail_if_no_key)[1] for item in value],
+            False,
+        )
+    elif isinstance(value, str) and is_secret_field(key):
+        # This is a secret field
+        if have_key:
+            fp = secret_fingerprint(value)
+            return f"{key}_fingerprint", fp, True
+        elif fail_if_no_key:
+            raise SecretFingerprintError(
+                f"Secret field '{key}' found but ELSPETH_FINGERPRINT_KEY "
+                "is not set. Either set the environment variable or use "
+                "ELSPETH_ALLOW_RAW_SECRETS=true for development "
+                "(not recommended for production)."
+            )
+        else:
+            # Dev mode: keep original value (user explicitly opted in)
+            return key, value, False
+    else:
+        return key, value, False
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one mapping node of a raw plugin-options tree — operator YAML or a web-authored dict — "
+        "during secret fingerprinting before audit persistence"
+    ),
+    source_param="d",
+    suppresses=("R5",),
+    invariant=(
+        "raises SecretFingerprintError when a secret field and its pre-supplied _fingerprint "
+        "counterpart are both present (fake-fingerprint injection), and (via "
+        "_fingerprint_process_value) when a secret is present with no key; other shapes pass through"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestFingerprintSecretsBoundary::test_fingerprint_collision_raises",
+    test_fingerprint="8c2d9016e282ea20471e25f39ae477b685c113b0d8bd44e3a584d0548407d753",
+)
+def _recurse(d: dict[str, Any], *, have_key: bool, fail_if_no_key: bool) -> dict[str, Any]:
+    """Fingerprint every secret field in one raw-options mapping node."""
+    # Detect collision: a secret field and its _fingerprint counterpart both present.
+    # Without this check, the pre-existing _fingerprint value would silently overwrite
+    # the computed HMAC, allowing an attacker to inject a fake fingerprint.
+    for key in d:
+        if isinstance(d[key], str) and is_secret_field(key):
+            fp_key = f"{key}_fingerprint"
+            if fp_key in d:
+                raise SecretFingerprintError(
+                    f"Config contains both '{key}' and '{fp_key}'. "
+                    f"The '{fp_key}' field is auto-generated from '{key}' during "
+                    f"fingerprinting — remove '{fp_key}' from your configuration."
                 )
+    result = {}
+    for key, value in d.items():
+        new_key, new_value, _was_secret = _fingerprint_process_value(key, value, have_key=have_key, fail_if_no_key=fail_if_no_key)
+        result[new_key] = new_value
+    return result
 
 
 def _fingerprint_secrets(
@@ -2087,59 +2818,13 @@ def _fingerprint_secrets(
         SecretFingerprintError: If secrets found but no fingerprint key available
                                 and fail_if_no_key is True
     """
-    from elspeth.core.security import get_fingerprint_key, secret_fingerprint
+    from elspeth.core.security import fingerprint_key_available
 
-    # Check if we have a fingerprint key available
-    try:
-        get_fingerprint_key()
-        have_key = True
-    except ValueError:
-        have_key = False
+    # The predicate derives from the same authority (contracts/security) that
+    # get_fingerprint_key raises from — no exception swallowing here.
+    have_key = fingerprint_key_available()
 
-    def _process_value(key: str, value: Any) -> tuple[str, Any, bool]:
-        """Process a single value, returning (new_key, new_value, was_secret)."""
-        if isinstance(value, dict):
-            return key, _recurse(value), False
-        elif isinstance(value, list):
-            return key, [_process_value("", item)[1] for item in value], False
-        elif isinstance(value, str) and is_secret_field(key):
-            # This is a secret field
-            if have_key:
-                fp = secret_fingerprint(value)
-                return f"{key}_fingerprint", fp, True
-            elif fail_if_no_key:
-                raise SecretFingerprintError(
-                    f"Secret field '{key}' found but ELSPETH_FINGERPRINT_KEY "
-                    "is not set. Either set the environment variable or use "
-                    "ELSPETH_ALLOW_RAW_SECRETS=true for development "
-                    "(not recommended for production)."
-                )
-            else:
-                # Dev mode: keep original value (user explicitly opted in)
-                return key, value, False
-        else:
-            return key, value, False
-
-    def _recurse(d: dict[str, Any]) -> dict[str, Any]:
-        # Detect collision: a secret field and its _fingerprint counterpart both present.
-        # Without this check, the pre-existing _fingerprint value would silently overwrite
-        # the computed HMAC, allowing an attacker to inject a fake fingerprint.
-        for key in d:
-            if isinstance(d[key], str) and is_secret_field(key):
-                fp_key = f"{key}_fingerprint"
-                if fp_key in d:
-                    raise SecretFingerprintError(
-                        f"Config contains both '{key}' and '{fp_key}'. "
-                        f"The '{fp_key}' field is auto-generated from '{key}' during "
-                        f"fingerprinting — remove '{fp_key}' from your configuration."
-                    )
-        result = {}
-        for key, value in d.items():
-            new_key, new_value, _was_secret = _process_value(key, value)
-            result[new_key] = new_value
-        return result
-
-    return _recurse(options)
+    return _recurse(options, have_key=have_key, fail_if_no_key=fail_if_no_key)
 
 
 def _sanitize_dsn(
@@ -2306,6 +2991,22 @@ def _reject_file_backed_template_options_for_in_memory_loader(raw_config: Mappin
     TemplateOptionMaterializer.reject_file_backed_options(raw_config)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a raw plugin-options mapping — operator YAML or a web-authored dict — whose DSN-bearing "
+        "option may hold a resolved server/user secret"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises SecretFingerprintError (via _sanitize_dsn) when the DSN carries a password but no "
+        "fingerprint key is available and fail_if_no_key is set; absent or non-string option values are "
+        "left for plugin config validation to classify, never coerced"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestSanitizeDsnOptionBoundary::test_dsn_password_without_key_raises",
+    test_fingerprint="5ba780c9d34f540eb1e42cbd8acdecc4d41e1894e216f1dfa4dcb9ef0b6c6f4f",
+)
 def _sanitize_dsn_option_for_audit(
     options: dict[str, Any],
     *,
@@ -2321,7 +3022,9 @@ def _sanitize_dsn_option_for_audit(
     secrets. Those fields must be sanitized by placement, not by key-name
     heuristics, before settings are written to Landscape audit storage.
     """
-    value = options.get(option_name)
+    if option_name not in options:
+        return
+    value = options[option_name]
     if not isinstance(value, str):
         return
 
@@ -2355,7 +3058,7 @@ def sanitize_node_config_for_audit(
     if type(thawed) is not dict:
         raise TypeError(f"Node config must thaw to dict[str, object], got {type(thawed).__name__}: {thawed!r}")
 
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = "ELSPETH_ALLOW_RAW_SECRETS" in os.environ and os.environ["ELSPETH_ALLOW_RAW_SECRETS"].lower() == "true"
     sanitized = _fingerprint_secrets(thawed, fail_if_no_key=not allow_raw)
     if plugin_name == "database":
         # Node config is flat: the DSN sits at top-level `url`.
@@ -2377,12 +3080,32 @@ def _fingerprint_config_for_audit(
     Called by resolve_config() to create a copy safe for audit storage.
     The original config (with secrets) is untouched.
 
+    Covers EVERY free-form mapping in the settings tree — any field annotated
+    ``dict[str, Any]`` / ``Mapping[str, Any]``, whatever it is named. That set
+    is pinned behaviourally by ``TestAuditRedactionSectionCoverage``
+    (tests/unit/core/test_config.py), which discovers the fields by walking
+    ``ElspethSettings.model_fields`` and testing the ANNOTATION rather than
+    trusting this list.
+
+    The discovery predicate is deliberately typed rather than named. Keying it
+    on the literal field name ``options`` encoded "free-form plugin config is
+    always called ``options``", which was true when written and false by the
+    time it was: ``collection_probes[*].provider_config`` is the same
+    arbitrary secret-bearing shape under a different name and was persisted in
+    cleartext (elspeth-fb8492c07b). A section or field added to the settings
+    tree and not added here fails OPEN with no error, exactly as ``collectors``
+    did (elspeth-bc1b2c2959). Keep this enumeration in step with the code
+    below; the pin, not the docstring, is the guarantee.
+
     Processes:
-    - source.options
+    - sources.*.options
     - sinks.*.options
     - database sink options.url (DSN password)
     - transforms[*].options
+    - collectors[*].options
     - aggregations[*].options
+    - telemetry.exporters[*].options
+    - collection_probes[*].provider_config
     - landscape.url (DSN password)
 
     Args:
@@ -2399,14 +3122,14 @@ def _fingerprint_config_for_audit(
     import os
 
     # Check dev mode override
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = "ELSPETH_ALLOW_RAW_SECRETS" in os.environ and os.environ["ELSPETH_ALLOW_RAW_SECRETS"].lower() == "true"
     fail_if_no_key = not allow_raw
 
     # Deep copy to avoid mutating the original
     config = copy.deepcopy(config_dict)
 
     # === Landscape URL (DSN password) ===
-    if "landscape" in config and isinstance(config["landscape"], dict):
+    if "landscape" in config and type(config["landscape"]) is dict:
         _sanitize_dsn_option_for_audit(
             config["landscape"],
             option_name="url",
@@ -2421,17 +3144,12 @@ def _fingerprint_config_for_audit(
             if type(source) is dict and "options" in source and type(source["options"]) is dict:
                 source["options"] = _fingerprint_secrets(source["options"], fail_if_no_key=fail_if_no_key)
 
-    if "source" in config and isinstance(config["source"], dict):
-        ds = config["source"]
-        if "options" in ds and isinstance(ds["options"], dict):
-            ds["options"] = _fingerprint_secrets(ds["options"], fail_if_no_key=fail_if_no_key)
-
     # === Sink options ===
-    if "sinks" in config and isinstance(config["sinks"], dict):
+    if "sinks" in config and type(config["sinks"]) is dict:
         for sink in config["sinks"].values():
-            if isinstance(sink, dict) and "options" in sink and isinstance(sink["options"], dict):
+            if type(sink) is dict and "options" in sink and type(sink["options"]) is dict:
                 options = _fingerprint_secrets(sink["options"], fail_if_no_key=fail_if_no_key)
-                if sink.get("plugin") == "database":
+                if "plugin" in sink and sink["plugin"] == "database":
                     # Database sink URLs are a plugin-specific secret-ref placement:
                     # the field is named "url" rather than a heuristic secret name.
                     _sanitize_dsn_option_for_audit(
@@ -2444,166 +3162,46 @@ def _fingerprint_config_for_audit(
                 sink["options"] = options
 
     # === Transform plugin options ===
-    if "transforms" in config and isinstance(config["transforms"], list):
+    if "transforms" in config and type(config["transforms"]) is list:
         for plugin in config["transforms"]:
-            if isinstance(plugin, dict) and "options" in plugin and isinstance(plugin["options"], dict):
+            if type(plugin) is dict and "options" in plugin and type(plugin["options"]) is dict:
                 plugin["options"] = _fingerprint_secrets(plugin["options"], fail_if_no_key=fail_if_no_key)
 
+    # === Collector plugin options ===
+    # Collectors reuse the batch-transform plugin contract, so their options
+    # are the same arbitrary secret-bearing shape as a transform's.
+    if "collectors" in config and type(config["collectors"]) is list:
+        for collector in config["collectors"]:
+            if type(collector) is dict and "options" in collector and type(collector["options"]) is dict:
+                collector["options"] = _fingerprint_secrets(collector["options"], fail_if_no_key=fail_if_no_key)
+
     # === Aggregation options ===
-    if "aggregations" in config and isinstance(config["aggregations"], list):
+    if "aggregations" in config and type(config["aggregations"]) is list:
         for agg in config["aggregations"]:
-            if isinstance(agg, dict) and "options" in agg and isinstance(agg["options"], dict):
+            if type(agg) is dict and "options" in agg and type(agg["options"]) is dict:
                 agg["options"] = _fingerprint_secrets(agg["options"], fail_if_no_key=fail_if_no_key)
 
     # === Telemetry exporter options ===
-    if "telemetry" in config and isinstance(config["telemetry"], dict):
+    if "telemetry" in config and type(config["telemetry"]) is dict:
         telemetry = config["telemetry"]
-        exporters = telemetry.get("exporters")
-        if isinstance(exporters, list):
+        exporters = telemetry["exporters"]
+        if type(exporters) is list:
             for exporter in exporters:
-                if isinstance(exporter, dict) and "options" in exporter and isinstance(exporter["options"], dict):
+                if type(exporter) is dict and "options" in exporter and type(exporter["options"]) is dict:
                     exporter["options"] = _fingerprint_secrets(exporter["options"], fail_if_no_key=fail_if_no_key)
 
+    # === Collection probe provider config ===
+    # Not named `options`, but the same free-form arbitrary-key mapping: the
+    # settings layer types it Mapping[str, Any], so any key an operator writes
+    # is carried into the audit copy. The provider model's own extra="forbid"
+    # is NOT containment here — it applies at probe construction, downstream of
+    # the settings validation that admits the value.
+    if "collection_probes" in config and type(config["collection_probes"]) is list:
+        for probe in config["collection_probes"]:
+            if type(probe) is dict and "provider_config" in probe and type(probe["provider_config"]) is dict:
+                probe["provider_config"] = _fingerprint_secrets(probe["provider_config"], fail_if_no_key=fail_if_no_key)
+
     return config
-
-
-def load_settings(config_path: Path) -> ElspethSettings:
-    """Load settings from YAML file with environment variable overrides.
-
-    Uses Dynaconf for multi-source loading with precedence:
-    1. Environment variables (ELSPETH_*) - highest priority
-    2. Config file (settings.yaml)
-    3. Defaults from Pydantic schema - lowest priority
-
-    Environment variable format: ELSPETH_DATABASE__URL for nested keys.
-
-    Args:
-        config_path: Path to YAML configuration file
-
-    Returns:
-        Validated ElspethSettings instance
-
-    Raises:
-        ValidationError: If configuration fails Pydantic validation
-        FileNotFoundError: If config file doesn't exist
-    """
-    from dynaconf import Dynaconf
-
-    # Explicit check for file existence (Dynaconf silently accepts missing files)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    # Load from file + environment
-    dynaconf_settings = Dynaconf(
-        envvar_prefix="ELSPETH",
-        settings_files=[str(config_path)],
-        environments=False,  # No [default]/[production] sections
-        load_dotenv=False,  # Don't auto-load .env
-        merge_enabled=True,  # Deep merge nested dicts
-    )
-
-    # Dynaconf returns uppercase keys; convert to lowercase for Pydantic
-    raw_dict = dynaconf_settings.as_dict()
-    raw_config = _lowercase_schema_keys(raw_dict)
-
-    # Reject unknown YAML keys before filtering. Only check keys that originate
-    # from the YAML file, NOT from environment variables. Dynaconf captures ALL
-    # ELSPETH_* env vars (e.g., ELSPETH_LOG_LEVEL → "log_level") and injects
-    # them into raw_config. These are legitimate runtime env vars, not typos.
-    known_fields = set(ElspethSettings.model_fields.keys())
-    with open(config_path) as _f:
-        _yaml_only = yaml.safe_load(_f) or {}
-    if not isinstance(_yaml_only, dict):
-        raise ValueError(f"Configuration file {config_path.name} must be a YAML mapping (key: value), not {type(_yaml_only).__name__}")
-    yaml_keys_lower = {str(k).lower() for k in _yaml_only}
-    unknown_yaml_keys = sorted(k for k in yaml_keys_lower if k not in known_fields and k not in _DYNACONF_INTERNAL_KEYS)
-    if unknown_yaml_keys:
-        raise ValueError(
-            f"Unknown configuration keys in {config_path.name}: {unknown_yaml_keys}. Check for typos. Valid top-level keys: {sorted(known_fields)}"
-        )
-
-    # Filter Dynaconf internals (now safe — all non-known keys are Dynaconf's)
-    raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
-    _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
-
-    # Expand ${VAR} and ${VAR:-default} patterns in config values
-    raw_config = _expand_env_vars(raw_config)
-
-    # Expand template files in plugin options before validation
-    # NOTE: Secrets are NOT fingerprinted here - they stay available for runtime.
-    # Fingerprinting happens in resolve_config() when creating the audit copy.
-    raw_config = _expand_config_templates(raw_config, settings_path=config_path)
-
-    return ElspethSettings(**raw_config)
-
-
-def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_env_vars: bool = False) -> ElspethSettings:
-    """Load settings from an already parsed in-memory config dict.
-
-    This is the common post-parse path for web execution and validation.
-    It skips Dynaconf (no env var merging) and file I/O, ensuring resolved
-    secrets and inline blob contents never need to be serialized back to
-    YAML before validation. File-backed template options (template_file,
-    lookup_file, system_prompt_file) are rejected because there is no
-    trusted settings-file root for resolving them.
-
-    Args:
-        config_dict: Parsed YAML configuration mapping.
-        expand_env_vars: Whether to expand ``${VAR}`` and ``${VAR:-default}``
-            patterns from the host environment. Defaults to ``False`` because
-            this in-memory loader is used for web-authored YAML, which is
-            user-controlled. Known secret inventory names are resolved via the
-            audited resolve_secret_refs() path beforehand, and any remaining
-            ``${VAR}`` must stay literal data rather than become a
-            host-environment lookup. Trusted in-process callers that intentionally
-            want host environment expansion must opt in explicitly.
-
-    Returns:
-        Validated ElspethSettings instance.
-    """
-    raw_config = _lowercase_schema_keys(dict(config_dict))
-    known_fields = set(ElspethSettings.model_fields.keys())
-
-    unknown_keys = sorted(k for k in raw_config if k not in known_fields)
-    if unknown_keys:
-        raise ValueError(f"Unknown configuration keys: {unknown_keys}. Valid top-level keys: {sorted(known_fields)}")
-
-    raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
-    _reject_file_backed_template_options_for_in_memory_loader(raw_config)
-    _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
-    if expand_env_vars:
-        raw_config = _expand_env_vars(raw_config)
-    return ElspethSettings(**raw_config)
-
-
-def load_settings_from_yaml_string(yaml_content: str, *, expand_env_vars: bool = False) -> ElspethSettings:
-    """Load settings from a YAML string without touching disk.
-
-    This is used by the web execution service to load pipeline configs
-    that may contain resolved secrets. Unlike load_settings(), this
-    skips Dynaconf (no env var merging) and file I/O, ensuring secret
-    values never leave process memory. File-backed template options
-    (template_file, lookup_file, system_prompt_file) are rejected because
-    there is no trusted settings-file root for resolving them.
-
-    Args:
-        yaml_content: YAML configuration as a string.
-        expand_env_vars: Whether to expand ``${VAR}`` and ``${VAR:-default}``
-            patterns from the host environment. Defaults to ``False`` because
-            this in-memory loader is used for web-authored YAML, which is
-            user-controlled. Known secret inventory names are resolved via the
-            audited resolve_secret_refs() path beforehand, and any remaining
-            ``${VAR}`` must stay literal data rather than become a
-            host-environment lookup. Trusted in-process callers that intentionally
-            want host environment expansion must opt in explicitly.
-
-    Returns:
-        Validated ElspethSettings instance.
-    """
-    config_dict = load_bounded_pipeline_yaml(yaml_content)
-    if not isinstance(config_dict, dict):
-        raise ValueError(f"Configuration must be a YAML mapping (key: value), not {type(config_dict).__name__}")
-    return load_settings_from_config_dict(config_dict, expand_env_vars=expand_env_vars)
 
 
 def resolve_config(settings: ElspethSettings) -> dict[str, Any]:

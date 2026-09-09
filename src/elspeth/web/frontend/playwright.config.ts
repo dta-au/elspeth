@@ -52,6 +52,13 @@ const composerSettingsEnv: Record<string, string> = {
   ELSPETH_WEB__composer_rate_limit_per_minute: "60",
   ELSPETH_WEB__auth_rate_limit_per_minute: "120",
   ELSPETH_WEB__e2e_state_seed_enabled: "true",
+  // Catalog acceptance exercises representative user-configurable plugins
+  // outside the universal minimum. Authorize them only in this ephemeral
+  // Playwright deployment; production REQUIRED_WEB_PLUGIN_IDS is unchanged.
+  ELSPETH_WEB__plugin_allowlist: JSON.stringify([
+    "transform:value_transform",
+    "sink:database",
+  ]),
   // Keep the operator-profiled LLM catalog surface available without a
   // credential or network call. The E2E schema test verifies the public
   // alias-only contract; it never executes this Bedrock profile.
@@ -61,6 +68,12 @@ const composerSettingsEnv: Record<string, string> = {
       model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
     },
   }),
+  // A deployment that configures llm_profiles must designate its standard
+  // profile: WebSettings refuses to start otherwise (see the
+  // _validate_default_llm_profile_alias model validator in
+  // src/elspeth/web/config.py). Without this the Playwright-managed backend
+  // raises before binding its port and every spec fails on webServer timeout.
+  ELSPETH_WEB__default_llm_profile: "e2e-bedrock",
   // Placeholder JWT signing key for the local webServer instance. The
   // backend refuses startup if cors_origins contains a non-loopback host
   // and secret_key is left at its default; here we set it explicitly so
@@ -73,6 +86,34 @@ const composerSettingsEnv: Record<string, string> = {
   ELSPETH_WEB__shareable_link_signing_key: "ZWxzcGV0aC1lMmUtc2hhcmUta2V5LTAwMDAwMDAwMDA=", // secret-scan: allow-this-line
 
   ELSPETH_WEB__cors_origins: JSON.stringify([FRONTEND_URL]),
+  // Hermetic composer availability (elspeth-e425a36805). litellm runs
+  // python-dotenv's load_dotenv() at import unless LITELLM_MODE is
+  // "PRODUCTION", and find_dotenv walks UP from the package, so on a
+  // developer box the Playwright-managed backend picked up the checkout's
+  // .env (a worktree sits beneath it too): the developer's provider key,
+  // composer models and turn/timeout limits — the .env's upper-case keys
+  // beat the lower-case pins above — and litellm logged completion() calls
+  // against those models at boot. CI has no .env anywhere above its
+  // checkout, so it booted without any of that. The tall-dialog full-page
+  // baseline captured the split: green locally with an empty notice band,
+  // red on CI where the band carried "Service unavailable: … missing
+  // OPENAI_API_KEY." This pin is a no-op on CI and makes the local backend
+  // boot the same way. It is litellm's only use of LITELLM_MODE.
+  LITELLM_MODE: "PRODUCTION",
+  // No ambient provider credential reaches the backend from the developer's
+  // shell either: every key in PROVIDER_REQUIRED_ENV_KEYS
+  // (src/elspeth/web/composer/provider_config.py) is blanked, and an empty
+  // value counts as missing (_missing_required_env_keys in
+  // src/elspeth/web/composer/availability.py). The composer is therefore
+  // unavailable in every E2E run — the state CI has always tested — and the
+  // model names are pinned so the notice copy the tall-dialog baseline
+  // carries does not move with the product default.
+  OPENAI_API_KEY: "",
+  ANTHROPIC_API_KEY: "",
+  AZURE_API_KEY: "",
+  OPENROUTER_API_KEY: "",
+  ELSPETH_WEB__composer_model: "gpt-5.5",
+  ELSPETH_WEB__composer_advisor_model: "anthropic/claude-sonnet-4-6",
 };
 
 export default defineConfig({
@@ -124,12 +165,14 @@ export default defineConfig({
   webServer: [
     {
       command:
+        "npm --prefix src/elspeth/web/frontend run build && " +
         "uv run --extra webui python -m uvicorn elspeth.web.app:create_app --factory " +
         `--host 127.0.0.1 --port ${BACKEND_PORT}`,
       cwd: REPO_ROOT_FROM_FRONTEND,
       url: BACKEND_HEALTH_URL,
-      // The backend must be the Playwright-managed process so
-      // composerSettingsEnv controls auth policy and .e2e-data isolation.
+      // Build before startup so this process serves the production SPA as
+      // well as the API. Browser-security specs exercise that document path;
+      // composerSettingsEnv still controls auth policy and .e2e-data isolation.
       reuseExistingServer: false,
       timeout: 60_000,
       stdout: "pipe",

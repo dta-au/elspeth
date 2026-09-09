@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from elspeth.contracts.freeze import require_int
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +178,14 @@ class TokenUsage:
         return cls(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source="LLM API provider response (OpenAI, Anthropic, OpenRouter, etc.)",
+        source_param="data",
+        suppresses=("R1", "R5"),
+        invariant="Coerces all input to TokenUsage with None sentinels for missing/malformed fields; never raises on external data. Silently converts unknown types, negative values, and absent keys to None per CLAUDE.md fabrication policy.",
+        non_raising=True,
+    )
     def from_dict(cls, data: Any) -> TokenUsage:
         """Reconstruct from external (Tier 3) data.
 
@@ -256,6 +265,21 @@ class TokenUsage:
         )
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "one token-count field lifted out of an LLM API provider response by TokenUsage.from_dict "
+        "(cached_prompt_tokens / prompt_tokens_details.cached_tokens / cache_creation_input_tokens / "
+        "cache_read_input_tokens / reasoning_tokens) — provider JSON ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns the value only when it is a non-negative, non-bool int; every other shape "
+        "(str, float, bool, None, absent key, negative int) returns None so an unreported cache "
+        "statistic stays unknown rather than being fabricated as zero; never raises on external data"
+    ),
+)
 def _coerce_nonneg_int(value: Any) -> int | None:
     """Tier-3 helper: coerce arbitrary input to a non-negative int or ``None``.
 

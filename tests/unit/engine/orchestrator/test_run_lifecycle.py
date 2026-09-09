@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.engine.orchestrator.run_lifecycle import ExecuteRun, InitializeDatabasePhase, RunLifecycleCoordinator
 
 
@@ -46,6 +47,7 @@ def test_execute_export_phase_forwards_explicit_payload_and_content_stores() -> 
             audit_export_content_store=content_store,
             audit_export_content_store_resolver=content_store_resolver,
             worker_id="worker:run-1:unique",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:unique", leader_epoch=1),
         )
 
     assert export.call_args.kwargs["payload_store"] is payload_store

@@ -21,7 +21,9 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     HarnessCaseSpec,
     ScenarioManifest,
     ScenarioSpec,
+    SemanticRunExpectation,
     Stage,
+    Workflow,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -38,6 +40,17 @@ _LIFECYCLE_STAGE_BY_DIMENSION: dict[Dimension, Stage] = {
     "audit": "audit",
     "recovery": "recovery",
 }
+_EXACT_HARNESS_STAGES_BY_WORKFLOW: dict[Workflow, tuple[Stage, ...]] = {
+    "build": ("config", "build"),
+    "run": ("config", "build", "runtime", "audit"),
+    "recovery": ("config", "build", "runtime", "audit", "recovery"),
+}
+
+
+def _exact_harness_stages(case: HarnessCaseSpec) -> tuple[Stage, ...]:
+    if isinstance(case.expected, SemanticRunExpectation):
+        return ("config", "build", "runtime")
+    return _EXACT_HARNESS_STAGES_BY_WORKFLOW[case.workflow]
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -72,15 +85,15 @@ def _load_yaml_without_duplicate_keys(path: Path) -> object:
 
 
 def load_manifest(path: Path = DEFAULT_MANIFEST_PATH) -> ScenarioManifest:
-    """Load the v1 manifest and fail closed on schema or semantic drift."""
+    """Load the corpus manifest schema v2 and fail closed on semantic drift."""
 
     raw = _load_yaml_without_duplicate_keys(path)
     if not isinstance(raw, dict):
         raise ValueError(f"DAG scenario manifest must be a YAML mapping: {path}")
     schema_version = raw.get("schema_version")
     # An isinstance check would admit bool because bool subclasses int.
-    if type(schema_version) is not int or schema_version != 1:
-        raise ValueError(f"DAG scenario manifest schema_version must be exactly integer 1: {path}")
+    if type(schema_version) is not int or schema_version != 2:
+        raise ValueError(f"DAG scenario manifest schema_version must be exactly integer 2: {path}")
     manifest = ScenarioManifest.model_validate(raw)
     _validate_exact_inventory(manifest)
     _validate_evidence_references(manifest)
@@ -161,16 +174,16 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
     for reference in manifest.evidence:
         _validate_evidence_locator(reference)
 
-    registered_case_locators: list[str] = []
+    registered_cases_by_locator: dict[str, HarnessCaseSpec] = {}
     for scenario in manifest.scenarios:
         case_ids = tuple(case.id for case in scenario.cases)
         duplicate_case_ids = tuple(identifier for identifier, count in Counter(case_ids).items() if count > 1)
         if duplicate_case_ids:
             duplicate_locators = ", ".join(f"{scenario.id}:{identifier}" for identifier in duplicate_case_ids)
             raise ValueError(f"DAG scenario manifest contains duplicate case id(s): {duplicate_locators}")
-        registered_case_locators.extend(f"{scenario.id}:{case.id}" for case in scenario.cases)
+        registered_cases_by_locator.update((f"{scenario.id}:{case.id}", case) for case in scenario.cases)
 
-    registered_cases = set(registered_case_locators)
+    registered_cases = set(registered_cases_by_locator)
     harness_locators = {reference.locator for reference in manifest.evidence if reference.kind == "harness"}
     unknown_harness_locators = sorted(harness_locators - registered_cases)
     if unknown_harness_locators:
@@ -178,6 +191,16 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
     missing_harness_locators = sorted(registered_cases - harness_locators)
     if missing_harness_locators:
         raise ValueError("DAG scenario harness case(s) " + ", ".join(missing_harness_locators) + " lack a matching evidence locator")
+    for reference in manifest.evidence:
+        if reference.kind != "harness":
+            continue
+        case = registered_cases_by_locator[reference.locator]
+        exact_stages = _exact_harness_stages(case)
+        if reference.stages != exact_stages:
+            raise ValueError(
+                f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} for {case.workflow} workflow "
+                f"must declare exact stages {exact_stages!r}; got {reference.stages!r}"
+            )
 
     referenced_evidence_ids: set[str] = set()
     for scenario in manifest.scenarios:
@@ -186,13 +209,36 @@ def _validate_evidence_references(manifest: ScenarioManifest) -> None:
             unknown_ids = tuple(evidence_id for evidence_id in cell.evidence if evidence_id not in evidence_by_id)
             if unknown_ids:
                 raise ValueError(f"DAG scenario {scenario.id}.{dimension} references unknown evidence id(s): {', '.join(unknown_ids)}")
+            required_stage = _LIFECYCLE_STAGE_BY_DIMENSION.get(dimension)
+            for evidence_id in cell.evidence:
+                reference = evidence_by_id[evidence_id]
+                if reference.kind != "harness":
+                    continue
+                locator_scenario_id = reference.locator.partition(":")[0]
+                if locator_scenario_id != scenario.id:
+                    raise ValueError(
+                        f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} has locator scenario "
+                        f"{locator_scenario_id!r}, which does not match containing cell {scenario.id}.{dimension}"
+                    )
+                case = registered_cases_by_locator[reference.locator]
+                validated_stages = _exact_harness_stages(case)
+                if required_stage is None or required_stage not in validated_stages:
+                    unsupported_dimension = (
+                        f"required stage {required_stage!r} for dimension {dimension!r}"
+                        if required_stage is not None
+                        else f"non-lifecycle dimension {dimension!r}"
+                    )
+                    raise ValueError(
+                        f"DAG scenario harness evidence {reference.id!r} at {reference.locator!r} is attached to "
+                        f"{scenario.id}.{dimension}, but its {case.workflow} workflow has validated lifecycle stages "
+                        f"{validated_stages!r} and cannot support {unsupported_dimension}"
+                    )
             if cell.status == "pass":
                 executable_evidence = tuple(
                     evidence_by_id[evidence_id] for evidence_id in cell.evidence if evidence_by_id[evidence_id].executable
                 )
                 if not executable_evidence:
                     raise ValueError(f"DAG scenario pass cell {scenario.id}.{dimension} references only document/decision evidence")
-                required_stage = _LIFECYCLE_STAGE_BY_DIMENSION.get(dimension)
                 if required_stage is not None and not any(required_stage in evidence.stages for evidence in executable_evidence):
                     raise ValueError(
                         f"DAG scenario pass lifecycle cell {scenario.id}.{dimension} lacks executable evidence declaring stage {required_stage!r}"
@@ -289,8 +335,16 @@ def _validate_document_locator(locator: str) -> None:
 
 def _validate_case_paths(manifest: ScenarioManifest) -> None:
     for scenario, case in iter_harness_cases(manifest):
-        for field_name, relative_path in (("fixture", case.fixture), ("input_fixture", case.input_fixture)):
+        try:
+            resolve_fixture_path(case.fixture)
+        except ValueError as exc:
+            raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid fixture: {exc}") from exc
+
+        resolved_inputs: list[Path] = []
+        for source_name, relative_path in case.input_fixtures.items():
             try:
-                resolve_fixture_path(relative_path)
+                resolved_inputs.append(resolve_fixture_path(relative_path))
             except ValueError as exc:
-                raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid {field_name}: {exc}") from exc
+                raise ValueError(f"DAG scenario case {scenario.id}:{case.id} has invalid input_fixtures[{source_name!r}]: {exc}") from exc
+        if len(set(resolved_inputs)) != len(resolved_inputs):
+            raise ValueError(f"DAG scenario case {scenario.id}:{case.id} input_fixtures resolve to duplicated paths")

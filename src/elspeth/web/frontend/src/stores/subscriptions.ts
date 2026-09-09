@@ -8,14 +8,65 @@ import { useSessionStore } from "./sessionStore";
 import { useExecutionStore } from "./executionStore";
 import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
-import type { ValidationResult } from "@/types/index";
+import type { CompositionState, ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
-import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import { compositionContentEqual } from "@/lib/compositionContent";
+import {
+  humaniseValidationMessage,
+  makePhraseFor,
+  stepPrefixPhrase,
+} from "@/lib/validationHumaniser";
+import {
+  characterisePendingControls,
+  pendingControlsInstruction,
+} from "@/components/chat/acknowledgementLabels";
+import { useInterpretationEventsStore } from "./interpretationEventsStore";
 
 let previousVersion: number | null = null;
 let previousSessionIds: Set<string> = new Set();
 let initialized = false;
 let unsubscribe: (() => void) | null = null;
+
+/**
+ * Last composition each version-keyed subscriber acted on, so a version bump
+ * that authored NOTHING can be recognised and skipped (elspeth-986801d218 —
+ * a post-completion guided chat persists a byte-identical state row, and
+ * clearing + re-validating on it flipped the completed heading off "Pipeline
+ * ready" for the round trip).
+ *
+ * ONE SNAPSHOT PER SUBSCRIBER, never a shared one. Zustand fires listeners in
+ * registration order on a single `setState`: the version-clear subscriber
+ * (registered first) would advance a shared snapshot to the current state and
+ * the auto-validate subscriber (registered second) would then compare the
+ * current state against itself, find it equal, and never validate again.
+ *
+ * Both must be reset in `_resetSubscriptionsForTesting()` AND in
+ * `resetPerUserState()` — a snapshot surviving a logout / user switch would
+ * suppress the first real change of the next identity.
+ */
+interface CompositionSnapshot {
+  sessionId: string | null;
+  version: number;
+  state: CompositionState;
+}
+let previousClearSnapshot: CompositionSnapshot | null = null;
+let previousValidatedSnapshot: CompositionSnapshot | null = null;
+
+/**
+ * True when `snapshot` describes the SAME session's composition and its
+ * authored content matches `state` — i.e. the version bump between them is a
+ * bookkeeping write, not an edit. Fails closed on a null snapshot or a
+ * session change (see compositionContent.ts's safe-direction rule).
+ */
+function isContentOnlyVersionBump(
+  snapshot: CompositionSnapshot | null,
+  sessionId: string | null,
+  state: CompositionState | null,
+): boolean {
+  if (snapshot === null || state === null) return false;
+  if (snapshot.sessionId !== sessionId) return false;
+  return compositionContentEqual(snapshot.state, state);
+}
 
 // Tracks the last-seen activeSessionId so the run-rehydration subscriber
 // fires once per session activation, not on every sessionStore write.
@@ -121,12 +172,12 @@ function validationFingerprint(result: ValidationResult | null): string | null {
  * Format one validation finding as a novice-register chat bullet
  * (elspeth-d9e5d157cb). Routes the raw backend message through the SHARED
  * humaniser and drops the engineer-grade "[type] id:" internal-id prefix the
- * old injection leaked verbatim. Prefixes the plain step name only when the
- * finding is attributed to a resolvable component AND was passed through
- * un-humanised (a humanised contract headline already names its steps) —
- * mirrors formatFindingBody (elspeth-901a404926). Interpretation-review-pending
- * findings never reach here (handled by isPendingInterpretationReviewResult
- * above), so no stepLabelFor is needed.
+ * old injection leaked verbatim. Prefixes the plain step name exactly when
+ * the SHARED stepPrefixPhrase (the same decision formatFindingBody renders
+ * from — elspeth-901a404926 / elspeth-9f21f3c57d) says the prefix adds a
+ * name the headline lacks. Interpretation-review-pending findings never
+ * reach here (handled by isPendingInterpretationReviewResult above), so no
+ * stepLabelFor is needed.
  *
  * `componentType` is the SAME finding's structured `component_type` —
  * required (not optional) so this can't silently drop the hint that lets
@@ -140,9 +191,9 @@ function humanisedValidationBullet(
   phraseFor: (componentId: string | null, componentType?: string | null) => string,
 ): string {
   const finding = humaniseValidationMessage(message, phraseFor);
-  const attributed = finding.raw === null && componentId !== null;
-  return attributed
-    ? `- **${phraseFor(componentId, componentType)}:** ${finding.headline}`
+  const prefix = stepPrefixPhrase(finding, componentId, componentType, phraseFor);
+  return prefix !== null
+    ? `- **${prefix}:** ${finding.headline}`
     : `- ${finding.headline}`;
 }
 
@@ -175,6 +226,8 @@ function authIdentityFingerprint(state: { token: string | null; user: { user_id:
  */
 function resetPerUserState(): void {
   previousVersion = null;
+  previousClearSnapshot = null;
+  previousValidatedSnapshot = null;
   previousValidationFingerprint = null;
   previousWasPendingReview = false;
   previousSessionIds = new Set();
@@ -226,12 +279,53 @@ export function initStoreSubscriptions(): void {
   previousSessionIds = new Set(useSessionStore.getState().sessions.map((s) => s.id));
 
   unsubscribe = useSessionStore.subscribe((state) => {
-    // Version-change clears validation.
-    const currentVersion = state.compositionState?.version ?? null;
+    // Version-change clears validation — UNLESS the new version carries the
+    // same authored content as the one it replaced. A content-equal bump
+    // (a post-completion guided chat's byte-identical settlement row) leaves
+    // the existing verdict exactly as true as it was; clearing it would blank
+    // the run gate's readiness and read on screen as "Pipeline updated" until
+    // a redundant re-validate landed.
+    const composition = state.compositionState;
+    const currentVersion = composition?.version ?? null;
     if (previousVersion !== null && currentVersion !== previousVersion) {
-      useExecutionStore.getState().clearValidation();
+      const contentOnlyBump = isContentOnlyVersionBump(
+        previousClearSnapshot,
+        state.activeSessionId,
+        composition,
+      );
+      if (!contentOnlyBump) {
+        useExecutionStore.getState().clearValidation();
+      } else if (
+        previousClearSnapshot !== null &&
+        state.activeSessionId !== null &&
+        currentVersion !== null
+      ) {
+        // Same authored content ⇒ the readiness the server computed for the
+        // previous version is exact for this one. Carry it forward rather
+        // than let `useAuditReadinessSync`'s version-keyed effect refetch:
+        // that fetch is the SAME defect on a third surface (Checks badge to
+        // "Checking", ExecuteButton's advisory snapshot to undefined, one
+        // extra server-side validation + audit projection per question).
+        // The store re-checks that the cached snapshot is the predecessor's
+        // before it moves — this side owns only the content proof.
+        useAuditReadinessStore
+          .getState()
+          .carrySnapshotForward(
+            state.activeSessionId,
+            previousClearSnapshot.version,
+            currentVersion,
+          );
+      }
     }
     previousVersion = currentVersion;
+    previousClearSnapshot =
+      composition === null || currentVersion === null
+        ? null
+        : {
+            sessionId: state.activeSessionId,
+            version: currentVersion,
+            state: composition,
+          };
 
     // Session removal clears audit-readiness cache.
     const currentIds = new Set(state.sessions.map((s) => s.id));
@@ -303,14 +397,53 @@ export function initStoreSubscriptions(): void {
       const count = result.readiness.blockers.filter(
         (blocker) => blocker.code === "interpretation_review_pending",
       ).length;
+      // Button names come from `characterisePendingControls` /
+      // `pendingControlsInstruction` (acknowledgementLabels.ts), the SAME
+      // rule ChatInput's placeholder uses, so this note cannot drift from
+      // the rendered controls or from the sibling surface
+      // (elspeth-0a9f77dd75). Any set that rule cannot characterise — a mix
+      // that includes a prompt card, or an empty/stale pending map (the
+      // events stream in on a separate fetch that can lag validation) —
+      // returns null and falls back to neutral wording that names no control
+      // at all. The invariant is one-way: never name a control the pending
+      // card(s) do not render.
+      //
+      // Not tutorial-aware, and does not need to be: the stack additionally
+      // suppresses amend in tutorial mode (AcknowledgementStack `showAmend={
+      // !isTutorial && …}`), but this note is injected into sessionStore
+      // `messages`, which only the FREEFORM ChatPanel branch renders — the
+      // tutorial/guided column renders `guidedSession.chat_history` instead.
+      const pendingMap =
+        useInterpretationEventsStore.getState().pendingBySession[
+          sessionStore.activeSessionId ?? ""
+        ];
+      const pendingKinds =
+        pendingMap === undefined
+          ? []
+          : Object.values(pendingMap).map((event) => event.kind);
+      const instruction = pendingControlsInstruction(
+        characterisePendingControls(pendingKinds),
+        (label) => `**${label}**`,
+      );
+      // One vocabulary for one action (ux-review 2026-08-13): the click
+      // records an attestation, so the prose says "sign-off"/"acknowledged"
+      // throughout rather than mixing "okay", "Acknowledge" and "approved".
+      // "approved" in particular was the lowercase form of a DIFFERENT
+      // control's name (Approve), which all-vague_term sets never render.
+      const pickSingular =
+        instruction ?? "use the buttons on the card to resolve it";
+      const pickPlural =
+        instruction === null
+          ? "use the buttons on each card to resolve them"
+          : `${instruction} for each`;
       const message =
         count === 1
-          ? "I made one choice while building this that I'd like you to okay. " +
-            "Check the card above and pick **Use** or **Change it** — then your " +
-            "pipeline's ready to run."
-          : `I made ${count} choices while building this that I'd like you to okay. ` +
-            "Check the cards above and pick **Use** or **Change it** for each — " +
-            "once they're all approved, your pipeline's ready to run.";
+          ? "I made one choice while building this that needs your sign-off. " +
+            `Check the card above and ${pickSingular} — then your pipeline's ` +
+            "ready to run."
+          : `I made ${count} choices while building this that need your sign-off. ` +
+            `Check the cards above and ${pickPlural} — once every card is ` +
+            "acknowledged, your pipeline's ready to run.";
       sessionStore.injectSystemMessage(message, VALIDATION_MSG_ID);
       return;
     }
@@ -337,15 +470,19 @@ export function initStoreSubscriptions(): void {
       sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);
     } else if (result.is_valid && previousWasPendingReview) {
       // The user just resolved the last pending interpretation review and the
-      // pipeline is otherwise clean. Replace the now-stale "needs your okay"
-      // message (same VALIDATION_MSG_ID) with a clear next step — the Run
-      // button lives in the side rail, away from the chat where the user's
-      // attention is, so name it explicitly. Gated on previousWasPendingReview
-      // so ordinary mid-compose valid results stay quiet.
+      // pipeline is otherwise clean. Replace the now-stale "needs your
+      // sign-off" message (same VALIDATION_MSG_ID) with a clear next step —
+      // the Run control lives away from the chat where the user's attention
+      // is, so NAME THE CONTROL. Deliberately no locative (was "in the side
+      // panel"): a place word is a second thing that can contradict the
+      // layout, which is the elspeth-eba8820005 defect class, and the control
+      // name "Run pipeline" is unique and searchable on its own. Gated on
+      // previousWasPendingReview so ordinary mid-compose valid results stay
+      // quiet.
       previousWasPendingReview = false;
       sessionStore.injectSystemMessage(
-        "All approved — your pipeline's ready. Select **Run pipeline** in the " +
-          "side panel to start it.",
+        "Every card acknowledged — your pipeline's ready. Select " +
+          "**Run pipeline** to start it.",
         VALIDATION_MSG_ID,
       );
     }
@@ -359,6 +496,38 @@ export function initStoreSubscriptions(): void {
     if (lastValidatedVersionBySession.get(sessionId) === version) return;
     const exec = useExecutionStore.getState();
     if (exec.isExecuting || exec.progress?.status === "running") return;
+
+    // Content-equal carry-forward: a verdict that LANDED for this exact
+    // content is carried to the new version instead of re-POSTing /validate.
+    //
+    // "Landed" is the load-bearing half — `lastValidatedVersionBySession`
+    // holding the snapshot's own version. Without it this would swallow the
+    // deliberate retry of a version whose validate FAILED or was suppressed:
+    // that path leaves the cache empty precisely so a re-fire validates
+    // again, and there is no verdict to carry forward from it.
+    //
+    // Advancing the cache is what makes the skip safe to repeat — a LATER
+    // version with genuinely different content still misses it and validates.
+    // This subscriber owns that map, so the advance lives here and nowhere
+    // else.
+    const carriedVerdict =
+      previousValidatedSnapshot !== null &&
+      lastValidatedVersionBySession.get(sessionId) ===
+        previousValidatedSnapshot.version &&
+      isContentOnlyVersionBump(
+        previousValidatedSnapshot,
+        sessionId,
+        state.compositionState,
+      );
+    previousValidatedSnapshot = {
+      sessionId,
+      version,
+      state: state.compositionState,
+    };
+    if (carriedVerdict) {
+      lastValidatedVersionBySession.set(sessionId, version);
+      return;
+    }
 
     pendingValidateTarget = { sessionId, version, force: false };
     if (validateInflight) return;
@@ -467,6 +636,8 @@ export function _resetSubscriptionsForTesting(): void {
   unsubscribeRunRehydration = null;
   previousActiveSessionId = null;
   previousVersion = null;
+  previousClearSnapshot = null;
+  previousValidatedSnapshot = null;
   previousValidationFingerprint = null;
   previousWasPendingReview = false;
   previousSessionIds = new Set();

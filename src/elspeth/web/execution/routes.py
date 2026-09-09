@@ -31,18 +31,31 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from starlette.types import Receive, Scope, Send
 
+from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerService, ComposerServiceError
 from elspeth.web.composer.service import _BadRequestLLMError
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
-from elspeth.web.execution.diagnostics import llm_safe_diagnostics_snapshot, load_run_diagnostics_for_settings
+from elspeth.web.execution.completion_gates import parse_completion_gates
+from elspeth.web.execution.diagnostics import (
+    RunDiagnosticsAuditUnavailableError,
+    llm_safe_diagnostics_snapshot,
+    load_run_diagnostics_for_settings,
+)
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
+    CompletionGateIntegrityError,
     ExecuteRequestValidationError,
+    ExecutionReadinessError,
     PipelineValidationError,
     RunSessionIntegrityError,
     SemanticContractViolationError,
@@ -76,18 +89,27 @@ from elspeth.web.execution.schemas import (
     RunStatusResponse,
     ValidationResult,
     WebSocketTicketResponse,
+    revalidated_with_discard_summary,
 )
+from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
+from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import (
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuthorityLostError,
     RunEventRecord,
     RunRecord,
     SessionServiceProtocol,
     TerminalSessionRunStatus,
 )
-from elspeth.web.sessions.routes._helpers import _litellm_error_detail
+from elspeth.web.sessions.routes._helpers import (
+    _get_session_compose_lock_registry,
+    _litellm_error_detail,
+    _persist_run_diagnostics_llm_calls,
+)
 
 slog = structlog.get_logger()
 _ARTIFACT_SNAPSHOT_CHUNK_SIZE = 1024 * 1024
@@ -106,6 +128,50 @@ async def _get_session_service(request: Request) -> SessionServiceProtocol:
 
 def _get_websocket_ticket_store(app: Any) -> WebSocketTicketStore:
     return cast(WebSocketTicketStore, app.state.websocket_ticket_store)
+
+
+async def _close_execute_lease_before_transfer(
+    lease: SessionOperationLease,
+    *,
+    cancellation: asyncio.CancelledError | None = None,
+) -> None:
+    """Join exact lease cleanup even when request cancellation repeats."""
+    close_task = asyncio.create_task(
+        lease.close(),
+        name="execution-pretransfer-lease-close",
+    )
+    while not close_task.done():
+        try:
+            # wait observes completion without propagating the close error or
+            # cancelling the close task when this request is cancelled.
+            await asyncio.wait({close_task})
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    try:
+        close_task.result()
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except BaseException as close_error:
+        if cancellation is None:
+            raise
+        cancellation.add_note(f"Execution pre-transfer lease close also failed with {type(close_error).__name__}.")
+        try:
+            slog.error(
+                "execution_pretransfer_lease_close_failed",
+                session_id=lease.context.fence.session_id,
+                operation_id=lease.context.fence.operation_id,
+                operation_epoch=lease.context.fence.operation_epoch,
+                error_type=type(close_error).__name__,
+                primary_error_type=type(cancellation).__name__,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as logging_error:
+            cancellation.add_note(f"Execution pre-transfer cleanup diagnostic also failed with {type(logging_error).__name__}.")
+    if cancellation is not None:
+        raise cancellation from None
 
 
 @dataclass(frozen=True)
@@ -132,12 +198,20 @@ class _ByteRange:
         return self.end_inclusive - self.start + 1
 
 
+class _ArtifactContentDriftError(HTTPException):
+    """An artifact candidate differs from its recorded content identity."""
+
+
+class _ArtifactPurgedOrMovedError(HTTPException):
+    """An artifact candidate no longer exists at its recorded location."""
+
+
 def _artifact_content_drift_http(
     artifact: RunOutputArtifact,
     *,
     actual_size_bytes: int,
 ) -> HTTPException:
-    return HTTPException(
+    return _ArtifactContentDriftError(
         status_code=409,
         detail={
             "error_type": "artifact_content_drift",
@@ -163,20 +237,13 @@ def _reject_artifact_content_drift(
 
 
 def _artifact_purged_or_moved_http(artifact: RunOutputArtifact) -> HTTPException:
-    return HTTPException(
+    return _ArtifactPurgedOrMovedError(
         status_code=410,
         detail={
             "error_type": "artifact_purged_or_moved",
             "path_or_uri": artifact.path_or_uri,
         },
     )
-
-
-def _artifact_error_type(exc: HTTPException) -> str | None:
-    if not isinstance(exc.detail, Mapping):
-        return None
-    error_type = exc.detail.get("error_type")
-    return error_type if isinstance(error_type, str) else None
 
 
 def _resolved_allowed_artifact_paths(
@@ -202,8 +269,11 @@ def _resolved_allowed_artifact_paths(
     for fs_path in fs_paths:
         try:
             resolved = fs_path.resolve()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"error_type": "artifact_path_resolution_failed"},
+            ) from exc
         if resolved in seen_paths:
             continue
         if any(resolved.is_relative_to(base) for base in allowed):
@@ -271,6 +341,30 @@ def _parse_single_range(range_header: str | None, *, size_bytes: int) -> _ByteRa
         start=start,
         end_inclusive=min(end_inclusive, size_bytes - 1),
     )
+
+
+@trust_boundary(
+    tier=3,
+    source="the optional client-supplied HTTP Range request header on the artefact download endpoint; "
+    "clients may omit it, and any present value is attacker-controlled text",
+    source_param="request",
+    suppresses=("R1",),
+    invariant="returns None when the client sent no Range header, and raises HTTPException (416 "
+    "range_not_satisfiable) for any present header that is malformed or unsatisfiable against "
+    "size_bytes; never fabricates or clamps a range from an unparsable header",
+    test_ref="tests/unit/web/execution/test_outputs_routes.py::test_requested_byte_range_rejects_a_malformed_range_header",
+    test_fingerprint="a4ad3768a999a76d9f242f4c8a881d6f6f2496740a23bd3369ae0f1a3d610934",
+)
+def _requested_byte_range(request: Request, *, size_bytes: int) -> _ByteRange | None:
+    """Read the optional ``Range`` request header and parse it against ``size_bytes``.
+
+    Absence of the header is a legal client choice and must become ``None``
+    for the caller, so the read is a ``.get()`` on Tier-3 HTTP input rather
+    than an assertion about an owned mapping. Every present value goes
+    straight into :func:`_parse_single_range`, which rejects anything it
+    cannot parse with a 416 rather than guessing an offset.
+    """
+    return _parse_single_range(request.headers.get("range"), size_bytes=size_bytes)
 
 
 def _stream_temp_snapshot(path: Path, *, byte_range: _ByteRange | None = None) -> Iterator[bytes]:
@@ -437,15 +531,12 @@ async def _verified_artifact_file_snapshot_from_candidates(
                 artifact,
                 snapshot_dir=snapshot_dir,
             )
-        except HTTPException as exc:
-            error_type = _artifact_error_type(exc)
-            if error_type == "artifact_purged_or_moved":
-                purged_error = exc
-                continue
-            if error_type == "artifact_content_drift":
-                drift_error = exc
-                continue
-            raise
+        except _ArtifactPurgedOrMovedError as exc:
+            purged_error = exc
+            continue
+        except _ArtifactContentDriftError as exc:
+            drift_error = exc
+            continue
         return resolved, snapshot
 
     if drift_error is not None:
@@ -472,15 +563,12 @@ async def _verified_artifact_preview_head_from_candidates(
     for resolved in candidates:
         try:
             snapshot = await _verified_artifact_preview_head(resolved, artifact)
-        except HTTPException as exc:
-            error_type = _artifact_error_type(exc)
-            if error_type == "artifact_purged_or_moved":
-                purged_error = exc
-                continue
-            if error_type == "artifact_content_drift":
-                drift_error = exc
-                continue
-            raise
+        except _ArtifactPurgedOrMovedError as exc:
+            purged_error = exc
+            continue
+        except _ArtifactContentDriftError as exc:
+            drift_error = exc
+            continue
         return resolved, snapshot
 
     if drift_error is not None:
@@ -577,15 +665,26 @@ async def _load_run_status_snapshot_with_accounting(
     accounting = None
     if run_record.landscape_run_id and run_record.status in RUN_STATUS_TERMINAL_VALUES:
         try:
-            accounting_by_run_id = await run_sync_in_worker(
+            accounting_batch = await run_sync_in_worker(
                 load_run_accounting_for_settings,
                 app.state.settings,
                 (run_record.landscape_run_id,),
             )
         except ValueError as exc:
             raise _RunStatusIntegrityError(str(exc)) from exc
-        if run_record.landscape_run_id in accounting_by_run_id:
-            accounting = accounting_by_run_id[run_record.landscape_run_id]
+        if run_record.landscape_run_id in accounting_batch.corrupt:
+            # Single-run surface: the explicit integrity status IS the
+            # structured per-run error envelope. The loader no longer raises,
+            # so the corruption marker must be converted here — silently
+            # dropping accounting would present the corrupt run as a run
+            # with no projection at all (elspeth-d5578ccd98).
+            corruption = accounting_batch.corrupt[run_record.landscape_run_id]
+            raise _RunStatusIntegrityError(
+                f"Landscape accounting for run {run_record.landscape_run_id!r} failed integrity validation: "
+                + "; ".join(corruption.violations)
+            )
+        if run_record.landscape_run_id in accounting_batch.accounting:
+            accounting = accounting_batch.accounting[run_record.landscape_run_id]
 
     try:
         status = await service.get_status(run_id, accounting=accounting, run_record=run_record)
@@ -696,7 +795,7 @@ def _run_event_from_record(record: RunEventRecord) -> RunEvent:
             "run_id": str(record.run_id),
             "timestamp": record.timestamp,
             "event_type": record.event_type,
-            "data": record.data,
+            "data": deep_thaw(record.data),
         }
     ).with_event_sequence(record.sequence)
 
@@ -833,23 +932,70 @@ def create_execution_router() -> APIRouter:
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
         session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> ValidationResult:
-        """Dry-run validation using real engine code paths."""
+        """Dry-run validation using real engine code paths.
+
+        Before delegating, both arms run the backend surfacer in repair mode
+        over the state they are about to validate (elspeth-03f5728c33): a
+        compose that dies after persisting its mutating turn (deferred
+        cancellation, convergence timeout, plugin crash) never reaches the
+        finalize surfacer, leaving pending interpretation requirements with
+        zero event rows — validation then blocks on interpretation_review
+        while the review list renders empty, with nothing the user can
+        resolve. The repair pass is idempotent and touches only sites with no
+        evidence in any resolution status, so it is a no-op on every state a
+        finalize already surfaced.
+        """
         await verify_session_ownership(session_id, user, request)
-        if state_id is None:
-            result = await service.validate(session_id, user_id=user.user_id)
-            return result
-        try:
-            state_record = await session_service.get_state(state_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="State not found") from exc
-        if state_record.session_id != session_id:
-            raise HTTPException(status_code=404, detail="State not found")
-        result = await service.validate_state(
-            state_from_record(state_record),
-            user_id=user.user_id,
+        composer: ComposerService = request.app.state.composer_service
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
             session_id=session_id,
+            operation_kind=SessionOperationKind.BLOB_READ,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
         )
-        return result
+        try:
+            if state_id is None:
+                current_record = await session_service.get_current_state(session_id)
+                if current_record is not None:
+                    await composer.surface_pending_interpretation_reviews(
+                        state_from_record(current_record),
+                        session_id=str(session_id),
+                        current_state_id=str(current_record.id),
+                        only_missing_evidence=True,
+                        session_operation_context=lease.context,
+                    )
+                return await service.validate(
+                    session_id,
+                    session_operation_context=lease.context,
+                    user_id=user.user_id,
+                )
+            try:
+                state_record = await session_service.get_state(state_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="State not found") from exc
+            if state_record.session_id != session_id:
+                raise HTTPException(status_code=404, detail="State not found")
+            # The web UI always validates by explicit state_id (executionStore
+            # passes the loaded head), so the requested snapshot gets the same
+            # repair pass as the None arm above, under the same BLOB_READ lease.
+            composition_state = state_from_record(state_record)
+            await composer.surface_pending_interpretation_reviews(
+                composition_state,
+                session_id=str(session_id),
+                current_state_id=str(state_record.id),
+                only_missing_evidence=True,
+                session_operation_context=lease.context,
+            )
+            return await service.validate_state(
+                composition_state,
+                session_operation_context=lease.context,
+                user_id=user.user_id,
+                session_id=session_id,
+                completion_gates=parse_completion_gates(state_record.composer_meta),
+            )
+        finally:
+            await lease.close()
 
     @router.post(
         "/api/sessions/{session_id}/execute",
@@ -862,6 +1008,7 @@ def create_execution_router() -> APIRouter:
         execute_request: ExecuteRequest | None = Body(default=None),  # noqa: B008
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
+        session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> dict[str, str]:
         """Start a background pipeline run. Returns run_id immediately.
 
@@ -872,14 +1019,30 @@ def create_execution_router() -> APIRouter:
         await verify_session_ownership(session_id, user, request)
         settings: WebSettings = request.app.state.settings
         fanout_ack_token = execute_request.fanout_ack_token if execute_request is not None else None
+        secret_ack_token = execute_request.secret_ack_token if execute_request is not None else None
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        transferred = False
+        request_cancellation: asyncio.CancelledError | None = None
         try:
             run_id = await service.execute(
                 session_id,
                 state_id,
+                session_operation_lease=lease,
                 user_id=user.user_id,
                 auth_provider_type=settings.auth_provider,
                 fanout_ack_token=fanout_ack_token,
+                secret_ack_token=secret_ack_token,
             )
+            transferred = True
+        except asyncio.CancelledError as error:
+            request_cancellation = error
+            raise
         except StateAccessError:
             # IDOR contract: the "state does not exist" and
             # "state belongs to another session" branches in the
@@ -938,6 +1101,31 @@ def create_execution_router() -> APIRouter:
                     "detail": public_detail,
                     "kind": "blob_source_path_mismatch",
                     "message": public_detail,
+                },
+            ) from exc
+        except CompletionGateIntegrityError as exc:
+            slog.error(
+                "completion_gate_integrity_failure",
+                session_id=exc.session_id,
+                state_id=exc.state_id,
+            )
+            public_detail = "Persisted completion-gate facts failed integrity validation."
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error_type": "completion_gate_integrity_failure",
+                    "detail": public_detail,
+                    "kind": "completion_gate_integrity_failure",
+                    "message": public_detail,
+                },
+            ) from exc
+        except ExecutionSecretApprovalRequired as exc:
+            raise HTTPException(
+                status_code=428,
+                detail={
+                    "error_type": SECRET_GUARD_ERROR_TYPE,
+                    "detail": str(exc),
+                    "secret_guard": exc.guard.to_dict(),
                 },
             ) from exc
         except ExecutionFanoutGuardRequired as exc:
@@ -1049,6 +1237,16 @@ def create_execution_router() -> APIRouter:
                     ],
                 },
             ) from exc
+        except ExecutionReadinessError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_type": "execution_not_ready",
+                    "detail": "Pipeline is not ready for execution.",
+                    "kind": "execution_not_ready",
+                    "blockers": [blocker.model_dump() for blocker in exc.blockers],
+                },
+            ) from exc
         except ExecuteRequestValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         except ValueError as exc:
@@ -1058,6 +1256,9 @@ def create_execution_router() -> APIRouter:
             # (path allowlist, malformed blob_ref) raise
             # ExecuteRequestValidationError above and return 400.
             raise HTTPException(status_code=404, detail=str(exc)) from None
+        finally:
+            if not transferred:
+                await _close_execute_lease_before_transfer(lease, cancellation=request_cancellation)
         return {"run_id": str(run_id)}
 
     # ── Run-scoped endpoints (status, cancel, results) ────────────────
@@ -1089,7 +1290,13 @@ def create_execution_router() -> APIRouter:
                 (status.landscape_run_id,),
             )
             if status.landscape_run_id in discard_summaries:
-                status = status.model_copy(update={"discard_summary": discard_summaries[status.landscape_run_id]})
+                # NOT model_copy(update=...): that bypasses validators, and
+                # this attach is exactly where the accounting/discard-summary
+                # reconciliation invariant must fire (elspeth-43f52d69a4).
+                try:
+                    status = revalidated_with_discard_summary(status, discard_summaries[status.landscape_run_id])
+                except ValidationError as exc:
+                    raise _run_integrity_http(exc) from exc
         return status
 
     @router.get(
@@ -1112,16 +1319,29 @@ def create_execution_router() -> APIRouter:
         except (ValidationError, _RunStatusIntegrityError) as exc:
             raise _run_integrity_http(exc) from exc
 
-        landscape_run_id = status.landscape_run_id or status.run_id
-        return await run_sync_in_worker(
-            load_run_diagnostics_for_settings,
-            request.app.state.settings,
-            run_id=status.run_id,
-            landscape_run_id=landscape_run_id,
-            run_status=status.status,
-            cancel_requested=status.cancel_requested,
-            limit=limit,
-        )
+        # Raw link, not the ``or status.run_id`` fallback: the loader needs
+        # ``None`` to mean "never admitted to Landscape" so a missing store
+        # file for a linked run raises instead of reading as a clean run
+        # (elspeth-1d24bb0d96).
+        try:
+            return await run_sync_in_worker(
+                load_run_diagnostics_for_settings,
+                request.app.state.settings,
+                run_id=status.run_id,
+                landscape_run_id=status.landscape_run_id,
+                run_status=status.status,
+                cancel_requested=status.cancel_requested,
+                limit=limit,
+            )
+        except RunDiagnosticsAuditUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_type": "run_diagnostics_audit_unavailable",
+                    "landscape_run_id": exc.landscape_run_id,
+                    "audit_location": exc.audit_location,
+                },
+            ) from exc
 
     @router.post(
         "/api/runs/{run_id}/diagnostics/evaluate",
@@ -1135,7 +1355,9 @@ def create_execution_router() -> APIRouter:
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunDiagnosticsEvaluationResponse:
         """Ask the configured LLM to explain the current diagnostics snapshot."""
-        await _verify_run_ownership(run_id, user, request)
+        run = await _verify_run_ownership(run_id, user, request)
+        rate_limiter = await get_rate_limiter(request)
+        await rate_limiter.check(user.user_id)
         try:
             status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)
         except _RunStatusNotFoundError:
@@ -1143,22 +1365,67 @@ def create_execution_router() -> APIRouter:
         except (ValidationError, _RunStatusIntegrityError) as exc:
             raise _run_integrity_http(exc) from exc
 
-        landscape_run_id = status.landscape_run_id or status.run_id
-        diagnostics = await run_sync_in_worker(
-            load_run_diagnostics_for_settings,
-            request.app.state.settings,
-            run_id=status.run_id,
-            landscape_run_id=landscape_run_id,
-            run_status=status.status,
-            cancel_requested=status.cancel_requested,
-            limit=limit,
-        )
+        # Same raw-link contract as GET /diagnostics above: a linked run with
+        # a missing store must 503 here too, BEFORE any LLM evaluation runs
+        # against a projection that would misreport evidence loss as a clean
+        # run (elspeth-1d24bb0d96).
+        try:
+            diagnostics = await run_sync_in_worker(
+                load_run_diagnostics_for_settings,
+                request.app.state.settings,
+                run_id=status.run_id,
+                landscape_run_id=status.landscape_run_id,
+                run_status=status.status,
+                cancel_requested=status.cancel_requested,
+                limit=limit,
+            )
+        except RunDiagnosticsAuditUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_type": "run_diagnostics_audit_unavailable",
+                    "landscape_run_id": exc.landscape_run_id,
+                    "audit_location": exc.audit_location,
+                },
+            ) from exc
 
         composer: ComposerService = request.app.state.composer_service
         settings: WebSettings = request.app.state.settings
+        recorder = BufferingRecorder()
+        audit_authority = RunDiagnosticsAuditAuthority(
+            run_id=run.id,
+            session_id=run.session_id,
+            state_id=run.state_id,
+        )
+
+        async def _persist_diagnostics_llm_calls(*, plugin_crash_pending: bool) -> None:
+            # elspeth-0fcf68d50f: diagnostics audit rows land in the same
+            # per-session ``chat_messages`` sequence the compose loop
+            # writes, so serialize on the same per-session compose lock the
+            # compose/guided routes hold. The lock wraps ONLY this persist
+            # step — never the LLM call above — so a slow diagnostics
+            # evaluation cannot starve an in-flight compose turn, and the
+            # lock order (compose lock, then the service's internal
+            # session write lock inside the persist) matches every
+            # compose-route writer, so no inverted-order deadlock exists.
+            # The write itself re-proves ``audit_authority`` durably in
+            # the same transaction as the insert.
+            compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(run.session_id))
+            async with compose_lock:
+                await _persist_run_diagnostics_llm_calls(
+                    request.app.state.session_service,
+                    audit_authority,
+                    recorder.llm_calls,
+                    plugin_crash_pending=plugin_crash_pending,
+                )
+
         try:
-            explanation = await composer.explain_run_diagnostics(llm_safe_diagnostics_snapshot(diagnostics))
+            explanation = await composer.explain_run_diagnostics(
+                llm_safe_diagnostics_snapshot(diagnostics),
+                recorder=recorder,
+            )
         except _BadRequestLLMError as exc:
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             # Provider rejected the request (400-class). Carrier exposes
             # `provider_detail` / `provider_status_code` precisely because
             # `str(exc)` is redacted to the class-name wrap. Delegate to
@@ -1173,10 +1440,30 @@ def create_execution_router() -> APIRouter:
                 ),
             ) from exc
         except ComposerServiceError as exc:
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             raise HTTPException(
                 status_code=502,
                 detail={"error_type": "run_diagnostics_explanation_failed", "detail": str(exc)},
             ) from exc
+        except BaseException:
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
+            raise
+        else:
+            try:
+                await _persist_diagnostics_llm_calls(plugin_crash_pending=False)
+            except RunDiagnosticsAuthorityLostError as lost:
+                # Custody moved (run/session/state binding no longer holds)
+                # before the audit row could land. Refuse to hand back an
+                # unaudited explanation — audit rows are the product here.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_type": "run_diagnostics_audit_authority_lost",
+                        "detail": (
+                            f"Run diagnostics audit authority lost ({lost.reason}); the explanation was discarded because its audit row could not be written."
+                        ),
+                    },
+                ) from lost
 
         explanation, working_view = _parse_run_diagnostics_working_view(explanation, diagnostics)
         return RunDiagnosticsEvaluationResponse(
@@ -1236,7 +1523,14 @@ def create_execution_router() -> APIRouter:
                 (status.landscape_run_id,),
             )
             if status.landscape_run_id in discard_summaries:
-                status = status.model_copy(update={"discard_summary": discard_summaries[status.landscape_run_id]})
+                # Same revalidating attach as get_run_status: the terminal
+                # RunResultsResponse below re-validates too, but failing here
+                # routes the contradiction through the structured
+                # run_integrity_error envelope instead of a bare 500.
+                try:
+                    status = revalidated_with_discard_summary(status, discard_summaries[status.landscape_run_id])
+                except ValidationError as exc:
+                    raise _run_integrity_http(exc) from exc
         # mypy can't narrow a Literal through frozenset membership — the
         # cast is safe because RUN_STATUS_NON_TERMINAL_VALUES is the exact
         # complement of RunResultsResponse's Literal values, enforced by a
@@ -1303,14 +1597,18 @@ def create_execution_router() -> APIRouter:
             # operator channel (CLAUDE.md logging policy: audit-system
             # failure). Close 1011 (internal error), mirroring the seed-snapshot
             # integrity handling below.
-            slog.error(
-                "websocket_run_ownership_session_integrity_error",
-                run_id=run_id,
-                session_id=integrity_exc.session_id,
-                error=str(integrity_exc),
-            )
-            await websocket.close(code=1011, reason="Run ownership check failed internal integrity validation")
-            return
+            try:
+                slog.error(
+                    "websocket_run_ownership_session_integrity_error",
+                    run_id=run_id,
+                    session_id=integrity_exc.session_id,
+                    exc_class=type(integrity_exc).__name__,
+                )
+            finally:
+                try:
+                    await websocket.close(code=1011, reason="Run ownership check failed internal integrity validation")
+                finally:
+                    raise integrity_exc
         except ValueError:
             await websocket.close(code=4004, reason="Run not found")
             return
@@ -1336,14 +1634,18 @@ def create_execution_router() -> APIRouter:
                 # diagnose the divergence — Landscape carries the run audit,
                 # not this projection failure, so slog is the only channel
                 # (CLAUDE.md logging policy: audit-system failure).
-                slog.error(
-                    "websocket_run_status_integrity_error",
-                    run_id=run_id,
-                    phase="seed",
-                    error=str(integrity_exc),
-                )
-                await websocket.close(code=1011, reason="Run status failed internal accounting validation")
-                return
+                try:
+                    slog.error(
+                        "websocket_run_status_integrity_error",
+                        run_id=run_id,
+                        phase="seed",
+                        exc_class=type(integrity_exc).__name__,
+                    )
+                finally:
+                    try:
+                        await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                    finally:
+                        raise integrity_exc
             current = current_snapshot.response
             max_replayed_sequence = 0
             replayed_terminal = False
@@ -1369,23 +1671,44 @@ def create_execution_router() -> APIRouter:
                     # Re-check authoritative run status instead of sending an
                     # ad-hoc payload outside the RunEvent contract.
                     try:
-                        current_snapshot = await _load_run_status_snapshot_with_accounting(UUID(run_id), app=websocket.app, service=service)
-                    except _RunStatusNotFoundError:
-                        await websocket.close(code=4004, reason="Run not found")
-                        break
+                        try:
+                            current_snapshot = await _load_run_status_snapshot_with_accounting(
+                                UUID(run_id), app=websocket.app, service=service
+                            )
+                        except _RunStatusNotFoundError as vanished_exc:
+                            # Tier-1 referential corruption, NOT the seed path's
+                            # client-facing not-found. The seed snapshot proved
+                            # this run row existed, and no ELSPETH writer deletes
+                            # a ``runs`` row: ``decide_and_soft_archive`` physically
+                            # deletes only a session with NO durable history and
+                            # soft-archives one that has a run, and run admission
+                            # shares the per-session ARCHIVE fence, so the
+                            # ``runs.session_id`` cascade never fires for an
+                            # existing run. A row that vanished mid-stream is
+                            # an invariant breach, reclassified here so the
+                            # integrity arm below records it, closes 1011 and
+                            # re-raises; closing 4004 would launder corruption
+                            # into a benign client answer.
+                            raise _RunStatusIntegrityError(
+                                f"Run {run_id} row vanished after the seed snapshot proved it existed"
+                            ) from vanished_exc
                     except (ValidationError, _RunStatusIntegrityError) as integrity_exc:
-                        # Same Tier-1 accounting integrity failure as the seed
+                        # Same Tier-1 integrity failure handling as the seed
                         # path, on the idle-timeout recheck. Record the detail
                         # before signalling internal-error close (see seed
                         # handler above for the logging-channel rationale).
-                        slog.error(
-                            "websocket_run_status_integrity_error",
-                            run_id=run_id,
-                            phase="idle_recheck",
-                            error=str(integrity_exc),
-                        )
-                        await websocket.close(code=1011, reason="Run status failed internal accounting validation")
-                        break
+                        try:
+                            slog.error(
+                                "websocket_run_status_integrity_error",
+                                run_id=run_id,
+                                phase="idle_recheck",
+                                exc_class=type(integrity_exc).__name__,
+                            )
+                        finally:
+                            try:
+                                await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                            finally:
+                                raise integrity_exc
                     current = current_snapshot.response
                     if current.status in RUN_STATUS_TERMINAL_VALUES:
                         terminal_event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
@@ -1481,7 +1804,7 @@ def create_execution_router() -> APIRouter:
 
         Path-allowlist guard: refuses any artefact whose ``path_or_uri``
         resolves outside the canonical sink set for the run's owning
-        session — ``data_dir/outputs`` plus that session's own
+        session — that session's own ``data_dir/outputs/<session>`` plus its
         ``data_dir/blobs/<session>/`` subtree (elspeth-bdc17cfdb1). This
         is defence-in-depth — the path was already allowlisted at write
         time, but the audit row is read-mutable in principle and the
@@ -1547,7 +1870,7 @@ def create_execution_router() -> APIRouter:
             snapshot_dir=Path(request.app.state.settings.data_dir) / ".run-output-snapshots",
         )
         try:
-            byte_range = _parse_single_range(request.headers.get("range"), size_bytes=snapshot.size_bytes)
+            byte_range = _requested_byte_range(request, size_bytes=snapshot.size_bytes)
         except HTTPException:
             _unlink_path(snapshot.path)
             raise

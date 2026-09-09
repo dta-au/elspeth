@@ -1253,6 +1253,52 @@ class TestWebScrapeDeclaredInputFields:
         assert transform.declared_input_fields == frozenset({"url", "tenant_id"})
 
 
+class TestUrlFieldMustNotNameACreatedField:
+    """``url_field`` must name an ARRIVING column, never one web_scrape writes.
+
+    ``url_field`` is read to get the URL and the created field is then written
+    over it, so pointing both at one column makes the transform consume its own
+    output. Nothing downstream catches it: the executor's collision check
+    compares ``declared_output_fields`` against the INPUT KEYS OF THE ROW, so it
+    fires only once a row actually carries the column, and under
+    ``mode: observed`` there is no declared field for DAG validation to carry
+    (elspeth-09dc6407f1).
+    """
+
+    def test_url_field_naming_the_content_target_is_rejected(self) -> None:
+        with pytest.raises(PluginConfigError, match="url_field names 'page_text', which web_scrape itself creates"):
+            WebScrapeTransform(_base_config(url_field="page_text", content_field="page_text"))
+
+    def test_url_field_naming_the_fingerprint_target_is_rejected(self) -> None:
+        with pytest.raises(PluginConfigError, match="url_field names 'page_fingerprint', which web_scrape itself creates"):
+            WebScrapeTransform(_base_config(url_field="page_fingerprint"))
+
+    def test_url_field_naming_a_hardcoded_operational_field_is_rejected(self) -> None:
+        """The created set is not only the configurable targets.
+
+        ``fetch_status`` and friends are literal constants in
+        ``declared_output_fields``, and an upstream column really can be called
+        that — a likelier authoring mistake than aiming ``url_field`` at the
+        content target.
+        """
+        with pytest.raises(PluginConfigError, match="url_field names 'fetch_status', which web_scrape itself creates"):
+            WebScrapeTransform(_base_config(url_field="fetch_status"))
+
+    def test_the_error_names_the_offending_value_and_the_plugin(self) -> None:
+        with pytest.raises(PluginConfigError) as excinfo:
+            WebScrapeTransform(_base_config(url_field="fetch_url_final"))
+
+        message = str(excinfo.value)
+        assert "url_field names 'fetch_url_final', which web_scrape itself creates" in message
+        assert "Point url_field at a column that ARRIVES on the row" in message
+
+    def test_a_url_field_naming_an_arriving_column_still_constructs(self) -> None:
+        """The arm that must not regress: rejecting legal configs is worse."""
+        transform = WebScrapeTransform(_base_config())
+
+        assert transform.declared_input_fields == frozenset({"url"})
+
+
 # ===========================================================================
 # allowed_hosts config validation
 # ===========================================================================
@@ -1639,18 +1685,124 @@ class TestWebScrapeOutputSemantics:
         assert facts.content_kind is ContentKind.MARKDOWN
         assert facts.text_framing is TextFraming.LINE_COMPATIBLE
 
-    def test_raw_declares_html_raw_not_text(self):
+    def test_raw_declares_html_raw_with_unconstrained_framing(self):
+        """The raw value is the fetched page verbatim: a str whose framing is
+        whatever the server sent, which no configuration settles. That is the
+        UNCONSTRAINED claim by definition. NOT_TEXT — a positive claim that the
+        value is not text at all — was false of a str of HTML, and it made
+        ``raw -> document`` (archive this page to a file) a false authoring
+        CONFLICT (elspeth-24c04df25f)."""
         from elspeth.contracts.plugin_semantics import ContentKind, TextFraming
 
         ws = self._build(format="raw")
         facts = next(f for f in ws.output_semantics().fields if f.field_name == "content")
         assert facts.content_kind is ContentKind.HTML_RAW
-        assert facts.text_framing is TextFraming.NOT_TEXT
+        assert facts.text_framing is TextFraming.UNCONSTRAINED
+
+    def test_raw_framing_grades_the_framing_constrained_consumers_correctly(self):
+        """The three consumers that constrain framing, graded against raw's claim.
+
+        ``raw -> text`` must stay refused — a fetched page carries newlines and
+        TextSink diverts on CR/LF, so {COMPACT} correctly excludes it. But
+        ``raw -> line_explode`` is legitimate: splitting arbitrary fetched text
+        into line rows is the same operation as splitting generated text, which
+        line_explode exists to bless. (``raw -> document`` is pinned from the
+        sink's side in test_document_sink.py.)
+        """
+        from elspeth.contracts.plugin_semantics import SemanticOutcome, compare_semantic
+        from elspeth.plugins.transforms.line_explode import _build_line_explode_input_requirements
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+
+        facts = _build_web_scrape_output_semantics(content_field="content", format="raw", text_separator="\n").fields[0]
+
+        from elspeth.plugins.sinks.text_sink import TextSink
+
+        text_requirement = (
+            TextSink({"path": "/tmp/lines.txt", "field": "content", "schema": {"mode": "observed"}}).input_semantic_requirements().fields[0]
+        )
+        line_explode_requirement = _build_line_explode_input_requirements(source_field="content").fields[0]
+
+        assert compare_semantic(facts, text_requirement) is SemanticOutcome.CONFLICT
+        assert compare_semantic(facts, line_explode_requirement) is SemanticOutcome.SATISFIED
 
     def test_custom_content_field_changes_semantic_field_name(self):
         ws = self._build(format="text", text_separator="\n", content_field="body")
         facts = next(f for f in ws.output_semantics().fields if f.field_name == "body")
         assert facts.field_name == "body"
+
+
+class TestWebScrapeValueTypeBindsToTheFieldNotTheTopology:
+    """web_scrape declaring STR must not cost json_explode its use case.
+
+    Every format CONFLICTS into ``json_explode`` when array_field IS the
+    scraped content field, and that refusal is correct: json_explode raises
+    TypeError on a str rather than parsing it, so the composition dies on row 1
+    (pinned end-to-end by TestWebScrapeValueTypeDeclarationSideEffect).
+
+    The regression to guard is the OTHER half — that the refusal binds to a
+    WIRING and not to the pair of plugins. ``_find_producer_facts`` matches
+    facts to requirements by exact field name, so a list-bearing field carried
+    alongside the scraped content compares UNKNOWN and stays authorable under
+    json_explode's WARN. Losing that would re-enter elspeth-7a2c9a24c3 from the
+    producer side, which is the claim this class exists to falsify.
+    """
+
+    def _content_facts(self, *, fmt: str, separator: str):
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+
+        return _build_web_scrape_output_semantics(
+            content_field="content",
+            format=fmt,
+            text_separator=separator,
+        ).fields[0]
+
+    @pytest.mark.parametrize(
+        ("fmt", "separator"),
+        [("markdown", "\n"), ("text", "\n"), ("text", " "), ("raw", "\n")],
+    )
+    def test_every_format_declares_str_and_conflicts_on_the_content_field(self, fmt: str, separator: str) -> None:
+        from elspeth.contracts.plugin_semantics import (
+            SemanticOutcome,
+            SemanticValueType,
+            compare_semantic,
+        )
+        from elspeth.plugins.transforms.json_explode import _build_json_explode_input_requirements
+
+        facts = self._content_facts(fmt=fmt, separator=separator)
+        requirement = _build_json_explode_input_requirements(array_field="content").fields[0]
+
+        assert facts.value_type is SemanticValueType.STR
+        assert compare_semantic(facts, requirement) is SemanticOutcome.CONFLICT
+
+    @pytest.mark.parametrize(
+        ("fmt", "separator"),
+        [("markdown", "\n"), ("text", "\n"), ("text", " "), ("raw", "\n")],
+    )
+    def test_a_sibling_field_stays_authorable_for_every_format(self, fmt: str, separator: str) -> None:
+        """web_scrape declares facts for content_field ONLY, so exploding a
+        different column is untouched: UNKNOWN, graded advisory by WARN."""
+        from elspeth.contracts.plugin_semantics import (
+            SemanticOutcome,
+            UnknownSemanticPolicy,
+            compare_semantic,
+        )
+        from elspeth.plugins.transforms.json_explode import _build_json_explode_input_requirements
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+        from elspeth.web.composer._semantic_validator import _find_producer_facts
+
+        declaration = _build_web_scrape_output_semantics(
+            content_field="content",
+            format=fmt,
+            text_separator=separator,
+        )
+        requirement = _build_json_explode_input_requirements(array_field="items").fields[0]
+
+        facts = _find_producer_facts(declaration, "items")
+        assert facts is None, "web_scrape must not claim a field it does not write"
+        assert compare_semantic(facts, requirement) is SemanticOutcome.UNKNOWN
+        assert requirement.unknown_policy is UnknownSemanticPolicy.WARN, (
+            "UNKNOWN is only authorable because json_explode grades it as an advisory"
+        )
 
 
 class TestWebScrapeAssistance:
@@ -2185,6 +2337,25 @@ def test_b3_10_binary_content_type_returns_error(mock_ctx):
     assert "non_text_content_type" in reason.get("reason", "") or "content_type" in reason.get("error", "").lower(), (
         f"Error reason should indicate non-text content type, got {reason}"
     )
+
+
+@respx.mock
+@pytest.mark.parametrize("headers, expected", [({}, None), ({"content-type": ""}, "")])
+def test_missing_and_empty_content_type_remain_distinct_in_error(mock_ctx, headers, expected):
+    """Rejected external headers retain absence rather than fabricating bytes."""
+    respx.get(f"https://{_TEST_IP}:443/page").mock(
+        return_value=httpx.Response(200, content=b"<html><body>Hello</body></html>", headers=headers)
+    )
+    transform = _make_basic_transform()
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/page"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "non_text_content_type"
+    assert result.reason["content_type"] == expected
+    assert result.row is None
 
 
 @respx.mock

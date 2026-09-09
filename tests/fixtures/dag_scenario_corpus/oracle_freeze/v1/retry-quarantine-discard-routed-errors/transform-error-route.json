@@ -1,0 +1,50 @@
+{
+ "case_id": "transform-error-route",
+ "expansions": [],
+ "rows": [
+  2,
+  1,
+  1
+ ],
+ "scenario_id": "retry-quarantine-discard-routed-errors",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"id\":1,\"value\":10}"
+   ],
+   "sink_name": "error_output"
+  }
+ ],
+ "status": "completed_with_failures",
+ "terminal_dispositions": [
+  {
+   "error_hash": "a2f3ed6052168a71",
+   "key": "primary:0#0",
+   "outcome": "failure",
+   "path": "on_error_routed",
+   "sink_name": "error_output",
+   "token_key": "primary:0#0"
+  },
+  {
+   "key": "primary:1#0",
+   "outcome": "success",
+   "path": "gate_discarded",
+   "sink_name": null,
+   "token_key": "primary:1#0"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  },
+  {
+   "branch_name": null,
+   "key": "primary:1#0",
+   "parents": [],
+   "row_key": "primary:1"
+  }
+ ]
+}

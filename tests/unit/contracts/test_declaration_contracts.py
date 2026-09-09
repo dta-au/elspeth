@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import ClassVar, NotRequired, TypedDict
 
@@ -34,6 +35,27 @@ from elspeth.contracts.declaration_contracts import (
     resolve_payload_schema_key_sets,
 )
 from elspeth.contracts.errors import FrameworkBugError
+
+
+def _dispatch_method(contract: DeclarationContract, site: DispatchSite) -> Callable[..., None]:
+    """The bound dispatch method a bundle's site names, by explicit table.
+
+    ADR-032: ``DeclarationContract`` is an owned type with exactly four
+    dispatch sites, so a bundle's site selects a real bound method instead of
+    resolving an attribute name dynamically. An unknown site raises KeyError
+    rather than silently producing a probe default. Kept byte-identical in
+    ``tests/invariants/test_contract_negative_examples_fire.py``,
+    ``tests/invariants/test_contract_non_fire.py``,
+    ``tests/invariants/test_framework_accepts_second_contract.py`` and
+    ``tests/unit/contracts/test_declaration_contracts.py``.
+    """
+    methods: Mapping[DispatchSite, Callable[..., None]] = {
+        DispatchSite.PRE_EMISSION: contract.pre_emission_check,
+        DispatchSite.POST_EMISSION: contract.post_emission_check,
+        DispatchSite.BATCH_FLUSH: contract.batch_flush_check,
+        DispatchSite.BOUNDARY: contract.boundary_check,
+    }
+    return methods[site]
 
 
 class _FakePayload(TypedDict):
@@ -596,7 +618,7 @@ def test_negative_example_fires_the_violation() -> None:
     """
     c = _FakeContract()
     bundle = c.negative_example()
-    method = getattr(c, bundle.site.value)
+    method = _dispatch_method(c, bundle.site)
     with pytest.raises(DeclarationContractViolation):
         method(*bundle.args)
 

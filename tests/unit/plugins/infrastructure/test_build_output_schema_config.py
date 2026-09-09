@@ -52,13 +52,15 @@ class TestBuildOutputSchemaConfig:
         result = transform._build_output_schema_config(base)
         assert frozenset(result.guaranteed_fields) == frozenset({"output_x"})
 
-    def test_preserves_mode_and_fields(self):
+    def test_preserves_mode_and_authored_field_declarations(self):
         fields = (FieldDefinition(name="id", field_type="int", required=True),)
         transform = _make_minimal_transform(frozenset({"extra"}))
         base = SchemaConfig(mode="fixed", fields=fields, guaranteed_fields=None)
         result = transform._build_output_schema_config(base)
         assert result.mode == "fixed"
-        assert result.fields == fields
+        # Authored declarations survive untouched; the created field is appended
+        # (declared, not merely guaranteed — elspeth-97487736ca).
+        assert result.fields[: len(fields)] == fields
 
     def test_preserves_audit_fields(self):
         transform = _make_minimal_transform(frozenset({"x"}))
@@ -79,6 +81,64 @@ class TestBuildOutputSchemaConfig:
         )
         result = transform._build_output_schema_config(base)
         assert result.required_fields == ("req_field",)
+
+    def test_fixed_mode_declares_created_fields(self):
+        """elspeth-97487736ca: a guaranteed field must also be DECLARED.
+
+        Under mode: fixed the model built from the output config is
+        extra='forbid' over the declared fields alone, so a created field
+        that lands only in guaranteed_fields is simultaneously guaranteed
+        on output and forbidden by the output model.
+        """
+        fields = (FieldDefinition(name="id", field_type="int", required=True),)
+        transform = _make_minimal_transform(frozenset({"created"}))
+        base = SchemaConfig(mode="fixed", fields=fields, guaranteed_fields=None)
+        result = transform._build_output_schema_config(base)
+        by_name = {f.name: f for f in result.fields}
+        assert "created" in by_name
+        # Guaranteed fields must be required (from_dict invariant); the base
+        # class knows the field will exist but not its type.
+        assert by_name["created"].required is True
+        assert by_name["created"].field_type == "any"
+        assert "created" in result.guaranteed_fields
+
+    def test_flexible_mode_declares_created_fields(self):
+        fields = (FieldDefinition(name="id", field_type="int", required=True),)
+        transform = _make_minimal_transform(frozenset({"created"}))
+        base = SchemaConfig(mode="flexible", fields=fields, guaranteed_fields=None)
+        result = transform._build_output_schema_config(base)
+        assert "created" in {f.name for f in result.fields}
+
+    def test_explicit_output_config_round_trips_through_from_dict(self):
+        """from_dict IS the validator the direct construction bypasses.
+
+        A config that cannot round-trip through its own parser is in a state
+        the type's contract forbids ('guaranteed_fields contains fields not
+        declared in schema').
+        """
+        fields = (
+            FieldDefinition(name="id", field_type="int", required=True),
+            FieldDefinition(name="text", field_type="str", required=True),
+        )
+        transform = _make_minimal_transform(frozenset({"created_a", "created_b"}))
+        base = SchemaConfig(mode="fixed", fields=fields, guaranteed_fields=("id",))
+        result = transform._build_output_schema_config(base)
+        reparsed = SchemaConfig.from_dict(result.to_dict())
+        assert frozenset(reparsed.guaranteed_fields) == frozenset({"id", "created_a", "created_b"})
+
+    def test_authored_declaration_of_created_field_is_untouched(self):
+        """A created field the author already declared keeps its real type."""
+        fields = (FieldDefinition(name="created", field_type="str", required=True),)
+        transform = _make_minimal_transform(frozenset({"created"}))
+        base = SchemaConfig(mode="fixed", fields=fields, guaranteed_fields=None)
+        result = transform._build_output_schema_config(base)
+        assert result.fields == fields
+
+    def test_observed_mode_keeps_fields_none(self):
+        transform = _make_minimal_transform(frozenset({"created"}))
+        base = SchemaConfig(mode="observed", fields=None, guaranteed_fields=None)
+        result = transform._build_output_schema_config(base)
+        assert result.fields is None
 
     def test_keyword_filter_initializes_output_schema_config(self):
         transform = _make_minimal_transform()

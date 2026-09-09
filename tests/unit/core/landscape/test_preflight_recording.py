@@ -7,10 +7,13 @@ import json
 import pytest
 
 from elspeth.contracts.preflight import CommencementGateResult, DependencyRunResult, PreflightResult
+from elspeth.core.dependency_config import CommencementGateConfig
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import preflight_results_table
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.engine.commencement import evaluate_commencement_gates
+from tests.fixtures.landscape import leader_coordination_token
 
 
 @pytest.fixture()
@@ -40,7 +43,7 @@ class TestRecordPreflightResults:
             gate_results=(),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         # Read back from database
         with db.connection() as conn:
@@ -73,7 +76,7 @@ class TestRecordPreflightResults:
             ),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
@@ -88,11 +91,36 @@ class TestRecordPreflightResults:
         # Nested snapshot must round-trip correctly
         assert data["context_snapshot"]["collections"]["test"]["count"] == 42
 
+    def test_gate_condition_literal_is_redacted_before_audit_recording(self, factory) -> None:
+        fac, run_id, db = factory
+        sensitive_literal = "literal-sensitive-value-9f3a"
+        gate_results = evaluate_commencement_gates(
+            [
+                CommencementGateConfig(
+                    name="literal_check",
+                    condition=f"collections['orders']['count'] != '{sensitive_literal}'",
+                )
+            ],
+            {
+                "dependency_runs": {},
+                "collections": {"orders": {"count": 0, "reachable": True}},
+            },
+        )
+        preflight = PreflightResult(dependency_runs=(), gate_results=tuple(gate_results))
+
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
+
+        with db.connection() as conn:
+            row = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).one()
+        data = json.loads(row.result_json)
+        assert data["condition"] == "collections['orders']['count'] != '<redacted-string-literal>'"
+        assert sensitive_literal not in row.result_json
+
     def test_empty_preflight_is_noop(self, factory) -> None:
         fac, run_id, db = factory
         preflight = PreflightResult(dependency_runs=(), gate_results=())
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
@@ -112,7 +140,7 @@ class TestRecordPreflightResults:
             gate_results=(),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
@@ -131,7 +159,7 @@ class TestRecordPreflightResults:
             gate_results=(CommencementGateResult(name="gate1", condition="True", result=True, context_snapshot={}),),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(
@@ -153,12 +181,12 @@ class TestRecordReadinessCheck:
         fac, run_id, db = factory
 
         fac.run_lifecycle.record_readiness_check(
-            run_id=run_id,
             name="rag_retrieval",
             collection="test-index",
             reachable=True,
             count=42,
             message="Collection 'test-index' has 42 documents",
+            coordination_token=leader_coordination_token(fac, run_id),
         )
 
         with db.connection() as conn:
@@ -179,12 +207,12 @@ class TestRecordReadinessCheck:
         fac, run_id, db = factory
 
         fac.run_lifecycle.record_readiness_check(
-            run_id=run_id,
             name="rag",
             collection="c",
             reachable=True,
             count=1,
             message="m",
+            coordination_token=leader_coordination_token(fac, run_id),
         )
 
         with db.connection() as conn:

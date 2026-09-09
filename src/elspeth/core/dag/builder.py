@@ -16,19 +16,29 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import RouteDestination, RoutingMode, error_edge_label
-from elspeth.contracts.enums import NodeType
+from elspeth.contracts.enums import NodeType, OutputMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig, get_raw_schema_config
 from elspeth.contracts.types import (
     AggregationName,
     BranchName,
     CoalesceName,
+    CollectorName,
     GateName,
     NodeID,
+    RowUnionName,
     SinkName,
 )
 from elspeth.core.canonical import canonical_json
+from elspeth.core.dag.bound_regions import (
+    compute_bound_regions,
+    derive_escalation_fixpoint_bound,
+    validate_no_aggregations_in_regions,
+    validate_openers_bound_in_region,
+    validate_sese_regions,
+)
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema
+from elspeth.core.dag.group_bindings import build_group_binding_registry
 from elspeth.core.dag.guarantees import walk_effective_guarantee_vote
 from elspeth.core.dag.models import (
     _NODE_ID_MAX_LENGTH,
@@ -43,12 +53,15 @@ if TYPE_CHECKING:
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
+        CollectorSettings,
         GateSettings,
         QueueSettings,
+        RowUnionSettings,
+        ScopeSettings,
         SourceSettings,
     )
     from elspeth.core.dag.graph import ExecutionGraph
-    from elspeth.core.dag.models import NodeConfig
+    from elspeth.core.dag.models import GraphValidationWarning, NodeConfig
     from elspeth.core.dag.wiring import WiredTransform
 
 
@@ -97,6 +110,15 @@ class _CoalescePlan:
     name: CoalesceName
     node_id: NodeID
     branches: tuple[_CoalesceBranchSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RowUnionBranchSpec:
+    branch_name: BranchName
+    row_union_name: RowUnionName
+    row_union_node_id: NodeID
+    input_connection: str
+    uses_transform_chain: bool
 
 
 def _validate_output_schema_contract(transform: Any) -> None:
@@ -167,6 +189,10 @@ def build_execution_graph(
     gates: Sequence[GateSettings] = (),
     coalesce_settings: Sequence[CoalesceSettings] | None = None,
     queues: Mapping[str, QueueSettings] | None = None,
+    row_union_settings: Sequence[RowUnionSettings] | None = None,
+    collectors: Mapping[str, tuple[TransformProtocol, CollectorSettings]] | None = None,
+    scope_settings: Sequence[ScopeSettings] | None = None,
+    max_bound_region_depth: int = 5,
 ) -> ExecutionGraph:
     """Build an ExecutionGraph from plugin instances.
 
@@ -180,10 +206,12 @@ def build_execution_graph(
     """
     if not sources:
         raise GraphValidationError("ExecutionGraph requires at least one source")
-    if sinks is None:
+    if not sinks:
         raise GraphValidationError("ExecutionGraph requires at least one sink")
     if aggregations is None:
         aggregations = {}
+    if collectors is None:
+        collectors = {}
     if set(sources) != set(source_settings_map):
         raise GraphValidationError(
             f"Source plugin names and source settings names must match. plugins={sorted(sources)}, settings={sorted(source_settings_map)}"
@@ -270,12 +298,20 @@ def build_execution_graph(
     source_ids: dict[str, NodeID] = {}
     for source_name, source_instance in sources.items():
         source_config = source_instance.config
-        source_schema_config = _parse_contract_schema_config(
-            source_config,
-            owner=f"source:{source_name}",
-            component_id=source_name,
-            component_type="source",
-        )
+        # Prefer the plugin-computed output contract over re-parsing the raw
+        # options dict — the source-side mirror of the transform path below.
+        # Sources that rewrite their schema at construction (the LLM source's
+        # guaranteed-field augmentation) must feed the augmented contract into
+        # graph validation (elspeth-db98d3f660). SourceProtocol owns this
+        # field; absence is a broken source contract and must fail loudly.
+        source_schema_config: SchemaConfig | None = source_instance._output_schema_config
+        if source_schema_config is None:
+            source_schema_config = _parse_contract_schema_config(
+                source_config,
+                owner=f"source:{source_name}",
+                component_id=source_name,
+                component_type="source",
+            )
         source_node_config = dict(source_config)
         source_node_config["source_name"] = source_name
         source_id = node_id("source", source_name, source_node_config)
@@ -287,6 +323,7 @@ def build_execution_graph(
             config=source_node_config,
             output_schema=source_instance.output_schema,  # SourceProtocol requires this
             output_schema_config=source_schema_config,
+            observed_value_type=source_instance.observed_value_type,
         )
 
     # Add sinks
@@ -315,7 +352,10 @@ def build_execution_graph(
 
     # Build declared scheduling queues. V1 queue semantics are pass-through
     # coordination only: queues do not merge fields or synthesize guarantees
-    # across sources, so their schema contract is deliberately observed.
+    # of their own, so their schema contract is deliberately observed. The
+    # effective guarantee at a queue is computed by the propagation walk
+    # (walk_effective_guarantee_vote), which intersects the arms feeding it
+    # and abstains entirely if any arm abstains (elspeth-5a372d3267).
     queue_ids: dict[str, NodeID] = {}
     observed_queue_schema = SchemaConfig(mode="observed", fields=None)
     for queue_name, queue_config in queue_settings.items():
@@ -363,6 +403,12 @@ def build_execution_graph(
                 component_type="transform",
             )
 
+        # This is the only site that projects declared_input_fields; the
+        # aggregation loop below deliberately does not. Aggregation wiring
+        # rejects any transform with is_batch_aware=False (runtime_factory), and
+        # _initialize_declared_input_fields raises FrameworkBugError when a
+        # batch-aware transform declares input fields, so the excluded space is
+        # empty by construction rather than an unhandled case.
         graph.add_node(
             tid,
             node_type=node_type,
@@ -371,10 +417,17 @@ def build_execution_graph(
             input_schema=transform.input_schema,  # TransformProtocol requires this
             output_schema=transform.output_schema,  # TransformProtocol requires this
             output_schema_config=output_schema_config,
+            declared_output_fields=transform.declared_output_fields,
+            declared_input_fields=transform.declared_input_fields,
+            declared_string_input_fields=transform.declared_string_input_fields,
             passes_through_input=transform.passes_through_input,
+            forwards_input_fields=transform.forwards_input_fields,
+            removed_input_fields=transform.removed_input_fields,
+            preserves_input_values=transform.preserves_input_values,
         )
 
     graph.set_transform_id_map(transform_ids_by_seq)
+    graph.set_transform_name_id_map(transform_ids_by_name)
 
     # Build aggregations
     aggregation_ids: dict[AggregationName, NodeID] = {}
@@ -421,6 +474,9 @@ def build_execution_graph(
             output_schema=transform.output_schema,
             output_schema_config=agg_output_schema_config,
             passes_through_input=transform.passes_through_input,
+            forwards_input_fields=transform.forwards_input_fields,
+            removed_input_fields=transform.removed_input_fields,
+            preserves_input_values=transform.preserves_input_values,
         )
 
     graph.set_aggregation_id_map(aggregation_ids)
@@ -434,6 +490,8 @@ def build_execution_graph(
             "condition": gate_config.condition,
             "routes": dict(gate_config.routes),
         }
+        if gate_config.on_error is not None:
+            gate_node_config["on_error"] = gate_config.on_error
         if gate_config.fork_to:
             gate_node_config["fork_to"] = list(gate_config.fork_to)
 
@@ -489,9 +547,18 @@ def build_execution_graph(
             # Note: Pydantic validates min_length=2 for branches field
             config_dict: NodeConfig = {
                 "branches": dict(coalesce_config.branches),
+                # Declared order drives merge precedence at runtime
+                # (first_wins/last_wins collisions, nested field order), but
+                # canonical hashing sorts mapping keys — carry the order
+                # explicitly so a reorder rotates node identity and topology
+                # hash instead of resuming checkpoints under different merge
+                # semantics (elspeth-9c5789c4ad parity).
+                "branch_order": list(coalesce_config.branches),
                 "policy": coalesce_config.policy,
                 "merge": coalesce_config.merge,
             }
+            if coalesce_config.merge == "union":
+                config_dict["union_collision_policy"] = coalesce_config.union_collision_policy
             if coalesce_config.timeout_seconds is not None:
                 config_dict["timeout_seconds"] = coalesce_config.timeout_seconds
             if coalesce_config.quorum_count is not None:
@@ -541,11 +608,180 @@ def build_execution_graph(
 
         graph.set_coalesce_id_map(coalesce_ids)
 
+    # ===== ROW_UNION IMPLEMENTATION (BUILD NODES AND MAPPINGS FIRST) =====
+    # row_union is the fork-branch UNION ALL barrier (elspeth-a5b86149d4 v1):
+    # correlated on row_id, require_all only, pass-through payloads. Like
+    # queues, it promises no schema synthesis — its contract is observed.
+    row_union_ids: dict[RowUnionName, NodeID] = {}
+    row_union_id_to_config: dict[NodeID, RowUnionSettings] = {}
+    row_union_branch_specs: dict[BranchName, _RowUnionBranchSpec] = {}
+    if row_union_settings:
+        observed_row_union_schema = SchemaConfig(mode="observed", fields=None)
+        for union_config in row_union_settings:
+            union_name = RowUnionName(union_config.name)
+            if SinkName(union_config.on_success) in sink_ids:
+                raise GraphValidationError(
+                    f"row_union '{union_config.name}' on_success '{union_config.on_success}' names a sink. "
+                    "A released group must continue on a processing connection; "
+                    "terminal row_union -> sink release is not supported in v1.",
+                    component_id=union_config.name,
+                    component_type="row_union",
+                )
+            union_node_config: NodeConfig = {
+                "branches": dict(union_config.branches),
+                # Declared order is the group release order (RowUnionExecutor
+                # iterates it), but canonical hashing sorts mapping keys — an
+                # ordered projection must carry it or a branch reorder keeps
+                # the node id / topology hash and checkpoint resume replays
+                # different release semantics (elspeth-9c5789c4ad).
+                "branch_order": list(union_config.branches),
+                "on_success": union_config.on_success,
+            }
+            if union_config.timeout_seconds is not None:
+                union_node_config["timeout_seconds"] = union_config.timeout_seconds
+
+            uid = node_id("row_union", union_config.name, union_node_config)
+            row_union_ids[union_name] = uid
+            row_union_id_to_config[uid] = union_config
+
+            for branch_name, input_connection in union_config.branches.items():
+                branch_key = BranchName(branch_name)
+                if branch_key in coalesce_branch_specs:
+                    raise GraphValidationError(
+                        f"Branch '{branch_name}' is already mapped to coalesce "
+                        f"'{coalesce_branch_specs[branch_key].coalesce_name}', but row_union "
+                        f"'{union_config.name}' also declares it.\n"
+                        f"Each fork branch can only join at one barrier.",
+                        component_id=union_config.name,
+                        component_type="row_union",
+                    )
+                if branch_key in row_union_branch_specs:
+                    raise GraphValidationError(
+                        f"Duplicate branch name '{branch_name}' found in row_union settings.\n"
+                        f"Branch '{branch_name}' is already mapped to row_union "
+                        f"'{row_union_branch_specs[branch_key].row_union_name}', but row_union "
+                        f"'{union_config.name}' also declares it.",
+                        component_id=union_config.name,
+                        component_type="row_union",
+                    )
+                row_union_branch_specs[branch_key] = _RowUnionBranchSpec(
+                    branch_name=branch_key,
+                    row_union_name=union_name,
+                    row_union_node_id=uid,
+                    input_connection=input_connection,
+                    uses_transform_chain=input_connection != branch_name,
+                )
+
+            graph.add_node(
+                uid,
+                node_type=NodeType.ROW_UNION,
+                plugin_name=f"row_union:{union_config.name}",
+                config=union_node_config,
+                output_schema_config=observed_row_union_schema,
+            )
+
+        graph.set_row_union_id_map(row_union_ids)
+
+    # ===== BUILD COLLECTORS (EXPAND-GROUP CLOSERS; barrier-scopes spec §3) =====
+    # A collector is a barrier reusing the batch-transform plugin contract.
+    # Its scope binding rides the node config as the "scope" key — present on
+    # collector nodes ONLY, so no pre-existing node's canonical hash moves
+    # (spec §3; Task-1 corpus pins it).
+    collector_ids: dict[CollectorName, NodeID] = {}
+    collector_transforms: dict[CollectorName, TransformProtocol] = {}
+    scopes_by_closer: dict[str, ScopeSettings] = {s.closer: s for s in (scope_settings or ())}
+    if collectors:
+        # The opener check core/config.py's _validate_scope_bindings defers
+        # here ("opener multi-row-ness is only visible with plugin instances
+        # in hand"). Derived from the same plugin attribute the rule-5
+        # census reads (creates_tokens), never from the opener's name.
+        transform_plugins_by_name: dict[str, TransformProtocol] = {wired.settings.name: wired.plugin for wired in transforms}
+        for collector_name, (transform, collector_config) in collectors.items():
+            if not transform.is_batch_aware:
+                raise GraphValidationError(
+                    f"Collector '{collector_name}' plugin '{collector_config.plugin}' has "
+                    f"is_batch_aware=False. Collectors reuse the batch-transform plugin contract.",
+                    component_id=collector_name,
+                    component_type="collector",
+                )
+            if collector_config.name not in scopes_by_closer:
+                raise GraphValidationError(
+                    f"Collector '{collector_name}' has no scopes: entry binding it. A collector is an "
+                    f"EXPAND-group closer and requires a scope (spec §7 rule 1).",
+                    component_id=collector_name,
+                    component_type="collector",
+                )
+            scope = scopes_by_closer[collector_config.name]
+            opener_plugin = transform_plugins_by_name.get(scope.opener)
+            if opener_plugin is None:
+                raise GraphValidationError(
+                    f"Scope '{scope.name}' opener '{scope.opener}' does not name a transforms: entry. "
+                    f"A scope opener is a multi-row transform declared in transforms:.",
+                    component_id=scope.opener,
+                    component_type="transform",
+                )
+            if not opener_plugin.creates_tokens:
+                # A non-expanding opener yields a bound region no token can
+                # enter: the first row cannot route onto the collector's
+                # input without an EXPAND group frame, and the run dies with
+                # an internal error naming a phantom sink (elspeth-9783949ed4).
+                raise GraphValidationError(
+                    f"Scope '{scope.name}' opener '{scope.opener}' is not a multi-row transform "
+                    f"(creates_tokens=False), so it expands no rows into the group collector "
+                    f"'{collector_name}' would close. A scope opener must be an expanding transform "
+                    f"(spec §3, §7 rule 5).",
+                    component_id=scope.opener,
+                    component_type="transform",
+                )
+            transform_config = transform.config
+            collector_node_config: NodeConfig = {
+                "options": dict(collector_config.options),
+                "input_schema": transform_config["schema"],
+                "scope": {
+                    "name": scope.name,
+                    "opener": scope.opener,
+                    "policy": scope.policy,
+                },
+            }
+            col_id = node_id("collector", collector_name, collector_node_config)
+            collector_ids[CollectorName(collector_name)] = col_id
+            collector_transforms[CollectorName(collector_name)] = transform
+            collector_output_schema_config = transform._output_schema_config
+            if collector_output_schema_config is None:
+                collector_output_schema_config = _parse_contract_schema_config(
+                    transform_config,
+                    owner=f"collector:{collector_name}",
+                    component_id=collector_name,
+                    component_type="collector",
+                )
+            graph.add_node(
+                col_id,
+                node_type=NodeType.COLLECTOR,
+                plugin_name=collector_config.plugin,
+                config=collector_node_config,
+                input_schema=transform.input_schema,
+                output_schema=transform.output_schema,
+                output_schema_config=collector_output_schema_config,
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+                removed_input_fields=transform.removed_input_fields,
+                preserves_input_values=transform.preserves_input_values,
+            )
+    graph.set_collector_id_map(collector_ids)
+    graph.set_collector_transform_map(collector_transforms)
+
     # ===== CONNECT FORK GATES - EXPLICIT DESTINATIONS ONLY =====
     # CRITICAL: No fallback behavior. All fork branches must have explicit destinations.
     # This prevents silent configuration bugs (typos, missing destinations).
     fork_branch_owner: dict[BranchName, GateName] = {}
     coalesce_branch_plans: dict[BranchName, _CoalesceBranchPlan] = {}
+    row_union_branch_gates: dict[BranchName, tuple[GateName, NodeID]] = {}
+    # Unbound (no barrier) branches consumed by exactly one ordinary
+    # downstream transform/gate (spec §7 E2). branch_name -> that consumer's
+    # node id. Registered as a producer once `register_producer` exists
+    # (below); the actual MOVE edge is drawn by the standard "MATCH
+    # PRODUCERS TO CONSUMERS" pass, reusing that machinery unchanged.
+    unbound_consumer_fed_branches: dict[BranchName, NodeID] = {}
     for gate_entry in gate_entries:
         if gate_entry.fork_to:
             branch_counts = Counter(gate_entry.fork_to)
@@ -582,6 +818,17 @@ def build_execution_graph(
                             label=branch_name,
                             mode=RoutingMode.COPY,
                         )
+                elif branch_key in row_union_branch_specs:
+                    ru_spec = row_union_branch_specs[branch_key]
+                    row_union_branch_gates[branch_key] = (GateName(gate_entry.name), gate_entry.node_id)
+                    if not ru_spec.uses_transform_chain:
+                        # Identity branch: direct COPY edge into the barrier
+                        graph.add_edge(
+                            gate_entry.node_id,
+                            ru_spec.row_union_node_id,
+                            label=branch_name,
+                            mode=RoutingMode.COPY,
+                        )
                 elif SinkName(branch_name) in sink_ids:
                     # Explicit sink destination (branch name matches sink name)
                     graph.add_edge(
@@ -591,18 +838,147 @@ def build_execution_graph(
                         mode=RoutingMode.COPY,
                     )
                 else:
-                    # NO FALLBACK - this is a configuration error
-                    raise GraphValidationError(
-                        f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with no destination.\n"
-                        f"Fork branches must either:\n"
-                        f"  1. Be listed in a coalesce 'branches' dict/list, or\n"
-                        f"  2. Match a sink name exactly\n"
-                        f"\n"
-                        f"Available coalesce branches: {sorted(coalesce_branch_specs.keys())}\n"
-                        f"Available sinks: {sorted(sink_ids.keys())}",
-                        component_id=gate_entry.name,
-                        component_type="gate",
-                    )
+                    # Fourth path (spec §7 E2): a branch consumed by exactly
+                    # one ordinary downstream transform/gate is legal —
+                    # pure fan-out with no barrier claiming it at all. The
+                    # consumer registry doesn't exist yet at this point in
+                    # the build, so scan the raw transform/gate settings
+                    # directly rather than reusing the later registry pass.
+                    consumer_matches: list[tuple[NodeID, str]] = [
+                        (transform_ids_by_name[wired.settings.name], f"transform '{wired.settings.name}'")
+                        for wired in transforms
+                        if wired.settings.input == branch_name
+                    ] + [
+                        (config_gate_ids[GateName(other_gate.name)], f"gate '{other_gate.name}'")
+                        for other_gate in gates
+                        if other_gate.input == branch_name
+                    ]
+                    if len(consumer_matches) == 1:
+                        consumer_node_id, _description = consumer_matches[0]
+                        unbound_consumer_fed_branches[branch_key] = consumer_node_id
+                    elif len(consumer_matches) > 1:
+                        raise GraphValidationError(
+                            f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with "
+                            f"{len(consumer_matches)} downstream consumers: "
+                            f"{sorted(description for _node_id, description in consumer_matches)}. "
+                            "A fork branch may feed at most one consumer (use a gate for fan-out).",
+                            component_id=gate_entry.name,
+                            component_type="gate",
+                        )
+                    else:
+                        # NO FALLBACK - this is a configuration error
+                        raise GraphValidationError(
+                            f"Gate '{gate_entry.name}' has fork branch '{branch_name}' with no destination.\n"
+                            f"Fork branches must either:\n"
+                            f"  1. Be listed in a coalesce 'branches' dict/list, or\n"
+                            f"  2. Be listed in a row_union 'branches' dict/list, or\n"
+                            f"  3. Match a sink name exactly, or\n"
+                            f"  4. Be consumed by exactly one downstream transform/gate 'input'\n"
+                            f"\n"
+                            f"Available coalesce branches: {sorted(coalesce_branch_specs.keys())}\n"
+                            f"Available row_union branches: {sorted(row_union_branch_specs.keys())}\n"
+                            f"Available sinks: {sorted(sink_ids.keys())}",
+                            component_id=gate_entry.name,
+                            component_type="gate",
+                        )
+
+    # ===== WHOLE-ROSTER FORK CLOSURE (spec §7 rule 2, ruling 23) =====
+    # A fork is fully bound (every branch flows to its ONE closer, rosters
+    # equal) or fully unbound (pure fan-out to sinks). Mixed closure and
+    # multi-closer splits are build errors; subset closure can be added
+    # additively later — the reverse narrowing never could be. Rule 2
+    # supersedes the old row_union-specific origin diagnostics (ancestor/
+    # descendant fork generations, unrelated fork origins): any topology
+    # those two arms used to catch is ALSO a roster mismatch here, since a
+    # closer whose roster spans more than one gate's fork_to can never equal
+    # any single contributing gate's roster (maintainer ruling 2026-08-23;
+    # the arms were deleted as dead code — see the closer-centric check
+    # below for the multi-gate enrichment that replaces their diagnostic
+    # value).
+    #
+    # closer_gate_rosters accumulates, per closer, every fork gate that
+    # contributes a branch to it — a closer_label with >1 entry is exactly
+    # the "unrelated/ancestor-descendant fork gates" shape the deleted arms
+    # used to name explicitly; the roster-equality pass below reads this
+    # map so its message can still name every contributing gate.
+    closer_gate_rosters: dict[str, dict[str, list[str]]] = {}
+    for gate_entry in gate_entries:
+        if not gate_entry.fork_to:
+            continue
+        closers: dict[str, str] = {}  # branch -> closer name ("coalesce:X" / "row_union:Y")
+        unbound: list[str] = []
+        for branch_name in gate_entry.fork_to:
+            branch_key = BranchName(branch_name)
+            if branch_key in coalesce_branch_specs:
+                closers[branch_name] = f"coalesce:{coalesce_branch_specs[branch_key].coalesce_name}"
+            elif branch_key in row_union_branch_specs:
+                closers[branch_name] = f"row_union:{row_union_branch_specs[branch_key].row_union_name}"
+            else:
+                unbound.append(branch_name)
+        if closers and unbound:
+            raise GraphValidationError(
+                f"Fork gate '{gate_entry.name}' has mixed closure: branches {sorted(closers)} close at a "
+                f"barrier while branches {unbound} go direct to a sink or an ordinary consumer. A fork is either fully bound — "
+                f"every declared branch flows to the fork's single closer — or fully unbound (pure "
+                f"fan-out). Route every branch to the closer, or none (spec §7 rule 2).",
+                component_id=gate_entry.name,
+                component_type="gate",
+            )
+        distinct_closers = sorted(set(closers.values()))
+        if len(distinct_closers) > 1:
+            raise GraphValidationError(
+                f"Fork gate '{gate_entry.name}' closes at multiple barriers: {distinct_closers}. "
+                f"A fork closes entirely at ONE closer (spec §7 rule 2). Split into nested forks — an "
+                f"outer pure fan-out whose branches each contain their own fork→closer pair.",
+                component_id=gate_entry.name,
+                component_type="gate",
+            )
+        if distinct_closers:
+            closer_label = distinct_closers[0]
+            if closer_label not in closer_gate_rosters:
+                closer_gate_rosters[closer_label] = {}
+            closer_gate_rosters[closer_label][gate_entry.name] = list(gate_entry.fork_to)
+
+    # Roster equality, checked once per CLOSER across every contributing
+    # gate (rather than once per gate against the closer's full roster) so
+    # a multi-gate mismatch can name every contributing gate's own roster
+    # plus any branch no gate produces at all, in one message.
+    #
+    # NOTE: legality is NOT "declared == union(all contributing gates'
+    # rosters)" — a multi-gate closer whose combined rosters happen to sum
+    # to exactly the declared set (the common shape: every declared branch
+    # has some producer, just spread across >1 gate) would wrongly pass that
+    # check, silently re-admitting the ancestor/descendant and unrelated-
+    # origin topologies rule 2 is supposed to supersede. The single legal
+    # shape is exactly ONE contributing gate whose own roster has zero
+    # orphans against the declared set; by construction (mixed-closure and
+    # multi-closer-split are already ruled out above) a single contributing
+    # gate's fork_to is always a subset of `declared`, so "one gate, no
+    # orphans" implies exact equality — no separate equality check needed.
+    for closer_label, gate_rosters in closer_gate_rosters.items():
+        kind, _, closer_name = closer_label.partition(":")
+        declared = (
+            {str(b.branch_name) for b in coalesce_plans[CoalesceName(closer_name)].branches}
+            if kind == "coalesce"
+            else {str(b) for b, spec in row_union_branch_specs.items() if str(spec.row_union_name) == closer_name}
+        )
+        produced: set[str] = set()
+        for fork_to in gate_rosters.values():
+            produced.update(fork_to)
+        orphaned = sorted(declared - produced)
+        if len(gate_rosters) == 1 and not orphaned:
+            continue
+        closer_word = "Coalesce" if kind == "coalesce" else "row_union"
+        gate_summary = "; ".join(f"'{name}' declares {sorted(roster)}" for name, roster in sorted(gate_rosters.items()))
+        orphan_clause = f"; no gate produces {orphaned}" if orphaned else ""
+        raise GraphValidationError(
+            f"{closer_word} '{closer_name}' roster mismatch: closer declares {sorted(declared)}, "
+            f"drawn from {len(gate_rosters)} fork gate(s): {gate_summary}{orphan_clause}. Whole-roster "
+            f"closure requires the closer's branches to come from exactly ONE gate's fork_to, with the "
+            f"rosters exactly equal (spec §7 rule 2).",
+            component_id=closer_name,
+            component_type=kind,
+        )
 
     # ===== VALIDATE COALESCE BRANCHES ARE PRODUCED BY GATES =====
     # All branches declared in coalesce settings must be produced by some fork gate
@@ -621,11 +997,48 @@ def build_execution_graph(
                     component_type="coalesce",
                 )
 
+    # ===== VALIDATE ROW_UNION BRANCHES ARE PRODUCED BY GATES =====
+    # Reachable only when a row_union's ENTIRE declared roster is disjoint
+    # from every fork gate's fork_to (no gate contributes even one of its
+    # branches) — verified 2026-08-23 (maintainer ruling on the rule-2
+    # supersession above). A PARTIAL orphan (some declared branches produced,
+    # some not) never reaches here: the producing gate(s) already enter
+    # closer_gate_rosters above, so rule 2's roster-equality check fires
+    # first and names the orphan branch itself (declared - produced). Keep
+    # this check for the wholly-disjoint case, where no gate ever registers
+    # the closer at all and rule 2 never sees it.
+    if row_union_branch_specs:
+        for branch_name, ru_spec in row_union_branch_specs.items():
+            if branch_name not in row_union_branch_gates:
+                raise GraphValidationError(
+                    f"row_union '{ru_spec.row_union_name}' declares branch '{branch_name}', "
+                    f"but no gate produces this branch.\n"
+                    f"Branches must be listed in a gate's fork_to list to be valid.\n"
+                    f"\n"
+                    f"Branches produced by gates: {sorted(fork_branch_owner.keys()) if fork_branch_owner else '(none)'}",
+                    component_id=str(ru_spec.row_union_name),
+                    component_type="row_union",
+                )
+        graph.set_branch_to_row_union_map({branch: spec.row_union_name for branch, spec in row_union_branch_specs.items()})
+        graph.set_row_union_branch_gates({branch: gate_node_id for branch, (_gate_name, gate_node_id) in row_union_branch_gates.items()})
+
     # ===== BUILD PRODUCER REGISTRY =====
     producers: dict[str, tuple[NodeID, str]] = {}
     producer_desc: dict[str, str] = {}
     queue_input_edges: defaultdict[str, list[tuple[NodeID, str, str]]] = defaultdict(list)
     gate_connection_route_labels: defaultdict[tuple[NodeID, str], list[str]] = defaultdict(list)
+    # (gate_node_id, connection_name) pairs registered AS a fork branch's own
+    # producer connection. gate_connection_route_labels is keyed only by
+    # (gate_id, target-connection-name-string) — an ordinary route entry
+    # whose target string happens to COINCIDE with a branch's own connection
+    # name (e.g. a route named after one of the gate's own branches) would
+    # otherwise silently override that branch edge's label at draw time
+    # (2026-08-23 fix, addendum A2: the true root cause of the F1 "label
+    # hole" — `edge.label in member_roster` was asking a correct question of
+    # corrupted data). A fork-branch connection's edge must ALWAYS carry the
+    # branch name as its label, never a same-gate route label, regardless of
+    # what else targets that connection name.
+    fork_branch_connections: set[tuple[NodeID, str]] = set()
 
     def register_producer(connection_name: str, node_id: NodeID, label: str, description: str) -> None:
         if connection_name in queue_ids:
@@ -664,6 +1077,11 @@ def build_execution_graph(
         elif SinkName(agg_settings.on_success) not in sink_ids:
             register_producer(agg_settings.on_success, aid, "continue", f"aggregation '{agg_settings.name}'")
 
+    for collector_name, (_transform, collector_settings_entry) in collectors.items():
+        cid = collector_ids[CollectorName(collector_name)]
+        if SinkName(collector_settings_entry.on_success) not in sink_ids:
+            register_producer(collector_settings_entry.on_success, cid, "continue", f"collector '{collector_settings_entry.name}'")
+
     if coalesce_settings:
         for coalesce_config in coalesce_settings:
             if coalesce_config.on_success is None:
@@ -674,6 +1092,15 @@ def build_execution_graph(
                     "continue",
                     f"coalesce '{coalesce_config.name}'",
                 )
+
+    if row_union_settings:
+        for union_config in row_union_settings:
+            register_producer(
+                union_config.on_success,
+                row_union_ids[RowUnionName(union_config.name)],
+                "continue",
+                f"row_union '{union_config.name}'",
+            )
 
     for queue_name, queue_id in queue_ids.items():
         producers[queue_name] = (queue_id, "continue")
@@ -690,6 +1117,35 @@ def build_execution_graph(
             plan.branch_name,
             f"fork branch '{plan.branch_name}' from gate '{plan.gate_name}'",
         )
+        fork_branch_connections.add((plan.gate_node_id, plan.branch_name))
+
+    for branch_key, (ru_gate_name, ru_gate_node_id) in row_union_branch_gates.items():
+        ru_spec = row_union_branch_specs[branch_key]
+        if not ru_spec.uses_transform_chain:
+            continue
+        register_producer(
+            ru_spec.branch_name,
+            ru_gate_node_id,
+            ru_spec.branch_name,
+            f"fork branch '{ru_spec.branch_name}' from gate '{ru_gate_name}'",
+        )
+        fork_branch_connections.add((ru_gate_node_id, ru_spec.branch_name))
+
+    # Unbound (no barrier) consumer-fed branches (spec §7 E2): registering
+    # the branch as a producer here lets the standard "MATCH PRODUCERS TO
+    # CONSUMERS" pass below draw the MOVE edge exactly as it already does for
+    # transform-chain coalesce branches — the branch's downstream consumer
+    # (a transform or gate) already registers itself as a consumer of this
+    # connection name unconditionally, regardless of this branch.
+    for branch_key in unbound_consumer_fed_branches:
+        owning_gate_name = fork_branch_owner[branch_key]
+        register_producer(
+            str(branch_key),
+            config_gate_ids[owning_gate_name],
+            str(branch_key),
+            f"fork branch '{branch_key}' from gate '{owning_gate_name}' (unbound, consumer-fed)",
+        )
+        fork_branch_connections.add((config_gate_ids[owning_gate_name], str(branch_key)))
 
     # ===== BUILD CONSUMER REGISTRY =====
     consumers: dict[str, NodeID] = {}
@@ -714,6 +1170,13 @@ def build_execution_graph(
             f"aggregation '{agg_settings.name}'",
         )
 
+    for collector_name, (_transform, collector_settings_entry) in collectors.items():
+        register_consumer(
+            collector_settings_entry.input,
+            collector_ids[CollectorName(collector_name)],
+            f"collector '{collector_settings_entry.name}'",
+        )
+
     for gate_settings in gates:
         register_consumer(
             gate_settings.input,
@@ -732,6 +1195,18 @@ def build_execution_graph(
             plan.input_connection,
             plan.coalesce_node_id,
             f"coalesce '{plan.coalesce_name}' branch '{plan.branch_name}'",
+        )
+
+    # Same shape for row_union transform branches: the barrier consumes the
+    # final transform's output connection; connection resolution creates the
+    # MOVE edges through the chain.
+    for ru_spec in row_union_branch_specs.values():
+        if not ru_spec.uses_transform_chain:
+            continue
+        register_consumer(
+            ru_spec.input_connection,
+            ru_spec.row_union_node_id,
+            f"row_union '{ru_spec.row_union_name}' branch '{ru_spec.branch_name}'",
         )
 
     for gate_id, route_label, target in gate_route_connections:
@@ -801,7 +1276,28 @@ def build_execution_graph(
         producer_id, producer_label = producers[connection_name]
         if producer_id in gate_node_ids and producer_label != "continue":
             route_labels = gate_connection_route_labels[(producer_id, connection_name)]
-            if route_labels:
+            if (producer_id, connection_name) in fork_branch_connections:
+                # This connection IS a fork branch's own producer connection —
+                # its edge must ALWAYS carry the branch name, never get
+                # overridden by a same-gate route_labels entry that
+                # coincidentally targets this same connection name (addendum
+                # A2; see fork_branch_connections).
+                #
+                # If a route ALSO targets this connection, its own edge must
+                # STILL be drawn alongside the branch-name edge, not instead
+                # of it (fix round 4, N1, controller-ruled): the route stays
+                # live in the route-resolution map at runtime regardless of
+                # what the graph's edges say, so dropping its edge here
+                # removes rule 4's only witness that an unframed route
+                # re-enters this branch's connection — exactly the F2 hazard
+                # that limb exists to catch. The branch-name edge and a
+                # route-labelled edge to the SAME target are two different
+                # facts about the graph (the branch exists; a route
+                # additionally feeds it), not alternatives.
+                graph.add_edge(producer_id, consumer_id, label=producer_label, mode=RoutingMode.MOVE)
+                for route_label in route_labels:
+                    graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
+            elif route_labels:
                 for route_label in route_labels:
                     graph.add_edge(producer_id, consumer_id, label=route_label, mode=RoutingMode.MOVE)
             else:
@@ -871,6 +1367,20 @@ def build_execution_graph(
                 f"Aggregation '{agg_settings.name}' on_success '{agg_on_success}' is neither a sink nor a known connection.{hint}",
                 component_id=agg_settings.name,
                 component_type="aggregation",
+            )
+
+    for collector_name, (_transform, collector_settings_entry) in collectors.items():
+        collector_on_success = collector_settings_entry.on_success
+        cid = collector_ids[CollectorName(collector_name)]
+        if SinkName(collector_on_success) in sink_ids:
+            graph.add_edge(cid, sink_ids[SinkName(collector_on_success)], label="on_success", mode=RoutingMode.MOVE)
+        elif collector_on_success not in consumers:
+            suggestions = _suggest_similar(collector_on_success, sorted(consumers.keys()))
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise GraphValidationError(
+                f"Collector '{collector_settings_entry.name}' on_success '{collector_on_success}' is neither a sink nor a known connection.{hint}",
+                component_id=collector_settings_entry.name,
+                component_type="collector",
             )
 
     if coalesce_settings:
@@ -958,11 +1468,30 @@ def build_execution_graph(
                 mode=RoutingMode.DIVERT,
             )
 
+    # rule 9 (spec §7): on_error may target the ENCLOSING bound region's
+    # closer, not only a sink. closer_name_to_node collects every legal
+    # closer name (coalesce/row_union/collector) so the two error-edge loops
+    # below can recognize a closer-shaped on_error and DEFER it — region
+    # membership is not known yet (compute_bound_regions runs later, after
+    # these loops) — rather than misclassifying it as an unknown sink.
+    # Resolved after region computation, below.
+    closer_name_to_node: dict[str, NodeID] = {
+        **{str(name): nid for name, nid in coalesce_ids.items()},
+        **{str(name): nid for name, nid in row_union_ids.items()},
+        **{str(name): nid for name, nid in collector_ids.items()},
+    }
+    deferred_error_closer_targets: list[tuple[NodeID, str, str, str]] = []  # (node_id, node_name, kind, target)
+
     # Transform error edges
     for wired in transforms:
         on_error = wired.settings.on_error
         if on_error != "discard":
             if SinkName(on_error) not in sink_ids:
+                if on_error in closer_name_to_node:
+                    deferred_error_closer_targets.append(
+                        (transform_ids_by_name[wired.settings.name], wired.settings.name, "transform", on_error)
+                    )
+                    continue
                 suggestions = _suggest_similar(on_error, sorted(str(s) for s in sink_ids))
                 hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
                 raise GraphValidationError(
@@ -977,6 +1506,32 @@ def build_execution_graph(
                 label=error_edge_label(wired.settings.name),
                 mode=RoutingMode.DIVERT,
             )
+
+    # Config-gate row-error edges. These are structural audit markers, not
+    # normal route labels: GateExecutor emits the DIVERT event only when this
+    # row's expression evaluation fails and a named policy sink is configured.
+    for gate_config in gates:
+        gate_on_error = gate_config.on_error
+        if gate_on_error is None or gate_on_error == "discard":
+            continue
+        if SinkName(gate_on_error) not in sink_ids:
+            if gate_on_error in closer_name_to_node:
+                deferred_error_closer_targets.append((config_gate_ids[GateName(gate_config.name)], gate_config.name, "gate", gate_on_error))
+                continue
+            suggestions = _suggest_similar(gate_on_error, sorted(str(s) for s in sink_ids))
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise GraphValidationError(
+                f"Gate '{gate_config.name}' on_error '{gate_on_error}' references unknown sink.{hint} "
+                f"Available sinks: {', '.join(sorted(str(s) for s in sink_ids))}",
+                component_id=gate_config.name,
+                component_type="gate",
+            )
+        graph.add_edge(
+            config_gate_ids[GateName(gate_config.name)],
+            sink_ids[SinkName(gate_on_error)],
+            label=error_edge_label(gate_config.name),
+            mode=RoutingMode.DIVERT,
+        )
 
     # Sink failsink edges
     for sink_name_key, sink_node_id in sink_ids.items():
@@ -1005,11 +1560,14 @@ def build_execution_graph(
     processing_node_ids.update(aggregation_ids.values())
     processing_node_ids.update(config_gate_ids.values())
     processing_node_ids.update(coalesce_ids.values())
+    processing_node_ids.update(row_union_ids.values())
+    processing_node_ids.update(collector_ids.values())
 
     pipeline_nodes = graph.topological_processing_order(processing_node_ids)
 
     branch_info: dict[BranchName, BranchInfo] = {branch_name: plan.to_branch_info() for branch_name, plan in coalesce_branch_plans.items()}
     graph.set_branch_info(branch_info)
+    graph.set_unbound_branch_first_nodes(dict(unbound_consumer_fed_branches))
 
     # ===== POPULATE PASS-THROUGH SCHEMA CONFIG =====
     # Coalesce nodes and their downstream gates are structural pass-throughs;
@@ -1116,15 +1674,332 @@ def build_execution_graph(
     # PHASE 2 VALIDATION: Validate schema compatibility AFTER graph is built
     graph.validate_edge_compatibility()
 
-    # Warn about DIVERT edges feeding require_all coalesces (non-fatal).
-    if coalesce_id_to_config:
-        graph.set_validation_warnings(graph.warn_divert_coalesce_interactions(coalesce_id_to_config))
+    # Warn about DIVERT edges feeding correlated barriers (non-fatal).
+    # set_validation_warnings ASSIGNS, so both barrier kinds contribute to one
+    # list and one call — a second call would silently displace the first.
+    # ORDERING CONSTRAINT: this pass must stay BEFORE the rule-9 resolution
+    # pass below, which lands DIVERT edges INTO closers. This warning's text
+    # ("rows will never reach the coalesce") is about diversion AWAY from a
+    # barrier and would be factually wrong for a rule-9 edge; running here,
+    # those edges do not exist yet, which is the intended exemption.
+    if coalesce_id_to_config or row_union_id_to_config:
+        build_warnings: list[GraphValidationWarning] = []
+        if coalesce_id_to_config:
+            build_warnings.extend(graph.warn_divert_coalesce_interactions(coalesce_id_to_config))
+        if row_union_id_to_config:
+            build_warnings.extend(graph.warn_divert_row_union_interactions(row_union_id_to_config))
+        graph.set_validation_warnings(build_warnings)
 
     # Deep-freeze all NodeInfo configs now that schema resolution is complete.
     # NodeInfo.__post_init__ cannot freeze config because graph construction
     # replaces NodeInfo payloads during multi-step schema propagation.
     # deep_freeze converts nested dicts/lists to MappingProxyType/tuple recursively.
     graph.finalize_node_configs()
+
+    # ===== ROW_UNION GROUP-INDIVISIBILITY GUARD (v1) =====
+    # A released union group is indivisible: downstream batch triggers may
+    # fire only BETWEEN complete groups, never between variants of one source
+    # row. v1 enforces this structurally — any aggregation reachable from a
+    # row_union may use only the implicit end_of_source trigger, which cannot
+    # split a group. Group-aware count/timeout/condition triggers are the
+    # production follow-up on elspeth-a5b86149d4.
+    #
+    # The same walk rejects a correlated barrier (coalesce or row_union)
+    # downstream of a row_union. Both barrier kinds key their pending map on
+    # (barrier name, row_id) with no fork_group_id, and row_union is the first
+    # N-to-N primitive in the engine — it puts N same-row_id tokens on the wire.
+    # A downstream coalesce therefore accepts one arrival per branch and rejects
+    # the rest as late arrivals (silent loss of half of every group); a
+    # downstream row_union crashes mid-run with a duplicate-arrival error that
+    # blames fork/retry/resume for a topology the builder accepted.
+    if row_union_ids:
+        aggregation_settings_by_node: dict[NodeID, AggregationSettings] = {
+            aggregation_ids[AggregationName(agg_name)]: agg_settings for agg_name, (_transform, agg_settings) in aggregations.items()
+        }
+        barrier_display_names: dict[NodeID, str] = {nid: str(name) for name, nid in coalesce_ids.items()}
+        barrier_display_names.update({nid: str(name) for name, nid in row_union_ids.items()})
+        for union_name, union_node_id in row_union_ids.items():
+            visited: set[NodeID] = set()
+            frontier: list[NodeID] = [union_node_id]
+            while frontier:
+                current = frontier.pop()
+                for out_edge in graph.get_outgoing_edges(current):
+                    downstream = out_edge.to_node
+                    if downstream in visited:
+                        continue
+                    visited.add(downstream)
+                    downstream_type = graph.get_node_info(downstream).node_type
+                    if downstream_type == NodeType.SINK:
+                        continue
+                    if downstream_type in (NodeType.COALESCE, NodeType.ROW_UNION):
+                        barrier_kind = downstream_type.value
+                        # Total by construction: every COALESCE / ROW_UNION node in this
+                        # graph is added by the loops above that populate coalesce_ids /
+                        # row_union_ids, and those are the only two sites in the tree that
+                        # add a node of either type. A missing key would mean the graph
+                        # holds a barrier the builder never registered — surface that as a
+                        # KeyError rather than naming the barrier by opaque node id.
+                        barrier_name = barrier_display_names[downstream]
+                        raise GraphValidationError(
+                            f"{barrier_kind} '{barrier_name}' is downstream of row_union '{union_name}' "
+                            f"with no intervening sink. row_union releases N tokens that share one row_id, "
+                            f"and a correlated barrier cannot consume an N-to-N group: it keys pending "
+                            f"arrivals on (barrier, row_id), so the second arrival on each branch is treated "
+                            f"as a late arrival — silently discarding part of every group, or failing mid-run "
+                            f"with a duplicate-arrival error. Move '{barrier_name}' upstream of the fork that "
+                            f"feeds '{union_name}', or terminate the released group at a sink.",
+                            component_id=str(union_name),
+                            component_type="row_union",
+                        )
+                    downstream_agg = aggregation_settings_by_node[downstream] if downstream in aggregation_settings_by_node else None
+                    if downstream_agg is not None:
+                        trigger = downstream_agg.trigger
+                        if trigger.has_count or trigger.has_timeout or trigger.has_condition:
+                            raise GraphValidationError(
+                                f"Aggregation '{downstream_agg.name}' is downstream of row_union "
+                                f"'{union_name}' but declares a count/timeout/condition trigger. "
+                                f"Such triggers can fire between variants of one source row, "
+                                f"splitting an indivisible union group. Use the implicit "
+                                f"end_of_source trigger (omit 'trigger' or set 'trigger: {{}}'), "
+                                f"or move the aggregation upstream of the fork.",
+                                component_id=str(union_name),
+                                component_type="row_union",
+                            )
+                    frontier.append(downstream)
+
+        # ===== BRANCH-INTERNAL AGGREGATION GUARD =====
+        # The forward walk above cannot see an aggregation that sits INSIDE a
+        # fork branch, upstream of the barrier — it walks away from the union,
+        # not toward it. That shape has its own hazard, and it is not the
+        # group-split one.
+        #
+        # A branch aggregation's flush routes through _route_transform_results,
+        # which calls expand_token with a SINGLE buffered parent token. Every
+        # emitted child therefore inherits that one parent's row_id: one row_id
+        # contributes M arrivals to the group (colliding on (row_id, branch)
+        # when M > 1) while every other buffered row_id contributes none. The
+        # group can never be satisfied, whatever the flush path does with the
+        # barrier binding.
+        #
+        # output_mode: passthrough is NOT rejected by THIS check — it targets
+        # only the transform-mode identity-collision hazard
+        # (_route_passthrough_results validates 1:1 and updates the ORIGINAL
+        # tokens, so every buffered row_id keeps its own arrival for THAT
+        # hazard specifically). Rule 6 (validate_no_aggregations_in_regions,
+        # called later in this function) independently bans ANY aggregation
+        # inside a bound region regardless of output_mode (spec §7 rule 6,
+        # ruling 25 — 2026-08-23: the BATCH_CONSUMED loss-blindness gap, a
+        # DIFFERENT hazard than this check's — a lost batch member is
+        # invisible to the roster even when passthrough preserves identity
+        # correctly). This comment used to say passthrough "stays
+        # satisfiable" and leave it there; it is no longer the whole truth
+        # for a BOUND region, so say so explicitly rather than let the old
+        # sentence imply a capability rule 6 has since removed. Note
+        # OutputMode defaults to TRANSFORM, so an aggregation that simply
+        # omits the field lands in the rejected arm here — hence the
+        # diagnostic names the field explicitly.
+        #
+        # The walk runs BACKWARD and MUST stop at THIS union's originating fork
+        # gate(s). Fork -> branch is a COPY edge only for an identity branch; a
+        # transform-chain branch is wired gate -> first node as MOVE, so an
+        # unbounded backward walk would cross into pre-fork topology and reject
+        # an aggregation that sits before the fork — the very remedy this
+        # diagnostic recommends. A fork for another union is not a boundary:
+        # stopping there would hide hazards earlier in the current branch.
+        configured_fork_gate_names = {gate_entry.node_id: gate_entry.name for gate_entry in gate_entries if gate_entry.fork_to}
+        for union_name, union_node_id in row_union_ids.items():
+            union_fork_gate_node_ids = {
+                gate_node_id
+                for branch_name, (_gate_name, gate_node_id) in row_union_branch_gates.items()
+                if row_union_branch_specs[branch_name].row_union_name == union_name
+            }
+            # Ancestor/descendant fork generations and unrelated multi-gate
+            # origins used to get their own targeted diagnostics here. Both
+            # are now dead code: rule 2 (WHOLE-ROSTER FORK CLOSURE, above)
+            # provably pre-empts both shapes — a closer whose roster spans
+            # more than one gate's fork_to can never equal any single
+            # contributing gate's roster, so the roster-equality check always
+            # fires first and names every contributing gate (maintainer
+            # ruling 2026-08-23; deleted per prerelease no-dead-code
+            # doctrine).
+            seen_upstream: set[NodeID] = set()
+            upstream_frontier: list[NodeID] = [union_node_id]
+            nested_fork_gate_names: set[str] = set()
+            while upstream_frontier:
+                current = upstream_frontier.pop()
+                for in_edge in graph.get_incoming_edges(current):
+                    upstream = in_edge.from_node
+                    if upstream in seen_upstream or upstream in union_fork_gate_node_ids:
+                        continue
+                    seen_upstream.add(upstream)
+                    if graph.get_node_info(upstream).node_type == NodeType.SINK:
+                        continue
+                    nested_fork_gate_name = configured_fork_gate_names[upstream] if upstream in configured_fork_gate_names else None
+                    if nested_fork_gate_name is not None:
+                        nested_fork_gate_names.add(nested_fork_gate_name)
+                    upstream_agg = aggregation_settings_by_node[upstream] if upstream in aggregation_settings_by_node else None
+                    if upstream_agg is not None and upstream_agg.output_mode == OutputMode.TRANSFORM:
+                        raise GraphValidationError(
+                            f"Aggregation '{upstream_agg.name}' is inside a fork branch that feeds "
+                            f"row_union '{union_name}' and uses output_mode 'transform' (the default). "
+                            f"A transform-mode flush emits its rows from a single buffered parent token, "
+                            f"so every emitted row carries that one parent's row_id: one row_id would "
+                            f"contribute several arrivals to the union group while every other buffered "
+                            f"row_id contributes none, and the group can never be satisfied. Move "
+                            f"'{upstream_agg.name}' upstream of the fork that feeds '{union_name}', or "
+                            f"downstream of its release — aggregators are banned inside every bound "
+                            f"region regardless of output_mode (spec §7 rule 6).",
+                            component_id=str(union_name),
+                            component_type="row_union",
+                        )
+                    upstream_frontier.append(upstream)
+            if nested_fork_gate_names:
+                raise GraphValidationError(
+                    f"Fork gate(s) {sorted(nested_fork_gate_names)} are nested inside a branch that feeds "
+                    f"row_union '{union_name}'. A nested fork replaces the enclosing branch identity and "
+                    f"terminalizes its parent before the enclosing row_union can receive or durably lose "
+                    f"that branch, so the union group can never be satisfied. Move the nested fork before "
+                    f"the fork that feeds '{union_name}', or terminate the branch at a sink.",
+                    component_id=str(union_name),
+                    component_type="row_union",
+                )
+
+        # ===== VALIDATE ROW_UNION CHAIN BRANCHES ROOT AT THEIR OWN ALIAS =====
+        # The consumer registry proves each mapped input HAS a producer, not
+        # that the producing chain descends from THIS branch's fork alias. A
+        # mapped input rooted elsewhere (e.g. another source, with the alias
+        # connection consumed by an unrelated chain) delivers rows that never
+        # traversed the fork, so they carry no branch identity and the group
+        # can never complete. Left unchecked, the same trace only fires at
+        # orchestrator wiring, labelled as a graph construction bug the
+        # author cannot act on (elspeth-d560c5e649).
+        for chain_branch_name, ru_spec in row_union_branch_specs.items():
+            if not ru_spec.uses_transform_chain:
+                continue
+            chain_gate_name, chain_gate_node_id = row_union_branch_gates[chain_branch_name]
+            try:
+                graph._trace_branch_endpoints(
+                    ru_spec.row_union_node_id,
+                    str(chain_branch_name),
+                    fork_gate_nid=chain_gate_node_id,
+                )
+            except GraphValidationError:
+                raise GraphValidationError(
+                    f"row_union '{ru_spec.row_union_name}' branch '{chain_branch_name}' maps input "
+                    f"connection '{ru_spec.input_connection}', but no chain arriving at the union "
+                    f"descends from fork branch '{chain_branch_name}' of gate '{chain_gate_name}'. "
+                    f"Rows arriving on '{ru_spec.input_connection}' never traversed that fork "
+                    f"branch, so they carry no matching branch identity and the union group can "
+                    f"never complete. Map '{chain_branch_name}' to the output of the transform "
+                    f"chain that consumes connection '{chain_branch_name}'.",
+                    component_id=str(ru_spec.row_union_name),
+                    component_type="row_union",
+                ) from None
+
+    # ===== UNIFIED GROUP-BINDING REGISTRY (barrier-scopes spec §3) =====
+    registry = build_group_binding_registry(
+        fork_rosters={
+            GateName(gate_entry.name): (gate_entry.node_id, tuple(gate_entry.fork_to)) for gate_entry in gate_entries if gate_entry.fork_to
+        },
+        coalesce_plans=coalesce_plans,
+        coalesce_settings_by_name={CoalesceName(c.name): c for c in (coalesce_settings or [])},
+        coalesce_ids=coalesce_ids,
+        row_union_branch_specs=row_union_branch_specs,
+        row_union_settings_by_name={RowUnionName(u.name): u for u in (row_union_settings or [])},
+        row_union_ids=row_union_ids,
+        scope_settings=tuple(scope_settings or ()),
+        collector_ids=collector_ids,
+        transform_ids_by_name=transform_ids_by_name,
+    )
+    graph.set_group_bindings(registry)
+
+    # ===== BOUND-REGION COMPUTATION (spec §7 rule 3, §6.3 depth cap) =====
+    regions = compute_bound_regions(graph, registry, max_depth=max_bound_region_depth)
+    graph.set_bound_regions(regions)
+    validate_sese_regions(graph, regions)
+    # multi_row_node_ids: direct attribute access on wired.plugin.creates_tokens
+    # — a declared TransformProtocol field (plugin_protocols.py:393), never a
+    # getattr probe (a "just to be safe" default would trip the masquerade
+    # gate; a test stub missing the attribute is the stub's own defect).
+    #
+    # Ruling 28 is node-kind-agnostic ("every creates_tokens node inside a
+    # bound region must be a declared scope opener closing in-region") — the
+    # census must ALSO cover BatchTransformProtocol.creates_tokens
+    # (plugin_protocols.py:613), which aggregation and collector plugins
+    # carry too, via the SAME direct attribute access. Not reachable on any
+    # shipped plugin today (no batch-aware plugin sets it True), but the
+    # ruling draws no node-kind exception, so the census must not either
+    # (2026-08-23 review finding, Task 8 follow-up). A creates_tokens
+    # aggregation inside a region is ALSO caught by rule 6
+    # (validate_no_aggregations_in_regions, below) regardless of
+    # creates_tokens — both rejections are correct for that shape; rule 5
+    # runs first (below) so its message wins for the overlap, and rule 6
+    # still independently covers every OTHER aggregation regardless of
+    # creates_tokens. A creates_tokens collector inside a region is a
+    # closer, not an opener, so this widened census rejects it flat via
+    # rule 5's "not a declared scope opener" limb — the correct fail-closed
+    # outcome, since a collector cannot open its own scope.
+    multi_row_node_ids: dict[NodeID, str] = {
+        transform_ids_by_name[wired.settings.name]: wired.settings.name for wired in transforms if wired.plugin.creates_tokens
+    }
+    multi_row_node_ids.update(
+        {
+            aggregation_ids[AggregationName(agg_name)]: agg_name
+            for agg_name, (agg_transform, _agg_settings) in aggregations.items()
+            if agg_transform.creates_tokens
+        }
+    )
+    multi_row_node_ids.update(
+        {
+            collector_ids[CollectorName(collector_name)]: collector_name
+            for collector_name, (collector_transform, _collector_settings) in collectors.items()
+            if collector_transform.creates_tokens
+        }
+    )
+    # META-38 commit 3: rule 5's FORK arm census — every gate with a fork_to,
+    # node-id keyed; the validator refuses any that sits inside a bound
+    # region without a FORK binding of its own.
+    fork_gate_node_ids = frozenset(config_gate_ids[GateName(gate_config.name)] for gate_config in gates if gate_config.fork_to)
+    validate_openers_bound_in_region(graph, regions, registry, multi_row_node_ids, fork_gate_node_ids)
+    validate_no_aggregations_in_regions(graph, regions, {aid: str(name) for name, aid in aggregation_ids.items()})
+    # rule 7 (roster authority, standing ruling) is structural: the policy
+    # vocabularies are closed per closer kind (spec §2) — ScopeSettings.policy
+    # and CoalesceSettings.policy both include "require_all" (their closers
+    # genuinely have a roster: a bound EXPAND group, or declared fork
+    # branches), RowUnionSettings carries no policy field at all (v1 arrival
+    # policy is require_all unconditionally), and AggregationSettings stays
+    # policy-free. Do not add a runtime check here — it can never fire.
+
+    # ===== RULE 9: on_error may target the enclosing region's closer (spec §7 rule 9) =====
+    # Resolve the deferrals collected above, now that region membership is
+    # known. A closer is a legal on_error target only from INSIDE its own
+    # bound region: escaping to a closer that does not enclose the failing
+    # node would let a row leave that closer's roster invisibly, the same
+    # loss-blindness rules 5/6 already close for other shapes. The DIVERT
+    # edge this adds targets a coalesce/row_union/collector, not a sink —
+    # exactly the shape schema_validation.py's `_live_predecessors` already
+    # defends the public `add_edge` surface against (see its "REACHABILITY,
+    # stated honestly" docstring, updated alongside this change); runtime
+    # semantics of the edge land in WS3, so until then it is a structural
+    # audit marker, same as every other DIVERT edge.
+    regions_by_closer = {r.binding.closer_node_id: r for r in regions}
+    for error_node_id, error_node_name, error_kind, error_target in deferred_error_closer_targets:
+        closer_node_id = closer_name_to_node[error_target]
+        enclosing_region = regions_by_closer[closer_node_id] if closer_node_id in regions_by_closer else None
+        if enclosing_region is None or error_node_id not in enclosing_region.member_node_ids:
+            raise GraphValidationError(
+                f"{error_kind.capitalize()} '{error_node_name}' on_error '{error_target}' names closer "
+                f"'{error_target}' but '{error_node_name}' is not inside that closer's bound region. A "
+                f"closer is a legal on_error target only from inside its own region (spec §7 rule 9). "
+                f"Use a sink, 'discard', or move the node inside the region.",
+                component_id=error_node_name,
+                component_type=error_kind,
+            )
+        graph.add_edge(error_node_id, closer_node_id, label=error_edge_label(error_node_name), mode=RoutingMode.DIVERT)
+
+    max_observed_depth = max((r.depth for r in regions), default=0)
+    graph.set_max_bound_region_depth(max_observed_depth)
+    graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)

@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import Column, ForeignKey, Integer, MetaData, Table, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError as SQLAlchemyIntegrityError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.core.landscape.journal import JournalRecord, LandscapeJournal
 from elspeth.core.landscape.schema import sidecar_journal_outbox_table
@@ -43,8 +43,8 @@ class _ConcurrentProbeJournal(LandscapeJournal):
 
 @pytest.fixture
 def postgres_engine() -> Iterator[Engine]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        engine = create_engine(postgres.get_connection_url())
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        engine = create_engine(postgres_url)
         try:
             yield engine
         finally:

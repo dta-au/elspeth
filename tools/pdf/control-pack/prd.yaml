@@ -1,0 +1,15 @@
+title: "ELSPETH – Product requirements"
+author: "John Morrissey"
+date: "7 September 2026"
+version: "1.0.0"
+status: "DRAFT"
+compact-control: true
+running-title: "Product requirements"
+doc-id: "ELS-PRD"
+document-category: "Product definition"
+document-type: "Product requirements document"
+classification: "OFFICIAL"
+revisions:
+  - version: "1.0.0"
+    date: "7 September 2026"
+    changes: "Draft."

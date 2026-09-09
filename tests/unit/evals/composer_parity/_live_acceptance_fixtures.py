@@ -128,7 +128,7 @@ def build_valid_evidence(*, revision: str = REVISION, surface: str = "guided_ful
             "proposal_id": "prop-abc",
             "commit_id": COMMIT,
             "run_id": "run-xyz",
-            "base_url_host": "elspeth.foundryside.dev",
+            "base_url_host": "elspeth.example.gov.au",
             "provider": {"mode": "live", "repair_count": 0, "operator_corrections": []},
         },
         la.GRAPH_FILE: graph,

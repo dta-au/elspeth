@@ -17,13 +17,14 @@ Usage:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import pluggy
 import structlog
 
 from elspeth.contracts.config import RuntimeTelemetryConfig
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.telemetry.errors import TelemetryExporterError
 from elspeth.telemetry.exporters import BuiltinExportersPlugin
 from elspeth.telemetry.hookspecs import PROJECT_NAME, ElspethTelemetrySpec
@@ -182,6 +183,7 @@ def create_telemetry_manager(
     config: RuntimeTelemetryConfig,
     *,
     exporter_plugins: Iterable[Any] = (),
+    event_observers: Iterable[Callable[[TelemetryEvent], None]] = (),
 ) -> TelemetryManager | None:
     """Create a TelemetryManager from runtime configuration.
 
@@ -193,6 +195,8 @@ def create_telemetry_manager(
         config: Runtime telemetry configuration from RuntimeTelemetryConfig.from_settings().
         exporter_plugins: Optional additional exporter plugin objects providing
             ``elspeth_get_exporters`` hooks.
+        event_observers: Best-effort projections invoked before exporter
+            granularity filtering.
 
     Returns:
         TelemetryManager instance if telemetry is enabled, None otherwise.
@@ -235,4 +239,4 @@ def create_telemetry_manager(
             message="Telemetry enabled but no exporters configured",
         )
 
-    return TelemetryManager(config, exporters=exporters)
+    return TelemetryManager(config, exporters=exporters, event_observers=tuple(event_observers))

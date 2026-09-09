@@ -33,7 +33,8 @@ import re
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from types import MemberDescriptorType
+from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
@@ -44,12 +45,22 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMProviderCostSource,
 )
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
+from elspeth.web.composer.bounded_json import (
+    PROVIDER_ARTIFACT_UNAVAILABLE,
+    JsonBoundaryError,
+    JsonTraversalBudget,
+    require_bounded_text,
+)
 
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
 
 __all__ = [
+    "PROVIDER_STRING_TRUNCATION_MARKER",
+    "admit_llm_provider_metadata",
     "apply_anthropic_cache_markers",
     "attach_llm_calls",
     "build_llm_call_record",
@@ -91,6 +102,76 @@ class _ReasoningMetadata(TypedDict):
     thinking_blocks: Any | None
 
 
+_PYDANTIC_EXTRA_SLOT = "__pydantic_extra__"
+
+
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM/provider response object whose pydantic v2 extra='allow' overflow slot holds undeclared provider fields",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None unless __pydantic_extra__ resolves through the owning class's __mro__ to a genuine "
+        "__slots__ member descriptor holding a non-empty dict; a provider-defined property is treated as "
+        "absent rather than invoked, so no provider-controlled code runs and the read never raises"
+    ),
+)
+def _pydantic_extra_fields(value: Any) -> Mapping[str, Any] | None:
+    """Return a pydantic v2 ``extra="allow"`` overflow mapping, or ``None``.
+
+    Pydantic v2 models with ``extra="allow"`` (LiteLLM response objects) store
+    undeclared provider fields in the ``__pydantic_extra__`` slot rather than
+    in ``__dict__``. ``usage`` on a real ``ModelResponse`` lives there, and a
+    real ``litellm.types.utils.ChatCompletionMessageToolCall`` declares no
+    model fields at all — its whole payload (``id``/``type``/``function``) is
+    in that slot and its ``__dict__`` is empty. Any reader that consults
+    ``__dict__`` alone therefore sees a real provider object as field-less
+    (ADR-032; the defect class of elspeth-9ea866438b).
+
+    The slot is resolved through the owning class's ``__mro__`` and read only
+    when it is a genuine ``__slots__`` member descriptor. A provider object
+    that defines ``__pydantic_extra__`` as its own property is treated as
+    having no extras rather than having its descriptor invoked, which keeps
+    this a data-only read: no provider-controlled code runs. That posture is
+    pinned by ``test_provider_reasoning_does_not_invoke_provider_descriptors``.
+    """
+    for klass in type(value).__mro__:
+        # Absence and a None-valued class attribute both mean "this class does
+        # not carry the slot"; each keeps walking the MRO so a genuine
+        # descriptor on a base class is still found.
+        if _PYDANTIC_EXTRA_SLOT not in klass.__dict__:
+            continue
+        descriptor = klass.__dict__[_PYDANTIC_EXTRA_SLOT]
+        if descriptor is None:
+            continue
+        if type(descriptor) is not MemberDescriptorType:
+            return None
+        try:
+            extra = descriptor.__get__(value, type(value))
+        except AttributeError:
+            return None
+        return extra if isinstance(extra, dict) and extra else None
+    return None
+
+
+def _merge_pydantic_extra(value: Any, fields: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Overlay an object's own ``__dict__`` fields onto its pydantic extras."""
+    extra = _pydantic_extra_fields(value)
+    if extra is None:
+        return fields
+    return {**extra, **fields}
+
+
+@observation_boundary(
+    tier=3,
+    source="one provider response value: a Mapping payload, or an attribute-style provider/SDK response object",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns None for None and for any object whose vars() is unavailable or is not a Mapping; "
+        "shape mismatch is absence, never a coercion, and the read never raises"
+    ),
+)
 def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
@@ -102,18 +183,7 @@ def _provider_field_map(value: Any) -> Mapping[str, Any] | None:
         return None
     if not isinstance(fields, Mapping):
         return None
-    # Pydantic v2 models with ``extra="allow"`` (LiteLLM response objects)
-    # store undeclared provider fields in the ``__pydantic_extra__`` slot,
-    # not ``__dict__`` — ``usage`` on a real ModelResponse lives there.
-    # Reading the slot is still a data-only read: no provider-named
-    # property is ever invoked.
-    try:
-        extra = object.__getattribute__(value, "__pydantic_extra__")
-    except AttributeError:
-        return fields
-    if isinstance(extra, dict) and extra:
-        return {**extra, **fields}
-    return fields
+    return _merge_pydantic_extra(value, fields)
 
 
 def _provider_field(value: Any, field: str) -> Any:
@@ -121,16 +191,6 @@ def _provider_field(value: Any, field: str) -> Any:
     if fields is None or field not in fields:
         return None
     return fields[field]
-
-
-def _provider_method(value: Any, method_name: str) -> Any | None:
-    try:
-        method = object.__getattribute__(value, method_name)
-    except AttributeError:
-        return None
-    if callable(method):
-        return method
-    return None
 
 
 def _provider_details_payload(value: Any, *, fields: tuple[str, ...]) -> Mapping[str, Any] | None:
@@ -177,9 +237,25 @@ def token_usage_from_response(response: Any | None) -> TokenUsage:
     Each constructs ``PromptTokensDetailsWrapper(cached_tokens=cache_read_input_tokens)``
     and emits both fields on the returned ``Usage`` object.
     """
-    if response is None:
+    usage = None if response is None else _provider_field(response, "usage")
+    return _token_usage_from_usage(usage)
+
+
+@observation_boundary(
+    tier=3,
+    source="one provider-reported usage payload (Mapping or attribute-style usage object) carried on a LiteLLM response",
+    source_param="usage",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns TokenUsage.unknown() for an absent usage payload and records every missing or "
+        "non-Mapping counter as None (absence) rather than a fabricated zero; never raises"
+    ),
+)
+def _token_usage_from_usage(usage: Any | None) -> TokenUsage:
+    """Normalize one already-captured provider usage value."""
+
+    if usage is None:
         return TokenUsage.unknown()
-    usage = _provider_field(response, "usage")
     if isinstance(usage, Mapping):
         details = usage.get("prompt_tokens_details")
         completion_details = usage.get("completion_tokens_details")
@@ -239,6 +315,26 @@ def _provider_cost_from_response(response: Any | None) -> tuple[float | None, Co
     if response is None:
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     usage = _provider_field(response, "usage")
+    return _provider_cost_from_captured_usage(response, usage)
+
+
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object's pydantic private-data mapping (__pydantic_private__ -> _hidden_params.response_cost)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns (None, PROVIDER_COST_SOURCE_NOT_AVAILABLE) whenever the private mapping, its "
+        "_hidden_params entry, or the cost value is absent or malformed; the private read goes through "
+        "object.__getattribute__ so no provider-named property is invoked, and it never raises"
+    ),
+)
+def _provider_cost_from_captured_usage(
+    response: Any,
+    usage: Any | None,
+) -> tuple[float | None, ComposerLLMProviderCostSource]:
+    """Extract cost without resolving the response's usage field again."""
+
     usage_fields = _provider_field_map(usage)
     if usage_fields is not None and "cost" in usage_fields:
         return _validated_provider_cost(usage_fields["cost"], PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST)
@@ -249,7 +345,9 @@ def _provider_cost_from_response(response: Any | None) -> tuple[float | None, Co
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     if not isinstance(private, Mapping):
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
-    hidden_params = private.get("_hidden_params")
+    if "_hidden_params" not in private:
+        return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    hidden_params = private["_hidden_params"]
     if not isinstance(hidden_params, Mapping) or "response_cost" not in hidden_params:
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     return _validated_provider_cost(
@@ -270,22 +368,146 @@ def _validated_provider_cost(
     return cost, source
 
 
+# ---------------------------------------------------------------------------
+# Bounds on provider-authored strings that reach a stored or rendered
+# projection (elspeth: composer endpoint affordance).
+#
+# ELSPETH lets an operator point the composer at any OpenAI-compatible
+# endpoint. The realistic failure mode is not a hostile provider but a
+# malfunctioning one: a buggy proxy, a mis-translated upstream, or an error
+# blob returned where a short token belongs. Those strings land in
+# ``chat_messages.tool_calls`` (stored) and, via ``llm_call_audit_summary``,
+# in the message-list view (rendered), so an unbounded value is unbounded
+# text in a durable, rendered column.
+#
+# The response is graceful degradation, never rejection: truncate, keep the
+# audit row, and make the anomaly legible. Dropping the record because a
+# field is oversized would discard the very evidence that the endpoint
+# misbehaved.
+#
+# Bounding happens HERE, at the single extraction point, so the envelope,
+# the rendered summary, and the sidecar all inherit one already-bounded
+# value and there is one place to reason about the limit. The contract
+# (``ComposerLLMCall``) deliberately does not re-check length: a contract
+# that rejected an oversized value would raise instead of recording, which
+# is exactly the outcome this bound exists to prevent.
+# ---------------------------------------------------------------------------
+
+PROVIDER_STRING_TRUNCATION_MARKER: Final[str] = "<truncated:"
+"""Opening marker of the in-band suffix appended to a truncated provider string.
+
+The full suffix is ``<truncated:{original_length}>``. Readers detect
+truncation with ``PROVIDER_STRING_TRUNCATION_MARKER in value`` rather than
+hardcoding the literal.
+"""
+
+# A closed-vocabulary provider token (``finish_reason``). Real values are
+# short: the longest ones any provider emits are Gemini's
+# ``FINISH_REASON_UNSPECIFIED`` / ``MALFORMED_FUNCTION_CALL`` at ~25
+# characters. 128 is ~5x the longest real value — no legitimate token, even
+# one no provider has invented yet, is ever cut — while anything longer is
+# self-evidently not a termination token.
+_PROVIDER_TOKEN_MAX_CHARS: Final[int] = 128
+
+# A provider routing or correlation identifier (``model_returned``,
+# ``provider_request_id``). These are legitimately long: Bedrock
+# inference-profile ARNs and Vertex resource paths run ~100-140 characters.
+# 256 clears those with room to spare, and both identifiers share it so
+# there is one identifier bound to justify rather than two.
+_PROVIDER_IDENTIFIER_MAX_CHARS: Final[int] = 256
+
+
+def _bounded_provider_string(value: str, *, limit: int) -> str:
+    """Cap one provider-authored string, signalling truncation in band.
+
+    Returns ``value`` unchanged — byte-identical — when it is within
+    ``limit``; a well-behaved endpoint's output is never altered. Beyond the
+    limit the value is cut and an in-band ``<truncated:{original_length}>``
+    suffix is appended.
+
+    Why in-band rather than a companion flag
+    ----------------------------------------
+    Silent truncation is the failure to avoid: it turns "the endpoint sent
+    garbage" into "the value looks fine but short". The signal therefore
+    travels with the value. An in-band suffix propagates through every
+    projection — the ``tool_calls`` envelope, the rendered summary, the
+    sidecar ``to_dict()`` — with no schema change and no risk of a
+    projection carrying the value while dropping its flag. This follows the
+    precedent this module already sets for a scalar provider string in
+    ``_append_llm_error_hash`` (``...[raw_error_hash=…]``); the companion
+    ``_truncated`` dict flag at ``audit.py:475`` works there only because
+    that value is already a dict.
+
+    The original length is included because it is the diagnostic that
+    distinguishes "the endpoint sent 200 characters" from "the endpoint sent
+    two megabytes" — the difference between a sloppy value and a broken one.
+
+    Accepted trade-off: a legitimate provider value that itself ended in
+    ``<truncated:N>`` would be indistinguishable from a truncated one. That
+    is not defended against — the collision is vanishingly unlikely, and
+    guarding it would cost more clarity than the risk is worth.
+
+    Typed ``str -> str``: both call sites assert the value is an exact
+    ``str`` before calling, so a non-string branch here would be dead code.
+    """
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}{PROVIDER_STRING_TRUNCATION_MARKER}{len(value)}>"
+
+
 def safe_response_model(response: Any | None) -> str | None:
+    """Return the provider's own ``response.model`` string, bounded.
+
+    Provider-authored: the endpoint chooses these bytes. Besides the audit
+    row's ``model_returned``, this value is the provenance ``model_version``
+    stored on proposals and interpretation events, so bounding it here
+    covers every stored consumer at once.
+
+    A legitimate identifier — including a Bedrock inference-profile ARN or a
+    Vertex resource path — passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+    """
     if response is None:
         return None
     model = _provider_field(response, "model")
     if isinstance(model, str) and model.strip():
-        return model
+        return _bounded_provider_string(model, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 
 
 def _safe_provider_request_id(response: Any | None) -> str | None:
+    """Return the provider's own correlation id (``id``, else ``request_id``), bounded.
+
+    Provider-authored: the endpoint chooses these bytes, and they reach the
+    stored ``provider_request_id`` column and the rendered audit summary, so
+    the same bound applies as to the sibling identifier
+    :func:`safe_response_model` — one identifier limit
+    (:data:`_PROVIDER_IDENTIFIER_MAX_CHARS`) to justify rather than two.
+
+    Selection and bounding are deliberately separate steps. The attribute
+    order is a *preference* — ``id`` is what OpenAI-compatible endpoints
+    populate, ``request_id`` the fallback some proxies use — so the first
+    non-empty string wins and is then capped. Folding the length test back
+    into the acceptance predicate would make an over-long ``id`` fall through
+    to ``request_id``, and the audit row would then record a perfectly clean
+    id from an endpoint that had just emitted a broken one: the anomaly
+    disappears, which is the exact failure this bound exists to prevent.
+
+    A legitimate id passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+
+    A blank id is absence, not a value — matching :func:`safe_response_model`
+    and the contract's own rule that a whitespace string reaching
+    ``_require_non_empty_str`` is a defect in the extraction site. Admitting
+    one on mere truthiness made the contract raise and destroyed the whole
+    audit row, which is precisely what bounding here exists to prevent.
+    """
     if response is None:
         return None
     for attr in ("id", "request_id"):
         value = _provider_field(response, attr)
-        if isinstance(value, str) and value and len(value) <= 256:
-            return value
+        if isinstance(value, str) and value.strip():
+            return _bounded_provider_string(value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 
 
@@ -293,41 +515,187 @@ def _response_field(value: Any, field: str) -> Any:
     return _provider_field(value, field)
 
 
-def _first_response_message(response: Any | None) -> Any | None:
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object's provider-authored 'choices' container",
+    source_param="response",
+    suppresses=("R5",),
+    invariant="returns None when choices is absent, is not a list/tuple, or is empty; never raises",
+)
+def _first_response_choice(response: Any | None) -> Any | None:
     if response is None:
         return None
     choices = _response_field(response, "choices")
     if not isinstance(choices, list | tuple) or not choices:
         return None
-    return _response_field(choices[0], "message")
+    return choices[0]
+
+
+def _first_response_message(response: Any | None) -> Any | None:
+    return _response_field(_first_response_choice(response), "message")
+
+
+def _finish_reason_from_response(response: Any | None) -> str | None:
+    """Return the provider's raw ``choices[0].finish_reason`` string, verbatim.
+
+    Tier-3 extraction: the value is read through ``_provider_field`` so the
+    pydantic v2 ``extra="allow"`` overflow slot is merged in — a reader that
+    consulted ``__dict__`` alone would see a real provider object as
+    field-less and silently record ``None`` (ADR-032; the defect class of
+    elspeth-9ea866438b).
+
+    Only the *value* is asserted, never the object's type: a non-``str`` or
+    blank finish reason is treated as absent. The surviving string is stored
+    exactly as received — no mapping onto the pipeline's ``FinishReason``
+    vocabulary (which lives in ``elspeth.plugins`` and must not be imported
+    from ``contracts``), and no normalisation of unrecognised values, so a
+    provider term ELSPETH has never seen still reaches the audit trail.
+
+    "Verbatim" is bounded, not unlimited. Every real termination token is a
+    handful of characters, so a value past
+    :data:`_PROVIDER_TOKEN_MAX_CHARS` is not a token the composer failed to
+    recognise — it is an endpoint returning something else entirely where a
+    token belongs (an error blob, an HTML page). Such a value is truncated
+    with an in-band marker rather than rejected: the audit row survives, and
+    the anomaly is legible in the rendered summary, which is precisely where
+    an operator would otherwise see unbounded provider text. A value within
+    the bound — which is every value a working endpoint produces — is
+    recorded byte-identically as before.
+    """
+    finish_reason = _provider_field(_first_response_choice(response), "finish_reason")
+    if type(finish_reason) is not str or not finish_reason.strip():
+        return None
+    return _bounded_provider_string(finish_reason, limit=_PROVIDER_TOKEN_MAX_CHARS)
+
+
+def _provider_artifact_owned_fields(value: Any) -> Mapping[str, Any] | None:
+    """Return data-only object fields without invoking provider serializers.
+
+    Reads the same two data-only stores ``_provider_field_map`` reads —
+    ``__dict__`` plus the pydantic v2 ``extra="allow"`` overflow slot — because
+    a real provider object frequently keeps its entire payload in the latter.
+    Consulting ``__dict__`` alone returned ``None`` here, which raised
+    ``JsonBoundaryError`` and made ``_json_safe_provider_artifact`` store the
+    ``PROVIDER_ARTIFACT_UNAVAILABLE`` sentinel in place of the real artifact,
+    silently (ADR-032).
+
+    This deliberately does NOT delegate to ``_provider_field_map``: that helper
+    short-circuits ``Mapping`` inputs and reads ``__dict__`` via ``vars()``,
+    whereas the artifact walker handles ``dict`` itself and must reach the
+    instance store through ``object.__getattribute__`` so that a provider
+    ``__getattribute__`` override cannot run. An object with no data fields at
+    all also stays ``None`` here so the sentinel fallback is preserved.
+    """
+    try:
+        raw_fields = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return None
+    if type(raw_fields) is not dict:
+        return None
+    fields = dict(_merge_pydantic_extra(value, raw_fields))
+    return fields or None
+
+
+def _normalize_provider_artifact(
+    value: Any,
+    *,
+    budget: JsonTraversalBudget,
+    depth: int,
+    active_container_ids: set[int],
+) -> Any:
+    label = "provider artifact"
+    budget.check_depth(depth, label=label)
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise JsonBoundaryError("provider artifact contains a non-finite number")
+        return value
+    if type(value) is str:
+        budget.consume_text(value, label=label)
+        return value
+    if type(value) is dict:
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise JsonBoundaryError("provider artifact contains a recursive mapping")
+        budget.consume_items(len(value), label=label)
+        active_container_ids.add(container_id)
+        try:
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise JsonBoundaryError("provider artifact contains a non-string key")
+                budget.consume_text(key, label=label)
+                normalized[key] = _normalize_provider_artifact(
+                    item,
+                    budget=budget,
+                    depth=depth + 1,
+                    active_container_ids=active_container_ids,
+                )
+            return normalized
+        finally:
+            active_container_ids.remove(container_id)
+    if type(value) in {list, tuple}:
+        container_id = id(value)
+        if container_id in active_container_ids:
+            raise JsonBoundaryError("provider artifact contains a recursive sequence")
+        budget.consume_items(len(value), label=label)
+        active_container_ids.add(container_id)
+        try:
+            return [
+                _normalize_provider_artifact(
+                    item,
+                    budget=budget,
+                    depth=depth + 1,
+                    active_container_ids=active_container_ids,
+                )
+                for item in value
+            ]
+        finally:
+            active_container_ids.remove(container_id)
+
+    fields = _provider_artifact_owned_fields(value)
+    if fields is None:
+        raise JsonBoundaryError("provider artifact has no data-only JSON representation")
+    container_id = id(value)
+    if container_id in active_container_ids:
+        raise JsonBoundaryError("provider artifact contains a recursive object")
+    active_container_ids.add(container_id)
+    try:
+        return _normalize_provider_artifact(
+            fields,
+            budget=budget,
+            depth=depth,
+            active_container_ids=active_container_ids,
+        )
+    finally:
+        active_container_ids.remove(container_id)
 
 
 def _json_safe_provider_artifact(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe_provider_artifact(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_json_safe_provider_artifact(item) for item in value]
-    if isinstance(value, set | frozenset):
-        return [_json_safe_provider_artifact(item) for item in value]
-    model_dump = _provider_method(value, "model_dump")
-    if callable(model_dump):
-        try:
-            return _json_safe_provider_artifact(model_dump(mode="json"))
-        except TypeError:
-            return _json_safe_provider_artifact(model_dump())
-    to_dict = _provider_method(value, "to_dict")
-    if callable(to_dict):
-        return _json_safe_provider_artifact(to_dict())
-    dict_method = _provider_method(value, "dict")
-    if callable(dict_method):
-        return _json_safe_provider_artifact(dict_method())
-    return repr(value)
+    try:
+        return _normalize_provider_artifact(
+            value,
+            budget=JsonTraversalBudget(),
+            depth=0,
+            active_container_ids=set(),
+        )
+    except JsonBoundaryError:
+        # The sentinel is closed and value-free. Provider values, reprs, keys,
+        # and rejection text never enter the audit record. Unexpected internal
+        # failures still propagate instead of being mislabeled as bad provider
+        # data.
+        return PROVIDER_ARTIFACT_UNAVAILABLE
 
 
 def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadata:
     message = _first_response_message(response)
+    return _reasoning_metadata_from_message(message)
+
+
+def _reasoning_metadata_from_message(message: Any | None) -> _ReasoningMetadata:
+    """Normalize reasoning fields from one already-captured message."""
+
     if message is None:
         return {
             "reasoning_content": None,
@@ -335,10 +703,15 @@ def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadat
             "thinking_blocks": None,
         }
     reasoning_content = _response_field(message, "reasoning")
-    if not isinstance(reasoning_content, str):
+    if type(reasoning_content) is not str:
         reasoning_content = _response_field(message, "reasoning_content")
-    if not isinstance(reasoning_content, str):
+    if type(reasoning_content) is not str:
         reasoning_content = None
+    else:
+        try:
+            reasoning_content = require_bounded_text(reasoning_content, label="provider reasoning content")
+        except JsonBoundaryError:
+            reasoning_content = PROVIDER_ARTIFACT_UNAVAILABLE
 
     reasoning_details = _response_field(message, "reasoning_details")
     if reasoning_details is None:
@@ -350,6 +723,76 @@ def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadat
         "reasoning_details": _json_safe_provider_artifact(reasoning_details),
         "thinking_blocks": _json_safe_provider_artifact(_response_field(message, "thinking_blocks")),
     }
+
+
+def _captured_field(fields: Mapping[str, Any] | None, field: str) -> Any:
+    """Read one provider mapping field once, returning absence on KeyError."""
+
+    if fields is None:
+        return None
+    try:
+        return fields[field]
+    except KeyError:
+        return None
+
+
+@observation_boundary(
+    tier=3,
+    source="a LiteLLM response object, with its already-captured first choice and message, from the composer provider call",
+    source_param="response",
+    suppresses=("R5",),
+    invariant=(
+        "records every absent, non-string, or blank provider identifier as None (absence, never a "
+        "fabricated value) and bounds every provider-authored string it retains; never raises on "
+        "response content"
+    ),
+)
+def admit_llm_provider_metadata(
+    response: Any,
+    *,
+    choice: Any | None,
+    message: Any | None,
+) -> _AdmittedLLMProviderMetadata:
+    """Capture every retained provider fact exactly once into an owned carrier."""
+
+    response_fields = _provider_field_map(response)
+    usage = _captured_field(response_fields, "usage")
+    usage_projection = _token_usage_from_usage(usage)
+    provider_cost, provider_cost_source = _provider_cost_from_captured_usage(response, usage)
+
+    model_value = _captured_field(response_fields, "model")
+    model_returned = (
+        _bounded_provider_string(model_value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+        if isinstance(model_value, str) and model_value.strip()
+        else None
+    )
+
+    provider_request_id: str | None = None
+    for field in ("id", "request_id"):
+        identifier = _captured_field(response_fields, field)
+        if isinstance(identifier, str) and identifier.strip():
+            provider_request_id = _bounded_provider_string(identifier, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+            break
+
+    choice_fields = _provider_field_map(choice)
+    finish_value = _captured_field(choice_fields, "finish_reason")
+    finish_reason = (
+        _bounded_provider_string(finish_value, limit=_PROVIDER_TOKEN_MAX_CHARS)
+        if type(finish_value) is str and finish_value.strip()
+        else None
+    )
+    reasoning_metadata = _reasoning_metadata_from_message(message)
+    return _AdmittedLLMProviderMetadata(
+        model_returned=model_returned,
+        finish_reason=finish_reason,
+        usage=usage_projection,
+        provider_cost=provider_cost,
+        provider_cost_source=provider_cost_source,
+        provider_request_id=provider_request_id,
+        reasoning_content=reasoning_metadata["reasoning_content"],
+        reasoning_details=reasoning_metadata["reasoning_details"],
+        thinking_blocks=reasoning_metadata["thinking_blocks"],
+    )
 
 
 def _llm_error_hash(raw_message: str) -> str:
@@ -408,19 +851,37 @@ def build_llm_call_record(
     temperature: float | None,
     seed: int | None,
     response: Any | None = None,
+    response_metadata: _AdmittedLLMProviderMetadata | None = None,
     error_class: str | None = None,
     error_message: str | None = None,
     max_completion_tokens_requested: int | None = None,
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
 ) -> ComposerLLMCall:
-    usage = token_usage_from_response(response)
-    provider_cost, provider_cost_source = _provider_cost_from_response(response)
-    reasoning_metadata = _reasoning_metadata_from_response(response)
+    if response_metadata is None:
+        usage = token_usage_from_response(response)
+        provider_cost, provider_cost_source = _provider_cost_from_response(response)
+        reasoning_metadata = _reasoning_metadata_from_response(response)
+        model_returned = safe_response_model(response)
+        finish_reason = _finish_reason_from_response(response)
+        provider_request_id = _safe_provider_request_id(response)
+    else:
+        usage = response_metadata.usage
+        provider_cost = response_metadata.provider_cost
+        provider_cost_source = response_metadata.provider_cost_source
+        reasoning_metadata = {
+            "reasoning_content": response_metadata.reasoning_content,
+            "reasoning_details": response_metadata.reasoning_details,
+            "thinking_blocks": response_metadata.thinking_blocks,
+        }
+        model_returned = response_metadata.model_returned
+        finish_reason = response_metadata.finish_reason
+        provider_request_id = response_metadata.provider_request_id
     return ComposerLLMCall(
         model_requested=model_requested,
-        model_returned=safe_response_model(response),
+        model_returned=model_returned,
         status=status,
+        finish_reason=finish_reason,
         prompt_tokens=usage.prompt_tokens,
         completion_tokens=usage.completion_tokens,
         total_tokens=usage.total_tokens,
@@ -434,7 +895,7 @@ def build_llm_call_record(
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
         latency_ms=(time.monotonic_ns() - started_ns) // 1_000_000,
-        provider_request_id=_safe_provider_request_id(response),
+        provider_request_id=provider_request_id,
         messages_hash=stable_hash(messages),
         tools_spec_hash=stable_hash(tools) if tools is not None else None,
         declared_tool_names=tuple(tool["function"]["name"] for tool in tools) if tools is not None else (),
@@ -471,8 +932,10 @@ def attach_llm_calls(
 # Anthropic-family providers (Anthropic direct, OpenRouter Anthropic routing,
 # AWS Bedrock Anthropic, Google Vertex Anthropic) use explicit
 # ``cache_control: {"type": "ephemeral"}`` markers placed on the system
-# message and on the trailing function tool to indicate the static prefix
-# that should be cached for follow-up requests within a session.
+# message, the deployment-constant catalog context message, the trailing
+# function tool, and (opt-in, freeform loop only) the last message — so the
+# static prefix AND the append-only conversation are cached for follow-up
+# requests (elspeth-4e79436719, extended by elspeth-a79f1b2e6b).
 #
 # OpenAI / OpenRouter OpenAI / Azure OpenAI providers use *automatic* prefix
 # caching above a 1024-token threshold and do NOT honor the ``cache_control``
@@ -516,17 +979,31 @@ def supports_anthropic_prompt_cache_markers(model: str | None) -> bool:
 def apply_anthropic_cache_markers(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
+    *,
+    mark_history_tail: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
     """Return new messages/tools lists with Anthropic ``cache_control`` markers.
 
-    Behavior:
+    Behavior (at most four breakpoints total — Anthropic's limit):
     - The first message with ``role == "system"`` receives a top-level
       ``cache_control: {"type": "ephemeral"}`` field. ``build_messages()``
-      keeps this first system message to the stable skill/deployment prompt;
-      the dynamic current-state JSON is emitted as a later ``role: "user"``
-      message, not a second system message. LiteLLM's Anthropic transform
-      recognizes this marker and propagates it onto the corresponding
-      ``AnthropicSystemMessageContent`` block on the wire.
+      keeps this first system message to the stable skill/deployment prompt.
+      LiteLLM's Anthropic transform recognizes this marker and propagates it
+      onto the corresponding ``AnthropicSystemMessageContent`` block on the
+      wire.
+    - A ``role == "user"`` message whose content starts with
+      ``CATALOG_CONTEXT_PREFIX`` (the deployment-constant catalog context
+      from ``build_catalog_context_string``) receives the same marker: the
+      block is byte-stable per deployment, so it is written to the cache
+      once and read at ~10% price on every later call of every session
+      (elspeth-a79f1b2e6b). Surfaces whose message lists carry no catalog
+      message (guided solver, planner) are unaffected.
+    - When ``mark_history_tail`` is True, the LAST message receives the
+      marker — the sliding-breakpoint pattern for append-only agentic
+      loops: each call re-reads the previously written conversation prefix
+      and writes only the new tail. Opt-in because on single-shot calls it
+      pays the cache-write premium with no follow-up call to redeem it;
+      only the freeform tool loop (``_call_llm_with_audit``) opts in.
     - The LAST tool in ``tools`` receives the same marker at the tool
       level. Anthropic caches all tools up to and including the marker,
       so marking the trailing tool covers the full tools array.
@@ -536,7 +1013,13 @@ def apply_anthropic_cache_markers(
     contents are not deep-copied) — this keeps the transform cheap and
     is safe because the receiver (LiteLLM) does not mutate them.
     """
+    # Local import: prompts.py has no import back into this module, but the
+    # header contract is authored there next to the builders that emit it.
+    from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX
+
     new_messages: list[dict[str, Any]] = list(messages)
+    system_marked = False
+    catalog_marked = False
     for index, message in enumerate(new_messages):
         # ``messages`` is our outbound request payload built by
         # ``build_messages()`` (prompts.py), not an external response object.
@@ -545,9 +1028,31 @@ def apply_anthropic_cache_markers(
         # directly and let ``KeyError`` surface it rather than masking it
         # with ``.get()``. This is Tier-2 data we authored, not the Tier-3
         # provider responses the rest of this module normalizes.
-        if message["role"] == "system":
+        if not system_marked and message["role"] == "system":
             new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
+            system_marked = True
+        elif (
+            not catalog_marked
+            and message["role"] == "user"
+            # ``content`` is genuinely optional on a message we author (an
+            # assistant tool-call turn carries none), so its absence is a
+            # value fact, not the first-party bug a missing ``role`` would
+            # be. Presence is therefore asserted explicitly and the value
+            # then read in membership form, keeping the Tier-2 posture the
+            # ``role`` read above states.
+            and "content" in message
+            and type(message["content"]) is str
+            and message["content"].startswith(CATALOG_CONTEXT_PREFIX)
+        ):
+            new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
+            catalog_marked = True
+        if system_marked and catalog_marked:
             break
+
+    if mark_history_tail and new_messages:
+        last = new_messages[-1]
+        if "cache_control" not in last:
+            new_messages[-1] = {**last, "cache_control": {"type": "ephemeral"}}
 
     new_tools: list[dict[str, Any]] | None = None
     if tools:

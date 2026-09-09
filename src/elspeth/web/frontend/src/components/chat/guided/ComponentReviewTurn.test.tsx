@@ -40,8 +40,8 @@ describe("ComponentReviewTurn", () => {
     render(<ComponentReviewTurn payload={SOURCE_REVIEW} onSubmit={onSubmit} />);
 
     expect(screen.getByRole("heading", { name: "Review sources" })).toBeVisible();
-    expect(screen.getByRole("listitem", { name: "customers, csv, reviewed" })).toBeVisible();
-    expect(screen.getByRole("listitem", { name: "orders, json, reviewed" })).toBeVisible();
+    expect(screen.getByRole("listitem", { name: "customers, CSV" })).toBeVisible();
+    expect(screen.getByRole("listitem", { name: "orders, JSON" })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Edit orders" }));
     await user.click(screen.getByRole("button", { name: "Remove customers" }));
@@ -86,8 +86,8 @@ describe("ComponentReviewTurn", () => {
     );
     // No optimistic reorder: the server response remains the rendered authority.
     expect(screen.getAllByRole("listitem").map((item) => item.getAttribute("aria-label"))).toEqual([
-      "customers, csv, reviewed",
-      "orders, json, reviewed",
+      "customers, CSV",
+      "orders, JSON",
     ]);
 
     rerender(
@@ -97,8 +97,8 @@ describe("ComponentReviewTurn", () => {
       />,
     );
     expect(screen.getAllByRole("listitem").map((item) => item.getAttribute("aria-label"))).toEqual([
-      "orders, json, reviewed",
-      "customers, csv, reviewed",
+      "orders, JSON",
+      "customers, CSV",
     ]);
     await user.click(screen.getByRole("button", { name: "Edit orders" }));
     expect(onSubmit).toHaveBeenLastCalledWith(
@@ -124,15 +124,30 @@ describe("ComponentReviewTurn", () => {
           allowed_actions: ["add", "edit", "reorder", "finish"],
         }}
         onSubmit={onSubmit}
+        isTutorial
       />,
     );
 
     expect(screen.queryByRole("button", { name: "Remove audit_log" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Move audit_log/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Add output" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Edit audit_log" }));
     expect(onSubmit).toHaveBeenCalledWith(
       componentBody({ action: "edit", target: { kind: "output", stable_id: SOURCE_A } }),
     );
+  });
+
+  it("disallows adding a source in tutorial review while keeping finish actionable", () => {
+    render(
+      <ComponentReviewTurn
+        payload={SOURCE_REVIEW}
+        onSubmit={vi.fn()}
+        isTutorial
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Add source" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Finish sources" })).toBeEnabled();
   });
 
   it("hides closed actions and disables every rendered control while pending", () => {

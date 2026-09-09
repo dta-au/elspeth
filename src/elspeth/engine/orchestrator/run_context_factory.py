@@ -52,6 +52,22 @@ if TYPE_CHECKING:
     )
 
 
+def build_agg_transform_lookup(config: PipelineConfig) -> dict[str, AggNodeEntry]:
+    """Index batch-aware transforms sitting at aggregation nodes, by node id.
+
+    config.transforms is homogeneous (Sequence[RowPlugin]) — protocol
+    conformance is deliberately not re-measured here (elspeth-8783933d99):
+    doing so silently dropped non-conforming transforms from the
+    aggregation-timeout lookup, so their nodes never fired timeout flushes.
+    """
+    agg_transform_lookup: dict[str, AggNodeEntry] = {}
+    if config.aggregation_settings:
+        for t in config.transforms:
+            if t.is_batch_aware and t.node_id is not None and t.node_id in config.aggregation_settings:
+                agg_transform_lookup[t.node_id] = AggNodeEntry(transform=t, node_id=NodeID(t.node_id))
+    return agg_transform_lookup
+
+
 class RunContextFactory:
     """Builds the per-run RunContext: node ids, PluginContext, on_start, processor.
 
@@ -136,6 +152,7 @@ class RunContextFactory:
             concurrency_config=self._concurrency_config,
             telemetry_emit=self._ceremony.emit_telemetry,
             shutdown_event=shutdown_event,
+            coordination_token=coordination_token,
         )
 
         # Set node_id on context for source validation error attribution
@@ -177,11 +194,12 @@ class RunContextFactory:
                 barrier_restore=barrier_restore,
                 coordination_token=coordination_token,
             )
-        except Exception:
+        except Exception as pending_exc:
             cleanup_plugins(
                 config,
                 ctx,
                 include_source=include_source_on_start,
+                pending_exc=pending_exc,
                 started_sources=started_sources,
                 started_transforms=tuple(started_transforms),
                 started_sinks=started_sinks,
@@ -189,16 +207,7 @@ class RunContextFactory:
             raise
 
         # Pre-compute aggregation transform lookup for O(1) access per timeout check
-        agg_transform_lookup: dict[str, AggNodeEntry] = {}
-        if config.aggregation_settings:
-            for t in config.transforms:
-                if (
-                    isinstance(t, TransformProtocol)
-                    and t.is_batch_aware
-                    and t.node_id is not None
-                    and t.node_id in config.aggregation_settings
-                ):
-                    agg_transform_lookup[t.node_id] = AggNodeEntry(transform=t, node_id=NodeID(t.node_id))
+        agg_transform_lookup = build_agg_transform_lookup(config)
 
         return RunContext(
             ctx=ctx,

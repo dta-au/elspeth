@@ -9,19 +9,25 @@ final publication is committed atomically with the pipeline audit outcome.
 from __future__ import annotations
 
 import json
+import logging
+import math
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import ClassVar, Literal, Protocol, cast
+from typing import ClassVar, Literal, Protocol, cast, overload
 
 from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt, SinkEffectMemberRecord
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import CallType
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
+    MemberSinkEffectCapability,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
     SinkEffectAttemptRequest,
@@ -46,18 +52,33 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReservationRequest,
     SinkEffectState,
 )
-from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.clock import Clock
+from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     SinkEffectReturnedResult,
     decode_sink_effect_returned_result,
     encode_sink_effect_returned_result,
 )
+from elspeth.core.landscape.execution.sink_effects import SinkEffectRepository
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.clock import DEFAULT_CLOCK, SystemClock
+
+logger = logging.getLogger(__name__)
+
+# Resolution of the clock the repository measures lease validity against:
+# SQLite's CURRENT_TIMESTAMP is whole-second (ADR-047), so a reported
+# remaining validity of N seconds means the lease lapses inside [N, N + 1).
+_LANDSCAPE_CLOCK_RESOLUTION_SECONDS = 1.0
 
 
 class SinkEffectExecutionSeam(StrEnum):
-    """Deterministic crash seams around the externally observable commit."""
+    """Deterministic crash seams at durable coordinator boundaries."""
 
+    BEFORE_RESERVATION = "before_reservation"
+    AFTER_RESERVATION = "after_reservation"
+    AFTER_PREPARATION_CLAIM = "after_preparation_claim"
+    AFTER_INSPECTION = "after_inspection"
+    AFTER_PLAN_CAS = "after_plan_cas"
     BEFORE_EFFECT = "before_effect"
     AFTER_EFFECT_BEFORE_RETURN = "after_effect_before_return"
     AFTER_RETURN_BEFORE_FINALIZE = "after_return_before_finalize"
@@ -91,6 +112,80 @@ class SinkEffectLeaseHeld(RuntimeError):
     contended effect becomes actionable again once the holder finalizes or its
     lease expires and takeover fences the generation.
     """
+
+
+class _SinkEffectLeaseHeartbeat:
+    """Keep one preparation or execution lease live during adapter I/O.
+
+    Every beat is a fenced Landscape verb (ADR-048), so the leader token
+    travels as a parameter: the background thread receives it as its thread
+    argument and the synchronous refresh takes it from its caller. A beat
+    that finds the seat deposed fails the heartbeat exactly like any other
+    repository refusal.
+    """
+
+    def __init__(
+        self,
+        *,
+        effects: SinkEffectRepository,
+        claim: SinkEffectLease,
+        ttl: timedelta,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        self._effects = effects
+        self._claim = claim
+        self._ttl = ttl
+        self._interval_seconds = max(ttl.total_seconds() / 3, 0.001)
+        self._stop_event = threading.Event()
+        self._failed_event = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(coordination_token,),
+            daemon=True,
+            name=f"sink-effect-heartbeat:{claim.effect_id[:8]}",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join()
+
+    def check_and_raise(self) -> None:
+        if not self._failed_event.is_set():
+            return
+        if self._error is None:  # pragma: no cover - Event publication orders the stored error first
+            raise LandscapeRecordError("sink effect preparation heartbeat failed without an error")
+        raise self._error
+
+    def refresh_and_check(self, *, coordination_token: CoordinationToken) -> None:
+        """Synchronously prove authority after an observable adapter call."""
+        self.check_and_raise()
+        self._effects.heartbeat_lease(
+            self._claim.effect_id,
+            owner=self._claim.owner,
+            generation=self._claim.generation,
+            ttl=self._ttl,
+            coordination_token=coordination_token,
+        )
+        self.check_and_raise()
+
+    def _run(self, coordination_token: CoordinationToken) -> None:
+        while not self._stop_event.wait(self._interval_seconds):
+            try:
+                self._effects.heartbeat_lease(
+                    self._claim.effect_id,
+                    owner=self._claim.owner,
+                    generation=self._claim.generation,
+                    ttl=self._ttl,
+                    coordination_token=coordination_token,
+                )
+            except BaseException as exc:
+                self._error = exc
+                self._failed_event.set()
+                return
 
 
 class _SinkEffectAdapter(Protocol):
@@ -174,38 +269,91 @@ class SinkEffectExecutionRequest:
 
 
 class SinkEffectCoordinator:
-    """Drive reservation, intent, external I/O, recovery, and finalization."""
+    """Drive reservation, intent, external I/O, recovery, and finalization.
+
+    The coordinator acts for one leader seat: ``coordination_token`` is bound
+    at construction and handed by value, as a parameter, to every method
+    that reaches a fenced sink-effect verb (ADR-048). It is never re-derived
+    from the database and never rebound.
+    """
 
     def __init__(
         self,
         *,
         factory: RecorderFactory,
         worker_id: str,
+        coordination_token: CoordinationToken,
         lease_ttl: timedelta = timedelta(minutes=5),
         fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
+        clock: Clock = DEFAULT_CLOCK,
+        sleep: Callable[[float], None] | None = None,
+        poll_interval: float = 0.5,
+        shutdown_event: threading.Event | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
+        make_shutdown_error: Callable[[], BaseException] | None = None,
     ) -> None:
         if not isinstance(factory, RecorderFactory):
             raise TypeError("factory must be RecorderFactory")
-        if not isinstance(worker_id, str) or not worker_id.strip():
+        if type(worker_id) is not str or not worker_id.strip():
             raise ValueError("worker_id must be non-empty")
+        if type(coordination_token) is not CoordinationToken:
+            raise TypeError("coordination_token must be exact CoordinationToken")
         if type(lease_ttl) is not timedelta or lease_ttl <= timedelta(0):
             raise ValueError("lease_ttl must be a positive timedelta")
+        if type(poll_interval) not in {int, float}:
+            raise TypeError("poll_interval must be a positive finite number")
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValueError("poll_interval must be a positive finite number")
         self._factory = factory
         self._effects = factory.execution.sink_effects
         self._worker_id = worker_id
+        self._coordination_token = coordination_token
         self._lease_ttl = lease_ttl
         self._fault_hook = fault_hook
+        self._clock = clock
+        # Waiting goes through the clock the deadline is measured on, so a
+        # controlled clock advances instead of blocking the worker. The
+        # shutdown-event wait below is a wall-clock primitive and is used
+        # only when the clock is the real one; a controlled clock still sees
+        # the event at the next poll via _check_wait_interruptions.
+        self._sleep = sleep if sleep is not None else clock.sleep
+        self._wait_on_shutdown_event = sleep is None and isinstance(clock, SystemClock)
+        self._poll_interval = float(poll_interval)
+        self._shutdown_event = shutdown_event
+        self._check_coordination_latch = check_coordination_latch
+        self._make_shutdown_error = make_shutdown_error
 
     def execute(
         self,
         request: SinkEffectExecutionRequest,
         sink: _SinkEffectAdapter,
     ) -> SinkEffectFinalizationResult:
+        """Execute once, preserving immediate lease and predecessor refusals."""
+        return self._execute(request, sink, wait_for_lease=False, coordination_token=self._coordination_token)
+
+    def execute_with_lease_wait(
+        self,
+        request: SinkEffectExecutionRequest,
+        sink: _SinkEffectAdapter,
+    ) -> SinkEffectFinalizationResult:
+        """Execute with one fixed TTL-derived budget shared by predecessor and live-lease waits."""
+        return self._execute(request, sink, wait_for_lease=True, coordination_token=self._coordination_token)
+
+    def _execute(
+        self,
+        request: SinkEffectExecutionRequest,
+        sink: _SinkEffectAdapter,
+        *,
+        wait_for_lease: bool,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectFinalizationResult:
         if type(request) is not SinkEffectExecutionRequest:
             raise TypeError("request must be exact SinkEffectExecutionRequest")
 
         self._persist_pipeline_member_payloads(request.effect_input)
-        reservation = self._effects.reserve(request.reservation)
+        self._fault(SinkEffectExecutionSeam.BEFORE_RESERVATION)
+        reservation = self._effects.reserve(request.reservation, coordination_token=coordination_token)
+        self._fault(SinkEffectExecutionSeam.AFTER_RESERVATION)
         effect_ids = (*reservation.finalized_effect_ids, *reservation.open_effect_ids)
         if reservation.new_effect is not None:
             effect_ids = (*effect_ids, reservation.new_effect.effect_id)
@@ -221,36 +369,258 @@ class SinkEffectCoordinator:
             ),
         )
         results: list[SinkEffectFinalizationResult] = []
+        wait_deadline: float | None = None
         for effect in effects:
-            refreshed = self._require_effect(effect.effect_id)
-            if refreshed.state is SinkEffectState.FINALIZED:
-                results.append(self._load_finalized(refreshed.effect_id))
-                continue
-            partition_request = self._request_for_effect(refreshed, request)
-            results.append(self._execute_effect(refreshed, partition_request, sink))
+            while True:
+                refreshed = self._require_effect(effect.effect_id)
+                if refreshed.state is SinkEffectState.FINALIZED:
+                    results.append(self._load_finalized(refreshed.effect_id))
+                    break
+                try:
+                    partition_request = self._request_for_effect(refreshed, request)
+                    results.append(self._execute_effect(refreshed, partition_request, sink, coordination_token=coordination_token))
+                except SinkEffectLeaseHeld as exc:
+                    if not wait_for_lease:
+                        raise
+                    wait_deadline = self._wait_until_effect_actionable(
+                        effect_id=refreshed.effect_id,
+                        deadline=wait_deadline,
+                        original_error=exc,
+                    )
+                    continue
+                except SinkEffectPredecessorPending as exc:
+                    if not wait_for_lease:
+                        raise
+                    wait_deadline = self._wait_until_predecessor_finalized(
+                        effect_id=refreshed.effect_id,
+                        deadline=wait_deadline,
+                        original_error=exc,
+                    )
+                    continue
+                break
         return results[-1]
+
+    def _wait_until_predecessor_finalized(
+        self,
+        *,
+        effect_id: str,
+        deadline: float | None,
+        original_error: SinkEffectPredecessorPending,
+    ) -> float | None:
+        """Poll the predecessor chain within the same fixed TTL-derived budget."""
+        while True:
+            self._check_wait_interruptions()
+            effect = self._require_effect(effect_id)
+            predecessor_id = effect.predecessor_effect_id
+            seen = {effect.effect_id}
+            pending = False
+            while predecessor_id is not None:
+                if predecessor_id in seen or len(seen) > 256:
+                    raise LandscapeRecordError("sink effect predecessor chain is cyclic or exceeds 256 effects")
+                seen.add(predecessor_id)
+                predecessor = self._effects.get_effect(predecessor_id)
+                if predecessor is None:
+                    raise LandscapeRecordError("sink effect predecessor disappeared")
+                if predecessor.state is not SinkEffectState.FINALIZED:
+                    pending = True
+                    break
+                predecessor_id = predecessor.predecessor_effect_id
+            if not pending:
+                return deadline
+
+            monotonic_now = self._clock.monotonic()
+            if deadline is None:
+                deadline = monotonic_now + self._lease_ttl.total_seconds() + self._poll_interval
+            if monotonic_now >= deadline:
+                logger.warning(
+                    "Bounded sink-effect predecessor wait exhausted for effect %s (lease_ttl_seconds=%.3f, poll_interval_seconds=%.3f)",
+                    effect.effect_id,
+                    self._lease_ttl.total_seconds(),
+                    self._poll_interval,
+                )
+                raise original_error
+
+            sleep_seconds = min(self._poll_interval, deadline - monotonic_now)
+            if sleep_seconds <= 0.0:  # pragma: no cover - guarded by deadline check
+                raise LandscapeRecordError("sink-effect predecessor wait produced a non-positive poll interval")
+            if self._shutdown_event is not None and self._wait_on_shutdown_event:
+                self._shutdown_event.wait(timeout=sleep_seconds)
+            else:
+                self._sleep(sleep_seconds)
+
+    def _wait_until_effect_actionable(
+        self,
+        *,
+        effect_id: str,
+        deadline: float | None,
+        original_error: SinkEffectLeaseHeld,
+    ) -> float | None:
+        """Poll strict repository state until finalize/retry, cancellation, or timeout."""
+        while True:
+            self._check_wait_interruptions()
+            effect = self._require_effect(effect_id)
+            remaining_validity = self._held_lease_remaining_seconds(effect)
+            if remaining_validity is None:
+                return deadline
+
+            monotonic_now = self._clock.monotonic()
+            if deadline is None:
+                # The repository reports validity against Landscape database
+                # time, whole-second on SQLite (ADR-047): "N seconds remain"
+                # means [N, N + 1), and the takeover needs the database clock
+                # strictly PAST the deadline, so a lease stamped at whole
+                # second S with TTL T is held until second S + T + 1. The
+                # budget therefore carries one clock resolution ABOVE the
+                # remaining validity.
+                #
+                # The cap is the TTL rounded up to that same resolution.
+                # Capping at the raw TTL assumes a lease cannot outlive the TTL
+                # it was asked for, and on a quantised clock it always can:
+                # that assumption cost nine recovery resumes once already,
+                # patched then by adding a resolution on top of the wrong cap
+                # rather than correcting it.
+                #
+                # The constant is the COARSEST resolution across dialects, and
+                # the executor holds no connection to ask for the live one. On
+                # SQLite it is exact: the cap is what
+                # ``sink_effect_lifecycle._aligned_lease_ttl`` stamps. On
+                # PostgreSQL the repository rounds to a microsecond, so a
+                # fractional TTL leaves the cap up to a second high -- slack in
+                # the safe direction, since remaining validity is measured on
+                # the database clock and still bounds the wait. Either way
+                # remaining validity never exceeds the cap, so the cap binds
+                # only on a corrupt deadline.
+                quantised_ttl = (
+                    math.ceil(self._lease_ttl.total_seconds() / _LANDSCAPE_CLOCK_RESOLUTION_SECONDS) * _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
+                )
+                initial_budget = min(quantised_ttl, remaining_validity) + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
+                # Repository takeover is deliberately strict (expires_at < now).
+                # One bounded poll interval permits the final authority check to
+                # cross an exact equality without introducing an open-ended wait.
+                deadline = monotonic_now + initial_budget + self._poll_interval
+            if monotonic_now >= deadline:
+                logger.warning(
+                    "Bounded sink-effect lease wait exhausted for effect %s in state %s "
+                    "(lease_ttl_seconds=%.3f, poll_interval_seconds=%.3f)",
+                    effect.effect_id,
+                    effect.state.value,
+                    self._lease_ttl.total_seconds(),
+                    self._poll_interval,
+                )
+                raise original_error
+
+            sleep_seconds = min(self._poll_interval, deadline - monotonic_now)
+            if sleep_seconds <= 0.0:  # pragma: no cover - guarded by deadline check
+                raise LandscapeRecordError("sink-effect lease wait produced a non-positive poll interval")
+            if self._shutdown_event is not None and self._wait_on_shutdown_event:
+                self._shutdown_event.wait(timeout=sleep_seconds)
+            else:
+                self._sleep(sleep_seconds)
+
+    def _held_lease_remaining_seconds(self, effect: SinkEffect) -> float | None:
+        """Return live foreign validity, or ``None`` when existing execute may retry."""
+        if effect.state in {SinkEffectState.FINALIZED, SinkEffectState.PREPARED}:
+            return None
+        if effect.state not in {SinkEffectState.RESERVED, SinkEffectState.IN_FLIGHT}:
+            raise LandscapeRecordError(f"sink effect wait cannot poll unsupported state {effect.state.value!r}")
+        if effect.lease_owner == self._worker_id:
+            return None
+        if effect.state is SinkEffectState.RESERVED and effect.lease_owner is None:
+            return None
+        if (
+            effect.lease_owner is None
+            or not effect.lease_owner.strip()
+            or len(effect.lease_owner) > 128
+            or effect.lease_expires_at is None
+            or effect.lease_heartbeat_at is None
+        ):
+            raise LandscapeRecordError("sink effect wait encountered incomplete lease authority")
+        expires_at = self._utc(effect.lease_expires_at)
+        heartbeat_at = self._utc(effect.lease_heartbeat_at)
+        if expires_at <= heartbeat_at:
+            raise LandscapeRecordError("sink effect wait encountered non-positive lease validity")
+        # Remaining validity is measured on Landscape database time (ADR-047),
+        # the clock the repository's takeover decides against; this process
+        # clock only paces the polls.
+        return self._effects.lease_validity_seconds(effect.effect_id)
+
+    def _check_wait_interruptions(self) -> None:
+        if self._shutdown_event is not None and self._shutdown_event.is_set():
+            if self._make_shutdown_error is None:
+                raise InterruptedError("shutdown requested during sink-effect lease wait")
+            raise self._make_shutdown_error()
+        self._guard_external_effect()
+
+    def _guard_external_effect(self) -> None:
+        """Poll caller authority immediately before an external-effect cohort."""
+        if self._check_coordination_latch is not None:
+            self._check_coordination_latch()
 
     def _execute_effect(
         self,
         effect: SinkEffect,
         request: SinkEffectExecutionRequest,
         sink: _SinkEffectAdapter,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
         self._require_predecessor(effect)
         ctx = self._context(effect)
-        plan = self._prepare(effect, request, sink, ctx)
+        plan = self._prepare(effect, request, sink, ctx, coordination_token=coordination_token)
         effect = self._require_effect(effect.effect_id)
+        if effect.state is SinkEffectState.FINALIZED:
+            return self._load_finalized(effect.effect_id)
 
         if plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION:
-            result = self._finalize_no_publication(effect, plan, request)
+            result = self._finalize_no_publication(effect, plan, request, coordination_token=coordination_token)
             self._fault(SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE)
             return result
 
-        lease = self._lease(effect)
+        lease = self._lease(effect, coordination_token=coordination_token)
+        heartbeat = _SinkEffectLeaseHeartbeat(
+            effects=self._effects,
+            claim=lease,
+            ttl=self._lease_ttl,
+            coordination_token=coordination_token,
+        )
+        heartbeat.start()
+        try:
+            result = self._execute_effect_under_lease(
+                effect=effect,
+                request=request,
+                sink=sink,
+                ctx=ctx,
+                plan=plan,
+                lease=lease,
+                heartbeat=heartbeat,
+                coordination_token=coordination_token,
+            )
+        finally:
+            heartbeat.stop()
+        # A heartbeat failure captured after the last in-flight
+        # refresh_and_check would otherwise ride out inside the stopped
+        # thread: authority was in doubt during the window, so the outcome
+        # must not be reported as a clean success.
+        heartbeat.check_and_raise()
+        return result
+
+    def _execute_effect_under_lease(
+        self,
+        *,
+        effect: SinkEffect,
+        request: SinkEffectExecutionRequest,
+        sink: _SinkEffectAdapter,
+        ctx: RestrictedSinkEffectContext,
+        plan: SinkEffectPlan,
+        lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectFinalizationResult:
         self._close_abandoned_attempts(
             effect.effect_id,
             actions=(SinkEffectAttemptAction.COMMIT, SinkEffectAttemptAction.RECONCILE),
             recovery_lease=lease,
+            coordination_token=coordination_token,
         )
         if self._is_member_effect_adapter(sink, request.effect_input):
             return self._execute_member_effects(
@@ -259,6 +629,8 @@ class SinkEffectCoordinator:
                 cast("_MemberSinkEffectAdapter", sink),
                 ctx,
                 lease,
+                heartbeat,
+                coordination_token=coordination_token,
             )
         returned_commit = self._returned_attempt(
             effect.effect_id,
@@ -267,12 +639,12 @@ class SinkEffectCoordinator:
         )
         if returned_commit is not None:
             commit_result, commit_attempt = returned_commit
-            if not isinstance(commit_result, SinkEffectCommitResult):
-                raise LandscapeRecordError("durable commit attempt decoded to the wrong result type")
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
             result = self._finalize(
                 effect_id=effect.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=commit_result.descriptor,
                 evidence=commit_result.evidence,
                 accepted_ordinals=tuple(commit_result.accepted_ordinals),
@@ -280,10 +652,11 @@ class SinkEffectCoordinator:
                 attempt_id=commit_attempt.attempt_id,
                 evidence_kind="returned",
                 reconcile_kind=None,
+                coordination_token=coordination_token,
             )
             self._fault(SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE)
             return result
-        reconciliation, reconcile_attempt_id = self._reconcile(plan, sink, ctx, lease)
+        reconciliation, reconcile_attempt_id = self._reconcile(plan, sink, ctx, lease, heartbeat, coordination_token=coordination_token)
         if reconciliation.kind is SinkEffectReconcileKind.UNKNOWN:
             raise SinkEffectUnknownError(effect.effect_id)
         if reconciliation.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR:
@@ -304,10 +677,12 @@ class SinkEffectCoordinator:
                 if reconciliation.accepted_ordinals is not None or reconciliation.diverted_ordinals is not None:
                     raise LandscapeRecordError("precomputed reconciliation must not carry result-derived ordinals")
                 accepted_ordinals, diverted_ordinals = self._prepared_partition(effect.effect_id, request)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
             result = self._finalize(
                 effect_id=effect.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=reconciliation.descriptor,
                 evidence=reconciliation.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -315,6 +690,7 @@ class SinkEffectCoordinator:
                 attempt_id=reconcile_attempt_id,
                 evidence_kind="reconciled",
                 reconcile_kind=reconciliation.kind,
+                coordination_token=coordination_token,
             )
             self._fault(SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE)
             return result
@@ -323,17 +699,21 @@ class SinkEffectCoordinator:
             # Repair a spool-lost staged body from durable inputs before the
             # commit attempt opens; a failed re-derivation is a local
             # precondition failure and must not accrete attempt rows.
+            self._guard_external_effect()
             cast("_RestagingSinkEffectAdapter", sink).restage_effect(
                 plan,
                 cast("SinkEffectPipelineMembersInput", request.effect_input),
                 ctx,
             )
-        commit, commit_attempt_id = self._commit(plan, sink, ctx, lease)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
+        commit, commit_attempt_id = self._commit(plan, sink, ctx, lease, heartbeat, coordination_token=coordination_token)
         self._fault(SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE)
+        heartbeat.refresh_and_check(coordination_token=coordination_token)
         result = self._finalize(
             effect_id=effect.effect_id,
             request=request,
             lease=lease,
+            heartbeat=heartbeat,
             descriptor=commit.descriptor,
             evidence=commit.evidence,
             accepted_ordinals=tuple(commit.accepted_ordinals),
@@ -341,22 +721,18 @@ class SinkEffectCoordinator:
             attempt_id=commit_attempt_id,
             evidence_kind="returned",
             reconcile_kind=None,
+            coordination_token=coordination_token,
         )
         self._fault(SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE)
         return result
 
     @staticmethod
     def _is_restaging_adapter(sink: object, effect_input: object) -> bool:
-        return isinstance(effect_input, SinkEffectPipelineMembersInput) and callable(getattr(sink, "restage_effect", None))
+        return type(effect_input) is SinkEffectPipelineMembersInput and isinstance(sink, RestagingSinkEffectCapability)
 
     @staticmethod
     def _is_member_effect_adapter(sink: object, effect_input: object) -> bool:
-        return (
-            isinstance(effect_input, SinkEffectPipelineMembersInput)
-            and getattr(type(sink), "supports_member_effects", False) is True
-            and callable(getattr(sink, "commit_member_effect", None))
-            and callable(getattr(sink, "reconcile_member_effect", None))
-        )
+        return type(effect_input) is SinkEffectPipelineMembersInput and isinstance(sink, MemberSinkEffectCapability)
 
     def _execute_member_effects(
         self,
@@ -365,8 +741,11 @@ class SinkEffectCoordinator:
         sink: _MemberSinkEffectAdapter,
         ctx: RestrictedSinkEffectContext,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
-        if not isinstance(request.effect_input, SinkEffectPipelineMembersInput):  # pragma: no cover - guarded by caller
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:  # pragma: no cover - guarded by caller
             raise TypeError("member effect execution requires pipeline members")
         effect_input = request.effect_input
         last_exact: tuple[SinkEffectCommitResult | SinkEffectReconcileResult, SinkEffectAttempt] | None = None
@@ -388,9 +767,7 @@ class SinkEffectCoordinator:
             )
             if returned_commit is not None:
                 commit_result, attempt = returned_commit
-                if not isinstance(commit_result, SinkEffectCommitResult):
-                    raise LandscapeRecordError("durable member commit decoded to the wrong result type")
-                self._effects.complete_member_result(attempt.attempt_id, commit_result, lease=lease)
+                self._effects.complete_member_result(attempt.attempt_id, commit_result, lease=lease, coordination_token=coordination_token)
                 last_exact = (commit_result, attempt)
                 continue
 
@@ -408,21 +785,43 @@ class SinkEffectCoordinator:
                 member_ordinal=member.ordinal,
             )
             if returned_reconcile is None:
-                reconciliation, reconcile_attempt = self._reconcile_member(plan, member, effect_input, sink, ctx, lease)
+                reconciliation, reconcile_attempt = self._reconcile_member(
+                    plan,
+                    member,
+                    effect_input,
+                    sink,
+                    ctx,
+                    lease,
+                    heartbeat,
+                    coordination_token=coordination_token,
+                )
             else:
-                returned_result, reconcile_attempt = returned_reconcile
-                if not isinstance(returned_result, SinkEffectReconcileResult):
-                    raise LandscapeRecordError("durable member reconcile decoded to the wrong result type")
-                reconciliation = returned_result
-            self._effects.complete_member_result(reconcile_attempt.attempt_id, reconciliation, lease=lease)
+                reconciliation, reconcile_attempt = returned_reconcile
+            self._effects.complete_member_result(
+                reconcile_attempt.attempt_id,
+                reconciliation,
+                lease=lease,
+                coordination_token=coordination_token,
+            )
             if reconciliation.kind is SinkEffectReconcileKind.UNKNOWN:
                 raise SinkEffectUnknownError(plan.effect_id)
             if reconciliation.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR:
                 last_exact = (reconciliation, reconcile_attempt)
                 continue
 
-            commit_result, commit_attempt = self._commit_member(plan, member, effect_input, sink, ctx, lease)
-            self._effects.complete_member_result(commit_attempt.attempt_id, commit_result, lease=lease)
+            commit_result, commit_attempt = self._commit_member(
+                plan,
+                member,
+                effect_input,
+                sink,
+                ctx,
+                lease,
+                heartbeat,
+                coordination_token=coordination_token,
+            )
+            self._effects.complete_member_result(
+                commit_attempt.attempt_id, commit_result, lease=lease, coordination_token=coordination_token
+            )
             last_exact = (commit_result, commit_attempt)
 
         if any(
@@ -434,6 +833,7 @@ class SinkEffectCoordinator:
             last_exact = self._latest_exact_member_result(plan.effect_id)
         result, attempt = last_exact
         self._fault(SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE)
+        heartbeat.refresh_and_check(coordination_token=coordination_token)
         # The final group partition comes from the durable per-member
         # dispositions, never from the last member result's group-wide claim:
         # a diverted earlier member would otherwise be finalized as accepted
@@ -444,6 +844,7 @@ class SinkEffectCoordinator:
                 effect_id=plan.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=result.descriptor,
                 evidence=result.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -451,6 +852,7 @@ class SinkEffectCoordinator:
                 attempt_id=attempt.attempt_id,
                 evidence_kind="returned",
                 reconcile_kind=None,
+                coordination_token=coordination_token,
             )
         else:
             if result.kind is not SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR or result.descriptor is None:
@@ -459,6 +861,7 @@ class SinkEffectCoordinator:
                 effect_id=plan.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=result.descriptor,
                 evidence=result.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -466,13 +869,14 @@ class SinkEffectCoordinator:
                 attempt_id=attempt.attempt_id,
                 evidence_kind="reconciled",
                 reconcile_kind=result.kind,
+                coordination_token=coordination_token,
             )
         self._fault(SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE)
         return finalized
 
     def _member_record(self, effect_id: str, ordinal: int) -> SinkEffectMemberRecord:
         record = next((item for item in self._effects.get_members(effect_id) if item.ordinal == ordinal), None)
-        if not isinstance(record, SinkEffectMemberRecord):
+        if record is None:
             raise LandscapeRecordError(f"sink effect {effect_id} is missing member ordinal {ordinal}")
         return record
 
@@ -484,7 +888,11 @@ class SinkEffectCoordinator:
         sink: _MemberSinkEffectAdapter,
         ctx: RestrictedSinkEffectContext,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        *,
+        coordination_token: CoordinationToken,
     ) -> tuple[SinkEffectReconcileResult, SinkEffectAttempt]:
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -493,20 +901,24 @@ class SinkEffectCoordinator:
                 action=SinkEffectAttemptAction.RECONCILE,
                 call_kind=sink.effect_call_type,
                 request_hash=self._member_reconcile_request_hash(plan, member),
-            )
+            ),
+            coordination_token=coordination_token,
         )
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
         except BaseException:
-            self._effects.mark_response_lost(attempt.attempt_id)
+            self._effects.mark_response_lost(attempt.attempt_id, coordination_token=coordination_token)
             raise
         self._effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
                 evidence=encode_sink_effect_returned_result(result),
                 latency_ms=(time.monotonic() - started) * 1_000,
-            )
+            ),
+            coordination_token=coordination_token,
         )
         return result, self._attempt_by_id(plan.effect_id, attempt.attempt_id)
 
@@ -518,7 +930,11 @@ class SinkEffectCoordinator:
         sink: _MemberSinkEffectAdapter,
         ctx: RestrictedSinkEffectContext,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        *,
+        coordination_token: CoordinationToken,
     ) -> tuple[SinkEffectCommitResult, SinkEffectAttempt]:
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -527,22 +943,26 @@ class SinkEffectCoordinator:
                 action=SinkEffectAttemptAction.COMMIT,
                 call_kind=sink.effect_call_type,
                 request_hash=self._member_commit_request_hash(plan, member),
-            )
+            ),
+            coordination_token=coordination_token,
         )
         self._fault(SinkEffectExecutionSeam.BEFORE_EFFECT)
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.commit_member_effect(plan, member, effect_input, ctx)
             self._fault(SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
         except BaseException:
-            self._effects.mark_response_lost(attempt.attempt_id)
+            self._effects.mark_response_lost(attempt.attempt_id, coordination_token=coordination_token)
             raise
         self._effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
                 evidence=encode_sink_effect_returned_result(result),
                 latency_ms=(time.monotonic() - started) * 1_000,
-            )
+            ),
+            coordination_token=coordination_token,
         )
         return result, self._attempt_by_id(plan.effect_id, attempt.attempt_id)
 
@@ -600,7 +1020,7 @@ class SinkEffectCoordinator:
         effect: SinkEffect,
         request: SinkEffectExecutionRequest,
     ) -> SinkEffectExecutionRequest:
-        if not isinstance(request.effect_input, SinkEffectPipelineMembersInput):
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             return request
         durable_members = self._effects.get_members(effect.effect_id)
         caller_by_token = {member.token_id: member for member in request.effect_input.members}
@@ -611,10 +1031,10 @@ class SinkEffectCoordinator:
         current_members: list[SinkEffectMember] = []
         current_finalization: list[SinkEffectFinalizationMember] = []
         for durable in durable_members:
-            caller = caller_by_token.get(durable.token_id)
-            finalization = finalization_by_token.get(durable.token_id)
-            if caller is None or finalization is None:
+            if durable.token_id not in caller_by_token or durable.token_id not in finalization_by_token:
                 raise LandscapeRecordError(f"open sink effect {effect.effect_id} cannot be recovered from a partial caller partition")
+            caller = caller_by_token[durable.token_id]
+            finalization = finalization_by_token[durable.token_id]
             current_members.append(
                 replace(
                     caller,
@@ -624,15 +1044,17 @@ class SinkEffectCoordinator:
             )
             current_finalization.append(replace(finalization, ordinal=durable.ordinal))
         members = tuple(current_members)
+        snapshot, delivered_count = self._target_snapshot_members(
+            effect,
+            members,
+            known_members=caller_by_token,
+        )
         return SinkEffectExecutionRequest(
             reservation=request.reservation,
             effect_input=SinkEffectPipelineMembersInput(
                 members=members,
-                target_snapshot_members=self._target_snapshot_members(
-                    effect,
-                    members,
-                    known_members=caller_by_token,
-                ),
+                target_snapshot_members=snapshot,
+                target_delivered_member_count=delivered_count,
             ),
             finalization_members=tuple(current_finalization),
         )
@@ -643,7 +1065,7 @@ class SinkEffectCoordinator:
         current_members: tuple[SinkEffectMember, ...],
         *,
         known_members: Mapping[str, SinkEffectMember],
-    ) -> tuple[SinkEffectMember, ...]:
+    ) -> tuple[tuple[SinkEffectMember, ...], int]:
         chain: list[SinkEffect] = []
         predecessor_id = effect.predecessor_effect_id
         seen = {effect.effect_id}
@@ -659,8 +1081,17 @@ class SinkEffectCoordinator:
         chain.reverse()
 
         snapshot: list[SinkEffectMember] = []
+        # Delivery counts every chain member BEFORE the disposition filter:
+        # a diverted member reached this output even though it never reached
+        # the target, and dropping it from the count is exactly what made an
+        # all-diverted predecessor indistinguishable from a fresh run
+        # (elspeth-694f771c69). Predecessors are all FINALIZED — the walk
+        # above raises SinkEffectPredecessorPending otherwise — so the count
+        # is complete for the stream, whichever workers prepared it.
+        delivered_count = len(current_members)
         for predecessor in chain:
             for durable in self._effects.get_members(predecessor.effect_id):
+                delivered_count += 1
                 # Diverted members never reached the target: replaying them in
                 # a cumulative successor would republish rejected rows as if
                 # they were immutable predecessor content.
@@ -671,33 +1102,34 @@ class SinkEffectCoordinator:
                         f"finalized sink effect predecessor {predecessor.effect_id} member ordinal "
                         f"{durable.ordinal} is missing its accepted/diverted disposition"
                     )
-                known = known_members.get(durable.token_id)
-                member = replace(known, member_effect_id=durable.member_effect_id) if known is not None else self._hydrate_member(durable)
+                if durable.token_id in known_members:
+                    known = known_members[durable.token_id]
+                    member = replace(known, member_effect_id=durable.member_effect_id)
+                else:
+                    member = self._hydrate_member(durable)
                 snapshot.append(replace(member, ordinal=len(snapshot)))
         current_start = len(snapshot)
         snapshot.extend(replace(member, ordinal=current_start + ordinal) for ordinal, member in enumerate(current_members))
-        return tuple(snapshot)
+        return tuple(snapshot), delivered_count
 
     def _persist_pipeline_member_payloads(self, effect_input: object) -> None:
-        if not isinstance(effect_input, SinkEffectPipelineMembersInput):
+        if type(effect_input) is not SinkEffectPipelineMembersInput:
             return
         store = self._factory.payload_store
         if store is None:
             return
         for member in effect_input.members:
             content = canonical_json(deep_thaw(member.row)).encode("utf-8")
+            self._guard_external_effect()
             content_hash = store.store(content)
             if content_hash != member.payload_hash:
                 raise LandscapeRecordError("sink effect payload store returned a divergent member content hash")
 
-    def _hydrate_member(self, durable: object) -> SinkEffectMember:
-        from elspeth.contracts.audit import SinkEffectMemberRecord
-
-        if not isinstance(durable, SinkEffectMemberRecord):
-            raise TypeError("durable must be SinkEffectMemberRecord")
+    def _hydrate_member(self, durable: SinkEffectMemberRecord) -> SinkEffectMember:
         store = self._factory.payload_store
         if store is None:
             raise LandscapeRecordError("replacing sink effect recovery requires the configured payload store")
+        self._guard_external_effect()
         content = store.retrieve(durable.payload_hash)
         try:
             row = json.loads(content)
@@ -724,83 +1156,113 @@ class SinkEffectCoordinator:
         request: SinkEffectExecutionRequest,
         sink: _SinkEffectAdapter,
         ctx: RestrictedSinkEffectContext,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectPlan:
         if effect.state is not SinkEffectState.RESERVED:
             return self._load_plan(effect)
         # Preparation runs side-effecting adapter code, so ownership must be
-        # durably claimed before any staging mutation. Refuse politely while
-        # another worker's claim is live; close abandoned inspect intents
-        # while their generation still matches the row; then claim (which
-        # bumps the generation and fences the eventual plan bind).
-        if (
-            effect.lease_owner is not None
-            and effect.lease_owner != self._worker_id
-            and effect.lease_expires_at is not None
-            and self._utc(effect.lease_expires_at) >= datetime.now(UTC)
-        ):
-            raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} preparation is claimed by another worker")
-        self._close_abandoned_attempts(effect.effect_id, actions=(SinkEffectAttemptAction.INSPECT,))
-        claim = self._effects.claim_preparation(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
+        # durably claimed before any staging mutation. Whether another
+        # worker's claim is still live is the repository's decision against
+        # Landscape database time (ADR-047), never this process clock's: the
+        # claim is attempted and a live foreign claim comes back as the typed
+        # refusal that the lease wait understands. Abandoned inspect intents
+        # are closed while their generation still matches the row; the claim
+        # then bumps the generation and fences the eventual plan bind.
+        self._close_abandoned_attempts(effect.effect_id, actions=(SinkEffectAttemptAction.INSPECT,), coordination_token=coordination_token)
+        try:
+            claim = self._effects.claim_preparation(
+                effect.effect_id,
+                owner=self._worker_id,
+                ttl=self._lease_ttl,
+                coordination_token=coordination_token,
+            )
+        except SinkEffectLeaseLiveError as exc:
+            raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} preparation is claimed by another worker") from exc
+        except LandscapeRecordError as exc:
+            current = self._require_effect(effect.effect_id)
+            if current.state in {SinkEffectState.PREPARED, SinkEffectState.IN_FLIGHT, SinkEffectState.FINALIZED}:
+                return self._load_plan(current)
+            if self._held_lease_remaining_seconds(current) is not None:
+                raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} preparation advanced concurrently under another worker") from exc
+            raise
+        self._fault(SinkEffectExecutionSeam.AFTER_PREPARATION_CLAIM)
         effect = self._require_effect(effect.effect_id)
         if effect.state is not SinkEffectState.RESERVED:  # pragma: no cover - claim holds the effect reserved
             return self._load_plan(effect)
-        predecessor = self._predecessor_descriptor(effect)
-        inspection_request = SinkEffectInspectionRequest(
-            effect_id=effect.effect_id,
-            target=effect.target_json,
-            predecessor_descriptor=predecessor,
-            input_kind=request.reservation.input_kind,
+        heartbeat = _SinkEffectLeaseHeartbeat(
+            effects=self._effects,
+            claim=claim,
+            ttl=self._lease_ttl,
+            coordination_token=coordination_token,
         )
-        request_hash = stable_hash(
-            {
-                "effect_id": effect.effect_id,
-                "predecessor": None if predecessor is None else predecessor.content_hash,
-                "schema": "sink-effect-inspection-request-v1",
-                "target": effect.target_json,
-            }
-        )
-        returned_inspection = self._returned_attempt(
-            effect.effect_id,
-            action=SinkEffectAttemptAction.INSPECT,
-            request_hash=request_hash,
-        )
-        if returned_inspection is not None:
-            inspection_result, _attempt = returned_inspection
-            if not isinstance(inspection_result, SinkEffectInspection):
-                raise LandscapeRecordError("durable inspect attempt decoded to the wrong result type")
-            inspection = inspection_result
-        else:
-            inspection_attempt = self._effects.begin_attempt(
-                SinkEffectAttemptRequest(
-                    effect_id=effect.effect_id,
-                    member_ordinal=None,
-                    generation=effect.generation,
-                    action=SinkEffectAttemptAction.INSPECT,
-                    call_kind=sink.effect_call_type,
-                    request_hash=request_hash,
-                )
+        heartbeat.start()
+        try:
+            predecessor = self._predecessor_descriptor(effect)
+            inspection_request = SinkEffectInspectionRequest(
+                effect_id=effect.effect_id,
+                target=effect.target_json,
+                predecessor_descriptor=predecessor,
+                input_kind=request.reservation.input_kind,
             )
-            started = time.monotonic()
-            try:
-                inspection = sink.inspect_effect(inspection_request, ctx)
-            except BaseException:
-                self._effects.mark_response_lost(inspection_attempt.attempt_id)
-                raise
-            self._effects.record_attempt_result(
-                SinkEffectAttemptResult(
-                    attempt_id=inspection_attempt.attempt_id,
-                    evidence=encode_sink_effect_returned_result(inspection),
-                    latency_ms=(time.monotonic() - started) * 1_000,
-                )
+            request_hash = stable_hash(
+                {
+                    "effect_id": effect.effect_id,
+                    "predecessor": None if predecessor is None else predecessor.content_hash,
+                    "schema": "sink-effect-inspection-request-v1",
+                    "target": effect.target_json,
+                }
             )
-        prepare_request = SinkEffectPrepareRequest(
-            effect_id=effect.effect_id,
-            effect_input=request.effect_input,  # type: ignore[arg-type]
-            inspection=inspection,
-        )
-        plan = sink.prepare_effect(prepare_request, ctx)
-        prepare_request.validate_plan(plan)
-        self._effects.complete_plan(effect.effect_id, plan, claim=claim)
+            returned_inspection = self._returned_attempt(
+                effect.effect_id,
+                action=SinkEffectAttemptAction.INSPECT,
+                request_hash=request_hash,
+            )
+            if returned_inspection is not None:
+                inspection, _attempt = returned_inspection
+            else:
+                self._guard_external_effect()
+                inspection_attempt = self._effects.begin_attempt(
+                    SinkEffectAttemptRequest(
+                        effect_id=effect.effect_id,
+                        member_ordinal=None,
+                        generation=effect.generation,
+                        action=SinkEffectAttemptAction.INSPECT,
+                        call_kind=sink.effect_call_type,
+                        request_hash=request_hash,
+                    ),
+                    coordination_token=coordination_token,
+                )
+                self._guard_external_effect()
+                started = time.monotonic()
+                try:
+                    inspection = sink.inspect_effect(inspection_request, ctx)
+                except BaseException:
+                    self._effects.mark_response_lost(inspection_attempt.attempt_id, coordination_token=coordination_token)
+                    raise
+                self._effects.record_attempt_result(
+                    SinkEffectAttemptResult(
+                        attempt_id=inspection_attempt.attempt_id,
+                        evidence=encode_sink_effect_returned_result(inspection),
+                        latency_ms=(time.monotonic() - started) * 1_000,
+                    ),
+                    coordination_token=coordination_token,
+                )
+            self._fault(SinkEffectExecutionSeam.AFTER_INSPECTION)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
+            prepare_request = SinkEffectPrepareRequest(
+                effect_id=effect.effect_id,
+                effect_input=request.effect_input,  # type: ignore[arg-type]
+                inspection=inspection,
+            )
+            self._guard_external_effect()
+            plan = sink.prepare_effect(prepare_request, ctx)
+            prepare_request.validate_plan(plan)
+        finally:
+            heartbeat.stop()
+        heartbeat.refresh_and_check(coordination_token=coordination_token)
+        self._effects.complete_plan(effect.effect_id, plan, claim=claim, coordination_token=coordination_token)
+        self._fault(SinkEffectExecutionSeam.AFTER_PLAN_CAS)
         return plan
 
     @staticmethod
@@ -813,21 +1275,21 @@ class SinkEffectCoordinator:
             raise LandscapeRecordError("prepared sink effect has invalid durable plan JSON") from exc
         if type(payload) is not dict:
             raise LandscapeRecordError("prepared sink effect durable plan must be an object")
-        descriptor_payload = payload.get("expected_descriptor")
-        descriptor: ArtifactDescriptor | None
-        if descriptor_payload is None:
-            descriptor = None
-        elif type(descriptor_payload) is dict:
-            descriptor = ArtifactDescriptor(
-                artifact_type=descriptor_payload["artifact_type"],
-                path_or_uri=descriptor_payload["path_or_uri"],
-                content_hash=descriptor_payload["content_hash"],
-                size_bytes=descriptor_payload["size_bytes"],
-                metadata=descriptor_payload.get("metadata"),
-            )
-        else:
-            raise LandscapeRecordError("prepared sink effect durable descriptor is invalid")
         try:
+            descriptor_payload = payload["expected_descriptor"]
+            descriptor: ArtifactDescriptor | None
+            if descriptor_payload is None:
+                descriptor = None
+            elif type(descriptor_payload) is dict:
+                descriptor = ArtifactDescriptor(
+                    artifact_type=descriptor_payload["artifact_type"],
+                    path_or_uri=descriptor_payload["path_or_uri"],
+                    content_hash=descriptor_payload["content_hash"],
+                    size_bytes=descriptor_payload["size_bytes"],
+                    metadata=descriptor_payload["metadata"],
+                )
+            else:
+                raise LandscapeRecordError("prepared sink effect durable descriptor is invalid")
             return SinkEffectPlan(
                 effect_id=payload["effect_id"],
                 protocol_version=payload["protocol_version"],
@@ -840,24 +1302,60 @@ class SinkEffectCoordinator:
                 expected_descriptor=descriptor,
                 safe_evidence=payload["safe_evidence"],
             )
+        except LandscapeRecordError:
+            raise
         except (KeyError, TypeError, ValueError) as exc:
             raise LandscapeRecordError("prepared sink effect durable plan is incomplete or divergent") from exc
 
-    def _lease(self, effect: SinkEffect) -> SinkEffectLease:
-        if effect.state is SinkEffectState.PREPARED:
-            return self._effects.acquire_lease(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
-        if effect.state is not SinkEffectState.IN_FLIGHT or effect.lease_expires_at is None:
-            raise LandscapeRecordError(f"sink effect cannot execute from state {effect.state.value!r}")
-        expires_at = (
-            effect.lease_expires_at.replace(tzinfo=UTC)
-            if effect.lease_expires_at.tzinfo is None
-            else effect.lease_expires_at.astimezone(UTC)
-        )
-        if effect.lease_owner == self._worker_id and expires_at >= datetime.now(UTC):
-            return self._effects.acquire_lease(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
-        if expires_at < datetime.now(UTC):
-            return self._effects.takeover_expired(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
-        raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} has a live lease owned by another worker")
+    def _lease(self, effect: SinkEffect, *, coordination_token: CoordinationToken) -> SinkEffectLease:
+        try:
+            if effect.state is SinkEffectState.PREPARED:
+                return self._effects.acquire_lease(
+                    effect.effect_id,
+                    owner=self._worker_id,
+                    ttl=self._lease_ttl,
+                    coordination_token=coordination_token,
+                )
+            if effect.state is not SinkEffectState.IN_FLIGHT or effect.lease_expires_at is None:
+                raise LandscapeRecordError(f"sink effect cannot execute from state {effect.state.value!r}")
+            # Whether this worker's own lease is still live, or a foreign
+            # lease has expired, is decided by the repository against
+            # Landscape database time (ADR-047): acquire_lease re-acquires a
+            # live own lease idempotently, takeover_expired refuses a live
+            # foreign lease with the typed error mapped to the lease wait.
+            if effect.lease_owner == self._worker_id:
+                try:
+                    return self._effects.acquire_lease(
+                        effect.effect_id,
+                        owner=self._worker_id,
+                        ttl=self._lease_ttl,
+                        coordination_token=coordination_token,
+                    )
+                except LandscapeRecordError:
+                    return self._effects.takeover_expired(
+                        effect.effect_id,
+                        owner=self._worker_id,
+                        ttl=self._lease_ttl,
+                        coordination_token=coordination_token,
+                    )
+            try:
+                return self._effects.takeover_expired(
+                    effect.effect_id,
+                    owner=self._worker_id,
+                    ttl=self._lease_ttl,
+                    coordination_token=coordination_token,
+                )
+            except SinkEffectLeaseLiveError as exc:
+                raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} has a live lease owned by another worker") from exc
+        except SinkEffectLeaseHeld:
+            raise
+        except LandscapeRecordError as exc:
+            current = self._require_effect(effect.effect_id)
+            if current.state is SinkEffectState.FINALIZED or self._held_lease_remaining_seconds(current) is not None:
+                raise SinkEffectLeaseHeld(
+                    f"sink effect {effect.effect_id} execution authority advanced concurrently under another worker"
+                ) from exc
+            raise
 
     def _reconcile(
         self,
@@ -865,6 +1363,9 @@ class SinkEffectCoordinator:
         sink: _SinkEffectAdapter,
         ctx: RestrictedSinkEffectContext,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        *,
+        coordination_token: CoordinationToken,
     ) -> tuple[SinkEffectReconcileResult, str]:
         request_hash = self._reconcile_request_hash(plan)
         latest_lost_commit = self._latest_attempt(
@@ -880,9 +1381,8 @@ class SinkEffectCoordinator:
         )
         if returned is not None:
             result, attempt = returned
-            if not isinstance(result, SinkEffectReconcileResult):
-                raise LandscapeRecordError("durable reconcile attempt decoded to the wrong result type")
             return result, attempt.attempt_id
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -891,20 +1391,24 @@ class SinkEffectCoordinator:
                 action=SinkEffectAttemptAction.RECONCILE,
                 call_kind=sink.effect_call_type,
                 request_hash=request_hash,
-            )
+            ),
+            coordination_token=coordination_token,
         )
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.reconcile_effect(plan, ctx)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
         except BaseException:
-            self._effects.mark_response_lost(attempt.attempt_id)
+            self._effects.mark_response_lost(attempt.attempt_id, coordination_token=coordination_token)
             raise
         self._effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
                 evidence=encode_sink_effect_returned_result(result),
                 latency_ms=(time.monotonic() - started) * 1_000,
-            )
+            ),
+            coordination_token=coordination_token,
         )
         return result, attempt.attempt_id
 
@@ -914,8 +1418,12 @@ class SinkEffectCoordinator:
         sink: _SinkEffectAdapter,
         ctx: RestrictedSinkEffectContext,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        *,
+        coordination_token: CoordinationToken,
     ) -> tuple[SinkEffectCommitResult, str]:
         request_hash = self._commit_request_hash(plan)
+        self._guard_external_effect()
         attempt = self._effects.begin_attempt(
             SinkEffectAttemptRequest(
                 effect_id=plan.effect_id,
@@ -924,22 +1432,26 @@ class SinkEffectCoordinator:
                 action=SinkEffectAttemptAction.COMMIT,
                 call_kind=sink.effect_call_type,
                 request_hash=request_hash,
-            )
+            ),
+            coordination_token=coordination_token,
         )
         self._fault(SinkEffectExecutionSeam.BEFORE_EFFECT)
+        self._guard_external_effect()
         started = time.monotonic()
         try:
             result = sink.commit_effect(plan, ctx)
             self._fault(SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN)
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
         except BaseException:
-            self._effects.mark_response_lost(attempt.attempt_id)
+            self._effects.mark_response_lost(attempt.attempt_id, coordination_token=coordination_token)
             raise
         self._effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
                 evidence=encode_sink_effect_returned_result(result),
                 latency_ms=(time.monotonic() - started) * 1_000,
-            )
+            ),
+            coordination_token=coordination_token,
         )
         return result, attempt.attempt_id
 
@@ -957,10 +1469,49 @@ class SinkEffectCoordinator:
         *,
         actions: tuple[SinkEffectAttemptAction, ...],
         recovery_lease: SinkEffectLease | None = None,
+        coordination_token: CoordinationToken,
     ) -> None:
         for attempt in self._effects.get_attempts(effect_id):
             if attempt.action in actions and attempt.state is SinkEffectAttemptState.INTENT:
-                self._effects.mark_response_lost(attempt.attempt_id, recovery_lease=recovery_lease)
+                self._effects.mark_response_lost(attempt.attempt_id, recovery_lease=recovery_lease, coordination_token=coordination_token)
+
+    # The decoder validates the durable envelope against the action it was
+    # asked for — an INSPECT row whose evidence_json carries a commit envelope
+    # raises "envelope is divergent" rather than returning the wrong member of
+    # the union — so the action fixes the result type. Declaring that here
+    # keeps the narrowing static instead of re-asserting it at each call site.
+    @overload
+    def _returned_attempt(
+        self,
+        effect_id: str,
+        *,
+        action: Literal[SinkEffectAttemptAction.INSPECT],
+        request_hash: str,
+        started_after: datetime | None = None,
+        member_ordinal: int | None = None,
+    ) -> tuple[SinkEffectInspection, SinkEffectAttempt] | None: ...
+
+    @overload
+    def _returned_attempt(
+        self,
+        effect_id: str,
+        *,
+        action: Literal[SinkEffectAttemptAction.COMMIT],
+        request_hash: str,
+        started_after: datetime | None = None,
+        member_ordinal: int | None = None,
+    ) -> tuple[SinkEffectCommitResult, SinkEffectAttempt] | None: ...
+
+    @overload
+    def _returned_attempt(
+        self,
+        effect_id: str,
+        *,
+        action: Literal[SinkEffectAttemptAction.RECONCILE],
+        request_hash: str,
+        started_after: datetime | None = None,
+        member_ordinal: int | None = None,
+    ) -> tuple[SinkEffectReconcileResult, SinkEffectAttempt] | None: ...
 
     def _returned_attempt(
         self,
@@ -1016,6 +1567,7 @@ class SinkEffectCoordinator:
         effect_id: str,
         request: SinkEffectExecutionRequest,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
         descriptor: ArtifactDescriptor,
         evidence: Mapping[str, object],
         accepted_ordinals: tuple[int, ...],
@@ -1023,12 +1575,20 @@ class SinkEffectCoordinator:
         attempt_id: str,
         evidence_kind: str,
         reconcile_kind: SinkEffectReconcileKind | None,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
         by_ordinal = {member.ordinal: member for member in request.finalization_members}
         try:
             members = tuple(by_ordinal[ordinal] for ordinal in accepted_ordinals)
         except KeyError as exc:
             raise LandscapeRecordError(f"sink result accepted unknown member ordinal {exc.args[0]}") from exc
+        # Retire and join the background renewer before our own terminal CAS.
+        # A beat after FINALIZED would correctly fail the repository's live-
+        # lease fence but would be our retirement, not a rival takeover. The
+        # synchronous final refresh proves exact authority at the handoff;
+        # finalize rechecks owner, generation, and expiry under its row locks.
+        heartbeat.stop()
+        heartbeat.refresh_and_check(coordination_token=coordination_token)
         return self._effects.finalize(
             SinkEffectFinalizeRequest(
                 effect_id=effect_id,
@@ -1043,7 +1603,8 @@ class SinkEffectCoordinator:
                 members=members,
                 attempt_id=attempt_id,
                 reconcile_kind=reconcile_kind,
-            )
+            ),
+            coordination_token=coordination_token,
         )
 
     def _finalize_no_publication(
@@ -1051,16 +1612,25 @@ class SinkEffectCoordinator:
         effect: SinkEffect,
         plan: SinkEffectPlan,
         request: SinkEffectExecutionRequest,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
         if plan.expected_descriptor is None:
             raise LandscapeRecordError("no-publication effect requires its precomputed descriptor")
-        publication_kind = plan.safe_evidence.get("publication_kind")
-        if publication_kind == "inherited":
+        try:
+            publication_kind = plan.safe_evidence["publication_kind"]
+        except KeyError as exc:
+            raise LandscapeRecordError("no-publication effect is missing publication evidence") from exc
+        if publication_kind in {"inherited", "reaffirmed"}:
+            # A reaffirmed effect never touched the remote target either (it
+            # proved the existing object's content already matches), so it
+            # is audited and walked back through predecessor chains exactly
+            # like an inherited no-op.
             evidence_kind: Literal["inherited", "virtual"] = "inherited"
         elif publication_kind == "virtual":
             evidence_kind = "virtual"
         else:
-            raise LandscapeRecordError("no-publication effect requires inherited or virtual publication evidence")
+            raise LandscapeRecordError("no-publication effect requires inherited, virtual, or reaffirmed publication evidence")
         accepted, diverted = self._prepared_partition(effect.effect_id, request)
         by_ordinal = {member.ordinal: member for member in request.finalization_members}
         return self._effects.finalize(
@@ -1075,7 +1645,8 @@ class SinkEffectCoordinator:
                 diverted_ordinals=diverted,
                 evidence=plan.safe_evidence,
                 members=tuple(by_ordinal[ordinal] for ordinal in accepted),
-            )
+            ),
+            coordination_token=coordination_token,
         )
 
     def _prepared_partition(
@@ -1136,17 +1707,30 @@ class SinkEffectCoordinator:
                 raise LandscapeRecordError("sink effect predecessor disappeared")
             if predecessor.state is not SinkEffectState.FINALIZED:
                 raise SinkEffectPredecessorPending(f"sink effect {effect.effect_id} is waiting for predecessor {predecessor.effect_id}")
-            artifact = artifacts_by_effect.get(predecessor.effect_id)
-            if artifact is None:
+            if predecessor.effect_id not in artifacts_by_effect:
                 raise LandscapeRecordError("finalized sink effect predecessor is missing its artifact")
+            artifact = artifacts_by_effect[predecessor.effect_id]
             if not artifact.publication_performed:
-                # A no-publication (virtual or inherited) predecessor never
-                # touched the remote target, so its artifact is not remote
-                # evidence: declaring it would wedge the successor's
-                # precondition forever. Walk back to the most recent real
-                # publication in the stream (elspeth-fac5260c6a).
-                predecessor_id = predecessor.predecessor_effect_id
-                continue
+                plan = self._load_plan(predecessor)
+                # A finalized no-publication predecessor's plan carries
+                # publication_kind by contract (SinkEffectPlan.__post_init__
+                # rejects NO_PUBLICATION evidence without it, and
+                # _finalize_no_publication refused to finalize without it) —
+                # absence here is audit corruption, not "not reaffirmed".
+                try:
+                    publication_kind = plan.safe_evidence["publication_kind"]
+                except KeyError as exc:
+                    raise LandscapeRecordError("finalized no-publication sink effect predecessor is missing publication evidence") from exc
+                if publication_kind != "reaffirmed":
+                    # A virtual or inherited predecessor did not establish new
+                    # remote identity: walk back to the most recent real
+                    # publication in the stream (elspeth-fac5260c6a).
+                    predecessor_id = predecessor.predecessor_effect_id
+                    continue
+                # Reaffirmation performed no write, but its durable plan proved
+                # that these exact descriptor bytes already occupied the
+                # target. Preserve that verified descriptor as successor
+                # lineage; inspection will still fence against later tampering.
             if artifact.artifact_type not in {"file", "database", "webhook"}:
                 raise LandscapeRecordError("finalized sink effect predecessor has an invalid artifact type")
             return ArtifactDescriptor(

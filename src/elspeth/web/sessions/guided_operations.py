@@ -23,7 +23,7 @@ def guided_operation_request_hash(*, session_id: UUID, kind: GuidedOperationKind
     """
 
     config = type(request).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
+    if "strict" not in config or config["strict"] is not True or "extra" not in config or config["extra"] != "forbid":
         raise AuditIntegrityError("Guided operation hashing requires a strict, extra-forbid request DTO")
     if "operation_id" not in type(request).model_fields:
         raise AuditIntegrityError("Guided operation request DTO is missing operation_id")

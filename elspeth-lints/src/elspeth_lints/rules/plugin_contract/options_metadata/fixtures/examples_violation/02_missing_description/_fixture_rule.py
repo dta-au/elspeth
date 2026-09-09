@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
+from elspeth.contracts.enums import Determinism
+from elspeth.plugins.infrastructure.base import BaseSink
+from elspeth.plugins.infrastructure.config_base import PluginConfig
 from elspeth_lints.rules.plugin_contract.options_metadata.rule import OptionsMetadataRule
 
 
-class _Options(BaseModel):
-    missing_description: str = Field(title="Missing description")
+class _Options(PluginConfig):
+    missing_description: str = Field(title="Missing description", description="")
 
 
-class _Sink:
+class _Sink(BaseSink):
     name = "metadata_gap"
+    determinism = Determinism.IO_WRITE
     config_model = _Options
 
 

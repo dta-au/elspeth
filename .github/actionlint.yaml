@@ -2,3 +2,9 @@ self-hosted-runner:
   labels:
     - nyx-ci
     - trusted
+    # state-engine-live-provider.yml runs its five jobs on a dedicated
+    # ephemeral runner class; these labels select it.
+    - ephemeral
+    - aws-ecs
+    - postgresql-16-rds
+    - state-engine-live-provider

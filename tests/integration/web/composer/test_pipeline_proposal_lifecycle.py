@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import threading
 import time
 from dataclasses import replace
@@ -10,14 +12,18 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.core.canonical import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
+from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_commit import (
     PipelineCommitConfig,
     PipelineCommitError,
@@ -26,7 +32,14 @@ from elspeth.web.composer.pipeline_commit import (
     prepare_pipeline_proposal_commit,
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface, PresentBase
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PipelineProposal,
+    PlannerSurface,
+    PresentBase,
+    owned_composition_state_authority,
+    owned_composition_state_review_arguments,
+)
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -40,11 +53,18 @@ from elspeth.web.sessions.models import (
     proposal_events_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, StaleComposeStateError
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    StaleComposeStateError,
+    TransitionAssistantDraft,
+    TrustModeAutoCommitRevokedError,
+)
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -55,7 +75,7 @@ def service() -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
 
 
 def _insert_session(service: SessionServiceImpl, session_id: UUID) -> None:
@@ -104,6 +124,24 @@ def _state_content_hash(state: CompositionStateData) -> str:
     )
 
 
+def _pipeline_dispatch_result(*, pipeline_content_hash: str) -> dict[str, object]:
+    return {
+        "success": True,
+        "validation": {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": 1,
+        "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
+        "pipeline_content_hash": pipeline_content_hash,
+    }
+
+
 def _plan(base: AbsentBase | PresentBase | None = None) -> PipelinePlanResult:
     if base is None:
         base = AbsentBase()
@@ -126,12 +164,15 @@ def _plan(base: AbsentBase | PresentBase | None = None) -> PipelinePlanResult:
     )
 
 
-def _runnable_pipeline(tmp_path) -> dict[str, object]:
+def _runnable_pipeline(tmp_path, session_id: UUID) -> dict[str, object]:
     return {
         "source": {
             "plugin": "csv",
             "on_success": "rows",
-            "options": {"path": str(tmp_path / "blobs" / "input.csv"), "schema": {"mode": "observed"}},
+            "options": {
+                "path": str(tmp_path / "blobs" / str(session_id) / "input.csv"),
+                "schema": {"mode": "observed"},
+            },
             "on_validation_failure": "discard",
         },
         "nodes": [],
@@ -141,7 +182,7 @@ def _runnable_pipeline(tmp_path) -> dict[str, object]:
                 "sink_name": "rows",
                 "plugin": "json",
                 "options": {
-                    "path": str(tmp_path / "outputs" / "result.jsonl"),
+                    "path": str(tmp_path / "outputs" / str(session_id) / "result.jsonl"),
                     "schema": {"mode": "observed"},
                     "format": "jsonl",
                     "mode": "write",
@@ -153,10 +194,10 @@ def _runnable_pipeline(tmp_path) -> dict[str, object]:
     }
 
 
-def _runnable_plan(tmp_path) -> PipelinePlanResult:
+def _runnable_plan(tmp_path, session_id: UUID) -> PipelinePlanResult:
     return PipelinePlanResult(
         proposal=PipelineProposal.create(
-            pipeline=_runnable_pipeline(tmp_path),
+            pipeline=_runnable_pipeline(tmp_path, session_id),
             base=AbsentBase(),
             reviewed_facts={},
             surface=PlannerSurface.FREEFORM,
@@ -166,6 +207,50 @@ def _runnable_plan(tmp_path) -> PipelinePlanResult:
             supersedes_draft_hash=None,
         ),
         tool_call_id="planner-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+
+
+def _runnable_owned_state_plan(tmp_path, session_id: UUID) -> PipelinePlanResult:
+    public = _runnable_pipeline(tmp_path, session_id)
+    source = public["source"]
+    outputs = public["outputs"]
+    assert type(source) is dict
+    assert type(outputs) is list
+    state = CompositionState.from_dict(
+        {
+            "version": 2,
+            "sources": {"source": source},
+            "nodes": public["nodes"],
+            "edges": public["edges"],
+            "outputs": [
+                {
+                    "name": output["sink_name"],
+                    "plugin": output["plugin"],
+                    "options": output["options"],
+                    "on_write_failure": output["on_write_failure"],
+                }
+                for output in outputs
+            ],
+            "metadata": {"name": "Owned pipeline", "description": "Lossless private authority"},
+        }
+    )
+    authority = owned_composition_state_authority(state)
+    return PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=authority,
+            base=AbsentBase(),
+            reviewed_facts={},
+            surface=PlannerSurface.FREEFORM,
+            repair_count=0,
+            skill_hash=stable_hash("skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="owned-terminal-call",
         custody_result="not_required",
         model_identifier="planner-model",
         model_version="planner-model-v1",
@@ -197,7 +282,6 @@ async def _persist_dispatch(
     session_id: UUID,
     *,
     tool_call_id: str = "planner-terminal-call",
-    result_hash_suffix: str = "",
 ) -> PipelineDispatchAuditBinding:
     audit = begin_dispatch(
         tool_call_id,
@@ -208,21 +292,22 @@ async def _persist_dispatch(
     )
     invocation = finish_success(
         audit,
-        result_payload={
-            "success": True,
-            "content_hash": _state_content_hash(_state_data()) + result_hash_suffix,
-            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
-            "pipeline_content_hash": _state_content_hash(_state_data()),
-        },
+        result_payload=_pipeline_dispatch_result(
+            pipeline_content_hash=_state_content_hash(_state_data()),
+        ),
         version_after=1,
     )
-    bindings = await _persist_tool_invocations(
-        service,
-        session_id,
-        (invocation,),
-        None,
-        plugin_crash_pending=False,
-    )
+    # P4-D6 family A2b: the dispatch audit rows are fenced session writes, so
+    # the helper holds the turn's COMPOSE operation across them.
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        bindings = await _persist_tool_invocations(
+            service,
+            session_id,
+            (invocation,),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=compose_context,
+        )
     assert len(bindings) == 1
     return bindings[0]
 
@@ -240,13 +325,15 @@ async def _persist_failed_dispatch(
         version_before=0,
         actor="user:alice",
     )
-    await _persist_tool_invocations(
-        service,
-        session_id,
-        (finish_plugin_crash(audit, exc=RuntimeError("redacted")),),
-        None,
-        plugin_crash_pending=False,
-    )
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        await _persist_tool_invocations(
+            service,
+            session_id,
+            (finish_plugin_crash(audit, exc=RuntimeError("redacted")),),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=compose_context,
+        )
 
 
 def _settlement_kwargs(session_id: UUID, proposal_id: UUID, plan: PipelinePlanResult, binding: PipelineDispatchAuditBinding):
@@ -275,6 +362,17 @@ def _latest_audit_envelope(service: SessionServiceImpl) -> dict[str, object]:
     envelope = deep_thaw(row.tool_calls[0])
     assert type(envelope) is dict
     return envelope
+
+
+def _replace_latest_audit_envelope(service: SessionServiceImpl, envelope: dict[str, object]) -> None:
+    with service._engine.begin() as conn:
+        audit_row = conn.execute(
+            select(chat_messages_table.c.id)
+            .where(chat_messages_table.c.role == "audit")
+            .order_by(chat_messages_table.c.created_at.desc())
+            .limit(1)
+        ).one()
+        conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=[envelope]))
 
 
 async def _persist_cloned_audit_envelope(
@@ -333,6 +431,253 @@ async def test_atomic_pipeline_settlement_inserts_state_terminal_event_and_row_t
     }
     assert terminal["schema"] == "pipeline_proposal_accepted.v1"
     assert terminal["dispatch"] == binding.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_settlement_required_trust_mode_fails_closed_when_revoked(service: SessionServiceImpl) -> None:
+    """A trust-mode downgrade durable before settlement blocks auto-commit.
+
+    Regression for the commit-boundary half of elspeth-01d4c6e683: the
+    staging-time re-read narrowed the TOCTOU window but the minted
+    ``PipelineCommitIntent`` still executed later with no trust check at
+    the commit boundary. ``required_trust_mode`` re-verifies the session's
+    trust mode INSIDE the settlement write transaction — the same
+    per-session write lock ``update_composer_preferences`` serialises on —
+    so a durable downgrade always lands the proposal on the review path.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)  # trust_mode="explicit_approve"
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+
+    with pytest.raises(TrustModeAutoCommitRevokedError):
+        await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+
+    # The settlement transaction records the non-terminal revocation before
+    # surfacing the exception: no published state or terminal event, and the
+    # proposal remains pending for review.
+    with service._engine.connect() as conn:
+        assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+        assert (
+            conn.execute(
+                select(func.count()).select_from(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.accepted")
+            ).scalar_one()
+            == 0
+        )
+    events = await service.list_proposal_events(session_id)
+    assert [item.event_type for item in events] == ["proposal.created", "auto_commit.revoked"]
+    assert events[-1].actor == "user:alice"
+    assert dict(events[-1].payload) == {
+        "required_trust_mode": "auto_commit",
+        "current_trust_mode": "explicit_approve",
+    }
+
+    # Manual review approval (no trust requirement) of the same proposal
+    # still succeeds — explicit approval is valid in either trust mode.
+    settled = await service.settle_pipeline_composition_proposal(**kwargs)
+    assert settled.proposal.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_revocation_leaves_a_durable_proposal_event(service: SessionServiceImpl) -> None:
+    """The blocked auto-commit is audit-recorded exactly once across retries.
+
+    The dispatch tool row persists BEFORE the settlement transaction, so the
+    settlement transaction writes the non-terminal ``auto_commit.revoked``
+    event carrying the trust facts before surfacing
+    ``TrustModeAutoCommitRevokedError``. An exact retry reuses that event;
+    the proposal stays pending and reviewable.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)  # trust_mode="explicit_approve"
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+
+    with pytest.raises(TrustModeAutoCommitRevokedError):
+        await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    with pytest.raises(TrustModeAutoCommitRevokedError):
+        await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+
+    events = await service.list_proposal_events(session_id)
+    assert [item.event_type for item in events] == ["proposal.created", "auto_commit.revoked"]
+    assert events[-1].proposal_id == row.id
+    assert events[-1].actor == "user:alice"
+    assert dict(events[-1].payload) == {
+        "required_trust_mode": "auto_commit",
+        "current_trust_mode": "explicit_approve",
+    }
+
+    # Non-terminal: the recorded block does not strand the proposal —
+    # manual review approval of the same proposal still succeeds.
+    settled = await service.settle_pipeline_composition_proposal(**kwargs)
+    assert settled.proposal.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_revocation_rejects_unknown_trust_mode_vocabulary(service: SessionServiceImpl) -> None:
+    # Offensive guard: the payload mirrors the sessions.trust_mode CHECK
+    # vocabulary; a value outside it is a programmer error, not a row.
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+
+    with pytest.raises(ValueError, match="required_trust_mode"):
+        await service.record_auto_commit_revocation(
+            session_id=session_id,
+            proposal_id=row.id,
+            required_trust_mode="guided",
+            current_trust_mode="explicit_approve",
+            actor="user:alice",
+        )
+    with pytest.raises(ValueError, match="current_trust_mode"):
+        await service.record_auto_commit_revocation(
+            session_id=session_id,
+            proposal_id=row.id,
+            required_trust_mode="auto_commit",
+            current_trust_mode="freeform",
+            actor="user:alice",
+        )
+    assert [item.event_type for item in await service.list_proposal_events(session_id)] == ["proposal.created"]
+
+
+@pytest.mark.asyncio
+async def test_settlement_required_trust_mode_commits_when_authority_holds(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    await service.update_composer_preferences(
+        session_id,
+        trust_mode="auto_commit",
+        density_default="high",
+        actor="user:alice",
+    )
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+
+    settled = await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    assert settled.proposal.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_settlement_exact_retry_ignores_trust_mode_downgrade(service: SessionServiceImpl) -> None:
+    """A downgrade AFTER the commit is durable must not block the exact retry.
+
+    The trust check guards only the pending->committed transition; the
+    committed-replay branch returns the already-durable result so a client
+    retrying a crashed response is not stranded by a later downgrade.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    await service.update_composer_preferences(
+        session_id,
+        trust_mode="auto_commit",
+        density_default="high",
+        actor="user:alice",
+    )
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+    settled = await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    assert settled.proposal.status == "committed"
+
+    await service.update_composer_preferences(
+        session_id,
+        trust_mode="explicit_approve",
+        density_default="high",
+        actor="user:alice",
+    )
+
+    retried = await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    assert retried.proposal.status == "committed"
+    assert retried.state.id == settled.state.id
+
+
+@pytest.mark.asyncio
+async def test_transition_assistant_failure_rolls_back_pipeline_settlement(
+    service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transition-bearing proposal publishes state and response together."""
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    transition_meta = {
+        "guided_session": replace(
+            GuidedSession.initial(),
+            transition_consumed=True,
+        ).to_dict()
+    }
+    state = _state_data(composer_meta=transition_meta)
+    original_insert = service._insert_chat_message  # type: ignore[attr-defined]
+    failed = False
+
+    def _fail_once(*args, **kwargs):
+        nonlocal failed
+        if kwargs.get("role") == "assistant" and not failed:
+            failed = True
+            raise IntegrityError(
+                "INSERT chat_messages",
+                {},
+                RuntimeError("injected proposal transition assistant failure"),
+            )
+        return original_insert(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_insert_chat_message", _fail_once)
+    kwargs = {
+        "session_id": session_id,
+        "proposal_id": row.id,
+        "draft_hash": plan.proposal.draft_hash,
+        "reviewed_facts": {},
+        "state": state,
+        "candidate_content_hash": _state_content_hash(state),
+        "executor_content_hash": _state_content_hash(state),
+        "final_composer_metadata": transition_meta,
+        "dispatch": binding,
+        "actor": "user:alice",
+        "transition_assistant": TransitionAssistantDraft(
+            content="transition response",
+            raw_content=None,
+        ),
+    }
+
+    with pytest.raises(IntegrityError, match="injected proposal transition assistant failure"):
+        await service.settle_pipeline_composition_proposal(**kwargs)
+
+    with service._engine.connect() as conn:
+        assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+        assert (
+            conn.execute(
+                select(func.count()).select_from(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.accepted")
+            ).scalar_one()
+            == 0
+        )
+
+    settled = await service.settle_pipeline_composition_proposal(**kwargs)
+    assert settled.proposal.status == "committed"
+    assert settled.transition_message is not None
+    assert settled.transition_message.content == "transition response"
+    assert settled.transition_message.composition_state_id == settled.state.id
+
+    retried = await service.settle_pipeline_composition_proposal(**kwargs)
+    assert retried == settled
+    with service._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.role == "assistant")
+            ).scalar_one()
+            == 1
+        )
 
 
 @pytest.mark.asyncio
@@ -494,6 +839,115 @@ async def test_settlement_rolls_back_state_event_and_status_when_interrupted_aft
 
 
 @pytest.mark.asyncio
+async def test_settlement_stamps_application_time_under_the_lock_not_at_request_entry(
+    service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The applied timestamp must describe the committing transaction.
+
+    A settlement that waits on the session lock must not record a time from
+    before the transaction it commits in. The clock is advanced exactly when
+    the lock is taken, so a pre-lock capture is distinguishable from a
+    post-lock one without depending on wall-clock timing.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+
+    before_lock = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+    after_lock = datetime(2026, 8, 2, 12, 0, 30, tzinfo=UTC)
+    clock = {"now": before_lock}
+    monkeypatch.setattr(service, "_now", lambda: clock["now"])
+    original_lock = service._session_write_lock
+
+    def advance_clock_on_lock(conn, session_id_arg):
+        clock["now"] = after_lock
+        return original_lock(conn, session_id_arg)
+
+    monkeypatch.setattr(service, "_session_write_lock", advance_clock_on_lock)
+
+    settled = await service.settle_pipeline_composition_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        draft_hash=plan.proposal.draft_hash,
+        reviewed_facts={},
+        state=_state_data(),
+        candidate_content_hash=_state_content_hash(_state_data()),
+        executor_content_hash=_state_content_hash(_state_data()),
+        final_composer_metadata=None,
+        dispatch=binding,
+        actor="user:alice",
+    )
+
+    assert settled.proposal.status == "committed"
+    with service._engine.begin() as conn:
+        accepted_at = conn.execute(
+            select(proposal_events_table.c.created_at).where(proposal_events_table.c.event_type == "proposal.accepted")
+        ).scalar_one()
+        state_at = conn.execute(select(composition_states_table.c.created_at)).scalar_one()
+    # SQLite hands back naive datetimes; compare on the same footing.
+    expected = after_lock.replace(tzinfo=None)
+    assert accepted_at.replace(tzinfo=None) == expected, "the accepted event was stamped before the settling transaction acquired the lock"
+    assert state_at.replace(tzinfo=None) == expected, "the committed state was stamped before the settling transaction acquired the lock"
+
+
+@pytest.mark.asyncio
+async def test_settlement_fails_closed_when_the_pending_cas_matches_no_row(
+    service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-row pending CAS must abort, not report a terminalization that never happened.
+
+    The status guard on the authority row reads a snapshot taken earlier in
+    the transaction; the ``WHERE status == 'pending'`` predicate on the
+    settling UPDATE is what actually closes that window. If its rowcount is
+    ignored, a proposal that left ``pending`` under the caller is reported
+    settled while the row still carries the other writer's terminal status.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    original = service._insert_composition_state
+
+    def terminalize_before_cas(conn, /, **kwargs):
+        state_id = original(conn, **kwargs)
+        # Same connection, so this lands inside the settling transaction and
+        # is exactly what the CAS predicate exists to detect.
+        conn.execute(update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(status="rejected"))
+        return state_id
+
+    monkeypatch.setattr(service, "_insert_composition_state", terminalize_before_cas)
+
+    with pytest.raises(AuditIntegrityError, match="pending"):
+        await service.settle_pipeline_composition_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            draft_hash=plan.proposal.draft_hash,
+            reviewed_facts={},
+            state=_state_data(),
+            candidate_content_hash=_state_content_hash(_state_data()),
+            executor_content_hash=_state_content_hash(_state_data()),
+            final_composer_metadata=None,
+            dispatch=binding,
+            actor="user:alice",
+        )
+
+    with service._engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+        assert (
+            conn.execute(
+                select(func.count()).select_from(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.accepted")
+            ).scalar_one()
+            == 0
+        )
+        assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
+
+
+@pytest.mark.asyncio
 async def test_settlement_rejects_missing_or_tampered_durable_dispatch_audit(service: SessionServiceImpl) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
@@ -555,28 +1009,26 @@ async def test_settlement_rejects_concurrent_successes_for_same_proposal_call_id
     second_audit = begin_dispatch(plan.tool_call_id, "set_pipeline", _pipeline(), version_before=0, actor="user:alice")
     first = finish_success(
         first_audit,
-        result_payload={
-            "success": True,
-            "attempt": 1,
-            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
-            "pipeline_content_hash": state_hash,
-        },
+        result_payload=_pipeline_dispatch_result(pipeline_content_hash=state_hash),
         version_after=1,
     )
     second = finish_success(
         second_audit,
-        result_payload={
-            "success": True,
-            "attempt": 2,
-            "pipeline_content_hash_schema": "composer.pipeline-dispatch-result.v1",
-            "pipeline_content_hash": state_hash,
-        },
+        result_payload=_pipeline_dispatch_result(pipeline_content_hash=state_hash),
         version_after=1,
     )
-    persisted = await asyncio.gather(
-        _persist_tool_invocations(service, session_id, (first,), None, plugin_crash_pending=False),
-        _persist_tool_invocations(service, session_id, (second,), None, plugin_crash_pending=False),
-    )
+    # P4-D6 family A2b: both racing writers belong to ONE turn, so they share
+    # the one COMPOSE operation that turn holds — the race under test is
+    # between the two dispatch records, not between two operations.
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        persisted = await asyncio.gather(
+            _persist_tool_invocations(
+                service, session_id, (first,), None, plugin_crash_pending=False, session_operation_context=compose_context
+            ),
+            _persist_tool_invocations(
+                service, session_id, (second,), None, plugin_crash_pending=False, session_operation_context=compose_context
+            ),
+        )
     binding = persisted[0][0]
 
     with pytest.raises(AuditIntegrityError, match=r"duplicate|exactly one|one durable|does not match"):
@@ -609,6 +1061,102 @@ async def test_settlement_rejects_malformed_or_mismatched_success_for_same_call_
 
     with pytest.raises(AuditIntegrityError):
         await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dispatch_recovery_rejects_noncanonical_json_representation(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    await _persist_dispatch(service, session_id)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    assert type(invocation) is dict
+    result_canonical = invocation["result_canonical"]
+    assert type(result_canonical) is str
+    invocation["result_canonical"] = f" {result_canonical}"
+    _replace_latest_audit_envelope(service, envelope)
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="canonical representation"):
+        await service.get_pipeline_dispatch_recovery(authority=authority)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    await _persist_dispatch(service, session_id)
+    envelope = _latest_audit_envelope(service)
+    invocation = envelope["invocation"]
+    assert type(invocation) is dict
+    arguments_canonical = invocation["arguments_canonical"]
+    assert type(arguments_canonical) is str
+    assert arguments_canonical.count('"sources":{}') == 1
+    invocation["arguments_canonical"] = arguments_canonical.replace(
+        '"sources":{}',
+        '"sources":{},"sources":{}',
+        1,
+    )
+    _replace_latest_audit_envelope(service, envelope)
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="duplicate JSON object key"):
+        await service.get_pipeline_dispatch_recovery(authority=authority)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"__elspeth_canonical_type__": {"literal": True}},
+        {"outer": {"__elspeth_canonical_type__": {"literal": True}}},
+    ],
+    ids=["top_level", "nested"],
+)
+def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapping(
+    arguments: dict[str, object],
+) -> None:
+    arguments_canonical = canonical_json(arguments)
+    result_canonical = canonical_json({"success": True})
+    assert arguments_canonical.count('"__elspeth_canonical_type__":"mapping"') == 1
+    assert '"entries":[' in arguments_canonical
+    arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
+    authority_arguments_canonical = composer_authority_canonical_json(arguments)
+    authority_arguments_hash = hashlib.sha256(authority_arguments_canonical.encode("utf-8")).hexdigest()
+    result_hash = hashlib.sha256(result_canonical.encode("utf-8")).hexdigest()
+    envelope: dict[str, object] = {
+        "_kind": "audit",
+        "invocation": {
+            "tool_call_id": "reserved-mapping-call",
+            "tool_name": "set_pipeline",
+            "status": ComposerToolStatus.SUCCESS.value,
+            "arguments_canonical": arguments_canonical,
+            "arguments_hash": arguments_hash,
+            "authority_arguments_canonical": authority_arguments_canonical,
+            "authority_arguments_hash": authority_arguments_hash,
+            "result_canonical": result_canonical,
+            "result_hash": result_hash,
+        },
+    }
+
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+    assert binding.tool_call_id == "reserved-mapping-call"
+    assert binding.tool_name == "set_pipeline"
+    assert binding.status is ComposerToolStatus.SUCCESS
+    assert binding.arguments_hash == authority_arguments_hash
+    assert binding.result_hash == result_hash
 
 
 @pytest.mark.asyncio
@@ -1030,14 +1578,14 @@ async def test_prepare_pipeline_commit_revalidates_and_audits_exact_arguments_wi
 ) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
-    plan = _runnable_plan(tmp_path)
+    plan = _runnable_plan(tmp_path, session_id)
     row = await service.create_pipeline_composition_proposal(
         session_id=session_id,
         plan=plan,
         summary="Replace the pipeline.",
         rationale="Requested by the operator.",
         affects=("graph", "validation"),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path)),
+        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
         actor="composer-web:user:alice",
         composer_model_identifier="planner-model",
         composer_model_version="planner-model-v1",
@@ -1085,6 +1633,96 @@ async def test_prepare_pipeline_commit_revalidates_and_audits_exact_arguments_wi
 
 
 @pytest.mark.asyncio
+async def test_prepare_pipeline_commit_accepts_server_canonical_review_rows_in_preflight_and_audited_execution(
+    service: SessionServiceImpl,
+    tmp_path,
+) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    pipeline = _runnable_pipeline(tmp_path, session_id)
+    pipeline["source"]["options"]["interpretation_requirements"] = [
+        {
+            "id": "trusted-source-review",
+            "kind": "invented_source",
+            "user_term": "inline_source_data",
+            "status": "pending",
+            "draft": "Review the generated source rows.",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+    ]
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=pipeline,
+            base=AbsentBase(),
+            reviewed_facts={},
+            surface=PlannerSurface.FREEFORM,
+            repair_count=0,
+            skill_hash=stable_hash("skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="planner-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Replace the pipeline.",
+        rationale="Requested by the operator.",
+        affects=("graph", "validation"),
+        arguments_redacted_json=_redacted_pipeline(pipeline),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    recorder = BufferingRecorder()
+    current = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+    prepared = await prepare_pipeline_proposal_commit(
+        authority=authority,
+        reviewed_facts={},
+        current_state=current,
+        current_state_id=None,
+        policy_catalog=policy,
+        plugin_snapshot=snapshot,
+        config=PipelineCommitConfig(
+            data_dir=str(tmp_path),
+            session_engine=service._engine,
+            secret_service=None,
+            user_id="alice",
+            user_message_content=None,
+            max_blob_storage_per_session_bytes=1_000_000,
+            runtime_preflight=None,
+            timeout_seconds=5.0,
+        ),
+        recorder=recorder,
+        actor="user:alice",
+        settlement_surface="generic",
+    )
+
+    requirement = prepared.result.updated_state.sources["source"].options["interpretation_requirements"][0]
+    assert requirement["id"] == "trusted-source-review"
+    assert requirement["status"] == "pending"
+    assert prepared.candidate_content_hash == prepared.executor_content_hash
+    assert len(recorder.invocations) == 1
+
+
+@pytest.mark.asyncio
 async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event_loop(
     service: SessionServiceImpl,
     tmp_path,
@@ -1092,14 +1730,14 @@ async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event
 ) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
-    plan = _runnable_plan(tmp_path)
+    plan = _runnable_plan(tmp_path, session_id)
     row = await service.create_pipeline_composition_proposal(
         session_id=session_id,
         plan=plan,
         summary="Replace the pipeline.",
         rationale="Requested by the operator.",
         affects=("graph",),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path)),
+        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
         actor="composer-web:user:alice",
         composer_model_identifier="planner-model",
         composer_model_version="planner-model-v1",
@@ -1163,6 +1801,206 @@ async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event
 
 
 @pytest.mark.asyncio
+async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blocking_event_loop(
+    service: SessionServiceImpl,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority as original_resolver
+
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    with fenced_operation_context(service._engine, session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+        blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+            session_id,
+            "reviewed.csv",
+            b"value\nreviewed\n",
+            "text/csv",
+            session_operation_context=create_context,
+        )
+    source_options = {
+        "schema": {"fields": ["value: str"], "mode": "flexible"},
+        "path": f"blob:{blob.id}",
+        "delimiter": ",",
+        "encoding": "utf-8",
+    }
+    output_options = {
+        "schema": {"mode": "observed"},
+        "path": "outputs/reviewed.json",
+        "collision_policy": "auto_increment",
+        "mode": "write",
+    }
+    source_stable_id = str(uuid4())
+    reviewed_facts = {
+        "source_order": [source_stable_id],
+        "reviewed_sources": {
+            source_stable_id: {
+                "name": "source",
+                "plugin": "csv",
+                "options": source_options,
+                "observed_columns": ["value"],
+                "sample_rows": [],
+                "on_validation_failure": "discard",
+            }
+        },
+        "output_order": [],
+        "reviewed_outputs": {},
+    }
+    pipeline: dict[str, object] = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": source_options,
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": output_options,
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=pipeline,
+            base=AbsentBase(),
+            reviewed_facts=reviewed_facts,
+            surface=PlannerSurface.GUIDED_STAGED,
+            repair_count=0,
+            skill_hash=stable_hash("guided skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="reviewed-source-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Use the reviewed source.",
+        rationale="Requested by the operator.",
+        affects=("source",),
+        arguments_redacted_json=_redacted_pipeline(pipeline),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts=reviewed_facts,
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+
+    import elspeth.web.composer.pipeline_commit as commit_module
+
+    loop = asyncio.get_running_loop()
+    event_loop_thread_id = threading.get_ident()
+    database_entered = asyncio.Event()
+    heartbeat_seen = asyncio.Event()
+    resolver_finished = asyncio.Event()
+    resolver_started = threading.Event()
+    release_database = threading.Event()
+    outer_watchdog_expired = threading.Event()
+    database_thread_ids: list[int] = []
+    original_connect = service._engine.connect
+    outer_failure_watchdog_seconds = 5.0
+
+    def delayed_connect():
+        database_thread_ids.append(threading.get_ident())
+        loop.call_soon_threadsafe(database_entered.set)
+        if not release_database.wait(timeout=outer_failure_watchdog_seconds):
+            outer_watchdog_expired.set()
+            raise AssertionError("outer test watchdog expired before the delayed database connection was released")
+        return original_connect()
+
+    def tracked_resolver(*args, **kwargs):
+        resolver_started.set()
+        try:
+            return original_resolver(*args, **kwargs)
+        finally:
+            loop.call_soon_threadsafe(resolver_finished.set)
+
+    async def heartbeat() -> None:
+        await database_entered.wait()
+        heartbeat_seen.set()
+
+    monkeypatch.setattr(service._engine, "connect", delayed_connect)
+    monkeypatch.setattr(commit_module, "resolve_reviewed_source_authority", tracked_resolver)
+    heartbeat_task = asyncio.create_task(heartbeat())
+    prepare_task = asyncio.create_task(
+        prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts=reviewed_facts,
+            current_state=CompositionState(
+                source=None,
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=0.2,
+            ),
+            recorder=BufferingRecorder(),
+            actor="user:alice",
+            settlement_surface="guided",
+        )
+    )
+    try:
+        await asyncio.wait_for(database_entered.wait(), timeout=outer_failure_watchdog_seconds)
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=outer_failure_watchdog_seconds)
+        await asyncio.wait_for(heartbeat_task, timeout=outer_failure_watchdog_seconds)
+        assert not release_database.is_set()
+        with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
+            await asyncio.wait_for(
+                asyncio.shield(prepare_task),
+                timeout=outer_failure_watchdog_seconds,
+            )
+        assert exc_info.value.code == "TIMEOUT"
+        assert not release_database.is_set()
+    finally:
+        release_database.set()
+        try:
+            if resolver_started.is_set():
+                await asyncio.wait_for(resolver_finished.wait(), timeout=outer_failure_watchdog_seconds)
+        finally:
+            for task in (heartbeat_task, prepare_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(heartbeat_task, prepare_task, return_exceptions=True)
+
+    assert resolver_finished.is_set()
+    assert not outer_watchdog_expired.is_set()
+    assert len(database_thread_ids) == 1
+    assert database_thread_ids[0] != event_loop_thread_id
+
+
+@pytest.mark.asyncio
 async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     service: SessionServiceImpl,
     tmp_path,
@@ -1170,14 +2008,14 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
 ) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
-    plan = _runnable_plan(tmp_path)
+    plan = _runnable_plan(tmp_path, session_id)
     row = await service.create_pipeline_composition_proposal(
         session_id=session_id,
         plan=plan,
         summary="Replace the pipeline.",
         rationale="Requested by the operator.",
         affects=("graph",),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path)),
+        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
         actor="composer-web:user:alice",
         composer_model_identifier="planner-model",
         composer_model_version="planner-model-v1",
@@ -1260,12 +2098,14 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
 
     session_id = uuid4()
     _insert_session(service, session_id)
-    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
-        session_id,
-        "project_urls.csv",
-        b"url\nhttps://example.gov.au/project-1.html\n",
-        "text/csv",
-    )
+    with fenced_operation_context(service._engine, session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+        blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+            session_id,
+            "project_urls.csv",
+            b"url\nhttps://example.gov.au/project-1.html\n",
+            "text/csv",
+            session_operation_context=create_context,
+        )
     source_options = {
         "schema": {"fields": ["url: str"], "mode": "flexible"},
         "path": f"blob:{blob.id}",
@@ -1342,7 +2182,8 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ page_content }}",
+                    "prompt_template": "Summarise {{ row.page_content }}",
+                    "required_input_fields": ["page_content"],
                 },
             },
             {
@@ -1448,14 +2289,14 @@ async def test_prepare_pipeline_commit_detects_candidate_executor_mismatch_after
 ) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
-    plan = _runnable_plan(tmp_path)
+    plan = _runnable_plan(tmp_path, session_id)
     row = await service.create_pipeline_composition_proposal(
         session_id=session_id,
         plan=plan,
         summary="Replace the pipeline.",
         rationale="Requested by the operator.",
         affects=("graph",),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path)),
+        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
         actor="composer-web:user:alice",
         composer_model_identifier="planner-model",
         composer_model_version="planner-model-v1",
@@ -1516,3 +2357,115 @@ async def test_prepare_pipeline_commit_detects_candidate_executor_mismatch_after
 
     assert len(recorder.invocations) == 1
     assert await service.get_current_state(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_owned_pipeline_executor_mismatch_binds_hash_and_supports_recovery_rejection(
+    service: SessionServiceImpl,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _runnable_owned_state_plan(tmp_path, session_id)
+    review_arguments = owned_composition_state_review_arguments(plan.proposal.pipeline)
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Replace the pipeline.",
+        rationale="Requested by the operator.",
+        affects=("graph",),
+        arguments_redacted_json=redact_tool_call_arguments(
+            "set_pipeline",
+            review_arguments,
+            telemetry=NoopRedactionTelemetry(),
+        ),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    recorder = BufferingRecorder()
+    current = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+    import elspeth.web.composer.pipeline_commit as commit_module
+
+    original_execute = commit_module.execute_tool
+
+    def mismatching_execute(*args, **kwargs):
+        result = original_execute(*args, **kwargs)
+        return replace(result, updated_state=replace(result.updated_state, metadata=PipelineMetadata(name="mismatch")))
+
+    monkeypatch.setattr(commit_module, "execute_tool", mismatching_execute)
+    with pytest.raises(PipelineCommitMismatchError) as exc_info:
+        await prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts={},
+            current_state=current,
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=recorder,
+            actor="user:alice",
+            settlement_surface="generic",
+        )
+
+    mismatch = exc_info.value
+    assert mismatch.invocation is not None
+    assert mismatch.dispatch is not None
+    result_payload = json.loads(mismatch.invocation.result_canonical or "null")
+    assert result_payload["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
+    executor_content_hash = result_payload["pipeline_content_hash"]
+    assert type(executor_content_hash) is str and len(executor_content_hash) == 64
+    assert mismatch.dispatch.result_hash == stable_hash(result_payload)
+
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        bindings = await _persist_tool_invocations(
+            service,
+            session_id,
+            (mismatch.invocation,),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=compose_context,
+        )
+    assert len(bindings) == 1
+    persisted_binding = bindings[0]
+    assert persisted_binding.tool_call_id == mismatch.dispatch.tool_call_id
+    assert persisted_binding.status is ComposerToolStatus.SUCCESS
+    recovery = await service.get_pipeline_dispatch_recovery(authority=authority)
+    assert recovery is not None
+    assert recovery.binding == persisted_binding
+    assert recovery.executor_content_hash == executor_content_hash
+
+    rejected = await service.reject_pipeline_composition_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        draft_hash=plan.proposal.draft_hash,
+        reviewed_facts={},
+        reason="candidate_executor_mismatch",
+        dispatch=recovery.binding,
+        actor="system:pipeline-commit",
+    )
+    assert rejected.status == "rejected"
+    assert await service.get_current_state(session_id) is None
+    terminal = (await service.list_proposal_events(session_id))[-1].payload
+    assert terminal["reason_code"] == "candidate_executor_mismatch"
+    assert terminal["dispatch"] == recovery.binding.to_dict()

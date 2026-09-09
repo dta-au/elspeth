@@ -14,9 +14,10 @@ Dependencies held by the coordinator:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import (
     GracefulShutdownError,
     OrchestrationInvariantError,
@@ -26,7 +27,9 @@ from elspeth.contracts.types import (
     NodeID,
     SinkName,
 )
+from elspeth.core.clock import Clock
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.sink import DiversionCounts
 from elspeth.engine.orchestrator.outcomes import (
     reconcile_sink_write_diversions,
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
         SinkProtocol,
         TokenInfo,
     )
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.engine.orchestrator.checkpointing import CheckpointCoordinator
     from elspeth.engine.orchestrator.ports import (
         CheckpointAfterSinkCallback,
@@ -117,9 +121,11 @@ class SinkFlushCoordinator:
         *,
         span_factory: SpanFactory,
         checkpoints: CheckpointCoordinator,
+        clock: Clock = DEFAULT_CLOCK,
     ) -> None:
         self._span_factory = span_factory
         self._checkpoints = checkpoints
+        self._clock = clock
 
     def write_pending_to_sinks(
         self,
@@ -136,6 +142,8 @@ class SinkFlushCoordinator:
         on_token_written_factory: _CheckpointFactory | None = None,
         scheduler_terminalizer: SchedulerTerminalizer | None = None,
         worker_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> DiversionCounts:
         """Write pending tokens to sinks using SinkExecutor.
 
@@ -158,10 +166,30 @@ class SinkFlushCoordinator:
                 checkpoint-progress callback for grouped batches whose pending outcome
                 carries a durable scheduler PENDING_SINK handoff (elspeth-107a29d02e).
                 When None, no scheduler terminalization is performed.
+            coordination_token: The processor's leader token (ADR-048), handed
+                to SinkExecutor so durable sink effects fence on it. None only
+                for a processor that holds no seat; the effect path then fails
+                closed inside SinkExecutor rather than writing unfenced.
         """
         from itertools import groupby
 
         from elspeth.engine.executors.sink import DiversionCounts, SinkExecutor
+
+        def _shutdown_during_sink_effect_wait() -> GracefulShutdownError:
+            return GracefulShutdownError(
+                rows_processed=counters.rows_processed,
+                run_id=run_id,
+                rows_succeeded=counters.rows_succeeded,
+                rows_failed=counters.rows_failed,
+                rows_quarantined=counters.rows_quarantined,
+                rows_routed_success=counters.rows_routed_success,
+                rows_routed_failure=counters.rows_routed_failure,
+                routed_destinations=dict(counters.routed_destinations),
+            )
+
+        effect_modes = config.sink_effect_modes
+        if set(effect_modes) != set(config.sinks):
+            raise OrchestrationInvariantError("Pipeline sink effect modes must exactly cover the runtime sink names")
 
         sink_executor = SinkExecutor(
             factory.execution,
@@ -170,10 +198,14 @@ class SinkFlushCoordinator:
             run_id,
             factory=factory,
             worker_id=worker_id,
+            coordination_token=coordination_token,
+            clock=self._clock,
+            shutdown_event=ctx.shutdown_event,
+            check_coordination_latch=check_coordination_latch,
+            make_shutdown_error=_shutdown_during_sink_effect_wait,
         )
         step = sink_step
         total_diversions = DiversionCounts()
-        effect_modes = getattr(config, "sink_effect_modes", {})
 
         def consume_group(
             live_pairs: list[tuple[TokenInfo, PendingOutcome | None]], group_pairs: list[tuple[TokenInfo, PendingOutcome | None]]
@@ -235,6 +267,9 @@ class SinkFlushCoordinator:
                 group_pairs = list(group)
                 pending_outcome = group_pairs[0][1]
                 group_tokens = [token for token, _pending in group_pairs]
+                join_group_id_by_token = {
+                    token.token_id: (pending.join_group_id if pending is not None else None) for token, pending in group_pairs
+                }
                 # Only tokens with a proven durable PENDING_SINK handoff are
                 # terminalized after sink durability. Aggregation flush
                 # outputs carry that handoff since F1/D6 (the atomic barrier
@@ -256,20 +291,30 @@ class SinkFlushCoordinator:
                 on_token_written: CheckpointAfterSinkCallback | None = (
                     _CompositeAfterSinkCallback(tuple(after_sink_callbacks)) if after_sink_callbacks else None
                 )
-                _, diversion_counts = sink_executor.write(
-                    sink=sink,
-                    tokens=group_tokens,
-                    ctx=ctx,
-                    step_in_pipeline=step,
-                    sink_name=sink_name,
-                    pending_outcome=pending_outcome,
-                    effect_mode=effect_modes.get(sink_name),
-                    failsink=failsink,
-                    failsink_name=failsink_config_name,
-                    failsink_effect_mode=None if failsink_config_name is None else effect_modes.get(failsink_config_name),
-                    failsink_edge_id=failsink_edge_id,
-                    on_token_written=on_token_written,
-                )
+                failsink_effect_mode = None
+                if failsink_config_name is not None:
+                    failsink_effect_mode = effect_modes[failsink_config_name]
+                with self._span_factory.sink_span(
+                    sink_name,
+                    node_id=sink_node_id,
+                    token_ids=tuple(token.token_id for token in group_tokens),
+                    run_id=run_id,
+                ):
+                    _, diversion_counts = sink_executor.write(
+                        sink=sink,
+                        tokens=group_tokens,
+                        ctx=ctx,
+                        step_in_pipeline=step,
+                        sink_name=sink_name,
+                        pending_outcome=pending_outcome,
+                        join_group_id_by_token=join_group_id_by_token,
+                        effect_mode=effect_modes[sink_name],
+                        failsink=failsink,
+                        failsink_name=failsink_config_name,
+                        failsink_effect_mode=failsink_effect_mode,
+                        failsink_edge_id=failsink_edge_id,
+                        on_token_written=on_token_written,
+                    )
                 if on_token_written is not None:
                     on_token_written.flush()
                 consume_group(token_outcome_pairs, group_pairs)
@@ -295,17 +340,25 @@ class SinkFlushCoordinator:
         edge_map: Mapping[tuple[NodeID, str], str],
         interrupted_by_shutdown: bool,
         *,
+        coordination_token: CoordinationToken,
         on_token_written_factory: _CheckpointFactory | None = None,
         scheduler_terminalizer: SchedulerTerminalizer | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> None:
         """Write all pending tokens to sinks and handle post-loop bookkeeping.
+
+        ``coordination_token`` is the leader token the calling drain holds;
+        it reaches the shutdown checkpoint as a parameter, by value
+        (ADR-048 §3).
 
         IMPORTANT: Aggregation flush and coalesce flush are NOT in this method.
         They stay inside the processing loop because they must execute inside
         the track_operation(source_load) context to preserve audit attribution.
 
         Handles:
-        1. Write pending tokens to sinks (each sink has its own track_operation)
+        1. Write pending tokens to sinks (each sink write has its own
+           sink_write operation, owned by the sink-effect reservation rather
+           than by a track_operation call in SinkExecutor)
         2. Raise GracefulShutdownError if interrupted
         """
         counters = loop_ctx.counters
@@ -323,6 +376,8 @@ class SinkFlushCoordinator:
             on_token_written_factory=on_token_written_factory,
             scheduler_terminalizer=scheduler_terminalizer,
             worker_id=(loop_ctx.processor.coordination_token.worker_id if loop_ctx.processor.coordination_token is not None else None),
+            coordination_token=loop_ctx.processor.coordination_token,
+            check_coordination_latch=check_coordination_latch,
         )
         # ADR-019: failsink-mode diversions are TRANSIENT structural evidence;
         # discard-mode diversions are FAILURE predicate inputs as well.
@@ -333,10 +388,7 @@ class SinkFlushCoordinator:
         # At this point: sink writes are done, and any buffered aggregation/coalesce
         # state that we intentionally preserved can be checkpointed for resume.
         if interrupted_by_shutdown:
-            self._checkpoints.checkpoint_interrupted_progress(
-                run_id=run_id,
-                loop_ctx=loop_ctx,
-            )
+            self._checkpoints.checkpoint_interrupted_progress(loop_ctx, coordination_token=coordination_token)
             raise GracefulShutdownError(
                 rows_processed=counters.rows_processed,
                 run_id=run_id,

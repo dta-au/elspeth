@@ -13,13 +13,14 @@ import codecs
 import keyword
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import Field, ValidationError, field_validator
 
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
@@ -44,7 +45,10 @@ def _surrogateescape_line_to_bytes(value: str, encoding: str) -> bytes:
 class TextSourceConfig(SourceDataConfig):
     """Configuration for the plain-text line source plugin."""
 
-    column: str = Field(description="Pipeline field name that receives each emitted text line.")
+    column: Annotated[
+        str,
+        EmittedToOutput("the text source uses this as the output row key for every emitted line and as a downstream artifact column"),
+    ] = Field(description="Pipeline field name that receives each emitted text line.")
     encoding: str = Field(default="utf-8", description="Text encoding used to decode the input file.")
     strip_whitespace: bool = Field(default=True, description="Whether to trim leading and trailing whitespace from each line.")
     skip_blank_lines: bool = Field(default=True, description="Whether to drop blank lines after optional whitespace trimming.")
@@ -74,9 +78,26 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:52f62dabd8bdef5e"
+    source_file_hash: str | None = "sha256:694e83b5f2d27bdd"
     config_model = TextSourceConfig
     _on_validation_failure: str
+
+    usage_when_to_use: str = "Use for a bounded plain-text or Markdown file when each retained line should become one row in a named field."
+    usage_when_not_to_use: str = (
+        "Do not use for structured or multi-field records, or when preserving the whole document as one value is required."
+    )
+    example_use: str = """sources:
+  url_lines:
+    plugin: text
+    on_success: output
+    options:
+      path: data/urls.txt
+      column: url
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("text", "file", "line-oriented", "batch")
 
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = TextSourceConfig.from_dict(config, plugin_name=self.name)

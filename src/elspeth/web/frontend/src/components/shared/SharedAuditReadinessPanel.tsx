@@ -24,6 +24,7 @@ import {
   AuditReadinessRow,
   type RowPresentation,
 } from "../audit/AuditReadinessRow";
+import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
 import type {
   AuditReadinessSnapshot,
   ReadinessRow,
@@ -83,7 +84,10 @@ function rowHeading(id: ReadinessRowId): string {
   }
 }
 
-function presentationForSharedRow(row: ReadinessRow): RowPresentation {
+function presentationForSharedRow(
+  row: ReadinessRow,
+  validationExecutionReady: boolean,
+): RowPresentation {
   const { glyph, aria } = statusGlyph(row.status);
   return {
     id: row.id,
@@ -92,6 +96,7 @@ function presentationForSharedRow(row: ReadinessRow): RowPresentation {
     summaryText: row.summary,
     glyph,
     ariaStatusLabel: aria,
+    blocksRun: isRunGatingReadinessRow(row.id, validationExecutionReady),
     // Per-row test ids match the pre-FIX-C inline table to keep any
     // upstream consumer / contract tests stable.
     testId: `shared-inspect-readiness-row-${row.id}`,
@@ -124,14 +129,14 @@ export function SharedAuditReadinessPanel({
           </p>
           {/* Gate legibility (elspeth-088bf83922 T-2, option (a)): a reviewer
               opening this frozen snapshot has no ExecuteButton in view, so
-              the per-row "Blocks Run" / "Advisory" badges (rendered by
+              the per-row "Blocks run" / "Advisory" badges (rendered by
               AuditReadinessRow below) need this standalone explanation —
               past tense, since the run this snapshot describes may already
               have happened. Same classification the live panel uses; no
               gating behaviour is described or implied here (this view has
               no Run control at all). */}
           <p className="audit-readiness-freshness">
-            Rows marked "Blocks Run" had to be clear before this pipeline
+            Rows marked "Blocks run" had to be clear before this pipeline
             could run; the rest are advisory and did not stop it.
           </p>
         </header>
@@ -142,7 +147,10 @@ export function SharedAuditReadinessPanel({
           {snapshot.rows.map((row) => (
             <AuditReadinessRow
               key={row.id}
-              row={presentationForSharedRow(row)}
+              row={presentationForSharedRow(
+                row,
+                snapshot.validation_result.readiness.execution_ready,
+              )}
             />
           ))}
         </ul>

@@ -1,0 +1,32 @@
+<!-- @dsCard group="Colors" viewport="700x150" name="Text & borders" subtitle="Teal-tinted text ramp and translucent borders" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 16px; background: var(--color-bg); font-family: var(--font-sans); }
+  .row { display: flex; gap: 10px; align-items: stretch; }
+  .col { flex: 1 1 0; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); padding: 12px 14px; }
+  .line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 4px 0; }
+  .val { font-family: var(--font-mono); font-size: 10px; color: var(--color-text-muted); }
+  .b { height: 28px; border-radius: var(--radius-md); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="col">
+      <div class="line"><span style="color:var(--color-text);font-size:15px;font-weight:600">Primary text</span><span class="val">#dff0ee</span></div>
+      <div class="line"><span style="color:var(--color-text-secondary);font-size:14px">Secondary text</span><span class="val">#a8d0d0</span></div>
+      <div class="line"><span style="color:var(--color-text-muted);font-size:13px">Muted text</span><span class="val">#7a9a9a</span></div>
+    </div>
+    <div class="col">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-muted);margin-bottom:8px;font-weight:600">Borders</div>
+      <div class="b" style="border:1px solid var(--color-border);margin-bottom:8px"></div>
+      <div class="val" style="margin-bottom:10px">border · rgba(143,200,200,.12)</div>
+      <div class="b" style="border:1px solid var(--color-border-strong)"></div>
+      <div class="val" style="margin-top:6px">border-strong · rgba(143,200,200,.25)</div>
+    </div>
+  </div>
+</body>
+</html>

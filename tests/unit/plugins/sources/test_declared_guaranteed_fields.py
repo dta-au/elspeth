@@ -44,6 +44,23 @@ def test_base_source_helper_uses_effective_guarantees_for_observed_schema() -> N
     assert source.declared_guaranteed_fields == frozenset({"customer_id", "account_id"})
 
 
+def test_base_source_helper_records_plugin_computed_output_schema_config() -> None:
+    """The DAG builder prefers the plugin-computed contract (elspeth-db98d3f660)."""
+    schema_config = SchemaConfig.from_dict(
+        {
+            "mode": "observed",
+            "guaranteed_fields": ["customer_id"],
+        }
+    )
+    source = _StubSource(schema_config)
+    assert source._output_schema_config == schema_config
+
+
+def test_base_source_output_schema_config_defaults_to_none() -> None:
+    source = NullSource({"on_success": "default"})
+    assert source._output_schema_config is None
+
+
 def test_base_source_helper_uses_required_declared_fields_for_fixed_schema() -> None:
     source = _StubSource(
         SchemaConfig.from_dict(

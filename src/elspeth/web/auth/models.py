@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.web.validation import has_visible_content
 
 
@@ -65,6 +66,29 @@ class AuthenticationError(Exception):
         super().__init__(detail)
 
 
+class AccessPending(AuthenticationError):
+    """The credential was correct; the identity has not been admitted yet.
+
+    A CLASS, not a message prefix. The spec's §Failure categories requires
+    exactly this ("each an explicit exception class, never a ``detail``
+    prefix") and the reason is visible in what a prefix costs: the raiser and
+    the classifier would hold the same literal in two files with nothing
+    binding them, so an ordinary copy edit to the message would silently
+    reclassify the event to ``authentication_error`` with every test green.
+    The type is the contract; the message is free to change.
+    """
+
+    def __init__(self, detail: str = "Account is pending — awaiting administrator approval") -> None:
+        super().__init__(detail)
+
+
+class IdentityDisabled(AuthenticationError):
+    """The identity has been disabled. Re-authenticating is not an appeal."""
+
+    def __init__(self, detail: str = "Account is disabled — contact an administrator") -> None:
+        super().__init__(detail)
+
+
 class AuthProviderUnavailable(AuthenticationError):
     """Raised when an upstream auth provider cannot validate availability.
 
@@ -75,3 +99,49 @@ class AuthProviderUnavailable(AuthenticationError):
 
     def __init__(self, detail: str = "Authentication provider unavailable") -> None:
         super().__init__(detail)
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityClaims:
+    """What one IdP login says about who the person is.
+
+    The OWNED type at the end of the Tier-3 boundary: a profile's
+    ``map_identity`` reads whatever shape the provider sent and constructs
+    this, so nothing downstream ever touches raw IdP data. Every field is a
+    scalar or None, and every one is validated here rather than trusted.
+
+    This is not a session and not an authorisation. It says who logged in;
+    whether they may do anything is ``identities.access_state`` plus their
+    roles, read on every request.
+    """
+
+    provider: AuthProviderType
+    subject: str
+    username: str
+    display_name: str | None = None
+    email: str | None = None
+    organisation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # ``(provider, subject)`` is the identity key. A blank subject would
+        # collapse every identity from one provider onto a single row, so it
+        # is refused here as well as by the database.
+        if not has_visible_content(self.subject):
+            raise AuthenticationError("IdP subject must be a non-blank string with visible content")
+        if not has_visible_content(self.username):
+            raise AuthenticationError("username must be a non-blank string with visible content")
+        # Cosmetic metadata is coerced rather than fatal, matching
+        # UserProfile: refusing a login over a blank display name would be
+        # disproportionate. An email that is present but blank is dropped for
+        # the same reason -- it is never an authorisation input.
+        #
+        # Written out rather than looped over field names: resolving an
+        # attribute from a string on a type we own is dynamic access, which
+        # this repository inventories and forbids outside a declared Tier-3
+        # parse. Three lines are cheaper than an adjudicated exemption.
+        if self.display_name is not None and not has_visible_content(self.display_name):
+            object.__setattr__(self, "display_name", None)
+        if self.email is not None and not has_visible_content(self.email):
+            object.__setattr__(self, "email", None)
+        if self.organisation_id is not None and not has_visible_content(self.organisation_id):
+            object.__setattr__(self, "organisation_id", None)

@@ -18,15 +18,15 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine, insert, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import SchemaCompatibilityError
-from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
+from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     nodes_table,
     rows_table,
     runs_table,
@@ -41,7 +41,10 @@ from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.schema_probe import SchemaState, init_landscape_schema, probe_landscape_schema
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 
@@ -70,20 +73,8 @@ def _connect(url: str) -> psycopg.Connection[Any]:
     assert parsed.host is not None
     assert parsed.username is not None
     assert parsed.database is not None
-    return psycopg.connect(
-        host=parsed.host,
-        port=parsed.port or 5432,
-        dbname=parsed.database,
-        user=parsed.username,
-        password=parsed.password,
-        autocommit=True,
-    )
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    psycopg_url = parsed.set(drivername="postgresql").render_as_string(hide_password=False)
+    return psycopg.connect(psycopg_url, autocommit=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +86,8 @@ class _RuntimeDatabase:
 
 
 @pytest.fixture
-def runtime_database(postgres_url: str) -> Iterator[_RuntimeDatabase]:
+def runtime_database(external_deployment_postgres_url: str) -> Iterator[_RuntimeDatabase]:
+    postgres_url = external_deployment_postgres_url
     session_database = _identifier("session")
     landscape_database = _identifier("landscape")
     runtime_role = _identifier("runtime")
@@ -354,7 +346,6 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             node_id="transform",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
         duplicate = scheduler.enqueue_ready(
@@ -364,7 +355,6 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             node_id="transform",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
         assert duplicate.work_item_id == item.work_item_id
@@ -387,7 +377,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             )
 
 
-def test_postgres_coalesce_branch_loss_insert_is_dialect_safe(
+def test_postgres_group_loss_insert_is_dialect_safe(
     tmp_path: Path,
     runtime_database: _RuntimeDatabase,
 ) -> None:
@@ -409,36 +399,66 @@ def test_postgres_coalesce_branch_loss_insert_is_dialect_safe(
                     openrouter_catalog_source="bundled",
                 )
             )
-            first_inserted = record_coalesce_branch_loss(
-                conn,
-                run_id="coalesce-loss-postgres-run",
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="left",
+            # group_losses.token_id carries an FK to tokens — seed a minimal
+            # source node/row/token for "token-left" before recording its loss.
+            conn.execute(
+                insert(nodes_table).values(
+                    run_id="coalesce-loss-postgres-run",
+                    node_id="source-1",
+                    plugin_name="test-source",
+                    node_type=NodeType.SOURCE.value,
+                    plugin_version="1.0",
+                    determinism="deterministic",
+                    config_hash="cfg",
+                    config_json="{}",
+                    registered_at=now,
+                )
+            )
+            conn.execute(
+                insert(rows_table).values(
+                    row_id="row-1",
+                    run_id="coalesce-loss-postgres-run",
+                    source_node_id="source-1",
+                    row_index=0,
+                    source_row_index=0,
+                    ingest_sequence=0,
+                    source_data_hash="hash-row-1",
+                    created_at=now,
+                )
+            )
+            conn.execute(
+                insert(tokens_table).values(
+                    token_id="token-left",
+                    row_id="row-1",
+                    run_id="coalesce-loss-postgres-run",
+                    created_at=now,
+                )
+            )
+            loss_spec = GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-1",
+                member_key="left",
                 token_id="token-left",
                 reason="failed",
+            )
+            first_inserted = record_group_loss(
+                conn,
+                run_id="coalesce-loss-postgres-run",
+                spec=loss_spec,
                 recorded_by="worker-1",
                 now=now,
             )
-            duplicate_inserted = record_coalesce_branch_loss(
+            duplicate_inserted = record_group_loss(
                 conn,
                 run_id="coalesce-loss-postgres-run",
-                coalesce_name="merge",
-                row_id="row-1",
-                branch_name="left",
-                token_id="token-left",
-                reason="failed",
+                spec=loss_spec,
                 recorded_by="worker-1",
                 now=now,
             )
 
         with landscape.engine.connect() as conn:
             rows = (
-                conn.execute(
-                    select(coalesce_branch_losses_table).where(coalesce_branch_losses_table.c.run_id == "coalesce-loss-postgres-run")
-                )
-                .mappings()
-                .all()
+                conn.execute(select(group_losses_table).where(group_losses_table.c.run_id == "coalesce-loss-postgres-run")).mappings().all()
             )
 
     assert first_inserted is True

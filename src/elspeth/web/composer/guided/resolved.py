@@ -5,17 +5,25 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.bounded_json import (
+    JSON_MAX_DEPTH,
+    JSON_MAX_ITEMS,
+    JSON_MAX_STRING_CHARS,
+    JSON_MAX_TOTAL_TEXT_CHARS,
+    JSON_MAX_TOTAL_UTF8_BYTES,
+)
 from elspeth.web.composer.guided.errors import InvariantError
 
-GUIDED_JSON_MAX_DEPTH = 64
-GUIDED_JSON_MAX_ITEMS = 10_000
-GUIDED_JSON_MAX_STRING_CHARS = 65_536
-GUIDED_JSON_MAX_TOTAL_TEXT_CHARS = 1_048_576
-GUIDED_JSON_MAX_TOTAL_UTF8_BYTES = 1_048_576
+GUIDED_JSON_MAX_DEPTH: Final[int] = JSON_MAX_DEPTH
+GUIDED_JSON_MAX_ITEMS: Final[int] = JSON_MAX_ITEMS
+GUIDED_JSON_MAX_STRING_CHARS: Final[int] = JSON_MAX_STRING_CHARS
+GUIDED_JSON_MAX_TOTAL_TEXT_CHARS: Final[int] = JSON_MAX_TOTAL_TEXT_CHARS
+GUIDED_JSON_MAX_TOTAL_UTF8_BYTES: Final[int] = JSON_MAX_TOTAL_UTF8_BYTES
 
 
 @dataclass(slots=True)
@@ -39,6 +47,26 @@ class GuidedJsonBudget:
             raise InvariantError(f"{field_name} exceeds the {GUIDED_JSON_MAX_TOTAL_UTF8_BYTES}-byte aggregate JSON UTF-8 limit at {path}")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one strict-JSON value from an externally submitted guided payload (LLM tool-call output or "
+        "client-submitted wire value), recursively re-entered for every child container and leaf"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises InvariantError for every value outside the bounded strict-JSON domain — excess depth, a "
+        "recursive container, a non-str mapping key, an over-limit string/key/item count, a number outside "
+        "the canonical JSON domain, or any non-JSON leaf type — and never coerces or defaults; the Mapping "
+        "ABC check is the parse (replay values arrive deep-frozen as MappingProxyType, which an exact-dict "
+        "test would reject) while lists are held to exact list/FrozenJsonArray"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_resolved_freeze_boundaries.py::test_validate_and_freeze_guided_json_rejects_non_json_leaf"
+    ),
+    test_fingerprint="26d4283f0ea786a2d3feaf5f27cab5ba262d28ccfce1b6b74edf572c305fdbcc",
+)
 def _validate_and_freeze_guided_json(
     value: object,
     field_name: str,
@@ -120,6 +148,22 @@ def _validate_and_freeze_guided_json(
     raise InvariantError(f"{field_name} value at {path} must be an exact JSON leaf, list, or mapping; got {type(value).__name__}")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an externally submitted guided JSON object (LLM tool-call output or client-submitted wire value) "
+        "being promoted to a detached frozen mapping"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError for any non-mapping value before promotion — the Mapping ABC check is the parse, "
+        "since replay values arrive deep-frozen as MappingProxyType — and delegates every interior value to "
+        "the bounded strict-JSON freezer, which raises InvariantError instead of coercing"
+    ),
+    test_ref=("tests/unit/web/composer/guided/test_resolved_freeze_boundaries.py::test_freeze_guided_json_mapping_rejects_non_mapping"),
+    test_fingerprint="9c395b3188c421683e9f51a67098142498d3647162796bb92a411283477c8436",
+)
 def freeze_guided_json_mapping(value: object, field_name: str, *, budget: GuidedJsonBudget | None = None) -> Mapping[str, Any]:
     """Return a detached immutable strict-JSON object with repository bounds."""
     if not isinstance(value, Mapping):
@@ -135,6 +179,22 @@ def freeze_guided_json_mapping(value: object, field_name: str, *, budget: Guided
     return cast(Mapping[str, Any], frozen)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an externally submitted guided sequence of strings (LLM tool-call output or client-submitted wire "
+        "value) being promoted to a bounded owned tuple"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError for a non-sequence value, for the str/bytes/bytearray character-sequence trap, and "
+        "for any non-str member; raises InvariantError for item-count or string-length bound violations; "
+        "never coerces or defaults"
+    ),
+    test_ref=("tests/unit/web/composer/guided/test_resolved_freeze_boundaries.py::test_freeze_guided_str_sequence_rejects_non_sequence"),
+    test_fingerprint="5216fdb2a0b805ff4807ff8782f99e58525782f30f9ac5737aa8369443c91a78",
+)
 def freeze_guided_str_sequence(
     value: object,
     field_name: str,
@@ -198,11 +258,21 @@ class SourceResolved:
     observed_columns: Sequence[str]
     sample_rows: Sequence[Mapping[str, Any]]
     on_validation_failure: str
+    # Content identity anchor: the inspected blob's content_hash prefix,
+    # captured at review time from the inspection facts.  ``None`` for
+    # non-blob sources and for pre-anchor legacy records.
+    # ``resolve_reviewed_source_authority`` refuses settlement when a
+    # recorded anchor no longer matches the live blob row — an in-place
+    # update_blob keeps id/path/status, so only content identity can revoke
+    # stale reviewed authority (elspeth-b3feba9a7c).
+    content_hash_prefix: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.name, "SourceResolved.name")
         _require_nonempty_str(self.plugin, "SourceResolved.plugin")
         _require_nonempty_str(self.on_validation_failure, "SourceResolved.on_validation_failure")
+        if self.content_hash_prefix is not None:
+            _require_nonempty_str(self.content_hash_prefix, "SourceResolved.content_hash_prefix")
         sample_rows_value = cast(object, self.sample_rows)
         if not isinstance(sample_rows_value, Sequence) or isinstance(sample_rows_value, (str, bytes, bytearray)):
             raise TypeError("SourceResolved.sample_rows must be a sequence[mapping]")
@@ -225,6 +295,7 @@ class SourceResolved:
             "observed_columns",
             freeze_guided_str_sequence(self.observed_columns, "SourceResolved.observed_columns", budget=budget),
         )
+        freeze_fields(self, "options", "observed_columns", "sample_rows")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -234,15 +305,23 @@ class SourceResolved:
             "observed_columns": list(deep_thaw(self.observed_columns)),
             "sample_rows": [dict(deep_thaw(row)) for row in self.sample_rows],
             "on_validation_failure": self.on_validation_failure,
+            "content_hash_prefix": self.content_hash_prefix,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SourceResolved:
+        # ``content_hash_prefix`` is accepted optionally: pre-anchor guided
+        # sessions persisted six-key records, and their absence honestly
+        # means "no content identity was captured" (None) rather than a
+        # malformed record.
         record = _require_exact_keys(
-            d,
-            frozenset({"name", "plugin", "options", "observed_columns", "sample_rows", "on_validation_failure"}),
+            {"content_hash_prefix": None, **d},
+            frozenset({"name", "plugin", "options", "observed_columns", "sample_rows", "on_validation_failure", "content_hash_prefix"}),
             "SourceResolved",
         )
+        anchor = record["content_hash_prefix"]
+        if anchor is not None and (type(anchor) is not str or anchor == ""):
+            raise InvariantError("SourceResolved.content_hash_prefix must be a non-empty exact str or None")
         if type(record["options"]) is not dict:
             raise InvariantError("SourceResolved.options must be an exact dict")
         sample_rows_raw = record["sample_rows"]
@@ -256,6 +335,7 @@ class SourceResolved:
                 observed_columns=_require_str_list(record["observed_columns"], "SourceResolved.observed_columns"),
                 sample_rows=tuple(sample_rows_raw),
                 on_validation_failure=_require_nonempty_str(record["on_validation_failure"], "SourceResolved.on_validation_failure"),
+                content_hash_prefix=anchor,
             )
         except (TypeError, ValueError) as exc:
             raise InvariantError(f"SourceResolved.from_dict: malformed record {record!r}") from exc
@@ -285,6 +365,7 @@ class SinkOutputResolved:
             "required_fields",
             freeze_guided_str_sequence(self.required_fields, "SinkOutputResolved.required_fields", budget=budget),
         )
+        freeze_fields(self, "options", "required_fields")
 
     def to_dict(self) -> dict[str, Any]:
         return {

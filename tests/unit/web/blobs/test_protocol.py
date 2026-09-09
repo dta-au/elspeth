@@ -154,9 +154,14 @@ class TestBlobExceptionFamilyInvariants:
         would inherit ``object.__setattr__`` and silently lack the
         freeze contract. The family invariant prevents that from
         slipping through review.
+
+        The lookup is class-dict scoped (``vars(cls)``) rather than
+        attribute resolution: each member must declare its OWN frozen
+        set, because inheriting a parent's set would freeze the wrong
+        payload names for the subclass.
         """
         for cls in self._FAMILY:
-            attrs = getattr(cls, "_FROZEN_ATTRS", None)
+            attrs = vars(cls).get("_FROZEN_ATTRS")
             assert isinstance(attrs, frozenset), (
                 f"{cls.__name__} must declare ``_FROZEN_ATTRS: ClassVar[frozenset[str]]`` "
                 "to match the blob exception family freeze contract. See "

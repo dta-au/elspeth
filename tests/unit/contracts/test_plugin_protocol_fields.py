@@ -85,3 +85,30 @@ def test_batch_transform_protocol_has_phase_7a_fields() -> None:
 
 def test_sink_protocol_has_phase_7a_fields() -> None:
     _assert_protocol_has_fields(SinkProtocol, "SinkProtocol")
+
+
+def _collect_inherited_methods(cls: type) -> set[str]:
+    """Union non-dunder callables (incl. class/staticmethods) across the MRO."""
+    names: set[str] = set()
+    for base in cls.__mro__:
+        names |= {
+            name
+            for name, value in vars(base).items()
+            if not name.startswith("__") and (callable(value) or isinstance(value, (classmethod, staticmethod)))
+        }
+    return names
+
+
+def test_batch_transform_protocol_mirrors_transform_members() -> None:
+    """BatchTransformProtocol carries every TransformProtocol member.
+
+    elspeth-8783933d99: the two protocols must not diverge on data members —
+    a member added to TransformProtocol but not mirrored here leaves the
+    batch surface describing a narrower contract than every conformer (all
+    BaseTransform subclasses) actually carries. Derived from
+    TransformProtocol, never restated as a hand-written list.
+    """
+    missing_annotations = _collect_inherited_annotations(TransformProtocol) - _collect_inherited_annotations(BatchTransformProtocol)
+    assert not missing_annotations, f"BatchTransformProtocol is missing data members: {sorted(missing_annotations)}"
+    missing_methods = _collect_inherited_methods(TransformProtocol) - _collect_inherited_methods(BatchTransformProtocol)
+    assert not missing_methods, f"BatchTransformProtocol is missing methods: {sorted(missing_methods)}"

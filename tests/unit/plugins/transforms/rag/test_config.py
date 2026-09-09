@@ -104,7 +104,7 @@ class TestRetrievalParams:
 
 class TestProviderConfig:
     def test_unknown_provider_rejected(self):
-        with pytest.raises(ValueError, match="Unknown provider"):
+        with pytest.raises(ValueError, match="Input should be 'azure_search' or 'chroma'"):
             RAGRetrievalConfig(**_valid_config(provider="unknown"))
 
     def test_invalid_provider_config_rejected_eagerly(self):

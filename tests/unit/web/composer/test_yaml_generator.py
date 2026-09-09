@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import yaml
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, PipelineLoweringError
 from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
@@ -18,7 +18,22 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
-from elspeth.web.composer.yaml_generator import generate_pipeline_dict, generate_public_pipeline_dict, generate_public_yaml, generate_yaml
+from elspeth.web.composer.yaml_generator import (
+    _MARKER_LABELS,
+    _PUBLIC_SOURCE_LINKAGE_KEYS,
+    _PUBLIC_STORAGE_OPTION_KEYS,
+    PUBLIC_EXPORT_REBIND_GUIDANCE,
+    PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX,
+    PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
+    PUBLIC_EXPORT_REDACTION_HEADER,
+    _generate_pipeline_dict,
+    generate_pipeline_dict,
+    generate_public_pipeline_dict,
+    generate_public_yaml,
+    generate_yaml,
+    public_export_redaction,
+    public_export_redaction_header,
+)
 from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY, SOURCE_AUTHORING_KEY
 
@@ -179,6 +194,76 @@ def _make_fork_coalesce_pipeline() -> CompositionState:
         ),
         edges=(),
         outputs=(OutputSpec(name="main_output", plugin="csv", options={}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _make_row_union_pipeline() -> CompositionState:
+    """Source -> fork gate -> two ordered row unions -> sink."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="fork_in",
+            options={"schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="fork_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "discard"},
+                fork_to=("control_branch", "treatment_branch"),
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="variants",
+                node_type="row_union",
+                plugin=None,
+                input="control_scored",
+                on_success="compared",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={
+                    "control_branch": "control_scored",
+                    "treatment_branch": "treatment_scored",
+                },
+                policy=None,
+                merge=None,
+                timeout_seconds=3.5,
+            ),
+            NodeSpec(
+                id="audit_variants",
+                node_type="row_union",
+                plugin=None,
+                input="audit_control",
+                on_success="output",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={
+                    "audit_control_branch": "audit_control",
+                    "audit_treatment_branch": "audit_treatment",
+                },
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="output", plugin="json", options={}, on_write_failure="discard"),),
         metadata=PipelineMetadata(),
         version=1,
     )
@@ -373,8 +458,32 @@ class TestGenerateYaml:
         assert g["routes"]["high"] == "good_output"
         assert g["routes"]["low"] == "review_output"
 
+    def test_gate_on_error_round_trips_when_configured(self) -> None:
+        state = _make_gate_pipeline()
+        gate = state.nodes[0]
+        state = replace(
+            state,
+            nodes=(replace(gate, on_error="gate_errors"),),
+            outputs=(
+                *state.outputs,
+                OutputSpec(name="gate_errors", plugin="csv", options={"path": "/errors.csv"}, on_write_failure="discard"),
+            ),
+        )
+
+        yaml_str = generate_yaml(state)
+        parsed = yaml.safe_load(yaml_str)
+        imported = composition_state_from_runtime_yaml(yaml_str)
+
+        assert parsed["gates"][0]["on_error"] == "gate_errors"
+        assert imported.nodes[0].on_error == "gate_errors"
+
+    def test_gate_on_error_is_omitted_when_not_configured(self) -> None:
+        yaml_str = generate_yaml(_make_gate_pipeline())
+
+        assert "on_error" not in yaml.safe_load(yaml_str)["gates"][0]
+
     def test_gate_route_to_discard_is_exported_as_virtual_destination(self) -> None:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         state = _make_gate_pipeline()
         gate = state.nodes[0]
@@ -547,8 +656,154 @@ class TestGenerateYaml:
         assert "/data/blobs/session/20b944e3_input.txt" not in public_yaml
         assert generate_pipeline_dict(state)["sources"]["source"]["options"]["path"] == "/data/blobs/session/20b944e3_input.txt"
 
+    def test_public_projection_recursively_strips_all_source_custody_data(self) -> None:
+        """Public dict/YAML must not depend on blob_ref truthiness.
+
+        A blob binding, an explicit-null binding, and a path-only source all
+        cross the same public projection. Nested authoring metadata is removed
+        as a unit so its private path/blob facts cannot survive indirectly.
+        """
+        private_values = {
+            "/private/blob-backed.csv",
+            "/private/explicit-null.csv",
+            "/private/path-only.csv",
+            "/private/nested.csv",
+            "/private/source-index",
+            "/private/vector-index",
+            "/private/node-input.csv",
+            "/private/output.csv",
+            "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+            "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+            "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+        }
+        state = CompositionState(
+            sources={
+                "blob_backed": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={
+                        "path": "/private/blob-backed.csv",
+                        "blob_ref": "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "explicit_null": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={
+                        "path": "/private/explicit-null.csv",
+                        "blob_ref": None,
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "path_only": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={
+                        "file": "/private/path-only.csv",
+                        SOURCE_AUTHORING_KEY: {
+                            "path": "/private/nested.csv",
+                            "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "custody": {
+                            "persist_directory": "/private/source-index",
+                            "blob_id": "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+            },
+            nodes=(
+                NodeSpec(
+                    id="pass",
+                    node_type="transform",
+                    plugin="llm",
+                    input="out",
+                    on_success="out",
+                    on_error="discard",
+                    options={
+                        "profile": "operator-owned-alias",
+                        "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
+                        "lookup": {
+                            "path": "north",
+                            "file": "case.txt",
+                            "mode": "bind_source",
+                            "safe": "kept",
+                        },
+                        "provider_config": {
+                            "persist_directory": "/private/vector-index",
+                            "nested": {"path": "/private/node-input.csv"},
+                        },
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out",
+                    plugin="csv",
+                    options={"path": "/private/output.csv"},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        public_dict = generate_public_pipeline_dict(state)
+        public_yaml = generate_public_yaml(state)
+        serialized = yaml.safe_dump(public_dict)
+
+        assert public_dict == yaml.safe_load(public_yaml)
+        assert all(value not in serialized for value in private_values)
+        assert "blob_ref" not in serialized
+        assert "blob_id" not in serialized
+        assert SOURCE_AUTHORING_KEY not in serialized
+        assert set(public_dict["sources"]) == {"blob_backed", "explicit_null", "path_only"}
+        assert all(source["plugin"] == "csv" for source in public_dict["sources"].values())
+        assert public_dict["transforms"][0]["options"]["lookup"] == {
+            "path": "north",
+            "file": "case.txt",
+            "mode": "bind_source",
+            "safe": "kept",
+        }
+
+    def test_public_projection_preserves_semantic_option_keys_ending_in_blob_id(self) -> None:
+        """Plugin-owned field names are data, not web blob custody."""
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={
+                    "path": "/private/input.csv",
+                    "field_mapping": {"customer_blob_id": "customer_id"},
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="csv", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        public_options = generate_public_pipeline_dict(state)["sources"]["source"]["options"]
+
+        assert public_options["field_mapping"] == {"customer_blob_id": "customer_id"}
+
     def test_public_yaml_strips_guided_blob_storage_path_without_committed_blob_ref(self) -> None:
-        blob_path = "/home/john/elspeth/data/blobs/session/20b944e3_project_pages.json"
+        blob_path = "/srv/elspeth/data/blobs/session/20b944e3_project_pages.json"
         blob_ref = "20b944e3-fd46-434f-b9a2-4fb508db30f0"
         guided_session = replace(
             GuidedSession.initial(),
@@ -594,7 +849,7 @@ class TestGenerateYaml:
         assert blob_path not in public_yaml
 
     def test_public_yaml_fails_closed_when_reviewed_name_drifts_onto_live_blob_path(self) -> None:
-        blob_path = "/home/john/elspeth/data/blobs/session/renamed.json"
+        blob_path = "/srv/elspeth/data/blobs/session/renamed.json"
         stable_id = "11111111-1111-4111-8111-111111111111"
         guided_session = replace(
             GuidedSession.initial(),
@@ -636,7 +891,7 @@ class TestGenerateYaml:
         ids=["none", "empty", "wrong_type", "noncanonical_uuid"],
     )
     def test_public_yaml_rejects_present_invalid_reviewed_blob_ref(self, invalid_blob_ref: object) -> None:
-        blob_path = "/home/john/elspeth/data/blobs/session/source.json"
+        blob_path = "/srv/elspeth/data/blobs/session/source.json"
         stable_id = "11111111-1111-4111-8111-111111111111"
         guided_session = replace(
             GuidedSession.initial(),
@@ -681,14 +936,14 @@ class TestGenerateYaml:
             {"file": ""},
             {"path": None},
             {"file": 123},
-            {"path": "/home/john/elspeth/data/blobs/foreign/source.json", "file": None},
-            {"path": "/home/john/elspeth/data/blobs/foreign/so\x00urce.json"},
+            {"path": "/srv/elspeth/data/blobs/foreign/source.json", "file": None},
+            {"path": "/srv/elspeth/data/blobs/foreign/so\x00urce.json"},
         ],
         ids=["empty_path", "empty_file", "none_path", "wrong_type_file", "valid_path_invalid_file", "nul_path"],
     )
     def test_public_yaml_rejects_invalid_reviewed_path_carriers(self, invalid_carriers: dict[str, object]) -> None:
         stable_id = "11111111-1111-4111-8111-111111111111"
-        live_path = "/home/john/elspeth/data/blobs/foreign/source.json"
+        live_path = "/srv/elspeth/data/blobs/foreign/source.json"
         snapshot_options = {**invalid_carriers, "blob_ref": stable_id}
         guided_session = replace(
             GuidedSession.initial(),
@@ -728,8 +983,8 @@ class TestGenerateYaml:
 
     def test_public_yaml_accepts_two_valid_reviewed_path_carriers(self) -> None:
         stable_id = "11111111-1111-4111-8111-111111111111"
-        path = "/home/john/elspeth/data/blobs/source.json"
-        file = "/home/john/elspeth/data/blobs/source-alias.json"
+        path = "/srv/elspeth/data/blobs/source.json"
+        file = "/srv/elspeth/data/blobs/source-alias.json"
         guided_session = replace(
             GuidedSession.initial(),
             source_order=(stable_id,),
@@ -770,23 +1025,23 @@ class TestGenerateYaml:
         ("reviewed_carriers", "live_options"),
         [
             (
-                {"path": " /home/john/elspeth/data/blobs/bogus.json "},
-                {"path": "/home/john/elspeth/data/blobs/live.json"},
+                {"path": " /srv/elspeth/data/blobs/bogus.json "},
+                {"path": "/srv/elspeth/data/blobs/live.json"},
             ),
-            ({"path": " /home/john/elspeth/data/blobs/bogus.json "}, {"schema": {"mode": "observed"}}),
+            ({"path": " /srv/elspeth/data/blobs/bogus.json "}, {"schema": {"mode": "observed"}}),
             (
-                {"path": "/home/john/elspeth/data/blobs/source.json"},
+                {"path": "/srv/elspeth/data/blobs/source.json"},
                 {
-                    "path": "/home/john/elspeth/data/blobs/source.json",
-                    "file": "/home/john/elspeth/data/blobs/secret.json",
+                    "path": "/srv/elspeth/data/blobs/source.json",
+                    "file": "/srv/elspeth/data/blobs/secret.json",
                 },
             ),
             (
                 {
-                    "path": "/home/john/elspeth/data/blobs/source.json",
-                    "file": "/home/john/elspeth/data/blobs/source-alias.json",
+                    "path": "/srv/elspeth/data/blobs/source.json",
+                    "file": "/srv/elspeth/data/blobs/source-alias.json",
                 },
-                {"path": "/home/john/elspeth/data/blobs/source.json"},
+                {"path": "/srv/elspeth/data/blobs/source.json"},
             ),
         ],
         ids=["mismatched_path", "missing_live_carrier", "extra_live_carrier", "missing_live_reviewed_carrier"],
@@ -835,7 +1090,7 @@ class TestGenerateYaml:
 
     def test_public_yaml_rejects_reviewed_blob_ref_without_string_path_carrier(self) -> None:
         stable_id = "11111111-1111-4111-8111-111111111111"
-        live_path = "/home/john/elspeth/data/blobs/foreign/source.json"
+        live_path = "/srv/elspeth/data/blobs/foreign/source.json"
         guided_session = replace(
             GuidedSession.initial(),
             source_order=(stable_id,),
@@ -1144,6 +1399,109 @@ class TestGenerateYaml:
         assert parsed is None or parsed == {}
 
 
+class TestGenerateRowUnionYaml:
+    def test_row_unions_emit_exact_runtime_shape_in_declared_order(self) -> None:
+        pipeline_dict = generate_pipeline_dict(_make_row_union_pipeline())
+
+        assert pipeline_dict["row_unions"] == [
+            {
+                "name": "variants",
+                "branches": {
+                    "control_branch": "control_scored",
+                    "treatment_branch": "treatment_scored",
+                },
+                "on_success": "compared",
+                "timeout_seconds": 3.5,
+            },
+            {
+                "name": "audit_variants",
+                "branches": {
+                    "audit_control_branch": "audit_control",
+                    "audit_treatment_branch": "audit_treatment",
+                },
+                "on_success": "output",
+            },
+        ]
+
+    def test_row_union_never_emits_synthetic_input_or_inapplicable_fields(self) -> None:
+        row_union = generate_pipeline_dict(_make_row_union_pipeline())["row_unions"][0]
+
+        assert set(row_union) == {"name", "branches", "on_success", "timeout_seconds"}
+        assert not {"plugin", "options", "input", "policy", "merge"} & row_union.keys()
+
+    def test_row_unions_are_in_canonical_section_order(self) -> None:
+        keys = list(generate_pipeline_dict(_make_row_union_pipeline()))
+
+        assert keys.index("sources") < keys.index("gates") < keys.index("row_unions") < keys.index("sinks")
+
+    def test_coalesce_timeout_is_preserved(self) -> None:
+        state = _make_fork_coalesce_pipeline()
+        coalesce = replace(state.nodes[1], timeout_seconds=6.25)
+
+        generated = generate_pipeline_dict(state.with_node(coalesce))
+
+        assert generated["coalesce"][0]["timeout_seconds"] == 6.25
+
+    def test_generated_row_union_yaml_reimports_to_equivalent_composer_state(self) -> None:
+        original = _make_row_union_pipeline()
+
+        reimported = composition_state_from_runtime_yaml(generate_yaml(original))
+
+        assert reimported.to_dict() == original.to_dict()
+
+    def test_imported_row_union_yaml_regenerates_equivalently(self) -> None:
+        imported = composition_state_from_runtime_yaml(
+            """
+row_unions:
+  - name: variants
+    branches:
+      control_branch: control_scored
+      treatment_branch: treatment_scored
+    on_success: compared
+    timeout_seconds: 8.5
+"""
+        )
+
+        assert yaml.safe_load(generate_yaml(imported))["row_unions"] == [
+            {
+                "name": "variants",
+                "branches": {
+                    "control_branch": "control_scored",
+                    "treatment_branch": "treatment_scored",
+                },
+                "on_success": "compared",
+                "timeout_seconds": 8.5,
+            }
+        ]
+
+    def test_generator_fails_closed_when_supported_node_lowering_drifts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer import yaml_generator
+
+        # The lowering table is the guard's derived-from-CODE operand; a
+        # lowering left behind by a removed kind is "obsolete".
+        monkeypatch.setattr(
+            yaml_generator,
+            "_NODE_KIND_LOWERINGS",
+            {**yaml_generator._NODE_KIND_LOWERINGS, "future_structural_node": lambda doc, *, state, state_dict: None},
+        )
+
+        with pytest.raises(RuntimeError, match=r"obsolete YAML lowering for \['future_structural_node'\]"):
+            generate_pipeline_dict(_make_linear_pipeline())
+
+    def test_a_kind_without_a_lowering_block_is_refused_not_silently_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-11d8cb0908 direction B: before the registry, adding a kind to
+        the hand-written set and forgetting its block left the guard passing
+        and the kind silently not lowered. The set is now the table's keys,
+        so a kind with no lowering entry cannot claim to be lowered."""
+        from elspeth.web.composer import yaml_generator
+
+        without_collector = {kind: fn for kind, fn in yaml_generator._NODE_KIND_LOWERINGS.items() if kind != "collector"}
+        monkeypatch.setattr(yaml_generator, "_NODE_KIND_LOWERINGS", without_collector)
+
+        with pytest.raises(RuntimeError, match=r"missing YAML lowering for \['collector'\]"):
+            generate_pipeline_dict(_make_linear_pipeline())
+
+
 def _queue_node(*, description: str | None = None) -> NodeSpec:
     """Canonical structural queue NodeSpec (elspeth-a5b86149d4)."""
     return NodeSpec(
@@ -1300,3 +1658,550 @@ sinks:
         assert dict(reimported_queue.options) == {"description": "interleave point"}
         assert dict(reimported_queue.options) == dict(original_queue.options)
         assert [source.on_success for source in reimported.sources.values()] == ["inbound", "inbound"]
+
+
+class TestGuidedTerminalProofDirectionSplit:
+    """Export and admission consume reviewed history in OPPOSITE directions.
+
+    elspeth-3b45cdb41e (epic elspeth-c1b8b26d32): the EXITED_TO_FREEFORM
+    identity return is correct for export-family consumers and a fail-open for
+    the run-admission proof. These tests pin the export direction unchanged
+    and assert the two directions DISAGREE for an exited session, so a future
+    re-unification fails loudly.
+    """
+
+    _BLOB_REF = "20b944e3-fd46-434f-b9a2-4fb508db30f0"
+    _STABLE_ID = "11111111-1111-4111-8111-111111111111"
+
+    def _guided_state(self, terminal: object) -> CompositionState:
+        from elspeth.web.composer.guided.state_machine import GuidedSession as _GuidedSession
+
+        storage_path = f"/srv/elspeth/data/blobs/session/{self._BLOB_REF}.csv"
+        guided_session = replace(
+            _GuidedSession.initial(),
+            source_order=(self._STABLE_ID,),
+            reviewed_sources={
+                self._STABLE_ID: SourceResolved(
+                    name="source",
+                    plugin="csv",
+                    options={
+                        "path": f"blob:{self._BLOB_REF}",
+                        "schema": {"mode": "observed"},
+                    },
+                    observed_columns=("amount",),
+                    sample_rows=(),
+                    on_validation_failure="discard",
+                )
+            },
+            terminal=terminal,
+        )
+        return CompositionState(
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={"path": storage_path, "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+            guided_session=guided_session,
+        )
+
+    @staticmethod
+    def _exited_terminal() -> object:
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+
+        return TerminalState(
+            kind=TerminalKind.EXITED_TO_FREEFORM,
+            reason=TerminalReason.USER_PRESSED_EXIT,
+            pipeline_yaml=None,
+        )
+
+    @staticmethod
+    def _completed_terminal() -> object:
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalState
+
+        return TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}")
+
+    def test_export_reattach_keeps_exited_identity_return(self) -> None:
+        from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+
+        state = self._guided_state(self._exited_terminal())
+        assert reattach_guided_blob_refs_for_public_export(state) is state
+
+    def test_sessions_route_export_wrapper_keeps_exited_identity_return(self) -> None:
+        from elspeth.web.sessions.routes.composer.state import _reattach_guided_blob_refs
+
+        state = self._guided_state(self._exited_terminal())
+        assert _reattach_guided_blob_refs(state) is state
+
+    def test_admission_derivation_disagrees_with_export_for_exited_terminal(self) -> None:
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        state = self._guided_state(self._exited_terminal())
+
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+
+        assert reattach_guided_blob_refs_for_public_export(state) is state
+        assert derivation.custody_unavailable is False
+        assert derivation.proof_state is not state
+        assert derivation.proof_state.sources["source"].options["blob_ref"] == self._BLOB_REF
+        # The durable state is never mutated by the admission derivation.
+        assert "blob_ref" not in state.sources["source"].options
+
+    @pytest.mark.parametrize("terminal_kind", ["live", "completed"])
+    def test_admission_derivation_matches_export_for_non_exited_terminals(self, terminal_kind: str) -> None:
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        terminal = None if terminal_kind == "live" else self._completed_terminal()
+        state = self._guided_state(terminal)
+
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+        export_state = reattach_guided_blob_refs_for_public_export(state)
+
+        assert derivation.custody_unavailable is False
+        assert derivation.proof_state.to_dict() == export_state.to_dict()
+        assert derivation.proof_state.sources["source"].options["blob_ref"] == self._BLOB_REF
+
+    def test_admission_derivation_fails_closed_when_exited_history_cannot_bind(self) -> None:
+        from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
+
+        base = self._guided_state(self._exited_terminal())
+        state = replace(base, sources={"renamed": base.sources["source"]})
+
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+
+        assert derivation.custody_unavailable is True
+        assert derivation.proof_state is state
+
+    def test_admission_derivation_propagates_binding_failure_for_non_exited_terminals(self) -> None:
+        from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
+
+        base = self._guided_state(None)
+        state = replace(base, sources={"renamed": base.sources["source"]})
+
+        with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+            derive_guided_blob_refs_for_admission_proof(state)
+
+    @pytest.mark.parametrize("terminal_kind", ["exited", "completed"])
+    def test_three_consumers_disagree_on_unbindable_terminal_history(self, terminal_kind: str) -> None:
+        """One shape, three directions (epic elspeth-c1b8b26d32; elspeth-201903a286).
+
+        A terminal session whose retained review can no longer bind to the live
+        sources (the reviewed name was replaced after the terminal) reaches:
+
+        * export — ``reattach_guided_blob_refs_for_public_export``: identity
+          for EXITED (exited history must not shadow a replaced source); strict
+          raise for COMPLETED (the completed pipeline is still the authored one);
+        * admission — ``derive_guided_blob_refs_for_admission_proof``:
+          ``custody_unavailable=True`` for EXITED (blocks, never admits an
+          unproven source); strict raise for COMPLETED;
+        * projection — ``redact_guided_snapshot_storage_paths`` on BOTH
+          terminals: degraded, every carrier masked, named with
+          ``custody_unavailable: true``. Its two consumers are
+          ``routes/_helpers._state_response`` and
+          ``sessions/guided_replay._composition_state_response`` (the guided
+          settlement replays), which pass the same raw sources.
+
+        A future re-unification of the predicate fails this test loudly.
+        """
+        from elspeth.web.composer.redaction import (
+            REDACTED_BLOB_SOURCE_PATH,
+            redact_guided_snapshot_storage_paths,
+            redact_source_storage_path,
+        )
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        terminal = self._exited_terminal() if terminal_kind == "exited" else self._completed_terminal()
+        base = self._guided_state(terminal)
+        state = replace(base, sources={"renamed": base.sources["source"]})
+        storage_path = base.sources["source"].options["path"]
+
+        if terminal_kind == "exited":
+            assert reattach_guided_blob_refs_for_public_export(state) is state
+            derivation = derive_guided_blob_refs_for_admission_proof(state)
+            assert derivation.custody_unavailable is True
+            assert derivation.proof_state is state
+        else:
+            with pytest.raises(AuditIntegrityError, match="guided blob"):
+                reattach_guided_blob_refs_for_public_export(state)
+            with pytest.raises(AuditIntegrityError, match="guided blob"):
+                derive_guided_blob_refs_for_admission_proof(state)
+
+        assert state.guided_session is not None
+        raw_sources = state.to_dict()["sources"]
+        composer_meta = {"guided_session": state.guided_session.to_dict()}
+        generic = redact_source_storage_path({"sources": raw_sources})["sources"]
+        projected_sources, projected_meta = redact_guided_snapshot_storage_paths(generic, composer_meta, raw_sources=raw_sources)
+
+        assert projected_meta is not None and projected_sources is not None
+        assert projected_meta["guided_session"]["custody_unavailable"] is True
+        assert projected_sources["renamed"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+        assert storage_path not in repr((projected_sources, projected_meta))
+        # Projection-only: the durable state never carries the marker.
+        assert "custody_unavailable" not in state.guided_session.to_dict()
+
+
+class TestConditionalKeyGuards:
+    """Conditionally-emitted node keys are read through a guarded accessor.
+
+    ``to_dict()`` emits ``condition``/``routes``/``branches``/``policy``/``merge``
+    only when the NodeSpec field is not None, so a Stage-1-invalid state reaching
+    the generator used to die on a bare ``KeyError`` naming only the key. The
+    accessor raises ``PipelineLoweringError`` naming the node and the field, which
+    the ``validate_pipeline`` seam converts into a red verdict the author can act
+    on. The message keeps Stage 1's phrasing so the composer repair hints route.
+    """
+
+    def test_gate_missing_condition_raises_typed_lowering_error(self) -> None:
+        base = _make_gate_pipeline()
+        state = replace(base, nodes=(replace(base.nodes[0], condition=None),))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "quality_check" in str(exc_info.value)
+        assert "condition" in str(exc_info.value)
+
+    def test_gate_missing_routes_raises_typed_lowering_error(self) -> None:
+        base = _make_gate_pipeline()
+        state = replace(base, nodes=(replace(base.nodes[0], routes=None),))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "quality_check" in str(exc_info.value)
+        assert "routes" in str(exc_info.value)
+        # Exactly the typed class — a blanket rewrite back to bare ValueError
+        # would re-widen the seam's catch to every builtin ValueError.
+        assert type(exc_info.value) is PipelineLoweringError
+
+    def test_row_union_missing_branches_raises_typed_lowering_error(self) -> None:
+        base = _make_row_union_pipeline()
+        state = replace(base, nodes=(base.nodes[0], replace(base.nodes[1], branches=None), base.nodes[2]))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "variants" in str(exc_info.value)
+        assert "branches" in str(exc_info.value)
+
+    def test_coalesce_missing_branches_raises_typed_lowering_error(self) -> None:
+        base = _make_fork_coalesce_pipeline()
+        state = replace(base, nodes=(base.nodes[0], replace(base.nodes[1], branches=None)))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "merge_point" in str(exc_info.value)
+        assert "branches" in str(exc_info.value)
+
+    def test_coalesce_options_raise_instead_of_disappearing_during_lowering(self) -> None:
+        """A validation-bypassing caller still cannot silently erase authored options."""
+        base = _make_fork_coalesce_pipeline()
+        state = replace(
+            base,
+            nodes=(
+                base.nodes[0],
+                replace(base.nodes[1], options={"schema": {"mode": "observed"}}),
+            ),
+        )
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "merge_point" in str(exc_info.value)
+        assert "options" in str(exc_info.value)
+
+    @pytest.mark.parametrize("field_name", ["merge", "policy"])
+    def test_injected_state_dict_missing_coalesce_default_raises_typed_lowering_error(self, field_name: str) -> None:
+        """The injected-state_dict entry point is the only path that can omit these.
+
+        ``NodeSpec.__post_init__`` records the runtime defaults for merge and
+        policy, so no NodeSpec-constructed state reaches these two guards.
+        Defaulting here instead of raising would reopen the drift that
+        normalisation closed — a second default site is a second thing to drift.
+        """
+        state = _make_fork_coalesce_pipeline()
+        state_dict = state.to_dict()
+        coalesce = next(node for node in state_dict["nodes"] if node["node_type"] == "coalesce")
+        del coalesce[field_name]
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            _generate_pipeline_dict(state, omit_source_paths=False, state_dict=state_dict)
+
+        assert "merge_point" in str(exc_info.value)
+        assert field_name in str(exc_info.value)
+
+    def test_nodespec_path_cannot_produce_missing_merge_or_policy(self) -> None:
+        """The construction boundary that keeps those two guards unreachable from real states.
+
+        If either normalisation is removed, the corresponding generator guard
+        becomes the only defence and this test says so.
+        """
+        node = NodeSpec(
+            id="merge_point",
+            node_type="coalesce",
+            plugin=None,
+            input="join",
+            on_success="main_output",
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=("path_a", "path_b"),
+            policy=None,
+            merge=None,
+        )
+
+        assert node.merge == "union"
+        assert node.policy == "require_all"
+
+    def test_pipeline_lowering_error_is_a_value_error(self) -> None:
+        """Compatibility contract the non-validation lowering callers depend on."""
+        assert issubclass(PipelineLoweringError, ValueError)
+        assert not issubclass(PipelineLoweringError, KeyError)
+
+
+class TestProfileLoweringProvenanceStrip:
+    """Scoped export strip for resolved_prompt_template_hash (elspeth-b73666ac82).
+
+    The batch/CLI loader's profile-lowering pass rejects any llm component
+    that both selects a ``profile`` and carries a private profile field, so a
+    profile-selecting export must not emit the hash. A plain provider-config
+    llm node keeps it: there the hash is a declared, drift-validated LLMConfig
+    field and the Landscape<->session-DB audit join anchor.
+    """
+
+    @staticmethod
+    def _state_with_llm_nodes() -> CompositionState:
+        prompt = "Summarize {{ row.text }}"
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="profiled",
+                options={"path": "/data/input.csv", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="profiled",
+                    node_type="transform",
+                    plugin="llm",
+                    input="source_out",
+                    on_success="plain",
+                    on_error="discard",
+                    options={
+                        "profile": "standard",
+                        "prompt_template": prompt,
+                        "resolved_prompt_template_hash": "a" * 64,
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                NodeSpec(
+                    id="plain",
+                    node_type="transform",
+                    plugin="llm",
+                    input="profiled",
+                    on_success="main_output",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "prompt_template": prompt,
+                        "resolved_prompt_template_hash": "b" * 64,
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(
+                EdgeSpec(id="e1", from_node="source", to_node="profiled", edge_type="on_success", label=None),
+                EdgeSpec(id="e2", from_node="profiled", to_node="plain", edge_type="on_success", label=None),
+                EdgeSpec(id="e3", from_node="plain", to_node="main_output", edge_type="on_success", label=None),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="main_output",
+                    plugin="csv",
+                    options={"path": "/data/output.csv"},
+                    on_write_failure="quarantine",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Profiled", description="hash strip pin"),
+            version=1,
+        )
+
+    def _transforms_by_name(self, doc: dict) -> dict[str, dict]:
+        return {t["name"]: t for t in doc["transforms"]}
+
+    def test_profile_selecting_llm_node_exports_without_the_hash(self) -> None:
+        doc = generate_pipeline_dict(self._state_with_llm_nodes())
+        transforms = self._transforms_by_name(doc)
+        assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
+        assert transforms["profiled"]["options"]["profile"] == "standard"
+
+    def test_plain_provider_llm_node_keeps_the_hash(self) -> None:
+        doc = generate_pipeline_dict(self._state_with_llm_nodes())
+        transforms = self._transforms_by_name(doc)
+        assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64
+
+    def test_public_yaml_matches_the_scoped_strip(self) -> None:
+        rendered = generate_public_yaml(self._state_with_llm_nodes())
+        doc = yaml.safe_load(rendered)
+        transforms = self._transforms_by_name(doc)
+        assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
+        assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64
+
+
+class TestPublicExportRedactionMarker:
+    """The public export can name its own redaction (elspeth-06f92da0d9).
+
+    The custody scrub is deliberate and stays; what these tests pin is that
+    the download boundary can say what was stripped instead of presenting the
+    not-runnable YAML bare, and that the marker stays OUT of
+    ``generate_public_yaml`` so the MCP / shareable-review / acceptance-import
+    consumers keep bare bytes. Blob UUIDs never appear (scrub ruling
+    2304d57fb).
+    """
+
+    @staticmethod
+    def _redacted_state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={
+                    "path": "/data/blobs/session/20b944e3_input.csv",
+                    "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out",
+                    plugin="csv",
+                    options={"path": "outputs/out.csv"},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    @staticmethod
+    def _clean_state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_redaction_header_names_each_stripped_component(self) -> None:
+        header = public_export_redaction_header(self._redacted_state())
+
+        assert header.startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+        assert f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob-linkage,local-path" in header
+        assert f"{PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX}out stripped=local-path" in header
+        assert PUBLIC_EXPORT_REBIND_GUIDANCE in header
+        # The marker names categories, never the stripped values themselves.
+        assert "20b944e3" not in header
+        assert "/data/blobs" not in header
+
+    def test_marker_prose_uses_labels_not_raw_option_keys(self) -> None:
+        """The category labels exist to keep custody-egress greps meaningful.
+
+        Sibling consumers assert no literal blob-linkage key token appears in
+        a serialised public artifact (``tests/unit/composer_mcp/test_server.py``,
+        ``tests/unit/web/shareable_reviews/test_service.py``). The labels keep
+        ``blob_ref`` out of the prose; ``blob_id`` survives only inside the
+        ``source_blob_ids`` request-field name the user must actually type,
+        which is the concrete reason this block cannot live in
+        ``generate_public_yaml`` (see the fence test below).
+        """
+        header = public_export_redaction_header(self._redacted_state())
+
+        assert "blob_ref" not in header
+        assert "source_blob_ids" in header
+        assert "blob_id" in header  # only as a substring of source_blob_ids
+        assert "blob_id=" not in header
+
+    def test_generate_public_yaml_stays_bare_for_sibling_consumers(self) -> None:
+        """Fence: the marker must never migrate back into the shared generator.
+
+        ``generate_public_yaml`` also feeds the MCP ``generate_yaml`` tool, the
+        content-addressed shareable-review snapshot, and the ECS acceptance
+        harness's ``POST /state/yaml`` round trip. Header bytes there break the
+        custody-egress greps and make an exporter emit text the importer
+        re-parses. Only ``GET /{session_id}/state/yaml`` composes the header.
+        """
+        rendered = generate_public_yaml(self._redacted_state())
+
+        assert PUBLIC_EXPORT_REDACTION_HEADER not in rendered
+        assert not rendered.startswith("#")
+        assert "blob_ref" not in rendered
+        assert "blob_id" not in rendered
+        assert "source_blob_ids" not in rendered
+
+    def test_header_is_comment_only_and_body_parses_unchanged(self) -> None:
+        state = self._redacted_state()
+
+        document = public_export_redaction_header(state) + generate_public_yaml(state)
+
+        assert yaml.safe_load(document) == generate_public_pipeline_dict(state)
+        # Deterministic for a given state: same bytes on every call.
+        assert public_export_redaction_header(state) + generate_public_yaml(state) == document
+
+    def test_clean_export_carries_no_marker(self) -> None:
+        assert public_export_redaction_header(self._clean_state()) == ""
+
+    def test_public_export_redaction_reports_stripped_keys_per_component(self) -> None:
+        assert public_export_redaction(self._redacted_state()) == {
+            "sources": {"source": ["blob_ref", "path"]},
+            "outputs": {"out": ["path"]},
+        }
+        assert public_export_redaction(self._clean_state()) == {"sources": {}, "outputs": {}}
+
+    def test_marker_labels_cover_every_stripped_key(self) -> None:
+        """A new storage/linkage key must not KeyError inside a user's export.
+
+        ``_marker_labels`` indexes ``_MARKER_LABELS`` directly (house offensive
+        style). This pins the label vocabulary against the same authorities
+        ``public_export_redaction`` reports from, so widening either set fails
+        here rather than 500-ing the export route.
+        """
+        assert set(_MARKER_LABELS) == _PUBLIC_STORAGE_OPTION_KEYS | _PUBLIC_SOURCE_LINKAGE_KEYS

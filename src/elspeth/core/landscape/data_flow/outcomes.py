@@ -44,7 +44,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 
-__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded"]
+__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded", "record_terminal_outcome_guarded"]
 
 # IN-clause chunk size for token-id lock queries — stays under SQLite's
 # default 999 bound-parameter ceiling (the node_states.py convention) and
@@ -201,15 +201,39 @@ class TokenOutcomeRepository:
             )
 
     @staticmethod
+    def _refuse_abandonment_contradiction(
+        ref: TokenRef,
+        *,
+        path: TerminalPath,
+        conn: Connection,
+    ) -> None:
+        """Refuse either half of decided-plus-abandoned after the token lock."""
+        if path is TerminalPath.ABANDONED:
+            contradiction = token_outcomes_table.c.completed == 1
+            description = "a completed terminal outcome"
+        else:
+            contradiction = token_outcomes_table.c.path == TerminalPath.ABANDONED.value
+            description = "an ABANDONED outcome"
+        existing = conn.execute(
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == ref.run_id)
+            .where(token_outcomes_table.c.token_id == ref.token_id)
+            .where(contradiction)
+            .limit(1)
+        ).first()
+        if existing is not None:
+            raise AuditIntegrityError(
+                f"Cannot record {path.value!r} for token {ref.token_id!r}: {description} already exists; "
+                "decided-plus-abandoned history is forbidden (ADR-038)"
+            )
+
+    @staticmethod
     def _validate_outcome_fields(
         outcome: TerminalOutcome | None,
         path: TerminalPath,
         *,
         sink_name: str | None,
         batch_id: str | None,
-        fork_group_id: str | None,
-        join_group_id: str | None,
-        expand_group_id: str | None,
         error_hash: str | None,
     ) -> None:
         """Validate discriminator fields for the (outcome, path) pair.
@@ -228,9 +252,6 @@ class TokenOutcomeRepository:
         field_values = {
             "sink_name": sink_name,
             "batch_id": batch_id,
-            "fork_group_id": fork_group_id,
-            "join_group_id": join_group_id,
-            "expand_group_id": expand_group_id,
             "error_hash": error_hash,
         }
         pair_label = f"({outcome.name if outcome else 'NULL'}, {path.name})"
@@ -413,9 +434,6 @@ class TokenOutcomeRepository:
         sink_node_id: str | None = None,
         artifact_id: str | None = None,
         batch_id: str | None = None,
-        fork_group_id: str | None = None,
-        join_group_id: str | None = None,
-        expand_group_id: str | None = None,
         error_hash: str | None = None,
         context: Mapping[str, object] | None = None,
         conn: Connection | None = None,
@@ -440,9 +458,6 @@ class TokenOutcomeRepository:
             artifact_id: Forward-compatible Phase 4 witness keyword for
                 failsink-paired outcomes. Accepted but not written in Phase 1.
             batch_id: For BATCH_CONSUMED / BUFFERED (REQUIRED)
-            fork_group_id: For FORK_PARENT (REQUIRED)
-            join_group_id: For COALESCED (REQUIRED)
-            expand_group_id: For EXPAND_PARENT (REQUIRED)
             error_hash: Error witness for failure/transient error paths
             context: Optional additional context (stored as JSON)
 
@@ -459,9 +474,6 @@ class TokenOutcomeRepository:
             path,
             sink_name=sink_name,
             batch_id=batch_id,
-            fork_group_id=fork_group_id,
-            join_group_id=join_group_id,
-            expand_group_id=expand_group_id,
             error_hash=error_hash,
         )
         # Canonicalization recursively normalizes caller-controlled data and
@@ -481,6 +493,7 @@ class TokenOutcomeRepository:
             if not dependencies_prelocked:
                 self.lock_token_outcome_dependencies((ref,), conn=active_conn)
             self._ownership.validate_token_run_ownership(ref, conn=active_conn)
+            self._refuse_abandonment_contradiction(ref, path=path, conn=active_conn)
             self._validate_cross_table_invariants(
                 ref,
                 outcome,
@@ -504,9 +517,6 @@ class TokenOutcomeRepository:
                 recorded_at=now(),
                 sink_name=sink_name,
                 batch_id=batch_id,
-                fork_group_id=fork_group_id,
-                join_group_id=join_group_id,
-                expand_group_id=expand_group_id,
                 error_hash=error_hash,
                 context_json=context_json,
             )
@@ -654,12 +664,8 @@ class TokenOutcomeRepository:
                 token_outcomes_table.c.recorded_at,
                 token_outcomes_table.c.sink_name,
                 token_outcomes_table.c.batch_id,
-                token_outcomes_table.c.fork_group_id,
-                token_outcomes_table.c.join_group_id,
-                token_outcomes_table.c.expand_group_id,
                 token_outcomes_table.c.error_hash,
                 token_outcomes_table.c.context_json,
-                token_outcomes_table.c.expected_branches_json,
             )
             .join(
                 tokens_table,
@@ -698,9 +704,6 @@ def record_buffered_outcome_guarded(
         TerminalPath.BUFFERED,
         sink_name=None,
         batch_id=batch_id,
-        fork_group_id=None,
-        join_group_id=None,
-        expand_group_id=None,
         error_hash=None,
     )
     context_json = canonical_json(context) if context is not None else None
@@ -724,4 +727,45 @@ def record_buffered_outcome_guarded(
         ) from exc
     if result.rowcount == 0:
         raise LandscapeRecordError(f"record_buffered_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
+    return outcome_id
+
+
+def record_terminal_outcome_guarded(
+    conn: Connection,
+    *,
+    run_id: str,
+    token_id: str,
+    outcome: TerminalOutcome,
+    path: TerminalPath,
+    recorded_at: datetime,
+    error_hash: str | None = None,
+) -> str:
+    """Record one terminal outcome inside a caller-owned fenced transaction."""
+    TokenOutcomeRepository._validate_outcome_fields(
+        outcome,
+        path,
+        sink_name=None,
+        batch_id=None,
+        error_hash=error_hash,
+    )
+    outcome_id = f"out_{generate_id()[:12]}"
+    try:
+        result = conn.execute(
+            token_outcomes_table.insert().values(
+                outcome_id=outcome_id,
+                run_id=run_id,
+                token_id=token_id,
+                outcome=outcome.value,
+                path=path.value,
+                completed=1,
+                recorded_at=recorded_at,
+                error_hash=error_hash,
+            )
+        )
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"record_terminal_outcome_guarded failed for token_id={token_id!r} — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if result.rowcount == 0:
+        raise LandscapeRecordError(f"record_terminal_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
     return outcome_id

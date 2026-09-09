@@ -4,27 +4,38 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock, Mock, create_autospec
 
 import pytest
 from sqlalchemy import Connection, Engine, create_engine
 
+import elspeth.web.doctor as doctor
+from elspeth.contracts.plugin_capabilities import (
+    CapabilityDeclaration,
+    ControlRole,
+    PluginCapability,
+)
 from elspeth.core.config import TelemetrySettings
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
 from elspeth.web.doctor import (
     _aws_operator_telemetry_check,
+    _aws_textract_plugin_check,
     _bedrock_guardrail_plugins_check,
     _initialize_database,
     _inspect_database,
     collect_checks,
+    collect_deployment_checks,
     database_target_check,
     plugin_and_dependency_checks,
+    postgres_tls_check,
     probe_directory_writable,
     sanitize_error,
     schema_check,
@@ -56,11 +67,11 @@ def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
         "operator_telemetry_task_definition_family": "elspeth-web-task",
         "operator_telemetry_task_definition_revision": "1",
         "host": "0.0.0.0",
-        "session_db_url": "postgresql+psycopg://doctor:secret@db/session",
-        "landscape_url": "postgresql+psycopg://doctor:secret@db/landscape",
+        "session_db_url": (f"postgresql+psycopg://doctor:secret@db/session?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"),
+        "landscape_url": (f"postgresql+psycopg://doctor:secret@db/landscape?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"),
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
-        "secret_key": "s" * 40,
+        "secret_key": "this-doctor-secret-is-long-enough",
         "shareable_link_signing_key": bytes(range(32)),
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
@@ -75,6 +86,18 @@ def _by_name(checks: list[ContractCheck]) -> dict[str, ContractCheck]:
     return {check.name: check for check in checks}
 
 
+@pytest.fixture(autouse=True)
+def _verified_rds_trust_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck("rds_trust_root", True, "immutable RDS trust root verified"),
+    )
+
+
+_REAL_TRUST_ROOT_CHECK = doctor._aws_rds_trust_root_check
+
+
 def test_sanitize_error_exposes_only_context_and_exception_class() -> None:
     detail = sanitize_error(
         "payload probe failed",
@@ -87,10 +110,12 @@ def test_sanitize_error_exposes_only_context_and_exception_class() -> None:
     assert "/srv/private" not in detail
 
 
-def test_existing_directory_probe_succeeds_without_named_artifact(tmp_path: Path) -> None:
-    check = probe_directory_writable("payload", tmp_path)
+@pytest.mark.parametrize("label", ["data_dir", "payload_store", "blob"])
+def test_owner_only_trust_root_probe_succeeds_without_named_artifact(tmp_path: Path, label: str) -> None:
+    tmp_path.chmod(0o700)
+    check = probe_directory_writable(label, tmp_path)
 
-    assert check == ContractCheck("payload_writable", True, "payload directory is writable")
+    assert check == ContractCheck(f"{label}_writable", True, f"{label} directory is writable")
     assert list(tmp_path.glob(".doctor-probe-*")) == []
 
 
@@ -248,61 +273,78 @@ def test_payload_symlink_fails_before_active_probe_and_redacts_path(tmp_path: Pa
     # the raw public field shape here so this unit test exercises doctor's own
     # symlink boundary independently of that earlier normalization layer.
     settings = _settings(tmp_path).model_copy(update={"payload_store_path": symlink})
-    probed: list[Path | None] = []
-    real_probe = doctor.probe_directory_writable
+    real_mkstemp = doctor.tempfile.mkstemp
 
-    def spy_probe(label: str, path: Path | None) -> ContractCheck:
-        if label == "payload_store":
-            probed.append(path)
-        return real_probe(label, path)
+    def spy_mkstemp(*, prefix: str, dir: Path) -> tuple[int, str]:
+        if dir in (symlink, target):
+            pytest.fail("symlink must not be probed")
+        return real_mkstemp(prefix=prefix, dir=dir)
 
-    monkeypatch.setattr(doctor, "probe_directory_writable", spy_probe)
+    monkeypatch.setattr(doctor.tempfile, "mkstemp", spy_mkstemp)
 
     check = _by_name(collect_checks(settings))["payload_store_writable"]
 
     assert check.ok is False
-    assert probed == []
     assert str(symlink) not in check.detail
     assert str(target) not in check.detail
 
 
-def test_blob_symlink_fails_before_active_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("label", ["data_dir", "payload_store", "blob"])
+def test_trust_root_symlink_fails_before_active_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
     import elspeth.web.doctor as doctor
 
-    target = tmp_path / "blob-target"
+    target = tmp_path / "target"
     target.mkdir()
-    link = tmp_path / "blob-link"
+    link = tmp_path / "link"
     link.symlink_to(target, target_is_directory=True)
     monkeypatch.setattr(doctor.tempfile, "mkstemp", lambda **_kwargs: pytest.fail("symlink must not be probed"))
 
-    check = probe_directory_writable("blob", link)
+    check = probe_directory_writable(label, link)
 
-    assert check == ContractCheck("blob_writable", False, "blob directory must not be a symlink")
+    assert check == ContractCheck(f"{label}_writable", False, f"{label} directory must not be a symlink")
 
 
-def test_group_or_world_writable_payload_fails_before_active_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("label", "path_for", "check_name"),
+    [
+        ("data_dir", lambda settings: settings.data_dir, "data_dir_writable"),
+        ("payload_store", lambda settings: settings.payload_store_path, "payload_store_writable"),
+        ("blob", lambda settings: settings.data_dir / "blobs", "blob_writable"),
+    ],
+)
+@pytest.mark.parametrize("unsafe_mode", [0o720, 0o702])
+def test_group_or_world_writable_trust_root_fails_before_active_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    path_for: Callable[[WebSettings], Path | None],
+    check_name: str,
+    unsafe_mode: int,
+) -> None:
     import elspeth.web.doctor as doctor
 
-    payload = tmp_path / "insecure-payload"
-    payload.mkdir(mode=0o700)
-    payload.chmod(0o770)
-    settings = _settings(tmp_path, payload_store_path=payload)
-    probed = False
-    real_probe = doctor.probe_directory_writable
+    settings = _settings(tmp_path)
+    insecure_root = path_for(settings)
+    assert insecure_root is not None
+    insecure_root.chmod(unsafe_mode)
+    probed_paths: list[Path] = []
+    real_mkstemp = doctor.tempfile.mkstemp
 
-    def spy_probe(label: str, path: Path | None) -> ContractCheck:
-        nonlocal probed
-        if label == "payload_store":
-            probed = True
-        return real_probe(label, path)
+    def spy_mkstemp(*, prefix: str, dir: Path) -> tuple[int, str]:
+        probed_paths.append(dir)
+        return real_mkstemp(prefix=prefix, dir=dir)
 
-    monkeypatch.setattr(doctor, "probe_directory_writable", spy_probe)
+    monkeypatch.setattr(doctor.tempfile, "mkstemp", spy_mkstemp)
 
-    check = _by_name(collect_checks(settings))["payload_store_writable"]
+    check = _by_name(collect_checks(settings))[check_name]
 
     assert check.ok is False
-    assert probed is False
-    assert str(payload) not in check.detail
+    assert insecure_root not in probed_paths
+    assert str(insecure_root) not in check.detail
     assert "group/world-writable" in check.detail
 
 
@@ -333,7 +375,9 @@ def test_capability_failures_are_isolated_and_preserve_complete_report(monkeypat
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "psycopg_dependency",
+        "psycopg2_dependency",
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
@@ -341,6 +385,16 @@ def test_capability_failures_are_isolated_and_preserve_complete_report(monkeypat
     assert by_name["aws_s3_plugin"].ok is False
     assert "password" not in by_name["aws_s3_plugin"].detail
     assert all(check.detail for check in checks)
+
+
+def test_shared_dependency_checks_exclude_aws_only_capabilities() -> None:
+    names = [check.name for check in plugin_and_dependency_checks(include_aws_checks=False)]
+
+    assert names == [
+        "psycopg_dependency",
+        "psycopg2_dependency",
+        "jinja2_dependency",
+    ]
 
 
 def test_operator_telemetry_check_resolves_actual_effective_policy(tmp_path: Path) -> None:
@@ -392,7 +446,7 @@ def test_operator_telemetry_check_rejects_policy_shape_and_endpoint_drift(
     assert _aws_operator_telemetry_check(settings).ok is False
 
 
-def test_guardrail_registration_check_requires_positive_detection_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_guardrail_registration_check_rejects_string_capability_impostors(monkeypatch: pytest.MonkeyPatch) -> None:
     import elspeth.plugins.infrastructure.manager as manager_module
 
     class _Manager:
@@ -405,7 +459,7 @@ def test_guardrail_registration_check_requires_positive_detection_blocking(monke
                         SimpleNamespace(
                             capability="prompt_shield",
                             control_role="input",
-                            blocks_positive_detection=False,
+                            blocks_positive_detection=True,
                         ),
                     ),
                 ),
@@ -426,11 +480,87 @@ def test_guardrail_registration_check_requires_positive_detection_blocking(monke
     assert _bedrock_guardrail_plugins_check().ok is False
 
 
+def test_guardrail_registration_check_accepts_typed_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.infrastructure.manager as manager_module
+
+    class _Manager:
+        @staticmethod
+        def get_transforms() -> list[object]:
+            return [
+                SimpleNamespace(
+                    name="aws_bedrock_prompt_shield",
+                    policy_capabilities=(
+                        CapabilityDeclaration(
+                            capability=PluginCapability.PROMPT_SHIELD,
+                            control_role=ControlRole.INPUT,
+                            blocks_positive_detection=True,
+                        ),
+                    ),
+                ),
+                SimpleNamespace(
+                    name="aws_bedrock_content_safety",
+                    policy_capabilities=(
+                        CapabilityDeclaration(
+                            capability=PluginCapability.CONTENT_SAFETY,
+                            control_role=ControlRole.OUTPUT,
+                            blocks_positive_detection=True,
+                        ),
+                    ),
+                ),
+            ]
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", _Manager)
+
+    assert _bedrock_guardrail_plugins_check().ok is True
+
+
+def test_textract_registration_check_accepts_registered_transform() -> None:
+    check = _aws_textract_plugin_check()
+
+    assert check == ContractCheck(
+        "aws_textract_plugin",
+        True,
+        "aws_textract_document_analysis transform is registered",
+    )
+
+
+def test_textract_registration_check_fails_when_transform_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.infrastructure.manager as manager_module
+
+    class _Manager:
+        @staticmethod
+        def get_transforms() -> list[object]:
+            return [SimpleNamespace(name="llm")]
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", _Manager)
+
+    check = _aws_textract_plugin_check()
+
+    assert check.ok is False
+    assert check.detail == "aws_textract_document_analysis transform must be registered"
+
+
+def test_textract_registration_check_redacts_discovery_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.infrastructure.manager as manager_module
+
+    def fail_manager() -> object:
+        raise RuntimeError("postgresql://user:password@private/db")  # secret-scan: allow-this-line
+
+    monkeypatch.setattr(manager_module, "get_shared_plugin_manager", fail_manager)
+
+    check = _aws_textract_plugin_check()
+
+    assert check.ok is False
+    assert "password" not in check.detail
+    assert "private" not in check.detail
+
+
 @pytest.mark.parametrize(
     ("module_name", "check_name"),
     [
         ("elspeth.plugins.transforms.llm.transform", "bedrock_provider"),
         ("psycopg", "psycopg_dependency"),
+        ("psycopg2", "psycopg2_dependency"),
         ("boto3", "boto3_dependency"),
         ("ijson", "ijson_dependency"),
         ("jinja2", "jinja2_dependency"),
@@ -455,7 +585,7 @@ def test_each_lazy_import_failure_keeps_other_named_checks(
     checks = plugin_and_dependency_checks()
     by_name = _by_name(checks)
 
-    assert len(checks) == 8
+    assert len(checks) == 10
     assert by_name[check_name].ok is False
     assert "secret import failure" not in by_name[check_name].detail
     assert "/private/path" not in by_name[check_name].detail
@@ -476,15 +606,219 @@ def test_collection_never_touches_auth_db(tmp_path: Path, monkeypatch: pytest.Mo
     assert all("auth" not in check.name for check in checks)
 
 
+def test_collection_blocks_postgresql_tls_downgrade_before_database_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_database_states(monkeypatch, SchemaState.CURRENT, SchemaState.CURRENT, events)
+    settings = _settings(
+        tmp_path,
+        session_db_url=("postgresql+psycopg://doctor:secret@db/session?sslmode=disable&sslrootcert=/private/ca.pem"),
+    )
+
+    checks = _by_name(collect_checks(settings))
+
+    assert checks["session_db_url"].ok is False
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+    assert events == []
+    assert "/private/ca.pem" not in repr(checks)
+
+
+def test_failed_trust_root_blocks_every_database_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    events: list[str] = []
+    _patch_database_states(
+        monkeypatch,
+        SchemaState.CURRENT,
+        SchemaState.CURRENT,
+        events,
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_aws_rds_trust_root_check",
+        lambda: ContractCheck(
+            "rds_trust_root",
+            False,
+            "immutable RDS trust root verification failed (digest_mismatch)",
+        ),
+    )
+
+    all_checks = collect_checks(_settings(tmp_path))
+    checks = _by_name(all_checks)
+
+    assert checks["rds_trust_root"].ok is False
+    assert [check.name for check in all_checks][-4:] == [
+        "session_tls",
+        "landscape_tls",
+        "session_schema",
+        "landscape_schema",
+    ]
+    assert checks["session_tls"].ok is False
+    assert checks["landscape_tls"].ok is False
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+    assert events == []
+
+
+def test_trust_root_check_formats_real_digest_mismatch_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doctor.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: (_ for _ in ()).throw(
+            doctor.aws_rds_trust.AwsRdsTrustBundleError(
+                "digest_mismatch",
+                actual_sha256="f" * 64,
+            )
+        ),
+    )
+
+    check = _REAL_TRUST_ROOT_CHECK()
+
+    assert check.name == "rds_trust_root"
+    assert check.ok is False
+    assert "digest_mismatch" in check.detail
+    assert str(doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH) in check.detail
+    assert doctor.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256 in check.detail
+    assert "f" * 64 in check.detail
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+)
+def test_deployment_collector_has_identical_common_contract_for_every_external_target(
+    target: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_database_states(monkeypatch, SchemaState.CURRENT, SchemaState.CURRENT, events)
+
+    checks = collect_deployment_checks(
+        _settings(
+            tmp_path,
+            deployment_target=target,
+            deployment_state_mode="external-postgresql",
+        )
+    )
+
+    assert [check.name for check in checks] == [
+        "deployment_target",
+        "deployment_state_mode",
+        "session_db_url",
+        "landscape_url",
+        "separate_db_targets",
+        "data_dir",
+        "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
+        "data_dir_writable",
+        "payload_store_writable",
+        "blob_writable",
+        "psycopg_dependency",
+        "psycopg2_dependency",
+        "jinja2_dependency",
+        "session_schema",
+        "landscape_schema",
+    ]
+    assert _by_name(checks)["session_schema"] == ContractCheck("session_schema", True, "current")
+    assert _by_name(checks)["landscape_schema"] == ContractCheck("landscape_schema", True, "current")
+    assert not {
+        "aws_s3_plugin",
+        "bedrock_provider",
+        "aws_operator_telemetry",
+        "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
+        "boto3_dependency",
+        "ijson_dependency",
+    }.intersection(_by_name(checks))
+    assert events == ["inspect:session_schema", "inspect:landscape_schema"]
+
+
+def test_deployment_init_schema_rejects_sqlite_mode_before_any_database_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    settings = _settings(
+        tmp_path,
+        deployment_target="linux-systemd",
+        deployment_state_mode="sqlite-single",
+        session_db_url="sqlite:///private-session.db",
+        landscape_url="sqlite:///private-landscape.db",
+    )
+    monkeypatch.setattr(doctor, "_inspect_database", lambda *_args, **_kwargs: pytest.fail("must not inspect SQLite"))
+    monkeypatch.setattr(
+        doctor,
+        "_initialize_database",
+        lambda *_args, **_kwargs: pytest.fail("must not initialize or replace SQLite"),
+    )
+
+    checks = _by_name(collect_deployment_checks(settings, init_schema=True))
+
+    assert checks["deployment_state_mode"] == ContractCheck(
+        "deployment_state_mode",
+        False,
+        "ELSPETH_WEB__DEPLOYMENT_STATE_MODE must resolve to external PostgreSQL for this startup contract",
+    )
+    assert checks["session_schema"].ok is False
+    assert checks["landscape_schema"].ok is False
+
+
+def test_aws_compatibility_collector_rejects_non_aws_target_before_common_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.doctor as doctor
+
+    monkeypatch.setattr(
+        doctor,
+        "_collect_deployment_checks",
+        lambda *_args, **_kwargs: pytest.fail("must require aws-ecs before common collection"),
+        raising=False,
+    )
+
+    checks = collect_checks(
+        _settings(
+            tmp_path,
+            deployment_target="azure-container-apps",
+            deployment_state_mode="external-postgresql",
+        )
+    )
+
+    assert checks == [
+        ContractCheck(
+            "deployment_target",
+            False,
+            "ELSPETH_WEB__DEPLOYMENT_TARGET must be aws-ecs",
+        )
+    ]
+
+
 def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
     names = [check.name for check in collect_checks(_settings(tmp_path))]
 
     assert names == [
         "deployment_target",
+        "deployment_state_mode",
         "session_db_url",
         "landscape_url",
+        "separate_db_targets",
         "data_dir",
         "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
         "operator_telemetry",
         "operator_telemetry_environment",
         "operator_telemetry_release",
@@ -492,10 +826,6 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "operator_telemetry_ecs_service",
         "operator_telemetry_task_definition_family",
         "operator_telemetry_task_definition_revision",
-        "host",
-        "secret_key",
-        "shareable_link_signing_key",
-        "separate_db_targets",
         "data_dir_writable",
         "payload_store_writable",
         "blob_writable",
@@ -503,10 +833,15 @@ def test_task1_check_names_are_exact_ordered_and_unique(tmp_path: Path) -> None:
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "psycopg_dependency",
+        "psycopg2_dependency",
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
+        "rds_trust_root",
+        "session_tls",
+        "landscape_tls",
         "session_schema",
         "landscape_schema",
     ]
@@ -584,7 +919,9 @@ def _patch_auxiliary_checks_green(monkeypatch: pytest.MonkeyPatch) -> None:
                 "bedrock_provider",
                 "aws_operator_telemetry",
                 "bedrock_guardrail_plugins",
+                "aws_textract_plugin",
                 "psycopg_dependency",
+                "psycopg2_dependency",
                 "boto3_dependency",
                 "ijson_dependency",
                 "jinja2_dependency",
@@ -657,6 +994,36 @@ def test_schema_state_details_are_static(label: str, state: SchemaState, ok: boo
     assert schema_check(label, state) == ContractCheck(label, ok, detail)
 
 
+@pytest.mark.parametrize(
+    ("label", "row", "ok"),
+    [
+        ("session_schema", (True, "TLSv1.3", 256), True),
+        ("landscape_schema", (True, "TLSv1.2", 256), True),
+        ("session_schema", (False, None, None), False),
+        ("landscape_schema", None, False),
+        ("session_schema", (True, "TLSv1.3", 64), False),
+        ("landscape_schema", (True, "SSLv3", 256), False),
+    ],
+)
+def test_postgres_tls_check_is_named_redacted_and_fail_closed(
+    label: str,
+    row: tuple[object, ...] | None,
+    ok: bool,
+) -> None:
+    connection = MagicMock(spec_set=Connection)
+    connection.execute.return_value.one_or_none.return_value = row
+
+    check = postgres_tls_check(label, connection)
+
+    expected_name = "session_tls" if label == "session_schema" else "landscape_tls"
+    assert check.name == expected_name
+    assert check.ok is ok
+    assert "pg_stat_ssl" not in check.detail
+    assert str(connection.execute.call_args.args[0]) == (
+        "SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()"
+    )
+
+
 def _engine_with_connection() -> tuple[MagicMock, MagicMock]:
     engine = MagicMock(spec_set=Engine)
     connection = MagicMock(spec_set=Connection)
@@ -667,8 +1034,10 @@ def _engine_with_connection() -> tuple[MagicMock, MagicMock]:
 
 
 @pytest.mark.parametrize("label", ["session_schema", "landscape_schema"])
+@pytest.mark.parametrize("require_authenticated_tls", [False, True])
 def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     label: str,
+    require_authenticated_tls: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import elspeth.web.doctor as doctor
@@ -678,10 +1047,15 @@ def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     landscape_factory = create_autospec(create_engine, return_value=engine)
     monkeypatch.setattr(doctor, "create_session_engine", session_factory)
     monkeypatch.setattr(doctor, "create_engine", landscape_factory)
+    if require_authenticated_tls:
+        connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
     probe = create_autospec(probe_session_schema, return_value=SchemaState.CURRENT)
+    manager = Mock(spec_set=["execute", "probe"])
+    manager.attach_mock(connection.execute, "execute")
+    manager.attach_mock(probe, "probe")
     raw_url = "postgresql+psycopg://user:password@host/database"
 
-    state, check = _inspect_database(label, raw_url, probe)
+    state, check, tls_check = _inspect_database(label, raw_url, probe, require_authenticated_tls=require_authenticated_tls)
 
     assert state is SchemaState.CURRENT
     assert check == ContractCheck(label, True, "current")
@@ -695,18 +1069,38 @@ def test_inspect_database_forwards_pool_and_timeout_and_uses_one_connection(
     expected_factory.assert_called_once_with(raw_url, **expected_kwargs)
     (landscape_factory if label == "session_schema" else session_factory).assert_not_called()
     probe.assert_called_once_with(connection)
-    assert str(connection.execute.call_args.args[0]) == "SELECT 1"
     engine.dispose.assert_called_once_with()
+    expected_tls_name = "session_tls" if label == "session_schema" else "landscape_tls"
+    if require_authenticated_tls:
+        assert tls_check == ContractCheck(
+            expected_tls_name,
+            True,
+            "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+        )
+        assert str(connection.execute.call_args.args[0]) == (
+            "SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()"
+        )
+        # TLS is queried on the same connection, before the schema probe.
+        assert [entry[0] for entry in manager.mock_calls if entry[0] in ("execute", "probe")] == [
+            "execute",
+            "probe",
+        ]
+    else:
+        assert tls_check is None
+        assert str(connection.execute.call_args.args[0]) == "SELECT 1"
 
 
 @pytest.mark.parametrize("failure_site", ["connect", "probe"])
+@pytest.mark.parametrize("require_authenticated_tls", [False, True])
 def test_inspect_database_disposes_after_connection_and_probe_failures(
     failure_site: str,
+    require_authenticated_tls: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import elspeth.web.doctor as doctor
 
-    engine, _connection = _engine_with_connection()
+    engine, connection = _engine_with_connection()
+    connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
     if failure_site == "connect":
         engine.connect.return_value.__enter__.side_effect = RuntimeError(
             "postgresql://user:secret@private/db"  # secret-scan: allow-this-line
@@ -723,16 +1117,83 @@ def test_inspect_database_disposes_after_connection_and_probe_failures(
     session_factory = create_autospec(create_session_engine, return_value=engine)
     monkeypatch.setattr(doctor, "create_session_engine", session_factory)
 
-    state, check = _inspect_database(
+    state, check, tls_check = _inspect_database(
         "session_schema",
         "postgresql+psycopg://user:password@host/database",
         probe,
+        require_authenticated_tls=require_authenticated_tls,
     )
 
     assert state is None
     assert check.ok is False
     assert "secret" not in check.detail
     assert "private" not in check.detail
+    engine.dispose.assert_called_once_with()
+
+    if not require_authenticated_tls:
+        assert tls_check is None
+        if failure_site == "probe":
+            assert str(connection.execute.call_args.args[0]) == "SELECT 1"
+    elif failure_site == "probe":
+        # The probe failed after TLS was already proven; that evidence is retained.
+        assert tls_check == ContractCheck(
+            "session_tls",
+            True,
+            "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+        )
+        assert str(connection.execute.call_args.args[0]) == (
+            "SELECT ssl, version, bits FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()"
+        )
+    else:
+        # The connection never opened, so no TLS evidence was ever collected.
+        assert tls_check == ContractCheck(
+            "session_tls",
+            False,
+            "authenticated PostgreSQL TLS is not active",
+        )
+        connection.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SessionSchemaError("secret compatibility cause"),
+        SchemaCompatibilityError("secret compatibility cause"),
+    ],
+)
+def test_inspect_database_stale_schema_after_proven_tls_does_not_read_as_transport_failure(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale-schema failure discovered after TLS was proven must retain that
+    TLS evidence rather than read as a transport failure (doctor JSON is
+    release-admission evidence)."""
+    import elspeth.web.doctor as doctor
+
+    engine, connection = _engine_with_connection()
+    connection.execute.return_value.one_or_none.return_value = (True, "TLSv1.3", 256)
+    probe = create_autospec(probe_session_schema, side_effect=error)
+    session_factory = create_autospec(create_session_engine, return_value=engine)
+    monkeypatch.setattr(doctor, "create_session_engine", session_factory)
+
+    state, check, tls_check = _inspect_database(
+        "session_schema",
+        "postgresql+psycopg://user:password@host/database",
+        probe,
+        require_authenticated_tls=True,
+    )
+
+    assert state is SchemaState.STALE
+    assert check == ContractCheck(
+        "session_schema",
+        False,
+        "stale; drop and recreate the session database, then rerun doctor",
+    )
+    assert tls_check == ContractCheck(
+        "session_tls",
+        True,
+        "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+    )
     engine.dispose.assert_called_once_with()
 
 
@@ -843,12 +1304,23 @@ def _patch_database_states(
 ) -> None:
     import elspeth.web.doctor as doctor
 
-    def inspect(label: str, _url: str, _probe: object) -> tuple[SchemaState | None, ContractCheck]:
+    def inspect(
+        label: str, _url: str, _probe: object, *, require_authenticated_tls: bool
+    ) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
         events.append(f"inspect:{label}")
         state = session if label == "session_schema" else landscape
+        tls_check = (
+            ContractCheck(
+                "session_tls" if label == "session_schema" else "landscape_tls",
+                True,
+                "authenticated PostgreSQL TLS is active (TLSv1.3, 256 bits)",
+            )
+            if require_authenticated_tls
+            else None
+        )
         if state is None:
-            return None, ContractCheck(label, False, f"{label} connection failed (RuntimeError)")
-        return state, schema_check(label, state)
+            return None, ContractCheck(label, False, f"{label} connection failed (RuntimeError)"), tls_check
+        return state, schema_check(label, state), tls_check
 
     monkeypatch.setattr(doctor, "_inspect_database", inspect)
 
@@ -936,7 +1408,9 @@ def test_any_auxiliary_preflight_failure_blocks_all_initializers(
                     "bedrock_provider",
                     "aws_operator_telemetry",
                     "bedrock_guardrail_plugins",
+                    "aws_textract_plugin",
                     "psycopg_dependency",
+                    "psycopg2_dependency",
                     "boto3_dependency",
                     "ijson_dependency",
                     "jinja2_dependency",
@@ -1005,10 +1479,15 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
 
     assert names == [
         "deployment_target",
+        "deployment_state_mode",
         "session_db_url",
         "landscape_url",
+        "separate_db_targets",
         "data_dir",
         "payload_store_path",
+        "host",
+        "secret_key",
+        "shareable_link_signing_key",
         "operator_telemetry",
         "operator_telemetry_environment",
         "operator_telemetry_release",
@@ -1016,10 +1495,6 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "operator_telemetry_ecs_service",
         "operator_telemetry_task_definition_family",
         "operator_telemetry_task_definition_revision",
-        "host",
-        "secret_key",
-        "shareable_link_signing_key",
-        "separate_db_targets",
         "data_dir_writable",
         "payload_store_writable",
         "blob_writable",
@@ -1027,10 +1502,15 @@ def test_task2_order_remains_exact_and_unique_after_database_inspection(tmp_path
         "bedrock_provider",
         "aws_operator_telemetry",
         "bedrock_guardrail_plugins",
+        "aws_textract_plugin",
         "psycopg_dependency",
+        "psycopg2_dependency",
         "boto3_dependency",
         "ijson_dependency",
         "jinja2_dependency",
+        "rds_trust_root",
+        "session_tls",
+        "landscape_tls",
         "session_schema",
         "landscape_schema",
     ]

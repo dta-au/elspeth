@@ -1,0 +1,28 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: routing
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: route_by_value
+    input: routing
+    condition: "row['value'] >= 20"
+    routes: {"true": accepted, "false": rejected}
+sinks:
+  accepted:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_accepted}
+      format: jsonl
+      schema: {mode: observed}
+  rejected:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_rejected}
+      format: jsonl
+      schema: {mode: observed}

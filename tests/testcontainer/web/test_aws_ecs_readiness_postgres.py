@@ -13,17 +13,18 @@ from typing import Any
 
 import psycopg
 import pytest
+from fastapi import FastAPI
 from psycopg import sql
 from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import URL, make_url
 from structlog.testing import capture_logs
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 import elspeth.web.readiness as readiness_module
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceMembership
 from elspeth.web.readiness import READINESS_CHECK_NAMES
 from elspeth.web.schema_probe import (
     SchemaState,
@@ -34,7 +35,10 @@ from elspeth.web.schema_probe import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 
@@ -63,20 +67,26 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
     assert parsed.host is not None
     assert parsed.username is not None
     assert parsed.database is not None
-    return psycopg.connect(
-        host=parsed.host,
-        port=parsed.port or 5432,
-        dbname=parsed.database,
-        user=parsed.username,
-        password=parsed.password,
-        autocommit=True,
-    )
+    psycopg_url = parsed.set(drivername="postgresql").render_as_string(hide_password=False)
+    return psycopg.connect(psycopg_url, autocommit=True)
 
 
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+def _grant_web_instances_dml(session_owner_url: str, runtime_role: str) -> None:
+    """Grant INSERT and UPDATE on the one table a booting replica writes.
+
+    Read-only is no longer enough for the runtime role: a PostgreSQL replica
+    registers itself in ``web_instances`` during the lifespan, needing UPDATE
+    for the ``SELECT ... FOR UPDATE`` that claims the row and INSERT for a
+    first registration. Deliberately not a blanket DML grant — this helper is
+    what proves which privileges boot actually requires. The table lives in the
+    session database only; an absent table is skipped because provisioning may
+    run before schema init.
+    """
+    with _psycopg_connect(session_owner_url) as owner:
+        existing = owner.execute("SELECT to_regclass('public.web_instances')").fetchone()
+        if existing is None or existing[0] is None:
+            return
+        owner.execute(sql.SQL("GRANT INSERT, UPDATE ON web_instances TO {}").format(sql.Identifier(runtime_role)))
 
 
 @dataclass
@@ -136,6 +146,7 @@ class _RuntimeDatabases:
                 owner.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
                 owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
                 owner.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
+        _grant_web_instances_dml(self.session_owner_url, self.runtime_role)
         self.role_created = True
 
     def set_login(self, *, enabled: bool) -> None:
@@ -150,21 +161,21 @@ class _RuntimeDatabases:
 
 
 @pytest.fixture
-def runtime_databases(postgres_url: str) -> Iterator[_RuntimeDatabases]:
+def runtime_databases(external_deployment_postgres_url: str) -> Iterator[_RuntimeDatabases]:
     databases = _RuntimeDatabases(
-        postgres_url=postgres_url,
+        postgres_url=external_deployment_postgres_url,
         session_database=_identifier("ready_session"),
         landscape_database=_identifier("ready_landscape"),
         runtime_role=_identifier("ready_runtime"),
         runtime_password=f"runtime-{uuid.uuid4().hex}",
     )
-    with _psycopg_connect(postgres_url) as admin:
+    with _psycopg_connect(databases.postgres_url) as admin:
         for database in (databases.session_database, databases.landscape_database):
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
     try:
         yield databases
     finally:
-        with _psycopg_connect(postgres_url) as admin:
+        with _psycopg_connect(databases.postgres_url) as admin:
             for database in (databases.session_database, databases.landscape_database):
                 admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
             if databases.role_created:
@@ -191,7 +202,7 @@ def _settings(tmp_path: Path, databases: _RuntimeDatabases) -> WebSettings:
         payload_store_path=payload_dir,
         session_db_url=databases.session_runtime_url,
         landscape_url=databases.landscape_runtime_url,
-        secret_key="s" * 40,
+        secret_key="readiness-production-shaped-test-secret-40",
         shareable_link_signing_key=SecretBytes(bytes(range(32))),
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
@@ -201,7 +212,7 @@ def _settings(tmp_path: Path, databases: _RuntimeDatabases) -> WebSettings:
     )
 
 
-def _initialized_app(tmp_path: Path, databases: _RuntimeDatabases) -> tuple[object, Engine, Engine]:
+def _initialized_app(tmp_path: Path, databases: _RuntimeDatabases) -> tuple[FastAPI, Engine, Engine]:
     session_owner = create_session_engine(databases.session_owner_url)
     landscape_owner = create_engine(databases.landscape_owner_url)
     init_session_schema(session_owner)
@@ -224,10 +235,39 @@ def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_database
         payload = response.json()
         assert payload["ready"] is True
         assert [check["name"] for check in payload["checks"]] == list(READINESS_CHECK_NAMES)
-        assert len({check["name"] for check in payload["checks"]}) == 8
+        assert len({check["name"] for check in payload["checks"]}) == 9
         assert all(check["ok"] for check in payload["checks"])
         assert probe_session_schema(session_owner) is SchemaState.CURRENT
         assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT
+    finally:
+        _dispose_app(app)
+        session_owner.dispose()
+        landscape_owner.dispose()
+
+
+def test_postgres_app_registers_membership_under_its_own_fencing_identity(tmp_path: Path, runtime_databases: _RuntimeDatabases) -> None:
+    """A PostgreSQL app takes the registered arm, bound to the id it fences with.
+
+    ``_create_app`` chooses the membership implementation from the session
+    engine's dialect, and only this arm writes a ``web_instances`` row. Every
+    unit proof of the wiring runs on SQLite, so without a PostgreSQL app the
+    dialect branch is unpinned: replacing it with the single-process arm — a
+    replica that never registers, leaving a killed peer's fenced sessions
+    refused forever — leaves both the unit gate and the PostgreSQL proofs
+    green. The identity seam is the ticket's premise: a peer joins an expired
+    fence's ``owner_instance_id`` to ``web_instances.instance_id``, so the
+    registered id must be the id this process fences with, under the same
+    lease.
+    """
+    app, session_owner, landscape_owner = _initialized_app(tmp_path, runtime_databases)
+    try:
+        membership = app.state.web_instance_membership
+        session_service = app.state.session_service
+        assert type(membership) is RegisteredWebInstanceMembership
+        assert membership.identity.instance_id == session_service.session_operation_owner_instance_id
+        assert membership._lease_seconds == session_service.session_operation_lease_seconds
+        assert app.state.instance_draining is membership.draining
+        assert not app.state.instance_draining.is_set()
     finally:
         _dispose_app(app)
         session_owner.dispose()

@@ -2,25 +2,33 @@
 
 A guided blob-backed source has ``blob_ref`` stripped from its committed
 options (the manual set_source path can't prove ``path == storage_path``); it
-survives only in the schema-8 GuidedSession ``reviewed_sources`` snapshot. The export
-sidecar and the public-YAML path-omit both key off ``source.options["blob_ref"]``,
-so without reattachment the export leaks the raw storage path AND emits no
-``source_blob_ids`` (breaking the re-import round-trip). This helper reconstitutes
-``blob_ref`` into the export's working copy from the snapshot, mirroring the
-cross-reference in redact_guided_snapshot_storage_paths.
+survives only in the schema-8 GuidedSession ``reviewed_sources`` snapshot. Public
+export custody verification and path omission key off
+``source.options["blob_ref"]``. This helper reconstitutes ``blob_ref`` into the
+private export working copy from the snapshot, mirroring the cross-reference in
+redact_guided_snapshot_storage_paths; the public response still omits the UUID.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided.resolved import SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.guided.state_machine import (
+    GuidedSession,
+    TerminalKind,
+    TerminalReason,
+    TerminalState,
+)
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.composer.yaml_generator import generate_public_pipeline_dict
+from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.routes._helpers import _state_response
 from elspeth.web.sessions.routes.composer.state import _reattach_guided_blob_refs
 
 BLOB_PATH = "/data/blobs/sess-1/abc12300-0000-4000-8000-000000000000_data.csv"
@@ -75,7 +83,189 @@ def test_reattaches_blob_ref_from_guided_snapshot() -> None:
     assert "blob_ref" not in state.sources["source"].options
 
 
-def test_reattached_state_omits_path_and_yields_sidecar() -> None:
+def test_reattaches_blob_ref_when_reviewed_snapshot_uses_public_blob_sentinel() -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        guided_session=_guided_with_snapshot(blob_ref=BLOB_REF, path=f"blob:{BLOB_REF}"),
+    )
+
+    out = _reattach_guided_blob_refs(state)
+
+    assert out.sources["source"].options == {
+        "path": BLOB_PATH,
+        "schema": {"mode": "observed"},
+        "blob_ref": BLOB_REF,
+    }
+    public_options = generate_public_pipeline_dict(out)["sources"]["source"]["options"]
+    assert "path" not in public_options
+    assert "blob_ref" not in public_options
+    assert BLOB_REF not in repr(public_options)
+    assert "blob_ref" not in state.sources["source"].options
+
+
+def test_reattaches_blob_ref_from_guided_native_sentinel_without_duplicate_identity_key() -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        guided_session=_guided_with_snapshot(blob_ref=None, path=f"blob:{BLOB_REF}"),
+    )
+
+    out = _reattach_guided_blob_refs(state)
+
+    assert out.sources["source"].options == {
+        "path": BLOB_PATH,
+        "schema": {"mode": "observed"},
+        "blob_ref": BLOB_REF,
+    }
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    (
+        "blob:",
+        "blob:not-a-uuid",
+        "blob:ABC12300-0000-4000-8000-000000000000",
+    ),
+)
+def test_rejects_malformed_guided_native_blob_sentinel_without_duplicate_identity_key(
+    sentinel: str,
+) -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH},
+        guided_session=_guided_with_snapshot(blob_ref=None, path=sentinel),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="canonical UUID"):
+        _reattach_guided_blob_refs(state)
+
+
+def test_rejects_guided_native_blob_sentinel_for_absent_live_source_name() -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH},
+        guided_session=_guided_with_snapshot(
+            blob_ref=None,
+            path=f"blob:{BLOB_REF}",
+            name="foreign_source",
+        ),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        _reattach_guided_blob_refs(state)
+
+
+def test_rejects_guided_native_blob_sentinel_mixed_with_private_path_carrier() -> None:
+    guided = _guided_with_snapshot(blob_ref=None, path=f"blob:{BLOB_REF}")
+    stable_id = guided.source_order[0]
+    snapshot = guided.reviewed_sources[stable_id]
+    guided = replace(
+        guided,
+        reviewed_sources={
+            stable_id: replace(
+                snapshot,
+                options={
+                    **snapshot.options,
+                    "file": BLOB_PATH,
+                },
+            )
+        },
+    )
+    state = _state(
+        source_options={"path": BLOB_PATH, "file": BLOB_PATH},
+        guided_session=guided,
+    )
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        _reattach_guided_blob_refs(state)
+
+
+def test_state_response_rejects_mixed_guided_sentinel_before_private_file_can_project() -> None:
+    private_path = "/internal/blobs/source.csv"
+    private_file = "/internal/blobs/private-file.csv"
+    record = CompositionStateRecord(
+        id=uuid4(),
+        session_id=uuid4(),
+        version=1,
+        sources={"source": {"plugin": "csv", "options": {"path": private_path, "file": private_file}}},
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata_=None,
+        is_valid=False,
+        validation_errors=("guided_composition_invalid",),
+        created_at=datetime.now(UTC),
+        derived_from_state_id=None,
+        composer_meta={
+            "guided_session": {
+                "reviewed_sources": {
+                    "11111111-1111-4111-8111-111111111111": {
+                        "name": "source",
+                        "options": {
+                            "path": f"blob:{BLOB_REF}",
+                            "file": private_file,
+                        },
+                    }
+                },
+                "pending_source_intents": {},
+            }
+        },
+    )
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        _state_response(record)
+
+
+def test_state_response_rejects_live_blob_ref_conflicting_with_guided_sentinel() -> None:
+    conflicting_blob_ref = "def45600-0000-4000-8000-000000000000"
+    record = CompositionStateRecord(
+        id=uuid4(),
+        session_id=uuid4(),
+        version=1,
+        sources={
+            "source": {
+                "plugin": "csv",
+                "options": {"path": BLOB_PATH, "blob_ref": conflicting_blob_ref},
+            }
+        },
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata_=None,
+        is_valid=False,
+        validation_errors=("guided_composition_invalid",),
+        created_at=datetime.now(UTC),
+        derived_from_state_id=None,
+        composer_meta={
+            "guided_session": {
+                "reviewed_sources": {
+                    "11111111-1111-4111-8111-111111111111": {
+                        "name": "source",
+                        "options": {"path": f"blob:{BLOB_REF}"},
+                    }
+                },
+                "pending_source_intents": {},
+            }
+        },
+    )
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        _state_response(record)
+
+
+def test_rejects_public_blob_sentinel_that_differs_from_retained_blob_ref() -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH},
+        guided_session=_guided_with_snapshot(
+            blob_ref=BLOB_REF,
+            path="blob:def45600-0000-4000-8000-000000000000",
+        ),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="sentinel and blob_ref differ"):
+        _reattach_guided_blob_refs(state)
+
+
+def test_reattached_state_omits_path_and_blob_identity_from_public_projection() -> None:
     state = _state(
         source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
         guided_session=_guided_with_snapshot(blob_ref=BLOB_REF, path=BLOB_PATH),
@@ -87,9 +277,9 @@ def test_reattached_state_omits_path_and_yields_sidecar() -> None:
     src_opts = doc["sources"]["source"]["options"]
     assert "path" not in src_opts
     assert "blob_ref" not in src_opts
-    # The export sidecar comprehension now finds a blob_ref to emit.
-    sidecar = {name: str(s.options["blob_ref"]) for name, s in out.sources.items() if "blob_ref" in s.options}
-    assert sidecar == {"source": BLOB_REF}
+    # Reattachment remains private input to custody verification and projection.
+    assert out.sources["source"].options["blob_ref"] == BLOB_REF
+    assert BLOB_REF not in repr(src_opts)
 
 
 def test_untouched_without_guided_session() -> None:
@@ -113,6 +303,49 @@ def test_rejects_operator_typed_source_reusing_reviewed_name() -> None:
 
     with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
         _reattach_guided_blob_refs(state)
+
+
+def test_exited_guided_session_does_not_leak_freeform_source_replacement() -> None:
+    freeform_path = "/tmp/operator/replacement.csv"
+    guided = replace(
+        _guided_with_snapshot(blob_ref=BLOB_REF, path=BLOB_PATH),
+        terminal=TerminalState(
+            kind=TerminalKind.EXITED_TO_FREEFORM,
+            reason=TerminalReason.USER_PRESSED_EXIT,
+            pipeline_yaml=None,
+        ),
+    )
+    state = _state(
+        source_options={"path": freeform_path, "schema": {"mode": "observed"}},
+        guided_session=guided,
+    )
+
+    assert _reattach_guided_blob_refs(state) is state
+    public_options = generate_public_pipeline_dict(state)["sources"]["source"]["options"]
+    assert public_options == {
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+    assert freeform_path not in repr(public_options)
+
+
+def test_completed_guided_session_retains_reviewed_source_authority() -> None:
+    guided = replace(
+        _guided_with_snapshot(blob_ref=BLOB_REF, path=BLOB_PATH),
+        terminal=TerminalState(
+            kind=TerminalKind.COMPLETED,
+            reason=None,
+            pipeline_yaml="sources: {}\n",
+        ),
+    )
+    state = _state(
+        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        guided_session=guided,
+    )
+
+    out = _reattach_guided_blob_refs(state)
+
+    assert out.sources["source"].options["blob_ref"] == BLOB_REF
 
 
 def test_allows_retired_reviewed_binding_when_name_and_path_are_absent() -> None:

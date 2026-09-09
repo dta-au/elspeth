@@ -22,6 +22,8 @@ prompt-patch can land on real node JSON.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -41,6 +43,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
     CompositionState,
@@ -51,6 +54,7 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
 )
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
@@ -66,9 +70,14 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     interpretation_events_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import (
     InterpretationPlaceholderConsumedError,
@@ -77,6 +86,7 @@ from elspeth.web.sessions.service import (
     _patch_llm_transform_prompt,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures and helpers
@@ -96,24 +106,94 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    instance = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
+    create_pending = instance.create_pending_interpretation_event
+
+    async def _create_pending_with_test_lease(**kwargs: Any) -> InterpretationEventRecord:
+        """Keep legacy semantic cases focused while production callers pass authority explicitly."""
+        if "session_operation_context" in kwargs:
+            return await create_pending(**kwargs)
+        async with _compose_operation(instance, kwargs["session_id"]) as context:
+            return await create_pending(**kwargs, session_operation_context=context)
+
+    instance.create_pending_interpretation_event = _create_pending_with_test_lease  # type: ignore[method-assign]
+    return instance
 
 
 def _insert_session(conn, session_id: str) -> None:
+    created_at = datetime.now(UTC)
     conn.execute(
         insert(sessions_table).values(
             id=session_id,
             user_id="alice",
             auth_provider_type="local",
             title="Phase 5b Task 4 Test",
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
+            created_at=created_at,
+            updated_at=created_at,
         )
     )
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=f"create-{session_id}",
+            lease_token=f"create-token-{session_id}",
+            operation_kind=SessionOperationKind.CREATE.value,
+            owner_instance_id="interpretation-events-test-owner",
+            operation_epoch=1,
+            lease_expires_at=created_at,
+            released_at=created_at,
+        )
+    )
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+@asynccontextmanager
+async def _compose_operation(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+) -> AsyncIterator[SessionOperationContext]:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _llm_node(
@@ -165,6 +245,7 @@ def _structured_llm_node(
     *,
     node_id: str = "llm_transform_1",
     user_term: str = "cool",
+    draft: str = "A draft of cool",
 ) -> dict:
     """Return a production-serialized LLM transform with structured pending interpretation state."""
     state = CompositionState(
@@ -189,7 +270,7 @@ def _structured_llm_node(
                             "id": user_term,
                             "user_term": user_term,
                             "status": "pending",
-                            "draft": "A draft of cool",
+                            "draft": draft,
                             "event_id": None,
                             "accepted_value": None,
                             "resolved_prompt_template_hash": None,
@@ -216,6 +297,7 @@ def _vague_term_and_prompt_template_node(
     *,
     node_id: str = "llm_transform_1",
     vague_term: str = "cool",
+    vague_draft: str = "A draft of cool",
 ) -> dict:
     """Structured LLM node carrying BOTH a pending vague_term slot AND a pending
     whole-prompt llm_prompt_template review — the real Turn-2b shape the composer
@@ -250,7 +332,7 @@ def _vague_term_and_prompt_template_node(
                             "id": vague_term,
                             "user_term": vague_term,
                             "status": "pending",
-                            "draft": "A draft of cool",
+                            "draft": vague_draft,
                             "event_id": None,
                             "accepted_value": None,
                             "resolved_prompt_template_hash": None,
@@ -464,7 +546,8 @@ async def _seed_state_with_llm_node(
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
     node = node if node is not None else _llm_node()
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[node],
@@ -485,7 +568,8 @@ async def _seed_state_with_source(
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
     source = source if source is not None else _llm_generated_source()
-    return await service.save_composition_state(
+    return await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=source,
@@ -530,24 +614,52 @@ async def _create_prompt_template_interpretation_event(
 
 
 @pytest.mark.asyncio
-async def test_01_create_pending_interpretation_event_inserts_row(service) -> None:
+async def test_state_commit_supersedes_pending_card_when_node_is_removed(service) -> None:
+    """The supersession sweep is kind-general: a prompt-template card whose
+    affected node a later commit deletes has a dead site (no surfacing path
+    remains to reconcile it), so the commit retires it as SUPERSEDED in the
+    same transaction (elspeth-d73139155a / elspeth-dbc39dd367)."""
+    sid, _state, event = await _create_prompt_template_interpretation_event(service)
+    assert event.choice is InterpretationChoice.PENDING
+
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            nodes=[],
+            metadata_={"name": "Phase 5b Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+
+    events = await service.list_interpretation_events(sid, status="all")
+    assert [row.choice for row in events] == [InterpretationChoice.SUPERSEDED]
+    assert events[0].resolved_at is not None
+    assert await service.list_interpretation_events(sid, status="pending") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation_kind", [SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL])
+async def test_01_create_pending_interpretation_event_inserts_row(service, operation_kind: SessionOperationKind) -> None:
     """Spec test 1: pending row inserted with all required fields."""
     session_id = uuid4()
     state = await _seed_state_with_llm_node(service, session_id=session_id)
 
-    event = await service.create_pending_interpretation_event(
-        session_id=session_id,
-        composition_state_id=state.id,
-        affected_node_id="llm_transform_1",
-        tool_call_id="call_42",
-        user_term="cool",
-        kind=InterpretationKind.VAGUE_TERM,
-        llm_draft="A draft definition of cool",
-        model_identifier="anthropic/claude-opus-4-7",
-        model_version="2026-05-01",
-        provider="anthropic",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(service, session_id, operation_kind) as context:
+        event = await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state.id,
+            affected_node_id="llm_transform_1",
+            tool_call_id="call_42",
+            user_term="cool",
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="A draft definition of cool",
+            model_identifier="anthropic/claude-opus-4-7",
+            model_version="2026-05-01",
+            provider="anthropic",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
 
     assert event.choice is InterpretationChoice.PENDING
     assert event.interpretation_source is InterpretationSource.USER_APPROVED
@@ -594,20 +706,22 @@ async def test_02_create_pending_rejects_unknown_node_id(service) -> None:
         node=_llm_node(node_id="node-A"),
     )
 
-    with pytest.raises(ValueError, match=r"node-does-not-exist|not present"):
-        await service.create_pending_interpretation_event(
-            session_id=session_id,
-            composition_state_id=state.id,
-            affected_node_id="node-does-not-exist",
-            tool_call_id="call_42",
-            user_term="cool",
-            kind=InterpretationKind.VAGUE_TERM,
-            llm_draft="A draft of cool",
-            model_identifier="anthropic/claude-opus-4-7",
-            model_version="2026-05-01",
-            provider="anthropic",
-            composer_skill_hash="a" * 64,
-        )
+    async with _compose_operation(service, session_id) as context:
+        with pytest.raises(ValueError, match=r"node-does-not-exist|not present"):
+            await service.create_pending_interpretation_event(
+                session_id=session_id,
+                composition_state_id=state.id,
+                affected_node_id="node-does-not-exist",
+                tool_call_id="call_42",
+                user_term="cool",
+                kind=InterpretationKind.VAGUE_TERM,
+                llm_draft="A draft of cool",
+                model_identifier="anthropic/claude-opus-4-7",
+                model_version="2026-05-01",
+                provider="anthropic",
+                composer_skill_hash="a" * 64,
+                session_operation_context=context,
+            )
 
     with service._engine.begin() as conn:
         count = conn.execute(
@@ -852,7 +966,8 @@ async def test_resolve_interpretation_event_preserves_named_sources(service) -> 
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             sources={
@@ -931,7 +1046,8 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
         composer_skill_hash="a" * 64,
     )
     stale_error = "Invalid Jinja2 template: expected token 'end of print statement', got ':'"
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[_llm_node()],
@@ -951,6 +1067,262 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
     )
 
     assert stale_error not in list(new_state.validation_errors or ())
+
+
+_GRAPH_STRUCTURE_ERROR = (
+    "Schema contract violation: edge 'row_union_1' → 'map1'\n"
+    "  Consumer (field_mapper) requires fields: ['summary']\n"
+    "  Producer (row_union:stack) guarantees: (none - dynamic schema)"
+)
+
+
+def _runtime_preflight_result(*, is_valid: bool, messages: tuple[str, ...] = ()):
+    from elspeth.web.execution.schemas import (
+        ValidationError as RuntimeValidationError,
+    )
+    from elspeth.web.execution.schemas import (
+        ValidationReadiness,
+        ValidationResult,
+    )
+
+    return ValidationResult(
+        is_valid=is_valid,
+        checks=[],
+        errors=[
+            RuntimeValidationError(
+                component_id="map1",
+                component_type="transform",
+                message=message,
+                suggestion=None,
+                error_code=None,
+            )
+            for message in messages
+        ],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=is_valid,
+            completion_ready=is_valid,
+            blockers=[],
+        ),
+    )
+
+
+def _preflight_service(engine, runtime_preflight) -> SessionServiceImpl:
+    return DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=runtime_preflight,
+    )
+
+
+def _authoring_valid_pipeline_dict() -> dict:
+    """Full source→llm→output pipeline that passes ``state.validate()``.
+
+    The runtime-preflight merge only runs after the authoring gate passes, so
+    these tests need a state whose only possible invalidity is runtime-level.
+    """
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="input",
+            options={"path": "/tmp/input.csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="llm_transform_1",
+                node_type="transform",
+                plugin="llm",
+                input="input",
+                on_success="out",
+                on_error="discard",
+                options={"prompt_template": "Rate how {{interpretation:cool}} this is."},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="out",
+                plugin="json",
+                options={"path": "/tmp/out.json", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Phase 5b Test", description=""),
+        version=1,
+    )
+    return state.to_dict()
+
+
+async def _seed_authoring_valid_state(
+    service: SessionServiceImpl,
+    *,
+    session_id: UUID,
+    is_valid: bool = True,
+    validation_errors: list[str] | None = None,
+    insert_session: bool = True,
+) -> CompositionStateRecord:
+    if insert_session:
+        with service._engine.begin() as conn:
+            _insert_session(conn, str(session_id))
+    pipeline = _authoring_valid_pipeline_dict()
+    return await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=pipeline["sources"],
+            nodes=pipeline["nodes"],
+            edges=pipeline["edges"],
+            outputs=pipeline["outputs"],
+            metadata_=pipeline["metadata"],
+            is_valid=is_valid,
+            validation_errors=validation_errors,
+        ),
+        provenance="tool_call",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_persists_runtime_preflight_verdict_over_authoring_validity(engine) -> None:
+    """battery-r5 g08-s2/s3 (elspeth-155947ca47): resolve must not flip a
+    runtime-invalid state to is_valid=true.
+
+    The persisted ``is_valid`` contract is the full runtime-preflight verdict
+    (the compose path persists ``validate_pipeline``'s outcome). The resolution
+    writer re-validates the patched state; when a runtime preflight is wired it
+    must persist that verdict — a graph_structure violation only the engine
+    graph build can see keeps the row invalid and disclosed, even though the
+    authoring-only validator passes the patched state.
+    """
+    preflight_calls: list[tuple] = []
+
+    def runtime_preflight(state, user_id, session_id, plugin_snapshot):
+        preflight_calls.append((state, user_id, session_id, plugin_snapshot))
+        return _runtime_preflight_result(is_valid=False, messages=(_GRAPH_STRUCTURE_ERROR,))
+
+    service = _preflight_service(engine, runtime_preflight)
+    session_id = uuid4()
+    surfacing_state = await _seed_authoring_valid_state(service, session_id=session_id)
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfacing_state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_preflight_verdict",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    # The live row was persisted invalid by the compose path (runtime verdict).
+    await _seed_authoring_valid_state(
+        service,
+        session_id=session_id,
+        is_valid=False,
+        validation_errors=[_GRAPH_STRUCTURE_ERROR],
+        insert_session=False,
+    )
+
+    _resolved, new_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert new_state.is_valid is False
+    assert _GRAPH_STRUCTURE_ERROR in list(new_state.validation_errors or ())
+    (call,) = preflight_calls
+    called_state, called_user_id, called_session_id, called_snapshot = call
+    assert called_user_id == "alice"
+    assert called_session_id == str(session_id)
+    assert called_snapshot is None  # no plugin_snapshot_factory in this fixture
+    # The preflight must see the PATCHED state — the placeholder is consumed.
+    patched_node = next(node for node in called_state.nodes if node.id == "llm_transform_1")
+    assert "{{interpretation:cool}}" not in patched_node.options["prompt_template"]
+    assert "Innovative and creative" in patched_node.options["prompt_template"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_runtime_preflight_valid_persists_true(engine) -> None:
+    """A passing runtime preflight keeps the resolve row valid (no blanket False)."""
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot):
+        return _runtime_preflight_result(is_valid=True)
+
+    service = _preflight_service(engine, runtime_preflight)
+    session_id = uuid4()
+    surfacing_state = await _seed_authoring_valid_state(service, session_id=session_id)
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfacing_state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_preflight_valid",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+
+    _resolved, new_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert new_state.is_valid is True
+    assert new_state.validation_errors is None
+
+
+@pytest.mark.asyncio
+async def test_opt_out_auto_resolve_persists_runtime_preflight_verdict(engine) -> None:
+    """The opt-out auto-resolve state writer shares the resolve path's contract:
+    a runtime-invalid patched state persists is_valid=False with the finding
+    disclosed (second writer at _prepare_or_create_pending_interpretation_event).
+    """
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot):
+        return _runtime_preflight_result(is_valid=False, messages=(_GRAPH_STRUCTURE_ERROR,))
+
+    service = _preflight_service(engine, runtime_preflight)
+    session_id = uuid4()
+    surfacing_state = await _seed_authoring_valid_state(service, session_id=session_id)
+    with service._engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True))
+
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfacing_state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_preflight_opt_out",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    assert event.choice is InterpretationChoice.OPTED_OUT
+
+    current_state = await service.get_current_state(session_id)
+    assert current_state is not None
+    assert current_state.is_valid is False
+    assert _GRAPH_STRUCTURE_ERROR in list(current_state.validation_errors or ())
 
 
 @pytest.mark.parametrize(
@@ -983,7 +1355,8 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
         provider="test-provider",
         composer_skill_hash="a" * 64,
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[_llm_node()],
@@ -998,7 +1371,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
     monkeypatch.setattr(
         service,
         "_validate_patched_composition_state",
-        lambda _state, *, plugin_snapshot: ValidationSummary(
+        lambda _state, *, plugin_snapshot, session_id, user_id: ValidationSummary(
             is_valid=False,
             errors=(ValidationEntry(component="node", message=canary, severity="high"),),
         ),
@@ -1117,7 +1490,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                 "region_name": "ap-northeast-1",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
     )
     runtime_config = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)
@@ -1134,7 +1507,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         selected_profile_aliases=((llm_id, "tutorial"),),
         binding_generation_fingerprint="profiled-interpretation-test-generation",
     )
-    policy_service = SessionServiceImpl(
+    policy_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1233,7 +1606,8 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                 conn.execute(
                     update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True)
                 )
-        saved_state = await policy_service.save_composition_state(
+        saved_state = await _save_composition_state(
+            policy_service,
             session_id,
             CompositionStateData(
                 sources=state_dict["sources"],
@@ -1248,19 +1622,21 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         return session_id, saved_state
 
     session_id, saved = await save_profiled_state()
-    event = await policy_service.create_pending_interpretation_event(
-        session_id=session_id,
-        composition_state_id=saved.id,
-        affected_node_id="llm1",
-        tool_call_id="call_profiled_prompt_template",
-        user_term=user_term,
-        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        llm_draft=prompt_template,
-        model_identifier="composer-model",
-        model_version="composer-model",
-        provider="openrouter",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(policy_service, session_id) as context:
+        event = await policy_service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=saved.id,
+            affected_node_id="llm1",
+            tool_call_id="call_profiled_prompt_template",
+            user_term=user_term,
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            llm_draft=prompt_template,
+            model_identifier="composer-model",
+            model_version="composer-model",
+            provider="openrouter",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
 
     _resolved, new_state = await policy_service.resolve_interpretation_event(
         session_id=session_id,
@@ -1274,19 +1650,21 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
     assert new_state.validation_errors is None
 
     opted_out_session_id, opted_out_saved = await save_profiled_state(review_disabled=True)
-    opted_out_event = await policy_service.create_pending_interpretation_event(
-        session_id=opted_out_session_id,
-        composition_state_id=opted_out_saved.id,
-        affected_node_id="llm1",
-        tool_call_id="call_profiled_prompt_template_opt_out",
-        user_term=user_term,
-        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        llm_draft=prompt_template,
-        model_identifier="composer-model",
-        model_version="composer-model",
-        provider="openrouter",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(policy_service, opted_out_session_id) as context:
+        opted_out_event = await policy_service.create_pending_interpretation_event(
+            session_id=opted_out_session_id,
+            composition_state_id=opted_out_saved.id,
+            affected_node_id="llm1",
+            tool_call_id="call_profiled_prompt_template_opt_out",
+            user_term=user_term,
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            llm_draft=prompt_template,
+            model_identifier="composer-model",
+            model_version="composer-model",
+            provider="openrouter",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
     opted_out_state = await policy_service.get_current_state(opted_out_session_id)
 
     assert opted_out_event.choice is InterpretationChoice.OPTED_OUT
@@ -1363,6 +1741,91 @@ async def test_resolve_invented_source_updates_authoring_metadata_without_mutati
     assert requirement["event_id"] == str(event.id)
     assert requirement["accepted_value"] == event.llm_draft
     assert requirement["accepted_artifact_hash"] == content_hash
+
+
+@pytest.mark.asyncio
+async def test_named_invented_source_reviews_resolve_independently_and_survive_reload(service) -> None:
+    """Each named source binds its event and accepted hash to its own map entry."""
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    orders_hash = stable_hash({"orders": [1]})
+    refunds_hash = stable_hash({"refunds": [2]})
+    state = await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(
+            sources={
+                "orders": _llm_generated_source(content_hash=orders_hash),
+                "refunds": _llm_generated_source(content_hash=refunds_hash),
+            },
+            nodes=[],
+            metadata_={"name": "Named source review", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    orders_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="source:orders",
+        tool_call_id="call_orders_review",
+        user_term="inline_source_url_list",
+        kind=InterpretationKind.INVENTED_SOURCE,
+        llm_draft="https://example.gov.au",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    refunds_event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="source:refunds",
+        tool_call_id="call_refunds_review",
+        user_term="inline_source_url_list",
+        kind=InterpretationKind.INVENTED_SOURCE,
+        llm_draft="https://example.gov.au",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+
+    with pytest.raises(ValueError, match=r"invented_source.*amendment|amended"):
+        await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=orders_event.id,
+            choice=InterpretationChoice.AMENDED,
+            amended_value="changed orders",
+            actor="user:alice",
+        )
+
+    _, orders_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=orders_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert orders_state.sources is not None
+    assert orders_state.sources["orders"]["options"][SOURCE_AUTHORING_KEY]["review_event_id"] == str(orders_event.id)
+    assert orders_state.sources["orders"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] == orders_hash
+    assert orders_state.sources["refunds"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]["status"] == "pending"
+
+    await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=refunds_event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    reloaded_record = await service.get_current_state(session_id)
+    assert reloaded_record is not None
+    reloaded = state_from_record(reloaded_record)
+    assert materialize_state_for_execution(reloaded) == reloaded
+    assert reloaded.sources["orders"].options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] == orders_hash
+    assert reloaded.sources["refunds"].options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] == refunds_hash
 
 
 @pytest.mark.asyncio
@@ -1455,7 +1918,8 @@ async def test_06_resolve_raises_when_node_removed_since_surfacing(service) -> N
     )
 
     # Advance composition state — the affected node disappears.
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[{"id": "different-node", "kind": "csv", "options": {}}],
@@ -1534,7 +1998,7 @@ async def test_resolve_prompt_template_review_survives_sibling_vague_term_bake(s
     state = await _seed_state_with_llm_node(
         service,
         session_id=session_id,
-        node=_vague_term_and_prompt_template_node(),
+        node=_vague_term_and_prompt_template_node(vague_draft="Innovative and creative"),
     )
 
     vague_event = await service.create_pending_interpretation_event(
@@ -1647,7 +2111,8 @@ async def test_resolve_prompt_template_review_still_rejects_genuine_skeleton_edi
         {"kind": "interpretation_ref", "requirement_id": "cool"},
         {"kind": "text", "text": " this is. EXTRA."},
     ]
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[edited_node],
@@ -1683,7 +2148,7 @@ async def test_08_list_status_pending_filters_to_pending_only(service) -> None:
     session_id = uuid4()
     state = await _seed_state_with_llm_node(service, session_id=session_id)
 
-    # Two pending events on distinct tool_call_ids.
+    # Two pending events on distinct review sites.
     e_pending = await service.create_pending_interpretation_event(
         session_id=session_id,
         composition_state_id=state.id,
@@ -1697,14 +2162,28 @@ async def test_08_list_status_pending_filters_to_pending_only(service) -> None:
         provider="anthropic",
         composer_skill_hash="a" * 64,
     )
+    second_node = _llm_node(
+        node_id="llm_transform_2",
+        user_term="warm",
+    )
+    second_state = await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(
+            nodes=[_llm_node(), second_node],
+            metadata_={"name": "Phase 5b Test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
     e_to_resolve = await service.create_pending_interpretation_event(
         session_id=session_id,
-        composition_state_id=state.id,
-        affected_node_id="llm_transform_1",
+        composition_state_id=second_state.id,
+        affected_node_id="llm_transform_2",
         tool_call_id="call_resolved",
-        user_term="cool",
+        user_term="warm",
         kind=InterpretationKind.VAGUE_TERM,
-        llm_draft="cool def 2",
+        llm_draft="warm def",
         model_identifier="anthropic/claude-opus-4-7",
         model_version="2026-05-01",
         provider="anthropic",
@@ -1792,10 +2271,12 @@ async def test_10_opt_out_writes_event_and_sets_session_boolean_no_proposal_even
         _insert_session(conn, str(session_id))
         before_count = conn.execute(select(proposal_events_table).where(proposal_events_table.c.session_id == str(session_id))).fetchall()
 
-    event = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
+    async with _compose_operation(service, session_id) as context:
+        event = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     assert event.choice is InterpretationChoice.OPTED_OUT
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT
@@ -1828,14 +2309,17 @@ async def test_10b_opt_out_is_idempotent(service) -> None:
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    first = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
-    second = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
+    async with _compose_operation(service, session_id) as context:
+        first = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+        second = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     assert first.id == second.id
     assert first.resolved_at == second.resolved_at
@@ -1853,7 +2337,8 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=_llm_generated_source(),
@@ -1867,10 +2352,12 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
         ),
         provenance="tool_call",
     )
-    marker = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
+    async with _compose_operation(service, session_id) as context:
+        marker = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     requests = [
         (InterpretationKind.INVENTED_SOURCE, SOURCE_COMPONENT_ID, "inline_source_url_list", "https://example.gov.au"),
@@ -1973,7 +2460,8 @@ async def test_create_pending_pipeline_decision_rejects_raw_html_mapping_preserv
         "content_fingerprint": "content_fingerprint",
         "primary_colours": "primary_colours",
     }
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2013,7 +2501,8 @@ async def test_create_pending_pipeline_decision_rejects_custom_raw_field_preserv
         "page_hash": "page_hash",
         "primary_colours": "primary_colours",
     }
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2058,7 +2547,8 @@ async def test_resolve_pipeline_decision_rejects_custom_raw_field_preservation(s
         "page_hash": "page_hash",
         "primary_colours": "primary_colours",
     }
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2118,7 +2608,8 @@ async def test_create_pending_interpretation_event_is_idempotent_for_same_pendin
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2158,7 +2649,8 @@ async def test_create_pending_pipeline_decision_is_idempotent_across_state_versi
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    first_state = await service.save_composition_state(
+    first_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2168,7 +2660,8 @@ async def test_create_pending_pipeline_decision_is_idempotent_across_state_versi
         ),
         provenance="tool_call",
     )
-    second_state = await service.save_composition_state(
+    second_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2217,15 +2710,17 @@ async def test_record_auto_interpreted_no_surfaces_carries_kind(service) -> None
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    event = await service.record_auto_interpreted_no_surfaces_event(
-        session_id=session_id,
-        actor="composer-llm",
-        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        model_identifier="anthropic/claude-opus-4-7",
-        model_version="2026-05-01",
-        provider="anthropic",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(service, session_id) as context:
+        event = await service.record_auto_interpreted_no_surfaces_event(
+            session_id=session_id,
+            actor="composer-llm",
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            model_identifier="anthropic/claude-opus-4-7",
+            model_version="2026-05-01",
+            provider="anthropic",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
 
     assert event.choice is InterpretationChoice.OPTED_OUT
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES
@@ -2241,18 +2736,135 @@ async def test_record_auto_interpreted_no_surfaces_requires_explicit_kind(servic
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    with pytest.raises(TypeError, match="kind"):
-        await service.record_auto_interpreted_no_surfaces_event(
-            session_id=session_id,
-            actor="composer-llm",
-            model_identifier="anthropic/claude-opus-4-7",
-            model_version="2026-05-01",
-            provider="anthropic",
-            composer_skill_hash="a" * 64,
-        )
+    async with _compose_operation(service, session_id) as context:
+        with pytest.raises(TypeError, match="kind"):
+            await service.record_auto_interpreted_no_surfaces_event(
+                session_id=session_id,
+                actor="composer-llm",
+                model_identifier="anthropic/claude-opus-4-7",
+                model_version="2026-05-01",
+                provider="anthropic",
+                composer_skill_hash="a" * 64,
+                session_operation_context=context,
+            )
 
     rows = await service.list_interpretation_events(session_id, status="all")
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_opt_out_rejects_wrong_kind_and_cross_session_contexts(service) -> None:
+    target_session_id = uuid4()
+    foreign_session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(target_session_id))
+        _insert_session(conn, str(foreign_session_id))
+
+    foreign_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=foreign_session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    wrong_kind_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=target_session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        for context in (foreign_context, wrong_kind_context):
+            with pytest.raises(SessionOperationFenceLost):
+                await service.record_session_interpretation_opt_out(
+                    session_id=target_session_id,
+                    actor="user:alice",
+                    session_operation_context=context,
+                )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, foreign_context)
+        await service._run_sync(service.session_operation_authority.release, wrong_kind_context)
+
+    with service._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == str(target_session_id))
+            ).scalar_one()
+            is False
+        )
+        assert (
+            conn.execute(
+                select(interpretation_events_table.c.id).where(interpretation_events_table.c.session_id == str(target_session_id))
+            ).all()
+            == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_no_surfaces_rejects_released_and_taken_over_contexts(service) -> None:
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+
+    kwargs = {
+        "session_id": session_id,
+        "actor": "composer-llm",
+        "kind": InterpretationKind.VAGUE_TERM,
+        "model_identifier": "anthropic/claude-opus-4-7",
+        "model_version": "2026-05-01",
+        "provider": "anthropic",
+        "composer_skill_hash": "a" * 64,
+    }
+    await service._run_sync(service.session_operation_authority.release, context)
+    with pytest.raises(SessionOperationFenceLost):
+        await service.record_auto_interpreted_no_surfaces_event(
+            **kwargs,
+            session_operation_context=context,
+        )
+
+    current = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id == str(session_id))
+            .values(lease_expires_at=datetime(2000, 1, 1, tzinfo=UTC))
+        )
+    replacement = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        with pytest.raises(SessionOperationFenceLost):
+            await service.record_auto_interpreted_no_surfaces_event(
+                **kwargs,
+                session_operation_context=current,
+            )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, replacement)
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
 
 
 # --------------------------------------------------------------------------- #
@@ -2800,7 +3412,8 @@ async def test_resolve_round_trips_through_state_from_record_and_yaml(service) -
     ]
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=nodes,
@@ -2858,7 +3471,7 @@ async def test_resolve_structured_requirement_round_trips_without_authoring_meta
     state = await _seed_state_with_llm_node(
         service,
         session_id=session_id,
-        node=_structured_llm_node(),
+        node=_structured_llm_node(draft="modern and clear"),
     )
     event = await service.create_pending_interpretation_event(
         session_id=session_id,

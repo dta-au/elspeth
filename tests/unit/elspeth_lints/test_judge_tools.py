@@ -74,7 +74,7 @@ def scope(tmp_path: Path) -> AgentToolScope:
     allow = tmp_path / "config" / "cicd" / "enforce_tier_model"
     src.mkdir(parents=True)
     allow.mkdir(parents=True)
-    return build_readonly_tool_scope(root=src, allowlist_dir=allow)
+    return AgentToolScope(allowed_roots=(src.resolve(), allow.resolve()), cwd=src.resolve(), max_turns=24)
 
 
 # --------------------------------------------------------------------------
@@ -88,11 +88,47 @@ def test_build_readonly_tool_scope_roots_and_cwd(tmp_path: Path) -> None:
     src.mkdir(parents=True)
     allow.mkdir()
     s = build_readonly_tool_scope(root=src, allowlist_dir=allow)
-    # roots are realpath-resolved; cwd is the source root (a valid allowed root).
-    assert s.cwd == Path(os.path.realpath(src))
+    # The canonical source layout admits repository-relative test evidence.
+    assert s.cwd == tmp_path.resolve()
     assert s.cwd in s.allowed_roots
     assert Path(os.path.realpath(allow)) in s.allowed_roots
     assert s.max_turns > 0
+
+
+def test_canonical_source_scope_does_not_widen_to_enclosing_checkout(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    checkout = tmp_path / "nested-project"
+    source = checkout / "src" / "elspeth"
+    source.mkdir(parents=True)
+    scope = build_readonly_tool_scope(root=source, allowlist_dir=checkout / "config")
+    assert scope.cwd == checkout
+    assert not _tool_scope_decision(scope, "Read", {"file_path": "../unrelated.txt"})[0]
+
+
+@pytest.mark.parametrize("git_marker_is_file", [False, True])
+def test_scope_discovers_checkout_from_noncanonical_source_root(tmp_path: Path, git_marker_is_file: bool) -> None:
+    repo = tmp_path / "checkout"
+    src = repo / "packages" / "application"
+    src.mkdir(parents=True)
+    marker = repo / ".git"
+    if git_marker_is_file:
+        marker.write_text("gitdir: /unread/admin/path\n")
+    else:
+        marker.mkdir()
+    external = tmp_path / "external-allowlists"
+    external.mkdir()
+    scope = build_readonly_tool_scope(root=src, allowlist_dir=external)
+    assert scope.cwd == repo
+    assert scope.allowed_roots == (repo, external)
+    for name in ("tests/proof.py", "docs/contract.md", "scripts/check.py", "config/policy.yaml", ".github/workflows/ci.yaml"):
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("evidence\n")
+        assert _tool_scope_decision(scope, "Read", {"file_path": name})[0]
+    assert _tool_scope_decision(scope, "Read", {"file_path": str(external / "rules.yaml")})[0]
+    assert not _tool_scope_decision(scope, "Read", {"file_path": "../outside.py"})[0]
+    assert not _tool_scope_decision(scope, "Read", {"file_path": ".git"})[0]
+    assert not _tool_scope_decision(scope, "Read", {"file_path": ".env.local"})[0]
 
 
 def test_agent_tool_scope_rejects_empty_roots() -> None:
@@ -458,9 +494,17 @@ def test_tool_mode_builds_streaming_hook_guarded_options(monkeypatch: pytest.Mon
     assert "TOOL-AUGMENTED INVESTIGATION MODE" in opts["system_prompt"]["append"]
 
 
-def test_tool_mode_policy_hash_unchanged() -> None:
-    # The signed corpus must not need re-signing because of tool mode.
-    assert JUDGE_POLICY_HASH == "sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da"
+def test_static_policy_hash_is_pinned() -> None:
+    # Rotated 2026-07-31 by ADR-032 (validate by trust domain): the policy's
+    # attribute-presence-probing section withdrew the runtime-checkable-Protocol
+    # option and added the external-boundary parse-don't-validate branch.
+    # Rotated again 2026-08-28 by f0e38838d: control-location claims became a
+    # named fault class (decision question 7) with two new corpus cases; the
+    # operator's real-LLM check-judge-quality re-run is owed before the next
+    # sign-bundle (see the Wave-2 tier-burndown handover).
+    # Recorded per-entry ``judge_policy_hash`` values are historical and are not
+    # compared against this constant, so no allowlist entry or signature moves.
+    assert JUDGE_POLICY_HASH == "sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb"
 
 
 def test_tool_mode_turn_budget_exhaustion_is_classified(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:
@@ -482,6 +526,26 @@ def test_tool_mode_no_verdict_without_exhaustion_is_contract_error(monkeypatch: 
         num_turns=1,
     )
     with pytest.raises(JudgeContractError, match="no trailing verdict"):
+        call_judge(_request(), transport=TRANSPORT_AGENT, tool_scope=scope)
+
+
+def test_tool_mode_rejects_boolean_num_turns(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:
+    _install_tool_fake_sdk(
+        monkeypatch,
+        messages=[("I decline to decide.", False)],
+        num_turns=True,
+    )
+    with pytest.raises(JudgeContractError, match="num_turns must be an exact int or None"):
+        call_judge(_request(), transport=TRANSPORT_AGENT, tool_scope=scope)
+
+
+def test_tool_mode_rejects_negative_num_turns(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:
+    _install_tool_fake_sdk(
+        monkeypatch,
+        messages=[("I decline to decide.", False)],
+        num_turns=-1,
+    )
+    with pytest.raises(JudgeContractError, match="num_turns must be non-negative"):
         call_judge(_request(), transport=TRANSPORT_AGENT, tool_scope=scope)
 
 

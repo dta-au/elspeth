@@ -61,6 +61,48 @@ def test_content_safety_declares_output_blocking_capability() -> None:
     assert AWSBedrockContentSafety.get_agent_assistance() is not None
 
 
+def test_content_safety_default_source_is_an_effective_output_control() -> None:
+    assert AWSBedrockContentSafety.is_effective_blocking_control(
+        capability=PluginCapability.CONTENT_SAFETY,
+        role=ControlRole.OUTPUT,
+        options={},
+    )
+
+
+def test_content_safety_rejects_source_equality_forgery() -> None:
+    class Pretender:
+        def __eq__(self, other: object) -> bool:
+            return other == "OUTPUT"
+
+    assert not AWSBedrockContentSafety.is_effective_blocking_control(
+        capability=PluginCapability.CONTENT_SAFETY,
+        role=ControlRole.OUTPUT,
+        options={"source": Pretender()},
+    )
+
+
+def test_content_safety_closes_owned_sdk_client_exactly_once() -> None:
+    class ClosingSDK:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def apply_guardrail(self, **_kwargs: object) -> object:
+            raise AssertionError("not called")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    transform = AWSBedrockContentSafety(_config())
+    sdk = ClosingSDK()
+    transform._sdk_client = sdk
+
+    transform.close()
+    transform.close()
+
+    assert sdk.close_count == 1
+    assert transform._sdk_client is None
+
+
 @pytest.mark.parametrize("source", ["INPUT", "OUTPUT"])
 def test_content_safety_uses_explicit_safe_source(monkeypatch: pytest.MonkeyPatch, source: str) -> None:
     transform, context = _started_transform(source=source)

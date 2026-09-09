@@ -16,12 +16,15 @@ from elspeth.contracts.barrier_scalars import (
     BarrierScalars,
     CoalescePendingScalars,
 )
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.core.checkpoint import manager as checkpoint_manager_module
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager, _validate_barrier_scalars_json_size
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import checkpoints_table, nodes_table, rows_table, runs_table, tokens_table
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.schema import checkpoints_table, nodes_table, rows_table, run_coordination_table, runs_table, tokens_table
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 
 
 @pytest.fixture
@@ -90,11 +93,32 @@ def _insert_checkpoint_prereqs(
     )
 
 
+def _seed_run(db: LandscapeDB, run_id: str = "run-001") -> CoordinationToken:
+    """Seed the checkpoint FK prerequisites and mint the run's epoch-1 leader seat.
+
+    The returned token is the seat's own image (what ``begin_run`` hands the
+    leader); every fenced checkpoint write in this module presents it.
+    """
+    with db.write_connection() as conn:
+        _insert_checkpoint_prereqs(conn, run_id=run_id, node_id=f"node-{run_id}", row_id=f"row-{run_id}", token_id=f"tok-{run_id}")
+    return register_run_leader(
+        RunCoordinationRepository(db.engine),
+        run_id=run_id,
+        worker_id=f"worker:{run_id}:leader",
+        window_seconds=80.0,
+    )
+
+
 def _select_checkpoint(db: LandscapeDB, checkpoint_id: str) -> Row[Any]:
     with db.engine.connect() as conn:
         row = conn.execute(select(checkpoints_table).where(checkpoints_table.c.checkpoint_id == checkpoint_id)).fetchone()
     assert row is not None
     return row
+
+
+def _checkpoint_rows(db: LandscapeDB) -> list[Row[Any]]:
+    with db.engine.connect() as conn:
+        return list(conn.execute(select(checkpoints_table)).fetchall())
 
 
 def _draft(
@@ -116,8 +140,7 @@ def test_create_checkpoint_persists_precomputed_topology_hash_without_graph(
     db: LandscapeDB,
     checkpoint_manager: CheckpointManager,
 ) -> None:
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn, run_id="run-draft")
+    token = _seed_run(db, "run-draft")
 
     draft = _draft(
         run_id="run-draft",
@@ -126,7 +149,7 @@ def test_create_checkpoint_persists_precomputed_topology_hash_without_graph(
         upstream_topology_hash="f" * 64,
     )
 
-    checkpoint = checkpoint_manager.create_checkpoint(draft=draft)
+    checkpoint = checkpoint_manager.create_checkpoint(draft=draft, coordination_token=token)
 
     assert checkpoint.upstream_topology_hash == "f" * 64
     row = _select_checkpoint(db, checkpoint.checkpoint_id)
@@ -134,8 +157,31 @@ def test_create_checkpoint_persists_precomputed_topology_hash_without_graph(
 
 
 def test_create_checkpoint_requires_draft(checkpoint_manager: CheckpointManager) -> None:
+    token = CoordinationToken(run_id="run-001", worker_id="worker:run-001:leader", leader_epoch=1)
     with pytest.raises(TypeError, match="draft must be CheckpointDraft"):
-        checkpoint_manager.create_checkpoint(draft=None)  # type: ignore[arg-type]
+        checkpoint_manager.create_checkpoint(draft=None, coordination_token=token)  # type: ignore[arg-type]
+
+
+def test_create_checkpoint_refuses_a_draft_for_another_run_before_any_database_effect(
+    db: LandscapeDB,
+    checkpoint_manager: CheckpointManager,
+) -> None:
+    """ADR-048 §2: the token's run is the only run a checkpoint can belong to.
+
+    The refusal precedes the fence, so the seat is neither extended nor
+    refused (no ``fence_refusal`` event) and no checkpoint row exists.
+    """
+    token = _seed_run(db, "run-001")
+    with db.engine.connect() as conn:
+        seat_before = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == "run-001")).one()
+
+    with pytest.raises(OrchestrationInvariantError, match=r"run-elsewhere.*run-001"):
+        checkpoint_manager.create_checkpoint(draft=_draft(run_id="run-elsewhere"), coordination_token=token)
+
+    assert _checkpoint_rows(db) == []
+    with db.engine.connect() as conn:
+        seat_after = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == "run-001")).one()
+    assert tuple(seat_after) == tuple(seat_before), "a refusal before the fence leaves the seat untouched"
 
 
 def test_validate_barrier_scalars_json_size_rejects_large_payload() -> None:
@@ -146,14 +192,13 @@ def test_validate_barrier_scalars_json_size_rejects_large_payload() -> None:
 
 def test_create_checkpoint_persists_barrier_scalars(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
     """F1 Task 1.2: the checkpoint row carries BarrierScalars only (format_version 5)."""
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn)
+    token = _seed_run(db)
 
     scalars = BarrierScalars(
         aggregation={"agg-1": AggregationNodeScalars(count_fire_offset=2.25, condition_fire_offset=None)},
         coalesce={},
     )
-    cp = checkpoint_manager.create_checkpoint(draft=_draft(barrier_scalars=scalars))
+    cp = checkpoint_manager.create_checkpoint(draft=_draft(barrier_scalars=scalars), coordination_token=token)
 
     row = _select_checkpoint(db, cp.checkpoint_id)
     assert row.barrier_scalars_json is not None
@@ -167,12 +212,12 @@ def test_create_checkpoint_persists_barrier_scalars(db: LandscapeDB, checkpoint_
 
 def test_create_checkpoint_empty_scalars_persist_null(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
     """Empty BarrierScalars (has_state=False) persists NULL, same as None."""
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn)
+    token = _seed_run(db)
 
-    cp_none = checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1, barrier_scalars=None))
+    cp_none = checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1, barrier_scalars=None), coordination_token=token)
     cp_empty = checkpoint_manager.create_checkpoint(
-        draft=_draft(sequence_number=2, barrier_scalars=BarrierScalars(aggregation={}, coalesce={}))
+        draft=_draft(sequence_number=2, barrier_scalars=BarrierScalars(aggregation={}, coalesce={})),
+        coordination_token=token,
     )
 
     assert cp_none.barrier_scalars_json is None
@@ -182,12 +227,11 @@ def test_create_checkpoint_empty_scalars_persist_null(db: LandscapeDB, checkpoin
 
 
 def test_get_checkpoints_returns_ascending_sequence_order(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn)
+    token = _seed_run(db)
 
-    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=5))
-    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1))
-    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=3))
+    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=5), coordination_token=token)
+    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1), coordination_token=token)
+    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=3), coordination_token=token)
 
     checkpoints = checkpoint_manager.get_checkpoints("run-001")
     assert [cp.sequence_number for cp in checkpoints] == [1, 3, 5]
@@ -195,19 +239,17 @@ def test_get_checkpoints_returns_ascending_sequence_order(db: LandscapeDB, check
 
 def test_create_checkpoint_rejects_duplicate_sequence_for_run(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
     """Duplicate per-run checkpoint sequence numbers would make resume order ambiguous."""
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn)
+    token = _seed_run(db)
 
-    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1))
+    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1), coordination_token=token)
 
     with pytest.raises(OrchestrationInvariantError, match="Duplicate checkpoint sequence_number"):
-        checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1))
+        checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1), coordination_token=token)
 
 
 def test_create_checkpoint_round_trips_coalesce_scalars(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
     """Coalesce lost-branch scalars round-trip through persistence unchanged."""
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn)
+    token = _seed_run(db)
 
     checkpoint = checkpoint_manager.create_checkpoint(
         draft=_draft(
@@ -215,7 +257,8 @@ def test_create_checkpoint_round_trips_coalesce_scalars(db: LandscapeDB, checkpo
                 aggregation={},
                 coalesce={("merge_paths", "row-001"): CoalescePendingScalars(lost_branches={"branch_b": "timeout"})},
             )
-        )
+        ),
+        coordination_token=token,
     )
 
     assert checkpoint.barrier_scalars_json is not None
@@ -237,11 +280,11 @@ def test_get_latest_checkpoint_loads_raw_format_versions(
 ) -> None:
     """Repository reads expose stored checkpoint rows; resume policy lives elsewhere."""
     run_id = f"run-format-{format_version}"
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn, run_id=run_id)
+    token = _seed_run(db, run_id)
 
     created = checkpoint_manager.create_checkpoint(
         draft=_draft(run_id=run_id, sequence_number=1, barrier_scalars=None),
+        coordination_token=token,
     )
 
     with db.engine.begin() as conn:
@@ -258,10 +301,9 @@ def test_get_latest_checkpoint_rejects_non_string_barrier_scalars_json(
     checkpoint_manager: CheckpointManager,
 ) -> None:
     run_id = "run-tampered-type"
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn, run_id=run_id)
+    token = _seed_run(db, run_id)
 
-    checkpoint_manager.create_checkpoint(draft=_draft(run_id=run_id, sequence_number=1, barrier_scalars=None))
+    checkpoint_manager.create_checkpoint(draft=_draft(run_id=run_id, sequence_number=1, barrier_scalars=None), coordination_token=token)
 
     with db.engine.begin() as conn:
         conn.execute(
@@ -282,10 +324,9 @@ def test_checkpoint_reads_reject_oversized_persisted_barrier_scalars_json(
     read_all: bool,
 ) -> None:
     run_id = "run-tampered-size"
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn, run_id=run_id)
+    token = _seed_run(db, run_id)
 
-    checkpoint_manager.create_checkpoint(draft=_draft(run_id=run_id, sequence_number=1, barrier_scalars=None))
+    checkpoint_manager.create_checkpoint(draft=_draft(run_id=run_id, sequence_number=1, barrier_scalars=None), coordination_token=token)
 
     with db.engine.begin() as conn:
         conn.execute(
@@ -301,13 +342,16 @@ def test_checkpoint_reads_reject_oversized_persisted_barrier_scalars_json(
             checkpoint_manager.get_latest_checkpoint(run_id)
 
 
-def test_delete_checkpoints_removes_all_for_run(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
-    with db.write_connection() as conn:
-        _insert_checkpoint_prereqs(conn)
+def test_delete_checkpoints_removes_all_for_the_token_run(db: LandscapeDB, checkpoint_manager: CheckpointManager) -> None:
+    """The run purged is the token's run (ADR-048 §2); another run's anchors stay."""
+    token = _seed_run(db)
+    other = _seed_run(db, "run-002")
 
-    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1))
-    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=2))
+    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=1), coordination_token=token)
+    checkpoint_manager.create_checkpoint(draft=_draft(sequence_number=2), coordination_token=token)
+    checkpoint_manager.create_checkpoint(draft=_draft(run_id="run-002", sequence_number=1), coordination_token=other)
 
-    deleted = checkpoint_manager.delete_checkpoints("run-001")
+    deleted = checkpoint_manager.delete_checkpoints(coordination_token=token)
     assert deleted == 2
     assert checkpoint_manager.get_checkpoints("run-001") == []
+    assert [cp.sequence_number for cp in checkpoint_manager.get_checkpoints("run-002")] == [1]

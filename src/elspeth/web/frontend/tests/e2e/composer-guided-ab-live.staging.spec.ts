@@ -48,9 +48,10 @@
 // `pendingBySession` store, which only the native resolve mutates.
 //
 // Invocation (dev/staging server):
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
-//   STAGING_USERNAME=dta_user STAGING_PASSWORD=dta_pass \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
+//   STAGING_USERNAME="${STAGING_USERNAME:?set STAGING_USERNAME in the environment}" \
+//   STAGING_PASSWORD="${STAGING_PASSWORD:?set STAGING_PASSWORD in the environment}" \
 //   ELSPETH_RUN_COMPOSER_LIVE=1 \
 //   ELSPETH_LIVE_OUTPUTS_DIR=<server data_dir>/outputs \
 //   npx playwright test --config=playwright.staging.config.ts composer-guided-ab-live --retries=0
@@ -465,7 +466,7 @@ test.describe("composer guided live — the two-LLM A/B test (staging)", () => {
 
       // Credential-egress confirmation: the run leaves the composer and uses
       // stored credentials, so an alertdialog interposes before execution.
-      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(runDialog).toBeVisible();
       await runDialog.getByRole("button", { name: "Run pipeline" }).click();
 

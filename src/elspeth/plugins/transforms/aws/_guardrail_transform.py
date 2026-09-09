@@ -77,13 +77,12 @@ class BedrockGuardrailTransformConfig(TransformDataConfig):
     @field_validator("fields")
     @classmethod
     def _fields(cls, value: list[str]) -> list[str]:
-        validated = validate_fields_not_empty(value)
-        assert isinstance(validated, list)
-        if len(set(validated)) != len(validated):
+        validate_fields_not_empty(value)
+        if len(set(value)) != len(value):
             raise ValueError("fields must not contain duplicates")
-        if any(len(field) > 256 for field in validated):
+        if any(len(field) > 256 for field in value):
             raise ValueError("field names must contain at most 256 characters")
-        return validated
+        return value
 
 
 class BedrockGuardrailTransformBase(BaseTransform, ABC):
@@ -108,6 +107,10 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self._guardrail_version = cfg.guardrail_version
         self._region = cfg.region
         self._fields = tuple(cfg.fields)
+        # Every configured field must arrive string-valued or process() fails
+        # the row closed — declare that so the DAG rejects a provably
+        # non-string producer at build time (elspeth-b19dfe41fb).
+        self.declared_string_input_fields = frozenset(cfg.fields)
         self._schema_config = cfg.schema_config
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
         self.input_schema, self.output_schema = self._create_schemas(cfg.schema_config, schema_name)
@@ -131,10 +134,10 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
             self._sdk_client = build_bedrock_runtime_client(self._region)
 
     def close(self) -> None:
-        close = getattr(self._sdk_client, "close", None)
-        if callable(close):
-            close()
+        sdk_client = self._sdk_client
         self._sdk_client = None
+        if sdk_client is not None:
+            sdk_client.close()
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:

@@ -30,7 +30,7 @@
     "This is prompt-injection defense; do not substitute azure_content_safety. Use azure_content_safety only for harmful-content moderation or safety classification.",
     "Concurrency is pool_size (1 = sequential, no pooling). Tune dispatch pacing with min_dispatch_delay_ms / max_dispatch_delay_ms and bound capacity retries with max_capacity_retry_seconds; there is no max_concurrency or per_minute_rate_limit field."
   ],
-  "description": "Unified LLM transform with provider dispatch and strategy selection.\n\nRegistered as plugin name=\"llm\". Uses BatchTransformMixin for concurrent\nrow processing with FIFO output ordering and backpressure.\n\nProvider dispatch:\n    \"azure\"      \u2192 AzureOpenAIConfig + AzureLLMProvider\n    \"openrouter\" \u2192 OpenRouterConfig  + OpenRouterLLMProvider\n    \"bedrock\"    \u2192 BedrockConfig     + BedrockLLMProvider\n\nStrategy selection:\n    queries is not None \u2192 MultiQueryStrategy\n    queries is None     \u2192 SingleQueryStrategy",
+  "description": "Unified LLM transform with provider dispatch and strategy selection.\n\nRegistered as plugin name=\"llm\". Uses BatchTransformMixin for concurrent\nrow processing with FIFO output ordering and backpressure.\n\nProvider dispatch:\n    \"azure\"      \u2192 AzureOpenAIConfig + AzureLLMProvider\n    \"openrouter\" \u2192 OpenRouterConfig  + OpenRouterLLMProvider\n    \"bedrock\"    \u2192 BedrockConfig     + BedrockLLMProvider\n    \"gateway\"    \u2192 GatewayConfig     + GatewayLLMProvider\n\nStrategy selection:\n    queries is not None \u2192 MultiQueryStrategy\n    queries is None     \u2192 SingleQueryStrategy",
   "json_schema": {
     "$defs": {
       "FieldDefinition": {
@@ -67,6 +67,53 @@
           "field_type"
         ],
         "title": "FieldDefinition",
+        "type": "object"
+      },
+      "ImageInputConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "title": "Field",
+            "type": "string"
+          },
+          "format": {
+            "anyOf": [
+              {
+                "enum": [
+                  "jpeg",
+                  "png"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Format"
+          },
+          "format_field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Format Field"
+          },
+          "required": {
+            "default": true,
+            "title": "Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "title": "ImageInputConfig",
         "type": "object"
       },
       "OutputFieldConfig": {
@@ -222,7 +269,7 @@
         "type": "string"
       },
       "SchemaConfig": {
-        "description": "Configuration for a plugin's data schema.\n\nA schema can be either observed (accept anything, infer types from data)\nor explicit (validate against specified fields).\n\nSchema Contracts (for DAG validation):\n    - guaranteed_fields: Fields the producer GUARANTEES will exist AND are\n      part of the stable API contract. Downstream can safely depend on these.\n    - required_fields: Fields the consumer REQUIRES in input.\n    - audit_fields: Fields that exist in output but are NOT part of the\n      stability contract. These are for audit trail reconstruction and may\n      change between versions. DAG validation does NOT enforce these.\n\nFor explicit schemas (mode='fixed' or 'flexible'), the declared fields are\nimplicitly guaranteed. Use guaranteed_fields/required_fields to express\ncontracts for observed schemas that still have known field requirements.\n\nExample YAML for an observed schema with explicit contracts:\n    schema:\n      mode: observed\n      guaranteed_fields: [customer_id, timestamp]  # Producer guarantees these\n\n    schema:\n      mode: observed\n      required_fields: [customer_id, amount]  # Consumer requires these\n\n    schema:\n      mode: observed\n      guaranteed_fields: [response, response_usage]  # Stable API\n      audit_fields: [response_template_hash]  # May change between versions\n\nAttributes:\n    mode: \"fixed\" (exact fields), \"flexible\" (at least these), or \"observed\" (infer from data)\n    fields: List of FieldDefinitions, or None if observed\n    is_observed: True if schema types are inferred from data\n    guaranteed_fields: Field names the producer guarantees (for observed schemas)\n    required_fields: Field names the consumer requires (for observed schemas)\n    audit_fields: Field names that exist but are not part of stability contract",
+        "description": "Configuration for a plugin's data schema.\n\nA schema can be either observed (accept anything, infer types from data)\nor explicit (validate against specified fields).\n\nSchema Contracts (for DAG validation):\n    - guaranteed_fields: Fields the producer GUARANTEES will exist AND are\n      part of the stable API contract. Downstream can safely depend on these.\n\n      This is a COMPLETE claim, not a partial hint, and that is the one\n      surprising thing about it. Declaring any guarantee makes the producer\n      PARTICIPATE in the effective-guarantee vote, and build-time validation\n      then holds it to exactly the set it named \u2014 so ADDING a guarantee can\n      narrow what validation accepts. An observed source that lists\n      `guaranteed_fields: [id]` while its rows also carry `colour` will be\n      REJECTED at build time by a sink requiring `colour`, even though the\n      same pipeline builds and runs with the line removed.\n\n      Declaring NOTHING is therefore a meaningful choice, not an omission:\n      a producer with no `guaranteed_fields` ABSTAINS, and sink requirements\n      are enforced per row at runtime instead. Declare the complete set to\n      get build-time enforcement; declare nothing to defer to runtime. A\n      partial declaration is the one option that buys neither.\n    - required_fields: Fields the consumer REQUIRES in input.\n    - audit_fields: Fields that exist in output but are NOT part of the\n      stability contract. These are for audit trail reconstruction and may\n      change between versions. DAG validation does NOT enforce these.\n\nFor explicit schemas (mode='fixed' or 'flexible'), the declared fields are\nimplicitly guaranteed. Use guaranteed_fields/required_fields to express\ncontracts for observed schemas that still have known field requirements.\n\nExample YAML for an observed schema with explicit contracts:\n    schema:\n      mode: observed\n      guaranteed_fields: [customer_id, timestamp]  # Producer guarantees these\n\n    schema:\n      mode: observed\n      required_fields: [customer_id, amount]  # Consumer requires these\n\n    schema:\n      mode: observed\n      guaranteed_fields: [response, response_usage]  # Stable API\n      audit_fields: [response_template_hash]  # May change between versions\n\nAttributes:\n    mode: \"fixed\" (exact fields), \"flexible\" (at least these), or \"observed\" (infer from data)\n    fields: List of FieldDefinitions, or None if observed\n    is_observed: True if schema types are inferred from data\n    guaranteed_fields: Field names the producer guarantees (for observed schemas)\n    required_fields: Field names the consumer requires (for observed schemas)\n    audit_fields: Field names that exist but are not part of stability contract",
         "properties": {
           "audit_fields": {
             "anyOf": [
@@ -303,6 +350,24 @@
     },
     "additionalProperties": false,
     "properties": {
+      "image_inputs": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/ImageInputConfig"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "composer_tier": "advanced",
+        "default": null,
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "title": "Image Inputs"
+      },
       "lookup": {
         "anyOf": [
           {
@@ -313,9 +378,45 @@
             "type": "null"
           }
         ],
+        "composer_tier": "advanced",
         "default": null,
         "description": "Lookup data loaded from YAML file",
         "title": "Lookup"
+      },
+      "max_image_bytes": {
+        "composer_tier": "advanced",
+        "default": 5242880,
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "exclusiveMinimum": 0,
+        "maximum": 20971520,
+        "title": "Max Image Bytes",
+        "type": "integer"
+      },
+      "max_images_per_call": {
+        "composer_tier": "advanced",
+        "default": 20,
+        "description": "Maximum resolved images per LLM call",
+        "exclusiveMinimum": 0,
+        "title": "Max Images Per Call",
+        "type": "integer"
+      },
+      "output_fields": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/OutputFieldConfig"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "composer_tier": "advanced",
+        "default": null,
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "title": "Output Fields"
       },
       "profile": {
         "description": "Operator-approved LLM profile alias",
@@ -373,9 +474,18 @@
         "title": "Response Field",
         "type": "string"
       },
+      "response_format": {
+        "$ref": "#/$defs/ResponseFormat",
+        "composer_tier": "advanced",
+        "default": "standard",
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "title": "Response Format"
+      },
       "schema": {
         "$ref": "#/$defs/SchemaConfig",
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "composer_description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "composer_placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "description": "This transform's INPUT contract: the schema of rows arriving from upstream. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
         "title": "Schema"
       },
       "system_prompt": {
@@ -392,6 +502,7 @@
         "title": "System Prompt"
       },
       "temperature": {
+        "composer_tier": "advanced",
         "default": 0.0,
         "description": "Sampling temperature",
         "maximum": 2.0,
@@ -416,54 +527,98 @@
         "description": "Operator-approved LLM profile alias",
         "name": "profile",
         "required": true,
+        "tier": "common",
         "type": "string"
       },
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "name": "schema",
         "required": true,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
         "name": "required_input_fields",
         "required": false,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Multi-query specs (None = single-query mode)",
         "name": "queries",
         "required": false,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Jinja2 prompt template",
         "name": "prompt_template",
         "required": true,
+        "tier": "common",
         "type": "string"
       },
       {
         "description": "Optional system prompt",
         "name": "system_prompt",
         "required": false,
+        "tier": "common",
         "type": "object"
       },
       {
         "description": "Sampling temperature",
         "name": "temperature",
         "required": false,
+        "tier": "advanced",
         "type": "number"
       },
       {
         "description": "Field name for LLM response in output",
         "name": "response_field",
         "required": false,
+        "tier": "common",
         "type": "string"
+      },
+      {
+        "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
+        "name": "response_format",
+        "required": false,
+        "tier": "advanced",
+        "type": "object"
+      },
+      {
+        "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
+        "name": "output_fields",
+        "required": false,
+        "tier": "advanced",
+        "type": "object"
+      },
+      {
+        "description": "Row columns to resolve as image message parts (absent = text-only)",
+        "name": "image_inputs",
+        "required": false,
+        "tier": "advanced",
+        "type": "object"
+      },
+      {
+        "description": "Per-image byte cap (hard upper bound 20 MiB)",
+        "name": "max_image_bytes",
+        "required": false,
+        "tier": "advanced",
+        "type": "integer"
+      },
+      {
+        "description": "Maximum resolved images per LLM call",
+        "name": "max_images_per_call",
+        "required": false,
+        "tier": "advanced",
+        "type": "integer"
       },
       {
         "description": "Lookup data loaded from YAML file",
         "name": "lookup",
         "required": false,
+        "tier": "advanced",
         "type": "object"
       }
     ]

@@ -29,6 +29,7 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import (
     BatchMembershipSpec,
     BufferedOutcomeSpec,
@@ -46,7 +47,8 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import landscape_database_now, make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-adopt-1"
 WORKER = f"worker:{RUN_ID}:deadbeef"
@@ -106,7 +108,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                 created_at=NOW,
             )
         )
-    return RunCoordinationRepository(db.engine).register_run_leader(run_id=RUN_ID, worker_id=WORKER, now=NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
 
 
 def _bump_epoch(db: LandscapeDB) -> None:
@@ -160,19 +162,115 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
-    blocked_at = NOW + timedelta(seconds=2)
     repo.mark_blocked(
         work_item_id=claimed.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        now=blocked_at,
         expected_lease_owner=WORKER,
     )
-    return token_id, claimed.work_item_id, blocked_at
+    # The hold instant is Landscape database time stamped by mark_blocked
+    # (ADR-047); the adoption backdates its BUFFERED outcome to it.
+    blocked_at = _work_item(db, token_id)["barrier_blocked_at"]
+    assert isinstance(blocked_at, datetime)
+    return token_id, claimed.work_item_id, blocked_at.replace(tzinfo=UTC)
+
+
+def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_name: str) -> tuple[str, str, datetime]:
+    """READY → LEASED → BLOCKED collector hold; returns (token_id, work_item_id, blocked_at).
+
+    Seeds ``collector_name`` at the READY enqueue via ``repo.queue`` directly
+    (``SchedulerQueueRepository``, WS4 Task 6's lane) rather than
+    ``TokenSchedulerRepository.enqueue_ready`` (the compatibility facade):
+    the facade's own passthrough was not extended to forward
+    ``collector_name`` in this fix round — it is a WS3-owned file under the
+    same shared-checkout deconfliction as barrier.py/dispositions.py, out of
+    this task's lane. ``mark_blocked`` (used below via the facade normally)
+    only transitions status/queue_key/barrier_key/lease fields, so it never
+    touches ``collector_name`` — the value seeded at enqueue time survives
+    the block transition unchanged.
+    """
+    repo = TokenSchedulerRepository(db.engine)
+    token_id = f"token-collector-{sequence}"
+    row_id = f"row-collector-{sequence}"
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(rows_table).values(
+                row_id=row_id,
+                run_id=RUN_ID,
+                source_node_id=SOURCE_NODE_ID,
+                row_index=sequence,
+                source_row_index=sequence,
+                ingest_sequence=sequence,
+                source_data_hash=f"hash-{row_id}",
+                created_at=NOW,
+            )
+        )
+        conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
+    repo.queue.enqueue_ready(
+        run_id=RUN_ID,
+        token_id=token_id,
+        row_id=row_id,
+        node_id=NODE_ID,
+        step_index=1,
+        ingest_sequence=sequence,
+        row_payload_json=_payload_json(),
+        collector_name=collector_name,
+    )
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
+    assert claimed is not None and claimed.token_id == token_id
+    repo.mark_blocked(
+        work_item_id=claimed.work_item_id,
+        queue_key=None,
+        barrier_key=collector_barrier_key(collector_name, "g-1"),
+        expected_lease_owner=WORKER,
+    )
+    blocked_at = _work_item(db, token_id)["barrier_blocked_at"]
+    assert isinstance(blocked_at, datetime)
+    return token_id, claimed.work_item_id, blocked_at.replace(tzinfo=UTC)
+
+
+def test_facade_enqueue_ready_forwards_collector_name(db: LandscapeDB, token: CoordinationToken) -> None:
+    """I-3 (fix round): the durable round-trip tests above are strong, but
+    they all reach the durable table through repo.queue.enqueue_ready
+    directly (see _seed_blocked_collector_hold's own docstring for why —
+    at the time it was written, TokenSchedulerRepository.enqueue_ready
+    itself, the FACADE every real production caller actually uses, had no
+    collector_name parameter at all). That was the one silent-NULL site:
+    a caller going through the facade with collector_name set would have
+    it dropped with no error. Now that the facade forwards it (held-hunk
+    item 3), pin the round trip through the facade specifically, not the
+    sub-repository."""
+    repo = TokenSchedulerRepository(db.engine)
+    token_id = "token-facade-collector"
+    row_id = "row-facade-collector"
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(rows_table).values(
+                row_id=row_id,
+                run_id=RUN_ID,
+                source_node_id=SOURCE_NODE_ID,
+                row_index=0,
+                source_row_index=0,
+                ingest_sequence=0,
+                source_data_hash=f"hash-{row_id}",
+                created_at=NOW,
+            )
+        )
+        conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
+    repo.enqueue_ready(
+        run_id=RUN_ID,
+        token_id=token_id,
+        row_id=row_id,
+        node_id=NODE_ID,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=_payload_json(),
+        collector_name="stitch",
+    )
+    assert _work_item(db, token_id)["collector_name"] == "stitch"
 
 
 def _work_item(db: LandscapeDB, token_id: str) -> dict[str, object]:
@@ -217,7 +315,6 @@ def _adopt(db: LandscapeDB, token: CoordinationToken, *, token_id: str, work_ite
         "barrier_key": BARRIER_KEY,
         "membership": BatchMembershipSpec(batch_id=BATCH_ID, ordinal=0) if aggregation else None,
         "buffered_outcome": BufferedOutcomeSpec(batch_id=BATCH_ID, context={"branch": "left"}) if aggregation else None,
-        "now": ADOPT_NOW,
         "coordination_token": token,
     }
     kwargs.update(overrides)
@@ -228,7 +325,9 @@ class TestAdoption:
     def test_aggregation_arm_adopts_with_membership_and_backdated_buffered_outcome(self, db: LandscapeDB, token: CoordinationToken) -> None:
         token_id, work_item_id, blocked_at = _seed_blocked_barrier_hold(db, sequence=0)
 
+        adopt_from = landscape_database_now(db.engine)
         result = _adopt(db, token, token_id=token_id, work_item_id=work_item_id)
+        adopt_until = landscape_database_now(db.engine)
 
         assert result.adopted is True
         assert result.barrier_adopted_epoch == token.leader_epoch
@@ -254,7 +353,9 @@ class TestAdoption:
         assert recorded_at.replace(tzinfo=UTC) == blocked_at, "§E.2 backdated accept: recorded_at == barrier_blocked_at, NOT now"
         context = json.loads(str(outcome["context_json"]))
         assert context["adopted_epoch"] == token.leader_epoch
-        assert context["adopted_at"] == ADOPT_NOW.isoformat()
+        # The adoption instant is Landscape database time read inside the
+        # fenced transaction (ADR-047), not a caller-supplied stamp.
+        assert adopt_from <= datetime.fromisoformat(context["adopted_at"]) <= adopt_until
         assert context["branch"] == "left", "caller context merges in"
 
     def test_idempotent_readoption_skips_all_inserts(self, db: LandscapeDB, token: CoordinationToken) -> None:
@@ -307,7 +408,6 @@ class TestAdoption:
             barrier_key="coalesce:merge",
             membership=None,
             buffered_outcome=None,
-            now=ADOPT_NOW,
             coordination_token=token,
         )
 
@@ -316,6 +416,49 @@ class TestAdoption:
         assert _work_item(db, token_id)["barrier_adopted_epoch"] == token.leader_epoch
         assert _batch_members(db) == []
         assert _outcomes(db, token_id) == []
+
+    def test_adopt_blocked_collector_item_is_cas_fenced(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """Collector arrivals ride the SAME barrier_adopted_epoch CAS as coalesce
+        (spec §5 decision 10: duplicate same-token arrival via lease-expiry
+        redelivery is a CAS-fenced idempotent skip). adopt_blocked_barrier_item
+        is generic over barrier_key's shape (barrier.py:908-990 has no
+        collector-specific branch) — the compound "collector:<name>:<group_id>"
+        key is just another string to the CAS UPDATE predicate."""
+        token_id, work_item_id, _blocked_at = _seed_blocked_collector_hold(db, sequence=0, collector_name="stitch")
+
+        repo = TokenSchedulerRepository(db.engine)
+        adopt_kwargs = {
+            "run_id": RUN_ID,
+            "work_item_id": work_item_id,
+            "token_id": token_id,
+            "barrier_key": collector_barrier_key("stitch", "g-1"),
+            "membership": None,
+            "buffered_outcome": None,
+            "coordination_token": token,
+        }
+        first = repo.adopt_blocked_barrier_item(**adopt_kwargs)
+        assert first.adopted is True
+        assert first.outcome_id is None
+        assert _work_item(db, token_id)["barrier_adopted_epoch"] == token.leader_epoch
+
+        second = repo.adopt_blocked_barrier_item(**adopt_kwargs)
+        assert second.adopted is False  # idempotent skip — the double-accept guard
+        assert _batch_members(db) == []
+        assert _outcomes(db, token_id) == []
+
+    def test_blocked_collector_item_counts_as_blocked_barrier_work(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """leader_drain.py's EOF fixpoint gate: collector-buffered members keep
+        the drain loop alive via list_blocked_barrier_items, which is
+        non-filtered by barrier_key shape by design (barrier.py:1071). This is
+        the journal-row half of the ratified always-journal pin (canon item
+        11, executor half in test_collector_executor.py): every collector
+        arrival is a durable BLOCKED row, and it carries collector_name."""
+        _token_id, _work_item_id, _blocked_at = _seed_blocked_collector_hold(db, sequence=0, collector_name="stitch")
+
+        repo = TokenSchedulerRepository(db.engine)
+        items = repo.list_blocked_barrier_items(run_id=RUN_ID)
+        assert [item.collector_name for item in items] == ["stitch"]
+        assert [item.barrier_key for item in items] == [collector_barrier_key("stitch", "g-1")]
 
 
 class TestAdoptionRefusals:
@@ -369,7 +512,6 @@ class TestAdoptionRefusals:
             run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             token_ids=(token_id,),
-            now=NOW,
             coordination_token=token,
         )
 

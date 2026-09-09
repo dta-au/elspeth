@@ -145,6 +145,17 @@ async def get_rate_limiter(request: Request) -> ComposerRateLimiter:
     return limiter
 
 
+async def get_write_rate_limiter(request: Request) -> ComposerRateLimiter:
+    """FastAPI dependency for the cheap-DB-write bucket.
+
+    Distinct from get_rate_limiter (the LLM/execution bucket) so bursty
+    but cheap writes — tutorial stage persistence above all — cannot
+    starve LLM-endpoint budget or vice versa.
+    """
+    limiter: ComposerRateLimiter = request.app.state.write_rate_limiter
+    return limiter
+
+
 async def check_auth_rate_limit(request: Request) -> None:
     """Rate-limit auth endpoints by client IP.
 

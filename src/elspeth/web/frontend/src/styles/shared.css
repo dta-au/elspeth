@@ -1,8 +1,7 @@
 /* shared.css — Cross-cutting primitives used by multiple areas.
    Owners: .btn family, .tab-strip, .type-badge*, .status-badge*,
    .validation-banner (base + detailed migrations), .empty-state,
-   .confirm-dialog, .app-layout, .layout-chat, .layout-siderail, .banner,
-   .side-rail (base layer; sidebar.css owns the per-component side-rail rules).
+   .confirm-dialog, .banner, and shared form primitives.
    Composed from multiple source ranges in App.css — preserves cascade order. */
 
 
@@ -66,11 +65,25 @@
   border: 1px solid var(--color-badge-coalesce-border);
 }
 
+/* Row union — correlated N-to-N fan-in; waits, then preserves every row. */
+.type-badge-row_union {
+  background-color: var(--color-badge-row-union-bg);
+  color: var(--color-badge-row-union);
+  border: 1px solid var(--color-badge-row-union-border);
+}
+
 /* Queue — pink (structural fan-in; interleaves incoming rows) */
 .type-badge-queue {
   background-color: var(--color-badge-queue-bg);
   color: var(--color-badge-queue);
   border: 1px solid var(--color-badge-queue-border);
+}
+
+/* Collector — lime (EXPAND-group closer; flushes a completed scope as one batch) */
+.type-badge-collector {
+  background-color: var(--color-badge-collector-bg);
+  color: var(--color-badge-collector);
+  border: 1px solid var(--color-badge-collector-border);
 }
 
 
@@ -110,6 +123,19 @@
 }
 
 .status-badge-cancelled {
+  background-color: rgba(227, 132, 68, 0.15);
+  color: var(--color-status-cancelled);
+}
+
+/* completed_with_failures gets its own warning-family tone
+   (elspeth-cd885f4c4d) instead of aliasing to the green completed badge:
+   the progress bar ~20px beneath it, the app toast, and the Run-tab dot
+   (ArtifactWorkspace) all report the status as a warning, and the badge —
+   the most prominent of the four — was the sole surface reporting an
+   unqualified success. Reuses the cancelled/warning pairing already proven
+   on every tint surface in both themes (colorContrast.test.ts); the ⚠ glyph
+   keeps the distinction non-colour-only. */
+.status-badge-completed_with_failures {
   background-color: rgba(227, 132, 68, 0.15);
   color: var(--color-status-cancelled);
 }
@@ -215,23 +241,69 @@
   cursor: not-allowed;
 }
 
-/* Side-rail action buttons (Run pipeline / Save for review / Export YAML) sit
-   on the warm inspection surface (--color-surface-inspector), where the global
-   disabled fill (--color-bg) reads as a raised dark chip rather than
-   "inactive" — so a disabled action (e.g. Run with "No pipeline yet") can be
-   mistaken for a clickable one. Re-merge disabled rail buttons into the rail
-   surface so they read as a recessed, outlined slot against the raised teal of
-   the enabled buttons. The global .btn:disabled rule is intentionally
-   unchanged — --color-bg merges into the page background and is gated by
-   colorContrast.test.ts; this only re-targets the surface the rail sits on.
-   Text stays --color-text-muted, AA-verified on --color-surface-inspector
-   (dark 6.53:1, light 6.33:1); the --color-border-strong outline is inherited
-   so the disabled control stays distinguishable. */
-.layout-siderail .btn:disabled,
-.layout-siderail .btn[aria-disabled="true"],
-.layout-siderail .btn-compact:disabled,
-.layout-siderail .btn-compact[aria-disabled="true"] {
-  background-color: var(--color-surface-inspector);
+/* Tab chrome for role="tab" controls in bordered toolbar rows (artifact
+   toolbar, inspector tabs, narrow workspace view tabs). Segmented-control
+   idiom rather than .tab-strip's underline: these rows carry padding and
+   sibling commands, so a flush underline has no container edge to sit on.
+   Selected state reads as "current view", not "pressed" — which is why this
+   is not a .btn composition. Hover guards live in :where() for the same
+   cascade reason as .btn:hover above (buttonCascade.test.ts). */
+.artifact-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  color: var(--color-text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  min-height: var(--size-control-compact);
+  cursor: pointer;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+  white-space: nowrap;
+}
+
+.artifact-tab:hover:where(:not(:disabled)):where(:not([aria-selected="true"])) {
+  background-color: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.artifact-tab[aria-selected="true"] {
+  background-color: var(--color-surface-elevated);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.artifact-tab:disabled {
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+/* Button that reads as a link, for actions inside prose (download the full
+   file, switch auth view). One definition for what previously existed as
+   three mechanisms (two inline-TSX style objects and .tutorial-link-button).
+   No --color-link-hover token exists, so the hover cue is underline weight,
+   not a color shift. The radius only shapes the global focus ring. */
+.link-button {
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-link);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  text-decoration-thickness: 2px;
 }
 
 .btn-primary {
@@ -270,23 +342,25 @@
 }
 
 /* .btn-small predates .btn-compact and is retained at its existing call sites.
-   New buttons that need a chrome-row size should compose .btn-compact instead. */
+   New buttons that need a chrome-row size should compose .btn-compact instead.
+
+   It set font-size and padding but NO min-height, so all 14 call sites — each
+   of which composes .btn, whether hand-written or via ui/Button, which emits
+   "btn" for compact={false} — rendered a 12px label inside .btn's 44px box
+   (elspeth-04d8ef4f3b). Binding the compact rung here is the single edit that
+   brings those 14 buttons onto a declared rung. .btn-small is declared AFTER
+   .btn at equal specificity (0,1,0), so it wins the tie by order; keep it
+   below .btn.
+
+   This deliberately trades WCAG 2.5.5 (AAA, 44px) for 2.5.8 (AA, >=24px) at
+   those sites. tokens.css:246-253 already sanctions exactly that trade for
+   chrome-row controls, which is what every .btn-small call site is (catalog
+   cards, YAML/tool-call toolbars, the runs-history drawer, import-YAML rows). */
 .btn-small {
   font-size: var(--font-size-xs);
   padding: var(--space-2xs) var(--space-sm);
+  min-height: var(--size-control-compact);
 }
-
-/* Layout helper shared by side-rail full-width slots (Execute, Export YAML,
-   Catalog). Extracted from three identical rules; do not re-declare width or
-   margin on side-rail buttons — compose this class instead. The .completion-bar
-   override below reverses these properties when the same components are
-   rendered in a row context. */
-.side-rail-slot-fill {
-  width: calc(100% - (2 * var(--space-sm)));
-  margin: var(--space-sm);
-  justify-content: center;
-}
-
 
 /* ---------------------------------------------------------------------------
    Form inputs (ui/Input primitive; .textarea/.select kept for parity)
@@ -313,6 +387,16 @@
   font-family: var(--font-sans);
   font-size: var(--font-size-base);
   line-height: 1.4;
+}
+/* .input alone binds to the 44px control rung (elspeth-39bd9d68b3). With no
+   min-height its height was content-derived — 16px x 1.4 line-height + 8px + 8px
+   padding + 2px border = 40.4px — against the 44px .btn that completes the same
+   form column, so every form shipped a 3.6px mismatch between its fields and its
+   submit (four times over on the register form). Deliberately NOT extended to
+   .textarea (height is rows/content-derived by design) or .select (no consumer;
+   the rule is kept only to mirror the website token sheet as one block). */
+.input {
+  min-height: var(--size-control);
 }
 .input::placeholder,
 .textarea::placeholder {
@@ -421,32 +505,119 @@
 
 
 /* ---------------------------------------------------------------------------
-   Confirm Dialog (replacement for window.confirm)
-   --------------------------------------------------------------------------- */
+   Dialog primitive + Confirm Dialog (replacement for window.confirm)
+
+   ONE frame, many closures (elspeth-e6fcd8d703): the seven blocking overlays
+   each hand-rolled radius, padding, width, height cap, backdrop and z-index.
+   `.app-dialog` / `.app-dialog-backdrop` are the compose targets for new and
+   migrating dialogs — the frame consumes the dialog band (--z-dialog /
+   --z-dialog-backdrop), the modal radius and shadow tiers, and the single
+   page-dimming veil (--color-scrim); width and frame padding stay per-dialog
+   modifiers. Grouped with `.confirm-dialog`, which (with the ShortcutsHelp
+   dialog that borrows its classes) already ships on exactly these
+   declarations — so the primitive is live from day one, not a dead rule
+   waiting for a consumer. Migrating the remaining frames' TSX class lists
+   onto it is the follow-up this rule exists for. */
+.app-dialog-backdrop,
 .confirm-dialog-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  /* Backdrops consume --color-scrim, never a literal (elspeth-9ae8ee9ac2):
+     this one shipped at rgba(0,0,0,0.45), one of eleven hand-copied scrims
+     across three alphas, so "blocked" dimmed three different amounts
+     depending on which overlay was open. */
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
+.app-dialog,
 .confirm-dialog {
   position: fixed;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
   z-index: var(--z-dialog);
-  width: 400px;
   max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background-color: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
+}
+
+/* Per-dialog closure: only width and frame padding are the confirm dialog's
+   own decisions (the padded-frame contract .confirm-dialog-header documents
+   below). */
+.confirm-dialog {
+  width: 400px;
   padding: var(--space-xl);
 }
 
+/* Per-dialog closures for the three settings dialogs (SecretsPanel,
+   UserAdminDialog, ComposerPreferencesPanel — elspeth-e6fcd8d703). These were
+   the last inline-styled frames: each carried a copy-pasted style object at
+   literal z-index 100/101 (the NON-modal overlay band, so they stacked as if
+   they were not modal), a hardcoded backdrop rgba and a string box-shadow no
+   theme override could ever reach. The chrome — dialog band, scrim, radius,
+   shadow, height cap — is .app-dialog's; only width and the content scale are
+   these dialogs' own decisions, mirroring how .confirm-dialog closes over the
+   primitive above. */
+.settings-dialog {
+  width: 480px;
+  /* The frame sets the settings content scale (the inline recipe's
+     fontSize: 13) — the .secrets-panel-* / .user-admin-* /
+     .composer-preferences-* content is designed against it, where body copy
+     elsewhere sits at --font-size-base. */
+  font-size: var(--font-size-sm);
+}
+
+.settings-dialog-wide {
+  width: 560px;
+}
+
+.confirm-dialog-header,
+.confirm-dialog-actions {
+  flex-shrink: 0;
+}
+
+/* The header carries a bottom rule like every other overlay header
+   (elspeth-329ca624a8) — this dialog declared `flex-shrink: 0` and nothing
+   else, so the app's most-used dialog had no separation between title and
+   body while .graph-modal-header / .yaml-modal-header / .explain-dialog-header
+   all had one.
+
+   Deliberately NOT the modal-header recipe verbatim: those are edge-to-edge
+   frames whose header owns the padding, whereas .confirm-dialog carries
+   --space-xl on the FRAME. Copying `padding: var(--space-md)` here would
+   double-pad the title and inset its rule 24px from the frame edge. Same
+   contract (a rule under the title), expressed for a padded frame — the
+   padding-bottom sets title-to-rule and the margin-bottom sets rule-to-body,
+   which is why .confirm-dialog-title no longer carries a bottom margin. */
+.confirm-dialog-header {
+  margin-bottom: var(--space-md);
+  padding-bottom: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.confirm-dialog-body {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Bracket the bottom of the scroll owner (elspeth-8013e385df). The last body
+     ink row measured y=634 against the button band's border at y=635 — zero
+     intervening rows — because the only vertical air was
+     .confirm-dialog-message's bottom margin, which lives INSIDE the scroller
+     and scrolls away exactly when the user is deciding whether to authorise
+     the run. Padding on the scroll owner survives to the end of the scroll. */
+  padding-bottom: var(--space-md);
+}
+
 .confirm-dialog-title {
-  margin: 0 0 var(--space-sm);
+  margin: 0;
   font-size: var(--font-size-lg);
   font-weight: var(--font-weight-semibold);
   color: var(--color-text);
@@ -459,10 +630,15 @@
   line-height: var(--line-height-normal);
 }
 
+/* The other end of the same bracket (elspeth-8013e385df): a rule over the
+   button band plus air between it and the buttons, so the body never appears
+   to sit on top of the controls that authorise the run. */
 .confirm-dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: var(--space-sm);
+  padding-top: var(--space-lg);
+  border-top: 1px solid var(--color-border);
 }
 
 .confirm-dialog-btn {
@@ -470,88 +646,129 @@
   min-height: var(--size-control);
 }
 
+/* The notice center OVERLAYS the application instead of participating in
+   flow (elspeth-1c4687ff67). Rendered in flow before the header, a notice's
+   arrival displaced the entire viewport — header, panes, canvas, action
+   bar — by the bar's height and snapped it all back on dismiss: whole-app
+   layout shift on an ordinary state change. Fixed at the top of the
+   viewport, above the header on the z stack (--z-overlay: over page chrome
+   and the catalog drawer, under dialog/palette backdrops), casting the
+   floating-surface shadow onto the header beneath. The fixed position also
+   creates the stacking context inside which the disclosure popover (its own
+   fixed box, --z-popover) paints above the bar. */
+.app-notice-center {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: var(--z-overlay);
+  /* Opaque ground is load-bearing, not decoration. The content row composes
+     .alert-banner, whose tone backgrounds are 10-14% alpha tints — fine while
+     the bar sat in flow over the app surface, but as a fixed overlay the bar
+     paints over the header (or the run-outcome toast), and a bare tint let
+     that content bleed through at ~88% transparency: text-on-text with
+     uncontrolled contrast. The surface also justifies the shadow — a shadow
+     cast by a transparent element reads as a rendering fault. */
+  background: var(--color-surface);
+  box-shadow: var(--shadow-popover);
+}
 
-/* ---------------------------------------------------------------------------
-   Layout Grid
-   --------------------------------------------------------------------------- */
-.app-layout {
-  display: grid;
-  grid-template-rows: 100%;
-  /* Rail width is tokenised (--siderail-width) — it was previously a
-     hardcoded inline style in Layout.tsx, which no media query could
-     override (elspeth-49dd290c7a). */
-  grid-template-columns: minmax(0, 1fr) var(--siderail-width);
-  grid-template-areas: "chat siderail";
-  height: 100%;
-  min-width: 640px;
+/* elspeth-81f714e210. Two separate defects met at this seam:
+
+   (1) The content box was 1px SHORT of the control it holds. 44px row − 1px
+       .alert-banner bottom border − 2x --space-xs (4px) = 35px, against a 36px
+       .alert-banner-action. --space-2xs leaves 39px, so the control fits.
+   (2) The focus ring was clipped, and (1) was NOT its cause. The action is
+       flex-CENTRED, so a symmetric padding-block change does not move it at
+       all: it sits 3.5px..39.5px inside the 43px padding box either way. The
+       ring (36px + 2x(2px offset + 2px width) = 44px of extent) simply cannot
+       fit a 43px padding box, so `overflow: hidden` cut ~0.5px off it at each
+       seam no matter what the padding was. Removing the PAINT clip is what
+       uncuts the ring; the row stays exactly as bounded as before because
+       height/max-height bound the LAYOUT, and every overflow source has its
+       own clip — .app-notice-primary-message carries nowrap + ellipsis +
+       overflow:hidden, and every notice `action` in App.tsx:540-643 is a
+       36px .alert-banner-action, never a 44px .btn. */
+.app-notice-primary.alert-banner {
+  height: var(--size-control);
+  max-height: var(--size-control);
+  gap: var(--space-sm);
+  padding-block: var(--space-2xs);
+  /* Centre the message + action cluster instead of .alert-banner's
+     space-between (elspeth-1c4687ff67 secondary): on a wide viewport the
+     base recipe parked one sentence at the far left and its action at the
+     far right with ~1600px of empty bar between them. The cluster is
+     content-sized, so centring caps the bar's inner measure without a
+     max-width wrapper; the message keeps its ellipsis clamp for overflow. */
+  justify-content: center;
+}
+
+.app-notice-primary-message {
+  min-width: 0;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* Single-column shell: Layout renders no .layout-siderail column when its
-   siderail prop is null (a guided build is active — the workspace inside the
-   chat panel carries its own rail at --siderail-width, so the chat column
-   takes the full width and the geometry matches the two-column freeform
-   shell). Also declared inside the ≤960px collapse below so the stacked
-   template can't resurrect a phantom second row. */
-.app-layout--chat-only {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: "chat";
+.app-notice-primary-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-xs);
 }
 
-/* Responsive collapse (elspeth-49dd290c7a, WCAG 1.4.10 Reflow). Below 960px
-   (640px chat minimum + 320px rail) the two-column shell cannot fit, and with
-   body{overflow:hidden} the rail was clipped with no scroll path. Collapse to
-   ONE column with the conversation + composer first and the rail stacked
-   below as a bounded, independently-scrolling panel — the same discipline as
-   the guided (900px) and tutorial (760px) workspaces. This replaces the
-   never-wired .app-layout--overlay chat-only fallback: hiding the rail
-   outright would strand Run / Save-for-review / Export YAML. */
-@media (max-width: 960px) {
-  .app-layout {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "chat"
-      "siderail";
-    min-width: 0;
-  }
-
-  .layout-siderail {
-    border-left: none;
-    border-top: 1px solid var(--color-border);
-    /* Cap the rail so the chat column keeps the majority of the viewport;
-       the rail scrolls its own content (overflow-y) instead of clipping it
-       (the base rule's overflow:hidden relied on the full-height .side-rail
-       child owning the scroll, which no longer applies when stacked). */
-    max-height: 45vh;
-    overflow-y: auto;
-  }
-
-  /* Chat-only shell has no rail row to stack — keep the single bounded row
-     or the auto second row leaves a dead band under the composer. */
-  .app-layout--chat-only {
-    grid-template-rows: minmax(0, 1fr);
-    grid-template-areas: "chat";
-  }
+.app-notice-primary-actions .alert-banner-action {
+  margin-left: 0;
 }
 
-.layout-chat {
-  grid-area: chat;
-  overflow: hidden;
+.app-notice-popover {
+  position: fixed;
+  z-index: var(--z-popover);
+  top: 16px;
+  right: 16px;
   display: flex;
   flex-direction: column;
-  background-color: var(--color-surface);
+  width: min(42rem, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-popover);
 }
 
-.layout-siderail {
-  grid-area: siderail;
-  position: relative;
-  border-left: 1px solid var(--color-border);
-  overflow: hidden;
+.app-notice-popover-header {
   display: flex;
-  flex-direction: column;
-  background-color: var(--color-surface-inspector);
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
 }
+
+.app-notice-popover-header h2 {
+  margin: 0;
+  font-size: var(--font-size-base);
+}
+
+.app-notice-list {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.app-notice-item.alert-banner {
+  align-items: flex-start;
+  gap: var(--space-md);
+  border-bottom-color: var(--color-border);
+}
+
+.app-notice-item-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 
 .banner {
   display: flex;
@@ -582,6 +799,15 @@
   cursor: pointer;
   font: inherit;
   flex: 0 0 auto;
+  /* Exactly the two properties :hover changes (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .banner-dismiss-btn {
+    transition: none;
+  }
 }
 
 .banner-dismiss-btn:hover,
@@ -593,22 +819,6 @@
 .banner-dismiss-btn:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
-}
-
-.side-rail {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  /* Variable-height slots (AuditReadiness rows, ValidationResult errors,
-     restored SuggestionList) can exceed the rail's bounded height on short
-     viewports. Without overflow-y the lower slots (ExportYaml, Execute) are
-     clipped and unreachable. The parent .layout-siderail still clips
-     horizontal overflow; this rule lets the rail scroll vertically. */
-  overflow-y: auto;
-}
-
-.side-rail-slot:empty {
-  display: none;
 }
 
 .side-rail-validation-banner {
@@ -631,6 +841,51 @@
   gap: var(--space-1-5);
 }
 
+/* Collapsed pass state: the whole banner is a single expand affordance,
+   mirroring .audit-readiness-summary. Padding moves onto the button so the
+   full banner surface is clickable. */
+.validation-banner--collapsed {
+  padding: 0;
+}
+
+.validation-banner-summary-btn {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  width: 100%;
+  padding: var(--space-sm) var(--space-lg);
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.validation-banner-summary-btn:hover .validation-banner-summary {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.validation-banner-summary-meta {
+  margin-left: auto;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-muted);
+}
+
+.validation-banner-collapse-btn {
+  margin-left: auto;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .validation-banner-summary {
   font-weight: var(--font-weight-semibold);
 }
@@ -644,6 +899,43 @@
 
 .validation-banner-check-item {
   margin-bottom: var(--space-2xs);
+}
+
+/* Standard-view stand-in for the per-check list (elspeth-27efd1e801):
+   show_advanced off shows this one line instead of .validation-banner-checks.
+   Same slot, same font size, but neutral text colour — it isn't itemising
+   pass/fail per check, so it shouldn't borrow .validation-banner-checks'
+   success-green. */
+.validation-banner-checks-summary {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+/* Technical-details disclosure for a humanised finding's raw engine dump
+   (elspeth-27efd1e801) — shared by ValidationResult.tsx's error/warning rows
+   and SideRailValidationBanner.tsx's suggestion rows, so both surfaces keep
+   one visual treatment for "the plain headline is above; the raw text is
+   here, closed by default". Mirrors .readiness-row-detail-raw's summary/pre
+   pairing (audit.css) without importing across component directories. */
+.validation-banner-technical {
+  margin-top: var(--space-2xs);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+.validation-banner-technical summary {
+  cursor: pointer;
+}
+
+.validation-banner-technical pre {
+  margin: var(--space-2xs) 0 0;
+  padding: var(--space-xs);
+  background-color: var(--color-surface);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .validation-banner-warnings-section {
@@ -667,14 +959,24 @@
   margin-bottom: var(--space-2xs);
 }
 
+/* Pass and fail states occupy the SAME slot, so they must share one indent
+   system (elspeth-d1edd9bef8). The fail state used to add its own padding on
+   top of .validation-banner's — 8px/12px on the title and 0/12px/8px/28px on
+   the list — while the pass state (.validation-banner-content /
+   .validation-banner-checks) inherits the banner padding and adds only the
+   bullet column. Measured from the banner box: the fail title landed 12px
+   right and 8px down of the pass summary, and the two bullet columns landed
+   4px apart (28px vs --space-xl 24px), so toggling validation re-positioned
+   the whole text block. Both states now take their inset from
+   .validation-banner alone and their bullet column from --space-xl; the
+   list's --space-xs top margin matches .validation-banner-content's gap. */
 .validation-banner-fail-title {
-  padding: var(--space-sm) var(--space-md);
   font-weight: var(--font-weight-semibold);
 }
 
 .validation-banner-fail-list {
-  margin: 0;
-  padding: 0 var(--space-md) var(--space-sm) 28px;
+  margin: var(--space-xs) 0 0;
+  padding: 0 0 0 var(--space-xl);
 }
 
 .validation-banner-error-item {

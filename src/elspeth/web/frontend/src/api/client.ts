@@ -20,6 +20,8 @@ import type {
   ComposerProgressSnapshot,
   ExecutionFanoutAck,
   ExecutionFanoutGuard,
+  ExecutionSecretAck,
+  ExecutionSecretGuard,
   CancelRunResponse,
   InlineSourceProvenance,
   PluginSchemaInfo,
@@ -35,6 +37,8 @@ import type {
   WebSocketTicketResponse,
   SecretInventoryItem,
   Session,
+  AdminGeneratedPassword,
+  AdminUserSummary,
   UserProfile,
   ValidationResult,
   SystemStatus,
@@ -55,6 +59,7 @@ import {
   decodeGuidedRespondResponse,
   decodeGuidedStartOperationReconciliation,
 } from "./guidedDecoder";
+import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
   InterpretationEvent,
   InterpretationOptOutResponse,
@@ -229,14 +234,21 @@ export async function parseResponse<T>(
     // responses.
     let detail = response.statusText;
     let errorType: string | undefined;
+    let requestId: string | undefined;
+    let failureCode: string | undefined;
     let componentId: string | undefined;
     let pluginId: string | undefined;
     let nestedSnapshotFingerprint: string | undefined;
     let providerDetail: string | undefined;
     let providerStatusCode: number | undefined;
     let fanoutGuard: ExecutionFanoutGuard | undefined;
+    let secretGuard: ExecutionSecretGuard | undefined;
     let validationErrors: ApiError["validation_errors"];
     let errors: ApiError["errors"];
+    let reason: string | undefined;
+    let recoveryText: ApiError["recovery_text"];
+    let timeoutSeconds: number | undefined;
+    let retryAfter: number | undefined;
     let partialState: ApiError["partial_state"];
     let failedTurn: ApiError["failed_turn"];
     let partialStateSaveFailed: ApiError["partial_state_save_failed"];
@@ -252,6 +264,33 @@ export async function parseResponse<T>(
         [body, nestedDetail],
         ["error_type", "error_code", "code", "kind"],
       );
+
+      requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+
+      // Convergence discriminator + its recovery copy. Kept off `detail` so
+      // the SPA branches on the taxonomy rather than parsing prose.
+      reason = firstStringField([body, nestedDetail], ["reason"]);
+      recoveryText = firstStringField([body, nestedDetail], ["recovery_text"]);
+
+      const rawTimeoutSeconds = firstDefined(
+        ownField(body, "timeout_seconds"),
+        ownField(nestedDetail, "timeout_seconds"),
+      );
+      // Finite and positive or absent — error copy must not name a number the
+      // response did not actually stand behind.
+      timeoutSeconds =
+        typeof rawTimeoutSeconds === "number" &&
+        Number.isFinite(rawTimeoutSeconds) &&
+        rawTimeoutSeconds > 0
+          ? rawTimeoutSeconds
+          : undefined;
+
+      const rawRetryAfter = firstDefined(
+        ownField(body, "retry_after"),
+        ownField(nestedDetail, "retry_after"),
+      );
+      retryAfter = typeof rawRetryAfter === "number" ? rawRetryAfter : undefined;
 
       const rawComponentId = firstDefined(
         ownField(body, "component_id"),
@@ -293,6 +332,9 @@ export async function parseResponse<T>(
 
       fanoutGuard =
         body.fanout_guard ?? nestedDetail?.fanout_guard;
+
+      secretGuard =
+        body.secret_guard ?? nestedDetail?.secret_guard;
 
       validationErrors =
         body.validation_errors ?? nestedDetail?.validation_errors;
@@ -362,13 +404,20 @@ export async function parseResponse<T>(
       status: response.status,
       detail,
       error_type: errorType,
+      request_id: requestId,
+      failure_code: failureCode,
       component_id: componentId,
       plugin_id: pluginId,
+      reason,
+      recovery_text: recoveryText,
+      timeout_seconds: timeoutSeconds,
+      retry_after: retryAfter,
       partial_state: partialState,
       failed_turn: failedTurn,
       partial_state_save_failed: partialStateSaveFailed,
       partial_state_save_error: partialStateSaveError,
       fanout_guard: fanoutGuard,
+      secret_guard: secretGuard,
       provider_detail: providerDetail,
       provider_status_code: providerStatusCode,
       validation_errors: validationErrors,
@@ -430,6 +479,53 @@ export async function fetchCurrentUser(): Promise<UserProfile> {
     headers: authHeaders(),
   });
   return parseResponse<UserProfile>(response);
+}
+
+// ── Dev-admin user management (env-gated; 404 unless the backend's
+//    dev_admin_user names the current local-auth user) ──────────────────────
+
+/** List every local-auth account (dev admin only). */
+export async function fetchAdminUsers(): Promise<{ users: AdminUserSummary[] }> {
+  const response = await fetch("/api/auth/admin/users", {
+    headers: authHeaders(),
+  });
+  return parseResponse<{ users: AdminUserSummary[] }>(response);
+}
+
+/** Create a local-auth account; the server generates and returns the password once. */
+export async function createAdminUser(body: {
+  username: string;
+  display_name: string;
+  email?: string;
+}): Promise<AdminGeneratedPassword> {
+  const response = await fetch("/api/auth/admin/users", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify(body),
+  });
+  return parseResponse<AdminGeneratedPassword>(response);
+}
+
+/** Reset an account's password; the server generates and returns it once. */
+export async function resetAdminUserPassword(
+  userId: string,
+): Promise<AdminGeneratedPassword> {
+  const response = await fetch(
+    `/api/auth/admin/users/${encodeURIComponent(userId)}/reset-password`,
+    { method: "POST", headers: authHeaders() },
+  );
+  return parseResponse<AdminGeneratedPassword>(response);
+}
+
+/** Delete a local-auth account. Backend returns 204 No Content. */
+export async function deleteAdminUser(userId: string): Promise<void> {
+  const response = await fetch(
+    `/api/auth/admin/users/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
 }
 
 /** Return boot-time system readiness for the web UX. */
@@ -660,7 +756,7 @@ export async function fetchUserComposerPreferences(): Promise<UserComposerPrefer
   const response = await fetch("/api/composer-preferences", {
     headers: authHeaders(),
   });
-  return parseResponse<UserComposerPreferencesPayload>(response);
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
 }
 
 /** Partial-update the user's account-level composer preferences. */
@@ -672,7 +768,7 @@ export async function updateUserComposerPreferences(
     headers: authHeaders("application/json"),
     body: JSON.stringify(payload),
   });
-  return parseResponse<UserComposerPreferencesPayload>(response);
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
 }
 
 /** List composition proposals for a session. */
@@ -814,10 +910,21 @@ export async function getTutorialSample(
  * SERVER constructs the concrete profile object and persists the GuidedSession.
  * Idempotent (D16): a second call for a session that already has a persisted
  * guided session returns the existing session unchanged.
+ *
+ * `intent` is required for BOTH profiles (goal-first start, elspeth-378cfa0e18
+ * / elspeth-13579d1110). It is the session's visible root intent: the goal the
+ * user typed on the goal card, or — for the tutorial — the frozen lesson prompt
+ * the shell seeds, which is the same shape a live goal takes. The server 400s a
+ * start with no intent for every profile, so a planner run can never be reached
+ * without one. The old `profile === "live"` conditional that STRIPPED intent for
+ * the tutorial is gone; sending it is not a tutorial-special path, it is the one
+ * path (ADR-031).
  */
-type GuidedStartCommand =
-  | { profile: "live"; intent: string; operationId: string }
-  | { profile: "tutorial"; operationId: string };
+interface GuidedStartCommand {
+  profile: "live" | "tutorial";
+  intent: string;
+  operationId: string;
+}
 
 export async function startGuidedSession(
   sessionId: string,
@@ -829,7 +936,7 @@ export async function startGuidedSession(
     headers: authHeaders("application/json"),
     body: JSON.stringify({
       profile: command.profile,
-      ...(command.profile === "live" ? { intent: command.intent } : {}),
+      intent: command.intent,
       operation_id: command.operationId,
     }),
     signal,
@@ -918,18 +1025,25 @@ export async function reenterGuided(
  * passive freeform-probe on session select). This POST is the explicit
  * conversion: it seeds a FRESH wizard as a new composition-state version,
  * setting the freeform pipeline aside (recoverable from version history), and
- * returns the same envelope shape as GET /guided. Idempotent — a session that
- * is already guided (including a terminal one) is returned unchanged.
+ * returns the same envelope shape as GET /guided.
+ *
+ * `intent` is REQUIRED (goal-first, elspeth-378cfa0e18): the converted wizard is
+ * rooted on the goal the user stated in the mode-switch card, exactly as a live
+ * start is. A convert is no longer idempotent-by-silence for an already-guided
+ * session — the server 409s `guided_already_started` rather than discarding the
+ * client's goal — so callers must probe GET /guided first (the store's GET-first
+ * `enterGuided` does) and only convert on the documented 400.
  */
 export async function convertToGuided(
   sessionId: string,
+  intent: string,
   operationId: string,
   signal?: AbortSignal,
 ): Promise<GetGuidedResponse> {
   const response = await fetch(`/api/sessions/${sessionId}/guided/convert`, {
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId }),
+    body: JSON.stringify({ operation_id: operationId, intent }),
     signal,
   });
   return decodeGetGuidedResponse(await parseResponse<unknown>(response));
@@ -1209,6 +1323,7 @@ export async function validatePipeline(
 export async function executePipeline(
   sessionId: string,
   fanoutAck?: ExecutionFanoutAck,
+  secretAck?: ExecutionSecretAck,
   stateId?: string,
 ): Promise<{ run_id: string }> {
   const params = new URLSearchParams();
@@ -1220,8 +1335,17 @@ export async function executePipeline(
     method: "POST",
     headers: authHeaders("application/json"),
   };
-  if (fanoutAck) {
-    init.body = JSON.stringify({ fanout_ack_token: fanoutAck.token });
+  if (fanoutAck || secretAck) {
+    // Both guards can fire on one run; an acknowledged re-send must carry
+    // every token acquired so far, never just the most recent one.
+    const body: Record<string, string> = {};
+    if (fanoutAck) {
+      body.fanout_ack_token = fanoutAck.token;
+    }
+    if (secretAck) {
+      body.secret_ack_token = secretAck.token;
+    }
+    init.body = JSON.stringify(body);
   }
   const response = await fetch(`/api/sessions/${sessionId}/execute${query}`, init);
   return parseResponse<{ run_id: string }>(response);
@@ -1750,6 +1874,25 @@ export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token }),
+  });
+  return parseResponse<AuthTokenResponse>(response, { logoutOnUnauthorized: false });
+}
+
+/**
+ * Exchange the single-use SSO handoff code (read from the `#/auth/callback`
+ * fragment) for the session token. The code is spent by this call whether
+ * or not the login is admitted, so a refusal here is final for that code.
+ *
+ * `logoutOnUnauthorized: false` for the same reason as `verifyEmail`: a 401
+ * is the backend refusing THIS handoff (pending, disabled, already spent) and
+ * must not evict a session that may already be signed in.
+ */
+export async function completeSsoLogin(code: string): Promise<AuthTokenResponse> {
+  const response = await fetch("/api/auth/sso/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+    cache: "no-store",
   });
   return parseResponse<AuthTokenResponse>(response, { logoutOnUnauthorized: false });
 }

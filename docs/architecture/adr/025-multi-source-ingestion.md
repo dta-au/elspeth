@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **Status:** Accepted
-**Deciders:** John Morrissey, Claude Opus
+**Deciders:** ELSPETH maintainer
 **Tags:** sources, config, resume, schema-contract, no-legacy-code,
           rc6, multi-source-token-scheduler
 
@@ -60,10 +60,8 @@ it. The structural state is unambiguous across four review lenses:
 
 ### Why this matters now
 
-The architecture review filed 64 tickets under the
-`multi-source-token-scheduler-audit` label (see
-`/home/john/elspeth/notes/RC6-large-list.md`). The structural family
-splits into four clusters:
+The architecture review identified a broad issue cohort, represented by the
+Filigree records named below. The structural family splits into four clusters:
 
 1. **Dual-truth surface** — `config.source` / `config.sources`,
    singular / plural ResumeState fields, dual writers for source schema
@@ -271,15 +269,15 @@ by code**. The singular `source` surface is deleted, not deprecated.
 - **Existing audit databases become unreadable on resume.** Runs
   recorded under the singular `runs.contract_json` writer cannot be
   resumed by the post-ADR engine. The operator policy is *delete the
-  old DB* (project memory `project_db_migration_policy`), which is
-  appropriate here because ELSPETH has no users yet. The runbook
+  old DB* under the pre-1.0 Landscape schema policy in
+  `docs/reference/configuration.md`. The runbook
   update (G19 / elspeth-559bce3459) must record the resume
   precondition explicitly.
 - **Every engine call site that reads `config.source.*` is touched
   in one commit.** Roughly 26 sites; the change is mechanical but
   large. The CICD allowlist will see a corresponding shift
-  (`tier-model` fingerprint rotation per the AST-shift discipline —
-  memory `feedback_ast_shift_fingerprint_rotation`).
+  and may require the judge-signature workflow documented in
+  `docs/judge-signature-handoff.md`.
 - **The composer LLM must be retaught.** Until the composer skill
   update (G16) lands, the composer authors a YAML the engine
   rejects. This is a load-bearing dependency between this ADR and
@@ -457,8 +455,7 @@ true; each ticket is then a focused fix)
 - elspeth-8fe6fc5f24 — Identity passthrough advisory: named-source
   producers ignored
 
-### Documentation / governance follow-ups (RC6 publish gate, not merge
-gate — per `project_multi_source_token_scheduler_rc6`)
+### Documentation / governance follow-ups (RC6 publish gate, not merge gate)
 
 - **G13 / elspeth-2409a7c7bf** — `CLAUDE.md "exactly 1 source per
   run"` (correct for RC5.2 today; update on RC6 ship).
@@ -504,8 +501,7 @@ gate — per `project_multi_source_token_scheduler_rc6`)
   work (covered by G22 / elspeth-7f3ac1ac65's lint and doc-rule
   remediation).
 - **Composer ingestion of dynamic sources.** The composer's
-  "dynamic-source-from-chat" workflow
-  (memory `project_composer_dynamic_source_from_chat`) creates one
+  dynamic-source-from-chat workflow creates one
   source from chat text. Whether the composer ever authors *multiple*
   dynamic sources in one pipeline is a UX question, not an engine
   question; deferred.
@@ -565,29 +561,19 @@ gate — per `project_multi_source_token_scheduler_rc6`)
 - `src/elspeth/core/landscape/scheduler_repository.py` — durable
   scheduler primitive (companion ADR-026).
 
-### Review notes
+### Review history
 
-- `notes/branch-review-multi-source-token-scheduler-architecture-2026-05-22.md`
-  (in the main checkout; orientation note).
-- `notes/branch-review-multi-source-token-scheduler-consolidation-2026-05-22.md`
-  (in the main checkout; tier consolidation, the *"upgrade around the
-  scheduler is unfinished"* framing).
-- `.worktrees/multi-source-token-scheduler/notes/multi-source-audit-dedup-map.md`
-  (execution-detail dedup map).
-- `notes/RC6-large-list.md` (in the main checkout; canonical RC6
-  ticket enumeration).
+- Commits `5d0881b4c` and `e73509ad6` preserve the historical architecture
+  and consolidation reviews.
+- Commit `e8448a68b` records the structural deletion and named issue cohort.
 
 ### Project policies
 
 - `CLAUDE.md` — *No Legacy Code Policy*, *Three-Tier Trust Model* (the
   Tier-1 audit-integrity rule that the arbitrary `schema_contract`
   pick violated).
-- Project memory `project_db_migration_policy` — *delete the old DB*
-  rather than migrate; rationale for the *negative consequences:
-  existing audit databases unreadable* line above.
-- Project memory `project_multi_source_token_scheduler_rc6` — this
-  branch targets RC6, not RC5.2; rationale for the Tier-3 doc tickets
-  being publish-gate rather than merge-gate.
+- `docs/reference/configuration.md` — pre-1.0 Landscape schema policy.
+- `CHANGELOG.md` — the 0.6.0 multi-source and scheduler release record.
 
 ## Notes
 

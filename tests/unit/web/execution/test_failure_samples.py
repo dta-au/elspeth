@@ -1,23 +1,43 @@
-"""Tests for failure-sample enrichment of run-level error messages."""
+"""Tests for the client-safe failure-category summary of run-level errors.
+
+The module under test feeds three surfaces outside the audit boundary
+(sessions DB ``runs.error``, ``RunStatusResponse.error``, and the SSE
+``failed`` detail), so the central property here is a negative one: no
+per-row free text may leave, whatever the Tier-3 audit payload contains.
+The positive property is that the category it does emit is provably drawn
+from a closed vocabulary.
+"""
 
 from __future__ import annotations
 
+import dataclasses
+import json
 from datetime import UTC, datetime
+
+import pytest
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import tokens_table
+from elspeth.core.landscape.schema import tokens_table, transform_errors_table
 from elspeth.web.execution.failure_samples import (
-    FailureSample,
-    _classify,
-    format_failure_samples,
-    load_top_failure_samples,
+    KNOWN_ERROR_CATEGORIES,
+    NON_CANONICAL_CATEGORY,
+    UNRECOGNIZED_CATEGORY,
+    ClientSafeFailureSummary,
+    _client_safe_category,
+    format_failure_categories,
+    load_top_failure_categories,
 )
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
+
+# Canaries stand in for the two Tier-3 sources the audit payload can carry:
+# row-derived data, and provider/LLM error text.
+CANARY_ROW = "CANARY_ROW_SECRET_9f3a"
+CANARY_PROVIDER = "CANARY_PROVIDER_ERROR_7b21"
 
 
 def _make_run_with_transform(transform_id: str = "fetch") -> tuple[LandscapeDB, str, str]:
@@ -52,8 +72,7 @@ def _record_error(
     run_id: str,
     transform_id: str,
     *,
-    error: str,
-    error_type: str,
+    error_details: dict[str, object],
     token_id: str,
     row_index: int,
 ) -> None:
@@ -81,224 +100,294 @@ def _record_error(
         ref=TokenRef(token_id=token_id, run_id=run_id),
         transform_id=transform_id,
         row_data={"url": f"row-{row_index}"},
-        error_details={"reason": "validation_failed", "error": error, "error_type": error_type},
+        error_details=error_details,  # type: ignore[arg-type]
         destination="discard",
     )
 
 
-def _record_messageless_error(
-    db: LandscapeDB,
-    run_id: str,
-    transform_id: str,
-    *,
-    reason: str,
-    token_id: str,
-    row_index: int,
-) -> None:
-    """Record an error whose details carry only the required ``reason`` category.
+def _canary_details(reason: str = "decode_failed", *, suffix: str = "") -> dict[str, object]:
+    """A canonical audit record whose every free-text field carries a canary."""
+    return {
+        "reason": reason,
+        "error": f"gzip: incorrect header check for {CANARY_ROW}{suffix}",
+        "message": f"secondary text {CANARY_ROW}{suffix}",
+        "error_type": f"BadGzipFile: {CANARY_PROVIDER}",
+    }
 
-    Exercises the canonical-shape branch where no human-message field
-    (``error``/``message``) is present — the honest fallback must keep distinct
-    categories in distinct aggregation buckets, not collapse them to ``""``.
-    """
-    factory = RecorderFactory(db)
-    row = factory.data_flow.create_row(
-        run_id=run_id,
-        source_node_id="source_test",
-        row_index=row_index,
-        data={"url": f"row-{row_index}"},
-        source_row_index=row_index,
-        ingest_sequence=row_index,
+
+class TestClientSafeFailureSummaryType:
+    """The formatter's input type is the boundary, not a convention."""
+
+    def test_summary_type_has_no_free_text_field(self) -> None:
+        """No field can carry the Tier-3 message, so none can render it.
+
+        This is what makes the raw text unroutable to a client surface by
+        accident: widening the client formatter would require changing the
+        type, not just a call site.
+        """
+        field_names = {field.name for field in dataclasses.fields(ClientSafeFailureSummary)}
+        assert field_names == {"transform_id", "category", "count"}
+
+    def test_sentinels_are_not_members_of_the_closed_vocabulary(self) -> None:
+        """Both sentinels must stay distinguishable from a real category.
+
+        ``unknown_category`` IS a real member, so a sentinel colliding with
+        the vocabulary would make "we could not validate this" indistinguishable
+        from "the plugin reported an unknown category".
+        """
+        assert UNRECOGNIZED_CATEGORY not in KNOWN_ERROR_CATEGORIES
+        assert NON_CANONICAL_CATEGORY not in KNOWN_ERROR_CATEGORIES
+        assert "unknown_category" in KNOWN_ERROR_CATEGORIES
+
+
+class TestClientSafeCategory:
+    """Direct coverage of the value-admission boundary."""
+
+    def test_member_reason_is_emitted_verbatim(self) -> None:
+        assert _client_safe_category(_canary_details("decode_failed")) == "decode_failed"
+
+    def test_non_member_reason_falls_back_to_the_sentinel(self) -> None:
+        """An unknown token is not echoed — not even truncated or hashed."""
+        details = {"reason": f"not_a_category_{CANARY_ROW}", "error": CANARY_ROW}
+        assert _client_safe_category(details) == UNRECOGNIZED_CATEGORY
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            pytest.param(42, id="int"),
+            pytest.param(None, id="none"),
+            pytest.param(["decode_failed"], id="unhashable-list"),
+            pytest.param({"decode_failed": 1}, id="unhashable-dict"),
+        ],
     )
-    with db.write_connection() as conn:
-        conn.execute(
-            tokens_table.insert().values(
-                token_id=token_id,
-                row_id=row.row_id,
-                run_id=run_id,
-                step_in_pipeline=0,
-                created_at=datetime.now(UTC),
-            )
-        )
-        conn.commit()
-    factory.data_flow.record_transform_error(
-        ref=TokenRef(token_id=token_id, run_id=run_id),
-        transform_id=transform_id,
-        row_data={"url": f"row-{row_index}"},
-        error_details={"reason": reason},
-        destination="discard",
-    )
+    def test_non_string_reason_falls_back_without_raising(self, reason: object) -> None:
+        """The ``str`` check is load-bearing: an unhashable value would
+        otherwise raise ``TypeError`` from the membership test alone."""
+        assert _client_safe_category({"reason": reason}) == UNRECOGNIZED_CATEGORY
+
+    def test_error_type_is_never_used_as_the_category(self) -> None:
+        """``error_type`` is free-form and validated nowhere, so it is ignored
+        even when ``reason`` is a member and ``error_type`` looks plausible."""
+        details = {"reason": "api_error", "error_type": "http_error"}
+        assert _client_safe_category(details) == "api_error"
+
+    def test_non_canonical_envelope_reads_neither_of_its_tier3_fields(self) -> None:
+        details = {
+            "__non_canonical__": True,
+            "repr": f"{{'val': '{CANARY_ROW}'}}",
+            "serialization_error": f"Out of range float {CANARY_PROVIDER}",
+        }
+        assert _client_safe_category(details) == NON_CANONICAL_CATEGORY
+
+    def test_missing_required_reason_still_raises(self) -> None:
+        """Shape corruption stays loud — the sentinel is for VALUES only."""
+        with pytest.raises(KeyError):
+            _client_safe_category({"error_type": "http_error", "error": "boom"})
 
 
-class TestLoadTopFailureSamples:
-    def test_aggregates_identical_errors_by_count(self) -> None:
+class TestLoadTopFailureCategories:
+    def test_no_row_or_provider_text_survives_the_load(self) -> None:
         db, run_id, transform_id = _make_run_with_transform()
-        for i in range(3):
+        for index in range(3):
             _record_error(
                 db,
                 run_id,
                 transform_id,
-                error="URL is missing a scheme",
-                error_type="SSRFBlockedError",
-                token_id=f"tok_{i}",
-                row_index=i,
+                error_details=_canary_details(suffix=f"-{index}"),
+                token_id=f"tok_{index}",
+                row_index=index,
             )
 
-        samples = load_top_failure_samples(db, run_id)
+        summaries = load_top_failure_categories(db, run_id)
+        rendered = format_failure_categories(summaries)
 
-        assert len(samples) == 1
-        assert samples[0] == FailureSample(
-            transform_id=transform_id,
-            error_type="SSRFBlockedError",
-            message="URL is missing a scheme",
-            count=3,
+        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+        for canary in (CANARY_ROW, CANARY_PROVIDER, "incorrect header check", "BadGzipFile"):
+            assert canary not in rendered, rendered
+            assert all(canary not in str(summary) for summary in summaries), summaries
+
+    def test_distinct_messages_in_one_category_aggregate_to_one_summary(self) -> None:
+        """Regression: aggregation keys on (node, category), not on message.
+
+        The previous form counted ``(transform_id, error_type, message)``, so
+        three rows failing the same way with three distinct texts reported
+        ``1x`` three times instead of ``3x`` once.
+        """
+        db, run_id, transform_id = _make_run_with_transform()
+        for index in range(3):
+            _record_error(
+                db,
+                run_id,
+                transform_id,
+                error_details={"reason": "decode_failed", "error": f"distinct text {index}"},
+                token_id=f"tok_{index}",
+                row_index=index,
+            )
+
+        summaries = load_top_failure_categories(db, run_id)
+
+        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+
+    def test_top_n_is_taken_after_category_aggregation(self) -> None:
+        """Regression: the top-N slice must not be taken over messages.
+
+        Four rows share one category but have four distinct message texts;
+        two rows share both category and text.  Slicing before aggregating
+        ranked the 2x text above each 1x text and reported the wrong dominant
+        failure mode.
+        """
+        db, run_id, transform_id = _make_run_with_transform()
+        for index in range(4):
+            _record_error(
+                db,
+                run_id,
+                transform_id,
+                error_details={"reason": "decode_failed", "error": f"spread-{index}"},
+                token_id=f"spread_{index}",
+                row_index=index,
+            )
+        for index in range(2):
+            _record_error(
+                db,
+                run_id,
+                transform_id,
+                error_details={"reason": "rate_limited", "error": "identical"},
+                token_id=f"same_{index}",
+                row_index=10 + index,
+            )
+
+        summaries = load_top_failure_categories(db, run_id, limit=2)
+
+        assert summaries == [
+            ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=4),
+            ClientSafeFailureSummary(transform_id=transform_id, category="rate_limited", count=2),
+        ]
+
+    def test_distinct_nodes_stay_distinct(self) -> None:
+        db, run_id, first = _make_run_with_transform("fetch")
+        factory = RecorderFactory(db)
+        factory.data_flow.register_node(
+            run_id=run_id,
+            plugin_name="llm",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config={},
+            schema_config=DYNAMIC_SCHEMA,
+            node_id="summarise",
+            sequence=2,
+        )
+        _record_error(
+            db,
+            run_id,
+            first,
+            error_details={"reason": "decode_failed"},
+            token_id="t0",
+            row_index=0,
+        )
+        _record_error(
+            db,
+            run_id,
+            "summarise",
+            error_details={"reason": "decode_failed"},
+            token_id="t1",
+            row_index=1,
         )
 
-    def test_orders_by_descending_count(self) -> None:
-        db, run_id, transform_id = _make_run_with_transform()
-        # 1x rare, 2x medium, 4x dominant
-        _record_error(db, run_id, transform_id, error="rare", error_type="A", token_id="t0", row_index=0)
-        for i in range(2):
-            _record_error(db, run_id, transform_id, error="medium", error_type="B", token_id=f"tm{i}", row_index=10 + i)
-        for i in range(4):
-            _record_error(db, run_id, transform_id, error="dominant", error_type="C", token_id=f"td{i}", row_index=20 + i)
+        summaries = load_top_failure_categories(db, run_id)
 
-        samples = load_top_failure_samples(db, run_id, limit=3)
-
-        assert [s.message for s in samples] == ["dominant", "medium", "rare"]
-        assert [s.count for s in samples] == [4, 2, 1]
+        assert {(s.transform_id, s.category) for s in summaries} == {
+            ("fetch", "decode_failed"),
+            ("summarise", "decode_failed"),
+        }
 
     def test_returns_empty_when_no_errors_recorded(self) -> None:
         db, run_id, _ = _make_run_with_transform()
-        assert load_top_failure_samples(db, run_id) == []
+        assert load_top_failure_categories(db, run_id) == []
 
     def test_limit_truncates_to_top_n(self) -> None:
         db, run_id, transform_id = _make_run_with_transform()
-        for i in range(5):
-            _record_error(db, run_id, transform_id, error=f"err-{i}", error_type="E", token_id=f"t{i}", row_index=i)
+        for index, reason in enumerate(["decode_failed", "rate_limited", "api_error", "missing_field"]):
+            _record_error(
+                db,
+                run_id,
+                transform_id,
+                error_details={"reason": reason},
+                token_id=f"t{index}",
+                row_index=index,
+            )
 
-        samples = load_top_failure_samples(db, run_id, limit=2)
-        assert len(samples) == 2
+        assert len(load_top_failure_categories(db, run_id, limit=2)) == 2
 
     def test_rejects_invalid_limit(self) -> None:
         db, run_id, _ = _make_run_with_transform()
-        try:
-            load_top_failure_samples(db, run_id, limit=0)
-        except ValueError:
-            return
-        raise AssertionError("expected ValueError for limit=0")
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            load_top_failure_categories(db, run_id, limit=0)
 
-    def test_messageless_errors_with_distinct_reasons_do_not_merge(self) -> None:
-        # Two errors that carry only the required ``reason`` category and no
-        # human-message field. Before the Tier-1 honest-read fix the terminal
-        # ``""`` default collapsed both into a single ``message=""`` bucket; the
-        # distinct categories must now stay distinct so the operator sees that
-        # two unrelated failure modes occurred, not one.
+    def test_rejects_scan_cap_below_limit(self) -> None:
+        db, run_id, _ = _make_run_with_transform()
+        with pytest.raises(ValueError, match="scan_cap must be >= limit"):
+            load_top_failure_categories(db, run_id, limit=5, scan_cap=2)
+
+    def test_unrecognized_category_reaches_the_summary_without_the_value(self) -> None:
+        """A stored category the write guard never saw fails closed on read.
+
+        ``record_transform_error`` enforces ``TransformErrorCategory``
+        membership at the Tier-1 write boundary, so a non-member cannot be
+        recorded through the typed API — the column is rewritten directly
+        here to model what the guard does not cover: rows written by an
+        earlier schema or by any future second writer.  The read-side check
+        exists so the egress property does not depend on that sibling
+        invariant holding for every row ever written.
+        """
         db, run_id, transform_id = _make_run_with_transform()
-        _record_messageless_error(db, run_id, transform_id, reason="missing_field", token_id="tm0", row_index=0)
-        _record_messageless_error(db, run_id, transform_id, reason="api_error", token_id="ta0", row_index=1)
-
-        samples = load_top_failure_samples(db, run_id, limit=3)
-
-        assert len(samples) == 2
-        messages = {s.message for s in samples}
-        assert messages == {
-            "(no message; category=missing_field)",
-            "(no message; category=api_error)",
-        }
-        # error_type falls back to the required reason category, not "UnknownError".
-        assert {s.error_type for s in samples} == {"missing_field", "api_error"}
-
-
-class TestClassify:
-    """Direct coverage of the two-shape discriminator.
-
-    The non-canonical envelope is produced by
-    ``DataFlowRepository._canonical_or_recorded_error_details_json`` only when
-    canonical serialization of ``error_details`` fails, which cannot be driven
-    through the typed recorder API — so it is asserted here against the exact
-    envelope shape that writer emits.
-    """
-
-    def test_canonical_prefers_error_field(self) -> None:
-        details = {"reason": "api_error", "error": "boom", "error_type": "http_error"}
-        assert _classify(details) == ("http_error", "boom")
-
-    def test_canonical_falls_back_to_message_field(self) -> None:
-        details = {"reason": "api_error", "message": "rate limited"}
-        # error_type absent -> falls back to the required reason category.
-        assert _classify(details) == ("api_error", "rate limited")
-
-    def test_canonical_messageless_carries_category_distinctly(self) -> None:
-        assert _classify({"reason": "missing_field"}) == (
-            "missing_field",
-            "(no message; category=missing_field)",
+        _record_error(
+            db,
+            run_id,
+            transform_id,
+            error_details={"reason": "decode_failed"},
+            token_id="t0",
+            row_index=0,
         )
+        with db.write_connection() as conn:
+            conn.execute(
+                transform_errors_table.update()
+                .where(transform_errors_table.c.run_id == run_id)
+                .values(error_details_json=json.dumps({"reason": f"invented_{CANARY_ROW}", "error": CANARY_PROVIDER}))
+            )
+            conn.commit()
 
-    def test_missing_required_reason_raises(self) -> None:
-        # Canonical shape with no reason is Tier-1 corruption: KeyError surfaces.
-        try:
-            _classify({"error_type": "http_error", "error": "boom"})
-        except KeyError:
-            return
-        raise AssertionError("expected KeyError on missing required 'reason'")
+        rendered = format_failure_categories(load_top_failure_categories(db, run_id))
 
-    def test_non_canonical_envelope_surfaces_serialization_error(self) -> None:
-        # Exact shape emitted by _canonical_or_recorded_error_details_json.
-        details = {
-            "__non_canonical__": True,
-            "repr": "{'reason': 'x', 'val': nan}",
-            "serialization_error": "Out of range float values are not JSON compliant",
-        }
-        error_type, message = _classify(details)
-        assert error_type == "NonCanonicalErrorDetails"
-        assert "Out of range float values" in message
-        assert "repr=" in message
-
-    def test_distinct_non_canonical_envelopes_do_not_merge(self) -> None:
-        first = _classify(
-            {
-                "__non_canonical__": True,
-                "repr": "{'a': nan}",
-                "serialization_error": "nan error",
-            }
-        )
-        second = _classify(
-            {
-                "__non_canonical__": True,
-                "repr": "{'b': inf}",
-                "serialization_error": "inf error",
-            }
-        )
-        assert first != second
+        assert UNRECOGNIZED_CATEGORY in rendered
+        assert CANARY_ROW not in rendered
+        assert CANARY_PROVIDER not in rendered
 
 
-class TestFormatFailureSamples:
-    def test_empty_samples_yields_empty_string(self) -> None:
-        assert format_failure_samples([]) == ""
+class TestFormatFailureCategories:
+    def test_empty_summaries_yields_empty_string(self) -> None:
+        assert format_failure_categories([]) == ""
 
-    def test_single_transform_omits_transform_prefix(self) -> None:
-        samples = [
-            FailureSample(transform_id="fetch", error_type="SSRFBlockedError", message="missing scheme", count=3),
-        ]
-        rendered = format_failure_samples(samples)
-        assert "[fetch]" not in rendered
-        assert "3x SSRFBlockedError: missing scheme" in rendered
+    def test_renders_count_node_and_category(self) -> None:
+        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="fetch", category="decode_failed", count=3)])
+        assert rendered == "  • 3x [fetch] decode_failed"
 
-    def test_multi_transform_includes_transform_prefix(self) -> None:
-        samples = [
-            FailureSample(transform_id="fetch", error_type="SSRFBlockedError", message="missing scheme", count=2),
-            FailureSample(transform_id="summarise", error_type="LLMError", message="rate limited", count=1),
-        ]
-        rendered = format_failure_samples(samples)
+    def test_node_is_shown_even_for_a_single_node_run(self) -> None:
+        """The failing node is half of what makes the category actionable."""
+        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="fetch", category="rate_limited", count=1)])
         assert "[fetch]" in rendered
-        assert "[summarise]" in rendered
 
-    def test_truncates_long_messages_with_ellipsis(self) -> None:
-        long = "x" * 1000
-        samples = [FailureSample(transform_id="fetch", error_type="E", message=long, count=1)]
-        rendered = format_failure_samples(samples, message_chars=50)
-        assert "…" in rendered
-        # Each rendered line is one bullet; cap is on the message portion only,
-        # so the line as a whole stays small.
-        assert len(rendered) < 200
+    def test_renders_one_bullet_per_summary(self) -> None:
+        rendered = format_failure_categories(
+            [
+                ClientSafeFailureSummary(transform_id="fetch", category="decode_failed", count=2),
+                ClientSafeFailureSummary(transform_id="summarise", category="rate_limited", count=1),
+            ]
+        )
+        assert rendered.splitlines() == [
+            "  • 2x [fetch] decode_failed",
+            "  • 1x [summarise] rate_limited",
+        ]
+
+    def test_long_node_id_is_bounded(self) -> None:
+        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="n" * 200, category="decode_failed", count=1)])
+        assert len(rendered) < 120

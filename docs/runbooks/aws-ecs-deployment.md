@@ -1,9 +1,20 @@
-# Runbook: AWS ECS Fargate deployment
+# Runbook: Full disposable AWS ECS acceptance environment
 
 Deploy one ELSPETH web task to AWS ECS Fargate with Aurora PostgreSQL, EFS,
 Cognito/OIDC, task-role S3 and Bedrock access, and CloudWatch operator
 telemetry. This runbook permits planned downtime: it deliberately uses a
 zero-overlap, single-task deployment.
+
+> **Scope:** This is the exhaustive, release-specific, two-scenario acceptance
+> and teardown program. Its supported Terraform source IS tracked in this
+> repository at [`deploy/aws-ecs/terraform/`](../../deploy/aws-ecs/terraform/README.md)
+> — start a cold install from that package's README. Only the owning remote
+> state (the per-run S3 state bucket and its contents) lives outside the
+> repository. For an ordinary rebuild and rollout to an existing ECS
+> service, use
+> [AWS ECS existing-service redeploy](aws-ecs-existing-service-redeploy.md).
+> Reconcile every schema epoch, task-definition input, and external Terraform
+> path with the selected release before using this acceptance program.
 
 ---
 
@@ -11,7 +22,8 @@ zero-overlap, single-task deployment.
 
 Use this runbook when you need to:
 
-- deploy or upgrade ELSPETH web on ECS Fargate;
+- provision, deploy, upgrade, and destroy the disposable two-scenario ECS
+  acceptance environment;
 - prove schema, persistence, authentication, S3, Bedrock, Guardrail, and
   operator-telemetry behavior before admitting traffic;
 - roll back one immutable task definition without guessing about database
@@ -27,8 +39,9 @@ Landscape audit record.
 
 ## Contract summary
 
-This is the canonical operator entry point for the AWS ECS deployment. The
-application and collector have deliberately separate evidence roles:
+This is the canonical operator entry point for the full disposable AWS
+acceptance program. The application and collector have deliberately separate
+evidence roles:
 
 - Landscape is the permanent source of truth for lineage, replay, and run
   decisions. Its write must succeed before an operational signal is emitted.
@@ -36,13 +49,33 @@ application and collector have deliberately separate evidence roles:
   never proves an audit write, and loss of the collector never rolls back a
   committed Landscape record.
 
-`ELSPETH_WEB__DEPLOYMENT_TARGET=aws-ecs` requires PostgreSQL
-`session_db_url` and `landscape_url` values (including
-`postgresql+psycopg://...`), a pre-provisioned writable `data_dir`, an explicit
+The controller does not synthesize or clone a generic task definition. The
+operator supplies exact `CANDIDATE_TASK_DEFINITION` and
+`DOCTOR_TASK_DEFINITION` ARNs, plus `PREVIOUS_TASK_DEFINITION` and
+`ROLLBACK_DOCTOR_TASK_DEFINITION` ARNs for an upgrade. The runbook resolves and
+validates those definitions before any service mutation.
+
+`ELSPETH_WEB__DEPLOYMENT_TARGET=aws-ecs` requires external PostgreSQL
+`session_db_url` and `landscape_url` values. The image contains PostgreSQL
+clients, not a PostgreSQL server. Both `postgresql+psycopg2://...` (psycopg2)
+and `postgresql+psycopg://...` (psycopg v3) are supported; bare
+`postgresql://...` also selects psycopg2. Production images that include the
+`postgres` extra contain both drivers. The deployment also requires
+a pre-provisioned writable `data_dir`, an explicit
 writable `payload_store_path`, and non-placeholder
 `ELSPETH_WEB__SECRET_KEY` and
 `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` secrets. Web startup validates this
 contract but never creates, migrates, drops, or repairs either schema.
+
+Run one web process in the one ECS task. Payload persistence on EFS is
+separate from database persistence in Aurora/PostgreSQL; back up and restore
+both. Every replacement retains the zero-overlap service settings
+`minimumHealthyPercent=0`, `maximumPercent=100`, and `desiredCount=1` and uses
+an immutable image digest.
+
+Use `elspeth doctor deployment --init-schema` as the provider-neutral schema
+bootstrap. This runbook retains the AWS-compatible task command
+`elspeth doctor aws-ecs --init-schema`.
 
 AWS credentials are provided by ECS task roles and AWS Secrets Manager
 injection — never baked into the image or passed on the command line. ECS
@@ -72,17 +105,25 @@ inventory. `scenario-load` exports these exact names and the computed
 - `ELSPETH_WEB__PLUGIN_PREFERENCES`
 - `ELSPETH_WEB__PLUGIN_CONTROL_MODES`
 - `ELSPETH_WEB__LLM_PROFILES`
-- `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`
+- `ELSPETH_WEB__DEFAULT_LLM_PROFILE`
 - `ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES`
 - `ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES`
 
 The same protected scenario inventory supplies
 `ELSPETH_BEDROCK_LIVE_TEST_MODEL`; it must exactly equal the private model in
 the selected tutorial profile, and `AWS_REGION` must equal that profile's
-private region.
+private region. It also supplies the non-provider-generated
+`CLOUDWATCH_AGENT_IMAGE`, `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256`, and
+`CLOUDWATCH_AGENT_OTEL_YAML_SHA256` values. The image is one exact digest-only
+reference, and both lowercase configuration digests are identical in the
+immutable preapply and resolved inventories.
 
 Values use the JSON/opaque-alias contract in
-[`configuration.md`](../reference/configuration.md). Never retain their raw
+[`configuration.md`](../reference/configuration.md); how these variables, the
+Composer model variables, and the tutorial launch contract relate is
+documented in
+[Web LLM Configuration](../reference/environment-variables.md#web-llm-configuration).
+Never retain their raw
 values or rendered task-definition JSON as evidence. Changing any member
 requires the operator to register a new task-definition revision. The operator
 must force a new deployment and restart candidate acceptance; ECS Exec cannot
@@ -234,6 +275,9 @@ export ELSPETH_AWS_CALL_CEILING_SECONDS=60
 export ELSPETH_AWS_WAITER_CEILING_SECONDS=900
 export ELSPETH_AWS_EXEC_CEILING_SECONDS=420
 export ELSPETH_ORPHAN_SWEEP_CEILING_SECONDS=900
+export ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS=1200
+export ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS=10
+export ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS=600
 # Aurora create/delete can legitimately consume the provider's two-hour
 # timeout. This outer ceiling adds ten minutes for provider bookkeeping.
 export ELSPETH_TERRAFORM_CALL_CEILING_SECONDS=7800
@@ -572,7 +616,7 @@ and destroy use, and again when an approved apply is recorded; verification
 performed before expiry cannot authorize later use after expiry.
 
 Each protected scenario inventory uses
-`elspeth.aws-ecs-scenario-inventory.v5` and binds the run ID, candidate SHA,
+`elspeth.aws-ecs-scenario-inventory.v9` and binds the run ID, candidate SHA,
 account, region, scenario ID, Terraform binding, and the closed `values`
 assignment set, including the protected binding-receipt path. The initial
 immutable `preapply` document leaves provider-generated identities empty; a
@@ -636,6 +680,42 @@ persist_sanitized_receipt() {
   fi
 }
 
+record_testcontainer_run() {
+  # The PostgreSQL contention proofs (`-m testcontainer`) are the SAME
+  # selection CI's required testcontainer job runs; the receipt records the
+  # selection, pytest's exit code, the junit id counts and WHICH database ran
+  # (`database`, `database_identity_sha256`). Evidence export REFUSES a
+  # candidate without exactly one passing run bound to the gate ledger's
+  # `tests` stage. Every suite obtains its server through one seam
+  # (tests/helpers/postgres_target.py) that honours ELSPETH_TEST_POSTGRES_URL:
+  # export it as the approved RDS instance's admin URL (the master user or a
+  # role holding CREATEDB, CREATEROLE and rds_superuser: the suites create and
+  # drop throwaway databases and roles and terminate other roles' backends),
+  # `postgresql+psycopg://<role>:<password>@<endpoint>:5432/<admin db>?sslmode=verify-full&sslrootcert=<bundle file>`,
+  # with `sslrootcert` a readable copy of the RDS global bundle (the
+  # deployment-acceptance suites stat and hash that file). The receipt derives
+  # its database fields from the same variable, so it can only say
+  # `provisioned` when the suites ran there; this function refuses to run
+  # without it so the acceptance record never describes a run on this host's
+  # Docker. Unset, the seam provisions a container per suite (what CI does).
+  local exit_status=0 receipt_file receipt_hash
+  : "${ELSPETH_TEST_POSTGRES_URL:?record_testcontainer_run needs the provisioned RDS admin URL in ELSPETH_TEST_POSTGRES_URL}"
+  rm -f testcontainer-junit.xml
+  uv run --frozen pytest tests/ -m testcontainer -n 0 --junitxml=testcontainer-junit.xml || exit_status=$?
+  receipt_file=$(mktemp -p /tmp elspeth-testcontainer-receipt.XXXXXX)
+  chmod 600 "$receipt_file"
+  uv run --frozen python -m elspeth.web._acceptance_common.testcontainer_run \
+    --provider aws --junit testcontainer-junit.xml --exit-code "$exit_status" \
+    --candidate-sha "$CANDIDATE_SHA" --scenario-id "$ACTIVE_SCENARIO_ID" >"$receipt_file"
+  receipt_hash=$(persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" testcontainer-run \
+    "$(jq -r .junit_sha256 "$receipt_file")" "$receipt_file")
+  uv run --frozen python -m elspeth.web.aws_ecs_acceptance gate-ledger record \
+    --file "$GATE_LEDGER" --check-id tests --exit-status "$exit_status" \
+    --receipt-hash "$receipt_hash" --candidate-sha "$CANDIDATE_SHA"
+  rm -f "$receipt_file" testcontainer-junit.xml
+  return "$exit_status"
+}
+
 require_signed_tf_plan_approval() {
   local scenario_id="$1" receipt_hash="$2"
   uv run --frozen python -m elspeth.web.aws_ecs_acceptance approval-verify \
@@ -677,13 +757,15 @@ load_scenario() {
   unset ACTIVE_SCENARIO_ID ACCEPTANCE_RUN_ID DEPLOYMENT_MODE TARGET_PLATFORM \
     AWS_REGION ECS_CLUSTER ECS_SERVICE WEB_CONTAINER_NAME TARGET_GROUP_ARN \
     ELSPETH_WEB__DATA_DIR ELSPETH_WEB__PAYLOAD_STORE_PATH \
+    ELSPETH_WEB__COMPOSER_MODEL ELSPETH_WEB__COMPOSER_ADVISOR_MODEL \
     ELSPETH_WEB__PLUGIN_ALLOWLIST ELSPETH_WEB__PLUGIN_PREFERENCES \
     ELSPETH_WEB__PLUGIN_CONTROL_MODES ELSPETH_WEB__LLM_PROFILES \
-    ELSPETH_WEB__TUTORIAL_LLM_PROFILE \
+    ELSPETH_WEB__DEFAULT_LLM_PROFILE \
     ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES \
     ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES \
     ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256 \
-    ELSPETH_BEDROCK_LIVE_TEST_MODEL \
+    ELSPETH_BEDROCK_LIVE_TEST_MODEL CLOUDWATCH_AGENT_IMAGE \
+    CLOUDWATCH_AGENT_CONFIG_JSON_SHA256 CLOUDWATCH_AGENT_OTEL_YAML_SHA256 \
     ALB_BASE_URL ALB_ARN CANDIDATE_TASK_DEFINITION DOCTOR_TASK_DEFINITION \
     DOCTOR_CONTAINER_NAME DOCTOR_NETWORK_CONFIGURATION \
     PAYLOAD_VERIFIER_TASK_DEFINITION LOCAL_AUTH_VERIFIER_TASK_DEFINITION \
@@ -818,7 +900,7 @@ remove_local_acceptance_images() {
   local ref
   for ref in \
     elspeth:ecs-rollback-baseline \
-    elspeth:ecs-0.7.1-closeout \
+    elspeth:ecs-0.8.0-closeout \
     "$ECR_REGISTRY/$ECR_REPOSITORY:$ROLLBACK_BASELINE_TAG" \
     "$ECR_REGISTRY/$ECR_REPOSITORY:$CANDIDATE_TAG" \
     "$ROLLBACK_BASELINE_IMAGE" \
@@ -899,7 +981,7 @@ BACKEND_STATE_BUCKET="elspeth-acc-${ACCEPTANCE_RUN_ID//-/}"
 export ECR_REGISTRY="${ECR_REGISTRY:?set approved account registry host}"
 export ECR_REPOSITORY="${ECR_REPOSITORY:?set run-scoped ECR repository name}"
 export ROLLBACK_BASELINE_TAG="acceptance-${ACCEPTANCE_RUN_ID}-baseline-${ROLLBACK_BASELINE_SHA}"
-export CANDIDATE_TAG="acceptance-${ACCEPTANCE_RUN_ID}-0.7.1-${CANDIDATE_SHA}"
+export CANDIDATE_TAG="acceptance-${ACCEPTANCE_RUN_ID}-0.8.0-${CANDIDATE_SHA}"
 
 test ! -L "$BOOTSTRAP_TF_DIR" && test -d "$BOOTSTRAP_TF_DIR"
 test "$BOOTSTRAP_STATE" = "$BOOTSTRAP_TF_DIR/terraform.tfstate"
@@ -939,7 +1021,8 @@ chmod 600 "$BOOTSTRAP_PLAN"
 BOOTSTRAP_PLAN_SHA=$(sha256sum "$BOOTSTRAP_PLAN" | awk '{print $1}')
 terraform_capture -chdir="$BOOTSTRAP_TF_DIR" show -json "$BOOTSTRAP_PLAN" \
   | uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$BOOTSTRAP_PLAN_RECEIPT"
+      sanitize-evidence --kind terraform-plan \
+      --plan-sha256 "$BOOTSTRAP_PLAN_SHA" >"$BOOTSTRAP_PLAN_RECEIPT"
 BOOTSTRAP_PLAN_RECEIPT_HASH=$(persist_sanitized_receipt bootstrap terraform-plan \
   "$BOOTSTRAP_PLAN_SHA" "$BOOTSTRAP_PLAN_RECEIPT")
 request_signed_tf_approval bootstrap terraform-plan "$BOOTSTRAP_PLAN_RECEIPT_HASH" \
@@ -1032,6 +1115,11 @@ test "${TARGET_PLATFORM:?}" = linux/amd64 || test "$TARGET_PLATFORM" = linux/arm
   chmod 700 "$ROLLBACK_CONTEXT"
   trap 'rm -rf -- "$ROLLBACK_CONTEXT"' EXIT HUP INT TERM
   git archive "$ROLLBACK_BASELINE_SHA" | tar -x -C "$ROLLBACK_CONTEXT"
+  # Do not let archived symlinks (including dangling ones) redirect these
+  # writes outside the private context or make chmod follow an external path.
+  rm -rf -- "$ROLLBACK_CONTEXT/Dockerfile" "$ROLLBACK_CONTEXT/.dockerignore"
+  test ! -e "$ROLLBACK_CONTEXT/Dockerfile" && test ! -L "$ROLLBACK_CONTEXT/Dockerfile"
+  test ! -e "$ROLLBACK_CONTEXT/.dockerignore" && test ! -L "$ROLLBACK_CONTEXT/.dockerignore"
   git show "$CANDIDATE_SHA:Dockerfile" >"$ROLLBACK_CONTEXT/Dockerfile"
   git show "$CANDIDATE_SHA:.dockerignore" >"$ROLLBACK_CONTEXT/.dockerignore"
   chmod 600 "$ROLLBACK_CONTEXT/Dockerfile" "$ROLLBACK_CONTEXT/.dockerignore"
@@ -1047,7 +1135,7 @@ test "$(docker image inspect elspeth:ecs-rollback-baseline --format '{{.Os}}/{{.
 export ECR_REGISTRY="${ECR_REGISTRY:?set approved account registry host}"
 export ECR_REPOSITORY="${ECR_REPOSITORY:?set approved repository name}"
 export ROLLBACK_BASELINE_TAG="acceptance-${ACCEPTANCE_RUN_ID}-baseline-${ROLLBACK_BASELINE_SHA}"
-export CANDIDATE_TAG="acceptance-${ACCEPTANCE_RUN_ID}-0.7.1-${CANDIDATE_SHA}"
+export CANDIDATE_TAG="acceptance-${ACCEPTANCE_RUN_ID}-0.8.0-${CANDIDATE_SHA}"
 
 test "$(aws_capture aws sts get-caller-identity --query Account --output text)" = "$AWS_ACCOUNT_ID"
 REPOSITORY_IDENTITY="$(aws_capture aws ecr describe-repositories \
@@ -1071,7 +1159,7 @@ arm_external_cleanup
   aws_ecr_login "$ECR_REGISTRY" "$AWS_REGION"
   docker tag elspeth:ecs-rollback-baseline \
     "$ECR_REGISTRY/$ECR_REPOSITORY:$ROLLBACK_BASELINE_TAG"
-  docker tag elspeth:ecs-0.7.1-closeout \
+  docker tag elspeth:ecs-0.8.0-closeout \
     "$ECR_REGISTRY/$ECR_REPOSITORY:$CANDIDATE_TAG"
   docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$ROLLBACK_BASELINE_TAG"
   docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$CANDIDATE_TAG"
@@ -1172,7 +1260,7 @@ render_resolved_inventory() (
   jq -e --arg run "$ACCEPTANCE_RUN_ID" --arg candidate "$CANDIDATE_SHA" \
     --arg account "$AWS_ACCOUNT_ID" --arg region "$AWS_REGION" --arg scenario "$scenario_id" '
       type == "object"
-      and .schema == "elspeth.aws-ecs-scenario-inventory.v5"
+      and .schema == "elspeth.aws-ecs-scenario-inventory.v9"
       and .phase == "resolved"
       and .acceptance_run_id == $run
       and .candidate_sha == $candidate
@@ -1210,11 +1298,11 @@ plan_and_apply_scenario() {
     -var="candidate_image=$CANDIDATE_IMAGE" \
     -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
   chmod 600 "$plan"
+  plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
   terraform_capture -chdir="$directory" show -json "$plan" | \
     uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$receipt"
+      sanitize-evidence --kind terraform-plan --plan-sha256 "$plan_sha" >"$receipt"
   chmod 600 "$receipt"
-  plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
   receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-plan "$plan_sha" "$receipt")"
   request_signed_tf_approval "$scenario_id" terraform-plan "$receipt_hash" \
     "$receipt" "$TERRAFORM_PLAN_APPROVAL_FILE"
@@ -1236,11 +1324,11 @@ plan_and_apply_scenario() {
     -var="candidate_image=$CANDIDATE_IMAGE" \
     -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
   chmod 600 "$plan"
+  noop_sha="$(sha256sum "$plan" | awk '{print $1}')"
   terraform_capture -chdir="$directory" show -json "$plan" | \
     uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-      sanitize-evidence --kind terraform-plan >"$receipt"
+      sanitize-evidence --kind terraform-plan --plan-sha256 "$noop_sha" >"$receipt"
   chmod 600 "$receipt"
-  noop_sha="$(sha256sum "$plan" | awk '{print $1}')"
   receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-noop "$noop_sha" "$receipt")"
   render_resolved_inventory "$scenario_id" "$directory" "$resolved_inventory"
   checkpoint_terraform_noop_and_bind "$scenario_id" "$noop_sha" \
@@ -1287,24 +1375,76 @@ completed or an interruption/failure requires Task 6.
 
 ## Authentication and secret injection
 
-Cognito/OIDC is recommended. Configure `auth_provider=oidc`, the user-pool
-`oidc_issuer`, and set both `oidc_audience` and `oidc_client_id` to the public
-app-client ID. Set the hosted/custom-domain
-`oidc_authorization_endpoint` and same-origin `oidc_token_endpoint`, exposed
-as `ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT` and
-`ELSPETH_WEB__OIDC_TOKEN_ENDPOINT`. The task environment also sets:
+A cold install (`first` mode) comes up on `auth_provider=local`, because it
+has no user pool yet and an operator has to be able to sign in to it. The
+upgrade deployment carries a Cognito user pool and selects `auth_provider=oidc`.
+
+Cognito is registered as a CONFIDENTIAL client, and Terraform creates it:
+`generate_secret = true` on `aws_cognito_user_pool_client.web`. Cognito mints
+the secret, Terraform reads it as an attribute into the runtime Secrets
+Manager entry beside the database credentials and the signing keys, and the
+task definition references it by ARN. There is no console step and no secret
+in the repository. The backend redeems the authorization code as that client:
+the browser never holds the secret and never performs the token exchange, and
+the implicit flow must not be enabled.
+
+The upgrade mode exports all eight settings the profile requires, together:
+`ELSPETH_WEB__SSO_ISSUER` (the user pool), `ELSPETH_WEB__SSO_CLIENT_ID` and
+`ELSPETH_WEB__SSO_CLIENT_SECRET` (the confidential client, the secret by ARN
+reference), `ELSPETH_WEB__SSO_ENDPOINT_ORIGINS` (the hosted domain, a JSON
+list, because Cognito serves authorize and token from a different origin than
+the pool issuer), `ELSPETH_WEB__SSO_TRANSACTION_SECRET`,
+`ELSPETH_WEB__PUBLIC_BASE_URL`, `ELSPETH_WEB__COMPARTMENT_ID` and the two
+quota defaults. Fewer than all eight is a task definition that does not
+start: since the legacy browser-client path was deleted, every registered
+profile is validated from the profile registry, and a partial identity
+configuration fails at settings load rather than reporting "not ready". They
+land in one revision rather than incrementally, for that reason.
+
+The client's `callback_urls` is the exact URI the backend redeems against,
+`https://<alb>/api/auth/sso/callback`. Cognito matches it exactly, so the
+load balancer root would be refused at the callback with nothing in the
+browser to say why.
+
+**A working upgrade deployment admits nobody until an operator makes the first
+administrator, and nothing in the deploy fails to tell you so.** The pool is
+created with `allow_admin_create_user_only = true`, so it ships with no users:
+you create one with `aws cognito-idp admin-create-user`. That person then
+authenticates successfully and lands **pending**, because an SSO first login
+is always pending until an administrator activates it — and on a new
+deployment there is no administrator to do it. The task is healthy, readiness
+passes, and the login walk works end to end; there is simply no way in. The
+seed setting is not exported by this package, and `dev_admin_user` is refused
+outright on any non-local provider, so there is no fallback to reach for.
+
+Make the first administrator with the operator command, against the
+deployment's sessions store:
 
 ```bash
-export ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS='["https://example.auth.ap-southeast-2.amazoncognito.com"]'
-export ELSPETH_WEB__OIDC_AUDIENCE_CLAIM=client_id
+elspeth composer users bootstrap-admin oidc <cognito-sub> \
+  --note "first administrator, <run id>"
 ```
 
-The allowlist accepts exact normalized HTTPS origins only. Wildcard or suffix
-matching, paths, and automatic Cognito-domain inference are rejected.
-`client_id` mode is exclusively for Cognito access tokens and requires
-`token_use=access`; generic OIDC continues to validate `aud`. The browser uses
-the authorization code flow with S256 PKCE. The public client has no client
-secret, and the implicit flow must not be enabled.
+`<cognito-sub>` is the user's `sub` claim, not their email or username — the
+same value `admin-get-user` reports and the acceptance inventory binds. The
+command creates or binds the identity row, activates it, grants a
+deployment-wide `admin`, writes its quota row and records the audit rows, in
+one transaction, and is refused once an active human admin exists.
+
+Then activate a second administrator through the admin API. Both bootstrap
+paths are gated on the deployment having *zero* active human admins, so
+neither can help once the count is above zero — and a deployment whose sole
+administrator keeps an active row but loses their provider account is
+recoverable by neither, only by direct work against the sessions store. Full
+background, including the alternative seed path and its hazards, is in the
+[Identity Providers guide](../guides/identity-providers.md), §Admitting the
+first person.
+
+The legacy browser-client settings (`oidc_*`), the browser-origin allowlist
+and the Cognito access-token audience-claim mode are deleted; a task
+definition that still exports any of them refuses to boot on an unknown
+setting (`tests/unit/deployment/test_web_settings_exports_resolve.py` pins
+that no tracked export or runbook names a setting that does not exist).
 
 Before browser acceptance, query the one approved pool/client through the
 protected capture wrapper and project only booleans and counts:
@@ -1318,10 +1458,10 @@ prepare_scenario_b_oidc() {
     --client-id "$OIDC_EXPECTED_AUDIENCE" \
     --query "UserPoolClient.{clientId:ClientId,allowedOAuthFlowsUserPoolClient:AllowedOAuthFlowsUserPoolClient,allowedOAuthFlows:AllowedOAuthFlows,allowedOAuthScopes:AllowedOAuthScopes,callbackURLs:CallbackURLs,hasClientSecret:contains(keys(@), 'ClientSecret')}" \
     --output json)
-  OIDC_REDIRECT_URI="${ALB_BASE_URL}/"
+  OIDC_REDIRECT_URI="${ALB_BASE_URL}/api/auth/sso/callback"
   jq -e --arg callback "$OIDC_REDIRECT_URI" '
     keys == ["allowedOAuthFlows","allowedOAuthFlowsUserPoolClient","allowedOAuthScopes","callbackURLs","clientId","hasClientSecret"]
-    and .hasClientSecret == false
+    and .hasClientSecret == true
     and .allowedOAuthFlowsUserPoolClient == true
     and (.allowedOAuthFlows | index("code") != null)
     and (.allowedOAuthFlows | index("implicit") == null)
@@ -1355,13 +1495,16 @@ prepare_scenario_b_oidc() {
 ```
 
 `ALB_BASE_URL` is an exact HTTPS origin with no path, query, fragment, or
-trailing slash. `OIDC_REDIRECT_URI` is the exact slash-bearing root URL the
-frontend sends during authorization and token exchange. ELSPETH disables
-Uvicorn's raw request-line access logger so
-the PKCE callback code is not logged. If ALB access logging is enabled, its
-short retention and access policy must be separately approved because those
-logs retain callback codes even though PKCE prevents redemption without the
-verifier.
+trailing slash. `OIDC_REDIRECT_URI` is the exact callback URL the BACKEND
+redeems against: `ALB_BASE_URL` joined to `sso_wiring.SSO_CALLBACK_PATH`. It
+must equal the `callback_urls` entry the Terraform sets, because Cognito
+matches that list exactly — the load balancer root is refused at the callback
+with nothing in the browser to say why. ELSPETH disables Uvicorn's raw
+request-line access logger so the callback code is not logged. If ALB access
+logging is enabled, its short retention and access policy must be separately
+approved because those logs retain callback codes. Redemption additionally
+requires the confidential client's secret and the PKCE verifier sealed in the
+transaction cookie, and neither is in the URL.
 
 Local auth (`auth_provider=local`) is an explicit single-task option. Mount
 `data_dir/auth.db` on EFS and keep SQLite journal mode `DELETE`, never WAL.
@@ -1456,17 +1599,17 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_task_definition": "exact-candidate-task-definition-arn",
   "candidate_doctor_task_definition": "exact-candidate-doctor-task-definition-arn",
-  "candidate_package_version": "0.7.1",
+  "candidate_package_version": "0.8.0",
   "previous_source_sha": "40-lowercase-hex",
   "previous_image_digest": "sha256:64-lowercase-hex",
   "previous_task_definition": "exact-previous-task-definition-arn",
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
-  "previous_package_version": "0.7.0",
+  "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "previous": {"session_epoch": 27, "landscape_epoch": 23, "run_web_plugin_policy_present": true},
-    "structural_changes": "landscape_epoch_23_to_29_token_ownership_artifact_idempotency_sink_effect_ledger_coalesce_receipts_per_member_failsink_provenance_output_contract_hash_run_scoped_validation_errors_and_token_ancestry_batch_expansion_claim_and_sidecar_journal_outbox",
-    "semantics_only_changes": "none",
+    "candidate": {"session_epoch": 53, "landscape_epoch": 38, "run_web_plugin_policy_present": true},
+    "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
+    "structural_changes": "session_epoch_35_to_53_landscape_epoch_29_to_38_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
+    "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
   },
@@ -1491,12 +1634,12 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 35, Landscape epoch 29 and `run_web_plugin_policy` presence,
+session epoch 53, Landscape epoch 38 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
-any later deployment action. The 0.7.0 image understands Landscape epoch 23,
-not epoch 29. Pre-1.0 candidates do not migrate predecessor schemas: the old
+any later deployment action. The 0.7.1 image understands session epoch 35,
+not epoch 53. Pre-1.0 candidates do not migrate predecessor schemas: the old
 deployment is stopped and uninstalled, required evidence is archived/exported,
 and the databases are recreated before the candidate is installed. The previous
 image cannot reopen the recreated current database, so Scenario B rollback is
@@ -1504,7 +1647,7 @@ forbidden after recreation. Unknown or unapproved compatibility is NO-GO;
 expiry or identity drift is also NO-GO.
 
 Before either schema initializer runs, create and prove the required EFS
-children with the candidate image's explicit `1000:1000` one-shot definition.
+children with the candidate image's explicit `1654:1654` one-shot definition.
 The command creates only the configured payload directory and `data_dir/blobs`
 under the already-mounted `data_dir`, then performs create/read/fsync/delete
 probes in all three directories. It emits no paths:
@@ -1566,8 +1709,8 @@ resolve_bound_task_definition() {
 validate_scenario_task_definitions() {
   resolve_bound_task_definition CANDIDATE_TASK_DEFINITION "$WEB_CONTAINER_NAME"
   resolve_bound_task_definition DOCTOR_TASK_DEFINITION "$DOCTOR_CONTAINER_NAME"
-  resolve_bound_task_definition PAYLOAD_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1000:1000
-  resolve_bound_task_definition LOCAL_AUTH_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1000:1000
+  resolve_bound_task_definition PAYLOAD_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1654:1654
+  resolve_bound_task_definition LOCAL_AUTH_VERIFIER_TASK_DEFINITION "$WEB_CONTAINER_NAME" 1654:1654
   if test "$DEPLOYMENT_MODE" = upgrade; then
     resolve_bound_task_definition ROLLBACK_DOCTOR_TASK_DEFINITION "$DOCTOR_CONTAINER_NAME"
     resolve_bound_task_definition PREVIOUS_TASK_DEFINITION "$WEB_CONTAINER_NAME"
@@ -1894,7 +2037,7 @@ loop rather than readiness.
 
 ## Packaging and platform identity
 
-Task 4's inspected `elspeth:ecs-0.7.1-closeout` image is the only candidate.
+Task 4's inspected `elspeth:ecs-0.8.0-closeout` image is the only candidate.
 The earlier fresh-account publication step binds that exact local image to its
 registry digest before either scenario apply; do not rebuild or retag a second
 candidate here. Validate the approved platform mapping only:
@@ -1916,13 +2059,144 @@ Every web, doctor, verifier, and rollback definition declares
 `ARM64`). A host-native image with no recorded target platform is NO-GO. The
 lean image omits the `azure` extra; `azure_blob` pipelines need the default
 `all` image or an expanded `INSTALL_EXTRAS`. The published GHCR/ACR default
-remains `all`.
+remains `all`. Every image records its exact selection in the
+`io.elspeth.install-extras` OCI label. Before promoting any generic release
+tag, require this check to print exactly `all`:
+
+```bash
+docker image inspect --format '{{ index .Config.Labels "io.elspeth.install-extras" }}' "$IMAGE"
+```
+
+Acceptance/lean images instead report `webui llm aws postgres`; never retag
+one of those digests as the generic GHCR/ACR release image.
+
+## Immutable RDS trust-root admission
+
+For server-certificate rotation, trust-root changes, and emergency distrust,
+follow the maintained
+[RDS trust-root response rules](../../deploy/aws-ecs/trust/README.md#rotation-and-emergency-distrust).
+
+The image must contain `/etc/elspeth/rds/global-bundle.pem` with SHA-256
+`e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`.
+Its OCI CA label must be `rds-ca-rsa2048-g1`. Every ELSPETH container in the
+task definitions except the web container (`elspeth-web`, candidate and
+rollback) must set `readonlyRootFilesystem` to `true`. The web container is
+exempt because ECS Exec — which runs the acceptance checks inside it — is
+unsupported by AWS with a read-only root filesystem, and its multipart and
+telemetry paths write to `/tmp`; its trust root remains immutable through
+startup digest verification of the 0444 root-owned baked file.
+
+The schema and runtime doctor JSON must report all of these checks as green
+before the web service is enabled:
+
+- `rds_trust_root`
+- `session_tls`
+- `landscape_tls`
+- `session_schema`
+- `landscape_schema`
+
+`session_tls` and `landscape_tls` attest only the connection that inspected
+each schema: TLS is proven on the same connection the schema probe ran over,
+not on every connection a run opens. A `--init-schema` DDL connection uses
+the identical URL and `sslmode` posture but is not itself separately probed.
+
+The task definitions and bootstrap must not contain
+`truststore.pki.rds.amazonaws.com`, `/tmp/rds-global-bundle.pem`, or
+`/var/lib/elspeth/rds-global-bundle.pem`.
+
+OCI digest
+`sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
+predates this contract. It is an acceptance-attempt artifact and is not
+eligible for `0.8.0-RC-290726`.
+
+Verify the baked trust root and its OCI CA labels against the candidate
+image directly:
+
+```bash
+docker buildx imagetools inspect "$CANDIDATE_IMAGE"
+test "$(docker inspect --format \
+  '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+  "$CANDIDATE_IMAGE")" = \
+  e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3
+test "$(docker inspect --format \
+  '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+  "$CANDIDATE_IMAGE")" = rds-ca-rsa2048-g1
+```
+
+Verify the live Aurora CA identifier and the task definitions'
+`readonlyRootFilesystem` split through the protected capture wrappers
+defined in [Protected command capture](#protected-command-capture):
+
+```bash
+DB_INSTANCE_IDENTIFIER=$(jq -er '.orphan_sweep.rds_db_instance_identifiers[0]' "$SCENARIO_A_INVENTORY")
+CA_IDENTIFIER=$(aws_capture aws rds describe-db-instances \
+  --db-instance-identifier "$DB_INSTANCE_IDENTIFIER" \
+  --query 'DBInstances[0].CACertificateIdentifier' --output text)
+test "$CA_IDENTIFIER" = rds-ca-rsa2048-g1
+
+TASK_DEFINITION="$DOCTOR_TASK_DEFINITION"
+NON_WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
+  --task-definition "$TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name!=`cloudwatch-agent` && name!=`elspeth-web`].{name: name, readonlyRootFilesystem: readonlyRootFilesystem}' \
+  --output json)
+jq -e 'length > 0 and all(.[]; .readonlyRootFilesystem == true)' <<<"$NON_WEB_READONLY_JSON" >/dev/null
+
+WEB_READONLY_JSON=$(aws_capture aws ecs describe-task-definition \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].{name: name, readonlyRootFilesystem: readonlyRootFilesystem}' \
+  --output json)
+jq -e 'length == 1 and all(.[]; .readonlyRootFilesystem != true)' <<<"$WEB_READONLY_JSON" >/dev/null
+```
+
+Both checks project `{name, readonlyRootFilesystem}` objects rather than the
+bare field because a JMESPath filter-then-field projection drops null
+results: against a container whose field is absent, the bare-field form
+yields the same empty array as a query that matched nothing at all, and any
+`all(...)` over an empty array is vacuously true. Run the first check only
+against `$DOCTOR_TASK_DEFINITION` — the schema-init
+or runtime doctor definition, container name `doctor` — never against
+`$PAYLOAD_VERIFIER_TASK_DEFINITION` or `$LOCAL_AUTH_VERIFIER_TASK_DEFINITION`:
+`resolve_bound_task_definition` binds those two under the `elspeth-web`
+container name (see
+[Saved-plan apply and scenario binding](#saved-plan-apply-and-scenario-binding)),
+so against either of them the `name!='elspeth-web'` projection returns an
+empty array and `length > 0` fails closed rather than silently passing. Run
+the second check only against a candidate or rollback web task definition —
+`$CANDIDATE_TASK_DEFINITION`, or `$PREVIOUS_TASK_DEFINITION` on an upgrade:
+its `readonlyRootFilesystem` field is absent, so the projection yields
+`[{"name": "elspeth-web", "readonlyRootFilesystem": null}]`; `length == 1`
+proves the query found exactly the intended container (a bare-field
+projection would drop the null and yield `[]`, which an unguarded `all()`
+would pass with zero evidentiary value — including against a wrong
+task-definition ARN or a typo'd container name), and
+`.readonlyRootFilesystem != true` proves the documented exemption rather
+than a silent `true` that would break ECS Exec. The payload and local-auth verifier
+task definitions run a read-only container (`readonlyRootFilesystem = true`)
+under the `elspeth-web` container name; neither jq command above exercises
+them — that source-level contract is asserted directly against
+`deploy/aws-ecs/terraform/modules/scenario/ecs.tf` by
+`tests/unit/deployment/test_aws_ecs_terraform_package.py`.
+
+### Upgrading an existing install
+
+Applying this module version to an existing install rotates all five Secrets
+Manager database URLs to the canonical immutable-trust query immediately,
+while `aws_ecs_service.web` ignores task-definition changes
+(`lifecycle.ignore_changes`). An old-image task that restarts inside that
+window injects the new canonical URL, lacks the baked bundle, and
+crash-loops. Apply and roll the service in one operation: run
+`terraform apply`, then immediately
+`aws ecs update-service --force-new-deployment` with the new qualified image
+digest. Pinning `ca_cert_identifier` on an existing Aurora instance triggers
+a database modification with engine-dependent restart semantics — expect and
+schedule it. No pre-trust-root image digest is rollback-eligible after the
+upgrade (see the rollback section).
 
 ## Storage provisioning and cold start
 
 Before doctor, run `provision_scenario_storage` above. It provisions
 `data_dir`, explicit `payload_store_path`, and the derived blob directory on
-the intended EFS access point and proves them as the non-root `1000:1000`
+the intended EFS access point and proves them as the non-root `1654:1654`
 user. Mounting only the parent is insufficient: doctor deliberately never
 calls `mkdir`, including with `--init-schema`, because an overlay child would
 mask a displaced EFS mount. Record the filesystem/access-point identity and
@@ -1938,11 +2212,50 @@ database-operator-approved schema-owner secret. The EFS task role has only
 `elasticfilesystem:ClientMount` and `elasticfilesystem:ClientWrite` scoped to
 the exact filesystem/access point; `ClientRootAccess` needs separate approval.
 
-## Bedrock, Guardrails, and S3 task-role shape
+## Bedrock, Guardrails, Textract, and S3 task-role shape
 
-Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Configure
-the ordinary `region_name` and a `bedrock/anthropic...` model identifier; do
-not embed AWS keys. For the two run-scoped Guardrails, grant resource-scoped
+Grant the runtime task role resource-scoped `bedrock:InvokeModel`. Whichever
+of Composer primary/advisor is a cross-region (`global.`/`us.`/`eu.`/`apac.`)
+inference-profile model also needs a wildcard-region foundation-model grant
+(`arn:aws:bedrock:*::foundation-model/<base-model-id>`) alongside the
+region-pinned inference-profile ARN, because Bedrock authorizes the
+underlying foundation-model call in whichever region the profile actually
+routes to and reports that check against a region-less resource ARN; a
+single region-pinned foundation-model grant does not match it. The
+run-scoped permissions boundary must independently allow the same
+wildcard-region resource — a task-role grant the boundary does not also
+allow is intersected away to nothing. Configure the ordinary `region_name`
+and a `bedrock/anthropic...` model identifier; do not embed AWS keys.
+
+When the deployment authorizes `transform:aws_textract_document_analysis`,
+grant the task role `textract:StartDocumentAnalysis` and
+`textract:GetDocumentAnalysis`, and grant the same pair in the run-scoped
+permissions boundary — as with Bedrock, a task-role grant the boundary does not
+also allow is intersected away. Neither action names an ARN, so `"*"` is the
+only expressible resource; the effective scope remains the S3 object grant,
+because Textract reads `DocumentLocation.S3Object` under the task role's own
+credentials and can therefore only analyse objects already inside this run's
+prefix. The role needs `s3:GetObject` on that prefix and, whenever the transform
+configures `version_field`, `s3:GetObjectVersion` on the same scope; the
+reference task policy and permissions boundary grant both. No Textract
+environment variable exists — the plugin is configured per node and
+authenticates through the default credential chain. Omitting either required
+grant is a late failure: the pipeline composes and validates cleanly, then fails
+at run time with `AccessDenied` or `InvalidS3ObjectException`, because
+authorization is not checked until the job is submitted.
+
+A correctly-shaped IAM policy is not sufficient on its own: the chosen model
+id also needs an active model-access agreement in the target account.
+Confirm with `aws bedrock get-foundation-model-availability --model-id <id>`
+that `agreementAvailability` reports `AVAILABLE` before granting access or
+running acceptance. First-party Amazon models generally have that agreement
+by default; third-party models (for example Anthropic's) may additionally
+require an AWS Marketplace subscription the account must complete first —
+without it, Bedrock invocation fails with an `AccessDeniedException` naming
+the missing Marketplace subscription even though the resource ARNs and
+boundary are correct.
+
+For the two run-scoped Guardrails, grant resource-scoped
 `bedrock:ApplyGuardrail` and grant `bedrock:GetGuardrail` only if the approved
 preflight uses it. Terraform creates two acceptance-run-tagged Guardrails,
 publishes immutable numeric versions, injects private identifier/version/
@@ -1957,12 +2270,32 @@ The runbook records the documented Bedrock/Azure category gap. Shared
 pre-existing Guardrails are not accepted because their ownership and
 configuration can drift.
 
-For S3, grant only `s3:GetObject` for approved source prefixes and
+Composer primary and advisor may also be `bedrock/...` identifiers. They are
+protected non-secret task environment values and LiteLLM uses the task role's
+default AWS credential chain; never inject access keys, profiles, endpoint
+overrides, Bedrock/AgentCore gateway ARNs, or parallel provider configuration.
+The task-definition acceptance gate requires `OPENROUTER_API_KEY` from the
+approved Secrets Manager selector when either Composer model is
+`openrouter/...`, and requires no OpenRouter secret when both are Bedrock.
+`/api/ready` remains the storage/auth/deployment readiness surface and is not
+made dependent on a live provider call; sanitized system status reports
+Composer availability separately.
+
+For S3, grant only `s3:GetObject` for approved source prefixes,
+`s3:GetObjectVersion` on those prefixes when a source selects versions, and
 `s3:PutObject` for approved sink prefixes. Never grant wildcard buckets. The
 disposable acceptance role additionally gets `s3:DeleteObject` only for
 `ELSPETH_ACCEPTANCE_S3_BUCKET` plus its UUID-scoped
 `ELSPETH_ACCEPTANCE_S3_PREFIX`; the Plan 12 operator receives the same narrow
 cleanup backstop. Steady-state production does not inherit test-only delete.
+Also grant bucket-scoped `s3:ListBucket` on the acceptance bucket, and grant
+it unconditioned: without it S3 cannot distinguish a missing object from a
+forbidden one and `HeadObject` on a not-yet-existing key returns `403`
+instead of `404`, and a prefix condition on this statement never matches
+because S3 evaluates that missing-vs-forbidden check outside the triggering
+request's own context. The statement stays narrow because it names only
+this run's own disposable bucket, and the permissions boundary must grant
+the same bucket-level (not object-level) `s3:ListBucket` resource.
 
 For ECS Exec, grant exactly `ssmmessages:CreateControlChannel`,
 `ssmmessages:CreateDataChannel`, `ssmmessages:OpenControlChannel`, and
@@ -1976,14 +2309,17 @@ permissions or the single-process local-auth contract.
 Store these two files in the deployment repository under a versioned
 `telemetry/elspeth.cloudwatch-agent.v1/` directory. Compute both digests with
 `sha256sum "$AGENT_CONFIG_JSON" "$AGENT_OTEL_YAML"`, record them in the
-reviewed task-definition manifest, and render each non-secret file as
+protected scenario inventory as `CLOUDWATCH_AGENT_CONFIG_JSON_SHA256` and
+`CLOUDWATCH_AGENT_OTEL_YAML_SHA256`, and render each non-secret file as
 single-line base64 plus its lowercase SHA-256 into the sidecar environment.
 Base64 is transport encoding, not a credential or secrecy mechanism. The
 sidecar entrypoint decodes both files into its task-local writable directory,
-verifies both hashes before use, then runs the agent's required `fetch-config`
-followed by `append-config` sequence. A mismatch or either control-script
-failure stops the sidecar. The task definition must refer to that exact
-manifest version; mutable “latest” configuration is not accepted.
+verifies both hashes before use, then runs `config-translator` to render the
+JSON config into the agent's TOML configuration file before `exec`ing
+`amazon-cloudwatch-agent` directly with that TOML plus the OTel YAML. A
+digest mismatch or translation failure stops the sidecar. The task definition
+must refer to that exact manifest version; mutable “latest” configuration is
+not accepted.
 
 CloudWatch Agent JSON (`elspeth.cloudwatch-agent.v1.json`):
 
@@ -2043,9 +2379,14 @@ scenario-owned `OPERATOR_METRICS_LOG_GROUP`, and extracts them into the
 `ELSPETH/Operator` CloudWatch namespace. `NoDimensionRollup` prevents the
 exporter from silently creating additional dimension sets, and retaining the
 first delta value preserves low-frequency acceptance and failure counters.
-The `awsxray` exporter sends traces to X-Ray. Both exporters use the default
-AWS credential chain and therefore the ECS task role; neither accepts an
-endpoint, role override, profile, or static credential here.
+The `awsxray` exporter sends traces to X-Ray. With this tracked empty exporter
+configuration, X-Ray records ELSPETH's bounded `run_id` and `status` lifecycle
+attributes under each segment document's `metadata.default` object. The
+acceptance query reads that store and also accepts the legacy indexed
+`annotations` representation during compatibility transitions; if both are
+present they must agree exactly. Both exporters use the default AWS credential
+chain and therefore the ECS task role; neither accepts an endpoint, role
+override, profile, or static credential here.
 
 Production permits only these two supported exporters. The unsupported
 `awscloudwatch` collector exporter must not be used. Diagnostic `debug` output
@@ -2054,23 +2395,25 @@ into an unreviewed retention surface.
 
 ## Task-definition shape
 
-Resolve an approved CloudWatch Agent repository and its 64-lowercase-hex
-digest into `CLOUDWATCH_AGENT_IMAGE_SHA256`. The rendered image reference must
-contain the digest and no tag. The approved ECS runtime variant must include
-the AWS control script plus `/bin/sh`, `base64`, `sha256sum`, `grep`, and
-`sleep`; those are part of the reviewed image contract and are exercised by
-the entrypoint below:
+Record the approved digest-only CloudWatch Agent reference in the protected
+scenario inventory as `CLOUDWATCH_AGENT_IMAGE`. The rendered image reference
+must equal it byte-for-byte and contain no tag. The approved ECS runtime variant must include
+the AWS config-translator, the `amazon-cloudwatch-agent` binary itself, plus `/bin/sh`, `base64`,
+`sha256sum`, and Python 3.13; those are part of the reviewed image contract and
+are exercised by the entrypoint and health probe below. The web container must
+override the image's diagnostic default with the exact service command
+`web --host 0.0.0.0 --port 8451`:
 
 ```json
 {
   "containerDefinitions": [
     {
       "name": "cloudwatch-agent",
-      "image": "${CLOUDWATCH_AGENT_IMAGE_REPOSITORY}@sha256:${CLOUDWATCH_AGENT_IMAGE_SHA256}",
+      "image": "${CLOUDWATCH_AGENT_IMAGE}",
       "essential": false,
       "memoryReservation": 192,
       "entryPoint": ["/bin/sh", "-ceu"],
-      "command": ["CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$CTL\" -a fetch-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -s; \"$CTL\" -a append-config -m auto -c \"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" -s; while \"$CTL\" -a status -m auto | grep -q '\"status\": \"running\"'; do sleep 30; done; exit 1"],
+      "command": ["CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$TRANSLATOR\" -mode auto -os linux -input \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -output \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\"; exec \"$AGENT\" -config \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\" -otelconfig \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\""],
       "environment": [
         {"name": "ELSPETH_CW_AGENT_CONFIG_JSON_B64", "value": "${CLOUDWATCH_AGENT_CONFIG_JSON_B64}"},
         {"name": "ELSPETH_CW_AGENT_CONFIG_JSON_SHA256", "value": "${CLOUDWATCH_AGENT_CONFIG_JSON_SHA256}"},
@@ -2078,7 +2421,7 @@ the entrypoint below:
         {"name": "ELSPETH_CW_AGENT_OTEL_YAML_SHA256", "value": "${CLOUDWATCH_AGENT_OTEL_YAML_SHA256}"}
       ],
       "healthCheck": {
-        "command": ["CMD-SHELL", "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q '\"status\": \"running\"'"],
+        "command": ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()"],
         "interval": 10,
         "timeout": 5,
         "retries": 6,
@@ -2087,13 +2430,14 @@ the entrypoint below:
     },
     {
       "name": "elspeth-web",
+      "command": ["web", "--host", "0.0.0.0", "--port", "8451"],
       "dependsOn": [{"containerName": "cloudwatch-agent", "condition": "HEALTHY"}],
       "environment": [
         {"name": "ELSPETH_WEB__PLUGIN_ALLOWLIST", "value": "${ELSPETH_WEB__PLUGIN_ALLOWLIST}"},
         {"name": "ELSPETH_WEB__PLUGIN_PREFERENCES", "value": "${ELSPETH_WEB__PLUGIN_PREFERENCES}"},
         {"name": "ELSPETH_WEB__PLUGIN_CONTROL_MODES", "value": "${ELSPETH_WEB__PLUGIN_CONTROL_MODES}"},
         {"name": "ELSPETH_WEB__LLM_PROFILES", "value": "${ELSPETH_WEB__LLM_PROFILES}"},
-        {"name": "ELSPETH_WEB__TUTORIAL_LLM_PROFILE", "value": "${ELSPETH_WEB__TUTORIAL_LLM_PROFILE}"},
+        {"name": "ELSPETH_WEB__DEFAULT_LLM_PROFILE", "value": "${ELSPETH_WEB__DEFAULT_LLM_PROFILE}"},
         {"name": "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES", "value": "${ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES}"},
         {"name": "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES", "value": "${ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES}"},
         {"name": "ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256", "value": "${ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256}"},
@@ -2116,6 +2460,13 @@ the entrypoint below:
   ]
 }
 ```
+
+The sidecar health check must reach the actual OTLP/gRPC listener at
+`127.0.0.1:4317`; checking PID 1 only proves that the setup shell has not
+exited. The Python connect uses a three-second socket timeout within ECS's
+five-second health-check timeout. It intentionally verifies listener readiness,
+not application-level gRPC health: a closed or not-yet-open collector socket
+keeps the web container's `HEALTHY` dependency unsatisfied.
 
 Do not add a task port map for the collector. Fargate containers in the task
 share the task network namespace, so the application reaches the loopback
@@ -2296,7 +2647,9 @@ first deploy left desired count zero and traffic fixed at 503. Validate these
 inputs from the approved inventory:
 
 - `TARGET_PLATFORM`, `AWS_REGION`, `ECS_CLUSTER`, `ECS_SERVICE`,
-  `WEB_CONTAINER_NAME`, `TARGET_GROUP_ARN`, and `ALB_BASE_URL`;
+  `WEB_CONTAINER_NAME`, `TARGET_GROUP_ARN`, `ALB_BASE_URL`,
+  `ELSPETH_WEB__COMPOSER_MODEL`, and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`;
 - `CANDIDATE_TASK_DEFINITION`, `DOCTOR_TASK_DEFINITION`,
   `DOCTOR_CONTAINER_NAME`, and the complete JSON
   `DOCTOR_NETWORK_CONFIGURATION`;
@@ -2315,7 +2668,8 @@ definition and replace it with the returned exact taskDefinitionArn. Require
 `ACTIVE`, the approved image digest, matching Linux CPU architecture, named
 container, network configuration, log group, and stream prefix. The
 manifest-backed validator below also compares the returned named container's
-seven policy settings, binding hash, live Bedrock model, and AWS region byte
+seven policy settings, Composer primary/advisor models, binding hash, live
+Bedrock model, and AWS region byte
 for byte with the loaded protected scenario inventory; recomputing a matching
 hash over a substituted bundle is not sufficient.
 
@@ -2553,6 +2907,16 @@ or sanitized doctor failure blocks service mutation. Diagnose only through
 bounded `aws logs filter-log-events` calls captured by `aws_capture` and sent
 directly to `sanitize-evidence`; raw logs are never printed or persisted.
 
+If the sanitized failure names `payload_store_writable` or `blob_writable`
+with a `FileNotFoundError` on an otherwise fresh stack, `provision_scenario_storage`
+(see [Fresh Scenario A database baseline](#fresh-scenario-a-database-baseline))
+has not yet run against this stack. Doctor deliberately never creates
+directories, including under `--init-schema` (see
+[Storage provisioning and cold start](#storage-provisioning-and-cold-start)),
+so a missing mount surfaces as this same sanitized failure. Run
+`provision_scenario_storage`, confirm the non-root probe booleans, then rerun
+this doctor step.
+
 ### 3. Apply the schema compatibility gate
 
 `--init-schema` may initialize a session or Landscape schema only when it is
@@ -2571,6 +2935,17 @@ database-operator-owned archive decision and drop/recreate procedure followed
 by `--init-schema`; never automate it. Predecessor archives are evidence, not
 recovery inputs for the current release. If the fresh candidate fails, fix it
 forward and repeat the uninstall/recreate/reinstall procedure.
+
+Record the testcontainer run before any image is deployed: it is the gate
+ledger's `tests` stage, and `evidence-export-receipt` later refuses the
+candidate (`testcontainer_run_missing`, `testcontainer_run_failed`,
+`testcontainer_run_ledger`) unless exactly one passing run is on record. A
+failed run is stored with its exit code and superseded by a later passing one;
+it is never deleted.
+
+```bash
+record_testcontainer_run
+```
 
 ### 4. Deploy exactly one candidate task
 
@@ -2666,6 +3041,17 @@ set_traffic_action forward
 verify_public_probes
 ```
 
+> **Known issue (elspeth-9a78b3a02f):** the `verify-s3` collision re-drive
+> currently fails deterministically because of a pre-existing sink
+> publication-protocol defect, unrelated to IAM or the deployment package.
+> Until that issue closes, S3-path qualification evidence is the raw
+> task-role S3 sequence — put/head/get/overwrite/delete → clean
+> 200s/204/404 with correct 404-vs-403 discrimination. A `verify-s3`
+> failure matching that signature (sanitized `s3_collision`
+> `AcceptanceCheckError`) does not gate release admission; any other
+> `verify-s3` failure signature still gates. Keep running the check in
+> sequence below — do not remove it from the acceptance program.
+
 #### Persistence, replacement, task-role, and local-auth sequence
 
 Run these checks in this order; a later check never substitutes for an earlier
@@ -2680,14 +3066,14 @@ one:
    protected state without mutating the session. Require the six-row
    `GET /api/system/status` contract and the typed HTTP 409
    `tutorial_required_control_coverage` recheck as part of this command.
-5. Start the explicit `1000:1000` one-shot payload verifier with the candidate
+5. Start the explicit `1654:1654` one-shot payload verifier with the candidate
    digest and the same PostgreSQL/EFS settings; do not use root-running ECS
    Exec for this proof.
 6. From every contributing healthy candidate task, use ECS Exec for the S3,
    Bedrock, Guardrail, and operator-telemetry checks and locally extract the
    one sanitized receipt sentinel.
 7. Drain traffic to fixed 503, scale the service to zero, then start the
-   explicit `1000:1000` local-auth verifier against the same EFS mount.
+   explicit `1654:1654` local-auth verifier against the same EFS mount.
 
 ```bash
 case "$ACTIVE_SCENARIO_ID" in
@@ -2754,7 +3140,7 @@ checkpoint_operator_retained_evidence() {
 }
 
 run_connection_budget_check() {
-  local task_arn="$1" stream envelope_file details_file command
+  local task_arn="$1" stream envelope_file command
   [[ "$ACCEPTANCE_START_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
   [[ "$ACCEPTANCE_CONNECTION_BUDGET" =~ ^[1-9][0-9]{0,8}$ ]]
   [[ "$ACCEPTANCE_CONNECTION_SAFETY_MARGIN" =~ ^[0-9]{1,9}$ ]]
@@ -2766,17 +3152,15 @@ run_connection_budget_check() {
     --cluster "$ECS_CLUSTER" --task "$task_arn" --container "$WEB_CONTAINER_NAME" \
     --interactive --command "$command")
   envelope_file=$(mktemp -p /tmp elspeth-connection-envelope.XXXXXX)
-  details_file=$(mktemp -p /tmp elspeth-connection-budget.XXXXXX)
-  chmod 600 "$envelope_file" "$details_file"
+  chmod 600 "$envelope_file"
   printf '%s' "$stream" | uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
     extract-exec-receipt --check verify-connection-budget \
     --candidate-sha "$CANDIDATE_SHA" --task-arn "$task_arn" \
     --scenario-id "$ACTIVE_SCENARIO_ID" >"$envelope_file"
   unset stream
-  jq -e '.details' "$envelope_file" >"$details_file"
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" connection-budget \
-    "$DB_CLUSTER_IDENTIFIER" "$details_file" >/dev/null
-  rm -f -- "$envelope_file" "$details_file"
+    "$task_arn" "$envelope_file" >/dev/null
+  rm -f -- "$envelope_file"
 }
 
 run_candidate_role_check "$CANDIDATE_TASK_ARN" verify-s3
@@ -2848,6 +3232,14 @@ if test "$ACTIVE_SCENARIO_ID" = A; then
 fi
 ```
 
+`verify-operator-telemetry` treats CloudWatch's normal not-yet-ingested
+`GetMetricData` result (`StatusCode: "Complete"` with aligned empty
+`Values`/`Timestamps`) as an absent signal and continues the bounded retry
+loop. It reads X-Ray lifecycle correlation from the tracked exporter's
+`metadata.default` representation, while retaining strict compatibility with
+legacy indexed annotations. Malformed shapes, duplicate JSON keys, and
+conflicting correlation stores remain fatal acceptance errors.
+
 The `verify-bedrock-guardrails` receipt must contain `plugin_policy` with the
 exact `target_llm` and the prompt-shield/content-safety entries in
 `selected_controls`, including both opaque aliases and `required` modes, plus
@@ -2855,7 +3247,7 @@ exact `target_llm` and the prompt-shield/content-safety entries in
 `run_web_plugin_policy` row was read back unchanged; a Guardrail API success
 without this policy proof is NO-GO.
 
-Both one-shot definitions set task-level `user: "1000:1000"`, override the
+Both one-shot definitions set task-level `user: "1654:1654"`, override the
 image entrypoint exactly once with
 `{"entryPoint": ["python", "-m", "elspeth.web.aws_ecs_acceptance"]}`,
 use the candidate digest, and reuse the exact
@@ -2906,7 +3298,7 @@ Retain only allowlisted checks, classes, counts, and hashes.
 ### 7. Prove rollback refusal without crossing the schema stop
 
 The current upgrade record proves the opposite of rollback authorization. Once
-the candidate has recreated Landscape at epoch 29, the 0.7.0 image must
+the candidate has recreated Landscape at epoch 38, the 0.7.1 image must
 never be deployed against that database. Scenario B therefore exercises a
 fail-closed rollback refusal and forward recovery: revalidate and persist the
 sanitized compatibility receipt, prove the candidate task remains the active
@@ -2927,8 +3319,8 @@ if test "$DEPLOYMENT_MODE" = upgrade; then
   jq -e '
     .backward_compatible == false
     and .rollback_permitted == false
-    and .schema_facts.previous.landscape_epoch == 23
-    and .schema_facts.candidate.landscape_epoch == 29
+    and .schema_facts.previous.landscape_epoch == 29
+    and .schema_facts.candidate.landscape_epoch == 38
   ' "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" compatibility-record \
     "$COMPATIBILITY_RECORD_SHA256" "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null
@@ -2946,9 +3338,15 @@ fi
 
 The compatibility receipt plus `candidate-after-rollback-refusal` evidence is
 the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
-drained and repair forward with epoch-35 session/epoch-29 Landscape code.
+drained and repair forward with epoch-51 session/epoch-36 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
+
+No image digest that predates the immutable trust-root contract is
+rollback-eligible: such images lack the baked bundle and are rejected by the
+canonical URL contract at startup. Scenario B rollback evidence is therefore
+structurally impossible until a second, independently qualified trust-root
+digest exists; until then, record live rollback as unavailable.
 
 For first/first-recovery, remove traffic before compute, verify the listener's
 fixed 503 action, then scale to zero:
@@ -3056,6 +3454,19 @@ SCENARIO_B_COGNITO_POOL_ID=$(jq -er '.values.COGNITO_USER_POOL_ID // ""' "$SCENA
 SCENARIO_B_COGNITO_POOL_OWNED=$(jq -r '.orphan_sweep.cognito_pool_owned' "$SCENARIO_B_INVENTORY")
 case "$SCENARIO_B_COGNITO_POOL_OWNED" in true|false) ;; *) exit 1 ;; esac
 
+# R2-D3 (elspeth-a229c247a1): a successful destroy here does not fully close
+# out the scenario's Container Insights performance log group. ECS's
+# service-linked role re-creates that exact log-group name minutes after the
+# cluster goes INACTIVE (a final metrics flush), and the recreated group is
+# untagged and outside every Terraform state, so `orphan-sweep`'s tag query
+# cannot see it. `cleanup_container_insights_log_group` below (called from
+# the disposable-cleanup sequence, after both scenario destroys and the
+# ECR/identity/bootstrap steps have bought the flush enough wall-clock time)
+# is the corresponding cleanup. A same-namespace redeploy retry that still
+# hits `ResourceAlreadyExistsException` on `CreateLogGroup` must generate a
+# replacement plan with `-var=adopt_container_insights_log_group=true`, pass
+# that replacement through the ordinary sanitized review, obtain a new signed
+# approval, and apply only those newly approved plan bytes.
 destroy_scenario() {
   local scenario_id="$1" directory="$2" vars="$3" binding="$4"
   local binding_file="$5" approval_file="$6" surface="$7"
@@ -3078,11 +3489,12 @@ destroy_scenario() {
       -var="candidate_image=$CANDIDATE_IMAGE" \
       -var="rollback_baseline_image=$ROLLBACK_BASELINE_IMAGE" -out="$plan" >/dev/null
     chmod 600 "$plan"
+    plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
     terraform_capture -chdir="$directory" show -json "$plan" | \
       uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-        sanitize-evidence --kind terraform-destroy-plan >"$receipt"
+        sanitize-evidence --kind terraform-destroy-plan \
+        --plan-sha256 "$plan_sha" >"$receipt"
     chmod 600 "$receipt"
-    plan_sha="$(sha256sum "$plan" | awk '{print $1}')"
     receipt_hash="$(persist_sanitized_receipt "$scenario_id" terraform-destroy-plan "$plan_sha" "$receipt")"
     request_signed_tf_approval "$scenario_id" terraform-destroy-plan "$receipt_hash" \
       "$receipt" "$approval_file"
@@ -3152,11 +3564,12 @@ destroy_shared_bootstrap() {
           -var="backend_state_bucket=$BACKEND_STATE_BUCKET" \
           -var="ecr_repository=$ECR_REPOSITORY" -out="$plan" >/dev/null
         chmod 600 "$plan"
+        plan_sha=$(sha256sum "$plan" | awk '{print $1}')
         terraform_capture -chdir="$BOOTSTRAP_TF_DIR" show -json "$plan" | \
           uv run --frozen python -m elspeth.web.aws_ecs_acceptance \
-            sanitize-evidence --kind terraform-destroy-plan >"$receipt"
+            sanitize-evidence --kind terraform-destroy-plan \
+            --plan-sha256 "$plan_sha" >"$receipt"
         chmod 600 "$receipt"
-        plan_sha=$(sha256sum "$plan" | awk '{print $1}')
         receipt_hash=$(persist_sanitized_receipt bootstrap terraform-destroy-plan "$plan_sha" "$receipt")
         request_signed_tf_approval bootstrap terraform-destroy-plan "$receipt_hash" \
           "$receipt" "${BOOTSTRAP_DESTROY_APPROVAL_FILE:?set bootstrap destroy approval file}"
@@ -3262,6 +3675,99 @@ else
   cleanup_failures+=(shared_resource_cleanup)
 fi
 
+# R2-D3 (elspeth-a229c247a1): delete each scenario's Container Insights
+# performance log group if ECS's service-linked role has already re-created
+# it. That role re-creates the group, untagged, minutes after the cluster
+# goes INACTIVE (a final metrics flush) — outside every Terraform state and
+# invisible to the tagged orphan-sweep below. Unlike delete_ecr_tag(),
+# point-in-time absence is not terminal here: the known service-linked-role
+# writer can still run later. Poll for the delayed recreation, delete every
+# exact-name appearance, and require one fully elapsed quiet window whether
+# the group was already absent or was deleted here. A deletion restarts that
+# window. The separate maximum bounds the procedure and fails cleanup if a
+# late recreation leaves too little time to demonstrate quiescence. Every
+# AWS call routes through aws_capture, so a real failure — AccessDenied,
+# throttling, a malformed region — also surfaces as a genuine, non-swallowed
+# error. This does not call checkpoint_cleanup (no
+# new cleanup-manifest surface; `_CLEANUP_SURFACES` in
+# aws_ecs_acceptance/manifest_schema.py is a closed, set-equality-validated
+# enum and adding to it is a separate change), but a real failure still
+# fails the overall cleanup run via cleanup_failures, exactly like
+# ecr_baseline/ecr_candidate above. If a later same-namespace redeploy still
+# hits `ResourceAlreadyExistsException` on `CreateLogGroup`, do not reuse the
+# failed saved plan: generate a replacement plan with the adoption variable,
+# sanitize and review it, obtain a new signed approval, and then apply exactly
+# that replacement plan without adding planning options to `terraform apply`.
+cleanup_container_insights_log_group() {
+  local inventory="$1"
+  if (
+    set -Eeuo pipefail
+    max_wait="${ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS:?set Container Insights maximum wait}"
+    poll_interval="${ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS:?set Container Insights poll interval}"
+    quiet_seconds="${ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS:?set Container Insights quiet duration}"
+    test "$max_wait" -gt 0 || exit 1
+    test "$poll_interval" -gt 0 || exit 1
+    test "$quiet_seconds" -gt 0 || exit 1
+    test "$quiet_seconds" -le "$max_wait" || exit 1
+    test -f "$inventory" || exit 0
+    cluster=$(jq -er '.values.ECS_CLUSTER // empty' "$inventory") || exit 0
+    test -n "$cluster" || exit 0
+    log_group="/aws/ecs/containerinsights/${cluster}/performance"
+    started_at=$SECONDS
+    quiet_started_at=-1
+    samples=0
+    deletions=0
+    while true; do
+      listing="$(aws_capture aws logs describe-log-groups --region "$AWS_REGION" \
+        --log-group-name-prefix "$log_group" --output json)" || exit $?
+      count="$(jq --arg name "$log_group" '[.logGroups[]? | select(.logGroupName == $name)] | length' <<<"$listing")" \
+        || exit $?
+      test "$count" = 0 || test "$count" = 1 || exit 1
+      samples=$((samples + 1))
+      if test "$count" = 1; then
+        aws_capture aws logs delete-log-group --region "$AWS_REGION" \
+          --log-group-name "$log_group" >/dev/null || exit $?
+        deletions=$((deletions + 1))
+        quiet_started_at=$SECONDS
+      else
+        if test "$quiet_started_at" -lt 0; then
+          quiet_started_at=$SECONDS
+        fi
+        elapsed=$((SECONDS - started_at))
+        quiet_elapsed=$((SECONDS - quiet_started_at))
+        if test "$quiet_elapsed" -ge "$quiet_seconds"; then
+          printf 'container_insights_log_group_stable elapsed_seconds=%s quiet_seconds=%s samples=%s deletions=%s\n' \
+            "$elapsed" "$quiet_elapsed" "$samples" "$deletions"
+          exit 0
+        fi
+      fi
+
+      elapsed=$((SECONDS - started_at))
+      if test "$elapsed" -ge "$max_wait"; then
+        printf 'container_insights_log_group_not_stabilized elapsed_seconds=%s samples=%s deletions=%s\n' \
+          "$elapsed" "$samples" "$deletions" >&2
+        exit 1
+      fi
+      remaining=$((max_wait - elapsed))
+      sleep_seconds=$poll_interval
+      if test "$sleep_seconds" -gt "$remaining"; then
+        sleep_seconds=$remaining
+      fi
+      sleep "$sleep_seconds" || exit $?
+    done
+  ); then
+    return 0
+  else
+    return 1
+  fi
+}
+if ! cleanup_container_insights_log_group "$SCENARIO_A_INVENTORY"; then
+  cleanup_failures+=(container_insights_log_group_a)
+fi
+if ! cleanup_container_insights_log_group "$SCENARIO_B_INVENTORY"; then
+  cleanup_failures+=(container_insights_log_group_b)
+fi
+
 ORPHAN_RECEIPT_DIR=$(dirname -- "$SANITIZED_ORPHAN_RECEIPT")
 test ! -e "$SANITIZED_ORPHAN_RECEIPT" || {
   test ! -L "$SANITIZED_ORPHAN_RECEIPT" && test -f "$SANITIZED_ORPHAN_RECEIPT"
@@ -3348,8 +3854,10 @@ deadline. Cleanup failure is itself NO-GO and escalates to the named owner.
 
 Durable lean-image publication is separate release-owner work after GO: build
 the GO SHA for each approved platform, verify SBOM/provenance/signature and
-vulnerability policy, and repeat live acceptance for any rebuilt digest.
-Mere retagging of the temporary candidate is not publication evidence.
+vulnerability policy, inspect `io.elspeth.install-extras` as
+`webui llm aws postgres`, and repeat live acceptance for any rebuilt digest.
+Mere retagging of the temporary candidate is not publication evidence, and a
+lean digest must never receive the generic release tag (whose label is `all`).
 
 ## See also
 

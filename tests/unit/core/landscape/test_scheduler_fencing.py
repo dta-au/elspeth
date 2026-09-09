@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +26,8 @@ from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import run_coordination_table, run_workers_table, runs_table
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
+from tests.helpers.tree_gate import iter_gate_sources
 
 RUN_ID = "run-scheduler-fencing"
 WORKER_ID = f"worker:{RUN_ID}:leader"
@@ -40,7 +42,6 @@ class _StrictFencedWrite(Protocol):
         engine: Tier1Engine,
         *,
         coordination_token: CoordinationToken,
-        now: datetime,
         verb: str,
     ) -> AbstractContextManager[Connection]: ...
 
@@ -157,15 +158,17 @@ def _method_attribute_references(
 
 
 def _strict_fenced_write() -> _StrictFencedWrite:
-    helper = getattr(fencing, "fenced_write", None)
-    assert helper is not None, "scheduler fencing must expose a strict fenced_write helper"
-    return cast(_StrictFencedWrite, helper)
+    """The strict helper, resolved directly so a rename fails at attribute access."""
+    return cast(_StrictFencedWrite, fencing.fenced_write)
 
 
 def _legacy_unfenced_recovery_write() -> _LegacyUnfencedRecoveryWrite:
-    helper = getattr(fencing, LEGACY_RECOVERY_HELPER, None)
-    assert helper is not None, "scheduler fencing must expose a recovery-specific legacy unfenced helper"
-    return cast(_LegacyUnfencedRecoveryWrite, helper)
+    """The recovery-specific legacy unfenced helper, resolved directly.
+
+    ``LEGACY_RECOVERY_HELPER`` still names this helper for the AST mutation
+    cases below; this direct access is what pins the helper's existence.
+    """
+    return cast(_LegacyUnfencedRecoveryWrite, fencing.legacy_unfenced_recover_expired_leases_write)
 
 
 def _resolved_parameter_annotation(method: FunctionType, parameter_name: str) -> object:
@@ -203,10 +206,10 @@ def _seed_leader() -> tuple[LandscapeDB, CoordinationToken]:
                 openrouter_catalog_source="bundled",
             )
         )
-    token = RunCoordinationRepository(db.engine).register_run_leader(
+    token = register_run_leader(
+        RunCoordinationRepository(db.engine),
         run_id=RUN_ID,
         worker_id=WORKER_ID,
-        now=NOW,
         window_seconds=80.0,
     )
     return db, token
@@ -230,7 +233,6 @@ def test_strict_helper_rejects_runtime_none_before_transaction() -> None:
             helper(
                 db.engine,
                 coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
-                now=NOW,
                 verb="strict_probe",
             )
     finally:
@@ -246,22 +248,20 @@ def test_strict_helper_type_contract_forbids_optional_authority() -> None:
     assert get_type_hints(helper)["coordination_token"] is CoordinationToken
 
 
+# The ids reproduce the node ids the previous stacked ``method_name`` x
+# ``repository_type`` parametrization produced, because the state-engine v3
+# proof catalog selects these tests by exact node id
+# (docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json).
 @pytest.mark.parametrize(
-    "repository_type",
-    [BarrierJournalRepository, TokenSchedulerRepository],
-    ids=["journal", "facade"],
+    "method",
+    [
+        pytest.param(BarrierJournalRepository.mark_blocked_barrier_terminal, id="terminal-journal"),
+        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_terminal, id="terminal-facade"),
+        pytest.param(BarrierJournalRepository.mark_blocked_barrier_pending_sink_many, id="pending-sink-journal"),
+        pytest.param(TokenSchedulerRepository.mark_blocked_barrier_pending_sink_many, id="pending-sink-facade"),
+    ],
 )
-@pytest.mark.parametrize(
-    "method_name",
-    ["mark_blocked_barrier_terminal", "mark_blocked_barrier_pending_sink_many"],
-    ids=["terminal", "pending-sink"],
-)
-def test_barrier_wrapper_type_contract_requires_authority(
-    repository_type: type[BarrierJournalRepository] | type[TokenSchedulerRepository],
-    method_name: str,
-) -> None:
-    method = cast(FunctionType, getattr(repository_type, method_name))
-
+def test_barrier_wrapper_type_contract_requires_authority(method: FunctionType) -> None:
     _assert_required_coordination_parameter(method)
 
 
@@ -311,11 +311,22 @@ def test_required_coordination_parameter_rejects_wrong_runtime_binding(monkeypat
         _assert_required_coordination_parameter(cast(FunctionType, probe))
 
 
-@pytest.mark.parametrize("repository_type", [SchedulerLeaseRepository, TokenSchedulerRepository])
-def test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector(repository_type: type[object]) -> None:
-    method = getattr(repository_type, LEGACY_RECOVERY_METHOD, None)
+# The ids reproduce the class-derived node ids of the previous
+# ``repository_type`` parametrization — see the proof-catalog note above.
+@pytest.mark.parametrize(
+    "method",
+    [
+        pytest.param(SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced, id="SchedulerLeaseRepository"),
+        pytest.param(TokenSchedulerRepository.recover_expired_leases_legacy_unfenced, id="TokenSchedulerRepository"),
+    ],
+)
+def test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector(method: Callable[..., object]) -> None:
+    """The legacy API keeps its explicit name and offers no authority selector.
 
-    assert method is not None
+    The explicit name is pinned twice over: this module fails to import if the
+    attribute below is renamed, and the AST reference tests assert the literal
+    ``LEGACY_RECOVERY_METHOD`` against the production call sites.
+    """
     assert "coordination_token" not in inspect.signature(method).parameters
 
 
@@ -327,7 +338,6 @@ def test_strict_helper_accepts_current_token_and_commits() -> None:
     with helper(
         db.engine,
         coordination_token=token,
-        now=NOW,
         verb="strict_probe",
     ) as conn:
         conn.execute(
@@ -362,7 +372,6 @@ def test_strict_helper_refuses_stale_token_without_payload_mutation() -> None:
         helper(
             db.engine,
             coordination_token=token,
-            now=NOW,
             verb="strict_probe",
         ) as conn,
     ):
@@ -455,11 +464,11 @@ def test_legacy_helper_reference_is_isolated_to_named_legacy_adapter_across_pack
     package_dir = Path(elspeth.__file__).parent
     references: list[tuple[str, str | None]] = []
 
-    for path in package_dir.rglob("*.py"):
+    for parsed in iter_gate_sources(package_dir):
         references.extend(
             _legacy_recovery_references(
-                path.read_text(),
-                filename=str(path.relative_to(package_dir)),
+                parsed.source,
+                filename=str(parsed.path.relative_to(package_dir)),
             )
         )
 
@@ -470,12 +479,12 @@ def test_production_sources_do_not_call_legacy_recovery_adapter() -> None:
     package_dir = Path(elspeth.__file__).parent
     references: list[tuple[str, str | None]] = []
 
-    for path in package_dir.rglob("*.py"):
+    for parsed in iter_gate_sources(package_dir):
         references.extend(
             _method_attribute_references(
-                path.read_text(),
+                parsed.source,
                 method_name=LEGACY_RECOVERY_METHOD,
-                filename=str(path.relative_to(package_dir)),
+                filename=str(parsed.path.relative_to(package_dir)),
             )
         )
 

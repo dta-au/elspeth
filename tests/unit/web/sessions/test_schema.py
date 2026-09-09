@@ -7,13 +7,28 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_mock_engine, insert, inspect, text
+from sqlalchemy import create_mock_engine, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import QueuePool
 
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, metadata, sessions_table
+from elspeth.web.sessions.models import (
+    SESSION_SCHEMA_EPOCH,
+    blob_deletion_cleanups_table,
+    blobs_table,
+    composition_states_table,
+    metadata,
+    run_execution_inputs_table,
+    run_start_permits_table,
+    runs_table,
+    session_operation_fences_table,
+    sessions_table,
+    user_secrets_table,
+    web_instances_table,
+    websocket_tickets_table,
+)
 from elspeth.web.sessions.schema import (
+    _COORDINATION_HARD_CUT_TABLES,
     SessionSchemaError,
     _stamp_schema_sentinels,
     _user_tables,
@@ -49,11 +64,11 @@ def _create_all_on_mock_engine(engine) -> None:
         # SQLAlchemy's mock PostgreSQL create_all path marks cycle-breaking
         # foreign keys with a transient _create_rule. If left on the shared
         # metadata object, later SQLite create_all calls omit those inline FKs.
-        _MISSING = object()
+        # ``Constraint.__init__`` always binds ``_create_rule`` (default None),
+        # so clearing it unconditionally is the whole reset.
         for table in metadata.tables.values():
             for constraint in table.constraints:
-                if getattr(constraint, "_create_rule", _MISSING) is not _MISSING:
-                    constraint._create_rule = None
+                constraint._create_rule = None
 
 
 @pytest.fixture
@@ -61,6 +76,55 @@ def engine():
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     return eng
+
+
+def _seed_session_state(conn) -> tuple[str, str]:
+    now = datetime.now(UTC)
+    session_id = str(uuid.uuid4())
+    state_id = str(uuid.uuid4())
+    conn.execute(
+        insert(sessions_table).values(
+            id=session_id,
+            user_id="alice",
+            auth_provider_type="local",
+            title="Schema test",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    conn.execute(
+        insert(composition_states_table).values(
+            id=state_id,
+            session_id=session_id,
+            version=1,
+            is_valid=True,
+            provenance="session_seed",
+            created_at=now,
+        )
+    )
+    return session_id, state_id
+
+
+def _seed_run(conn) -> str:
+    now = datetime.now(UTC)
+    session_id, state_id = _seed_session_state(conn)
+    run_id = str(uuid.uuid4())
+    conn.execute(
+        insert(runs_table).values(
+            id=run_id,
+            session_id=session_id,
+            state_id=state_id,
+            status="pending",
+            started_at=now,
+            rows_processed=0,
+            rows_succeeded=0,
+            rows_failed=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+        )
+    )
+    return run_id
 
 
 def test_validator_rejects_same_named_unique_index_with_wrong_columns(engine) -> None:
@@ -93,6 +157,274 @@ def test_initialize_session_schema_creates_current_schema_without_alembic_table(
     assert "rows_routed_failure" in run_columns
     assert "content_hash" in {column["name"] for column in inspector.get_columns("blobs")}
     assert "ck_blobs_ready_hash" in {check["name"] for check in inspector.get_check_constraints("blobs")}
+    assert {column["name"] for column in inspector.get_columns("blob_deletion_cleanups")} == {
+        "blob_id",
+        "session_id",
+        "storage_path",
+        "tombstone_path",
+        "operation_id",
+        "operation_epoch",
+        "operation_kind",
+        "phase",
+        "blob_snapshot_hash",
+        "expected_file_present",
+        "expected_file_size",
+        "expected_file_hash",
+        "created_at",
+        "updated_at",
+    }
+
+
+def _blob_deletion_cleanup_values(session_id: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    blob_id = str(uuid.uuid4())
+    storage_path = f"/data/blobs/{session_id}/{blob_id}_artifact.txt"
+    return {
+        "blob_id": blob_id,
+        "session_id": session_id,
+        "storage_path": storage_path,
+        "tombstone_path": f"{storage_path}.delete-operation",
+        "operation_id": "operation-1",
+        "operation_epoch": 1,
+        "operation_kind": "archive",
+        "phase": "intent",
+        "blob_snapshot_hash": "a" * 64,
+        "expected_file_present": True,
+        "expected_file_size": 4,
+        "expected_file_hash": "b" * 64,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"operation_kind": "execute"},
+        {"phase": "deleted"},
+        {"blob_snapshot_hash": "A" * 64},
+        {"expected_file_hash": "B" * 64},
+        {"storage_path": " "},
+        {"tombstone_path": "\t"},
+        {"expected_file_present": False},
+        {"expected_file_present": False, "expected_file_size": None},
+        {"expected_file_present": True, "expected_file_size": None, "expected_file_hash": None},
+        {"updated_at": datetime(2000, 1, 1, tzinfo=UTC)},
+    ],
+)
+def test_blob_deletion_cleanup_rejects_invalid_exact_ledger_constraints(
+    engine,
+    overrides: dict[str, object],
+) -> None:
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        values = _blob_deletion_cleanup_values(session_id)
+        values.update(overrides)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(blob_deletion_cleanups_table).values(**values))
+
+
+@pytest.mark.parametrize(
+    "custody",
+    [
+        {"custody_operation_id": "operation-1"},
+        {"custody_operation_epoch": 1},
+        {"custody_operation_kind": "create"},
+        {
+            "custody_operation_id": "operation-1",
+            "custody_operation_epoch": 1,
+            "custody_operation_kind": "blob_read",
+        },
+        {
+            "custody_operation_id": "\t",
+            "custody_operation_epoch": 1,
+            "custody_operation_kind": "create",
+        },
+    ],
+)
+def test_blob_reservation_rejects_partial_or_invalid_custody(
+    engine,
+    custody: dict[str, object],
+) -> None:
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        values: dict[str, object] = {
+            "id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "filename": "artifact.txt",
+            "mime_type": "text/plain",
+            "size_bytes": 4,
+            "content_hash": "a" * 64,
+            "storage_path": f"/data/blobs/{session_id}/artifact.txt",
+            "created_at": datetime.now(UTC),
+            "created_by": "user",
+            "status": "pending",
+            "creation_modality": "verbatim",
+        }
+        values.update(custody)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(blobs_table).values(**values))
+
+
+def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    inspector = inspect(eng)
+
+    # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5), then -> 52
+    # when the pluggable-SSO identity substrate landed (elspeth-07cd19ba73),
+    # then -> 53 for the per-admission read records (elspeth-f98e0ae8b2).
+    # _COORDINATION_HARD_CUT_EPOCH tracks this by exact equality, so a bump
+    # that missed it would stop every session DB from opening.
+    assert SESSION_SCHEMA_EPOCH == 53
+    expected_tables = frozenset(
+        {
+            "web_instances",
+            "session_operation_fences",
+            "session_read_admissions",
+            "run_start_permits",
+            "run_execution_inputs",
+            "websocket_tickets",
+            "rate_limit_buckets",
+            "rate_limit_events",
+            "sessions_cleanup_claims",
+        }
+    )
+    assert expected_tables == _COORDINATION_HARD_CUT_TABLES
+    assert expected_tables <= set(inspector.get_table_names())
+    assert not any("deleted" in table and "session" in table for table in inspector.get_table_names())
+
+    expected_indexes = {
+        "web_instances": {"ix_web_instances_compatibility", "ix_web_instances_lease_expires_at"},
+        "session_operation_fences": {"ix_session_operation_fences_lease_expires_at"},
+        "session_read_admissions": {"ix_session_read_admissions_expires_at"},
+        "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
+        "run_execution_inputs": set(),
+        "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
+        "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
+        "rate_limit_events": {"ix_rate_limit_events_expires_at", "ix_rate_limit_events_subject_occurred"},
+        "sessions_cleanup_claims": {"ix_sessions_cleanup_claims_lease_expires_at"},
+    }
+    for table_name, index_names in expected_indexes.items():
+        assert {index["name"] for index in inspector.get_indexes(table_name)} == index_names, table_name
+
+    run_indexes = {index["name"] for index in inspector.get_indexes("runs")}
+    assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
+
+
+def test_coordination_hard_cut_check_constraints_are_exact() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    inspector = inspect(eng)
+
+    expected_checks = {
+        "web_instances": {
+            "ck_web_instances_generation_nonblank",
+            "ck_web_instances_image_digest_nonblank",
+            "ck_web_instances_instance_id_nonblank",
+            "ck_web_instances_positive_compatibility",
+            "ck_web_instances_revision_label_nonblank",
+            "ck_web_instances_state",
+            "ck_web_instances_target_nonblank",
+        },
+        "session_operation_fences": {
+            "ck_session_operation_fences_kind",
+            "ck_session_operation_fences_lease_token_nonblank",
+            "ck_session_operation_fences_operation_id_nonblank",
+            "ck_session_operation_fences_owner_nonblank",
+            "ck_session_operation_fences_positive_epoch",
+            "ck_session_operation_fences_session_id_nonblank",
+            "ck_session_operation_fences_token_not_owner",
+        },
+        "session_read_admissions": {
+            "ck_session_read_admissions_expiry_after_admission",
+            "ck_session_read_admissions_lease_token_nonblank",
+            "ck_session_read_admissions_operation_id_nonblank",
+            "ck_session_read_admissions_owner_nonblank",
+            "ck_session_read_admissions_positive_epoch",
+            "ck_session_read_admissions_session_id_nonblank",
+            "ck_session_read_admissions_token_not_owner",
+        },
+        "run_start_permits": {
+            "ck_run_start_permits_run_id_nonblank",
+            "ck_run_start_permits_state",
+            "ck_run_start_permits_state_fields",
+        },
+        "run_execution_inputs": {
+            "ck_run_execution_inputs_deployment_generation_nonblank",
+            "ck_run_execution_inputs_positive_compatibility",
+            "ck_run_execution_inputs_positive_schema_version",
+            "ck_run_execution_inputs_run_id_nonblank",
+            "ck_run_execution_inputs_sha256_identities",
+        },
+        "run_events": {
+            "ck_run_events_positive_sequence",
+            "ck_run_events_type",
+        },
+        "websocket_tickets": {
+            "ck_websocket_tickets_auth_provider_type",
+            "ck_websocket_tickets_digest_sha256",
+            "ck_websocket_tickets_run_id_nonblank",
+            "ck_websocket_tickets_user_id_nonblank",
+        },
+        "rate_limit_buckets": {
+            "ck_rate_limit_buckets_digest_sha256",
+            "ck_rate_limit_buckets_positive_window",
+        },
+        "rate_limit_events": {
+            "ck_rate_limit_events_digest_sha256",
+            "ck_rate_limit_events_event_id_nonblank",
+        },
+        "sessions_cleanup_claims": {
+            "ck_sessions_cleanup_claims_bounded_counts",
+            "ck_sessions_cleanup_claims_name_nonblank",
+            "ck_sessions_cleanup_claims_owner_nonblank",
+            "ck_sessions_cleanup_claims_positive_epoch",
+            "ck_sessions_cleanup_claims_token_nonblank",
+            "ck_sessions_cleanup_claims_token_not_owner",
+        },
+    }
+    for table_name, check_names in expected_checks.items():
+        assert {check["name"] for check in inspector.get_check_constraints(table_name)} == check_names, table_name
+
+    run_checks = {check["name"] for check in inspector.get_check_constraints("runs")}
+    assert {"ck_runs_id_nonblank", "ck_runs_session_id_nonblank", "ck_runs_ownership_all_or_none"} <= run_checks
+    user_secret_checks = {check["name"] for check in inspector.get_check_constraints("user_secrets")}
+    assert "ck_user_secrets_id_nonblank" in user_secret_checks
+
+
+def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> None:
+    from elspeth.web.sessions import models as session_models
+
+    session_operation_fences_table = session_models.session_operation_fences_table
+    columns = {column.name: column for column in session_operation_fences_table.columns}
+
+    assert tuple(columns) == (
+        "session_id",
+        "operation_id",
+        "lease_token",
+        "operation_kind",
+        "owner_instance_id",
+        "operation_epoch",
+        "lease_expires_at",
+        "released_at",
+    )
+    assert all(not columns[name].nullable for name in columns if name != "released_at")
+    assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
+
+
+def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    with eng.begin() as conn:
+        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
+        conn.execute(text("PRAGMA user_version = 36"))
+
+    with pytest.raises(
+        SessionSchemaError,
+        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
+    ):
+        initialize_session_schema(eng)
 
 
 def test_postgres_schema_emits_native_audit_trigger_ddl() -> None:
@@ -139,9 +471,283 @@ def test_postgres_schema_uses_postgres_non_blank_check_syntax() -> None:
     assert "ck_blobs_creating_llm_provenance_nullability" in ddl
     assert "btrim(composer_model_identifier" in ddl
     assert "btrim(creating_model_identifier" in ddl
+    for constraint_name in (
+        "ck_web_instances_instance_id_nonblank",
+        "ck_session_operation_fences_session_id_nonblank",
+        "ck_runs_id_nonblank",
+        "ck_runs_session_id_nonblank",
+        "ck_runs_ownership_all_or_none",
+        "ck_run_start_permits_run_id_nonblank",
+        "ck_run_start_permits_state_fields",
+        "ck_run_execution_inputs_run_id_nonblank",
+        "ck_run_execution_inputs_deployment_generation_nonblank",
+        "ck_websocket_tickets_run_id_nonblank",
+        "ck_rate_limit_events_event_id_nonblank",
+        "ck_sessions_cleanup_claims_name_nonblank",
+        "ck_user_secrets_id_nonblank",
+    ):
+        assert constraint_name in ddl
+    assert "ck_run_execution_inputs_sha256_identities" in ddl
+    assert "~ '^[a-f0-9]+$'" in ddl
     assert "chr(9)" in ddl
     assert "char(9)" not in ddl
     assert " NOT GLOB " not in ddl
+    assert "length(trim(" not in ddl
+
+
+@pytest.mark.parametrize("blank", ["\t", "\n", "\r", "\t\n\r "])
+def test_coordination_identifiers_reject_ascii_whitespace(engine, blank: str) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.execute(
+            insert(web_instances_table).values(
+                instance_id=blank,
+                deployment_target="web",
+                deployment_generation="generation-1",
+                session_epoch=SESSION_SCHEMA_EPOCH,
+                landscape_epoch=1,
+                coordination_protocol=1,
+                image_digest="sha256:image",
+                revision_label="revision-1",
+                state="active",
+                started_at=now,
+                last_heartbeat_at=now,
+                lease_expires_at=now,
+            )
+        )
+
+
+def test_session_operation_fence_rejects_ascii_whitespace_authority(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        session_id, _ = _seed_session_state(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(
+                insert(session_operation_fences_table).values(
+                    session_id=session_id,
+                    operation_id="\t",
+                    lease_token="\n",
+                    operation_kind="execute",
+                    owner_instance_id="\r",
+                    operation_epoch=1,
+                    lease_expires_at=now,
+                )
+            )
+
+
+def test_epoch_37_session_operation_kind_check_accepts_exact_closed_vocabulary(engine) -> None:
+    expected_sql = "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress', 'blob_read', 'session_fork')"
+    checks = {check["name"]: check["sqltext"] for check in inspect(engine).get_check_constraints("session_operation_fences")}
+    assert checks["ck_session_operation_fences_kind"] == expected_sql
+
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        session_id, _ = _seed_session_state(conn)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=session_id,
+                operation_id="blob-read-operation",
+                lease_token="blob-read-lease",
+                operation_kind="blob_read",
+                owner_instance_id="instance-a",
+                operation_epoch=1,
+                lease_expires_at=now,
+            )
+        )
+        session_id, _ = _seed_session_state(conn)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=session_id,
+                operation_id="session-fork-operation",
+                lease_token="session-fork-lease",
+                operation_kind="session_fork",
+                owner_instance_id="instance-a",
+                operation_epoch=2,
+                lease_expires_at=now,
+            )
+        )
+
+    with engine.begin() as conn:
+        session_id, _ = _seed_session_state(conn)
+        with pytest.raises(IntegrityError, match="ck_session_operation_fences_kind"):
+            conn.execute(
+                insert(session_operation_fences_table).values(
+                    session_id=session_id,
+                    operation_id="unknown-operation",
+                    lease_token="unknown-lease",
+                    operation_kind="unknown",
+                    owner_instance_id="instance-a",
+                    operation_epoch=1,
+                    lease_expires_at=now,
+                )
+            )
+
+
+def test_runs_id_rejects_ascii_whitespace(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        session_id, state_id = _seed_session_state(conn)
+        with pytest.raises(IntegrityError, match="ck_runs_id_nonblank"):
+            conn.execute(
+                insert(runs_table).values(
+                    id="\t",
+                    session_id=session_id,
+                    state_id=state_id,
+                    status="completed",
+                    started_at=now,
+                )
+            )
+
+
+def test_runs_session_id_rejects_ascii_whitespace(engine) -> None:
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_runs_session_id_nonblank"):
+        conn.execute(
+            insert(runs_table).values(
+                id=str(uuid.uuid4()),
+                session_id="\n",
+                state_id=str(uuid.uuid4()),
+                status="completed",
+                started_at=datetime.now(UTC),
+            )
+        )
+
+
+def test_run_start_permit_run_id_rejects_ascii_whitespace(engine) -> None:
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_run_start_permits_run_id_nonblank"):
+        conn.execute(insert(run_start_permits_table).values(run_id="\r", start_state="pending"))
+
+
+def test_run_execution_input_run_id_rejects_ascii_whitespace(engine) -> None:
+    valid_hash = "a" * 64
+    values = {
+        "run_id": "\t",
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "deployment_generation": "generation-1",
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": datetime.now(UTC),
+    }
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_run_execution_inputs_run_id_nonblank"):
+        conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+def test_websocket_ticket_run_id_rejects_ascii_whitespace(engine) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_websocket_tickets_run_id_nonblank"):
+        conn.execute(
+            insert(websocket_tickets_table).values(
+                ticket_digest="a" * 64,
+                run_id="\n",
+                user_id="alice",
+                auth_provider_type="local",
+                issued_at=now,
+                expires_at=now,
+            )
+        )
+
+
+_EXECUTION_IDENTITY_COLUMNS = (
+    "canonical_input_digest",
+    "topology_digest",
+    "source_manifest_digest",
+    "application_fingerprint",
+    "plugin_registry_fingerprint",
+    "configuration_fingerprint",
+    "graph_fingerprint",
+    "runtime_fingerprint",
+    "implementation_fingerprint",
+)
+
+
+@pytest.mark.parametrize("column_name", _EXECUTION_IDENTITY_COLUMNS)
+def test_run_execution_inputs_reject_malformed_sha256_identity(engine, column_name: str) -> None:
+    now = datetime.now(UTC)
+    valid_hash = "a" * 64
+    values = {
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "deployment_generation": "generation-1",
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": now,
+    }
+    values[column_name] = "a" * 63
+
+    with engine.begin() as conn:
+        values["run_id"] = _seed_run(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+@pytest.mark.parametrize("invalid_identity", ["A" * 64, "g" * 64, "\t" * 64])
+def test_run_execution_inputs_reject_non_lowercase_hex_identity(engine, invalid_identity: str) -> None:
+    now = datetime.now(UTC)
+    valid_hash = "a" * 64
+    values = {
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "canonical_input_digest": invalid_identity,
+        "deployment_generation": "generation-1",
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": now,
+    }
+
+    with engine.begin() as conn:
+        values["run_id"] = _seed_run(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+@pytest.mark.parametrize("blank", ["\t", "\n", "\r"])
+def test_run_execution_inputs_reject_blank_deployment_generation(engine, blank: str) -> None:
+    now = datetime.now(UTC)
+    valid_hash = "a" * 64
+    values = {
+        "schema_version": 1,
+        "envelope": {},
+        **dict.fromkeys(_EXECUTION_IDENTITY_COLUMNS, valid_hash),
+        "deployment_generation": blank,
+        "session_epoch": SESSION_SCHEMA_EPOCH,
+        "landscape_epoch": 1,
+        "coordination_protocol": 1,
+        "automatic_recovery_eligible": True,
+        "created_at": now,
+    }
+
+    with engine.begin() as conn:
+        values["run_id"] = _seed_run(conn)
+        with pytest.raises(IntegrityError):
+            conn.execute(insert(run_execution_inputs_table).values(**values))
+
+
+@pytest.mark.parametrize("blank", ["\t", "\n", "\r"])
+def test_user_secret_id_rejects_ascii_whitespace(engine, blank: str) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as conn, pytest.raises(IntegrityError, match="ck_user_secrets_id_nonblank"):
+        conn.execute(
+            insert(user_secrets_table).values(
+                id=blank,
+                name="api-key",
+                user_id="alice",
+                auth_provider_type="local",
+                encrypted_value=b"ciphertext",
+                salt=b"salt",
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
 
 def test_initialize_session_schema_is_idempotent_for_current_schema() -> None:
@@ -268,8 +874,8 @@ def test_initialize_session_schema_rejects_partial_stale_schema() -> None:
         initialize_session_schema(eng)
 
 
-def test_initialize_session_schema_rejects_epoch_34_database() -> None:
-    """An epoch-34 DB without exclusive proposal admission fails at boot.
+def test_initialize_session_schema_rejects_epoch_35_database() -> None:
+    """An epoch-35 DB without durable blob deletion cleanup fails at boot.
 
     Seed a complete current-schema DB, then re-stamp only the SQLite epoch.
     Because the SQL shape and cross-dialect identity row remain current, the
@@ -278,14 +884,64 @@ def test_initialize_session_schema_rejects_epoch_34_database() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)  # full schema + stamps the CURRENT epoch
     with eng.begin() as conn:
-        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 34 WHERE store_kind = 'session'"))
-        conn.execute(text("PRAGMA user_version = 34"))
+        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 35 WHERE store_kind = 'session'"))
+        conn.execute(text("PRAGMA user_version = 35"))
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 34 does not match SESSION_SCHEMA_EPOCH=35.*Delete the session DB file and restart",
+        match=rf"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
+
+
+def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tmp_path) -> None:
+    """The pre-decline epoch-36 CHECKs are rejected as an older schema."""
+    db_path = tmp_path / "epoch-36-without-declined-result.db"
+    engine = create_session_engine(f"sqlite:///{db_path}")
+    initialize_session_schema(engine)
+    with engine.begin() as connection:
+        guided_operations_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
+        ).scalar_one()
+        declined_result_kind = "'composition_state', 'pipeline_proposal', 'session', 'declined'"
+        prior_result_kind = "'composition_state', 'pipeline_proposal', 'session'"
+        declined_result_locator = (
+            "(kind = 'guided_plan' AND result_kind = 'declined' "
+            "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
+            "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
+        )
+        epoch_36_sql = guided_operations_sql.replace(declined_result_kind, prior_result_kind).replace(
+            declined_result_locator,
+            "",
+        )
+        assert epoch_36_sql != guided_operations_sql
+        assert "'declined'" not in epoch_36_sql
+        connection.execute(text("PRAGMA writable_schema = ON"))
+        connection.execute(
+            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
+            {"sql": epoch_36_sql},
+        )
+        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
+        connection.execute(text("PRAGMA user_version = 36"))
+        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
+        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
+        connection.execute(text("PRAGMA writable_schema = OFF"))
+    engine.dispose()
+
+    stale_engine = create_session_engine(f"sqlite:///{db_path}")
+    with stale_engine.connect() as connection:
+        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 36
+        stored_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
+        ).scalar_one()
+        assert "'declined'" not in stored_sql
+
+    with pytest.raises(
+        SessionSchemaError,
+        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
+        r"Delete the session DB file and restart",
+    ):
+        initialize_session_schema(stale_engine)
 
 
 def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with_recreate_guidance(tmp_path) -> None:
@@ -323,7 +979,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=35.*"
+        match=rf"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)
@@ -547,3 +1203,48 @@ def test_validator_accepts_index_unique_true_as_unique_constraint() -> None:
     initialize_session_schema(eng)  # must not raise
 
     del inspector
+
+
+def test_session_schema_authority_stamps_asserts_and_validates_on_an_engine_or_a_connection() -> None:
+    """The schema-management authority behaves identically whether it holds an Engine or a Connection.
+
+    P4-D6 family S moved the three schema-management operations into
+    ``SessionSchemaAuthority`` so the writer inventory can bind them, and the
+    entry points below became thin delegations. The bind arm matters at
+    runtime, not only to the scanner: ``schema_probe`` constructs the
+    authority on a connection it already holds inside a lock, so an
+    Engine-only implementation would deadlock a bounded pool by checking out
+    a second connection. Both arms are exercised here on one database, and
+    the connection arm's stamp is asserted through a SEPARATE connection so
+    it is a committed write rather than a rolled-back one.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from elspeth.web.sessions.engine import create_session_engine
+    from elspeth.web.sessions.models import metadata, schema_identity_table
+    from elspeth.web.sessions.schema import SessionSchemaAuthority
+
+    engine = create_session_engine("sqlite:///:memory:")
+    metadata.create_all(engine)
+
+    SessionSchemaAuthority(engine).stamp_sentinels()
+    SessionSchemaAuthority(engine).assert_sentinels()
+    SessionSchemaAuthority(engine).validate_required_triggers()
+    with engine.connect() as connection:
+        SessionSchemaAuthority(connection).assert_sentinels()
+        SessionSchemaAuthority(connection).validate_required_triggers()
+        assert connection.execute(text("PRAGMA user_version")).scalar_one() == SESSION_SCHEMA_EPOCH
+        identity_rows = connection.execute(select(schema_identity_table)).all()
+    assert len(identity_rows) == 1
+
+    other = create_session_engine("sqlite:///:memory:")
+    metadata.create_all(other)
+    with other.begin() as connection:
+        SessionSchemaAuthority(connection).stamp_sentinels()
+    with other.connect() as connection:
+        assert connection.execute(select(schema_identity_table)).all() == identity_rows
+        assert sa_inspect(connection).get_table_names() == sa_inspect(engine).get_table_names()
+    SessionSchemaAuthority(other).assert_sentinels()
+
+    with pytest.raises(IntegrityError):
+        SessionSchemaAuthority(other).stamp_sentinels()

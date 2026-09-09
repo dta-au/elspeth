@@ -61,6 +61,7 @@ def _make_app(user_id: str | None = "alice") -> FastAPI:
     app.state.preferences_service = PreferencesService(engine)
     app.state.session_engine = engine
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
+    app.state.write_rate_limiter = ComposerRateLimiter(limit=100)
     app.state.sessions_telemetry = build_sessions_telemetry()
 
     if user_id is not None:
@@ -193,3 +194,29 @@ def test_patch_same_default_mode_value_still_emits(client: TestClient) -> None:
     assert resp2.status_code == 200
     assert observed_value(telemetry.mode_opted_out_total) == 2
     assert observed_value(telemetry.mode_opted_in_total) == 0
+
+
+# ---------------------------------------------------------------------------
+# Bucket split — PATCH is metered by the WRITE bucket, not the composer one
+# ---------------------------------------------------------------------------
+
+
+def test_preferences_patch_uses_the_write_bucket_not_the_composer_bucket() -> None:
+    """A starved composer bucket must not block preference writes, and
+    the write bucket must actually meter them.
+
+    This is the tutorial-graduation incident regression test: with the
+    old shared bucket, limit=1 on the composer bucket 429'd the second
+    PATCH."""
+    app = _make_app()
+    app.state.rate_limiter = ComposerRateLimiter(limit=1)
+    app.state.write_rate_limiter = ComposerRateLimiter(limit=3)
+    with TestClient(app) as client:
+        for _ in range(3):
+            response = client.patch("/api/composer-preferences", json={})
+            assert response.status_code == 200
+        # Write bucket exhausted -> 429 WITH retry_after in the envelope
+        # (the frontend retry in Task 5/6 depends on that field).
+        response = client.patch("/api/composer-preferences", json={})
+    assert response.status_code == 429
+    assert response.json()["detail"]["retry_after"] >= 1

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -47,6 +48,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SanitizedDatabaseUrl
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.core.canonical import canonical_json
@@ -131,9 +133,8 @@ def database_effect_ledger_table(metadata: MetaData, table_name: str) -> Table:
     """Build the version-1 operator provisioning table; runtime never calls create_all()."""
     if _DATABASE_EFFECT_TABLE_NAME.fullmatch(table_name) is None:
         raise ValueError("effect ledger table must be a namespaced identifier beginning with '_elspeth_'")
-    existing = metadata.tables.get(table_name)
-    if existing is not None:
-        return existing
+    if table_name in metadata.tables:
+        return metadata.tables[table_name]
     return Table(
         table_name,
         metadata,
@@ -214,7 +215,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4cb64957f47335f4"
+    source_file_hash: str | None = "sha256:3980d51683d66ca6"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -224,6 +225,33 @@ class DatabaseSink(BaseSink):
 
     # Resume capability: Database can append to existing tables
     supports_resume: bool = True
+
+    usage_when_to_use: str = (
+        "Use for transactional append to an operator-provisioned SQLite or PostgreSQL table when the target also provides "
+        "the declared exactly-once effect ledger."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use when ELSPETH would need to perform DDL, replace or drop a table, use an unsupported dialect, embed "
+        "credentials in YAML, or publish without the provisioned effect ledger."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: database
+    options:
+      url:
+        secret_ref: PROVISIONED_SQLITE_URL
+      table: processed_records
+      if_exists: append
+      effect_ledger:
+        table: _elspeth_sink_effects
+        schema_version: 1
+        permissions:
+          - insert
+          - select
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("database", "sql", "tabular", "exactly-once")
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -362,8 +390,7 @@ class DatabaseSink(BaseSink):
             raise DatabaseEffectLedgerError(
                 f"Database target-side effect ledger {ledger_config.table!r} does not match schema version {ledger_config.schema_version}"
             )
-        primary_key = inspector.get_pk_constraint(ledger_config.table).get("constrained_columns")
-        if primary_key != ["effect_id"]:
+        if inspector.get_pk_constraint(ledger_config.table)["constrained_columns"] != ["effect_id"]:
             raise DatabaseEffectLedgerError("Database target-side effect ledger must use effect_id as its sole primary key")
         required_not_null = _DATABASE_EFFECT_LEDGER_COLUMNS - {
             "accepted_ordinals_json",
@@ -373,8 +400,15 @@ class DatabaseSink(BaseSink):
             "diverted_ordinals_json",
             "evidence_json",
         }
-        if any(bool(ledger_columns[name].get("nullable")) for name in required_not_null):
-            raise DatabaseEffectLedgerError("Database target-side effect ledger required columns must be NOT NULL")
+        for name in required_not_null:
+            column = ledger_columns[name]
+            if "nullable" not in column:
+                raise DatabaseEffectLedgerError("Database target-side effect ledger provider omitted nullable metadata")
+            nullable = column["nullable"]
+            if type(nullable) is not bool:
+                raise DatabaseEffectLedgerError("Database target-side effect ledger provider returned non-boolean nullable metadata")
+            if nullable:
+                raise DatabaseEffectLedgerError("Database target-side effect ledger required columns must be NOT NULL")
 
         if not inspector.has_table(self._table_name):
             raise DatabaseEffectLedgerError(
@@ -482,18 +516,18 @@ class DatabaseSink(BaseSink):
         if inspection.mode is not SinkEffectInspectionMode.INSPECTED:
             raise DatabaseEffectLedgerError("Database sink effects require a completed read-only target inspection")
         target = self._target_reference()
-        if inspection.reference != target or inspection.evidence.get("effect_id") != request.effect_id:
+        if inspection.reference != target or inspection.evidence["effect_id"] != request.effect_id:
             raise DatabaseEffectLedgerError("Database sink effect inspection does not bind this exact target and effect")
         ledger = self._require_effect_ledger_config()
         if (
-            inspection.evidence.get("ledger_table") != ledger.table
-            or inspection.evidence.get("ledger_schema_version") != ledger.schema_version
-            or inspection.evidence.get("target_table") != self._table_name
-            or inspection.evidence.get("dialect") not in _DATABASE_EFFECT_SUPPORTED_DIALECTS
+            inspection.evidence["ledger_table"] != ledger.table
+            or inspection.evidence["ledger_schema_version"] != ledger.schema_version
+            or inspection.evidence["target_table"] != self._table_name
+            or inspection.evidence["dialect"] not in _DATABASE_EFFECT_SUPPORTED_DIALECTS
         ):
             raise DatabaseEffectLedgerError("Database sink effect inspection is divergent from configured target authority")
-        target_columns_value = inspection.evidence.get("target_columns")
-        if not isinstance(target_columns_value, tuple) or any(not isinstance(value, str) for value in target_columns_value):
+        target_columns_value = inspection.evidence["target_columns"]
+        if type(target_columns_value) is not tuple or any(type(value) is not str for value in target_columns_value):
             raise DatabaseEffectLedgerError("Database sink effect inspection lacks exact target columns")
         target_columns = set(target_columns_value)
 
@@ -547,7 +581,7 @@ class DatabaseSink(BaseSink):
 
     @staticmethod
     def _require_canonical_json(value: object, *, field_name: str) -> object:
-        if not isinstance(value, str):
+        if type(value) is not str:
             raise DatabaseEffectMarkerDivergence(f"Database effect marker {field_name} must be text")
         try:
             decoded = json.loads(value)
@@ -606,9 +640,9 @@ class DatabaseSink(BaseSink):
             row = raw_member["row"]
             if type(ordinal) is not int or ordinal != expected_ordinal:
                 raise DatabaseEffectLedgerError("Database effect plan member ordinals must be dense and ordered")
-            if not isinstance(payload_hash, str) or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None:
+            if type(payload_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", payload_hash) is None:
                 raise DatabaseEffectLedgerError("Database effect plan member payload hash is invalid")
-            if type(row) is not dict or any(not isinstance(key, str) for key in row):
+            if type(row) is not dict or any(type(key) is not str for key in row):
                 raise DatabaseEffectLedgerError("Database effect plan member row must be a canonical object")
             detached_row = dict(row)
             members.append((ordinal, detached_row))
@@ -709,18 +743,18 @@ class DatabaseSink(BaseSink):
         member_count: int,
     ) -> SinkEffectCommitResult:
         if (
-            marker.get("effect_id") != plan.effect_id
-            or marker.get("schema_version") != _DATABASE_EFFECT_LEDGER_SCHEMA_VERSION
-            or marker.get("protocol_version") != SINK_EFFECT_PROTOCOL_VERSION
-            or marker.get("plan_hash") != plan.plan_hash
-            or marker.get("payload_hash") != plan.payload_hash
-            or marker.get("completed") is not True
+            marker["effect_id"] != plan.effect_id
+            or marker["schema_version"] != _DATABASE_EFFECT_LEDGER_SCHEMA_VERSION
+            or marker["protocol_version"] != SINK_EFFECT_PROTOCOL_VERSION
+            or marker["plan_hash"] != plan.plan_hash
+            or marker["payload_hash"] != plan.payload_hash
+            or marker["completed"] is not True
         ):
             raise DatabaseEffectMarkerDivergence("Database effect marker does not exactly bind this effect plan")
-        accepted_value = self._require_canonical_json(marker.get("accepted_ordinals_json"), field_name="accepted_ordinals_json")
-        diverted_value = self._require_canonical_json(marker.get("diverted_ordinals_json"), field_name="diverted_ordinals_json")
-        diversion_hashes = self._require_canonical_json(marker.get("diversion_hashes_json"), field_name="diversion_hashes_json")
-        evidence_value = self._require_canonical_json(marker.get("evidence_json"), field_name="evidence_json")
+        accepted_value = self._require_canonical_json(marker["accepted_ordinals_json"], field_name="accepted_ordinals_json")
+        diverted_value = self._require_canonical_json(marker["diverted_ordinals_json"], field_name="diverted_ordinals_json")
+        diversion_hashes = self._require_canonical_json(marker["diversion_hashes_json"], field_name="diversion_hashes_json")
+        evidence_value = self._require_canonical_json(marker["evidence_json"], field_name="evidence_json")
         if (
             type(accepted_value) is not list
             or type(diverted_value) is not list
@@ -745,22 +779,22 @@ class DatabaseSink(BaseSink):
                 type(item) is not dict
                 or set(item) != {"error_hash", "ordinal", "reason_hash"}
                 or item["ordinal"] != ordinal
-                or not isinstance(item["reason_hash"], str)
+                or type(item["reason_hash"]) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", item["reason_hash"]) is None
-                or not isinstance(item["error_hash"], str)
+                or type(item["error_hash"]) is not str
                 or re.fullmatch(r"[0-9a-f]{16}", item["error_hash"]) is None
             ):
                 raise DatabaseEffectMarkerDivergence("Database effect marker diversion hashes are invalid")
-        descriptor = self._descriptor_from_json(marker.get("descriptor_json"))
-        accepted_payload_hash = marker.get("accepted_payload_hash")
+        descriptor = self._descriptor_from_json(marker["descriptor_json"])
+        accepted_payload_hash = marker["accepted_payload_hash"]
         if accepted_payload_hash != descriptor.content_hash:
             raise DatabaseEffectMarkerDivergence("Database effect marker accepted payload hash diverges from descriptor")
         metadata = None if descriptor.metadata is None else deep_thaw(descriptor.metadata)
         if (
             descriptor.artifact_type != "database"
             or type(metadata) is not dict
-            or metadata.get("table") != self._table_name
-            or metadata.get("row_count") != len(accepted)
+            or metadata["table"] != self._table_name
+            or metadata["row_count"] != len(accepted)
         ):
             raise DatabaseEffectMarkerDivergence("Database effect marker descriptor does not bind the configured target/result")
         expected_descriptor = ArtifactDescriptor.for_database(
@@ -774,7 +808,7 @@ class DatabaseSink(BaseSink):
             raise DatabaseEffectMarkerDivergence("Database effect marker descriptor does not bind the configured database URL")
         expected_evidence = {
             "accepted_ordinals": list(accepted),
-            "descriptor": self._require_canonical_json(marker.get("descriptor_json"), field_name="descriptor_json"),
+            "descriptor": self._require_canonical_json(marker["descriptor_json"], field_name="descriptor_json"),
             "diversion_attribution": list(diversion_hashes),
             "diverted_ordinals": list(diverted),
         }
@@ -834,8 +868,8 @@ class DatabaseSink(BaseSink):
                     # the outer transaction whose RELEASE commits accepted rows
                     # before the marker insert. Establish a real outer write
                     # transaction so every savepoint and the marker share it.
-                    driver_connection = conn.connection.driver_connection
-                    if not bool(getattr(driver_connection, "in_transaction", False)):
+                    driver_connection = cast("sqlite3.Connection", conn.connection.driver_connection)
+                    if not driver_connection.in_transaction:
                         conn.exec_driver_sql("BEGIN IMMEDIATE")
                 target_columns = set(target.columns.keys())
                 planned_columns = set(deep_thaw(plan.safe_evidence)["target_columns"])
@@ -956,7 +990,7 @@ class DatabaseSink(BaseSink):
             for field in fields_to_check:
                 if field in new_row:
                     value = new_row[field]
-                    if isinstance(value, (dict, list)):
+                    if type(value) is dict or type(value) is list:
                         new_row[field] = json.dumps(value)
             result.append(new_row)
         return result
@@ -1068,6 +1102,16 @@ class DatabaseSink(BaseSink):
         return None
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "a composer/tool-call config snapshot for this sink — LLM- or operator-authored option values ELSPETH has not yet validated"
+        ),
+        source_param="config_snapshot",
+        suppresses=("R1",),
+        invariant=("returns advisory hint strings only; an absent or non-'replace' if_exists contributes no hint and nothing raises"),
+        non_raising=True,
+    )
     def get_post_call_hints(
         cls,
         *,

@@ -114,7 +114,7 @@ def _build_composer_state(
                 "guaranteed_fields": declared_fields,
             },
         },
-        on_validation_failure="quarantine",
+        on_validation_failure="discard",
     )
 
     nodes: list[NodeSpec] = []

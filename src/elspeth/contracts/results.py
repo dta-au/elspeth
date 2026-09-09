@@ -12,7 +12,7 @@ IMPORTANT:
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
@@ -163,7 +163,11 @@ def _require_artifact_metadata(value: object, field_name: str = "metadata") -> N
     for key, item in value.items():
         if type(key) is not str:
             raise TypeError(f"{field_name} key must be str, got {type(key).__name__}: {key!r}")
-        if isinstance(item, MappingProxyType):
+        # Recurse into EVERY nested mapping, not only already-frozen ones: a
+        # plain dict nested inside a MappingProxyType must FAIL the frozen
+        # check above, not be skipped by it (skipping was the deep-freeze hole
+        # where MappingProxyType({'a': {'b': 1}}) passed unchanged).
+        if isinstance(item, Mapping):
             _require_artifact_metadata(item, f"{field_name}[{key!r}]")
 
 
@@ -550,6 +554,8 @@ class RowResult:
             recomputing from the synthetic replay FailureInfo, so the replayed
             audit record correlates with the pre-crash one
             (filigree elspeth-d74d19f901). None for live results.
+        join_group_id: For COALESCED results, the merge-event identity of the
+            coalesce that produced this token. None for all other paths.
     """
 
     token: TokenInfo
@@ -560,6 +566,7 @@ class RowResult:
     error: FailureInfo | None = None
     scheduler_pending_sink: bool = False
     authoritative_error_hash: str | None = None
+    join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.scheduler_pending_sink) is not bool:
@@ -599,6 +606,10 @@ class RowResult:
                 raise OrchestrationInvariantError("(FAILURE, ON_ERROR_ROUTED) outcome requires error to be a FailureInfo instance")
         if self.path == TerminalPath.COALESCED and self.sink_name is None:
             raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires sink_name to be set")
+        if self.path == TerminalPath.COALESCED and self.join_group_id is None:
+            raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires join_group_id to be set")
+        if self.path != TerminalPath.COALESCED and self.join_group_id is not None:
+            raise OrchestrationInvariantError(f"RowResult.join_group_id is only valid for COALESCED results, got path={self.path!r}")
 
 
 @dataclass(frozen=True, slots=True)

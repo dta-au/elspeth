@@ -5,14 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
+from weakref import WeakSet
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
+from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_DERIVATION_VERSION,
@@ -27,6 +29,7 @@ from elspeth.contracts.audit_export import (
     H,
     RegisteredAuditExportContent,
 )
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import (
@@ -37,10 +40,13 @@ from elspeth.contracts.sink_effects import (
     _create_restricted_audit_export_snapshot_reader,
 )
 from elspeth.core.landscape.model_loaders import AuditExportSnapshotChunkLoader, _AuditExportSnapshotRowLoader
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import audit_export_snapshot_chunks_table, audit_export_snapshots_table
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from elspeth.core.landscape.database import Tier1Engine
 
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -79,11 +85,14 @@ def _verify_snapshot_graph(
                 emitted = json.loads(frame[:-1])
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains invalid JSON") from exc
-            if type(emitted) is not dict or emitted.get("record_type") == "manifest":
+            if type(emitted) is not dict or ("record_type" in emitted and emitted["record_type"] == "manifest"):
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains an invalid data record")
             if canonical_json(emitted).encode("utf-8") + b"\n" != frame:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains non-canonical record bytes")
-            signature = emitted.pop("signature", None)
+            if "signature" in emitted:
+                signature = emitted.pop("signature")
+            else:
+                signature = None
             unsigned_bytes = canonical_json(emitted).encode("utf-8")
             if snapshot.signing_mode is AuditExportSigningMode.UNSIGNED:
                 if signature is not None:
@@ -343,7 +352,7 @@ class AuditExportSnapshotRegistration:
 _VERIFICATION_PROOF: Final = object()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
 class VerifiedAuditExportCandidate:
     """Proof-carrying candidate produced only by ``verify_candidate``.
 
@@ -364,15 +373,55 @@ class VerifiedAuditExportCandidate:
 
 
 def _snapshot_values(snapshot: AuditExportSnapshot) -> dict[str, object]:
-    return {field.name: getattr(snapshot, field.name) for field in fields(AuditExportSnapshot)} | {
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "source_run_id": snapshot.source_run_id,
         "source_status": snapshot.source_status.value,
+        "source_completed_at": snapshot.source_completed_at,
+        "exported_at": snapshot.exported_at,
+        "registry_key_hash": snapshot.registry_key_hash,
+        "exporter_version": snapshot.exporter_version,
+        "serialization_version": snapshot.serialization_version,
         "export_format": snapshot.export_format.value,
         "signing_mode": snapshot.signing_mode.value,
+        "signer_key_id": snapshot.signer_key_id,
+        "derivation_version": snapshot.derivation_version,
+        "public_export_config_hash": snapshot.public_export_config_hash,
+        "chunking_algorithm_version": snapshot.chunking_algorithm_version,
+        "per_chunk_record_limit": snapshot.per_chunk_record_limit,
+        "per_chunk_byte_limit": snapshot.per_chunk_byte_limit,
+        "record_count": snapshot.record_count,
+        "total_bytes": snapshot.total_bytes,
+        "chunk_count": snapshot.chunk_count,
+        "terminal_chunk_ordinal": snapshot.terminal_chunk_ordinal,
+        "content_store_id": snapshot.content_store_id,
+        "manifest_hash": snapshot.manifest_hash,
+        "last_chunk_seal_hash": snapshot.last_chunk_seal_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "snapshot_seal_hash": snapshot.snapshot_seal_hash,
+        "signature_hex": snapshot.signature_hex,
+        "record_chain_algorithm": snapshot.record_chain_algorithm,
+        "final_hash": snapshot.final_hash,
+        "signed_manifest_schema": snapshot.signed_manifest_schema,
+        "signed_manifest_hash": snapshot.signed_manifest_hash,
+        "signed_manifest_ref": snapshot.signed_manifest_ref,
+        "signed_manifest_size_bytes": snapshot.signed_manifest_size_bytes,
     }
 
 
 def _chunk_values(chunk: AuditExportSnapshotChunk) -> dict[str, object]:
-    return {field.name: getattr(chunk, field.name) for field in fields(AuditExportSnapshotChunk)}
+    return {
+        "snapshot_id": chunk.snapshot_id,
+        "ordinal": chunk.ordinal,
+        "content_ref": chunk.content_ref,
+        "content_hash": chunk.content_hash,
+        "size_bytes": chunk.size_bytes,
+        "record_count": chunk.record_count,
+        "predecessor_seal_hash": chunk.predecessor_seal_hash,
+        "cumulative_records": chunk.cumulative_records,
+        "cumulative_bytes": chunk.cumulative_bytes,
+        "chunk_seal_hash": chunk.chunk_seal_hash,
+    }
 
 
 def _timestamp(value: datetime) -> str:
@@ -384,31 +433,89 @@ def _timestamp(value: datetime) -> str:
 
 
 def _snapshot_comparison_values(snapshot: AuditExportSnapshot) -> tuple[object, ...]:
-    values: list[object] = []
-    for field in fields(AuditExportSnapshot):
-        # Store provenance belongs to the CAS winner, not to the canonical
-        # byte graph. A rotated writer may derive and store the exact same
-        # graph under a new store ID and must reuse the prior winner.
-        if field.name == "content_store_id":
-            continue
-        value = getattr(snapshot, field.name)
-        if isinstance(value, datetime):
-            value = _timestamp(value)
-        values.append(value)
-    return tuple(values)
+    # Store provenance belongs to the CAS winner, not to the canonical byte
+    # graph. A rotated writer may derive and store the exact same graph under a
+    # new store ID and must reuse the prior winner, so content_store_id is the
+    # one deliberately omitted field.
+    return (
+        snapshot.snapshot_id,
+        snapshot.source_run_id,
+        snapshot.source_status,
+        _timestamp(snapshot.source_completed_at),
+        _timestamp(snapshot.exported_at),
+        snapshot.registry_key_hash,
+        snapshot.exporter_version,
+        snapshot.serialization_version,
+        snapshot.export_format,
+        snapshot.signing_mode,
+        snapshot.signer_key_id,
+        snapshot.derivation_version,
+        snapshot.public_export_config_hash,
+        snapshot.chunking_algorithm_version,
+        snapshot.per_chunk_record_limit,
+        snapshot.per_chunk_byte_limit,
+        snapshot.record_count,
+        snapshot.total_bytes,
+        snapshot.chunk_count,
+        snapshot.terminal_chunk_ordinal,
+        snapshot.manifest_hash,
+        snapshot.last_chunk_seal_hash,
+        snapshot.snapshot_hash,
+        snapshot.snapshot_seal_hash,
+        snapshot.signature_hex,
+        snapshot.record_chain_algorithm,
+        snapshot.final_hash,
+        snapshot.signed_manifest_schema,
+        snapshot.signed_manifest_hash,
+        snapshot.signed_manifest_ref,
+        snapshot.signed_manifest_size_bytes,
+    )
+
+
+def _acquire_signer_lineage_authority(conn: Connection, key: AuditExportSnapshotRegistryKey) -> None:
+    """Serialize the signer-policy recheck with registry insertion.
+
+    Relocated from the orchestrator (ADR-048): the registry write now opens
+    its own leader-fenced transaction, so the lock that guards the recheck
+    has to be taken on that connection, inside the repository.
+
+    ``fenced_leader_transaction`` composes ``begin_write``, which on SQLite
+    begins ``BEGIN IMMEDIATE`` — the same write-intent transaction
+    ``LandscapeDB.write_connection`` opened before, so the SQLite arm's
+    premise is unchanged.
+    """
+    if conn.dialect.name == "sqlite":
+        # The fenced transaction already holds BEGIN IMMEDIATE.
+        return
+    if conn.dialect.name == "postgresql":
+        lineage = "\x1f".join((key.source_run_id, key.exporter_version, key.serialization_version, key.export_format.value))
+        conn.exec_driver_sql(
+            "SELECT pg_catalog.pg_advisory_xact_lock(%s, pg_catalog.hashtext(%s))",
+            (ELSPETH_AUDIT_EXPORT_LOCK_CLASSID, lineage),
+        )
+        return
+    raise RuntimeError(f"unsupported Landscape backend {conn.dialect.name!r}")
 
 
 class AuditExportSnapshotRepository:
     """Exact CAS registry and bound-winner construction surface.
 
-    Transaction ownership stays with the caller. Long source reads and short
-    winner CAS transactions therefore cannot accidentally span content-store
-    I/O.
+    Reads (``find_winner``, ``find_lineage_signer_key_ids``) still take the
+    caller's connection, so a long source read and the short winner CAS
+    cannot accidentally span content-store I/O. The registry WRITE owns its
+    own transaction: it is leader-fenced (ADR-048 §2), and a fence is only a
+    fence when the verb opens the transaction whose first statement it is.
+
+    The constructor stores the engine and probes nothing, so this repository
+    is safe to build on a read-only Landscape handle for its read verbs; a
+    write attempt on such a handle fails at ``begin_write``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, engine: Tier1Engine) -> None:
+        self._engine = engine
         self._snapshot_loader = _AuditExportSnapshotRowLoader()
         self._chunk_loader = AuditExportSnapshotChunkLoader()
+        self._verified_candidates: WeakSet[VerifiedAuditExportCandidate] = WeakSet()
 
     @staticmethod
     def winner_from_candidate(candidate: AuditExportSnapshotCandidate) -> AuditExportSnapshotWinner:
@@ -439,8 +546,6 @@ class AuditExportSnapshotRepository:
         connection: Connection,
         key: AuditExportSnapshotRegistryKey,
     ) -> AuditExportSnapshotWinner | None:
-        if not isinstance(connection, Connection):
-            raise TypeError("connection must be a SQLAlchemy Connection")
         if type(key) is not AuditExportSnapshotRegistryKey:
             raise TypeError("key must be exact AuditExportSnapshotRegistryKey")
         query = select(audit_export_snapshots_table).where(
@@ -470,8 +575,6 @@ class AuditExportSnapshotRepository:
         key: AuditExportSnapshotRegistryKey,
     ) -> tuple[str, ...]:
         """Return signer identities already sealed for this export lineage."""
-        if not isinstance(connection, Connection):
-            raise TypeError("connection must be a SQLAlchemy Connection")
         if type(key) is not AuditExportSnapshotRegistryKey:
             raise TypeError("key must be exact AuditExportSnapshotRegistryKey")
         table = audit_export_snapshots_table.c
@@ -532,24 +635,34 @@ class AuditExportSnapshotRepository:
             signed_manifest_verifier=signed_manifest_verifier,
             record_signature_verifier=record_signature_verifier,
         )
-        return VerifiedAuditExportCandidate(candidate=candidate, _proof=_VERIFICATION_PROOF)
+        verified = VerifiedAuditExportCandidate(candidate=candidate, _proof=_VERIFICATION_PROOF)
+        self._verified_candidates.add(verified)
+        return verified
 
     def register_candidate(
         self,
-        connection: Connection,
         candidate: AuditExportSnapshotCandidate,
         *,
+        coordination_token: CoordinationToken,
+        assert_signer_rotation_allowed: Callable[[str], None],
         content_store_resolver: AuditExportContentStoreResolver,
         limits: AuditExportSnapshotReadLimits,
         signed_manifest_verifier: Callable[[bytes, AuditExportSignedManifestInput], None],
         record_signature_verifier: Callable[[bytes, str], None] | None = None,
     ) -> AuditExportSnapshotRegistration:
-        """Verify then register in one call.
+        """Verify then register under this run's leader seat, in one call.
 
         Prefer :meth:`verify_candidate` + :meth:`register_verified_candidate`
-        when the caller holds a write transaction or lineage lock: this
-        combined form runs content verification while ``connection``'s
-        transaction stays open.
+        when the caller can keep the expensive content reread outside the
+        fenced write transaction: this combined form runs verification with no
+        transaction open, then opens its own fence, so it is a convenience
+        rather than a different durability story.
+
+        This verb owns its transaction rather than delegating to
+        :meth:`register_verified_candidate`: the registry write is a
+        clock-authority boundary, and each public write verb opening its own
+        fence over the one shared connection helper keeps the fence's first
+        statement provably first for both entry points.
         """
         verified = self.verify_candidate(
             candidate,
@@ -558,35 +671,107 @@ class AuditExportSnapshotRepository:
             signed_manifest_verifier=signed_manifest_verifier,
             record_signature_verifier=record_signature_verifier,
         )
-        return self.register_verified_candidate(connection, verified)
+        self._refuse_unproven_registration(verified, coordination_token, assert_signer_rotation_allowed)
+        with fenced_leader_transaction(
+            self._engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="register_candidate",
+        ) as conn:
+            return self._register_verified_on(conn, verified, assert_signer_rotation_allowed=assert_signer_rotation_allowed)
 
     def register_verified_candidate(
         self,
-        connection: Connection,
         verified: VerifiedAuditExportCandidate,
+        *,
+        coordination_token: CoordinationToken,
+        assert_signer_rotation_allowed: Callable[[str], None],
     ) -> AuditExportSnapshotRegistration:
-        """Short write/CAS registration of a verification-proven candidate."""
-        if type(verified) is not VerifiedAuditExportCandidate:
+        """Leader-fenced write/CAS registration of a verification-proven candidate.
+
+        ADR-048 §2: the run whose export this snapshot is IS
+        ``coordination_token.run_id``; a candidate derived from any other run
+        is refused before any database effect. ADR-030 §C.4: the
+        verify-and-extend epoch fence is the FIRST statement of the write
+        transaction, so a deposed export leader's CAS is refused with zero
+        mutation and one ``fence_refusal`` event, before the lineage lock,
+        the rotation recheck, or the registry insert is reached.
+
+        The signer-lineage lock and the rotation recheck run inside that same
+        transaction (they were previously inside the orchestrator's raw
+        ``write_connection``), so the policy decision and the insert it
+        authorises still cannot be interleaved by another writer.
+        ``assert_signer_rotation_allowed`` is the caller's policy — the
+        repository holds no export configuration — and is called once per
+        signer identity already sealed for this lineage.
+        """
+        self._refuse_unproven_registration(verified, coordination_token, assert_signer_rotation_allowed)
+        with fenced_leader_transaction(
+            self._engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="register_verified_candidate",
+        ) as conn:
+            return self._register_verified_on(conn, verified, assert_signer_rotation_allowed=assert_signer_rotation_allowed)
+
+    def _refuse_unproven_registration(
+        self,
+        verified: VerifiedAuditExportCandidate,
+        coordination_token: CoordinationToken,
+        assert_signer_rotation_allowed: Callable[[str], None],
+    ) -> None:
+        """Every refusal a registration owes BEFORE its fence opens.
+
+        Shared by both public write verbs so neither can drift into opening a
+        transaction on an unproven carrier or another run's bytes.
+        """
+        if type(verified) is not VerifiedAuditExportCandidate or verified not in self._verified_candidates:
             raise TypeError("verified must be exact VerifiedAuditExportCandidate from verify_candidate")
+        if not callable(assert_signer_rotation_allowed):
+            raise TypeError("assert_signer_rotation_allowed must be callable")
+        source_run_id = verified.candidate.snapshot.source_run_id
+        if source_run_id != coordination_token.run_id:
+            raise AuditIntegrityError(
+                f"audit-export snapshot candidate for run {source_run_id!r} presented under a leader token for run "
+                f"{coordination_token.run_id!r}; the token's run is the only run an export can register (ADR-048 §2)"
+            )
+
+    def _register_verified_on(
+        self,
+        conn: Connection,
+        verified: VerifiedAuditExportCandidate,
+        *,
+        assert_signer_rotation_allowed: Callable[[str], None],
+    ) -> AuditExportSnapshotRegistration:
+        """The registry lock, rotation recheck and CAS, on a caller-owned fenced connection.
+
+        Only reachable from the two public verbs above, each of which opens
+        exactly one ``fenced_leader_transaction`` and passes its exact
+        connection here — so every execution of this DML is inside a proven
+        epoch fence.
+        """
         candidate = verified.candidate
         key = AuditExportSnapshotRegistryKey.from_snapshot(candidate.snapshot)
-        existing = self.find_winner(connection, key)
+        _acquire_signer_lineage_authority(conn, key)
+        for existing_signer_key_id in self.find_lineage_signer_key_ids(conn, key):
+            assert_signer_rotation_allowed(existing_signer_key_id)
+        existing = self.find_winner(conn, key)
         if existing is not None:
             self._assert_candidate_equals_winner(candidate, existing)
             return AuditExportSnapshotRegistration(winner=existing, inserted=False)
 
         conflict: IntegrityError | None = None
         try:
-            with connection.begin_nested():
-                connection.execute(
+            with conn.begin_nested():
+                conn.execute(
                     audit_export_snapshot_chunks_table.insert(),
                     [_chunk_values(chunk) for chunk in candidate.chunks],
                 )
-                connection.execute(audit_export_snapshots_table.insert().values(**_snapshot_values(candidate.snapshot)))
+                conn.execute(audit_export_snapshots_table.insert().values(**_snapshot_values(candidate.snapshot)))
         except IntegrityError as exc:
             conflict = exc
 
-        winner = self.find_winner(connection, key)
+        winner = self.find_winner(conn, key)
         if winner is None:
             if conflict is None:
                 raise AuditIntegrityError("audit-export registry CAS insert completed without a visible winner")
@@ -598,13 +783,27 @@ class AuditExportSnapshotRepository:
         self,
         winner: AuditExportSnapshotWinner,
         *,
+        coordination_token: CoordinationToken,
         content_store_resolver: AuditExportContentStoreResolver,
         limits: AuditExportSnapshotReadLimits,
         signed_manifest_verifier: Callable[[bytes, AuditExportSignedManifestInput], None],
         record_signature_verifier: Callable[[bytes, str], None] | None = None,
     ) -> SinkEffectAuditExportSnapshotInput:
+        """Build the sink-effect input for the run the token leads.
+
+        No database effect of its own: this rereads the registered bytes and
+        recomputes the whole cryptographic graph. The token is the authority
+        under which the export phase runs, and binding a winner belonging to
+        a DIFFERENT run under it is a wiring bug, not a recoverable state —
+        the reader this returns would publish another run's audit bytes.
+        """
         if type(winner) is not AuditExportSnapshotWinner:
             raise TypeError("winner must be exact AuditExportSnapshotWinner")
+        if winner.snapshot.source_run_id != coordination_token.run_id:
+            raise AuditIntegrityError(
+                f"audit-export winner for run {winner.snapshot.source_run_id!r} bound under a leader token for run "
+                f"{coordination_token.run_id!r}; the token's run is the only run an export may publish (ADR-048 §2)"
+            )
         if type(content_store_resolver) is not AuditExportContentStoreResolver:
             raise TypeError("content_store_resolver must be exact AuditExportContentStoreResolver")
         if type(limits) is not AuditExportSnapshotReadLimits:

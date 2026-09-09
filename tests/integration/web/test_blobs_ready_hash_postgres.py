@@ -40,11 +40,11 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import Engine, insert, update
 from sqlalchemy.exc import IntegrityError
-from testcontainers.postgres import PostgresContainer
 
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.postgres_target import postgres_test_target
 
 # Integration-suite shared session-insert helper. Mirrors the import
 # pattern in test_compose_loop_concurrent_sessions.py so all
@@ -67,8 +67,8 @@ def pg_engine() -> Iterator[Engine]:
     parametrized cases; the test itself uses fresh blob-record IDs
     per case so there is no cross-test state leak.
     """
-    with PostgresContainer("postgres:16-alpine") as pg:
-        engine = create_session_engine(pg.get_connection_url())
+    with postgres_test_target() as postgres_url:
+        engine = create_session_engine(postgres_url)
         initialize_session_schema(engine)
         yield engine
 

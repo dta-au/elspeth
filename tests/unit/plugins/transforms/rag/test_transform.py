@@ -9,12 +9,48 @@ from unittest.mock import patch
 
 import pytest
 
-from elspeth.contracts.errors import RetrievalNotReadyError
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
+from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError, RetrievalProvider
+from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+from elspeth.testing import make_field
+
+# Observed mode forbids explicit field definitions, so author-declared output
+# field metadata reaches the emitted contract only under fixed/flexible mode.
+# The retrieval outputs are declared optional because the same field list also
+# builds the transform's INPUT schema, and no input row carries them yet.
+DECLARED_SCHEMA = {
+    "mode": "flexible",
+    "fields": [
+        "question: str",
+        "policy__rag_context: str?",
+        "policy__rag_score: float?",
+        "policy__rag_count: int",
+        "policy__rag_sources: str",
+    ],
+}
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="rag_retrieval-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -68,23 +104,26 @@ class _TelemetrySinkFake:
         self.payloads.append(payload)
 
 
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
+
+
 @dataclass
 class _LandscapeRecorderFake:
     readiness_checks: list[dict[str, Any]] = field(default_factory=list)
 
     def record_readiness_check(
         self,
-        run_id: str,
         *,
         name: str,
         collection: str,
         reachable: bool,
         count: int | None,
         message: str,
+        coordination_token: CoordinationToken,
     ) -> None:
         self.readiness_checks.append(
             {
-                "run_id": run_id,
+                "run_id": coordination_token.run_id,
                 "name": name,
                 "collection": collection,
                 "reachable": reachable,
@@ -98,6 +137,9 @@ class _LandscapeRecorderFake:
 class _LifecycleContextFake:
     run_id: str = "run-1"
     landscape: _LandscapeRecorderFake | None = field(default_factory=_LandscapeRecorderFake)
+    # Carried BY VALUE from the executor (ADR-048 §3); the fake models the
+    # real PluginContext forwarder, so the transform never sees the token.
+    coordination_token: CoordinationToken | None = field(default_factory=lambda: _LEADER_TOKEN)
     telemetry_emit: _TelemetrySinkFake = field(default_factory=_TelemetrySinkFake)
     rate_limit_registry: None = None
     node_id: str | None = None
@@ -106,10 +148,17 @@ class _LifecycleContextFake:
     concurrency_config: None = None
     shutdown_event: None = None
 
-
-class _ProviderConfigFake:
-    def __init__(self, **kwargs: Any) -> None:
-        self.index = kwargs.get("index", "test-index")
+    def record_readiness_check(self, *, name: str, collection: str, reachable: bool, count: int | None, message: str) -> None:
+        if self.landscape is None or self.coordination_token is None:
+            raise FrameworkBugError("record_readiness_check() called without landscape or leader token")
+        self.landscape.record_readiness_check(
+            name=name,
+            collection=collection,
+            reachable=reachable,
+            count=count,
+            message=message,
+            coordination_token=self.coordination_token,
+        )
 
 
 @dataclass
@@ -216,6 +265,16 @@ def _make_row(data: dict[str, Any]) -> PipelineRow:
     return PipelineRow(data, contract)
 
 
+def _make_declared_row(data: dict[str, Any]) -> PipelineRow:
+    """Create a PipelineRow whose query field already carries a declared contract."""
+    contract = SchemaContract(
+        mode="FLEXIBLE",
+        fields=(make_field("question", str, required=True, source="declared"),),
+        locked=True,
+    )
+    return PipelineRow(data, contract)
+
+
 class TestTransformLifecycle:
     def test_close_before_on_start_does_not_raise(self):
         transform = _make_transform()
@@ -223,6 +282,32 @@ class TestTransformLifecycle:
 
     def test_declares_truthful_pass_through(self) -> None:
         assert RAGRetrievalTransform.passes_through_input is True
+
+    def test_collection_audit_identity_dispatches_by_provider_and_owned_config(self) -> None:
+        transform = _make_transform()
+        chroma = ChromaSearchProviderConfig(collection="test-collection")
+        azure = AzureSearchProviderConfig(
+            endpoint="https://test.search.windows.net",
+            index="test-index",
+            api_key="test-key",
+        )
+
+        assert transform._configured_collection_name("chroma", chroma) == "test-collection"
+        assert transform._configured_collection_name("azure_search", azure) == "test-index"
+
+    def test_shape_impostor_is_rejected_as_provider_config(self) -> None:
+        transform = _make_transform()
+        impostor = type("ProviderConfigImpostor", (), {"index": "test-index"})()
+
+        with pytest.raises(FrameworkBugError, match="provider azure_search requires AzureSearchProviderConfig"):
+            transform._configured_collection_name("azure_search", impostor)
+
+    def test_provider_config_category_mismatch_is_rejected(self) -> None:
+        transform = _make_transform()
+        chroma = ChromaSearchProviderConfig(collection="test-collection")
+
+        with pytest.raises(FrameworkBugError, match="provider azure_search requires AzureSearchProviderConfig"):
+            transform._configured_collection_name("azure_search", chroma)
 
     def test_declared_output_fields(self):
         transform = _make_transform()
@@ -294,6 +379,47 @@ class TestTransformLifecycle:
         assert original_provider.close_calls == 1
 
 
+class TestQueryFieldMustNotNameACreatedField:
+    """``query_field`` must name an ARRIVING column, never one retrieval writes.
+
+    The retrieval outputs are derived from ``output_prefix``, so a query field
+    named ``<prefix>__rag_context`` is read for the query and then overwritten
+    with the retrieved context. Nothing downstream catches it under
+    ``mode: observed`` (elspeth-09dc6407f1).
+    """
+
+    def test_query_field_naming_a_retrieval_output_is_rejected(self) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        with pytest.raises(PluginConfigError, match="query_field names 'policy__rag_context', which rag_retrieval itself creates"):
+            _make_transform(query_field="policy__rag_context")
+
+    def test_the_error_names_the_offending_value_and_the_plugin(self) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            _make_transform(query_field="policy__rag_score")
+
+        message = str(excinfo.value)
+        assert "query_field names 'policy__rag_score', which rag_retrieval itself creates" in message
+        assert "Point query_field at a column that ARRIVES on the row" in message
+
+    def test_a_prefix_that_moves_the_created_set_moves_the_rejection(self) -> None:
+        """The created set follows ``output_prefix``, so the guard must too."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        transform = _make_transform(output_prefix="other", query_field="policy__rag_context")
+        assert transform.declared_input_fields == frozenset({"policy__rag_context"})
+
+        with pytest.raises(PluginConfigError, match="query_field names 'other__rag_context', which rag_retrieval itself creates"):
+            _make_transform(output_prefix="other", query_field="other__rag_context")
+
+    def test_a_query_field_naming_an_arriving_column_still_constructs(self) -> None:
+        transform = _make_transform()
+
+        assert transform.declared_input_fields == frozenset({"question"})
+
+
 def _ready_provider_result():
     """Default CollectionReadinessResult for tests that don't care about readiness."""
     from elspeth.contracts.probes import CollectionReadinessResult
@@ -313,7 +439,7 @@ def _setup_transform_with_mock_provider(chunks=None, **config_overrides):
     (which passes the readiness check) instead of a real Azure provider.
     """
     mock_provider = _RetrievalProviderFake(chunks=list(chunks or []))
-    mock_config_cls = _ProviderConfigFake
+    mock_config_cls = AzureSearchProviderConfig
     mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
     transform = _make_transform(**config_overrides)
@@ -620,7 +746,7 @@ class TestRAGTransformReadinessGuard:
 
     def _run_on_start_with_mock(self, mock_provider: _RetrievalProviderFake) -> RAGRetrievalTransform:
         """Patch PROVIDERS registry and call on_start()."""
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -645,7 +771,7 @@ class TestRAGTransformReadinessGuard:
     def test_readiness_recorded_in_landscape(self) -> None:
         """on_start() records the readiness check outcome in the audit trail."""
         mock_provider = self._make_mock_provider(count=42, collection="my-index")
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -672,7 +798,7 @@ class TestRAGTransformReadinessGuard:
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, reachable=True)
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -694,7 +820,7 @@ class TestRAGTransformReadinessGuard:
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, reachable=False)
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -717,7 +843,7 @@ class TestRAGTransformReadinessGuard:
         from elspeth.contracts.errors import RetrievalNotReadyError
 
         mock_provider = self._make_mock_provider(count=0, collection="my-vectors")
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -738,7 +864,7 @@ class TestRAGTransformReadinessGuard:
     def test_failed_readiness_still_recorded_in_landscape(self) -> None:
         """record_readiness_check is called even when the check fails (audit before raise)."""
         mock_provider = self._make_mock_provider(count=0, reachable=True, collection="empty-col")
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -767,7 +893,7 @@ class TestRAGTransformReadinessGuard:
 
     def test_provider_construction_failure_is_recorded_before_raise(self) -> None:
         """Constructor-time provider failures still emit a failed readiness audit row."""
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(error=RetrievalError("missing collection", retryable=False))
 
         transform = _make_transform()
@@ -800,7 +926,7 @@ class TestRAGTransformReadinessGuard:
                 retryable=False,
             )
         )
-        mock_config_cls = _ProviderConfigFake
+        mock_config_cls = AzureSearchProviderConfig
         mock_factory = _ProviderFactoryFake(provider=mock_provider)
 
         transform = _make_transform()
@@ -843,6 +969,76 @@ class TestRAGTransformReadinessGuard:
                 count=-1,
                 message="corrupted",
             )
+
+
+class TestRAGDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-1f6493861b).
+
+    RAG creates its four retrieval fields, so contract propagation infers their
+    metadata from the runtime values it just wrote. When the author also declares
+    those fields in ``schema.fields``, the declaration flows into
+    ``_output_schema_config``, and ADR-014's post-emission check compares declared
+    ``python_type``/``required``/``nullable`` against the inferred metadata. Both
+    emit paths must therefore restamp the declaration the way the sibling
+    field-adding transforms do.
+    """
+
+    def test_results_present_emission_restamps_declared_optional_metadata(self) -> None:
+        """A declared-optional retrieval field emits nullable, not inferred non-nullable."""
+        chunks = [RetrievalChunk(content="Result 1", score=0.9, source_id="doc1", metadata={})]
+        transform, _ = _setup_transform_with_mock_provider(chunks, schema_config=DECLARED_SCHEMA)
+        row = _make_declared_row({"question": "What is RAG?"})
+
+        result = transform.process(row, _mock_ctx())
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        _run_post_emission_check(transform, result.row)
+        context_field = result.row.contract.get_field("policy__rag_context")
+        assert context_field.python_type is str
+        assert context_field.required is False
+        assert context_field.nullable is True
+        score_field = result.row.contract.get_field("policy__rag_score")
+        assert score_field.python_type is float
+        assert score_field.nullable is True
+
+    def test_no_results_continue_emission_restamps_declared_field_types(self) -> None:
+        """None sentinels infer as untyped, so the declared type must be restamped."""
+        transform, _ = _setup_transform_with_mock_provider(
+            chunks=[],
+            on_no_results="continue",
+            schema_config=DECLARED_SCHEMA,
+        )
+        row = _make_declared_row({"question": "obscure query"})
+
+        result = transform.process(row, _mock_ctx())
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row["policy__rag_context"] is None
+        _run_post_emission_check(transform, result.row)
+        # The declared narrow type is stamped over a None sentinel. That is
+        # honest here because the declaration is nullable, and the wider
+        # created-field value-vs-declaration gap is tracked as elspeth-f1e7679e2a.
+        context_field = result.row.contract.get_field("policy__rag_context")
+        assert context_field.python_type is str
+        assert context_field.nullable is True
+        assert result.row.contract.get_field("policy__rag_count").python_type is int
+
+    def test_observed_mode_emission_keeps_inferred_metadata(self) -> None:
+        """Observed mode declares no fields, so emission stays purely inferred."""
+        chunks = [RetrievalChunk(content="Result 1", score=0.9, source_id="doc1", metadata={})]
+        transform, _ = _setup_transform_with_mock_provider(chunks)
+        row = _make_row({"question": "What is RAG?"})
+
+        result = transform.process(row, _mock_ctx())
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert transform._output_schema_config is not None
+        assert transform._output_schema_config.fields is None
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("policy__rag_context").source == "inferred"
 
 
 def test_plugin_discoverable():

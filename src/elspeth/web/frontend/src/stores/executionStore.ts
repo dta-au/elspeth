@@ -27,8 +27,11 @@ import type {
   ApiError,
   ExecutionFanoutAck,
   ExecutionFanoutGuard,
+  ExecutionSecretAck,
+  ExecutionSecretGuard,
 } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { isTerminalRunStatus } from "@/types/index";
 import * as api from "@/api/client";
 import { connectToRun, type WebSocketConnection } from "@/api/websocket";
 import { useAuthStore } from "./authStore";
@@ -36,12 +39,47 @@ import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { useSessionStore } from "./sessionStore";
 
-
 const MAX_RECENT_ERRORS = 50;
+const STALE_FANOUT_READINESS_ERROR =
+  "This pipeline is no longer ready to run. Validate it again before executing.";
+
+export type RunHistoryLoadOutcome = "loaded" | "stale" | "unavailable";
+
+/**
+ * Terminal-outcome record for the most recent run this tab was attached to
+ * (elspeth-3a7b7c7b37). Every consumer that lives OUTSIDE the Run artifact
+ * panel (the always-mounted RunOutcomeNotice toast, the Run-tab badge) reads
+ * this instead of progress/runs, which only Run-panel components consume.
+ * `status` is the backend's verbatim terminal status — never re-derived.
+ */
+export interface RunOutcome {
+  runId: string;
+  status: RunStatus;
+  sessionId: string | null;
+}
 
 interface ExecutionState {
   runs: Run[];
   activeRunId: string | null;
+  /**
+   * Session the active run was LAUNCHED under (elspeth-3a7b7c7b37). Stamped
+   * alongside activeRunId by execute() and rehydrateActiveRun(), cleared by
+   * reset().
+   *
+   * Every outcome record copies THIS field rather than reading the session
+   * store's activeSessionId at terminal-event time, because the session is
+   * the outcome's ROUTING KEY, not a decoration: RunOutcomeNotice passes it
+   * to dispatchArtifactViewIntent, and ArtifactWorkspace ADMITS the intent
+   * only when it matches the committed controller's session. A routing key
+   * must therefore be fixed at launch and never re-derived from mutable
+   * store state — independently of whether any particular ordering of
+   * session-switch commit and reset() could produce a mismatch. (It is not
+   * the case that a WS terminal event landing before reset() would
+   * mis-attribute the outcome: activeRunId still identifies the launch
+   * session's run there, and reset() clears lastRunOutcome outright. The
+   * stamp is cheaper than depending on that reasoning staying true.)
+   */
+  activeRunSessionId: string | null;
   progress: RunProgress | null;
   diagnosticsByRunId: Record<string, RunDiagnostics>;
   diagnosticsLoadingByRunId: Record<string, boolean>;
@@ -52,10 +90,40 @@ interface ExecutionState {
   validationResult: ValidationResult | null;
   pendingFanoutGuard: ExecutionFanoutGuard | null;
   pendingFanoutSessionId: string | null;
+  /**
+   * Secret ack already acquired for this launch attempt, held alongside
+   * pendingFanoutGuard so the acknowledged fanout re-send carries BOTH
+   * tokens — the secret guard fires first, so its approved token must
+   * survive a subsequent fanout 428.
+   */
+  pendingFanoutSecretAck: ExecutionSecretAck | null;
+  pendingSecretGuard: ExecutionSecretGuard | null;
+  pendingSecretSessionId: string | null;
+  /**
+   * Fanout ack already acquired for this launch attempt, held alongside
+   * pendingSecretGuard so the acknowledged secret re-send carries BOTH
+   * tokens (a rotated secret token re-arms this guard after the fanout
+   * guard was already approved).
+   */
+  pendingSecretFanoutAck: ExecutionFanoutAck | null;
   isValidating: boolean;
+  validationError: string | null;
   isExecuting: boolean;
   wsDisconnected: boolean;
   error: string | null;
+  /**
+   * Unacknowledged terminal outcome of the active run (elspeth-3a7b7c7b37).
+   * Set inside applyRunEvent's terminal branch (WS, the primary source),
+   * cleared by acknowledgeRunOutcome(), by reset() (session switch), and by
+   * a new launch superseding it. The REST-poll fallback (InlineRunResults'
+   * 3s loadRuns loop) also records it when the poll observes the active run
+   * terminal while progress still says in-flight — the WS-drop degraded
+   * path must not silently reinstate the off-Run-tab silence this state
+   * exists to fix. Known gap: that poll only runs while the Run tab body is
+   * mounted, so a WS drop with the Run tab closed still surfaces the
+   * outcome only on the next Run-tab visit.
+   */
+  lastRunOutcome: RunOutcome | null;
   /**
    * Sessions whose user ticked "don't ask again" on the pre-run egress
    * disclosure (elspeth-c18ad229cc). In-memory only (a page reload re-arms
@@ -67,13 +135,20 @@ interface ExecutionState {
 
   validate: (sessionId: string, options?: ValidateOptions) => Promise<boolean>;
   setValidationResult: (result: ValidationResult | null) => void;
-  execute: (sessionId: string, fanoutAck?: ExecutionFanoutAck) => Promise<string | null>;
+  execute: (
+    sessionId: string,
+    fanoutAck?: ExecutionFanoutAck,
+    secretAck?: ExecutionSecretAck,
+  ) => Promise<string | null>;
   confirmFanoutExecution: () => Promise<string | null>;
   dismissFanoutGuard: () => void;
+  confirmSecretExecution: () => Promise<string | null>;
+  dismissSecretGuard: () => void;
   acknowledgeRunDisclosure: (sessionId: string) => void;
   clearRunDisclosureAcks: () => void;
+  acknowledgeRunOutcome: () => void;
   cancel: (runId: string) => Promise<void>;
-  loadRuns: (sessionId: string) => Promise<void>;
+  loadRuns: (sessionId: string) => Promise<RunHistoryLoadOutcome>;
   rehydrateActiveRun: (sessionId: string) => Promise<void>;
   loadRunDiagnostics: (runId: string) => Promise<void>;
   evaluateRunDiagnostics: (runId: string) => Promise<void>;
@@ -138,6 +213,8 @@ function describePendingInterpretation(event: InterpretationEvent): string {
       return `Resolve the pipeline decision for ${nodeLabel} before running.`;
     case "llm_model_choice":
       return `Set the LLM model choice for ${nodeLabel} before running.`;
+    case "source_data_contract":
+      return `Acknowledge the data contract for ${nodeLabel} before running.`;
     case "vague_term":
     case null:
       return `Resolve the pending interpretation for ${nodeLabel} before running.`;
@@ -313,9 +390,26 @@ function applyRunEvent(
     );
   }
 
+  // Terminal transition for the run this tab owns → record the outcome for
+  // the always-mounted surfaces (RunOutcomeNotice, Run-tab badge). The
+  // run_id guard pins the RUN (a stale event for a superseded run can never
+  // masquerade as the active run's outcome) but NOT the session — so the
+  // session is copied from activeRunSessionId, captured at launch, because
+  // the outcome's routing key must be fixed at launch rather than re-derived
+  // from mutable store state (see the activeRunSessionId doc comment).
+  const lastRunOutcome =
+    isTerminal && event.run_id === state.activeRunId
+      ? {
+          runId: event.run_id,
+          status: newProgress.status,
+          sessionId: state.activeRunSessionId,
+        }
+      : state.lastRunOutcome;
+
   return {
     progress: newProgress,
     runs: updatedRuns,
+    lastRunOutcome,
     wsDisconnected: false,
   };
 }
@@ -323,6 +417,7 @@ function applyRunEvent(
 const initialExecutionState = {
   runs: [] as Run[],
   activeRunId: null as string | null,
+  activeRunSessionId: null as string | null,
   progress: null as RunProgress | null,
   diagnosticsByRunId: {} as Record<string, RunDiagnostics>,
   diagnosticsLoadingByRunId: {} as Record<string, boolean>,
@@ -333,10 +428,16 @@ const initialExecutionState = {
   validationResult: null as ValidationResult | null,
   pendingFanoutGuard: null as ExecutionFanoutGuard | null,
   pendingFanoutSessionId: null as string | null,
+  pendingFanoutSecretAck: null as ExecutionSecretAck | null,
+  pendingSecretGuard: null as ExecutionSecretGuard | null,
+  pendingSecretSessionId: null as string | null,
+  pendingSecretFanoutAck: null as ExecutionFanoutAck | null,
   isValidating: false,
+  validationError: null as string | null,
   isExecuting: false,
   wsDisconnected: false,
   error: null as string | null,
+  lastRunOutcome: null as RunOutcome | null,
   runDisclosureAckBySession: {} as Record<string, boolean>,
 };
 
@@ -348,7 +449,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     const compositionState = useSessionStore.getState().compositionState;
     const expectedVersion = options.expectedVersion ?? compositionState?.version ?? null;
     const stateId = compositionState?.id;
-    set({ isValidating: true, validationResult: null, error: null });
+    set({
+      isValidating: true,
+      validationResult: null,
+      validationError: null,
+      error: null,
+    });
     try {
       const result =
         stateId === undefined
@@ -359,7 +465,15 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         set({ isValidating: false });
         return false;
       }
-      set({ validationResult: result, isValidating: false });
+      set({
+        validationResult: result,
+        isValidating: false,
+        validationError: null,
+      });
+      // Validation is also the backend repair seam for review-event debt.
+      // Refresh the independent projection so a repaired card is visible
+      // without requiring a full session reload.
+      void useInterpretationEventsStore.getState().refreshAll(sessionId);
       return true;
     } catch (err) {
       if (requestSeq !== validationRequestSeq) return false;
@@ -374,6 +488,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           : apiErr.detail ?? "Validation failed. Please try again.";
       set({
         isValidating: false,
+        validationError: message,
         error: message,
       });
       // false = caller must not record this version as validated.
@@ -382,10 +497,14 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   setValidationResult(result: ValidationResult | null) {
-    set({ validationResult: result });
+    set({ validationResult: result, validationError: null });
   },
 
-  async execute(sessionId: string, fanoutAck?: ExecutionFanoutAck) {
+  async execute(
+    sessionId: string,
+    fanoutAck?: ExecutionFanoutAck,
+    secretAck?: ExecutionSecretAck,
+  ) {
     const blockedByInterpretation = getRunBlockError(sessionId);
     if (blockedByInterpretation !== null) {
       set({ isExecuting: false, error: blockedByInterpretation });
@@ -396,9 +515,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     set({ isExecuting: true, error: null });
     try {
       const { run_id } =
-        fanoutAck === undefined && stateId === undefined
+        fanoutAck === undefined && secretAck === undefined && stateId === undefined
           ? await api.executePipeline(sessionId)
-          : await api.executePipeline(sessionId, fanoutAck, stateId);
+          : await api.executePipeline(sessionId, fanoutAck, secretAck, stateId);
       if (!shouldApplyExecutionResult(sessionId, requestSeq)) {
         if (requestSeq === executionRequestSeq) {
           set({ isExecuting: false });
@@ -407,9 +526,20 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       }
       set({
         activeRunId: run_id,
+        // The launch session travels with the run: it is the routing key
+        // every outcome record stamps (see the activeRunSessionId doc
+        // comment).
+        activeRunSessionId: sessionId,
         isExecuting: false,
         pendingFanoutGuard: null,
         pendingFanoutSessionId: null,
+        pendingFanoutSecretAck: null,
+        pendingSecretGuard: null,
+        pendingSecretSessionId: null,
+        pendingSecretFanoutAck: null,
+        // A fresh launch supersedes any unacknowledged prior outcome: the
+        // Run-tab badge switches to the live pulse and the toast retires.
+        lastRunOutcome: null,
         progress: {
           source_rows_processed: 0,
           tokens_succeeded: 0,
@@ -440,6 +570,22 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       const apiErr = err as ApiError;
       if (
         apiErr.status === 428 &&
+        apiErr.error_type === "execution_secret_approval_required" &&
+        apiErr.secret_guard
+      ) {
+        set({
+          isExecuting: false,
+          pendingSecretGuard: apiErr.secret_guard,
+          pendingSecretSessionId: sessionId,
+          // A fanout token already acquired on this attempt rides along so
+          // the approved re-send carries both tokens.
+          pendingSecretFanoutAck: fanoutAck ?? null,
+          error: null,
+        });
+        return null;
+      }
+      if (
+        apiErr.status === 428 &&
         apiErr.error_type === "execution_fanout_ack_required" &&
         apiErr.fanout_guard
       ) {
@@ -447,6 +593,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           isExecuting: false,
           pendingFanoutGuard: apiErr.fanout_guard,
           pendingFanoutSessionId: sessionId,
+          // The secret guard fires first, so a secret token approved on
+          // this attempt must survive into the fanout confirm re-send.
+          pendingFanoutSecretAck: secretAck ?? null,
           error: null,
         });
         return null;
@@ -470,10 +619,41 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     if (!pendingGuard || !pendingSessionId) {
       return null;
     }
-    return get().execute(pendingSessionId, {
-      accepted: true,
-      token: pendingGuard.ack_token,
+    if (get().validationResult?.readiness?.execution_ready !== true) {
+      set({
+        isExecuting: false,
+        pendingFanoutGuard: null,
+        pendingFanoutSessionId: null,
+        pendingFanoutSecretAck: null,
+        error: STALE_FANOUT_READINESS_ERROR,
+      });
+      return null;
+    }
+    const heldSecretAck = get().pendingFanoutSecretAck;
+    // Settle the confirmation SYNCHRONOUSLY, before dispatch
+    // (elspeth-8363555f05). The ConfirmDialog is mounted solely off
+    // pendingFanoutGuard, so clearing it here closes the dialog atomically
+    // with the decision to run: a second Execute activation finds no guard
+    // and is a no-op instead of a duplicate dispatch, and no Cancel/Escape/
+    // backdrop affordance survives to read as a successful cancellation
+    // while the request is in flight. Waiting for execute() to clear the
+    // guard after its await left the dialog live for the whole network
+    // round-trip. If the acknowledged dispatch itself returns a fresh 428
+    // (rotated token), execute()'s catch re-arms the guard for a new
+    // explicit confirmation, so atomic settlement cannot dead-end a run.
+    set({
+      pendingFanoutGuard: null,
+      pendingFanoutSessionId: null,
+      pendingFanoutSecretAck: null,
     });
+    return get().execute(
+      pendingSessionId,
+      {
+        accepted: true,
+        token: pendingGuard.ack_token,
+      },
+      heldSecretAck ?? undefined,
+    );
   },
 
   dismissFanoutGuard() {
@@ -481,6 +661,47 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       isExecuting: false,
       pendingFanoutGuard: null,
       pendingFanoutSessionId: null,
+      pendingFanoutSecretAck: null,
+    });
+  },
+
+  async confirmSecretExecution() {
+    const pendingGuard = get().pendingSecretGuard;
+    const pendingSessionId = get().pendingSecretSessionId;
+    if (!pendingGuard || !pendingSessionId) {
+      return null;
+    }
+    if (get().validationResult?.readiness?.execution_ready !== true) {
+      set({
+        isExecuting: false,
+        pendingSecretGuard: null,
+        pendingSecretSessionId: null,
+        pendingSecretFanoutAck: null,
+        error: STALE_FANOUT_READINESS_ERROR,
+      });
+      return null;
+    }
+    const heldFanoutAck = get().pendingSecretFanoutAck;
+    // Settle synchronously before dispatch, for the same reasons as
+    // confirmFanoutExecution above (elspeth-8363555f05): the dialog closes
+    // atomically with the decision, and a re-keyed 428 re-arms the guard.
+    set({
+      pendingSecretGuard: null,
+      pendingSecretSessionId: null,
+      pendingSecretFanoutAck: null,
+    });
+    return get().execute(pendingSessionId, heldFanoutAck ?? undefined, {
+      accepted: true,
+      token: pendingGuard.ack_token,
+    });
+  },
+
+  dismissSecretGuard() {
+    set({
+      isExecuting: false,
+      pendingSecretGuard: null,
+      pendingSecretSessionId: null,
+      pendingSecretFanoutAck: null,
     });
   },
 
@@ -495,6 +716,10 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
 
   clearRunDisclosureAcks() {
     set({ runDisclosureAckBySession: {} });
+  },
+
+  acknowledgeRunOutcome() {
+    set({ lastRunOutcome: null });
   },
 
   connectWebSocket(runId: string) {
@@ -581,26 +806,50 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   async cancel(runId: string) {
     try {
       const result = await api.cancelRun(runId);
-      set((state) => ({
-        runs: state.runs.map((run) =>
-          run.id === runId
-            ? {
-                ...run,
-                status: result.status,
-                cancel_requested: result.cancel_requested,
-              }
-            : run,
-        ),
-        progress:
-          state.activeRunId === runId && state.progress
-            ? {
-                ...state.progress,
-                status: result.status,
-                cancel_requested: result.cancel_requested,
-              }
-            : state.progress,
-        error: null,
-      }));
+      set((state) => {
+        // Cancelling a run that had not started yet takes the backend's
+        // non-Event branch: ExecutionService.cancel writes status="cancelled"
+        // straight to the DB with NO run-event broadcast, and the response
+        // carries that terminal status. Writing it into progress without
+        // also recording the outcome would strand the run twice over — the
+        // toast would wait on the WebSocket's 60s idle recheck, and the
+        // loadRuns degraded-path reconciliation (gated on progress NOT being
+        // terminal) would be disarmed by the very write that needs it. So
+        // cancel() records the outcome itself, symmetric with the WS
+        // terminal branch and the loadRuns fallback; the later WS delivery
+        // becomes a redundant confirmation of the same runId/status rather
+        // than the only source. Stamped with the LAUNCH session for the same
+        // routing-key reason as every other outcome write.
+        const ownsRun = state.activeRunId === runId;
+        return {
+          runs: state.runs.map((run) =>
+            run.id === runId
+              ? {
+                  ...run,
+                  status: result.status,
+                  cancel_requested: result.cancel_requested,
+                }
+              : run,
+          ),
+          progress:
+            ownsRun && state.progress
+              ? {
+                  ...state.progress,
+                  status: result.status,
+                  cancel_requested: result.cancel_requested,
+                }
+              : state.progress,
+          lastRunOutcome:
+            ownsRun && isTerminalRunStatus(result.status)
+              ? {
+                  runId,
+                  status: result.status,
+                  sessionId: state.activeRunSessionId,
+                }
+              : state.lastRunOutcome,
+          error: null,
+        };
+      });
     } catch (err) {
       const apiErr = err as ApiError;
       set({ error: apiErr.detail ?? "Failed to cancel run." });
@@ -610,10 +859,47 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   async loadRuns(sessionId: string) {
     try {
       const runs = await api.fetchRuns(sessionId);
-      if (!shouldApplyRunListResult(sessionId)) return;
-      set({ runs });
+      if (!shouldApplyRunListResult(sessionId)) return "stale";
+      set((state) => {
+        // Degraded-path reconciliation (WS drop): when the poll observes the
+        // active run terminal while progress still claims in-flight, the WS
+        // terminal event was lost — record the outcome (stamped with the
+        // LAUNCH session) and reconcile progress.status so the always-mounted
+        // surfaces (toast, badge) and ProgressView retire instead of showing
+        // a live run forever. Known gap: this poll only runs while the Run
+        // tab body is mounted (InlineRunResults' 3s loop), so a WS drop with
+        // the Run tab closed still surfaces only on the next Run-tab visit.
+        const activeRow =
+          state.activeRunId !== null
+            ? runs.find((run) => run.id === state.activeRunId)
+            : undefined;
+        if (
+          activeRow !== undefined &&
+          isTerminalRunStatus(activeRow.status) &&
+          state.progress !== null &&
+          !isTerminalRunStatus(state.progress.status)
+        ) {
+          return {
+            runs,
+            progress: {
+              ...state.progress,
+              status: activeRow.status,
+              cancel_requested: false,
+              accounting: activeRow.accounting ?? state.progress.accounting,
+            },
+            lastRunOutcome: {
+              runId: activeRow.id,
+              status: activeRow.status,
+              sessionId: state.activeRunSessionId,
+            },
+          };
+        }
+        return { runs };
+      });
+      return "loaded";
     } catch {
       // Non-critical -- runs list can be stale temporarily
+      return "unavailable";
     }
   },
 
@@ -646,6 +932,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     if (get().activeRunId !== null) return;
     set({
       activeRunId: liveRun.id,
+      activeRunSessionId: sessionId,
       progress: {
         source_rows_processed: 0,
         tokens_succeeded: 0,
@@ -751,7 +1038,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   clearValidation() {
-    set({ validationResult: null });
+    set({ validationResult: null, validationError: null });
   },
 
   reset() {

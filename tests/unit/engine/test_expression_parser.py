@@ -1044,6 +1044,16 @@ class TestExpressionParserFuzz:
             self._assert_safe_parse(expr)
 
 
+class TestIsConstantExpression:
+    @pytest.mark.parametrize("expression", ["True", "False", "None", "42", "3.14", "'route'"])
+    def test_bare_literals_read_no_row_data(self, expression: str) -> None:
+        assert ExpressionParser(expression).is_constant_expression() is True
+
+    @pytest.mark.parametrize("expression", ["row['x']", "row.get('x')", "row['x'] > 0", "'a' if row['x'] else 'b'"])
+    def test_row_dependent_expressions_are_not_constant(self, expression: str) -> None:
+        assert ExpressionParser(expression).is_constant_expression() is False
+
+
 class TestIsBooleanExpression:
     """Tests for is_boolean_expression() static type detection."""
 
@@ -1516,6 +1526,266 @@ class TestExpressionValidatorFailClosed:
         assert parser.evaluate({"a": 1, "b": 3}) is True
 
 
+class TestEvaluatorFailClosed:
+    """Verify the evaluator raises for AST node types it has no arm for.
+
+    _ExpressionEvaluator.visit() must reject any node type outside
+    _ALLOWED_EXPR_TYPES (plus the ast.Expression root wrapper). Without the
+    guard, a validator-allowed-but-evaluator-uncovered node falls through to
+    generic_visit and silently returns None, so a gate routes on the falsy
+    branch instead of failing loudly.
+    """
+
+    def test_uncovered_expr_node_raises_security_error(self) -> None:
+        """A node type with no evaluator arm raises ExpressionSecurityError.
+
+        Uses a synthetic ast.expr subclass rather than a real forbidden type
+        (e.g. JoinedStr): forbidden types are validator-rejected, so a test
+        keyed on one would silently invert its meaning if the type ever
+        moved between the allowed and forbidden sets.
+        """
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        class FakeExpr(_ast.expr):
+            _fields = ()
+
+        fake_node = FakeExpr()
+        fake_node.lineno = 1
+        fake_node.col_offset = 0
+        fake_node.end_lineno = 1
+        fake_node.end_col_offset = 1
+
+        evaluator = _ExpressionEvaluator({"x": 42})
+        with pytest.raises(ExpressionSecurityError, match="FakeExpr"):
+            evaluator.visit(fake_node)
+
+    def test_compound_allowed_expression_still_evaluates(self) -> None:
+        """Over-strictness control: every allowed node type passes the guard.
+
+        Exercises Name/Subscript/Attribute/Call/Compare/BoolOp/BinOp/UnaryOp/
+        Constant/List/Dict/Tuple/Set/IfExp in executed positions.
+        """
+        parser = ExpressionParser(
+            "(len(row['tags']) + (0 if row.get('missing') is None else 1)) == 1"
+            " and row['x'] >= 2"
+            " and not (row['x'] in [10, 20])"
+            " and row['x'] in {2, 3}"
+            " and row['x'] in (2, 4)"
+            " and {'k': row['x']} == {'k': 2}"
+        )
+        assert parser.evaluate({"tags": ["t1"], "x": 2}) is True
+
+    def test_expression_root_wrapper_admitted(self) -> None:
+        """The ast.Expression root is admitted despite not being an ast.expr."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        tree = _ast.parse("row['x'] == 1", mode="eval")
+        evaluator = _ExpressionEvaluator({"x": 1})
+        assert evaluator.visit(tree) is True
+
+    def test_structural_node_rejected(self) -> None:
+        """Non-ast.expr structural nodes raise too — the strictness delta.
+
+        The evaluator guard deliberately omits the validator's
+        isinstance(node, ast.expr) qualifier: the evaluator never visits
+        structural children, so ast.Load reaching visit() is a framework
+        bug. FakeExpr alone cannot pin this — it IS an ast.expr, so a
+        weaker validator-shaped guard would still pass that test while
+        silently returning None for structural nodes.
+        """
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        evaluator = _ExpressionEvaluator({"x": 1})
+        with pytest.raises(ExpressionSecurityError, match="Load"):
+            evaluator.visit(_ast.Load())
+
+
+class TestVisitorCouplingAssertion:
+    """The import-time visitor/type coupling check is a testable mechanism."""
+
+    def test_missing_handler_raises_type_error(self) -> None:
+        """An expected type without a visit_* arm fails the coupling check."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _assert_visitor_coupling
+
+        class MismatchedVisitor(_ast.NodeVisitor):
+            def visit_Name(self, node: _ast.Name) -> None:
+                pass
+
+        with pytest.raises(TypeError, match="without visit_"):
+            _assert_visitor_coupling(MismatchedVisitor, {"Name", "Call"}, label="synthetic")
+
+    def test_orphan_visitor_raises_type_error(self) -> None:
+        """A visit_* arm without an expected type entry fails the coupling check."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _assert_visitor_coupling
+
+        class OrphanVisitor(_ast.NodeVisitor):
+            def visit_Name(self, node: _ast.Name) -> None:
+                pass
+
+        with pytest.raises(TypeError, match="without type entry"):
+            _assert_visitor_coupling(OrphanVisitor, set(), label="synthetic")
+
+    def test_matched_visitor_passes(self) -> None:
+        """A visitor whose arms exactly match the expected set passes."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _assert_visitor_coupling
+
+        class MatchedVisitor(_ast.NodeVisitor):
+            def visit_Name(self, node: _ast.Name) -> None:
+                pass
+
+        _assert_visitor_coupling(MatchedVisitor, {"Name"}, label="synthetic")
+
+    def test_production_visitors_satisfy_their_coupling_relations(self) -> None:
+        """The coupling relation holds for both production visitors.
+
+        The import-time _assert_visitor_coupling calls enforce this at
+        module load; this test re-derives the relation independently so
+        deleting one of those calls (which would silently drop the
+        enforcement) is caught here rather than never.
+        """
+        from elspeth.core.expression_parser import (
+            _ALLOWED_EXPR_TYPES,
+            _HANDLED_EXPR_TYPES,
+            _ExpressionEvaluator,
+            _ExpressionValidator,
+        )
+
+        def arm_names(visitor_cls: type) -> set[str]:
+            return {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_")}
+
+        assert arm_names(_ExpressionValidator) == {t.__name__ for t in _HANDLED_EXPR_TYPES}
+        assert arm_names(_ExpressionEvaluator) == {t.__name__ for t in _ALLOWED_EXPR_TYPES} | {"Expression"}
+
+
+class TestStringAmplificationRisk:
+    """has_string_amplification_risk(): Mult/Mod with a can-be-string operand.
+
+    THREAT-001: str repetition (s * n) and printf-style formatting (fmt % x)
+    allocate output linear in their inputs, and is_provably_non_routable()
+    deliberately leaves Mult/Mod routable — so the property that makes them
+    dangerous exempts them from that guard. The predicate classifies by
+    POLARITY (operand not provably numeric under _is_non_routable_node), not
+    node shape, so str-returning Call operands fire the moment such builtins
+    exist in _SAFE_BUILTINS.
+    """
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "row['name'] * 1000",  # Subscript operand — the staging repro
+            "1000 * row['name']",  # commuted
+            "row['fmt'] % row['x']",  # printf-style formatting
+            "row['x'] * row['y']",  # both operands unknown
+            "(row['x'] * 1000) == 'aaa'",  # amplifying BinOp below the root
+            "row.get('name') * 50",  # .get() form is row-derived too
+        ],
+    )
+    def test_fires_when_an_operand_can_be_string(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_string_amplification_risk() is True
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "len(row['x']) * 1000",  # numeric Call operand — polarity, not shape
+            "abs(row['x']) % 3",
+            "2 * 3",
+            "row['x'] + 1",  # Add is not an amplifying operator
+            "row['x'] > 5",  # no Mult/Mod at all
+            "-row['x'] * 4",  # unary minus proves the operand numeric
+        ],
+    )
+    def test_quiet_when_no_string_polarity(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_string_amplification_risk() is False
+
+    def test_polarity_not_shape_for_call_operands(self) -> None:
+        """A str-capable Call operand fires; a numeric one does not.
+
+        Pinned on a raw (unvalidated) AST because no str-returning builtin
+        exists before A3 — ``lower`` is validator-rejected today. A
+        Subscript-shape probe would pass every other test in this class and
+        silently reopen the hole the moment A3's builtins land.
+        """
+        import ast as _ast
+
+        parser = ExpressionParser("row['x'] == 1")
+        amplifying = _ast.parse("lower(row['x']) * 1000", mode="eval").body
+        numeric = _ast.parse("len(row['x']) * 1000", mode="eval").body
+        assert parser._node_has_string_amplification(amplifying) is True
+        assert parser._node_has_string_amplification(numeric) is False
+
+
+class TestCaseFoldingBuiltins:
+    """A3 (elspeth-38dffd9bec): lower/upper/strip/casefold in function-call form.
+
+    str→str case folding coerces nothing — the no-coercion doctrine targets
+    type coercion (int/str/float/bool). The callables MUST be the unbound
+    str.* descriptors, not lambdas: str.lower(5) raises TypeError, which
+    visit_Call wraps into a clean ExpressionEvaluationError; a lambda's
+    AttributeError rides evaluate()'s crash-through tuple into the web
+    process unwrapped.
+    """
+
+    @pytest.mark.parametrize(
+        ("expression", "row", "expected"),
+        [
+            ("lower(row['x'])", {"x": "AbC"}, "abc"),
+            ("upper(row['x'])", {"x": "AbC"}, "ABC"),
+            ("casefold(row['x'])", {"x": "Straße"}, "strasse"),
+            ("strip(row['x'])", {"x": "  padded  "}, "padded"),
+            ("strip(row['x'], 'z')", {"x": "zzabczz"}, "abc"),  # 2-arg surface, pinned
+        ],
+    )
+    def test_evaluates_on_str_input(self, expression: str, row: dict, expected: str) -> None:
+        assert ExpressionParser(expression).evaluate(row) == expected
+
+    @pytest.mark.parametrize("name", ["lower", "upper", "strip", "casefold"])
+    def test_non_str_input_raises_evaluation_error(self, name: str) -> None:
+        """The descriptor tripwire: TypeError wrapped clean, never an
+        AttributeError riding the crash-through tuple."""
+        parser = ExpressionParser(f"{name}(row['x'])")
+        with pytest.raises(ExpressionEvaluationError):
+            parser.evaluate({"x": 5})
+
+    @pytest.mark.parametrize("name", ["lower", "upper", "strip", "casefold"])
+    def test_stays_routable(self, name: str) -> None:
+        """str-returning builtins must stay routable (route labels are str) —
+        they must never join _ALWAYS_NUMERIC_BUILTINS."""
+        assert ExpressionParser(f"{name}(row['x'])").is_provably_non_routable() is False
+
+    @pytest.mark.parametrize("name", ["replace", "split", "format", "title"])
+    def test_other_str_builtins_still_rejected(self, name: str) -> None:
+        with pytest.raises(ExpressionSecurityError):
+            ExpressionParser(f"{name}(row['x'])")
+
+    def test_bare_name_reference_still_rejected(self) -> None:
+        with pytest.raises(ExpressionSecurityError):
+            ExpressionParser("lower")
+
+    def test_method_call_form_still_rejected(self) -> None:
+        """Only the function-call form is admitted; attribute access stays
+        closed to row.get."""
+        with pytest.raises(ExpressionSecurityError):
+            ExpressionParser("row['x'].lower()")
+
+    def test_amplification_regression_takes_a2_path(self) -> None:
+        """The A2-before-A3 ordering, mechanically enforced: the first
+        str-producing builtins widen what Mult/Mod can amplify, and the
+        polarity predicate must fire on the Call-operand form."""
+        assert ExpressionParser("lower(row['x']) * 1000000").has_string_amplification_risk() is True
+
+
 class TestExpressionParserDictContext:
     """Tests for evaluating expressions against plain dict contexts.
 
@@ -1681,3 +1951,54 @@ class TestExpressionParserBoundaryGuards:
         parser = ExpressionParser("1e308 * 10")
         with pytest.raises(ExpressionEvaluationError, match="non-finite float"):
             parser.evaluate({})
+
+
+class TestStaticFieldReads:
+    """Static enumeration of top-level fields an expression reads."""
+
+    def test_literal_subscript_reads(self) -> None:
+        reads = ExpressionParser("row['a'] + row['b']['c']").static_field_reads()
+        assert reads.fields == frozenset({"a", "b"})
+        assert reads.complete is True
+
+    def test_get_call_reads(self) -> None:
+        reads = ExpressionParser("row.get('x') is not None").static_field_reads()
+        assert reads.fields == frozenset({"x"})
+        assert reads.complete is True
+
+    def test_no_row_reference_is_empty_and_complete(self) -> None:
+        reads = ExpressionParser("1 + 1").static_field_reads()
+        assert reads.fields == frozenset()
+        assert reads.complete is True
+
+    def test_dynamic_subscript_key_marks_incomplete(self) -> None:
+        reads = ExpressionParser("row[row['k']]").static_field_reads()
+        assert "k" in reads.fields
+        assert reads.complete is False
+
+    def test_non_string_constant_key_marks_incomplete(self) -> None:
+        reads = ExpressionParser("row[0]").static_field_reads()
+        assert reads.complete is False
+
+    def test_nested_subscript_counts_only_top_level_field(self) -> None:
+        reads = ExpressionParser("row['item']['product']").static_field_reads()
+        assert reads.fields == frozenset({"item"})
+        assert reads.complete is True
+
+    def test_namespace_mode_reads_named_root(self) -> None:
+        parser = ExpressionParser(
+            "collections['facts']['count'] > 0",
+            allowed_names=["collections"],
+        )
+        reads = parser.static_field_reads("collections")
+        assert reads.fields == frozenset({"facts"})
+        assert reads.complete is True
+
+    def test_namespace_mode_other_root_reads_nothing(self) -> None:
+        parser = ExpressionParser(
+            "collections['facts']['count'] > 0",
+            allowed_names=["collections"],
+        )
+        reads = parser.static_field_reads("row")
+        assert reads.fields == frozenset()
+        assert reads.complete is True

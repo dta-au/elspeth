@@ -9,11 +9,24 @@ import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
+from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved
-from elspeth.web.sessions._guided_step_chat import Step1SourceResolvedResult, Step2SinkResolvedResult, StepChatResult
+from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint
+from elspeth.web.sessions._guided_step_chat import (
+    GuidedStepDeferredIntentWithheldResolutionResult,
+    Step1SourceResolvedResult,
+    Step2SinkResolvedResult,
+    StepChatResult,
+)
 from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
-from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session, _outputs_path
+from tests.integration.web.composer.guided import test_respond as guided_respond_tests
+from tests.integration.web.composer.guided.test_step_chat import (
+    TestStepChatCrossStep,
+    _create_session,
+    _outputs_path,
+    _session_outputs_path,
+)
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -49,6 +62,26 @@ async def _resolved_source_provider(**_kwargs: object) -> GuidedChatProviderOutc
             error_class=None,
         ),
         resolution=resolution,
+        deferred_actions=(),
+    )
+
+
+def _retained_passthrough_action() -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind="transform",
+        catalog_name="passthrough",
+        redacted_summary="Include passthrough during topology authoring.",
+        constraints=(
+            ComponentCountConstraint(
+                kind="component_count",
+                component_kind="node",
+                plugin_kind="transform",
+                plugin_name="passthrough",
+                operator="at_least",
+                count=1,
+            ),
+        ),
     )
 
 
@@ -135,7 +168,7 @@ def test_step_2_chat_projects_sink_selection_without_committing_an_output(
                 name="main",
                 plugin="json",
                 options={
-                    "path": _outputs_path(client, "chat-output.jsonl"),
+                    "path": _session_outputs_path(client, session_id, "chat-output.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -156,6 +189,7 @@ def test_step_2_chat_projects_sink_selection_without_committing_an_output(
                 error_class=None,
             ),
             sink=sink,
+            deferred_actions=(),
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", sink_provider)
@@ -171,3 +205,280 @@ def test_step_2_chat_projects_sink_selection_without_committing_an_output(
     refreshed = client.get(f"/api/sessions/{session_id}/guided").json()
     assert refreshed["next_turn"] == response_json["next_turn"]
     assert refreshed["composition_state"]["outputs"] == []
+
+
+def test_applied_sink_chat_revision_cannot_replace_hidden_form_state(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model resolution cannot replace values hidden from its projection."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    staged = guided_respond_tests.TestStep2IntraStep()._stage_proposal(
+        client,
+        session_id,
+        filename="operator-owned.jsonl",
+    )
+    proposal_turn = staged["next_turn"]
+    target = next(candidate for candidate in proposal_turn["payload"]["edit_targets"] if candidate["kind"] == "output")
+    entered = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": proposal_turn["turn_token"],
+            "proposal_id": proposal_turn["payload"]["proposal_id"],
+            "draft_hash": proposal_turn["payload"]["draft_hash"],
+            "edit_target": target,
+        },
+    )
+    assert entered.status_code == 200, entered.json()
+    edit_body = entered.json()
+    edit_turn = edit_body["next_turn"]
+    assert edit_turn["type"] == "schema_form"
+    guided_before = guided_respond_tests._full_guided_session(edit_body)
+    reviewed_before = guided_before["reviewed_outputs"][target["stable_id"]]
+    pending_before = guided_before["pending_output_intents"]
+    assert reviewed_before["name"] == "output"
+    assert reviewed_before["options"]["path"].endswith("operator-owned.jsonl")
+    assert reviewed_before["options"]["collision_policy"] == "auto_increment"
+    assert reviewed_before["on_write_failure"] == "discard"
+
+    replacement = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="model-authored-name",
+                plugin="json",
+                options={
+                    "path": _outputs_path(client, "model-overwrite.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "fail_if_exists",
+                },
+                required_fields=("category",),
+                schema_mode="observed",
+                on_write_failure="model-failure-sink",
+            ),
+        )
+    )
+
+    async def malicious_revision_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return Step2SinkResolvedResult(
+            chat=StepChatResult(
+                assistant_message="I replaced the output settings.",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            sink=replacement,
+            deferred_actions=(),
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", malicious_revision_provider)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(edit_turn, "Change only the output description."),
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert "wizard form is authoritative" in body["assistant_message"]
+    assert body["next_turn"] == edit_turn
+    guided_after = guided_respond_tests._full_guided_session(body)
+    assert guided_after["active_edit_target"] == target
+    assert guided_after["reviewed_outputs"][target["stable_id"]] == reviewed_before
+    assert guided_after["pending_output_intents"] == pending_before
+
+
+def test_applied_source_chat_revision_cannot_replace_hidden_form_state(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The source form remains authoritative over values absent from chat context."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    staged = guided_respond_tests.TestStep2IntraStep()._stage_proposal(
+        client,
+        session_id,
+        filename="source-revision.jsonl",
+    )
+    proposal_turn = staged["next_turn"]
+    target = next(candidate for candidate in proposal_turn["payload"]["edit_targets"] if candidate["kind"] == "source")
+    entered = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": proposal_turn["turn_token"],
+            "proposal_id": proposal_turn["payload"]["proposal_id"],
+            "draft_hash": proposal_turn["payload"]["draft_hash"],
+            "edit_target": target,
+        },
+    )
+    assert entered.status_code == 200, entered.json()
+    edit_body = entered.json()
+    edit_turn = edit_body["next_turn"]
+    assert edit_turn["type"] == "schema_form"
+    guided_before = guided_respond_tests._full_guided_session(edit_body)
+    reviewed_before = guided_before["reviewed_sources"][target["stable_id"]]
+    pending_before = guided_before["pending_source_intents"]
+    assert reviewed_before["name"] == "source"
+    assert reviewed_before["plugin"] == "csv"
+    assert reviewed_before["options"]["path"]
+    assert reviewed_before["on_validation_failure"] == "discard"
+
+    replacement = Step1SourceChatResolution(
+        assistant_message="I replaced the source settings.",
+        plugin="csv",
+        filename="model-overwrite.csv",
+        mime_type="text/csv",
+        content="model_field\nmodel_value\n",
+        options={
+            "delimiter": "|",
+            "schema": {"mode": "observed"},
+        },
+        observed_columns=("model_field",),
+        sample_rows=({"model_field": "model_value"},),
+        on_validation_failure="quarantine",
+    )
+
+    async def malicious_revision_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return Step1SourceResolvedResult(
+            chat=StepChatResult(
+                assistant_message=replacement.assistant_message,
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            resolution=replacement,
+            deferred_actions=(),
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", malicious_revision_provider)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(edit_turn, "Change only the source description."),
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert "wizard form is authoritative" in body["assistant_message"]
+    assert body["next_turn"] == edit_turn
+    guided_after = guided_respond_tests._full_guided_session(body)
+    assert guided_after["active_edit_target"] == target
+    assert guided_after["reviewed_sources"][target["stable_id"]] == reviewed_before
+    assert guided_after["pending_source_intents"] == pending_before
+
+
+@pytest.mark.parametrize("target_kind", ["source", "output"])
+def test_form_directed_stale_pair_keeps_retain_without_chat_rebuild_instruction(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+) -> None:
+    """The retain applies, but a withheld revision never invites a chat retry."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    staged = guided_respond_tests.TestStep2IntraStep()._stage_proposal(
+        client,
+        session_id,
+        filename="stale-pair.jsonl",
+    )
+    proposal_turn = staged["next_turn"]
+    target = next(candidate for candidate in proposal_turn["payload"]["edit_targets"] if candidate["kind"] == target_kind)
+    entered = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": proposal_turn["turn_token"],
+            "proposal_id": proposal_turn["payload"]["proposal_id"],
+            "draft_hash": proposal_turn["payload"]["draft_hash"],
+            "edit_target": target,
+        },
+    )
+    assert entered.status_code == 200, entered.json()
+    edit_body = entered.json()
+    edit_turn = edit_body["next_turn"]
+    guided_before = guided_respond_tests._full_guided_session(edit_body)
+    reviewed_key = "reviewed_sources" if target_kind == "source" else "reviewed_outputs"
+    reviewed_before = guided_before[reviewed_key][target["stable_id"]]
+
+    generic_fallback = (
+        f"I couldn't apply the {target_kind} configuration from that message, so your pipeline {target_kind} is unchanged. "
+        f"Describe the {target_kind} again and I'll rebuild it."
+    )
+
+    async def stale_pair_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return GuidedStepDeferredIntentWithheldResolutionResult(
+            chat=StepChatResult(
+                assistant_message=generic_fallback,
+                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                latency_ms=1,
+                error_class="PairedResolutionNotResent",
+            ),
+            actions=(_retained_passthrough_action(),),
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", stale_pair_provider)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(
+            edit_turn,
+            f"Keep the current {target_kind} settings, and later add the passthrough transform.",
+        ),
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    message = body["assistant_message"]
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert "wizard form" in message
+    assert "I saved that instruction for the topology stage." in message
+    assert "rebuild" not in message.lower()
+    assert "describe the" not in message.lower()
+    assert "resend" not in message.lower()
+    assert body["next_turn"] == edit_turn
+    guided_after = guided_respond_tests._full_guided_session(body)
+    assert guided_after["active_edit_target"] == target
+    assert guided_after[reviewed_key][target["stable_id"]] == reviewed_before
+    (retained,) = guided_after["deferred_intents"]
+    assert retained["catalog_kind"] == "transform"
+    assert retained["catalog_name"] == "passthrough"
+
+
+def test_route_settlement_preserves_resolution_open_duplicate_action_custody(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The solver's immutable tuple reaches durable settlement without deduping."""
+
+    client = composer_test_client
+    session_id = _create_session(client)
+    current = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert current["guided_session"]["step"] == "step_1_source"
+    turn = current["next_turn"]
+    action = _retained_passthrough_action()
+
+    async def withheld_resolution_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return GuidedStepDeferredIntentWithheldResolutionResult(
+            chat=StepChatResult(
+                assistant_message="I did not apply the current-stage resolution.",
+                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                latency_ms=1,
+                error_class="PairedResolutionNotResent",
+            ),
+            actions=(action, action),
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", withheld_resolution_provider)
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(turn, "Later add passthrough for each of the two stated topology requirements."),
+    )
+
+    assert response.status_code == 200, response.json()
+    guided_after = guided_respond_tests._full_guided_session(response.json())
+    retained = guided_after["deferred_intents"]
+    assert len(retained) == 2
+    assert [intent["catalog_name"] for intent in retained] == ["passthrough", "passthrough"]
+    assert retained[0]["intent_id"] != retained[1]["intent_id"]

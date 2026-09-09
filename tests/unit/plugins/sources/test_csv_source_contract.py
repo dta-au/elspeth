@@ -193,3 +193,36 @@ class TestCSVSourceContract:
         contract = source.get_schema_contract()
         assert contract is not None
         assert contract.locked is True
+
+    def test_mixed_case_header_contract_carries_original_name(self, tmp_path: Path, mock_context: PluginContext) -> None:
+        """A mixed-case header resolves to its normalized declared name in the contract.
+
+        Pins the contract layer independently of the pydantic layer
+        (elspeth-3664e213c4): declared ``ticketid`` against header ``TicketID``
+        must register one field with normalized_name='ticketid' AND
+        original_name='TicketID' — not an identity entry keyed by the declared
+        name that leaves the header unrepresented.
+        """
+        csv_file = tmp_path / "tickets.csv"
+        csv_file.write_text("TicketID,CustomerName\nT-1,Alice\n")
+
+        source = CSVSource(
+            {
+                "path": str(csv_file),
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["ticketid: str", "customername: str"],
+                },
+                "on_validation_failure": "quarantine",
+            }
+        )
+
+        rows = list(source.load(mock_context))
+        assert len(rows) == 1
+        assert rows[0].is_quarantined is False
+
+        contract = source.get_schema_contract()
+        assert contract is not None
+        fields_by_name = {f.normalized_name: f for f in contract.fields}
+        assert fields_by_name["ticketid"].original_name == "TicketID"
+        assert fields_by_name["customername"].original_name == "CustomerName"

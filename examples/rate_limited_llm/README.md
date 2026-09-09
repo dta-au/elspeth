@@ -16,8 +16,15 @@ source ─(source_out)─> llm (30 req/min) ─┬─ results.json
 Start the ChaosLLM server:
 
 ```bash
-chaosllm serve --port 8199 --preset=realistic
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
+chaosllm serve --port 8199 --preset=realistic --workers=1
 ```
+
+`ELSPETH_FINGERPRINT_KEY` protects the audit fingerprint of the fake inline
+token. It is not an OpenRouter credential: the configured endpoint is the
+local server at `127.0.0.1`, and no request leaves the machine.
 
 ## Running
 
@@ -29,6 +36,11 @@ elspeth run --settings examples/rate_limited_llm/settings.yaml --execute
 
 - `output/results.json` — Enriched rows with sentiment analysis (JSONL)
 - `output/quarantined.json` — Rows that failed after all retries
+
+The realistic preset is stochastic. Row-level retry exhaustion produces a
+`PARTIAL` run and process exit 1 after error routing. A fault injected during
+runtime preflight can instead stop the run before source ingestion; rerun the
+example to exercise the row-level rate-limited path.
 
 ## Rate Limit Configuration
 

@@ -10,10 +10,11 @@
 // - Per-tab filter chips for capability tags and audit characteristics
 // - Tab-based filtering by plugin type with counts
 // - Principal/fingerprint-isolated list and schema caches
-// - Sources tab pins an InlineChatSourceEntry as the first row — a
+// - Sources tab pins an InlineChatSourceEntry as the first plugin row — a
 //   synthetic affordance that is unaffected by filters or search and is
 //   always visible alongside the empty-state message when filters
-//   eliminate every real plugin.
+//   eliminate every real plugin. The unavailable-components notice, when
+//   present, precedes it inside the same scrollable tabpanel.
 //
 // Filter state is **per-tab** (one CatalogFilters record per CatalogTab),
 // so an active capability filter on Sources does NOT silently hide every
@@ -32,6 +33,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import type { PluginPolicyFinding, PluginSummary } from "@/types/index";
+import { Button, Input } from "@/components/ui";
 import { PluginCard, PREFILL_CHAT_INPUT_EVENT } from "./PluginCard";
 import { FilterChipStrip, type CatalogFilters } from "./FilterChipStrip";
 import { InlineChatSourceEntry } from "./InlineChatSourceEntry";
@@ -41,7 +43,20 @@ import {
   confidenceFromScore,
   fuzzyMatch,
 } from "@/utils/fuzzyScore";
-import { pluginDisplayName } from "./pluginDisplayName";
+import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+import { UnavailableComponentRow, unavailablePluginDisplayName } from "./UnavailableComponentRow";
+
+/**
+ * Drop internal-machinery plugins from a catalog tab's list, preserving the
+ * `null` "not loaded yet" state so loading checks keep working.
+ */
+function hideInternal(
+  plugins: PluginSummary[] | null,
+): PluginSummary[] | null {
+  return plugins === null
+    ? null
+    : plugins.filter((plugin) => !isInternalPlugin(plugin.name));
+}
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -154,9 +169,9 @@ interface CatalogDrawerProps {
 export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
   const [activeTab, setActiveTab] = useState<CatalogTab>("sources");
   const principal = useAuthStore((state) => state.user?.user_id ?? null);
-  const sources = usePluginCatalogStore((state) => state.sources);
-  const transforms = usePluginCatalogStore((state) => state.transforms);
-  const sinks = usePluginCatalogStore((state) => state.sinks);
+  const rawSources = usePluginCatalogStore((state) => state.sources);
+  const rawTransforms = usePluginCatalogStore((state) => state.transforms);
+  const rawSinks = usePluginCatalogStore((state) => state.sinks);
   const schemaCache = usePluginCatalogStore((state) => state.schemas);
   const schemaErrors = usePluginCatalogStore((state) => state.schemaErrors);
   const fetchError = usePluginCatalogStore((state) => state.error);
@@ -167,6 +182,24 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
   const storedPolicyFindings = useSessionStore(
     (state) => state.compositionState?.plugin_policy_findings ?? EMPTY_POLICY_FINDINGS,
   );
+  // elspeth-06566208b3: internal machinery — today the resume-only `null`
+  // source — is not part of the user-facing reference catalog. Browsing
+  // Sources is a "what can I read data from?" question, and a source whose
+  // whole contract is "yields no rows" answers it wrongly; its own plugin
+  // assistance tells agents never to pick it for ingestion.
+  //
+  // Filtered HERE, where the arrays enter the drawer, so the rendered cards,
+  // the search results, the filter chips and the per-tab counts all derive
+  // from the same set. Filtering at the render path alone would leave the tab
+  // count one ahead of the cards.
+  //
+  // Frontend-only by design: CatalogServiceImpl.list_sources also feeds
+  // composer and MCP discovery, where `null` must stay resolvable for resume.
+  // `null` is preserved (not []) so the loading-state checks below still read.
+  const sources = useMemo(() => hideInternal(rawSources), [rawSources]);
+  const transforms = useMemo(() => hideInternal(rawTransforms), [rawTransforms]);
+  const sinks = useMemo(() => hideInternal(rawSinks), [rawSinks]);
+
   const policyFindings = useMemo(
     () =>
       catalogFingerprint === null
@@ -397,78 +430,31 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
         <div className="catalog-header">
           <div className="catalog-header-copy">
             <span className="catalog-header-eyebrow">Reference</span>
+            {/* Sentence case, matching CatalogButton's "Plugin catalog" — one
+                surface must not carry two names. This span is the drawer's
+                accessible name via aria-labelledby, so it is also what a
+                screen reader announces on open. */}
             <span id="catalog-drawer-title" className="catalog-header-title">
-              Plugin Catalog
+              Plugin catalog
             </span>
             <span className="catalog-header-subtitle">
               Browse available sources, transforms, and sinks before asking the
               composer to apply them.
             </span>
           </div>
-          <button
+          <Button
             onClick={onClose}
             aria-label="Close plugin catalog"
-            className="btn catalog-close-btn"
+            className="catalog-close-btn"
           >
             ×
-          </button>
+          </Button>
         </div>
-
-        {policyFindings.length > 0 && (
-          <section
-            role="region"
-            aria-labelledby="catalog-disabled-components-title"
-            className="validation-banner validation-banner-fail"
-          >
-            <div
-              id="catalog-disabled-components-title"
-              className="validation-banner-fail-title"
-            >
-              Unavailable saved components
-            </div>
-            <p>
-              These historical components remain visible, but must be removed
-              or replaced before the pipeline can run.
-            </p>
-            <ul className="validation-banner-fail-list">
-              {policyFindings.map((finding) => (
-                <li
-                  key={`${finding.component_id}:${finding.plugin_id}`}
-                  className="validation-banner-error-item"
-                >
-                  <div>
-                    <strong>{finding.component_id}</strong>{" "}
-                    <code>{finding.plugin_id}</code> —{" "}
-                    {unavailableReasonLabel(finding.reason_code)}
-                  </div>
-                  <div className="import-yaml-actions">
-                    <button
-                      type="button"
-                      className="btn btn-small"
-                      aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
-                      onClick={() => handleRemoveDisabled(finding)}
-                    >
-                      Remove
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-small"
-                      aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
-                      onClick={() => handleReplaceDisabled(finding)}
-                    >
-                      Replace
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
 
         {/* Search input */}
         <div className="catalog-search-wrapper">
           <div className="catalog-search-container">
-            <input
+            <Input
               ref={searchInputRef}
               type="text"
               placeholder="Search plugins... (press /)"
@@ -478,7 +464,8 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
               className="catalog-search-input"
             />
             {searchQuery && (
-              <button
+              <Button
+                variant="bare"
                 onClick={() => {
                   setSearchQuery("");
                   searchInputRef.current?.focus();
@@ -487,7 +474,7 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
                 className="catalog-search-clear"
               >
                 ×
-              </button>
+              </Button>
             )}
           </div>
         </div>
@@ -511,8 +498,9 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
             const count = counts[tab];
             const isActive = activeTab === tab;
             return (
-              <button
+              <Button
                 key={tab}
+                variant="bare"
                 role="tab"
                 id={catalogTabId(tab)}
                 aria-controls={catalogPanelId(tab)}
@@ -531,7 +519,7 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
                     {count}
                   </span>
                 )}
-              </button>
+              </Button>
             );
           })}
         </div>
@@ -541,13 +529,71 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
             the fetchError → loading → empty → list conditional ladder so it
             remains visible even when filters eliminate every real plugin.
             The empty-state message applies to the plugin list, not the
-            Sources tab as a whole — the synthetic entry stays usable. */}
+            Sources tab as a whole — the synthetic entry stays usable.
+
+            The unavailable-components notice lives here too, for the same
+            reason and one more (elspeth-98757e13ae): this band is the drawer's
+            only shrinkable one (`.catalog-list` is `flex: 1 1 0%` with
+            `overflow-y: auto`, so its automatic minimum resolves to 0, while
+            the header, search wrapper, chip strip and tab strip all carry
+            `flex-shrink: 0`). Rendered in the drawer FRAME the notice grew
+            without bound and squeezed the list — the content the user came
+            for — towards nothing, and could not scroll itself. Inside the
+            tabpanel it scrolls with the body instead of competing with it. */}
         <div
           id={catalogPanelId(activeTab)}
           role="tabpanel"
           aria-labelledby={catalogTabId(activeTab)}
           className="catalog-list"
         >
+          {policyFindings.length > 0 && (
+            <section
+              role="region"
+              aria-labelledby="catalog-disabled-components-title"
+              className="validation-banner validation-banner-fail"
+            >
+              <div
+                id="catalog-disabled-components-title"
+                className="validation-banner-fail-title"
+              >
+                Unavailable saved components
+              </div>
+              <p>
+                These historical components remain visible, but must be removed
+                or replaced before the pipeline can run.
+              </p>
+              <ul className="validation-banner-fail-list">
+                {policyFindings.map((finding) => (
+                  <UnavailableComponentRow
+                    key={`${finding.component_id}:${finding.plugin_id}`}
+                    finding={finding}
+                    reasonLabel={unavailableReasonLabel(finding.reason_code)}
+                    actions={
+                      <>
+                        <Button
+                          className="btn-small"
+                          aria-label={`Remove disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)})`}
+                          title={finding.plugin_id}
+                          onClick={() => handleRemoveDisabled(finding)}
+                        >
+                          Remove
+                        </Button>
+                        <Button
+                          className="btn-small"
+                          aria-label={`Replace disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
+                          title={finding.plugin_id}
+                          onClick={() => handleReplaceDisabled(finding)}
+                        >
+                          Replace
+                        </Button>
+                      </>
+                    }
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+
           {activeTab === "sources" && (
             <InlineChatSourceEntry onCloseDrawer={onClose} />
           )}
@@ -561,14 +607,13 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
               className="catalog-status-message catalog-status-message--error"
             >
               <span>Failed to load plugin catalog.</span>
-              <button
-                type="button"
-                className="btn btn-small"
+              <Button
+                className="btn-small"
                 onClick={loadCatalog}
                 aria-label="Retry loading plugin catalog"
               >
                 Retry
-              </button>
+              </Button>
             </div>
           ) : isLoading || isFetching ? (
             <div

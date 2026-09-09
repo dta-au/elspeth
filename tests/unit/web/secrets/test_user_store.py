@@ -94,6 +94,35 @@ class TestUserSecretStore:
         value, _ = store.get_secret("TOKEN", user_id="user-1", auth_provider_type="local")
         assert value == "new-value"
 
+    def test_upsert_advances_positive_monotonic_row_version_atomically(self, store: UserSecretStore, db_engine) -> None:
+        store.set_secret("VERSIONED", value="v1", user_id="user-1", auth_provider_type="local")
+        with db_engine.connect() as conn:
+            first = conn.execute(
+                sa.select(user_secrets_table.c.id, user_secrets_table.c.version).where(
+                    sa.and_(
+                        user_secrets_table.c.name == "VERSIONED",
+                        user_secrets_table.c.user_id == "user-1",
+                        user_secrets_table.c.auth_provider_type == "local",
+                    )
+                )
+            ).one()
+
+        store.set_secret("VERSIONED", value="v2", user_id="user-1", auth_provider_type="local")
+        with db_engine.connect() as conn:
+            second = conn.execute(
+                sa.select(user_secrets_table.c.id, user_secrets_table.c.version).where(
+                    sa.and_(
+                        user_secrets_table.c.name == "VERSIONED",
+                        user_secrets_table.c.user_id == "user-1",
+                        user_secrets_table.c.auth_provider_type == "local",
+                    )
+                )
+            ).one()
+
+        assert first.id == second.id
+        assert first.version == 1
+        assert second.version == 2
+
     def test_delete_removes_secret(self, store: UserSecretStore) -> None:
         """Delete then get must raise SecretNotFoundError."""
         store.set_secret("TEMP", value="ephemeral", user_id="user-1", auth_provider_type="local")
@@ -277,9 +306,21 @@ class TestUserSecretStore:
             t.join()
 
         assert errors == [], f"Concurrent writes failed: {errors}"
-        # One value should have won
+        # Every committed write increments the one surviving row's version.
         val, _ = store.get_secret("RACE", user_id="u1", auth_provider_type="local")
         assert val.startswith("v")
+        with engine.connect() as conn:
+            row_count, version = conn.execute(
+                sa.select(sa.func.count(), sa.func.max(user_secrets_table.c.version)).where(
+                    sa.and_(
+                        user_secrets_table.c.name == "RACE",
+                        user_secrets_table.c.user_id == "u1",
+                        user_secrets_table.c.auth_provider_type == "local",
+                    )
+                )
+            ).one()
+        assert row_count == 1
+        assert version == 5
 
     @pytest.mark.parametrize("dialect_name", ["mysql", "mariadb"])
     def test_mysql_family_dialects_use_atomic_upsert_statements(self, dialect_name: str) -> None:

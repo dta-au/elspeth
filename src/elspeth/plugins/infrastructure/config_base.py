@@ -14,15 +14,101 @@ Example usage:
     path = cfg.path  # Direct access, fails fast if missing
 """
 
+import json
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Final, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from elspeth.contracts.emitted_option import (
+    EmittedToOutput,
+    emitted_option_fields,
+    env_placeholders_in,
+)
 from elspeth.contracts.header_modes import HeaderMode, parse_header_mode
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FIELD_TYPE_MAP, SchemaConfig
 
 OutputCollisionPolicy = Literal["fail_if_exists", "auto_increment", "append_or_create"]
+
+# The header-mode option, shared by every sink that writes a header row.
+#
+# Declared once as an annotated alias rather than spelled out per sink. The
+# three declaring models do NOT share a base — ``SinkPathConfig`` descends from
+# ``LocalFileSinkConfig`` while the S3 and Azure sink configs descend straight
+# from ``DataPluginConfig`` — so there is no inherited field to mark, and
+# marking each site by hand is the drift shape this alias exists to prevent.
+# A mixin would unify them but reorders fields in ``model_json_schema()``
+# (inherited fields sort first), which is wire-shape churn for no behavioural
+# gain; the alias changes no emitted schema at all.
+#
+# The CUSTOM mapping form's VALUES are written as the artifact's header row, so
+# a ``${VAR}`` here reaches output bytes as a host environment value
+# (elspeth-8f0a6b3391).
+HeaderModeOption = Annotated[
+    str | dict[str, str] | None,
+    EmittedToOutput("a sink writes these names as the artifact's header row, so the value reaches the output bytes"),
+]
+
+# Shared normalization options for every source/transform that turns external
+# tabular names into pipeline row keys. Several plugin config classes cannot
+# share ``TabularSourceDataConfig`` but do share the same wire fields; aliases
+# keep the output-emission fact attached across those independent declarations.
+NormalizedColumnsOption = Annotated[
+    list[str] | None,
+    EmittedToOutput("each configured column becomes an output row field name and a column in downstream artifacts"),
+]
+NormalizedFieldMappingOption = Annotated[
+    dict[str, str] | None,
+    EmittedToOutput("field-mapping values become normalized output row keys and columns in downstream artifacts"),
+]
+
+# --- Composer-surface help text -------------------------------------------
+#
+# ``Field(description=...)`` is the CLI/YAML truth and stays as-is: it
+# describes what the field means in a hand-authored settings file. The web
+# composer renders these fields as a bare form with no surrounding document,
+# and the web surface is *narrower* than YAML for paths. Those fields carry a
+# ``composer_description`` (and, where the value has internal structure, a
+# ``composer_placeholder``) in ``json_schema_extra``; the catalog's knob
+# lowering substitutes it for ``description`` on that surface only. See
+# ``elspeth.web.catalog.knob_schema._composer_description``.
+
+# The worked example rendered into COMPOSER_SCHEMA_DESCRIPTION. It is data, not
+# prose, so a test can feed this exact object through ``SchemaConfig.from_dict``
+# and prove the help text advertises a shape the parser actually accepts.
+COMPOSER_SCHEMA_EXAMPLE: Final[dict[str, Any]] = {
+    "mode": "fixed",
+    "fields": ["doc_id: str", "page_count: int", "note: str?"],
+}
+
+# The compact form used as the form-input placeholder.
+COMPOSER_SCHEMA_PLACEHOLDER: Final[str] = json.dumps({"mode": "fixed", "fields": ["doc_id: str", "note: str?"]})
+
+# Field types come from the authoritative grammar (FIELD_TYPE_MAP, which
+# FIELD_PATTERN's alternation mirrors) so a new legal type cannot appear in the
+# parser while the help text still lists the old five.
+COMPOSER_SCHEMA_DESCRIPTION: Final[str] = (
+    f"Enter one JSON object. Worked example: {json.dumps(COMPOSER_SCHEMA_EXAMPLE)}. "
+    f'Every entry in "fields" is the string "name: type", where type is one of '
+    f'{", ".join(FIELD_TYPE_MAP)}, and a trailing "?" marks the field optional '
+    f'("note: str?" is an optional string). Field names must be valid Python '
+    f'identifiers — write "doc_id", not "doc-id" or "doc.id". '
+    f'Modes: "fixed" accepts exactly these fields, "flexible" accepts these plus '
+    f'any extras the data carries, and "observed" infers every field from the '
+    f'data — with "observed" leave "fields" out entirely ({{"mode": "observed"}}).'
+)
+
+COMPOSER_PATH_DESCRIPTION: Final[str] = (
+    "On the web surface this field takes one of exactly two values: the sentinel "
+    '"blob:<uuid>" naming a file uploaded to this session — normally prefilled for '
+    "you, so leave it as it is — or a plain path that resolves inside this "
+    "session's own subtree (a source reads from <data_dir>/blobs/<session_id>/; an "
+    "output writes to <data_dir>/outputs/<session_id>/ or "
+    "<data_dir>/blobs/<session_id>/). Every other path is rejected, including "
+    "another session's subtree, a shared or deployment-level directory, and any "
+    "absolute path outside those trees. Hand-authored YAML runs are not confined "
+    "this way."
+)
 
 
 def _plugin_config_field_title(field_name: str, _field_info: Any) -> str:
@@ -189,6 +275,36 @@ class PluginConfig(BaseModel):
         """
         return _validate_schema_config(value, require_dict=False)
 
+    @model_validator(mode="after")
+    def _reject_env_placeholders_in_emitted_options(self) -> Self:
+        """Refuse a raw ``${VAR}`` in any field declared :class:`EmittedToOutput`.
+
+        DERIVED, not restated: the fields come from the model's own annotations,
+        so a plugin declares the fact once on the field and gets this check for
+        free. Nothing here lists a plugin or a field name.
+
+        This is the plugin-side half. It is BYPASSABLE on the CLI/YAML path,
+        where ``_expand_env_vars`` runs before plugin validation and hands this
+        validator an already-expanded host value that no longer matches. The
+        pre-expansion guard in the settings loader closes that window and reads
+        the same declarations. Neither is redundant; both derive from here.
+        """
+        declared = emitted_option_fields(type(self))
+        if not declared:
+            return self
+
+        # Iterating the model yields (field_name, value) for its own fields —
+        # direct access to an owned type, not a dynamic-attribute probe. A
+        # getattr(self, name) here would read as a masquerade site under
+        # ADR-032 and would need baselining, for no gain: the names come from
+        # this model's own model_fields, so nothing about the lookup is
+        # uncertain.
+        for field_name, value in self:
+            reason = declared[field_name] if field_name in declared else None
+            if reason is not None and env_placeholders_in(value):
+                raise ValueError(f"{field_name} must not contain environment-variable placeholders; {reason}")
+        return self
+
     @classmethod
     def from_dict(
         cls,
@@ -328,6 +444,10 @@ class DataPluginConfig(PluginConfig):
             "Use 'schema: {mode: observed}' to infer types from data, or "
             "provide explicit field definitions with mode (fixed/flexible)."
         ),
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
     )
 
 
@@ -342,7 +462,10 @@ class PathConfig(DataPluginConfig):
 
     _component_type_exempt: ClassVar[bool] = True
 
-    path: str = Field(description="Filesystem path for the source input or sink output, resolved relative to the run data directory.")
+    path: str = Field(
+        description="Filesystem path for the source input or sink output, resolved relative to the run data directory.",
+        json_schema_extra={"composer_description": COMPOSER_PATH_DESCRIPTION},
+    )
 
     @field_validator("path")
     @classmethod
@@ -395,6 +518,31 @@ class SourceDataConfig(PathConfig):
         return v.strip()
 
 
+def declared_source_schema_field_names(schema_config: SchemaConfig | None) -> tuple[str, ...]:
+    """Names a source's schema config commits to producing on rows.
+
+    Declared field names (required and optional) plus guaranteed_fields and
+    required_fields entries — observed schemas carry the latter two without
+    declared fields. Deduplicated in first-declaration order so reachability
+    diagnostics report each name once, in the order the author wrote them.
+    """
+    if schema_config is None:
+        return ()
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for group in (
+        tuple(field.name for field in schema_config.fields) if schema_config.fields is not None else (),
+        schema_config.guaranteed_fields or (),
+        schema_config.required_fields or (),
+    ):
+        for name in group:
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return tuple(names)
+
+
 class TabularSourceDataConfig(SourceDataConfig):
     """Config for sources that read tabular external data with headers.
 
@@ -407,11 +555,11 @@ class TabularSourceDataConfig(SourceDataConfig):
     provides clean names for headerless files (mutually exclusive path).
     """
 
-    columns: list[str] | None = Field(
+    columns: NormalizedColumnsOption = Field(
         default=None,
         description="Explicit normalized column names for headerless tabular input.",
     )
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Optional mapping from observed source field names to normalized pipeline field names.",
     )
@@ -428,6 +576,22 @@ class TabularSourceDataConfig(SourceDataConfig):
         # Validate field_mapping values are valid identifiers and not keywords
         if self.field_mapping is not None and self.field_mapping:
             validate_field_names(list(self.field_mapping.values()), "field_mapping values")
+
+        # Reject declared schema names the header resolution can never produce
+        # (elspeth-3664e213c4): headers are normalized to lowercase identifiers
+        # at the source boundary while declared names are used verbatim, so an
+        # unreachable declaration silently discards every row (required fields)
+        # or crashes contract inference (optional fields). Function-local import
+        # keeps the infrastructure->sources dependency contained to this check.
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            from elspeth.plugins.sources.field_normalization import check_declared_fields_reachable
+
+            check_declared_fields_reachable(
+                declared,
+                columns=self.columns,
+                field_mapping=self.field_mapping,
+            )
 
         return self
 
@@ -465,14 +629,29 @@ class LocalFileSinkConfig(PathConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
+    # Conditionally required, not optional. YAML may omit it (the runtime
+    # resolves a default), but the composer refuses a runnable file sink that
+    # does not choose explicitly — see
+    # ``validate_composer_file_sink_collision_policy``. The old "Optional …"
+    # text contradicted that on every surface, and the correct guidance existed
+    # only as an LLM-facing hint on the sink plugins, so a form user was told
+    # the knob was optional and then rejected for omitting it (R2-F2).
     collision_policy: OutputCollisionPolicy | None = Field(
         default=None,
         description=(
-            "Optional local output collision policy. "
+            "Required when mode='write': "
             "'fail_if_exists' refuses an existing write target; "
             "'auto_increment' picks a free sibling path; "
-            "'append_or_create' is valid with append mode."
+            "'append_or_create' only with mode='append'."
         ),
+        json_schema_extra={
+            "composer_description": (
+                "Required when mode is 'write'. 'auto_increment' is the safe default — it picks a free sibling path. "
+                "'fail_if_exists' refuses an existing write target. "
+                "'append_or_create' only with mode='append'."
+            ),
+            "composer_required_when": {"field": "mode", "equals": "write"},
+        },
     )
 
 
@@ -492,7 +671,7 @@ class SinkPathConfig(LocalFileSinkConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
-    headers: str | dict[str, str] | None = Field(
+    headers: HeaderModeOption = Field(
         default=None,
         description=("Header output mode: 'normalized', 'original', or {field: header} mapping"),
     )
@@ -542,6 +721,36 @@ class TransformDataConfig(DataPluginConfig):
     """
 
     _plugin_component_type: ClassVar[str | None] = "transform"
+
+    # Redeclared from DataPluginConfig to state DIRECTION. The inherited wording
+    # ("Schema configuration for data validation") is direction-neutral, and a
+    # transform sits between two contracts, so an author — including the LLM
+    # composer, which reads this exact string — reasonably reads it as "describe
+    # this node's data" and enumerates the node's own OUTPUTS here. That is the
+    # authoring mistake behind elspeth-d6eeb3a71d / elspeth-5955a9c421.
+    #
+    # Deliberately NOT saying "do not list fields this transform creates":
+    # declaring a created field is legal and automatically demoted to optional on
+    # input (BaseTransform.input_schema), and it is the ONLY route to a typed
+    # downstream guarantee — SchemaConfig requires every guaranteed_fields entry
+    # to be declared in `fields` AND marked required. Telling authors to omit
+    # them would forbid the supported path.
+    #
+    # Sources and sinks keep the inherited wording: each has one data contract,
+    # so there is no direction to disambiguate.
+    schema_config: SchemaConfig = Field(
+        ...,
+        alias="schema",
+        description=(
+            "This transform's INPUT contract: the schema of rows arriving from upstream. "
+            "Use 'schema: {mode: observed}' to infer types from data, or "
+            "provide explicit field definitions with mode (fixed/flexible)."
+        ),
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
+    )
 
     required_input_fields: list[str] | None = Field(
         default=None,

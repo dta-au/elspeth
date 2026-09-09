@@ -1,5 +1,5 @@
-/* catalog.css — Catalog drawer, plugin cards, shortcuts help, and audit-icon glyph.
-   Owners: .shortcuts-group, .shortcuts-list*, .plugin-card*, .audit-icon*,
+/* catalog.css — Catalog drawer, plugin cards, shortcuts help, and audit icons.
+   Owners: .shortcuts-*, .plugin-card*, .audit-icon*,
    .catalog-backdrop, .catalog-drawer, .catalog-header*, .catalog-close-btn,
    .catalog-search*, .catalog-tab*, .catalog-list, .filter-chip*,
    .catalog-status-message*, .inline-chat-source-entry*.
@@ -14,6 +14,27 @@
   margin-bottom: var(--space-md);
 }
 
+/* Group headings inside the shortcuts dialog (elspeth-44491d3ea1). The class
+   was applied by ShortcutsHelp.tsx with no rule anywhere, so the four <h3>s
+   fell to the UA default — 18.72px/700 with 18.72px margins, LARGER AND
+   HEAVIER than the dialog's own 18px/600 <h2> title: a measured hierarchy
+   inversion, at a rhythm off the spacing scale. These groups (Actions /
+   Navigation / Reference / Editing) are the same sections the command
+   palette lists, so they take the palette's group-header register
+   (.command-palette-group-header, common.css) — an uppercase xs eyebrow —
+   which sits unambiguously below the dialog title and above the 13px rows.
+   Tracking comes from the letter-spacing scale (the em equivalent of the
+   palette's shipped 0.5px at the 12px floor). */
+.shortcuts-subheading {
+  margin: 0 0 var(--space-sm);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--letter-spacing-normal);
+  line-height: var(--line-height-heading);
+  color: var(--color-text-secondary);
+}
+
 .shortcuts-list {
   margin: 0 0 var(--space-xl);
   padding: 0;
@@ -23,6 +44,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* space-between distributes FREE space, so on the longest rows there is
+     none left and the keycap chip meets its description with zero gutter.
+     The gap guarantees a minimum gutter that survives that case
+     (elspeth-453d9756be). It does not align the dd edges into a column —
+     that would need a fixed dt width or a grid. */
+  gap: var(--space-md);
   padding: var(--space-xs) 0;
   border-bottom: 1px solid var(--color-border);
 }
@@ -52,6 +79,16 @@
   background-color: var(--color-surface);
 }
 
+/* The list must not end on a separator that separates nothing — in a
+   scrollable drawer a trailing rule reads as a card that failed to load
+   below it (elspeth-112aa6c484). The child-combinator form is REQUIRED:
+   CatalogDrawer wraps each card in its own role="listitem" div, so
+   `.plugin-card:last-child` would match EVERY card and delete all the
+   dividers instead of just the last one. */
+.catalog-plugin-list > div:last-child .plugin-card {
+  border-bottom: none;
+}
+
 .plugin-card-header-row {
   display: flex;
   align-items: baseline;
@@ -60,7 +97,7 @@
 }
 
 .plugin-card-name {
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   font-size: var(--font-size-sm);
   color: var(--color-text);
   line-height: 1.25;
@@ -84,26 +121,29 @@
   line-height: 1.25;
 }
 
-/* Internal-machinery badge (e.g. the resume-only "null" source): the
-   catalog is a reference, so internal plugins stay listed but are marked
-   so first-run users do not reach for them. */
-.plugin-card-internal-badge {
-  padding: 0 var(--space-xs);
+/* TYPE SLOT — ONE treatment for every entry in the drawer.
+   The top-right slot of a plugin card (SOURCE / TRANSFORM / SINK) and the
+   same slot on the synthetic inline-chat entry (CHAT INPUT) carry the same
+   semantic role, so they share one bordered-badge recipe and let the LABEL
+   carry the difference between them. Before this they were styled two ways
+   in one position — the first card in the list read as an unfinished
+   special case (elspeth-64ca50785d).
+   Deliberately neutral rather than components/ui/TypeBadge: "chat input" is
+   not one of TypeBadge's pipeline primitives, so a colour-coded TypeBadge
+   could only ever cover the plugin cards and the two slots would diverge
+   again — which is the defect, not the fix. */
+.plugin-card-kind,
+.inline-chat-source-entry-badge {
+  padding: var(--space-2xs) var(--space-1-5);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
+  background-color: var(--color-surface);
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
-  font-weight: 700;
-  line-height: 1.6;
-  text-transform: uppercase;
-}
-
-.plugin-card-kind {
-  color: var(--color-text-muted);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   line-height: 1.2;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .plugin-card-desc {
@@ -136,13 +176,19 @@
   /* secondary not muted: muted is ~3.84:1 on elevated at 10px (fails AA). */
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
-  font-weight: 650;
+  /* Was a raw 650. Inter ships static 400/500/600/700 faces (fonts.css), so
+     CSS font matching resolved 650 UP to 700 — rendering these metadata
+     chips exactly as bold as .plugin-card-name above them and flattening the
+     title-over-metadata hierarchy the value was chosen to create. Semibold
+     is a real face and sits below the title (elspeth-806c5f79ec). */
+  font-weight: var(--font-weight-semibold);
   line-height: 1.2;
 }
 
-.audit-icon-glyph {
-  display: none;
-}
+/* .audit-icon-glyph was deleted together with the hidden emoji span and the
+   glyph metadata column (elspeth-09a1a87051): a dead `display: none` over a
+   populated emoji field was a loaded trap — removing only the rule would have
+   shipped nine emoji outside the sanctioned gear/warning/empty-set glyph set. */
 
 .audit-icon-positive {
   color: var(--color-success);
@@ -183,7 +229,12 @@
   border-top: 1px solid var(--color-border);
 }
 
-.plugin-card-prose-section {
+/* The two detail sections are the same shape — a label over a body — so they
+   are built the same way. .plugin-card-example was a class name PluginCard.tsx
+   used with no rule behind it, and its spacing lived on the <pre>'s margin
+   instead (elspeth-56e9c8e3b2's root cause, applied to its sibling). */
+.plugin-card-prose-section,
+.plugin-card-example {
   display: grid;
   gap: var(--space-2xs);
 }
@@ -192,7 +243,7 @@
 .plugin-card-example-label {
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   line-height: 1.25;
 }
 
@@ -228,7 +279,9 @@
 
 .plugin-card-example-code {
   max-height: 140px;
-  margin: var(--space-xs) 0 0;
+  /* Resets the <pre> UA margin only; the gap to the label comes from
+     .plugin-card-example's grid, like .plugin-card-prose-section's. */
+  margin: 0;
   padding: var(--space-sm);
   overflow: auto;
   border: 1px solid var(--color-border);
@@ -264,8 +317,32 @@
   color: var(--color-text-muted);
 }
 
+/* Discriminated schemas (oneOf + $defs — the shape the LLM transform ships,
+   see plugins/transforms/llm/transform.py). The three class names below were
+   used by PluginCard.tsx but defined NOWHERE, so the variant labels inherited
+   the 16px body register INSIDE a 12px reference card and the variant blocks
+   butted together with no separating gap: a wall of oversized undifferentiated
+   text where a structured list of alternatives was intended
+   (elspeth-56e9c8e3b2). The block gap replaces the hint's old margin-bottom so
+   the hint and the variants are spaced by ONE decision. */
+.plugin-card-variants {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.plugin-card-variant {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.plugin-card-variant-label {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
+  line-height: 1.25;
+}
+
 .plugin-card-variants-hint {
-  margin-bottom: var(--space-sm);
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
   line-height: 1.35;
@@ -278,7 +355,7 @@
 }
 
 .plugin-card-field-name {
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-xs);
 }
 
@@ -292,6 +369,17 @@
   color: var(--color-warning);
   margin-left: var(--space-sm);
   font-size: var(--font-size-xs);
+}
+
+.plugin-card-field-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) minmax(4rem, max-content) auto;
+  column-gap: 0.75rem;
+  align-items: baseline;
+}
+
+.plugin-card-field-row .plugin-card-field-desc {
+  grid-column: 1 / -1;
 }
 
 .plugin-card-field-desc {
@@ -312,7 +400,12 @@
 .catalog-backdrop {
   position: absolute;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.3);
+  /* The shared scrim token, not a literal (elspeth-9ae8ee9ac2): this backdrop
+     shipped at rgba(0,0,0,0.3) — the drawer is aria-modal and traps focus,
+     yet dimmed the page a third less than every other blocking overlay, so
+     "blocked" was not legible as one state. Backdrops consume --color-scrim,
+     never a literal. */
+  background-color: var(--color-scrim);
   z-index: var(--z-catalog-backdrop);
 }
 
@@ -325,6 +418,13 @@
   z-index: var(--z-catalog);
   background-color: var(--color-surface);
   border-left: 1px solid var(--color-border);
+  /* The drawer is aria-modal="true" and traps focus, but it was the only
+     styled blocking overlay in the app with NO elevation, so it sat flat
+     against the surface it blocks, separated by a single hairline, and read
+     as an inline panel the page behind it was still usable from
+     (elspeth-9ae8ee9ac2). --shadow-modal is the blocking-dialog tier and is
+     theme-paired (tokens.css defines a tinted-navy light variant). */
+  box-shadow: var(--shadow-modal);
   display: flex;
   flex-direction: column;
 }
@@ -349,13 +449,13 @@
 .catalog-header-eyebrow {
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   line-height: 1.2;
   text-transform: uppercase;
 }
 
 .catalog-header-title {
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   font-size: var(--font-size-base);
   line-height: 1.25;
 }
@@ -382,16 +482,36 @@
 
 .catalog-search-container {
   position: relative;
+  /* The input's right gutter and the clear control's box are ONE decision:
+     the gutter exists so the input's own text never runs under the control
+     overlaid on it. It was written as a bare 28px literal in each of the two
+     places, so resizing the control silently decoupled them
+     (elspeth-c4111235e9). Declared on the container both elements descend
+     from, so one edit moves both. Deliberately NOT snapped onto the
+     --space-* scale: this is control clearance, not spacing rhythm — the
+     neighbouring rungs (24px / 32px) would put the text under the control or
+     overshoot it. */
+  --catalog-search-clear-size: 28px;
 }
 
 .catalog-search-input {
   width: 100%;
-  padding: var(--space-1-5) 28px var(--space-1-5) var(--space-2-5);
+  padding: var(--space-1-5) var(--catalog-search-clear-size) var(--space-1-5) var(--space-2-5);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   font-size: var(--font-size-sm);
+  /* This field routes through ui/Input (D3 primitive census), so .input's
+     base recipe now sits UNDER this one. The drawer's search band is denser
+     than the 44px control rung, so re-assert the field's own geometry over
+     .input's min-height/line-height — value-preserving: content-derived
+     height and single-line metrics, exactly as the field shipped. The
+     primitive's font/placeholder/focus-ring vocabulary is adopted
+     deliberately: those were UA-default chrome here, the defect class the
+     ui primitives exist to retire. */
+  min-height: auto;
+  line-height: normal;
 }
 
 .catalog-search-clear {
@@ -401,9 +521,11 @@
   transform: translateY(-50%);
   /* Hit-target floor: previously the 2px padding + 16px glyph left a ~20×20
      button (below WCAG 2.5.8 AA's 24×24 floor). 28×28 clears the floor with
-     room to spare while staying small enough to sit inside the search input. */
-  min-width: 28px;
-  min-height: 28px;
+     room to spare while staying small enough to sit inside the search input.
+     The size lives on .catalog-search-container so the input's right gutter
+     moves with it (elspeth-c4111235e9). */
+  min-width: var(--catalog-search-clear-size);
+  min-height: var(--catalog-search-clear-size);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -415,6 +537,11 @@
   font-size: var(--font-size-base);
   padding: var(--space-2xs);
   line-height: 1;
+  /* Hover states change colour without a transition elsewhere in this file
+     too (elspeth-616a236fc3 family) — declare the eased pair on the base
+     rule, with the per-selector reduced-motion guard below, chat.css-style. */
+  transition: background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .catalog-search-clear:hover,
@@ -442,8 +569,12 @@
 .catalog-tab-count {
   font-size: var(--font-size-xs);
   padding: var(--space-2xs) var(--space-xs);
-  border-radius: var(--radius-lg);
-  font-weight: 600;
+  /* Badge radius, matching .type-badge / .status-badge / .audit-icon. It was
+     the only --radius-lg badge in the tree: 8px on a ~20px box rounds nearly
+     to a pill, giving the count a silhouette no other badge in the product
+     has (elspeth-6ee56bb5f5). */
+  border-radius: var(--radius-sm);
+  font-weight: var(--font-weight-semibold);
 }
 
 .catalog-tab-count--active {
@@ -462,6 +593,16 @@
 }
 
 .filter-chip-strip {
+  /* ONE control height for the whole strip. Raised from the WCAG 2.5.8 AA
+     floor (24px exactly) to 28px so the chips comfortably clear it and
+     tolerate browser font-size variation. Declared on the strip — the only
+     ancestor every chip and the clear control descend from — because
+     .filter-chip-clear shipped at --size-control-compact (36px) against 28px
+     chips and was the only control in the strip 8px taller than everything
+     around it, leaving the band with no single baseline (elspeth-05bb15df70).
+     Not --size-control-compact: this band sits below the chrome rung by
+     design, which is what makes it a band. */
+  --filter-chip-height: 28px;
   display: grid;
   gap: var(--space-xs);
   padding: var(--space-sm) var(--space-md);
@@ -481,7 +622,7 @@
   padding-top: var(--space-2xs);
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   line-height: 1.2;
   text-transform: uppercase;
 }
@@ -494,9 +635,7 @@
 }
 
 .filter-chip {
-  /* Raised from the WCAG 2.5.8 AA floor (24px exactly) to 28px so the chip
-     comfortably clears the floor and tolerates browser font-size variation. */
-  min-height: 28px;
+  min-height: var(--filter-chip-height);
   padding: var(--space-2xs) var(--space-sm);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -505,8 +644,11 @@
   cursor: pointer;
   font: inherit;
   font-size: var(--font-size-xs);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   line-height: 1.2;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .filter-chip:hover,
@@ -529,7 +671,9 @@
 
 .filter-chip-clear {
   justify-self: start;
-  min-height: var(--size-control-compact);
+  /* Same band height as the chips it clears (see .filter-chip-strip). The
+     horizontal offset is a deliberate design call and is left alone. */
+  min-height: var(--filter-chip-height);
   padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -538,21 +682,56 @@
   cursor: pointer;
   font: inherit;
   font-size: var(--font-size-xs);
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
+.filter-chip-clear:hover {
+  background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+
+/* Mirror chat.css's per-selector reduced-motion guards — the global guard in
+   animations.css is not a universal `*` reset, so every eased control names
+   itself here (elspeth-616a236fc3). */
+@media (prefers-reduced-motion: reduce) {
+  .catalog-search-clear,
+  .filter-chip,
+  .filter-chip-clear {
+    transition: none;
+  }
+}
+
+/* The catalog list's loading, empty and load-failure states occupy ONE slot,
+   so they get ONE geometry. They shipped with three alignments and two
+   paddings between them — "Loading..." left, "No plugins match" centred,
+   "Failed to load" left — so an ordinary state transition re-laid-out the
+   slot and read as a rendering fault; and all three sat two steps below the
+   app's shared .empty-state register (12px on a 16px pad against 13px on 32px),
+   so they read as lower-fidelity than the equivalent states elsewhere
+   (elspeth-c33d029f96). This is .empty-state's recipe (shared.css), applied
+   to the base class so every state inherits it. */
 .catalog-status-message {
-  padding: var(--space-lg);
-  font-size: var(--font-size-xs);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  padding: var(--space-2xl);
   color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-relaxed);
+  text-align: center;
 }
 
 .catalog-status-message--error {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
   color: var(--color-error);
 }
 
+/* Centring is now the shared base; this modifier only re-states it. Kept
+   defined because CatalogDrawer.tsx still applies it to the empty state, and
+   a class name with no rule behind it is the defect this sweep is closing. */
 .catalog-status-message--center {
   text-align: center;
 }
@@ -575,22 +754,12 @@
 .inline-chat-source-entry-title {
   color: var(--color-text);
   font-size: var(--font-size-sm);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   line-height: 1.25;
 }
 
-.inline-chat-source-entry-badge {
-  padding: var(--space-2xs) var(--space-1-5);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  color: var(--color-text-muted);
-  background-color: var(--color-surface);
-  font-size: var(--font-size-xs);
-  font-weight: 700;
-  line-height: 1.2;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
+/* .inline-chat-source-entry-badge is styled with .plugin-card-kind in the
+   shared TYPE SLOT rule above — both slots must stay one treatment. */
 
 .inline-chat-source-entry-desc {
   color: var(--color-text-secondary);

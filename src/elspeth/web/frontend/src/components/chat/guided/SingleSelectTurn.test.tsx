@@ -31,12 +31,14 @@ const PAYLOAD_NO_CUSTOM: SingleSelectPayload = {
     { id: "api", label: "REST API", hint: "Fetches data from an HTTP endpoint" },
   ],
   allow_custom: false,
+  source_blob_compatible_option_ids: ["csv"],
 };
 
 const PAYLOAD_WITH_CUSTOM: SingleSelectPayload = {
   question: "Which transform should we use?",
   options: [{ id: "llm_classify", label: "LLM Classifier", hint: null }],
   allow_custom: true,
+  source_blob_compatible_option_ids: ["llm_classify"],
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -85,6 +87,113 @@ describe("SingleSelectTurn — option click", () => {
     expect(body.chosen).toEqual(["llm_classify"]);
     expect(body.custom_inputs).toBeNull();
   });
+
+  it("does not restore an invalidated source choice when the same UUID reappears", async () => {
+    const user = userEvent.setup();
+    const first = {
+      id: "00000000-0000-4000-8000-000000000831",
+      filename: "first.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:00:00Z",
+    };
+    const second = {
+      id: "00000000-0000-4000-8000-000000000832",
+      filename: "second.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:00:00Z",
+    };
+    const { rerender } = render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[first, second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Source file" }),
+      first.id,
+    );
+
+    rerender(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+    expect(screen.getByRole("combobox", { name: "Source file" })).toHaveValue("");
+
+    rerender(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[first, second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+    expect(screen.getByRole("combobox", { name: "Source file" })).toHaveValue("");
+    expect(screen.getByRole("button", { name: "CSV File" })).toBeDisabled();
+  });
+
+  it.each([
+    [
+      "omitted",
+      {
+        question: PAYLOAD_NO_CUSTOM.question,
+        options: PAYLOAD_NO_CUSTOM.options,
+        allow_custom: PAYLOAD_NO_CUSTOM.allow_custom,
+      } satisfies SingleSelectPayload,
+    ],
+    [
+      "empty",
+      {
+        ...PAYLOAD_NO_CUSTOM,
+        source_blob_compatible_option_ids: [],
+      } satisfies SingleSelectPayload,
+    ],
+  ])(
+    "ignores recovered source-file state when compatible metadata is %s",
+    async (_metadataState, payload) => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      const sourceBlobCandidates = [
+        {
+          id: "00000000-0000-4000-8000-000000000841",
+          filename: "first.csv",
+          sizeBytes: 16,
+          createdAt: "2026-07-26T09:00:00Z",
+        },
+        {
+          id: "00000000-0000-4000-8000-000000000842",
+          filename: "second.csv",
+          sizeBytes: 24,
+          createdAt: "2026-07-26T09:00:00Z",
+        },
+      ];
+      render(
+        <SingleSelectTurn
+          payload={payload}
+          onSubmit={onSubmit}
+          sourceBlobCandidates={sourceBlobCandidates}
+          sourceBlobChoiceRequired
+          sourceUploadPending
+        />,
+      );
+
+      expect(
+        screen.queryByRole("combobox", { name: "Source file" }),
+      ).not.toBeInTheDocument();
+      const csvOption = screen.getByRole("button", { name: "CSV File" });
+      expect(csvOption).toBeEnabled();
+      expect(screen.getByRole("button", { name: "REST API" })).toBeEnabled();
+
+      await user.click(csvOption);
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      expect(onSubmit.mock.calls[0][0]).not.toHaveProperty("source_blob_id");
+    },
+  );
 });
 
 describe("SingleSelectTurn — allow_custom=false", () => {
@@ -124,6 +233,100 @@ describe("SingleSelectTurn — allow_custom=true", () => {
       custom_inputs: ["my custom transform"],
       ...nullResponse(),
     });
+  });
+
+  it("does not attach source identity to a custom submission", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const sourceBlobCandidates = [
+      {
+        id: "00000000-0000-4000-8000-000000000821",
+        filename: "first.csv",
+        sizeBytes: 16,
+        createdAt: "2026-07-26T09:00:00Z",
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000822",
+        filename: "second.csv",
+        sizeBytes: 24,
+        createdAt: "2026-07-26T09:00:00Z",
+      },
+    ];
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_WITH_CUSTOM}
+        onSubmit={onSubmit}
+        sourceBlobCandidates={sourceBlobCandidates}
+      />,
+    );
+
+    await user.type(
+      screen.getByRole("textbox", { name: /custom/i }),
+      "my custom source",
+    );
+    const submit = screen.getByRole("button", { name: /submit custom/i });
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+
+    const body = onSubmit.mock.calls[0][0];
+    expect(body.custom_inputs).toEqual(["my custom source"]);
+    expect(body).not.toHaveProperty("source_blob_id");
+  });
+
+  it("limits a pending source upload to source-bound controls", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const sourceBlobCandidates = [
+      {
+        id: "00000000-0000-4000-8000-000000000831",
+        filename: "first.csv",
+        sizeBytes: 16,
+        createdAt: "2026-07-26T09:00:00Z",
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000832",
+        filename: "second.csv",
+        sizeBytes: 24,
+        createdAt: "2026-07-26T09:00:00Z",
+      },
+    ];
+    const { rerender } = render(
+      <SingleSelectTurn
+        payload={PAYLOAD_WITH_CUSTOM}
+        onSubmit={onSubmit}
+        sourceBlobCandidates={sourceBlobCandidates}
+      />,
+    );
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Source file" }),
+      sourceBlobCandidates[0].id,
+    );
+
+    rerender(
+      <SingleSelectTurn
+        payload={PAYLOAD_WITH_CUSTOM}
+        onSubmit={onSubmit}
+        sourceBlobCandidates={sourceBlobCandidates}
+        sourceUploadPending
+      />,
+    );
+
+    expect(
+      screen.getByRole("combobox", { name: "Source file" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "LLM Classifier" }),
+    ).toBeDisabled();
+    const customInput = screen.getByRole("textbox", { name: /custom/i });
+    expect(customInput).toBeEnabled();
+    await user.type(customInput, "my pending-upload custom source");
+    const submit = screen.getByRole("button", { name: /submit custom/i });
+    expect(submit).toBeEnabled();
+    await user.click(submit);
+
+    const body = onSubmit.mock.calls[0][0];
+    expect(body.custom_inputs).toEqual(["my pending-upload custom source"]);
+    expect(body).not.toHaveProperty("source_blob_id");
   });
 });
 
@@ -213,5 +416,112 @@ describe("SingleSelectTurn — tutorial passive mode", () => {
     expect(
       screen.getByText(/choosing an option continues/i),
     ).toBeInTheDocument();
+  });
+});
+
+// ── Duplicate-filename disambiguation (elspeth-ca456d9d8d) ───────────────────
+
+describe("SingleSelectTurn — duplicate source filenames", () => {
+  // Locale/timezone are the runner's, so the expectation is computed with the
+  // same formatter the component uses rather than hard-coded.
+  const uploadTime = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
+  it("names two same-named uploads by upload time when the times separate them", () => {
+    const earlier = {
+      id: "00000000-0000-4000-8000-000000000851",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:00Z",
+    };
+    const later = {
+      id: "00000000-0000-4000-8000-000000000852",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:37:00Z",
+    };
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[earlier, later]}
+        sourceBlobChoiceRequired
+      />,
+    );
+
+    expect(
+      screen.getByRole("option", {
+        name: `duplicate.csv (uploaded ${uploadTime.format(new Date(earlier.createdAt))})`,
+      }),
+    ).toHaveValue(earlier.id);
+    expect(
+      screen.getByRole("option", {
+        name: `duplicate.csv (uploaded ${uploadTime.format(new Date(later.createdAt))})`,
+      }),
+    ).toHaveValue(later.id);
+  });
+
+  it("falls back to size + id fragment when the uploads share a minute", () => {
+    const first = {
+      id: "00000000-0000-4000-8000-000000000861",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:11Z",
+    };
+    const second = {
+      id: "00000000-0000-4000-8000-000000000862",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:52Z",
+    };
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[first, second]}
+        sourceBlobChoiceRequired
+      />,
+    );
+
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000861" }),
+    ).toHaveValue(first.id);
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000862" }),
+    ).toHaveValue(second.id);
+  });
+
+  it("falls back to size + id fragment when an upload time is unusable", () => {
+    // Intl.DateTimeFormat.format() throws on an invalid Date: the label must
+    // degrade, never crash the turn.
+    const good = {
+      id: "00000000-0000-4000-8000-000000000871",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "2026-07-26T09:04:00Z",
+    };
+    const broken = {
+      id: "00000000-0000-4000-8000-000000000872",
+      filename: "duplicate.csv",
+      sizeBytes: 16,
+      createdAt: "not a timestamp",
+    };
+    render(
+      <SingleSelectTurn
+        payload={PAYLOAD_NO_CUSTOM}
+        onSubmit={vi.fn()}
+        sourceBlobCandidates={[good, broken]}
+        sourceBlobChoiceRequired
+      />,
+    );
+
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000871" }),
+    ).toHaveValue(good.id);
+    expect(
+      screen.getByRole("option", { name: "duplicate.csv — 16 B — ID 00000872" }),
+    ).toHaveValue(broken.id);
   });
 });

@@ -57,6 +57,229 @@ def test_audit_evidence_nominal_accepts_direct_base() -> None:
     assert findings == []
 
 
+def test_audit_evidence_nominal_distinguishes_same_named_classes_by_lexical_scope() -> None:
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+            class Duplicate(AuditEvidenceBase):
+                pass
+
+            class Left:
+                class Duplicate(RuntimeError):
+                    def to_audit_dict(self):
+                        return {}
+
+            class Right:
+                class Duplicate(RuntimeError):
+                    def to_audit_dict(self):
+                        return {}
+
+            class Control(RuntimeError):
+                def to_audit_dict(self):
+                    return {}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert {finding.fingerprint for finding in findings} == {
+        "example.py:AEN1:Control",
+        "example.py:AEN1:Left.Duplicate",
+        "example.py:AEN1:Right.Duplicate",
+    }
+
+
+def test_audit_evidence_nominal_prefers_lexical_class_over_same_named_import(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "contracts" / "parent.py",
+        """
+        from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+        class Parent(AuditEvidenceBase):
+            def to_audit_dict(self):
+                return {}
+        """,
+    )
+    _write(
+        tmp_path / "consumer.py",
+        """
+        from elspeth.contracts.parent import Parent
+
+        class ImportedChild(Parent):
+            def to_audit_dict(self):
+                return {}
+
+        def make_child():
+            class Parent(RuntimeError):
+                pass
+
+            class Child(Parent):
+                def to_audit_dict(self):
+                    return {}
+
+        class Control(RuntimeError):
+            def to_audit_dict(self):
+                return {}
+        """,
+    )
+
+    findings = _root_findings(AUDIT_EVIDENCE_NOMINAL_RULE, tmp_path)
+
+    assert {finding.fingerprint for finding in findings} == {
+        "consumer.py:AEN1:Control",
+        "consumer.py:AEN1:make_child.Child",
+    }
+
+
+def test_audit_evidence_nominal_direct_base_respects_lexical_shadowing() -> None:
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+            class ImportedChild(AuditEvidenceBase):
+                def to_audit_dict(self):
+                    return {}
+
+            def make_child():
+                class AuditEvidenceBase:
+                    pass
+
+                class Child(AuditEvidenceBase):
+                    def to_audit_dict(self):
+                        return {}
+
+                class Control(RuntimeError):
+                    def to_audit_dict(self):
+                        return {}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert {finding.fingerprint for finding in findings} == {
+        "example.py:AEN1:make_child.Child",
+        "example.py:AEN1:make_child.Control",
+    }
+
+
+def test_audit_evidence_nominal_resolves_nearest_enclosing_lexical_class() -> None:
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+            class Parent(AuditEvidenceBase):
+                pass
+
+            class ModuleChild(Parent):
+                def to_audit_dict(self):
+                    return {}
+
+            def outer():
+                class Parent(RuntimeError):
+                    pass
+
+                def inner():
+                    class Child(Parent):
+                        def to_audit_dict(self):
+                            return {}
+
+                    class Control(RuntimeError):
+                        def to_audit_dict(self):
+                            return {}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert {finding.fingerprint for finding in findings} == {
+        "example.py:AEN1:outer.inner.Child",
+        "example.py:AEN1:outer.inner.Control",
+    }
+
+
+def test_audit_evidence_nominal_skips_enclosing_class_namespaces() -> None:
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+            class Outer:
+                class Parent(AuditEvidenceBase):
+                    pass
+
+                class DirectChild(Parent):
+                    def to_audit_dict(self):
+                        return {}
+
+                class Inner:
+                    class Child(Parent):
+                        def to_audit_dict(self):
+                            return {}
+
+                    class Control(RuntimeError):
+                        def to_audit_dict(self):
+                            return {}
+
+            def factory():
+                class Parent(AuditEvidenceBase):
+                    pass
+
+                class Nested:
+                    class Inner:
+                        class ClosureChild(Parent):
+                            def to_audit_dict(self):
+                                return {}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert {finding.fingerprint for finding in findings} == {
+        "example.py:AEN1:Outer.Inner.Child",
+        "example.py:AEN1:Outer.Inner.Control",
+    }
+
+
+def test_audit_evidence_nominal_fails_closed_on_ambiguous_lexical_class_binding() -> None:
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+            class Namespace:
+                class Parent(AuditEvidenceBase):
+                    pass
+
+                class Parent(RuntimeError):
+                    pass
+
+                class Child(Parent):
+                    def to_audit_dict(self):
+                        return {}
+
+                class Control(RuntimeError):
+                    def to_audit_dict(self):
+                        return {}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert {finding.fingerprint for finding in findings} == {
+        "example.py:AEN1:Namespace.Child",
+        "example.py:AEN1:Namespace.Control",
+    }
+
+
 def test_audit_evidence_nominal_flags_spoofed_base_name() -> None:
     # elspeth-584d4ea502: a base merely NAMED AuditEvidenceBase (here a local
     # class, not imported from the canonical module) must NOT satisfy nominal
@@ -100,6 +323,172 @@ def test_audit_evidence_nominal_accepts_local_base_inside_canonical_module() -> 
     )
 
     assert findings == []
+
+
+def test_audit_evidence_nominal_accepts_local_intermediate_base() -> None:
+    # One-hop transitive inheritance inside a file: Parent nominally inherits
+    # the canonical base, Child inherits Parent. Child IS an AuditEvidenceBase
+    # at runtime, so overriding to_audit_dict there is not a duck-type mimic.
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+            class Parent(AuditEvidenceBase, RuntimeError):
+                def to_audit_dict(self):
+                    return {}
+
+            class Child(Parent):
+                def to_audit_dict(self):
+                    return {"x": 1}
+
+            class Grandchild(Child):
+                def to_audit_dict(self):
+                    return {"x": 2}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert findings == []
+
+
+def test_audit_evidence_nominal_flags_intermediate_base_that_is_itself_spoofed() -> None:
+    # Transitive resolution must carry the provenance rule up the chain: a
+    # parent built on a locally-defined fake base is not evidence, so neither
+    # is its child.
+    findings = list(
+        AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
+            _tree("""
+            class AuditEvidenceBase:
+                pass
+
+            class Parent(AuditEvidenceBase):
+                pass
+
+            class Child(Parent):
+                def to_audit_dict(self):
+                    return {}
+            """),
+            Path("example.py"),
+            RuleContext(root=Path(".")),
+        )
+    )
+
+    assert [finding.message.split(" ")[0] for finding in findings] == ["Child"]
+
+
+def test_audit_evidence_nominal_resolves_imported_intermediate_base(tmp_path: Path) -> None:
+    # Cross-file one-hop chain, the PassThroughContractViolation shape:
+    # contracts/errors.py subclasses a parent imported from
+    # elspeth.contracts.declaration_contracts, which inherits the canonical base.
+    _write(
+        tmp_path / "contracts" / "declaration_contracts.py",
+        """
+        from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+        class DeclarationContractViolation(AuditEvidenceBase, RuntimeError):
+            def to_audit_dict(self):
+                return {}
+        """,
+    )
+    _write(
+        tmp_path / "contracts" / "errors.py",
+        """
+        from elspeth.contracts.declaration_contracts import DeclarationContractViolation
+        from elspeth.contracts.declaration_contracts import DeclarationContractViolation as DCV
+        import elspeth.contracts.declaration_contracts as decl
+
+        class PassThrough(DeclarationContractViolation):
+            def to_audit_dict(self):
+                return {"a": 1}
+
+        class ViaAlias(DCV):
+            def to_audit_dict(self):
+                return {"b": 1}
+
+        class ViaModule(decl.DeclarationContractViolation):
+            def to_audit_dict(self):
+                return {"c": 1}
+        """,
+    )
+
+    assert _root_findings(AUDIT_EVIDENCE_NOMINAL_RULE, tmp_path) == []
+
+
+def test_audit_evidence_nominal_fails_closed_when_imported_base_is_unresolvable(tmp_path: Path) -> None:
+    # The parent's module is not under the scan root, so its ancestry cannot be
+    # proven from the tree. Absence of proof is a finding, not an exemption.
+    _write(
+        tmp_path / "contracts" / "errors.py",
+        """
+        from elspeth.contracts.elsewhere import Parent
+
+        class Child(Parent):
+            def to_audit_dict(self):
+                return {}
+        """,
+    )
+
+    findings = _root_findings(AUDIT_EVIDENCE_NOMINAL_RULE, tmp_path)
+
+    assert [finding.rule_id for finding in findings] == ["AEN1"]
+    assert "Child" in findings[0].message
+
+
+def test_audit_evidence_nominal_fails_closed_on_ambiguous_module_resolution(tmp_path: Path) -> None:
+    # Two files under the root answer to the same module suffix; the rule must
+    # not guess which one the import means.
+    parent_source = """
+        from elspeth.contracts.audit_evidence import AuditEvidenceBase
+
+        class Parent(AuditEvidenceBase):
+            def to_audit_dict(self):
+                return {}
+        """
+    _write(tmp_path / "a" / "contracts" / "decl.py", parent_source)
+    _write(tmp_path / "b" / "contracts" / "decl.py", parent_source)
+    _write(
+        tmp_path / "contracts" / "errors.py",
+        """
+        from elspeth.contracts.decl import Parent
+
+        class Child(Parent):
+            def to_audit_dict(self):
+                return {}
+        """,
+    )
+
+    findings = _root_findings(AUDIT_EVIDENCE_NOMINAL_RULE, tmp_path)
+
+    assert [finding.message.split(" ")[0] for finding in findings] == ["Child"]
+
+
+def test_audit_evidence_nominal_imported_base_must_come_from_a_scanned_definition(tmp_path: Path) -> None:
+    # The module resolves, but the named class there does NOT inherit the
+    # canonical base — the child inherits nothing evidentiary.
+    _write(
+        tmp_path / "contracts" / "decl.py",
+        """
+        class Parent(RuntimeError):
+            pass
+        """,
+    )
+    _write(
+        tmp_path / "contracts" / "errors.py",
+        """
+        from elspeth.contracts.decl import Parent
+
+        class Child(Parent):
+            def to_audit_dict(self):
+                return {}
+        """,
+    )
+
+    findings = _root_findings(AUDIT_EVIDENCE_NOMINAL_RULE, tmp_path)
+
+    assert [finding.message.split(" ")[0] for finding in findings] == ["Child"]
 
 
 def test_audit_evidence_nominal_flags_annotated_assignment_form() -> None:
@@ -980,8 +1369,10 @@ def test_gve_attribution_syntax_errors_surface_as_parse_error_findings(tmp_path:
             rule_set="static",
             format="json",
             root=tmp_path,
+            repo_root=None,
             allowlist_dir=empty_allowlist,
             files=None,
+            fail_on_inert=False,
         ),
         registry=registry,
     )

@@ -1,12 +1,26 @@
-import { useId, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
-import type { CompositionState } from "@/types/index";
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { modelDisplayName } from "@/components/chat/modelDisplayName";
+import { componentPhrase } from "@/components/workspace/specRouting";
+import type {
+  CompositionState,
+  NodeSpec,
+  PluginSummary,
+  SourceSpec,
+} from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
+import {
+  REQUEST_RUN_EVENT,
+  dispatchArtifactViewIntent,
+} from "@/lib/composer-events";
 
 /**
  * Run-button tooltip text used when a pending interpretation event blocks
@@ -18,9 +32,16 @@ export const INTERPRETATION_PENDING_RUN_BLOCK_TITLE =
   "Resolve pending interpretation first.";
 
 /**
- * Transform plugins that reach the network during a run (page fetches and
- * external analysis services). Used only to phrase the pre-run disclosure —
- * which nodes appear is always derived from the actual pipeline config.
+ * Fallback transform plugins treated as network-reaching when the plugin
+ * catalog hasn't loaded yet (so `PluginSummary.audit_characteristics` isn't
+ * available to classify by). This set predates the catalog-driven check
+ * below and is Azure-only by history, not by design — it under-discloses
+ * the AWS externals (aws_textract_document_analysis,
+ * aws_bedrock_content_safety, aws_bedrock_prompt_shield, all backend-side
+ * `Determinism.EXTERNAL_CALL`) once R2-F7 (elspeth-27bc704359) surfaced the
+ * gap. Kept ONLY as the no-catalog fallback; whenever the catalog has
+ * loaded, `audit_characteristics` (below) is the sole source of truth so
+ * this list can never drift from the backend's own classification again.
  */
 const NETWORK_FETCH_PLUGINS = new Set([
   "web_scrape",
@@ -29,57 +50,359 @@ const NETWORK_FETCH_PLUGINS = new Set([
   "azure_document_intelligence",
 ]);
 
+/** True if `pluginName` is classified as reaching the network, per the
+ *  catalog's `audit_characteristics` for that transform.
+ *
+ *  Fail-open by design for a plugin name absent from a *loaded* catalog
+ *  (e.g. a saved composition referencing a plugin since renamed or
+ *  policy-revoked): `.some()` over no match returns `false`, so an
+ *  unrecognised plugin is silently treated as non-network rather than
+ *  flagged. This differs from the catalog-*failed-to-load* case in
+ *  `buildRunEgressSummary`, which surfaces an explicit uncertainty line
+ *  instead of guessing. A stale-but-present catalog entry is assumed
+ *  accurate; if that assumption stops holding (e.g. plugin renames
+ *  routinely leave orphaned references in saved compositions) this should
+ *  fail closed the same way the load-failure path does. */
+function catalogFlagsExternalCall(
+  pluginName: string,
+  catalogTransforms: readonly PluginSummary[],
+): boolean {
+  return catalogTransforms.some(
+    (summary) =>
+      summary.name === pluginName &&
+      summary.audit_characteristics.includes("external_call"),
+  );
+}
+
+/** True if `node` is already disclosed via the "Sends rows to the
+ *  configured LLM" line in `buildRunEgressSummary`. Used there to keep the
+ *  network-egress classification (and its catalog-load-failure uncertainty
+ *  note) from re-listing the same node under a second line.
+ *
+ *  Assumption this depends on: no `Determinism.EXTERNAL_CALL` transform
+ *  today declares a `model` option or has "llm" in its plugin name, so LLM
+ *  nodes and network-reaching transforms are disjoint sets. If a future
+ *  plugin is both (e.g. a hosted LLM-gateway transform also flagged
+ *  `external_call`), it would only ever appear on the LLM line, not the
+ *  network line or the load-failure uncertainty line below — revisit this
+ *  helper if that happens. */
+function isLlmNode(node: NodeSpec): boolean {
+  return (
+    typeof node.options?.model === "string" ||
+    (node.plugin ?? "").includes("llm")
+  );
+}
+
+const SAFE_LLM_PROFILE_ALIAS = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
+const SAFE_LLM_MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$/;
+
+function hasOwnOption(options: Record<string, unknown>, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(options, name);
+}
+
+/** Return only a safe, author-visible LLM binding label.
+ *
+ * Web profile lowering deliberately keeps the opaque authored `profile`
+ * alias in composition state while provider, model, endpoint, and credential
+ * bindings stay operator-private. If profile provenance is present but
+ * malformed, fail closed to the generic label instead of falling through to
+ * a possibly resolved private model. `profile_alias` and `resolved_model`
+ * are executable/audit provenance, never consent-dialog display values.
+ */
+function llmSourceBindingLabel(source: SourceSpec): string {
+  const { options } = source;
+  if (hasOwnOption(options, "profile")) {
+    const profile = options.profile;
+    if (typeof profile === "string" && SAFE_LLM_PROFILE_ALIAS.test(profile)) {
+      return `profile ${profile}`;
+    }
+    return "configured LLM";
+  }
+  if (
+    hasOwnOption(options, "profile_alias") ||
+    hasOwnOption(options, "resolved_model")
+  ) {
+    return "configured LLM";
+  }
+  const model = options.model;
+  if (typeof model === "string" && SAFE_LLM_MODEL_IDENTIFIER.test(model)) {
+    return `model ${model}`;
+  }
+  return "configured LLM";
+}
+
+function catalogFlagsLlmSource(
+  source: SourceSpec,
+  catalogSources: readonly PluginSummary[] | null,
+  catalogCurrent: boolean,
+): boolean {
+  if (source.plugin === "llm") return true;
+  if (!catalogCurrent || catalogSources === null) return false;
+  return catalogSources.some(
+    (summary) =>
+      summary.plugin_type === "source" &&
+      summary.name === source.plugin &&
+      summary.capability_tags.includes("llm"),
+  );
+}
+
 /**
  * Derive the pre-run egress disclosure lines from the actual composition
- * (elspeth-c18ad229cc). Nothing here is hardcoded pipeline content: each
- * line names the configured components (sources, LLM nodes and their model
- * option, network-fetching transforms, output sinks) from the live
- * CompositionState. Exported for tests.
+ * (elspeth-c18ad229cc). Each line names configured components from the live
+ * CompositionState; catalog metadata classifies their external effects.
+ *
+ * `catalogTransforms` is the plugin catalog's transform list
+ * (`usePluginCatalogStore((s) => s.transforms)`), the same source of truth
+ * the audit-readiness `plugin_trust` row and
+ * `tests/unit/web/audit_readiness/test_boundary_predicate_parity.py` are
+ * pinned against (R2-F7, elspeth-27bc704359) — a transform is network-
+ * reaching here iff its backend-declared `audit_characteristics` contains
+ * `"external_call"`. `catalogTransforms === null` is ambiguous by itself —
+ * it means either "hasn't loaded yet" (transient; `catalogLoadFailed`
+ * false) or "failed to load" (`catalogLoadFailed` true, from
+ * `pluginCatalogStore.error`) — because the store resets `transforms` to
+ * `null` in both cases and only `error`/`isLoading` carry the
+ * discriminator. The two are handled differently:
+ *   - not yet loaded: silently fall back to the hardcoded
+ *     `NETWORK_FETCH_PLUGINS` set, same as before catalog-driven
+ *     classification existed — expected to resolve before the user reaches
+ *     this dialog.
+ *   - failed to load: still use the hardcoded set for the confident line,
+ *     but any other configured transform cannot be verified either way, so
+ *     it is named in an explicit uncertainty line rather than silently
+ *     assumed safe — the exact under-disclosure R2-F7 fixed must not
+ *     reappear whenever a catalog fetch errors.
+ *
+ * `catalogSources` classifies source plugins carrying the catalog's `llm`
+ * capability tag. Only a settled catalog is authoritative. The exact built-in
+ * `llm` identity remains a bounded fallback while the catalog is loading,
+ * failed, stale, or missing that entry, so its authored prompt is never
+ * silently omitted from consent.
+ *
+ * Returns reader-register lines with the identifier-register sentence beside
+ * each, surfaced via `aria-describedby` (never `title` alone — see below).
+ * Exported for tests.
  */
+export interface RunEgressLine {
+  /** Reader register: step labels and plugin display names. */
+  text: string;
+  /** Identifier register — the exact sentence this dialog showed before
+   *  Wave 3, unchanged so every component and plugin is still named by id
+   *  (R2-F7). Surfaced via an `.sr-only` span wired with `aria-describedby`
+   *  on the line, NOT via `title` alone — `title` is not reliably announced
+   *  and an <li> is not focusable, so it is a mouse convenience beside the
+   *  span, never the only route (see the `.sr-only` block below). */
+  identifiers: string;
+}
+
+/**
+ * One egress item — a component, a plugin, a model — in BOTH registers at
+ * once. The registers travel together from the moment the value is derived,
+ * so a sentence cannot exist in one register and not the other.
+ *
+ * This replaced a dual traversal: `egressSentences(register, …)` was called
+ * twice and the two arrays zipped, with a runtime `throw` on a length
+ * mismatch guarding the property "register substitutes label TEXT, never
+ * gates emission". The whole function body was `register ===` conditionals,
+ * so the edit that breaks that property — a clarifying sentence added under
+ * `if (register === "reader")` — is exactly the edit the shape invited, and
+ * its failure landed as an exception on the run-confirm dialog, i.e. on the
+ * product's consent surface (systems I-3). Here the property holds by
+ * construction: `emit` decides once whether a line exists, and every
+ * sentence template below is written once and applied to both registers.
+ */
+interface EgressPhrase {
+  /** Reader register: step labels, plugin display names, phrased models. */
+  reader: string;
+  /** Identifier register: the exact wire form — component id, plugin id,
+   *  model id. */
+  identifier: string;
+}
+
+/** A value that is deliberately the SAME in both registers. */
+function bothRegisters(text: string): EgressPhrase {
+  return { reader: text, identifier: text };
+}
+
+/** "<component> (<qualifier>)" — the shape every egress item takes. */
+function qualified(component: EgressPhrase, qualifier: EgressPhrase): EgressPhrase {
+  return {
+    reader: `${component.reader} (${qualifier.reader})`,
+    identifier: `${component.identifier} (${qualifier.identifier})`,
+  };
+}
+
+/** Prefix both registers with a fixed word ("model "). */
+function prefixed(prefix: string, phrase: EgressPhrase): EgressPhrase {
+  return {
+    reader: `${prefix}${phrase.reader}`,
+    identifier: `${prefix}${phrase.identifier}`,
+  };
+}
+
+/**
+ * Push one disclosure line, or none. `sentence` is written ONCE and applied
+ * to each register's joined item list, and the emptiness test is evaluated
+ * once for both — the two properties the deleted throw was checking.
+ */
+function emit(
+  lines: RunEgressLine[],
+  items: readonly EgressPhrase[],
+  sentence: (list: string) => string,
+): void {
+  if (items.length === 0) return;
+  lines.push({
+    text: sentence(items.map((item) => item.reader).join(", ")),
+    identifiers: sentence(items.map((item) => item.identifier).join(", ")),
+  });
+}
+
 export function buildRunEgressSummary(
   compositionState: CompositionState | null,
-): string[] {
+  catalogTransforms: readonly PluginSummary[] | null = null,
+  catalogLoadFailed = false,
+  catalogSources: readonly PluginSummary[] | null = null,
+  catalogIsLoading = false,
+): RunEgressLine[] {
   if (!compositionState) return [];
-  const lines: string[] = [];
+  const state = compositionState;
+  const lines: RunEgressLine[] = [];
 
-  const sources = sortedSourceEntries(compositionState).map(
-    ([sourceName, source]) =>
-      `${sourceComponentId(sourceName)} (${source.plugin})`,
+  /** A source, node or output, by its COMPONENT id — which is exactly the
+   *  identifier register, and exactly the vocabulary `componentPhrase`
+   *  accepts (`sourceComponentId(name)` for a source, the node id, the output
+   *  name). The reader half goes through the SHARED description-first ladder
+   *  rather than `stepLabelForNodeId` alone: that ladder consults a
+   *  description for nodes only, so a source described "Quarterly invoices
+   *  from finance" read that way on the Spec tab and in validation prose but
+   *  "Intake (CSV)" here — on the surface where recognition matters most
+   *  (ux M-4). Same concept, same phrase, every surface. */
+  const component = (id: string): EgressPhrase => ({
+    reader: componentPhrase(state, id),
+    identifier: id,
+  });
+  const plugin = (pluginId: string): EgressPhrase => ({
+    reader: pluginDisplayName(pluginId),
+    identifier: pluginId,
+  });
+  const model = (modelId: string): EgressPhrase => {
+    const cut = modelId.lastIndexOf("/");
+    // The provider path IS the egress destination on this surface. Phrase the
+    // model, keep the route (elspeth-59631ec7f7 / R2-F7). ModelChip keeps the
+    // leaf-only form; a header chip is not a consent surface.
+    return {
+      reader:
+        cut === -1
+          ? modelDisplayName(modelId)
+          : `${modelDisplayName(modelId)} via ${modelId.slice(0, cut)}`,
+      identifier: modelId,
+    };
+  };
+
+  const sourceEntries = sortedSourceEntries(state);
+  const catalogCurrent =
+    catalogSources !== null && !catalogLoadFailed && !catalogIsLoading;
+  const llmSourceEntries = sourceEntries.filter(([, source]) =>
+    catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
   );
-  if (sources.length > 0) {
-    lines.push(`Reads source data: ${sources.join(", ")}.`);
-  }
+
+  emit(
+    lines,
+    sourceEntries
+      .filter(([, source]) =>
+        !catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
+      )
+      .map(([sourceName, source]) =>
+        qualified(component(sourceComponentId(sourceName)), plugin(source.plugin)),
+      ),
+    (list) => `Reads source data: ${list}.`,
+  );
+
+  // `llmSourceBindingLabel` is the same in BOTH registers by design: it
+  // establishes egress SAFETY (provider, model, endpoint and credential
+  // bindings stay operator-private), and the authored profile alias is the
+  // one binding the user may see. Phrasing it would title-case an
+  // operator-chosen token into something that looks like a product name.
+  emit(
+    lines,
+    llmSourceEntries.map(([sourceName, source]) =>
+      qualified(
+        component(sourceComponentId(sourceName)),
+        bothRegisters(llmSourceBindingLabel(source)),
+      ),
+    ),
+    (list) => `Sends one authored prompt to the configured LLM: ${list}.`,
+  );
 
   // `?.` on options: display-only derivation that must tolerate partially
   // formed compositions mid-authoring rather than crash the Run button.
-  const llmNodes = compositionState.nodes
-    .filter(
-      (node) =>
-        typeof node.options?.model === "string" ||
-        (node.plugin ?? "").includes("llm"),
-    )
-    .map((node) =>
-      typeof node.options?.model === "string"
-        ? `${node.id} (model ${node.options.model})`
-        : node.id,
-    );
-  if (llmNodes.length > 0) {
-    lines.push(`Sends rows to the configured LLM: ${llmNodes.join(", ")}.`);
-  }
-
-  const networkNodes = compositionState.nodes
-    .filter((node) => node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin))
-    .map((node) => `${node.id} (${node.plugin})`);
-  if (networkNodes.length > 0) {
-    lines.push(`Fetches over the network: ${networkNodes.join(", ")}.`);
-  }
-
-  const outputs = compositionState.outputs.map(
-    (output) => `${output.name} (${output.plugin})`,
+  emit(
+    lines,
+    state.nodes
+      .filter(isLlmNode)
+      .map((node) =>
+        typeof node.options?.model === "string"
+          ? qualified(component(node.id), prefixed("model ", model(node.options.model)))
+          : component(node.id),
+      ),
+    (list) => `Sends rows to the configured LLM: ${list}.`,
   );
-  if (outputs.length > 0) {
-    lines.push(`Writes output: ${outputs.join(", ")}.`);
+
+  const withPlugin = (node: NodeSpec): EgressPhrase =>
+    qualified(component(node.id), plugin(node.plugin as string));
+
+  let networkNodes: EgressPhrase[];
+  let unverifiableNodes: EgressPhrase[] = [];
+
+  if (catalogTransforms !== null) {
+    // Catalog loaded — audit_characteristics is authoritative.
+    networkNodes = state.nodes
+      .filter(
+        (node) =>
+          node.plugin !== null &&
+          catalogFlagsExternalCall(node.plugin, catalogTransforms),
+      )
+      .map(withPlugin);
+  } else if (catalogLoadFailed) {
+    // Catalog failed to load — the hardcoded set still yields a confident
+    // (if incomplete) line, but every other configured, non-LLM transform
+    // is genuinely unverifiable: silently omitting it here would reproduce
+    // R2-F7's under-disclosure, so it is named explicitly instead.
+    const nonLlmTransforms = state.nodes.filter(
+      (node) => node.plugin !== null && !isLlmNode(node),
+    );
+    networkNodes = nonLlmTransforms
+      .filter((node) => NETWORK_FETCH_PLUGINS.has(node.plugin as string))
+      .map(withPlugin);
+    unverifiableNodes = nonLlmTransforms
+      .filter((node) => !NETWORK_FETCH_PLUGINS.has(node.plugin as string))
+      .map(withPlugin);
+  } else {
+    // Not loaded yet (transient) — same fallback behaviour as before
+    // catalog-driven classification existed.
+    networkNodes = state.nodes
+      .filter(
+        (node) => node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin),
+      )
+      .map(withPlugin);
   }
+
+  emit(lines, networkNodes, (list) => `Fetches over the network: ${list}.`);
+  emit(
+    lines,
+    unverifiableNodes,
+    (list) =>
+      `Plugin catalog unavailable — external-service effects could not be ` +
+      `fully enumerated for: ${list}.`,
+  );
+
+  emit(
+    lines,
+    state.outputs.map((output) =>
+      qualified(component(output.name), plugin(output.plugin)),
+    ),
+    (list) => `Writes output: ${list}.`,
+  );
 
   return lines;
 }
@@ -88,23 +411,27 @@ export function buildRunEgressSummary(
  * Which audit-readiness rows are load-bearing for `canExecute` below, and
  * which are informational/advisory only (elspeth-088bf83922 finding T-2,
  * option (a) — legibility, NOT new gating). Read together with
- * `canExecute`: `validationResult?.is_valid === true` corresponds to the
+ * `canExecute`: `validationResult?.readiness?.execution_ready === true`
+ * corresponds to the backend-owned execution admission reported through the
  * `validation` row; `!isRunBlocked` corresponds to the `llm_interpretations`
  * row (both are driven by the same interpretationEventsStore pending/
  * opted-out state used to compute `isRunBlocked` below). The other four
  * rows (plugin_trust, provenance, retention, secrets) never appear in
  * `canExecute` and are always advisory.
  *
- * This file is the single source of truth for what actually gates Run —
- * AuditReadinessRow (components/audit) imports this function rather than
- * re-deriving the classification, so the audit panel's "Blocks Run" /
- * "Advisory" labelling cannot drift from the real predicate below. The
- * exhaustive switch (the `never` default arm) fails the build if a future
- * backend row id is added without an explicit classification here.
+ * This helper is the single source of truth for what actually gates Run.
+ * The live and shared panel parents use it to prepare each row's explicit
+ * `blocksRun` value from backend execution readiness; AuditReadinessRow only
+ * renders that prepared fact. The exhaustive switch fails the build if a
+ * future backend row id lacks an explicit classification.
  */
-export function isRunGatingReadinessRow(id: ReadinessRowId): boolean {
+export function isRunGatingReadinessRow(
+  id: ReadinessRowId,
+  validationExecutionReady: boolean,
+): boolean {
   switch (id) {
     case "validation":
+      return !validationExecutionReady;
     case "llm_interpretations":
       return true;
     case "plugin_trust":
@@ -124,16 +451,18 @@ export function isRunGatingReadinessRow(id: ReadinessRowId): boolean {
  *  (elspeth-088bf83922 T-2). Priority order: an in-flight run takes
  *  precedence (nothing else matters until it finishes); pending
  *  interpretation review is next (it also drives the dedicated
- *  aria-disabled/title/aria-describedby treatment below); structural
- *  validation is the remaining case. Returns null when none apply, i.e.
- *  when `canExecute` is true. Exported for the corresponding test. */
-export type RunBlockReason = "running" | "interpretation" | "validation" | "not_validated";
+ *  aria-disabled/title/aria-describedby treatment below); then no validation
+ *  result, structural validation failure, and backend execution-readiness
+ *  refusal. Returns null when none apply, i.e. when `canExecute` is true.
+ *  Exported for the corresponding test. */
+export type RunBlockReason = "running" | "interpretation" | "validation" | "readiness" | "not_validated";
 
 export function primaryRunBlockReason(input: {
   isExecuting: boolean;
   progressRunning: boolean;
   isRunBlocked: boolean;
   validationFailing: boolean;
+  executionReadinessBlocked: boolean;
   validationNotRun: boolean;
 }): RunBlockReason | null {
   if (input.isExecuting || input.progressRunning) return "running";
@@ -145,6 +474,7 @@ export function primaryRunBlockReason(input: {
   // anywhere (elspeth-088bf83922 review follow-up).
   if (input.validationNotRun) return "not_validated";
   if (input.validationFailing) return "validation";
+  if (input.executionReadinessBlocked) return "readiness";
   return null;
 }
 
@@ -156,7 +486,8 @@ export function primaryRunBlockReason(input: {
 const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
   running: "The pipeline is already running.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
-  validation: "Fix the validation errors shown in the Audit panel before running.",
+  validation: "Fix the validation errors shown in the Checks tab before running.",
+  readiness: "The backend has not admitted this pipeline for execution.",
   not_validated: "This pipeline hasn't been validated yet.",
 };
 
@@ -179,7 +510,8 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
  *     same text so screen readers receive the affordance text (a
  *     `title` attribute alone is not reliably announced).
  *
- * Other not-runnable states (validation failing, already executing/running)
+ * Other not-runnable states (not yet validated, structural validation
+ * failing, backend execution readiness blocked, already executing/running)
  * keep native `disabled` — the WCAG 4.1.2 concern above is specific to the
  * interpretation block, which is the only state that removes reachability
  * from a mouseless/AT user if left natively disabled. They still get a
@@ -198,11 +530,13 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
  *
  * Gate legibility (elspeth-088bf83922 T-2, option (a)): the audit-readiness
  * panel's rows other than validation/llm_interpretations never block Run —
- * this button previously gave no hint of that distinction. Two small,
- * NON-gating additions (`canExecute` itself is untouched):
- *   - when disabled, a visible one-line reason ("The pipeline is already
- *     running." / the interpretation-pending line / a validation pointer)
- *     renders below the button, driven by `primaryRunBlockReason`;
+ * this button previously gave no hint of that distinction. `canExecute`
+ * explicitly gates on backend execution readiness, interpretation review,
+ * and active-run state; the visible surfaces make those decisions legible:
+ *   - when disabled, a one-line reason for an active run, pending
+ *     interpretation, missing validation, structural validation failure, or
+ *     backend readiness refusal renders below the button, driven by
+ *     `primaryRunBlockReason`;
  *   - when enabled but the audit snapshot has a non-green advisory row
  *     (plugin_trust/provenance/retention/secrets), a single line notes
  *     that advisory checks don't block Run.
@@ -242,21 +576,36 @@ export function ExecuteButton(): JSX.Element | null {
     return cached?.composition_version === compositionVersion ? cached : undefined;
   });
 
+  // R2-F7 (elspeth-27bc704359): the same catalog transforms list the
+  // audit-readiness panel reads, used below to classify network-egress
+  // lines in the pre-run disclosure by `audit_characteristics` rather than
+  // the Azure-only hardcoded fallback. `error` is read too: the store
+  // resets `transforms` to `null` on BOTH "not loaded yet" and "load
+  // failed", and only `error` distinguishes them — collapsing that
+  // distinction previously meant a catalog fetch failure silently and
+  // permanently fell back to the same under-disclosing hardcoded set R2-F7
+  // exists to fix (finding elspeth-27bc704359 follow-up).
+  const catalogTransforms = usePluginCatalogStore((s) => s.transforms);
+  const catalogSources = usePluginCatalogStore((s) => s.sources);
+  const catalogIsLoading = usePluginCatalogStore((s) => s.isLoading);
+  const catalogLoadFailed = usePluginCatalogStore((s) => s.error !== null);
+
   const reactId = useId();
   const describedById = `${reactId}-run-block-reason`;
   const [showRunDisclosure, setShowRunDisclosure] = useState(false);
   const [skipFutureDisclosure, setSkipFutureDisclosure] = useState(false);
 
-  if (!activeSessionId) return null;
-
-  const optedOut = optedOutInterpretationsBySession[activeSessionId] ?? false;
-  const pendingCount = Object.keys(
-    pendingInterpretationsBySession[activeSessionId] ?? {},
-  ).length;
+  const optedOut = activeSessionId
+    ? optedOutInterpretationsBySession[activeSessionId] ?? false
+    : false;
+  const pendingCount = activeSessionId
+    ? Object.keys(pendingInterpretationsBySession[activeSessionId] ?? {}).length
+    : 0;
   const isRunBlocked = !optedOut && pendingCount > 0;
 
   const canExecute =
-    validationResult?.is_valid === true &&
+    activeSessionId !== null &&
+    validationResult?.readiness?.execution_ready === true &&
     !isExecuting &&
     progress?.status !== "running" &&
     !isRunBlocked;
@@ -270,46 +619,144 @@ export function ExecuteButton(): JSX.Element | null {
     isRunBlocked,
     validationNotRun: validationResult == null,
     validationFailing: validationResult != null && validationResult.is_valid !== true,
+    executionReadinessBlocked:
+      validationResult != null &&
+      validationResult.readiness?.execution_ready !== true,
   });
+  const blockReasonText =
+    blockReason === "readiness"
+      ? validationResult?.readiness?.blockers[0]?.detail ??
+        RUN_BLOCK_REASON_TEXT.readiness
+      : blockReason
+        ? RUN_BLOCK_REASON_TEXT[blockReason]
+        : null;
   const advisoryRowsNonGreen =
     auditSnapshot?.rows.some(
       (row) =>
-        !isRunGatingReadinessRow(row.id) &&
+        !isRunGatingReadinessRow(
+          row.id,
+          auditSnapshot.validation_result.readiness.execution_ready,
+        ) &&
         (row.status === "warning" || row.status === "error"),
     ) ?? false;
 
-  function handleRunClick(): void {
+  // Launch, then switch the workspace to the Run artifact
+  // (elspeth-3a7b7c7b37): all run-lifecycle feedback (ProgressView's
+  // progress bar, Cancel, and its terminal live region) mounts only inside
+  // the Run panel, so a successful launch must bring it on screen. Keyed on
+  // execute()'s returned run_id being a real id — the null returns (428
+  // fanout guard, 409 conflict, interpretation block, stale-session drop)
+  // must not switch tabs. Same dispatch idiom as the palette's Export YAML
+  // command.
+  const launchRun = useCallback(
+    async (sessionId: string): Promise<void> => {
+      const runId = await execute(sessionId);
+      if (typeof runId === "string") {
+        dispatchArtifactViewIntent({
+          tab: "run",
+          focusMode: false,
+          sessionId,
+        });
+      }
+    },
+    [execute],
+  );
+
+  const handleRunClick = useCallback((): void => {
     // Blocked-but-focusable case (aria-disabled): activation is a no-op.
     if (!canExecute || !activeSessionId) return;
     if (disclosureAcknowledged) {
-      void execute(activeSessionId);
+      void launchRun(activeSessionId);
       return;
     }
     setShowRunDisclosure(true);
-  }
+  }, [activeSessionId, canExecute, disclosureAcknowledged, launchRun]);
+
+  useEffect(() => {
+    function handleRunRequest(): void {
+      handleRunClick();
+    }
+    window.addEventListener(REQUEST_RUN_EVENT, handleRunRequest);
+    return () => window.removeEventListener(REQUEST_RUN_EVENT, handleRunRequest);
+  }, [handleRunClick]);
 
   function handleDisclosureConfirm(): void {
-    if (!activeSessionId) return;
+    if (!canExecute || !activeSessionId) {
+      setShowRunDisclosure(false);
+      return;
+    }
     if (skipFutureDisclosure) {
       acknowledgeRunDisclosure(activeSessionId);
     }
     setShowRunDisclosure(false);
-    void execute(activeSessionId);
+    void launchRun(activeSessionId);
   }
 
-  const egressLines = buildRunEgressSummary(compositionState);
+  if (!activeSessionId) return null;
+
+  const egressLines = buildRunEgressSummary(
+    compositionState,
+    catalogTransforms,
+    catalogLoadFailed,
+    catalogSources,
+    catalogIsLoading,
+  );
 
   return (
     <>
-      <button
-        type="button"
-        // Plain .btn, never .btn-primary: CompletionBar's contract (its
-        // docstring, per plan 19b §"Scope boundaries") renders Save-for-review
-        // / Run / Export YAML as CO-EQUAL verbs with no primary emphasis. A
-        // conditional btn-primary here singled Run out as the lone filled
-        // accent button whenever the composition was valid, contradicting the
-        // documented design (elspeth-0d37694c8c).
-        className="btn side-rail-execute-btn"
+      {/* Gate legibility (elspeth-088bf83922 T-2): a visible (not sr-only)
+          one-line reason for whichever gate is currently holding Run back.
+          Deliberately plain text, not a tooltip — tooltips on natively
+          disabled buttons are not reliably reachable by keyboard/AT users
+          (see the WCAG 4.1.2 note below), and this line is meant for every
+          user, not just the interpretation-pending case that already has
+          its own aria-describedby announcement.
+
+          It is emitted BEFORE the button (operator decision, 2026-08-16) so it
+          renders to Run's LEFT and vertically centred against it, rather than
+          on a line of its own underneath. DOM order, not CSS `order`: the two
+          <p> variants are mutually exclusive, so exactly one can precede the
+          button, and workspace.css keys the spacing off that adjacency. Using
+          `order` would have worked visually but the rule against it on
+          interactive controls exists precisely so nobody has to re-derive
+          whether a given lift is the safe kind — moving the markup keeps
+          visual, DOM and tab order identical with nothing to reason about.
+          For AT this reads better too: the reason is announced on the way IN
+          to the button rather than after it (WCAG 1.3.2 meaningful sequence). */}
+      {blockReason && (
+        <p
+          className="side-rail-execute-reason"
+          data-run-block-reason={blockReason}
+        >
+          {blockReasonText}
+        </p>
+      )}
+      {/* Run is enabled, but the audit-readiness panel has a non-green
+          advisory row (plugin trust / provenance / retention / secrets).
+          These rows never gate Run — say so in one line rather than
+          leaving the user to infer it from an amber/red row that did
+          nothing when they ran anyway. */}
+      {!blockReason && advisoryRowsNonGreen && (
+        <p className="side-rail-execute-reason side-rail-execute-reason--advisory">
+          Advisory checks don't block Run.
+        </p>
+      )}
+      <Button
+        // variant="danger" is a DELIBERATE 2026-08-15 operator decision that
+        // supersedes the earlier no-emphasis rule (elspeth-0d37694c8c): Run
+        // is the one verb with consequences outside the composer (provider
+        // egress and spend), so it carries the danger-family red fill to
+        // stand out in both themes. Never "correct" this back to secondary
+        // or swap it for variant="primary" — green-as-valid was the exact
+        // reading 0d37694c8c removed. The co-equal contract retired fully
+        // in the 2026-08-15 recut: Run is isolated at the action bar's
+        // right edge (workspace.css, workspaceChrome.test.ts). Disabled
+        // and aria-disabled states still win by specificity (.btn:disabled
+        // is (0,2,0) vs .btn-danger (0,1,0)), so the fill is grey until
+        // the pipeline is actually runnable and the red reads as "this
+        // will actually fire".
+        variant="danger"
+        className="side-rail-execute-btn"
         onClick={handleRunClick}
         // Native disabled ONLY for reasons without a button-attached
         // explanation. The interpretation-pending block must stay focusable
@@ -323,7 +770,7 @@ export function ExecuteButton(): JSX.Element | null {
         // interpretations — the other not-runnable states are natively
         // `disabled`, and a `title` on a disabled element is not reliably
         // reachable by keyboard/AT users, so their reason is carried by the
-        // always-visible <p> below instead (elspeth-088bf83922 T-2).
+        // always-visible <p> above instead (elspeth-088bf83922 T-2).
         title={isRunBlocked ? INTERPRETATION_PENDING_RUN_BLOCK_TITLE : undefined}
         aria-describedby={isRunBlocked ? describedById : undefined}
       >
@@ -339,7 +786,7 @@ export function ExecuteButton(): JSX.Element | null {
         ) : (
           "Run pipeline"
         )}
-      </button>
+      </Button>
       {/*
         Visually-hidden description for AT users. The `title` attribute on
         the button alone is not reliably announced by all screen readers
@@ -354,34 +801,9 @@ export function ExecuteButton(): JSX.Element | null {
           {INTERPRETATION_PENDING_RUN_BLOCK_TITLE}
         </span>
       )}
-      {/* Gate legibility (elspeth-088bf83922 T-2): a visible (not sr-only)
-          one-line reason for whichever gate is currently holding Run back.
-          Deliberately plain text, not a tooltip — tooltips on natively
-          disabled buttons are not reliably reachable by keyboard/AT users
-          (see the WCAG 4.1.2 note above), and this line is meant for every
-          user, not just the interpretation-pending case that already has
-          its own aria-describedby announcement. */}
-      {blockReason && (
-        <p
-          className="side-rail-execute-reason"
-          data-run-block-reason={blockReason}
-        >
-          {RUN_BLOCK_REASON_TEXT[blockReason]}
-        </p>
-      )}
-      {/* Run is enabled, but the audit-readiness panel has a non-green
-          advisory row (plugin trust / provenance / retention / secrets).
-          These rows never gate Run — say so in one line rather than
-          leaving the user to infer it from an amber/red row that did
-          nothing when they ran anyway. */}
-      {!blockReason && advisoryRowsNonGreen && (
-        <p className="side-rail-execute-reason side-rail-execute-reason--advisory">
-          Advisory checks don't block Run.
-        </p>
-      )}
       {showRunDisclosure && (
         <ConfirmDialog
-          title="Run pipeline?"
+          title="Run pipeline"
           message={
             egressLines.length > 0
               ? "This run leaves the composer and uses your stored credentials:"
@@ -394,12 +816,40 @@ export function ExecuteButton(): JSX.Element | null {
           {egressLines.length > 0 && (
             <ul className="run-disclosure-summary">
               {egressLines.map((line) => (
-                <li key={line}>{line}</li>
+                <li key={line.identifiers} title={line.identifiers}>
+                  {line.text}
+                  {/* The identifier register, reachable by AT and by
+                      keyboard users: it is in-flow content of this <li>, so
+                      it is already part of the list item's accessible
+                      content — no `aria-describedby` needed (that would
+                      make AT announce it a second time as a description).
+                      `title` is kept for sighted mouse hover; it is a
+                      convenience, never the only route (the run-button
+                      comment above records why).
+
+                      The "(exact identifiers: …)" FRAMING is load-bearing,
+                      not decoration. Unframed, the <li>'s accessible content
+                      was "Reads source data: Source (CSV). Reads source data:
+                      source (csv)." — and case and parentheses do not survive
+                      speech, so a screen-reader user heard the same sentence
+                      twice, back to back, on every line of a consent dialog.
+                      Four lines became eight sentences that present as a
+                      stutter or a rendering bug. One phrase turns apparent
+                      duplication into an intelligible disclosure and keeps
+                      every sentence (the R2-F7 obligation).
+
+                      Written as a template literal, not JSX text: JSX strips
+                      whitespace around a line break, so a leading space
+                      authored as markup would not survive Prettier rewrapping
+                      the element. The space matters — without it speech runs
+                      the reader sentence into the disclosure. */}
+                  <span className="sr-only">{` (exact identifiers: ${line.identifiers})`}</span>
+                </li>
               ))}
             </ul>
           )}
           <label className="run-disclosure-opt-out">
-            <input
+            <Input
               type="checkbox"
               checked={skipFutureDisclosure}
               onChange={(event) => setSkipFutureDisclosure(event.target.checked)}

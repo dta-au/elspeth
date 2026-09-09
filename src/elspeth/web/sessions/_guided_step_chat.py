@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -24,13 +26,16 @@ from elspeth.web.composer.guided.chat_solver import (
     AssistantScaffoldLeakError,
     DeferredIntentManagementChatRequest,
     GuidedChatDeferredIntentOutcome,
+    GuidedChatDeferredIntentWithheldResolutionOutcome,
     GuidedChatDeferredManagementOutcome,
     GuidedChatEmptyOutcome,
     GuidedChatProseOutcome,
     GuidedToolArgumentShapeError,
     Step1SourceChatResolution,
+    Step1SourcePluginReselectedOutcome,
     Step1SourceResolvedOutcome,
     Step2SinkResolvedOutcome,
+    StepChatContextInput,
     maybe_manage_deferred_intent_chat,
     maybe_resolve_step_1_source_chat,
     maybe_resolve_step_2_sink_chat,
@@ -49,6 +54,9 @@ from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkResolved, SourceResolved
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+if TYPE_CHECKING:
+    from typing import TypeIs
 
 slog = structlog.get_logger()
 
@@ -119,15 +127,59 @@ class GuidedStepChatOnlyResult:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GuidedStepDeferredClarificationResult:
+    """Retain repair exhausted: degrade to durable clarification retention.
+
+    The Send carried a future-stage instruction the model could not express as
+    a well-formed ``retain_deferred_intent`` action even after the bounded
+    repair turn. Instead of discarding the instruction (the R2-F15 failure),
+    the route appends a constraint-free clarification intent
+    (:func:`elspeth.web.composer.guided.deferred_intents.create_deferred_clarification_intent`)
+    bound to the private originating message, and the chat reply asks for the
+    missing structural constraint.
+    """
+
+    chat: StepChatResult
+
+    def __post_init__(self) -> None:
+        if type(self.chat) is not StepChatResult:
+            raise TypeError("GuidedStepDeferredClarificationResult.chat must be exact")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class GuidedStepDeferredIntentResult:
     chat: StepChatResult
-    action: DeferredIntentAction
+    # One action per retain_deferred_intent call in the reply, in call order
+    # (elspeth-3a21f09f09).
+    actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("GuidedStepDeferredIntentResult.chat must be exact")
-        if type(self.action) is not DeferredIntentAction:
-            raise TypeError("GuidedStepDeferredIntentResult.action must be exact")
+        if type(self.actions) is not tuple or not self.actions or any(type(action) is not DeferredIntentAction for action in self.actions):
+            raise TypeError("GuidedStepDeferredIntentResult.actions must be a non-empty tuple of exact actions")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuidedStepDeferredIntentWithheldResolutionResult:
+    """A pair's retain applies alone; its resolution half was withheld.
+
+    ``chat`` carries the scoped not-applied failure (SYNTHETIC_UNAVAILABLE +
+    the resolution half's closed error_class); the route composes it with the
+    retain disposition exactly like the F1 contract, so the turn never claims
+    a clean success while the requested resolution was not configured.
+    """
+
+    chat: StepChatResult
+    actions: tuple[DeferredIntentAction, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.chat) is not StepChatResult:
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.chat must be exact")
+        if self.chat.status is not ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE or self.chat.error_class is None:
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.chat must carry the scoped not-applied failure")
+        if type(self.actions) is not tuple or not self.actions or any(type(action) is not DeferredIntentAction for action in self.actions):
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.actions must be a non-empty tuple of exact actions")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -146,31 +198,58 @@ class GuidedStepDeferredManagementResult:
 class Step1SourceResolvedResult:
     chat: StepChatResult
     resolution: Step1SourceChatResolution
+    # Set when the reply GROUPED resolve_source with retain_deferred_intent
+    # calls (elspeth-a96b2f1b0a / R2-F15, generalized by elspeth-3a21f09f09):
+    # every half applies in the same settlement.
+    deferred_actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step1SourceResolvedResult.chat must be exact")
         if type(self.resolution) is not Step1SourceChatResolution:
             raise TypeError("Step1SourceResolvedResult.resolution must be exact")
+        if type(self.deferred_actions) is not tuple or any(type(action) is not DeferredIntentAction for action in self.deferred_actions):
+            raise TypeError("Step1SourceResolvedResult.deferred_actions must be a tuple of exact actions")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Step1SourcePluginReselectedResult:
+    chat: StepChatResult
+    plugin: str
+
+    def __post_init__(self) -> None:
+        if type(self.chat) is not StepChatResult:
+            raise TypeError("Step1SourcePluginReselectedResult.chat must be exact")
+        if type(self.plugin) is not str or not self.plugin:
+            raise TypeError("Step1SourcePluginReselectedResult.plugin must be a non-empty exact string")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Step2SinkResolvedResult:
     chat: StepChatResult
     sink: SinkResolved
+    # Set when the reply GROUPED resolve_sink with retain_deferred_intent
+    # calls (elspeth-a96b2f1b0a / R2-F15, generalized by elspeth-3a21f09f09):
+    # every half applies in the same settlement.
+    deferred_actions: tuple[DeferredIntentAction, ...]
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step2SinkResolvedResult.chat must be exact")
         if type(self.sink) is not SinkResolved:
             raise TypeError("Step2SinkResolvedResult.sink must be exact")
+        if type(self.deferred_actions) is not tuple or any(type(action) is not DeferredIntentAction for action in self.deferred_actions):
+            raise TypeError("Step2SinkResolvedResult.deferred_actions must be a tuple of exact actions")
 
 
 type Step1SourceChatResult = (
     GuidedStepChatEmptyResult
     | GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredIntentWithheldResolutionResult
+    | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
+    | Step1SourcePluginReselectedResult
     | Step1SourceResolvedResult
 )
 
@@ -178,9 +257,24 @@ type Step2SinkChatResult = (
     GuidedStepChatEmptyResult
     | GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredIntentWithheldResolutionResult
+    | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step2SinkResolvedResult
 )
+
+
+def is_guided_step_chat_empty_result(outcome: Step1SourceChatResult | Step2SinkChatResult) -> TypeIs[GuidedStepChatEmptyResult]:
+    """Discriminate the empty member of a step-chat union by exact type.
+
+    A ``TypeIs`` guard (PEP 742) so mypy narrows BOTH arms: a caller that
+    falls through the negative branch holds the non-empty members, every one
+    of which declares ``chat``. Strict ``type() is`` on purpose — the unions
+    are closed sets of exact frozen dataclasses this package owns, and a
+    subclass arriving here would be a first-party contract violation to
+    surface, not an empty result to route.
+    """
+    return type(outcome) is GuidedStepChatEmptyResult
 
 
 # Synthetic message returned to the user when the LLM is transiently
@@ -219,9 +313,27 @@ _SCAFFOLD_LEAK_MESSAGE = (
     "with the wizard controls."
 )
 
-_DEFERRED_ACTION_REPAIR_MESSAGE = (
-    "I couldn't verify that future-stage instruction, so I didn't retain it. "
-    "Please restate the target stage and the structural requirement."
+# Not-applied copy for a pair whose RESOLUTION half was withheld while its
+# retain half applies alone. The route appends the retain disposition, so the
+# copy covers only the resolution half's fate.
+_PAIRED_SOURCE_NOT_APPLIED_MESSAGE = (
+    "I couldn't apply the source content from that message, so your "
+    "pipeline source is unchanged. Describe the source again and I'll rebuild it."
+)
+
+_PAIRED_SINK_NOT_APPLIED_MESSAGE = (
+    "I couldn't apply the output configuration from that message, so your "
+    "pipeline output is unchanged. Describe the output again and I'll rebuild it."
+)
+
+# Reply for the clarification-retention fallback: the instruction WAS kept
+# (as a constraint-free clarification intent) — the copy must say so and ask
+# for the missing structure, never claim the instruction was dropped.
+_DEFERRED_CLARIFICATION_RETAINED_MESSAGE = (
+    "I kept that future-stage instruction, but I couldn't verify its structure "
+    "yet. Tell me the target stage and the concrete structural requirement — "
+    "for example the plugin it must add or the connection it must produce — "
+    "and I'll firm it up."
 )
 
 _DEFERRED_MANAGEMENT_REPAIR_MESSAGE = (
@@ -375,7 +487,11 @@ async def resolve_step_1_source_chat_with_auto_drop(
     seed: int | None,
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
-    context_block: str | None = None,
+    context_block: StepChatContextInput | None = None,
+    allow_plugin_reselection: bool = False,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Step1SourceChatResult:
     """Wrap Step-1 ``resolve_source`` chat with the guided-chat fallback contract.
 
@@ -383,7 +499,8 @@ async def resolve_step_1_source_chat_with_auto_drop(
     :func:`maybe_resolve_step_1_source_chat` so a declined-to-prose reply
     (returned as ``GuidedStepChatOnlyResult``) is grounded in the same
     "current build" context a second, tool-less call would otherwise have
-    supplied.
+    supplied. ``api_base``/``api_key`` are the PRIMARY-role endpoint
+    affordance (Phase 3 Task 2); guided solvers never use the advisor's.
     """
     started = time.perf_counter()
     try:
@@ -398,6 +515,10 @@ async def resolve_step_1_source_chat_with_auto_drop(
             recorder=recorder,
             timeout_seconds=timeout_seconds,
             context_block=context_block,
+            allow_plugin_reselection=allow_plugin_reselection,
+            api_base=api_base,
+            api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step1SourceResolvedOutcome:
@@ -409,16 +530,41 @@ async def resolve_step_1_source_chat_with_auto_drop(
                     error_class=None,
                 ),
                 resolution=outcome.resolution,
+                deferred_actions=outcome.deferred_actions,
             )
-        if type(outcome) is GuidedChatDeferredIntentOutcome:
-            return GuidedStepDeferredIntentResult(
+        if type(outcome) is Step1SourcePluginReselectedOutcome:
+            return Step1SourcePluginReselectedResult(
                 chat=StepChatResult(
-                    assistant_message="I found a future-stage instruction and will validate it before retaining it.",
+                    assistant_message=outcome.assistant_message,
                     status=ComposerChatTurnStatus.SUCCESS,
                     latency_ms=latency_ms,
                     error_class=None,
                 ),
-                action=outcome.action,
+                plugin=outcome.plugin,
+            )
+        if type(outcome) is GuidedChatDeferredIntentOutcome:
+            return GuidedStepDeferredIntentResult(
+                chat=StepChatResult(
+                    assistant_message=(
+                        "I found a future-stage instruction and will validate it before retaining it."
+                        if len(outcome.actions) == 1
+                        else f"I found {len(outcome.actions)} future-stage instructions and will validate each before retaining it."
+                    ),
+                    status=ComposerChatTurnStatus.SUCCESS,
+                    latency_ms=latency_ms,
+                    error_class=None,
+                ),
+                actions=outcome.actions,
+            )
+        if type(outcome) is GuidedChatDeferredIntentWithheldResolutionOutcome:
+            return GuidedStepDeferredIntentWithheldResolutionResult(
+                chat=StepChatResult(
+                    assistant_message=_PAIRED_SOURCE_NOT_APPLIED_MESSAGE,
+                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                    latency_ms=latency_ms,
+                    error_class=outcome.resolution_error_class,
+                ),
+                actions=outcome.actions,
             )
         if type(outcome) is GuidedChatDeferredManagementOutcome:
             return GuidedStepDeferredManagementResult(
@@ -442,7 +588,34 @@ async def resolve_step_1_source_chat_with_auto_drop(
         if type(outcome) is GuidedChatEmptyOutcome:
             return GuidedStepChatEmptyResult()
         raise GuidedSolverResponseShapeError(f"unexpected Step-1 chat outcome: {type(outcome).__name__}")
-    except (DeferredIntentActionShapeError, DeferredIntentManagementActionShapeError) as exc:
+    except DeferredIntentActionShapeError as exc:
+        # Retain repair exhausted: degrade to durable clarification retention
+        # (R2-F15) — the route appends a constraint-free clarification intent,
+        # so the user's instruction is kept, not discarded. The turn itself
+        # succeeds (status SUCCESS; ComposerChatTurn forbids an error_class on
+        # SUCCESS) — the model defect stays visible in the recorded LLM calls
+        # and this slog event.
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        slog.error(
+            "guided.step_1_deferred_intent_shape_rejected",
+            session_id=session_id,
+            user_id=user_id,
+            site=site,
+            step=GuidedStep.STEP_1_SOURCE.value,
+            exc_class=type(exc).__name__,
+            latency_ms=latency_ms,
+            degraded_to_clarification=True,
+            frames=_safe_frame_strings(exc),
+        )
+        return GuidedStepDeferredClarificationResult(
+            chat=StepChatResult(
+                assistant_message=_DEFERRED_CLARIFICATION_RETAINED_MESSAGE,
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=latency_ms,
+                error_class=None,
+            ),
+        )
+    except DeferredIntentManagementActionShapeError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_1_deferred_intent_shape_rejected",
@@ -456,7 +629,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_DEFERRED_ACTION_REPAIR_MESSAGE,
+                assistant_message=_DEFERRED_MANAGEMENT_REPAIR_MESSAGE,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,
@@ -497,6 +670,11 @@ async def resolve_step_1_source_chat_with_auto_drop(
         # "unavailable" mislabels a model-output defect as provider weather
         # (observed live: session f9836d91, 2026-07-23). The message is
         # value-free by construction, so it is journal-safe verbatim.
+        # Since elspeth-79e66ff613 stage 2 this branch fires only at repair
+        # EXHAUSTION: the solver threads the rejection back for one in-Send
+        # resend first, so a single stochastic omission no longer reaches
+        # the user (composer.guided_shape_repair outcome=exhausted coincides
+        # 1:1 with these events).
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_1_source_chat_model_shape_rejected",
@@ -555,9 +733,17 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     secret_service: WebSecretResolver | None = None,
     max_discovery_iters: int | None = None,
+    max_tool_calls_per_turn: int | None = None,
     timeout_seconds: float,
-    context_block: str | None = None,
+    context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
+    revision_target_index: int | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    reasoning_effort: str | None = None,
+    # F2 marking hook, threaded verbatim to the solver's discovery loop —
+    # binds ComposerServiceImpl._mark_plugin_schema_loaded at the route.
+    mark_schema_loaded: Callable[[str, str], None] | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.
 
@@ -565,11 +751,14 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     sink discovery-tool loop in :func:`maybe_resolve_step_2_sink_chat`; the
     route always threads them so the composer model can ``list_sinks`` /
     ``get_plugin_schema`` before resolving. ``max_discovery_iters`` bounds the
-    loop (the route passes ``settings.composer_max_discovery_turns``); ``None``
-    defers to the solver's own default. ``context_block`` threads straight
-    through so a declined-to-prose reply (returned as
+    loop and ``max_tool_calls_per_turn`` bounds each discovery batch (the route
+    passes both configured limits); ``None`` defers to the solver's own
+    defaults. ``context_block`` threads straight through so a declined-to-prose
+    reply (returned as
     ``GuidedStepChatOnlyResult``) is grounded in the same "current build"
     context a second, tool-less call would otherwise have supplied.
+    ``api_base``/``api_key`` are the PRIMARY-role endpoint affordance
+    (Phase 3 Task 2); guided solvers never use the advisor's.
     """
     started = time.perf_counter()
     try:
@@ -586,9 +775,15 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             secret_service=secret_service,
             user_id=user_id,
             max_discovery_iters=max_discovery_iters,
+            max_tool_calls_per_turn=max_tool_calls_per_turn,
             timeout_seconds=timeout_seconds,
             context_block=context_block,
             progress=progress,
+            revision_target_index=revision_target_index,
+            api_base=api_base,
+            api_key=api_key,
+            reasoning_effort=reasoning_effort,
+            mark_schema_loaded=mark_schema_loaded,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step2SinkResolvedOutcome:
@@ -600,16 +795,31 @@ async def resolve_step_2_sink_chat_with_auto_drop(
                     error_class=None,
                 ),
                 sink=outcome.sink,
+                deferred_actions=outcome.deferred_actions,
             )
         if type(outcome) is GuidedChatDeferredIntentOutcome:
             return GuidedStepDeferredIntentResult(
                 chat=StepChatResult(
-                    assistant_message="I found a future-stage instruction and will validate it before retaining it.",
+                    assistant_message=(
+                        "I found a future-stage instruction and will validate it before retaining it."
+                        if len(outcome.actions) == 1
+                        else f"I found {len(outcome.actions)} future-stage instructions and will validate each before retaining it."
+                    ),
                     status=ComposerChatTurnStatus.SUCCESS,
                     latency_ms=latency_ms,
                     error_class=None,
                 ),
-                action=outcome.action,
+                actions=outcome.actions,
+            )
+        if type(outcome) is GuidedChatDeferredIntentWithheldResolutionOutcome:
+            return GuidedStepDeferredIntentWithheldResolutionResult(
+                chat=StepChatResult(
+                    assistant_message=_PAIRED_SINK_NOT_APPLIED_MESSAGE,
+                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                    latency_ms=latency_ms,
+                    error_class=outcome.resolution_error_class,
+                ),
+                actions=outcome.actions,
             )
         if type(outcome) is GuidedChatDeferredManagementOutcome:
             return GuidedStepDeferredManagementResult(
@@ -633,7 +843,31 @@ async def resolve_step_2_sink_chat_with_auto_drop(
         if type(outcome) is GuidedChatEmptyOutcome:
             return GuidedStepChatEmptyResult()
         raise GuidedSolverResponseShapeError(f"unexpected Step-2 chat outcome: {type(outcome).__name__}")
-    except (DeferredIntentActionShapeError, DeferredIntentManagementActionShapeError) as exc:
+    except DeferredIntentActionShapeError as exc:
+        # Mirror of the step-1 branch: retain repair exhausted degrades to
+        # durable clarification retention (R2-F15) rather than discarding the
+        # user's future-stage instruction.
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        slog.error(
+            "guided.step_2_deferred_intent_shape_rejected",
+            session_id=session_id,
+            user_id=user_id,
+            site=site,
+            step=GuidedStep.STEP_2_SINK.value,
+            exc_class=type(exc).__name__,
+            latency_ms=latency_ms,
+            degraded_to_clarification=True,
+            frames=_safe_frame_strings(exc),
+        )
+        return GuidedStepDeferredClarificationResult(
+            chat=StepChatResult(
+                assistant_message=_DEFERRED_CLARIFICATION_RETAINED_MESSAGE,
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=latency_ms,
+                error_class=None,
+            ),
+        )
+    except DeferredIntentManagementActionShapeError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_2_deferred_intent_shape_rejected",
@@ -647,7 +881,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_DEFERRED_ACTION_REPAIR_MESSAGE,
+                assistant_message=_DEFERRED_MANAGEMENT_REPAIR_MESSAGE,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,
@@ -683,8 +917,10 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     # A malformed discovery-tool dispatch deep in the sink loop raises a
     # GuidedSolverResponseShapeError; the shared tool classification absorbs it.
     except GuidedToolArgumentShapeError as exc:
-        # Mirror of the step-1 branch; see the comment there. Must precede
-        # the transient set (GuidedToolArgumentShapeError is a ValueError).
+        # Mirror of the step-1 branch; see the comment there (both steps now
+        # self-repair in-Send, so this too fires only at repair exhaustion).
+        # Must precede the transient set (GuidedToolArgumentShapeError is a
+        # ValueError).
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_2_sink_chat_model_shape_rejected",
@@ -739,7 +975,10 @@ async def solve_step_chat_with_auto_drop(
     seed: int | None,
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
-    context_block: str | None = None,
+    context_block: StepChatContextInput | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> StepChatResult:
     """Wrap ``solve_step_chat`` with the synthetic-message-on-transient contract.
 
@@ -817,6 +1056,9 @@ async def solve_step_chat_with_auto_drop(
             recorder=recorder,
             timeout_seconds=timeout_seconds,
             context_block=context_block,
+            api_base=api_base,
+            api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         return StepChatResult(

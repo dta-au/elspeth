@@ -1,6 +1,6 @@
 # Token Outcome Test Strategy
 
-Current as of 2026-05-20.
+Current as of 2026-08-03.
 
 Tests should prove the two-axis token outcome contract, not the retired
 single-axis `RowOutcome` model.
@@ -25,8 +25,9 @@ Use unit tests for producer-specific rules:
   `src/elspeth/contracts/enums.py`.
 - `TokenOutcome` field constraints in `src/elspeth/contracts/audit.py`.
 - Data-flow repository writes for parent, child, batch, and buffered outcomes.
-- Processor branches for gate, transform-error, filter/drop, batch, and
-  coalesce paths.
+- Processor branches for gate routing, gate expression-error sink/discard,
+  transform-error, filter/drop, batch, and coalesce paths. Gate error tests must
+  also preserve fail-fast execution when `on_error` is omitted.
 - Sink executor branches for normal success, failsink fallback, and discard.
 
 ## Integration Tests
@@ -34,7 +35,10 @@ Use unit tests for producer-specific rules:
 Use minimal pipelines that exercise the full config-to-runtime path:
 
 - Default source -> transform -> sink success.
-- Gate route to named sink and gate discard.
+- Gate route to named sink and intentional gate discard.
+- Gate expression failure routed to a named error sink, discarded by policy,
+  and allowed to fail fast when the policy is omitted. Configured policies must
+  affect only the bad row; unaffected source rows continue.
 - Transform `on_error` to sink and discard/failure paths.
 - Filter/drop path.
 - Fork plus coalesce.

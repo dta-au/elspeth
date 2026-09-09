@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -169,14 +170,34 @@ class PromptTemplate:
             "lookup": self._lookup_data if self._lookup_data is not None else {},
         }
 
+        return self._render_context(context)
+
+    def _render_context(self, context: Mapping[str, Any]) -> str:
+        """Render an explicit template context through the shared sandbox."""
         try:
             return self._template.render(**context)
         except UndefinedError as e:
             raise TemplateError(f"Undefined variable: {e}") from e
         except SecurityError as e:
             raise TemplateError(f"Sandbox violation: {e}") from e
-        except (TemplateSyntaxError, TemplateRuntimeError, TypeError, ValueError) as e:
+        except (TemplateSyntaxError, TemplateRuntimeError, ArithmeticError, TypeError, ValueError) as e:
             raise TemplateError(f"Template rendering failed: {e}") from e
+
+    def render_static_with_metadata(self) -> RenderedPrompt:
+        """Render a source prompt with lookup data and no row binding."""
+        prompt = self._render_context(
+            {"lookup": self._lookup_data if self._lookup_data is not None else {}},
+        )
+        return RenderedPrompt(
+            prompt=prompt,
+            template_hash=self._template_hash,
+            variables_hash=_sha256(canonical_json({})),
+            rendered_hash=_sha256(prompt),
+            template_source=self._template_source,
+            lookup_hash=self._lookup_hash,
+            lookup_source=self._lookup_source,
+            contract_hash=None,
+        )
 
     def render_with_metadata(
         self,

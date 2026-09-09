@@ -588,8 +588,174 @@ async def test_preview_runtime_preflight_failure_records_tool_invocation() -> No
 
 
 @pytest.mark.asyncio
-async def test_dispatch_records_plugin_crash_on_cancelled_error() -> None:
-    """Reviewer fix: ``CancelledError`` MUST be audited before propagation.
+async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> None:
+    """The tolerant (structural-preview) pass runs in the same audit envelope.
+
+    elspeth-229e9e8195: when the strict preview preflight is handoff-shaped,
+    tool_batch additionally runs the interpretation-tolerant preflight. A
+    crash there must carry the same PLUGIN_CRASH invocation for the preview
+    tool call as a strict-pass crash — not escape unaudited.
+    """
+    from elspeth.web.execution.schemas import ValidationReadinessBlocker
+    from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
+
+    catalog = _mock_catalog()
+    settings = _make_settings()
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    state = _empty_state()
+
+    handoff = ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=True,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=INTERPRETATION_REVIEW_PENDING_CODE,
+                    component_id="llm1",
+                    component_type="transform",
+                    detail="pending review",
+                )
+            ],
+        ),
+    )
+
+    def strict_handoff_tolerant_crash(*args: Any, **kwargs: Any) -> ValidationResult:
+        if kwargs.get("allow_pending_interpretation_placeholders"):
+            raise RuntimeError("synthetic tolerant preflight bug")
+        return handoff
+
+    turn = _make_llm_response(
+        tool_calls=[
+            {
+                "id": "call_tolerant_preflight_crash",
+                "name": "preview_pipeline",
+                "arguments": {},
+            }
+        ],
+    )
+
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service, "_runtime_preflight", side_effect=strict_handoff_tolerant_crash),
+        patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
+        pytest.raises(ComposerRuntimePreflightError) as exc_info,
+    ):
+        mock_llm.return_value = turn
+        await service.compose("Preview the current pipeline", [], state)
+
+    mock_execute_tool.assert_not_called()
+    invocations = exc_info.value.tool_invocations
+    assert len(invocations) == 1
+    inv = invocations[0]
+    assert inv.status == ComposerToolStatus.PLUGIN_CRASH
+    assert inv.tool_call_id == "call_tolerant_preflight_crash"
+    assert inv.tool_name == "preview_pipeline"
+    assert inv.error_class == "RuntimeError"
+    assert inv.version_after is None
+
+
+@pytest.mark.asyncio
+async def test_handoff_shaped_preview_threads_the_structural_callback_into_execute_tool() -> None:
+    """tool_batch wires ``structural_preflight`` only for a handoff-shaped strict verdict.
+
+    elspeth-229e9e8195: the dispatch loop precomputes the tolerant preflight
+    when — and only when — the strict preview verdict is handoff-shaped, and
+    hands it to ``execute_tool`` as the ``structural_preflight`` callback.
+    """
+    from elspeth.web.execution.schemas import ValidationReadinessBlocker
+    from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
+
+    catalog = _mock_catalog()
+    settings = _make_settings()
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    state = _empty_state()
+
+    handoff = ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=True,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=INTERPRETATION_REVIEW_PENDING_CODE,
+                    component_id="llm1",
+                    component_type="transform",
+                    detail="pending review",
+                )
+            ],
+        ),
+    )
+    tolerant = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+    def strict_handoff_or_tolerant(*args: Any, **kwargs: Any) -> ValidationResult:
+        return tolerant if kwargs.get("allow_pending_interpretation_placeholders") else handoff
+
+    preview_result = ToolResult(
+        success=True,
+        updated_state=state,
+        validation=ValidationSummary(
+            is_valid=True,
+            errors=(),
+            warnings=(),
+            suggestions=(),
+            semantic_contracts=(),
+        ),
+        affected_nodes=(),
+        data={"is_valid": False},
+    )
+
+    turn = _make_llm_response(
+        tool_calls=[
+            {
+                "id": "call_preview_structural",
+                "name": "preview_pipeline",
+                "arguments": {},
+            }
+        ],
+    )
+
+    calls = {"count": 0}
+
+    async def tool_turn_then_timeout(*_args: Any, **_kwargs: Any) -> Any:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return turn
+        raise TimeoutError
+
+    with (
+        patch.object(service, "_call_llm", new=tool_turn_then_timeout),
+        patch.object(service, "_runtime_preflight", side_effect=strict_handoff_or_tolerant),
+        patch(
+            "elspeth.web.composer.tool_batch.execute_tool",
+            return_value=preview_result,
+        ) as mock_execute_tool,
+        pytest.raises(ComposerConvergenceError),
+    ):
+        await service.compose("Preview the current pipeline", [], state)
+
+    assert mock_execute_tool.call_count == 1
+    kwargs = mock_execute_tool.call_args.kwargs
+    structural_callback = kwargs["structural_preflight"]
+    assert structural_callback is not None
+    assert structural_callback(state) is tolerant
+    assert kwargs["runtime_preflight"](state) is handoff
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
+    """``CancelledError`` must be audited as cancellation before propagation.
 
     ``asyncio.CancelledError`` inherits from ``BaseException`` (not
     ``Exception``), so the typed handlers inside
@@ -604,7 +770,7 @@ async def test_dispatch_records_plugin_crash_on_cancelled_error() -> None:
     The ``try/finally`` shape closes the hole: the ``finally`` clause
     runs on every exit (including BaseException propagation),
     reconstructs the propagating exception via :func:`sys.exc_info`,
-    and records ``PLUGIN_CRASH`` before the helper unwinds.
+    and records ``CANCELLED`` before the helper unwinds.
 
     Production-realistic path: the test injects
     ``asyncio.CancelledError`` into the ``execute_tool`` worker call
@@ -618,7 +784,7 @@ async def test_dispatch_records_plugin_crash_on_cancelled_error() -> None:
       in ``ComposerPluginCrashError`` — the typed handlers never
       caught it, so neither does any wrap site).
     - The recorder captured exactly one invocation with
-      ``status=PLUGIN_CRASH``, ``error_class="CancelledError"``,
+      ``status=CANCELLED``, ``error_class="CancelledError"``,
       ``version_after=None``.
     """
     catalog = _mock_catalog()
@@ -653,7 +819,7 @@ async def test_dispatch_records_plugin_crash_on_cancelled_error() -> None:
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
-            side_effect=asyncio.CancelledError(),
+            side_effect=asyncio.CancelledError("raw cancellation detail must not persist"),
         ),
         patch("elspeth.web.composer.service.BufferingRecorder", _SpyRecorder),
     ):
@@ -663,13 +829,13 @@ async def test_dispatch_records_plugin_crash_on_cancelled_error() -> None:
 
     spy = captured_recorder["instance"]
     invocations = spy.invocations
-    assert len(invocations) == 1, f"Expected exactly one PLUGIN_CRASH audit row for the cancelled dispatch; got {len(invocations)}"
+    assert len(invocations) == 1, f"Expected exactly one CANCELLED audit row for the cancelled dispatch; got {len(invocations)}"
     inv = invocations[0]
-    assert inv.status == ComposerToolStatus.PLUGIN_CRASH
+    assert inv.status.value == "cancelled"
     assert inv.tool_call_id == "call_cancelled"
     assert inv.error_class == "CancelledError"
-    # Redaction discipline: error_message is class-name only.
-    assert inv.error_message == "CancelledError"
+    # Redaction discipline: the generic reason is a closed, value-free code.
+    assert inv.error_message == "cancelled"
     # Dispatch did not complete — version_after must be None to
     # satisfy the Tier-1 verifier invariant.
     assert inv.version_after is None

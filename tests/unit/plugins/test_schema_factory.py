@@ -132,6 +132,21 @@ class TestCreateSchemaFromConfig:
         instance3 = Schema(id=3, score=None)
         assert instance3.model_dump() == {"id": 3, "score": None}
 
+    def test_required_nullable_field_requires_presence_and_accepts_none(self) -> None:
+        from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        config = SchemaConfig(
+            mode="fixed",
+            fields=(FieldDefinition(name="value", field_type="str", required=True, nullable=True),),
+        )
+        schema = create_schema_from_config(config, "RequiredNullableSchema", allow_coercion=False)
+
+        assert schema.model_fields["value"].is_required()
+        assert schema.model_validate({"value": None}, strict=True).value is None
+        with pytest.raises(ValidationError):
+            schema.model_validate({}, strict=True)
+
     def test_type_coercion_int_to_float(self) -> None:
         """Int values coerce to float fields."""
         from elspeth.contracts.schema import SchemaConfig

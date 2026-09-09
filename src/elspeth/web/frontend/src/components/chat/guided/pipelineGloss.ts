@@ -9,10 +9,12 @@
 //   * buildPlainPhraseMap(state) — Map<component_id, plain phrase>, keyed by the
 //                                  SAME component_id scheme GraphView uses
 //                                  (source → sourceComponentId(name), node →
-//                                  node.id, output → output.name). Reused by
-//                                  PipelineValidationSummary so a finding's raw
-//                                  component_id renders as "rate each row"
-//                                  rather than "rater".
+//                                  node.id, output → output.name). Consumed by
+//                                  validationHumaniser's makePhraseFor, which
+//                                  overlays each component's own identity
+//                                  (description / title-cased id) over these
+//                                  category phrases (elspeth-9f21f3c57d) so a
+//                                  finding names the actual step.
 //
 // These deliberately live in the guided wrapper, NOT in the shared GraphView —
 // humanising labels there would bleed into the live composer (see Slice C
@@ -59,6 +61,11 @@ export const WRITE_JSON_PHRASE = "write a JSON file";
 export const WRITE_RESULTS_PHRASE = "write the results";
 export const SCRAPE_PAGE_PHRASE = "scrape each page";
 export const PROCESS_ROW_PHRASE = "process each row";
+export const COALESCE_PHRASE = "merge the branches";
+export const ROW_UNION_PHRASE =
+  "wait for every branch, then preserve every branch row";
+export const QUEUE_PHRASE = "interleave the incoming rows";
+export const COLLECTOR_PHRASE = "gather each expanded group back into one batch";
 
 function sourcePhrase(source: SourceSpec): string {
   const plugin = (source.plugin ?? "").toLowerCase();
@@ -69,13 +76,26 @@ function sourcePhrase(source: SourceSpec): string {
 
 function transformPhrase(node: NodeSpec): string {
   // Structural node types read off the shape, not the plugin.
-  if (node.node_type === "gate") return "filter the rows";
+  // A gate's gloss carries the authored predicate verbatim (F11): "filter
+  // the rows" alone hides which condition routes which way.
+  if (node.node_type === "gate") {
+    const condition = node.condition?.trim();
+    return condition ? `filter the rows (when ${condition})` : "filter the rows";
+  }
   if (node.node_type === "aggregation") return "summarise the rows";
-  if (node.node_type === "coalesce") return "merge the branches";
+  if (node.node_type === "coalesce") return COALESCE_PHRASE;
+  // A row_union is correlated N-to-N fan-in: it waits for the complete
+  // branch set and then forwards each row. It neither merges branch records
+  // into one coalesced result nor interleaves uncorrelated arrivals.
+  if (node.node_type === "row_union") return ROW_UNION_PHRASE;
   // A queue is uncorrelated fan-in: many producers publish one connection name
   // and the queue interleaves those rows. NEVER merge/join/union language — it
   // does not correlate or combine schemas (contrast with coalesce above).
-  if (node.node_type === "queue") return "interleave the incoming rows";
+  if (node.node_type === "queue") return QUEUE_PHRASE;
+  // A collector is a scoped group closer, not a per-row step: whatever its
+  // batch-aware plugin does, the sentence must say it acts on the whole
+  // reassembled group — never fall through to the per-row plugin phrases.
+  if (node.node_type === "collector") return COLLECTOR_PHRASE;
   const plugin = (node.plugin ?? "").toLowerCase();
   if (/llm|rate|score|classif|grade/.test(plugin)) return "rate each row";
   if (/scrape|fetch|http|web/.test(plugin)) return SCRAPE_PAGE_PHRASE;
@@ -89,6 +109,38 @@ function outputPhrase(output: OutputSpec): string {
   if (plugin.includes("csv")) return WRITE_CSV_PHRASE;
   if (plugin.includes("json")) return WRITE_JSON_PHRASE;
   return WRITE_RESULTS_PHRASE;
+}
+
+/**
+ * Collapse consecutive runs of an identical phrase into one counted clause
+ * (elspeth-bc8a35c1ab). The phrases above are CATEGORY labels, not identities,
+ * so a two-transform chain that lands twice on the generic fallback used to
+ * read "…process each row, process each row, and write a JSON file".
+ *
+ * The count is carried ("twice", "3 times") rather than the repeat being
+ * dropped: silently printing one clause for two nodes would under-report the
+ * pipeline, which this gloss sits directly beside the graph to describe.
+ *
+ * Only consecutive runs collapse — a phrase that recurs after an intervening
+ * different step ("rate each row, merge the branches, rate each row") is a
+ * genuinely different position in the pipeline and stays separate.
+ *
+ * Sentence-level only: `buildPlainPhraseMap` must NOT collapse, because it is
+ * a component_id → phrase lookup that PipelineValidationSummary uses to
+ * attribute findings, where two nodes sharing a phrase is correct.
+ */
+function collapseRepeatedPhrases(phrases: string[]): string[] {
+  const collapsed: string[] = [];
+  for (let index = 0; index < phrases.length; ) {
+    const phrase = phrases[index];
+    let run = 1;
+    while (index + run < phrases.length && phrases[index + run] === phrase) run += 1;
+    if (run === 1) collapsed.push(phrase);
+    else if (run === 2) collapsed.push(`${phrase} twice`);
+    else collapsed.push(`${phrase} ${run} times`);
+    index += run;
+  }
+  return collapsed;
 }
 
 /** Join with an Oxford comma: [a] → "a"; [a,b] → "a and b"; [a,b,c] → "a, b, and c". */
@@ -119,7 +171,7 @@ export function pipelineGloss(
     phrases.push(outputPhrase(output));
   }
   if (phrases.length === 0) return GLOSS_FALLBACK;
-  return `This pipeline will ${oxfordJoin(phrases)}.`;
+  return `This pipeline will ${oxfordJoin(collapseRepeatedPhrases(phrases))}.`;
 }
 
 /**

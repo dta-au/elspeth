@@ -12,14 +12,17 @@ sync by hand" comments with an enforced round-trip invariant.
 from __future__ import annotations
 
 from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.scheduler_work_codec import (
     TERMINAL_NODE_SENTINEL,
@@ -66,14 +69,21 @@ def _create_work_item(
     current_node_id: NodeID | None,
     coalesce_name: CoalesceName | None = None,
     coalesce_node_id: NodeID | None = None,
+    row_union_name: RowUnionName | None = None,
+    collector_name: CollectorName | None = None,
     on_success_sink: str | None = None,
+    join_group_id: str | None = None,
 ) -> WorkItem:
     return WorkItem(
         token=token,
         current_node_id=current_node_id,
         coalesce_node_id=coalesce_node_id,
         coalesce_name=coalesce_name,
+        row_union_node_id=NodeID(f"row_union_node_{row_union_name}") if row_union_name is not None else None,
+        row_union_name=row_union_name,
+        collector_name=collector_name,
         on_success_sink=on_success_sink,
+        join_group_id=join_group_id,
     )
 
 
@@ -98,10 +108,10 @@ def _make_item(**overrides) -> WorkItem:
         row_id="row-1",
         token_id="tok-1",
         row_data=PipelineRow({"id": 1, "name": "alpha"}, _CONTRACT),
-        branch_name="branch-a",
-        fork_group_id="fork-1",
-        join_group_id="join-1",
-        expand_group_id="expand-1",
+        lineage_path=(
+            LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="branch-a"),
+            LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="tok-1"),
+        ),
     )
     defaults = {
         "token": token,
@@ -109,6 +119,48 @@ def _make_item(**overrides) -> WorkItem:
         "coalesce_node_id": NodeID("merge-node"),
         "coalesce_name": CoalesceName("merge"),
         "on_success_sink": "default-sink",
+        "join_group_id": "join-1",
+    }
+    defaults.update(overrides)
+    return WorkItem(**defaults)
+
+
+def _make_collector_item(**overrides) -> WorkItem:
+    """A collector-bound item: no coalesce_name/coalesce_node_id (mutually
+    exclusive with collector_name — WorkItem.__post_init__ refuses both)."""
+    token = TokenInfo(
+        row_id="row-1",
+        token_id="tok-1",
+        row_data=PipelineRow({"id": 1, "name": "alpha"}, _CONTRACT),
+        lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="tok-1"),),
+    )
+    defaults = {
+        "token": token,
+        "current_node_id": NodeID("normalize"),
+        "collector_name": CollectorName("stitch"),
+        "on_success_sink": "default-sink",
+        "join_group_id": "join-1",
+    }
+    defaults.update(overrides)
+    return WorkItem(**defaults)
+
+
+def _make_row_union_item(**overrides) -> WorkItem:
+    """A row_union-bound item: no coalesce_name/coalesce_node_id (mutually
+    exclusive with row_union_name — WorkItem.__post_init__ refuses both)."""
+    token = TokenInfo(
+        row_id="row-1",
+        token_id="tok-1",
+        row_data=PipelineRow({"id": 1, "name": "alpha"}, _CONTRACT),
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
+    )
+    defaults = {
+        "token": token,
+        "current_node_id": NodeID("normalize"),
+        "row_union_node_id": NodeID("row_union::variants"),
+        "row_union_name": RowUnionName("variants"),
+        "on_success_sink": "default-sink",
+        "join_group_id": "join-1",
     }
     defaults.update(overrides)
     return WorkItem(**defaults)
@@ -133,12 +185,12 @@ def _scheduler_row_from_fields(fields: ScheduledWorkFields) -> TokenWorkItem:
         queue_key=fields.queue_key,
         barrier_key=fields.barrier_key,
         on_success_sink=fields.on_success_sink,
-        branch_name=fields.branch_name,
-        fork_group_id=fields.fork_group_id,
         join_group_id=fields.join_group_id,
-        expand_group_id=fields.expand_group_id,
+        lineage_path=fields.lineage_path,
         coalesce_node_id=fields.coalesce_node_id,
         coalesce_name=fields.coalesce_name,
+        row_union_name=fields.row_union_name,
+        collector_name=fields.collector_name,
     )
 
 
@@ -154,14 +206,59 @@ class TestReadyFieldsRoundTrip:
         assert rehydrated.token.token_id == item.token.token_id
         assert rehydrated.token.branch_name == item.token.branch_name
         assert rehydrated.token.fork_group_id == item.token.fork_group_id
-        assert rehydrated.token.join_group_id == item.token.join_group_id
         assert rehydrated.token.expand_group_id == item.token.expand_group_id
+        # join_group_id is a merge-event carrier (ruling 20): it rides the
+        # WorkItem, never TokenInfo. The round-trip proves WorkItem.join_group_id
+        # -> ScheduledWorkFields -> TokenWorkItem -> WorkItem survives intact.
+        assert rehydrated.join_group_id == item.join_group_id
         # PipelineRow has identity equality; payload parity is dict-level.
         assert rehydrated.token.row_data.to_dict() == item.token.row_data.to_dict()
         assert rehydrated.current_node_id == item.current_node_id
         assert rehydrated.coalesce_node_id == item.coalesce_node_id
         assert rehydrated.coalesce_name == item.coalesce_name
         assert rehydrated.on_success_sink == item.on_success_sink
+
+    def test_collector_name_round_trips_through_scheduler_row(self) -> None:
+        """META-19: collector_name's codec bijection — durable TokenWorkItem
+        -> WorkItem -> durable TokenWorkItem carries the field intact in both
+        directions, no dropped field anywhere in the mapping (WorkItem gained
+        collector_name with the ready_fields/ready_emission/
+        work_item_from_scheduler mappings all threading it through, matching
+        row_union_name's shape one column over)."""
+        codec = _make_codec()
+        item = _make_collector_item()
+
+        fields = codec.ready_fields(item)
+        assert fields.collector_name == "stitch"
+        assert fields.coalesce_name is None
+        assert fields.row_union_name is None
+
+        emission = codec.ready_emission(item)
+        assert emission.collector_name == "stitch"
+
+        rehydrated = codec.work_item_from_scheduler(_scheduler_row_from_fields(fields))
+        assert rehydrated.collector_name == item.collector_name
+        assert rehydrated.coalesce_name is None
+        assert rehydrated.row_union_name is None
+
+    def test_row_union_name_round_trips_through_scheduler_row(self) -> None:
+        """M-4 (fix round): coalesce and collector each have a positive
+        rehydrate assertion (test_work_item_round_trips_through_scheduler_row,
+        test_collector_name_round_trips_through_scheduler_row); row_union_name
+        only ever appeared as an "is None" spot-check inside the collector
+        test. The row_union_name mapper fix removed the mask but nothing
+        positively pinned this field on the rehydrate axis — symmetric
+        coverage for all three barrier kinds."""
+        codec = _make_codec()
+        item = _make_row_union_item()
+
+        fields = codec.ready_fields(item)
+        assert fields.row_union_name == "variants"
+
+        rehydrated = codec.work_item_from_scheduler(_scheduler_row_from_fields(fields))
+        assert rehydrated.row_union_name == item.row_union_name
+        assert rehydrated.coalesce_name is None
+        assert rehydrated.collector_name is None
 
     def test_derived_fields_match_resolvers(self) -> None:
         codec = _make_codec()
@@ -212,8 +309,32 @@ class TestReadyEmissionParity:
         emission = codec.ready_emission(item)
 
         assert isinstance(emission, BarrierEmission)
-        for field in dataclass_fields(ScheduledWorkFields):
-            assert getattr(emission, field.name) == getattr(fields, field.name), field.name
+        # Explicit (field, emission, ready-fields) table. Both sides are owned
+        # dataclasses, so direct access makes a dropped field an AttributeError
+        # instead of a silently skipped comparison; the coverage assertion keeps
+        # the table pinned to the live ScheduledWorkFields shape.
+        parity: tuple[tuple[str, object, object], ...] = (
+            ("token_id", emission.token_id, fields.token_id),
+            ("row_id", emission.row_id, fields.row_id),
+            ("node_id", emission.node_id, fields.node_id),
+            ("step_index", emission.step_index, fields.step_index),
+            ("ingest_sequence", emission.ingest_sequence, fields.ingest_sequence),
+            ("row_payload_json", emission.row_payload_json, fields.row_payload_json),
+            ("queue_key", emission.queue_key, fields.queue_key),
+            ("barrier_key", emission.barrier_key, fields.barrier_key),
+            ("on_success_sink", emission.on_success_sink, fields.on_success_sink),
+            ("join_group_id", emission.join_group_id, fields.join_group_id),
+            ("lineage_path", emission.lineage_path, fields.lineage_path),
+            ("coalesce_node_id", emission.coalesce_node_id, fields.coalesce_node_id),
+            ("coalesce_name", emission.coalesce_name, fields.coalesce_name),
+            ("row_union_name", emission.row_union_name, fields.row_union_name),
+            ("collector_name", emission.collector_name, fields.collector_name),
+        )
+        covered = {name for name, _, _ in parity}
+        declared = {field.name for field in dataclass_fields(ScheduledWorkFields)}
+        assert covered == declared, f"parity table drifted: missing={declared - covered}, extra={covered - declared}"
+        for name, emitted, ready in parity:
+            assert emitted == ready, name
 
     def test_emission_is_ready_lane_shaped(self) -> None:
         codec = _make_codec()
@@ -234,13 +355,30 @@ class TestRehydrateCursor:
         codec = _make_codec()
         fields = codec.ready_fields(_make_item())
         row = _scheduler_row_from_fields(fields)
-        terminal_row = TokenWorkItem(
-            **{
-                **{f.name: getattr(row, f.name) for f in dataclass_fields(TokenWorkItem)},
-                "node_id": stored_node_id,
-            }
-        )
+        # ``replace`` copies the frozen owned dataclass field-for-field without a
+        # reflective read per field.
+        terminal_row = replace(row, node_id=stored_node_id)
 
         rehydrated = codec.work_item_from_scheduler(terminal_row)
 
         assert rehydrated.current_node_id is None
+
+
+_LINEAGE_PATH = (
+    LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="tok-1"),
+    LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="branch-a"),
+)
+
+
+def test_lineage_path_round_trips_through_ready_fields_and_rehydrate() -> None:
+    item = _make_item(
+        token=replace(_make_item().token, lineage_path=_LINEAGE_PATH),
+    )
+    codec = _make_codec()
+    fields = codec.ready_fields(item)
+    assert fields.lineage_path == _LINEAGE_PATH
+    emission = codec.ready_emission(item)
+    assert emission.lineage_path == _LINEAGE_PATH
+    scheduled = _scheduler_row_from_fields(fields)
+    rehydrated = codec.work_item_from_scheduler(scheduled)
+    assert rehydrated.token.lineage_path == _LINEAGE_PATH

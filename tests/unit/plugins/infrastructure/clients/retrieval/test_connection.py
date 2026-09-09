@@ -2,15 +2,39 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from pydantic import ValidationError
 
+from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
+    _validate_chroma_http_target,
 )
 
 
 class TestChromaConnectionConfig:
+    def test_localhost_must_resolve_to_a_loopback_address(self) -> None:
+        public_target = SSRFSafeRequest(
+            original_url="http://localhost:8000/",
+            resolved_ip="203.0.113.10",
+            host_header="localhost:8000",
+            port=8000,
+            path="/",
+            scheme="http",
+            bare_hostname="localhost",
+        )
+
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=public_target,
+            ),
+            pytest.raises(ValueError, match="outside the loopback ranges"),
+        ):
+            _validate_chroma_http_target("localhost", 8000, ssl=False)
+
     def test_persistent_mode_requires_persist_directory(self) -> None:
         with pytest.raises(ValidationError, match="persist_directory"):
             ChromaConnectionConfig(

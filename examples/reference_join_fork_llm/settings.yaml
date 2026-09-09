@@ -1,0 +1,160 @@
+# reference_join + fork + two LLM calls + coalesce
+#
+#   tickets.csv ─(raw)─> [enrich: reference_join] ─(enriched)─> [fork_gate] ─┬─ path_triage ─> [llm triage] ─(triaged)─┐
+#                                                                            └─ path_reply  ─> [llm reply ] ─(drafted)─┤
+#                                                                                                                      ├─ [merge_branches]
+#                                                                                                          ─(merged)──> [route_output] ─> output
+#
+# The point of the shape: ONE lookup, TWO consumers. The product's description,
+# category, support tier and warranty are joined onto the ticket exactly once,
+# before the fork. Both LLM branches then see the enriched row — the reference
+# data AND the customer's original message — without either branch repeating
+# the lookup or the branches disagreeing about what the product is.
+#
+# Doing it the other way round (fork first, join inside each branch) would run
+# the same join twice, put two copies of the reference table in the config, and
+# make it possible for the branches to be enriched from different table
+# versions. Enrich before you fan out.
+#
+# Each branch targets its own endpoint, which is what fanning out to two models
+# looks like in practice. Here both are local ChaosLLM servers with canned
+# responses and zero fault injection; in production they would be two real
+# providers or two models. Start them with ./examples/reference_join_fork_llm/run.sh.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/reference_join_fork_llm/tickets.csv
+      on_validation_failure: quarantine
+      schema:
+        mode: fixed
+        fields:
+          - 'ticket_id: str'
+          - 'product: str'
+          - 'message: str'
+
+transforms:
+  # ── Shared enrichment, once, before the fan-out ────────────────────────────
+  # products.csv is resolved relative to THIS directory and confined to it,
+  # because the loader reads it into the node's options at load time. Its bytes
+  # therefore reach the run's topology hash: edit the table between a run and
+  # its resume and the resume is refused.
+  - name: enrich
+    plugin: reference_join
+    input: raw
+    on_success: enriched
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      reference_file: products.csv
+      reference_format: csv
+      key_field: product
+      reference_key_name: sku
+      output:
+        product_description: "ref['description']"
+        product_category: "ref['category']"
+        support_tier: "ref['support_tier']"
+        warranty_months: "ref['warranty_months']"
+      on_miss: fail
+
+  # ── Branch 1: triage the ticket ───────────────────────────────────────────
+  - name: triage
+    plugin: llm
+    input: path_triage
+    on_success: triaged
+    on_error: quarantine
+    options:
+      provider: openrouter
+      api_key: fake-key-chaosllm-does-not-check
+      base_url: http://127.0.0.1:8201/v1
+      model: chaosllm/fake-triage
+      timeout_seconds: 10
+      temperature: 0.0
+      response_field: triage_note
+      required_input_fields: [message, product_description, product_category, support_tier, warranty_months]
+      prompt_template: |
+        Assign an urgency to this support ticket. Answer in one line.
+
+        Customer message: {{ row.message }}
+        Product: {{ row.product_description }} ({{ row.product_category }})
+        Support tier: {{ row.support_tier }}
+        Warranty: {{ row.warranty_months }} months
+      schema:
+        mode: observed
+
+  # ── Branch 2: draft a reply ───────────────────────────────────────────────
+  - name: draft_reply
+    plugin: llm
+    input: path_reply
+    on_success: drafted
+    on_error: quarantine
+    options:
+      provider: openrouter
+      api_key: fake-key-chaosllm-does-not-check
+      base_url: http://127.0.0.1:8202/v1
+      model: chaosllm/fake-reply
+      timeout_seconds: 10
+      temperature: 0.0
+      response_field: draft_reply
+      required_input_fields: [message, product_description, warranty_months]
+      prompt_template: |
+        Draft a short reply to this customer.
+
+        Customer message: {{ row.message }}
+        Product: {{ row.product_description }}
+        Warranty: {{ row.warranty_months }} months
+      schema:
+        mode: observed
+
+gates:
+  - name: fork_gate
+    input: enriched
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to:
+      - path_triage
+      - path_reply
+
+  - name: route_output
+    input: merge_branches
+    condition: "True"
+    routes:
+      'true': output
+      'false': output
+
+coalesce:
+  # require_all: a ticket is only written when BOTH the triage and the draft
+  # exist. A half-answered ticket is worse than an unanswered one, because it
+  # looks answered.
+  - name: merge_branches
+    branches:
+      path_triage: triaged
+      path_reply: drafted
+    policy: require_all
+    merge: nested
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/reference_join_fork_llm/output/handled_tickets.json
+      schema:
+        mode: observed
+      format: jsonl
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/reference_join_fork_llm/output/quarantine.json
+      schema:
+        mode: observed
+      format: jsonl
+
+landscape:
+  url: sqlite:///examples/reference_join_fork_llm/runs/audit.db

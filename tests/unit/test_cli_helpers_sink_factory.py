@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -27,21 +27,30 @@ class _SinkFake:
         self._on_write_failure = "fail"
 
 
-class _SinkClassRecorder:
-    def __init__(self) -> None:
-        self.instances: list[_SinkFake] = []
+def _make_recording_sink_class() -> type[_SinkFake]:
+    """Build a fresh sink CLASS whose instances are recorded on the class.
 
-    def __call__(self, options: dict[str, Any]) -> _SinkFake:
-        instance = _SinkFake(options)
-        self.instances.append(instance)
-        return instance
+    The plugin manager hands ``make_sink_factory`` a registered class, and the
+    factory reasons about it with ``issubclass`` — so the double must be a real
+    class, not a callable instance. A fresh subclass per test keeps the
+    instance record isolated.
+    """
+
+    class _RecordingSink(_SinkFake):
+        instances: ClassVar[list[_SinkFake]] = []
+
+        def __init__(self, options: dict[str, Any]) -> None:
+            super().__init__(options)
+            type(self).instances.append(self)
+
+    return _RecordingSink
 
 
 class _PluginManagerFake:
-    def __init__(self, sink_cls: type[_SinkFake] | _SinkClassRecorder) -> None:
+    def __init__(self, sink_cls: type[_SinkFake]) -> None:
         self._sink_cls = sink_cls
 
-    def get_sink_by_name(self, _name: str) -> type[_SinkFake] | _SinkClassRecorder:
+    def get_sink_by_name(self, _name: str) -> type[_SinkFake]:
         return self._sink_cls
 
 
@@ -70,7 +79,7 @@ class TestMakeSinkFactory:
 
         config = self._make_config_with_sink(on_write_failure="quarantine")
 
-        sink_cls = _SinkClassRecorder()
+        sink_cls = _make_recording_sink_class()
         manager = _PluginManagerFake(sink_cls)
 
         with patch("elspeth.plugins.infrastructure.manager.get_shared_plugin_manager", return_value=manager):

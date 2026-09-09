@@ -58,6 +58,64 @@ def test_rejects_http_endpoint() -> None:
         _cfg(endpoint="http://di.cognitiveservices.azure.com")
 
 
+def test_rejects_non_azure_document_intelligence_endpoint() -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint="https://attacker.example")
+
+
+def test_accepts_sovereign_azure_document_intelligence_endpoint() -> None:
+    assert _cfg(endpoint="https://di.cognitiveservices.azure.us").endpoint == "https://di.cognitiveservices.azure.us"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://australiaeast.api.cognitive.microsoft.com",
+        "https://usgovvirginia.api.cognitive.microsoft.us",
+        "https://chinaeast2.api.cognitive.azure.cn",
+    ],
+)
+def test_accepts_regional_azure_document_intelligence_endpoint(endpoint: str) -> None:
+    assert _cfg(endpoint=endpoint).endpoint == endpoint
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evilcognitiveservices.azure.com",
+        "https://di.cognitiveservices.azure.com.attacker.example",
+    ],
+)
+def test_rejects_azure_suffix_confusion_endpoint(endpoint: str) -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://di.cognitiveservices.azure.com:8443",
+        "https://di.cognitiveservices.azure.com/documentintelligence",
+        "https://di.cognitiveservices.azure.com?redirect=https://attacker.example",
+        "https://di.cognitiveservices.azure.com#attacker.example",
+    ],
+)
+def test_rejects_non_origin_azure_document_intelligence_endpoint(endpoint: str) -> None:
+    with pytest.raises(PluginConfigError):
+        _cfg(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://di.cognitiveservices.azure.com:443",
+        "https://di.cognitiveservices.azure.com/",
+    ],
+)
+def test_accepts_origin_only_https_variants(endpoint: str) -> None:
+    assert _cfg(endpoint=endpoint).endpoint == endpoint
+
+
 def test_rejects_empty_api_key() -> None:
     with pytest.raises(PluginConfigError):
         _cfg(api_key="   ")
@@ -150,6 +208,59 @@ def test_transform_metadata_and_declared_fields() -> None:
 
 def test_probe_config_instantiates() -> None:
     AzureDocumentIntelligence(AzureDocumentIntelligence.probe_config())
+
+
+def test_output_schema_admits_created_fields_under_fixed_schema() -> None:
+    """The output contract must not forbid the field it creates (elspeth-97487736ca).
+
+    Under mode: fixed the output model is extra='forbid'; if di_content lands
+    only in guaranteed_fields and never in the declared fields, every emitted
+    row fails the post-emission output-schema check against the transform's
+    own contract.
+    """
+    t = _transform(schema={"mode": "fixed", "fields": ["doc_id: str", "doc_url: str"]})
+    assert "di_content" in t.output_schema.model_fields
+    validated = t.output_schema.model_validate(
+        {"doc_id": "a", "doc_url": "https://docs.example/d.pdf", "di_content": "text"},
+        strict=True,
+    )
+    assert validated.di_content == "text"
+
+
+# ── source_field must name an arriving column, not a created one ───────────
+#
+# source_field is read to locate the document and the analysis results are
+# written back onto the same row, so pointing it at an output target makes the
+# transform overwrite the column it reads. Nothing downstream catches it: the
+# executor's collision check compares declared_output_fields against the input
+# keys OF THE ROW, so it fires only once a row carries the column, and under
+# mode: observed there is no declared field for DAG validation to carry
+# (elspeth-09dc6407f1).
+
+
+def test_source_field_naming_the_content_target_is_rejected() -> None:
+    with pytest.raises(PluginConfigError, match="source_field names 'di_content', which azure_document_intelligence itself creates"):
+        _transform(source_field="di_content")
+
+
+def test_source_field_naming_an_extract_facet_target_is_rejected() -> None:
+    with pytest.raises(PluginConfigError, match="source_field names 'di_tables', which azure_document_intelligence itself creates"):
+        _transform(source_field="di_tables", extract={"tables": "di_tables"})
+
+
+def test_the_error_names_the_offending_value_and_the_plugin() -> None:
+    with pytest.raises(PluginConfigError) as excinfo:
+        _transform(source_field="di_pages", page_count_field="di_pages")
+
+    message = str(excinfo.value)
+    assert "source_field names 'di_pages', which azure_document_intelligence itself creates" in message
+    assert "Point source_field at a column that ARRIVES on the row" in message
+
+
+def test_a_source_field_naming_an_arriving_column_still_constructs() -> None:
+    transform = _transform()
+
+    assert transform.declared_input_fields == frozenset({"doc_url"})
 
 
 def test_process_raises_use_accept() -> None:
@@ -380,6 +491,19 @@ def test_operation_location_host_mismatch_suppresses_get() -> None:
     result = _run_with_fake(t, fake)
     assert result.reason["reason"] == "operation_location_untrusted"
     assert fake.get_calls == 0  # api-key never sent to the attacker host
+
+
+@pytest.mark.parametrize("port", ["invalid", "65536", "-1"])
+def test_operation_location_malformed_port_suppresses_get(port: str) -> None:
+    """Malformed lazy port parsing fails closed before the API key can be sent."""
+    t = _t_for_lro()
+    bad = f"{_ENDPOINT}:{port}/x/analyzeResults/abc"
+    fake = _FakeClient(_Resp(202, headers={"operation-location": bad}), [])
+
+    result = _run_with_fake(t, fake)
+
+    assert result.reason["reason"] == "operation_location_untrusted"
+    assert fake.get_calls == 0
 
 
 def test_poll_request_failed_non_capacity() -> None:

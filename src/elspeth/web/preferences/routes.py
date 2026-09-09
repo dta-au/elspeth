@@ -20,7 +20,10 @@ from elspeth.web.composer.telemetry_phase8 import (
     record_mode_opted_in,
     record_mode_opted_out,
 )
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
+from elspeth.web.middleware.rate_limit import (
+    ComposerRateLimiter,
+    get_write_rate_limiter,
+)
 from elspeth.web.preferences.models import (
     ComposerPreferences,
     UpdateComposerPreferencesRequest,
@@ -44,13 +47,15 @@ def create_preferences_router() -> APIRouter:
         body: UpdateComposerPreferencesRequest,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> ComposerPreferences:
-        # Panel C1: per-user rate limit. Sibling write routes
-        # (sessions/routes.py:3716, 4435) all check the limiter; this
-        # PATCH was previously the only authenticated write endpoint
-        # without one. Read GET is intentionally unguarded — idempotent,
-        # safe to spam, no write amplification.
+        # Panel C1: per-user rate limit — metered by the WRITE bucket
+        # (app.state.write_rate_limiter), not the composer LLM bucket.
+        # This PATCH is a cheap DB upsert, and the tutorial legitimately
+        # fires resume-state persists in bursts; sharing the LLM-sized
+        # bucket let those bursts 429 the tutorial-completion save.
+        # Read GET is intentionally unguarded — idempotent, safe to
+        # spam, no write amplification.
         await rate_limiter.check(user.user_id)
         service: PreferencesService = request.app.state.preferences_service
         # B2 (load-bearing): the service returns ``(prior, current)`` for

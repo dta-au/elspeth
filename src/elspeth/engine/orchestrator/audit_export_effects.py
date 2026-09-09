@@ -15,7 +15,7 @@ from tempfile import TemporaryFile
 from typing import Any, BinaryIO, cast
 from uuid import uuid4
 
-from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_DERIVATION_VERSION,
@@ -35,6 +35,7 @@ from elspeth.contracts.audit_export import (
     derive_public_export_config_hash,
     derive_registry_key_hash,
 )
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.sink_effects import (
     AuditExportFormat,
     AuditExportSignedManifestInput,
@@ -45,6 +46,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReservationRequest,
     SinkEffectRole,
 )
+from elspeth.core.clock import Clock
 from elspeth.core.config import LandscapeExportSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.execution.audit_export_snapshots import (
@@ -54,6 +56,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import compute_audit_
 from elspeth.core.landscape.export_read_model import open_export_read_transaction
 from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionRequest,
@@ -63,33 +66,48 @@ from elspeth.engine.executors.sink_effects import (
 logger = logging.getLogger(__name__)
 
 
-def _contain_cleanup_failure(action: Callable[[], object], description: str) -> None:
-    """Run a cleanup step, recording (never propagating) its failure.
+def _contain_cleanup_failure(action: Callable[[], object], description: str, *, pending_exc: BaseException | None = None) -> None:
+    """Record ordinary cleanup failures; preserve Tier-1 integrity failures.
 
-    Cleanup runs while a primary export, cancellation, or process-control
-    exception may already be propagating; replacing that exception would
-    obscure the recovery state. Process-control exceptions raised *by* the
-    cleanup itself (KeyboardInterrupt, SystemExit) still propagate.
+    Two call topologies are legitimate, and only these two:
+
+    1. While a primary export, cancellation, or process-control exception is
+       already propagating — replacing it would obscure the recovery state,
+       so an ordinary cleanup failure is recorded (ERROR with traceback) and the
+       primary exception stays the outcome.
+    2. Post-registration teardown of the private spool on the success path —
+       the export is durably registered and its audit record exists, so a
+       ordinary temp-resource close failure must not fail the already-registered
+       export (ratified: elspeth-1c31195f26,
+       test_spool_close_failure_preserves_integrity_priority_after_registration); it is
+       recorded loudly with the export identity in ``description``.
+
+    Containment is never a substitute for recording: every call must pass a
+    ``description`` specific enough to identify what was lost. Process-control
+    exceptions raised *by* the cleanup itself (KeyboardInterrupt, SystemExit)
+    still propagate. Registered Tier-1 integrity/framework errors also
+    propagate in both topologies: successful registration cannot authorize
+    hiding corruption discovered during teardown.
     """
     try:
         action()
-    except Exception:
-        logger.exception("audit-export cleanup failed: %s", description)
-
-
-def _acquire_signer_lineage_authority(connection: Any, key: AuditExportSnapshotRegistryKey) -> None:
-    """Serialize the signer-policy recheck with registry insertion."""
-    if connection.dialect.name == "sqlite":
-        # ``LandscapeDB.write_connection`` already holds BEGIN IMMEDIATE.
-        return
-    if connection.dialect.name == "postgresql":
-        lineage = "\x1f".join((key.source_run_id, key.exporter_version, key.serialization_version, key.export_format.value))
-        connection.exec_driver_sql(
-            "SELECT pg_catalog.pg_advisory_xact_lock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_AUDIT_EXPORT_LOCK_CLASSID, lineage),
-        )
-        return
-    raise RuntimeError(f"unsupported Landscape backend {connection.dialect.name!r}")
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as cleanup_exc:
+        try:
+            logger.exception("audit-export cleanup failed: %s", description)
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as logging_exc:
+            # No working diagnostic channel remains. Preserve both failure
+            # classes on the exception that the caller will actually raise.
+            target = pending_exc if pending_exc is not None else cleanup_exc
+            target.add_note(
+                f"Audit-export cleanup failed: {description}; cleanup_error={type(cleanup_exc).__name__}; "
+                f"diagnostic_error={type(logging_exc).__name__}"
+            )
+            if pending_exc is None:
+                raise cleanup_exc from logging_exc
 
 
 def _required_limit(value: int | None, field_name: str) -> int:
@@ -156,7 +174,7 @@ def _derivation_config(
 
 def _private_spool_root(config: LandscapeExportSettings) -> Path:
     root = config.spool_root
-    if not isinstance(root, Path):
+    if root is None:
         raise ValueError("enabled audit export requires an explicit spool_root")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     mode = stat.S_IMODE(root.stat().st_mode)
@@ -244,7 +262,10 @@ def _manifest_verifier(
         if type(value) is not dict:
             raise TypeError("audit export final manifest must be an exact object")
         manifest = cast(dict[str, ClosedAuditExportJSON], value)
-        signature = manifest.pop("signature", None)
+        if "signature" in manifest:
+            signature = manifest.pop("signature")
+        else:
+            signature = None
         signing_body = C("audit-export-final-manifest-signing-body-v2", manifest)
         if signing_mode is AuditExportSigningMode.UNSIGNED:
             if signing_key is not None or signature is not None or descriptor.signature is not None:
@@ -291,24 +312,40 @@ def _read_limits(config: LandscapeExportSettings) -> AuditExportSnapshotReadLimi
 def prepare_audit_export_snapshot(
     db: LandscapeDB,
     *,
-    run_id: str,
+    coordination_token: CoordinationToken,
     config: LandscapeExportSettings,
     signing_key: bytes | None,
     content_store: AuditExportContentStore,
     content_store_resolver: AuditExportContentStoreResolver | None = None,
     repository: AuditExportSnapshotRepository | None = None,
 ) -> SinkEffectAuditExportSnapshotInput:
-    """Reuse or durably materialize one immutable export snapshot winner."""
-    if not isinstance(db, LandscapeDB):
-        raise TypeError("db must be LandscapeDB")
+    """Reuse or durably materialize one immutable export snapshot winner.
+
+    ADR-048 §2/§3: the run being exported IS ``coordination_token.run_id``,
+    and the token arrives as a parameter of this call — carried by value from
+    the export seat ``acquire_export_leadership`` minted, or the run leader
+    seat the export phase already holds. It is never minted or re-read here.
+    Every registry write runs inside the repository's own leader-fenced
+    transaction, so no raw write connection is opened on this path.
+    """
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
-    if not isinstance(content_store, AuditExportContentStore) or not content_store.is_durable():
+    run_id = coordination_token.run_id
+    # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
+    # Protocol, so the check admits any object carrying the right attribute names
+    # and rejects honest dynamic-attribute ones (ADR-032 rule 3). The binding
+    # controls are this durability proof and the identifier/namespace assertions
+    # the resolver runs on register() two statements below.
+    if not content_store.is_durable():
         raise TypeError("content_store must implement durable AuditExportContentStore")
     resolver = content_store_resolver or AuditExportContentStoreResolver()
     resolver.register(content_store)
-    snapshots = repository or AuditExportSnapshotRepository()
+    snapshots = repository or AuditExportSnapshotRepository(db.engine)
     key = _registry_key(run_id, config)
+
+    def _assert_signer_rotation_allowed(existing_signer_key_id: str) -> None:
+        """The export config's rotation policy, applied inside the fenced write."""
+        config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
 
     winner: AuditExportSnapshotWinner | None = None
     bundle: AuditExportSpooledBundle | None = None
@@ -350,8 +387,8 @@ def prepare_audit_export_snapshot(
                 )
                 spool.flush()
                 os.fsync(spool.fileno())
-            except BaseException:
-                _contain_cleanup_failure(spool.close, "spool close after derivation failure")
+            except BaseException as primary_exc:
+                _contain_cleanup_failure(spool.close, "spool close after derivation failure", pending_exc=primary_exc)
                 spool = None
                 raise
 
@@ -361,6 +398,7 @@ def prepare_audit_export_snapshot(
     if winner is not None:
         return snapshots.bind_winner(
             winner,
+            coordination_token=coordination_token,
             content_store_resolver=resolver,
             limits=_read_limits(config),
             signed_manifest_verifier=verifier,
@@ -404,27 +442,45 @@ def prepare_audit_export_snapshot(
             signed_manifest_verifier=verifier,
             record_signature_verifier=record_verifier,
         )
-        with db.write_connection() as connection:
-            _acquire_signer_lineage_authority(connection, key)
-            for existing_signer_key_id in snapshots.find_lineage_signer_key_ids(connection, key):
-                config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
-            registration = snapshots.register_verified_candidate(connection, verified)
+        # The lineage lock, the signer-rotation recheck and the CAS insert all
+        # run inside the repository's leader-fenced transaction (ADR-048 §2),
+        # so no raw write connection is opened here.
+        registration = snapshots.register_verified_candidate(
+            verified,
+            coordination_token=coordination_token,
+            assert_signer_rotation_allowed=_assert_signer_rotation_allowed,
+        )
         if not registration.inserted:
             content_store.mark_candidate_orphans(candidate_id, descriptors)
         winner = registration.winner
-    except BaseException:
+    except BaseException as primary_exc:
         # The primary export, cancellation, or process-control exception is
-        # propagating; a cleanup failure is recorded, never substituted.
-        _contain_cleanup_failure(
-            lambda: content_store.mark_candidate_orphans(candidate_id, descriptors),
-            f"orphan marking for candidate {candidate_id}",
-        )
+        # propagating; ordinary cleanup failures are recorded rather than
+        # substituted. Tier-1 cleanup failures retain their crash priority.
+        try:
+            _contain_cleanup_failure(
+                lambda: content_store.mark_candidate_orphans(candidate_id, descriptors),
+                f"orphan marking for candidate {candidate_id}",
+                pending_exc=primary_exc,
+            )
+        finally:
+            _contain_cleanup_failure(spool.close, "spool close after candidate registration failure", pending_exc=primary_exc)
         raise
-    finally:
-        _contain_cleanup_failure(spool.close, "spool close after candidate registration")
+    # Success path: the export is durably registered and its audit record
+    # already exists, so an ordinary spool-close failure is post-success cleanup of a
+    # private temp resource. Ratified semantic (elspeth-1c31195f26, pinned by
+    # test_spool_close_failure_preserves_integrity_priority_after_registration): contain it
+    # and record it loudly with the export identity — an already-registered
+    # export does not fail on ordinary temp-file teardown, and the failure is
+    # never silent. Tier-1 integrity failures still propagate.
+    _contain_cleanup_failure(
+        spool.close,
+        f"spool close after successful registration of candidate {candidate_id} (run {run_id}); registered snapshot is unaffected",
+    )
 
     return snapshots.bind_winner(
         winner,
+        coordination_token=coordination_token,
         content_store_resolver=resolver,
         limits=_read_limits(config),
         signed_manifest_verifier=verifier,
@@ -440,10 +496,18 @@ def execute_audit_export_effect(
     sink_node_id: str,
     target_config: Mapping[str, object],
     worker_id: str,
+    coordination_token: CoordinationToken,
     lease_ttl: timedelta = timedelta(minutes=5),
     fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
+    clock: Clock = DEFAULT_CLOCK,
+    sleep: Callable[[float], None] | None = None,
+    poll_interval: float = 0.5,
 ) -> SinkEffectFinalizationResult:
-    """Reserve and execute one zero-member audit-export snapshot effect."""
+    """Reserve and execute one zero-member audit-export snapshot effect.
+
+    ``coordination_token`` is the export seat on the snapshot's source run
+    (ADR-048 §4): every sink-effect verb the coordinator drives fences on it.
+    """
     identity = compute_audit_export_effect_identity(
         snapshot,
         target_config,
@@ -469,11 +533,15 @@ def execute_audit_export_effect(
     coordinator = SinkEffectCoordinator(
         factory=factory,
         worker_id=worker_id,
+        coordination_token=coordination_token,
         lease_ttl=lease_ttl,
         fault_hook=fault_hook,
+        clock=clock,
+        sleep=sleep,
+        poll_interval=poll_interval,
     )
     # Capability preflight owns structural validation of the delayed adapter.
-    return coordinator.execute(request, cast(Any, sink))
+    return coordinator.execute_with_lease_wait(request, cast(Any, sink))
 
 
 __all__ = ["execute_audit_export_effect", "prepare_audit_export_snapshot"]

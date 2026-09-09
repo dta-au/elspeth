@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_args
 from uuid import UUID
 
 from elspeth.contracts.composer_interpretation import (
@@ -19,9 +19,9 @@ from elspeth.contracts.enums import Determinism
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol, TransformProtocol
 from elspeth.contracts.secrets import SecretInventoryItem
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.sink_effect_diagnostics import load_sink_effect_recovery_history
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.audit_readiness.models import (
     AuditReadinessSnapshot,
     PluginPolicyReadinessRow,
@@ -32,7 +32,8 @@ from elspeth.web.audit_readiness.models import (
     SinkEffectRecoveryDiagnostic,
 )
 from elspeth.web.catalog.schemas import PluginKind
-from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state import CompositionState, NodeType
+from elspeth.web.execution.completion_gates import CompletionGateFacts, advisor_signoff_check_failed, parse_completion_gates
 from elspeth.web.execution.schemas import (
     CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     CHECK_OUTCOME_SECRET_REFS_RESOLVED,
@@ -161,11 +162,17 @@ def build_plugin_policy_readiness(
     )
 
     unavailable = {item.plugin_id: item.reason for item in snapshot.unavailable}
+    # ``snapshot.unavailable`` is the complete owned enumeration of the plugins
+    # this principal cannot use, so absence from the index is a positive fact —
+    # the plugin is available — not an unknown standing in for one. The
+    # membership test says that out loud instead of leaning on a defaulted read
+    # whose miss and whose "reason is not locally repairable" collapse together.
     missing_local_optional = tuple(
         sorted(
             plugin_id
             for plugin_id in policy.configured_optional
-            if unavailable.get(plugin_id)
+            if plugin_id in unavailable
+            and unavailable[plugin_id]
             in {
                 PluginUnavailableReason.NOT_INSTALLED,
                 PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING,
@@ -173,10 +180,14 @@ def build_plugin_policy_readiness(
         )
     )
     selected = dict(snapshot.selected)
+    # A REQUIRED capability is unimplemented in two distinct ways — no entry in
+    # ``selected`` at all, or an entry whose selection is an explicit ``None`` —
+    # and readiness must report NOT ready for both. Each is spelled out: no
+    # default may stand in for a capability whose implementation is unknown.
     missing_required_controls = tuple(
         capability.value
         for capability, mode in snapshot.control_modes
-        if mode is ControlMode.REQUIRED and selected.get(capability) not in snapshot.available
+        if mode is ControlMode.REQUIRED and (capability not in selected or selected[capability] not in snapshot.available)
     )
     local_status: ReadinessStatus
     if missing_local_optional or missing_required_controls:
@@ -234,7 +245,13 @@ def build_plugin_policy_readiness(
         )
 
     llm_id = PluginId("transform", "llm")
-    usable_aliases = dict(snapshot.usable_profile_aliases).get(llm_id, ())
+    # An LLM plugin with no alias entry has no credential-ready profile at all,
+    # which is a legal deployment this row exists to report rather than
+    # audit-data corruption. The absent branch is written out so it can only
+    # resolve to "not credential-ready" below — never to a value that could
+    # satisfy the membership test.
+    usable_alias_index = dict(snapshot.usable_profile_aliases)
+    usable_aliases = usable_alias_index[llm_id] if llm_id in usable_alias_index else ()
     tutorial_profile_status: ReadinessStatus
     if tutorial_profile is None:
         tutorial_profile_status = "error"
@@ -301,7 +318,7 @@ def build_boot_plugin_policy_readiness(
     """
     llm_id = PluginId("transform", "llm")
     configured_aliases = tuple(alias for alias, _profile in settings.llm_profiles)
-    tutorial_profile = settings.tutorial_llm_profile
+    tutorial_profile = settings.default_llm_profile
     selected_by_capability = dict(policy.preferences)
     implementations: dict[PluginCapability, list[PluginId]] = {capability: [] for capability in PluginCapability}
     plugin_classes = _plugin_catalog_snapshot()
@@ -443,6 +460,8 @@ class _ExecutionServiceLike(Protocol):
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ValidationResult: ...
 
 
@@ -511,7 +530,13 @@ class ReadinessService:
             state_from_record if state_from_record is not None else _default_state_from_record
         )
 
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str) -> AuditReadinessSnapshot:
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditReadinessSnapshot:
         """Return the six-row snapshot.
 
         Raises:
@@ -527,10 +552,16 @@ class ReadinessService:
         # that the llm_interpretations row scopes its event lookup to.
         composition_state_id: UUID = record.id
         state: CompositionState = self._state_from_record(record)
-        validation = await self._execution_service.validate_state(state, user_id=user_id, session_id=session_id)
-        inventory = await run_sync_in_worker(
-            self._scoped_secret_resolver.list_refs,
-            user_id,  # scoped_secret_resolver.list_refs takes user_id only
+        # Persisted composer completion-gate facts (completion advisory review, R2-F14)
+        # ride the record's composer_meta; the graph recompute below cannot
+        # rediscover them, so they are threaded into validate_state and merged
+        # into the readiness this snapshot reports.
+        validation = await self._execution_service.validate_state(
+            state,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            completion_gates=parse_completion_gates(record.composer_meta),
         )
         # Pre-fetch interpretation-event signal for the llm_interpretations
         # row. Two separate reads because:
@@ -547,10 +578,11 @@ class ReadinessService:
         # Both reads are skipped when the composition has no LLM
         # transforms — the row short-circuits to not_applicable and
         # nothing further is queried.
-        has_llm = _composition_has_llm_transform(state)
+        has_llm_transform = _composition_has_llm_transform(state)
+        has_llm_source = _composition_has_llm_source(state)
         interpretation_events: tuple[InterpretationEventRecord, ...] = ()
         opted_out = False
-        if has_llm:
+        if has_llm_transform:
             opt_out_rows = await self._session_service.list_interpretation_events(
                 session_id,
                 status="all",
@@ -572,11 +604,12 @@ class ReadinessService:
             _build_provenance_row(validation),
             _build_retention_row(self._settings.payload_store_retention_days),
             _build_llm_interpretations_row(
-                has_llm=has_llm,
+                has_llm_transform=has_llm_transform,
+                has_llm_source=has_llm_source,
                 opted_out=opted_out,
                 events=interpretation_events,
             ),
-            _build_secrets_row(validation, inventory),
+            _build_secrets_row(validation),
         )
         policy_readiness = None
         if self._web_plugin_policy is not None and self._plugin_snapshot_factory is not None:
@@ -607,6 +640,21 @@ class ReadinessService:
 
 
 def _build_validation_row(result: ValidationResult) -> ReadinessRow:
+    advisor_completion_pending = (
+        result.is_valid
+        and result.readiness.execution_ready
+        and not result.readiness.completion_ready
+        and advisor_signoff_check_failed(result.checks)
+    )
+    if advisor_completion_pending:
+        return ReadinessRow(
+            id="validation",
+            label="Validation",
+            status="warning",
+            summary="Completion advisory review pending",
+            detail="This pipeline can run, but Composer completion is withheld until the evidence-scoped advisor review clears.",
+            component_ids=(),
+        )
     if result.is_valid:
         return ReadinessRow(
             id="validation",
@@ -707,17 +755,32 @@ _INTERNAL_TRANSFORM_DETERMINISMS: frozenset[Determinism] = frozenset(
 
 _AUDIT_FLAGGED_DETERMINISMS: frozenset[Determinism] = frozenset(Determinism) - _INTERNAL_TRANSFORM_DETERMINISMS
 
-# Module-load assertion: the exclusion list must be a subset of the
-# live enum. A drop or rename of a Determinism member that leaves a
-# stale name in ``_INTERNAL_TRANSFORM_DETERMINISMS`` would otherwise
-# silently shrink ``_AUDIT_FLAGGED_DETERMINISMS`` without test signal.
-# This assertion runs at import time so a stale exclusion surfaces
-# before any test exercises the predicate.
-assert frozenset(Determinism) >= _INTERNAL_TRANSFORM_DETERMINISMS, (
-    "_INTERNAL_TRANSFORM_DETERMINISMS contains values not in Determinism; "
-    f"stale members: {sorted(_INTERNAL_TRANSFORM_DETERMINISMS - frozenset(Determinism))}. "
-    "Remove the stale entries or restore the missing enum members."
-)
+# Module-load guard: the exclusion list must be a subset of the live enum.
+# A drop or rename of a Determinism member that leaves a stale name in
+# ``_INTERNAL_TRANSFORM_DETERMINISMS`` would otherwise silently SHRINK
+# ``_AUDIT_FLAGGED_DETERMINISMS``, so a transform that should be
+# audit-flagged stops being flagged. It runs at import so a stale
+# exclusion surfaces before any test exercises the predicate.
+#
+# RAISES rather than asserting (elspeth-37941f1731). ``python -O`` strips
+# ``assert`` outright, so as an assertion this guard did not exist in an
+# optimised deployment — and nothing else caught the drift, because no test
+# consumes ``_INTERNAL_TRANSFORM_DETERMINISMS``. Measured, not inferred: with
+# a stale member injected, the module imports clean under ``-O`` and the
+# panel is computed from the corrupted set.
+#
+# Only the EXCLUSION side is hand-written; the other side is the live
+# ``Determinism`` enum. Deriving both would be a tautology no drift could
+# fail — the exclusion is a policy decision about which determinisms are
+# internal, and stating it by hand is what gives this comparison something
+# to check.
+_stale_determinisms = _INTERNAL_TRANSFORM_DETERMINISMS - frozenset(Determinism)
+if _stale_determinisms:
+    raise RuntimeError(
+        "_INTERNAL_TRANSFORM_DETERMINISMS contains values not in Determinism; "
+        f"stale members: {sorted(_stale_determinisms)}. "
+        "Remove the stale entries or restore the missing enum members."
+    )
 
 # Version identifier for the boundary-classification rule encoded by
 # ``_AUDIT_FLAGGED_DETERMINISMS`` and ``_build_plugin_trust_row``. The
@@ -729,11 +792,105 @@ assert frozenset(Determinism) >= _INTERNAL_TRANSFORM_DETERMINISMS, (
 # version pin recorded here MUST be stamped alongside each persisted
 # verdict so historical rows remain reproducible.
 #
-# Bump on every semantic change to either the predicate or the
-# ``_AUDIT_FLAGGED_DETERMINISMS`` set (membership, name, or wire-format
-# meaning). The pin is opaque to consumers — they record it verbatim and
-# never parse the version string.
-_BOUNDARY_RULE_VERSION = "phase-7a-v2"
+# Bump on every semantic change to the predicate, to the
+# ``_AUDIT_FLAGGED_DETERMINISMS`` set, to the set of nodes ENUMERATED into
+# the predicate (``PLUGIN_HOSTING_NODE_TYPES``), or to the ``detail`` wire
+# shape (membership, name, or wire-format meaning). The pin is opaque to
+# consumers — they record it verbatim and never parse the version string.
+#
+# The last two clauses were added with the v2 -> v3 bump they authorise
+# (elspeth-1c8a4b6199): that bump changed which nodes are fed to the
+# predicate and the ``[kind]`` token in ``detail``, and touched NEITHER of
+# the two triggers previously listed here. ``boundary_expectations.py``
+# step 5(b) already stated the wire-shape trigger, so the authority and its
+# derived documentation disagreed; this is the authority catching up.
+_BOUNDARY_RULE_VERSION = "phase-7a-v3"
+
+
+# Composer node types that are wired with ``plugin=null`` and therefore
+# host no plugin to classify. ``web/composer/state.py`` enforces this for
+# every member: gate/coalesce via ``structural_node_plugin_error``, queue
+# via ``queue_node_contract_error``, row_union via its forbidden-fields
+# block in ``validate()``.
+#
+# Declared as the EXCLUSION list, by exact analogy with
+# ``_INTERNAL_TRANSFORM_DETERMINISMS`` above and for the same reason: a
+# node type added to ``NodeType`` without an entry here defaults to
+# BOUNDARY-ENUMERATED rather than silently vanishing from the audit
+# inventory. Audit-relevance is the default; opting a new node kind OUT
+# of the panel is an explicit act recorded in this set.
+#
+# This is the fix for elspeth-1c8a4b6199: the three enumeration sites
+# below (``_build_plugin_trust_row``, ``_composition_has_llm_transform``,
+# and ``explain.build_narrative``) each hard-coded ``node_type ==
+# "transform"``, so a boundary plugin hosted on a collector or an
+# aggregation was silently omitted from the boundary inventory — an
+# undercount, with the node dropped from both ``detail`` and
+# ``component_ids``. Enumerating by this shared set puts the panel on the
+# same footing as ``web/plugin_policy/coverage.py``, which resolves a
+# node's plugin without consulting the node kind at all.
+#
+# KNOWN DUPLICATE — this set is the THIRD hand-written statement of the
+# plugin-free node kinds in the tree. The siblings:
+#
+#   - ``web/composer/state.py::_PLUGINLESS_STRUCTURAL_NODE_TYPES``
+#     — {gate, coalesce}. A strict SUBSET, not a disagreement: it backs
+#     ``structural_node_plugin_error``, which enforces plugin=null only
+#     for the two kinds no other validator already covered (queue and
+#     row_union are enforced by ``queue_node_contract_error`` and by
+#     row_union's forbidden-fields block respectively).
+#   - ``web/sessions/routes/composer/guided_chat_intent_management.py::
+#     _STRUCTURAL_NODE_TYPES`` — {gate, coalesce, row_union, queue}.
+#     IDENTICAL membership, and — CORRECTED 2026-08-26, see below — the
+#     SAME underlying rule, reached from the other direction. It is not a
+#     validation set: it keyword-matches the USER'S CHAT TEXT to pick a
+#     teaching line. But the line it picks reads "a {x} is a built-in
+#     topology node, NOT a transform plugin", so a kind belongs in the
+#     tuple exactly when that sentence is true of it — which is the
+#     plugin-free partition, the same one this set states. Same question,
+#     different consumer.
+#
+#     What this entry said before f4565143e was wrong on both halves, and
+#     the correction is recorded rather than silently swapped because the
+#     mistake is instructive. It said the tuple "carries no comment" —
+#     true when written, false now: ``_model_catalog_identity_chat``
+#     acquired a docstring stating this membership rule explicitly. And
+#     it said the rationale was "about dispatch ordering, not about
+#     hosting a plugin", which conflated the tuple's MECHANISM (a
+#     ``next()`` scan, which is indeed ordering-sensitive) with its
+#     MEMBERSHIP RULE (the truth condition of the clause, which is
+#     entirely about hosting a plugin). Writing "different predicate"
+#     over two sets that share a rule is the same restatement error this
+#     block warns about, one level up: it manufactured a licence for the
+#     two to diverge that neither side actually has.
+#
+# All three currently agree BY HAND, not by structure. Nothing in the
+# tree fails if one drifts from the others. Unifying them is
+# elspeth-b3117ec3ac's job (the node-kind vocabulary ticket) — do NOT
+# unify from here, which would add a fourth authority beside the three
+# rather than removing one.
+#
+# For the same reason this set is subtracted from ``get_args(NodeType)``
+# rather than from ``state.py::COMPOSER_NODE_TYPES``: that frozenset is
+# itself a hand-written restatement of the ``NodeType`` Literal declared
+# a few lines above it, and ``NodeType`` is the authority ``NodeSpec.
+# node_type`` is actually annotated against. Deriving from the Literal is
+# what makes the module-load assertion below able to catch drift at all.
+_PLUGINLESS_NODE_TYPES: frozenset[str] = frozenset({"gate", "coalesce", "queue", "row_union"})
+
+# Node types that host a plugin, and whose plugin therefore participates
+# in the boundary partition. Derived by exclusion — see above.
+PLUGIN_HOSTING_NODE_TYPES: frozenset[str] = frozenset(get_args(NodeType)) - _PLUGINLESS_NODE_TYPES
+
+# Module-load assertion mirroring the ``_INTERNAL_TRANSFORM_DETERMINISMS``
+# one: a rename or removal in ``NodeType`` that leaves a stale name in
+# ``_PLUGINLESS_NODE_TYPES`` would otherwise silently widen the panel
+# without test signal.
+assert frozenset(get_args(NodeType)) >= _PLUGINLESS_NODE_TYPES, (
+    "_PLUGINLESS_NODE_TYPES contains values not in NodeType; "
+    f"stale members: {sorted(_PLUGINLESS_NODE_TYPES - frozenset(get_args(NodeType)))}. "
+    "Remove the stale entries or restore the missing NodeType members."
+)
 
 
 def _build_plugin_trust_row(state: CompositionState) -> ReadinessRow:
@@ -751,9 +908,17 @@ def _build_plugin_trust_row(state: CompositionState) -> ReadinessRow:
     is classified correctly at registration time without a separate
     declared attribute.
 
+    "Transform" above is the PLUGIN kind, not the node kind. Collector and
+    aggregation nodes host transform-registry plugins too, so every node
+    type in ``PLUGIN_HOSTING_NODE_TYPES`` is enumerated and its plugin
+    resolved through the transform registry. The detail line reports the
+    NODE kind (``[collector]``, ``[aggregation]``) rather than the registry
+    kind, because the operator locates the component by the vocabulary they
+    authored it in; ``component_ids`` carries the node id either way.
+
     The rule version encoded by this predicate and
     ``_AUDIT_FLAGGED_DETERMINISMS`` is ``_BOUNDARY_RULE_VERSION``
-    (currently ``"phase-7a-v2"``). Bump that constant on any semantic
+    (currently ``"phase-7a-v3"``). Bump that constant on any semantic
     change here. See its module-level docstring for the
     persistence-vs-UX rationale.
 
@@ -766,20 +931,30 @@ def _build_plugin_trust_row(state: CompositionState) -> ReadinessRow:
     boundary: list[tuple[str, str, str]] = []
     unknown: list[tuple[str, str]] = []
 
-    def _record(kind: PluginKind, component_id: str, name: str | None) -> None:
+    def _record(kind: PluginKind, component_id: str, name: str | None, *, label: str | None = None) -> None:
+        """Classify one component; ``label`` overrides the displayed kind.
+
+        ``kind`` is the PLUGIN kind and drives registry resolution — the two
+        registry helpers raise on any value outside the ``PluginKind``
+        Literal, so it must never be widened to a node kind. ``label`` is
+        display-only prose and defaults to ``kind``; a collector or
+        aggregation node passes its node type so the detail line names the
+        component in the vocabulary the operator authored.
+        """
+        display = kind if label is None else label
         if name is None or not _is_registered_plugin(kind, name):
-            unknown.append((kind, component_id))
+            unknown.append((display, component_id))
             return
         plugin_cls = _get_plugin_class_for_kind(kind, name)
         if kind in ("source", "sink") or plugin_cls.determinism in _AUDIT_FLAGGED_DETERMINISMS:
-            boundary.append((kind, component_id, name))
+            boundary.append((display, component_id, name))
 
     for source_name, source in state.sources.items():
         component_id = "source" if source_name == "source" else f"source:{source_name}"
         _record("source", component_id, source.plugin)
     for node in state.nodes:
-        if node.node_type == "transform":
-            _record("transform", node.id, node.plugin)
+        if node.node_type in PLUGIN_HOSTING_NODE_TYPES:
+            _record("transform", node.id, node.plugin, label=node.node_type)
     for output in state.outputs:
         _record("sink", output.name, output.plugin)
 
@@ -888,13 +1063,55 @@ def _composition_has_llm_transform(state: CompositionState) -> bool:
     interpretation-event reads when no LLM transforms are present —
     a composition without LLM transforms cannot have interpretation
     events bound to its nodes.
+
+    Enumerates ``PLUGIN_HOSTING_NODE_TYPES`` rather than ``"transform"``
+    alone so the three panel enumeration sites share one node-kind
+    vocabulary (elspeth-1c8a4b6199). **This widening is a LIVE behaviour
+    change, not a consistency tidy-up**, and the aggregation half is the
+    reason:
+
+      - COLLECTOR: genuinely unreachable for ``llm``. The batch-aware
+        constraint is enforced at composition time by
+        ``collector_plugin_not_batch_aware``, and ``llm`` declares
+        ``is_batch_aware=False``.
+      - AGGREGATION: **reachable.** That constraint is collector-ONLY —
+        it lives inside ``state.py``'s ``_collector_intrinsic_errors``,
+        and ``validate()``'s aggregation arm checks plugin-presence,
+        ``on_error``, ``trigger`` and ``output_mode`` but nothing about
+        ``is_batch_aware``. An ``llm`` transform on an aggregation node
+        validates with ZERO errors; it is rejected only later, at
+        RUNTIME, by ``runtime_factory``.
+
+    So before this widening, a composition with ``llm`` on an aggregation
+    made this predicate return False, which rendered the
+    ``llm_interpretations`` row ``not_applicable`` — "No LLM transforms in
+    this pipeline" — and skipped the interpretation-event reads entirely.
+    That is a second false all-clear of exactly this ticket's shape, on a
+    different row, and widening the predicate closes it.
+
+    The claim previously recorded here — that the widening is a no-op and
+    not independently mutation-checkable — was WRONG on both halves, and
+    wrong because it reasoned from the collector constraint and assumed
+    aggregation shared it. Reverting this line fails
+    ``test_llm_predicate_shares_the_node_kind_vocabulary``.
+
+    The name keeps "transform" because the transform-vs-source contrast it
+    feeds is load-bearing in ``_build_llm_interpretations_row``'s status
+    mapping.
     """
-    return any(n.node_type == "transform" and n.plugin == "llm" for n in state.nodes)
+    return any(n.node_type in PLUGIN_HOSTING_NODE_TYPES and n.plugin == "llm" for n in state.nodes)
+
+
+def _composition_has_llm_source(state: CompositionState) -> bool:
+    """Return whether a source-native LLM is present, without reading options."""
+
+    return any(source.plugin == "llm" for source in state.sources.values())
 
 
 def _build_llm_interpretations_row(
     *,
-    has_llm: bool,
+    has_llm_transform: bool,
+    has_llm_source: bool,
     opted_out: bool,
     events: Sequence[InterpretationEventRecord],
 ) -> ReadinessRow:
@@ -902,7 +1119,9 @@ def _build_llm_interpretations_row(
 
     Phase 5b Task 10 (18a-phase-5b-backend.md §Task 10). Status mapping:
 
-      - No LLM transforms in composition → not_applicable
+      - LLM source only → not_applicable with source-specific authored-prompt
+        narrative; no interpretation events are queried
+      - No LLM transforms or sources in composition → not_applicable
       - LLM transforms present, session opted out → not_applicable
         (with an opt-out note in the summary)
       - LLM transforms present, no interpretation events for the
@@ -923,7 +1142,18 @@ def _build_llm_interpretations_row(
     sorted; opt-out rows have ``affected_node_id=None`` and contribute
     nothing.
     """
-    if not has_llm:
+    if not has_llm_transform and has_llm_source:
+        return ReadinessRow(
+            id="llm_interpretations",
+            label="LLM interpretations",
+            status="not_applicable",
+            summary="LLM source prompts do not use interpretation review",
+            detail=(
+                "The rowless LLM source issues one authored prompt without incoming row data, so it creates no row interpretation events."
+            ),
+            component_ids=(),
+        )
+    if not has_llm_transform:
         return ReadinessRow(
             id="llm_interpretations",
             label="LLM interpretations",
@@ -1001,7 +1231,7 @@ def _build_llm_interpretations_row(
 _SECRET_ERROR_CODES: frozenset[str] = frozenset({"missing_secret_ref", "fabricated_secret", "disallowed_secret_ref"})
 
 
-def _build_secrets_row(validation: ValidationResult, inventory: list[SecretInventoryItem]) -> ReadinessRow:
+def _build_secrets_row(validation: ValidationResult) -> ReadinessRow:
     """error/ok/not_applicable per secret ref resolution.
     Keyed on ValidationError.error_code, not message substring.
     """
@@ -1020,15 +1250,6 @@ def _build_secrets_row(validation: ValidationResult, inventory: list[SecretInven
         None,
     )
     if secret_check is not None and secret_check.outcome_code == CHECK_OUTCOME_SECRET_REFS_NO_REFS:
-        return ReadinessRow(
-            id="secrets",
-            label="Secrets",
-            status="not_applicable",
-            summary="No secret references in this composition",
-            detail=None,
-            component_ids=(),
-        )
-    if secret_check is None and not inventory:
         return ReadinessRow(
             id="secrets",
             label="Secrets",
@@ -1065,7 +1286,9 @@ def _build_secrets_row(validation: ValidationResult, inventory: list[SecretInven
         label="Secrets",
         status="ok",
         summary="All secret references resolve",
-        detail=(f"{len(inventory)} secret(s) in your inventory" if inventory else "Composition references no secrets"),
+        # Readiness is composition-scoped. Owner-global inventory size is
+        # unrelated to this pipeline and must not perturb share snapshots.
+        detail=None,
         component_ids=(),
     )
 

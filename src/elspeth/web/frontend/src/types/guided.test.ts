@@ -6,11 +6,13 @@ import { describe, expect, it } from "vitest";
 
 import type {
   ChatTurn,
+  ComponentReviewItem,
   ControlSignal,
   GuidedChatResponse,
   GuidedRespondAction,
   GuidedRespondRequest,
   GuidedRespondResponse,
+  GuidedReviewedComponents,
   GuidedSession,
   GuidedStep,
   GetGuidedResponse,
@@ -132,10 +134,12 @@ describe("guided protocol types", () => {
     expect(payload.proposal_id).toMatch(/^[0-9a-f-]{36}$/);
   });
 
-  it("GuidedSession has exactly step, history, terminal, chat_history, chat_turn_seq, profile — exhaustive", () => {
+  it("GuidedSession has exactly step, history, terminal, chat_history, chat_turn_seq, reviewed_components, profile — exhaustive", () => {
     // Compile-time mutual-extends: adding/removing a key in GuidedSession
     // makes this assignment fail tsc.  Slice 5 added chat_history and
-    // chat_turn_seq; P6.2 added profile (server-owned WorkflowProfile).
+    // chat_turn_seq; P6.2 added profile (server-owned WorkflowProfile);
+    // elspeth-f2a8550b3d added reviewed_components (the server-projected
+    // ledger that replaced the client-side fold).
     const _exact: Equals<
       keyof GuidedSession,
       | "step"
@@ -143,9 +147,44 @@ describe("guided protocol types", () => {
       | "terminal"
       | "chat_history"
       | "chat_turn_seq"
+      | "reviewed_components"
       | "profile"
     > = true;
     expect(_exact).toBe(true);
+  });
+
+  it("reviewed_components carries closed review items, per kind", () => {
+    // The ledger's entries ARE ComponentReviewItems: the server projects the
+    // wire ledger and the review card from one derivation, so a type that
+    // let them drift apart here would hide that.
+    const ledger: GuidedReviewedComponents = {
+      sources: [
+        {
+          stable_id: "00000000-0000-4000-8000-000000000001",
+          name: "colours",
+          plugin: "csv",
+          status: "reviewed",
+        },
+      ],
+      outputs: [],
+    };
+    const item: ComponentReviewItem = ledger.sources[0]!;
+    expect(item.status).toBe("reviewed");
+
+    const session: GuidedSession = {
+      step: "step_2_sink",
+      history: [],
+      terminal: null,
+      chat_history: [],
+      chat_turn_seq: 0,
+      reviewed_components: ledger,
+      profile: null,
+    };
+    expect(session.reviewed_components.sources).toHaveLength(1);
+
+    // @ts-expect-error a settled entry cannot be published as anything but reviewed
+    const unsettled: ComponentReviewItem = { ...item, status: "pending" };
+    expect(unsettled.name).toBe("colours");
   });
 
   it("TurnRecord nullable response_hash is honoured", () => {
@@ -201,7 +240,7 @@ describe("guided protocol types", () => {
     expect(emptyCustom.custom_inputs).toEqual([]);
   });
 
-  it("GuidedRespondAction uses a target-only proposal revision contract", () => {
+  it("GuidedRespondAction permits target-only form rewinds but requires node feedback", () => {
     const targetOnlyRevision: GuidedRespondAction = {
       chosen: null,
       edited_values: null,
@@ -209,9 +248,30 @@ describe("guided protocol types", () => {
       proposal_id: "00000000-0000-4000-8000-000000000701",
       draft_hash: "f".repeat(64),
       edit_target: {
-        kind: "node",
+        kind: "source",
         stable_id: "00000000-0000-4000-8000-000000000702",
       },
+      control_signal: null,
+    };
+    // @ts-expect-error node proposal revisions require exact correction feedback
+    const targetOnlyNodeRevision: GuidedRespondAction = {
+      ...targetOnlyRevision,
+      edit_target: {
+        kind: "node",
+        stable_id: "00000000-0000-4000-8000-000000000703",
+      },
+    };
+    const nodeRevisionWithFeedback: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: "00000000-0000-4000-8000-000000000701",
+      draft_hash: "f".repeat(64),
+      edit_target: {
+        kind: "node",
+        stable_id: "00000000-0000-4000-8000-000000000703",
+      },
+      correction_feedback: "Change the selected node mapping.",
       control_signal: null,
     };
     // @ts-expect-error proposal revisions name only the durable target; inline edited values are not accepted
@@ -219,7 +279,8 @@ describe("guided protocol types", () => {
       ...targetOnlyRevision,
       edited_values: {},
     };
-    expect(targetOnlyRevision.edit_target?.kind).toBe("node");
+    expect(targetOnlyRevision.edit_target?.kind).toBe("source");
+    expect(nodeRevisionWithFeedback.correction_feedback).toBe("Change the selected node mapping.");
     expect(revisionWithInlineValues.edited_values).toEqual({});
   });
 
@@ -306,6 +367,7 @@ describe("guided protocol types", () => {
       ts_iso: "t",
       assistant_message_kind: "synthetic_failure",
       synthetic_failure_reason: "unavailable",
+      turn_token: null,
     };
     expect(withKind.assistant_message_kind).toBe("synthetic_failure");
     expect(withKind.synthetic_failure_reason).toBe("unavailable");
@@ -318,6 +380,7 @@ describe("guided protocol types", () => {
       ts_iso: "t",
       assistant_message_kind: "synthetic_failure",
       synthetic_failure_reason: "not_applied",
+      turn_token: null,
     };
     expect(notApplied.synthetic_failure_reason).toBe("not_applied");
   });
@@ -332,6 +395,7 @@ describe("guided protocol types", () => {
         terminal: null,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       next_turn: {

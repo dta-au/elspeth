@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from typing import NoReturn, Protocol, cast
+from typing import Literal, NoReturn, Protocol
 
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
+from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 
@@ -17,38 +18,63 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
     {
         PluginId("source", "csv"),
         PluginId("source", "json"),
+        PluginId("source", "llm"),
         PluginId("source", "text"),
         PluginId("sink", "csv"),
+        # Paired with sink:text. text refuses any value carrying CR or LF, so
+        # document is the only sink that can publish generated multiline text;
+        # authorizing text alone leaves that request with no correct sink and
+        # is what produced elspeth-afdf55a17c.
+        PluginId("sink", "document"),
         PluginId("sink", "json"),
         PluginId("sink", "text"),
         PluginId("transform", "field_mapper"),
+        # The remedies text and document name in their own guidance. A remedy
+        # the surface does not authorize is one the Composer cannot take.
+        PluginId("transform", "line_explode"),
         PluginId("transform", "llm"),
+        PluginId("transform", "reference_join"),
+        PluginId("transform", "report_assemble"),
         PluginId("transform", "web_scrape"),
     }
 )
 
 
-class _PluginClass(Protocol):
-    name: str
-    plugin_version: str
-    source_file_hash: str | None
+type _PluginClass = BaseSource | BaseTransform | BaseSink
 
 
 class PluginRegistry(Protocol):
-    def get_sources(self) -> Sequence[type[_PluginClass]]: ...
-    def get_transforms(self) -> Sequence[type[_PluginClass]]: ...
-    def get_sinks(self) -> Sequence[type[_PluginClass]]: ...
+    def get_sources(self) -> Sequence[type]: ...
+    def get_transforms(self) -> Sequence[type]: ...
+    def get_sinks(self) -> Sequence[type]: ...
+
+
+def _policy_error(reason: str) -> ValueError:
+    return ValueError(f"web plugin policy invalid: {reason}")
 
 
 def _fail(reason: str) -> NoReturn:
-    raise ValueError(f"web plugin policy invalid: {reason}")
+    raise _policy_error(reason)
+
+
+def _admit_registry_category(
+    classes: Sequence[type],
+    expected_base: type[_PluginClass],
+    category: Literal["source", "transform", "sink"],
+) -> dict[PluginId, type[_PluginClass]]:
+    admitted: dict[PluginId, type[_PluginClass]] = {}
+    for plugin_cls in classes:
+        if not issubclass(plugin_cls, expected_base):
+            _fail("plugin_category_mismatch")
+        admitted[PluginId(category, plugin_cls.name)] = plugin_cls
+    return admitted
 
 
 def _registry_map(registry: PluginRegistry) -> dict[PluginId, type[_PluginClass]]:
     return {
-        **{PluginId("source", cls.name): cls for cls in registry.get_sources()},
-        **{PluginId("transform", cls.name): cls for cls in registry.get_transforms()},
-        **{PluginId("sink", cls.name): cls for cls in registry.get_sinks()},
+        **_admit_registry_category(registry.get_sources(), BaseSource, "source"),
+        **_admit_registry_category(registry.get_transforms(), BaseTransform, "transform"),
+        **_admit_registry_category(registry.get_sinks(), BaseSink, "sink"),
     }
 
 
@@ -58,8 +84,8 @@ def _parse_unique(raw_values: Iterable[str]) -> tuple[PluginId, ...]:
     for raw in raw_values:
         try:
             plugin_id = PluginId.parse(raw)
-        except ValueError:
-            _fail("invalid_plugin_id")
+        except ValueError as exc:
+            raise _policy_error("invalid_plugin_id") from exc
         if plugin_id in seen:
             _fail("duplicate_plugin_id")
         seen.add(plugin_id)
@@ -68,11 +94,16 @@ def _parse_unique(raw_values: Iterable[str]) -> tuple[PluginId, ...]:
 
 
 def _validate_identity(plugin_cls: type[_PluginClass]) -> tuple[str, str]:
-    version = getattr(plugin_cls, "plugin_version", None)
-    source_hash = getattr(plugin_cls, "source_file_hash", None)
-    if not isinstance(version, str) or version == "0.0.0" or _VERSION.fullmatch(version) is None:
+    version = plugin_cls.plugin_version
+    source_hash = plugin_cls.source_file_hash
+    # Exact-type admission: ``plugin_version``/``source_file_hash`` are declared
+    # ``str`` / ``str | None`` on the plugin base classes, so a registry entry
+    # carrying anything else is a plugin-contract violation this gate refuses
+    # rather than coerces. Exact ``type(...) is str`` also refuses a ``str``
+    # subclass whose ``fullmatch`` input could differ from its own value.
+    if type(version) is not str or version == "0.0.0" or _VERSION.fullmatch(version) is None:
         _fail("invalid_plugin_version")
-    if not isinstance(source_hash, str) or _SOURCE_HASH.fullmatch(source_hash) is None:
+    if type(source_hash) is not str or _SOURCE_HASH.fullmatch(source_hash) is None:
         _fail("invalid_plugin_source_hash")
     return version, source_hash
 
@@ -95,12 +126,14 @@ def compile_web_plugin_policy(*, registry: PluginRegistry, settings: RuntimeWebP
     implementations: dict[PluginCapability, set[PluginId]] = {capability: set() for capability in PluginCapability}
     for plugin_id in sorted(authorized):
         plugin_cls = installed[plugin_id]
-        local_check = getattr(plugin_cls, "check_web_local_requirements", None)
-        if local_check is not None and not local_check():
+        if not plugin_cls.check_web_local_requirements():
             _fail("plugin_unavailable")
-        raw_declarations: object = getattr(plugin_cls, "policy_capabilities", frozenset())
-        declarations = cast("frozenset[CapabilityDeclaration]", raw_declarations)
-        if not isinstance(declarations, frozenset) or any(not isinstance(item, CapabilityDeclaration) for item in declarations):
+        declarations = plugin_cls.policy_capabilities
+        # ``policy_capabilities`` is declared ``frozenset[CapabilityDeclaration]``
+        # on every plugin base class and ``CapabilityDeclaration`` is a frozen
+        # owned dataclass with no subclasses, so exact types are the whole
+        # admitted set — a look-alike declaration never reaches ``implementations``.
+        if type(declarations) is not frozenset or any(type(item) is not CapabilityDeclaration for item in declarations):
             _fail("invalid_capability_declaration")
         for declaration in declarations:
             implementations[declaration.capability].add(plugin_id)

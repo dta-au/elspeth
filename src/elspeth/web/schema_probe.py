@@ -9,12 +9,12 @@ from enum import Enum
 from types import MappingProxyType
 from typing import TypedDict
 
-import structlog
 from sqlalchemy import Connection, Engine, inspect, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.advisory_locks import ELSPETH_SCHEMA_INIT_LOCK_CLASSID
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import (
     LandscapeSchemaShape,
     SchemaCompatibilityError,
@@ -31,10 +31,10 @@ from elspeth.web.sessions.schema import (
     _assert_schema_sentinels,
     _create_session_tables,
     _stamp_schema_sentinels,
+    explain_non_current_schema,
     probe_current_schema,
 )
 
-_slog = structlog.get_logger(__name__)
 _LOCK_TARGET = "elspeth_schema_init"
 _LOCK_TIMEOUT = "5s"
 _TARGET_ERROR = "PostgreSQL database target cannot be proven safe from static URL configuration."
@@ -75,7 +75,8 @@ class PostgresLogicalTarget:
     explicit_schema: str | None
 
 
-AWS_ECS_POOL_KWARGS: Mapping[str, object] = MappingProxyType({"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True})
+EXTERNAL_POSTGRES_POOL_KWARGS: Mapping[str, object] = MappingProxyType({"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True})
+AWS_ECS_POOL_KWARGS = EXTERNAL_POSTGRES_POOL_KWARGS
 
 
 class PostgresEngineKwargs(TypedDict, total=False):
@@ -95,6 +96,20 @@ def _target_error() -> DatabaseTargetConflictError:
     return DatabaseTargetConflictError(_TARGET_ERROR)
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-supplied database URL (settings/env-authored connection string) whose query "
+    "string sqlalchemy parses into an unguaranteed mapping",
+    source_param="url",
+    suppresses=("R1", "R5"),
+    invariant="raises DatabaseTargetConflictError on every malformed or unprovable input: an "
+    "unparseable URL, a non-postgresql driver, a missing host or database, a connection-target "
+    "query override, a non-string or non-single-search-path options value, and an unstable or "
+    "oversized schema identifier; absence of the optional options key is the only tolerated gap "
+    "and never fabricates a schema",
+    test_ref="tests/unit/web/test_schema_probe.py::test_unprovable_target_is_rejected_with_static_message",
+    test_fingerprint="32df7ac5a595bab682693c7b20c9aeeacac93809fd5752f4e1fb6b34374f8092",
+)
 def postgres_logical_target_key(url: str | URL) -> PostgresLogicalTarget:
     """Parse only statically provable PostgreSQL logical-target attributes."""
     try:
@@ -171,6 +186,17 @@ def probe_landscape_schema(bind: Engine | Connection) -> SchemaState:
     }[probe_schema_shape(bind)]
 
 
+@trust_boundary(
+    tier=3,
+    source="a sqlalchemy OperationalError wrapping a third-party DBAPI driver exception whose "
+    "sqlstate/pgcode attributes are driver-specific and unguaranteed",
+    source_param="exc",
+    suppresses=("R5",),
+    invariant="never raises on exc: returns the SQLSTATE only when the driver exposes it as a "
+    "str (psycopg 'sqlstate', psycopg2 'pgcode'), and the None sentinel for an absent or "
+    "non-string value; never coerces or fabricates a code",
+    non_raising=True,
+)
 def _sqlstate(exc: OperationalError) -> str | None:
     original = exc.orig
     value = getattr(original, "sqlstate", None)
@@ -184,10 +210,8 @@ def _invalidate_uncertain(conn: Connection, *, original: BaseException) -> None:
     try:
         conn.invalidate()
     except BaseException as invalidation_error:
-        _slog.error(
-            "schema_connection_invalidation_failed",
-            original_exc_class=type(original).__name__,
-            invalidation_exc_class=type(invalidation_error).__name__,
+        original.add_note(
+            f"Schema connection invalidation also failed with {type(invalidation_error).__name__}; connection disposal was not verified."
         )
 
 
@@ -197,13 +221,9 @@ def _finish_lock_cleanup(
     cleanup_error: BaseException,
     earlier: BaseException | None,
 ) -> None:
-    _invalidate_uncertain(conn, original=cleanup_error)
+    _invalidate_uncertain(conn, original=cleanup_error if earlier is None else earlier)
     if earlier is not None:
-        _slog.error(
-            "schema_lock_cleanup_unverified",
-            original_exc_class=type(earlier).__name__,
-            cleanup_exc_class=type(cleanup_error).__name__,
-        )
+        earlier.add_note(f"Schema lock cleanup was not verified: {type(cleanup_error).__name__}.")
         return
     raise SchemaLockCleanupError(
         "Schema initialization may have completed but lock cleanup was not verified; investigate and rerun."
@@ -278,6 +298,9 @@ def _run_locked(
                 except BaseException as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
+                    else:
+                        note_target = cleanup_error if earlier is None else earlier
+                        note_target.add_note(f"Final schema rollback also failed with {type(exc).__name__}.")
 
                 if cleanup_error is not None:
                     _finish_lock_cleanup(conn, cleanup_error=cleanup_error, earlier=earlier)
@@ -294,11 +317,23 @@ def init_session_schema(engine: Engine) -> None:
             _create_session_tables(conn, checkfirst=True)
             _stamp_schema_sentinels(conn)
             return
-        raise SessionSchemaError("Session database schema is stale or partial; delete the old session database and restart.")
+        # Same treatment as verify(), and for the same reason: the operator
+        # instruction alone does not say WHAT drifted. The validator's own
+        # message already ends with "Delete the old session database and
+        # restart", so routing through the explainer keeps the instruction
+        # and adds the table, the constraint and both sides of the mismatch.
+        explain_non_current_schema(conn)
 
     def verify(conn: Connection) -> None:
-        if probe_session_schema(conn) is not SchemaState.CURRENT:
-            raise SessionSchemaError("Session database initialization did not produce the current schema.")
+        if probe_session_schema(conn) is SchemaState.CURRENT:
+            return
+        # Never raise a bare "did not produce the current schema" here. The
+        # probe collapsed a precise diagnosis into an enum to answer a yes/no
+        # question; on this path the answer is fatal, so re-run the validators
+        # un-guarded and let the one that objects say WHAT drifted. See
+        # ``explain_non_current_schema`` for why re-validating is the right
+        # trade. It never returns.
+        explain_non_current_schema(conn)
 
     _run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)
 

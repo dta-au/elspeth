@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ConfigDict
+from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.coordination.contracts import (
+    SessionOperationContext,
+    SessionOperationFence,
+    SessionOperationKind,
+)
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import (
+    GUIDED_OPERATION_FAILURE_CODE_VALUES,
     GuidedCompositionStateResult,
     GuidedOperationActive,
     GuidedOperationClaimed,
@@ -18,13 +28,18 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationConflictError,
     GuidedOperationFailed,
     GuidedOperationFence,
+    GuidedOperationFenceLostError,
 )
+from elspeth.web.sessions.routes import guided_operations as guided_operations_module
 from elspeth.web.sessions.routes.guided_operations import (
+    _SAFE_FAILURES,
     GuidedOperationExpired,
     GuidedOperationLease,
     guided_response_hash,
+    raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
+from elspeth.web.sessions.routes.sessions import _close_fork_operation_leases
 from elspeth.web.sessions.schemas import ReenterGuidedRequest
 
 
@@ -39,9 +54,14 @@ class _Service:
         self.outcomes = list(outcomes)
         self.reserve_calls = 0
         self.get_calls = 0
+        self.reserve_kwargs = []
+        self.session_operation_authority = object()
+        self.session_operation_owner_instance_id = "route-test"
+        self.session_operation_lease_seconds = 30
 
-    async def reserve_guided_operation(self, **_kwargs):
+    async def reserve_guided_operation(self, **kwargs):
         self.reserve_calls += 1
+        self.reserve_kwargs.append(kwargs)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -59,11 +79,40 @@ def _request() -> ReenterGuidedRequest:
     return ReenterGuidedRequest(operation_id="00000000-0000-4000-8000-000000000001")
 
 
+class _Lease:
+    def __init__(self, context: SessionOperationContext) -> None:
+        self.context = context
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _context(session_id, *, kind: SessionOperationKind = SessionOperationKind.COMPOSE) -> SessionOperationContext:
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=str(session_id),
+            operation_id="session-operation",
+            lease_token="session-secret",
+            operation_epoch=1,
+        ),
+        operation_kind=kind,
+    )
+
+
 @pytest.mark.asyncio
-async def test_new_operation_returns_live_fence() -> None:
+async def test_new_operation_acquires_compose_before_reserve_and_returns_composite_lease(monkeypatch) -> None:
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id=_request().operation_id, lease_token="secret", attempt=1)
-    service = _Service([GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))])
+    service = _Service([None, GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))])
+    session_lease = _Lease(_context(session_id))
+    acquired: list[dict[str, object]] = []
+
+    async def acquire(_cls, authority, **kwargs):
+        acquired.append({"authority": authority, **kwargs})
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
 
     result = await reserve_or_replay_guided_operation(
         service=service,
@@ -73,7 +122,235 @@ async def test_new_operation_returns_live_fence() -> None:
         replay=lambda _locator: _never(),
     )
 
-    assert result == GuidedOperationLease(fence=fence)
+    assert result == GuidedOperationLease(fence=fence, session_lease=session_lease)
+    assert acquired == [
+        {
+            "authority": service.session_operation_authority,
+            "session_id": session_id,
+            "operation_kind": SessionOperationKind.COMPOSE,
+            "owner_instance_id": "route-test",
+            "lease_seconds": 30,
+        }
+    ]
+    assert service.reserve_kwargs[0]["session_operation_context"] is session_lease.context
+
+
+@pytest.mark.asyncio
+async def test_terminal_replay_never_acquires_session_authority(monkeypatch) -> None:
+    session_id = uuid4()
+    locator = GuidedCompositionStateResult(state_id=uuid4())
+    response = _Response(value="replayed")
+    service = _Service([GuidedOperationCompleted(result=locator, response_hash=guided_response_hash(response))])
+
+    async def forbidden_acquire(*_args, **_kwargs):
+        raise AssertionError("join/replay must not acquire session authority")
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", forbidden_acquire)
+
+    result = await reserve_or_replay_guided_operation(
+        service=service,
+        session_id=session_id,
+        kind="guided_reenter",
+        request=_request(),
+        replay=lambda _locator: _response("replayed"),
+    )
+
+    assert result == response
+    assert service.get_calls == 1
+    assert service.reserve_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_acquire_reserve_race_releases_session_authority_before_join(monkeypatch) -> None:
+    session_id = uuid4()
+    locator = GuidedCompositionStateResult(state_id=uuid4())
+    response = _Response(value="race winner")
+    session_lease = _Lease(_context(session_id))
+
+    class RaceService(_Service):
+        async def get_guided_operation(self, **kwargs):
+            if self.get_calls == 1:
+                assert session_lease.closed
+            return await super().get_guided_operation(**kwargs)
+
+    service = RaceService(
+        [
+            None,
+            GuidedOperationActive(attempt=1, lease_expires_at=datetime.now(UTC) + timedelta(seconds=30)),
+            GuidedOperationCompleted(result=locator, response_hash=guided_response_hash(response)),
+        ]
+    )
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    monkeypatch.setattr("elspeth.web.sessions.routes.guided_operations.asyncio.sleep", no_sleep)
+
+    result = await reserve_or_replay_guided_operation(
+        service=service,
+        session_id=session_id,
+        kind="guided_reenter",
+        request=_request(),
+        replay=lambda _locator: _response("race winner"),
+    )
+
+    assert result == response
+    assert session_lease.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_write_fails", [False, True])
+async def test_cancellation_after_reserve_started_fails_guided_before_releasing_session(monkeypatch, status_write_fails: bool) -> None:
+    """Cancellation after the reserve started fails the claim, then closes the lease.
+
+    A failed ``request_cancelled`` status write is a fault of this process's
+    own: it escapes with the cancellation as its context, after the lease is
+    still closed, and is never reduced to a note or a log line.
+    """
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id=_request().operation_id, lease_token="secret", attempt=1)
+    claimed = GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))
+    session_lease = _Lease(_context(session_id))
+    reserve_started = asyncio.Event()
+    finish_reserve = asyncio.Event()
+    events: list[str] = []
+    status_write_error = OSError("PRIVATE-STATUS-WRITE-DETAIL")
+
+    class CancellationService(_Service):
+        async def reserve_guided_operation(self, **kwargs):
+            self.reserve_kwargs.append(kwargs)
+            reserve_started.set()
+            try:
+                await finish_reserve.wait()
+            except asyncio.CancelledError:
+                await finish_reserve.wait()
+            return claimed
+
+        async def fail_guided_operation(self, actual_fence, **kwargs):
+            assert actual_fence == fence
+            assert kwargs["session_operation_context"] is session_lease.context
+            assert not session_lease.closed
+            events.append("failed")
+            if status_write_fails:
+                raise status_write_error
+            return GuidedOperationFailed(failure_code="request_cancelled")
+
+    service = CancellationService([None])
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    task = asyncio.create_task(
+        reserve_or_replay_guided_operation(
+            service=service,
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    )
+    await reserve_started.wait()
+    task.cancel()
+    finish_reserve.set()
+
+    with capture_logs() as logs:
+        if status_write_fails:
+            with pytest.raises(OSError) as caught:
+                await task
+            assert caught.value is status_write_error
+            assert isinstance(caught.value.__context__, asyncio.CancelledError)
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    assert events == ["failed"]
+    assert session_lease.closed
+    assert [entry for entry in logs if entry["event"] == "guided.operation_cleanup_failed"] == []
+    assert "PRIVATE-STATUS-WRITE-DETAIL" not in repr(logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("close_error", "status_write_error"),
+    [
+        (OSError("PRIVATE-LEASE-CLOSE"), None),
+        (AuditIntegrityError("lease close integrity"), None),
+        (AuditIntegrityError("lease close integrity"), OSError("PRIVATE-STATUS-WRITE")),
+    ],
+    ids=["ordinary_close", "integrity_close", "integrity_close_after_failed_status_write"],
+)
+async def test_cancellation_close_failure_escapes_with_the_cancellation_as_context(
+    monkeypatch, close_error: BaseException, status_write_error: BaseException | None
+) -> None:
+    """A lease the cancelled reservation could not release is raised, never noted or logged.
+
+    The close failure escapes in its own right, ordinary or integrity alike,
+    with the cancellation as its ``__context__``. When the status write failed
+    first, the close is still attempted and its failure chains the earlier one.
+    """
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id=_request().operation_id, lease_token="secret", attempt=1)
+    claimed = GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))
+    reserve_started = asyncio.Event()
+    finish_reserve = asyncio.Event()
+
+    class FailingCloseLease(_Lease):
+        async def close(self) -> None:
+            self.closed = True
+            raise close_error
+
+    session_lease = FailingCloseLease(_context(session_id))
+
+    class CancellationService(_Service):
+        async def reserve_guided_operation(self, **kwargs):
+            reserve_started.set()
+            try:
+                await finish_reserve.wait()
+            except asyncio.CancelledError:
+                await finish_reserve.wait()
+            return claimed
+
+        async def fail_guided_operation(self, actual_fence, **kwargs):
+            assert actual_fence == fence
+            assert not session_lease.closed
+            if status_write_error is not None:
+                raise status_write_error
+            return GuidedOperationFailed(failure_code="request_cancelled")
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    task = asyncio.create_task(
+        reserve_or_replay_guided_operation(
+            service=CancellationService([None]),
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    )
+    await reserve_started.wait()
+    task.cancel()
+    finish_reserve.set()
+
+    with capture_logs() as logs, pytest.raises(type(close_error)) as caught:
+        await task
+
+    assert caught.value is close_error
+    assert session_lease.closed
+    if status_write_error is None:
+        assert isinstance(caught.value.__context__, asyncio.CancelledError)
+    else:
+        assert caught.value.__context__ is status_write_error
+        assert isinstance(status_write_error.__context__, asyncio.CancelledError)
+    assert [entry for entry in logs if entry["event"] == "guided.operation_cleanup_failed"] == []
+    assert "PRIVATE-LEASE-CLOSE" not in repr(logs)
+    assert "PRIVATE-STATUS-WRITE" not in repr(logs)
 
 
 @pytest.mark.asyncio
@@ -157,8 +434,8 @@ async def test_active_operation_polls_to_terminal_replay(monkeypatch) -> None:
     )
 
     assert result == response
-    assert service.get_calls == 1
-    assert service.reserve_calls == 1
+    assert service.get_calls == 2
+    assert service.reserve_calls == 0
 
 
 @pytest.mark.asyncio
@@ -195,13 +472,13 @@ async def test_host_clock_ahead_does_not_trigger_reserve_spin(monkeypatch) -> No
     )
 
     assert result == response
-    assert service.reserve_calls == 1
-    assert service.get_calls == 1
+    assert service.reserve_calls == 0
+    assert service.get_calls == 2
     assert sleeps == [pytest.approx(0.05)]
 
 
 @pytest.mark.asyncio
-async def test_reserve_result_cannot_authorise_takeover_without_get_confirmation(monkeypatch) -> None:
+async def test_db_expired_get_acquires_session_authority_before_takeover(monkeypatch) -> None:
     session_id = uuid4()
     locator = GuidedCompositionStateResult(state_id=uuid4())
     response = _Response(value="joined")
@@ -219,7 +496,13 @@ async def test_reserve_result_cannot_authorise_takeover_without_get_confirmation
     async def no_sleep(_seconds: float) -> None:
         return None
 
+    session_lease = _Lease(_context(session_id))
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
     monkeypatch.setattr("elspeth.web.sessions.routes.guided_operations.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
     result = await reserve_or_replay_guided_operation(
         service=service,
         session_id=session_id,
@@ -231,6 +514,7 @@ async def test_reserve_result_cannot_authorise_takeover_without_get_confirmation
     assert result == response
     assert service.reserve_calls == 1
     assert service.get_calls == 1
+    assert session_lease.closed
 
 
 @pytest.mark.asyncio
@@ -321,9 +605,493 @@ async def test_terminal_stale_settlement_conflict_maps_to_safe_http_409() -> Non
     }
 
 
+@pytest.mark.asyncio
+async def test_guided_lease_guard_repeated_cancellation_fails_guided_before_exact_once_close() -> None:
+    guard_factory = guided_operations_module.guided_operation_lease_guard
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="guard-cancel", lease_token="guided-secret", attempt=1)
+    context = _context(session_id)
+    failure_entered = asyncio.Event()
+    release_failure = asyncio.Event()
+    events: list[str] = []
+
+    class OrderedLease(_Lease):
+        async def close(self) -> None:
+            assert not self.closed
+            events.append("close")
+            await super().close()
+
+    class GuardService:
+        async def fail_guided_operation(self, actual_fence, **kwargs):
+            assert actual_fence == fence
+            assert kwargs["session_operation_context"] == context
+            events.append("fail-start")
+            failure_entered.set()
+            await release_failure.wait()
+            events.append("fail-end")
+            return GuidedOperationFailed(failure_code="request_cancelled")
+
+    lease = OrderedLease(context)
+    reserved = GuidedOperationLease(fence=fence, session_lease=lease)
+    entered = asyncio.Event()
+
+    async def run() -> None:
+        async with guard_factory(
+            service=GuardService(),
+            lease=reserved,
+        ):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(run())
+    await entered.wait()
+    task.cancel("first guided cancellation")
+    await failure_entered.wait()
+    task.cancel("repeated guided cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_failure.set()
+    with pytest.raises(asyncio.CancelledError, match="first guided cancellation") as caught:
+        await task
+
+    assert caught.value.args == ("first guided cancellation",)
+    assert events == ["fail-start", "fail-end", "close"]
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+async def test_guided_guard_cancellation_during_normal_exit_drains_and_propagates() -> None:
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="cancel-close", lease_token="secret", attempt=1)
+    close_entered = asyncio.Event()
+    finish_close = asyncio.Event()
+
+    class ClosingLease(_Lease):
+        async def close(self) -> None:
+            close_entered.set()
+            await finish_close.wait()
+            await super().close()
+
+    class TerminalService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise GuidedOperationFenceLostError(fence)
+
+    lease = ClosingLease(_context(session_id))
+
+    async def run() -> None:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=TerminalService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            pass
+
+    task = asyncio.create_task(run())
+    await close_entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    finish_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+async def test_guided_lease_guard_preserves_primary_with_sanitized_cleanup_notes() -> None:
+    guard_factory = guided_operations_module.guided_operation_lease_guard
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="guard-error", lease_token="guided-secret", attempt=1)
+    context = _context(session_id)
+
+    class FailingLease(_Lease):
+        async def close(self) -> None:
+            raise ValueError("SESSION-CLEANUP-SECRET")
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise RuntimeError("GUIDED-CLEANUP-SECRET")
+
+    primary = KeyError("primary failure")
+    with pytest.raises(KeyError) as caught:
+        async with guard_factory(
+            service=GuardService(),
+            lease=GuidedOperationLease(fence=fence, session_lease=FailingLease(context)),
+        ):
+            raise primary
+
+    assert caught.value is primary
+    rendered_notes = repr(caught.value.__notes__)
+    assert "RuntimeError" in rendered_notes
+    assert "ValueError" in rendered_notes
+    assert "GUIDED-CLEANUP-SECRET" not in rendered_notes
+    assert "SESSION-CLEANUP-SECRET" not in rendered_notes
+
+
+@pytest.mark.asyncio
+async def test_guard_diagnostic_integrity_takes_priority_over_ordinary_proof_failure(monkeypatch) -> None:
+    proof_error = RuntimeError("proof failed")
+    diagnostic_error = AuditIntegrityError("diagnostic integrity failed")
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="proof-diagnostic", lease_token="secret", attempt=1)
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise proof_error
+
+    class FailingLease(_Lease):
+        async def close(self):
+            self.closed = True
+            raise OSError("close failed")
+
+    def fail_logging(*_args, **_kwargs):
+        raise diagnostic_error
+
+    monkeypatch.setattr(guided_operations_module.slog, "error", fail_logging)
+    lease = FailingLease(_context(session_id))
+    with pytest.raises(AuditIntegrityError) as caught:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            pass
+    assert caught.value is diagnostic_error
+    assert caught.value.__context__ is proof_error
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+async def test_integrity_logger_failure_does_not_skip_guided_or_fork_close(monkeypatch) -> None:
+    logger_error = AuditIntegrityError("logger integrity")
+    calls = 0
+
+    def fail_logging(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AuditIntegrityError("secondary logger integrity")
+        raise logger_error
+
+    monkeypatch.setattr(guided_operations_module.slog, "error", fail_logging)
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="logger-failure", lease_token="secret", attempt=1)
+
+    class FailingLease(_Lease):
+        async def close(self):
+            self.closed = True
+            raise OSError("close failure")
+
+    lease = FailingLease(_context(session_id))
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise OSError("cleanup failure")
+
+    with pytest.raises(AuditIntegrityError) as caught:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            raise HTTPException(409, "primary")
+    assert caught.value is logger_error
+    assert lease.closed
+    assert calls == 1  # Fatal emission escapes after both cleanup attempts.
+
+    calls = 0
+    child = FailingLease(_context(uuid4()))
+    parent = _Lease(_context(uuid4()))
+    with pytest.raises(AuditIntegrityError) as caught:
+        await _close_fork_operation_leases(child, parent, asyncio.CancelledError())
+    assert caught.value is logger_error
+    assert child.closed and parent.closed
+
+
+@pytest.mark.asyncio
+async def test_guided_integrity_cleanup_failure_escapes_http_conflict() -> None:
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="http-cleanup", lease_token="secret", attempt=1)
+    context = _context(session_id)
+    integrity_error = AuditIntegrityError("PRIVATE-INTEGRITY-DETAIL")
+    closed = False
+
+    class FailingLease(_Lease):
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+            raise OSError("PRIVATE-LEASE-DETAIL")
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise integrity_error
+
+    app = FastAPI()
+
+    @app.get("/guarded")
+    async def guarded() -> None:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(),
+            lease=GuidedOperationLease(fence=fence, session_lease=FailingLease(context)),
+        ):
+            raise HTTPException(409, "primary conflict")
+
+    with capture_logs() as logs:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            with pytest.raises(AuditIntegrityError) as caught:
+                await client.get("/guarded")
+    assert caught.value is integrity_error
+    assert isinstance(caught.value.__cause__, HTTPException)
+    assert closed
+    assert not logs
+
+
+@pytest.mark.asyncio
+async def test_guard_retains_multiple_integrity_failures_and_closes_before_propagation() -> None:
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="fatal-cleanup", lease_token="secret", attempt=1)
+    primary = AuditIntegrityError("primary integrity")
+    proof_error = ExceptionGroup("proof cohort", [AuditIntegrityError("proof integrity")])
+    close_error = AuditIntegrityError("close integrity")
+
+    class FailingLease(_Lease):
+        async def close(self):
+            self.closed = True
+            raise close_error
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise proof_error
+
+    lease = FailingLease(_context(session_id))
+    with pytest.raises(BaseExceptionGroup) as caught:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            raise primary
+    assert caught.value.exceptions == (primary, proof_error, close_error)
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_reservation_integrity_error_propagates_after_close(monkeypatch, cancel: bool) -> None:
+    session_id = uuid4()
+    session_lease = _Lease(_context(session_id))
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    failure = AuditIntegrityError("reservation integrity")
+
+    class FailingService(_Service):
+        async def reserve_guided_operation(self, **_kwargs):
+            started.set()
+            await finish.wait()
+            raise failure
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    task = asyncio.create_task(
+        reserve_or_replay_guided_operation(
+            service=FailingService([None]),
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    )
+    await started.wait()
+    if cancel:
+        task.cancel()
+        await asyncio.sleep(0)
+    finish.set()
+    with pytest.raises(AuditIntegrityError) as caught:
+        await task
+    assert caught.value is failure
+    assert session_lease.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reservation_failure",
+    [RuntimeError("reservation failed"), AuditIntegrityError("reservation integrity")],
+    ids=["ordinary_primary", "integrity_primary"],
+)
+async def test_reservation_failure_close_fault_propagates_alongside_the_reservation_failure(
+    monkeypatch, reservation_failure: BaseException
+) -> None:
+    """A session lease the failed reservation could not release is raised, not logged.
+
+    The cancellation arm keeps its close fault as a note because cancellation
+    must stay a plain ``CancelledError``; the ordinary-failure arm has no such
+    constraint, so both faults propagate together and an integrity primary is
+    still recognisable through the group.
+    """
+
+    class FailingCloseLease(_Lease):
+        def __init__(self, context: SessionOperationContext) -> None:
+            super().__init__(context)
+            self.close_error = OSError("PRIVATE-LEASE-CLOSE")
+
+        async def close(self) -> None:
+            self.closed = True
+            raise self.close_error
+
+    session_id = uuid4()
+    session_lease = FailingCloseLease(_context(session_id))
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    with capture_logs() as logs, pytest.raises(BaseExceptionGroup) as caught:
+        await reserve_or_replay_guided_operation(
+            service=_Service([None, reservation_failure]),
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    assert caught.value.exceptions == (reservation_failure, session_lease.close_error)
+    assert session_lease.closed
+    assert guided_operations_module._is_guided_integrity_failure(caught.value) is isinstance(reservation_failure, AuditIntegrityError)
+    assert [entry["event"] for entry in logs if entry["event"] == "guided.operation_cleanup_failed"] == []
+    assert "PRIVATE-LEASE-CLOSE" not in repr(logs)
+
+
+@pytest.mark.asyncio
+async def test_fork_reverse_close_failures_are_recorded_outside_http_exception_notes() -> None:
+    class FailingLease(_Lease):
+        async def close(self) -> None:
+            self.closed = True
+            raise OSError("PRIVATE-FORK-CLEANUP")
+
+    parent = FailingLease(_context(uuid4()))
+    child = FailingLease(_context(uuid4()))
+    app = FastAPI()
+
+    @app.get("/fork-failed")
+    async def fork_failed() -> None:
+        primary = HTTPException(409, "fork conflict")
+        try:
+            raise primary
+        finally:
+            await _close_fork_operation_leases(child, parent, primary)
+
+    with capture_logs() as logs:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/fork-failed")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "fork conflict"}
+    records = [entry for entry in logs if entry["event"] == "session.fork_lease_cleanup_failed"]
+    assert [entry["session_id"] for entry in records] == [child.context.fence.session_id, parent.context.fence.session_id]
+    assert all(entry["exc_class"] == "OSError" for entry in records)
+    assert "PRIVATE-FORK-CLEANUP" not in repr(records)
+
+
+@pytest.mark.asyncio
+async def test_guided_lease_guard_rejects_normal_exit_while_guided_fence_is_still_live() -> None:
+    guard_factory = guided_operations_module.guided_operation_lease_guard
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="guard-live-return", lease_token="secret", attempt=1)
+    context = _context(session_id)
+    lease = _Lease(context)
+    calls: list[str] = []
+
+    class GuardService:
+        async def fail_guided_operation(self, actual_fence, **kwargs):
+            assert actual_fence == fence
+            assert kwargs["failure_code"] == "operation_failed"
+            calls.append("failed")
+            return GuidedOperationFailed(failure_code="operation_failed")
+
+    with pytest.raises(AuditIntegrityError, match="returned before its guided operation became terminal"):
+        async with guard_factory(
+            service=GuardService(),
+            lease=GuidedOperationLease(fence=fence, session_lease=lease),
+        ):
+            pass
+
+    assert calls == ["failed"]
+    assert lease.closed
+
+
 async def _response(value: str) -> _Response:
     return _Response(value=value)
 
 
 async def _never() -> _Response:
     raise AssertionError("replay callback must not run")
+
+
+class TestClosedFailureEnvelope:
+    """``_SAFE_FAILURES`` is the HTTP face of the closed failure vocabulary.
+
+    ``raise_guided_operation_failure`` refuses an unmapped code with an
+    ``AuditIntegrityError`` — a raw 500 — so a code added to
+    ``GuidedOperationFailureCode`` without an entry here turns a well-classified
+    failure back into the generic crash it was classified out of.
+    """
+
+    def test_every_closed_failure_code_has_an_http_envelope(self) -> None:
+        assert set(_SAFE_FAILURES) == GUIDED_OPERATION_FAILURE_CODE_VALUES
+
+    def test_policy_blocked_answers_422_without_provider_blame_or_a_retry_offer(self) -> None:
+        """The permanent half of the split must not read as a transient fault.
+
+        The observed failure (guided S3, 2026-07-31) reached the user as
+        "The provider returned an invalid response. Retry with a new operation
+        id." for a refusal that had ZERO provider calls and could never succeed
+        on retry. The replacement copy must blame neither the provider nor the
+        client's operation id, and must not invite a retry.
+        """
+        with pytest.raises(HTTPException) as caught:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="policy_blocked"))
+
+        assert caught.value.status_code == 422
+        detail = caught.value.detail
+        assert isinstance(detail, dict)
+        assert detail["error_type"] == "guided_operation_terminal_failure"
+        assert detail["failure_code"] == "policy_blocked"
+        copy = str(detail["detail"])
+        lowered = copy.lower()
+        assert "provider" not in lowered
+        assert "operation id" not in lowered
+        assert "deployment policy" in lowered
+        # Names the permanence explicitly rather than offering a retry.
+        assert "retrying will fail the same way" in lowered
+
+    def test_permanent_and_transient_codes_are_partitioned_by_status_class(self) -> None:
+        """A 5xx says "our side broke, try again"; a policy refusal is neither."""
+        transient = ("provider_unavailable", "provider_timeout", "invalid_provider_response")
+        for code in transient:
+            status, copy = _SAFE_FAILURES[code]
+            assert status >= 500, code
+            assert "retry" in copy.lower(), code
+        status, _copy = _SAFE_FAILURES["policy_blocked"]
+        assert 400 <= status < 500
+
+    def test_invalid_provider_response_copy_drops_the_operation_id_jargon(self) -> None:
+        """The client mints a fresh operation id on every re-click by itself.
+
+        Naming the id taught the reader an internal protocol detail they cannot
+        act on; "Retry the request." is the whole actionable instruction.
+        """
+        _status, copy = _SAFE_FAILURES["invalid_provider_response"]
+
+        assert copy.endswith("Retry the request.")
+        assert "operation id" not in copy.lower()
+
+    def test_the_raise_site_leaves_request_id_to_the_app_boundary(self) -> None:
+        """The correlation id is injected once, at the app-level handler.
+
+        ``raise_guided_operation_failure`` has no ``Request`` and must not
+        acquire one: the id is stamped by ``RequestIdMiddleware`` and folded
+        into every dict-shaped detail by ``create_app``'s ``HTTPException``
+        handler (see ``tests/unit/web/test_composer_exception_handlers.py``).
+        Sourcing it here as well would give the envelope two authorities for
+        one field — and would silently diverge the moment a route composed the
+        envelope outside a request scope. Pin the closed key set so that
+        second source cannot be added here by accident.
+        """
+        for code in sorted(GUIDED_OPERATION_FAILURE_CODE_VALUES):
+            with pytest.raises(HTTPException) as caught:
+                raise_guided_operation_failure(GuidedOperationFailed(failure_code=code))
+            detail = caught.value.detail
+            assert isinstance(detail, dict)
+            assert set(detail) == {"error_type", "failure_code", "detail"}, code

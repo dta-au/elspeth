@@ -717,12 +717,20 @@ def test_frozen_annotations_uses_core_loader() -> None:
 
 
 def test_existing_yaml_loads_with_core_loader() -> None:
-    """The migrated YAML must parse under the core allow_hits schema."""
+    """The migrated YAML must parse under the core allow_hits schema.
+
+    9, not 8: GroupBindingRegistry._expand_groups (commit 466808f75, spec §3
+    unified group-binding registry) is a reviewed 9th entry — the runtime
+    EXPAND-group mint-path index, symmetric with ToolBatchContext.discovery_cache
+    above it in the same file. The sibling FG3 freeze-guard entry added same-day
+    in 57bddf434 (config/cicd/enforce_freeze_guards/core.yaml) cites this exact
+    entry as its reviewed precedent.
+    """
     from elspeth_lints.core.allowlist import load_allowlist
 
     path = Path("config/cicd/enforce_frozen_annotations/existing.yaml")
     result = load_allowlist(path, valid_rule_ids={"immutability.frozen_annotations"})
-    assert len(result.entries) == 8, f"expected 8 live entries, got {len(result.entries)}"
+    assert len(result.entries) == 9, f"expected 9 live entries, got {len(result.entries)}"
 
 
 def _analyze_freeze_guards(source: str) -> list[Finding]:

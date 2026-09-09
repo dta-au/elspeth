@@ -61,13 +61,20 @@ from elspeth.contracts.audit_export import (
     AuditExportSnapshotWinner,
     AuditExportTerminalWitness,
 )
-from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.auth import (
+    ActivationRole,
+    AuthProviderType,
+    IdentityAccessState,
+    IdentityProviderType,
+    IdentityRole,
+    RelationshipType,
+)
 from elspeth.contracts.barrier_scalars import (
     AggregationNodeScalars,
     BarrierScalars,
     CoalescePendingScalars,
 )
-from elspeth.contracts.batch_runtime import BatchTransformRuntimeProtocol
+from elspeth.contracts.batch_runtime import BatchTransformRuntime
 from elspeth.contracts.call_data import (
     CallPayload,
     HTTPCallError,
@@ -141,8 +148,23 @@ from elspeth.contracts.data import (
     validate_row,
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
-from elspeth.contracts.engine import BufferEntry, CoalesceParentCompletion, PendingOutcome, RetryPolicy
+from elspeth.contracts.engine import (
+    AggregationParentDisposition,
+    AggregationResultMember,
+    AggregationResultReceipt,
+    BufferEntry,
+    CoalesceParentCompletion,
+    CommittedAggregationChild,
+    CommittedAggregationOutputReceipt,
+    CommittedAggregationResidual,
+    CommittedChild,
+    CommittedCoalesceResidual,
+    CommittedCollect,
+    PendingOutcome,
+    RetryPolicy,
+)
 from elspeth.contracts.enums import (
+    AggregationMemberAction,
     AuditCharacteristic,
     BackpressureMode,
     BatchStatus,
@@ -152,8 +174,10 @@ from elspeth.contracts.enums import (
     DerivedAuditCharacteristics,
     Determinism,
     ExportStatus,
+    FrameKind,
     NodeStateStatus,
     NodeType,
+    OutputMode,
     ReproducibilityGrade,
     RoutingKind,
     RoutingMode,
@@ -169,6 +193,7 @@ from elspeth.contracts.errors import (
     # Tier 1 guard tuple — single source of truth for "never catch" exceptions
     CoalesceFailureReason,
     CommencementGateFailedError,
+    ConfigGateErrorReason,
     ConfigGateReason,
     # Schema contract violations
     ContractMergeError,
@@ -191,6 +216,7 @@ from elspeth.contracts.errors import (
     RetrievalNotReadyError,
     RoutingReason,
     RowErrorEntry,
+    RowUnionFailureReason,
     SinkDiversionReason,
     SourceQuarantineReason,
     TemplateErrorEntry,
@@ -212,6 +238,7 @@ from elspeth.contracts.events import (
     PhaseError,
     PhaseStarted,
     PipelinePhase,
+    ResourceCleanupFailed,
     RowCreated,
     RunCompletionStatus,
     RunFinished,
@@ -227,7 +254,7 @@ from elspeth.contracts.header_modes import (
     resolve_headers,
 )
 from elspeth.contracts.identifiers import validate_field_name, validate_field_names
-from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.identity import LineageFrame, TokenInfo
 from elspeth.contracts.node_state_context import (
     AggregationFlushContext,
     GateEvaluationContext,
@@ -288,7 +315,9 @@ from elspeth.contracts.sink_effects import (
     AuditExportSignedManifestInput,
     AuditExportSigningMode,
     AuditExportSnapshotChunkInput,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
+    RestagingSinkEffectCapability,
     RestrictedAuditExportSnapshotReader,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
@@ -297,6 +326,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectAttemptState,
     SinkEffectAuditExportSnapshotInput,
     SinkEffectCommitResult,
+    SinkEffectContract,
     SinkEffectDescriptorMode,
     SinkEffectExecutionPurpose,
     SinkEffectFinalizationMember,
@@ -341,6 +371,7 @@ from elspeth.contracts.types import (
     CoalesceName,
     GateName,
     NodeID,
+    RowUnionName,
     SinkName,
     StepResolver,
 )
@@ -382,6 +413,8 @@ __all__ = [  # Grouped by category for readability
     "PluginContractViolation",
     "RetrievalNotReadyError",
     "CoalesceFailureReason",
+    "RowUnionFailureReason",
+    "ConfigGateErrorReason",
     "ConfigGateReason",
     "ErrorDetail",
     "ExecutionError",
@@ -429,7 +462,12 @@ __all__ = [  # Grouped by category for readability
     "TransformErrorRecord",
     "ValidationErrorRecord",
     # auth
+    "ActivationRole",
     "AuthProviderType",
+    "IdentityAccessState",
+    "IdentityProviderType",
+    "IdentityRole",
+    "RelationshipType",
     # config - Runtime protocols (contracts, not core)
     "RuntimeCheckpointProtocol",
     "RuntimeConcurrencyProtocol",
@@ -458,8 +496,10 @@ __all__ = [  # Grouped by category for readability
     "DerivedAuditCharacteristics",
     "Determinism",
     "ExportStatus",
+    "FrameKind",
     "NodeStateStatus",
     "NodeType",
+    "OutputMode",
     "ReproducibilityGrade",
     "RoutingKind",
     "RoutingMode",
@@ -471,6 +511,7 @@ __all__ = [  # Grouped by category for readability
     "TriggerType",
     "error_edge_label",
     # identity
+    "LineageFrame",
     "TokenInfo",
     # identifiers
     "validate_field_name",
@@ -507,6 +548,7 @@ __all__ = [  # Grouped by category for readability
     "AggregationName",
     "BranchName",
     "CoalesceName",
+    "RowUnionName",
     "GateName",
     "NODE_ID_MAX_LENGTH",
     "NodeID",
@@ -536,8 +578,18 @@ __all__ = [  # Grouped by category for readability
     "check_compatibility",
     "validate_row",
     # engine
+    "AggregationParentDisposition",
+    "AggregationMemberAction",
+    "AggregationResultMember",
+    "AggregationResultReceipt",
     "BufferEntry",
     "CoalesceParentCompletion",
+    "CommittedAggregationChild",
+    "CommittedAggregationResidual",
+    "CommittedAggregationOutputReceipt",
+    "CommittedChild",
+    "CommittedCoalesceResidual",
+    "CommittedCollect",
     "PendingOutcome",
     "RetryPolicy",
     # payload_store
@@ -554,9 +606,10 @@ __all__ = [  # Grouped by category for readability
     "TransformErrorToken",
     "ValidationErrorToken",
     # plugin protocols
-    "BatchTransformRuntimeProtocol",
+    "BatchTransformRuntime",
     "BatchTransformProtocol",
     "SinkEffectProtocol",
+    "SinkEffectContract",
     "SinkProtocol",
     "SourceProtocol",
     "TransformProtocol",
@@ -571,6 +624,7 @@ __all__ = [  # Grouped by category for readability
     "PhaseStarted",
     "PipelinePhase",
     "RowCreated",
+    "ResourceCleanupFailed",
     "RunCompletionStatus",
     "RunFinished",
     "RunStarted",
@@ -593,7 +647,9 @@ __all__ = [  # Grouped by category for readability
     "AuditExportSignedManifestInput",
     "AuditExportSigningMode",
     "AuditExportSnapshotChunkInput",
+    "MemberSinkEffectCapability",
     "ResolvedSinkEffectMode",
+    "RestagingSinkEffectCapability",
     "RestrictedAuditExportSnapshotReader",
     "RestrictedSinkEffectContext",
     "SinkEffectAttemptAction",

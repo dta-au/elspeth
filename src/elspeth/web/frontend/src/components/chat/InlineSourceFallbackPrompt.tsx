@@ -43,6 +43,8 @@
 //     a duplicate dismissal source-of-truth.
 // ============================================================================
 
+import { Button } from "@/components/ui";
+
 export interface InlineSourceFallbackPromptProps {
   /**
    * Predicate gate computed by the caller (ChatPanel). When false the
@@ -98,20 +100,26 @@ export function InlineSourceFallbackPrompt({
         </p>
       </div>
       <div className="inline-source-fallback-prompt-actions">
-        <button
-          type="button"
-          className="btn btn-compact btn-primary inline-source-fallback-prompt-accept"
+        {/* Composes .btn-compact with .btn-primary (the shared.css:222 idiom).
+            The pre-migration class list carried a redundant `.btn` token too;
+            every one of its declarations was overridden by the later
+            .btn-compact block at equal specificity (or duplicated verbatim in
+            its hover/disabled rules), so dropping it is computed-style inert. */}
+        <Button
+          variant="primary"
+          compact
+          className="inline-source-fallback-prompt-accept"
           onClick={() => onAccept(candidateText)}
         >
           Create source
-        </button>
-        <button
-          type="button"
-          className="btn-compact inline-source-fallback-prompt-dismiss"
+        </Button>
+        <Button
+          compact
+          className="inline-source-fallback-prompt-dismiss"
           onClick={onDismiss}
         >
           Dismiss
-        </button>
+        </Button>
       </div>
     </section>
   );

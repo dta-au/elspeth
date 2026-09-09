@@ -39,11 +39,30 @@ class AWSBedrockContentSafety(BedrockGuardrailTransformBase):
         }
     )
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6f796eb6a8db2678"
+    source_file_hash: str | None = "sha256:a2616df0b0a79c6b"
     config_model = AWSBedrockContentSafetyConfig
     _required_filters = HARMFUL_CONTENT_FILTERS
     _detected_reason = "content_safety_violation"
     _probe_field = "bedrock_content_safety_probe_text"
+    capability_tags: tuple[str, ...] = ("aws", "bedrock", "content-safety")
+
+    usage_when_to_use = (
+        "Use as a post-LLM harmful content control through an opaque operator profile. Set "
+        "source: OUTPUT; that direction is required for output-control credit."
+    )
+    usage_when_not_to_use = (
+        "Not for pre-LLM prompt attack screening, and source: INPUT does not satisfy the post-generation "
+        "output-control role. Use aws_bedrock_prompt_shield before the LLM instead."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: aws_bedrock_content_safety\n"
+        "  options:\n"
+        "    profile: approved-output-guardrail\n"
+        "    fields: [generated_text]\n"
+        "    source: OUTPUT\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def is_effective_blocking_control(
@@ -55,7 +74,10 @@ class AWSBedrockContentSafety(BedrockGuardrailTransformBase):
     ) -> bool:
         if not super().is_effective_blocking_control(capability=capability, role=role, options=options):
             return False
-        return options.get("source", "OUTPUT") == "OUTPUT"
+        source: object = "OUTPUT"
+        if "source" in options:
+            source = options["source"]
+        return type(source) is str and source == "OUTPUT"
 
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = AWSBedrockContentSafetyConfig.from_dict(config, plugin_name=self.name)

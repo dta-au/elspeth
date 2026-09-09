@@ -22,13 +22,19 @@ so the from-tree verify only ever sees structurally valid actions.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.strict_json import strict_json_loads
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+DEFAULT_SIGN_BUNDLE_RATIONALE = "Staged via sign-bundle; see bundle provenance for the agent rationale."
+
+_FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40,64}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # A bundle ``kind`` fully determines its ``lane`` -- the two can never drift.
 _KIND_TO_LANE: dict[str, str] = {
@@ -36,16 +42,6 @@ _KIND_TO_LANE: dict[str, str] = {
     "drift_repair": "resign",
     "rotation": "resign",
     "stale_delete": "resign",
-}
-
-# Per-kind required fields (``key`` is required for every kind, checked
-# separately). A malformed action raises a typed ``ValueError`` at construction
-# so ``load_bundle`` rejects it before any tree walk.
-_REQUIRED_FIELDS_BY_KIND: dict[str, tuple[str, ...]] = {
-    "justify": ("file_path", "symbol", "fingerprint"),
-    "drift_repair": ("diagnosis_status",),
-    "rotation": ("source_file",),
-    "stale_delete": ("source_file",),
 }
 
 _PREVIEW_FIELDS = ("verdict", "rationale", "model", "transport", "authoritative")
@@ -74,6 +70,7 @@ _BUNDLE_FIELDS = (
     "allowlist_dir",
     "source_rev",
     "source_dirty",
+    "source_snapshot_sha256",
     "actions",
     "rekey",
 )
@@ -95,6 +92,16 @@ class ActionPreview:
     authoritative: bool = False
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("verdict", self.verdict),
+            ("rationale", self.rationale),
+            ("model", self.model),
+            ("transport", self.transport),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(f"ActionPreview.{name} must be a string; got {type(value).__name__}")
+        if not isinstance(self.authoritative, bool):
+            raise ValueError(f"ActionPreview.authoritative must be a boolean; got {type(self.authoritative).__name__}")
         if self.authoritative:
             raise ValueError("ActionPreview.authoritative must be False; a bundle preview is never authoritative")
 
@@ -122,7 +129,25 @@ class BundleAction:
     preview: ActionPreview | None = None
 
     def __post_init__(self) -> None:
-        if not self.key:
+        for name, value in (("lane", self.lane), ("kind", self.kind), ("key", self.key)):
+            if not isinstance(value, str):
+                raise ValueError(f"BundleAction.{name} must be a string; got {type(value).__name__}")
+        for name, optional_value in (
+            ("file_path", self.file_path),
+            ("symbol", self.symbol),
+            ("rule", self.rule),
+            ("fingerprint", self.fingerprint),
+            ("scope_fingerprint", self.scope_fingerprint),
+            ("ast_path", self.ast_path),
+            ("draft_rationale", self.draft_rationale),
+            ("diagnosis_status", self.diagnosis_status),
+            ("source_file", self.source_file),
+        ):
+            if optional_value is not None and not isinstance(optional_value, str):
+                raise ValueError(f"BundleAction.{name} must be a string or null; got {type(optional_value).__name__}")
+        if self.preview is not None and not isinstance(self.preview, ActionPreview):
+            raise ValueError(f"BundleAction.preview must be an ActionPreview or null; got {type(self.preview).__name__}")
+        if self.key == "":
             raise ValueError("BundleAction.key must be a non-empty canonical allowlist key")
         expected_lane = _KIND_TO_LANE.get(self.kind)
         if expected_lane is None:
@@ -132,9 +157,22 @@ class BundleAction:
                 f"BundleAction.lane={self.lane!r} is incoherent with kind={self.kind!r} "
                 f"(kind {self.kind!r} requires lane {expected_lane!r})"
             )
-        missing = [name for name in _REQUIRED_FIELDS_BY_KIND[self.kind] if not getattr(self, name)]
+        required_values_by_kind = {
+            "justify": (("file_path", self.file_path), ("symbol", self.symbol), ("fingerprint", self.fingerprint)),
+            "drift_repair": (("diagnosis_status", self.diagnosis_status),),
+            "rotation": (("source_file", self.source_file),),
+            "stale_delete": (("source_file", self.source_file),),
+        }
+        missing = [name for name, value in required_values_by_kind[self.kind] if value in {None, ""}]
         if missing:
             raise ValueError(f"BundleAction kind={self.kind!r} is missing required field(s): {missing}")
+        if self.kind in {"rotation", "stale_delete"}:
+            assert self.source_file is not None
+            source_path = Path(self.source_file)
+            if source_path.is_absolute() or len(source_path.parts) != 1 or source_path.name != self.source_file:
+                raise ValueError(
+                    f"BundleAction kind={self.kind!r} source_file must be one local allowlist filename; got {self.source_file!r}"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,10 +200,21 @@ class ReviewBundle:
     staged_by: str
     root: str
     allowlist_dir: str
-    source_rev: str | None
+    source_rev: str
     source_dirty: bool
+    source_snapshot_sha256: str
     actions: tuple[BundleAction, ...]
     rekey: RekeyPlan | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise ValueError(f"ReviewBundle.schema_version must be {SCHEMA_VERSION}; got {self.schema_version!r}")
+        if not isinstance(self.source_rev, str) or _FULL_GIT_REVISION.fullmatch(self.source_rev) is None:
+            raise ValueError("ReviewBundle.source_rev must be a full lowercase 40-64 hex Git revision")
+        if not isinstance(self.source_dirty, bool):
+            raise ValueError(f"ReviewBundle.source_dirty must be a boolean; got {type(self.source_dirty).__name__}")
+        if not isinstance(self.source_snapshot_sha256, str) or _SHA256.fullmatch(self.source_snapshot_sha256) is None:
+            raise ValueError("ReviewBundle.source_snapshot_sha256 must be a lowercase SHA-256 hex digest")
 
 
 def dump_bundle(bundle: ReviewBundle) -> str:
@@ -183,7 +232,7 @@ def load_bundle(text: str) -> ReviewBundle:
     Unknown keys raise, ``schema_version`` is checked, and each action is
     validated per-kind via ``BundleAction.__post_init__``.
     """
-    data = json.loads(text)
+    data = strict_json_loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"review bundle must be a JSON object; got {type(data).__name__}")
     _reject_unknown_keys(data, _BUNDLE_FIELDS, "bundle")
@@ -191,13 +240,19 @@ def load_bundle(text: str) -> ReviewBundle:
     schema_version = data.get("schema_version")
     if schema_version is None:
         raise ValueError("review bundle is missing required field 'schema_version'")
-    if schema_version != SCHEMA_VERSION:
+    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
         raise ValueError(f"review bundle schema_version={schema_version!r}; this build understands {SCHEMA_VERSION}")
 
     raw_actions = _require(data, "actions", "bundle")
     if not isinstance(raw_actions, list):
         raise ValueError(f"review bundle 'actions' must be a list; got {type(raw_actions).__name__}")
     actions = tuple(_action_from_dict(item) for item in raw_actions)
+    identities: set[str] = set()
+    for action in actions:
+        identity = _action_identity(action)
+        if identity in identities:
+            raise ValueError(f"review bundle contains duplicate semantic action identity for key {action.key!r}")
+        identities.add(identity)
 
     raw_rekey = data.get("rekey")
     rekey = _rekey_from_dict(raw_rekey) if raw_rekey is not None else None
@@ -209,8 +264,9 @@ def load_bundle(text: str) -> ReviewBundle:
         staged_by=_require_str(data, "staged_by", "bundle"),
         root=_require_str(data, "root", "bundle"),
         allowlist_dir=_require_str(data, "allowlist_dir", "bundle"),
-        source_rev=data.get("source_rev"),
-        source_dirty=bool(_require(data, "source_dirty", "bundle")),
+        source_rev=_require_str(data, "source_rev", "bundle"),
+        source_dirty=_require_bool(data, "source_dirty", "bundle"),
+        source_snapshot_sha256=_require_str(data, "source_snapshot_sha256", "bundle"),
         actions=actions,
         rekey=rekey,
     )
@@ -222,8 +278,29 @@ def write_bundle(bundle: ReviewBundle, *, staged_dir: Path) -> Path:
     Creates ``staged_dir`` if absent (``.elspeth/staged-reviews/`` is already
     gitignored).
     """
-    path = Path(staged_dir) / f"{bundle.bundle_id}.json"
+    path = resolve_staged_bundle_path(staged_dir=staged_dir, bundle_id=bundle.bundle_id)
     atomic_update_text(path, lambda _current: dump_bundle(bundle), create_parent=True)
+    return path
+
+
+def resolve_staged_bundle_path(*, staged_dir: Path, bundle_id: str) -> Path:
+    """Resolve one local bundle ID beneath ``staged_dir``.
+
+    ``bundle_id`` crosses the MCP trust boundary.  It names a bundle, not a
+    caller-controlled path, so absolute paths and path components are invalid.
+    The resolved-parent check additionally rejects an existing target symlink
+    that redirects outside the configured staging directory.
+    """
+    if type(bundle_id) is not str or not bundle_id:
+        raise ValueError("bundle_id must be a non-empty string")
+    bundle_name = Path(bundle_id)
+    if bundle_name.is_absolute() or bundle_name.parts != (bundle_id,) or bundle_name.name != bundle_id:
+        raise ValueError(f"bundle_id must be one local filename stem; got {bundle_id!r}")
+
+    staged_root = Path(staged_dir)
+    path = staged_root / f"{bundle_id}.json"
+    if path.resolve().parent != staged_root.resolve():
+        raise ValueError(f"bundle_id resolves outside staged_dir; got {bundle_id!r}")
     return path
 
 
@@ -242,6 +319,7 @@ def _bundle_to_dict(bundle: ReviewBundle) -> dict[str, Any]:
         "allowlist_dir": bundle.allowlist_dir,
         "source_rev": bundle.source_rev,
         "source_dirty": bundle.source_dirty,
+        "source_snapshot_sha256": bundle.source_snapshot_sha256,
         "actions": [_action_to_dict(action) for action in bundle.actions],
         "rekey": _rekey_to_dict(bundle.rekey) if bundle.rekey is not None else None,
     }
@@ -295,15 +373,15 @@ def _action_from_dict(data: Any) -> BundleAction:
         lane=_require_str(data, "lane", "action"),
         kind=_require_str(data, "kind", "action"),
         key=_require_str(data, "key", "action"),
-        file_path=data.get("file_path"),
-        symbol=data.get("symbol"),
-        rule=data.get("rule"),
-        fingerprint=data.get("fingerprint"),
-        scope_fingerprint=data.get("scope_fingerprint"),
-        ast_path=data.get("ast_path"),
-        draft_rationale=data.get("draft_rationale"),
-        diagnosis_status=data.get("diagnosis_status"),
-        source_file=data.get("source_file"),
+        file_path=_optional_str(data, "file_path", "action"),
+        symbol=_optional_str(data, "symbol", "action"),
+        rule=_optional_str(data, "rule", "action"),
+        fingerprint=_optional_str(data, "fingerprint", "action"),
+        scope_fingerprint=_optional_str(data, "scope_fingerprint", "action"),
+        ast_path=_optional_str(data, "ast_path", "action"),
+        draft_rationale=_optional_str(data, "draft_rationale", "action"),
+        diagnosis_status=_optional_str(data, "diagnosis_status", "action"),
+        source_file=_optional_str(data, "source_file", "action"),
         preview=preview,
     )
 
@@ -317,7 +395,7 @@ def _preview_from_dict(data: Any) -> ActionPreview:
         rationale=_require_str(data, "rationale", "preview"),
         model=_require_str(data, "model", "preview"),
         transport=_require_str(data, "transport", "preview"),
-        authoritative=bool(data.get("authoritative", False)),
+        authoritative=_optional_bool(data, "authoritative", "preview", default=False),
     )
 
 
@@ -350,6 +428,42 @@ def _require_str(data: dict[str, Any], key: str, context: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"review {context} field {key!r} must be a string; got {type(value).__name__}")
     return value
+
+
+def _optional_str(data: dict[str, Any], key: str, context: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"review {context} field {key!r} must be a string or null; got {type(value).__name__}")
+    return value
+
+
+def _require_bool(data: dict[str, Any], key: str, context: str) -> bool:
+    value = _require(data, key, context)
+    if not isinstance(value, bool):
+        raise ValueError(f"review {context} field {key!r} must be a boolean; got {type(value).__name__}")
+    return value
+
+
+def _optional_bool(
+    data: dict[str, Any],
+    key: str,
+    context: str,
+    *,
+    default: bool,
+) -> bool:
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"review {context} field {key!r} must be a boolean; got {type(value).__name__}")
+    return value
+
+
+def _action_identity(action: BundleAction) -> str:
+    """Return the canonical mutation identity shared by every action kind."""
+    return action.key
 
 
 def _require_str_list(data: dict[str, Any], key: str, context: str) -> list[str]:

@@ -4,6 +4,8 @@ below must return zero rows."""
 
 from __future__ import annotations
 
+from uuid import UUID
+
 import pytest
 import structlog
 from sqlalchemy import text
@@ -13,13 +15,15 @@ from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import FencedComposeTurnHarness
 
 # ``_make_session`` lives in ``tests/integration/web/conftest.py`` — a
 # duplicate of the unit-test conftest helper. Importing the helper
 # here keeps the per-test session-insert site uniform with the rest
-# of the suite.
+# of the suite. These tests insert ``sessions`` rows by hand, so the
+# live COMPOSE fence a compose turn requires is seeded by the shared
+# ``FencedComposeTurnHarness`` on the session's first turn.
 from .conftest import _make_session
 
 
@@ -37,7 +41,7 @@ def service(tmp_path):
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
-    return SessionServiceImpl(
+    return FencedComposeTurnHarness(
         eng,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -223,6 +227,78 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
         assert state_count == 1
 
 
+def test_turn_assistant_row_state_diverges_from_post_turn_settlement_state(service):
+    """Pin the design record from elspeth-3574f87208 (ruling 2026-09-01).
+
+    Within one persisted compose turn the assistant row binds to the
+    PRE-turn state (``parent_composition_state_id``), while each
+    state-mutating tool call inserts a NEW chained state carried on its
+    tool row — and the finalization surfacing pass mints its
+    ``backend_auto_surface:`` interpretation events against that POST-turn
+    id (``AuditOutcome.current_state_id``), never the assistant row's. A
+    frontend equality join from an event's ``composition_state_id`` to the
+    turn's assistant row therefore does not exist on this path; the ticket
+    records that finding so the join is not re-proposed. If a refactor
+    ever makes these ids equal, this test flags that the recorded
+    rationale has been invalidated — re-read the ticket before relying on
+    either behaviour.
+    """
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id="divergence1")
+    # Turn 1 establishes the pre-turn state the second turn hangs off.
+    service.persist_compose_turn(
+        session_id="divergence1",
+        assistant_content="ok",
+        redacted_assistant_tool_calls=({"id": "tc_d1", "function": {"name": "f"}},),
+        redacted_tool_rows=(
+            RedactedToolRow(
+                "tc_d1",
+                '{"r": 1}',
+                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+            ),
+        ),
+        parent_composition_state_id=None,
+        expected_current_state_id=None,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+    with service._engine.begin() as conn:
+        pre_turn_state_id = conn.execute(
+            text("SELECT id FROM composition_states WHERE session_id='divergence1' ORDER BY version DESC LIMIT 1")
+        ).scalar_one()
+    outcome = service.persist_compose_turn(
+        session_id="divergence1",
+        assistant_content="turn 2",
+        redacted_assistant_tool_calls=({"id": "tc_d2", "function": {"name": "f"}},),
+        redacted_tool_rows=(
+            RedactedToolRow(
+                "tc_d2",
+                '{"r": 2}',
+                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+            ),
+        ),
+        parent_composition_state_id=pre_turn_state_id,
+        expected_current_state_id=pre_turn_state_id,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+    with service._engine.begin() as conn:
+        assistant_state_id = conn.execute(
+            text("SELECT composition_state_id FROM chat_messages WHERE session_id='divergence1' AND role='assistant' AND content='turn 2'")
+        ).scalar_one()
+        tool_state_id = conn.execute(
+            text("SELECT composition_state_id FROM chat_messages WHERE session_id='divergence1' AND role='tool' AND tool_call_id='tc_d2'")
+        ).scalar_one()
+    # The assistant row carries the PRE-turn state...
+    assert assistant_state_id == pre_turn_state_id
+    # ...the settlement id the surfacers mint against is the tool row's
+    # newly inserted state...
+    assert outcome.current_state_id == tool_state_id
+    # ...and the two are different rows, so the event↔assistant-row join
+    # fails by construction on exactly the turns that mutate the pipeline.
+    assert assistant_state_id != outcome.current_state_id
+
+
 def test_get_messages_orders_assistant_before_tool_rows_within_one_turn(service):
     """B2 (Phase 1 plan-review synthesis): a single ``persist_compose_turn``
     stamps every row in the turn with one shared ``created_at`` = ``now``;
@@ -234,7 +310,6 @@ def test_get_messages_orders_assistant_before_tool_rows_within_one_turn(service)
     (assistant first, tool rows in plan order). This test would have
     failed on the pre-B2 codebase.
     """
-    from uuid import UUID
 
     # B2 (Phase 1 plan-review synthesis): pre-B2 this test bound
     # ``sid="ord1"`` and ``sid_uuid=UUID("00000000-...-001")``, then

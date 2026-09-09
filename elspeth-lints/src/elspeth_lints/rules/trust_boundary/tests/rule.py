@@ -74,7 +74,7 @@ from elspeth_lints.rules.trust_boundary.shared import (
     display_path,
     extract_keywords,
     filter_allowlisted_findings,
-    iter_trust_boundary_decorators,
+    iter_boundary_decorators,
     load_honesty_gate_allowlist,
     make_decorator_finding,
     repository_root,
@@ -164,8 +164,10 @@ class TrustBoundaryTestsRule:
 def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path) -> list[Finding]:
     """Return ``trust_boundary.tests`` findings for one parsed syntax tree."""
     findings: list[Finding] = []
-    for func_node, call in iter_trust_boundary_decorators(tree):
-        extraction = extract_keywords(call)
+    for match in iter_boundary_decorators(tree):
+        func_node = match.function
+        call = match.call
+        extraction = extract_keywords(call, implicit_non_raising=match.non_raising)
         if extraction.kwargs is None:
             # Non-literal kwarg (or **-unpacking / positional args). Per the
             # C6-4 honesty-gate hardening (epic elspeth-2ed3bb0f7d, ticket
@@ -713,12 +715,30 @@ def _exception_names_from_expr(expr: ast.expr) -> set[str]:
     return set()
 
 
+def _is_classmethod(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if the boundary is declared as a ``@classmethod``."""
+    return any(isinstance(decorator, ast.Name) and decorator.id == "classmethod" for decorator in func_node.decorator_list)
+
+
 def _source_param_index(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     source_param: str,
 ) -> int | None:
-    """Return the positional parameter index for ``source_param`` if it has one."""
+    """Return the positional parameter index for ``source_param`` if it has one.
+
+    A ``@classmethod`` binds ``cls`` implicitly at *every* call form —
+    ``Cls.method(payload)``, ``instance.method(payload)``, and a module-level
+    alias alike — so ``cls`` never appears in the caller's argument list and
+    must not be counted here. The ``_is_unbound_method_call`` adjustment in
+    :func:`_call_uses_source_param` cannot cover this case: it keys off the
+    receiver *name*, and a classmethod's canonical receiver IS the class, which
+    that helper reads as an unbound ``Cls.method(self, payload)`` call.
+    Declaring the index without ``cls`` up front leaves that helper's
+    instance-method handling untouched.
+    """
     positional = [*func_node.args.posonlyargs, *func_node.args.args]
+    if positional and _is_classmethod(func_node):
+        positional = positional[1:]
     for index, arg in enumerate(positional):
         if arg.arg == source_param:
             return index

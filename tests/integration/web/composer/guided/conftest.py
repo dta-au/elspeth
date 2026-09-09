@@ -12,14 +12,16 @@ tests/integration/web/composer/guided/*.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 import structlog
 from fastapi import FastAPI
-from testcontainers.postgres import PostgresContainer
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import stable_hash
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -32,18 +34,61 @@ from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.routes import create_session_router
+from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+
+
+class _GuidedTestExecutionService:
+    """Exercise the route's production validation protocol in the minimal app."""
+
+    def __init__(self, app: FastAPI) -> None:
+        self._app = app
+
+    async def validate_state(
+        self,
+        state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+        session_id: UUID | None = None,
+        completion_gates: object | None = None,
+    ) -> ValidationResult:
+        # Mirror the production protocol exactly: the operation context is a
+        # required keyword there, so a route that omits it must fail HERE, not
+        # only on a live deployment (the platform lane's guided wiring-confirm
+        # call shipped without it because this fake did not demand it).
+        del completion_gates
+        if not isinstance(session_operation_context, SessionOperationContext):
+            raise AssertionError("guided confirmation validation requires the operation's session context")
+        if user_id is None or session_id is None:
+            raise AssertionError("guided confirmation validation requires principal and session custody")
+        app_state = self._app.state
+        snapshot = app_state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id))
+        return await _runtime_preflight_for_state(
+            state,
+            settings=app_state.settings,
+            secret_service=app_state.scoped_secret_resolver,
+            user_id=user_id,
+            session_id=session_id,
+            plugin_snapshot=snapshot,
+            profile_registry=app_state.operator_profile_registry,
+            catalog=app_state.catalog_service,
+        )
 
 
 @pytest.fixture
@@ -66,32 +111,36 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             resp = composer_test_client.post("/api/sessions", json={"title": "x"})
             assert resp.status_code == 201
     """
-    backend = getattr(request, "param", "sqlite")
-    postgres: PostgresContainer | None = None
+    # pytest sets ``request.param`` only for indirectly parametrized requests
+    # (``@pytest.mark.parametrize(..., indirect=True)``); a plain request of
+    # this fixture has no such attribute at all, and the absence IS the
+    # sqlite default.  The backend value itself is then contract-checked
+    # below, so an unexpected parameter fails loudly rather than silently.
+    try:
+        backend = request.param
+    except AttributeError:
+        backend = "sqlite"
+    postgres_target = ExitStack()
     if backend == "sqlite":
         # Use independent SQLite connections so route-race tests exercise the
         # same transaction/locking boundary as a deployed file-backed database.
         engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     elif backend == "postgres":
-        postgres = PostgresContainer("postgres:16-alpine")
-        postgres.start()
-        engine = create_session_engine(postgres.get_connection_url())
+        engine = create_session_engine(postgres_target.enter_context(postgres_test_target()))
     else:  # pragma: no cover - fixture contract
         raise AssertionError(f"unsupported guided integration backend: {backend}")
     initialize_session_schema(engine)
     database_url = str(engine.url)
     engines_to_dispose = [engine]
 
-    # Session and blob services
-    session_service = SessionServiceImpl(
-        engine,
-        telemetry=build_sessions_telemetry(),
-        log=structlog.get_logger("test.guided.conftest"),
-    )
+    # Blob service (the profile-aware session service is constructed after
+    # the plugin-policy stack below, mirroring production create_app wiring).
     blob_service = BlobServiceImpl(engine, tmp_path)
 
-    # FastAPI app
+    # FastAPI app -- with the production session-operation handlers: an
+    # ownership race answers the same 404/409 bodies a deployed worker sends.
     app = FastAPI()
+    register_session_operation_exception_handlers(app)
 
     # Mock auth: all requests authenticated as "alice"
     identity = UserIdentity(user_id="alice", username="alice")
@@ -102,7 +151,6 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     app.dependency_overrides[get_current_user] = mock_user
 
     # App state: minimal set required by session router
-    app.state.session_service = session_service
     app.state.session_engine = engine  # for guided step-2.5 recipe application
     app.state.blob_service = blob_service
     app.state.payload_store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -125,10 +173,31 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                 "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             }
         },
+        default_llm_profile="task-role",
     )
 
     class _DeterministicGuidedPlanner:
         """Explicit test double for the shared planner route seam."""
+
+        def __init__(self) -> None:
+            # Mirrors ComposerServiceImpl's per-session get_plugin_schema
+            # tracker contract: the guided chat route binds
+            # ``_mark_plugin_schema_loaded`` eagerly for every provider
+            # attempt (F2), so the double must model it — fix the fake,
+            # never the production code, per the masquerade doctrine.
+            self._schemas_loaded_by_session: dict[str, set[tuple[str, str]]] = {}
+
+        def _mark_plugin_schema_loaded(self, session_id: str | None, plugin_type: str, plugin_name: str) -> None:
+            if session_id is None:
+                return
+            if session_id not in self._schemas_loaded_by_session:
+                self._schemas_loaded_by_session[session_id] = set()
+            self._schemas_loaded_by_session[session_id].add((plugin_type, plugin_name))
+
+        def _schemas_loaded_for_session(self, session_id: str | None) -> frozenset[tuple[str, str]]:
+            if session_id is None or session_id not in self._schemas_loaded_by_session:
+                return frozenset()
+            return frozenset(self._schemas_loaded_by_session[session_id])
 
         async def plan_guided_full_pipeline(self, *, base, recorder, policy_catalog, **_kwargs):
             pipeline = {
@@ -185,21 +254,51 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             supersedes_draft_hash,
             recorder,
             correction_target=None,
+            revision_authority=None,
             **_kwargs,
         ):
             output_names = [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]
-            corrected_source = correction_target is not None and correction_target.owner_kind == "source"
+            corrected_source = (
+                correction_target is not None and correction_target.requested.kind == "source" and correction_target.owner_kind == "source"
+            )
+            corrected_validation_edge = (
+                correction_target is not None
+                and correction_target.requested.kind == "edge"
+                and correction_target.edge_routing is not None
+                and correction_target.edge_routing.field == "on_validation_failure"
+            )
+            corrected_success_edge = (
+                correction_target is not None
+                and correction_target.requested.kind == "edge"
+                and correction_target.edge_routing is not None
+                and correction_target.edge_routing.field == "on_success"
+            )
+            corrected_success_destination = None
+            if corrected_success_edge:
+                corrected_success_destination = next(
+                    (output_name for output_name in output_names if output_name != correction_target.edge_routing.before_destination),
+                    None,
+                )
+                if corrected_success_destination is None:
+                    raise AssertionError("guided edge-correction fixture requires another reviewed output")
+            prose_revision = revision_authority is not None
             pipeline = {
                 "sources": {
                     guided.reviewed_sources[stable_id].name: {
                         "plugin": guided.reviewed_sources[stable_id].plugin,
                         "options": deep_thaw(guided.reviewed_sources[stable_id].options),
                         "on_success": (
-                            f"{correction_target.owner_key}_corrected_rows"
+                            corrected_success_destination
+                            if corrected_success_edge and guided.reviewed_sources[stable_id].name == correction_target.owner_key
+                            else f"{correction_target.owner_key}_corrected_rows"
                             if corrected_source and guided.reviewed_sources[stable_id].name == correction_target.owner_key
-                            else output_names[index % len(output_names)]
+                            else (f"guided_revision_{index}_rows" if prose_revision else output_names[index % len(output_names)])
                         ),
-                        "on_validation_failure": guided.reviewed_sources[stable_id].on_validation_failure,
+                        "on_validation_failure": (
+                            output_names[0]
+                            if corrected_validation_edge and guided.reviewed_sources[stable_id].name == correction_target.owner_key
+                            else guided.reviewed_sources[stable_id].on_validation_failure
+                        ),
                     }
                     for index, stable_id in enumerate(guided.source_order)
                 },
@@ -216,7 +315,22 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                         }
                     ]
                     if corrected_source
-                    else []
+                    else (
+                        [
+                            {
+                                "id": f"guided_revision_{index}",
+                                "node_type": "transform",
+                                "plugin": "passthrough",
+                                "input": f"guided_revision_{index}_rows",
+                                "on_success": output_names[index % len(output_names)],
+                                "on_error": "discard",
+                                "options": {"schema": {"mode": "observed"}},
+                            }
+                            for index, _stable_id in enumerate(guided.source_order)
+                        ]
+                        if prose_revision
+                        else []
+                    )
                 ),
                 "edges": (
                     [
@@ -262,7 +376,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                 ),
                 {
                     "source": frozenset(source.plugin for source in guided.reviewed_sources.values()),
-                    "transform": frozenset({"passthrough"}) if corrected_source else frozenset(),
+                    "transform": frozenset({"passthrough"}) if corrected_source or prose_revision else frozenset(),
                     "sink": frozenset(output.plugin for output in guided.reviewed_outputs.values()),
                 },
             )
@@ -296,14 +410,32 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
         def user_generation(self, principal: str, name: str) -> str | None:
             return None
 
-    app.state.plugin_snapshot_factory = lambda user: build_plugin_snapshot(
-        policy=app.state.web_plugin_policy,
+    def _principal_snapshot(user_id: str):
+        return build_plugin_snapshot(
+            policy=app.state.web_plugin_policy,
+            catalog=app.state.catalog_service,
+            profiles=app.state.operator_profile_registry,
+            principal_scope=f"local:{user_id}",
+            secret_inventory=_EmptyInventory(),
+            generation_key=b"guided-integration-policy-key",
+        )
+
+    app.state.plugin_snapshot_factory = lambda user: _principal_snapshot(user.user_id)
+    app.state.execution_service = _GuidedTestExecutionService(app)
+
+    # Session service — profile-aware, mirroring production create_app()
+    # wiring: the guided proposal settlement independently re-derives wire
+    # reviews through the session principal's snapshot.
+    session_service = DualFencedSessionServiceHarness(
+        engine,
+        data_dir=tmp_path,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.guided.conftest"),
+        plugin_snapshot_factory=_principal_snapshot,
+        operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
-        profiles=app.state.operator_profile_registry,
-        principal_scope=f"local:{user.user_id}",
-        secret_inventory=_EmptyInventory(),
-        generation_key=b"guided-integration-policy-key",
     )
+    app.state.session_service = session_service
 
     # Audit recorder for test inspection (Phase 3 Task 3.4 will wire this)
     app.state.composer_recorder = BufferingRecorder()
@@ -336,11 +468,6 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             return UserIdentity(user_id="alice", username="alice")
 
         restarted_app.dependency_overrides[get_current_user] = restarted_mock_user
-        restarted_app.state.session_service = SessionServiceImpl(
-            restarted_engine,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger("test.guided.conftest.restarted"),
-        )
         restarted_app.state.session_engine = restarted_engine
         restarted_app.state.blob_service = BlobServiceImpl(restarted_engine, tmp_path)
         restarted_app.state.payload_store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -358,13 +485,27 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             policy=restarted_app.state.web_plugin_policy,
             settings=restarted_runtime_policy,
         )
-        restarted_app.state.plugin_snapshot_factory = lambda user: build_plugin_snapshot(
-            policy=restarted_app.state.web_plugin_policy,
+
+        def _restarted_principal_snapshot(user_id: str):
+            return build_plugin_snapshot(
+                policy=restarted_app.state.web_plugin_policy,
+                catalog=restarted_app.state.catalog_service,
+                profiles=restarted_app.state.operator_profile_registry,
+                principal_scope=f"local:{user_id}",
+                secret_inventory=_EmptyInventory(),
+                generation_key=b"guided-integration-policy-key",
+            )
+
+        restarted_app.state.plugin_snapshot_factory = lambda user: _restarted_principal_snapshot(user.user_id)
+        restarted_app.state.execution_service = _GuidedTestExecutionService(restarted_app)
+        restarted_app.state.session_service = DualFencedSessionServiceHarness(
+            restarted_engine,
+            data_dir=tmp_path,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.guided.conftest.restarted"),
+            plugin_snapshot_factory=_restarted_principal_snapshot,
+            operator_profile_registry=restarted_app.state.operator_profile_registry,
             catalog=restarted_app.state.catalog_service,
-            profiles=restarted_app.state.operator_profile_registry,
-            principal_scope=f"local:{user.user_id}",
-            secret_inventory=_EmptyInventory(),
-            generation_key=b"guided-integration-policy-key",
         )
         restarted_app.state.composer_recorder = BufferingRecorder()
         restarted_app.state.composer_progress_registry = ComposerProgressRegistry()
@@ -382,8 +523,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     finally:
         for fixture_engine in engines_to_dispose:
             fixture_engine.dispose()
-        if postgres is not None:
-            postgres.stop()
+        postgres_target.close()
 
 
 @pytest.fixture

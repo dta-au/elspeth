@@ -22,6 +22,7 @@ Dependencies held by this driver:
 
 from __future__ import annotations
 
+import enum
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -51,6 +52,7 @@ from elspeth.engine.orchestrator.leader_drain import run_end_of_input_barrier_fl
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
     handle_coalesce_timeouts,
+    handle_row_union_timeouts,
 )
 from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
@@ -59,11 +61,20 @@ from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
     PipelineConfig,
 )
+from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.engine.spans import SpanFactory
 
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.core.events import EventBusProtocol
+
+
+class _SourceRowSentinel(enum.Enum):
+    EXHAUSTED = enum.auto()
+
+
+_SOURCE_ROW_EXHAUSTED = _SourceRowSentinel.EXHAUSTED
 
 
 class SourceIterationDriver:
@@ -110,13 +121,19 @@ class SourceIterationDriver:
         ctx.node_id = source_id
         ctx.operation_id = source_operation_id
 
-    def _requires_idle_aggregation_polling(self, config: PipelineConfig) -> bool:
+    def _requires_idle_aggregation_polling(
+        self,
+        config: PipelineConfig,
+        *,
+        row_union_executor: RowUnionExecutor | None = None,
+    ) -> bool:
         """Return True when the pipeline has time-sensitive buffered work."""
         has_aggregation_timeout = any(
             settings.trigger.has_timeout or settings.trigger.has_condition for settings in config.aggregation_settings.values()
         )
         has_coalesce_timeout = any(settings.timeout_seconds is not None for settings in config.coalesce_settings)
-        return has_aggregation_timeout or has_coalesce_timeout
+        has_row_union_timeout = row_union_executor is not None and row_union_executor.has_timeout_configured() is True
+        return has_aggregation_timeout or has_coalesce_timeout or has_row_union_timeout
 
     def _idle_timeout_context(self, source_ctx: PluginContext) -> PluginContext:
         """Create an isolated context for idle timeout work.
@@ -136,6 +153,7 @@ class SourceIterationDriver:
             shutdown_event=source_ctx.shutdown_event,
             contract=source_ctx.contract,
             telemetry_emit=source_ctx.telemetry_emit,
+            coordination_token=source_ctx.coordination_token,
         )
 
     def _process_idle_timeout_flushes(
@@ -170,6 +188,15 @@ class SourceIterationDriver:
                 ctx=ctx,
                 counters=loop_ctx.counters,
                 pending_tokens=loop_ctx.pending_tokens,
+            )
+
+        row_union_executor = loop_ctx.processor.row_union_executor
+        if row_union_executor is not None:
+            handle_row_union_timeouts(
+                row_union_executor=row_union_executor,
+                processor=loop_ctx.processor,
+                ctx=ctx,
+                counters=loop_ctx.counters,
             )
 
     def _build_idle_timeout_pump(
@@ -317,6 +344,7 @@ class SourceIterationDriver:
         interrupted_by_shutdown: bool,
         flush_end_of_input: bool,
         active_source: SourceProtocol,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Post-loop work after source iteration completes or is interrupted.
 
@@ -364,22 +392,22 @@ class SourceIterationDriver:
         # fixed-header sources see no second write or telemetry event.
         self._lifecycle_recorder.record_field_resolution(
             factory,
-            run_id,
             active_source=active_source,
             previously_recorded=recorded_field_resolution,
+            coordination_token=coordination_token,
         )
 
         if not schema_contract_recorded:
-            record_schema_contract(factory, run_id, source_id, ctx, active_source=active_source)
+            record_schema_contract(factory, run_id, source_id, ctx, active_source=active_source, coordination_token=coordination_token)
 
         if source_exhausted and not interrupted_by_shutdown:
             self._lifecycle_recorder.record_run_source_lifecycle(
                 factory,
-                run_id,
                 source_id,
                 active_source_name,
                 active_source,
                 RunSourceLifecycleState.EXHAUSTED,
+                coordination_token=coordination_token,
             )
 
         if not interrupted_by_shutdown and flush_end_of_input:
@@ -436,13 +464,11 @@ class SourceIterationDriver:
             )
 
             try:
-                with self._span_factory.source_span(active_source.name):
-                    source_iterator = iter(active_source.load(ctx))
-                    try:
-                        first_row = next(source_iterator)
-                    except StopIteration:
-                        self._events.emit(PhaseCompleted(phase=PipelinePhase.SOURCE, duration_seconds=time.perf_counter() - phase_start))
-                        return
+                source_iterator = iter(active_source.load(ctx))
+                first_row = next(source_iterator, _SOURCE_ROW_EXHAUSTED)
+                if first_row is _SOURCE_ROW_EXHAUSTED:
+                    self._events.emit(PhaseCompleted(phase=PipelinePhase.SOURCE, duration_seconds=time.perf_counter() - phase_start))
+                    return
             except Exception as e:
                 self._ceremony.emit_phase_error(PipelinePhase.SOURCE, e, target=active_source.name)
                 raise
@@ -466,6 +492,7 @@ class SourceIterationDriver:
         shutdown_event: threading.Event | None = None,
         flush_end_of_input: bool = True,
         check_coordination_latch: Callable[[], None] | None = None,
+        coordination_token: CoordinationToken,
     ) -> LoopResult:
         """Run the main processing loop: source iteration, quarantine, transform, flush.
 
@@ -498,19 +525,23 @@ class SourceIterationDriver:
         coalesce_executor = loop_ctx.coalesce_executor
         coalesce_node_map = dict(loop_ctx.coalesce_node_map)
         agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
+        row_union_executor = processor.row_union_executor
 
         start_time = time.perf_counter()
         last_progress_time = start_time
 
         # source_load operation covers the entire source consumption lifecycle
-        with track_operation(
-            recorder=factory.execution,
-            run_id=run_id,
-            node_id=source_id,
-            operation_type="source_load",
-            ctx=ctx,
-            input_data={"source_plugin": active_source.name},
-        ) as source_op_handle:
+        with (
+            self._span_factory.source_span(active_source.name, run_id=run_id),
+            track_operation(
+                recorder=factory.execution,
+                run_id=run_id,
+                node_id=source_id,
+                operation_type="source_load",
+                ctx=ctx,
+                input_data={"source_plugin": active_source.name},
+            ) as source_op_handle,
+        ):
             # Generator-based sources execute on next() — restore operation_id
             # before each iteration so external calls are attributed to source_load
             source_operation_id = source_op_handle.operation.operation_id
@@ -522,15 +553,18 @@ class SourceIterationDriver:
             )
             self._lifecycle_recorder.record_run_source_lifecycle(
                 factory,
-                run_id,
                 source_id,
                 active_source_name,
                 active_source,
                 RunSourceLifecycleState.LOADING,
+                coordination_token=coordination_token,
             )
 
             source_iterator = self.load_source_with_events(run_id, ctx, active_source=active_source)
-            use_idle_polling = self._requires_idle_aggregation_polling(config)
+            use_idle_polling = self._requires_idle_aggregation_polling(
+                config,
+                row_union_executor=row_union_executor,
+            )
             idle_pump: IdleTimeoutPump | None = None
             if use_idle_polling:
                 # ONE persistent idle-flush worker for the whole run; the two
@@ -547,6 +581,7 @@ class SourceIterationDriver:
                 idle_pump.start()
             try:
                 source_exhausted = False
+                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
                 pending_source_item: SourceRow | None = None
                 try:
                     if use_idle_polling:
@@ -562,7 +597,8 @@ class SourceIterationDriver:
                     else:
                         pending_source_item = next(source_iterator)
                 except StopIteration:
-                    source_exhausted = True
+                    interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                    source_exhausted = not interrupted_by_shutdown
 
                 # Deferred recording flags — field resolution after first iteration,
                 # schema contract after first VALID row. Always start false so
@@ -584,10 +620,11 @@ class SourceIterationDriver:
                     )
                 )
 
-                interrupted_by_shutdown = False
                 try:
                     source_row_index = 0
                     while True:
+                        if interrupted_by_shutdown:
+                            break
                         if pending_source_item is not None:
                             source_item = pending_source_item
                             pending_source_item = None
@@ -606,7 +643,8 @@ class SourceIterationDriver:
                                 else:
                                     source_item = next(source_iterator)
                             except StopIteration:
-                                source_exhausted = True
+                                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                                source_exhausted = not interrupted_by_shutdown
                                 break
 
                         current_source_row_index = source_row_index
@@ -625,7 +663,7 @@ class SourceIterationDriver:
                         if not field_resolution_recorded:
                             field_resolution_recorded = True
                             recorded_field_resolution = self._lifecycle_recorder.record_field_resolution(
-                                factory, run_id, active_source=active_source
+                                factory, active_source=active_source, coordination_token=coordination_token
                             )
 
                         # Quarantine path — route directly to sink, skip normal processing
@@ -642,6 +680,44 @@ class SourceIterationDriver:
                                 loop_ctx,
                                 active_source=active_source,
                             )
+                            # elspeth-c6d083d150 / elspeth-321f335ff2: a
+                            # continuously ready stream of quarantined rows
+                            # never reaches the per-row sweeps below and keeps
+                            # the source non-idle (no idle pump), so buffered
+                            # aggregation timeouts and pending coalesce /
+                            # row_union group deadlines would starve until EOF
+                            # and be misclassified there. Sweep all three at
+                            # this boundary too, in idle-pump order. Clear
+                            # operation_id first — flushed transform work must
+                            # not inherit the source operation id (same
+                            # contract as the pre-processing check below); the
+                            # restore_source_iteration_context call after the
+                            # sweeps re-establishes source identity.
+                            ctx.operation_id = None
+                            timeout_result = check_aggregation_timeouts(
+                                config=config,
+                                processor=processor,
+                                ctx=ctx,
+                                pending_tokens=pending_tokens,
+                                agg_transform_lookup=agg_transform_lookup,
+                            )
+                            counters.accumulate_flush_result(timeout_result)
+                            if coalesce_executor is not None:
+                                handle_coalesce_timeouts(
+                                    coalesce_executor=coalesce_executor,
+                                    coalesce_node_map=coalesce_node_map,
+                                    processor=processor,
+                                    ctx=ctx,
+                                    counters=counters,
+                                    pending_tokens=pending_tokens,
+                                )
+                            if row_union_executor is not None:
+                                handle_row_union_timeouts(
+                                    row_union_executor=row_union_executor,
+                                    processor=processor,
+                                    ctx=ctx,
+                                    counters=counters,
+                                )
                             last_progress_time = self.maybe_emit_progress(
                                 counters,
                                 start_time,
@@ -666,6 +742,7 @@ class SourceIterationDriver:
                             source_id,
                             ctx,
                             active_source=active_source,
+                            coordination_token=coordination_token,
                         ):
                             schema_contract_recorded = True
 
@@ -704,6 +781,14 @@ class SourceIterationDriver:
                                 ctx=ctx,
                                 counters=counters,
                                 pending_tokens=pending_tokens,
+                            )
+
+                        if row_union_executor is not None:
+                            handle_row_union_timeouts(
+                                row_union_executor=row_union_executor,
+                                processor=processor,
+                                ctx=ctx,
+                                counters=counters,
                             )
 
                         last_progress_time = self.maybe_emit_progress(
@@ -749,24 +834,25 @@ class SourceIterationDriver:
                         interrupted_by_shutdown=interrupted_by_shutdown,
                         flush_end_of_input=flush_end_of_input,
                         active_source=active_source,
+                        coordination_token=coordination_token,
                     )
                     if interrupted_by_shutdown:
                         self._lifecycle_recorder.record_run_source_lifecycle(
                             factory,
-                            run_id,
                             source_id,
                             active_source_name,
                             active_source,
                             RunSourceLifecycleState.INTERRUPTED,
+                            coordination_token=coordination_token,
                         )
                     elif not source_exhausted:
                         self._lifecycle_recorder.record_run_source_lifecycle(
                             factory,
-                            run_id,
                             source_id,
                             active_source_name,
                             active_source,
                             RunSourceLifecycleState.LOADED,
+                            coordination_token=coordination_token,
                         )
 
                 except Exception as e:

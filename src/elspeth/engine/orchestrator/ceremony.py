@@ -216,17 +216,17 @@ class RunCeremony:
         shutdown_exc: GracefulShutdownError,
         start_time: float,
         *,
-        token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Emit telemetry and EventBus events for a gracefully interrupted run.
 
         Shared between run() and resume() — the interrupted ceremony is identical
         in both paths: finalize as INTERRUPTED, emit RunFinished, emit RunSummary.
 
-        ``token`` (ADR-030) is threaded into the finalize, whose epoch fence
-        refuses a deposed leader's ceremony — "the run is no longer its to
-        fail" (§C.4 row 4). Every ceremony call site wraps this in
-        ``best_effort``, which logs-and-suppresses: a deposed leader's
+        ``coordination_token`` (ADR-030) is threaded into the finalize, whose
+        epoch fence refuses a deposed leader's ceremony — "the run is no
+        longer its to fail" (§C.4 row 4). Every ceremony call site wraps this
+        in ``best_effort``, which logs-and-suppresses: a deposed leader's
         ``RunLeadershipLostError`` is swallowed and the process exits WITHOUT
         stamping INTERRUPTED over the new leader's progress. That is the
         designed semantics; the ``fence_refusal`` event (written by the
@@ -235,7 +235,7 @@ class RunCeremony:
         """
 
         total_duration = time.perf_counter() - start_time
-        factory.run_lifecycle.finalize_run(run_id, status=RunStatus.INTERRUPTED, token=token)
+        factory.run_lifecycle.finalize_run(RunStatus.INTERRUPTED, coordination_token=coordination_token)
 
         self.emit_run_finished(
             run_id=run_id,
@@ -264,7 +264,7 @@ class RunCeremony:
         start_time: float,
         result: RunResult | None = None,
         *,
-        token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Emit telemetry and EventBus events for a failed run.
 
@@ -272,7 +272,7 @@ class RunCeremony:
         with the best available metrics. Shared between run() (when
         run_completed=False) and resume().
 
-        ``token`` (ADR-030) is threaded into the finalize, whose epoch fence
+        ``coordination_token`` (ADR-030) is threaded into the finalize, whose epoch fence
         refuses a deposed leader's ceremony — "the run is no longer its to
         fail" (§C.4 row 4). Every ceremony call site wraps this in
         ``best_effort``, which logs-and-suppresses: a deposed leader's
@@ -300,7 +300,7 @@ class RunCeremony:
             routed_destinations={},
         )
         total_duration = time.perf_counter() - start_time
-        factory.run_lifecycle.finalize_run(run_id, status=RunStatus.FAILED, token=token)
+        factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=coordination_token)
 
         self.emit_run_finished(
             run_id=run_id,

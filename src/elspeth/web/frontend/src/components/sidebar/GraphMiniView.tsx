@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import type { CompositionState } from "@/types/index";
@@ -34,10 +35,29 @@ export function GraphMiniView({
   compositionStateOverride,
 }: GraphMiniViewProps = {}): JSX.Element {
   const storeCompositionState = useSessionStore((s) => s.compositionState);
+  // R2-F5 (elspeth-139a345050): `compositionState === null` is ambiguous —
+  // it means both "the session's composition fetch is still in flight" and
+  // "loaded, and this session genuinely has no pipeline yet". Without this
+  // discriminator the mini view showed "No pipeline yet" during load, which
+  // read as a false defect during acceptance review (see sessionStore's
+  // `compositionStateLoaded` doc comment for the same ambiguity at the
+  // store level). The override path (SharedInspectView's frozen snapshot)
+  // never subscribes to session-load state, so it is exempt.
+  const storeCompositionStateLoaded = useSessionStore((s) => s.compositionStateLoaded);
+  const isLoading =
+    compositionStateOverride === undefined && !storeCompositionStateLoaded;
   const compositionState =
     compositionStateOverride !== undefined
       ? compositionStateOverride
       : storeCompositionState;
+
+  if (isLoading) {
+    return (
+      <div className="graph-mini graph-mini--empty" data-testid="graph-mini-loading">
+        <span>Loading pipeline…</span>
+      </div>
+    );
+  }
 
   if (!hasCompositionContent(compositionState)) {
     return (
@@ -48,8 +68,8 @@ export function GraphMiniView({
   }
 
   return (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className="graph-mini"
       onClick={() =>
         window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT))
@@ -57,7 +77,7 @@ export function GraphMiniView({
       aria-label="Pipeline graph (click to expand)"
     >
       <MiniSvg state={compositionState} />
-    </button>
+    </Button>
   );
 }
 

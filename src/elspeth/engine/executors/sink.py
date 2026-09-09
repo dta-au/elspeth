@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -23,6 +23,7 @@ from elspeth.contracts import (
     TokenInfo,
 )
 from elspeth.contracts.audit import NodeState, NodeStateFailed, TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.declaration_contracts import (
     AggregateDeclarationContractViolation,
     BoundaryInputs,
@@ -39,10 +40,11 @@ from elspeth.contracts.errors import (
     SinkDiversionReason,
     SinkTransactionalInvariantError,
 )
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
     SinkEffectAttemptState,
@@ -54,12 +56,15 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
+from elspeth.core.clock import Clock
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import decode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.operations import _render_exception
 from elspeth.engine._error_hash import compute_error_hash
+from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.declaration_dispatch import run_boundary_checks
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
@@ -72,15 +77,9 @@ from elspeth.engine.spans import SpanFactory
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    import threading
+
     from elspeth.core.landscape.factory import RecorderFactory
-
-
-@runtime_checkable
-class _BulkBeginNodeStateRepository(Protocol):
-    def begin_node_states_many(
-        self,
-        entries: Sequence[tuple[str, str, str, int, Mapping[str, object]]],
-    ) -> list[NodeStateOpen]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +137,7 @@ class SinkExecutor:
             step_in_pipeline=5,
             sink_name="output",
             pending_outcome=pending,
+            join_group_id_by_token={t.token_id: None for t in tokens_to_write},
             effect_mode="write",
         )
         print(diversion_counts.total)
@@ -152,7 +152,12 @@ class SinkExecutor:
         *,
         factory: RecorderFactory | None = None,
         worker_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+        clock: Clock = DEFAULT_CLOCK,
         sink_effect_fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
+        shutdown_event: threading.Event | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
+        make_shutdown_error: Callable[[], BaseException] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -161,18 +166,39 @@ class SinkExecutor:
             data_flow: Data flow repository for token outcomes
             span_factory: Span factory for tracing
             run_id: Run identifier for artifact registration
+            coordination_token: The run's current leader token (ADR-048).
+                Every durable sink effect this executor drives fences on it;
+                like ``factory``, it is required on the effect path and
+                checked there, so a plain (non-effect) sink write needs neither.
         """
         self._execution = execution
         self._data_flow = data_flow
         self._spans = span_factory
         self._run_id = run_id
         self._factory = factory
+        self._coordination_token = coordination_token
         # A deterministic per-run owner lets separate processes look like the
         # same live lease holder and dispatch the same external effect. Normal
         # orchestration threads its registered coordination worker id; direct
         # executor callers still receive a process-unique owner.
         self._worker_id = worker_id or f"sink-effects:{run_id}:{uuid.uuid4().hex}"
+        # Sink-effect lease waits measure and sleep on this clock (the
+        # orchestrator's), so a controlled clock never blocks a real thread.
+        self._clock = clock
         self._sink_effect_fault_hook = sink_effect_fault_hook
+        self._shutdown_event = shutdown_event
+        self._check_coordination_latch = check_coordination_latch
+        self._make_shutdown_error = make_shutdown_error
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        """The leader token every fenced sink-effect verb requires (ADR-048)."""
+        if self._coordination_token is None:
+            raise OrchestrationInvariantError(
+                "effect-capable sink execution requires the run's coordination token: durable sink effects are "
+                "leader-fenced Landscape writes with no unfenced arm (ADR-048). Construct SinkExecutor with "
+                "coordination_token — the orchestrator threads the processor's leader token through the sink flush."
+            )
+        return self._coordination_token
 
     def _complete_states_failed(
         self,
@@ -326,15 +352,113 @@ class SinkExecutor:
             context=exc.to_audit_dict(),
         )
 
+    def _record_boundary_failure_operation(
+        self,
+        *,
+        sink_node_id: str,
+        sink_name: str,
+        violation: BaseException,
+    ) -> None:
+        """Record the failed ``sink_write`` operation for a pre-reservation boundary failure.
+
+        A sink write normally gets its operation from the sink-effect
+        reservation (``SinkEffectReservation._insert_or_compare_operation``),
+        which inserts one ``sink_write`` row keyed on the effect identity and
+        flips it to ``completed`` at finalization. A boundary violation raises
+        *before* any effect is reserved, so that row is never created and the
+        run would otherwise finish carrying no failed operation naming the sink
+        that raised (elspeth-207c9fbb0b). Sources do not have this gap: the
+        ``source_load`` operation wraps the whole source lifecycle, so a source
+        boundary failure fails an operation that already exists.
+
+        Within a single attempt this never duplicates the reservation's row:
+        reaching the reservation means that attempt's validation passed.
+
+        It is NOT unique per node across attempts, and callers must not read it
+        that way. A redrive whose batch composition changed is a supported
+        shape (``test_retry_with_mixed_interrupted_and_fresh_members_progresses``):
+        an earlier attempt can reserve an effect and then be interrupted,
+        leaving an ``open`` row, while the redrive's wider batch fails the
+        boundary before reservation and writes this ``failed`` row — two
+        ``sink_write`` rows at one node for what an operator would call one
+        write. ``uq_operations_sink_effect_id`` cannot collapse them because
+        this row's effect id is NULL. The stranded ``open`` row is the known
+        residual tracked as elspeth-800d00c03e.
+
+        THIS ROW SHAPE IS A STOPGAP, not settled design — read it that way
+        before building on it. The three caveats above (not unique per node
+        across attempts, a NULL effect id the unique index cannot use, and a
+        stranded ``open`` sibling) are not independent: they share one root.
+        ``sink_write`` operations are owned by the effect RESERVATION, so their
+        identity is the EFFECT, and nothing covers the ATTEMPT. This method
+        inserts an effect-less row into an effect-keyed table and then explains
+        why that is tolerable. The shape that dissolves all three is to open the
+        ``sink_write`` operation at the START of the write attempt, before
+        boundary validation, and let the reservation ATTACH the effect id to the
+        row that already exists: one operation per attempt, uniqueness intact,
+        no NULL-effect special case, and elspeth-800d00c03e's stranded ``open``
+        row becomes the same row rather than a second one. That is the right fix
+        and it is deliberately not attempted here — it reshapes an audit record
+        the reservation and finalization paths both depend on.
+
+        A run can also legitimately carry several sink_write rows at *different*
+        nodes: a batch whose primary effect finalized and whose failsink then
+        failed its boundary has a completed primary row alongside this failed
+        failsink row, because they record two writes to two nodes.
+
+        The row carries no ``sink_effect_id``: there is no durable effect to
+        point at. ``ck_operations_sink_effect_type`` constrains only the
+        reverse direction (an effect id implies ``sink_write``), so a
+        ``sink_write`` with no effect id is the schema's own encoding of "a
+        write attempt that died before acquiring an effect identity".
+
+        Tier-1: this is an audit record. A failure to write it propagates and
+        fails the run rather than being swallowed alongside the violation —
+        audit corruption is categorically worse than the boundary error.
+
+        What that costs, stated precisely because it is easy to over-promise:
+        at THIS level the boundary error survives as the raised error's
+        ``__context__``. It does not survive the run. ``Orchestrator.run``
+        re-raises ``from None``, so on this path no ``PluginContractViolation``
+        appears anywhere in the final chain, the persisted run error is empty,
+        and the exception *type* a caller sees changes — anything catching
+        ``PluginContractViolation`` around the sink write behaves differently
+        when the audit write is the thing that failed. This exposure is not
+        introduced here: ``_complete_states_failed`` and
+        ``_record_boundary_failure_outcomes`` already write to the audit DB in
+        this same ``except`` branch. This call is a third such write.
+        """
+        operation = self._execution.begin_operation(
+            run_id=self._run_id,
+            node_id=sink_node_id,
+            operation_type="sink_write",
+            input_data=scrub_payload_for_audit({"sink_plugin": sink_name}),
+        )
+        # track_operation's canonical renderer: the violation text can
+        # interpolate row values, so it is scrubbed before it reaches the audit
+        # trail, and an unrenderable message degrades to the (secret-free) type.
+        self._execution.complete_operation(
+            operation_id=operation.operation_id,
+            status="failed",
+            error=_render_exception(violation),
+            duration_ms=0.0,
+        )
+
     def _record_boundary_failure_outcomes(
         self,
         *,
         tokens: Sequence[TokenInfo],
         sink_name: str,
         phase: str,
-        violation: (DeclarationContractViolation | AggregateDeclarationContractViolation | SinkTransactionalInvariantError),
+        violation: (DeclarationContractViolation | AggregateDeclarationContractViolation | PluginContractViolation),
     ) -> None:
-        """Record FAILED token_outcomes for sink boundary failures before write."""
+        """Record FAILED token_outcomes for sink boundary failures before write.
+
+        ``PluginContractViolation`` covers both ``SinkTransactionalInvariantError``
+        (its subclass) and the bare violation raised by sink input-schema
+        validation (elspeth-82d4c5146c): the run still crashes, but every
+        token at the boundary must carry a terminal outcome first.
+        """
         base_context = dict(violation.to_audit_dict())
         failing_token_id = base_context["token_id"] if "token_id" in base_context else None
         failing_row_id = base_context["row_id"] if "row_id" in base_context else None
@@ -431,9 +555,11 @@ class SinkExecutor:
         """
         all_states: list[tuple[TokenInfo, NodeStateOpen]] = []
         try:
-            can_use_bulk_begin = isinstance(self._execution, _BulkBeginNodeStateRepository) and all(
-                token.resume_attempt_offset == 0 and token.resume_checkpoint_id is None for token in tokens
-            )
+            # ExecutionRepository declares begin_node_states_many directly, so the
+            # bulk path needs no capability probe (ADR-032: never dispatch on a
+            # structural Protocol). Resumed tokens still take the singular API,
+            # which alone carries per-token attempt/checkpoint provenance.
+            can_use_bulk_begin = all(token.resume_attempt_offset == 0 and token.resume_checkpoint_id is None for token in tokens)
             if can_use_bulk_begin:
                 opened_states = self._execution.begin_node_states_many(
                     tuple(
@@ -531,12 +657,11 @@ class SinkExecutor:
                 fresh_state_by_token[token.token_id] = opened
         states: list[tuple[TokenInfo, NodeState]] = []
         for token in tokens:
-            fresh_state = fresh_state_by_token.get(token.token_id)
-            if fresh_state is not None:
-                states.append((token, fresh_state))
+            if token.token_id in fresh_state_by_token:
+                states.append((token, fresh_state_by_token[token.token_id]))
                 continue
-            open_state_id = open_ids.get(token.token_id)
-            if open_state_id is not None:
+            if token.token_id in open_ids:
+                open_state_id = open_ids[token.token_id]
                 state = self._execution.get_node_state(open_state_id)
             else:
                 candidates = [
@@ -559,6 +684,7 @@ class SinkExecutor:
         all_states: list[tuple[TokenInfo, NodeState]],
         sink_name: str,
         sink_node_id: str,
+        join_group_id_by_token: Mapping[str, str | None],
     ) -> _EffectPrimaryWrite:
         """Publish one primary batch through the durable effect coordinator."""
         if self._factory is None:
@@ -577,7 +703,7 @@ class SinkExecutor:
                 row_contracts=row_contracts,
             )
             self._validate_sink_input(sink, rows, contracts=row_contracts)
-        except (DeclarationContractViolation, AggregateDeclarationContractViolation, SinkTransactionalInvariantError) as violation:
+        except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             self._complete_states_failed(
                 states=[(token, state) for token, state in all_states if isinstance(state, NodeStateOpen)],
                 duration_ms=0.0,
@@ -587,6 +713,11 @@ class SinkExecutor:
                 tokens=tokens,
                 sink_name=sink_name,
                 phase="sink_write",
+                violation=violation,
+            )
+            self._record_boundary_failure_operation(
+                sink_node_id=sink_node_id,
+                sink_name=sink_name,
                 violation=violation,
             )
             raise
@@ -633,7 +764,6 @@ class SinkExecutor:
             replacing_target=True,
             primary_effect_id=None,
         )
-        token_by_id = {token.token_id: token for token in tokens}
         finalization_members = tuple(
             SinkEffectFinalizationMember(
                 ordinal=member.ordinal,
@@ -642,7 +772,7 @@ class SinkExecutor:
                 outcome=pending_outcome.outcome,
                 path=pending_outcome.path,
                 sink_name=sink_name,
-                join_group_id=(token_by_id[member.token_id].join_group_id if pending_outcome.path is TerminalPath.COALESCED else None),
+                join_group_id=(join_group_id_by_token[member.token_id] if pending_outcome.path is TerminalPath.COALESCED else None),
                 error_hash=pending_outcome.error_hash,
             )
             for member in identity.members
@@ -651,13 +781,22 @@ class SinkExecutor:
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
+            coordination_token=self._require_coordination_token(),
+            clock=self._clock,
             fault_hook=self._sink_effect_fault_hook,
-        ).execute(
+            shutdown_event=self._shutdown_event,
+            check_coordination_latch=self._check_coordination_latch,
+            make_shutdown_error=self._make_shutdown_error,
+        ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
                 effect_input=SinkEffectPipelineMembersInput(
                     members=identity.members,
                     target_snapshot_members=identity.members,
+                    # Placeholder like the snapshot beside it: the coordinator
+                    # re-derives both from durable records per effect
+                    # (_request_for_effect) before any sink sees them.
+                    target_delivered_member_count=len(identity.members),
                 ),
                 finalization_members=finalization_members,
             ),
@@ -680,8 +819,7 @@ class SinkExecutor:
         diverted_keys = {(member.effect_id, member.ordinal) for member in durable_members if member.prepared_disposition == "diverted"}
         effect_ids = tuple(dict.fromkeys(member.effect_id for member in durable_members))
         single_effect = len(effect_ids) == 1
-        get_diversions = getattr(sink, "_get_diversions", None)
-        returned_diversions = tuple(get_diversions()) if callable(get_diversions) else ()
+        returned_diversions = sink._get_diversions()
         # The in-memory diversion log indexes rows within one effect's member
         # list; across several effects those indexes are ambiguous, so a
         # spanning batch recovers from each effect's durable attribution only.
@@ -689,27 +827,47 @@ class SinkExecutor:
         attribution_by_key: dict[tuple[str, int], tuple[str, str]] = {}
 
         def merge_attribution(effect_id: str, raw_attribution: object) -> None:
-            if not isinstance(raw_attribution, Sequence) or isinstance(raw_attribution, (str, bytes, bytearray)):
-                return
+            if type(raw_attribution) is not list:
+                raise AuditIntegrityError("effect diversion attribution must be a list")
             for item in raw_attribution:
-                if not isinstance(item, Mapping):
+                if type(item) is not dict:
                     raise AuditIntegrityError("effect diversion attribution is not a mapping")
-                ordinal = item.get("ordinal")
-                reason_hash = item.get("reason_hash")
-                error_hash = item.get("error_hash")
-                if type(ordinal) is not int or not isinstance(reason_hash, str) or not isinstance(error_hash, str):
-                    raise AuditIntegrityError("effect diversion attribution is incomplete")
+                if set(item) != {"error_hash", "ordinal", "reason_hash"}:
+                    raise AuditIntegrityError("effect diversion attribution has a divergent field set")
+                ordinal = item["ordinal"]
+                reason_hash = item["reason_hash"]
+                error_hash = item["error_hash"]
+                if (
+                    type(ordinal) is not int
+                    or type(reason_hash) is not str
+                    or len(reason_hash) != 64
+                    or any(character not in "0123456789abcdef" for character in reason_hash)
+                    or type(error_hash) is not str
+                    or len(error_hash) != 16
+                    or any(character not in "0123456789abcdef" for character in error_hash)
+                ):
+                    raise AuditIntegrityError("effect diversion attribution is incomplete or invalid")
                 key = (effect_id, ordinal)
                 value = (reason_hash, error_hash)
-                if attribution_by_key.setdefault(key, value) != value:
+                if key in attribution_by_key:
+                    if attribution_by_key[key] == value:
+                        continue
                     raise AuditIntegrityError("effect diversion attribution sources diverge for one durable member")
+                attribution_by_key[key] = value
 
         for effect_id in effect_ids:
             effect = self._execution.sink_effects.get_effect(effect_id)
             if effect is None:
                 raise AuditIntegrityError("durable effect partition references a missing effect")
             plan = SinkEffectCoordinator._load_plan(effect)
-            merge_attribution(effect_id, plan.safe_evidence.get("diversion_attribution", ()))
+            plan_evidence = deep_thaw(plan.safe_evidence)
+            if type(plan_evidence) is not dict:
+                raise AuditIntegrityError("durable effect plan evidence must be an object")
+            if "diversion_attribution" in plan_evidence:
+                plan_attribution = plan_evidence["diversion_attribution"]
+            else:
+                plan_attribution = []
+            merge_attribution(effect_id, plan_attribution)
             if not diverted_keys:
                 continue
             # Commit-time diversions (e.g. database constraints) cannot exist in
@@ -724,11 +882,18 @@ class SinkExecutor:
                 ):
                     continue
                 decoded = decode_sink_effect_returned_result(attempt.action, attempt.evidence_json)
-                merge_attribution(effect_id, decoded.evidence.get("diversion_attribution", ()))
+                attempt_evidence = deep_thaw(decoded.evidence)
+                if type(attempt_evidence) is not dict:
+                    raise AuditIntegrityError("durable effect attempt evidence must be an object")
+                if "diversion_attribution" in attempt_evidence:
+                    attempt_attribution = attempt_evidence["diversion_attribution"]
+                else:
+                    attempt_attribution = []
+                merge_attribution(effect_id, attempt_attribution)
         if returned_by_ordinal and set(returned_by_ordinal) != {ordinal for _effect_id, ordinal in diverted_keys}:
             raise AuditIntegrityError("effect result diversion evidence does not match the durable member partition")
-        if not returned_by_ordinal and set(attribution_by_key) != diverted_keys:
-            raise AuditIntegrityError("recovered effect is missing durable diversion attribution")
+        if set(attribution_by_key) != diverted_keys:
+            raise AuditIntegrityError("effect is missing durable diversion attribution")
         diversions: list[RowDiversion] = []
         diversion_error_hashes: dict[int, str] = {}
         diversion_reason_hashes: dict[int, str] = {}
@@ -737,11 +902,16 @@ class SinkExecutor:
             _diverted_effect_id, durable_ordinal = diverted_key
             durable = durable_by_key[diverted_key]
             caller_index = caller_index_by_token[durable.token_id]
-            returned = returned_by_ordinal.get(durable_ordinal)
-            attribution = attribution_by_key.get(diverted_key)
-            reason = returned.reason if returned is not None else f"effect-diversion:{attribution[0]}"  # type: ignore[index]
-            error_hash = attribution[1] if attribution is not None else compute_error_hash(reason)
-            reason_hash = attribution[0] if attribution is not None else stable_hash({"diversion_reason": reason})
+            returned = None
+            if durable_ordinal in returned_by_ordinal:
+                returned = returned_by_ordinal[durable_ordinal]
+            reason_hash, error_hash = attribution_by_key[diverted_key]
+            if returned is None:
+                reason = f"effect-diversion:{reason_hash}"
+            else:
+                reason = returned.reason
+                if stable_hash({"diversion_reason": reason}) != reason_hash or compute_error_hash(reason) != error_hash:
+                    raise AuditIntegrityError("live reason disagrees with durable attribution")
             diversions.append(
                 RowDiversion(
                     row_index=caller_index,
@@ -760,6 +930,44 @@ class SinkExecutor:
             accepted_token_ids=accepted_token_ids,
             primary_effect_id_by_token={member.token_id: member.effect_id for member in durable_members},
         )
+
+    @staticmethod
+    def _disclosable_diversion_reason(*, reason: str, reason_hash: str) -> str:
+        """The sink's own reason when it can be disclosed verbatim, else the hash form.
+
+        One rule for both diversion anchors, so exactly one invariant holds on
+        every path: what lands in ``ExecutionError.exception`` is EITHER the
+        verbatim reason — which ``_write_primary_effect`` proved hashes to
+        ``reason_hash`` before building the ``RowDiversion`` — OR the
+        ``effect-diversion:<hash>`` form naming that same evidence. Nothing else
+        is ever recorded, so the ``diversion_reason_hash`` in ``context`` always
+        checks out against the text sitting beside it.
+
+        Two independent conditions force the hash form:
+
+        * A recovered batch has no live diversion log, so ``RowDiversion.reason``
+          is already this exact string (``_write_primary_effect``).
+        * A reason quoting a driver error can trip the audit scrubber, which
+          replaces the WHOLE string rather than the matched span. Falling back
+          here rather than letting ``ExecutionError`` scrub in place is the
+          difference between "no disclosure, still checkable" and
+          "``<redacted-secret>`` whose neighbouring hash it does not match" —
+          precisely for the sinks whose reasons are most worth reading
+          (``database_sink`` constraint violations, ``dataverse`` HTTP bodies).
+
+        Decided per TOKEN, not per batch. A crash between two
+        ``complete_node_state`` calls can split one batch's anchors across a
+        live and a recovered attempt (``_open_or_reuse_effect_states``,
+        elspeth-d1a1399381), leaving some tokens with prose and some with the
+        hash form. That is tolerable because both texts are honest and both are
+        checkable — unlike ``output_data``, which feeds ``output_hash`` and is
+        therefore held to the hash form on every path so one logical state
+        cannot hash differently by recovery provenance.
+        """
+        hash_form = f"effect-diversion:{reason_hash}"
+        if reason == hash_form or scrub_text_for_audit(reason) != reason:
+            return hash_form
+        return reason
 
     def _handle_failsink_effect_diversions(
         self,
@@ -820,7 +1028,7 @@ class SinkExecutor:
                 row_contracts=None,
             )
             self._validate_sink_input(failsink, enriched_rows, skip_schema=True)
-        except (DeclarationContractViolation, AggregateDeclarationContractViolation, SinkTransactionalInvariantError) as violation:
+        except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             # Mirror the primary path's boundary-failure terminalization
             # (elspeth-2a75af7f8f): the enriched row never reached the
             # failsink, so terminalize both the quarantine states just opened
@@ -841,6 +1049,14 @@ class SinkExecutor:
                 tokens=diverted_tokens,
                 sink_name=failsink_name,
                 phase="failsink_write",
+                violation=violation,
+            )
+            # The failsink effect was never reserved either, and the primary
+            # effect has already finalized its own operation as 'completed', so
+            # without this the run carries no failed operation at all.
+            self._record_boundary_failure_operation(
+                sink_node_id=failsink_node_id,
+                sink_name=failsink_name,
                 violation=violation,
             )
             raise
@@ -900,11 +1116,20 @@ class SinkExecutor:
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
+            coordination_token=self._require_coordination_token(),
+            clock=self._clock,
             fault_hook=self._sink_effect_fault_hook,
-        ).execute(
+            shutdown_event=self._shutdown_event,
+            check_coordination_latch=self._check_coordination_latch,
+            make_shutdown_error=self._make_shutdown_error,
+        ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
-                effect_input=SinkEffectPipelineMembersInput(members=identity.members, target_snapshot_members=identity.members),
+                effect_input=SinkEffectPipelineMembersInput(
+                    members=identity.members,
+                    target_snapshot_members=identity.members,
+                    target_delivered_member_count=len(identity.members),
+                ),
                 finalization_members=finalization_members,
             ),
             failsink,  # type: ignore[arg-type]
@@ -929,7 +1154,22 @@ class SinkExecutor:
                     status=NodeStateStatus.FAILED,
                     output_data={"diverted_to": failsink_name, "reason_hash": reason_hash},
                     duration_ms=0.0,
-                    error=ExecutionError(exception=reason["diversion_reason"], exception_type="SinkDiversion", phase="write"),
+                    # Same audit column and same disclosure contract as the
+                    # discard anchor, so it gets the same treatment: a quarantined
+                    # row's primary state named only the hash, leaving failsink
+                    # mode as undiagnosable as discard mode was
+                    # (elspeth-9595abb7b0). The routing event above keeps the hash
+                    # form — that is a typed routing payload, not the operator's
+                    # reason surface.
+                    error=ExecutionError(
+                        exception=self._disclosable_diversion_reason(
+                            reason=diversion_by_index[index].reason,
+                            reason_hash=reason_hash,
+                        ),
+                        exception_type="SinkDiversion",
+                        phase="write",
+                        context={"diversion_reason_hash": reason_hash},
+                    ),
                 )
             elif isinstance(current, NodeStateFailed):
                 events = self._factory.query.get_routing_events(current.state_id)
@@ -945,6 +1185,7 @@ class SinkExecutor:
         self,
         *,
         primary_divert_states: list[tuple[TokenInfo, int, NodeState]],
+        diversion_by_index: Mapping[int, RowDiversion],
         diversion_error_hashes: Mapping[int, str],
         diversion_reason_hashes: Mapping[int, str],
         on_token_written: Callable[[TokenInfo], None] | None,
@@ -954,25 +1195,48 @@ class SinkExecutor:
         No routing_event (no DAG edge for discard) and no failsink write — the
         row does not reach its destination. Records SINK_DISCARDED outcomes and
         checkpoints. Returns the number of discarded tokens.
+
+        The FAILED state's error is this token's ONLY disclosure of why the sink
+        refused the row: discard-mode leaves no operation failed (the batch
+        effect really did publish, so ``sink_write`` completes and
+        ``failure_detail`` is correctly empty) and no ``validation_errors`` row.
+        ``RunDiagnosticDiscard`` states that contract — sink discard "leaves a
+        token whose failed node state already discloses the reason" — so a state
+        carrying only the durable hash makes a discarded row undiagnosable on
+        every surface at once (elspeth-9595abb7b0).
+
+        ``output_data`` deliberately keeps the hash form while ``error`` carries
+        the reason: only the former is hashed into ``output_hash``, which must
+        not depend on whether the state was recovered. See
+        ``_disclosable_diversion_reason`` for what ``error`` may hold and why
+        that field can afford to vary where ``output_data`` cannot.
         """
         discard_count = 0
         # Discard mode: complete primary states and record DIVERTED outcomes.
         # No routing_event (no DAG edge for discard), no failsink write.
         for token, idx, primary_state in primary_divert_states:
-            durable_reason = f"effect-diversion:{diversion_reason_hashes[idx]}"
+            recovery_stable_reason = f"effect-diversion:{diversion_reason_hashes[idx]}"
+            # The sink's own words when they can be disclosed verbatim, else the
+            # hash form; the reason hash rides along in `context` either way, so
+            # the recorded text always checks out against the durable evidence.
+            disclosed_reason = self._disclosable_diversion_reason(
+                reason=diversion_by_index[idx].reason,
+                reason_hash=diversion_reason_hashes[idx],
+            )
 
             # FAILED — the row didn't reach its destination (discarded).
             discard_error = ExecutionError(
-                exception=durable_reason,
+                exception=disclosed_reason,
                 exception_type="SinkDiscard",
                 phase="write",
+                context={"diversion_reason_hash": diversion_reason_hashes[idx]},
             )
             current = self._execution.get_node_state(primary_state.state_id)
             if isinstance(current, NodeStateOpen):
                 self._execution.complete_node_state(
                     state_id=current.state_id,
                     status=NodeStateStatus.FAILED,
-                    output_data={"discarded": True, "reason": durable_reason},
+                    output_data={"discarded": True, "reason": recovery_stable_reason},
                     duration_ms=0.0,
                     error=discard_error,
                 )
@@ -1025,6 +1289,7 @@ class SinkExecutor:
         *,
         sink_name: str,
         pending_outcome: PendingOutcome | None,
+        join_group_id_by_token: Mapping[str, str | None],
         effect_mode: str | None = None,
         failsink: SinkProtocol | None = None,
         failsink_name: str | None = None,
@@ -1058,6 +1323,11 @@ class SinkExecutor:
             sink_name: Name of the sink (for token_outcome recording)
             pending_outcome: PendingOutcome containing outcome and optional error_hash.
                     Required - all sink-bound tokens must have their outcome recorded.
+            join_group_id_by_token: Per-token merge-event identity (ruling 20):
+                    a merge is an event carried by PendingOutcome/RowResult, never
+                    TokenInfo, so this map is the only source for the COALESCED
+                    finalization member's join_group_id. Callers pass an
+                    all-None map for non-coalesce lanes.
             effect_mode: Validated sink-effect mode. Required for non-empty batches.
             failsink: Resolved failsink instance (or None for discard mode)
             failsink_name: Config-level name of the failsink (for outcome recording)
@@ -1124,6 +1394,7 @@ class SinkExecutor:
             all_states=all_states,
             sink_name=sink_name,
             sink_node_id=sink_node_id,
+            join_group_id_by_token=join_group_id_by_token,
         )
         diversions = effect_write.diversions
 
@@ -1188,6 +1459,7 @@ class SinkExecutor:
             else:
                 discard_count = self._handle_discard_diversions(
                     primary_divert_states=primary_divert_states,
+                    diversion_by_index=diversion_by_index,
                     diversion_error_hashes=effect_write.diversion_error_hashes,
                     diversion_reason_hashes=effect_write.diversion_reason_hashes,
                     on_token_written=on_token_written,

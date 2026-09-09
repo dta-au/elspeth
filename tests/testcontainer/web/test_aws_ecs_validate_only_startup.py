@@ -16,7 +16,6 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 
 from elspeth.web.app import create_app
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
@@ -30,7 +29,10 @@ from elspeth.web.schema_probe import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 
@@ -63,10 +65,23 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
     )
 
 
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+def _grant_web_instances_dml(session_owner_url: str, runtime_role: str) -> None:
+    """Grant INSERT and UPDATE on the one table a booting replica writes.
+
+    Read-only is no longer enough for the runtime role: a PostgreSQL replica
+    registers itself in ``web_instances`` during the lifespan, needing UPDATE
+    for the ``SELECT ... FOR UPDATE`` that claims the row and INSERT for a
+    first registration. Deliberately not a blanket DML grant — this helper is
+    what proves which privileges boot actually requires, and validate-only
+    still means DDL denied, not "no DML at boot". The table lives in the
+    session database only; several tests here provision the role before schema
+    init, so an absent table is skipped rather than an error.
+    """
+    with _psycopg_connect(session_owner_url) as owner:
+        existing = owner.execute("SELECT to_regclass('public.web_instances')").fetchone()
+        if existing is None or existing[0] is None:
+            return
+        owner.execute(sql.SQL("GRANT INSERT, UPDATE ON web_instances TO {}").format(sql.Identifier(runtime_role)))
 
 
 @dataclass
@@ -128,27 +143,28 @@ class _RuntimeDatabases:
                 owner.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
                 owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
                 owner.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
+        _grant_web_instances_dml(self.session_owner_url, self.runtime_role)
         self.role_created = True
 
 
 @pytest.fixture
-def runtime_databases(postgres_url: str) -> Iterator[_RuntimeDatabases]:
+def runtime_databases(external_deployment_postgres_url: str) -> Iterator[_RuntimeDatabases]:
     databases = _RuntimeDatabases(
-        postgres_url=postgres_url,
+        postgres_url=external_deployment_postgres_url,
         session_database=_identifier("session"),
         landscape_database=_identifier("landscape"),
         runtime_role=_identifier("runtime"),
         runtime_password=f"runtime-{uuid.uuid4().hex}",
     )
     assert databases.session_database != databases.landscape_database
-    with _psycopg_connect(postgres_url) as admin:
+    with _psycopg_connect(external_deployment_postgres_url) as admin:
         for database in (databases.session_database, databases.landscape_database):
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
 
     try:
         yield databases
     finally:
-        with _psycopg_connect(postgres_url) as admin:
+        with _psycopg_connect(external_deployment_postgres_url) as admin:
             for database in (databases.session_database, databases.landscape_database):
                 admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
             if databases.role_created:
@@ -175,7 +191,7 @@ def _settings(tmp_path: Path, *, session_url: str, landscape_url: str) -> WebSet
         payload_store_path=payload_dir,
         session_db_url=session_url,
         landscape_url=landscape_url,
-        secret_key="s" * 40,
+        secret_key="this-validate-only-startup-secret-is-long-enough",
         shareable_link_signing_key=SecretBytes(bytes(range(32))),
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,

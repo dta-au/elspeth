@@ -133,10 +133,9 @@ class EnvSecretLoader:
         Raises:
             SecretNotFoundError: If the env var is not set or is empty
         """
-        value = os.environ.get(name)
-
-        if value is None or value == "":
+        if name not in os.environ or os.environ[name] == "":
             raise SecretNotFoundError(f"Environment variable '{name}' not set or empty")
+        value = os.environ[name]
 
         # No fingerprint computed here - that's the caller's responsibility
         # (they have the fingerprint key, we don't)

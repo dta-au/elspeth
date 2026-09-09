@@ -8,8 +8,8 @@ Extracted from ``TokenSchedulerRepository`` (filigree elspeth-ef9c36d767).
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from datetime import datetime
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import ClassVar
 
 from sqlalchemy import and_, select, update
@@ -17,12 +17,13 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
-from elspeth.contracts.scheduler import BarrierEmission, BranchLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import BarrierEmission, GroupLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
-from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.fencing import fenced_write
+from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler.payload_codec import scrubbed_row_payload_json
 from elspeth.core.landscape.scheduler.work_items import (
     insert_work_item_idempotent,
@@ -37,6 +38,46 @@ from elspeth.core.landscape.schema import (
     token_outcomes_table,
     token_work_items_table,
 )
+
+
+class _PendingSinkTerminalMiss(Exception):
+    """Internal rollback signal for a singleton pending-sink CAS miss."""
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedImage:
+    """Column image of a BLOCKED disposition: the hold location.
+
+    ``barrier_blocked_at`` is stamped from Landscape database time inside the
+    transaction (ADR-047); the lease is cleared. Nothing here is a deadline a
+    caller can supply.
+    """
+
+    queue_key: str | None
+    barrier_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalImage:
+    """Column image of a TERMINAL or FAILED disposition: the scrubbed payload; the lease is cleared."""
+
+    row_payload_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSinkImage:
+    """Column image of a PENDING_SINK park: the durable sink bundle, owner-attributed, not leased."""
+
+    row_payload_json: str
+    sink_name: str
+    outcome: str
+    path: str
+    error_hash: str | None
+    error_message: str | None
+    lease_owner: str
+
+
+DispositionImage = BlockedImage | TerminalImage | PendingSinkImage
 
 
 class SchedulerDispositionRepository:
@@ -59,14 +100,14 @@ class SchedulerDispositionRepository:
         work_item_id: str,
         queue_key: str | None,
         barrier_key: str | None,
-        now: datetime,
         expected_lease_owner: str,
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Move an item to BLOCKED at a queue or barrier.
 
         ``worker_id`` (optional): membership-fence identity — see
-        :meth:`mark_terminal`.
+        :meth:`mark_terminal`. The hold's ``barrier_blocked_at`` is Landscape
+        database time read inside the transaction (ADR-047).
         """
         if queue_key is None and barrier_key is None:
             raise AuditIntegrityError(
@@ -75,36 +116,26 @@ class SchedulerDispositionRepository:
             )
         return self._transition(
             work_item_id=work_item_id,
-            now=now,
             status=TokenWorkStatus.BLOCKED,
             expected_lease_owner=expected_lease_owner,
             fenced_worker_id=worker_id,
-            queue_key=queue_key,
-            barrier_key=barrier_key,
-            # F1: barrier holds are restored from the journal using this
-            # absolute timestamp. Queue-holds (ADR-028) get stamped too —
-            # harmless; nothing reads the column on that arm, and a single
-            # UPDATE shape keeps this verb the column's only writer.
-            barrier_blocked_at=now,
-            lease_owner=None,
-            lease_expires_at=None,
+            image=BlockedImage(queue_key=queue_key, barrier_key=barrier_key),
         )
 
     def mark_terminal(
         self,
         *,
         work_item_id: str,
-        now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Mark a leased work item terminal.
 
-        ``branch_loss`` (§E.5): a non-failure lossy disposition of a
-        fork-lineage branch feeding a coalesce (filter-drop / gate-discard)
-        records its durable loss in the SAME transaction (record-then-notify
-        uniformity rule).
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): a non-failure lossy disposition of a
+        bound frame member (filter-drop / gate-discard) records its durable
+        loss in the SAME transaction (record-then-notify uniformity rule).
 
         ``worker_id`` (optional): membership-fence identity (ADR-030 §G
         parity, filigree elspeth-ba7b2cc25d). When supplied, the disposition
@@ -112,17 +143,18 @@ class SchedulerDispositionRepository:
         run (LENIENT ``claim_verb_fence_clause`` — N=0 runs pass); an
         evicted/departed worker is refused with ``RunWorkerEvictedError``
         and zero mutation.
+
+        Every disposition stamps ``updated_at`` and its event's
+        ``recorded_at`` from Landscape database time read inside its own
+        transaction (ADR-047); no caller instant enters the scheduler.
         """
         return self._transition(
             work_item_id=work_item_id,
-            now=now,
             status=TokenWorkStatus.TERMINAL,
             expected_lease_owner=expected_lease_owner,
             fenced_worker_id=worker_id,
-            branch_loss=branch_loss,
-            row_payload_json=scrubbed_row_payload_json(work_item_id),
-            lease_owner=None,
-            lease_expires_at=None,
+            group_losses=group_losses,
+            image=TerminalImage(row_payload_json=scrubbed_row_payload_json(work_item_id)),
         )
 
     def mark_terminal_with_ready_children(
@@ -130,9 +162,8 @@ class SchedulerDispositionRepository:
         *,
         work_item_id: str,
         emitted_ready: Sequence[BarrierEmission],
-        now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue child continuations and terminalize their parent.
@@ -145,44 +176,38 @@ class SchedulerDispositionRepository:
         return self._transition_with_ready_children(
             work_item_id=work_item_id,
             emitted_ready=emitted_ready,
-            now=now,
             status=TokenWorkStatus.TERMINAL,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
-            row_payload_json=scrubbed_row_payload_json(work_item_id),
-            lease_owner=None,
-            lease_expires_at=None,
+            image=TerminalImage(row_payload_json=scrubbed_row_payload_json(work_item_id)),
         )
 
     def mark_failed(
         self,
         *,
         work_item_id: str,
-        now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Mark a leased work item failed after retries are exhausted.
 
-        ``branch_loss`` (§E.5): when the failed item is a fork-lineage branch
-        feeding a coalesce, the durable loss record commits in the SAME
-        transaction as this disposition (record-then-notify uniformity rule).
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): when the failed item is a bound frame
+        member, the durable loss record commits in the SAME transaction as
+        this disposition (record-then-notify uniformity rule).
 
         ``worker_id`` (optional): membership-fence identity — see
         :meth:`mark_terminal`.
         """
         return self._transition(
             work_item_id=work_item_id,
-            now=now,
             status=TokenWorkStatus.FAILED,
             expected_lease_owner=expected_lease_owner,
             fenced_worker_id=worker_id,
-            branch_loss=branch_loss,
-            row_payload_json=scrubbed_row_payload_json(work_item_id),
-            lease_owner=None,
-            lease_expires_at=None,
+            group_losses=group_losses,
+            image=TerminalImage(row_payload_json=scrubbed_row_payload_json(work_item_id)),
         )
 
     def mark_failed_with_ready_children(
@@ -190,23 +215,19 @@ class SchedulerDispositionRepository:
         *,
         work_item_id: str,
         emitted_ready: Sequence[BarrierEmission],
-        now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue child continuations and fail their parent."""
         return self._transition_with_ready_children(
             work_item_id=work_item_id,
             emitted_ready=emitted_ready,
-            now=now,
             status=TokenWorkStatus.FAILED,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
-            row_payload_json=scrubbed_row_payload_json(work_item_id),
-            lease_owner=None,
-            lease_expires_at=None,
+            image=TerminalImage(row_payload_json=scrubbed_row_payload_json(work_item_id)),
         )
 
     def mark_pending_sink(
@@ -219,9 +240,8 @@ class SchedulerDispositionRepository:
         path: str,
         error_hash: str | None,
         error_message: str | None,
-        now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Move a claimed item to a durable sink handoff state.
@@ -237,25 +257,26 @@ class SchedulerDispositionRepository:
         CASes strictly on that owner; the historical NULL park forced a
         NULL-acceptance arm there that a takeover could slip through.
 
-        ``branch_loss`` (§E.5): a divert arm that lossy-disposes a
-        fork-lineage branch records its durable loss in the SAME transaction.
+        ``group_losses`` (spec §6.2: losses staged by the settle-member seam
+        for any bound closer kind): a divert arm that lossy-disposes a bound
+        frame member records its durable loss in the SAME transaction.
         """
         return self._transition(
             work_item_id=work_item_id,
-            now=now,
             status=TokenWorkStatus.PENDING_SINK,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
             require_complete_pending_sink_bundle=True,
-            row_payload_json=row_payload_json,
-            pending_sink_name=sink_name,
-            pending_outcome=outcome,
-            pending_path=path,
-            pending_error_hash=error_hash,
-            pending_error_message=error_message,
-            lease_owner=expected_lease_owner,
-            lease_expires_at=None,
+            image=PendingSinkImage(
+                row_payload_json=row_payload_json,
+                sink_name=sink_name,
+                outcome=outcome,
+                path=path,
+                error_hash=error_hash,
+                error_message=error_message,
+                lease_owner=expected_lease_owner,
+            ),
         )
 
     def mark_pending_sink_with_ready_children(
@@ -269,29 +290,28 @@ class SchedulerDispositionRepository:
         path: str,
         error_hash: str | None,
         error_message: str | None,
-        now: datetime,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         worker_id: str | None = None,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         """Atomically enqueue children and durably park their parent for a sink."""
         return self._transition_with_ready_children(
             work_item_id=work_item_id,
             emitted_ready=emitted_ready,
-            now=now,
             status=TokenWorkStatus.PENDING_SINK,
             expected_lease_owner=expected_lease_owner,
-            branch_loss=branch_loss,
+            group_losses=group_losses,
             fenced_worker_id=worker_id,
             require_complete_pending_sink_bundle=True,
-            row_payload_json=row_payload_json,
-            pending_sink_name=sink_name,
-            pending_outcome=outcome,
-            pending_path=path,
-            pending_error_hash=error_hash,
-            pending_error_message=error_message,
-            lease_owner=expected_lease_owner,
-            lease_expires_at=None,
+            image=PendingSinkImage(
+                row_payload_json=row_payload_json,
+                sink_name=sink_name,
+                outcome=outcome,
+                path=path,
+                error_hash=error_hash,
+                error_message=error_message,
+                lease_owner=expected_lease_owner,
+            ),
         )
 
     def mark_pending_sink_terminal(
@@ -299,7 +319,6 @@ class SchedulerDispositionRepository:
         *,
         run_id: str,
         token_id: str,
-        now: datetime,
         expected_lease_owner: str,
         coordination_token: CoordinationToken,
     ) -> int:
@@ -314,7 +333,8 @@ class SchedulerDispositionRepository:
         always re-claimed via ``claim_pending_sink``, which overwrites the
         owner, before terminalization). A row whose owner does not match —
         including NULL — is simply not terminalized (returns 0 for the
-        caller's loud invariant check).
+        caller's loud invariant check). The miss rolls back the surrounding
+        leader-heartbeat extension so this F-04 refusal is zero-mutation.
 
         ``coordination_token`` (ADR-030 §C.4 row 7, slice-4 ratchet:
         REQUIRED): the verify-and-extend leader epoch fence is the FIRST
@@ -329,57 +349,64 @@ class SchedulerDispositionRepository:
             token_work_items_table.c.pending_sink_name.is_not(None),
             token_work_items_table.c.lease_owner == expected_lease_owner,
         ]
-        with fenced_leader_transaction(
-            self._engine,
-            token=coordination_token,
-            now=now,
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="mark_pending_sink_terminal",
-        ) as conn:
-            rows = (
-                conn.execute(select(token_work_items_table).where(and_(*predicates)).order_by(token_work_items_table.c.work_item_id))
-                .mappings()
-                .all()
-            )
-            terminalized = 0
-            for row in rows:
-                result = conn.execute(
-                    update(token_work_items_table)
-                    .where(token_work_items_table.c.work_item_id == row["work_item_id"])
-                    .where(and_(*predicates))
-                    .values(
-                        status=TokenWorkStatus.TERMINAL.value,
-                        row_payload_json=scrubbed_row_payload_json(token_id),
-                        lease_owner=None,
-                        lease_expires_at=None,
-                        updated_at=now,
-                    )
+        try:
+            with fenced_leader_transaction(
+                self._engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="mark_pending_sink_terminal",
+            ) as conn:
+                database_now = read_landscape_transaction_time(conn)
+                rows = (
+                    conn.execute(select(token_work_items_table).where(and_(*predicates)).order_by(token_work_items_table.c.work_item_id))
+                    .mappings()
+                    .all()
                 )
-                if result.rowcount == 1:
-                    self._events.record(
-                        conn,
-                        event_type=SchedulerEventType.MARK_PENDING_SINK_TERMINAL,
-                        run_id=run_id,
-                        token_id=row["token_id"],
-                        work_item_id=row["work_item_id"],
-                        node_id=row["node_id"],
-                        from_status=TokenWorkStatus(row["status"]),
-                        to_status=TokenWorkStatus.TERMINAL,
-                        from_lease_owner=row["lease_owner"],
-                        to_lease_owner=None,
-                        from_attempt=row["attempt"],
-                        to_attempt=row["attempt"],
-                        recorded_at=now,
-                        from_lease_expires_at=row["lease_expires_at"],
-                        to_lease_expires_at=None,
-                        caller_owner=expected_lease_owner,
+                if not rows:
+                    raise _PendingSinkTerminalMiss
+                terminalized = 0
+                for row in rows:
+                    result = conn.execute(
+                        update(token_work_items_table)
+                        .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                        .where(and_(*predicates))
+                        .values(
+                            status=TokenWorkStatus.TERMINAL.value,
+                            row_payload_json=scrubbed_row_payload_json(token_id),
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            updated_at=database_now,
+                        )
                     )
-                    terminalized += 1
-                elif result.rowcount not in (0, None):
-                    raise AuditIntegrityError(
-                        f"Scheduler pending-sink terminalization affected {result.rowcount} rows for "
-                        f"run_id={run_id!r} token_id={token_id!r} work_item_id={row['work_item_id']!r}; expected 0 or 1."
-                    )
+                    if result.rowcount == 1:
+                        self._events.record(
+                            conn,
+                            event_type=SchedulerEventType.MARK_PENDING_SINK_TERMINAL,
+                            run_id=run_id,
+                            token_id=row["token_id"],
+                            work_item_id=row["work_item_id"],
+                            node_id=row["node_id"],
+                            from_status=TokenWorkStatus(row["status"]),
+                            to_status=TokenWorkStatus.TERMINAL,
+                            from_lease_owner=row["lease_owner"],
+                            to_lease_owner=None,
+                            from_attempt=row["attempt"],
+                            to_attempt=row["attempt"],
+                            recorded_at=database_now,
+                            from_lease_expires_at=row["lease_expires_at"],
+                            to_lease_expires_at=None,
+                            caller_owner=expected_lease_owner,
+                        )
+                        terminalized += 1
+                    elif result.rowcount in (0, None):
+                        raise _PendingSinkTerminalMiss
+                    else:
+                        raise AuditIntegrityError(
+                            f"Scheduler pending-sink terminalization affected {result.rowcount} rows for "
+                            f"run_id={run_id!r} token_id={token_id!r} work_item_id={row['work_item_id']!r}; expected 0 or 1."
+                        )
+        except _PendingSinkTerminalMiss:
+            return 0
         return terminalized
 
     def mark_pending_sink_terminal_many(
@@ -387,7 +414,6 @@ class SchedulerDispositionRepository:
         *,
         run_id: str,
         token_ids: tuple[str, ...],
-        now: datetime,
         expected_lease_owner: str,
         coordination_token: CoordinationToken,
     ) -> int:
@@ -396,6 +422,11 @@ class SchedulerDispositionRepository:
         This preserves the audit contract of one scheduler event per terminalized
         work item while avoiding one transaction and one indexed SELECT per token
         after large sink writes.
+
+        Every requested token must resolve to exactly one complete durable sink
+        bundle with the expected owner before the first mutation. Completeness
+        is repeated in each update CAS so a concurrently malformed member aborts
+        and rolls back the whole batch rather than returning a partial count.
 
         ``expected_lease_owner`` is REQUIRED and the owner CAS is STRICT
         (ADR-030 §C.4 row 7; see :meth:`mark_pending_sink_terminal` for the
@@ -427,16 +458,17 @@ class SchedulerDispositionRepository:
             token_work_items_table.c.status.in_((TokenWorkStatus.PENDING_SINK.value, TokenWorkStatus.LEASED.value)),
             token_work_items_table.c.pending_sink_name.is_not(None),
         ]
+        complete_bundle = pending_sink_bundle_clause()
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="mark_pending_sink_terminal_many",
         ) as conn:
+            database_now = read_landscape_transaction_time(conn)
             rows = (
                 conn.execute(
-                    select(token_work_items_table)
+                    select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
                     .where(and_(*predicates))
                     .order_by(
                         token_work_items_table.c.ingest_sequence,
@@ -465,7 +497,13 @@ class SchedulerDispositionRepository:
                         f"Scheduler pending-sink batch terminalization for run_id={run_id!r} token_id={token_id!r} found "
                         f"{len(matching_rows)} matching rows; expected exactly one."
                     )
-                row_lease_owner = matching_rows[0]["lease_owner"]
+                matching_row = matching_rows[0]
+                if not matching_row["_pending_sink_bundle_complete"]:
+                    raise AuditIntegrityError(
+                        f"Scheduler pending-sink batch terminalization for run_id={run_id!r} token_id={token_id!r} "
+                        "refused a member without a complete durable sink bundle; refusing partial terminalization."
+                    )
+                row_lease_owner = matching_row["lease_owner"]
                 if row_lease_owner != expected_lease_owner:
                     raise AuditIntegrityError(
                         f"Scheduler pending-sink batch terminalization for run_id={run_id!r} token_id={token_id!r} found "
@@ -483,12 +521,13 @@ class SchedulerDispositionRepository:
                     .where(token_work_items_table.c.status == row["status"])
                     .where(token_work_items_table.c.pending_sink_name.is_not(None))
                     .where(token_work_items_table.c.lease_owner == expected_lease_owner)
+                    .where(complete_bundle)
                     .values(
                         status=TokenWorkStatus.TERMINAL.value,
                         row_payload_json=scrubbed_row_payload_json(row["token_id"]),
                         lease_owner=None,
                         lease_expires_at=None,
-                        updated_at=now,
+                        updated_at=database_now,
                     )
                 )
                 if result.rowcount == 1:
@@ -505,16 +544,17 @@ class SchedulerDispositionRepository:
                         to_lease_owner=None,
                         from_attempt=row["attempt"],
                         to_attempt=row["attempt"],
-                        recorded_at=now,
+                        recorded_at=database_now,
                         from_lease_expires_at=row["lease_expires_at"],
                         to_lease_expires_at=None,
                         caller_owner=expected_lease_owner,
                     )
                     terminalized += 1
-                elif result.rowcount not in (0, None):
+                else:
                     raise AuditIntegrityError(
                         f"Scheduler pending-sink batch terminalization affected {result.rowcount} rows for "
-                        f"run_id={run_id!r} token_id={row['token_id']!r} work_item_id={row['work_item_id']!r}; expected 0 or 1."
+                        f"run_id={run_id!r} token_id={row['token_id']!r} work_item_id={row['work_item_id']!r}; expected exactly 1 "
+                        "complete owner-matched member. Refusing partial terminalization."
                     )
         return terminalized
 
@@ -522,7 +562,6 @@ class SchedulerDispositionRepository:
         self,
         *,
         run_id: str,
-        now: datetime,
         caller_owner: str,
         coordination_token: CoordinationToken,
     ) -> int:
@@ -547,8 +586,9 @@ class SchedulerDispositionRepository:
             .exists()
         )
         with fenced_write(
-            self._engine, coordination_token=coordination_token, now=now, verb="terminalize_pending_sinks_with_terminal_outcomes"
+            self._engine, coordination_token=coordination_token, verb="terminalize_pending_sinks_with_terminal_outcomes"
         ) as conn:
+            database_now = read_landscape_transaction_time(conn)
             rows = (
                 conn.execute(
                     select(token_work_items_table)
@@ -578,7 +618,7 @@ class SchedulerDispositionRepository:
                         row_payload_json=scrubbed_row_payload_json(row["token_id"]),
                         lease_owner=None,
                         lease_expires_at=None,
-                        updated_at=now,
+                        updated_at=database_now,
                     )
                 )
                 if result.rowcount == 1:
@@ -595,7 +635,7 @@ class SchedulerDispositionRepository:
                         to_lease_owner=None,
                         from_attempt=row["attempt"],
                         to_attempt=row["attempt"],
-                        recorded_at=now,
+                        recorded_at=database_now,
                         from_lease_expires_at=row["lease_expires_at"],
                         to_lease_expires_at=None,
                         caller_owner=caller_owner,
@@ -612,27 +652,25 @@ class SchedulerDispositionRepository:
         self,
         *,
         work_item_id: str,
-        now: datetime,
         status: TokenWorkStatus,
+        image: DispositionImage,
         expected_statuses: tuple[TokenWorkStatus, ...] = (TokenWorkStatus.LEASED,),
         expected_lease_owner: str | None = None,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         fenced_worker_id: str | None = None,
         require_complete_pending_sink_bundle: bool = False,
-        **values: object,
     ) -> TokenWorkItem:
         with begin_write(self._engine) as conn:
             after = self._transition_on(
                 conn,
                 work_item_id=work_item_id,
-                now=now,
                 status=status,
+                image=image,
                 expected_statuses=expected_statuses,
                 expected_lease_owner=expected_lease_owner,
-                branch_loss=branch_loss,
+                group_losses=group_losses,
                 fenced_worker_id=fenced_worker_id,
                 require_complete_pending_sink_bundle=require_complete_pending_sink_bundle,
-                values=values,
             )
         return item_from_mapping(after)
 
@@ -641,13 +679,12 @@ class SchedulerDispositionRepository:
         *,
         work_item_id: str,
         emitted_ready: Sequence[BarrierEmission],
-        now: datetime,
         status: TokenWorkStatus,
+        image: DispositionImage,
         expected_lease_owner: str,
-        branch_loss: BranchLossSpec | None,
+        group_losses: tuple[GroupLossSpec, ...],
         fenced_worker_id: str | None,
         require_complete_pending_sink_bundle: bool = False,
-        **values: object,
     ) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
         if not emitted_ready:
             raise ValueError("atomic child disposition requires at least one READY emission")
@@ -659,20 +696,18 @@ class SchedulerDispositionRepository:
                     parent_work_item_id=work_item_id,
                     run_id=run_id,
                     emission=emission,
-                    now=now,
                 )
                 for emission in emitted_ready
             )
             parent_row = self._transition_on(
                 conn,
                 work_item_id=work_item_id,
-                now=now,
                 status=status,
+                image=image,
                 expected_lease_owner=expected_lease_owner,
-                branch_loss=branch_loss,
+                group_losses=group_losses,
                 fenced_worker_id=fenced_worker_id,
                 require_complete_pending_sink_bundle=require_complete_pending_sink_bundle,
-                values=values,
             )
         return item_from_mapping(parent_row), tuple(item_from_mapping(row) for row in child_rows)
 
@@ -683,7 +718,6 @@ class SchedulerDispositionRepository:
         parent_work_item_id: str,
         run_id: str,
         emission: BarrierEmission,
-        now: datetime,
     ) -> RowMapping:
         """Insert or reconcile one child READY cursor on a caller transaction."""
         if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
@@ -700,6 +734,10 @@ class SchedulerDispositionRepository:
             node_id=emission.node_id,
             coalesce_node_id=emission.coalesce_node_id,
         )
+        # The child becomes available at Landscape database time (ADR-047):
+        # claim_ready admits it against that clock, and its ENQUEUE event is
+        # recorded at the same instant.
+        available_at = read_landscape_transaction_time(conn)
         values = ready_work_item_values(
             run_id=run_id,
             token_id=emission.token_id,
@@ -708,17 +746,17 @@ class SchedulerDispositionRepository:
             step_index=emission.step_index,
             ingest_sequence=emission.ingest_sequence,
             row_payload_json=emission.row_payload_json,
-            available_at=now,
+            available_at=available_at,
             attempt=emission.attempt,
             queue_key=emission.queue_key,
             barrier_key=emission.barrier_key,
             on_success_sink=emission.on_success_sink,
-            branch_name=emission.branch_name,
-            fork_group_id=emission.fork_group_id,
             join_group_id=emission.join_group_id,
-            expand_group_id=emission.expand_group_id,
+            lineage_path=emission.lineage_path,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
+            row_union_name=emission.row_union_name,
+            collector_name=emission.collector_name,
         )
         inserted = insert_work_item_idempotent(
             conn,
@@ -739,7 +777,7 @@ class SchedulerDispositionRepository:
                 to_lease_owner=None,
                 from_attempt=None,
                 to_attempt=emission.attempt,
-                recorded_at=now,
+                recorded_at=available_at,
             )
         return (
             conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == values["work_item_id"]))
@@ -761,16 +799,19 @@ class SchedulerDispositionRepository:
         conn: Connection,
         *,
         work_item_id: str,
-        now: datetime,
         status: TokenWorkStatus,
+        image: DispositionImage,
         expected_statuses: tuple[TokenWorkStatus, ...] = (TokenWorkStatus.LEASED,),
         expected_lease_owner: str | None = None,
-        branch_loss: BranchLossSpec | None = None,
+        group_losses: tuple[GroupLossSpec, ...] = (),
         fenced_worker_id: str | None = None,
         require_complete_pending_sink_bundle: bool = False,
-        values: Mapping[str, object],
     ) -> RowMapping:
-        update_values = {"status": status.value, "updated_at": now, **values}
+        # ADR-047: one database-time read per disposition transaction stamps
+        # updated_at, the hold instant and the event; the lease is always
+        # cleared (a PENDING_SINK park keeps its owner with no deadline), so
+        # no caller value can reach a deadline column.
+        database_now = read_landscape_transaction_time(conn)
         expected_status_values = tuple(candidate.value for candidate in expected_statuses)
         expected_status_text = " or ".join(candidate.name for candidate in expected_statuses)
         predicates = [
@@ -797,7 +838,59 @@ class SchedulerDispositionRepository:
             .mappings()
             .one_or_none()
         )
-        result = conn.execute(update(token_work_items_table).where(and_(*predicates)).values(**update_values))
+        next_lease_owner: str | None
+        if isinstance(image, BlockedImage):
+            # F1: barrier holds are restored from the journal using this
+            # absolute timestamp. Queue-holds (ADR-028) get stamped too —
+            # harmless; nothing reads the column on that arm, and a single
+            # UPDATE shape keeps this verb the column's only writer.
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(and_(*predicates))
+                .values(
+                    status=status.value,
+                    updated_at=database_now,
+                    queue_key=image.queue_key,
+                    barrier_key=image.barrier_key,
+                    barrier_blocked_at=database_now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            )
+            next_lease_owner = None
+        elif isinstance(image, TerminalImage):
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(and_(*predicates))
+                .values(
+                    status=status.value,
+                    updated_at=database_now,
+                    row_payload_json=image.row_payload_json,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            )
+            next_lease_owner = None
+        elif isinstance(image, PendingSinkImage):
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(and_(*predicates))
+                .values(
+                    status=status.value,
+                    updated_at=database_now,
+                    row_payload_json=image.row_payload_json,
+                    pending_sink_name=image.sink_name,
+                    pending_outcome=image.outcome,
+                    pending_path=image.path,
+                    pending_error_hash=image.error_hash,
+                    pending_error_message=image.error_message,
+                    lease_owner=image.lease_owner,
+                    lease_expires_at=None,
+                )
+            )
+            next_lease_owner = image.lease_owner
+        else:
+            raise TypeError(f"disposition image must be BlockedImage, TerminalImage or PendingSinkImage, got {type(image).__name__}")
         if result.rowcount != 1:
             if fenced_worker_id is not None and before is not None:
                 base_predicates_match = (
@@ -855,19 +948,7 @@ class SchedulerDispositionRepository:
                 f"Scheduler transition to {status.name!r} for work_item_id={work_item_id!r} "
                 "updated a row that could not be read before the write; audit transition history cannot be proven."
             )
-        next_lease_owner = update_values["lease_owner"] if "lease_owner" in update_values else before["lease_owner"]
-        next_lease_expires_at = update_values["lease_expires_at"] if "lease_expires_at" in update_values else before["lease_expires_at"]
-        next_attempt = update_values["attempt"] if "attempt" in update_values else before["attempt"]
-        if next_lease_owner is not None and type(next_lease_owner) is not str:
-            raise AuditIntegrityError(
-                f"Scheduler transition to {status.name!r} for work_item_id={work_item_id!r} "
-                f"produced invalid lease_owner type {type(next_lease_owner).__name__}; audit transition history cannot be proven."
-            )
-        if next_lease_expires_at is not None and type(next_lease_expires_at) is not datetime:
-            raise AuditIntegrityError(
-                f"Scheduler transition to {status.name!r} for work_item_id={work_item_id!r} "
-                f"produced invalid lease_expires_at type {type(next_lease_expires_at).__name__}; audit transition history cannot be proven."
-            )
+        next_attempt = before["attempt"]
         if type(next_attempt) is not int:
             raise AuditIntegrityError(
                 f"Scheduler transition to {status.name!r} for work_item_id={work_item_id!r} "
@@ -886,23 +967,19 @@ class SchedulerDispositionRepository:
             to_lease_owner=next_lease_owner,
             from_attempt=before["attempt"],
             to_attempt=next_attempt,
-            recorded_at=now,
+            recorded_at=database_now,
             from_lease_expires_at=before["lease_expires_at"],
-            to_lease_expires_at=next_lease_expires_at,
+            to_lease_expires_at=None,
             caller_owner=expected_lease_owner,
         )
-        if branch_loss is not None:
-            # §E.5 record-then-notify: the durable loss record commits iff
-            # this disposition and every child enqueue commit.
-            record_coalesce_branch_loss(
+        for spec in group_losses:
+            # §E.5 record-then-notify carried: each durable loss record
+            # commits iff this disposition and every child enqueue commit.
+            record_group_loss(
                 conn,
                 run_id=before["run_id"],
-                coalesce_name=branch_loss.coalesce_name,
-                row_id=branch_loss.row_id,
-                branch_name=branch_loss.branch_name,
-                token_id=branch_loss.token_id,
-                reason=branch_loss.reason,
-                recorded_by=branch_loss.recorded_by,
-                now=now,
+                spec=spec,
+                recorded_by=expected_lease_owner if expected_lease_owner is not None else "<unfenced>",
+                now=database_now,
             )
         return after

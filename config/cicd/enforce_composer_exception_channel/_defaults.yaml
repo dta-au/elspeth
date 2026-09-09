@@ -2,7 +2,7 @@
 # Entries here are explicit exemptions — each MUST include a non-empty
 # justification field (enforced by the lint rule; missing/empty justification
 # fails the build). Entries are seeded from Task 1.5's audit artifact at
-# docs/superpowers/plans/2026-04-17-composer-tool-argument-error.audit.md.
+# docs/plans/2026-04-17-composer-tool-argument-error.audit.md.
 # After Tasks 2 and 3, the "Convert" rows are gone; only "Internal invariant"
 # rows from the audit remain here.
 #

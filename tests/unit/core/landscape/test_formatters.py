@@ -766,6 +766,8 @@ class TestLineageTextFormatter:
             Call,
             CallStatus,
             CallType,
+            FrameKind,
+            LineageFrame,
             NodeStateCompleted,
             NodeStateStatus,
             RoutingEvent,
@@ -788,7 +790,7 @@ class TestLineageTextFormatter:
                 row_id="row-456",
                 created_at=now,
                 run_id="run-001",
-                branch_name="review-path",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-formatters-test", member_key="review-path"),),
             ),
             source_row=RowLineage(
                 row_id="row-456",
@@ -840,6 +842,7 @@ class TestLineageTextFormatter:
             ),
             scheduler_events=(
                 SchedulerEvent(
+                    seq=1,
                     event_id="sched-1",
                     run_id="run-001",
                     token_id="tok-child",

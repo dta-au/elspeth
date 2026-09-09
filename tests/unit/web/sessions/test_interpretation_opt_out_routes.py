@@ -25,19 +25,23 @@ Fixture model: shared ``test_client`` from ``tests/unit/web/conftest.py``.
 from __future__ import annotations
 
 import pathlib
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.sessions.models import (
     interpretation_events_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.telemetry import observed_value
+from tests.helpers.tree_gate import iter_gate_sources
 from tests.unit.web.conftest import _make_session
 
 # Phase 8 Sub-task 7e (Q7 content-probe skip). Gates the route-level
@@ -49,7 +53,7 @@ from tests.unit.web.conftest import _make_session
 # ``auto_interpreted_opt_out`` is a string-literal column value in an
 # audit row, not an exported identifier.
 _WEB_ROOT = pathlib.Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web"
-_PHASE_5B_OPT_OUT_PRESENT = any("auto_interpreted_opt_out" in p.read_text() for p in _WEB_ROOT.rglob("*.py") if p.is_file())
+_PHASE_5B_OPT_OUT_PRESENT = any("auto_interpreted_opt_out" in parsed.source for parsed in iter_gate_sources(_WEB_ROOT))
 
 
 async def _post(test_client: TestClient, url: str) -> Response:
@@ -67,6 +71,19 @@ def _seed_session(test_client: TestClient, *, user_id: str = "alice") -> UUID:
     sid = uuid4()
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(sid), user_id=user_id)
+        created_at = datetime.now(UTC)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(sid),
+                operation_id=f"create-{sid}",
+                lease_token=f"create-token-{sid}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id="interpretation-opt-out-route-test",
+                operation_epoch=1,
+                lease_expires_at=created_at,
+                released_at=created_at,
+            )
+        )
     return sid
 
 

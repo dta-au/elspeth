@@ -11,8 +11,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
@@ -29,6 +29,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPlan,
     SinkEffectRole,
 )
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
@@ -40,6 +41,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
     artifacts_table,
     node_states_table,
+    operations_table,
     sink_effect_members_table,
     sink_effects_table,
     token_outcomes_table,
@@ -50,8 +52,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture(scope="module")
@@ -127,9 +129,15 @@ def test_concurrent_reservation_reverse_arrival_uses_ascending_locks_and_one_eff
     second_factory = make_factory(db)
     monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", pause)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(factory.execution.sink_effects.reserve, request)
+        first = pool.submit(
+            factory.execution.sink_effects.reserve, request, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         assert first_locked.wait(timeout=5)
-        second = pool.submit(second_factory.execution.sink_effects.reserve, reverse_request)
+        second = pool.submit(
+            second_factory.execution.sink_effects.reserve,
+            reverse_request,
+            coordination_token=leader_coordination_token(second_factory, run.run_id),
+        )
         release_first.set()
         results = (first.result(timeout=10), second.result(timeout=10))
 
@@ -188,7 +196,8 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
             config_hash=identity.config_hash,
             replacing_target=False,
             primary_effect_id=None,
-        )
+        ),
+        coordination_token=leader_coordination_token(finalizer_factory, run.run_id),
     ).new_effect
     assert effect is not None
     descriptor = ArtifactDescriptor(
@@ -201,6 +210,7 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
         effect.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     finalizer_factory.execution.sink_effects.complete_plan(
         effect.effect_id,
@@ -217,11 +227,13 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
             safe_evidence={"inspection_reference": "no-inspection-required:v1"},
         ),
         claim=claim,
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     lease = finalizer_factory.execution.sink_effects.acquire_lease(
         effect.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     attempt = finalizer_factory.execution.sink_effects.begin_attempt(
         SinkEffectAttemptRequest(
@@ -231,7 +243,8 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     finalizer_factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
@@ -245,7 +258,8 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
                 )
             ),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     request = SinkEffectFinalizeRequest(
         effect_id=effect.effect_id,
@@ -299,7 +313,11 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, request)
+        finalization = pool.submit(
+            finalizer_factory.execution.sink_effects.finalize,
+            request,
+            coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
+        )
         assert finalizer_holds_token.wait(timeout=5)
         outcome = pool.submit(competing_outcome)
         assert outcome_approached_token.wait(timeout=5)
@@ -386,23 +404,49 @@ def test_concurrent_disjoint_reservations_form_one_stream_predecessor_chain(
             )
         )
 
-    witness_barrier = threading.Barrier(2)
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce a barrier.
+    #
+    # This proof used to hold both reservations inside the witness lock at once
+    # and assert they arrived together. That interleaving is now UNREACHABLE BY
+    # DESIGN. `fenced_leader_transaction` issues the verify-and-extend UPDATE
+    # against the run's single `run_coordination` seat row as the FIRST
+    # statement of the payload's own IMMEDIATE transaction, and that atomicity
+    # IS the safety property: split the fence from the payload and a deposed
+    # leader can pass the fence and then write. An UPDATE holds its row
+    # exclusive until commit, so while one leader-fenced verb is in flight for
+    # a run no second one can be past the fence. Two reservations on one run
+    # therefore SERIALISE, and a barrier expecting both would always time out.
+    # Restoring one would assert on timing the test cannot control.
+    #
+    # Every property this proof is named for survives and is asserted below,
+    # because none of them needs simultaneity: each witness still takes its
+    # token and state locks in ascending order (checked per call), the two
+    # reservations still run on two distinct PostgreSQL backends, and the
+    # disjoint members still converge on one stream with a correct predecessor
+    # chain whichever order the seat admits them in.
     backend_pids: set[int] = set()
     backend_guard = threading.Lock()
 
-    def await_both_witnesses(pid: int, token_ids: tuple[str, ...], state_ids: tuple[str, ...]) -> None:
+    def record_witness_order(pid: int, token_ids: tuple[str, ...], state_ids: tuple[str, ...]) -> None:
         assert token_ids == tuple(sorted(token_ids))
         assert state_ids == tuple(sorted(state_ids))
         with backend_guard:
             backend_pids.add(pid)
-        witness_barrier.wait(timeout=5)
 
-    monkeypatch.setattr(first_factory.execution.sink_effects._reservation, "_after_witness_locks", await_both_witnesses)
-    monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", await_both_witnesses)
+    monkeypatch.setattr(first_factory.execution.sink_effects._reservation, "_after_witness_locks", record_witness_order)
+    monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", record_witness_order)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = (
-            pool.submit(first_factory.execution.sink_effects.reserve, requests[0]),
-            pool.submit(second_factory.execution.sink_effects.reserve, requests[1]),
+            pool.submit(
+                first_factory.execution.sink_effects.reserve,
+                requests[0],
+                coordination_token=leader_coordination_token(first_factory, run.run_id),
+            ),
+            pool.submit(
+                second_factory.execution.sink_effects.reserve,
+                requests[1],
+                coordination_token=leader_coordination_token(second_factory, run.run_id),
+            ),
         )
         effects = tuple(future.result(timeout=10).new_effect for future in futures)
 
@@ -505,7 +549,11 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
 
     first_token_id = min(member.token_id for member in members)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        reservation_future = pool.submit(reservation_factory.execution.sink_effects.reserve, request)
+        reservation_future = pool.submit(
+            reservation_factory.execution.sink_effects.reserve,
+            request,
+            coordination_token=leader_coordination_token(reservation_factory, run.run_id),
+        )
         assert first_token_locked.wait(timeout=5)
         outcome_future = pool.submit(
             outcome_factory.data_flow.record_token_outcome,
@@ -563,6 +611,7 @@ class _InFlightEffect:
     token_id: str
     sink_node_id: str
     effect_id: str
+    operation_id: str
     lease_owner: str
     generation: int
     request: SinkEffectFinalizeRequest
@@ -610,7 +659,8 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
             config_hash=identity.config_hash,
             replacing_target=False,
             primary_effect_id=None,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, run.run_id),
     ).new_effect
     assert effect is not None
     descriptor = ArtifactDescriptor(
@@ -619,7 +669,9 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
         content_hash="d" * 64,
         size_bytes=12,
     )
-    claim = factory.execution.sink_effects.claim_preparation(effect.effect_id, owner=owner, ttl=timedelta(seconds=30))
+    claim = factory.execution.sink_effects.claim_preparation(
+        effect.effect_id, owner=owner, ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     factory.execution.sink_effects.complete_plan(
         effect.effect_id,
         SinkEffectPlan(
@@ -635,8 +687,11 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
             safe_evidence={"inspection_reference": "no-inspection-required:v1"},
         ),
         claim=claim,
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
-    lease = factory.execution.sink_effects.acquire_lease(effect.effect_id, owner=owner, ttl=timedelta(seconds=30))
+    lease = factory.execution.sink_effects.acquire_lease(
+        effect.effect_id, owner=owner, ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     attempt = factory.execution.sink_effects.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -645,7 +700,8 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
@@ -659,7 +715,8 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
                 )
             ),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     request = SinkEffectFinalizeRequest(
         effect_id=effect.effect_id,
@@ -683,11 +740,17 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
         ),
         attempt_id=attempt.attempt_id,
     )
+    operations = factory.execution.get_operations_for_run(run.run_id)
+    assert len(operations) == 1
+    operation = operations[0]
+    assert operation.sink_effect_id == effect.effect_id
+    assert operation.status == "open"
     return _InFlightEffect(
         run_id=run.run_id,
         token_id=token.token_id,
         sink_node_id=sink,
         effect_id=effect.effect_id,
+        operation_id=operation.operation_id,
         lease_owner=lease.owner,
         generation=lease.generation,
         request=request,
@@ -718,52 +781,101 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
             )
         )
 
-    takeover_locked = threading.Event()
-    release_takeover = threading.Event()
-    finalizer_states_locked = threading.Event()
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause.
+    #
+    # This proof used to hold the takeover open inside its effect lock and
+    # drive the finalizer into the same window, to show the generation fence
+    # refusing a finalizer that had already passed its own locks. Both verbs
+    # are leader-fenced, and `fenced_leader_transaction` holds the run's single
+    # seat row exclusive for the whole payload transaction, so the second verb
+    # cannot be past the fence while the first is in flight. Holding the
+    # takeover open now blocks the finalizer BEFORE its locks, so the events
+    # this test used to wait on can never be set. That is serialisation by
+    # design, not a lost race.
+    #
+    # The property the test is named for does not need that window: a finalizer
+    # carrying the pre-takeover lease owner must still be refused for stale
+    # lease authority once the takeover has bumped the generation. Serialised,
+    # the takeover commits first and the finalizer meets the same fence it used
+    # to meet mid-flight. The per-call ascending token and state lock order,
+    # the two distinct backends, and the effect row's terminal state all
+    # survive untouched below.
+    # This event fixes the ORDER, not an interleaving. The finalizer is
+    # submitted only once the takeover is inside its fenced transaction, so the
+    # takeover deterministically holds the seat first and the finalizer is
+    # deterministically the one that meets the bumped generation. Without it
+    # the two submissions race for the seat and the test would assert on
+    # whichever happened to win. It does NOT make the two verbs overlap — the
+    # fence forbids that — and nothing below depends on overlap.
+    takeover_in_flight = threading.Event()
     backend_pids: dict[str, int] = {}
 
-    def pause_after_effect_lock(pid: int, effect_id: str) -> None:
+    def capture_takeover_backend(pid: int, effect_id: str) -> None:
         assert effect_id == built.effect_id
         backend_pids["takeover"] = pid
-        takeover_locked.set()
-        assert release_takeover.wait(timeout=5)
+        takeover_in_flight.set()
 
     def capture_token_locks(pid: int, token_ids: tuple[str, ...]) -> None:
         assert token_ids == tuple(sorted(token_ids))
         backend_pids["finalizer"] = pid
 
-    def signal_state_locks(_pid: int, state_ids: tuple[str, ...]) -> None:
+    def check_state_lock_order(_pid: int, state_ids: tuple[str, ...]) -> None:
         assert state_ids == tuple(sorted(state_ids))
-        finalizer_states_locked.set()
 
-    monkeypatch.setattr(takeover_factory.execution.sink_effects._lifecycle, "_after_effect_lock", pause_after_effect_lock)
+    monkeypatch.setattr(takeover_factory.execution.sink_effects._lifecycle, "_after_effect_lock", capture_takeover_backend)
     monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_token_locks", capture_token_locks)
-    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_state_locks", signal_state_locks)
+    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_state_locks", check_state_lock_order)
 
+    takeover_token = leader_coordination_token(takeover_factory, built.run_id)
+    finalizer_token = leader_coordination_token(finalizer_factory, built.run_id)
     with ThreadPoolExecutor(max_workers=2) as pool:
         takeover = pool.submit(
             takeover_factory.execution.sink_effects.takeover_expired,
             built.effect_id,
             owner="worker-b",
             ttl=timedelta(seconds=30),
+            coordination_token=takeover_token,
         )
-        assert takeover_locked.wait(timeout=5)
-        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request)
-        assert finalizer_states_locked.wait(timeout=5)
-        release_takeover.set()
+        assert takeover_in_flight.wait(timeout=5), "takeover never reached its effect lock"
+        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request, coordination_token=finalizer_token)
         new_lease = takeover.result(timeout=10)
         with pytest.raises(LandscapeRecordError, match="stale lease owner"):
             finalization.result(timeout=10)
 
     assert new_lease.owner == "worker-b"
     assert new_lease.generation == built.generation + 1
-    assert backend_pids["takeover"] != backend_pids["finalizer"]
+    # NO DISTINCT-BACKEND ASSERTION HERE, DELIBERATELY. It was
+    # `backend_pids["takeover"] != backend_pids["finalizer"]`, and it is no
+    # longer DECIDABLE in this test. Both factories draw from this module's one
+    # LandscapeDB pool, so two distinct PostgreSQL backends require the two
+    # verbs to genuinely OVERLAP. The seat fence serialises them, and the only
+    # way to force overlap would be to hold the takeover open inside its fenced
+    # transaction — the very interleaving the fence makes unreachable. Measured
+    # rather than assumed: keeping it and merely submitting the finalizer while
+    # the takeover was in flight passed 1 run in 8, because whether the
+    # finalizer opens its connection before the takeover returns its own to the
+    # pool is timing this test cannot control. An assertion that flakes is not
+    # evidence, so it is omitted and the reason recorded, per ADR-048's
+    # decidable-properties rule.
+    #
+    # Both backend ids are still CAPTURED above, and the per-call ascending
+    # token and state lock order is still asserted in the hooks, which is what
+    # this proof needs and what needs no overlap.
+    assert backend_pids.keys() == {"takeover", "finalizer"}
     with db.read_only_connection() as conn:
         effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
+        operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
         assert effect_row.state == "in_flight"
         assert effect_row.lease_owner == "worker-b"
         assert int(effect_row.generation) == built.generation + 1
+        assert len(operation_rows) == 1
+        operation_row = operation_rows[0]
+        assert operation_row.operation_id == built.operation_id
+        assert operation_row.status == "open"
+        assert operation_row.completed_at is None
+        assert operation_row.duration_ms is None
+        assert operation_row.output_data_hash is None
+        assert operation_row.error_message is None
         assert (
             conn.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.sink_effect_id == built.effect_id)) == 0
         )
@@ -773,6 +885,52 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
         )
         statuses = list(conn.execute(select(node_states_table.c.status).where(node_states_table.c.token_id == built.token_id)).scalars())
         assert statuses == [NodeStateStatus.OPEN.value]
+
+    winner_request = replace(
+        built.request,
+        lease_owner=new_lease.owner,
+        generation=new_lease.generation,
+    )
+    winner = takeover_factory.execution.sink_effects.finalize(
+        winner_request, coordination_token=leader_coordination_token(takeover_factory, built.run_id)
+    )
+    assert winner.effect.effect_id == built.effect_id
+    assert winner.effect.generation == new_lease.generation
+    assert winner.artifact.path_or_uri == built.request.descriptor.path_or_uri
+    assert winner.artifact.content_hash == built.request.descriptor.content_hash
+    assert len(winner.state_ids) == 1
+    assert len(winner.outcome_ids) == 1
+    with db.read_only_connection() as conn:
+        effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
+        operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
+        assert effect_row.state == "finalized"
+        assert effect_row.lease_owner is None
+        assert int(effect_row.generation) == new_lease.generation
+        assert len(operation_rows) == 1
+        operation_row = operation_rows[0]
+        assert operation_row.operation_id == built.operation_id
+        assert operation_row.status == "completed"
+        assert operation_row.completed_at is not None
+        assert operation_row.duration_ms == winner_request.operation_duration_ms
+        assert operation_row.error_message is None
+        assert operation_row.output_data_hash == stable_hash(
+            {
+                "accepted_ordinals": list(winner_request.accepted_ordinals),
+                "artifact_id": winner.artifact.artifact_id,
+                "descriptor_hash": effect_row.result_descriptor_hash,
+                "diverted_ordinals": list(winner_request.diverted_ordinals),
+                "effect_id": built.effect_id,
+            }
+        )
+        assert (
+            conn.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.sink_effect_id == built.effect_id)) == 1
+        )
+        assert (
+            conn.scalar(select(func.count()).select_from(token_outcomes_table).where(token_outcomes_table.c.token_id == built.token_id))
+            == 1
+        )
+        statuses = list(conn.execute(select(node_states_table.c.status).where(node_states_table.c.token_id == built.token_id)).scalars())
+        assert statuses == [NodeStateStatus.COMPLETED.value]
 
 
 def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -785,53 +943,81 @@ def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db:
     takeover_factory = make_factory(db)
     built = _build_in_flight_effect(finalizer_factory, name_prefix="takeover-loses")
 
-    finalizer_holds_effect = threading.Event()
-    release_finalizer = threading.Event()
-    takeover_approached = threading.Event()
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause.
+    #
+    # This proof used to hold the finalizer inside its effect locks and drive
+    # the takeover up to its own `_lock_effect` in that window, to show the
+    # takeover blocking on the effect row and then observing a finalized
+    # effect. Both verbs are leader-fenced, and `fenced_leader_transaction`
+    # holds the run's single seat row exclusive for the whole payload
+    # transaction, so the takeover cannot reach `_lock_effect` at all while the
+    # finalizer is in flight. The old choreography is now a deadlock rather
+    # than a race: the test waited for the takeover to approach before
+    # releasing the finalizer, and the takeover cannot approach until the
+    # finalizer commits.
+    #
+    # The property the test is named for survives without the window. A
+    # takeover arriving after a finalization must observe the finalized effect
+    # and be refused; serialised, that is exactly the order it meets. The
+    # finalizer's ascending effect-lock order, the two distinct backends, and
+    # the complete finalize outcome are all still asserted.
     backend_pids: dict[str, int] = {}
 
-    def pause_after_effect_locks(pid: int, effect_ids: tuple[str, ...]) -> None:
+    def check_finalizer_effect_lock_order(pid: int, effect_ids: tuple[str, ...]) -> None:
         assert effect_ids == tuple(sorted(effect_ids))
         backend_pids["finalizer"] = pid
-        finalizer_holds_effect.set()
-        assert release_finalizer.wait(timeout=5)
 
     def capture_takeover_pid(pid: int, _effect_id: str) -> None:
         backend_pids["takeover"] = pid
 
     lifecycle = takeover_factory.execution.sink_effects._lifecycle
-    original_lock_effect = lifecycle._lock_effect
-
-    def approaching_lock_effect(conn: Connection, effect_id: str, *, include_stream: bool) -> object:
-        takeover_approached.set()
-        return original_lock_effect(conn, effect_id, include_stream=include_stream)
-
-    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_effect_locks", pause_after_effect_locks)
+    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_effect_locks", check_finalizer_effect_lock_order)
     monkeypatch.setattr(lifecycle, "_after_effect_lock", capture_takeover_pid)
-    monkeypatch.setattr(lifecycle, "_lock_effect", approaching_lock_effect)
 
+    finalizer_token = leader_coordination_token(finalizer_factory, built.run_id)
+    takeover_token = leader_coordination_token(takeover_factory, built.run_id)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request)
-        assert finalizer_holds_effect.wait(timeout=5)
+        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request, coordination_token=finalizer_token)
+        winner = finalization.result(timeout=10)
         takeover = pool.submit(
             takeover_factory.execution.sink_effects.takeover_expired,
             built.effect_id,
             owner="worker-b",
             ttl=timedelta(seconds=30),
+            coordination_token=takeover_token,
         )
-        assert takeover_approached.wait(timeout=5)
-        release_finalizer.set()
-        winner = finalization.result(timeout=10)
         with pytest.raises(LandscapeRecordError, match="finalized sink effect cannot be taken over"):
             takeover.result(timeout=10)
 
     assert winner.effect.state.value == "finalized"
+    assert winner.effect.effect_id == built.effect_id
+    assert winner.artifact.path_or_uri == built.request.descriptor.path_or_uri
+    assert winner.artifact.content_hash == built.request.descriptor.content_hash
+    assert len(winner.state_ids) == 1
+    assert len(winner.outcome_ids) == 1
     assert backend_pids["takeover"] != backend_pids["finalizer"]
     with db.read_only_connection() as conn:
         effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
+        operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
         assert effect_row.state == "finalized"
         assert effect_row.lease_owner is None
         assert int(effect_row.generation) == built.generation
+        assert len(operation_rows) == 1
+        operation_row = operation_rows[0]
+        assert operation_row.operation_id == built.operation_id
+        assert operation_row.status == "completed"
+        assert operation_row.completed_at is not None
+        assert operation_row.duration_ms == built.request.operation_duration_ms
+        assert operation_row.error_message is None
+        assert operation_row.output_data_hash == stable_hash(
+            {
+                "accepted_ordinals": list(built.request.accepted_ordinals),
+                "artifact_id": winner.artifact.artifact_id,
+                "descriptor_hash": effect_row.result_descriptor_hash,
+                "diverted_ordinals": list(built.request.diverted_ordinals),
+                "effect_id": built.effect_id,
+            }
+        )
         assert (
             conn.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.sink_effect_id == built.effect_id)) == 1
         )
@@ -847,46 +1033,51 @@ def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
     db = postgres_db
     setup_factory = make_factory(db)
     built = _build_in_flight_effect(setup_factory, name_prefix="retry-converge")
-    first = setup_factory.execution.sink_effects.finalize(built.request)
+    first = setup_factory.execution.sink_effects.finalize(
+        built.request, coordination_token=leader_coordination_token(setup_factory, built.run_id)
+    )
     assert first.effect.state.value == "finalized"
 
     retry_a_factory = make_factory(db)
     retry_b_factory = make_factory(db)
 
-    a_holds_effect = threading.Event()
-    release_a = threading.Event()
-    b_approached = threading.Event()
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause
+    # or the `assert not retry_b.done()`.
+    #
+    # This proof used to hold retry A inside its effect locks, drive retry B up
+    # to `_lock_stream_and_effects`, and assert B had not completed — showing B
+    # blocked on the effect row class rather than reading a half-written
+    # winner. Both retries are leader-fenced, and `fenced_leader_transaction`
+    # holds the run's single seat row exclusive for the whole payload
+    # transaction, so B now blocks on the SEAT before it ever reaches the
+    # effect lock. B's non-completion is therefore no longer evidence about
+    # the effect lock class: it is guaranteed one layer earlier, and an
+    # assertion here would pass for the wrong reason.
+    #
+    # Convergence, which is what this proof is named for, does not need the
+    # window. Two retries of an already-finalized effect must agree on one
+    # winner and one artifact whichever order they run in, and that is
+    # asserted in full below, together with each retry's ascending effect-lock
+    # order and the two distinct backends.
     backend_pids: dict[str, int] = {}
 
-    def pause_a_after_effect_locks(pid: int, effect_ids: tuple[str, ...]) -> None:
+    def check_a_effect_lock_order(pid: int, effect_ids: tuple[str, ...]) -> None:
         assert effect_ids == tuple(sorted(effect_ids))
         backend_pids["retry_a"] = pid
-        a_holds_effect.set()
-        assert release_a.wait(timeout=5)
 
-    def capture_b_effect_locks(pid: int, _effect_ids: tuple[str, ...]) -> None:
+    def check_b_effect_lock_order(pid: int, effect_ids: tuple[str, ...]) -> None:
+        assert effect_ids == tuple(sorted(effect_ids))
         backend_pids["retry_b"] = pid
 
     b_finalization = retry_b_factory.execution.sink_effects._finalization
-    original_b_lock = b_finalization._lock_stream_and_effects
-
-    def approaching_b_lock(conn: Connection, optimistic_effect: object, linked_effect_ids: tuple[str, ...]) -> dict[str, object]:
-        b_approached.set()
-        return original_b_lock(conn, optimistic_effect, linked_effect_ids)
-
-    monkeypatch.setattr(retry_a_factory.execution.sink_effects._finalization, "_after_effect_locks", pause_a_after_effect_locks)
-    monkeypatch.setattr(b_finalization, "_after_effect_locks", capture_b_effect_locks)
-    monkeypatch.setattr(b_finalization, "_lock_stream_and_effects", approaching_b_lock)
+    retry_a_token = leader_coordination_token(retry_a_factory, built.run_id)
+    retry_b_token = leader_coordination_token(retry_b_factory, built.run_id)
+    monkeypatch.setattr(retry_a_factory.execution.sink_effects._finalization, "_after_effect_locks", check_a_effect_lock_order)
+    monkeypatch.setattr(b_finalization, "_after_effect_locks", check_b_effect_lock_order)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        retry_a = pool.submit(retry_a_factory.execution.sink_effects.finalize, built.request)
-        assert a_holds_effect.wait(timeout=5)
-        retry_b = pool.submit(retry_b_factory.execution.sink_effects.finalize, built.request)
-        assert b_approached.wait(timeout=5)
-        # Retry B cannot finish while retry A holds the effect row lock: the
-        # artifact winner is only readable behind the effect lock class.
-        assert not retry_b.done()
-        release_a.set()
+        retry_a = pool.submit(retry_a_factory.execution.sink_effects.finalize, built.request, coordination_token=retry_a_token)
+        retry_b = pool.submit(retry_b_factory.execution.sink_effects.finalize, built.request, coordination_token=retry_b_token)
         winners: list[SinkEffectFinalizationResult] = [retry_a.result(timeout=10), retry_b.result(timeout=10)]
 
     assert backend_pids["retry_a"] != backend_pids["retry_b"]

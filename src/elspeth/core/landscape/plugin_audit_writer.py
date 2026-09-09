@@ -24,6 +24,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 
 if TYPE_CHECKING:
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.schema_contract import PipelineRow
 
 
@@ -33,7 +34,9 @@ class PluginAuditWriterAdapter:
     Each method delegates to the correct repository. This is a thin adapter
     with no logic of its own.
 
-    Method-count budget: Do not exceed 20 methods.
+    Method-count ratchet: the public method count is pinned exactly by the
+    ``contract_invariants.adapter_method_budget`` elspeth-lints rule — growth
+    fails CI, and removals must lower the ratchet there to lock them in.
     """
 
     def __init__(
@@ -205,19 +208,19 @@ class PluginAuditWriterAdapter:
 
     def record_readiness_check(
         self,
-        run_id: str,
         *,
         name: str,
         collection: str,
         reachable: bool,
         count: int | None,
         message: str,
+        coordination_token: CoordinationToken,
     ) -> None:
         self._run_lifecycle.record_readiness_check(
-            run_id,
             name=name,
             collection=collection,
             reachable=reachable,
             count=count,
             message=message,
+            coordination_token=coordination_token,
         )

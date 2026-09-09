@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-18
 **Status:** Accepted
-**Deciders:** ELSPETH maintainers
+**Deciders:** ELSPETH maintainer
 **Tags:** audit-readiness, trust-tier, boundary-classification, supersedes-trust.py
 
 ## Context
@@ -57,7 +57,7 @@ local file or a remote service.** The csv/json sink exclusion is gone.
 
 The widening was deliberate but the rationale lived only in inline
 comments inside `boundary_expectations.py`. A compliance-focused
-reviewer (the Linda persona in `project_composer_personas`) now sees
+compliance-focused reviewer now sees
 every local CSV write annotated as "crosses an external boundary" and
 has no discoverable record of why that classification was chosen over
 the prior, narrower one. Without an ADR, the next maintainer asking

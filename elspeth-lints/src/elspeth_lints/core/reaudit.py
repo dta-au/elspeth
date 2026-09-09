@@ -53,6 +53,7 @@ from elspeth_lints.core.allowlist import (
     load_allowlist,
     verify_entry_binding_against_finding,
 )
+from elspeth_lints.core.allowlist_similarity import find_similar_allowlist_entries
 from elspeth_lints.core.judge import (
     TRANSPORT_OPENROUTER,
     AgentToolScope,
@@ -512,6 +513,14 @@ def _aggregate_cached_prompt_tokens(outcomes: Sequence[ReauditOutcome]) -> int |
 # * ``meta.no-new-bespoke-cicd-enforcer`` is a project-policy gate, not
 #   a code-pattern lint. It does not emit per-site findings with the
 #   key shape reaudit can dispatch against.
+# * ``masquerade.attribute-probes`` suppresses via its own per-site
+#   classification ledger (``config/cicd/masquerade_baseline.yaml``,
+#   loaded by ``elspeth_lints.rules.masquerade.baseline``), not the
+#   standard ``AllowlistEntry``/``load_allowlist`` shape this module
+#   re-judges. It has no sub-rule vocabulary (one rule id, ``getattr``/
+#   ``hasattr``/``getattr_static``/``dunder_getattr`` site kinds, not
+#   R-numbered sub-findings) and carries no judge-gated allow_hits for
+#   reaudit to re-verify.
 #
 # Adding a new rule package: ensure its YAML files use ``entries:`` (not
 # a private legacy format) and that ``Rule.analyze`` produces findings
@@ -522,6 +531,7 @@ _EXCLUDED_FROM_REAUDIT: frozenset[str] = frozenset(
     {
         "audit_evidence.nominal_base",
         "meta.no-new-bespoke-cicd-enforcer",
+        "masquerade.attribute-probes",
     }
 )
 
@@ -606,6 +616,10 @@ _RULE_VOCABULARY_REGISTRY: dict[str, _VocabularySpec] = {
     ),
     "contract_invariants.validation_theatre": _VocabularySpec(
         "elspeth_lints.rules.contract_invariants.validation_theatre.rule",
+        ("RULE_ID",),
+    ),
+    "contract_invariants.adapter_method_budget": _VocabularySpec(
+        "elspeth_lints.rules.contract_invariants.adapter_method_budget.rule",
         ("RULE_ID",),
     ),
     "audit_evidence.guard_symmetry": _VocabularySpec(
@@ -696,7 +710,7 @@ def reaudit_entries(
     1. ``rule_filter`` — entries whose key encodes a rule outside the
        supported scanner are silently skipped (defensive at boundary
        since the YAML may carry entries from other rule packages once
-       wardline-style multi-rule allowlists land).
+       multi-rule allowlists land).
     2. ``include_pre_judge`` — entries with ``judge_verdict is None``
        are skipped unless this flag is set. Default off because the
        pre-judge corpus is ~700 entries and routine sweeps target the
@@ -819,6 +833,7 @@ def reaudit_entries(
         try:
             outcome = _reaudit_one_entry(
                 entry=entry,
+                allowlist_entries=allowlist.entries,
                 root=root,
                 rule_filter=rule_filter,
                 findings_cache=findings_cache,
@@ -918,6 +933,7 @@ def _entry_matches_rule_filter(entry: AllowlistEntry, valid_rule_ids: frozenset[
 def _reaudit_one_entry(
     *,
     entry: AllowlistEntry,
+    allowlist_entries: Sequence[AllowlistEntry],
     root: Path,
     rule_filter: str,
     findings_cache: dict[str, list[Any]],
@@ -1056,8 +1072,8 @@ def _reaudit_one_entry(
     # record-and-continue handling as ENTRY_OBSOLETE — rather than aborting the
     # whole sweep on the first drifted entry. The cryptographic anti-forgery
     # gate remains HMAC-at-load in CI; this is benign development drift, not the
-    # forgery surface. ``getattr(..., "scope_fingerprint", "")`` is the
-    # sanctioned cross-protocol bridge (v1 findings predate the field); the
+    # forgery surface. The shared Finding contract carries an empty default for
+    # v1 findings that predate the field; the
     # verifier rejects an empty value for a v2 entry, which is the right crash —
     # but that crash is captured here as drift, not propagated.
     try:
@@ -1065,7 +1081,7 @@ def _reaudit_one_entry(
             entry,
             file_path=matching_finding.file_path,
             ast_path=matching_finding.ast_path,
-            scope_fingerprint=getattr(matching_finding, "scope_fingerprint", ""),
+            scope_fingerprint=matching_finding.scope_fingerprint,
         )
     except ValueError as exc:
         return ReauditOutcome(
@@ -1094,6 +1110,15 @@ def _reaudit_one_entry(
     surrounding_code = safe_excerpt.text
     symbol_for_request = ".".join(symbol_part) if symbol_part else "_module_"
 
+    # Duplicate-rationale evidence, same derivation as the justify CLI and
+    # stage_preview (elspeth-0502deb48c): the re-judge should see the same
+    # copy/paste-drift signal the original signing judge saw, excluding the
+    # entry under re-audit itself.
+    rationale_duplicate_count, similar_entries = find_similar_allowlist_entries(
+        allowlist_entries,
+        rationale=entry.reason,
+        exclude_key=entry.key,
+    )
     request = JudgeRequest(
         file_path=file_path,
         rule_id=rule_id,
@@ -1102,6 +1127,8 @@ def _reaudit_one_entry(
         fingerprint=fingerprint,
         rationale=entry.reason,
         surrounding_code=surrounding_code,
+        rationale_duplicate_count=rationale_duplicate_count,
+        similar_entries=similar_entries,
     )
     # Per-entry judge-boundary isolation (closes elspeth-9a4e54cc01 /
     # C3-2). The judge call is a Tier-3 external boundary: a transient

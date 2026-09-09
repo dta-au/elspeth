@@ -26,25 +26,33 @@
 
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+import { TUTORIAL_TRANSFORMS_PROMPT } from "@/components/tutorial/tutorialMachine";
+
 const tutorialSession = {
-  id: "session-tutorial",
+  id: "11111111-1111-4111-8111-111111111111",
   title: "New session",
   created_at: "2026-05-19T12:00:00Z",
   updated_at: "2026-05-19T12:00:00Z",
 };
 
 const graduationSession = {
-  id: "session-graduation",
+  id: "22222222-2222-4222-8222-222222222222",
   title: "New session",
   created_at: "2026-05-19T12:10:00Z",
   updated_at: "2026-05-19T12:10:00Z",
 };
 
+const SOURCE_ID = "00000000-0000-4000-8000-000000000010";
+const SCRAPE_ID = "00000000-0000-4000-8000-000000000020";
+const RATE_ID = "00000000-0000-4000-8000-000000000030";
+const OUTPUT_ID = "00000000-0000-4000-8000-000000000040";
+
 // Composition state the guided respond/state endpoints return. The canonical
 // tutorial pipeline is web_scrape → llm (rate) → jsonl, the shape that triggers
 // the prompt-injection shield advisory at the wire stage.
 const compositionState = {
-  id: "state-1",
+  id: "00000000-0000-4000-8000-000000000001",
+  session_id: tutorialSession.id,
   version: 1,
   sources: {
     source: {
@@ -52,6 +60,8 @@ const compositionState = {
       options: {
         rows: [{ url: "dta.gov.au" }, { url: "data.gov.au" }],
       },
+      on_success: "scrape",
+      on_validation_failure: "discard",
     },
   },
   nodes: [
@@ -75,8 +85,23 @@ const compositionState = {
     },
   ],
   edges: [],
-  outputs: [{ name: "ratings", plugin: "jsonl", options: {} }],
+  outputs: [
+    {
+      name: "ratings",
+      plugin: "jsonl",
+      options: {},
+      on_write_failure: "discard",
+    },
+  ],
   metadata: { name: null, description: null },
+  is_valid: true,
+  validation_errors: [],
+  validation_warnings: [],
+  validation_suggestions: [],
+  derived_from_state_id: null,
+  created_at: "2026-05-19T12:00:00Z",
+  composer_meta: null,
+  plugin_policy_findings: [],
 };
 
 interface GuidedFixtureState {
@@ -85,14 +110,64 @@ interface GuidedFixtureState {
   requestLog: string[];
 }
 
+// The server line that follows the goal on every started or converted session
+// (GUIDED_GOAL_ACKNOWLEDGEMENT, composer/guided/protocol.py). Held literally
+// here, as the other server strings in this mock are: this file IS the server
+// for the canary walk.
+const GUIDED_GOAL_ACKNOWLEDGEMENT =
+  "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?";
+
+/** One `chat_history` entry in the closed ChatTurn wire shape. */
+function chatTurn(
+  role: "user" | "assistant",
+  content: string,
+  seq: number,
+  step: string,
+): Record<string, unknown> {
+  return {
+    role,
+    content,
+    seq,
+    step,
+    ts_iso: "2026-05-19T12:00:00Z",
+    assistant_message_kind: role === "assistant" ? "assistant" : null,
+    synthetic_failure_reason: null,
+    turn_token: null,
+  };
+}
+
+// Goal-first (elspeth-378cfa0e18): a started session's transcript OPENS with
+// the author's goal and the server's acknowledgement, both stamped with the
+// step the session opens on — for the tutorial, the frozen transforms prompt at
+// step_1_source. A fixture returning `chat_history: []` models a session the
+// backend can no longer emit, and it is exactly the seeded goal turn that the
+// rewritten locked-prompt predicate (ChatPanel `tutorialPromptSentForStep`)
+// has to survive: under the old "any user turn at this step that isn't Explain"
+// form this pair alone flips the locked source box to the static "Sent" line
+// and un-suppresses the rival single-select. With an empty transcript the
+// canary cannot tell the two forms apart.
+function seededGoalTurns(): Array<Record<string, unknown>> {
+  return [
+    chatTurn("user", TUTORIAL_TRANSFORMS_PROMPT, 0, "step_1_source"),
+    chatTurn("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+  ];
+}
+
 // A guided session at a given step with no terminal yet.
-function guidedSession(step: string): Record<string, unknown> {
+function guidedSession(
+  step: string,
+  chatHistory: Array<Record<string, unknown>> = seededGoalTurns(),
+): Record<string, unknown> {
   return {
     step,
     history: [],
     terminal: null,
-    chat_history: [],
-    chat_turn_seq: 0,
+    chat_history: chatHistory,
+    chat_turn_seq: chatHistory.length,
+    // Server-projected reviewed ledger (elspeth-f2a8550b3d). Empty here: this
+    // route mock drives the stepper and transcript, not the pre-commit graph,
+    // and the decoder requires the key to be present rather than absent.
+    reviewed_components: { sources: [], outputs: [] },
     // null profile == empty/live; the tutorial seeds via /guided/start. The
     // shell reads profile.bookends but tolerates a null profile (defaults true).
     profile: {
@@ -102,10 +177,15 @@ function guidedSession(step: string): Record<string, unknown> {
   };
 }
 
-function singleSelectTurn(question: string, options: Array<[string, string]>): Record<string, unknown> {
+function singleSelectTurn(
+  question: string,
+  options: Array<[string, string]>,
+  stepIndex = 0,
+): Record<string, unknown> {
   return {
     type: "single_select",
-    step_index: 0,
+    step_index: stepIndex,
+    turn_token: (stepIndex === 0 ? "a" : "b").repeat(64),
     payload: {
       question,
       options: options.map(([id, label]) => ({ id, label, hint: null })),
@@ -125,65 +205,108 @@ function singleSelectTurn(question: string, options: Array<[string, string]>): R
 const wireTurn: Record<string, unknown> = {
   type: "confirm_wiring",
   step_index: 3,
+  turn_token: "c".repeat(64),
   payload: {
-    topology: {
-      sources: {
-        source: {
-          id: "source",
-          plugin: "inline_blob",
-          on_success: "scrape",
-          on_validation_failure: "discard",
+    proposal_id: "00000000-0000-4000-8000-000000000002",
+    draft_hash: "d".repeat(64),
+    sources: [
+      {
+        stable_id: SOURCE_ID,
+        label: "Source",
+        plugin: "inline_blob",
+        on_validation_failure: "discard",
+        guaranteed_fields: ["url"],
+        row_cardinality: {
+          input: "none",
+          output: "zero_or_many",
+          expected_output_count: null,
         },
       },
-      nodes: [
-        {
-          id: "scrape",
-          node_type: "transform",
-          plugin: "web_scrape",
-          input: "scrape",
-          on_success: "rate",
-          on_error: "discard",
-          routes: null,
-          fork_to: null,
-          branches: null,
-        },
-        {
-          id: "rate",
-          node_type: "transform",
-          plugin: "llm_rate",
-          input: "rate",
-          on_success: "ratings",
-          on_error: "discard",
-          routes: null,
-          fork_to: null,
-          branches: null,
-        },
-      ],
-      outputs: [
-        {
-          id: "output:ratings",
-          sink_name: "ratings",
-          plugin: "jsonl",
-          on_write_failure: "discard",
-        },
-      ],
-    },
-    edge_contracts: [
+    ],
+    nodes: [
       {
-        from: "source",
-        to: "scrape",
-        producer_guarantees: ["url"],
-        consumer_requires: ["url"],
-        missing_fields: [],
-        satisfied: true,
+        stable_id: SCRAPE_ID,
+        label: "Fetch step",
+        node_type: "transform",
+        plugin: "web_scrape",
+        behavior: { kind: "transform" },
+        node_options_summary: [],
+        required_fields: ["url"],
+        guaranteed_fields: ["url", "html"],
+        row_cardinality: {
+          input: "one",
+          output: "one",
+          expected_output_count: null,
+        },
+        structured_output_fields: [],
       },
       {
-        from: "scrape",
-        to: "rate",
-        producer_guarantees: ["url", "html"],
-        consumer_requires: ["html"],
-        missing_fields: [],
-        satisfied: true,
+        stable_id: RATE_ID,
+        label: "Llm Rate step",
+        node_type: "transform",
+        plugin: "llm_rate",
+        behavior: { kind: "transform" },
+        node_options_summary: [],
+        required_fields: ["html"],
+        guaranteed_fields: ["url", "score", "rationale"],
+        row_cardinality: {
+          input: "one",
+          output: "one",
+          expected_output_count: null,
+        },
+        structured_output_fields: [],
+      },
+    ],
+    outputs: [
+      {
+        stable_id: OUTPUT_ID,
+        label: "Ratings output",
+        plugin: "jsonl",
+        on_write_failure: "discard",
+        required_fields: ["score", "rationale"],
+        business_schema: {
+          mode: "observed",
+          fields: [],
+          guaranteed_fields: [],
+          required_fields: ["score", "rationale"],
+        },
+      },
+    ],
+    connections: [
+      {
+        stable_id: "00000000-0000-4000-8000-000000000050",
+        from_endpoint: { kind: "source", stable_id: SOURCE_ID },
+        to_endpoint: { kind: "node", stable_id: SCRAPE_ID },
+        flow: { kind: "source_success", branch: null },
+        schema_contract: {
+          from: "source",
+          to: "scrape",
+          producer_guarantees: ["url"],
+          consumer_requires: ["url"],
+          missing_fields: [],
+          satisfied: true,
+        },
+      },
+      {
+        stable_id: "00000000-0000-4000-8000-000000000051",
+        from_endpoint: { kind: "node", stable_id: SCRAPE_ID },
+        to_endpoint: { kind: "node", stable_id: RATE_ID },
+        flow: { kind: "node_success", branch: null },
+        schema_contract: {
+          from: "scrape",
+          to: "rate",
+          producer_guarantees: ["url", "html"],
+          consumer_requires: ["html"],
+          missing_fields: [],
+          satisfied: true,
+        },
+      },
+      {
+        stable_id: "00000000-0000-4000-8000-000000000052",
+        from_endpoint: { kind: "node", stable_id: RATE_ID },
+        to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
+        flow: { kind: "node_success", branch: null },
+        schema_contract: null,
       },
     ],
     semantic_contracts: [],
@@ -194,15 +317,19 @@ const wireTurn: Record<string, unknown> = {
         // Advisory copy — contains "prompt-injection shield" but not the
         // azure_prompt_shield node literal (see note above).
         message:
-          "LLM node 'rate' consumes externally-fetched content from a web_scrape upstream without an authorized prompt-injection shield between them. Continuing without it is allowed.",
+          "LLM node 'rate' consumes untrusted or externally controlled upstream content produced by web_scrape without an authorized prompt-injection shield between them. Continuing without it is allowed.",
       },
     ],
+    blockers: [],
+    can_confirm: true,
   },
 };
 
-function completedSession(): Record<string, unknown> {
+function completedSession(
+  chatHistory: Array<Record<string, unknown>> = seededGoalTurns(),
+): Record<string, unknown> {
   return {
-    ...guidedSession("step_4_wire"),
+    ...guidedSession("step_4_wire", chatHistory),
     terminal: {
       kind: "completed",
       reason: null,
@@ -215,6 +342,11 @@ async function installTutorialRoutes(
   page: Page,
   state: GuidedFixtureState,
 ): Promise<void> {
+  // The transcript ACCUMULATES, as the server's does: every answered /guided/chat
+  // appends the user's message and the reply at the step it was sent on, on top
+  // of the seeded goal pair. A mock that reset the history each turn would make
+  // the locked-prompt predicate trivially false forever.
+  const chatHistory: Array<Record<string, unknown>> = seededGoalTurns();
   await page.route("**/api/**", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -254,12 +386,22 @@ async function installTutorialRoutes(
       return;
     }
 
+    // The account-preferences payload is decoded structurally since
+    // 69c910a56 (preferencesDecoder.ts KEYS): every key must be present or
+    // the store records a preferences error and App.tsx's fail-closed
+    // tutorial gate never shows the welcome turn. Mock the full wire shape.
     if (path === "/api/composer-preferences" && method === "GET") {
       await route.fulfill({
         json: {
           default_mode: "guided",
           banner_dismissed_at: null,
+          freeform_intro_dismissed_at: null,
           tutorial_completed_at: null,
+          tutorial_stage: null,
+          tutorial_session_id: null,
+          tutorial_run_id: null,
+          tutorial_source_data_hash: null,
+          show_advanced: false,
           updated_at: null,
         },
       });
@@ -268,14 +410,19 @@ async function installTutorialRoutes(
 
     if (path === "/api/composer-preferences" && method === "PATCH") {
       const body = request.postDataJSON() as Record<string, unknown>;
+      const echoNullableString = (key: string): string | null =>
+        typeof body[key] === "string" ? (body[key] as string) : null;
       await route.fulfill({
         json: {
           default_mode: body.default_mode ?? "guided",
           banner_dismissed_at: null,
-          tutorial_completed_at:
-            typeof body.tutorial_completed_at === "string"
-              ? body.tutorial_completed_at
-              : null,
+          freeform_intro_dismissed_at: null,
+          tutorial_completed_at: echoNullableString("tutorial_completed_at"),
+          tutorial_stage: echoNullableString("tutorial_stage"),
+          tutorial_session_id: echoNullableString("tutorial_session_id"),
+          tutorial_run_id: echoNullableString("tutorial_run_id"),
+          tutorial_source_data_hash: echoNullableString("tutorial_source_data_hash"),
+          show_advanced: typeof body.show_advanced === "boolean" ? body.show_advanced : false,
           updated_at: "2026-05-19T12:11:00Z",
         },
       });
@@ -330,7 +477,7 @@ async function installTutorialRoutes(
             ["csv", "csv"],
           ]),
           terminal: null,
-          composition_state: null,
+          composition_state: compositionState,
         },
       });
       return;
@@ -343,9 +490,9 @@ async function installTutorialRoutes(
       await route.fulfill({
         json: {
           sample_urls: [
-            "https://johnm-dta.github.io/elspeth/tutorial-site/project-1.html",
-            "https://johnm-dta.github.io/elspeth/tutorial-site/project-2.html",
-            "https://johnm-dta.github.io/elspeth/tutorial-site/project-3.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-1.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-2.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-3.html",
           ],
         },
       });
@@ -358,13 +505,13 @@ async function installTutorialRoutes(
     ) {
       await route.fulfill({
         json: {
-          guided_session: guidedSession("step_1_source"),
+          guided_session: guidedSession("step_1_source", [...chatHistory]),
           next_turn: singleSelectTurn("Which data source would you like to use?", [
             ["inline_blob", "inline_blob"],
             ["csv", "csv"],
           ]),
           terminal: null,
-          composition_state: null,
+          composition_state: compositionState,
         },
       });
       return;
@@ -377,23 +524,35 @@ async function installTutorialRoutes(
       state.guidedRespondCount += 1;
       const n = state.guidedRespondCount;
       state.requestLog.push(`guided-chat:${n}`);
+      const body = request.postDataJSON() as { message?: unknown };
+      const sentStep = n === 1 ? "step_1_source" : "step_2_sink";
+      const assistantMessage =
+        n === 1
+          ? "I set this up as an inline source."
+          : "I set up a JSONL output.";
+      chatHistory.push(
+        chatTurn(
+          "user",
+          typeof body.message === "string" ? body.message : "",
+          chatHistory.length,
+          sentStep,
+        ),
+        chatTurn("assistant", assistantMessage, chatHistory.length + 1, sentStep),
+      );
       let next: Record<string, unknown> | null;
-      let session = guidedSession("step_2_sink");
+      let session = guidedSession("step_2_sink", [...chatHistory]);
       if (n === 1) {
         next = singleSelectTurn("What format should the output be in?", [
           ["jsonl", "jsonl"],
           ["json", "json"],
-        ]);
+        ], 1);
       } else {
         next = wireTurn;
-        session = guidedSession("step_4_wire");
+        session = guidedSession("step_4_wire", [...chatHistory]);
       }
       await route.fulfill({
         json: {
-          assistant_message:
-            n === 1
-              ? "I set this up as an inline source."
-              : "I set up a JSONL output.",
+          assistant_message: assistantMessage,
           assistant_message_kind: "assistant",
           guided_session: session,
           next_turn: next,
@@ -412,24 +571,26 @@ async function installTutorialRoutes(
       const n = state.guidedRespondCount;
       state.requestLog.push(`guided-respond:${n}`);
       // Drive a deterministic walk: source → sink → wire → completed. The
-      // mock ignores the request body and advances by count.
+      // mock ignores the request body and advances by count. Every response
+      // carries the transcript accumulated so far — a respond never drops the
+      // chat turns that preceded it.
       let next: Record<string, unknown> | null;
-      let session = guidedSession("step_2_sink");
+      let session = guidedSession("step_2_sink", [...chatHistory]);
       if (n === 1) {
         // after source pick → sink pick turn
         next = singleSelectTurn("What format should the output be in?", [
           ["jsonl", "jsonl"],
           ["json", "json"],
-        ]);
-        session = guidedSession("step_2_sink");
+        ], 1);
+        session = guidedSession("step_2_sink", [...chatHistory]);
       } else if (n === 2) {
         // after sink pick → wire turn
         next = wireTurn;
-        session = guidedSession("step_4_wire");
+        session = guidedSession("step_4_wire", [...chatHistory]);
       } else {
         // wire confirm → completed
         next = null;
-        session = completedSession();
+        session = completedSession([...chatHistory]);
       }
       const terminal =
         next === null
@@ -626,6 +787,67 @@ async function installTutorialRoutes(
 }
 
 test.describe("first-run tutorial (staged guided flow)", () => {
+  test("guided workspace fills compact desktop and grows through WQHD", async ({
+    page,
+  }) => {
+    const state: GuidedFixtureState = {
+      sessionPostCount: 0,
+      guidedRespondCount: 0,
+      requestLog: [],
+    };
+    await installTutorialRoutes(page, state);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await page.getByRole("button", { name: "Let's go" }).click();
+    await expect(page.getByLabel(/guided composer/i)).toBeVisible();
+
+    const measure = async (): Promise<number> => {
+      const appMain = page.locator(".app-main");
+      const shell = page.locator(".tutorial-shell--guided");
+      const progress = page.locator(".tutorial-progress");
+      const workspace = page.getByTestId("composer-workspace");
+      const authoring = page.getByRole("region", { name: "Authoring pane" });
+      const artifact = page.getByRole("region", { name: "Pipeline artifact" });
+      await expect(workspace).toBeVisible();
+      await expect(authoring).toBeVisible();
+      await expect(artifact).toBeVisible();
+      const [appBox, shellBox, progressBox, workspaceBox, authoringBox, artifactBox] =
+        await Promise.all([
+          appMain.boundingBox(),
+          shell.boundingBox(),
+          progress.boundingBox(),
+          workspace.boundingBox(),
+          authoring.boundingBox(),
+          artifact.boundingBox(),
+        ]);
+      expect(appBox).not.toBeNull();
+      expect(shellBox).not.toBeNull();
+      expect(progressBox).not.toBeNull();
+      expect(workspaceBox).not.toBeNull();
+      expect(authoringBox).not.toBeNull();
+      expect(artifactBox).not.toBeNull();
+      expect(shellBox!.height).toBeGreaterThanOrEqual(appBox!.height - 1);
+      expect(workspaceBox!.height).toBeGreaterThanOrEqual(
+        appBox!.height - progressBox!.height - 40,
+      );
+      expect(authoringBox!.height).toBeGreaterThanOrEqual(420);
+      expect(artifactBox!.height).toBeGreaterThanOrEqual(420);
+      expect(
+        await page.evaluate(
+          () =>
+            document.documentElement.scrollWidth <=
+            document.documentElement.clientWidth,
+        ),
+      ).toBe(true);
+      return workspaceBox!.height;
+    };
+
+    const compactHeight = await measure();
+    await page.setViewportSize({ width: 2560, height: 1280 });
+    const wqhdHeight = await measure();
+    expect(wqhdHeight).toBeGreaterThan(compactHeight + 400);
+  });
+
   test("welcome → guided (source/sink/wire) → run → audit → graduation", async ({
     page,
   }) => {
@@ -656,14 +878,30 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     await page.getByRole("button", { name: "Send message", exact: true }).click();
     // ── Step 4 wire stage: topology + edge-contract overlay (M1 from/to) ─────
     await expect(page.getByRole("heading", { name: "Review wiring" })).toBeVisible();
+    // The parenthetical is the PLUGIN-derived step label, not the author's
+    // label: buildEntityNames renders `${node.label} (${stepLabelForPlugin(
+    // node.plugin)})`. `web_scrape` hits the curated override map ("Fetch");
+    // `llm_rate` has no override and falls through to the shared acronym-aware
+    // title-caser (elspeth-d2de348437), whose closed ACRONYMS set contains
+    // "llm" — so it renders "LLM Rate", never "Llm Rate". Only the
+    // parenthetical is re-cased; the author's own "Llm Rate step" label is
+    // deliberately passed through untouched.
     await expect(
-      page.getByRole("listitem", { name: "Source to Fetch step" }),
+      page.getByRole("listitem", { name: /Source to Fetch step \(Fetch\)/ }),
     ).toBeVisible();
     await expect(
-      page.getByRole("listitem", { name: "Fetch step to Llm Rate step" }),
+      page.getByRole("listitem", {
+        name: /Fetch step \(Fetch\) to Llm Rate step \(LLM Rate\)/,
+      }),
     ).toBeVisible();
-    await expect(page.getByText(/Source\s+→\s+Fetch step\s+—\s+connected/)).toBeVisible();
-    await expect(page.getByText(/Fetch step\s+→\s+Llm Rate step\s+—\s+connected/)).toBeVisible();
+    await expect(
+      page.getByRole("listitem", { name: /Source to Fetch step \(Fetch\).*connected/ }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("listitem", {
+        name: /Fetch step \(Fetch\) to Llm Rate step \(LLM Rate\).*connected/,
+      }),
+    ).toBeVisible();
     // M1 guard: post-M1 naming, never from_id/to_id.
     await expect(
       page.getByRole("listitem", { name: /from_id|to_id/ }),
@@ -679,6 +917,13 @@ test.describe("first-run tutorial (staged guided flow)", () => {
     // ── Wire confirm → completed → run turn (no 409 dead-end) ────────────────
     await page.getByRole("button", { name: "Confirm wiring", exact: true }).click();
     // TutorialGuidedShell handed off to the run turn on terminal=completed.
+    // The run turn mounts on its pre-run card (I-1): the committed graph in
+    // the pipeline pane and an explicit Run button; nothing runs until it is
+    // clicked.
+    await expect(
+      page.getByRole("heading", { name: /Ready to run/i }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Run", exact: true }).click();
     await expect(
       page.getByRole("heading", { name: /Running your pipeline/i }),
     ).toBeVisible();

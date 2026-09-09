@@ -115,9 +115,30 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ead9c6381cdb2985"
+    source_file_hash: str | None = "sha256:e62f3d946b8a4518"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
+    usage_when_to_use: str = "Use for Cohen's d and Hedges' g comparisons between unpaired numeric variants present in one flushed batch."
+    usage_when_not_to_use: str = (
+        "Not for hypothesis testing or matched observations: it does not establish statistical significance and is not a paired analysis."
+    )
+    example_use: str = """aggregations:
+  - name: prompt_effect_size
+    plugin: batch_effect_size
+    input: variant_scores
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      variant_field: prompt_variant
+      score_field: score
+      baseline_variant: control
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "effect-size", "comparison")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

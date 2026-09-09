@@ -9,29 +9,42 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, ClassVar, cast, get_origin
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricExporter, MetricExportResult, MetricsData
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import CompileError, OperationalError
+from sqlalchemy.exc import CompileError, OperationalError, ProgrammingError
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
+from starlette.routing import Mount, Route, WebSocketRoute
 from structlog.testing import capture_logs
 
 import elspeth.web.app as app_module
+import elspeth.web.aws_ecs_startup as aws_ecs_startup_module
+import elspeth.web.deployment_contract as deployment_contract_module
+import elspeth.web.external_state_startup as external_state_startup_module
+import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth.contracts import RunStatus
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.web import aws_rds_trust as aws_rds_trust_module
 from elspeth.web.app import (
     _BodySizeLimitMiddleware,
     _BrowserDocumentHeadersMiddleware,
@@ -40,20 +53,135 @@ from elspeth.web.app import (
     lifespan,
 )
 from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.auth.providers import get_profile
+from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
 from elspeth.web.composer.boot_probe import ComposerBootConfigError
+from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
+from elspeth.web.coordination.membership_lifecycle import (
+    MembershipShutdownOutcome,
+    SingleProcessWebInstanceMembership,
+    WebInstanceMembership,
+)
 from elspeth.web.dependencies import get_settings
+from elspeth.web.deployment_contract import DeploymentConfigurationError
+from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
+from elspeth.web.operator_telemetry import OperatorTelemetryFactories, OperatorTelemetryRuntime
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX,
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     CompositionStateData,
+    CompositionStateRecord,
     RunRecord,
 )
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
+from elspeth.web.sso_wiring import SsoWiring
+from tests.fixtures.landscape import expire_leader_seat
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+
+
+class _HermeticMetricExporter(MetricExporter):
+    """No-network exporter for app-factory tests that select AWS policy."""
+
+    def export(self, _metrics_data: MetricsData, timeout_millis: float = 10_000, **_kwargs: object) -> MetricExportResult:
+        del timeout_millis
+        return MetricExportResult.SUCCESS
+
+    def force_flush(self, timeout_millis: float = 10_000) -> bool:
+        del timeout_millis
+        return True
+
+    def shutdown(self, timeout_millis: float = 30_000, **_kwargs: object) -> None:
+        del timeout_millis
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_operator_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Exercise bootstrap policy without process-global providers or OTLP I/O."""
+
+    isolated_runtime: OperatorTelemetryRuntime | None = None
+    previous_runtime: OperatorTelemetryRuntime | None = None
+    runtime_swapped = False
+
+    def meter_provider(readers: Sequence[object], *, resource: Resource, views: tuple[object, ...]) -> MeterProvider:
+        return MeterProvider(
+            metric_readers=cast(Sequence[Any], readers),
+            resource=resource,
+            views=cast(Sequence[Any], views),
+            shutdown_on_exit=False,
+        )
+
+    factories = OperatorTelemetryFactories(
+        prometheus_reader=InMemoryMetricReader,
+        otlp_exporter=lambda **_kwargs: _HermeticMetricExporter(),
+        periodic_reader=lambda _exporter, **_kwargs: InMemoryMetricReader(),
+        meter_provider=meter_provider,
+        set_meter_provider=lambda _provider: None,
+    )
+
+    def bootstrap(settings: WebSettings) -> OperatorTelemetryRuntime:
+        nonlocal isolated_runtime, previous_runtime, runtime_swapped
+        if isolated_runtime is not None:
+            return isolated_runtime
+
+        # bootstrap owns a process singleton in production. Save any runtime
+        # installed by an earlier module, then keep this test's injected
+        # runtime active so module-level event projection reaches the same
+        # provider retained by the app. Teardown restores the prior runtime.
+        with operator_telemetry_module._runtime_lock:
+            previous_runtime = operator_telemetry_module._runtime
+            operator_telemetry_module._runtime = None
+        try:
+            isolated_runtime = operator_telemetry_module.bootstrap_operator_telemetry(settings, factories=factories)
+            runtime_swapped = True
+        except BaseException:
+            with operator_telemetry_module._runtime_lock:
+                operator_telemetry_module._runtime = previous_runtime
+            raise
+        assert isolated_runtime is not None
+        return isolated_runtime
+
+    monkeypatch.setattr(app_module, "bootstrap_operator_telemetry", bootstrap)
+    try:
+        yield
+    finally:
+        try:
+            if isolated_runtime is not None and isolated_runtime._begin_shutdown():
+                try:
+                    isolated_runtime.provider.shutdown(timeout_millis=5_000)
+                finally:
+                    isolated_runtime._finish_shutdown()
+        finally:
+            if runtime_swapped:
+                with operator_telemetry_module._runtime_lock:
+                    operator_telemetry_module._runtime = previous_runtime
+
+
+@pytest.fixture(autouse=True)
+def _verified_aws_rds_trust_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the immutable RDS trust-root verification for app-factory tests.
+
+    The image-baked trust bundle at ``aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH``
+    only exists inside the built container, not in the unit-test environment.
+    These tests exercise startup validation ordering unrelated to that
+    verification, so stub a passing report the same way
+    ``tests/unit/web/test_aws_ecs_startup.py::_verified_trust_root`` does; no
+    test in this module asserts on the trust-root failure path itself.
+    """
+    monkeypatch.setattr(
+        aws_rds_trust_module,
+        "verify_aws_rds_trust_bundle",
+        lambda: aws_rds_trust_module.AwsRdsTrustBundleReport(
+            path=str(aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH),
+            expected_sha256=aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            actual_sha256=aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            certificate_count=108,
+        ),
+    )
 
 
 def _settings(tmp_path: Path, **overrides) -> WebSettings:
@@ -65,33 +193,77 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
         "shareable_link_signing_key": SecretBytes(b"\x00" * 32),
+        "operator_metrics_bearer_token": "operator-metrics-token-for-tests-0001",
     }
     defaults.update(overrides)
     return WebSettings(**defaults)  # type: ignore[arg-type]
 
 
+async def _save_session_seed_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+) -> CompositionStateRecord:
+    """Persist startup-test state under a real live COMPOSE authority."""
+    authority = service.session_operation_authority
+    context = await service._run_sync(
+        lambda: authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(authority.release, context)
+
+
 def _aws_settings(tmp_path: Path, **overrides: object) -> WebSettings:
+    return _external_settings(tmp_path, "aws-ecs", **overrides)
+
+
+def _external_settings(tmp_path: Path, deployment_target: str, **overrides: object) -> WebSettings:
     data_dir = tmp_path / "data"
     payload_dir = tmp_path / "payload"
     for directory in (data_dir, data_dir / "blobs", payload_dir):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
+    if deployment_target == "aws-ecs":
+        # aws-ecs uniquely requires authenticated TLS pinned to the immutable
+        # RDS trust root (deployment_contract._has_approved_aws_ecs_tls_query).
+        tls_query = f"sslmode=verify-full&sslrootcert={aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH}"
+    else:
+        # Non-aws external targets still exercise authenticated TLS, but may
+        # trust the platform's certificate store.
+        tls_query = "sslmode=verify-full&sslrootcert=system"
+    session_db_url = f"postgresql+psycopg://runtime:session-secret@db/session?{tls_query}"
+    landscape_url = f"postgresql+psycopg://runtime:landscape-secret@db/landscape?{tls_query}"
     values: dict[str, object] = {
-        "deployment_target": "aws-ecs",
-        "operator_telemetry": "aws-otlp",
-        "operator_telemetry_environment": "test",
-        "operator_telemetry_release": "git-test",
-        "operator_telemetry_ecs_cluster": "elspeth-test",
-        "operator_telemetry_ecs_service": "elspeth-web",
-        "operator_telemetry_task_definition_family": "elspeth-web-task",
-        "operator_telemetry_task_definition_revision": "1",
-        "host": "0.0.0.0",
+        "deployment_target": deployment_target,
+        "deployment_state_mode": "external-postgresql",
+        "host": "0.0.0.0" if deployment_target in {"docker-compose", "aws-ecs", "azure-container-apps", "kubernetes"} else "127.0.0.1",
         "payload_store_path": payload_dir,
-        "session_db_url": "postgresql+psycopg://runtime@db/session",
-        "landscape_url": "postgresql+psycopg://runtime@db/landscape",
-        "secret_key": "s" * 40,
+        "session_db_url": session_db_url,
+        "landscape_url": landscape_url,
+        "secret_key": "this-app-external-startup-secret-is-long-enough",
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
     }
+    if deployment_target == "aws-ecs":
+        values.update(
+            operator_telemetry="aws-otlp",
+            operator_telemetry_environment="test",
+            operator_telemetry_release="git-test",
+            operator_telemetry_ecs_cluster="elspeth-test",
+            operator_telemetry_ecs_service="elspeth-web",
+            operator_telemetry_task_definition_family="elspeth-web-task",
+            operator_telemetry_task_definition_revision="1",
+        )
     values.update(overrides)
     return _settings(data_dir, **values)
 
@@ -242,11 +414,57 @@ class TestCreateApp:
         assert app.state.settings is settings
         assert app.state.settings.port == 9999
 
+    def test_blob_acquire_archive_race_maps_to_nonleaking_not_found(self, tmp_path, monkeypatch) -> None:
+        """Archive may win after ownership verification but before lease acquire."""
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app = create_app(_settings(tmp_path))
+
+        async def _mock_user() -> UserIdentity:
+            return UserIdentity(user_id="test-user", username="test-user")
+
+        app.dependency_overrides[get_current_user] = _mock_user
+        client = TestClient(app, raise_server_exceptions=False)
+        created = client.post("/api/sessions", json={"title": "Acquire race"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+
+        authority = app.state.session_service.session_operation_authority
+
+        def _archive_won(**_kwargs: object) -> None:
+            raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+
+        monkeypatch.setattr(authority, "acquire", _archive_won)
+        response = client.get(f"/api/sessions/{session_id}/blobs/{uuid4()}")
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Session not found"}
+        assert "owner" not in response.text.lower()
+
     def test_repeated_create_app_reuses_process_telemetry_provider(self, tmp_path) -> None:
         first = create_app(_settings(tmp_path / "first"))
         second = create_app(_settings(tmp_path / "second"))
 
         assert first.state.operator_telemetry is second.state.operator_telemetry
+
+    def test_app_metrics_bind_to_hermetic_runtime_provider(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        assert operator_telemetry_module._runtime is app.state.operator_telemetry
+        app_module._COMPOSER_BOOT_CONFIG_COUNTER.add(1, {"surface": "unit-test"})
+        reader = app.state.operator_telemetry.readers[0]
+        assert isinstance(reader, InMemoryMetricReader)
+
+        data = reader.get_metrics_data()
+        assert data is not None
+        metric_names = {
+            metric.name
+            for resource_metric in data.resource_metrics
+            for scope_metric in resource_metric.scope_metrics
+            for metric in scope_metric.metrics
+        }
+        assert "composer.boot_config" in metric_names
 
     def test_invalid_aws_operator_policy_fails_before_provider_bootstrap(self, tmp_path) -> None:
         settings = _aws_settings(tmp_path, operator_telemetry="prometheus")
@@ -341,14 +559,14 @@ class TestHealthEndpoint:
         app = create_app(_settings(tmp_path))
         entered = threading.Event()
         release = threading.Event()
-        real_resolver = readiness_module.allowed_source_directories
+        real_resolver = readiness_module.managed_blob_directory
 
         def blocked_resolver(data_dir: str):
             entered.set()
             release.wait()
             return real_resolver(data_dir)
 
-        monkeypatch.setattr("elspeth.web.readiness.allowed_source_directories", blocked_resolver)
+        monkeypatch.setattr("elspeth.web.readiness.managed_blob_directory", blocked_resolver)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             ready_task = asyncio.create_task(client.get("/api/ready"))
@@ -365,7 +583,7 @@ class TestHealthEndpoint:
 
 
 class TestReadinessEndpoint:
-    def test_ready_returns_200_with_exact_eight_check_json(self, tmp_path, monkeypatch) -> None:
+    def test_ready_returns_200_with_exact_nine_check_json(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))
         checks = tuple(ReadinessCheck(name, True, "ok") for name in READINESS_CHECK_NAMES)
 
@@ -509,6 +727,34 @@ class TestSystemStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["composer_timeout_seconds"] == 300.0
 
+    def test_classification_banner_defaults_to_null(self, tmp_path) -> None:
+        """An undeclared deployment renders no protective-marking banner."""
+        app = create_app(_settings(tmp_path))
+        response = TestClient(app).get("/api/system/status")
+        assert response.status_code == 200
+        assert response.json()["classification_banner"] is None
+
+    @pytest.mark.parametrize(
+        "marking",
+        ["unofficial", "official", "official_sensitive", "protected", "protected_cabinet"],
+    )
+    def test_reports_the_declared_classification_banner(self, tmp_path, marking: str) -> None:
+        """Every marking in the closed vocabulary reaches the SPA verbatim."""
+        app = create_app(_settings(tmp_path, classification_banner=marking))
+        response = TestClient(app).get("/api/system/status")
+        assert response.status_code == 200
+        assert response.json()["classification_banner"] == marking
+
+    def test_classification_banner_vocabulary_is_closed(self, tmp_path) -> None:
+        """Markings above PROTECTED (and typos) are not declarable.
+
+        An unsupported marking (e.g. "secret") must fail settings load rather
+        than silently render an unstyled banner claiming a protection level
+        the deployment does not implement.
+        """
+        with pytest.raises(ValidationError):
+            _settings(tmp_path, classification_banner="secret")
+
     def test_reports_the_deployed_frontend_build_identity(self, tmp_path) -> None:
         """Deploy-cache coherence beacon: stale tabs must self-announce.
 
@@ -574,7 +820,7 @@ class TestSystemStatusEndpoint:
                         "region_name": "ap-southeast-2",
                     }
                 },
-                tutorial_llm_profile="tutorial-default",
+                default_llm_profile="tutorial-default",
             )
         )
         response = TestClient(app).get("/api/system/status")
@@ -620,12 +866,50 @@ class TestMetricsEndpoint:
         client = TestClient(app)
         response = client.get("/metrics")
         assert response.status_code == 401
+        assert response.headers["www-authenticate"] == 'Bearer realm="metrics"'
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_authenticated_tenant_cannot_scrape_process_global_metrics(self, tmp_path) -> None:
+        client = self._authed_client(tmp_path)
+
+        response = client.get("/metrics", headers={"Authorization": "Bearer tenant-user-b"})
+
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == 'Bearer realm="metrics"'
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_metrics_scrape_fails_closed_on_tenant_identifier_labels(self, tmp_path) -> None:
+        client = self._authed_client(tmp_path)
+        unsafe_exposition = (
+            b"# TYPE execution_progress_broadcast_dropped_total counter\n"
+            b'execution_progress_broadcast_dropped_total{reason="queue_full",run_id="run-user-a"} 1\n'
+        )
+
+        with patch("elspeth.web.app.generate_latest", return_value=unsafe_exposition):
+            response = client.get("/metrics", headers={"Authorization": "Bearer operator-metrics-token-for-tests-0001"})
+
+        assert response.status_code == 503
+        assert response.content == b"# scrape failed\n"
+        assert b"run-user-a" not in response.content
+        assert response.headers["cache-control"] == "no-store"
 
     def test_metrics_returns_plaintext_on_success(self, tmp_path) -> None:
         client = self._authed_client(tmp_path)
-        response = client.get("/metrics")
+        response = client.get("/metrics", headers={"Authorization": "Bearer operator-metrics-token-for-tests-0001"})
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/plain")
+        assert response.headers["cache-control"] == "no-store"
+        assert 'run_id="' not in response.text
+        assert 'session_id="' not in response.text
+        assert 'user_id="' not in response.text
+
+    def test_metrics_is_disabled_when_operator_token_is_unset(self, tmp_path) -> None:
+        client = TestClient(create_app(_settings(tmp_path, operator_metrics_bearer_token=None)))
+
+        response = client.get("/metrics", headers={"Authorization": "Bearer tenant-user"})
+
+        assert response.status_code == 404
+        assert response.headers["cache-control"] == "no-store"
 
     def test_metrics_scrape_failure_returns_503_and_records_cause(self, tmp_path) -> None:
         """A third-party collector raising inside generate_latest() must not
@@ -640,7 +924,7 @@ class TestMetricsEndpoint:
             patch("elspeth.web.app.generate_latest", side_effect=boom),
             capture_logs() as logs,
         ):
-            response = client.get("/metrics")
+            response = client.get("/metrics", headers={"Authorization": "Bearer operator-metrics-token-for-tests-0001"})
         assert response.status_code == 503
         assert response.content == b"# scrape failed\n"
         events = [e for e in logs if e.get("event") == "prometheus_scrape_failed"]
@@ -684,9 +968,20 @@ class TestBrowserDocumentHeaders:
     """The SPA response carries callback secrecy and exact runtime CSP."""
 
     @staticmethod
-    def _app(token_endpoint: str | None) -> FastAPI:
+    def _csp_directives(response: httpx.Response) -> dict[str, tuple[str, ...]]:
+        directives: dict[str, tuple[str, ...]] = {}
+        for raw_directive in response.headers["Content-Security-Policy"].split(";"):
+            parts = raw_directive.split()
+            if not parts:
+                continue
+            name, *sources = parts
+            assert name not in directives, f"duplicate CSP directive: {name}"
+            directives[name] = tuple(sources)
+        return directives
+
+    @staticmethod
+    def _app() -> FastAPI:
         app = FastAPI()
-        app.state.oidc_token_endpoint = token_endpoint
         app.add_middleware(_BrowserDocumentHeadersMiddleware)
 
         @app.get("/")
@@ -696,20 +991,60 @@ class TestBrowserDocumentHeaders:
         return app
 
     def test_callback_document_is_no_referrer_and_non_cacheable(self) -> None:
-        with TestClient(self._app(None)) as client:
+        """The document policy is a constant: no request can widen it.
+
+        The middleware once read ``app.state.oidc_token_endpoint`` and added
+        that origin to ``connect-src`` for the browser-client code exchange.
+        The exchange is the backend's now (spec D2), so the header carries no
+        IdP origin at all and there is nothing left for a request to vary.
+        """
+        with TestClient(self._app()) as client:
             response = client.get("/?code=secret&state=state")
         assert response.headers["Referrer-Policy"] == "no-referrer"
         assert response.headers["Cache-Control"] == "no-store"
-        assert response.headers["Content-Security-Policy"].endswith("connect-src 'self' ws://localhost:* wss://localhost:*")
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert self._csp_directives(response) == {
+            "default-src": ("'self'",),
+            "script-src": ("'self'",),
+            "style-src": ("'self'", "'unsafe-inline'"),
+            "font-src": ("'self'",),
+            "img-src": ("'self'", "data:"),
+            "connect-src": ("'self'", "ws://localhost:*", "wss://localhost:*"),
+            "frame-ancestors": ("'none'",),
+        }
+        # No third-party origin and no wildcard beyond the two local
+        # WebSocket sources -- the guards the deleted origin-widening test
+        # carried, kept as properties of the constant itself.
+        policy = response.headers["Content-Security-Policy"]
+        assert "https:" not in policy
+        assert "*" not in policy.replace("ws://localhost:*", "").replace("wss://localhost:*", "")
 
-    def test_csp_adds_only_exact_validated_cross_origin_token_origin(self) -> None:
-        endpoint = "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token"
-        with TestClient(self._app(endpoint)) as client:
-            response = client.get("/")
-        csp = response.headers["Content-Security-Policy"]
-        assert csp.endswith("connect-src 'self' ws://localhost:* wss://localhost:* https://example.auth.ap-southeast-2.amazoncognito.com")
-        assert "https:" not in csp.replace("https://example.auth.ap-southeast-2.amazoncognito.com", "")
-        assert "*" not in csp.replace("ws://localhost:*", "").replace("wss://localhost:*", "")
+    def test_static_spa_callback_and_hash_document_is_protected_without_mislabeling_api(self, tmp_path: Path) -> None:
+        from starlette.staticfiles import StaticFiles
+
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html><body>SPA</body></html>", encoding="utf-8")
+
+        app = FastAPI()
+        app.add_middleware(_BrowserDocumentHeadersMiddleware)
+
+        @app.get("/api/status")
+        def status() -> dict[str, bool]:
+            return {"ok": True}
+
+        app.mount("/", StaticFiles(directory=dist, html=True), name="spa")
+
+        with TestClient(app) as client:
+            document = client.get("/?code=secret&state=state#/session-id")
+            api = client.get("/api/status")
+
+        assert document.status_code == 200
+        assert document.text == "<html><body>SPA</body></html>"
+        assert self._csp_directives(document)["frame-ancestors"] == ("'none'",)
+        assert document.headers["X-Frame-Options"] == "DENY"
+        assert "Content-Security-Policy" not in api.headers
+        assert "X-Frame-Options" not in api.headers
 
     def test_source_index_has_no_static_csp_meta(self) -> None:
         index = (Path(__file__).parents[3] / "src/elspeth/web/frontend/index.html").read_text(encoding="utf-8")
@@ -956,6 +1291,9 @@ class TestSessionWiring:
         service = app.state.session_service
         assert service._operator_profile_registry is app.state.operator_profile_registry
         assert service._plugin_snapshot_factory.__self__ is app.state.plugin_snapshot_factory
+        assert service._audit_access_log_authority is app.state.audit_access_log_authority
+        assert service._skill_markdown_history_authority is app.state.skill_markdown_history_authority
+        assert app.state.user_secret_store._mutation_authority is app.state.user_secret_authority
 
     def test_session_routes_registered(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
@@ -1030,136 +1368,227 @@ class TestExecutionWiring:
 
     def test_execution_routes_registered(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))
-        route_paths = [path for route in app.routes if isinstance(path := getattr(route, "path", None), str)]
+        route_paths = [route.path for route in app.routes if isinstance(route, (Route, WebSocketRoute, Mount))]
         assert "/api/sessions/{session_id}/validate" in route_paths
         assert "/api/sessions/{session_id}/execute" in route_paths
         assert "/api/runs/{run_id}" in route_paths
         assert "/api/runs/{run_id}/cancel" in route_paths
         assert "/ws/runs/{run_id}" in route_paths
 
+    def test_session_runtime_preflight_honors_secret_wiring_allowlist(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-session-runtime-preflight-fingerprint")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-session-runtime-preflight-secret")
+        app = create_app(
+            _settings(
+                tmp_path,
+                secret_wiring_allowlist=(
+                    {
+                        "secret": "OPENROUTER_API_KEY",
+                        "component_type": "source",
+                        "plugin": "csv",
+                        "option_key": "api_key",
+                    },
+                ),
+            )
+        )
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="primary",
+                options={"api_key": {"secret_ref": "OPENROUTER_API_KEY"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        plugin_snapshot = app.state.plugin_snapshot_factory.for_user_id("alice")
+        runtime_preflight = app.state.session_service._runtime_preflight
 
-class TestOidcDiscoveryStartup:
-    """OIDC discovery in lifespan() must validate response shape before storing it."""
+        assert runtime_preflight is not None
+        result = runtime_preflight(state, "alice", "session-1", plugin_snapshot)
+
+        secret_check = next(check for check in result.checks if check.name == "secret_refs")
+        assert secret_check.passed is True
+        assert all(error.error_code != "unauthorized_secret_ref" for error in result.errors)
+
+    def test_session_runtime_preflight_keeps_empty_secret_wiring_allowlist_fail_closed(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-session-runtime-preflight-fingerprint")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-session-runtime-preflight-secret")
+        app = create_app(_settings(tmp_path))
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="primary",
+                options={"api_key": {"secret_ref": "OPENROUTER_API_KEY"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        plugin_snapshot = app.state.plugin_snapshot_factory.for_user_id("alice")
+        runtime_preflight = app.state.session_service._runtime_preflight
+
+        assert runtime_preflight is not None
+        result = runtime_preflight(state, "alice", "session-1", plugin_snapshot)
+
+        secret_check = next(check for check in result.checks if check.name == "secret_refs")
+        assert secret_check.passed is False
+        assert [error.error_code for error in result.errors] == ["unauthorized_secret_ref"]
+
+
+class TestSsoWiring:
+    """A deployment whose profile is fully configured is wired for SSO at boot; anything less refuses closed."""
 
     @staticmethod
-    def _oidc_settings(tmp_path: Path) -> WebSettings:
-        return _settings(
-            tmp_path,
-            auth_provider="oidc",
-            composer_boot_probe_enabled=False,
-            oidc_issuer="https://issuer.example.com",
-            oidc_audience="test-audience",
-            oidc_client_id="test-client-id",
-            secret_key="dev-secret",
-        )
-
-    def test_create_app_threads_client_id_mode_only_to_oidc(self, tmp_path) -> None:
-        oidc_app = create_app(
-            _settings(
-                tmp_path / "oidc",
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="client",
-                oidc_client_id="client",
-                oidc_audience_claim="client_id",
-                secret_key="dev-secret",
-            )
-        )
-        assert oidc_app.state.auth_provider._validator._audience_claim == "client_id"
-
-        entra_app = create_app(
-            _settings(
-                tmp_path / "entra",
-                auth_provider="entra",
-                oidc_audience="client",
-                oidc_client_id="client",
-                entra_tenant_id="tenant",
-                secret_key="dev-secret",
-            )
-        )
-        assert entra_app.state.auth_provider._validator._audience_claim == "aud"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            [],
-            {"issuer": "https://issuer.example.com", "authorization_endpoint": 123, "token_endpoint": "https://issuer.example.com/token"},
-            {"issuer": "https://issuer.example.com", "authorization_endpoint": "   ", "token_endpoint": "https://issuer.example.com/token"},
-            {
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "javascript:alert(1)",
-                "token_endpoint": "https://issuer.example.com/token",
-            },
-            {
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "http://issuer.example.com/oauth2/authorize",
-                "token_endpoint": "https://issuer.example.com/token",
-            },
-            {
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "https://evil.example.com/oauth2/authorize",
-                "token_endpoint": "https://evil.example.com/token",
-            },
-            {
-                "issuer": "https://wrong.example.com",
-                "authorization_endpoint": "https://issuer.example.com/oauth2/authorize",
-                "token_endpoint": "https://issuer.example.com/token",
-            },
-            {"issuer": "https://issuer.example.com", "authorization_endpoint": "https://issuer.example.com/oauth2/authorize"},
-        ],
-    )
-    async def test_lifespan_rejects_invalid_discovery_authorization_endpoint(self, tmp_path, payload) -> None:
-        """Malformed discovery JSON must fail as deterministic startup error."""
-        app = create_app(self._oidc_settings(tmp_path))
-
-        with (
-            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])),
-            pytest.raises(SystemExit, match="OIDC discovery failed"),
-        ):
-            async with lifespan(app):
-                pass
-
-    @pytest.mark.asyncio
-    async def test_lifespan_accepts_same_origin_https_discovery_authorization_endpoint(self, tmp_path) -> None:
-        """Discovery authorization endpoints are stored only after issuer-origin validation."""
-        app = create_app(self._oidc_settings(tmp_path))
-
-        payload = {
-            "issuer": "https://issuer.example.com",
-            "authorization_endpoint": "https://issuer.example.com/oauth2/authorize",
-            "token_endpoint": "https://issuer.example.com/oauth2/token",
+    def _vanguard_settings(tmp_path: Path, **overrides: object) -> WebSettings:
+        base: dict[str, object] = {
+            "auth_provider": "vanguard",
+            "composer_boot_probe_enabled": False,
+            "secret_key": "dev-secret",
+            "sso_issuer": "https://idp.example.gov.au",
+            "sso_client_id": "elspeth",
+            "sso_client_secret": "s" * 40,
+            "sso_transaction_secret": "t" * 40,
+            "public_base_url": "https://elspeth.example.gov.au",
+            "compartment_id": "example-compartment",
+            "quota_default_tokens_per_day": 100_000,
+            "quota_default_storage_bytes": 1_000_000,
+            # Break-glass endpoints: no discovery request at startup, so the
+            # test proves the wiring rather than a fake IdP.
+            "sso_authorization_endpoint": "https://idp.example.gov.au/authorize",
+            "sso_token_endpoint": "https://idp.example.gov.au/token",
+            "sso_jwks_uri": "https://idp.example.gov.au/keys",
+            "sso_userinfo_endpoint": "https://idp.example.gov.au/userinfo",
         }
-        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])):
-            async with lifespan(app):
-                assert app.state.oidc_authorization_endpoint == "https://issuer.example.com/oauth2/authorize"
-                assert app.state.oidc_token_endpoint == "https://issuer.example.com/oauth2/token"
+        base.update(overrides)
+        return _settings(tmp_path, **base)
+
+    def test_a_configured_profile_makes_the_session_token_provider_the_bearer_authority(self, tmp_path) -> None:
+        app = create_app(self._vanguard_settings(tmp_path))
+        assert isinstance(app.state.auth_provider, SsoAuthProvider)
+        assert isinstance(app.state.sso_wiring, SsoWiring)
+        assert app.state.sso_wiring.token_issuer.audience == "https://elspeth.example.gov.au"
 
     @pytest.mark.asyncio
-    async def test_lifespan_accepts_exact_allowlisted_cognito_discovery_pair(self, tmp_path) -> None:
-        settings = self._oidc_settings(tmp_path).model_copy(
-            update={
-                "oidc_issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-                "oidc_authorization_allowed_origins": ("https://example.auth.ap-southeast-2.amazoncognito.com",),
-            }
-        )
-        app = create_app(settings)
-        payload = {
-            "issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-            "authorization_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/authorize",
-            "token_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
-        }
-        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])):
+    async def test_lifespan_binds_the_runtime_and_the_config_publishes_the_start_url(self, tmp_path) -> None:
+        app = create_app(self._vanguard_settings(tmp_path))
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
-                assert app.state.oidc_token_endpoint == payload["token_endpoint"]
+                runtime = app.state.sso
+                assert isinstance(runtime, SsoRuntime)
+                assert runtime.client.redirect_uri == "https://elspeth.example.gov.au/api/auth/sso/callback"
+                assert runtime.client.start_url == "https://elspeth.example.gov.au/api/auth/sso/start"
+                assert runtime.client.endpoints.jwks_uri == "https://idp.example.gov.au/keys"
+                assert runtime.client.userinfo is True
+                client = TestClient(app)
+                config = client.get("/api/auth/config").json()
+                assert config["provider"] == "vanguard"
+                assert config["sso_start_url"] == "https://elspeth.example.gov.au/api/auth/sso/start"
+                started = client.get("/api/auth/sso/start", follow_redirects=False)
+                assert started.status_code == 302
+                assert started.headers["location"].startswith("https://idp.example.gov.au/authorize?")
+
+    @pytest.mark.asyncio
+    async def test_lifespan_threads_the_profiles_algorithms_and_stale_bound_onto_the_validator(self, tmp_path) -> None:
+        """The validator's algorithms come from the profile, its stale bound from settings.
+
+        Both used to be threaded by ``create_app`` onto the deleted
+        ``OIDCAuthProvider``/``EntraAuthProvider``, and were pinned per
+        provider for oidc and entra. The seam moved to ``build_sso_runtime``,
+        so the assertion moves with it: the profile's pinned algorithm tuple,
+        never a value read from a token header, and the operator's
+        ``jwks_max_stale_seconds`` rather than the default.
+
+        Vanguard, not oidc/entra, because it is the profile this class already
+        has a wired-settings helper for and the threading is profile-agnostic.
+        ``test_sso_wiring.py`` covers the same validator without an app.
+        """
+        app = create_app(self._vanguard_settings(tmp_path, jwks_max_stale_seconds=12_345))
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                validator = app.state.sso.validator
+                assert validator._algorithms == get_profile("vanguard").id_token_algorithms
+                assert validator._jwks_max_stale_seconds == 12_345
+
+    def test_an_unwired_deployment_refuses_to_boot_and_names_its_missing_settings(self, tmp_path) -> None:
+        """``create_app``'s total boundary: an IdP provider with no wiring cannot serve anyone.
+
+        There is no legacy bearer path left to fall back to, so a non-local
+        provider whose profile is not fully configured must fail at boot
+        rather than accept requests it can never authenticate.
+
+        No operator reaches this by configuration: ``WebSettings`` now
+        enforces the same profile-required set that ``build_sso_wiring``
+        reads, so a validly constructed settings object for a non-local
+        provider is always wired. ``model_copy`` is how the test reaches the
+        boundary -- it skips validation, which is exactly the mocked or
+        corrupted settings object the arm exists to catch.
+        """
+        unwired = self._vanguard_settings(tmp_path).model_copy(update={"sso_client_id": None})
+
+        with pytest.raises(RuntimeError, match="vanguard is not wired for single sign-on: missing sso_client_id"):
+            create_app(unwired)
 
 
 class TestLifespanShutdown:
     """Shutdown must await the execution-service drain path."""
 
     @pytest.mark.asyncio
+    async def test_lifespan_aborts_when_inline_custody_reconciliation_fails(self, monkeypatch, tmp_path) -> None:
+        """The server must not serve while a custody journal is unresolved."""
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+
+        async def _fail_reconciliation() -> None:
+            raise OSError("inline custody journal unavailable")
+
+        monkeypatch.setattr(app.state.blob_service, "reconcile_inline_custody_publications", _fail_reconciliation)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            pytest.raises(OSError, match="inline custody journal unavailable"),
+        ):
+            async with lifespan(app):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_lifespan_aborts_when_startup_orphan_sweep_fails(self, monkeypatch, tmp_path) -> None:
+        """A server that cannot settle orphaned runs must not serve.
+
+        The startup sweep has no catch: sessions would stay blocked by the
+        active-run partial unique index and Landscape rows would stay pending
+        reconciliation with no record that the sweep never ran, so any SQL/IO
+        fault fails startup — same posture as the inline-custody
+        reconciliation above.
+        """
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+
+        async def _fail_sweep(**_kwargs: object) -> list[RunRecord]:
+            raise OperationalError("UPDATE runs", {}, Exception("db unavailable"))
+
+        monkeypatch.setattr(app.state.session_service, "cancel_all_orphaned_run_records", _fail_sweep)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            pytest.raises(OperationalError),
+        ):
+            async with lifespan(app):
+                pass
+
+    @pytest.mark.asyncio
     async def test_lifespan_aborts_on_composer_config_rejection(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+        app.state._session_engine_finalizer()
+        finalizer_calls = 0
+
+        def finalize_session_engine() -> None:
+            nonlocal finalizer_calls
+            finalizer_calls += 1
+
+        app.state._session_engine_finalizer = finalize_session_engine
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
@@ -1181,6 +1610,7 @@ class TestLifespanShutdown:
         assert attributes["probe_status"] == "rejected"
         assert attributes["probed_model"] == "gpt-5.5"
         assert len(latency.calls) == 1
+        assert finalizer_calls == 1
 
     @pytest.mark.asyncio
     async def test_lifespan_skips_composer_probe_when_disabled(self, monkeypatch, tmp_path) -> None:
@@ -1210,10 +1640,29 @@ class TestLifespanShutdown:
         )
         session_service = app.state.session_service
         session = await session_service.create_session("alice", "Pipeline", "local")
-        state = await session_service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await session_service.create_run(session.id, state.id)
+        state = await _save_session_seed_state(session_service, session.id)
         landscape_run_id = "lscp-startup-orphan"
-        await session_service.update_run_status(web_run.id, "running", landscape_run_id=landscape_run_id)
+        authority = session_service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await session_service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await session_service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             RecorderFactory(db).run_lifecycle.begin_run(
@@ -1223,6 +1672,9 @@ class TestLifespanShutdown:
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
+            # The dead leader's seat has lapsed: the orphan finaliser takes it
+            # through the takeover CAS before stamping INTERRUPTED (ADR-048 §4).
+            expire_leader_seat(db, landscape_run_id)
 
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
@@ -1252,9 +1704,28 @@ class TestLifespanShutdown:
         )
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
-        await service.update_run_status(web_run.id, "running", landscape_run_id="RAW_ABSENT_ANCHOR_SENTINEL")
+        state = await _save_session_seed_state(service, session.id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id="RAW_ABSENT_ANCHOR_SENTINEL",
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
@@ -1286,8 +1757,22 @@ class TestLifespanShutdown:
         )
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
+        state = await _save_session_seed_state(service, session.id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         real_finalize = app_module._finalize_orphaned_landscape_runs
 
@@ -1308,10 +1793,29 @@ class TestLifespanShutdown:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
+        state = await _save_session_seed_state(service, session.id)
         landscape_run_id = "landscape-marker-retry"
-        await service.update_run_status(web_run.id, "running", landscape_run_id=landscape_run_id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             RecorderFactory(db).run_lifecycle.begin_run(
                 config={},
@@ -1320,6 +1824,7 @@ class TestLifespanShutdown:
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
+            expire_leader_seat(db, landscape_run_id)
         await service.cancel_all_orphaned_run_records(reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}")
         service_type = type(service)
         original_mark = service_type.mark_landscape_reconciliation_outcomes
@@ -1391,6 +1896,79 @@ class TestLifespanShutdown:
             assert attributes["probe_status"] == "success"
 
     @pytest.mark.asyncio
+    async def test_lifespan_probes_each_role_against_its_own_endpoint(self, monkeypatch, tmp_path) -> None:
+        """Phase 3 Task 2: each role probes ITS OWN configured endpoint — a
+        misconfigured custom endpoint must fail boot, not a user's first turn.
+        The primary and advisor endpoints are deliberately different here to
+        prove there is no cross-role mixup.
+        """
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="anthropic/claude-sonnet-4-6",
+                composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+                composer_endpoint_api_key="primary-bearer-token",  # secret-scan: allow-this-line
+                composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+                composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+            )
+        )
+        probed: list[dict[str, object]] = []
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+
+        async def _probe(**kwargs: object) -> bool:
+            probed.append(kwargs)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert len(probed) == 2
+        primary_call, advisor_call = probed
+        assert primary_call["model"] == "gpt-5.5"
+        assert primary_call["api_base"] == "https://primary-gateway.example.test/v1"
+        assert primary_call["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+        assert advisor_call["model"] == "anthropic/claude-sonnet-4-6"
+        assert advisor_call["api_base"] == "https://advisor-gateway.example.test/v1"
+        assert advisor_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+
+    @pytest.mark.asyncio
+    async def test_lifespan_probe_omits_endpoint_kwargs_when_unset(self, monkeypatch, tmp_path) -> None:
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="anthropic/claude-sonnet-4-6",
+            )
+        )
+        probed: list[dict[str, object]] = []
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+
+        async def _probe(**kwargs: object) -> bool:
+            probed.append(kwargs)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert len(probed) == 2
+        for call in probed:
+            assert call["api_base"] is None
+            assert call["api_key"] is None
+
+    @pytest.mark.asyncio
     async def test_lifespan_records_transient_failure_when_composer_probe_times_out(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         counter = _RecordingCounter()
@@ -1456,8 +2034,27 @@ class TestLifespanShutdown:
 
     @pytest.mark.asyncio
     async def test_lifespan_propagates_catalog_client_context_failure(self, tmp_path) -> None:
-        """Outer HTTP-client construction failures are startup failures, not fallback decisions."""
-        app = create_app(_settings(tmp_path))
+        """Outer HTTP-client construction failures are startup failures, not fallback decisions.
+
+        The catalog prime is gated on OpenRouter being a configured LLM
+        provider (elspeth-c67ba40e4a), so the deployment must bind an
+        ``openrouter`` profile for the probe client to be constructed at
+        all — without one the prime (and this failure mode) never runs.
+        """
+        app = create_app(
+            _settings(
+                tmp_path,
+                llm_profiles={
+                    "tutorial": {
+                        "provider": "openrouter",
+                        "model": "openai/gpt-5-mini",
+                        "credential_scope": "server",
+                        "credential_ref": "OPENROUTER_API_KEY",
+                    }
+                },
+                default_llm_profile="tutorial",
+            )
+        )
 
         with (
             patch("httpx.AsyncClient", return_value=_EnteringAsyncClientRaises()),
@@ -1481,21 +2078,86 @@ class TestLifespanShutdown:
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("deployment_target", "expected_create_tables"), [("default", True), ("aws-ecs", False)])
+    async def test_fatal_periodic_cleanup_failure_stops_lifespan_and_preserves_shutdown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        """A dead required sweeper must stop serving and cannot skip teardown."""
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+        fake_execution_service = _RecordingExecutionService()
+        fake_operator_telemetry = _RecordingOperatorTelemetry()
+        app.state.operator_telemetry = fake_operator_telemetry
+        cleanup_failed = asyncio.Event()
+
+        async def fatal_cleanup(*_args: object, **_kwargs: object) -> None:
+            cleanup_failed.set()
+            raise OSError("orphan cleanup storage unavailable")
+
+        async def shutdown_workers() -> None:
+            return None
+
+        monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", fatal_cleanup)
+        monkeypatch.setattr("elspeth.web.async_workers.shutdown_async_workers", shutdown_workers)
+
+        async def serve_until_stopped() -> None:
+            async with lifespan(app):
+                await asyncio.Event().wait()
+
+        with patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service):
+            lifespan_task = asyncio.create_task(serve_until_stopped())
+            await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
+            done, _pending = await asyncio.wait({lifespan_task}, timeout=0.2)
+            if lifespan_task not in done:
+                lifespan_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, OSError):
+                    await lifespan_task
+
+        assert lifespan_task in done, "fatal orphan cleanup left the service lifespan running"
+        with pytest.raises(OSError, match="orphan cleanup storage unavailable"):
+            await lifespan_task
+        assert fake_execution_service.shutdown_calls == 1
+        assert fake_operator_telemetry.shutdown_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("deployment_target", "state_mode", "expected_create_tables"),
+        [
+            ("default", "sqlite-single", True),
+            ("docker-compose", "sqlite-single", True),
+            ("linux-systemd", "sqlite-single", True),
+            ("default", "external-postgresql", False),
+            ("docker-compose", "external-postgresql", False),
+            ("linux-systemd", "external-postgresql", False),
+            ("aws-ecs", "external-postgresql", False),
+            ("azure-container-apps", "external-postgresql", False),
+            ("kubernetes", "external-postgresql", False),
+        ],
+    )
     async def test_lifespan_forwards_orphan_reconciliation_schema_creation_policy(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         deployment_target: str,
+        state_mode: str,
         expected_create_tables: bool,
     ) -> None:
         base_dir = tmp_path / deployment_target / "base"
         app = create_app(_settings(base_dir, composer_boot_probe_enabled=False))
-        if deployment_target == "aws-ecs":
-            app.state.settings = _aws_settings(
+        if state_mode == "external-postgresql":
+            app.state.settings = _external_settings(
                 tmp_path / deployment_target / "runtime",
+                deployment_target,
                 composer_boot_probe_enabled=False,
             )
+        else:
+            app.state.settings = _settings(
+                tmp_path / deployment_target / "runtime",
+                deployment_target=deployment_target,
+                deployment_state_mode=state_mode,
+                composer_boot_probe_enabled=False,
+            )
+        app.state.deployment_state_mode = state_mode
 
         one_shot_calls: list[bool] = []
         periodic_calls: list[bool] = []
@@ -1604,7 +2266,7 @@ class TestSettingsFromEnv:
             "ELSPETH_WEB__LLM_PROFILES",
             '{"tutorial": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0"}}',
         )
-        monkeypatch.setenv("ELSPETH_WEB__TUTORIAL_LLM_PROFILE", "tutorial")
+        monkeypatch.setenv("ELSPETH_WEB__DEFAULT_LLM_PROFILE", "tutorial")
 
         settings = settings_from_env()
 
@@ -1624,27 +2286,6 @@ class TestSettingsFromEnv:
             settings_from_env()
 
         assert marker not in str(exc_info.value)
-
-    def test_oidc_authorization_allowed_origins_from_json(self, monkeypatch) -> None:
-        monkeypatch.setenv(
-            "ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS",
-            '["https://Login.Example.com:443/"]',
-        )
-        monkeypatch.setenv("ELSPETH_WEB__AUTH_PROVIDER", "oidc")
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_ISSUER", "https://issuer.example.com")
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_AUDIENCE", "audience")
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_CLIENT_ID", "client")
-        settings = settings_from_env()
-        assert settings.oidc_authorization_allowed_origins == ("https://login.example.com",)
-
-    @pytest.mark.parametrize("raw", ["not-json", "null", "{}", '"string"', "[1]", '["https://a.example", null]'])
-    def test_oidc_authorization_allowed_origins_rejects_bad_json_without_echo(self, monkeypatch, raw: str) -> None:
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS", raw)
-        with pytest.raises((RuntimeError, ValidationError)) as raised:
-            settings_from_env()
-        rendered = str(raised.value)
-        assert "oidc_authorization_allowed_origins" in rendered.lower()
-        assert raw not in rendered
 
     @pytest.mark.parametrize(
         ("raw_allowlist", "match"),
@@ -1680,10 +2321,17 @@ class TestSettingsFromEnv:
             settings_from_env()
 
     def test_nullable_field_null_becomes_none(self, monkeypatch) -> None:
-        """'null' → None for nullable fields, enabling default fallback."""
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT", "null")
+        """'null' → None for nullable fields, enabling default fallback.
+
+        A local-auth settings load, like every test in this class: the
+        break-glass endpoint overrides are all-or-none, but that rule runs
+        only on the non-local branch, so this lone override reaches the field
+        parser and nothing else. What is under test is the parser mapping
+        'null' to None rather than to the four-character string.
+        """
+        monkeypatch.setenv("ELSPETH_WEB__SSO_AUTHORIZATION_ENDPOINT", "null")
         settings = settings_from_env()
-        assert settings.oidc_authorization_endpoint is None
+        assert settings.sso_authorization_endpoint is None
 
     def test_nullable_db_url_null_becomes_none(self, monkeypatch) -> None:
         """'null' → None for landscape_url, so get_landscape_url() uses the default."""
@@ -1710,9 +2358,7 @@ class TestJsonCollectionFieldsSync:
 
     def test_all_tuple_fields_in_allowlist(self) -> None:
         """Every tuple-typed field on WebSettings must appear in _JSON_COLLECTION_FIELDS."""
-        tuple_fields = {
-            name for name, field_info in WebSettings.model_fields.items() if getattr(field_info.annotation, "__origin__", None) is tuple
-        }
+        tuple_fields = {name for name, field_info in WebSettings.model_fields.items() if get_origin(field_info.annotation) is tuple}
         missing = tuple_fields - _JSON_COLLECTION_FIELDS
         assert not missing, (
             f"Tuple-typed WebSettings fields missing from _JSON_COLLECTION_FIELDS: {missing}. "
@@ -1721,9 +2367,7 @@ class TestJsonCollectionFieldsSync:
 
     def test_no_non_tuple_fields_in_allowlist(self) -> None:
         """_JSON_COLLECTION_FIELDS must not contain non-tuple fields."""
-        tuple_fields = {
-            name for name, field_info in WebSettings.model_fields.items() if getattr(field_info.annotation, "__origin__", None) is tuple
-        }
+        tuple_fields = {name for name, field_info in WebSettings.model_fields.items() if get_origin(field_info.annotation) is tuple}
         extra = _JSON_COLLECTION_FIELDS - tuple_fields
         assert not extra, f"Non-tuple fields in _JSON_COLLECTION_FIELDS: {extra}. Scalar fields should not be JSON-decoded."
 
@@ -1803,12 +2447,12 @@ class TestPeriodicOrphanCleanup:
         """Periodic cleanup logs recoverable audit/DB failures and keeps running.
 
         The catch in _periodic_orphan_cleanup is narrowed to
-        (SQLAlchemyError, OSError). OperationalError models the realistic
-        production failure — transient connection drop, lock timeout, or
-        SQLite-busy — that the loop must survive. A prior iteration used
-        RuntimeError here, which is now the wrong signal: RuntimeError is a
-        programmer-bug class and must propagate past the catch (see the
-        companion programmer-bug test below).
+        OperationalError — transient connection drop, lock timeout, or
+        SQLite-busy — the one failure class the loop must survive (and only
+        up to the consecutive-failure bound; see the escalation test below).
+        A prior iteration used RuntimeError here, which is now the wrong
+        signal: RuntimeError is a programmer-bug class and must propagate
+        past the catch (see the companion programmer-bug test below).
 
         The leak assertions on the structured log entry verify that the
         exc_info drop holds: the DB URL fragment and SQL statement from
@@ -1865,12 +2509,16 @@ class TestPeriodicOrphanCleanup:
         assert "SELECT * FROM runs" not in str(event)
 
     @pytest.mark.asyncio
-    async def test_schema_compatibility_failure_is_redacted_and_loop_retries(
+    async def test_schema_compatibility_failure_terminates_task_without_leaking_detail(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """An incompatible Landscape schema is operator-actionable state, not
+        a transient: retrying every interval can never fix it. It must escape
+        the narrowed catch (terminating the task so it surfaces at lifespan
+        shutdown, same mechanism as programmer bugs) and must not be logged
+        through the redacted retry channel."""
         sentinel = "opaque-schema-secret SELECT raw_schema FROM forbidden"
-        recovered = asyncio.Event()
         finalize_calls: list[bool] = []
 
         class _RecordSessionService:
@@ -1890,10 +2538,7 @@ class TestPeriodicOrphanCleanup:
             create_tables: bool,
         ) -> tuple[frozenset[object], frozenset[object]]:
             finalize_calls.append(create_tables)
-            if len(finalize_calls) == 1:
-                raise SchemaCompatibilityError(sentinel)
-            recovered.set()
-            return frozenset(), frozenset()
+            raise SchemaCompatibilityError(sentinel)
 
         monkeypatch.setattr(app_module, "_finalize_orphaned_landscape_runs", finalize)
         telemetry = build_sessions_telemetry()
@@ -1909,19 +2554,12 @@ class TestPeriodicOrphanCleanup:
                     create_tables=False,
                 )
             )
-            try:
-                await asyncio.wait_for(recovered.wait(), timeout=5.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            with pytest.raises(SchemaCompatibilityError):
+                await asyncio.wait_for(task, timeout=5.0)
 
-        assert finalize_calls[:2] == [False, False]
+        assert finalize_calls == [False]
         failures = [entry for entry in logs if entry.get("event") == "periodic_orphan_cleanup_failed"]
-        assert len(failures) == 1
-        assert failures[0]["exc_class"] == "SchemaCompatibilityError"
-        assert "exc_info" not in failures[0]
-        assert sentinel not in repr(failures[0])
+        assert failures == []
 
     @pytest.mark.asyncio
     async def test_cancellation_is_clean(self) -> None:
@@ -1947,7 +2585,7 @@ class TestPeriodicOrphanCleanup:
 
         This is the guardrail for the narrowed catch at
         _periodic_orphan_cleanup: replacing ``except Exception`` with
-        ``except (SQLAlchemyError, OSError)`` means a drifted attribute on
+        ``except OperationalError`` means a drifted attribute on
         ExecutionServiceImpl, a signature change on SessionServiceImpl, or
         an assertion violation now terminates the task immediately. A future
         regression that re-widens the catch would turn production into an
@@ -2023,6 +2661,105 @@ class TestPeriodicOrphanCleanup:
             }
         ]
 
+    @pytest.mark.asyncio
+    async def test_persistent_operational_error_escalates_after_bound(self) -> None:
+        """Contention absorption is bounded: after the consecutive-failure
+        bound the sweeper stops presuming transience and re-raises, so the
+        stored failure surfaces through the task-death route instead of being
+        logged every interval forever."""
+
+        async def always_fail(**_: object) -> int:
+            raise OperationalError("SELECT * FROM runs", {}, Exception("db unavailable"))
+
+        session_service = _RecordingSessionService(cancel_side_effect=always_fail)
+        execution_service = _RecordingExecutionService()
+
+        with capture_logs() as cap_logs:
+            telemetry = build_sessions_telemetry()
+            task = asyncio.create_task(
+                _periodic_orphan_cleanup(session_service, execution_service, telemetry, interval_seconds=0, max_age_seconds=3600)
+            )
+            with pytest.raises(OperationalError):
+                await asyncio.wait_for(task, timeout=5.0)
+
+        bound = app_module._ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES
+        assert len(session_service.cancel_all_orphaned_runs_calls) == bound
+
+        failure_events = [entry for entry in cap_logs if entry.get("event") == "periodic_orphan_cleanup_failed"]
+        escalation_events = [entry for entry in cap_logs if entry.get("event") == "periodic_orphan_cleanup_escalating"]
+        assert len(failure_events) == bound - 1
+        assert len(escalation_events) == 1
+        event = escalation_events[0]
+        assert event["exc_class"] == "OperationalError"
+        assert event["consecutive_failures"] == bound
+        # The redaction pattern holds on the escalation event too.
+        assert "db unavailable" not in str(event)
+        assert "SELECT * FROM runs" not in str(event)
+
+    @pytest.mark.asyncio
+    async def test_recovery_resets_the_escalation_counter(self) -> None:
+        """A successful sweep resets the consecutive-failure counter: only an
+        unbroken failure run escalates. Without the reset, the post-recovery
+        failure below would be failure number ``bound`` and kill the task, and
+        the second recovery would never be observed."""
+        bound = app_module._ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES
+        second_recovery = asyncio.Event()
+        call_count = {"n": 0}
+
+        async def fail_recover_fail_recover(**_: object) -> int:
+            call_count["n"] += 1
+            if call_count["n"] <= bound - 1 or call_count["n"] == bound + 1:
+                raise OperationalError("stmt", {}, Exception("db unavailable"))
+            if call_count["n"] >= bound + 2:
+                second_recovery.set()
+            return 0
+
+        session_service = _RecordingSessionService(cancel_side_effect=fail_recover_fail_recover)
+        execution_service = _RecordingExecutionService()
+
+        telemetry = build_sessions_telemetry()
+        task = asyncio.create_task(
+            _periodic_orphan_cleanup(session_service, execution_service, telemetry, interval_seconds=0, max_age_seconds=3600)
+        )
+        try:
+            await asyncio.wait_for(second_recovery.wait(), timeout=5.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "standing_exc",
+        [
+            pytest.param(ProgrammingError("SELECT bad", {}, Exception("no such column")), id="programming_error"),
+            pytest.param(OSError("sessions.db unreachable"), id="os_error"),
+        ],
+    )
+    async def test_standing_faults_terminate_task_immediately(self, standing_exc: Exception) -> None:
+        """Only OperationalError models transient contention. A non-operational
+        SQLAlchemyError or a raw OSError is standing operator/programmer state:
+        it must escape the catch on the first occurrence — no retry, no
+        redacted-retry log event."""
+
+        async def raise_standing(**_: object) -> int:
+            raise standing_exc
+
+        session_service = _RecordingSessionService(cancel_side_effect=raise_standing)
+        execution_service = _RecordingExecutionService()
+
+        with capture_logs() as cap_logs:
+            telemetry = build_sessions_telemetry()
+            task = asyncio.create_task(
+                _periodic_orphan_cleanup(session_service, execution_service, telemetry, interval_seconds=0, max_age_seconds=3600)
+            )
+            with pytest.raises(type(standing_exc)):
+                await asyncio.wait_for(task, timeout=5.0)
+
+        assert len(session_service.cancel_all_orphaned_runs_calls) == 1
+        failure_events = [entry for entry in cap_logs if entry.get("event") == "periodic_orphan_cleanup_failed"]
+        assert failure_events == [], cap_logs
+
 
 class TestOrphanLandscapeReconciliation:
     """Cross-DB orphan cleanup reconciliation."""
@@ -2041,6 +2778,7 @@ class TestOrphanLandscapeReconciliation:
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
+            expire_leader_seat(db, landscape_run_id)
 
         cancelled_run = RunRecord(
             id=uuid4(),
@@ -2071,6 +2809,51 @@ class TestOrphanLandscapeReconciliation:
         assert run is not None
         assert run.status == RunStatus.INTERRUPTED
         assert run.completed_at is not None
+
+    def test_live_leader_seat_defers_reconciliation_and_leaves_the_run_running(self, tmp_path: Path) -> None:
+        """ADR-048 §4: a run whose seat is still live is NOT orphaned — no write, no outcome, retried next sweep."""
+        settings = _settings(tmp_path)
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        (settings.data_dir / "runs").mkdir(exist_ok=True)
+        landscape_url = settings.get_landscape_url()
+        landscape_run_id = "lscp-live-leader"
+        with LandscapeDB.from_url(landscape_url) as db:
+            RecorderFactory(db).run_lifecycle.begin_run(
+                config={},
+                canonical_version="v1",
+                run_id=landscape_run_id,
+                openrouter_catalog_sha256="0" * 64,
+                openrouter_catalog_source="bundled",
+            )
+        cancelled_run = RunRecord(
+            id=uuid4(),
+            session_id=uuid4(),
+            state_id=uuid4(),
+            status="cancelled",
+            started_at=datetime.now(tz=UTC),
+            finished_at=datetime.now(tz=UTC),
+            rows_processed=0,
+            rows_succeeded=0,
+            rows_failed=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+            error="Orphaned by server restart - no active process",
+            landscape_run_id=landscape_run_id,
+            pipeline_yaml=None,
+        )
+
+        with capture_logs() as logs:
+            complete, absent = app_module._finalize_orphaned_landscape_runs(landscape_url, [cancelled_run])
+
+        assert complete == frozenset()
+        assert absent == frozenset()
+        assert any(entry.get("event") == "orphan_landscape_run_leader_live" for entry in logs), logs
+        with LandscapeDB.from_url(landscape_url) as db:
+            run = RecorderFactory(db).run_lifecycle.get_run(landscape_run_id)
+        assert run is not None
+        assert run.status == RunStatus.RUNNING
+        assert run.completed_at is None
 
     def test_missing_landscape_row_returns_absent_outcome_without_identifier_log(self, tmp_path: Path) -> None:
         settings = _settings(tmp_path)
@@ -2248,16 +3031,91 @@ class TestValidationErrorRedaction:
     def test_secrets_route_redacts_input(self, tmp_path) -> None:
         """POST /api/secrets with wrong value type must not echo the value."""
         client = self._authed_client(tmp_path)
-        resp = client.post(
-            "/api/secrets",
-            json={"name": "API_KEY", "value": {"nested": "super-secret-hunter2"}},
-        )
+        request_id = "trace-validation-422"
+        secret_canary = "super-secret-hunter2"
+        with capture_logs() as logs:
+            resp = client.post(
+                "/api/secrets",
+                headers={"X-Request-ID": request_id},
+                json={"name": "API_KEY", "value": {"nested": secret_canary}},
+            )
         assert resp.status_code == 422
         body = resp.json()
         body_text = resp.text
-        assert "super-secret-hunter2" not in body_text
+        assert secret_canary not in body_text
+        assert secret_canary not in repr(logs)
+        assert body["request_id"] == request_id
+        assert resp.headers["X-Request-ID"] == request_id
+        assert logs == [
+            {
+                "event": "http_validation_error_envelope",
+                "log_level": "warning",
+                "request_id": request_id,
+                "status_code": 422,
+            }
+        ]
         for error in body["detail"]:
             assert set(error.keys()) <= self._SAFE_KEYS
+
+    def test_validation_response_survives_a_warning_sink_failure(self, tmp_path: Path) -> None:
+        """Operational correlation logging cannot replace the primary 422."""
+        with patch("elspeth.web.app.structlog.get_logger") as get_logger:
+            get_logger.return_value.warning.side_effect = RuntimeError("logging backend unavailable")
+            app = create_app(_settings(tmp_path))
+
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+
+        async def _mock_user() -> UserIdentity:
+            return UserIdentity(user_id="test-user", username="test-user")
+
+        app.dependency_overrides[get_current_user] = _mock_user
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/api/secrets",
+            headers={"X-Request-ID": "trace-validation-log-failure"},
+            json={"name": "API_KEY", "value": {"bad": "type"}},
+        )
+
+        assert resp.status_code == 422
+        assert resp.json()["request_id"] == "trace-validation-log-failure"
+        get_logger.return_value.warning.assert_called_once_with(
+            "http_validation_error_envelope",
+            status_code=422,
+            request_id="trace-validation-log-failure",
+        )
+
+    @pytest.mark.asyncio
+    async def test_validation_tier_one_warning_failure_escapes(self, tmp_path: Path) -> None:
+        """Registered Tier-1 failures outrank even the primary validation response."""
+        with patch("elspeth.web.app.structlog.get_logger") as get_logger:
+            get_logger.return_value.warning.side_effect = FrameworkBugError("logger invariant failed")
+            app = create_app(_settings(tmp_path))
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/secrets",
+                "headers": [],
+                "query_string": b"",
+            }
+        )
+        request.state.request_id = "trace-validation-tier-one"
+        validation_error = RequestValidationError(
+            [
+                {
+                    "type": "string_type",
+                    "loc": ("body", "value"),
+                    "msg": "Input should be a valid string",
+                    "input": {"sensitive": "canary"},
+                }
+            ]
+        )
+        handler = app.exception_handlers[RequestValidationError]
+
+        with pytest.raises(FrameworkBugError, match="logger invariant failed"):
+            await handler(request, validation_error)
 
     def test_redaction_preserves_error_structure(self, tmp_path) -> None:
         """Redacted errors retain type, loc, msg for client debugging."""
@@ -2551,6 +3409,343 @@ class TestSecretsExceptionHandlers:
         _prop()
 
 
+class TestDeploymentStateModeStartup:
+    """Application startup policy is selected by resolved state mode."""
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            pytest.param(
+                lambda root: _settings(
+                    root,
+                    deployment_target="aws-ecs",
+                    deployment_state_mode="sqlite-single",
+                    session_db_url="sqlite:///sessions.db",
+                    landscape_url="sqlite:///landscape.db",
+                ),
+                id="aws-rejects-sqlite",
+            ),
+            pytest.param(
+                lambda root: _settings(
+                    root,
+                    deployment_target="default",
+                    deployment_state_mode="external-postgresql",
+                    session_db_url="sqlite:///sessions.db",
+                    landscape_url="sqlite:///landscape.db",
+                ),
+                id="external-mode-rejects-sqlite-urls",
+            ),
+        ],
+    )
+    def test_invalid_mode_combination_precedes_all_startup_effects(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        settings: Callable[[Path], WebSettings],
+    ) -> None:
+        runtime = settings(tmp_path / "must-not-exist")
+        side_effects: list[str] = []
+
+        monkeypatch.setattr(
+            app_module,
+            "bootstrap_operator_telemetry",
+            lambda *_args: side_effects.append("telemetry") or pytest.fail("telemetry bootstrapped before state resolution"),
+        )
+        monkeypatch.setattr(
+            app_module,
+            "create_session_engine",
+            lambda *_args, **_kwargs: side_effects.append("engine") or pytest.fail("database URL opened before state resolution"),
+        )
+        monkeypatch.setattr(
+            app_module.AuthAuditRecorder,
+            "from_settings",
+            lambda *_args: side_effects.append("auth") or pytest.fail("auth audit constructed before state resolution"),
+        )
+        monkeypatch.setattr(
+            Path,
+            "mkdir",
+            lambda *_args, **_kwargs: side_effects.append("mkdir") or pytest.fail("directory created before state resolution"),
+        )
+
+        with pytest.raises(DeploymentConfigurationError):
+            create_app(runtime)
+
+        assert side_effects == []
+        assert runtime.data_dir.exists() is False
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_create_app_resolves_external_state_mode_exactly_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
+    ) -> None:
+        settings = _external_settings(tmp_path / deployment_target, deployment_target)
+        engine = create_engine("sqlite:///:memory:")
+        real_resolve = deployment_contract_module.resolve_deployment_state_mode
+        resolve_calls = 0
+
+        def resolve(passed_settings: WebSettings) -> str:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return real_resolve(passed_settings)
+
+        monkeypatch.setattr(app_module, "resolve_deployment_state_mode", resolve)
+        monkeypatch.setattr(deployment_contract_module, "resolve_deployment_state_mode", resolve)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+
+        app = create_app(settings)
+
+        assert resolve_calls == 1
+        app.state._session_engine_finalizer()
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_mode_uses_raw_urls_validate_only_and_one_session_engine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
+    ) -> None:
+        settings = _external_settings(tmp_path / deployment_target, deployment_target)
+        engine = create_engine("sqlite:///:memory:")
+        engine_calls: list[tuple[str, dict[str, object]]] = []
+        schema_calls: list[tuple[WebSettings, Engine]] = []
+        mkdir_calls: list[Path] = []
+        original_mkdir = Path.mkdir
+
+        def build_engine(url: str, **kwargs: object) -> Engine:
+            engine_calls.append((url, kwargs))
+            return engine
+
+        def validate(passed_settings: WebSettings, passed_engine: Engine) -> None:
+            schema_calls.append((passed_settings, passed_engine))
+
+        def mkdir(path: Path, *args: object, **kwargs: object) -> None:
+            mkdir_calls.append(path)
+            original_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(app_module, "create_session_engine", build_engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", validate)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", validate)
+        monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("external startup ran session DDL"))
+        monkeypatch.setattr(app_module, "open_landscape_db", lambda *_args: pytest.fail("external startup ran Landscape DDL"))
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+
+        app = create_app(settings)
+
+        assert app.state.deployment_state_mode == "external-postgresql"
+        assert engine_calls == [
+            (
+                settings.session_db_url,
+                {"connect_args": {"connect_timeout": 10}, "pool_size": 5, "max_overflow": 5, "pool_pre_ping": True},
+            )
+        ]
+        assert schema_calls == [(settings, engine)]
+        assert settings.data_dir not in mkdir_calls
+        assert settings.data_dir / "runs" not in mkdir_calls
+        app.state._session_engine_finalizer()
+
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "azure-container-apps", "kubernetes"],
+    )
+    @pytest.mark.parametrize("state", ["MISSING", "STALE"])
+    def test_external_noncurrent_schema_fails_without_ddl_and_disposes_session_engine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
+        state: str,
+    ) -> None:
+        settings = _external_settings(tmp_path / deployment_target, deployment_target)
+        engine = create_engine("sqlite:///:memory:")
+        original_dispose = engine.dispose
+        dispose_calls = 0
+
+        def dispose(*args: object, **kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            original_dispose(*args, **kwargs)
+
+        def reject(*_args: object, **_kwargs: object) -> None:
+            raise ExternalStateSchemaNotReadyError(
+                f"External-state session_schema is {state.lower()}; Run 'elspeth doctor deployment' for full diagnostics."
+            )
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", reject)
+        monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("external startup ran session DDL"))
+        monkeypatch.setattr(app_module, "open_landscape_db", lambda *_args: pytest.fail("external startup ran Landscape DDL"))
+
+        with pytest.raises(ExternalStateSchemaNotReadyError, match="doctor deployment"):
+            create_app(settings)
+
+        assert dispose_calls == 1
+
+    def test_external_schema_failure_survives_dispose_failure_with_redacted_log(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = _external_settings(tmp_path, "linux-systemd")
+        engine = create_engine("sqlite:///:memory:")
+        primary = ExternalStateSchemaNotReadyError("primary schema validation failure")
+        cleanup_sentinel = "dispose-cleanup-sensitive-detail"
+        cleanup_detail = f"{cleanup_sentinel}: {settings.session_db_url}"
+        dispose_calls = 0
+
+        def dispose(*_args: object, **_kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            raise RuntimeError(cleanup_detail)
+
+        def reject(*_args: object, **_kwargs: object) -> None:
+            raise primary
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", reject)
+
+        with capture_logs() as logs, pytest.raises(ExternalStateSchemaNotReadyError) as exc_info:
+            create_app(settings)
+
+        assert exc_info.value is primary
+        assert type(exc_info.value) is ExternalStateSchemaNotReadyError
+        assert str(exc_info.value) == "primary schema validation failure"
+        assert dispose_calls == 1
+        assert logs == [
+            {
+                "event": "session_engine_finalization_failed",
+                "log_level": "error",
+                "primary_exc_class": "ExternalStateSchemaNotReadyError",
+                "finalization_exc_class": "RuntimeError",
+            }
+        ]
+        assert cleanup_sentinel not in repr(logs)
+        assert settings.session_db_url not in repr(logs)
+
+    @pytest.mark.parametrize("failure", [RuntimeError("late failure"), KeyboardInterrupt()])
+    def test_later_create_app_base_exception_invokes_same_one_shot_finalizer(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: BaseException,
+    ) -> None:
+        settings = _external_settings(tmp_path, "linux-systemd")
+        engine = create_engine("sqlite:///:memory:")
+        original_dispose = engine.dispose
+        dispose_calls = 0
+
+        def dispose(*args: object, **kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            original_dispose(*args, **kwargs)
+
+        def fail_catalog() -> object:
+            raise failure
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
+
+        with pytest.raises(type(failure)):
+            create_app(settings)
+
+        assert dispose_calls == 1
+
+    def test_later_create_app_base_exception_survives_dispose_failure_with_redacted_log(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = _external_settings(tmp_path, "linux-systemd")
+        engine = create_engine("sqlite:///:memory:")
+        primary = KeyboardInterrupt("primary synchronous startup failure")
+        cleanup_sentinel = "dispose-cleanup-sensitive-detail"
+        cleanup_detail = f"{cleanup_sentinel}: {settings.session_db_url}"
+        dispose_calls = 0
+
+        def dispose(*_args: object, **_kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            raise RuntimeError(cleanup_detail)
+
+        def fail_catalog() -> object:
+            raise primary
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
+
+        with capture_logs() as logs, pytest.raises(KeyboardInterrupt) as exc_info:
+            create_app(settings)
+
+        assert exc_info.value is primary
+        assert type(exc_info.value) is KeyboardInterrupt
+        assert str(exc_info.value) == "primary synchronous startup failure"
+        assert dispose_calls == 1
+        assert logs == [
+            {
+                "event": "session_engine_finalization_failed",
+                "log_level": "error",
+                "primary_exc_class": "KeyboardInterrupt",
+                "finalization_exc_class": "RuntimeError",
+            }
+        ]
+        assert cleanup_sentinel not in repr(logs)
+        assert settings.session_db_url not in repr(logs)
+
+    @pytest.mark.asyncio
+    async def test_successful_external_lifespan_finalizes_engine_exactly_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = _external_settings(tmp_path, "azure-container-apps", composer_boot_probe_enabled=False)
+        from elspeth.web.sessions.engine import create_session_engine as real_create_session_engine
+        from elspeth.web.sessions.schema import initialize_session_schema as real_initialize_session_schema
+
+        # External mode assumes an externally managed schema that exists
+        # before boot, and the startup orphan sweep fails startup when it
+        # cannot read the runs table — so the fake engine must carry the
+        # real schema, not an empty in-memory database.
+        engine = real_create_session_engine(f"sqlite:///{tmp_path / 'external-sessions.db'}")
+        real_initialize_session_schema(engine)
+        original_dispose = engine.dispose
+        dispose_calls = 0
+
+        def dispose(*args: object, **kwargs: object) -> None:
+            nonlocal dispose_calls
+            dispose_calls += 1
+            original_dispose(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "dispose", dispose)
+        monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+        app = create_app(settings)
+
+        with (
+            patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+        ):
+            async with lifespan(app):
+                pass
+
+        app.state._session_engine_finalizer()
+        assert dispose_calls == 1
+
+
 class TestAwsEcsValidateOnlyStartup:
     """AWS startup must validate completely before persistent mutation."""
 
@@ -2583,7 +3778,7 @@ class TestAwsEcsValidateOnlyStartup:
             probe_calls += 1
 
         monkeypatch.setattr(app_module, "create_session_engine", build_engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", probe, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", probe)
 
         with pytest.raises(AwsEcsStartupContractError):
             create_app(settings)
@@ -2682,7 +3877,7 @@ class TestAwsEcsValidateOnlyStartup:
             pytest.fail("AWS startup must not initialize schema")
 
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", reject, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", reject)
         monkeypatch.setattr(app_module, "initialize_session_schema", initialize)
 
         with pytest.raises(AwsEcsSchemaNotReadyError, match=label):
@@ -2721,7 +3916,7 @@ class TestAwsEcsValidateOnlyStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", reject, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", reject)
         monkeypatch.setattr(
             app_module,
             "initialize_session_schema",
@@ -2749,16 +3944,16 @@ class TestAwsEcsValidateOnlyStartup:
 
         assert (settings.data_dir / "auth.db").exists() is False
 
-    def test_session_engine_construction_failure_is_static_redacted_and_unchained(self, tmp_path: Path) -> None:
+    def test_unsupported_session_driver_fails_contract_before_engine_with_static_diagnostic(self, tmp_path: Path) -> None:
         sentinel_driver = "sentinel_driver_raw_sqlalchemy_text"
         session_url = f"postgresql+{sentinel_driver}://runtime@db/session"
         settings = _aws_settings(tmp_path, session_db_url=session_url)
 
-        with capture_logs() as logs, pytest.raises(AwsEcsSchemaNotReadyError) as exc_info:
+        with capture_logs() as logs, pytest.raises(AwsEcsStartupContractError) as exc_info:
             create_app(settings)
 
         rendered = repr(exc_info.value)
-        assert "session_schema" in str(exc_info.value)
+        assert "session_db_url" in str(exc_info.value)
         assert "Run 'elspeth doctor aws-ecs' for full diagnostics." in str(exc_info.value)
         assert exc_info.value.__cause__ is None
         assert sentinel_driver not in rendered
@@ -2782,7 +3977,8 @@ class TestAwsEcsValidateOnlyStartup:
         original_catalog = app_module.create_catalog_service
         original_mkdir = Path.mkdir
 
-        def enforce(_settings: WebSettings) -> None:
+        def enforce(_settings: WebSettings, *, resolved_state_mode: str | None = None) -> None:
+            assert resolved_state_mode == "external-postgresql"
             order.append("contract")
 
         def directories(_settings: WebSettings) -> None:
@@ -2809,10 +4005,10 @@ class TestAwsEcsValidateOnlyStartup:
             mkdir_calls.append(path)
             original_mkdir(path, *args, **kwargs)
 
-        monkeypatch.setattr(app_module, "enforce_aws_ecs_contract", enforce, raising=False)
-        monkeypatch.setattr(app_module, "require_runtime_directories_mounted", directories, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "enforce_aws_ecs_contract", enforce)
+        monkeypatch.setattr(aws_ecs_startup_module, "require_runtime_directories_mounted", directories)
         monkeypatch.setattr(app_module, "create_session_engine", build_engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", validate, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", validate)
         monkeypatch.setattr(app_module, "create_catalog_service", catalog)
         monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("initializer called"))
         monkeypatch.setattr(app_module.weakref, "finalize", finalize)
@@ -2880,3 +4076,165 @@ class TestAwsEcsValidateOnlyStartup:
         assert (data_dir / "runs").is_dir()
         assert initialize_calls == 1
         app.state.session_engine.dispose()
+
+
+class TestBootPrimeOpenRouterCatalogGate:
+    """elspeth-c67ba40e4a: boot catalog prime follows configured LLM providers.
+
+    A deployment must not egress to providers it has not configured: the
+    boot-time OpenRouter ``/models`` prime runs only when a configured LLM
+    profile binds the ``openrouter`` provider. Bedrock-only (AWS ECS via
+    the task role) and profile-less deployments skip the prime entirely —
+    no request to openrouter.ai — and serve the bundled litellm fallback.
+    """
+
+    _OPENROUTER_PROFILE: ClassVar[dict[str, str]] = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5-mini",
+        "credential_scope": "server",
+        "credential_ref": "OPENROUTER_API_KEY",
+    }
+    _BEDROCK_PROFILE: ClassVar[dict[str, str]] = {
+        "provider": "bedrock",
+        "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+        "region_name": "ap-southeast-2",
+    }
+
+    def _run_boot_prime(self, settings: WebSettings, monkeypatch, *, prime_result: bool = True) -> tuple[int, list[dict]]:
+        """Run the boot-prime helper with the live prime mocked out.
+
+        Returns ``(prime_call_count, captured_logs)``. The mock replaces
+        ``prime_openrouter_catalog_from_live`` on the app module so no
+        real HTTP request can occur regardless of the gate's decision.
+        """
+        calls: list[object] = []
+
+        async def _fake_prime(*, http_get: object) -> bool:
+            calls.append(http_get)
+            return prime_result
+
+        monkeypatch.setattr(app_module, "prime_openrouter_catalog_from_live", _fake_prime)
+        with capture_logs() as logs:
+            asyncio.run(app_module._boot_prime_openrouter_catalog(settings))
+        return len(calls), logs
+
+    def _event(self, logs: list[dict], event: str) -> dict:
+        matches = [entry for entry in logs if entry["event"] == event]
+        assert len(matches) == 1, f"expected exactly one {event!r} log, got {logs!r}"
+        return matches[0]
+
+    def test_bedrock_only_deployment_skips_prime(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"llm-default": dict(self._BEDROCK_PROFILE)},
+            default_llm_profile="llm-default",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 0
+        skipped = self._event(logs, "openrouter_catalog_boot_prime_skipped")
+        assert skipped["configured_llm_providers"] == ("bedrock",)
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_complete" for entry in logs)
+
+    def test_no_llm_profiles_skips_prime(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(tmp_path)
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 0
+        skipped = self._event(logs, "openrouter_catalog_boot_prime_skipped")
+        assert skipped["configured_llm_providers"] == ()
+
+    def test_openrouter_deployment_primes(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 1
+        self._event(logs, "openrouter_catalog_boot_prime_complete")
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_skipped" for entry in logs)
+
+    def test_mixed_providers_primes_once(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={
+                "tutorial": dict(self._OPENROUTER_PROFILE),
+                "bedrock-task-role": dict(self._BEDROCK_PROFILE),
+            },
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 1
+        self._event(logs, "openrouter_catalog_boot_prime_complete")
+
+    def test_failed_prime_logs_fallback_warning(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch, prime_result=False)
+
+        assert prime_calls == 1
+        failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
+        assert failed["log_level"] == "warning"
+
+
+class TestWebInstanceMembershipWiring:
+    """The web_instances writer is wired through the lifespan and the readiness route (6b-2)."""
+
+    def test_sqlite_app_owns_a_single_process_membership_and_the_draining_signal(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        assert type(app.state.web_instance_membership) is SingleProcessWebInstanceMembership
+        assert type(app.state.instance_draining) is threading.Event
+        assert app.state.instance_draining is app.state.web_instance_membership.draining
+        assert not app.state.instance_draining.is_set()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_starts_membership_and_drains_as_the_first_act_of_shutdown(self, tmp_path) -> None:
+        class _SpyMembership(WebInstanceMembership):
+            """Records the lifespan's calls; the concrete arms are slotted and final."""
+
+            __slots__ = ("order",)
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.order: list[str] = []
+
+            async def start(self) -> None:
+                self.order.append("start")
+
+            async def begin_drain(self) -> MembershipShutdownOutcome:
+                self.order.append("begin_drain")
+                self._draining.set()
+                return MembershipShutdownOutcome.NO_MEMBERSHIP
+
+            async def stop(self) -> MembershipShutdownOutcome:
+                self.order.append("stop")
+                return MembershipShutdownOutcome.NO_MEMBERSHIP
+
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+        spy = _SpyMembership()
+        app.state.web_instance_membership = spy
+        app.state.instance_draining = spy.draining
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                assert spy.order == ["start"]
+                assert not app.state.instance_draining.is_set()
+        assert spy.order == ["start", "begin_drain", "stop"]
+        assert app.state.instance_draining.is_set()
+
+    def test_ready_route_passes_the_process_draining_signal(self, tmp_path, monkeypatch) -> None:
+        app = create_app(_settings(tmp_path))
+        seen: dict[str, object] = {}
+
+        async def capture(*_args: object, **kwargs: object) -> ReadinessReport:
+            seen.update(kwargs)
+            return ReadinessReport(True, tuple(ReadinessCheck(name, True, "ok") for name in READINESS_CHECK_NAMES))
+
+        monkeypatch.setattr(app_module, "readiness_report", capture)
+        assert TestClient(app).get("/api/ready").status_code == 200
+        assert seen["instance_draining"] is app.state.instance_draining

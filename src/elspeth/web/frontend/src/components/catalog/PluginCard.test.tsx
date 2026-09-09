@@ -8,11 +8,27 @@
 //      variant, labelled via the discriminator mapping.
 // ============================================================================
 
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PluginCard } from "./PluginCard";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import type { AuditCharacteristicFlag } from "./auditCharacteristics";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+
+beforeEach(() => resetStore(usePreferencesStore));
+
+// The wire is structurally JSON string[] (types/index.ts:412-420); the TS
+// union tightens in-repo construction so a typo'd flag cannot compile. A
+// fixture simulating an out-of-vocabulary flag arriving over the wire —
+// exactly the drift lookupAuditCharacteristic tolerates at runtime — has to
+// go around that same narrowing, the same way this file already does for
+// PluginSchemaInfo (`as unknown as` below, e.g. :943).
+function withWireDriftFlag(flags: string[]): AuditCharacteristicFlag[] {
+  return flags as unknown as AuditCharacteristicFlag[];
+}
 
 function makePlugin(overrides: Partial<PluginSummary> = {}): PluginSummary {
   return {
@@ -40,6 +56,7 @@ const FLAT_SCHEMA: PluginSchemaInfo = {
     },
     required: ["path"],
   },
+  knob_schema: { fields: [] },
 };
 
 // Minimal Pydantic-shaped discriminated union (real LLM transform shape,
@@ -79,6 +96,26 @@ const DISCRIMINATED_SCHEMA: PluginSchemaInfo = {
       },
     },
   },
+  knob_schema: { fields: [] },
+};
+
+// Fixtures for the detail-level describe block below (elspeth-8555a6a9e0).
+// Written as distinct literals rather than reusing makePlugin()/FLAT_SCHEMA:
+// those existing fixtures' audit_characteristics and json_schema.required
+// don't match what the gating tests need to assert against.
+const CARD_PLUGIN: PluginSummary = makePlugin({
+  audit_characteristics: ["deterministic", "quarantine", "credentials", "coerce"],
+});
+
+const CARD_SCHEMA: PluginSchemaInfo = {
+  name: "example",
+  plugin_type: "transform",
+  description: "An example plugin",
+  json_schema: {
+    properties: { profile: { type: "string" } },
+    required: ["profile"],
+  },
+  knob_schema: { fields: [] },
 };
 
 describe("PluginCard — collapsed header", () => {
@@ -115,39 +152,18 @@ describe("PluginCard — collapsed header", () => {
     );
   });
 
-  it("never uses the developer value 'null' as the primary label and badges it internal", () => {
-    render(
-      <PluginCard
-        plugin={makePlugin({
-          name: "null",
-          plugin_type: "source",
-          description: "A source that yields no rows.",
-        })}
-        schema={null}
-        onExpand={vi.fn()}
-      />,
-    );
-    const article = screen.getByRole("article", { name: "Resume Placeholder" });
-    expect(within(article).getByText("internal")).toHaveClass(
-      "plugin-card-internal-badge",
-    );
-    // The raw id stays visible, but only as demoted mono metadata.
-    expect(within(article).getByText("null")).toHaveClass("plugin-card-id");
-  });
-
-  it("does not render the internal badge for ordinary plugins", () => {
-    render(
-      <PluginCard
-        plugin={makePlugin({ name: "csv" })}
-        schema={null}
-        onExpand={vi.fn()}
-      />,
-    );
-    expect(screen.queryByText("internal")).not.toBeInTheDocument();
-  });
+  // The internal badge is gone with elspeth-06566208b3: CatalogDrawer now
+  // omits internal-machinery plugins entirely, so no card can carry one and
+  // a badge branch here would be unreachable render code. The filter is
+  // covered by CatalogDrawer.test.tsx ("CatalogDrawer — internal plugins").
 });
 
 describe("PluginCard — flat single-model schema", () => {
+  // These tests exercise the Schema disclosure mechanics themselves (not the
+  // detail-level gate), so they need the Schema button visible — see the
+  // "detail level (elspeth-8555a6a9e0)" describe block below for the gate.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
   it("links the schema disclosure to the expanded schema panel", async () => {
     const user = userEvent.setup();
     render(
@@ -189,6 +205,10 @@ describe("PluginCard — flat single-model schema", () => {
 });
 
 describe("PluginCard — discriminated union", () => {
+  // Schema-disclosure mechanics — needs the Schema button visible; see the
+  // "detail level (elspeth-8555a6a9e0)" describe block for the gate itself.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
   it("renders one section per variant labelled by discriminator value", async () => {
     const user = userEvent.setup();
     render(
@@ -371,6 +391,10 @@ describe("PluginCard — discriminated union", () => {
 });
 
 describe("PluginCard — error and loading states", () => {
+  // Schema-disclosure mechanics — needs the Schema button visible; see the
+  // "detail level (elspeth-8555a6a9e0)" describe block for the gate itself.
+  beforeEach(() => usePreferencesStore.setState({ showAdvanced: true }));
+
   it("shows schema error message and suppresses content", async () => {
     const user = userEvent.setup();
     const onRetrySchema = vi.fn();
@@ -444,6 +468,9 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("renders one audit-characteristic icon per flag", () => {
+    // io_read is not one of the DEFAULT_VISIBLE_AUDIT_FLAGS; this test pins
+    // the general per-flag rendering mechanism, not the detail-level gate.
+    usePreferencesStore.setState({ showAdvanced: true });
     render(
       <PluginCard
         plugin={makePlugin({ audit_characteristics: ["io_read", "quarantine"] })}
@@ -458,6 +485,9 @@ describe("PluginCard — Phase 7B reshape", () => {
   it("exposes the audit strip as a group named 'Audit characteristics' (WCAG 1.3.1)", () => {
     // aria-label on a role-less div is not exposed to AT; the strip must
     // carry role="group" for the label to associate (elspeth-37293a3b7c).
+    // io_read is not a DEFAULT_VISIBLE_AUDIT_FLAGS entry, so the flag must
+    // be on for the strip to render at all.
+    usePreferencesStore.setState({ showAdvanced: true });
     render(
       <PluginCard
         plugin={makePlugin({ audit_characteristics: ["io_read"] })}
@@ -468,6 +498,56 @@ describe("PluginCard — Phase 7B reshape", () => {
     expect(
       screen.getByRole("group", { name: "Audit characteristics" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows the known chip and no raw flag at the DEFAULT detail level (elspeth-0bfd019f68)", () => {
+    // external_call is in DEFAULT_VISIBLE_AUDIT_FLAGS, so its chip renders
+    // here; future_characteristic is filtered out by that same list before it
+    // ever reaches the icon. This test pins the default surface — it does NOT
+    // exercise the deleted branch, which is what the next test is for.
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["external_call", "future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText("network call")).toBeInTheDocument(); // positive anchor
+    expect(screen.queryByText("future_characteristic")).not.toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("renders no chip at all for an out-of-vocabulary flag at the DETAILED level (elspeth-0bfd019f68)", () => {
+    // THIS is the test that exercises the deleted branch: with the flag on,
+    // the unknown characteristic reaches AuditCharacteristicIcon, which now
+    // returns null. Before the change it rendered `future_characteristic`
+    // verbatim, so this assertion goes from red to green on the deletion.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["external_call", "future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.getByText("network call")).toBeInTheDocument();
+    expect(screen.queryByText("future_characteristic")).not.toBeInTheDocument();
+  });
+
+  it("renders no labelled group at all when every characteristic is out of vocabulary (elspeth-0bfd019f68)", () => {
+    // PluginCard.tsx:189's `length > 0` guard counts flags, not rendered
+    // chips. Without the lookup filter this is a <div role="group"
+    // aria-label="Audit characteristics"> with no children — announced as a
+    // labelled group containing nothing.
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(
+      <PluginCard
+        plugin={makePlugin({ audit_characteristics: withWireDriftFlag(["future_characteristic"]) })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("group", { name: "Audit characteristics" })).not.toBeInTheDocument();
   });
 
   it("renders the 'Use when' prose in the details disclosure", async () => {
@@ -504,10 +584,19 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("renders the example use as a code block preserving whitespace in details", async () => {
-    render(<PluginCard plugin={makePlugin({ example_use: "source:\n  plugin: csv" })} schema={null} onExpand={() => {}} />);
+    const exampleUse = "source:\n  plugin: csv\n  options:\n    path: data/input.csv";
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ example_use: exampleUse })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
     await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
-    const codeBlock = screen.getByText(/plugin: csv/);
-    expect(codeBlock.tagName.toLowerCase()).toBe("pre");
+    const codeBlock = container.querySelector(".plugin-card-example-code");
+    expect(codeBlock).not.toBeNull();
+    expect(codeBlock?.tagName.toLowerCase()).toBe("pre");
+    expect(codeBlock?.textContent).toBe(exampleUse);
   });
 
   it("preserves inline and fenced code formatting in details prose", async () => {
@@ -560,18 +649,213 @@ describe("PluginCard — Phase 7B reshape", () => {
     expect(within(list).getByText("when credentials would be embedded")).toBeInTheDocument();
   });
 
-  it("falls back to a generic message when prose fields are null in details", async () => {
-    render(
+  it.each(
+    (["usage_when_to_use", "usage_when_not_to_use", "example_use"] as const)
+      .flatMap((field) =>
+        ([null, "", "   ", "\n\t"] as const).map((value) => [field, value] as const),
+      ),
+  )("hides details when %s is %j and the other catalogue fields are empty", (field, value) => {
+    const { container } = render(
       <PluginCard
-        plugin={makePlugin({ usage_when_to_use: null, usage_when_not_to_use: null, example_use: null })}
+        plugin={makePlugin({ [field]: value })}
         schema={null}
         onExpand={() => {}}
       />,
     );
-    await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
-    // Per design doc 08-§Risks: "Empty entries fall back to a generic
-    // 'see the technical description' message rather than blocking display."
-    expect(screen.getByText(/see the technical description/i)).toBeInTheDocument();
+
+    expect(
+      screen.queryByRole("button", { name: /reference details for example/i }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+    expect(screen.queryByText(/see the technical description above/i)).not.toBeInTheDocument();
+  });
+
+  it("renders only meaningful catalogue sections when sibling fields are whitespace", async () => {
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use: "   ",
+          usage_when_not_to_use: "Use a database sink for relational queries.",
+          example_use: "\n\t",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for example/i,
+    });
+    await userEvent.click(detailsButton);
+
+    expect(screen.queryByText("Use when:")).not.toBeInTheDocument();
+    expect(screen.getByText("Avoid when:")).toBeInTheDocument();
+    expect(
+      screen.getByText("Use a database sink for relational queries."),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-example")).not.toBeInTheDocument();
+    expect(screen.queryByText(/see the technical description above/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps populated CSV details collapsed by default and supports close and reopen", async () => {
+    const user = userEvent.setup();
+    const csvPlugin = makePlugin({
+      name: "csv",
+      plugin_type: "source",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+      usage_when_not_to_use: "When the rows are already structured.",
+      example_use: "source:\n  plugin: csv",
+    });
+    const { container } = render(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("When the input is a bounded CSV file.")).toBeInTheDocument();
+  });
+
+  it("operates the populated details disclosure from the keyboard", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ usage_when_to_use: "When the input is tabular." })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for example/i,
+    });
+
+    detailsButton.focus();
+    await user.keyboard("{Enter}");
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    await user.keyboard(" ");
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("starts details collapsed when the card switches to another plugin", async () => {
+    const user = userEvent.setup();
+    const { container, rerender } = render(
+      <PluginCard
+        plugin={makePlugin({
+          name: "csv",
+          usage_when_to_use: "When the input is a bounded CSV file.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard
+        plugin={makePlugin({
+          name: "json",
+          usage_when_to_use: "When the input is structured JSON.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    const jsonDetails = screen.getByRole("button", {
+      name: /reference details for json/i,
+    });
+    expect(jsonDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("does not restore stale details state after switching away and back", async () => {
+    const user = userEvent.setup();
+    const csvPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+    });
+    const jsonPlugin = makePlugin({
+      name: "json",
+      usage_when_to_use: "When the input is structured JSON.",
+    });
+    const { container, rerender } = render(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={jsonPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const jsonDetails = screen.getByRole("button", {
+      name: /reference details for json/i,
+    });
+    expect(jsonDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const returningCsvDetails = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    expect(returningCsvDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("resets details after the same plugin loses and regains reference content", async () => {
+    const user = userEvent.setup();
+    const populatedPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+      usage_when_not_to_use: "When rows are already structured.",
+      example_use: "source:\n  plugin: csv",
+    });
+    const blankPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "   ",
+      usage_when_not_to_use: "\n\t",
+      example_use: "",
+    });
+    const { container, rerender } = render(
+      <PluginCard plugin={populatedPlugin} schema={null} onExpand={() => {}} />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={blankPlugin} schema={null} onExpand={() => {}} />,
+    );
+    expect(
+      screen.queryByRole("button", { name: /reference details for csv/i }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={populatedPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const returningDetails = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    expect(returningDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
   });
 
   it("does NOT render a 'Use in pipeline' button (toolkit affordance removed)", () => {
@@ -649,6 +933,7 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("calls onExpand when the 'Schema →' disclosure is activated", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const onExpand = vi.fn();
     render(<PluginCard plugin={makePlugin({ name: "csv" })} schema={null} onExpand={onExpand} />);
     const disclosure = screen.getByRole("button", { name: /schema for csv/i });
@@ -657,6 +942,7 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("renders the expanded schema after onExpand resolves and schema arrives", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     const schema: PluginSchemaInfo = {
       name: "csv",
       plugin_type: "source",
@@ -668,5 +954,40 @@ describe("PluginCard — Phase 7B reshape", () => {
     } as unknown as PluginSchemaInfo;
     render(<PluginCard plugin={makePlugin({ name: "csv" })} schema={schema} onExpand={() => {}} initialExpanded />);
     expect(screen.getByText("path")).toBeInTheDocument();
+  });
+});
+
+describe("detail level (elspeth-8555a6a9e0)", () => {
+  it("shows only the behavioural flags and no Schema button by default", () => {
+    const { container } = render(<PluginCard plugin={CARD_PLUGIN} schema={null} onExpand={vi.fn()} />);
+    expectNoIdentifiersInDefaultDom(container);
+    const strip = screen.getByRole("group", { name: "Audit characteristics" });
+    expect(within(strip).getByText("quarantines bad rows")).toBeInTheDocument();
+    expect(within(strip).getByText("needs credentials")).toBeInTheDocument();
+    expect(within(strip).queryByText("deterministic")).not.toBeInTheDocument();
+    expect(within(strip).queryByText("can coerce types")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Schema for / })).not.toBeInTheDocument();
+  });
+
+  it("shows all flags, the Schema button, and separated schema columns with show_advanced on", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<PluginCard plugin={CARD_PLUGIN} schema={CARD_SCHEMA} onExpand={vi.fn()} initialExpanded />);
+    const strip = screen.getByRole("group", { name: "Audit characteristics" });
+    for (const label of ["deterministic", "quarantines bad rows", "needs credentials", "can coerce types"]) {
+      expect(within(strip).getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByRole("button", { name: /^Schema for / })).toBeInTheDocument();
+    const row = screen.getByText("profile").closest(".plugin-card-field-row") as HTMLElement;
+    expect(within(row).getByText("string")).toBeInTheDocument();
+    expect(within(row).getByText("required")).toBeInTheDocument();
+  });
+
+  it("closes an open Schema panel when the flag goes off on a mounted card", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<PluginCard plugin={CARD_PLUGIN} schema={CARD_SCHEMA} onExpand={vi.fn()} initialExpanded />);
+    expect(screen.getByText("profile")).toBeInTheDocument();
+    act(() => usePreferencesStore.setState({ showAdvanced: false }));
+    expect(screen.queryByText("profile")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Schema for / })).not.toBeInTheDocument();
   });
 });

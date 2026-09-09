@@ -2967,19 +2967,25 @@ class TestCoalesceNodes:
                 coalesce_settings=settings.coalesce,
             )
 
-    def test_partial_branch_coverage_branches_not_in_coalesce_route_to_sink(
+    def test_partial_branch_coverage_branches_not_in_coalesce_is_mixed_closure(
         self,
         plugin_manager,
     ) -> None:
-        """Fork branches not in any coalesce should still route to output sink."""
-        from elspeth.contracts import CoalesceName, GateName, SinkName
+        """Whole-roster fork closure (spec §7 rule 2, ruling 23): a fork with
+        one branch bound to a coalesce and a sibling branch routed direct to
+        a sink is MIXED closure, rejected at build time. Pre-ruling-23 this
+        subset shape silently built (branches outside the coalesce fell
+        through to the sink); ruling 23 retired that interim — a fork is
+        either fully bound (every declared branch closes at the SAME
+        barrier) or fully unbound (pure fan-out), never a mix.
+        """
         from elspeth.core.config import (
             CoalesceSettings,
             ElspethSettings,
             SinkSettings,
             SourceSettings,
         )
-        from elspeth.core.dag import ExecutionGraph
+        from elspeth.core.dag import ExecutionGraph, GraphValidationError
 
         settings = ElspethSettings(
             sources={
@@ -3021,35 +3027,27 @@ class TestCoalesceNodes:
         )
 
         plugins = instantiate_plugins_from_config(settings)
-        graph = ExecutionGraph.from_plugin_instances(
-            sources=plugins.sources,
-            source_settings_map=plugins.source_settings_map,
-            transforms=plugins.transforms,
-            sinks=plugins.sinks,
-            aggregations=plugins.aggregations,
-            gates=list(settings.gates),
-            coalesce_settings=settings.coalesce,
-        )
 
-        # Get node IDs
-        gate_id = graph.get_config_gate_id_map()[GateName("forker")]
-        coalesce_id = graph.get_coalesce_id_map()[CoalesceName("merge_results")]
-        path_c_sink_id = graph.get_sink_id_map()[SinkName("path_c")]
-
-        # Verify path_c goes to path_c sink, not coalesce
-        edges = graph.get_edges()
-        path_c_edges = [e for e in edges if e.from_node == gate_id and e.label == "path_c"]
-
-        assert len(path_c_edges) == 1
-        assert path_c_edges[0].to_node == path_c_sink_id
-
-        # Verify path_a and path_b go to coalesce
-        coalesce_edges = [e for e in edges if e.from_node == gate_id and e.to_node == coalesce_id]
-        coalesce_labels = {e.label for e in coalesce_edges}
-        assert coalesce_labels == {"path_a", "path_b"}
+        with pytest.raises(GraphValidationError, match="mixed closure"):
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(settings.gates),
+                coalesce_settings=settings.coalesce,
+            )
 
     def test_get_coalesce_id_map_returns_mapping(self, plugin_manager) -> None:
-        """get_coalesce_id_map should return coalesce_name -> node_id."""
+        """get_coalesce_id_map should return coalesce_name -> node_id.
+
+        Two SEQUENTIAL (not nested) fork/coalesce pairs, each whole-roster
+        bound to its own single coalesce (spec §7 rule 2, ruling 23): one
+        fork closing at TWO sibling coalesces is a multi-closer split and
+        now build-rejected, so this fixture cannot use a single shared fork
+        the way it did pre-ruling-23.
+        """
         from elspeth.contracts import CoalesceName
         from elspeth.core.config import (
             CoalesceSettings,
@@ -3061,9 +3059,9 @@ class TestCoalesceNodes:
 
         settings = ElspethSettings(
             sources={
-                "primary": _source_settings(
-                    SourceSettings,
+                "primary": SourceSettings(
                     plugin="csv",
+                    on_success="routed",
                     options={
                         "path": "test.csv",
                         "on_validation_failure": "discard",
@@ -3077,12 +3075,19 @@ class TestCoalesceNodes:
                 ),
             },
             gates=[
-                _gate_settings(
-                    GateSettings,
-                    name="forker",
+                GateSettings(
+                    name="forker_ab",
+                    input="routed",
                     condition="True",
                     routes={"true": "fork", "false": "output"},
-                    fork_to=["path_a", "path_b", "path_c", "path_d"],
+                    fork_to=["path_a", "path_b"],
+                ),
+                GateSettings(
+                    name="forker_cd",
+                    input="merge_ab",
+                    condition="True",
+                    routes={"true": "fork", "false": "output"},
+                    fork_to=["path_c", "path_d"],
                 ),
             ],
             coalesce=[
@@ -3097,6 +3102,7 @@ class TestCoalesceNodes:
                     branches=["path_c", "path_d"],
                     policy="require_all",
                     merge="nested",
+                    on_success="output",
                 ),
             ],
         )
@@ -3371,7 +3377,25 @@ class TestCoalesceNodes:
             )
 
     def test_coalesce_branch_not_produced_by_any_gate_rejected(self, plugin_manager) -> None:
-        """Coalesce referencing non-existent fork branches should be rejected."""
+        """Coalesce referencing non-existent fork branches should be rejected.
+
+        Vehicle reshaped for whole-roster fork closure (spec §7 rule 2,
+        ruling 23): the original fixture routed 'path_b' direct to a sink
+        alongside a coalesce-bound 'path_a', which is MIXED closure and now
+        fires first — an unrelated defect in the fixture's own scaffolding,
+        not what this test means to pin (same reshape Task 6 applied to its
+        own row_union fallout). Both declared fork branches now close at the
+        coalesce; only 'path_x' is a genuine orphan no gate produces, which
+        isolates the roster-mismatch message this test checks for.
+
+        Naming note (review F10, 2026-08-23): after the reshape, this pins
+        rule 2's aggregate closer-roster-mismatch site (`builder.py` ~935,
+        "…drawn from 1 fork gate(s)… no gate produces […]…"), not the
+        dedicated "coalesce declares branch X but no gate produces this
+        branch" check (`builder.py` ~949) the test's name and original
+        fixture were written against. The dedicated check has no test
+        naming it directly as of this fix round.
+        """
         from elspeth.core.config import (
             CoalesceSettings,
             ElspethSettings,
@@ -3396,9 +3420,6 @@ class TestCoalesceNodes:
                 "output": SinkSettings(
                     plugin="json", on_write_failure="discard", options={"path": "output.json", "schema": {"mode": "observed"}}
                 ),
-                "path_b": SinkSettings(
-                    plugin="json", on_write_failure="discard", options={"path": "path_b.json", "schema": {"mode": "observed"}}
-                ),
             },
             gates=[
                 _gate_settings(
@@ -3406,13 +3427,13 @@ class TestCoalesceNodes:
                     name="forker",
                     condition="True",
                     routes={"true": "fork", "false": "output"},
-                    fork_to=["path_a", "path_b"],  # path_b goes to sink, path_a goes to coalesce
+                    fork_to=["path_a", "path_b"],
                 ),
             ],
             coalesce=[
                 CoalesceSettings(
                     name="merge_results",
-                    branches=["path_a", "path_x"],  # path_x not in fork_to!
+                    branches=["path_a", "path_b", "path_x"],  # path_x not in fork_to!
                     policy="require_all",
                     merge="union",
                 ),
@@ -3421,7 +3442,7 @@ class TestCoalesceNodes:
 
         plugins = instantiate_plugins_from_config(settings)
 
-        with pytest.raises(GraphValidationError, match=r"branch 'path_x'.*no gate produces"):
+        with pytest.raises(GraphValidationError, match=r"no gate produces.*path_x"):
             ExecutionGraph.from_plugin_instances(
                 sources=plugins.sources,
                 source_settings_map=plugins.source_settings_map,
@@ -3438,6 +3459,12 @@ class TestCoalesceNodes:
         This is the CRITICAL contract between DAG builder and Processor.
         The processor does: coalesce_node_map[branch_to_coalesce[branch_name]]
         This test ensures the production path (`from_plugin_instances`) produces compatible mappings.
+
+        Two SEQUENTIAL (not nested) fork/coalesce pairs (spec §7 rule 2,
+        ruling 23): one fork closing at TWO sibling coalesces is a
+        multi-closer split and now build-rejected, so this fixture cannot
+        use a single shared fork the way it did pre-ruling-23 (see
+        `test_get_coalesce_id_map_returns_mapping`, same reshape).
         """
         from elspeth.core.config import (
             CoalesceSettings,
@@ -3450,9 +3477,9 @@ class TestCoalesceNodes:
 
         settings = ElspethSettings(
             sources={
-                "primary": _source_settings(
-                    SourceSettings,
+                "primary": SourceSettings(
                     plugin="csv",
+                    on_success="to_gate_in",
                     options={
                         "path": "test.csv",
                         "on_validation_failure": "discard",
@@ -3466,17 +3493,29 @@ class TestCoalesceNodes:
                 ),
             },
             transforms=[
-                _transform_settings(
-                    TransformSettings, plugin="passthrough", on_success="to_gate", options={"schema": {"mode": "observed"}}
+                TransformSettings(
+                    name="passthrough",
+                    plugin="passthrough",
+                    input="to_gate_in",
+                    on_success="routed",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
                 ),
             ],
             gates=[
-                _gate_settings(
-                    GateSettings,
-                    name="analysis_fork",
+                GateSettings(
+                    name="forker_ab",
+                    input="routed",
                     condition="True",
                     routes={"true": "fork", "false": "output"},
-                    fork_to=["path_a", "path_b", "path_c", "path_d"],
+                    fork_to=["path_a", "path_b"],
+                ),
+                GateSettings(
+                    name="forker_cd",
+                    input="merge_ab",
+                    condition="True",
+                    routes={"true": "fork", "false": "output"},
+                    fork_to=["path_c", "path_d"],
                 ),
             ],
             coalesce=[
@@ -3491,6 +3530,7 @@ class TestCoalesceNodes:
                     branches=["path_c", "path_d"],
                     policy="require_all",
                     merge="union",
+                    on_success="output",
                 ),
             ],
         )
@@ -3739,6 +3779,126 @@ class TestCoalesceNodes:
         assert node_info.config["merge"] == "nested"
         assert node_info.config["timeout_seconds"] == 30.0
         assert node_info.config["quorum_count"] == 1
+
+    def test_union_collision_policy_binds_coalesce_config_and_identity_with_default_compatibility(
+        self,
+        plugin_manager,
+    ) -> None:
+        """Behavior-changing union policies must bind audit and fail-closed resume identity."""
+        from datetime import UTC, datetime
+
+        from elspeth.contracts import Checkpoint, CoalesceName
+        from elspeth.core.canonical import compute_full_topology_hash
+        from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+        from elspeth.core.config import (
+            CoalesceSettings,
+            ElspethSettings,
+            SinkSettings,
+            SourceSettings,
+        )
+        from elspeth.core.dag import ExecutionGraph
+
+        def build(policy: str | None) -> tuple[str, dict[str, Any], ExecutionGraph]:
+            coalesce_kwargs: dict[str, Any] = {
+                "name": "merge_results",
+                "branches": ["path_a", "path_b"],
+                "policy": "require_all",
+                "merge": "union",
+            }
+            if policy is not None:
+                coalesce_kwargs["union_collision_policy"] = policy
+            settings = ElspethSettings(
+                sources={
+                    "primary": _source_settings(
+                        SourceSettings,
+                        plugin="csv",
+                        options={
+                            "path": "test.csv",
+                            "on_validation_failure": "discard",
+                            "schema": {"mode": "observed"},
+                        },
+                    )
+                },
+                sinks={
+                    "output": SinkSettings(
+                        plugin="json",
+                        on_write_failure="discard",
+                        options={"path": "output.json", "schema": {"mode": "observed"}},
+                    ),
+                },
+                gates=[
+                    _gate_settings(
+                        GateSettings,
+                        name="forker",
+                        condition="True",
+                        routes={"true": "fork", "false": "output"},
+                        fork_to=["path_a", "path_b"],
+                    ),
+                ],
+                coalesce=[CoalesceSettings(**coalesce_kwargs)],
+            )
+            plugins = instantiate_plugins_from_config(settings)
+            graph = ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=list(settings.gates),
+                coalesce_settings=settings.coalesce,
+            )
+            coalesce_id = graph.get_coalesce_id_map()[CoalesceName("merge_results")]
+            return str(coalesce_id), dict(graph.get_node_info(coalesce_id).config), graph
+
+        default_id, default_config, default_graph = build(None)
+        explicit_last_id, explicit_last_config, explicit_last_graph = build("last_wins")
+        first_id, first_config, first_graph = build("first_wins")
+        fail_id, fail_config, fail_graph = build("fail")
+
+        assert default_id == explicit_last_id
+        assert len({default_id, first_id, fail_id}) == 3
+        assert default_config == explicit_last_config
+        assert {
+            policy: config["union_collision_policy"]
+            for policy, config in (
+                ("last_wins", default_config),
+                ("first_wins", first_config),
+                ("fail", fail_config),
+            )
+        } == {
+            "last_wins": "last_wins",
+            "first_wins": "first_wins",
+            "fail": "fail",
+        }
+
+        default_topology_hash = compute_full_topology_hash(default_graph)
+        assert compute_full_topology_hash(explicit_last_graph) == default_topology_hash
+        assert (
+            len(
+                {
+                    default_topology_hash,
+                    compute_full_topology_hash(first_graph),
+                    compute_full_topology_hash(fail_graph),
+                }
+            )
+            == 3
+        )
+
+        checkpoint = Checkpoint(
+            checkpoint_id="cp-coalesce-policy",
+            run_id="run-coalesce-policy",
+            sequence_number=1,
+            created_at=datetime.now(UTC),
+            upstream_topology_hash=default_topology_hash,
+            format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+        )
+        validator = CheckpointCompatibilityValidator()
+        assert validator.validate(checkpoint, explicit_last_graph).can_resume is True
+        for drifted_graph in (first_graph, fail_graph):
+            result = validator.validate(checkpoint, drifted_graph)
+            assert result.can_resume is False
+            assert result.reason is not None
+            assert "Pipeline configuration changed since checkpoint was created." in result.reason
 
     def test_select_merge_coalesce_through_production_path(self, plugin_manager) -> None:
         """Select merge coalesce builds through from_plugin_instances() with select_branch.
@@ -4577,7 +4737,7 @@ def test_from_plugin_instances_extracts_schemas():
     import tempfile
     from pathlib import Path
 
-    from elspeth.core.config import load_settings
+    from elspeth.config_loading import load_settings
     from elspeth.core.dag import ExecutionGraph
 
     config_yaml = """
@@ -4658,7 +4818,7 @@ def test_from_plugin_instances_cycle_raises_graph_validation_error(monkeypatch: 
 
     import networkx as nx
 
-    from elspeth.core.config import load_settings
+    from elspeth.config_loading import load_settings
     from elspeth.core.dag import ExecutionGraph, GraphValidationError
 
     config_yaml = """

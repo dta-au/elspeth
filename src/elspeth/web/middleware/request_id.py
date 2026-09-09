@@ -36,6 +36,7 @@ from __future__ import annotations
 import re
 import uuid
 
+import structlog
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -113,11 +114,19 @@ class RequestIdMiddleware:
                 MutableHeaders(scope=message)[REQUEST_ID_HEADER] = request_id
             await send(message)
 
-        try:
-            await self.app(scope, receive, send_with_request_id)
-        except Exception:
-            if not response_started:
-                response = Response("Internal Server Error", status_code=500)
-                response.headers[REQUEST_ID_HEADER] = request_id
-                await response(scope, receive, send)
-            raise
+        # Bind the (already-sanitised) id into structlog contextvars for the
+        # request's whole scope: with merge_contextvars in the processor
+        # chain, EVERY log line emitted while handling this request carries
+        # request_id — not only the envelope lines the exception handlers
+        # stamp explicitly. bound_contextvars restores the prior state on
+        # exit, so concurrent requests on other tasks are unaffected
+        # (contextvars are task-local) and nothing leaks across requests.
+        with structlog.contextvars.bound_contextvars(request_id=request_id):
+            try:
+                await self.app(scope, receive, send_with_request_id)
+            except Exception:
+                if not response_started:
+                    response = Response("Internal Server Error", status_code=500)
+                    response.headers[REQUEST_ID_HEADER] = request_id
+                    await response(scope, receive, send)
+                raise

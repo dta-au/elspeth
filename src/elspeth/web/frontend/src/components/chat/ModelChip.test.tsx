@@ -1,69 +1,56 @@
-import { render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import { ModelChip } from "./ModelChip";
-import * as apiClient from "@/api/client";
-import type { SystemStatus } from "@/types/index";
+import { useSessionStore } from "@/stores/sessionStore";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import { resetStore } from "@/test/store-helpers";
 
-vi.mock("@/api/client", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/api/client")>();
-  return {
-    ...actual,
-    fetchSystemStatus: vi.fn(),
-  };
-});
-
-const fetchSystemStatus = vi.mocked(apiClient.fetchSystemStatus);
-
-function makeStatus(overrides: Partial<SystemStatus> = {}): SystemStatus {
-  return {
-    composer_available: true,
-    composer_model: "anthropic/claude-sonnet-4.6",
-    composer_provider: "openrouter",
-    composer_reason: null,
-    composer_missing_keys: [],
-    ...overrides,
-  };
-}
+// The chip is a pure store reader: App's health poll is the app's single
+// /api/system/status consumer and publishes composerModel into the session
+// store (one derivation per surface — a chip-owned fetch raced sequenced
+// test doubles and double-fetched in production, elspeth-8fa71e6d15).
 
 describe("ModelChip", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetStore(useSessionStore);
   });
 
-  it("shows the composer model from system status with an accessible label", async () => {
-    fetchSystemStatus.mockResolvedValue(makeStatus());
+  it("shows the composer model's display name with the raw id in title", () => {
+    useSessionStore.setState({
+      composerModel: "anthropic/claude-sonnet-4.6",
+    });
 
     render(<ModelChip />);
 
-    await waitFor(() => {
-      expect(
-        screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
-      ).toBeInTheDocument();
-    });
-    expect(screen.getByText("anthropic/claude-sonnet-4.6")).toBeInTheDocument();
+    // The visible label says "Composer:", not "Model:" — the chip names the
+    // composing model, which must stay distinguishable from LLM models
+    // configured inside the pipeline being authored. It is no longer
+    // aria-hidden: the chip carries no ARIA, so this word is the only thing
+    // saying what the model name names (elspeth-37293a3b7c).
+    expect(screen.getByText("Composer:")).toBeInTheDocument();
+    expect(screen.getByText("Claude Sonnet 4.6")).toBeInTheDocument();
+    expect(
+      screen.getByTitle("anthropic/claude-sonnet-4.6"),
+    ).toBeInTheDocument();
   });
 
-  it("renders nothing while the model is unknown or the status call fails", async () => {
-    fetchSystemStatus.mockRejectedValue(new Error("offline"));
+  it("keeps the raw model id out of visible text", () => {
+    useSessionStore.setState({
+      composerModel: "openrouter/anthropic/claude-sonnet-5",
+    });
 
     const { container } = render(<ModelChip />);
 
-    // Absence of chrome, never a fabricated model name.
-    await waitFor(() => {
-      expect(fetchSystemStatus).toHaveBeenCalled();
-    });
-    expect(container).toBeEmptyDOMElement();
+    expectNoIdentifiersInDefaultDom(container);
+    expect(screen.getByText("Claude Sonnet 5")).toBeInTheDocument();
+    expect(container).not.toHaveTextContent("openrouter");
   });
 
-  it("renders nothing when the deployment reports no composer model", async () => {
-    fetchSystemStatus.mockResolvedValue(makeStatus({ composer_model: "" }));
-
+  it("renders nothing while no model is known", () => {
+    // Absence of chrome, never a fabricated model name. composerModel stays
+    // null until a successful health poll reports a non-empty model.
     const { container } = render(<ModelChip />);
-
-    await waitFor(() => {
-      expect(fetchSystemStatus).toHaveBeenCalled();
-    });
     expect(container).toBeEmptyDOMElement();
   });
 });

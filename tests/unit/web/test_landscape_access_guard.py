@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 
 @dataclass(frozen=True, slots=True)
 class _DirectCall:
@@ -180,20 +182,20 @@ def test_real_web_tree_has_only_the_reviewed_direct_call_map() -> None:
     root = Path(__file__).resolve().parents[3]
     web_root = root / "src" / "elspeth" / "web"
     results = [
-        _collect_landscape_accesses(path.read_text(encoding="utf-8"), path=path.relative_to(root).as_posix())
-        for path in sorted(web_root.rglob("*.py"))
+        _collect_landscape_accesses(parsed.source, path=parsed.path.relative_to(root).as_posix()) for parsed in iter_gate_sources(web_root)
     ]
     offenders = tuple(offender.render() for result in results for offender in result.offenders)
     direct_map = tuple(sorted((site.path, site.kind) for result in results for site in result.direct_calls))
 
     assert offenders == ()
     assert direct_map == (
+        ("src/elspeth/web/_aws_ecs_acceptance/bedrock.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/capture.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py", "from_url"),
+        ("src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py", "from_url"),
         ("src/elspeth/web/app.py", "from_url"),
         ("src/elspeth/web/auth/audit.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
-        ("src/elspeth/web/aws_ecs_acceptance.py", "from_url"),
         ("src/elspeth/web/execution/accounting.py", "from_url"),
         ("src/elspeth/web/execution/diagnostics.py", "from_url"),
         ("src/elspeth/web/execution/discard_summary.py", "from_url"),

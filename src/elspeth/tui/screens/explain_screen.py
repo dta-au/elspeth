@@ -205,13 +205,17 @@ class ExplainScreen:
                 artifacts_by_state_id: dict[str, list[Artifact]] = {}
                 artifacts_by_token_id: dict[str, list[Artifact]] = {}
                 if lineage_result.outcome is not None:
+                    # get_effect_artifact_members keys only those artifacts that join
+                    # a sink_effect with recorded members. A sink-effect artifact whose
+                    # members were never recorded is ABSENT from the mapping, not mapped
+                    # to an empty tuple, and indexes under no token.
                     effect_members = factory.query.get_effect_artifact_members(run_id)
                     for artifact in factory.execution.get_artifacts(run_id):
                         if artifact.producer_kind == "node_state":
                             assert artifact.produced_by_state_id is not None
                             artifacts_by_state_id.setdefault(artifact.produced_by_state_id, []).append(artifact)
-                        else:
-                            for token_id in effect_members.get(artifact.artifact_id, ()):
+                        elif artifact.artifact_id in effect_members:
+                            for token_id in effect_members[artifact.artifact_id]:
                                 artifacts_by_token_id.setdefault(token_id, []).append(artifact)
                 focused_tokens.append(self._token_display_info(lineage_result, artifacts_by_state_id, artifacts_by_token_id))
                 focused_state_by_node_id = {state.node_id: state for state in lineage_result.node_states}
@@ -323,10 +327,11 @@ class ExplainScreen:
         artifacts_by_state_id: Mapping[str, Sequence[Artifact]],
         artifacts_by_token_id: Mapping[str, Sequence[Artifact]],
     ) -> Artifact | None:
-        """Return effect membership evidence first, then legacy state evidence."""
-        effect_artifacts = artifacts_by_token_id.get(token_id, ())
-        if effect_artifacts:
-            return effect_artifacts[-1]
+        """Return effect membership evidence first, then node-state producer evidence."""
+        # Construction only inserts a token key alongside a first artifact, so
+        # membership guarantees a non-empty sequence.
+        if token_id in artifacts_by_token_id:
+            return artifacts_by_token_id[token_id][-1]
         for state in reversed(node_states):
             artifacts = artifacts_by_state_id.get(state.state_id, ())
             if artifacts:
@@ -341,16 +346,17 @@ class ExplainScreen:
             case _:
                 return None
 
-    def on_tree_select(self, selection: TreeSelection | str | None) -> None:
+    def on_tree_select(self, selection: TreeSelection | None) -> None:
         """Handle tree row selection.
 
         Args:
-            selection: Selected tree row payload, or a legacy node ID string.
+            selection: Selected tree row payload, or ``None`` to clear the
+                detail panel. Every caller reads the payload straight off the
+                tree row (``Tree[TreeSelection]``), so there is no untyped
+                identifier form to accept.
         """
         if selection is None:
             node_id = None
-        elif isinstance(selection, str):
-            node_id = selection
         elif selection["kind"] == "node":
             node_id = selection["node_id"]
         else:

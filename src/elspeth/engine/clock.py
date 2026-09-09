@@ -36,6 +36,10 @@ class SystemClock:
         """Return current UTC wall-clock time."""
         return datetime.now(UTC)
 
+    def sleep(self, seconds: float) -> None:
+        """Block the calling thread for ``seconds``."""
+        time.sleep(seconds)
+
 
 class MockClock:
     """Controllable clock for deterministic testing.
@@ -74,6 +78,10 @@ class MockClock:
     def now_utc(self) -> datetime:
         """Return current mock time as a UTC datetime."""
         return datetime.fromtimestamp(self._current, UTC)
+
+    def sleep(self, seconds: float) -> None:
+        """Advance mock time instead of blocking: waiting IS time passing here."""
+        self.advance(seconds)
 
     def advance(self, seconds: float) -> None:
         """Advance mock time by specified seconds.

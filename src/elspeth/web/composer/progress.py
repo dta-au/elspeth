@@ -79,6 +79,8 @@ class ComposerProgressRegistry:
         self._snapshots: dict[str, ComposerProgressSnapshot] = {}
         self._user_index: dict[str, str] = {}
         self._inflight: dict[str, int] = {}
+        self._request_generations: dict[str, int] = {}
+        self._next_request_generation = 0
         self._lock = threading.Lock()
 
     def begin_request(self, session_id: str) -> None:
@@ -89,16 +91,18 @@ class ComposerProgressRegistry:
         :meth:`end_request` at request teardown.
         """
         with self._lock:
-            self._inflight[session_id] = self._inflight.get(session_id, 0) + 1
+            if session_id not in self._inflight:
+                self._inflight[session_id] = 0
+            self._inflight[session_id] += 1
 
     def end_request(self, session_id: str) -> None:
         """Release one in-flight compose request for ``session_id``."""
         with self._lock:
-            remaining = self._inflight.get(session_id, 0) - 1
+            remaining = self._inflight[session_id] - 1
             if remaining > 0:
                 self._inflight[session_id] = remaining
             else:
-                self._inflight.pop(session_id, None)
+                del self._inflight[session_id]
 
     async def publish(
         self,
@@ -116,20 +120,97 @@ class ComposerProgressRegistry:
         returned to the SPA.
         """
         with self._lock:
-            updated_at = self._next_timestamp(session_id)
-            snapshot = ComposerProgressSnapshot(
+            return self._publish_locked(
                 session_id=session_id,
                 request_id=request_id,
-                phase=event.phase,
-                headline=event.headline,
-                evidence=event.evidence,
-                likely_next=event.likely_next,
-                reason=event.reason,
-                updated_at=updated_at,
+                user_id=user_id,
+                event=event,
             )
-            self._snapshots[session_id] = snapshot
-            self._user_index[session_id] = user_id
-            return snapshot
+
+    async def publish_replay_if_unclaimed(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> ComposerProgressSnapshot | None:
+        """Publish a restart replay only when no live/newer request owns the session.
+
+        Completed guided operations can be replayed after an app restart, when
+        the in-memory registry is empty and owes the caller a terminal
+        snapshot. A replay of an older operation in a live process must not
+        displace a newer request that already claimed or published progress.
+        """
+        with self._lock:
+            if session_id in self._request_generations or session_id in self._snapshots:
+                return None
+            self._next_request_generation += 1
+            self._request_generations[session_id] = self._next_request_generation
+            return self._publish_locked(
+                session_id=session_id,
+                request_id=request_id,
+                user_id=user_id,
+                event=event,
+            )
+
+    def bind_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
+        user_id: str,
+    ) -> ComposerProgressSink:
+        """Claim latest-request progress custody and return its guarded sink.
+
+        A guided full-plan releases the per-session compose lock while its
+        provider call runs, so two distinct operations can overlap. The newer
+        operation must remain the progress owner even if the older operation
+        settles later. The captured generation makes every late publication
+        from that superseded operation a no-op without retaining an unbounded
+        set of historical request ids.
+        """
+        with self._lock:
+            self._next_request_generation += 1
+            generation = self._next_request_generation
+            self._request_generations[session_id] = generation
+
+        async def _publish(event: ComposerProgressEvent) -> None:
+            with self._lock:
+                if session_id not in self._request_generations or self._request_generations[session_id] != generation:
+                    return
+                self._publish_locked(
+                    session_id=session_id,
+                    request_id=request_id,
+                    user_id=user_id,
+                    event=event,
+                )
+
+        return _publish
+
+    def _publish_locked(
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> ComposerProgressSnapshot:
+        """Store one snapshot while ``self._lock`` is held."""
+        updated_at = self._next_timestamp(session_id)
+        snapshot = ComposerProgressSnapshot(
+            session_id=session_id,
+            request_id=request_id,
+            phase=event.phase,
+            headline=event.headline,
+            evidence=event.evidence,
+            likely_next=event.likely_next,
+            reason=event.reason,
+            updated_at=updated_at,
+        )
+        self._snapshots[session_id] = snapshot
+        self._user_index[session_id] = user_id
+        return snapshot
 
     async def get_latest(self, session_id: str) -> ComposerProgressSnapshot:
         """Return latest progress or a neutral idle snapshot.
@@ -139,7 +220,7 @@ class ComposerProgressRegistry:
         live quiescence state alongside the last narrative phase.
         """
         with self._lock:
-            snapshot = self._snapshots.get(session_id) or _idle_snapshot(session_id)
+            snapshot = self._snapshots[session_id] if session_id in self._snapshots else _idle_snapshot(session_id)
             return self._with_live_inflight(session_id, snapshot)
 
     def _with_live_inflight(self, session_id: str, snapshot: ComposerProgressSnapshot) -> ComposerProgressSnapshot:
@@ -150,7 +231,7 @@ class ComposerProgressRegistry:
         an actively composing session as quiescent. Caller must hold
         ``self._lock``.
         """
-        inflight = self._inflight.get(session_id, 0)
+        inflight = self._inflight[session_id] if session_id in self._inflight else 0
         if snapshot.inflight_requests == inflight:
             return snapshot
         return snapshot.model_copy(update={"inflight_requests": inflight})
@@ -196,6 +277,8 @@ class ComposerProgressRegistry:
                 del self._snapshots[session_id]
             if session_id in self._user_index:
                 del self._user_index[session_id]
+            if session_id in self._request_generations:
+                del self._request_generations[session_id]
 
     def _next_timestamp(self, session_id: str) -> datetime:
         now = datetime.now(UTC)
@@ -331,18 +414,20 @@ def advisor_checkpoint_progress_event(checkpoint: str) -> ComposerProgressEvent:
     otherwise the snapshot stays frozen on its previous phase while the
     (slower, frontier) advisor model runs, which is indistinguishable from a
     stall to a poller or a watching user. ``checkpoint`` is "early" (plan
-    review) or "end" (sign-off).
+    review) or "end" (evidence-scoped completion review).
     """
     if checkpoint == "early":
         headline = "I'm asking the advisor model to review the plan."
+        evidence = "A second, model-distinct advisor is reviewing the pipeline."
         likely_next = "The advisor may suggest changes before the composer continues."
     else:
-        headline = "I'm asking the advisor model to sign off on the pipeline."
-        likely_next = "The advisor may approve the pipeline or flag changes before finalizing."
+        headline = "I'm asking the advisor model to review the completion evidence."
+        evidence = "A second, model-distinct advisor is reviewing the bounded completion evidence."
+        likely_next = "The advisor may flag a blocker visible in the supplied evidence before the composer finalizes."
     return ComposerProgressEvent(
         phase="calling_model",
         headline=headline,
-        evidence=("A second, model-distinct advisor is reviewing the pipeline.",),
+        evidence=(evidence,),
         likely_next=likely_next,
     )
 

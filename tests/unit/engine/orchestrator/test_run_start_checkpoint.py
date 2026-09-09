@@ -15,6 +15,7 @@ and must NOT rewrite sequence 0.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -27,6 +28,7 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import checkpoints_table
+from elspeth.engine.clock import MockClock
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.pipeline import build_production_graph
@@ -193,10 +195,17 @@ class TestRunStartCheckpoint:
             )
             graph = build_production_graph(config)
 
+            # The crashed run leaves its sink-effect lease held by a worker id
+            # the resume never reuses, so the resume's sink write waits out
+            # that lease (default TTL five minutes). Waiting goes through the
+            # orchestrator clock: a controlled clock advances instead of
+            # blocking the test for the whole TTL.
+            clock = MockClock(start=datetime.now(UTC).timestamp())
             orchestrator = Orchestrator(
                 db=db,
                 checkpoint_manager=checkpoint_mgr,
                 checkpoint_config=_checkpoint_config(),
+                clock=clock,
             )
             with pytest.raises(RuntimeError, match="still broken"):
                 orchestrator.run(config, graph=graph, payload_store=payload_store, run_id="run-resume-cp")
@@ -227,6 +236,7 @@ class TestRunStartCheckpoint:
             # what Task 3.3 pins is the resume ENTRY: rebase onto the persisted
             # sequence, never a second run-start write.
             resume_error: Exception | None = None
+            resume_started_at = clock.monotonic()
             try:
                 orchestrator.resume(
                     resume_point=resume_point,
@@ -237,6 +247,12 @@ class TestRunStartCheckpoint:
             except Exception as exc:  # any replay failure shape is acceptable here
                 resume_error = exc
 
+            # Mechanism pin: the foreign-lease wait consumed CONTROLLED time,
+            # not wall time. If the sink executor ever stops threading the
+            # orchestrator clock into its lease waits, the mock clock stays
+            # still and this fails long before the five-minute real sleep
+            # would have finished.
+            assert clock.monotonic() - resume_started_at >= 300.0, "resume lease wait must sleep on the orchestrator clock"
             assert all(call["sequence_number"] != 0 for call in resume_calls), (
                 f"Resume must never rewrite the sequence-0 baseline; saw writes at {[c['sequence_number'] for c in resume_calls]}"
             )

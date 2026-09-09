@@ -14,8 +14,9 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from elspeth.contracts import NodeStateStatus
-from elspeth.contracts.coalesce_metadata import collision_value_fingerprint as _fingerprint_collision_value
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.hashing import repr_hash, stable_hash
+from elspeth.contracts.identity import path_branch_name, path_expand_group_id, path_fork_group_id
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
 from elspeth.core.landscape.serialization import dataclass_to_dict, serialize_datetime
@@ -29,6 +30,9 @@ from elspeth.mcp.types import (
     CollisionFieldRecord,
     CollisionRecord,
     CollisionValueFingerprint,
+    GroupLossEntry,
+    GroupRecordEntry,
+    LineageFrameEntry,
     NodeDetail,
     NodeStateRecord,
     OperationCallRecord,
@@ -196,18 +200,110 @@ def list_tokens(
 
         rows = conn.execute(query).fetchall()
 
+    paths = factory.data_flow.load_lineage_paths(run_id, [row.token_id for row in rows])
+
     return [
         {
             "token_id": row.token_id,
             "row_id": row.row_id,
-            "branch_name": row.branch_name,
-            "fork_group_id": row.fork_group_id,
+            "branch_name": path_branch_name(paths[row.token_id]),
+            "fork_group_id": path_fork_group_id(paths[row.token_id]),
             "join_group_id": row.join_group_id,
             "step_in_pipeline": row.step_in_pipeline,
-            "expand_group_id": row.expand_group_id,
+            "expand_group_id": path_expand_group_id(paths[row.token_id]),
+            "lineage_path": [
+                {"depth": depth, "kind": f.kind.value, "group_id": f.group_id, "member_key": f.member_key}
+                for depth, f in enumerate(paths[row.token_id])
+            ],
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
         for row in rows
+    ]
+
+
+def list_group_records(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str, kind: str | None = None) -> list[GroupRecordEntry]:
+    """List group roster records (fork/expand openings) for a run.
+
+    The audit authority for group membership counts (spec §4.3): one row
+    per opened group, empty expansions included (member_count=0).
+    """
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import group_records_table
+
+    with db.connection() as conn:
+        query = (
+            select(group_records_table)
+            .where(group_records_table.c.run_id == run_id)
+            .order_by(group_records_table.c.created_at, group_records_table.c.group_id)
+        )
+        if kind is not None:
+            query = query.where(group_records_table.c.kind == kind)
+        rows = conn.execute(query).fetchall()
+    return [
+        {
+            "group_id": row.group_id,
+            "kind": row.kind,
+            "opener_token_id": row.opener_token_id,
+            "member_count": int(row.member_count),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+def list_group_losses(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str, group_id: str | None = None) -> list[GroupLossEntry]:
+    """List the group-loss ledger for a run (append-only; adopted or not).
+
+    §6.2 full-table-read discipline applies on the wire too: adoption is a
+    leader replay cursor, so no ``adopted_epoch`` filter exists here.
+    """
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import group_losses_table
+
+    with db.connection() as conn:
+        query = (
+            select(group_losses_table)
+            .where(group_losses_table.c.run_id == run_id)
+            .order_by(group_losses_table.c.recorded_at, group_losses_table.c.loss_id)
+        )
+        if group_id is not None:
+            query = query.where(group_losses_table.c.group_id == group_id)
+        rows = conn.execute(query).fetchall()
+    return [
+        {
+            "loss_id": row.loss_id,
+            "closer_name": row.closer_name,
+            "group_id": row.group_id,
+            "member_key": row.member_key,
+            "token_id": row.token_id,
+            "reason": row.reason,
+            "recorded_by": row.recorded_by,
+            "recorded_at": row.recorded_at.isoformat() if row.recorded_at else None,
+            "adopted_epoch": int(row.adopted_epoch) if row.adopted_epoch is not None else None,
+        }
+        for row in rows
+    ]
+
+
+def get_token_lineage(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str, token_id: str) -> list[LineageFrameEntry]:
+    """A token's full lineage path, outermost (depth 0) first."""
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import token_lineage_frames_table
+
+    with db.connection() as conn:
+        rows = conn.execute(
+            select(token_lineage_frames_table)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.token_id == token_id,
+            )
+            .order_by(token_lineage_frames_table.c.depth)
+        ).fetchall()
+    return [
+        {"depth": int(row.depth), "kind": str(row.kind), "group_id": str(row.group_id), "member_key": str(row.member_key)} for row in rows
     ]
 
 
@@ -665,7 +761,7 @@ def get_calls(db: LandscapeDB, factory: AnalyzerRepositories, state_id: str) -> 
 _VALUE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="stored coalesce collision values re-read from audit context JSON (heterogeneous persisted shapes)",
     source_param="value",
@@ -674,7 +770,6 @@ _VALUE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
         "total boolean classifier: returns False for any value not matching the exact "
         "redacted {value_hash, value_type} envelope; never raises"
     ),
-    non_raising=True,
 )
 def _is_collision_value_fingerprint(value: Any) -> bool:
     """Return True when a stored collision value is already an audit-safe fingerprint."""
@@ -688,13 +783,20 @@ def _is_collision_value_fingerprint(value: Any) -> bool:
 
 
 def _collision_value_fingerprint(value: Any) -> CollisionValueFingerprint:
-    """Fingerprint raw legacy values, or pass through already-redacted metadata."""
+    """Fingerprint raw legacy values, or pass through stored fingerprints.
+
+    This compatibility helper is confined to the historical read path. The
+    current coalesce audit contract has no value-fingerprint write surface.
+    """
     if _is_collision_value_fingerprint(value):
         return {
             "value_hash": value["value_hash"],
             "value_type": value["value_type"],
         }
-    return _fingerprint_collision_value(value)
+    try:
+        return {"value_hash": stable_hash(value), "value_type": type(value).__name__}
+    except (TypeError, ValueError):
+        return {"value_hash": repr_hash(value), "value_type": type(value).__name__}
 
 
 def list_collisions(
@@ -705,28 +807,32 @@ def list_collisions(
 ) -> list[CollisionRecord]:
     """List coalesce collision events for a run.
 
-    Finds all coalesce node states where union_field_collision_values is present,
-    indicating that fields had conflicting values from different branches.
+    Finds coalesce node states with current branch-only collision provenance or
+    the historical ``union_field_collision_values`` representation.
 
     This is essential for debugging production coalesce failures — without this,
     operators must use raw SQL to find why a merged row has unexpected values.
 
     Note: A single coalesce merge produces multiple node_states rows (one per
     consumed branch token). This function returns one record per node_states row
-    that contains actual collisions (differing values). Callers who want to count
-    unique collision patterns can group by (node_id, collision_fields) themselves.
+    containing a collision-policy event. Callers who want to count unique
+    collision patterns can group by (node_id, collision_fields) themselves.
+
+    Current records expose contributing branches and the selected winner only.
+    Historical records remain queryable and retain their stored/read-time value
+    fingerprints, but that compatibility path cannot write new audit metadata.
 
     Args:
         db: Database connection
         factory: Recorder factory
         run_id: Run ID to query
         limit: Maximum collision records to return (applied AFTER filtering
-            overlap-only rows that don't contain real collisions)
+            equal-value overlaps from historical value-bearing rows)
 
     Returns:
-        List of collision records with field-level branch provenance and value
-        fingerprints. Only fields with genuinely differing value fingerprints are
-        reported as collisions.
+        List of collision records with field-level branch provenance. Historical
+        records also include value fingerprints and continue to filter equal-value
+        overlaps; current records deliberately contain no value-derived material.
     """
     from sqlalchemy import or_, select
 
@@ -738,7 +844,7 @@ def list_collisions(
     # while ensuring we find enough real collisions.
     #
     # Over-fetch factor of 3 means: if we want 10 results, fetch 30 rows at a time.
-    # Most coalesce rows that have union_field_collision_values also have real
+    # Most historical rows with union_field_collision_values also have real
     # collisions (not just overlap), so this is usually sufficient in one batch.
     batch_size = max(50, limit * 3)
     offset = 0
@@ -770,7 +876,12 @@ def list_collisions(
             )
         )
         .where(node_states_table.c.context_after_json.isnot(None))
-        .where(node_states_table.c.context_after_json.like("%union_field_collision_values%"))
+        .where(
+            or_(
+                node_states_table.c.context_after_json.like("%union_field_collisions%"),
+                node_states_table.c.context_after_json.like("%union_field_collision_values%"),
+            )
+        )
         # state_id as tie-breaker ensures stable LIMIT/OFFSET pagination when
         # multiple rows share the same completed_at timestamp. Without this,
         # row order between batches is undefined and pagination can skip/duplicate.
@@ -798,6 +909,7 @@ def list_collisions(
                 # Legacy rows may still contain raw values; those are fingerprinted
                 # before comparison or response construction.
                 collision_values = context.get("union_field_collision_values", {})
+                collision_branches = context.get("union_field_collisions", {})
                 field_origins = context.get("union_field_origins", {})
 
                 collision_fields: list[CollisionFieldRecord] = []
@@ -844,17 +956,40 @@ def list_collisions(
                     collision_fields.append(
                         {
                             "field": field,
+                            "contributing_branches": [branch for branch, _fingerprint in entry_fingerprints],
                             "winner_branch": winner_branch,
                             "winner_value_fingerprint": winner_value_fingerprint,
                             "competing_value_fingerprints": entry_fingerprints,
                         }
                     )
 
-                # Only emit a record if there are actual collisions (differing values)
+                # Current records contain field/branch/winner provenance only.
+                # If both representations exist, the historical value record owns
+                # that field so equality filtering and fingerprint responses remain
+                # backward-compatible without producing a duplicate result.
+                for field, branches in collision_branches.items():
+                    if field in collision_values or not branches:
+                        continue
+                    contributing_branches = [cast(str, branch) for branch in branches]
+                    winner_branch = None if row.status == NodeStateStatus.FAILED.value else field_origins.get(field)
+                    collision_fields.append(
+                        {
+                            "field": field,
+                            "contributing_branches": contributing_branches,
+                            "winner_branch": winner_branch,
+                            "winner_value_fingerprint": None,
+                            "competing_value_fingerprints": [],
+                        }
+                    )
+
+                # Historical overlaps are equality-filtered above. Current records
+                # are collision-policy events by construction and carry no values
+                # from which an analyzer could repeat that comparison.
                 if not collision_fields:
                     continue
 
-                # Check limit AFTER filtering to ensure we return up to `limit` real collisions
+                # Check limit after historical equality filtering so the result
+                # still contains up to ``limit`` collision-policy events.
                 if len(results) >= limit:
                     break
 

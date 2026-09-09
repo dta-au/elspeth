@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
-from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT, FAILSINK_ELIGIBLE_SINK_PLUGINS
+from elspeth.contracts.sink import FAILSINK_ELIGIBLE_SINK_PLUGINS
+from elspeth.core.config import CoalesceSettings
 from elspeth.plugins.infrastructure.templates import TemplateError
 from elspeth.web.composer.state import (
     CompositionState,
@@ -19,8 +22,14 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
+    _closer_backward_reach_connections,
+    _fork_branch_reaches_sink_before_closer,
+    _runtime_nodes_downstream_of_connection,
     queue_node_contract_error,
+    route_destination_facts,
 )
+from elspeth.web.composer.yaml_generator import generate_yaml
+from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
 class TestSourceSpec:
@@ -144,7 +153,7 @@ class TestCompositionStateNamedSources:
 
         result = state.validate()
 
-        assert any(w.component == "source:orders" and "on_validation_failure" in w.message for w in result.warnings)
+        assert any(e.component == "source:orders" and e.error_code == "quarantine_unknown_output" for e in result.errors)
         assert any(s.component == "source:orders" and "no explicit schema" in s.message for s in result.suggestions)
 
     def test_sources_mapping_is_the_only_domain_and_serialized_source_shape(self) -> None:
@@ -846,7 +855,7 @@ class TestStage1Validation:
             version=1,
         )
 
-    def _make_source(self, on_success: str = "t1", on_validation_failure: str = "quarantine") -> SourceSpec:
+    def _make_source(self, on_success: str = "t1", on_validation_failure: str = "discard") -> SourceSpec:
         return SourceSpec(
             plugin="csv",
             on_success=on_success,
@@ -945,6 +954,711 @@ class TestStage1Validation:
         result = state.validate()
         assert result.is_valid, result.errors
 
+    def _single_transform_state(self, node_id: str) -> CompositionState:
+        """source -> <node_id> -> sink; the two-call pair differs ONLY in the node id."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t_in"))
+        state = state.with_node(self._make_transform(node_id, "t_in", "main"))
+        return state.with_output(self._make_output("main"))
+
+    @pytest.mark.parametrize(
+        ("node_id", "reason"),
+        [
+            pytest.param("t" * 39, "exceeds max length 38", id="too-long"),
+            pytest.param("1abc", "start with a letter", id="leading-digit"),
+            pytest.param("has space", "invalid characters", id="whitespace"),
+            # The runtime's ``__`` branch is unreachable for node names (the
+            # character class already demands a leading letter); the mirror
+            # keeps the same order, so this trips the same rule the runtime does.
+            pytest.param("__private", "invalid characters", id="dunder-prefix"),
+            pytest.param("continue", "is reserved", id="reserved-edge-label"),
+            pytest.param("fork", "is reserved", id="reserved-fork"),
+        ],
+    )
+    def test_node_id_violating_runtime_name_rules_is_rejected(self, node_id: str, reason: str) -> None:
+        """A node id the runtime settings model rejects must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). Every runtime node kind
+        (transform/gate/aggregation/coalesce/row_union/queue) validates its
+        ``name`` through ``core/config.py::validate_runtime_node_name`` — max
+        38, ``^[a-zA-Z][a-zA-Z0-9_-]*$``, not a reserved edge label, no ``__``
+        prefix. Stage 1 mirrored those rules for SOURCE names only
+        (``_composer_source_name_validation_message``); a 60-character
+        transform id validated green and died at ``settings_load`` with
+        "Transform name exceeds max length 38".
+        """
+        result = self._single_transform_state(node_id).validate()
+
+        assert not result.is_valid
+        [entry] = [e for e in result.errors if e.error_code == "node_id_invalid"]
+        assert entry.component == f"node:{node_id}"
+        assert reason in entry.message
+
+    def test_node_id_at_runtime_limits_is_accepted(self) -> None:
+        """Positive control: a 38-char id with every permitted character class validates green."""
+        node_id = "T" + "a1_-" * 9 + "z"
+        assert len(node_id) == 38
+        result = self._single_transform_state(node_id).validate()
+
+        assert result.is_valid, result.errors
+
+    def test_queue_node_id_must_be_lowercase_like_the_runtime(self) -> None:
+        """Queue names are lowercase-only at the runtime; transform names are not."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="Q_in"))
+        queue = NodeSpec(
+            id="Q_in",
+            node_type="queue",
+            plugin=None,
+            input="Q_in",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = state.with_node(queue)
+        state = state.with_node(self._make_transform("t1", "Q_in", "main"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "node_id_invalid"]
+        assert entry.component == "node:Q_in"
+        assert "lowercase" in entry.message
+
+    def _label_probe_state(self, **overrides: Any) -> CompositionState:
+        """source -> t1 -> main with one field overridden; the control passes no override."""
+        source = SourceSpec(
+            plugin="csv",
+            on_success=overrides.get("source_on_success", "t_in"),
+            options={},
+            on_validation_failure="discard",
+        )
+        transform = NodeSpec(
+            id="t1",
+            node_type="transform",
+            plugin="passthrough",
+            input=overrides.get("transform_input", "t_in"),
+            on_success=overrides.get("transform_on_success", "main"),
+            on_error=overrides.get("transform_on_error", "discard"),
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        output = OutputSpec(
+            name=overrides.get("output_name", "main"),
+            plugin="csv",
+            options={},
+            on_write_failure=overrides.get("on_write_failure", "discard"),
+        )
+        state = self._empty_state().with_source(source).with_node(transform)
+        return state.with_output(output)
+
+    @pytest.mark.parametrize(
+        ("overrides", "code", "fragment"),
+        [
+            pytest.param(
+                {"source_on_success": ""},
+                "connection_label_invalid",
+                "Source on_success must be a connection name or sink name",
+                id="source-on_success-empty",
+            ),
+            pytest.param({"source_on_success": "__t"}, "connection_label_invalid", "starts with '__'", id="source-on_success-dunder"),
+            pytest.param(
+                {"transform_input": ""},
+                "connection_label_invalid",
+                "Transform input connection must not be empty",
+                id="transform-input-empty",
+            ),
+            pytest.param({"transform_input": "continue"}, "connection_label_invalid", "is reserved", id="transform-input-reserved"),
+            pytest.param({"transform_input": "t" * 65}, "connection_label_invalid", "exceeds max length 64", id="transform-input-too-long"),
+            pytest.param(
+                {"transform_on_success": "has space"}, "connection_label_invalid", "invalid characters", id="transform-on_success-chars"
+            ),
+            pytest.param(
+                {"transform_on_error": ""},
+                "connection_label_invalid",
+                "on_error must be a sink name or 'discard'",
+                id="transform-on_error-empty",
+            ),
+            pytest.param({"output_name": "Main"}, "output_name_invalid", "must be lowercase", id="output-name-uppercase"),
+            pytest.param({"output_name": "__main"}, "output_name_invalid", "starts with '__'", id="output-name-dunder"),
+            pytest.param(
+                {"on_write_failure": ""},
+                "connection_label_invalid",
+                "on_write_failure must be a sink name or 'discard'",
+                id="on_write_failure-empty",
+            ),
+        ],
+    )
+    def test_label_violating_runtime_rules_is_rejected(self, overrides: dict[str, Any], code: str, fragment: str) -> None:
+        """Every routing label the runtime settings model validates must be validated by Stage 1 too.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). ``core/config.py`` runs
+        ``_validate_connection_or_sink_name`` (non-empty, <=64, connection
+        character class, not a reserved edge label, no ``__`` prefix) on every
+        connection/route/branch label and ``validate_sink_name`` (plus
+        lowercase, <=38) on every sink name. Stage 1 only noticed a bad label
+        indirectly through the dangling-reference rules — and those go silent
+        exactly when the bad label is CONSISTENT (a blank on_success feeding a
+        blank input validated green), while ``_SetOutputArgumentsModel.sink_name``
+        was an unconstrained string on the freeform path (elspeth-88a4db09f9).
+        """
+        result = self._label_probe_state(**overrides).validate()
+
+        assert not result.is_valid
+        matching = [e for e in result.errors if e.error_code == code]
+        assert matching, [(e.error_code, e.message) for e in result.errors]
+        assert any(fragment in e.message for e in matching), [e.message for e in matching]
+
+    def test_label_probe_control_is_accepted(self) -> None:
+        """Positive control for the label rules — the unmodified probe state validates green."""
+        result = self._label_probe_state().validate()
+
+        assert result.is_valid, result.errors
+
+    def test_gate_route_and_fork_labels_follow_runtime_rules(self) -> None:
+        """Route labels must be non-empty and valid; ``continue`` is a removed destination; fork branch names are labels too."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="'x'",
+                routes={"": "main", "b": "continue", "c": "fork"},
+                fork_to=("", "__hidden"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        messages = [e.message for e in result.errors if e.error_code == "connection_label_invalid"]
+        assert any("Route labels must not be empty" in m for m in messages), result.errors
+        assert any("Route destination 'continue' has been removed" in m for m in messages), result.errors
+        assert any("Fork branch names must not be empty" in m for m in messages), result.errors
+        assert any("Fork branch name '__hidden' starts with '__'" in m for m in messages), result.errors
+
+    def test_coalesce_branch_labels_follow_runtime_rules(self) -> None:
+        """Branch keys/values must be non-empty, valid, and not collide after trimming or repeat in list form."""
+
+        def coalesce(node_id: str, branches: Any) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="coalesce",
+                plugin=None,
+                input="cx",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=branches,
+                policy="require_all",
+                merge="union",
+            )
+
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "discard"},
+                fork_to=("x", "x ", "p", "e"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(coalesce("c_trim", {"x": "cx", "x ": "cy"}))
+        state = state.with_node(coalesce("c_empty", {"e": ""}))
+        state = state.with_node(coalesce("c_list", ("p", "p")))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        by_component: dict[str, list[str]] = {}
+        for e in result.errors:
+            if e.error_code == "connection_label_invalid":
+                by_component.setdefault(e.component, []).append(e.message)
+        assert any("collide after trimming whitespace" in m for m in by_component.get("node:c_trim", ())), result.errors
+        assert any("input connection must not be empty" in m for m in by_component.get("node:c_empty", ())), result.errors
+        assert by_component.get("node:c_list") == ["Duplicate branch names in list: ['p']"], result.errors
+
+    def test_gate_empty_fork_to_is_rejected(self) -> None:
+        """``fork_to=()`` is neither "no fork" nor a fork: the runtime rejects it, and used to crash on it."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['x'] > 0",
+                routes={"true": "main", "false": "discard"},
+                fork_to=(),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "gate_fork_to_empty"]
+        assert entry.component == "node:g"
+
+    @pytest.mark.parametrize("collides_with", ["sink", "source"])
+    def test_node_id_colliding_with_sink_or_source_name_is_rejected(self, collides_with: str) -> None:
+        """One namespace across nodes, sources and sinks (``validate_globally_unique_node_names``)."""
+        state = CompositionState(
+            sources={"primary": self._make_source(on_success="t_in")},
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        node_id = "primary" if collides_with == "source" else "main"
+        state = state.with_node(self._make_transform(node_id, "t_in", "main"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "node_id_collides_with_source_or_sink"]
+        assert entry.component == f"node:{node_id}"
+        assert f"used by both transform and {collides_with}" in entry.message
+
+    def _fork_gate(self, node_id: str, input_name: str, fork_to: tuple[str, ...]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="gate",
+            plugin=None,
+            input=input_name,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=fork_to,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_fork_branch_declared_by_two_gates_over_sink_names_is_rejected(self) -> None:
+        """Fork branch names are globally unique across gates — even when they are also sink names.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). The duplicate-producer
+        accounting deliberately skips branch names that are sink names, so
+        two gates each forking to ['main', 'other'] validated green while
+        the DAG build raised "Fork branch 'main' is declared by multiple
+        gates". The control forks DISTINCT sink names from the second gate.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g1_in"))
+        state = state.with_node(self._fork_gate("g1", "g1_in", ("main", "other")))
+        state = state.with_node(self._make_transform("t1", "other", "g2_in"))
+        state = state.with_node(self._fork_gate("g2", "g2_in", ("main", "third")))
+        for name in ("main", "other", "third"):
+            state = state.with_output(self._make_output(name))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "fork_branch_declared_by_multiple_gates"]
+        assert entry.component == "node:g2"
+        assert "'g1' and 'g2'" in entry.message
+
+    def test_fork_branches_over_distinct_sink_names_are_accepted(self) -> None:
+        """Positive control for the multi-gate fork-branch rule."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g1_in"))
+        state = state.with_node(self._fork_gate("g1", "g1_in", ("main", "other")))
+        state = state.with_node(self._make_transform("t1", "other", "g2_in"))
+        state = state.with_node(self._fork_gate("g2", "g2_in", ("third", "fourth")))
+        for name in ("main", "other", "third", "fourth"):
+            state = state.with_output(self._make_output(name))
+
+        result = state.validate()
+
+        assert not any(e.error_code == "fork_branch_declared_by_multiple_gates" for e in result.errors), result.errors
+
+    def test_single_branch_coalesce_is_rejected(self) -> None:
+        """``CoalesceSettings.branches`` is ``min_length=2`` — declarative, so no raise site names it."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(self._fork_gate("g", "g_in", ("x",)))
+        state = state.with_node(self._make_transform("tx", "x", "cx"))
+        state = state.with_node(
+            NodeSpec(
+                id="c",
+                node_type="coalesce",
+                plugin=None,
+                input="cx",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"x": "cx"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_branches_invalid"]
+        assert entry.component == "node:c"
+
+    def test_coalesce_branch_alias_no_gate_forks_is_rejected(self) -> None:
+        """A coalesce branch KEY must be some gate's fork_to entry (row_union already had this rule)."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(self._fork_gate("g", "g_in", ("b2", "b3")))
+        state = state.with_node(self._make_transform("t1", "b3", "t1_out"))
+        state = state.with_node(
+            NodeSpec(
+                id="c",
+                node_type="coalesce",
+                plugin=None,
+                input="b2",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"b1": "t1_out", "b2": "b2"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_branch_alias_unreachable"]
+        assert entry.component == "node:c"
+        assert "['b1']" in entry.message
+
+    def test_more_sinks_than_the_runtime_cap_is_rejected(self) -> None:
+        """``ElspethSettings.sinks`` is ``Field(max_length=50)`` — declarative, no raise site; 51 sinks validated green."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="main0"))
+        for index in range(51):
+            state = state.with_output(self._make_output(f"main{index}"))
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "pipeline_collection_cap_exceeded"]
+        assert "51 sinks" in entry.message and "at most 50" in entry.message
+
+    def test_gate_with_more_than_32_fork_branches_is_rejected(self) -> None:
+        """``GateSettings.fork_to`` is ``Field(max_length=32)``."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        branches = tuple(f"b{i}" for i in range(33))
+        state = state.with_node(self._fork_gate("g", "g_in", branches))
+        for branch in branches:
+            state = state.with_output(self._make_output(branch))
+
+        result = state.validate()
+
+        assert any(e.error_code == "pipeline_collection_cap_exceeded" and "33 fork branches" in e.message for e in result.errors), (
+            result.errors
+        )
+
+    @pytest.mark.parametrize("provider", ["fake", {"name": "openrouter"}], ids=["unknown-string", "mapping"])
+    def test_llm_node_with_bad_provider_returns_a_verdict_not_a_crash(self, provider: object) -> None:
+        """``validate()`` must never raise on authorable options.
+
+        An llm node whose ``provider`` was an unknown string, or a mapping,
+        made the semantic validator's consumer probe raise a bare
+        ``ValueError`` / ``TypeError`` out of ``validate()`` — a 500 for a
+        ``upsert_node`` payload (elspeth-2ed41f0a4a census, 2026-08-17). Plugin
+        OPTION validity is owned by the tool-layer prevalidation and Stage 2's
+        plugin_instantiation; Stage 1 abstains on an un-constructable draft,
+        so the verdict here is simply "no crash".
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="t1",
+                node_type="transform",
+                plugin="llm",
+                input="t_in",
+                on_success="main",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}, "provider": provider, "model": "m", "prompt": "p"},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()  # must not raise
+
+        assert isinstance(result.is_valid, bool)
+
+    def test_transform_cycle_is_rejected(self) -> None:
+        """Two transforms feeding each other must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). Stage 1 had NO cycle detection
+        at all: ``t1.input=b, t1.on_success=c; t2.input=c, t2.on_success=b``
+        satisfies the per-node "input has a producer" check on both sides, so
+        the pipeline validated ``is_valid=True`` with no warning, while the
+        DAG build raised ``GraphValidationError`` "Pipeline contains a cycle".
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="main"))
+        state = state.with_node(self._make_transform("t1", "b", "c"))
+        state = state.with_node(self._make_transform("t2", "c", "b"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not result.is_valid
+        [entry] = [e for e in result.errors if e.error_code == "pipeline_cycle"]
+        assert "t1" in entry.message and "t2" in entry.message
+        assert entry.component in ("node:t1", "node:t2")
+
+    def _implicit_aggregation_cycle_state(self) -> CompositionState:
+        """A clean main path, plus a 2-cycle closed through an implicit self-publisher.
+
+        ``agg`` omits ``on_success``, so it publishes under its own id;
+        ``t2`` consumes ``agg`` and routes back to ``agg``'s own input ``b``.
+        Deliberately free of every other defect — one producer per connection,
+        every input reachable — so the ONLY thing under test is the cycle.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(self._make_transform("t0", "rows", "main", on_error="main"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="b",
+                on_success=None,
+                on_error="main",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+            )
+        )
+        state = state.with_node(self._make_transform("t2", "agg", "b", on_error="main"))
+        return state.with_output(self._make_output("main"))
+
+    def test_cycle_through_an_implicitly_publishing_aggregation_is_rejected(self) -> None:
+        """The composer used to GREEN this and the engine killed it at build.
+
+        A false accept, the worst polarity. ``_node_published_connections``
+        restated the publishing rule by hand as "a coalesce with no
+        ``on_success``", which omits the other implicit self-publishers. An
+        aggregation that omits ``on_success`` publishes under its own id
+        (``core/dag/builder.py`` registers ``agg_settings.name``), so the
+        cycle detector saw no outbound edge from ``agg`` and found nothing.
+
+        Measured on this exact shape before the fix:
+
+            composer : is_valid=True, errors=[]
+            engine   : GraphValidationError: Pipeline contains a cycle:
+                       transform_t2_... -> aggregation_agg_...
+
+        Deriving the success channel from ``published_success_connection``
+        closes it. Do not restate the rule here again.
+        """
+        result = self._implicit_aggregation_cycle_state().validate()
+
+        assert not result.is_valid
+        cycle_errors = [e for e in result.errors if e.error_code == "pipeline_cycle"]
+        assert cycle_errors, [e.to_dict() for e in result.errors]
+        message = cycle_errors[0].message
+        assert "agg" in message and "t2" in message, message
+
+    def test_the_same_cycle_spelled_explicitly_was_always_rejected(self) -> None:
+        """Isolates the blindness to the IMPLICIT arm, not to aggregations.
+
+        Control contributed by the hunt-strategy lane's independent repro. The
+        identical graph, with the aggregation naming ``on_success: "agg"``
+        instead of omitting it, was rejected before this fix and after — the
+        hand restatement's ``elif node.on_success is not None`` arm caught it.
+
+        Without this control, "an aggregation cycle was missed" could equally
+        mean the detector was blind to aggregations generally. It is not: it
+        was blind to the one arm that had to ask the helper.
+        """
+        state = self._implicit_aggregation_cycle_state()
+        explicit = tuple(replace(node, on_success="agg") if node.id == "agg" else node for node in state.nodes)
+        state = replace(state, nodes=explicit)
+
+        result = state.validate()
+
+        assert not result.is_valid
+        assert [e for e in result.errors if e.error_code == "pipeline_cycle"], [e.to_dict() for e in result.errors]
+
+    def test_a_queue_pipeline_gains_no_spurious_cycle(self) -> None:
+        """The guard the aggregation arm must not dissolve.
+
+        A queue's ``input`` IS its own id, and it publishes under that id, so
+        deriving the success channel makes ``published_success_connection``
+        return a queue's own id here. That would be a self-edge — a cycle on
+        EVERY pipeline containing a queue — were it not for
+        ``_node_topology_cycle`` skipping queues in both its consumer and
+        successor maps, which is why this function needs no carve-out.
+
+        This pins that coupling behaviourally: remove either skip and this
+        goes red rather than shipping a spurious rejection.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="q",
+                node_type="queue",
+                plugin=None,
+                input="q",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("feed", "rows", "q", on_error="main"))
+        state = state.with_node(self._make_transform("drain", "q", "main", on_error="main"))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not any(e.error_code == "pipeline_cycle" for e in result.errors), [e.to_dict() for e in result.errors]
+        assert result.is_valid, [e.to_dict() for e in result.errors]
+
+    def test_gate_routing_back_upstream_is_rejected_as_a_cycle(self) -> None:
+        """A gate whose route re-enters an ancestor's input connection is a cycle through the gate."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t_in"))
+        state = state.with_node(self._make_transform("t1", "t_in", "g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "main", "false": "t_in"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        cycle_errors = [e for e in result.errors if e.error_code == "pipeline_cycle"]
+        assert len(cycle_errors) == 1, result.errors
+        assert "g" in cycle_errors[0].message and "t1" in cycle_errors[0].message
+
+    def test_fork_and_coalesce_diamond_is_not_a_cycle(self) -> None:
+        """Positive control: a fork/coalesce diamond revisits no node and must stay green."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="g_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="g",
+                node_type="gate",
+                plugin=None,
+                input="g_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("a", "b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("ta", "a", "a_done"))
+        state = state.with_node(self._make_transform("tb", "b", "b_done"))
+        state = state.with_node(
+            NodeSpec(
+                id="c",
+                node_type="coalesce",
+                plugin=None,
+                input="a_done",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"a": "a_done", "b": "b_done"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not any(e.error_code == "pipeline_cycle" for e in result.errors), result.errors
+        assert result.is_valid, result.errors
+
     def test_connection_only_runtime_pipeline_is_valid_without_ui_edges(self) -> None:
         """Runtime connection fields, not UI edges, determine Stage 1 validity."""
         state = self._empty_state()
@@ -999,6 +1713,221 @@ class TestStage1Validation:
         result = state.validate()
 
         assert result.is_valid, result.errors
+
+    def test_coalesce_timeout_survives_serialization_round_trip(self) -> None:
+        state = self._coalesce_route_state(on_success="main")
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        state = state.with_node(replace(coalesce, timeout_seconds=5.0))
+
+        restored = CompositionState.from_dict(state.to_dict())
+
+        assert restored == state
+        assert next(node for node in restored.nodes if node.node_type == "coalesce").timeout_seconds == 5.0
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # 10**400 and its negation are only reachable from a persisted session
+        # payload (JSON has no integer ceiling and NodeSpec.from_dict does not
+        # cross the Pydantic tool boundary). float() overflows on them, which
+        # used to abort validate() with OverflowError instead of rejecting.
+        [True, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
+    def test_coalesce_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
+        state = self._coalesce_route_state(on_success="main")
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        state = state.with_node(replace(coalesce, timeout_seconds=timeout_seconds))
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_timeout_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("node", "error_code"),
+        [
+            pytest.param(
+                NodeSpec(
+                    id="transform_1",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="transform_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="transform",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="gate_1",
+                    node_type="gate",
+                    plugin=None,
+                    input="gate_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "main", "false": "main"},
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="gate",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="aggregation_1",
+                    node_type="aggregation",
+                    plugin="batch_counter",
+                    input="aggregation_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    trigger={"count": 100, "timeout_seconds": 5.0},
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="aggregation",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="queue_1",
+                    node_type="queue",
+                    plugin=None,
+                    input="queue_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "queue_config_invalid",
+                id="queue",
+            ),
+        ],
+    )
+    def test_only_barrier_nodes_accept_top_level_timeout(self, node: NodeSpec, error_code: str) -> None:
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success=node.input))
+        state = state.with_node(node)
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert any(error.error_code == error_code and "timeout_seconds" in error.message for error in result.errors), result.errors
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            pytest.param(
+                NodeSpec(
+                    id="gate_1",
+                    node_type="gate",
+                    plugin="fork",
+                    input="gate_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="row['x'] > 1",
+                    routes={"true": "fork", "false": "main"},
+                    fork_to=("main", "alt"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                id="gate",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="coalesce_1",
+                    node_type="coalesce",
+                    plugin="passthrough",
+                    input="coalesce_1",
+                    on_success="main",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=("path_a", "path_b"),
+                    policy="require_all",
+                    merge="union",
+                ),
+                id="coalesce",
+            ),
+        ],
+    )
+    def test_structural_nodes_reject_a_plugin(self, node: NodeSpec) -> None:
+        """gate and coalesce are built-in node_types wired with plugin=null.
+
+        Queues (``queue_node_contract_error``) and row_unions (their
+        forbidden-fields block) already reject a plugin; gate and coalesce
+        silently persisted one, so a state could carry ``('g', 'gate', 'fork')``
+        while ``is_valid`` — an authored token that neither generated YAML nor
+        the runtime ever sees.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success=node.input))
+        state = state.with_node(node)
+        state = state.with_output(self._make_output("main"))
+        state = state.with_output(self._make_output("alt"))
+
+        result = state.validate()
+
+        matching = [e for e in result.errors if e.error_code == "structural_node_plugin_forbidden"]
+        assert len(matching) == 1, result.errors
+        assert matching[0].component == f"node:{node.id}"
+        assert "plugin" in matching[0].message and "plugin=null" in matching[0].message
+        assert node.plugin not in matching[0].message, "the rejected plugin token is not echoed"
+
+    def test_structural_node_without_plugin_is_not_flagged(self) -> None:
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="gate_1"))
+        state = state.with_node(
+            NodeSpec(
+                id="gate_1",
+                node_type="gate",
+                plugin=None,
+                input="gate_1",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['x'] > 1",
+                routes={"true": "fork", "false": "main"},
+                fork_to=("main", "alt"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+        state = state.with_output(self._make_output("alt"))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(e.error_code == "structural_node_plugin_forbidden" for e in result.errors)
 
     def test_multiple_fork_gates_do_not_collide_on_fork_route_keyword(self) -> None:
         """Two gates routing to the reserved 'fork' keyword are not duplicate producers.
@@ -1596,6 +2525,188 @@ class TestStage1Validation:
         assert result.is_valid
         assert any("orphan" in w.message and "never receive data" in w.message for w in result.warnings)
 
+    def test_validate_w3_warns_on_a_dead_ended_non_terminal_coalesce(self) -> None:
+        """W3 must still fire when NOTHING consumes the coalesce.
+
+        Regression pair for the two ways this warning has been wrong. It first
+        asked ``node.on_success is not None``, which accused every CONNECTED
+        non-terminal coalesce (a false positive the composer's own planner saw
+        and talked itself past). Replacing that with "does it publish
+        anything?" fixed the false positive and introduced a false NEGATIVE:
+        an implicit self-publisher always publishes — under its own id — so a
+        genuinely dead-ended coalesce went unreported.
+
+        The question that is right in both directions is whether the published
+        connection is CONSUMED. Both halves are pinned here and in
+        ``test_validate_w3_silent_when_the_coalesce_is_consumed`` below; do not
+        "simplify" either back into a presence check.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="fan",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=["ba", "bb"],
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("a", "ba", "a_out"))
+        state = state.with_node(self._make_transform("b", "bb", "b_out"))
+        state = state.with_node(
+            NodeSpec(
+                id="merge",
+                node_type="coalesce",
+                plugin=None,
+                input="a_out",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"ba": "a_out", "bb": "b_out"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+        result = state.validate()
+        assert any("merge" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def test_validate_w3_silent_when_the_coalesce_is_consumed(self) -> None:
+        """The other half: a CONSUMED non-terminal coalesce is not accused."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="fan",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=["ba", "bb"],
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("a", "ba", "a_out"))
+        state = state.with_node(self._make_transform("b", "bb", "b_out"))
+        state = state.with_node(
+            NodeSpec(
+                id="merge",
+                node_type="coalesce",
+                plugin=None,
+                input="a_out",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"ba": "a_out", "bb": "b_out"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        # The consumer names the coalesce BY ID — the shape the runtime resolves.
+        state = state.with_node(self._make_transform("tidy", "merge", "main"))
+        state = state.with_output(self._make_output("main"))
+        result = state.validate()
+        assert not any("merge" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def _dangling_aggregation_state(self, *, on_error: str) -> CompositionState:
+        """source -> t1 -> aggregation, with NOTHING consuming the aggregation."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="rows"))
+        state = state.with_node(self._make_transform("t1", "rows", "agg_in", on_error="main"))
+        state = state.with_node(
+            NodeSpec(
+                id="agg",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="agg_in",
+                on_success=None,
+                on_error=on_error,
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_validate_w3_warns_when_the_only_outbound_is_on_error_discard(self) -> None:
+        """``on_error: "discard"`` is not a connection out — it is a hole.
+
+        The rows go nowhere and the author is never told. Counting discard as
+        an outbound made W3 contradict its own message, which promises the
+        node's output is "not connected to any downstream node or sink";
+        discard is neither. ``_runtime_connection_targets`` in the same module
+        already excluded it, so W3 was the inconsistent sibling.
+
+        An aggregation is the archetypal case because ``on_error`` is REQUIRED
+        for one (``aggregation_missing_on_error``) — so before this it could
+        always satisfy the limb with ``discard`` and dead-end in silence.
+
+        This test is the ENTIRE evidence base for the change: all 715 saved
+        composition states are unaffected (5 warned before, 5 after), because
+        ``on_error`` is only ever ``discard`` or None across the corpus's 1033
+        nodes and every discard node already satisfies the consumed limb
+        first. The corpus cannot exercise this in either direction.
+        """
+        result = self._dangling_aggregation_state(on_error="discard").validate()
+        assert any("agg" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def test_validate_w3_silent_when_on_error_names_a_real_sink(self) -> None:
+        """The other direction: a real ``on_error`` target IS a connection out.
+
+        Guards the tightening from becoming a blanket "ignore on_error". Same
+        dangling aggregation, but its errors reach a sink — the rows leave in
+        good order, so there is nothing to warn about.
+        """
+        result = self._dangling_aggregation_state(on_error="main").validate()
+        assert not any("agg" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
+    def test_validate_w3_silent_when_the_aggregation_is_consumed(self) -> None:
+        """A consumed aggregation is quiet even with ``on_error: discard``.
+
+        The consumed limb is checked first and independently, so tightening
+        the ``on_error`` limb must not accuse a correctly-wired node.
+        """
+        state = self._dangling_aggregation_state(on_error="discard")
+        state = state.with_node(self._make_transform("t2", "agg", "main", on_error="main"))
+        result = state.validate()
+        assert not any("agg" in (w.component or "") and "no outgoing edges" in w.message for w in result.warnings), [
+            w.to_dict() for w in result.warnings
+        ]
+
     def test_validate_source_on_success_mismatch_warns(self) -> None:
         """W2: Source on_success doesn't match any node input."""
         state = self._empty_state()
@@ -1729,8 +2840,9 @@ class TestStage1Validation:
 
     # --- W7: on_write_failure reference validation ---
 
-    def test_validate_on_write_failure_nonexistent_output_warns(self) -> None:
-        """W7: on_write_failure references output that doesn't exist."""
+    def test_validate_on_write_failure_nonexistent_output_is_error(self) -> None:
+        """A dangling failsink raises RouteValidationError at runtime init, so
+        Stage 1 reports it as an error (elspeth-eb4127fb49)."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1739,10 +2851,10 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("not a configured output" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_unknown_output" for e in result.errors)
 
-    def test_validate_on_write_failure_self_reference_warns(self) -> None:
-        """W7: on_write_failure references itself."""
+    def test_validate_on_write_failure_self_reference_is_error(self) -> None:
+        """A self-referencing failsink is a deterministic runtime rejection."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1751,10 +2863,10 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("references itself" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_self_reference" for e in result.errors)
 
-    def test_validate_on_write_failure_ineligible_plugin_warns(self) -> None:
-        """W7: failsink target uses non-file plugin (e.g. database)."""
+    def test_validate_on_write_failure_ineligible_plugin_is_error(self) -> None:
+        """A non-file failsink target is a deterministic runtime rejection."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1767,11 +2879,11 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any(f"must use {FAILSINK_ELIGIBLE_PLUGIN_TEXT}" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_ineligible_plugin" for e in result.errors)
 
     @pytest.mark.parametrize("plugin_name", sorted(FAILSINK_ELIGIBLE_SINK_PLUGINS))
     def test_validate_on_write_failure_shared_policy_plugins_are_valid(self, plugin_name: str) -> None:
-        """W7: every centrally failsink-capable plugin is accepted by composer warnings."""
+        """Every centrally failsink-capable plugin is accepted by Stage 1."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1784,10 +2896,10 @@ class TestStage1Validation:
 
         result = state.validate()
 
-        assert not any("on_write_failure" in w.message for w in result.warnings)
+        assert not any("on_write_failure" in e.message for e in (*result.errors, *result.warnings))
 
-    def test_validate_on_write_failure_chain_warns(self) -> None:
-        """W7: failsink target has its own non-discard on_write_failure (chain)."""
+    def test_validate_on_write_failure_chain_is_error(self) -> None:
+        """A chained failsink is a deterministic runtime rejection."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1800,7 +2912,7 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("no chains" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_chain" for e in result.errors)
 
     def test_validate_on_write_failure_valid_no_warning(self) -> None:
         """W7: Valid failsink reference produces no warning."""
@@ -1814,8 +2926,8 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        # No on_write_failure warnings
-        assert not any("on_write_failure" in w.message for w in result.warnings)
+        # No on_write_failure findings at any severity
+        assert not any("on_write_failure" in e.message for e in (*result.errors, *result.warnings))
 
     def test_validate_on_write_failure_discard_no_warning(self) -> None:
         """W7: on_write_failure='discard' is always valid, no warning."""
@@ -1830,8 +2942,9 @@ class TestStage1Validation:
 
     # --- W8: on_validation_failure reference validation ---
 
-    def test_validate_on_validation_failure_nonexistent_output_warns(self) -> None:
-        """W8: on_validation_failure references output that doesn't exist."""
+    def test_validate_on_validation_failure_nonexistent_output_is_error(self) -> None:
+        """A dangling quarantine destination raises RouteValidationError at
+        runtime init, so Stage 1 reports it as an error."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1", on_validation_failure="nonexistent_sink"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1839,7 +2952,7 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("not a configured output" in w.message for w in result.warnings)
+        assert any(e.error_code == "quarantine_unknown_output" for e in result.errors)
 
     def test_validate_on_validation_failure_discard_no_warning(self) -> None:
         """W8: on_validation_failure='discard' is always valid, no warning."""
@@ -1868,14 +2981,29 @@ class TestStage1Validation:
 
     # --- Suggestion rules (S1-S3) ---
 
-    def test_validate_no_error_routing_suggests(self) -> None:
-        """S1: Transforms now require on_error (section 7), so a valid pipeline
-        always has explicit error routing and S1 cannot fire.  Verify S1 is
-        absent when on_error='discard' is set."""
+    def test_validate_discard_only_routing_suggests_retention(self) -> None:
+        """S1: on_error='discard' does NOT count as error routing
+        (elspeth-0aace271b4 I5) — the tool layer default-fills it, so counting
+        it made the one advisory nudge toward retention permanently
+        unreachable. A discard-only pipeline gets the retention suggestion."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main", on_error="discard"))
         state = state.with_output(self._make_output("main"))
+        state = state.with_edge(self._make_edge("e1", "source", "t1"))
+        state = state.with_edge(self._make_edge("e2", "t1", "main"))
+        result = state.validate()
+        assert result.is_valid
+        assert any("error routing" in s.message for s in result.suggestions)
+
+    def test_validate_named_sink_routing_suppresses_s1(self) -> None:
+        """S1 stays quiet when a node routes failures to a real output —
+        retaining routing is exactly what the suggestion asks for."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="t1"))
+        state = state.with_node(self._make_transform("t1", "t1", "main", on_error="errors"))
+        state = state.with_output(self._make_output("main"))
+        state = state.with_output(self._make_output("errors"))
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
@@ -2232,8 +3360,8 @@ class TestStage1Validation:
         assert not result.is_valid
         assert any("output_mode" in e.message and "agg1" in e.message for e in result.errors)
 
-    def test_validate_aggregation_with_trigger_passes(self) -> None:
-        """Aggregation with all required fields passes validation."""
+    def test_validate_aggregation_with_trigger_timeout_passes(self) -> None:
+        """Aggregation keeps its nested trigger timeout when top-level timeout is forbidden."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="agg1"))
         node = NodeSpec(
@@ -2250,7 +3378,7 @@ class TestStage1Validation:
             branches=None,
             policy=None,
             merge=None,
-            trigger={"count": 100},
+            trigger={"count": 100, "timeout_seconds": 5.0},
         )
         state = state.with_node(node)
         state = state.with_output(self._make_output("main"))
@@ -2291,7 +3419,13 @@ class TestStage1Validation:
         source = SourceSpec(
             plugin="csv",
             on_success="t1",
-            options={"path": "/in.csv", "schema_config": {"fields": []}},
+            # `mode` is REQUIRED by `get_raw_schema_config`, the parser BOTH
+            # surfaces share (core/dag/builder.py:161, core/dag/graph.py:199).
+            # This fixture previously omitted it and still asserted is_valid —
+            # a pipeline the runtime would reject at build time, called clean.
+            # Nothing parsed it because Stage 1's schema parse was lazy; the
+            # eager syntax sweep (elspeth-33738eedb6) now reaches it.
+            options={"path": "/in.csv", "schema_config": {"mode": "observed", "fields": []}},
             on_validation_failure="quarantine",
         )
         state = state.with_source(source)
@@ -2323,8 +3457,8 @@ class TestStage1Validation:
         state = state.with_output(quarantine_output)
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "gate_1"))
-        state = state.with_edge(self._make_edge("e3", "gate_1", "main"))
-        state = state.with_edge(self._make_edge("e4", "gate_1", "errors"))
+        state = state.with_edge(self._make_edge("e3", "gate_1", "main", edge_type="route_true"))
+        state = state.with_edge(self._make_edge("e4", "gate_1", "errors", edge_type="route_false"))
         result = state.validate()
         assert result.is_valid, result.errors
         assert result.warnings == ()
@@ -2383,6 +3517,161 @@ class TestStage1Validation:
             routes={"high": "main", "low": "main"},
         ).validate()
         assert result.is_valid is True, [e.message for e in result.errors]
+
+
+class TestImplicitPublisherWalksReachThroughAggregations:
+    """The three remaining graph walks derive the success channel, not restate it.
+
+    All three stopped dead at an aggregation that omits ``on_success``. That
+    aggregation publishes under its own id (``core/dag/builder.py`` registers
+    ``agg_settings.name``), so "publishes nothing" was wrong and everything
+    beyond it was invisible to the walk.
+
+    These are not cosmetic conversions — the walks feed real checks:
+    ``_runtime_nodes_downstream_of_connection`` backs
+    ``row_union_downstream_group_invalid``, and the other two back bound-region
+    fork-branch anchoring.
+
+    Tested at the function level deliberately. Each blind spot is a property of
+    one walk, and building a fully-valid pipeline that isolates one walk's
+    contribution to a caller's verdict takes a fixture so elaborate that it
+    pins the fixture rather than the walk — a first attempt here produced a
+    graph whose error came from a different arm entirely.
+
+    Each case carries a QUEUE control, because deriving the channel means these
+    walks now see a queue's own id where they did not before. That is inert:
+    every one of them is entered only when the node's input already intersects
+    the reachable set, and a queue's sole input IS its own id
+    (``queue_node_contract_error`` enforces it), so re-adding it is a no-op.
+    The controls hold that reasoning to account.
+    """
+
+    @staticmethod
+    def _node(**overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "x",
+            "node_type": "transform",
+            "plugin": None,
+            "input": "in",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _transform(self, node_id: str, input_connection: str, on_success: str) -> NodeSpec:
+        return self._node(id=node_id, plugin="passthrough", input=input_connection, on_success=on_success)
+
+    def _implicit_aggregation(self, node_id: str, input_connection: str) -> NodeSpec:
+        """An aggregation that omits on_success — it publishes under its own id."""
+        return self._node(
+            id=node_id,
+            node_type="aggregation",
+            plugin="batch_stats",
+            input=input_connection,
+            on_success=None,
+            on_error="discard",
+            trigger={"count": 2},
+        )
+
+    def test_downstream_walk_continues_past_an_implicit_aggregation(self) -> None:
+        """Site A. Backs ``row_union_downstream_group_invalid``."""
+        nodes = (
+            self._implicit_aggregation("agg", "start"),
+            self._transform("after", "agg", "done"),
+        )
+        reached = [node.id for node in _runtime_nodes_downstream_of_connection("start", nodes)]
+        assert reached == ["agg", "after"], (
+            f"The walk stopped at the aggregation and never saw 'after'. Got {reached}. "
+            "An aggregation omitting on_success publishes under its own id."
+        )
+
+    def test_downstream_walk_is_unchanged_for_queues(self) -> None:
+        nodes = (
+            self._node(id="q", node_type="queue", input="q"),
+            self._transform("feed", "rows", "q"),
+            self._transform("drain", "q", "done"),
+        )
+        reached = [node.id for node in _runtime_nodes_downstream_of_connection("rows", nodes)]
+        assert reached == ["feed", "drain"], reached
+
+    def test_backward_reach_continues_past_an_implicit_aggregation(self) -> None:
+        """Site B. Widens the fork-branch seed roster for bound regions."""
+        closer = self._node(
+            id="co",
+            node_type="coalesce",
+            input="l_done",
+            on_success="out",
+            branches={"l": "l_done", "r": "r_done"},
+            policy="require_all",
+            merge="union",
+        )
+        nodes = (
+            self._implicit_aggregation("agg", "seed"),
+            self._transform("mid", "agg", "l_done"),
+            self._transform("right", "r_in", "r_done"),
+            closer,
+        )
+        reach = _closer_backward_reach_connections(nodes, closer)
+        assert "seed" in reach, (
+            f"Backward reach stopped at the aggregation, so its own input 'seed' was never reached. Got {sorted(reach)}."
+        )
+
+    def test_backward_reach_is_unchanged_for_queues(self) -> None:
+        closer = self._node(
+            id="co",
+            node_type="coalesce",
+            input="l_done",
+            on_success="out",
+            branches={"l": "l_done"},
+            policy="require_all",
+            merge="union",
+        )
+        nodes = (self._node(id="q", node_type="queue", input="q"), self._transform("drain", "q", "l_done"), closer)
+        reach = _closer_backward_reach_connections(nodes, closer)
+        assert "q" in reach and "l_done" in reach, sorted(reach)
+
+    def test_fork_branch_sink_walk_continues_past_an_implicit_aggregation(self) -> None:
+        """Site C. A sink reached THROUGH an in-region aggregation was invisible."""
+        nodes = (
+            self._implicit_aggregation("agg", "branch_l"),
+            self._transform("leak", "agg", "main"),
+            self._node(
+                id="closer",
+                node_type="coalesce",
+                input="branch_l",
+                on_success="out",
+                branches={"l": "branch_l"},
+                policy="require_all",
+                merge="union",
+            ),
+        )
+        hit = _fork_branch_reaches_sink_before_closer({"branch_l"}, "closer", nodes, frozenset({"main"}))
+        assert hit == "main", f"The in-region sink leak was invisible because the walk stopped at the aggregation. Got {hit!r}."
+
+    def test_fork_branch_sink_walk_reports_no_leak_when_there_is_none(self) -> None:
+        """Control: the walk must still abstain when nothing reaches a sink."""
+        nodes = (
+            self._implicit_aggregation("agg", "branch_l"),
+            self._transform("inner", "agg", "closer_in"),
+            self._node(
+                id="closer",
+                node_type="coalesce",
+                input="closer_in",
+                on_success="out",
+                branches={"l": "closer_in"},
+                policy="require_all",
+                merge="union",
+            ),
+        )
+        assert _fork_branch_reaches_sink_before_closer({"branch_l"}, "closer", nodes, frozenset({"main"})) is None
 
 
 class TestWebScrapeAbuseContactValidation:
@@ -2534,9 +3823,9 @@ class TestWebScrapeAbuseContactValidation:
     @pytest.mark.parametrize(
         "address",
         [
-            "abuse-contact-unset@elspeth.foundryside.dev",
+            "abuse-contact-unset@elspeth.example.gov.au",
             "ops@somecompany.gov.au",
-            "abuse@example.foundryside.dev",  # 'example' as a label, not the reserved TLD
+            "abuse@example.somecompany.gov.au",  # 'example' as a label, not the reserved TLD
             "user@reallytest.example-mail.org",  # not endswith ".test" / ".example.org"
             "ops@notlocalhost.com",
             "ops@subdomain.example.io",  # 'example' inside string but not reserved
@@ -2654,6 +3943,639 @@ class TestWebScrapeAbuseContactValidation:
         assert not messages
 
 
+class TestPromptTemplateUnboundVariables:
+    """LLM prompt templates render with exactly ``{row, lookup}`` under
+    StrictUndefined (``PromptTemplate.render``), so a bare ``{{ text }}``
+    raises ``TemplateError: Undefined variable`` at runtime and the model
+    receives none of the row's data. Composer validation must reject such
+    templates with the closed, repairable ``prompt_template_unbound_variables``
+    code instead of letting the pipeline crash live (R2-F17 compounding
+    finding, elspeth-bea314a89b).
+    """
+
+    def _state_with_llm(self, prompt_template: str) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model"},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _unbound_errors(self, state: CompositionState) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == "prompt_template_unbound_variables"]
+
+    def test_rejects_bare_variable_template(self) -> None:
+        """The acceptance-run shape: every interpolation is an unbound bare name."""
+        state = self._state_with_llm("Classify: {{ text }}")
+        errors = self._unbound_errors(state)
+        assert errors, "Expected prompt_template_unbound_variables for bare {{ text }}"
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "'text'" in entry.message
+        assert "row." in entry.message
+
+    def test_rejects_mixed_template_with_unbound_name(self) -> None:
+        """A template can reference row fields AND still crash on a stray bare
+        name — StrictUndefined raises on the unbound one regardless."""
+        state = self._state_with_llm("Compare {{ row.summary }} against {{ reference }}")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert "'reference'" in errors[0].message
+        assert "'summary'" not in errors[0].message
+
+    def test_names_all_unbound_variables_sorted(self) -> None:
+        state = self._state_with_llm("{{ zeta }} then {{ alpha }}")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert errors[0].message.index("'alpha'") < errors[0].message.index("'zeta'")
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "Classify: {{ row.text }}",
+            'Classify: {{ row["Original Header"] }}',
+            "Instructions: {{ lookup.instructions }}",
+            "Rate how {{interpretation:cool}} this row is.",
+            "Rate how {{ interpretation: primary colour }} this page is.",
+            "Static prompt with no interpolation at all.",
+            "{% set t = row.text %}Classify: {{ t }}",
+            "{% for x in row %}{{ x }}{% endfor %}",
+            "{{ range(3) | join(', ') }}",  # env global, defined at render time
+            "",
+        ],
+    )
+    def test_accepts_bound_or_static_templates(self, template: str) -> None:
+        state = self._state_with_llm(template)
+        assert not self._unbound_errors(state), f"False positive for {template!r}"
+
+    def test_accepts_local_assigned_in_every_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        assert not self._unbound_errors(self._state_with_llm(template))
+
+    def test_rejects_local_assigned_in_only_one_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        errors = self._unbound_errors(self._state_with_llm(template))
+
+        assert len(errors) == 1
+        assert errors[0].component == "node:classify"
+        assert "'verdict'" in errors[0].message
+
+    def test_masked_interpretation_placeholder_does_not_hide_unbound_names(self) -> None:
+        """Placeholders are masked before parsing, but bare names elsewhere in
+        the same template must still be caught."""
+        state = self._state_with_llm("Rate how {{interpretation:cool}} this {{ item }} is.")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert "'item'" in errors[0].message
+
+    def test_syntax_error_template_is_not_this_rules_business(self) -> None:
+        """Unparseable templates are reported by other layers; this rule must
+        stay silent rather than mask the syntax problem."""
+        state = self._state_with_llm("Classify: {{ text")
+        assert not self._unbound_errors(state)
+
+    def test_skips_nodes_without_prompt_template(self) -> None:
+        node = NodeSpec(
+            id="rename",
+            node_type="transform",
+            plugin="field_mapper",
+            input="rows",
+            on_success="renamed",
+            on_error="discard",
+            options={"mapping": {"a": "b"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        assert not self._unbound_errors(state)
+
+    def test_multi_query_nodes_are_owned_by_the_multi_query_rule(self) -> None:
+        """With ``queries`` present the multi-query sibling rule owns the node.
+
+        A bare ``{{ text }}`` is unbound in multi-query mode too —
+        ``PromptTemplate.render`` wraps the per-query context under ``row``
+        (transform.py ``_execute_one_query`` → templates.py ``render``), so the
+        binding idiom is ``{{ row.text }}`` with ``text`` an ``input_fields``
+        key. The error must therefore still surface, emitted by
+        ``_validate_multi_query_template_variable_bindings`` (see
+        ``TestMultiQueryTemplateVariableBindings``)."""
+        state = self._state_with_llm("Classify {{ text }}.")
+        options = dict(state.nodes[0].options)
+        options["queries"] = [{"name": "classify", "input_fields": {"text": "body"}}]
+        node = replace(state.nodes[0], options=options)
+        state = replace(state, nodes=(node,))
+        errors = self._unbound_errors(state)
+        assert errors, "Bare names crash multi-query renders too — the sibling rule must flag them"
+        assert "'text'" in errors[0].message
+
+    def test_skips_non_string_prompt_template(self) -> None:
+        """A mistyped prompt_template is the plugin schema's problem — this
+        rule only reasons about string templates."""
+        state = self._state_with_llm("Classify: {{ row.text }}")
+        options = dict(state.nodes[0].options)
+        options["prompt_template"] = {"not": "a-string"}
+        node = replace(state.nodes[0], options=options)
+        state = replace(state, nodes=(node,))
+        assert not self._unbound_errors(state)
+
+
+class TestPromptTemplateUndeclaredRowFields:
+    """A single-prompt llm node may declare one row field and reference another.
+
+    Both authoring layers accepted that before elspeth-a9ba80cb0b: the edge
+    contract is satisfied by the DECLARATION, so a producer guaranteeing the
+    declared field passes, and every row then raised ``UndefinedError`` at
+    render. The composer must carry this rule itself — its plugin probes do
+    construct the node and do see the plugin's rejection, then swallow it
+    through ``_is_config_probe_exception`` so a draft never crashes validation.
+    """
+
+    def _state(self, prompt_template: str, **options: object) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model", **options},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == "prompt_template_undeclared_row_fields"]
+
+    def test_rejects_reference_outside_the_declaration(self) -> None:
+        errors = self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1"]))
+        assert errors, "expected prompt_template_undeclared_row_fields"
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "'case_study'" in entry.message
+        assert "'case_study_1'" in entry.message
+
+    def test_accepts_a_declared_reference(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study"]))
+
+    def test_accepts_a_declaration_wider_than_the_template(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study", "audit_id"]))
+
+    def test_empty_declaration_is_the_documented_opt_out(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=[]))
+
+    def test_absent_declaration_is_the_sibling_validators_business(self) -> None:
+        assert not self._errors(self._state("Rate: {{ row.case_study }}"))
+
+    def test_multi_query_nodes_are_out_of_scope(self) -> None:
+        """Multi-query binds ``row`` per query from ``input_fields``; its own rule owns that."""
+        state = self._state(
+            "Rate: {{ row.case_study }}",
+            required_input_fields=["case_study_1"],
+            queries={"q1": {"input_fields": {"case_study": "case_study_1"}}},
+        )
+        assert not self._errors(state)
+
+    def test_original_header_literal_is_covered_by_its_canonical_key(self) -> None:
+        """``row["Original Header"]`` is not a declarable name at all.
+
+        It can therefore only be an ``original_name``, and the row key it
+        resolves to is its canonical form — the one sound bridge, and it runs
+        only in this direction.
+        """
+        assert not self._errors(self._state('Rate: {{ row["Original Header"] }}', required_input_fields=["original_header"]))
+
+    def test_uncovered_original_header_literal_is_reported_with_its_declarable_form(self) -> None:
+        errors = self._errors(self._state('Rate: {{ row["Original Header"] }}', required_input_fields=["something_else"]))
+        assert errors
+        assert "declare as 'original_header'" in errors[0].message
+
+    def test_case_variant_reference_is_reported(self) -> None:
+        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident
+        of the producer's header, which no validator can see."""
+        errors = self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+        assert errors
+        assert "'Name'" in errors[0].message
+
+    def test_interpretation_placeholder_does_not_silence_the_rule(self) -> None:
+        """Unmasked, ``{{interpretation:...}}`` is a TemplateSyntaxError that would
+        abstain BOTH limbs on every interpretation-carrying node."""
+        errors = self._errors(
+            self._state("Rate how {{interpretation:cool}} {{ row.case_study }} is.", required_input_fields=["case_study_1"])
+        )
+        assert errors
+        assert "'case_study'" in errors[0].message
+
+    def test_both_limbs_can_fire_on_one_node(self) -> None:
+        """A bare name and an undeclared row field are separate defects with separate codes."""
+        codes = {
+            e.error_code for e in self._state("{{ text }} {{ row.case_study }}", required_input_fields=["case_study_1"]).validate().errors
+        }
+        assert "prompt_template_unbound_variables" in codes
+        assert "prompt_template_undeclared_row_fields" in codes
+
+    def test_message_routes_to_its_own_catalogue_entry(self) -> None:
+        """``_VALIDATION_ERROR_PATTERNS`` matches in LIST ORDER against raw text.
+
+        The two prompt_template codes are neighbours in that list and the
+        unbound-variables pattern also matches the phrase "prompt render
+        context does not define", so a message reusing that natural phrasing
+        would be served the wrong repair — advice telling the planner to
+        "rewrite each name as row.<field>" when the reference already IS
+        row.<field>, which sends it in a circle.
+        """
+        from elspeth.web.composer.state import (
+            _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+        )
+        from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS
+
+        def first_match_fix(message: str) -> str | None:
+            for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS:
+                if re.search(pattern, message):
+                    return fix
+            return None
+
+        errors = self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1"]))
+        assert errors
+        assert first_match_fix(errors[0].message) is _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX
+
+    def test_named_repair_clears_the_error(self) -> None:
+        """Pin TRUTH, not existence: applying the advice must actually clear it.
+
+        Both named remedies are exercised — declaring the field the template
+        reads, and rewriting the reference to the field already declared.
+        """
+        assert not self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study"]))
+        assert not self._errors(self._state("Rate: {{ row.case_study_1 }}", required_input_fields=["case_study_1"]))
+
+    def test_a_malformed_declaration_is_the_type_rule_business_not_a_silent_bypass(self) -> None:
+        """A declaration the composer cannot read must not read as "no declaration".
+
+        ``declared_names`` filters non-strings, so ``[5, 6]`` collapses to empty
+        and this rule stays silent — correct only because ``contract_config_invalid``
+        owns the type rejection. Measured, not assumed; a mixed list still yields
+        the shortfall for the names that ARE readable.
+        """
+        for declared in ([5, 6], "case_study_1", {}):
+            codes = {e.error_code for e in self._state("Rate: {{ row.case_study }}", required_input_fields=declared).validate().errors}
+            assert "contract_config_invalid" in codes, f"{declared!r} is not rejected by the type rule"
+
+        assert self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1", 5]))
+
+    def test_advice_leads_with_rewrite_and_qualifies_declaring(self) -> None:
+        """Declaring a read name the producer does not guarantee is accepted at
+        config time and then fails every row (``verify_declared_required_fields``
+        is a plain set difference with no dual-name limb), so the ordering of
+        the two remedies is load-bearing."""
+        from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as fix
+
+        assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
+        assert "ONLY if the upstream producer guarantees that exact name" in fix
+        assert "fails every row at run time" in fix
+        assert "patch_node_options replaces the option's value, it does not append" in fix
+
+    def test_both_authoring_surfaces_carry_the_same_substantive_advice(self) -> None:
+        """The plugin message and the composer message reach authors on disjoint
+        paths and cannot be byte-identical — one names YAML, the other names
+        composer tools. Their CLAIMS must still agree, or the same defect gets
+        opposite guidance depending on how it was found (elspeth-920bd88299)."""
+        from elspeth.plugins.transforms.llm.base import _UNDECLARED_ROW_FIELDS_REMEDY as plugin_fix
+        from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as composer_fix
+
+        for text in (plugin_fix, composer_fix):
+            assert text.index("Rewrite each reference") < text.index("Add a name to options.required_input_fields")
+            assert "ONLY if the upstream producer guarantees that exact name" in text
+            assert "fails every row at run time" in text
+            assert "withdraws the contract for every field" in text
+
+
+class TestMultiQueryTemplateVariableBindings:
+    """Multi-query LLM templates render with ``row`` bound to the query's
+    synthetic context (``build_template_context``: input_fields variables plus
+    ``source_row``) and ``lookup`` — under StrictUndefined. Two distinct
+    defects must be caught at compose time (elspeth-bea314a89b follow-up):
+
+    * a top-level name outside ``{row, lookup}`` + environment globals never
+      binds (same failure as single-prompt; code
+      ``prompt_template_unbound_variables``);
+    * a ``row.<name>`` reference outside that query's ``input_fields`` keys +
+      ``{source_row}`` raises ``Undefined variable`` when that query renders
+      (new code ``query_template_unbound_row_fields``).
+
+    Each query's effective template is its ``template`` override when present,
+    else the node-level ``prompt_template`` — a node-level template used by no
+    well-formed query never renders and must not be flagged.
+    """
+
+    def _state(self, prompt_template: str, queries: Any) -> CompositionState:
+        node = NodeSpec(
+            id="assess",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="assessed",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model", "queries": queries},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == code]
+
+    def test_bare_name_in_query_override_is_rejected(self) -> None:
+        """The task-shaped defect: an override interpolating a bare input_fields
+        variable — the binding idiom is ``{{ row.text }}``, never ``{{ text }}``."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "classify", "input_fields": {"text": "body", "input_1": "body"}, "template": "Classify {{ text }}"}],
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert errors, "Expected prompt_template_unbound_variables for bare {{ text }} in a query override"
+        entry = errors[0]
+        assert entry.component == "node:assess"
+        assert entry.severity == "high"
+        assert "'classify'" in entry.message
+        assert "'text'" in entry.message
+        assert "input_fields" in entry.message
+
+    def test_legacy_positional_bare_name_in_node_template_flagged_once(self) -> None:
+        """The legacy positional idiom ``{{ input_1 }}`` is a bare top-level
+        name; a shared node-level template must yield ONE entry, not one per
+        query that falls back to it."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            {
+                "q1": {"input_fields": {"input_1": "col_a"}},
+                "q2": {"input_fields": {"input_1": "col_b"}},
+            },
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert len(errors) == 1
+        assert "'input_1'" in errors[0].message
+
+    def test_node_template_used_by_no_query_is_not_flagged(self) -> None:
+        """When every query overrides the template, the node-level
+        prompt_template never renders — flagging it would be a false positive
+        (the shipped multi-query examples carry exactly this dead slot)."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            [{"name": "q1", "input_fields": {"text": "body"}, "template": "Classify {{ row.text }}"}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_unbound_row_field_in_override_is_rejected(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                {
+                    "name": "diagnose",
+                    "input_fields": {"input_1": "background"},
+                    "template": "Background: {{ row.input_1 }} Symptoms: {{ row.input_2 }}",
+                }
+            ],
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors, "Expected query_template_unbound_row_fields for row.input_2 outside input_fields"
+        entry = errors[0]
+        assert entry.component == "node:assess"
+        assert entry.severity == "high"
+        assert "'diagnose'" in entry.message
+        assert "'input_2'" in entry.message
+        assert "'input_1'" in entry.message  # names the bound set so the repair is obvious
+        assert "source_row" in entry.message
+
+    def test_bound_variables_source_row_lookup_and_globals_accepted(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                {
+                    "name": "q1",
+                    "input_fields": {"input_1": "background", "input-2": "symptoms"},
+                    "template": (
+                        "{{ row.input_1 }} / {{ row['input-2'] }} / {{ row.source_row.raw_column }} "
+                        "/ {{ lookup.rubric }} / {{ range(3) | join(', ') }}"
+                    ),
+                }
+            ],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_accepts_query_local_assigned_in_every_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+        state = self._state(
+            "Unused node template",
+            [{"name": "q1", "input_fields": {"flag": "source_flag"}, "template": template}],
+        )
+
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_rejects_query_local_assigned_in_only_one_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+        state = self._state(
+            "Unused node template",
+            [{"name": "q1", "input_fields": {"flag": "source_flag"}, "template": template}],
+        )
+
+        errors = self._errors(state, "prompt_template_unbound_variables")
+
+        assert len(errors) == 1
+        assert "'q1'" in errors[0].message
+        assert "'verdict'" in errors[0].message
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_accepts_shared_node_template_local_assigned_in_every_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+        state = self._state(template, {"q1": {"input_fields": {"flag": "source_flag"}}})
+
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_rejects_shared_node_template_local_assigned_in_only_one_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+        state = self._state(template, {"q1": {"input_fields": {"flag": "source_flag"}}})
+
+        errors = self._errors(state, "prompt_template_unbound_variables")
+
+        assert len(errors) == 1
+        assert "'verdict'" in errors[0].message
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_shared_node_template_checked_against_each_querys_bindings(self) -> None:
+        """The same node-level template can be fine for one query and broken
+        for another — the row-field check is per query."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            {
+                "ok_query": {"input_fields": {"input_1": "col_a"}},
+                "broken_query": {"input_fields": {"text": "col_b"}},
+            },
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert len(errors) == 1
+        assert "'broken_query'" in errors[0].message
+        assert "'ok_query'" not in errors[0].message
+
+    def test_mapping_form_query_override_is_checked(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            {"classify": {"input_fields": {"input_1": "body"}, "template": "{{ row.nope }}"}},
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors
+        assert "'classify'" in errors[0].message
+        assert "'nope'" in errors[0].message
+
+    def test_malformed_query_entries_are_skipped(self) -> None:
+        """Entry shape is QueryDefinition's contract; this rule stays silent on
+        malformed entries rather than double-reporting them."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                "not-a-mapping",
+                {"name": "bad_fields", "input_fields": "oops", "template": "{{ row.x }}"},
+                {"name": "no_fields", "template": "{{ row.y }}"},
+            ],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_queries_of_unexpected_shape_are_skipped(self) -> None:
+        state = self._state("Assess: {{ row.input_1 }}", "not-a-collection")
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_syntax_error_override_is_not_this_rules_business(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body"}, "template": "Classify {{ row.input_1"}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_non_string_override_skips_the_query(self) -> None:
+        """A mistyped ``template`` is QueryDefinition's problem; the query is
+        skipped outright — guessing that it falls back to the node template
+        would flag a template the (invalid) config never declared it to use."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body"}, "template": 42}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_interpretation_placeholder_masked_in_node_template(self) -> None:
+        """``{{interpretation:...}}`` placeholders are resolved upstream of
+        rendering and must not parse as Jinja2 names — but real defects beside
+        them must still be caught."""
+        state = self._state(
+            "Rate how {{interpretation:severe}} this is: {{ row.input_1 }} vs {{ row.missing }}",
+            {"q1": {"input_fields": {"input_1": "body"}}},
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors
+        assert "'missing'" in errors[0].message
+        assert "interpretation" not in errors[0].message
+
+    def test_dynamic_row_access_is_not_flagged(self) -> None:
+        """``row[expr]`` cannot be proven unbound at parse time — only the
+        concrete names feeding it are checked (here ``selector`` is bound)."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body", "selector": "kind"}, "template": "{{ row[row.selector] }}"}],
+        )
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_single_prompt_nodes_are_not_this_rules_business(self) -> None:
+        """Without ``queries`` the single-prompt sibling rule owns the node —
+        this rule must not double-report."""
+        node_options = {"prompt_template": "Classify {{ text }}", "model": "test-model"}
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="out",
+            on_error="discard",
+            options=node_options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert len(errors) == 1  # from the single-prompt rule, exactly once
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+
 class TestSchemaContractValidation:
     """Tests for schema contract validation (pass 9) in CompositionState.validate()."""
 
@@ -2672,7 +4594,7 @@ class TestSchemaContractValidation:
         on_success: str = "t1",
         plugin: str = "csv",
         options: dict[str, Any] | None = None,
-        on_validation_failure: str = "quarantine",
+        on_validation_failure: str = "discard",
     ) -> SourceSpec:
         opts = dict(options or {})
         if plugin == "csv":
@@ -2747,6 +4669,8 @@ class TestSchemaContractValidation:
         input: str,
         on_success: str | None,
         branches: tuple[str, ...] | None = None,
+        merge: str = "nested",
+        options: dict[str, Any] | None = None,
     ) -> NodeSpec:
         return NodeSpec(
             id=id,
@@ -2755,13 +4679,13 @@ class TestSchemaContractValidation:
             input=input,
             on_success=on_success,
             on_error=None,
-            options={},
+            options=options or {},
             condition=None,
             routes=None,
             fork_to=None,
             branches=branches if branches is not None else (input,),
             policy="require_all",
-            merge="nested",
+            merge=merge,
         )
 
     def _make_output(self, name: str = "main") -> OutputSpec:
@@ -2771,6 +4695,493 @@ class TestSchemaContractValidation:
             options={"path": f"outputs/{name}.csv", "schema": {"mode": "observed"}},
             on_write_failure="discard",
         )
+
+    def _make_typed_edge_state(self, producer_type: str, consumer_type: str) -> CompositionState:
+        """Build csv(fixed age:<producer_type>) -> value_transform(fixed age:<consumer_type>) -> sink.
+
+        The two calls differ ONLY in the declared field type, so a test that
+        pins the mismatch against its own type-agreeing control cannot pass by
+        accident on an unrelated error (elspeth-f2eb8fef9f). See the clean-probe
+        rule in the module docstring of the agreement suite.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"age: {producer_type}"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={
+                    "schema": {"mode": "fixed", "fields": [f"age: {consumer_type}"]},
+                    "operations": [{"field": "age", "operation": "upper"}],
+                },
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_edge_field_type_mismatch_is_rejected(self) -> None:
+        """A plain producer/consumer field-TYPE conflict must not validate green.
+
+        elspeth-f2eb8fef9f. Stage 1's edge-contract accounting compares field
+        NAMES; the runtime compares TYPES via
+        ``core/dag/schema_validation.py::validate_single_edge`` ->
+        ``contracts/data.py::check_compatibility``. Before this fix a plain
+        two-node pipeline whose producer declared ``age: int`` and whose
+        consumer declared ``age: str`` returned ``is_valid=True`` with ZERO
+        errors — byte-identical to the type-agreeing control below — while the
+        DAG build raised ``EdgeContractError`` "Type mismatches: age (expected
+        str, got int)". No coalesce, no row_union, no special topology.
+        """
+        result = self._make_typed_edge_state("int", "str").validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_edge_field_type_check_does_not_false_red_on_nullable(self) -> None:
+        """A nullable-but-required producer field must not be read as a type conflict.
+
+        Regression pin. The first implementation reconstructed both sides as
+        PluginSchema models via ``build_coalesce_schema`` and called
+        ``check_compatibility``. That factory widens a field to ``X | None``
+        when ``fd.nullable or not fd.required`` — correct for coalesce output,
+        where a branch can lose a ``last_wins`` collision — but the factory that
+        builds ordinary source/transform schemas
+        (``plugins/infrastructure/schema_factory.py::_get_python_type``) widens
+        ONLY on ``not required`` and never reads ``nullable``. So this pipeline,
+        whose real schemas are both plain ``int``, was REJECTED as ``int |
+        None`` vs ``int``.
+
+        A false red is worse than the gap it closed: it misdirects the LLM
+        authoring loop toward a defect that does not exist, and the runtime
+        would have accepted the pipeline.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": [{"name": "age", "field_type": "int", "required": True, "nullable": True}],
+                    }
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": [{"name": "age", "field_type": "int", "required": True, "nullable": False}],
+                    },
+                    "operations": [{"field": "age", "operation": "upper"}],
+                },
+            )
+        )
+        result = state.with_output(self._make_output("main")).validate()
+
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_edge_field_type_agreement_is_accepted(self) -> None:
+        """Positive control for :meth:`test_edge_field_type_mismatch_is_rejected`.
+
+        Identical topology and identical field NAME; only the declared type
+        agrees. This is what makes the mismatch test falsifiable — without it a
+        blanket rejection would pass the test above.
+        """
+        result = self._make_typed_edge_state("int", "int").validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors)
+
+    def _make_typed_sink_edge_state(self, producer_type: str, sink_type: str) -> CompositionState:
+        """Build csv(fixed value:<producer_type>) -> sink(fixed value:<sink_type>) with NO node between.
+
+        The sink-consumer twin of :meth:`_make_typed_edge_state`. The two calls
+        differ ONLY in the sink's declared field type, so the mismatch test is
+        pinned against its own type-agreeing control (clean-probe rule).
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"value: {producer_type}"]}},
+            )
+        )
+        return state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv", "schema": {"mode": "fixed", "fields": [f"value: {sink_type}"]}},
+                on_write_failure="discard",
+            )
+        )
+
+    def test_sink_edge_field_type_mismatch_is_rejected(self) -> None:
+        """A typed source feeding a SINK that declares a conflicting field type must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). The node-consumer mirror
+        (elspeth-f2eb8fef9f) left the sink consumer uncovered: ``csv(value: str)
+        -> sink(value: int)`` returned ``is_valid=True`` byte-identical to the
+        type-agreeing control while the runtime edge check raised
+        ``GraphValidationError`` "incompatible ... value" — a two-component
+        pipeline with a typo-level mistake, no special topology.
+        """
+        result = self._make_typed_sink_edge_state("str", "int").validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+        [entry] = [error for error in result.errors if error.error_code == "edge_field_type_incompatible"]
+        assert entry.component == "output:main"
+
+    def test_sink_edge_field_type_agreement_is_accepted(self) -> None:
+        """Positive control for :meth:`test_sink_edge_field_type_mismatch_is_rejected`."""
+        result = self._make_typed_sink_edge_state("str", "str").validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+
+    def test_sink_edge_field_type_check_abstains_on_dynamic_producer(self) -> None:
+        """A transform-fed sink is a DYNAMIC producer edge: the runtime skips it, so Stage 1 must too.
+
+        Runtime Phase-2 type validation fires only when the effective producer
+        schema is a typed model (``graph.py`` observed/dynamic bypass); a
+        transform producer resolves to a dynamic schema. Rejecting here would be
+        a false red the runtime does not share.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": ["value: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={"schema": {"mode": "observed"}},
+            )
+        )
+        result = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv", "schema": {"mode": "fixed", "fields": ["value: int"]}},
+                on_write_failure="discard",
+            )
+        ).validate()
+
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def _make_string_scan_state(self, upstream_type: str) -> CompositionState:
+        """Build csv(fixed value:<upstream_type>) -> keyword_filter(fields=[value]) -> sink.
+
+        The two calls differ ONLY in the source's declared type for the scanned
+        field, so the mismatch test is pinned against its own control.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="kf_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"value: {upstream_type}"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "kf",
+                "kf_in",
+                "main",
+                plugin="keyword_filter",
+                options={"schema": {"mode": "observed"}, "fields": ["value"], "blocked_patterns": ["forbidden"]},
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_string_scan_field_typed_non_string_upstream_is_rejected(self) -> None:
+        """A transform scanning a field its typed producer declares non-string must not validate green.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). ``keyword_filter`` declares its
+        ``fields`` as ``declared_string_input_fields``; the runtime's
+        ``validate_transform_string_typed_input_fields`` rejects a live
+        predecessor that provably types one of them non-string, because the
+        transform fails closed on the first non-string value and every row from
+        that producer would be quarantined. Stage 1 had no counterpart: this
+        state validated green and died at the DAG build.
+        """
+        result = self._make_string_scan_state("int").validate()
+
+        assert not result.is_valid
+        [entry] = [e for e in result.errors if e.error_code == "transform_string_input_field_type_incompatible"]
+        assert entry.component == "node:kf"
+        assert "value" in entry.message and "int" in entry.message
+
+    def test_string_scan_field_str_upstream_is_accepted(self) -> None:
+        """Positive control: the same scan over a ``str``-typed upstream field validates green."""
+        result = self._make_string_scan_state("str").validate()
+
+        assert not any(e.error_code == "transform_string_input_field_type_incompatible" for e in result.errors), result.errors
+        assert result.is_valid, result.errors
+
+    def _make_unreferenced_source_schema_state(self, source_fields: list[str]) -> CompositionState:
+        """Build csv(fixed, <source_fields>) -> sink, where the SINK DECLARES NO SCHEMA.
+
+        The absent sink schema is the whole point: Stage 1's
+        ``contract_config_invalid`` parse was incidental to contract checking,
+        so with nothing to compare against, the source's block was never parsed
+        (elspeth-33738eedb6). ``_make_output`` always declares one, so this
+        state builds its own sink.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": source_fields}},
+            )
+        )
+        return state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv"},
+                on_write_failure="discard",
+            )
+        )
+
+    def test_malformed_source_schema_is_rejected_without_a_consumer_schema(self) -> None:
+        """A malformed field spec must be rejected even when nothing consumes it.
+
+        elspeth-33738eedb6. ``age_no_colon_no_type`` is not a valid field spec.
+        Before this fix it validated GREEN whenever no downstream consumer
+        declared a schema — because the parse fired only when something forced
+        the schema to be resolved for a comparison — and died later at plugin
+        construction with ``PluginConfigError``. ``source -> sink`` with a
+        plain unschema'd sink is among the most common pipeline shapes.
+        """
+        result = self._make_unreferenced_source_schema_state(["age_no_colon_no_type"]).validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "contract_config_invalid" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_wellformed_source_schema_is_accepted_without_a_consumer_schema(self) -> None:
+        """Positive control for the test above — identical but for the field spec."""
+        result = self._make_unreferenced_source_schema_state(["age: int"]).validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+
+    def test_malformed_source_schema_is_reported_once(self) -> None:
+        """The eager parse must not double-report against the lazy contract parsers.
+
+        With a consumer schema present, both the eager sweep and the contract
+        loop's own ``_parse_*`` helpers can observe the same broken spec. One
+        authoring defect must yield one error.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": ["age_no_colon_no_type"]}},
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv", "schema": {"mode": "fixed", "fields": ["age: int"]}},
+                on_write_failure="discard",
+            )
+        )
+
+        result = state.validate()
+
+        source_config_errors = [
+            error for error in result.errors if error.error_code == "contract_config_invalid" and "age_no_colon_no_type" in error.message
+        ]
+        assert len(source_config_errors) == 1, [(e.component, e.message) for e in result.errors]
+
+    def test_schema_validation_closes_every_constructed_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every schema-inspection instance is owned and closed exactly once."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager
+
+        tracking = TrackingPluginManager(get_shared_plugin_manager())
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: tracking,
+        )
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="mapper_in",
+                plugin="text",
+                options={"schema": {"mode": "fixed", "fields": ["text: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "mapper",
+                "mapper_in",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        # 'text' is DECLARED because it is a mapping SOURCE and
+                        # therefore a configured READ (elspeth-d4ae04b374); a
+                        # fixed schema omitting it is rejected at construction
+                        # (elspeth-d3958d90f5), which would build no probe at
+                        # all and make this lifecycle assertion vacuous.
+                        "fields": ["body: str", "text: str"],
+                        "required_fields": ["body"],
+                    },
+                    "mapping": {"text": "body"},
+                    "select_only": True,
+                    "strict": True,
+                },
+            )
+        )
+        state = state.with_output(self._make_output())
+
+        state.validate()
+
+        assert len(tracking.instances) >= 2, "fixture did not exercise the schema probe sites"
+        assert [instance.close_count for instance in tracking.instances] == [1] * len(tracking.instances)
+
+    def test_declared_field_type_probe_closes_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The standalone producer-field probe owns its constructed transform."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.composer.state import _producer_declared_field_type
+        from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager
+
+        tracking = TrackingPluginManager(get_shared_plugin_manager())
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: tracking,
+        )
+        producer = self._make_transform(
+            "mapper",
+            "mapper_in",
+            "main",
+            plugin="field_mapper",
+            options={
+                # 'text' declared for the same reason as the sibling probe
+                # test above: a mapping source is a configured read.
+                "schema": {"mode": "fixed", "fields": ["body: str", "text: str"]},
+                "mapping": {"text": "body"},
+                "select_only": True,
+                "strict": True,
+            },
+        )
+
+        field_type = _producer_declared_field_type(
+            "mapper",
+            "field_mapper",
+            {},
+            node_by_id={"mapper": producer},
+            field_name="body",
+        )
+
+        assert field_type == "str"
+        assert len(tracking.instances) == 1
+        assert tracking.instances[0].close_count == 1
+
+    def _make_coalesce_schema_mode_state(
+        self,
+        *,
+        source_schema: dict[str, Any],
+        transformed_branch_schema: dict[str, Any],
+        merge: str | None = "union",
+        policy: str | None = "require_all",
+        branch_order: tuple[str, str] = ("path_a", "path_b"),
+        branch_plugin: str = "value_transform",
+        timeout_seconds: float | None = None,
+    ) -> CompositionState:
+        """Build a legal transformed fork/coalesce shape for schema-mode parity tests."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="gate_in",
+                options={"schema": source_schema},
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("path_a", "path_b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        branch_options: dict[str, Any] = {"schema": transformed_branch_schema}
+        if branch_plugin == "value_transform":
+            branch_options["operations"] = [{"target": "value", "expression": "row['value']"}]
+        state = state.with_node(
+            self._make_transform(
+                "branch_b",
+                "path_b",
+                "path_b_done",
+                plugin=branch_plugin,
+                options=branch_options,
+            )
+        )
+        branch_connections = {"path_a": "path_a", "path_b": "path_b_done"}
+        state = state.with_node(
+            NodeSpec(
+                id="merge_results",
+                node_type="coalesce",
+                plugin=None,
+                input="path_a",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={branch_name: branch_connections[branch_name] for branch_name in branch_order},
+                policy=policy,
+                merge=merge,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+        return state
 
     def _make_web_scrape_to_line_explode_state(
         self,
@@ -2787,7 +5198,7 @@ class TestSchemaContractValidation:
             "format": "text",
             "fingerprint_mode": "content",
             "http": {
-                "abuse_contact": "pipeline-tests@elspeth.foundryside.dev",
+                "abuse_contact": "pipeline-tests@elspeth.example.gov.au",
                 "scraping_reason": "test scrape",
                 "allowed_hosts": "public_only",
             },
@@ -3060,7 +5471,7 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "map_body"))
         state = state.with_edge(self._make_edge("e2", "map_body", "main"))
 
-        class _BrokenManager:
+        class _BrokenManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise TemplateError("invalid template syntax")
 
@@ -3124,7 +5535,7 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "map_body"))
         state = state.with_edge(self._make_edge("e2", "map_body", "main"))
 
-        class _BrokenManager:
+        class _BrokenManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise RuntimeError("framework bug inside transform __init__")
 
@@ -3168,7 +5579,7 @@ class TestSchemaContractValidation:
         output field absent from the mapping) → sink. The field_mapper's
         upstream is the source sentinel (no producer-probe call), and the
         sink uses ``mode: observed`` with no required_fields (so neither
-        sink-Rule-A nor sink-Rule-B reaches ``_producer_emit_set``). Rule C
+        sink-Rule-A nor sink-Rule-B reaches ``_producer_emit_profile``). Rule C
         is therefore the only probe site that calls ``create_transform``
         for the broken plugin.
         """
@@ -3205,7 +5616,7 @@ class TestSchemaContractValidation:
             on_write_failure="discard",
         )
 
-        class _BrokenManager:
+        class _BrokenManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise RuntimeError("framework bug inside field_mapper __init__")
 
@@ -3275,7 +5686,7 @@ class TestSchemaContractValidation:
             "CONSTRUCTION_PROBE_SECRET_SENTINEL",
         )
 
-        class _LeakyManager:
+        class _LeakyManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise TemplateError(f"plugin '{plugin_name}' failed to initialize: " + " | ".join(leaked_substrings))
 
@@ -3577,17 +5988,13 @@ class TestSchemaContractValidation:
         assert sink_contract.satisfied is False
         assert "text" in sink_contract.missing_fields
 
-    def test_sink_required_fields_abstaining_producer_defers_to_runtime(self) -> None:
-        """An abstaining producer must not fail the sink required-fields check.
+    def test_sink_required_fields_accepts_mapper_derived_target_guarantee(self) -> None:
+        """Configured mapping sources make every target present on success.
 
-        Mirror of the runtime abstention clause in
-        ``core/dag/schema_validation.py::validate_sink_required_fields``:
-        when the producer's guarantee vote is (no fields, did not participate),
-        the static check defers to per-row runtime validation instead of
-        rejecting. A select_only field_mapper with an observed schema and no
-        local guaranteed_fields abstains exactly this way — the tutorial's
-        accepted transform chain (elspeth-3283f2eaec) was permanently blocked
-        because the composer hard-failed where the runtime would build and run.
+        The executor dispatches any row missing a configured source before
+        ``process``. The mapper therefore participates with its derived target
+        guarantees even when its authored observed schema has no local
+        ``guaranteed_fields``.
         """
         state = self._empty_state()
         state = state.with_source(
@@ -3622,24 +6029,13 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         result = state.validate()
         assert result.is_valid, result.errors
-        # No static claim either way: the edge renders as "not yet checked",
-        # not as a satisfied contract the composer cannot actually vouch for.
-        assert not any(ec.to_id == "output:main" for ec in result.edge_contracts)
+        sink_contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("summary", "url")
+        assert sink_contract.satisfied is True
 
-    @pytest.mark.parametrize(
-        ("proven_sources", "expected_targets", "expected_missing"),
-        [
-            (("raw_url", "raw_summary"), ("summary", "url"), ()),
-            (("raw_url",), ("url",), ("summary",)),
-        ],
-    )
-    def test_guided_select_only_mapper_declares_only_proven_guarantees(
-        self,
-        proven_sources: tuple[str, ...],
-        expected_targets: tuple[str, ...],
-        expected_missing: tuple[str, ...],
-    ) -> None:
-        """Guided cleanup earns a positive verdict without guessing missing fields."""
+    @pytest.mark.parametrize("proven_sources", [("raw_url", "raw_summary"), ("raw_url",)])
+    def test_guided_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
+        """Upstream schema lower bounds do not narrow successful-row outputs."""
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -3674,10 +6070,10 @@ class TestSchemaContractValidation:
 
         result = state.validate()
         sink_contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
-        assert result.is_valid is (not expected_missing)
-        assert sink_contract.satisfied is (not expected_missing)
-        assert sink_contract.producer_guarantees == expected_targets
-        assert sink_contract.missing_fields == expected_missing
+        assert result.is_valid
+        assert sink_contract.satisfied is True
+        assert sink_contract.producer_guarantees == ("summary", "url")
+        assert sink_contract.missing_fields == ()
 
     def test_sink_required_fields_inherited_participation_still_fails(self) -> None:
         """A pass-through downstream of a participating producer cannot abstain.
@@ -3782,21 +6178,47 @@ class TestSchemaContractValidation:
         assert result.is_valid, result.errors
         assert not any("contract probe" in w.message.lower() for w in result.warnings), [w.message for w in result.warnings]
 
-    def test_rule_c_self_consistency_fires_through_authoring_metadata(self) -> None:
-        """Rule C must not be silently skipped by composer-only option keys.
+    # ---- Mapping guarantee authority after d4ae04b374 ---------------------
 
-        The per-node select_only self-consistency check probes the plugin
-        constructor; with ``interpretation_requirements`` left in options the
-        probe raised (extra keys forbidden) and Rule C silently skipped the
-        exact guided nodes it exists to check. The probe must strip authoring
-        metadata like every other contract probe.
+    @staticmethod
+    def _run_field_mapper_as_the_executor_would(options: dict[str, Any], row: Any) -> Any:
+        """Execute the preflight -> process -> output-contract chain."""
+        from elspeth.contracts.schema_contract import PipelineRow
+        from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.testing import make_pipeline_row
+        from tests.fixtures.factories import make_context
+
+        transform = get_shared_plugin_manager().create_transform("field_mapper", options)
+        try:
+            pipeline_row = row if isinstance(row, PipelineRow) else make_pipeline_row(row)
+            transform.input_schema.model_validate(pipeline_row.to_dict(), strict=True)
+            result = transform.process(pipeline_row, make_context())
+            if result.status == "success":
+                verify_schema_config_mode(
+                    output_schema_config=transform._output_schema_config,
+                    emitted_rows=(result.row,),
+                    plugin_name=transform.name,
+                    node_id="t1",
+                    run_id="run-1",
+                    row_id="row-1",
+                    token_id="token-1",
+                )
+            return result
+        finally:
+            transform.close()
+
+    def test_rule_c_advises_per_source_class_within_one_node(self) -> None:
+        """The historical Rule C classes now share one mapping authority.
+
+        The input-side enforcement differs by representability, but every
+        successful row contains every configured target. Rule C must therefore
+        stay quiet instead of prescribing per-source repair clauses. The test
+        name is retained so the integrated affected matrix keeps its original
+        regression identifier.
         """
         state = self._empty_state()
-        state = state.with_source(
-            self._make_source(
-                options={"schema": {"mode": "observed", "guaranteed_fields": ["url"]}},
-            )
-        )
+        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
         state = state.with_node(
             self._make_transform(
                 "t1",
@@ -3805,31 +6227,135 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "mapping": {"url": "url"},
-                    # Declares 'bogus' as a required output field the mapping
-                    # will never emit -> Rule C violation.
-                    "schema": {"mode": "fixed", "fields": ["url: str", "bogus: str"]},
-                    "interpretation_requirements": [
-                        {
-                            "id": "drop_fields_review",
-                            "kind": "pipeline_decision",
-                            "user_term": "drop_fields",
-                            "status": "resolved",
-                            "draft": "Keep only url.",
-                            "event_id": "00000000-0000-0000-0000-000000000001",
-                            "accepted_value": "Keep only url.",
-                            "accepted_artifact_hash": "0" * 64,
-                        }
-                    ],
+                    "strict": False,
+                    "mapping": {"first_name": "fname", "user.name": "uname", "Name": "nm"},
+                    "schema": {"mode": "flexible", "fields": ["fname: str", "uname: str", "nm: str"]},
                 },
             )
         )
-        state = state.with_output(self._make_output())
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["fname: str", "uname: str", "nm: str"],
+                        "required_input_fields": ["fname", "uname", "nm"],
+                    }
+                },
+                on_write_failure="discard",
+            )
+        )
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
+
         result = state.validate()
-        assert any("Transform contract violation" in e.message and "bogus" in e.message for e in result.errors), [
-            e.message for e in result.errors
-        ]
+
+        assert not any(error.error_code == "transform_declared_output_not_guaranteed" for error in result.errors)
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("fname", "nm", "uname")
+        assert sink_contract.satisfied is True
+
+    def test_rule_c_offers_strict_only_for_a_nested_read_and_it_works(self) -> None:
+        """The historical strict-only premise is retired after d4ae04b374.
+
+        A dotted mapping with its root declared guarantees the target without
+        ``strict``. The old regression identifier is retained deliberately.
+        """
+        state = self._empty_state()
+        state = state.with_source(self._make_source(options={"schema": {"mode": "observed"}}))
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "select_only": True,
+                    "strict": False,
+                    "mapping": {"user.name": "uname"},
+                    "schema": {"mode": "fixed", "fields": ["user: any"]},
+                },
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["uname: any"],
+                        "required_input_fields": ["uname"],
+                    }
+                },
+                on_write_failure="discard",
+            )
+        )
+        state = state.with_edge(self._make_edge("e1", "source", "t1"))
+
+        result = state.validate()
+
+        assert not any(error.error_code == "transform_declared_output_not_guaranteed" for error in result.errors)
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("uname",)
+        assert sink_contract.satisfied is True
+
+    def test_rule_c_nested_read_remedy_is_executable_and_the_old_one_was_not(self) -> None:
+        """The fixed input model names ``user``; the emitted target is not an input.
+
+        The old target-only schema is rejected at construction. With the root
+        declared, a present leaf succeeds and a missing child routes in
+        non-strict mode, which is the behavior that makes ``uname`` guaranteed
+        on every successful row. The historical regression identifier is kept
+        for integration-matrix traceability.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        incoherent = {
+            "select_only": True,
+            "strict": True,
+            "mapping": {"user.name": "uname"},
+            "schema": {"mode": "fixed", "fields": ["uname: str"]},
+        }
+        with pytest.raises(PluginConfigError, match=r"fixed schema forbids.*'user'"):
+            self._run_field_mapper_as_the_executor_would(incoherent, {"user": {"name": "Ada"}})
+
+        coherent = {
+            "select_only": True,
+            "strict": False,
+            "mapping": {"user.name": "uname"},
+            "schema": {"mode": "fixed", "fields": ["user: any"]},
+        }
+        present = self._run_field_mapper_as_the_executor_would(coherent, {"user": {"name": "Ada"}})
+        missing_child = self._run_field_mapper_as_the_executor_would(coherent, {"user": {}})
+
+        assert present.status == "success"
+        assert present.row.to_dict() == {"uname": "Ada"}
+        assert missing_child.status == "error"
+        assert missing_child.reason["reason"] == "missing_field"
+
+    def test_historical_rule_c_diagnostic_still_routes_separately_from_collision(self) -> None:
+        """Persisted/older diagnostics retain code-keyed explanation parity."""
+        from elspeth.web.composer.state import (
+            _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
+            _TRANSFORM_OUTPUT_COLLISION_FIX,
+        )
+        from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS
+
+        def first_match_fix(message: str) -> str | None:
+            for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS:
+                if re.search(pattern, message):
+                    return fix
+            return None
+
+        guarantee_message = "Transform output guarantee violation: internal field_mapper contract drift."
+        collision_message = (
+            "Transform contract violation: node 'rewrite' (llm) declares output fields [headline] but "
+            "[headline] already arrive(s) on its input row."
+        )
+        assert first_match_fix(guarantee_message) is _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX
+        assert first_match_fix(collision_message) is _TRANSFORM_OUTPUT_COLLISION_FIX
 
     def test_consumer_schema_required_fields_violation_fails(self) -> None:
         state = self._empty_state()
@@ -4199,6 +6725,495 @@ class TestSchemaContractValidation:
         assert any("fork" in w.message.lower() and "contract" in w.message.lower() for w in result.warnings)
         assert not any(ec.to_id in {"ta", "tb"} for ec in result.edge_contracts)
 
+    @pytest.mark.parametrize("branch_order", [("path_a", "path_b"), ("path_b", "path_a")])
+    def test_union_coalesce_rejects_mixed_observed_explicit_branch_schemas_regardless_of_order(
+        self,
+        branch_order: tuple[str, str],
+    ) -> None:
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+            branch_order=branch_order,
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_schema_mode_mixed"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+        assert entries[0].severity == "high"
+        assert "observed" in entries[0].message.lower()
+        assert "explicit" in entries[0].message.lower()
+
+    @pytest.mark.parametrize(
+        ("source_schema", "transformed_branch_schema"),
+        [
+            ({"mode": "observed"}, {"mode": "observed"}),
+            (
+                {"mode": "fixed", "fields": ["id: int", "value: int"]},
+                {"mode": "fixed", "fields": ["id: int", "value: int"]},
+            ),
+        ],
+    )
+    def test_union_coalesce_accepts_homogeneous_branch_schema_modes(
+        self,
+        source_schema: dict[str, Any],
+        transformed_branch_schema: dict[str, Any],
+    ) -> None:
+        state = self._make_coalesce_schema_mode_state(
+            source_schema=source_schema,
+            transformed_branch_schema=transformed_branch_schema,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+
+    def test_nested_coalesce_allows_mixed_branch_schema_modes(self) -> None:
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+            merge="nested",
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+
+    def test_union_coalesce_abstains_when_a_branch_schema_mode_is_unresolved(self) -> None:
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+            branch_plugin="not_registered",
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+
+    def test_union_coalesce_unresolved_branch_does_not_hide_known_mixed_modes(self) -> None:
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+        )
+        gate = next(node for node in state.nodes if node.id == "fork_gate")
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        state = state.with_node(replace(gate, fork_to=("path_a", "path_b", "path_c")))
+        state = state.with_node(
+            self._make_transform(
+                "branch_c",
+                "path_c",
+                "path_c_done",
+                plugin="not_registered",
+                options={"schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            replace(
+                coalesce,
+                branches={"path_a": "path_a", "path_b": "path_b_done", "path_c": "path_c_done"},
+            )
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_schema_mode_mixed"]
+        assert len(entries) == 1, result.errors
+
+    def test_union_coalesce_rejects_incompatible_shared_field_types(self) -> None:
+        """Stage 1 mirrors the runtime's union type-compatibility rule.
+
+        Battery round-6 g03 (elspeth-85f3cc3022): the composer declared the
+        same field with different types on two branches it authored in one
+        ``set_pipeline`` call. Stage 1 reported ``is_valid=True``, so the
+        mutation envelope told the compose loop the pipeline was clean and it
+        stopped; only the DAG build rejected it. The type rule is now checked
+        where the authoring surface can act on it.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+        assert entries[0].severity == "high"
+        assert "value" in entries[0].message
+        assert "'int'" in entries[0].message
+        assert "'str'" in entries[0].message
+
+    def test_union_coalesce_type_entry_carries_structured_repair_facts(self) -> None:
+        """The planner's feedback strips messages, so the facts must be structured.
+
+        Without these the closed code names the failing NODE but never the
+        FIELD, and the repair is unreachable for a field a plugin contributed
+        rather than the author declaring it.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "coalesce_union_type_incompatible")
+        assert entry.coalesce_union_type is not None
+        detail = entry.coalesce_union_type
+        assert detail.field == "value"
+        assert {detail.branch_a, detail.branch_b} == {"path_a", "path_b"}
+        assert {detail.type_a, detail.type_b} == {"int", "str"}
+        assert entry.to_dict()["coalesce_union_type"] == {
+            "field": "value",
+            "branch_a": detail.branch_a,
+            "type_a": detail.type_a,
+            "branch_b": detail.branch_b,
+            "type_b": detail.type_b,
+        }
+
+    def test_union_coalesce_type_conflict_is_policy_independent(self) -> None:
+        """The verdict must not depend on the coalesce policy.
+
+        Composer derives ``require_all`` from the policy alone while the
+        runtime uses ``has_all_branch_semantics``. The two cannot disagree on
+        a composer-authored pipeline (no ``quorum_count`` field exists), but
+        this pins the stronger property the mirror actually relies on: the type
+        conflict is raised before ``require_all`` is read at all, so no policy
+        can turn the rejection on or off.
+        """
+        for policy in ("require_all", "quorum", "best_effort", "first"):
+            state = self._make_coalesce_schema_mode_state(
+                source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+                transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            )
+            coalesce = next(node for node in state.nodes if node.id == "merge_results")
+            state = state.with_node(replace(coalesce, policy=policy))
+
+            result = state.validate()
+
+            assert any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors), (
+                f"policy={policy} did not reject",
+            )
+
+    def test_union_coalesce_accepts_compatible_shared_field_types(self) -> None:
+        """Identical declared types across branches stay valid."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_union_coalesce_type_check_abstains_on_unresolved_branch(self) -> None:
+        """One resolvable branch is not enough to prove a conflict."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            branch_plugin="not_registered",
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_union_coalesce_mode_mixed_suppresses_the_type_entry(self) -> None:
+        """The runtime raises the mode conflict first, so only it is reported.
+
+        Emitting both would hand the repair loop a second, phantom target on a
+        node whose real defect is the mode mismatch.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+        assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_nested_coalesce_ignores_incompatible_shared_field_types(self) -> None:
+        """Only union merge merges typed branch fields; nested keys by branch."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            merge="nested",
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_unset_coalesce_merge_normalizes_to_the_runtime_default(self) -> None:
+        """An omitted ``merge`` becomes ``"union"``, because that is what the runtime runs.
+
+        ``CoalesceSettings.merge`` defaults to ``"union"`` (``core/config.py``),
+        so a coalesce authored without the optional field IS a union merge at
+        run time. Carrying ``None`` through composer state made every union
+        rule read the node as "not a union" and skip it. Normalising once at
+        construction is what keeps a THIRD union rule, added later, from
+        inheriting the same hole.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        assert coalesce.merge == "union"
+        # Non-coalesce nodes keep None: ``merge`` is forbidden on them, and
+        # row_union rejects the field outright (``row_union_field_forbidden``).
+        assert next(node for node in state.nodes if node.id == "fork_gate").merge is None
+
+    def test_unset_coalesce_merge_survives_yaml_generation(self) -> None:
+        """The unset field crashed YAML generation outright — not, as assumed, ``merge: null``.
+
+        ``to_dict()`` emits ``merge`` only when it is set, while
+        ``yaml_generator`` reads ``c["merge"]`` unconditionally, so an unset
+        merge raised ``KeyError`` before pydantic ever saw the config. That
+        made the runtime's answer an internal crash rather than a repair
+        signal. Normalising at construction closes the path that runs through
+        ``state.to_dict()``; a caller injecting its own ``state_dict`` still
+        bypasses ``NodeSpec`` entirely.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        node_dict = next(node for node in state.to_dict()["nodes"] if node["id"] == "merge_results")
+        assert node_dict["merge"] == "union"
+        assert "merge: union" in generate_yaml(state)
+
+    def test_unset_coalesce_policy_normalizes_to_the_runtime_default(self) -> None:
+        """An omitted ``policy`` becomes the runtime's own default, read from the model.
+
+        The equality is against ``CoalesceSettings.model_fields["policy"]``
+        rather than the literal ``"require_all"`` deliberately: the value of
+        normalising is that the two surfaces cannot disagree about what an
+        omitted field means, so if the runtime ever changes its default this
+        test tracks it instead of pinning a stale copy.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy=None,
+        )
+
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        assert coalesce.policy == CoalesceSettings.model_fields["policy"].default
+        # Non-coalesce nodes keep None: ``policy`` is forbidden on them, and the
+        # splice canonical-transform check reads it as a disqualifier.
+        assert next(node for node in state.nodes if node.id == "fork_gate").policy is None
+
+    def test_unset_coalesce_policy_stays_valid(self) -> None:
+        """The runtime runs a policy-less coalesce as require_all, so Stage 1 must accept it.
+
+        ``CoalesceSettings.policy`` DEFAULTS to ``"require_all"``, and the
+        production loader parses a policy-less coalesce without complaint.
+        Stage 1 nonetheless emitted ``coalesce_missing_policy``
+        (elspeth-deb2f5ed93) — a validate-red/runtime-green divergence, the
+        inverse of the shapes this surface usually carries, and the one
+        violation of the placement rule that Stage 1 models the runtime's
+        treatment rather than inventing one.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy=None,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_invalid_coalesce_policy_still_rejected(self) -> None:
+        """Retiring the missing-policy code must not weaken the closed-vocabulary guard.
+
+        The two checks shared an ``if``/``elif`` chain, so deleting the first
+        arm restructures the second. A committed value outside the runtime's
+        vocabulary is still valid-but-not-runnable and must still be rejected.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="require_all_branches",
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_policy_invalid"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+
+    def test_coalesce_rejects_options_that_runtime_lowering_would_erase(self) -> None:
+        """A structural coalesce has no plugin options contract to author.
+
+        The composer used to accept ``options.schema`` here, then silently
+        omit the entire options mapping while lowering to ``CoalesceSettings``.
+        Refuse the misleading declaration before it can persist.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+        )
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        state = state.with_node(replace(coalesce, options={"schema": {"mode": "observed"}}))
+
+        result = state.validate()
+
+        [entry] = [error for error in result.errors if error.error_code == "coalesce_config_invalid"]
+        assert entry.component == "node:merge_results"
+        assert "options" in entry.message
+
+    def test_coalesce_merge_select_is_rejected_as_unauthorable(self) -> None:
+        """``merge: select`` cannot be made runnable from the composer, so Stage 1 must say so.
+
+        elspeth-2ed41f0a4a (census 2026-08-17). The runtime's ``select`` merge
+        requires ``select_branch`` (``CoalesceSettings.validate_merge_requirements``);
+        ``NodeSpec`` carries no such field and the YAML importer lists it as
+        unsupported, so a coalesce authored with ``merge: select`` validated
+        green and died at ``settings_load`` with "select merge strategy
+        requires select_branch". A closed-vocabulary check that ADVERTISES a
+        value the surface can never run is the defect, not a feature.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge="select",
+        )
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_merge_select_unsupported"]
+        assert entry.component == "node:merge_results"
+        assert "select_branch" in entry.message
+        assert not any(e.error_code == "coalesce_merge_invalid" for e in result.errors)
+
+    def test_coalesce_policy_quorum_is_rejected_as_unauthorable(self) -> None:
+        """``policy: quorum`` needs ``quorum_count``, which no NodeSpec field carries."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="quorum",
+        )
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_policy_quorum_unsupported"]
+        assert entry.component == "node:merge_results"
+        assert "quorum_count" in entry.message
+        assert not any(e.error_code == "coalesce_policy_invalid" for e in result.errors)
+
+    def test_coalesce_best_effort_without_timeout_is_rejected(self) -> None:
+        """``policy: best_effort`` requires ``timeout_seconds`` at the runtime; the composer CAN set it."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="best_effort",
+        )
+
+        result = state.validate()
+
+        [entry] = [e for e in result.errors if e.error_code == "coalesce_best_effort_requires_timeout"]
+        assert entry.component == "node:merge_results"
+        assert "timeout_seconds" in entry.message
+
+    def test_coalesce_best_effort_with_timeout_is_accepted(self) -> None:
+        """Positive control for the best_effort/timeout coupling — same state plus ``timeout_seconds``."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="best_effort",
+            timeout_seconds=5.0,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_unset_coalesce_policy_survives_yaml_generation(self) -> None:
+        """The normalised value must be byte-visible in the exported YAML.
+
+        This is the whole disclosure channel: no advisory replaces the retired
+        error, so ``policy: require_all`` in the generated settings is what
+        tells an author which arrival semantics they got. It also pins the
+        normalisation's PLACEMENT — ``to_dict`` bypasses ``validate()``
+        entirely, so a fix applied inside ``validate()`` would leave this red,
+        exactly as the same seam did for ``merge``.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy=None,
+        )
+
+        node_dict = next(node for node in state.to_dict()["nodes"] if node["id"] == "merge_results")
+        assert node_dict["policy"] == "require_all"
+        assert "policy: require_all" in generate_yaml(state)
+
+    def test_union_type_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
+        """The type mirror must fire on the runtime's default merge, not only the declared one.
+
+        Shipped by the very commit that closed the previous union divergence
+        (elspeth-85f3cc3022): both union mirrors gated on ``merge == "union"``,
+        so an LLM that simply omitted the optional field got ``is_valid=True``
+        on a pipeline the runtime rejects. Omission is the CHEAPEST thing an
+        authoring model does, which made the gap the likeliest path through
+        the surface rather than an exotic one.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+        assert entries[0].coalesce_union_type is not None
+        assert entries[0].coalesce_union_type.field == "value"
+
+    def test_mode_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
+        """The mode mirror shares the gate, so it shares the repair."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+
+    def test_unset_coalesce_merge_stays_valid_when_branch_types_agree(self) -> None:
+        """POSITIVE CONTROL — applying the union rules must not become rejecting the node.
+
+        The runtime ACCEPTS an unset merge; it defaults it. Stage 1 must
+        therefore run the union rules over the node, never reject it for
+        having no explicit merge. Without this control a blanket rejection
+        would satisfy every other test in this group.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
     def test_fork_gate_direct_sink_contract_checked(self) -> None:
         """Fork branches that terminate at sinks stay statically checkable."""
         state = self._empty_state()
@@ -4420,8 +7435,8 @@ class TestSchemaContractValidation:
             )
         )
         state = state.with_edge(self._make_edge("e1", "source", "g1"))
-        state = state.with_edge(self._make_edge("e2", "g1", "sink_a"))
-        state = state.with_edge(self._make_edge("e3", "g1", "sink_b"))
+        state = state.with_edge(self._make_edge("e2", "g1", "sink_a", edge_type="route_true"))
+        state = state.with_edge(self._make_edge("e3", "g1", "sink_b", edge_type="route_false"))
 
         result = state.validate()
 
@@ -4745,12 +7760,48 @@ class TestSchemaContractValidation:
         assert any(e.severity == "high" for e in wrapper_errors)
 
     def test_coalesce_producer_emits_skip_warning(self) -> None:
-        """Coalesce producers stay unresolved until runtime validation."""
+        """A coalesce Composer cannot MIRROR stays unresolved until runtime.
+
+        The population is ``select`` alone (``_MIRRORED_COALESCE_MERGES``): it
+        forwards ONE branch's raw schema keyed by a ``select_branch`` a
+        composer ``NodeSpec`` cannot carry, so there is nothing to mirror and
+        abstaining with this advisory is the correct answer. Union and nested
+        both resolve through the guarantee walk — see
+        ``TestUnionCoalesceGuaranteeExtras`` and
+        ``test_nested_coalesce_producer_resolves_to_branch_names`` below.
+
+        The node is separately rejected as unauthorable
+        (``coalesce_merge_select_unsupported``), which is why the pipeline is
+        invalid; the abstention under test is that no edge contract is asserted
+        against ``t1``.
+        """
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
-                on_success="branch_a",
+                on_success="fork_in",
                 options={"schema": {"mode": "fixed", "fields": ["text: str"]}},
+            )
+        )
+        # A coalesce's branches must be produced by a gate fork_to (the
+        # runtime rejects a coalesce no gate feeds; Stage 1 mirrors that as
+        # ``coalesce_branch_alias_unreachable``, elspeth-2ed41f0a4a), so the
+        # fixture forks first — the abstention under test is about the
+        # coalesce's MERGE mode, not its wiring.
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="fork_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_a", "branch_b"),
+                branches=None,
+                policy=None,
+                merge=None,
             )
         )
         state = state.with_node(
@@ -4758,6 +7809,12 @@ class TestSchemaContractValidation:
                 "after_merge",
                 "branch_a",
                 None,
+                branches=("branch_a", "branch_b"),
+                merge="select",
+                # NodeSpec cannot author select_branch (that is the defect
+                # this unmirrorable-merge rejection explains), and structural
+                # coalesces accept no options at all.
+                options={},
             )
         )
         state = state.with_node(
@@ -4769,14 +7826,76 @@ class TestSchemaContractValidation:
             )
         )
         state = state.with_output(self._make_output())
-        state = state.with_edge(self._make_edge("e1", "source", "after_merge"))
+        state = state.with_edge(self._make_edge("e1", "source", "fork_gate"))
         state = state.with_edge(self._make_edge("e2", "after_merge", "t1"))
 
         result = state.validate()
 
-        assert result.is_valid, result.errors
+        assert [error.error_code for error in result.errors] == ["coalesce_merge_select_unsupported"], result.errors
         assert any("coalesce node" in w.message.lower() and "runtime validator will check" in w.message.lower() for w in result.warnings)
         assert not any(ec.to_id == "t1" for ec in result.edge_contracts)
+
+    def test_nested_coalesce_producer_resolves_to_branch_names(self) -> None:
+        """The nested half of the same fixture, which no longer abstains.
+
+        Engine parity: the DAG builder stamps a nested coalesce with a flexible
+        schema keyed BY BRANCH NAME, so a consumer requiring an INNER field
+        (``text``, guaranteed by the source) is rejected at build with
+        ``EdgeContractError``. Stage 1 used to hand this back green with a
+        "runtime validator will check this edge" advisory — a preview the
+        authoring loop had nothing to repair against.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="fork_in",
+                options={"schema": {"mode": "fixed", "fields": ["text: str"]}},
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="fork_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_a", "branch_b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(
+            self._make_coalesce(
+                "after_merge",
+                "branch_a",
+                None,
+                branches=("branch_a", "branch_b"),
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "after_merge",
+                "main",
+                options={"required_input_fields": ["text"]},
+            )
+        )
+        state = state.with_output(self._make_output())
+        state = state.with_edge(self._make_edge("e1", "source", "fork_gate"))
+        state = state.with_edge(self._make_edge("e2", "after_merge", "t1"))
+
+        result = state.validate()
+
+        violation = next(error for error in result.errors if error.error_code == "schema_contract_violation")
+        assert "guarantees: [branch_a, branch_b]" in violation.message
+        assert "Missing fields: [text]" in violation.message
+        contract = next(ec for ec in result.edge_contracts if ec.to_id == "t1")
+        assert contract.producer_guarantees == ("branch_a", "branch_b")
 
     # --- Guard tests ---
 
@@ -5149,16 +8268,13 @@ class TestSchemaContractValidation:
         assert "mode: flexible" in msg  # operator-actionable: relax sink schema
         assert "field_mapper" in msg and "select_only: true" in msg  # operator-actionable: drop extras upstream
 
-    def test_v2_field_mapper_select_only_with_inconsistent_declared_output(self) -> None:
-        """Rule C: field_mapper declares an output field its mapping won't emit.
+    def _make_select_only_cleanup_state(self, *, sink_fields: list[str]) -> CompositionState:
+        """batch_stats -> field_mapper(select_only) -> json sink.
 
-        Reproduces /tmp/elspeth_eval/2026-05-03/s3/msg2.json. The composer
-        previously accepted this YAML; the engine crashed at the schema
-        config mode contract with SchemaConfigModeViolation (``missing
-        required fields ['batch_size']``). The runtime check expects the
-        emitted row to satisfy the declared output schema, but with
-        ``select_only: true`` the actual emit is exactly ``mapping.values()``
-        — which excludes ``batch_size``.
+        The mapper declares ``batch_size`` in its authored ``schema.fields``
+        (the INPUT contract — batch_stats really does emit it) and deliberately
+        omits it from the whitelist. ``sink_fields`` decides whether anything
+        downstream still needs the dropped field.
         """
         state = self._empty_state()
         state = state.with_source(
@@ -5242,7 +8358,7 @@ class TestSchemaContractValidation:
                     "path": "outputs/ticket_totals_by_tier.json",
                     "schema": {
                         "mode": "fixed",
-                        "fields": ["customer_tier: str", "count: int", "sum: float"],
+                        "fields": sink_fields,
                     },
                     "format": "json",
                     "indent": 2,
@@ -5253,18 +8369,531 @@ class TestSchemaContractValidation:
             )
         )
 
+        return state
+
+    def test_select_only_may_drop_a_declared_input_field_nothing_downstream_needs(self) -> None:
+        """Cleanup is what select_only is FOR, so the composer must accept it.
+
+        Regression: elspeth-a2bf676e6f. ``schema.fields`` on a transform is the
+        INPUT contract (``BaseTransform._build_output_schema_config``: "the
+        transform's input schema config"), so naming ``batch_size`` there and
+        leaving it out of the whitelist is an honest "save only these fields"
+        gesture — note the node's own ``required_fields`` already excludes it.
+        This previously produced a Rule C rejection of a correct pipeline, and
+        was the shape that made a renaming mapper unsatisfiable and stalled the
+        composer (elspeth-92fa1fe86e).
+        """
+        state = self._make_select_only_cleanup_state(sink_fields=["customer_tier: str", "count: int", "sum: float"])
+
         result = state.validate()
 
-        assert not result.is_valid, "Composer must reject field_mapper whose declared output won't be emitted."
-        rule_c_errors = [
-            e
-            for e in result.errors
-            if e.component == "node:select_output_fields" and "Transform contract violation" in e.message and "batch_size" in e.message
-        ]
-        assert rule_c_errors, f"Expected Rule C self-consistency rejection naming batch_size, got: {[e.message for e in result.errors]}"
-        msg = rule_c_errors[0].message
-        assert "select_only: true" in msg
-        assert "Declared required output fields not produced by this transform: [batch_size]" in msg
+        assert result.is_valid, [e.message for e in result.errors]
+
+    def test_select_only_drop_still_rejected_when_a_consumer_requires_the_field(self) -> None:
+        """Dropping a field something downstream needs is still caught.
+
+        The safety net the old Rule C rejection provided is not lost — it moves
+        to where the requirement actually lives, so the message names the
+        consumer instead of accusing the mapper of a self-inconsistency.
+        """
+        state = self._make_select_only_cleanup_state(sink_fields=["customer_tier: str", "count: int", "sum: float", "batch_size: int"])
+
+        result = state.validate()
+
+        assert not result.is_valid, "A dropped field that a consumer requires must still be rejected."
+        assert any("batch_size" in e.message for e in result.errors), [e.message for e in result.errors]
+
+    # ── Rule D: declared output collides with a definitely-arriving input field ──
+    # elspeth-cfcd333f83. The runtime surface is TransformExecutor._run_preflight's
+    # detect_field_collisions call, which raises PluginContractViolation on row 1.
+
+    def _llm_options(self, response_field: str) -> dict[str, Any]:
+        """Minimal constructible llm transform config for the collision probe."""
+        return {
+            "provider": "gateway",
+            "model": "anthropic/claude-sonnet-4.6",
+            "endpoint": "https://gateway.example.invalid/v1",
+            "api_key": "${LLM_API_KEY}",
+            "prompt_template": "Title-case this: {headline}",
+            "response_field": response_field,
+            "schema": {"mode": "observed"},
+        }
+
+    def _llm_rewrite_state(
+        self,
+        *,
+        response_field: str,
+        source_plugin: str = "text",
+        source_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        """source -> llm -> sink, with the llm writing ``response_field``."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rewrite",
+                plugin=source_plugin,
+                options=source_options if source_options is not None else {"column": "headline", "schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rewrite",
+                "rewrite",
+                "main",
+                plugin="llm",
+                options=self._llm_options(response_field),
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_rule_d_llm_rewrite_in_place_collides_with_source_field(self) -> None:
+        """Rule D: an llm rewriting its own input field in place is rejected.
+
+        The reported defect: a text source emits ``headline`` and an llm
+        transform sets ``response_field: headline`` to title-case it. Compose
+        succeeded and /validate returned is_valid=true, then the run died on
+        row 1 because TransformExecutor's collision preflight rejects a
+        transform whose declared_output_fields overlap the arriving row.
+        """
+        result = self._llm_rewrite_state(response_field="headline").validate()
+
+        assert not result.is_valid, "Composer must reject an llm that overwrites a field already on the row."
+        rule_d_errors = [e for e in result.errors if e.component == "node:rewrite" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected a Rule D rejection naming headline, got: {[e.message for e in result.errors]}"
+        msg = rule_d_errors[0].message
+        assert "[headline] already arrive(s) on its input row" in msg
+        # Actionable in both repair directions, so the planner can fix it.
+        assert "response_field" in msg
+        assert "field_mapper" in msg
+        # Only the colliding field is reported — the llm's other declared
+        # outputs (headline_model / headline_usage) do not arrive on the row.
+        contract = rule_d_errors[0].contract
+        assert contract is not None
+        assert contract.extra_fields == ("headline",)
+        assert contract.producer == "rewrite"
+        assert contract.consumer == "rewrite"
+
+    def test_rule_d_negative_control_non_colliding_output_authors_cleanly(self) -> None:
+        """Rule D stays silent when the declared output is a fresh field name.
+
+        Same topology as the rejection above with only ``response_field``
+        changed, so a failure here means Rule D fires on shape rather than on
+        the collision itself.
+        """
+        result = self._llm_rewrite_state(response_field="headline_titlecased").validate()
+
+        assert result.is_valid, result.errors
+
+    def test_rule_d_abstains_when_arrival_is_not_definite(self) -> None:
+        """Rule D abstains when the field is not PROVEN to arrive.
+
+        A csv source with an observed schema declares no guaranteed fields, so
+        ``_connection_definite_emits`` contributes nothing and the composer
+        cannot prove ``headline`` reaches the node. These predicates are lower
+        bounds: erroring on a merely-possible collision would be a false
+        rejection, so the runtime preflight owns this case per-row.
+        """
+        result = self._llm_rewrite_state(
+            response_field="headline",
+            source_plugin="csv",
+            source_options={"schema": {"mode": "observed"}},
+        ).validate()
+
+        assert result.is_valid, result.errors
+
+    def test_rule_d_skips_a_select_only_field_mapper_that_cannot_overwrite(self) -> None:
+        """Rule D is capability-keyed: a fresh-dict writer cannot overwrite (elspeth-6ea3619737).
+
+        A ``select_only`` + ``strict`` field_mapper declares its rename target
+        (an honest guarantee — strict promises the source), and the target name
+        definitely arrives on its input. But ``process`` builds its output from
+        a fresh ``{}``: the arriving field is dropped, never overwritten —
+        which is what select_only MEANS. Before the capability key this shape
+        was rejected here and lost 100% of rows at the runtime twin.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["a", "b"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": True,
+                    "strict": True,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_rule_d_fires_on_an_open_branch_fixed_schema_rename_onto_a_guaranteed_field(self) -> None:
+        """Declaration-channel stability (elspeth-0d1da6dc44): fixed schema arms Rule D too.
+
+        Under ``select_only: false`` the mapper deep-copies the row and writes
+        the target — a real overwrite of the arriving ``c``. Spelling the input
+        promise as ``mode: fixed`` required fields used to leave
+        ``declared_output_fields`` empty and every collision gate asleep, while
+        ``guaranteed_fields: [a, c]`` — the same promise — was rejected. Both
+        spellings must reach the same verdict.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["a", "c"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "c"},
+                    "schema": {"mode": "fixed", "fields": ["a: str", "c: str"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not result.is_valid, "The fixed-schema spelling must not disarm the collision gate."
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected a Rule D rejection naming c, got: {[e.message for e in result.errors]}"
+        assert "[c] already arrive(s) on its input row" in rule_d_errors[0].message
+
+    def test_rule_d_abstains_when_original_header_collision_depends_on_runtime_lineage(self) -> None:
+        """Static validation must not reject a possible runtime identity.
+
+        Composer knows ``full_name`` arrives but cannot know whether ``Name``
+        resolves to that same field or to a different normalized/source-mapped
+        key. FieldMapper's row-aware guard owns the uncertain collision; Rule D
+        remains reserved for provable collisions.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["name", "full_name"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"Name": "full_name"},
+                    "select_only": False,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert not rule_d_errors, [e.message for e in rule_d_errors]
+
+    def test_open_mapper_propagates_guaranteed_passthrough_to_sink_contract(self) -> None:
+        """The local target lower bound composes with forwarded predecessor fields."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": ["keep: str", "b: str?"],
+                        "required_input_fields": ["keep"],
+                    }
+                },
+                on_write_failure="discard",
+            )
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        sink_contract = next(contract for contract in result.edge_contracts if contract.to_id == "output:main")
+        assert sink_contract.producer_guarantees == ("b", "keep")
+        assert sink_contract.satisfied is True
+
+    def test_open_mapper_forwarded_type_mismatch_is_rejected(self) -> None:
+        """Composer mirrors runtime type evidence carried by an open forwarder."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "mapped",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "flexible", "fields": ["a: str"]},
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "typed",
+                "mapped",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"keep": "keep"},
+                    "select_only": True,
+                    "schema": {"mode": "flexible", "fields": ["keep: int"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        mismatch = [entry for entry in result.errors if entry.error_code == "edge_field_type_incompatible"]
+        assert mismatch
+        assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
+
+    @pytest.mark.parametrize(
+        ("source_plugin", "source_options", "expects_mismatch"),
+        [
+            ("csv", {"schema": {"mode": "observed", "guaranteed_fields": ["a", "keep"]}}, True),
+            (
+                "json",
+                {"path": "/data/input.json", "schema": {"mode": "observed", "guaranteed_fields": ["a", "keep"]}},
+                False,
+            ),
+        ],
+    )
+    def test_open_mapper_forwards_only_known_observed_source_structural_type(
+        self,
+        source_plugin: str,
+        source_options: dict[str, Any],
+        expects_mismatch: bool,
+    ) -> None:
+        """Structural CSV typing propagates; an untyped observed source abstains."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                plugin=source_plugin,
+                options=source_options,
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "mapped",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"a": "b"},
+                    "select_only": False,
+                    "schema": {"mode": "flexible", "fields": ["a: str"]},
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "typed",
+                "mapped",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"keep": "keep"},
+                    "select_only": True,
+                    "schema": {"mode": "flexible", "fields": ["keep: int"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        mismatch = [entry for entry in result.errors if entry.error_code == "edge_field_type_incompatible"]
+        assert bool(mismatch) is expects_mismatch
+        if mismatch:
+            assert "keep (consumer expects int, producer emits str)" in mismatch[0].message
+
+    def test_rule_d_fires_on_a_required_fields_rename_onto_a_guaranteed_field(self) -> None:
+        """Third declaration channel (adversarial review of a7c783423): required_fields.
+
+        ``schema.required_fields`` is build-time fail-closed against every
+        non-guaranteeing upstream, so it is the same per-row promise as
+        ``guaranteed_fields`` — the same rename must get the same verdict.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rename",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["email", "username"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rename",
+                "rename",
+                "main",
+                plugin="field_mapper",
+                options={
+                    "mapping": {"email": "username"},
+                    "schema": {"mode": "observed", "required_fields": ["email", "username"]},
+                },
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert not result.is_valid, "The required_fields spelling must not disarm the collision gate."
+        rule_d_errors = [e for e in result.errors if e.component == "node:rename" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected a Rule D rejection naming username, got: {[e.message for e in result.errors]}"
+        assert "[username] already arrive(s) on its input row" in rule_d_errors[0].message
+
+    def test_rule_d_fires_when_only_one_row_union_arm_delivers_the_field(self) -> None:
+        """Rule D rejects a collision carried by a SINGLE fan-in arm.
+
+        ``_connection_definite_emits`` deliberately UNIONS row_union arm emit
+        sets where the presence walk would intersect them, because the two
+        directions have opposite safety polarities. A row_union republishes
+        each arm's rows unchanged, so a field guaranteed by one arm really is
+        present on that arm's rows; the executor's collision preflight runs
+        per row and dies on them. Requiring the field on EVERY arm would miss
+        this genuine failure, so union — not intersection — is correct here.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="gate_in",
+                plugin="text",
+                options={"column": "headline", "schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("arm_a_in", "arm_b_in"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        # Only arm A mints `tag`; arm B carries the bare source row.
+        state = state.with_node(self._make_transform("tagger", "arm_a_in", "arm_a_out", plugin="llm", options=self._llm_options("tag")))
+        state = state.with_node(
+            NodeSpec(
+                id="union",
+                node_type="row_union",
+                plugin=None,
+                input="arm_a_out",
+                on_success="union_out",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                # Barrier branches are keyed by FORK BRANCH NAME; arm B reaches
+                # the barrier untransformed, so its key and connection coincide.
+                branches={"arm_a_in": "arm_a_out", "arm_b_in": "arm_b_in"},
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("retag", "union_out", "main", plugin="llm", options=self._llm_options("tag")))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        rule_d_errors = [e for e in result.errors if e.component == "node:retag" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected Rule D to reject the single-arm collision, got: {[e.message for e in result.errors]}"
+        assert rule_d_errors[0].contract is not None
+        assert "tag" in rule_d_errors[0].contract.extra_fields
+        # The collision must be the ONLY reason this pipeline is rejected —
+        # otherwise a structural complaint could carry the test and the fan-in
+        # semantics would go unverified.
+        assert [e.error_code for e in result.errors] == ["transform_contract_violation"], [e.message for e in result.errors]
+
+    def test_rule_d_ignores_transforms_declaring_no_output_fields(self) -> None:
+        """A transform that declares no output fields is never a Rule D subject.
+
+        ``value_transform`` deliberately keeps ``declared_output_fields`` empty
+        because its targets may legitimately be overwrites — the same opt-out
+        the executor's collision check honours. Rule D must inherit that
+        abstention rather than re-deriving emission from the schema.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rewrite",
+                plugin="text",
+                options={"column": "headline", "schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rewrite",
+                "rewrite",
+                "main",
+                options={"operations": [{"target": "headline", "expression": "row['headline'].title()"}]},
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
 
     def test_v3_field_mapper_locked_input_rejects_upstream_batch_size_extra(self) -> None:
         """Rule A: locked-mode field_mapper input rejects upstream batch_stats extra.
@@ -5459,6 +9088,142 @@ class TestSchemaContractValidation:
             f"Flexible consumer must not trigger locked-input rejection, got errors: {[e.message for e in result.errors]}"
         )
 
+    # ── Projected declared_input_fields: a transform's own options name a
+    # required input column (elspeth-ada5a60249). The runtime surface is
+    # DeclaredRequiredFieldsContract.pre_emission_check, which raises before
+    # process() runs, so every row fails.
+
+    def _web_scrape_options(self, url_field: str) -> dict[str, Any]:
+        """Minimal constructible web_scrape config for the declared-input probe."""
+        return {
+            "url_field": url_field,
+            "content_field": "page_content",
+            "fingerprint_field": "page_fingerprint",
+            "http": {
+                # A non-reserved domain, so the composer's abuse_contact rule
+                # stays silent and these tests observe only the contract check.
+                "abuse_contact": "ops@somecompany.gov.au",
+                "scraping_reason": "contract validation test",
+                "allowed_hosts": ["127.0.0.0/8"],
+            },
+            "schema": {"mode": "observed"},
+        }
+
+    def _web_scrape_state(self, *, url_field: str, source_mode: str) -> CompositionState:
+        """source -> web_scrape -> sink, with the scraper's url_field under test."""
+        source_schema: dict[str, Any] = (
+            {"mode": "fixed", "fields": ["id: int", "url: str", "label: str"]} if source_mode == "fixed" else {"mode": "observed"}
+        )
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="urls", plugin="csv", options={"schema": source_schema}))
+        state = state.with_node(
+            self._make_transform(
+                "scraper",
+                "urls",
+                "main",
+                plugin="web_scrape",
+                options=self._web_scrape_options(url_field),
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_declared_input_field_missing_from_typed_producer_is_rejected(self) -> None:
+        """The reported defect: a misnamed url_field composed clean and died on row 1.
+
+        ``url_field`` never reaches ``required_input_fields`` or the ``schema:``
+        block, so both raw config surfaces were blind; only the constructed
+        plugin knows the column name.
+        """
+        result = self._web_scrape_state(url_field="page_url", source_mode="fixed").validate()
+
+        assert not result.is_valid, "Composer must reject a url_field naming a column no producer emits."
+        declared_errors = [
+            e
+            for e in result.errors
+            if e.component == "node:scraper" and e.error_code == "schema_contract_violation" and "page_url" in e.message
+        ]
+        assert declared_errors, f"Expected a declared-input rejection naming page_url, got: {[e.message for e in result.errors]}"
+        msg = declared_errors[0].message
+        assert "Missing fields: [page_url]" in msg
+        # The message must say WHERE the requirement came from, since the author
+        # never wrote `required_input_fields`.
+        assert "declared by its own options" in msg
+        assert "url_field" in msg
+
+    def test_declared_input_field_satisfied_by_producer_is_clean(self) -> None:
+        """Negative control: the correctly wired chaosweb shape must stay valid."""
+        result = self._web_scrape_state(url_field="url", source_mode="fixed").validate()
+
+        assert result.is_valid, f"Correctly wired url_field must not be rejected, got: {[e.message for e in result.errors]}"
+
+    def test_declared_input_field_against_observed_producer_abstains(self) -> None:
+        """ABSTENTION: an observed producer proves nothing, so enforcement stays per-row.
+
+        This is the case that separates the projected declaration from the raw
+        ``required_input_fields`` surface, which fails closed here.
+        """
+        result = self._web_scrape_state(url_field="page_url", source_mode="observed").validate()
+
+        assert result.is_valid, f"Observed producer must abstain, got: {[e.message for e in result.errors]}"
+
+    def _blob_csv_expand_state(self, *, source_fields: list[str]) -> CompositionState:
+        """blob_ref_field OMITTED — its default names 'blob_ref', so nothing in the options says so."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="manifest",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": source_fields}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "expand",
+                "manifest",
+                "main",
+                plugin="blob_csv_expand",
+                options={"columns": ["id", "text"], "schema": {"mode": "observed"}},
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_declared_input_field_from_option_default_is_rejected(self) -> None:
+        """Omission shape: the author wrote no option at all, so only the probe can know.
+
+        Pins that ``prepare_validation_probe_options`` preserves a
+        default-derived declaration — nothing in the raw options names
+        ``blob_ref``, so a probe that lost the default would leave this rule
+        silently inert for every omission-shaped defect.
+        """
+        result = self._blob_csv_expand_state(source_fields=["manifest_index: int", "source_name: str"]).validate()
+
+        assert not result.is_valid, "Composer must reject a default blob_ref_field no producer emits."
+        declared_errors = [e for e in result.errors if e.component == "node:expand" and "blob_ref" in e.message]
+        assert declared_errors, f"Expected a declared-input rejection naming blob_ref, got: {[e.message for e in result.errors]}"
+        assert "declared by its own options" in declared_errors[0].message
+
+    def test_declared_input_field_from_option_default_satisfied_is_clean(self) -> None:
+        """Negative control: the canonical manifest shape guarantees blob_ref."""
+        result = self._blob_csv_expand_state(source_fields=["manifest_index: int", "blob_ref: str"]).validate()
+
+        assert result.is_valid, f"Canonical blob manifest must stay valid, got: {[e.message for e in result.errors]}"
+
+    def test_declared_input_probe_closes_every_constructed_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The declared-input probe owns the validation-only transform it constructs."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager
+
+        tracking = TrackingPluginManager(get_shared_plugin_manager())
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: tracking,
+        )
+
+        self._web_scrape_state(url_field="page_url", source_mode="fixed").validate()
+
+        assert tracking.instances, "fixture did not exercise the declared-input probe site"
+        assert [instance.close_count for instance in tracking.instances] == [1] * len(tracking.instances)
+
 
 class TestPassThroughComposerParity:
     """ADR-007 composer parity tests for known-pass-through plugins.
@@ -5493,7 +9258,7 @@ class TestPassThroughComposerParity:
             plugin=plugin,
             on_success=on_success,
             options=opts,
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         )
 
     def _make_transform(
@@ -5647,7 +9412,13 @@ class TestPassThroughComposerParity:
         assert consumer_contract.satisfied is True
 
     def test_preview_inherits_upstream_guarantees_through_fork_gate_into_pass_through(self) -> None:
-        """Pass-through preview must follow fork branches back to their producer."""
+        """Pass-through preview must follow fork branches back to their producer.
+
+        The fixture is whole-roster (fork_to == the coalesce's branches): a
+        former third direct-to-sink "overflow" branch was removed when spec §7
+        rule 2 (ruling 23) made mixed closure a build error — it was vehicle,
+        not subject.
+        """
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -5672,7 +9443,7 @@ class TestPassThroughComposerParity:
                 options={},
                 condition="True",
                 routes={"true": "fork", "false": "fork"},
-                fork_to=("path_a", "overflow"),
+                fork_to=("path_a", "path_b"),
                 branches=None,
                 policy=None,
                 merge=None,
@@ -5683,6 +9454,20 @@ class TestPassThroughComposerParity:
                 "pt_node",
                 "path_a",
                 "pt_out",
+                plugin="passthrough",
+                options={"schema": {"mode": "observed"}},
+            )
+        )
+        # A coalesce needs at least two branches at the runtime
+        # (``CoalesceSettings.branches`` min_length=2; Stage 1 mirrors it as
+        # ``coalesce_branches_invalid``, elspeth-2ed41f0a4a) — the second
+        # pass-through arm keeps the fixture runnable without changing what
+        # the test pins (guarantee inheritance through the fork/pass-through).
+        state = state.with_node(
+            self._make_transform(
+                "pt_node_b",
+                "path_b",
+                "pt_b_out",
                 plugin="passthrough",
                 options={"schema": {"mode": "observed"}},
             )
@@ -5699,7 +9484,7 @@ class TestPassThroughComposerParity:
                 condition=None,
                 routes=None,
                 fork_to=None,
-                branches={"path_a": "pt_out"},
+                branches={"path_a": "pt_out", "path_b": "pt_b_out"},
                 policy="require_all",
                 merge="union",
             )
@@ -5715,33 +9500,28 @@ class TestPassThroughComposerParity:
                 on_write_failure="discard",
             )
         )
-        state = state.with_output(
-            OutputSpec(
-                name="overflow",
-                plugin="csv",
-                options={
-                    "path": "outputs/overflow.csv",
-                    "schema": {"mode": "observed"},
-                },
-                on_write_failure="discard",
-            )
-        )
         state = state.with_edge(self._make_edge("e1", "source", "fork_gate"))
         state = state.with_edge(EdgeSpec(id="e2", from_node="fork_gate", to_node="pt_node", edge_type="fork", label="path_a"))
-        state = state.with_edge(EdgeSpec(id="e3", from_node="fork_gate", to_node="overflow", edge_type="fork", label="overflow"))
 
         result = state.validate()
 
         # Engine-legal fork chains route branches through a coalesce (or a
-        # sink-named branch); preview deliberately defers coalesce-fed sink
-        # contracts to the runtime validator with an explicit skip warning
-        # rather than fabricating a contract row. The previous assertion
-        # (a satisfied contract at output:main) was reachable only in a
-        # fork-into-transform-into-sink shape the engine rejects at pre-run
-        # ("fork branch with no destination").
+        # sink-named branch), and the guarantee walk now RESOLVES a union
+        # coalesce instead of deferring to the runtime validator
+        # (elspeth-ae83a6b60c): its merged guarantee is the same one the DAG
+        # builder stamps, so the contract row is computed rather than
+        # fabricated and the skip warning would now be a false "not yet
+        # checked" signal. This test therefore pins the end-to-end inheritance
+        # it is named for — source guarantees, through the fork gate, through
+        # the pass-through, through the merge, to the sink's requirement —
+        # which the previous no-contract-row assertion could not see.
         assert result.is_valid, result.errors
-        assert any("coalesce" in w.message.lower() and "skipped" in w.message.lower() for w in result.warnings)
-        assert not any(ec.to_id == "output:main" for ec in result.edge_contracts)
+        assert not any("coalesce" in w.message.lower() and "skipped" in w.message.lower() for w in result.warnings)
+        contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
+        assert contract.from_id == "rejoin"
+        assert set(contract.producer_guarantees) == {"id", "body"}
+        assert contract.consumer_requires == ("body",)
+        assert contract.satisfied is True
 
     def test_preview_fails_closed_when_known_pass_through_constructor_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Probe failure on a known pass-through plugin → Stage 1 rejects pipeline.
@@ -5786,9 +9566,11 @@ class TestPassThroughComposerParity:
         class _StubPassThrough:
             name = "passthrough"
             passes_through_input = True
+            forwards_input_fields = False
+            removed_input_fields = frozenset()
             is_batch_aware = False  # Required by _known_batch_aware_transform_plugins()
 
-        class _StubPluginManager:
+        class _StubPluginManager(DelegatingPluginManagerDouble):
             def get_transforms(self) -> list[type]:
                 return [_StubPassThrough]
 
@@ -5952,6 +9734,7 @@ class TestCompositionStateQueue:
             ("trigger", {"kind": "count"}),
             ("output_mode", "passthrough"),
             ("expected_output_count", 2),
+            ("timeout_seconds", 5.0),
         ):
             error = queue_node_contract_error(self._queue(**{field: value}))
             assert error is not None and field in error, f"{field} not rejected: {error}"
@@ -6022,6 +9805,225 @@ class TestCompositionStateQueue:
         result = state.validate()
         assert not result.is_valid
         assert any("Duplicate producer" in e.message for e in result.errors)
+
+
+class TestCompositionStateQueueGuaranteePropagation:
+    """Stage-1 mirrors engine queue guarantee propagation (elspeth-3619b8774f).
+
+    Since 83a53388a (elspeth-5a372d3267) the engine walker propagates
+    effective guarantees through QUEUE nodes: intersection of arm votes when
+    every arm participates, total abstention when any arm abstains. The
+    composer preview must vote identically — checking a queue consumer's
+    required fields against the fan-in intersection instead of abstaining
+    with the medium 'Contract check skipped' warning — so validate() agrees
+    with the runtime walker in both directions (green where the engine
+    passes, red where it rejects).
+    """
+
+    def _queue(self, queue_id: str = "inbound") -> NodeSpec:
+        return NodeSpec(
+            id=queue_id,
+            node_type="queue",
+            plugin=None,
+            input=queue_id,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _source(self, *, guarantees: list[str] | None = None, on_success: str = "inbound") -> SourceSpec:
+        schema: dict[str, Any] = {"mode": "observed"}
+        if guarantees is not None:
+            schema["guaranteed_fields"] = guarantees
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"schema": schema},
+            on_validation_failure="discard",
+        )
+
+    def _consumer(
+        self,
+        node_id: str = "consumer",
+        *,
+        input: str = "inbound",
+        on_success: str = "combined",
+        required: list[str] | None = None,
+    ) -> NodeSpec:
+        options: dict[str, Any] = {"schema": {"mode": "observed"}}
+        if required is not None:
+            options["required_input_fields"] = required
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input,
+            on_success=on_success,
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _sink(self, name: str = "combined", *, required: list[str] | None = None) -> OutputSpec:
+        schema: dict[str, Any] = {"mode": "observed"}
+        if required is not None:
+            schema["required_fields"] = required
+        return OutputSpec(name=name, plugin="json", options={"schema": schema}, on_write_failure="discard")
+
+    def _state(self, *, sources: dict[str, SourceSpec], nodes: tuple[NodeSpec, ...], outputs: tuple[OutputSpec, ...]) -> CompositionState:
+        return CompositionState(
+            source=None,
+            sources=sources,
+            nodes=nodes,
+            edges=(),
+            outputs=outputs,
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _queue_skip_warnings(self, result: Any) -> list[str]:
+        return [w.message for w in result.warnings if "Contract check skipped" in w.message and "queue" in w.message]
+
+    def test_queue_consumer_requiring_arm_guaranteed_field_validates_without_skip_warning(self) -> None:
+        # Battery g08 shape (plugin-neutral): every arm guarantees the field
+        # the consumer requires — the engine accepts, so Stage 1 must accept
+        # WITHOUT the abstention warning.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["llm_response"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
+        assert self._queue_skip_warnings(result) == []
+
+    def test_queue_consumer_requiring_unguaranteed_field_is_rejected(self) -> None:
+        # Red-parity direction: the engine rejects this at graph build
+        # ("guarantees: (none - dynamic schema)" pre-fix / missing-field
+        # post-fix), so Stage 1 must reject it too instead of abstaining.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["never_guaranteed"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert not result.is_valid
+        assert any(e.error_code == "schema_contract_violation" for e in result.errors), [e.message for e in result.errors]
+
+    def test_fan_in_intersects_arm_guarantees(self) -> None:
+        # A field only ONE arm guarantees is not guaranteed on the queue's
+        # interleaved stream (rows arrive from exactly one arm).
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["shared", "only_orders"]),
+                "refunds": self._source(guarantees=["shared"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["only_orders"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert not result.is_valid
+        assert any(e.error_code == "schema_contract_violation" for e in result.errors)
+
+        shared_state = self._state(
+            sources={
+                "orders": self._source(guarantees=["shared", "only_orders"]),
+                "refunds": self._source(guarantees=["shared"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["shared"])),
+            outputs=(self._sink(),),
+        )
+        shared_result = shared_state.validate()
+        assert shared_result.is_valid, [e.message for e in shared_result.errors]
+
+    def test_abstaining_arm_collapses_queue_vote_and_keeps_skip_warning(self) -> None:
+        # One dynamic (no-guarantee) arm collapses the whole vote to
+        # abstention — mirroring the engine — and the abstention warning
+        # stays: the runtime enforces the requirement per-row, and the
+        # warning is the honest "not yet checked" signal.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(),
+            },
+            nodes=(self._queue(), self._consumer(required=["llm_response"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
+        assert self._queue_skip_warnings(result) != []
+
+    def test_queue_guarantee_flows_through_pass_through_to_sink_check(self) -> None:
+        # The _connection_propagation_vote path: a pass-through transform
+        # downstream of the queue inherits the fan-in intersection, so the
+        # sink's required-fields check resolves instead of abstaining.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer()),
+            outputs=(self._sink(required=["llm_response"]),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
+
+        missing_state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer()),
+            outputs=(self._sink(required=["never_guaranteed"]),),
+        )
+        missing_result = missing_state.validate()
+        assert not missing_result.is_valid
+        assert any(e.error_code == "sink_contract_violation" for e in missing_result.errors), [e.message for e in missing_result.errors]
+
+    def test_gate_arm_routing_back_into_queue_terminates(self) -> None:
+        # Drafts are not DAG-checked at Stage 1: a gate consuming the queue
+        # and routing one label back into it makes the fan-in walk cyclic.
+        # The vote must terminate (conservative abstention on the revisit),
+        # never recurse unboundedly.
+        gate = NodeSpec(
+            id="triage",
+            node_type="gate",
+            plugin=None,
+            input="inbound",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="row.get('retry') == True",
+            routes={"true": "inbound", "false": "combined"},
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(
+            sources={"orders": self._source(guarantees=["llm_response"])},
+            nodes=(self._queue(), gate),
+            outputs=(self._sink(required=["llm_response"]),),
+        )
+        result = state.validate()  # must not raise RecursionError
+        assert result is not None
 
 
 def test_structural_node_shape_errors_carry_closed_error_codes() -> None:
@@ -6099,8 +10101,9 @@ def test_structural_node_shape_errors_carry_closed_error_codes() -> None:
     for expected in (
         ("node:t_bad", "transform_missing_on_success"),
         ("node:t_bad", "transform_missing_on_error"),
+        # ``branches`` has NO runtime default, so it stays required; ``policy``
+        # is absent from this list because it HAS one (elspeth-deb2f5ed93).
         ("node:c_bad", "coalesce_missing_branches"),
-        ("node:c_bad", "coalesce_missing_policy"),
         ("node:g_bad", "gate_missing_condition"),
         ("node:g_bad", "gate_missing_routes"),
         ("node:g_half", "gate_route_labels_mismatch"),
@@ -6113,6 +10116,43 @@ def test_structural_node_shape_errors_carry_closed_error_codes() -> None:
         assert expected in codes, f"missing {expected}; got {sorted(c for c in codes if c[1])}"
 
 
+def test_gate_on_error_must_reference_declared_sink_or_discard() -> None:
+    gate = NodeSpec(
+        id="threshold",
+        node_type="gate",
+        plugin=None,
+        input="rows",
+        on_success=None,
+        on_error="missing_error_sink",
+        options={},
+        condition="row['amount'] > 500",
+        routes={"true": "high", "false": "standard"},
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="rows", options={}, on_validation_failure="discard"),
+        nodes=(gate,),
+        edges=(),
+        outputs=(
+            OutputSpec(name="high", plugin="csv", options={}, on_write_failure="discard"),
+            OutputSpec(name="standard", plugin="csv", options={}, on_write_failure="discard"),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    result = state.validate()
+
+    assert ("node:threshold", "gate_on_error_unknown_sink") in {(entry.component, entry.error_code) for entry in result.errors}
+    assert route_destination_facts(state)["node:threshold"] == {
+        "dangling_on_error": "missing_error_sink",
+        "declared_sinks": ["high", "standard"],
+    }
+
+
 def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
     """Mirror the engine's fork-branch destination rule at composition time.
 
@@ -6121,6 +10161,13 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
     coalesce branches keys or sink names — the model keyed coalesce branches
     by incoming connection instead of fork branch name. Composer validation
     accepted it: valid-but-not-runnable.
+
+    Since the E2 destination-rule fix (a fork branch may feed an ordinary
+    downstream consumer), 'branch_b' — consumed by the 'usage' transform —
+    is a LEGAL destination, so this topology's defect is now mixed closure
+    (spec §7 rule 2: 'branch_a' row_union-bound, 'branch_b' unbound), not a
+    missing destination. The genuinely-orphaned-branch case lives in
+    test_state_bound_regions.py::test_orphan_fork_branch_still_has_no_destination.
     """
 
     def _node(**overrides: Any) -> NodeSpec:
@@ -6168,6 +10215,18 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
                 policy="require_all",
                 merge="union",
             ),
+            _node(
+                id="row_union",
+                node_type="row_union",
+                plugin=None,
+                input="tone_out",
+                on_success="union_out",
+                on_error=None,
+                branches={"branch_a": "tone_out", "other_branch": "usage_out"},
+                policy=None,
+                merge=None,
+            ),
+            _node(id="after_union", input="union_out", on_success="out"),
             _node(id="finalize", input="reconcile", on_success="out"),
         ),
         edges=(),
@@ -6178,7 +10237,3222 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
 
     result = state.validate()
     entries = [(e.component, e.error_code) for e in result.errors]
-    assert ("node:fork_rows", "fork_branch_no_destination") in entries, entries
-    offending = next(e for e in result.errors if e.error_code == "fork_branch_no_destination")
-    assert "branch_a" in offending.message
-    assert "tone_out" in offending.message
+    assert ("node:fork_rows", "fork_mixed_closure_invalid") in entries, entries
+    # E2: a consumer-fed branch is a legal destination — the old code must NOT fire here.
+    assert not any(e.error_code == "fork_branch_no_destination" for e in result.errors), entries
+    offending = [e for e in result.errors if e.error_code == "fork_mixed_closure_invalid"]
+    assert len(offending) == 1, offending
+    assert "branch_b" in offending[0].message
+    assert "['branch_a']" in offending[0].message  # bound side named as the barrier-closing set
+    assert "mixed closure" in offending[0].message
+
+
+class TestCompositionStateRowUnion:
+    """Composer parity for the plugin-free correlated row_union barrier."""
+
+    def _source(self, on_success: str = "fork_in", *, schema: dict[str, Any] | None = None) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"schema": schema or {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+
+    def _gate(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "fork_rows",
+            "node_type": "gate",
+            "plugin": None,
+            "input": "fork_in",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ("control_branch", "treatment_branch"),
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _transform(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _llm(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        response_field: str,
+    ) -> NodeSpec:
+        """An llm arm emitting its guaranteed provenance trio.
+
+        ``llm`` guarantees ``<response_field>`` plus the ``_usage``/``_model``
+        side-fields (``LLM_GUARANTEED_SUFFIXES``). Those are row data, not
+        audit-only provenance, so they reach a downstream consumer's input
+        contract — the shape that produced elspeth-9d13900064.
+        """
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="llm",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Judge this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": response_field,
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _aggregation(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        output_mode: str | None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="aggregation",
+            plugin="batch_stats",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "value_field": "value",
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={},
+            output_mode=output_mode,
+        )
+
+    def _row_union(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "variant_union",
+            "node_type": "row_union",
+            "plugin": None,
+            # Serialized adapter placeholder: the first branch connection.
+            "input": "control_done",
+            "on_success": "union_out",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": {
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _output(self, name: str = "output", *, options: dict[str, Any] | None = None) -> OutputSpec:
+        return OutputSpec(
+            name=name,
+            plugin="json",
+            options=options or {"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def _state(
+        self,
+        *,
+        row_union: NodeSpec | None = None,
+        gate: NodeSpec | None = None,
+        arms: tuple[NodeSpec, ...] | None = None,
+        extra_nodes: tuple[NodeSpec, ...] = (),
+        tail_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        return CompositionState(
+            source=self._source(),
+            nodes=(
+                gate or self._gate(),
+                *(
+                    arms
+                    or (
+                        self._transform("control", "control_branch", "control_done"),
+                        self._transform("treatment", "treatment_branch", "treatment_done"),
+                    )
+                ),
+                row_union or self._row_union(),
+                self._transform("after_union", "union_out", "output", options=tail_options),
+                *extra_nodes,
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_row_union_survives_serialization_round_trip(self) -> None:
+        state = self._state(row_union=self._row_union(timeout_seconds=2.5))
+
+        payload = state.to_dict()
+        restored = CompositionState.from_dict(payload)
+
+        assert payload["nodes"][3]["timeout_seconds"] == 2.5
+        assert restored == state
+        assert restored.nodes[3].timeout_seconds == 2.5
+
+    def test_from_dict_normalizes_row_union_branch_list_to_identity_mapping(self) -> None:
+        node = NodeSpec.from_dict(
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "control_branch",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": ["control_branch", "treatment_branch"],
+            }
+        )
+
+        assert node.branches == {
+            "control_branch": "control_branch",
+            "treatment_branch": "treatment_branch",
+        }
+
+    def test_direct_row_union_branch_list_normalizes_before_round_trip(self) -> None:
+        row_union = self._row_union(
+            input="control_branch",
+            branches=("control_branch", "treatment_branch"),
+        )
+        state = self._state(row_union=row_union)
+
+        assert row_union.branches == {
+            "control_branch": "control_branch",
+            "treatment_branch": "treatment_branch",
+        }
+        assert CompositionState.from_dict(state.to_dict()) == state
+
+    def test_from_dict_does_not_hide_duplicate_row_union_branch_aliases(self) -> None:
+        row_union = NodeSpec.from_dict(
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "control_branch",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": ["control_branch", "treatment_branch", "control_branch"],
+            }
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_branches_invalid" for error in result.errors)
+
+    def test_valid_row_union_topology(self) -> None:
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+
+    @pytest.mark.parametrize("output_mode", [None, "transform"])
+    def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode=output_mode,
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_branch_aggregation_invalid")
+        assert error.component == "node:variant_union"
+        assert "control" in error.message
+        assert "row_id" in error.message
+        # The remedy must NOT recommend passthrough mode — rule 6 rejects an
+        # in-region aggregation regardless of output_mode (WS2 Task 9 wrong-
+        # remedy enrichment); the message says so instead.
+        assert "passthrough" not in error.message
+        assert "banned inside every bound region" in error.message
+
+    def test_row_union_rejects_passthrough_aggregation_inside_branch(self) -> None:
+        # RULING-25 CASUALTY (WS2 Task 9, 2026-08-23; formerly
+        # test_row_union_accepts_passthrough_aggregation_inside_branch, an
+        # elspeth-a5b86149d4-family positive control). The identity-preservation
+        # property passthrough mode demonstrates is real and unaffected, but
+        # spec §7 rule 6 bans aggregators inside every bound region regardless
+        # of output mode: a batch flush consumes members the region's roster
+        # must account for (loss-blindness), and passthrough does not mitigate
+        # that. Stage 1 mirrors the runtime rejection.
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode="passthrough",
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        assert not result.is_valid
+        error = next(error for error in result.errors if error.error_code == "bound_region_aggregation_invalid")
+        assert error.component == "node:variant_union"
+        assert "control" in error.message
+        assert "rule 6" in error.message
+        # The twin's transform-mode-specific code must NOT fire for a
+        # passthrough aggregation — this shape belongs to rule 6 alone.
+        assert not any(error.error_code == "row_union_branch_aggregation_invalid" for error in result.errors)
+
+    def test_row_union_accepts_transform_mode_aggregation_before_fork(self) -> None:
+        state = self._state()
+        pre_fork_aggregation = self._aggregation(
+            "pre_fork_batch",
+            "pre_fork_in",
+            "fork_in",
+            output_mode="transform",
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(on_success="pre_fork_in")},
+            nodes=(pre_fork_aggregation, *state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_rejects_nested_fork_inside_branch(self) -> None:
+        nested_gate = self._gate(
+            id="nested_fork",
+            input="control_branch",
+            fork_to=("nested_a", "nested_b"),
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                nested_gate,
+                self._transform("control", "nested_a", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(), self._output("nested_b")),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_nested_fork_invalid")
+        assert error.component == "node:variant_union"
+        assert "nested_fork" in error.message
+        assert "control_branch" in error.message
+
+    def test_gate_fork_aliases_must_be_unique_before_row_union_origin_resolution(self) -> None:
+        state = self._state(
+            gate=self._gate(
+                fork_to=("control_branch", "control_branch", "treatment_branch"),
+            )
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "gate_duplicate_fork_branch")
+        assert error.component == "node:fork_rows"
+        assert "control_branch" in error.message
+
+    @pytest.mark.parametrize(
+        "node_id",
+        [
+            "bad name",
+            "a" * 39,
+            "fork",
+            "__private",
+            " variant_union ",
+        ],
+    )
+    def test_row_union_name_matches_runtime_identifier_contract(self, node_id: str) -> None:
+        result = self._state(row_union=self._row_union(id=node_id)).validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_name_invalid")
+        assert error.component == f"node:{node_id}"
+
+    def test_malformed_row_union_branch_values_return_errors_without_sorting_type_error(self) -> None:
+        payload = json.loads(json.dumps(self._state().to_dict()))
+        row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+        row_union["branches"] = {
+            "control_branch": 123,
+            "treatment_branch": "missing",
+        }
+        row_union["input"] = 123
+
+        result = CompositionState.from_dict(payload).validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
+
+    def test_row_union_rejects_branch_aliases_from_multiple_fork_gates(self) -> None:
+        # Single-branch gates: the pre-rule-2 overflow filler branches were
+        # independently mixed-closure-invalid and would drown the finding
+        # under test.
+        second_gate = self._gate(
+            id="fork_treatment",
+            input="second_fork_in",
+            fork_to=("treatment_branch",),
+        )
+        state = CompositionState(
+            sources={
+                "control_source": self._source(on_success="fork_in"),
+                "treatment_source": self._source(on_success="second_fork_in"),
+            },
+            nodes=(
+                self._gate(fork_to=("control_branch",)),
+                second_gate,
+                self._transform("control", "control_branch", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        codes = {error.error_code for error in result.errors}
+        # Rule 2 supersedes the retired origin-analysis mirror (maintainer
+        # ruling 2026-08-23): the enriched roster mismatch is the one
+        # rejection for a union drawn from multiple gates.
+        assert "row_union_branch_origin_invalid" not in codes, codes
+        roster_errors = [error for error in result.errors if error.error_code == "fork_roster_mismatch" and "drawn from" in error.message]
+        assert len(roster_errors) == 1, [error.message for error in result.errors]
+        enriched = roster_errors[0].message
+        assert "variant_union" in enriched
+        assert "drawn from 2 fork gate(s)" in enriched
+        assert "fork_rows" in enriched
+        assert "fork_treatment" in enriched
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in codes
+
+    def test_row_union_rejects_branch_connection_from_a_different_alias(self) -> None:
+        row_union = self._row_union(
+            input="treatment_done",
+            branches={
+                "control_branch": "treatment_done",
+                "treatment_branch": "control_done",
+            },
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        mapping_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in mapping_error.message
+        assert "treatment_done" in mapping_error.message
+        assert "not downstream" in mapping_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
+
+    def test_row_union_rejects_queue_branch_with_unrelated_producer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+        state = replace(
+            state,
+            sources={
+                "primary": self._source(),
+                "contaminant": self._source(on_success="control_done"),
+            },
+        )
+
+        result = state.validate()
+
+        lineage_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in lineage_error.message
+        assert "control_done" in lineage_error.message
+
+    @pytest.mark.parametrize(
+        ("control_fields", "treatment_fields", "is_compatible"),
+        [
+            (["id: str", "score: float"], ["id: str", "score: float"], True),
+            (["id: str", "score: float"], ["id: str", "label: str"], False),
+        ],
+    )
+    def test_row_union_requires_compatible_known_fixed_branch_schemas(
+        self,
+        control_fields: list[str],
+        treatment_fields: list[str],
+        is_compatible: bool,
+    ) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": control_fields}},
+            )
+            if node.id == "control"
+            else replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": treatment_fields}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+        schema_errors = [
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+        ]
+
+        assert bool(schema_errors) is not is_compatible, result.errors
+        if not is_compatible:
+            detail = schema_errors[0].row_union_schema
+            assert detail is not None
+            assert detail.conflicting_fields == ("label", "score")
+            assert tuple(branch.branch for branch in detail.branches) == (
+                "control_branch",
+                "treatment_branch",
+            )
+
+    def test_row_union_observed_branch_abstains_against_fixed_branch(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": ["id: str", "score: float"]}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(
+            error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+            for error in result.errors
+        ), result.errors
+
+    def test_row_union_accepts_disjoint_flexible_branch_declarations(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["score: float"] if node.id == "control" else ["label: str"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(error.error_code == "row_union_schema_incompatible" for error in result.errors), result.errors
+
+    def test_row_union_flexible_shared_type_conflict_carries_repair_facts(self) -> None:
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+        from elspeth.web.composer.tools import ToolResult
+
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["id: str"] if node.id == "control" else ["id: int"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+        candidate = replace(state, nodes=nodes)
+
+        result = candidate.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "row_union_schema_incompatible")
+        detail = entry.row_union_schema
+        assert detail is not None
+        assert detail.conflicting_fields == ("id",)
+        assert [
+            {
+                "branch": branch.branch,
+                "mode": branch.mode,
+                "fields": tuple((field.name, field.field_type) for field in branch.fields),
+            }
+            for branch in detail.branches
+        ] == [
+            {
+                "branch": "control_branch",
+                "mode": "flexible",
+                "fields": (("id", "str"),),
+            },
+            {
+                "branch": "treatment_branch",
+                "mode": "flexible",
+                "fields": (("id", "int"),),
+            },
+        ]
+
+        tool_result = ToolResult(
+            success=False,
+            updated_state=candidate,
+            validation=result,
+            affected_nodes=(),
+        )
+        projected = next(
+            error
+            for error in _allowlisted_candidate_feedback(tool_result)["validation"]["errors"]
+            if error["error_code"] == "row_union_schema_incompatible"
+        )
+        assert "message" not in projected
+        assert projected["row_union_schema"] == detail.to_dict()
+        assert projected["suggested_fix"]
+
+    def _coalesce(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "dup_merge",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "join",
+            "on_success": "output",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            # Identity branches: direct gate->barrier COPY edges that claim no
+            # ordinary connection consumer, so the duplicate-consumer check
+            # cannot mask the barrier-ownership conflict under test.
+            "branches": ("control_branch", "treatment_branch"),
+            "policy": "require_all",
+            "merge": "nested",
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def test_fork_branch_claimed_by_a_coalesce_and_a_row_union_is_rejected(self) -> None:
+        """Composer/runtime parity for the engine's one-barrier-per-branch rule.
+
+        The DAG builder raises ``GraphValidationError`` ("Each fork branch can
+        only join at one barrier") when a coalesce and a row_union both declare
+        the same branch, because the branch's arrival is delivered to exactly
+        one barrier's pending map. validate() used to pass this composition, so
+        generate_yaml handed the runtime a graph it refuses to build.
+        """
+        result = self._state(extra_nodes=(self._coalesce(),)).validate()
+
+        codes = {error.error_code for error in result.errors}
+        assert "fork_branch_multiple_barriers" in codes, result.errors
+        # composer_mcp.server gates generate_yaml on is_valid, so a red
+        # validate() is what stops the runtime-invalid YAML being exported.
+        assert not result.is_valid
+        conflict = next(error for error in result.errors if error.error_code == "fork_branch_multiple_barriers")
+        assert "control_branch" in conflict.message
+        assert "variant_union" in conflict.message
+        assert "dup_merge" in conflict.message
+        # A cross-node topology finding, not either barrier's intrinsic
+        # node-shape code the mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in codes
+
+    def test_fork_branch_claimed_by_two_coalesces_is_rejected(self) -> None:
+        """The same engine rule covers coalesce/coalesce claims."""
+        result = self._state(
+            extra_nodes=(self._coalesce(), self._coalesce(id="second_merge")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_fork_branch_claimed_by_two_row_unions_is_rejected(self) -> None:
+        """And row_union/row_union claims, which the engine rejects too."""
+        second_union = self._row_union(id="second_union", on_success="second_union_out")
+        result = self._state(
+            extra_nodes=(second_union, self._transform("after_second", "second_union_out", "output")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_valid_topology_does_not_report_a_barrier_conflict(self) -> None:
+        """A single barrier per branch stays clean — the rule is not a blanket ban."""
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors)
+
+    def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
+        state = self._state()
+
+        result = state.validate()
+
+        assert any(node.id == "after_union" and node.input == "union_out" for node in state.nodes)
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_queue_output_feeds_row_union_branch_without_placeholder_consumer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_identity_row_union_branch_does_not_consume_same_named_queue(self) -> None:
+        queue = NodeSpec(
+            id="control_branch",
+            node_type="queue",
+            plugin=None,
+            input="control_branch",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        row_union = self._row_union(
+            input="control_branch",
+            branches={
+                "control_branch": "control_branch",
+                "treatment_branch": "treatment_branch",
+            },
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                queue,
+                row_union,
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "queue_no_consumer" and error.component == "node:control_branch" for error in result.errors)
+
+    def test_row_union_rejects_downstream_aggregation_with_early_trigger(self) -> None:
+        aggregation = NodeSpec(
+            id="after_union",
+            node_type="aggregation",
+            plugin="batch_stats",
+            input="union_out",
+            on_success="output",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={"count": 2},
+            output_mode="transform",
+        )
+        state = self._state()
+        state = replace(
+            state,
+            nodes=tuple(aggregation if node.id == "after_union" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "indivisible" in error.message
+        )
+        assert "count/timeout/condition trigger" in group_error.message
+
+    @pytest.mark.parametrize("aggregation_first", (False, True))
+    def test_row_union_invalid_downstream_trigger_keeps_intrinsic_rejection(self, aggregation_first: bool) -> None:
+        """Skipping derived group analysis must retain the actual parse error."""
+        aggregation = replace(
+            self._aggregation("after_union", "union_out", "output", output_mode="transform"),
+            trigger={"count": "not-a-count"},
+        )
+        state = self._state()
+        nodes = tuple(aggregation if node.id == "after_union" else node for node in state.nodes)
+        if aggregation_first:
+            nodes = (aggregation, *(node for node in nodes if node.id != aggregation.id))
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not result.is_valid
+        errors = [error for error in result.errors if error.error_code == "aggregation_trigger_invalid"]
+        assert len(errors) == 1
+        assert errors[0].component == "node:after_union"
+        assert errors[0].severity == "high"
+
+    @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+    def test_row_union_rejects_downstream_correlated_barrier(self, barrier_type: str) -> None:
+        post_union_gate = self._gate(
+            id="post_union_fork",
+            input="union_out",
+            fork_to=("downstream_a", "downstream_b"),
+        )
+        if barrier_type == "coalesce":
+            downstream_barrier = self._coalesce(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches=("downstream_a", "downstream_b"),
+            )
+            tail: tuple[NodeSpec, ...] = ()
+        else:
+            downstream_barrier = self._row_union(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches={
+                    "downstream_a": "downstream_a",
+                    "downstream_b": "downstream_b",
+                },
+                on_success="downstream_out",
+            )
+            tail = (self._transform("after_downstream", "downstream_out", "output"),)
+
+        state = self._state()
+        state = replace(
+            state,
+            nodes=(
+                *(node for node in state.nodes if node.id != "after_union"),
+                post_union_gate,
+                downstream_barrier,
+                *tail,
+            ),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "correlated barrier" in error.message
+        )
+        assert barrier_type in group_error.message
+        assert "downstream_barrier" in group_error.message
+
+    @pytest.mark.parametrize("branches", [None, (), ("only_branch",), {"only_branch": "control_done"}])
+    def test_row_union_requires_at_least_two_branches(self, branches: object) -> None:
+        result = self._state(row_union=self._row_union(branches=branches)).validate()
+
+        assert any(error.error_code == "row_union_branches_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize("on_success", [None, "", "   "])
+    def test_row_union_requires_non_empty_on_success(self, on_success: object) -> None:
+        result = self._state(row_union=self._row_union(on_success=on_success)).validate()
+
+        assert any(error.error_code == "row_union_on_success_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("plugin", "passthrough"),
+            ("options", {"schema": {"mode": "observed"}}),
+            ("on_error", "discard"),
+            ("condition", "True"),
+            ("routes", {"true": "union_out"}),
+            ("fork_to", ("branch",)),
+            ("policy", "require_all"),
+            ("merge", "union"),
+            ("trigger", {"kind": "count"}),
+            ("output_mode", "passthrough"),
+            ("expected_output_count", 2),
+        ],
+    )
+    def test_row_union_rejects_fields_owned_by_other_node_kinds(self, field: str, value: object) -> None:
+        result = self._state(row_union=self._row_union(**{field: value})).validate()
+
+        assert any(error.error_code == "row_union_config_invalid" and field in error.message for error in result.errors), result.errors
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # The two oversized ints are unrepresentable as float; classifying them
+        # INVALID must not regress the bool / NaN / inf / non-positive verdicts.
+        [True, False, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
+    def test_row_union_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
+        result = self._state(row_union=self._row_union(timeout_seconds=timeout_seconds)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_oversized_persisted_timeout_rejects_instead_of_overflowing(self) -> None:
+        """An oversized int from a restored session must reject, not crash.
+
+        ``timeout_seconds`` reaches ``NodeSpec.from_dict`` straight from the
+        persisted session payload, bypassing the Pydantic
+        ``_StrictTimeoutSeconds`` tool boundary. JSON has no integer ceiling,
+        so ``10**400`` survives the round trip as an ``int`` that ``float()``
+        cannot represent — ``math.isfinite`` used to raise ``OverflowError``
+        out of ``validate()`` instead of producing a rejection.
+        """
+        payload = json.loads(
+            json.dumps(
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "plugin": None,
+                    "input": "control_done",
+                    "on_success": "union_out",
+                    "on_error": None,
+                    "options": {},
+                    "branches": {"control_branch": "control_done", "treatment_branch": "treatment_done"},
+                    "timeout_seconds": 10**400,
+                }
+            )
+        )
+        assert isinstance(payload["timeout_seconds"], int)
+
+        result = self._state(row_union=NodeSpec.from_dict(payload)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_row_union_input_is_only_first_branch_placeholder(self) -> None:
+        result = self._state(row_union=self._row_union(input="treatment_done")).validate()
+
+        assert any(error.error_code == "row_union_input_mismatch" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        "branches",
+        [
+            {"__control": "control_done", "treatment_branch": "treatment_done"},
+            {"control_branch": "__control_done", "treatment_branch": "treatment_done"},
+        ],
+    )
+    def test_row_union_branch_aliases_and_connections_obey_connection_name_rules(
+        self,
+        branches: dict[str, str],
+    ) -> None:
+        row_union = self._row_union(input=next(iter(branches.values())), branches=branches)
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
+
+    def test_row_union_requires_each_branch_alias_and_value_to_be_reachable(self) -> None:
+        row_union = self._row_union(
+            branches={
+                "control_branch": "control_done",
+                "unforked_branch": "missing_connection",
+            }
+        )
+        result = self._state(row_union=row_union).validate()
+        codes = {error.error_code for error in result.errors}
+
+        assert "row_union_branch_alias_unreachable" in codes
+        assert "row_union_branch_unreachable" in codes
+
+    def test_row_union_claims_every_branch_value_as_a_consumer(self) -> None:
+        competing = self._transform("competing", "treatment_done", "unused")
+        state = self._state(
+            extra_nodes=(competing,),
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_row_union_on_success_must_feed_a_processing_node(self) -> None:
+        row_union = self._row_union(on_success="output")
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_on_success_must_be_connection" for error in result.errors)
+
+    def test_row_union_with_participating_branches_propagates_guarantees(self) -> None:
+        """elspeth-41bcaa882e: a participating union is checked, not skipped.
+
+        Historically the walk-back abstained at every row_union with a
+        medium "Contract check skipped" warning and emitted no EdgeContract,
+        which let the composer author union-consumer requirements the engine
+        then deterministically rejected at /validate. When every branch
+        participates, the contract check now proceeds against the union's
+        branch-intersection guarantee.
+        """
+        state = self._state(
+            tail_options={
+                "required_input_fields": ["id"],
+                "schema": {"mode": "observed"},
+            }
+        )
+        state = replace(
+            state,
+            sources={
+                "source": self._source(
+                    schema={
+                        "mode": "fixed",
+                        "fields": ["id: str"],
+                        "guaranteed_fields": ["id"],
+                    }
+                )
+            },
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        contract = next(contract for contract in result.edge_contracts if contract.to_id == "after_union")
+        assert contract.from_id == "variant_union"
+        assert contract.satisfied
+        assert not any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
+
+    def _union_arm_queue(self, connection_name: str) -> NodeSpec:
+        """An in-place queue on a branch connection: an arm Composer cannot resolve."""
+        return NodeSpec(
+            id=connection_name,
+            node_type="queue",
+            plugin=None,
+            input=connection_name,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _locked_tail_options(self, fields: list[str]) -> dict[str, Any]:
+        return {"schema": {"mode": "fixed", "fields": fields}}
+
+    def _llm_arms(self, *, control_field: str = "verdict", treatment_field: str = "verdict") -> tuple[NodeSpec, ...]:
+        return (
+            self._llm("control", "control_branch", "control_done", response_field=control_field),
+            self._llm("treatment", "treatment_branch", "treatment_done", response_field=treatment_field),
+        )
+
+    def test_row_union_arm_emits_reach_a_locked_input_consumer(self) -> None:
+        """elspeth-9d13900064: Rule A must not fail open across a row_union.
+
+        The presence direction abstains at a row_union (an arm's guarantees
+        cannot be promoted to the union's), but the extras direction is the
+        opposite polarity: a field guaranteed by an arm WILL arrive on that
+        arm's rows, so a fixed-mode consumer forbidding it is a definite
+        runtime PluginContractViolation, not a maybe.
+        """
+        state = self._state(
+            arms=self._llm_arms(),
+            tail_options=self._locked_tail_options(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:after_union"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.consumer == "after_union"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_row_union_extras_reach_a_fixed_mode_field_mapper_consumer(self) -> None:
+        """The ticket's literal graph: llm x2 -> row_union -> fixed field_mapper.
+
+        A field_mapper consumer also selects the plugin-specific repair
+        wording, which the boundary path must carry like the resolved-producer
+        path does.
+        """
+        field_mapper = NodeSpec(
+            id="after_union",
+            node_type="transform",
+            plugin="field_mapper",
+            input="union_out",
+            on_success="output",
+            on_error="discard",
+            options={
+                "schema": {"mode": "fixed", "fields": ["verdict: str"]},
+                "mapping": {"verdict": "verdict"},
+                "select_only": True,
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._gate(), *self._llm_arms(), self._row_union(), field_mapper),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+        assert "consumer's schema.fields" in entry.message
+
+    def test_row_union_arm_emits_union_rather_than_intersect(self) -> None:
+        """A field guaranteed by ONE arm only is still a definite extra.
+
+        Intersection math (the presence-direction merge) would clear this
+        graph: the arms share no guaranteed field. Rows from the treatment arm
+        still carry its trio, so the union is the sound set here.
+        """
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            tail_options=self._locked_tail_options(["verdict: str", "verdict_usage: any", "verdict_model: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("tone", "tone_model", "tone_usage")
+
+    def test_row_union_locked_input_accepting_every_arm_emit_is_clean(self) -> None:
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            tail_options=self._locked_tail_options(
+                [
+                    "verdict: str",
+                    "verdict_usage: any",
+                    "verdict_model: str",
+                    "tone: str",
+                    "tone_usage: any",
+                    "tone_model: str",
+                ]
+            ),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_unresolvable_arm_does_not_invent_locked_input_extras(self) -> None:
+        """An arm the EMIT walker cannot resolve contributes no fields, and no error.
+
+        The guarantee-direction vote sees through the in-place queue (fan-in
+        intersection, elspeth-3619b8774f), so the union participates and the
+        contract check runs — no skip warning. The emit direction stays
+        conservative: the queued arm contributes nothing, so no extras are
+        invented for it.
+        """
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            extra_nodes=(self._union_arm_queue("treatment_done"),),
+            tail_options=self._locked_tail_options(["verdict: str", "verdict_usage: any", "verdict_model: str"]),
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" for error in result.errors), result.errors
+
+    def test_row_union_known_arm_extras_survive_an_unresolvable_sibling(self) -> None:
+        """Partial knowledge still errors on what IS known.
+
+        The queued treatment arm is opaque to the EMIT walker, but the
+        control arm's guarantees are proven — so its extras are reported.
+        """
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            extra_nodes=(self._union_arm_queue("treatment_done"),),
+            tail_options=self._locked_tail_options(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_row_union_arm_emits_reach_a_locked_sink_through_a_gate(self) -> None:
+        """Rule B shares Rule A's walker, so it shares the row_union hole.
+
+        A row_union cannot feed a sink directly (its on_success must be a
+        processing connection), so the sink boundary is only reachable through
+        an intervening routing gate.
+        """
+        release_gate = self._gate(
+            id="release",
+            input="union_out",
+            routes={"true": "output", "false": "output"},
+            fork_to=None,
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._gate(), *self._llm_arms(), self._row_union(), release_gate),
+            edges=(),
+            outputs=(self._output(options={"schema": {"mode": "fixed", "fields": ["verdict: str"]}}),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.consumer == "output:output"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_resolvable_pass_through_node_between_union_and_locked_consumer_still_errors(self) -> None:
+        """elspeth-902fc354b2 gap 1: a resolvable intermediate node must not bypass Rule A.
+
+        With a pass-through relay between the row_union and the locked
+        consumer, the presence walk RESOLVES (to the relay), so the row_union
+        boundary path never runs. The relay declares
+        ``passes_through_input=True`` — a runtime-verified ADR-008 contract —
+        so every arm emit definitely survives it and must still reach the
+        Rule A comparison at the locked consumer.
+        """
+        relay = self._transform("relay", "union_out", "relay_done")
+        locked_tail = self._transform(
+            "after_union",
+            "relay_done",
+            "output",
+            options=self._locked_tail_options(["verdict: str"]),
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._gate(), *self._llm_arms(), self._row_union(), relay, locked_tail),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:after_union"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "relay"
+        assert detail.consumer == "after_union"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_row_union_arm_pass_through_carries_source_guarantees_to_locked_consumer(self) -> None:
+        """elspeth-902fc354b2 gap 2 through a union: arms pass through source fields.
+
+        g08's live rejection included ``complaint_text`` — an ordinary
+        pass-through field, not an llm side-field. An llm arm declares
+        ``passes_through_input=True``, so a source-guaranteed field definitely
+        arrives on every union row and a locked consumer forbidding it is a
+        definite runtime PluginContractViolation.
+        """
+        state = self._state(
+            arms=self._llm_arms(),
+            tail_options=self._locked_tail_options(["verdict: str", "verdict_model: str", "verdict_usage: any"]),
+        )
+        state = replace(
+            state,
+            sources={
+                "source": self._source(
+                    schema={
+                        "mode": "fixed",
+                        "fields": ["complaint_text: str"],
+                        "guaranteed_fields": ["complaint_text"],
+                    }
+                )
+            },
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.extra_fields == ("complaint_text",)
+
+    def test_union_consumer_requirement_satisfied_by_every_branch_validates(self) -> None:
+        """elspeth-41bcaa882e (battery-2026-08-06 g08): the barrier is transparent.
+
+        Both arms are pass-through, so a source-guaranteed field arrives on
+        every released row. A consumer downstream of the union requiring it
+        must validate — the walker abstaining at the row_union previously
+        reported "guarantees: (none)" and rejected the runnable pipeline,
+        mirroring the engine's "(none - dynamic schema)" rejection.
+        """
+        state = self._state(
+            tail_options={
+                "schema": {"mode": "observed"},
+                "required_input_fields": ["amount"],
+            },
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(schema={"mode": "observed", "guaranteed_fields": ["id", "amount"]})},
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, [e.message for e in result.errors]
+
+    def test_union_consumer_requiring_branch_only_field_still_errors(self) -> None:
+        """Fail-closed twin: a field only ONE branch guarantees is not union-guaranteed.
+
+        Control rows never carry the treatment arm's extra field, and every
+        released group contains a control row, so the intersection must drop
+        it and the consumer requirement must still reject.
+        """
+        arms = (
+            self._transform("control", "control_branch", "control_done"),
+            self._transform(
+                "treatment",
+                "treatment_branch",
+                "treatment_done",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["treatment_tag"]}},
+            ),
+        )
+        state = self._state(
+            arms=arms,
+            tail_options={
+                "schema": {"mode": "observed"},
+                "required_input_fields": ["treatment_tag"],
+            },
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(schema={"mode": "observed", "guaranteed_fields": ["id", "amount"]})},
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "schema_contract_violation")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.consumer == "after_union"
+        assert detail.missing_fields == ("treatment_tag",)
+
+
+class TestUnionCoalesceGuaranteeExtras:
+    """Rule A/B must see a union coalesce's MERGED guarantees (elspeth-ae83a6b60c).
+
+    The composer half of agreement Shape 19. Stage 1 abstained at EVERY
+    coalesce, at three separate sites, so a union coalesce's merged guarantee
+    set was invisible to the extras rules while the runtime rejected the
+    identical pipeline at build time
+    (``validate_typed_producer_guaranteed_extras``). Composer green, ``elspeth
+    run`` red — and because Stage 1 emitted no error, the authoring loop had
+    nothing to repair against.
+
+    Deliberately the coalesce mirror of ``TestCompositionStateRowUnion``'s
+    locked-input tests, down to the llm-arm fixtures: the row_union half of
+    the same walk was closed first (elspeth-9d13900064 / elspeth-41bcaa882e),
+    so the two classes diverging is itself a signal.
+
+    The merged set is NOT computed here. It comes from the composer's existing
+    coalesce accumulation in ``_producer_entry_propagation_vote``, which calls
+    the runtime's own ``merge_guaranteed_fields`` — the same function the DAG
+    builder stamps a coalesce's guarantees with. Both surfaces therefore read
+    one implementation, and the tests below pin the mirror rather than a
+    re-derivation of it.
+    """
+
+    def _source(self, *, schema: dict[str, Any] | None = None) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success="fork_in",
+            options={"schema": schema or {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+
+    def _fork_gate(self) -> NodeSpec:
+        return NodeSpec(
+            id="fork_rows",
+            node_type="gate",
+            plugin=None,
+            input="fork_in",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("control_branch", "treatment_branch"),
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _llm(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        response_field: str = "verdict",
+    ) -> NodeSpec:
+        """An llm arm guaranteeing its provenance trio, as in the row_union class.
+
+        ``llm`` guarantees ``<response_field>`` plus the ``_usage``/``_model``
+        side-fields, which are row data rather than audit-only provenance and
+        so reach a downstream consumer's input contract. Using the same arm
+        plugin as the row_union tests keeps the two guarantee sets comparable.
+        """
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="llm",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Judge this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": response_field,
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _passthrough(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _coalesce(self, **overrides: Any) -> NodeSpec:
+        """A TERMINAL union coalesce: no ``on_success``, consumed by NAME.
+
+        Terminal is not incidental. ``coalesce_on_success_must_be_sink``
+        rejects a coalesce routed into a transform, so the runtime-legal shape
+        for a coalesce feeding a non-sink consumer is a terminal barrier whose
+        id IS the connection the consumer reads (the same shape
+        ``test_coalesce_producer_emits_skip_warning`` uses). Wiring
+        ``on_success`` at a transform instead would trip that unrelated rule
+        and the probe would prove nothing.
+        """
+        defaults: dict[str, Any] = {
+            "id": "variant_merge",
+            "node_type": "coalesce",
+            "plugin": None,
+            # Serialized adapter placeholder: the first branch connection.
+            "input": "control_done",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": {
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            "policy": "require_all",
+            "merge": "union",
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _output(self, *, options: dict[str, Any] | None = None) -> OutputSpec:
+        return OutputSpec(
+            name="output",
+            plugin="json",
+            options=options or {"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def _state(
+        self,
+        *,
+        coalesce: NodeSpec | None = None,
+        arms: tuple[NodeSpec, ...] | None = None,
+        tail: NodeSpec | None = None,
+        extra_nodes: tuple[NodeSpec, ...] = (),
+        output_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        return CompositionState(
+            source=self._source(),
+            nodes=(
+                self._fork_gate(),
+                *(
+                    arms
+                    or (
+                        self._llm("control", "control_branch", "control_done"),
+                        self._llm("treatment", "treatment_branch", "treatment_done"),
+                    )
+                ),
+                coalesce or self._coalesce(),
+                *((tail,) if tail is not None else (self._passthrough("after_merge", "variant_merge", "output"),)),
+                *extra_nodes,
+            ),
+            edges=(),
+            outputs=(self._output(options=output_options),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _locked(self, fields: list[str]) -> dict[str, Any]:
+        return {"schema": {"mode": "fixed", "fields": fields}}
+
+    def test_terminal_union_coalesce_into_locked_transform_reports_locked_input_extras(self) -> None:
+        """Rule A through the walk-back escape and the emit profile (sites 1 + 2).
+
+        Both llm arms guarantee the same trio, so the require_all union merge
+        is that trio, and the locked consumer admits only the response field.
+        The two extras are the ones the runtime names in its own
+        ``EdgeContractError`` on the equivalent graph.
+
+        Reverting the walk-back escape alone restores the unconditional
+        coalesce abstention and this goes green; reverting the emit-profile
+        branch alone ALSO goes green, because the walk-back then resolves the
+        coalesce but ``_effective_producer_vote`` answers with the coalesce
+        node's own (empty) declared set and Rule A finds no extras. Neither
+        site is sufficient by itself.
+        """
+        state = self._state(
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            )
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:after_merge"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_merge"
+        assert detail.consumer == "after_merge"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+        # The abstention advisory is the pre-fix signal; a resolved coalesce
+        # must stop emitting it, or the authoring loop is told the edge was
+        # deferred while an error names it.
+        assert not [
+            warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message
+        ], result.warnings
+
+    def test_definite_emits_traverse_union_coalesce_behind_pass_through(self) -> None:
+        """Rule B through ``_connection_definite_emits`` (site 3) in isolation.
+
+        The locked SINK's direct producer is the pass-through relay, so the
+        walk-back and the emit profile never see the coalesce at all — only
+        the definite-arrivals walk crosses it, because the relay declares
+        ``passes_through_input=True`` with an extras-allowing contract and so
+        propagates upstream arrivals. Reverting site 3 alone leaves the relay
+        contributing its own emits only, and this goes green.
+
+        The relay must declare its OWN ``guaranteed_fields``, which is what
+        isolates site 3. Without them ``_producer_emit_profile`` has no
+        computed set to prefer and falls back to the relay's inherited vote —
+        which already resolves the coalesce through the propagation vote's
+        long-standing coalesce branch — so the test would pass pre-fix and pin
+        nothing. ``flexible`` keeps the relay extras-allowing, so it
+        propagates rather than firewalling arrivals off.
+        """
+        state = self._state(
+            tail=self._passthrough(
+                "pt_mid",
+                "variant_merge",
+                "output",
+                options={"schema": {"mode": "flexible", "fields": ["verdict: str"], "guaranteed_fields": ["verdict"]}},
+            ),
+            output_options=self._locked(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.consumer == "output:output"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_best_effort_union_coalesce_intersects_branch_guarantees(self) -> None:
+        """The require_all discriminator, both halves, on ONE pipeline shape.
+
+        ``merge_guaranteed_fields`` unions branch guarantees under
+        ``require_all`` (every branch always arrives, so any branch's
+        guarantee survives) and INTERSECTS otherwise (a branch may be lost).
+        The arms here guarantee disjoint trios, so the intersection is empty:
+        under ``best_effort`` there is no field the coalesce can promise, and
+        reporting extras would be a FALSE RED against a runtime that also
+        intersects.
+
+        Mutating the composer branch to always union fails the best_effort
+        half; to always intersect fails the require_all half.
+        """
+        arms = (
+            self._llm("control", "control_branch", "control_done", response_field="verdict"),
+            self._llm("treatment", "treatment_branch", "treatment_done", response_field="tone"),
+        )
+        tail = self._passthrough(
+            "after_merge",
+            "variant_merge",
+            "output",
+            options=self._locked(["verdict: str", "verdict_model: str", "verdict_usage: any"]),
+        )
+
+        require_all = self._state(arms=arms, coalesce=self._coalesce(policy="require_all"), tail=tail).validate()
+
+        entry = next(error for error in require_all.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("tone", "tone_model", "tone_usage")
+
+        best_effort = self._state(arms=arms, coalesce=self._coalesce(policy="best_effort"), tail=tail).validate()
+
+        assert not [error for error in best_effort.errors if error.error_code == "locked_input_extras"], best_effort.errors
+
+    def test_every_runtime_merge_strategy_is_adjudicated(self) -> None:
+        """No merge strategy may be silently unaccounted for.
+
+        The strategy list is READ FROM the runtime model
+        (``CoalesceSettings.model_fields["merge"]``'s Literal), never restated
+        here — the same rule the fix itself follows. Each strategy must be in
+        exactly one of two populations:
+
+        * MIRRORED — Composer derives its guarantees from
+          ``merge_coalesce_schema`` and Rule A/B adjudicate the coalesce;
+        * UNMIRRORABLE — Composer abstains with the "runtime validator will
+          check this edge" advisory, and authoring rejects the node outright so
+          the abstention can never gate an acceptance.
+
+        A new strategy added to the runtime Literal lands in NEITHER and fails
+        here, which is the point: the nested defect existed because a strategy
+        sat in the abstaining population by default with no one adjudicating
+        it. Silence is the failure mode this test removes.
+        """
+        from typing import get_args
+
+        from elspeth.core.config import CoalesceSettings
+        from elspeth.web.composer.state import _MIRRORED_COALESCE_MERGES
+
+        runtime_strategies = frozenset(get_args(CoalesceSettings.model_fields["merge"].annotation))
+        unmirrorable = frozenset({"select"})
+
+        assert runtime_strategies >= _MIRRORED_COALESCE_MERGES, (
+            "Composer claims to mirror a merge strategy the runtime does not define",
+            sorted(_MIRRORED_COALESCE_MERGES - runtime_strategies),
+        )
+        unaccounted = runtime_strategies - _MIRRORED_COALESCE_MERGES - unmirrorable
+        assert not unaccounted, (
+            f"Merge strategy {sorted(unaccounted)} is adjudicated by neither population. "
+            "Either mirror it (derive its guarantees from merge_coalesce_schema, and pin the "
+            "engine's verdict on the same pipeline) or declare it unmirrorable (name the input "
+            "the composer NodeSpec cannot carry, and reject it at authoring).",
+        )
+        assert not (_MIRRORED_COALESCE_MERGES & unmirrorable)
+
+    def test_unmirrorable_merge_is_rejected_at_authoring(self) -> None:
+        """The abstention for ``select`` is safe ONLY because authoring refuses it.
+
+        If a future change legalises ``select`` without giving Composer a
+        ``select_branch`` to mirror with, this seam silently reverts to the
+        nested defect: an abstention that lets a pipeline the runtime rejects
+        validate green. This test is the tripwire for that day.
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="select", options={"select_branch": "control_branch"}),
+            tail=self._passthrough("after_merge", "variant_merge", "output", options={"schema": {"mode": "observed"}}),
+        )
+
+        result = state.validate()
+
+        assert "coalesce_merge_select_unsupported" in [error.error_code for error in result.errors], result.errors
+
+    @pytest.mark.parametrize("merge", ["select"])
+    def test_unmirrorable_coalesce_keeps_the_skip_warning(self, merge: str) -> None:
+        """The ``_MIRRORED_COALESCE_MERGES`` scope gate, in the shape that trips it.
+
+        ``select`` forwards ONE branch's raw schema keyed by a ``select_branch``
+        a composer ``NodeSpec`` cannot carry, so Composer has nothing to mirror
+        and abstaining with its advisory is the correct answer — the runtime
+        validator remains authoritative for that merge.
+
+        Parametrized over a single value deliberately: ``nested`` USED to sit
+        in this population on the argument that "the propagation vote mirrors
+        neither". That argument was empirically false — see
+        ``test_nested_coalesce_reports_the_branch_name_extras`` for the engine
+        rejection this abstention was hiding — so nested moved into the
+        mirrored set and only ``select`` remains. Adding a merge back here
+        needs the same evidence: an engine build that AGREES with the
+        abstention. ``test_every_runtime_merge_strategy_is_adjudicated`` is the
+        gate that makes that decision mandatory rather than optional.
+        """
+        overrides: dict[str, Any] = {"merge": merge}
+        if merge == "select":
+            overrides["options"] = {"select_branch": "control_branch"}
+        state = self._state(
+            coalesce=self._coalesce(**overrides),
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            ),
+        )
+
+        result = state.validate()
+
+        assert not [error for error in result.errors if error.error_code == "locked_input_extras"], result.errors
+        assert [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
+            result.warnings
+        )
+
+    def test_nested_coalesce_reports_the_branch_name_extras(self) -> None:
+        """A nested merge emits BRANCH NAMES, and a locked tail must see them.
+
+        The engine builds this exact pipeline and rejects it with
+        ``EdgeContractError``: "Consumer (passthrough) input is locked (mode:
+        fixed) and accepts: ['verdict']. Producer (coalesce:merge_results)
+        guarantees fields: ['branch_a', 'branch_b']". Stage 1 abstained here
+        instead, so the authoring loop got a green preview and a runtime that
+        would not run — the elspeth-ae83a6b60c shape that survived for nested
+        after the union half closed.
+
+        The extras set is NOT re-derived here. The vote dispatches on the merge
+        strategy exactly as ``core/dag/coalesce_merge.merge_coalesce_schema``
+        does and calls that same function, so the branch-name set is the
+        runtime's own.
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="nested", policy="require_all"),
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            ),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("control_branch", "treatment_branch")
+        assert not [
+            warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message
+        ], result.warnings
+
+    def test_definite_emits_traverse_nested_coalesce_behind_pass_through(self) -> None:
+        """The nested twin of the site-3 test above — the only topology that
+        arm reaches.
+
+        With an extras-allowing relay between the coalesce and the locked sink,
+        the walk-back and the emit profile never see the coalesce; only
+        ``_connection_definite_emits`` crosses it. Widening the seam without
+        this leg would leave the third of three sites unverified for nested.
+
+        Engine parity, measured on the equivalent settings graph: it rejects
+        the same two-hop pipeline with ``EdgeContractError`` naming
+        ``['branch_a', 'branch_b']`` as the producer's guaranteed fields, and
+        BUILDS it under a lossy policy — the pairing
+        ``test_nested_coalesce_under_a_lossy_policy_promises_nothing`` holds
+        for the one-hop shape.
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="nested", policy="require_all"),
+            tail=self._passthrough(
+                "pt_mid",
+                "variant_merge",
+                "output",
+                options={"schema": {"mode": "flexible", "fields": ["verdict: str"], "guaranteed_fields": ["verdict"]}},
+            ),
+            output_options=self._locked(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("control_branch", "treatment_branch")
+
+    def test_nested_coalesce_under_a_lossy_policy_promises_nothing(self) -> None:
+        """A branch may be lost, so no branch name is guaranteed — and the
+        engine agrees: the same pipeline under ``policy="first"`` BUILDS.
+
+        The lower-bound discipline of the extras direction: reporting branch
+        names here would be a false red against a runtime that marks every
+        nested field optional (``merge_coalesce_schema``'s
+        ``optional = not require_all``).
+        """
+        state = self._state(
+            coalesce=self._coalesce(merge="nested", policy="first"),
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            ),
+        )
+
+        result = state.validate()
+
+        assert not [error for error in result.errors if error.error_code == "locked_input_extras"], result.errors
+
+    def test_unparseable_branch_options_abstain_instead_of_crashing_validate(self) -> None:
+        """A branch parsed for the FIRST time here is Tier-3 input, not our bug.
+
+        The Rule A/B call sites deliberately let a ValueError from the emit
+        profile crash, because THEIR producer was already parsed earlier in the
+        same iteration — a fault there would be a non-determinism bug in our own
+        code and masking it would hide it. A coalesce BRANCH is the other case:
+        the seam walks branch nodes the consumer's own iteration never touched,
+        so a malformed schema block there is ordinary recoverable external input
+        and must abstain, exactly as ``_arm_emit_profile`` does.
+
+        The node ORDER is load-bearing and this test is worthless without it.
+        ``treatment`` is placed AFTER the locked consumer, so the walk reaches
+        its malformed options before that node's own iteration has parsed them.
+        With the branch first, the ValueError never fires inside the seam and
+        the test would pass vacuously — which is why the skip warning is
+        asserted positively rather than merely asserting no crash: the warning
+        only appears when the seam actually abstained.
+
+        The malformed value must break the PRODUCER-side parse the seam walks:
+        a non-mapping ``schema`` block, which ``parse_raw_schema_config``
+        rejects with "schema config must be a mapping". A malformed
+        ``required_input_fields`` does NOT work here — that is a consumer-side
+        parse the guarantee vote never reads, so the seam resolves normally and
+        the extras error still fires. The branch's own node iteration still
+        reports the malformed block against the right owner
+        (``contract_config_invalid``), which is why abstaining here loses no
+        diagnosis.
+        """
+        malformed_branch = self._passthrough(
+            "treatment",
+            "treatment_branch",
+            "treatment_done",
+            options={"schema": "observed"},
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._fork_gate(),
+                self._llm("control", "control_branch", "control_done"),
+                self._coalesce(),
+                self._passthrough("after_merge", "variant_merge", "output", options=self._locked(["verdict: str"])),
+                # AFTER the consumer: see the docstring's order note.
+                malformed_branch,
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not [error for error in result.errors if error.error_code == "locked_input_extras"], result.errors
+        assert [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
+            result.warnings
+        )
+
+    @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+    def test_draft_cycle_through_a_fan_in_barrier_returns_a_verdict(self, barrier_type: str) -> None:
+        """A cyclic draft must produce a verdict, never ``RecursionError``.
+
+        Drafts are not DAG-checked at Stage 1, so a half-wired composition can
+        route a barrier's own output back into one of its branches. The
+        guarantee vote's coalesce and row_union arms recursed on branch
+        connections with no visited-node guard — only queues had one — and
+        resolving a union coalesce at the walk-back widened the trigger
+        surface: every locked consumer behind a coalesce now votes. Unbounded
+        recursion here is a /validate 500, not a rejection.
+
+        Both barrier kinds are covered because the guard is one shared
+        ``visited_fan_in_ids`` set: the coalesce case is the one this fix made
+        reachable, the row_union case was already reachable through
+        pass-through inheritance, and a guard that covered only the newly
+        reachable half would leave its sibling recursing.
+
+        ``spin`` must be a pass-through: only a pass-through transform's vote
+        walks to its own input, so only that closes the cycle through the
+        guarantee channel. Reverting the guard raises ``RecursionError`` from
+        BOTH parameters — the check that they reach the vote at all rather than
+        being turned back by an earlier pass.
+        """
+        arms = (
+            self._llm("control", "control_branch", "control_done"),
+            self._passthrough("treatment", "treatment_branch", "treatment_mid"),
+        )
+        # ``spin`` reads the barrier's output and republishes it as the branch
+        # connection the barrier itself consumes — the cycle.
+        spin = self._passthrough("spin", "variant_merge", "treatment_done", options=self._locked(["verdict: str"]))
+        if barrier_type == "coalesce":
+            state = self._state(arms=arms, tail=spin)
+        else:
+            state = self._state(
+                arms=arms,
+                coalesce=NodeSpec(
+                    id="variant_merge",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={
+                        "control_branch": "control_done",
+                        "treatment_branch": "treatment_done",
+                    },
+                    policy=None,
+                    merge=None,
+                ),
+                tail=self._passthrough("spin", "union_out", "treatment_done", options=self._locked(["verdict: str"])),
+            )
+
+        result = state.validate()
+
+        assert result is not None
+        assert isinstance(result.is_valid, bool)
+
+
+class TestPassThroughArrivalExtras:
+    """Rule A/B must compare DEFINITE ARRIVALS, not the nearest producer's own emits.
+
+    elspeth-902fc354b2 (battery round 3, g08): the runtime predicate these
+    rules mirror — the consumer's generated input model with
+    ``extra='forbid'`` — validates the ENTIRE arriving row, which includes
+    every field passed through ``passes_through_input=True`` transforms
+    (a runtime-verified ADR-008 declaration) from arbitrarily far upstream.
+    A producer's own predicted emit set is therefore only a fragment of what
+    arrives; the walker must union in upstream definite arrivals wherever the
+    pass-through declaration proves they survive.
+    """
+
+    def _source(self) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "schema": {
+                    "mode": "fixed",
+                    "fields": ["complaint_id: str", "complaint_text: str"],
+                    "guaranteed_fields": ["complaint_id", "complaint_text"],
+                }
+            },
+            on_validation_failure="discard",
+        )
+
+    def _llm(self, *, on_success: str = "summarized", schema: dict[str, Any] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": schema or {"mode": "observed"},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Summarize this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": "one_sentence_summary",
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _passthrough(self, node_id: str, input_connection: str, on_success: str, *, options: dict[str, Any] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _output(self, *, options: dict[str, Any] | None = None) -> OutputSpec:
+        return OutputSpec(
+            name="output",
+            plugin="json",
+            options=options or {"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def test_pass_through_source_fields_reach_a_locked_consumer(self) -> None:
+        """The g08 linear shape: source fields survive the llm and hit the locked tail."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._llm(),
+                self._passthrough(
+                    "final_cleanup",
+                    "summarized",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["one_sentence_summary: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:final_cleanup"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == (
+            "complaint_id",
+            "complaint_text",
+            "one_sentence_summary_model",
+            "one_sentence_summary_usage",
+        )
+
+    def test_pass_through_source_fields_reach_a_locked_sink(self) -> None:
+        """Rule B shares the arrival math: pass-through fields hit a locked sink too."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._llm(on_success="output"),),
+            edges=(),
+            outputs=(self._output(options={"schema": {"mode": "fixed", "fields": ["one_sentence_summary: str"]}}),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == (
+            "complaint_id",
+            "complaint_text",
+            "one_sentence_summary_model",
+            "one_sentence_summary_usage",
+        )
+
+    def test_non_pass_through_intermediate_stops_upstream_arrivals(self) -> None:
+        """A select_only field_mapper is NOT pass-through: arrivals stop at its emit set.
+
+        ``passes_through_input=False`` means pass-through of any given
+        upstream field is not definite, so contributing only the mapper's own
+        computed emit set is the correct lower bound — no invented extras at
+        the tail.
+        """
+        mapper = NodeSpec(
+            id="select",
+            node_type="transform",
+            plugin="field_mapper",
+            input="summarized",
+            on_success="selected",
+            on_error="discard",
+            options={
+                "schema": {"mode": "flexible", "fields": ["summary_out: str"]},
+                "mapping": {"one_sentence_summary": "summary_out"},
+                "select_only": True,
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._llm(),
+                mapper,
+                self._passthrough(
+                    "final_cleanup",
+                    "selected",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["summary_out: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
+            result.errors
+        )
+
+    def test_fixed_output_pass_through_transform_stops_upstream_arrivals(self) -> None:
+        """A ``mode: fixed`` output contract is an extras firewall at that transform.
+
+        Runtime enforces the relay's own fixed output with extra='forbid':
+        rows either match the declared set exactly or the run fails AT THE
+        RELAY — extras can never travel past it. The defect is reported at
+        the relay's own locked input, not invented at the downstream tail.
+        """
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._passthrough(
+                    "relay",
+                    "rows",
+                    "relayed",
+                    options={"schema": {"mode": "fixed", "fields": ["complaint_id: str"]}},
+                ),
+                self._passthrough(
+                    "final_cleanup",
+                    "relayed",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["complaint_id: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
+            result.errors
+        )
+        relay_entry = next(
+            error for error in result.errors if error.error_code == "locked_input_extras" and error.component == "node:relay"
+        )
+        detail = relay_entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("complaint_text",)
+
+    def _rename_mapper(self, input_connection: str, on_success: str) -> NodeSpec:
+        """A reductive fixed-output mapper: renames complaint_text -> body.
+
+        The declared fixed schema lists the ARRIVING fields (with guarantees,
+        so the plugin can compute); the mapping drops ``complaint_text`` by
+        renaming it. The plugin computes its own emit set (``complaint_id``,
+        ``body``) — the declared-required union must never override that
+        computation.
+        """
+        return NodeSpec(
+            id="rename",
+            node_type="transform",
+            plugin="field_mapper",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {
+                    "mode": "fixed",
+                    "fields": ["complaint_id: str", "complaint_text: str"],
+                    "guaranteed_fields": ["complaint_id", "complaint_text"],
+                },
+                "mapping": {"complaint_text": "body"},
+                "select_only": False,
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_reductive_fixed_mapper_does_not_predict_dropped_fields_at_locked_sink(self) -> None:
+        """A fixed-mode reductive producer's PLUGIN-COMPUTED emit set is authoritative.
+
+        Regression for the mode:fixed pin introduced with elspeth-902fc354b2:
+        pinning to ``get_effective_guaranteed_fields()`` unions the declared
+        required fields — for a reductive transform, exactly the fields it
+        drops — into the Rule B prediction, rejecting a pipeline the runtime
+        executes clean (field_mapper deletes the renamed source key).
+        """
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._rename_mapper("rows", "output"),),
+            edges=(),
+            outputs=(self._output(options={"schema": {"mode": "fixed", "fields": ["complaint_id: str", "body: str"]}}),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "sink_locked_extras" for error in result.errors), result.errors
+
+    def test_reductive_fixed_mapper_does_not_predict_dropped_fields_at_locked_consumer(self) -> None:
+        """Rule A shares the emit-profile math: no invented extras at a locked node input."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._rename_mapper("rows", "renamed"),
+                self._passthrough(
+                    "final_cleanup",
+                    "renamed",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["complaint_id: str", "body: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
+            result.errors
+        )
+
+    def _fixed_llm_schema(self) -> dict[str, Any]:
+        """The llm's own arriving fields, declared fixed — an ADDITIVE firewall.
+
+        Mirror image of ``_rename_mapper``: the same ``mode: fixed`` contract,
+        but on a producer that declares ``passes_through_input=True``, so the
+        declared fields are ones it FORWARDS rather than ones it drops.
+        """
+        return {"mode": "fixed", "fields": ["complaint_id: str", "complaint_text: str"]}
+
+    def _locked_summary_trio(self) -> dict[str, Any]:
+        return {
+            "schema": {
+                "mode": "fixed",
+                "fields": [
+                    "one_sentence_summary: str",
+                    "one_sentence_summary_model: str",
+                    "one_sentence_summary_usage: any",
+                ],
+            }
+        }
+
+    def test_additive_fixed_pass_through_predicts_forwarded_fields_at_a_locked_sink(self) -> None:
+        """An ADDITIVE fixed-output producer still emits the fields it forwards.
+
+        elspeth-9a8367078f, the mirror of the reductive pair above. ``llm``
+        declares ``passes_through_input=True`` — runtime-enforced by the
+        executor's pass-through cross-check (ADR-008), which fails the run if
+        an input field is dropped — so ``complaint_id``/``complaint_text``
+        reach every emitted row. Its computed ``guaranteed_fields`` names only
+        the summary trio it ADDS, so predicting that alone let this pipeline
+        compose valid and die on row 1 against the locked sink's
+        ``extra='forbid'`` model: the compose-valid/run-dies direction.
+        """
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._llm(on_success="output", schema=self._fixed_llm_schema()),),
+            edges=(),
+            outputs=(self._output(options=self._locked_summary_trio()),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == ("complaint_id", "complaint_text")
+
+    def test_additive_fixed_pass_through_predicts_forwarded_fields_at_a_locked_consumer(self) -> None:
+        """Rule A shares the emit-profile math, so it shares the additive blind spot."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._llm(schema=self._fixed_llm_schema()),
+                self._passthrough("final_cleanup", "summarized", "output", options=self._locked_summary_trio()),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(
+            error for error in result.errors if error.error_code == "locked_input_extras" and error.component == "node:final_cleanup"
+        )
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == ("complaint_id", "complaint_text")
+
+
+class TestExtrasFirewallDirection:
+    """The composer rejects the shape the DAG's un-gated walk accepts — via Rule A, not the twin.
+
+    ``walk_effective_guarantee_vote`` unions guarantees through a
+    ``passes_through_input`` node without consulting its extras firewall, so a
+    ``mode: fixed`` llm still carries ``a`` downstream and
+    ``validate_transform_declared_input_fields`` accepts a web_scrape that needs
+    it (pinned in
+    ``tests/unit/core/dag/test_transform_declared_input_fields.py::TestExtrasFirewallDirection``).
+
+    The composer's own declared-input block shares that un-gated union and
+    likewise raises nothing here. What rejects is Rule A at the llm's locked
+    input, whose emit profile stops propagation at a non-extras-allowing
+    contract. Both assertions below are load-bearing: the positive one pins that
+    the divergence stays DAG-accept/composer-reject, and the negative one pins
+    WHICH check owns the rejection, so gating the declared-input block registers
+    here as a change rather than passing silently (elspeth-9c5ff8fa7d).
+    """
+
+    def _state(self) -> CompositionState:
+        """source {a,url} -> llm (locked to [url], pass-through) -> web_scrape needing 'a'."""
+        source = SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={"schema": {"mode": "fixed", "fields": ["a: str", "url: str"], "guaranteed_fields": ["a", "url"]}},
+            on_validation_failure="discard",
+        )
+        llm = NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="scraped",
+            on_error="discard",
+            options={
+                "schema": {"mode": "fixed", "fields": ["url: str"]},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Summarize this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": "summary",
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        scraper = NodeSpec(
+            id="scraper",
+            node_type="transform",
+            plugin="web_scrape",
+            input="scraped",
+            on_success="output",
+            on_error="discard",
+            options={
+                "url_field": "a",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": {
+                    "abuse_contact": "ops@dta.gov.au",
+                    "scraping_reason": "contract validation test",
+                    "allowed_hosts": ["127.0.0.0/8"],
+                },
+                "schema": {"mode": "observed"},
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=source,
+            nodes=(llm, scraper),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="output",
+                    plugin="json",
+                    options={"schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_rule_a_rejects_at_the_firewall_node(self) -> None:
+        """The safe-direction pin: the row carrying 'a' dies at the llm, and composing says so."""
+        result = self._state().validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:summarize"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "source"
+        assert detail.extra_fields == ("a",)
+
+    def test_declared_input_block_does_not_report_the_downstream_consumer(self) -> None:
+        """Discriminator: the composer's declared-input twin shares the walk's un-gated union."""
+        result = self._state().validate()
+
+        assert [error.component for error in result.errors if error.error_code == "schema_contract_violation"] == []
+
+
+class TestOpenProducerProvesNoAbsence:
+    """Composer mirror of the runtime ``TestOpenProducerProvesNoAbsence``.
+
+    ``declared_missing`` is a set DIFFERENCE, so it proves ABSENCE and needs an
+    UPPER bound on what a producer emits. ``producer_guaranteed`` is a LOWER
+    one. An ``observed`` source naming ``guaranteed_fields: [id]`` participates
+    in the vote AND still admits every other column, so subtracting its
+    guarantee reported a miss for the pass-through columns its rows genuinely
+    carry — a false REJECT of a pipeline the engine builds and runs
+    (elspeth-9c5ff8fa7d).
+
+    Both tests are load-bearing and must move together: the first pins that an
+    OPEN producer no longer manufactures a rejection, the second that a CLOSED
+    producer which provably omits the column still does. Gating the block on
+    closedness alone would pass the first; deleting the check entirely would
+    pass the first and FAIL the second.
+    """
+
+    def _state(self, source_options: dict[str, Any]) -> CompositionState:
+        """source -> web_scrape whose ``url_field`` names a column the source never declares."""
+        source = SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options=source_options,
+            on_validation_failure="discard",
+        )
+        scraper = NodeSpec(
+            id="scraper",
+            node_type="transform",
+            plugin="web_scrape",
+            input="rows",
+            on_success="output",
+            on_error="discard",
+            options={
+                "url_field": "colour",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": {
+                    "abuse_contact": "ops@dta.gov.au",
+                    "scraping_reason": "contract validation test",
+                    "allowed_hosts": ["127.0.0.0/8"],
+                },
+                "schema": {"mode": "observed"},
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=source,
+            nodes=(scraper,),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="output",
+                    plugin="json",
+                    options={"schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _declared_input_errors(self, state: CompositionState) -> list[str]:
+        return [
+            error.message
+            for error in state.validate().errors
+            if error.error_code == "schema_contract_violation" and "declared by its own options" in error.message
+        ]
+
+    def test_an_open_producer_naming_a_guarantee_proves_no_absence(self) -> None:
+        """The false red: observed + guaranteed_fields participates but admits extras."""
+        state = self._state({"schema": {"mode": "observed", "guaranteed_fields": ["id"]}})
+
+        assert self._declared_input_errors(state) == []
+
+    def test_a_closed_producer_that_omits_the_column_still_rejects(self) -> None:
+        """The gate that must NOT be lost: a fixed schema forbids extras, so absence is provable."""
+        state = self._state({"schema": {"mode": "fixed", "fields": ["id: str"], "guaranteed_fields": ["id"]}})
+
+        messages = self._declared_input_errors(state)
+        assert len(messages) == 1, messages
+        assert "colour" in messages[0]
+
+
+class TestForwardingTransformExtrasReachTheLockedSink:
+    """Composer half of elspeth-15c72686f2 — the surface the defect was reported on.
+
+    The battery observed this through ``/api/sessions/{id}/validate`` and the
+    persisted composition state, BOTH reporting ``is_valid: true`` with zero
+    errors, so a DAG-only fix would have left the reporting surface green. The
+    truncation was ``_producer_emit_profile`` answering
+    ``propagates_upstream=False`` for a transform that forwards the whole row
+    minus the column it consumed — it can never declare ``passes_through_input``,
+    so the walk stopped and the upstream llm's ``_usage`` / ``_model`` never
+    reached Rule B.
+    """
+
+    _LLM_SOURCE_OPTIONS: ClassVar[dict[str, Any]] = {
+        "provider": "openrouter",
+        "model": "openai/gpt-4o-mini",
+        "api_key": "test-api-key",
+        "prompt_template": "Write an announcement.",
+        "response_field": "announcement",
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+
+    def _explode(self, input_connection: str) -> NodeSpec:
+        return NodeSpec(
+            id="exploded",
+            node_type="transform",
+            plugin="line_explode",
+            input=input_connection,
+            on_success="sentence_rows",
+            on_error="discard",
+            options={
+                "source_field": "announcement",
+                "output_field": "sentence",
+                "include_index": False,
+                "schema": {"mode": "observed"},
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _locked_sink(self, fields: list[str]) -> OutputSpec:
+        return OutputSpec(
+            name="sentence_rows",
+            plugin="text",
+            options={
+                "path": "outputs/announcement_sentences.txt",
+                "field": "sentence",
+                "schema": {"mode": "fixed", "fields": fields},
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            on_write_failure="discard",
+        )
+
+    def _llm_source_state(self, sink: OutputSpec) -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                options=dict(self._LLM_SOURCE_OPTIONS),
+                on_success="brief",
+                on_validation_failure="discard",
+            ),
+            nodes=(self._explode("brief"),),
+            edges=(),
+            outputs=(sink,),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_llm_source_metadata_reaches_the_locked_sink_through_line_explode(self) -> None:
+        """The literal g11-s2 graph, on the gate that reported it clean."""
+        result = self._llm_source_state(self._locked_sink(["sentence: str"])).validate()
+
+        assert not result.is_valid
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "exploded"
+        assert detail.extra_fields == ("announcement_model", "announcement_usage")
+
+    def test_consumed_source_field_is_not_named_as_an_extra(self) -> None:
+        """``announcement`` is what line_explode CONSUMES, so it never arrives.
+
+        Naming it would send the authoring loop after a field the transform
+        already removed — the removal set exists to prevent exactly that.
+        """
+        result = self._llm_source_state(self._locked_sink(["sentence: str"])).validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.contract is not None
+        assert "announcement" not in entry.contract.extra_fields
+
+    def test_llm_transform_upstream_reaches_the_same_dead_end(self) -> None:
+        """Shape B: the defect never needed ``source:llm`` to be authorable.
+
+        The ticket argued no earlier battery round could have found this because
+        ``source:llm`` was outside the plugin allowlist. An llm TRANSFORM in
+        front of the same exploder — the far commoner authored shape — was
+        always reachable and equally green.
+        """
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options={
+                    "path": "data/in.csv",
+                    "schema": {"mode": "fixed", "fields": ["topic: str"]},
+                    "on_validation_failure": "discard",
+                },
+                on_success="rows",
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="writer",
+                    node_type="transform",
+                    plugin="llm",
+                    input="rows",
+                    on_success="written",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "test-api-key",
+                        "prompt_template": "Write an announcement about {{ row.topic }}.",
+                        "response_field": "announcement",
+                        "required_input_fields": ["topic"],
+                        "schema": {"mode": "observed"},
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                self._explode("written"),
+            ),
+            edges=(),
+            outputs=(self._locked_sink(["sentence: str"]),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.contract is not None
+        # The csv column rides through BOTH hops, so the walk composes across
+        # the pass-through llm and the forwarding exploder rather than stopping
+        # at the nearest producer.
+        assert entry.contract.extra_fields == ("announcement_model", "announcement_usage", "topic")
+
+    def test_sink_declaring_the_metadata_optional_is_clean(self) -> None:
+        """Rejection is on ARRIVAL, not on having an llm upstream.
+
+        The sink stays locked (``mode: fixed``); declaring the metadata
+        OPTIONAL admits it without requiring line_explode to guarantee it. Two
+        of the three g11 samples authored a tolerant sink and ran correctly —
+        those must keep validating.
+        """
+        result = self._llm_source_state(
+            self._locked_sink(["sentence: str", "announcement_usage: any?", "announcement_model: str?"])
+        ).validate()
+
+        assert [error.error_code for error in result.errors if error.error_code == "sink_locked_extras"] == []
+
+    def test_locked_transform_input_downstream_of_the_forwarder_trips_rule_a(self) -> None:
+        """Rule A (node-level) shares the edited union site with Rule B and must fire too.
+
+        The sink tests above exercise Rule B; this pins the locked TRANSFORM
+        consumer — a fixed-schema value_transform fed by the exploder — so the
+        node-level arm of the forwarding propagation cannot silently regress
+        while the sink arm stays green.
+        """
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                options=dict(self._LLM_SOURCE_OPTIONS),
+                on_success="brief",
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                self._explode("brief"),
+                NodeSpec(
+                    id="shout",
+                    node_type="transform",
+                    plugin="value_transform",
+                    input="sentence_rows",
+                    on_success="out_conn",
+                    on_error="discard",
+                    options={
+                        "operations": [{"field": "sentence", "operation": "uppercase"}],
+                        "schema": {"mode": "fixed", "fields": ["sentence: str"]},
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out_conn",
+                    plugin="json",
+                    options={"path": "outputs/out.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:shout"
+        assert entry.contract is not None
+        assert entry.contract.extra_fields == ("announcement_model", "announcement_usage")
+
+
+class TestStepDescriptions:
+    """Contract for the optional composer-authored per-step ``description``.
+
+    Three invariants (elspeth-051eadb901):
+      * every spec kind round-trips the field through to_dict/from_dict;
+      * a dict persisted BEFORE the field existed deserialises to None; and
+      * to_dict omits the key when None, so pre-existing serialised states —
+        and therefore their composition_content_hash values — are unchanged.
+    """
+
+    def _node(self, description: str | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="summarized",
+            on_error="discard",
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            description=description,
+        )
+
+    def test_source_round_trips_description(self) -> None:
+        source = SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={},
+            on_validation_failure="discard",
+            description="Read the three project-brief pages.",
+        )
+        d = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {},
+            "on_validation_failure": "discard",
+            "description": "Read the three project-brief pages.",
+        }
+        assert SourceSpec.from_dict(d) == source
+
+    def test_node_round_trips_description(self) -> None:
+        node = self._node("Have an LLM write a short summary of each page.")
+        restored = NodeSpec.from_dict(
+            {
+                "id": "summarize",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "rows",
+                "on_success": "summarized",
+                "on_error": "discard",
+                "options": {},
+                "description": "Have an LLM write a short summary of each page.",
+            }
+        )
+        assert restored == node
+
+    def test_output_round_trips_description(self) -> None:
+        output = OutputSpec(
+            name="results",
+            plugin="json",
+            options={},
+            on_write_failure="discard",
+            description="Write url and summary to a JSON file.",
+        )
+        d = {
+            "name": "results",
+            "plugin": "json",
+            "options": {},
+            "on_write_failure": "discard",
+            "description": "Write url and summary to a JSON file.",
+        }
+        assert OutputSpec.from_dict(d) == output
+
+    def test_legacy_dicts_without_the_key_deserialise_to_none(self) -> None:
+        source = SourceSpec.from_dict({"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"})
+        node = NodeSpec.from_dict(
+            {
+                "id": "summarize",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "rows",
+                "on_success": "summarized",
+                "on_error": "discard",
+                "options": {},
+            }
+        )
+        output = OutputSpec.from_dict({"name": "results", "plugin": "json", "options": {}, "on_write_failure": "discard"})
+        assert source.description is None
+        assert node.description is None
+        assert output.description is None
+
+    def test_state_to_dict_omits_the_key_when_none_and_carries_it_when_set(self) -> None:
+        undescribed = CompositionState(
+            sources={"source": SourceSpec(plugin="csv", on_success="rows", options={}, on_validation_failure="discard")},
+            nodes=(self._node(None),),
+            edges=(),
+            outputs=(OutputSpec(name="summarized", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        d = undescribed.to_dict()
+        assert "description" not in d["sources"]["source"]
+        assert "description" not in d["nodes"][0]
+        assert "description" not in d["outputs"][0]
+
+        described = CompositionState(
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={},
+                    on_validation_failure="discard",
+                    description="Read the pages.",
+                )
+            },
+            nodes=(self._node("Summarise each page."),),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="summarized",
+                    plugin="json",
+                    options={},
+                    on_write_failure="discard",
+                    description="Write the results.",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        restored = CompositionState.from_dict(described.to_dict())
+        assert restored.sources["source"].description == "Read the pages."
+        assert restored.nodes[0].description == "Summarise each page."
+        assert restored.outputs[0].description == "Write the results."
+
+
+class TestRowUnionDownstreamBanDoesNotWalkASentinel:
+    """The ban must skip when there is no connection, not walk ``""``.
+
+    ``row_union_downstream_group_invalid`` forbids a correlated barrier directly
+    downstream of a row_union. It resolved its connection as
+    ``node.on_success or ""`` — and an empty connection name is NOT a no-op to
+    ``_runtime_nodes_downstream_of_connection``: ``NodeSpec`` accepts
+    ``input=""``, so the walk matched any empty-input node and this ban accused
+    it of being downstream of the row_union (elspeth-6b48bda677).
+
+    The state IS already invalid in that case — ``row_union_on_success_invalid``
+    reports it in the same pass, because that guard COLLECTS rather than
+    short-circuiting — which is exactly why the ban still runs and why the
+    sentinel mattered. A second error computed from a state already known bad
+    named two nodes that had no relationship at all.
+
+    Deliberately NOT fixed by calling ``published_success_connection`` like the
+    rest of its family: row_union is absent from
+    ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES`` BECAUSE it requires ``on_success``,
+    so the authority returns ``None`` here and calling it would change nothing.
+    """
+
+    @staticmethod
+    def _state(ru_on_success: str | None, ghost_input: str) -> CompositionState:
+        def node(**kw: Any) -> NodeSpec:
+            base: dict[str, Any] = {
+                "id": None,
+                "node_type": "transform",
+                "plugin": None,
+                "input": None,
+                "on_success": None,
+                "on_error": None,
+                "options": {},
+                "condition": None,
+                "routes": None,
+                "fork_to": None,
+                "branches": None,
+                "policy": None,
+                "merge": None,
+            }
+            base.update(kw)
+            return NodeSpec(**base)
+
+        state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv", on_success="rows", options={"path": "in.csv", "schema": {"mode": "observed"}}, on_validation_failure="discard"
+            )
+        )
+        state = state.with_node(
+            node(id="fan", node_type="gate", input="rows", condition="'all'", routes={"all": "fork"}, fork_to=("a", "b"))
+        )
+        state = state.with_node(
+            node(id="pa", plugin="passthrough", input="a", on_success="a_out", on_error="discard", options={"schema": {"mode": "observed"}})
+        )
+        state = state.with_node(
+            node(id="pb", plugin="passthrough", input="b", on_success="b_out", on_error="discard", options={"schema": {"mode": "observed"}})
+        )
+        state = state.with_node(
+            node(
+                id="ru",
+                node_type="row_union",
+                input="a_out",
+                branches={"a": "a_out", "b": "b_out"},
+                policy="require_all",
+                on_success=ru_on_success,
+            )
+        )
+        state = state.with_node(
+            node(
+                id="ghost_co",
+                node_type="coalesce",
+                input=ghost_input,
+                branches={"x": ghost_input, "y": ghost_input},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        return state.with_output(
+            OutputSpec(name="main", plugin="csv", options={"path": "o.csv", "schema": {"mode": "observed"}}, on_write_failure="discard")
+        )
+
+    @staticmethod
+    def _codes(state: CompositionState) -> set[str]:
+        return {entry.error_code for entry in state.validate().errors}
+
+    def test_a_genuinely_downstream_barrier_is_still_rejected(self) -> None:
+        """The ban's real job must survive the fix."""
+        assert "row_union_downstream_group_invalid" in self._codes(self._state("ru_out", "ru_out"))
+
+    def test_an_unrelated_empty_input_node_is_not_accused(self) -> None:
+        """THE regression. ``ghost_co`` is not downstream of ``ru`` by any edge.
+
+        Mutating the resolution back to ``node.on_success or ""`` reds exactly
+        this test — a two-case pin (fires with on_success, silent without) passes
+        against the buggy code, which is why the false positive survived the
+        first diagnosis.
+        """
+        assert "row_union_downstream_group_invalid" not in self._codes(self._state(None, ""))
+
+    def test_the_real_error_is_still_reported(self) -> None:
+        """Skipping the ban must not hide why the state is invalid."""
+        assert "row_union_on_success_invalid" in self._codes(self._state(None, ""))
+
+
+# --- tier-rem/web-composer: pinning tests -----------------------------------
+
+
+def _tier_rem_node(**overrides: Any) -> NodeSpec:
+    defaults: dict[str, Any] = {
+        "id": "n1",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "in",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": {},
+        "condition": None,
+        "routes": None,
+        "fork_to": None,
+        "branches": None,
+        "policy": None,
+        "merge": None,
+    }
+    defaults.update(overrides)
+    return NodeSpec(**defaults)
+
+
+def test_coalesce_non_string_branch_connection_is_rejected_at_composition_time() -> None:
+    """A persisted payload can hand NodeSpec.from_dict a non-string coalesce
+    branch connection; without an intrinsic type check it validated green here
+    and died at the runtime's CoalesceSettings load (valid-but-not-runnable)."""
+    state = CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state = state.with_source(SourceSpec(plugin="csv", on_success="g_in", options={}, on_validation_failure="discard"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="g",
+            node_type="gate",
+            plugin=None,
+            input="g_in",
+            on_success=None,
+            on_error=None,
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("x",),
+        )
+    )
+    state = state.with_node(_tier_rem_node(id="tx", input="x", on_success="cx"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="c",
+            node_type="coalesce",
+            plugin=None,
+            input="cx",
+            on_success="main",
+            on_error=None,
+            branches={"x": 7},
+            policy="require_all",
+            merge="union",
+        )
+    )
+    state = state.with_output(OutputSpec(name="main", plugin="csv", options={}, on_write_failure="discard"))
+
+    result = state.validate()
+
+    messages = [e.message for e in result.errors if e.error_code == "coalesce_branches_invalid"]
+    assert any("must be a string (got int)" in message for message in messages), messages
+
+
+def test_coalesce_non_string_branch_name_is_rejected_at_composition_time() -> None:
+    """The branch NAME operand of the same intrinsic type check.
+
+    ``_routing_label_errors`` skips a pair whose branch name is not a string,
+    so the rejection must come from the intrinsic coalesce shape check, which
+    runs ``type(value) is not str`` over the branch name and the branch
+    connection in one loop. This test plants the name operand; its sibling
+    above plants the connection operand.
+    """
+    state = CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state = state.with_source(SourceSpec(plugin="csv", on_success="g_in", options={}, on_validation_failure="discard"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="g",
+            node_type="gate",
+            plugin=None,
+            input="g_in",
+            on_success=None,
+            on_error=None,
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("x",),
+        )
+    )
+    state = state.with_node(_tier_rem_node(id="tx", input="x", on_success="cx"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="c",
+            node_type="coalesce",
+            plugin=None,
+            input="cx",
+            on_success="main",
+            on_error=None,
+            branches={7: "cx"},
+            policy="require_all",
+            merge="union",
+        )
+    )
+    state = state.with_output(OutputSpec(name="main", plugin="csv", options={}, on_write_failure="discard"))
+
+    result = state.validate()
+
+    assert not result.is_valid
+    messages = [e.message for e in result.errors if e.error_code == "coalesce_branches_invalid"]
+    assert any("branch name must be a string (got int)" in message for message in messages), messages
+
+
+def test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules() -> None:
+    """The composer's template advisory rules abstain on unparseable templates;
+    the raising rejection is owned by LLMConfig (pydantic ValidationError at
+    plugin-config admission), so the abstention loses no integrity signal."""
+    from pydantic import ValidationError
+
+    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.plugins.transforms.llm.base import LLMConfig
+    from elspeth.plugins.transforms.llm.multi_query import QueryDefinition
+    from elspeth.web.composer.state import (
+        _parse_template_names,
+        _validate_prompt_template_variable_bindings,
+    )
+
+    bad_template = "{% if %}"
+    parsed, syntax_error = _parse_template_names(bad_template)
+    assert parsed is None
+    assert syntax_error is not None and "Expected an expression" in syntax_error
+    node = _tier_rem_node(id="llm1", plugin="llm", options={"prompt_template": bad_template})
+    assert _validate_prompt_template_variable_bindings(node) == ()
+
+    with pytest.raises(ValidationError) as node_error:
+        LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template=bad_template,
+            schema_config=SchemaConfig(mode="observed", fields=None),
+        )
+    assert any(error["loc"] == ("prompt_template",) for error in node_error.value.errors())
+
+    with pytest.raises(ValidationError) as query_error:
+        QueryDefinition(input_fields={"text": "text"}, template=bad_template)
+    assert any(error["loc"] == ("template",) for error in query_error.value.errors())

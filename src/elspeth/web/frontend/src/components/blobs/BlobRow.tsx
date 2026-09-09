@@ -1,7 +1,8 @@
 // src/components/blobs/BlobRow.tsx
 import { useMemo, useState } from "react";
 import { previewBlobContentSnippet } from "@/api/client";
-import { Icon, StructuredJsonPreview, type IconName } from "@/components/ui";
+import { Button, Icon, StructuredJsonPreview, type IconName } from "@/components/ui";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import type { BlobMetadata } from "@/types/api";
 import {
   describeStructuralSummary,
@@ -24,6 +25,9 @@ interface BlobRowProps {
   onDownload: (blobId: string) => void;
   onDelete: (blobId: string) => void;
   onUseAsInput: (blob: BlobMetadata) => void;
+  /** Disables the Use-as-input compose entry point while a freeform compose
+   *  is in flight (elspeth-3f38ebb1b5). Preview/download/delete stay live. */
+  useAsInputDisabled?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -75,7 +79,14 @@ function statusIndicator(status: string): {
   }
 }
 
-export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }: BlobRowProps) {
+export function BlobRow({
+  blob,
+  sessionId,
+  onDownload,
+  onDelete,
+  onUseAsInput,
+  useAsInputDisabled = false,
+}: BlobRowProps) {
   const status = statusIndicator(blob.status);
   const creatorLabel = creatorBadgeLabel(blob.created_by);
   const normalizedMimeType = normalizeMimeType(blob.mime_type);
@@ -132,18 +143,29 @@ export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }:
     if (previewContent === null) return null;
     return summarizeContentStructure(normalizedMimeType, previewContent, { truncated });
   }, [previewContent, truncated, normalizedMimeType]);
-  const structuralSummaryLine = structuralSummary
+  const showAdvanced = useShowAdvanced();
+  // The row/column counts are structural introspection — engineer register,
+  // gated (elspeth-f1394307e3). structuralSummary.caveat is NOT gated: a
+  // ragged/unterminated-quote/oversized/unparseable body must disclose that at
+  // every detail level, because nothing else in the row says so. (Truncation
+  // is the one case the preview <pre> already covers with its own
+  // "... (truncated)" span at :286-290; the rest have no counterpart.)
+  const structuralSummaryLine = showAdvanced && structuralSummary
     ? describeStructuralSummary(structuralSummary)
     : null;
 
   return (
-    <div>
-      <div
-        className="blob-row blob-row-container"
-        style={{
-          borderBottom: previewOpen ? "none" : "1px solid var(--color-border)",
-        }}
-      >
+    // The row divider is CSS, not an inline style (elspeth-a1a1b62aa9): the
+    // last-row exception — suppressing the border that would otherwise stack
+    // on .chat-input's border-top as a doubled seam — cannot be expressed from
+    // JSX at all, because a row cannot know it is last. The open/closed state
+    // is published as a class so blobs.css can own both cases.
+    <div
+      className={
+        previewOpen ? "blob-row-item blob-row-item--preview-open" : "blob-row-item"
+      }
+    >
+      <div className="blob-row blob-row-container">
         {/* Status indicator: shape icon (non-colour cue) + accessible name. */}
         <span
           className="blob-row-status-dot"
@@ -183,7 +205,8 @@ export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }:
         {/* Actions */}
         <div className="blob-row-actions">
           {canPreview && blob.status === "ready" && (
-            <button
+            <Button
+              variant="bare"
               onClick={handleTogglePreview}
               title={previewOpen ? "Hide preview" : "Preview content"}
               aria-label={`${previewOpen ? "Hide" : "Preview"} ${blob.filename}`}
@@ -191,36 +214,44 @@ export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }:
               className="blob-action-btn"
             >
               <Icon name="eye" />
-            </button>
+            </Button>
           )}
           {blob.status === "ready" && (
             <>
-              <button
+              <Button
+                variant="bare"
                 onClick={() => onUseAsInput(blob)}
                 title="Use as pipeline input"
                 aria-label={`Use ${blob.filename} as input`}
                 className="blob-action-btn"
+                disabled={useAsInputDisabled}
               >
                 <Icon name="play" />
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="bare"
                 onClick={() => onDownload(blob.id)}
                 title="Download"
                 aria-label={`Download ${blob.filename}`}
                 className="blob-action-btn"
               >
                 <Icon name="download" />
-              </button>
+              </Button>
             </>
           )}
-          <button
+          {/* Neutral trigger by recorded decision (elspeth-50fd9b04e0):
+              destructive pattern is neutral trigger + red CONFIRM step. The
+              red step is the variant="danger" ConfirmDialog BlobManager opens
+              for this request — do not repaint this trigger red. */}
+          <Button
+            variant="bare"
             onClick={() => onDelete(blob.id)}
             title="Delete"
             aria-label={`Delete ${blob.filename}`}
             className="blob-action-btn"
           >
             <Icon name="trash" />
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -240,7 +271,8 @@ export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }:
           {structuralSummary &&
             structuralSummary.format !== "unsupported" &&
             !previewLoading &&
-            !previewError && (
+            !previewError &&
+            (structuralSummary.caveat !== null || structuralSummaryLine !== null) && (
               <div className="blob-row-structure" data-testid="blob-row-structure">
                 {structuralSummary.caveat && (
                   <p className="blob-row-structure-caveat">{structuralSummary.caveat}</p>

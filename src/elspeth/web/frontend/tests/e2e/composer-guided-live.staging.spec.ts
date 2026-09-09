@@ -20,8 +20,8 @@
 // real provider tokens, which is the point.
 //
 // Invocation (dev server):
-//   STAGING_BASE_URL=https://elspeth.foundryside.dev \
-//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.foundryside.dev \
+//   STAGING_BASE_URL=https://elspeth.example.gov.au \
+//   PLAYWRIGHT_BACKEND_BASE_URL=https://elspeth.example.gov.au \
 //   STAGING_USERNAME=... STAGING_PASSWORD=... \
 //   ELSPETH_RUN_COMPOSER_LIVE=1 \
 //   ELSPETH_LIVE_OUTPUTS_DIR=<server data_dir>/outputs \
@@ -46,6 +46,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
+import { switchToGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -109,7 +110,16 @@ test.describe("composer guided live — the colour test (staging)", () => {
       const composer = new ComposerPage(page);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
-      await page.getByRole("button", { name: "Switch to guided" }).click();
+      // Goal-first (elspeth-378cfa0e18): the switch card collects the session's
+      // goal, and the wizard is rooted on it — without a root intent the step-2
+      // finish refuses to plan. This walk is the colour PASS-THROUGH, so the
+      // goal names the source's own rows and no processing: the planner's one
+      // run at "Finish outputs" is expected to propose the empty transform set
+      // the wire stage below accepts.
+      await switchToGuidedWithGoal(
+        page,
+        "Write every colour row from the uploaded CSV to a JSON file, unchanged.",
+      );
       await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
       // ── Step 1 source: SINGLE_SELECT — CSV binds the uploaded blob ───────
@@ -208,7 +218,7 @@ test.describe("composer guided live — the colour test (staging)", () => {
 
       // Credential-egress confirmation: the run leaves the composer and uses
       // stored credentials, so an alertdialog interposes before execution.
-      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(runDialog).toBeVisible();
       await runDialog.getByRole("button", { name: "Run pipeline" }).click();
 

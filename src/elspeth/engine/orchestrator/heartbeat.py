@@ -4,26 +4,36 @@ Each run worker (currently only the N=1 leader) starts one
 :class:`RunHeartbeatThread` after the coordination seat is minted and joins
 it (via :meth:`RunHeartbeatThread.stop`) before every ``release_seat`` call.
 The thread shares ZERO Python state with the ``RowProcessor`` — it
-communicates through two :class:`threading.Event` flags:
+communicates through :class:`threading.Event` flags:
 
 - ``_stop_event``: set by the owner to signal the thread to exit; also used
   as the clock/sleep primitive via ``_stop_event.wait(interval)`` so that unit
   tests can inject a fast-forwarding ``wait_fn`` without real wall-clock sleeps.
+- ``_skip_final_beat_event``: set only for a known-terminal follower whose
+  membership row may already be departed, preventing shutdown from
+  misclassifying that clean departure as eviction.
 - ``_coordination_lost_event``: set by the thread when ``worker_heartbeat``
-  returns ``worker_active=False`` (this worker's registry row left ``active``)
+    returns ``WorkerMembershipLost`` (this worker's registry row left ``active``)
   OR when the snapshot's ``leader_worker_id`` differs from our own worker_id
   (deposed — another process took the seat). The drain loop raises
   :class:`~elspeth.contracts.errors.RunWorkerEvictedError` at the next
   boundary by polling :meth:`check_and_raise`.
+- ``_fatal_event``: set when a Tier-1 integrity failure must be re-raised by
+  the drain thread at its next boundary.
 
 Design invariants enforced here:
 
-- **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` (SQLite
-  busy-timeout) is logged at DEBUG and counted toward the ``heartbeat_degraded``
-  threshold ``k``; the thread never sets the latch on a DB error.
-- **Never self-terminate on DB errors** — the per-tick try/except swallows
-  contention and unexpected errors and continues looping; only a deliberate
-  ``_stop_event.set()`` exits the loop. EXCEPTION: Tier-1 integrity errors
+- **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` whose DBAPI
+  message is SQLite write-lock contention (``_is_lock_contention``) is logged
+  at DEBUG and counted toward the ``heartbeat_degraded`` threshold ``k``; the
+  thread never sets the latch on contention. An ``OperationalError`` that is
+  NOT contention (unable to open the database file, disk I/O error, a readonly
+  database) is an audit-store failure carrying no liveness evidence, and
+  latches like any other non-contention failure.
+- **Never self-terminate on DB errors** — the per-tick try/except contains
+  contention and continues looping; every other error latches a fatal failure
+  for the drain thread. A failure of the thread's own clock or diagnostic
+  channel also latches a fatal cause before the thread exits. Tier-1 integrity errors
   (e.g. a vanished ``run_workers`` row) are corruption, not contention — they
   latch a fatal exception that ``check_and_raise`` re-raises at the next
   drain boundary (fail closed; the thread still never raises on its own
@@ -32,15 +42,16 @@ Design invariants enforced here:
   verb) updates ``run_workers`` and, for the leader, ``run_coordination`` in a
   single BEGIN IMMEDIATE transaction; the two liveness clocks cannot skew in
   the worker-fresher-than-seat direction.
-- **Deterministic testability** — inject ``now_fn`` (defaults to
-  ``datetime.now(UTC)``) and ``wait_fn`` (defaults to ``stop_event.wait``);
-  unit tests step the beat with ``_step_beat()`` and an injected
-  ``wait_fn=lambda _: False`` to drive ticks without sleeping.
+- **Deterministic testability** — inject ``wait_fn`` (defaults to
+  ``stop_event.wait``); unit tests step the beat with ``_step_beat()`` and an
+  injected ``wait_fn=lambda _: False`` to drive ticks without sleeping. The
+  beat itself carries no clock: its deadline is the Landscape database's own
+  time (ADR-047). ``now_fn`` (defaults to ``datetime.now(UTC)``) stamps only
+  the forensic ``heartbeat_degraded`` record.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 from collections.abc import Callable
@@ -56,7 +67,9 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-    CoordinationToken,
+    CoordinationSnapshot,
+    WorkerMembershipLost,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
 
@@ -70,23 +83,38 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DEGRADED_THRESHOLD: int = 3
 
 
-class _HeartbeatSnapshot(Protocol):
-    """Snapshot fields consumed by the heartbeat thread."""
+def _is_lock_contention(exc: OperationalError) -> bool:
+    """True only for SQLite write-lock contention (SQLITE_BUSY / SQLITE_LOCKED).
 
-    @property
-    def leader_worker_id(self) -> str | None: ...
+    ``begin_write`` takes the WAL write lock at BEGIN IMMEDIATE and raises
+    ``OperationalError("database is locked")`` after the 5000 ms busy_timeout
+    poll; SQLITE_LOCKED renders as "database table is locked". Both driver
+    messages end in "is locked" and neither says anything about this worker's
+    liveness, which is what makes the BUSY = liveness-unknown arm legitimate.
 
-    @property
-    def worker_active(self) -> bool: ...
+    The message is read from the DBAPI exception (``exc.orig``), never from
+    ``str(exc)``: SQLAlchemy's rendering appends ``[SQL: <statement>]``, so a
+    statement that merely mentions a lock would read as contention. An
+    ``OperationalError`` carrying no DBAPI exception at all proves nothing
+    about contention and is reported as non-contention — this predicate gates
+    a fatal latch, so its unknown case must fail closed.
 
-    @property
-    def worker_role(self) -> str: ...
+    Every other ``OperationalError`` — unable to open the database file, disk
+    I/O error, a readonly database — is an audit-store failure rather than
+    contention, and the heartbeat must not silently count it as a busy tick.
+    """
+    origin = exc.orig
+    if origin is None:
+        return False
+    return "is locked" in str(origin).lower()
 
 
 class _HeartbeatRepository(Protocol):
     """Repository operations required by ``RunHeartbeatThread``."""
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> _HeartbeatSnapshot: ...
+    def worker_heartbeat(
+        self, *, member_token: WorkerMembershipToken, window_seconds: float
+    ) -> CoordinationSnapshot | WorkerMembershipLost: ...
 
     def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None: ...
 
@@ -96,7 +124,7 @@ class RunHeartbeatThread:
 
     Lifecycle::
 
-        thread = RunHeartbeatThread(repo, token=token, now_fn=..., ...)
+        thread = RunHeartbeatThread(repo, member_token=member_token, now_fn=..., ...)
         thread.start()
         try:
             # run body — call thread.check_and_raise() at every boundary
@@ -110,9 +138,13 @@ class RunHeartbeatThread:
         :class:`~elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository`
         instance backed by the run's engine, typed structurally here to avoid
         importing the concrete repository into the orchestrator layer.
-    token:
-        The leader's coordination token (worker_id + run_id); used to detect
-        seat deposition (snapshot ``leader_worker_id`` ≠ our ``worker_id``).
+    member_token:
+        This worker's :class:`~elspeth.contracts.coordination.WorkerMembershipToken`
+        (run_id + worker_id). The heartbeat is a MEMBER write (ADR-030 D4):
+        a follower carries the token ``admit_follower`` returned, a leader
+        derives its own from its coordination token
+        (``CoordinationToken.membership``). Also used to detect seat
+        deposition (snapshot ``leader_worker_id`` ≠ our ``worker_id``).
     heartbeat_seconds:
         Beat cadence; defaults to
         :data:`~elspeth.contracts.coordination.DEFAULT_RUN_HEARTBEAT_SECONDS`
@@ -122,8 +154,9 @@ class RunHeartbeatThread:
         :data:`~elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS`
         (80 s).
     now_fn:
-        Callable returning the current UTC datetime.  Inject a fixed-clock
-        callable in unit tests.
+        Callable returning the current UTC datetime, used only for the
+        forensic ``recorded_at`` of the ``heartbeat_degraded`` event; the
+        beat's deadline is database time (ADR-047).
     wait_fn:
         Called as ``wait_fn(interval_seconds) -> bool`` (same signature as
         :meth:`threading.Event.wait`); returns ``True`` when the stop event
@@ -138,7 +171,7 @@ class RunHeartbeatThread:
         self,
         repo: _HeartbeatRepository,
         *,
-        token: CoordinationToken,
+        member_token: WorkerMembershipToken,
         heartbeat_seconds: float = DEFAULT_RUN_HEARTBEAT_SECONDS,
         window_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         now_fn: Callable[[], datetime] | None = None,
@@ -146,13 +179,14 @@ class RunHeartbeatThread:
         degraded_threshold: int = _DEFAULT_DEGRADED_THRESHOLD,
     ) -> None:
         self._repo = repo
-        self._token = token
+        self._token = member_token
         self._heartbeat_seconds = heartbeat_seconds
         self._window_seconds = window_seconds
         self._now_fn: Callable[[], datetime] = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._degraded_threshold = degraded_threshold
 
         self._stop_event = threading.Event()
+        self._skip_final_beat_event = threading.Event()
         # wait_fn defaults to _stop_event.wait after construction so that
         # injected wait_fn overrides are honoured while still allowing the
         # default binding to reference the instance's own Event.
@@ -172,7 +206,7 @@ class RunHeartbeatThread:
         self._fatal_event = threading.Event()
         self._fatal_exc: BaseException | None = None
 
-        self._thread = threading.Thread(target=self._run, daemon=True, name=f"run-heartbeat:{token.run_id[:8]}")
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"run-heartbeat:{member_token.run_id[:8]}")
         self._consecutive_busy: int = 0
 
     # ------------------------------------------------------------------
@@ -183,13 +217,18 @@ class RunHeartbeatThread:
         """Start the background thread."""
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, final_beat: bool = True) -> None:
         """Signal the thread to stop and block until it exits.
 
         Must be called (in a ``finally`` block) before every ``release_seat``
         call so that the thread cannot beat the seat after the release vacates
-        it.  Idempotent — safe to call more than once.
+        it.  A follower that has already observed terminal run state may pass
+        ``final_beat=False``: finalization can atomically depart its membership
+        row before the follower stops, so another beat would misclassify that
+        clean departure as eviction.  Idempotent — safe to call more than once.
         """
+        if not final_beat:
+            self._skip_final_beat_event.set()
         self._stop_event.set()
         self._thread.join()
 
@@ -216,9 +255,23 @@ class RunHeartbeatThread:
         1. Fatal-integrity latch — a Tier-1 error captured by the beat thread
            (e.g. ``AuditIntegrityError`` for a vanished registry row) is
            re-raised verbatim; audit corruption outranks eviction semantics.
-        2. Coordination-lost latch — ``worker_active=False`` or seat
+        2. Coordination-lost latch — ``WorkerMembershipLost`` or seat
            deposition raises
            :class:`~elspeth.contracts.errors.RunWorkerEvictedError`.
+        """
+        self.raise_fatal_failure()
+        if self._coordination_lost_event.is_set():
+            raise RunWorkerEvictedError(
+                worker_id=self._token.worker_id,
+                run_id=self._token.run_id,
+            )
+
+    def raise_fatal_failure(self) -> None:
+        """Surface fatal thread failures, including the final shutdown beat.
+
+        Owners call this after joining and completing mandatory teardown.
+        Membership loss is deliberately separate: finalization may already
+        have departed the membership, but cannot excuse an integrity failure.
         """
         if self._fatal_event.is_set():
             if self._fatal_exc is None:
@@ -226,45 +279,65 @@ class RunHeartbeatThread:
                 # set, same thread) — but a bare latch must still fail closed.
                 raise contract_errors.OrchestrationInvariantError("fatal heartbeat latch set without a stored exception")
             raise self._fatal_exc
-        if self._coordination_lost_event.is_set():
-            raise RunWorkerEvictedError(
-                worker_id=self._token.worker_id,
-                run_id=self._token.run_id,
-            )
 
     # ------------------------------------------------------------------
     # Internal — the beat loop
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Thread entry point: beat loop, exits only when stop_event is set."""
-        while not self._wait_fn(self._heartbeat_seconds):
-            self._beat_once()
-        # Final beat on exit: keeps the seat live until release_seat is called
-        # (stop() is called in the finally block just before release_seat).
-        # Best-effort — never raises.
-        self._beat_once()
+        """Beat until stopped; transport failures of the thread itself too."""
+        try:
+            while not self._wait_fn(self._heartbeat_seconds):
+                self._beat_once()
+            # Join includes a final beat unless membership already departed.
+            if not self._skip_final_beat_event.is_set() and not self._coordination_lost_event.is_set():
+                self._beat_once()
+        except BaseException as exc:
+            # A failure of the clock or last-resort logger is outside the
+            # repository handlers. Transport it to the owner too: an uncaught
+            # daemon exception would otherwise leave a healthy-looking latch.
+            self._capture_fatal(exc)
+
+    def _capture_fatal(self, exc: BaseException) -> None:
+        """Publish the first fatal cause; later failures keep their own logs.
+
+        Only the beat thread writes this latch. The drain reads the exception
+        after the event is set, so its identity cannot change between the
+        publication check and the raise, even when another beat fails.
+        """
+        if not self._fatal_event.is_set():
+            self._fatal_exc = exc
+            self._fatal_event.set()
+        elif self._fatal_exc is not exc:
+            if self._fatal_exc is None:
+                raise contract_errors.OrchestrationInvariantError("fatal heartbeat latch set without a stored exception")
+            self._fatal_exc.add_note(f"Additional heartbeat failure: {type(exc).__name__}")
 
     def _beat_once(self) -> None:
         """Execute one heartbeat tick; NEVER raises.
 
-        Three outcomes:
+        Outcomes:
         1. ``worker_active=True``, and (if leader) snapshot
            ``leader_worker_id==our_id`` → healthy; reset busy counter.
-        2. ``worker_active=False`` → coordination lost; latch the flag.
+        2. ``WorkerMembershipLost`` (the membership fence refused this beat —
+           ADR-030 D4; the repository returns the refusal as this declared
+           outcome) → coordination lost; latch the flag.
            For a LEADER ONLY: foreign ``leader_worker_id`` (deposed) also
            latches.  A follower seeing a foreign leader is the NORMAL case
            (the follower is never the leader); follower deposed-latch is
-           triggered only by ``worker_active=False`` (eviction/departure).
+           triggered only by ``WorkerMembershipLost`` (eviction/departure).
         3. ``TIER_1_ERRORS`` (audit-integrity / framework invariant, e.g. a
            vanished registry row) → corruption, not contention: latch the
            exception for ``check_and_raise()`` to re-raise at the next drain
            boundary (fail closed); never raises on this thread's stack.
-        4. SQLITE_BUSY ``OperationalError`` → liveness-unknown; DEBUG log,
-           count toward degraded threshold, continue.
-        5. Any other exception (programming error / repository contract
-           regression) → liveness-unknown, but actionable: WARNING log with
-           traceback, count toward degraded threshold, continue.
+        4. Write-lock contention ``OperationalError`` (``_is_lock_contention``:
+           the DBAPI message is SQLITE_BUSY / SQLITE_LOCKED) → liveness-unknown;
+           DEBUG log, count toward degraded threshold, continue.
+        5. Any other ``OperationalError`` (unable to open the database file,
+           disk I/O error, readonly database) → an audit-store failure with no
+           liveness evidence: latch it for the drain thread and log it.
+        6. Any other exception (programming error / repository contract
+           regression) → latch the failure for the drain thread and log it.
 
         ADR-030 §B: ``snapshot.worker_role`` discriminates leader vs follower
         so that the deposed-latch is role-gated.  The field defaults to
@@ -273,8 +346,7 @@ class RunHeartbeatThread:
         """
         try:
             snapshot = self._repo.worker_heartbeat(
-                worker_id=self._token.worker_id,
-                now=self._now_fn(),
+                member_token=self._token,
                 window_seconds=self._window_seconds,
             )
             # Reset busy counter on any successful DB round-trip.
@@ -284,7 +356,7 @@ class RunHeartbeatThread:
             # Applies to BOTH leaders and followers: if the run_workers row is
             # no longer active the worker must stop (evicted by leader, or
             # departed at finalize).
-            if not snapshot.worker_active:
+            if isinstance(snapshot, WorkerMembershipLost):
                 logger.warning(
                     "run_heartbeat: worker %r row left 'active' in run %r (evicted or departed)",
                     self._token.worker_id,
@@ -322,8 +394,7 @@ class RunHeartbeatThread:
             # (elspeth-d0ce4e12af). The thread never raises on its own stack:
             # latch the exception and let check_and_raise() surface it at the
             # next drain boundary.
-            self._fatal_exc = exc
-            self._fatal_event.set()
+            self._capture_fatal(exc)
             logger.error(
                 "run_heartbeat: Tier-1 integrity failure for worker %r in run %r — failing closed at next drain boundary",
                 self._token.worker_id,
@@ -331,6 +402,22 @@ class RunHeartbeatThread:
                 exc_info=exc,
             )
         except OperationalError as exc:
+            if not _is_lock_contention(exc):
+                # NOT contention: an operational failure of the audit store
+                # itself (unable to open the database file, disk I/O error, a
+                # readonly database). It carries no evidence about this
+                # worker's liveness, so counting it as a busy tick would let
+                # the run keep traversing while its beat never lands. Fail
+                # closed at the next drain boundary, like every other
+                # non-contention failure this thread sees.
+                self._capture_fatal(exc)
+                logger.error(
+                    "run_heartbeat: non-contention operational failure for worker %r in run %r — failing closed at next drain boundary",
+                    self._token.worker_id,
+                    self._token.run_id,
+                    exc_info=exc,
+                )
+                return
             # BUSY = liveness-unknown (design §A.3): count toward degraded
             # threshold but never crash and never set the latch.
             self._consecutive_busy += 1
@@ -344,29 +431,46 @@ class RunHeartbeatThread:
             if self._consecutive_busy >= self._degraded_threshold:
                 self._emit_degraded()
         except Exception as exc:
-            # Unexpected (programming error / repository contract regression):
-            # still liveness-unknown — no latch, no crash — but actionable, so
-            # log WITH traceback at WARNING, never a DEBUG 'busy' line.
-            self._consecutive_busy += 1
-            logger.warning(
-                "run_heartbeat: unexpected error for worker %r in run %r (consecutive=%d)",
+            # Keep the heartbeat thread alive while making the owned-contract
+            # failure authoritative at the next drain boundary.
+            self._capture_fatal(exc)
+            logger.error(
+                "run_heartbeat: unexpected error for worker %r in run %r — failing closed at next drain boundary",
                 self._token.worker_id,
                 self._token.run_id,
-                self._consecutive_busy,
                 exc_info=exc,
             )
-            if self._consecutive_busy >= self._degraded_threshold:
-                self._emit_degraded()
 
     def _emit_degraded(self) -> None:
-        """Emit ``heartbeat_degraded`` event; best-effort, never raises."""
-        with contextlib.suppress(Exception):
+        """Emit the ``heartbeat_degraded`` event; latches any failure, never raises.
+
+        ``record_heartbeat_degraded`` delegates to the repository's
+        best-effort recorder, which already catches every ``SQLAlchemyError``
+        and reports it as the declared ``LOST_TO_DB_FAULT`` result, so audit
+        -store unavailability never reaches this frame. Anything that does
+        reach it is a breach of that owned contract rather than a DB
+        availability event, and is latched for ``check_and_raise`` at the next
+        drain boundary. Raising on this stack instead would kill the beat
+        thread before it can latch coordination-lost, so the latch is the
+        fail-closed form available here.
+        """
+        try:
             self._repo.record_heartbeat_degraded(
                 run_id=self._token.run_id,
                 worker_id=self._token.worker_id,
                 failures=self._consecutive_busy,
                 now=self._now_fn(),
             )
+        except contract_errors.TIER_1_ERRORS as exc:
+            self._capture_fatal(exc)
+            logger.error("run_heartbeat: degraded event integrity failed", exc_info=exc)
+        except Exception as exc:
+            # Every remaining failure — a broken repository contract, a
+            # programming fault — is authoritative, not DB availability. The
+            # caller is an exception handler, so re-raising here would kill
+            # the beat thread instead of notifying its owner.
+            self._capture_fatal(exc)
+            logger.error("run_heartbeat: degraded event invariant failed", exc_info=exc)
 
     # ------------------------------------------------------------------
     # Test seam: step a single beat synchronously

@@ -116,12 +116,12 @@ class RetryManager:
         # This ensures callback fires ONLY when a retry is actually scheduled,
         # never on the final attempt when retries are exhausted.
         def before_sleep_handler(retry_state: RetryCallState) -> None:
+            raise_if_shutdown_requested("during retry backoff")
             if on_retry:
                 exc = retry_state.outcome.exception() if retry_state.outcome else None
                 if exc is not None:
                     # Convert tenacity's 1-based attempt_number to 0-based for audit convention
                     on_retry(retry_state.attempt_number - 1, exc)
-            raise_if_shutdown_requested("during retry backoff")
 
         try:
             for attempt_state in Retrying(

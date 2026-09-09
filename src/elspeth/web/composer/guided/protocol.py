@@ -1,6 +1,6 @@
 """Guided-mode protocol: turn types, payloads, responses, legal-turn matrix.
 
-See docs/superpowers/specs/2026-05-11-composer-guided-mode-design.md §4.
+See docs/specs/2026-05-11-composer-guided-mode-design.md §4.
 """
 
 from __future__ import annotations
@@ -9,9 +9,12 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, TypedDict, cast
+from types import MappingProxyType
+from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.catalog.knob_schema import FieldTier
 from elspeth.web.catalog.knob_schema import SchemaFormPayload as SchemaFormPayload
 
 # Wire sentinel for a blob-backed source's ``path`` knob in a schema_form payload.
@@ -57,6 +60,7 @@ class SingleSelectPayload(TypedDict):
     question: str
     options: Sequence[_Option]
     allow_custom: bool
+    source_blob_compatible_option_ids: NotRequired[Sequence[str]]
 
 
 class MultiSelectWithCustomPayload(TypedDict):
@@ -177,6 +181,11 @@ class _CoalesceSuccessFlow(TypedDict):
     branch: str | None
 
 
+class _RowUnionSuccessFlow(TypedDict):
+    kind: Literal["row_union_success"]
+    branch: str | None
+
+
 class _OutputWriteFailureFlow(TypedDict):
     kind: Literal["output_write_failure"]
 
@@ -190,6 +199,7 @@ _ProposalFlow = (
     | _GateForkFlow
     | _QueueContinueFlow
     | _CoalesceSuccessFlow
+    | _RowUnionSuccessFlow
     | _OutputWriteFailureFlow
 )
 
@@ -210,9 +220,18 @@ class _TransformBehavior(TypedDict):
     kind: Literal["transform"]
 
 
+class _GateRouteBinding(TypedDict):
+    """One ordinal route alias bound to its author-visible route key."""
+
+    alias: str
+    key: str
+
+
 class _GateBehavior(TypedDict):
     kind: Literal["gate"]
+    condition: str
     route_aliases: Sequence[str]
+    routes: Sequence[_GateRouteBinding]
     fork_branches: Sequence[Mapping[str, Any]]
 
 
@@ -234,17 +253,47 @@ class _CoalesceBehavior(TypedDict):
     branch_aliases: Sequence[str]
     policy: Literal["require_all", "quorum", "best_effort", "first"]
     merge: Literal["union", "nested", "select"]
+    timeout_seconds: float | None
 
 
-_ProposalNodeBehavior = _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior
+class _RowUnionBehavior(TypedDict):
+    kind: Literal["row_union"]
+    branch_aliases: Sequence[str]
+    policy: Literal["require_all"]
+    timeout_seconds: float | None
+
+
+class _CollectorBehavior(TypedDict):
+    """EXPAND-scope closer: the scope binding projected by opener identity.
+
+    ``opener_stable_id`` is the projection's own stable id for the multi-row
+    transform whose expansion this collector closes; ``policy`` is the closed
+    arrival vocabulary (``ScopeSettings.policy``). The authored ``scope_name``
+    stays private: it has no semantics beyond binding the YAML ``scopes:``
+    entry, and the projection replaces canonical component names with server
+    ordinals/stable ids.
+    """
+
+    kind: Literal["collector"]
+    opener_stable_id: str
+    policy: Literal["require_all", "best_effort"]
+
+
+_ProposalNodeBehavior = (
+    _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior | _RowUnionBehavior | _CollectorBehavior
+)
 
 
 class _ProposalNodeSummary(TypedDict):
     stable_id: str
     label: str
-    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce"]
+    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union", "collector"]
     plugin: _ProposalPluginRef | None
     behavior: _ProposalNodeBehavior
+    # Allowlisted key options as pre-rendered display pairs; see
+    # ``_NODE_OPTION_SUMMARY_ALLOWLIST``. Empty for a structural node or an
+    # unlisted plugin — the key itself is always present.
+    node_options_summary: Sequence[_NodeOptionSummary]
 
 
 class _ProposalOutputSummary(TypedDict):
@@ -264,9 +313,21 @@ class ProposePipelinePayload(TypedDict):
     """Redacted display/audit projection of a durable pipeline proposal.
 
     This projection is deliberately non-executable: it contains only
-    catalog-authoritative plugin identities, never component names, options,
-    prompts, paths, inline content, secret references, or model-authored
-    rationale. Exact canonical arguments remain in private proposal custody.
+    catalog-authoritative plugin identities, never component names, paths,
+    inline content, secret references, or model-authored rationale. Exact
+    canonical arguments remain in private proposal custody. The sole authored
+    values it publishes are the ones a human must see to accept the proposal
+    at all, each drawn from a closed server-owned allowlist: gate behavior
+    (the predicate and its trigger thresholds) and, per
+    ``_NODE_OPTION_SUMMARY_ALLOWLIST``, a node's key options rendered as
+    display text — including an llm node's model and prompts, which are the
+    decision the user is approving (I-2) — and, per
+    ``_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST``, options shown but never
+    correctable (web_scrape's responsible-scraping identity). Everything
+    outside those allowlists stays private. Only the first table is the
+    correction authority (``public_node_option_keys``), so a key goes there
+    only when the card renders its whole value: a partially rendered option
+    would be planner-writable on a correction with the card text unchanged.
     Human copy is selected from exact server-owned template ids; structural
     labels are deterministic ordinals rather than canonical route, branch, or
     component names. Task 4 must validate catalog and private-proposal
@@ -295,7 +356,7 @@ class ProposePipelinePayload(TypedDict):
 
 class _WireRowCardinality(TypedDict):
     input: Literal["none", "one", "batch", "branches", "many_producers"]
-    output: Literal["one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count"]
+    output: Literal["one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"]
     expected_output_count: str | None
 
 
@@ -332,6 +393,7 @@ class _WireNodeReview(TypedDict):
     guaranteed_fields: Sequence[str]
     row_cardinality: _WireRowCardinality
     structured_output_fields: Sequence[_WireStructuredOutputField]
+    node_options_summary: Sequence[_NodeOptionSummary]
 
 
 class _WireBusinessSchema(TypedDict):
@@ -468,8 +530,11 @@ class ChatTurn:
     persisted discriminator. User turns require both fields to be ``None``.
     Assistant turns require a kind; real replies require a ``None`` reason,
     while synthetic failures require one closed reason: quality rejection,
-    provider unavailability, or a safe response that was deliberately not
-    applied. There is no nested compatibility reader for omitted fields.
+    provider unavailability, a safe response that was deliberately not
+    applied, or a model-output defect (the provider answered but the reply
+    violated a tool's argument contract — retrying the same message is the
+    designed remedy, unlike the deterministic ``not_applied`` causes).
+    There is no nested compatibility reader for omitted fields.
     """
 
     role: ChatRole
@@ -478,7 +543,16 @@ class ChatTurn:
     step: GuidedStep
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None = None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied"] | None = None
+    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None = None
+    # The guided turn token under which this USER chat message was submitted —
+    # the occurrence the retry affordance must be bound to. Without it, Retry
+    # on a historical synthetic failure resubmits old prose under whatever
+    # token is CURRENT, applying stale intent against newer session state
+    # (elspeth-ea80e34fdc). Carried only by user turns recorded through the
+    # /guided/chat submission path; transcript-only user turns (respond-path
+    # revision instructions and corrections, which have no retry affordance)
+    # and assistant turns carry None.
+    turn_token: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.role) is not ChatRole:
@@ -495,9 +569,10 @@ class ChatTurn:
             "quality_guard",
             "unavailable",
             "not_applied",
+            "model_defect",
         ):
             raise ValueError(
-                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', or None; "
+                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', 'model_defect', or None; "
                 f"got {self.synthetic_failure_reason!r}"
             )
         if self.synthetic_failure_reason is not None and self.assistant_message_kind != "synthetic_failure":
@@ -518,6 +593,11 @@ class ChatTurn:
             raise TypeError(f"ts_iso must be str, got {type(self.ts_iso).__name__}")
         if self.ts_iso == "":
             raise ValueError("ts_iso must be non-empty")
+        if self.turn_token is not None:
+            if self.role is not ChatRole.USER:
+                raise ValueError("turn_token is not applicable to an ASSISTANT turn")
+            if type(self.turn_token) is not str or self.turn_token == "":
+                raise TypeError("turn_token must be a non-empty str or None")
 
 
 _LEGAL_TURN_MATRIX: Mapping[GuidedStep, frozenset[TurnType]] = {
@@ -561,6 +641,25 @@ _STEP_INDEX: Mapping[GuidedStep, int] = {
 }
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-protocol turn: LLM tool-call output or client-submitted wire payload, admitted at construction, durable load, and replay",
+    source_param="turn",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError on any deviation from the current turn schema — non-mapping turn, wrong top-level key set, "
+        "non-string type discriminator, a type outside the closed TurnType vocabulary, a step_index that does not match "
+        "the step, a turn type illegal for the step, or a non-mapping/invalid payload; never coerces or defaults silently. "
+        "Deliberately NOT claimed: on CONFIRM_WIRING, the business_schema, structured_output_fields, semantic_contracts, "
+        "warnings and blockers fields are checked only as bounded JSON via _public_json_error, NOT against their declared "
+        "TypedDict shapes, so e.g. business_schema.mode=123 is accepted despite being declared str"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_protocol.py::TestPayloadValidation::"
+        "test_validate_current_turn_rejects_recursively_malformed_nonproposal_payloads"
+    ),
+    test_fingerprint="3b25f11a2e6f12ef74d3c18e79a053c43cd43dfaf5e9d4d4687594721273e31b",
+)
 def validate_current_turn(step: GuidedStep, turn: Mapping[str, Any]) -> TurnType:
     """Validate one exact current-schema turn and return its discriminator.
 
@@ -639,7 +738,7 @@ _REQUIRED_KEYS: Mapping[TurnType, frozenset[str]] = {
 
 _ALLOWED_KEYS: Mapping[TurnType, frozenset[str]] = {
     TurnType.INSPECT_AND_CONFIRM: frozenset({"observed"}),
-    TurnType.SINGLE_SELECT: frozenset({"question", "options", "allow_custom"}),
+    TurnType.SINGLE_SELECT: frozenset({"question", "options", "allow_custom", "source_blob_compatible_option_ids"}),
     TurnType.MULTI_SELECT_WITH_CUSTOM: frozenset({"question", "options", "default_chosen", "escape_label"}),
     TurnType.SCHEMA_FORM: frozenset({"mode", "knobs", "prefilled", "plugin"}),
     TurnType.REVIEW_COMPONENTS: _REQUIRED_KEYS[TurnType.REVIEW_COMPONENTS],
@@ -668,6 +767,32 @@ _PROPOSAL_BLOCKER_CATEGORY: Mapping[str, str] = {
 }
 PROPOSAL_SUMMARY_TEMPLATE = "guided.proposal.summary.full_graph.v1"
 PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1"
+# Transcript custody (R2-F6): the transform-stage prose revision and the
+# wire-stage correction are author-written instructions that drive a full
+# re-plan, but they arrived through ``/guided/respond`` and so never reached
+# ``GuidedSession.chat_history`` — the transcript the operator reads back.
+# The settlement branches append the author's verbatim instruction plus one
+# of these server-authored outcome lines, so the conversation reads as a
+# request and its answer rather than an unexplained new proposal. Named
+# constants (not inline literals) so the assertion in the integration tests
+# binds the exact rendered text.
+GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT = "I re-planned the whole pipeline with that instruction. Review the updated proposal below."
+GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the selected component with that correction. Review the updated proposal below."
+GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the pipeline with that wiring correction. Review the updated wiring below."
+# Goal-first entry: ``/guided/start`` and ``/guided/convert`` now REQUIRE the
+# author's one-sentence goal, seed it as the session's first user turn, and
+# follow it with this single server-authored line so the transcript opens on
+# the source question instead of on silence.
+#
+# The copy is deliberately a server statement about what the SERVER will do,
+# never a claim that the assistant has read the goal: the Step-1/Step-2 chat
+# solver is handed the step skill, the user's message, and
+# ``build_step_chat_context_block`` — never ``GuidedSession.chat_history`` — so
+# "I read your goal" would be false at the very next turn. The planner is the
+# one reader, at the Step-2 finish, which is exactly what this line promises.
+GUIDED_GOAL_ACKNOWLEDGEMENT = (
+    "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?"
+)
 _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "pipeline_invalid": "guided.proposal.blocker.pipeline_invalid.v1",
     "policy_review_required": "guided.proposal.blocker.policy_review_required.v1",
@@ -675,7 +800,23 @@ _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "interpretation_required": "guided.proposal.blocker.interpretation_required.v1",
 }
 _COMPONENT_KINDS = frozenset({"source", "node", "edge", "output"})
-_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce"})
+_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union", "collector"})
+# Per-kind legal flow kinds for node-origin edges. Module-level BESIDE
+# _NODE_TYPES so the two vocabularies cannot drift apart silently: extending
+# _NODE_TYPES without a flows arm here fails the coverage pin in
+# test_collector_guard.py, and the validator returns a typed verdict rather
+# than crashing on the miss.
+_LEGAL_NODE_FLOWS: Mapping[str, frozenset[str]] = {
+    "transform": frozenset({"node_success", "node_error"}),
+    "aggregation": frozenset({"node_success", "node_error"}),
+    "gate": frozenset({"gate_route", "gate_fork"}),
+    "queue": frozenset({"queue_continue"}),
+    "coalesce": frozenset({"coalesce_success"}),
+    "row_union": frozenset({"row_union_success"}),
+    # A collector flushes to on_success only. Failures are whole-group
+    # verdicts settled structurally through scope policy and nesting.
+    "collector": frozenset({"node_success"}),
+}
 _FLOW_KINDS = frozenset(
     {
         "source_success",
@@ -686,6 +827,7 @@ _FLOW_KINDS = frozenset(
         "gate_fork",
         "queue_continue",
         "coalesce_success",
+        "row_union_success",
         "output_write_failure",
     }
 )
@@ -720,6 +862,314 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
     return f"{kind}-{index + 1}"
 
 
+# ── Key transform options at the review surfaces (R2-F3) ─────────────────────
+#
+# Both review cards used to render only the behavior discriminant, so every
+# transform read as "transforms each incoming item" — a field_mapper's renames
+# and its drop-the-rest projection were invisible on the surfaces an operator
+# accepts. This projects those knobs as pre-rendered {key, value} text.
+#
+# The allowlist is a CLOSED server-owned vocabulary keyed by plugin, and it is
+# enforced by the validator, not just by the projector — same hygiene rationale
+# as ``_wire_schema``: path-, credential-, and prompt-adjacent options must
+# never reach a public projection, so adding a plugin here is a deliberate
+# per-option decision rather than a whole-options dump.
+# Each allowlisted key carries its presentational catalog tier
+# (elspeth-ca456d9d8d). Per-plugin on purpose: adding a plugin or a key here is
+# a deliberate per-option decision, and two plugins may tier a same-named knob
+# differently. The tier lives here rather than being derived because both
+# projections and the audit verifier's re-derivation run without a catalog
+# handle; tests/unit/web/catalog/test_guided_option_tier_parity.py pins every
+# entry to the lowering.
+_NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
+    "field_mapper": {"mapping": "common", "select_only": "common"},
+    # The llm node's decision inputs (design review 2026-09-02, I-2): what
+    # the model is asked to do was invisible until the post-commit approval
+    # card, so the learner approved a pipeline whose most consequential
+    # authored value they had never seen. Model, system prompt and prompt
+    # template are planner-authored text, not row data; the adjacent
+    # credentials, endpoints, ``*_source`` file paths and sampling knobs stay
+    # private. Order is display order: model first, then the prompts.
+    "llm": {"model": "common", "system_prompt": "common", "prompt_template": "common"},
+    # NOT here: web_scrape's ``http`` object — see
+    # _NODE_OPTION_DISPLAY_ONLY_ALLOWLIST. Every key in THIS table is also
+    # what ``public_node_option_keys`` lets a node-scoped correction
+    # overwrite (planning.py replaces the object wholesale and drops it when
+    # a full candidate omits it), so a key whose value the card renders only
+    # in part would be planner-writable unseen (Phase 1 red-team finding F1,
+    # 2026-09-02). List a key here only when its renderer publishes the
+    # whole value.
+}
+# Options the review cards SHOW but a correction may NEVER touch. Same tier
+# semantics and the same renderer table as the allowlist above; the one
+# difference is that ``public_node_option_keys`` does not return these keys,
+# so the node-patch schema never advertises them and the binder never
+# overlays them — the reviewed value always comes back from the predecessor.
+# web_scrape's ``http`` object carries the SSRF host allowlist, timeout and
+# body cap beside the two responsible-scraping declarations the card renders
+# (the material of the post-commit ``web_scrape_http_identity`` decision);
+# display-only is what lets the identity show before commit without making
+# the policy writable. A key may appear in exactly one of the two tables
+# (pinned by tests/unit/web/composer/guided/test_protocol.py).
+_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST: Mapping[str, Mapping[str, FieldTier]] = {
+    "web_scrape": {"http": "common"},
+}
+
+
+def _node_option_display_tiers(plugin: str | None) -> dict[str, FieldTier]:
+    """Every option key the cards render for ``plugin``, correctable first."""
+
+    # Membership form, not ``.get``: an absent plugin (structural node or an
+    # unlisted plugin) legitimately renders nothing, and the two signed R1
+    # reads of the correctable table below already carry that adjudication.
+    tiers: dict[str, FieldTier] = {}
+    if plugin is not None and plugin in _NODE_OPTION_SUMMARY_ALLOWLIST:
+        tiers.update(_NODE_OPTION_SUMMARY_ALLOWLIST[plugin])
+    if plugin is not None and plugin in _NODE_OPTION_DISPLAY_ONLY_ALLOWLIST:
+        tiers.update(_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST[plugin])
+    return tiers
+
+
+_MAX_NODE_OPTION_SUMMARY_PAIRS = 20
+_MAX_NODE_OPTION_SUMMARY_VALUE = 240
+# The prompt keys reach the card under the SAME bound the post-commit approval
+# card already publishes the prompt at — ``InterpretationEventResponse.llm_draft``
+# (sessions/schemas.py, max_length=8192) — so the projection reuses that
+# boundary rather than adding a second one; the parity is pinned by
+# tests/unit/web/composer/guided/test_protocol.py.
+_MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE = 8_192
+# Room reserved at the tail of a cut prompt for the honest "… (N more
+# characters not shown)" marker: the text is what the user is approving, so
+# it is never cut silently.
+_NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE = 64
+_NODE_OPTION_SUMMARY_PROMPT_KEYS = frozenset({"prompt_template", "system_prompt"})
+
+
+def _node_option_summary_value_bound(key: str) -> int:
+    """The rendered-length bound for one allowlisted option key."""
+
+    return _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE if key in _NODE_OPTION_SUMMARY_PROMPT_KEYS else _MAX_NODE_OPTION_SUMMARY_VALUE
+
+
+# The two accepted projected-pair shapes: fresh projections always carry
+# ``tier``, durable turns written before it landed do not.
+_NODE_OPTION_SUMMARY_PAIR_KEYS = frozenset({"key", "value"})
+_NODE_OPTION_SUMMARY_PAIR_KEYS_WITH_TIER = frozenset({"key", "value", "tier"})
+
+
+class _NodeOptionSummary(TypedDict):
+    key: str
+    value: str
+    # Emitted on every fresh projection; NotRequired because durable turns
+    # written before the tier landed replay through the same shape.
+    tier: NotRequired[FieldTier]
+
+
+@trust_boundary(
+    tier=3,
+    source="authored node option value carried on a guided proposal: LLM tool-call output of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns bounded display text, or the empty string for a non-mapping value and for a mapping with no "
+        "exact-string pairs; never coerces a non-string key or target into the rendered text and never raises. "
+        "The Mapping ABC check is the parse — a proposal reaching this renderer on the replay path is "
+        "deep-frozen to MappingProxyType — while each pair is held to exact ``str`` by ``type(...) is str``"
+    ),
+    non_raising=True,
+)
+def _rendered_mapping(value: object) -> str:
+    """Render ``{source: target}`` renames as bounded "src → dst" display text."""
+
+    if not isinstance(value, Mapping):
+        return ""
+    pairs = [f"{source} → {target}" for source, target in value.items() if type(source) is str and type(target) is str]
+    if not pairs:
+        return ""
+    shown = pairs[:_MAX_NODE_OPTION_SUMMARY_PAIRS]
+    remaining = len(pairs) - len(shown)
+    rendered = ", ".join(shown) + (f", +{remaining} more" if remaining > 0 else "")
+    if len(rendered) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return rendered[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return rendered
+
+
+def _rendered_select_only(value: object) -> str:
+    """Name the consequence of the projection flag, not the flag's literal."""
+
+    if value is True:
+        return "only the mapped fields are kept"
+    if value is False:
+        return "unmapped fields pass through"
+    return ""
+
+
+def _rendered_short_text(value: object) -> str:
+    """Render an exact-string scalar (the llm ``model``) verbatim, bounded."""
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return value[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return value
+
+
+def _rendered_prompt_text(value: object) -> str:
+    """Render a prompt verbatim up to the approval card's bound.
+
+    Past the bound the text is cut with an explicit remaining-character count:
+    the prompt is the thing the user is approving, so a silent cut would show
+    them a different instruction than the one the pipeline will run.
+    """
+
+    if type(value) is not str or not value.strip():
+        return ""
+    if len(value) <= _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE:
+        return value
+    shown = value[: _MAX_NODE_OPTION_SUMMARY_PROMPT_VALUE - _NODE_OPTION_SUMMARY_PROMPT_MARKER_RESERVE]
+    return f"{shown}… ({len(value) - len(shown)} more characters not shown)"
+
+
+def _rendered_scrape_identity(value: object) -> str:
+    """Render web_scrape's ``http`` identity as "contact: …; reason: …".
+
+    Only the two responsible-scraping declarations are published; every other
+    member of the ``http`` mapping (the SSRF host allowlist, timeout, body cap)
+    is private. A member that is absent, empty or not an exact string is
+    omitted rather than defaulted, and both missing renders to nothing. This
+    partial rendering is exactly why ``http`` lives in the display-only table:
+    a correction must never be able to rewrite the members the card omits.
+    """
+
+    # Exact types, not an ABC test: the value is either the planner's JSON
+    # object (a dict) or the same object deep-frozen for replay
+    # (contracts/freeze.py renders every mapping as MappingProxyType). Those
+    # are the only two producers, so the exact-type idiom IS exact here.
+    if type(value) is not dict and type(value) is not MappingProxyType:
+        return ""
+    parts: list[str] = []
+    for member, label in (("abuse_contact", "contact"), ("scraping_reason", "reason")):
+        text = value[member] if member in value else None
+        if type(text) is str and text.strip():
+            parts.append(f"{label}: {text.strip()}")
+    return _rendered_short_text("; ".join(parts))
+
+
+_NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
+    "mapping": _rendered_mapping,
+    "select_only": _rendered_select_only,
+    "model": _rendered_short_text,
+    "system_prompt": _rendered_prompt_text,
+    "prompt_template": _rendered_prompt_text,
+    "http": _rendered_scrape_identity,
+}
+
+
+@trust_boundary(
+    tier=3,
+    source="authored node options carried on a guided proposal: LLM tool-call output of unknown shape",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns only pairs whose key is in the server-owned allowlist for ``plugin`` and whose renderer "
+        "produced non-empty bounded text, each pair carrying the allowlist's presentational ``tier``; returns "
+        "[] for a non-mapping ``options``, an unlisted plugin, or a structural node, and never raises. The "
+        "Mapping ABC check is the parse — a proposal reaching this projection on the replay path is "
+        "deep-frozen to MappingProxyType, which an exact-dict test would reject"
+    ),
+    non_raising=True,
+)
+def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list[_NodeOptionSummary]:
+    """Project one node's allowlisted key options as bounded display pairs.
+
+    Returns ``[]`` for a structural node, an unlisted plugin, or an allowlisted
+    knob whose authored value renders to nothing — the review surfaces render
+    an empty summary as "no key options", never as a missing section. Both
+    the correctable and the display-only tables are rendered here; only the
+    former is returned by ``public_node_option_keys``.
+    """
+
+    tiers = _node_option_display_tiers(plugin)
+    if not tiers or not isinstance(options, Mapping):
+        return []
+    summary: list[_NodeOptionSummary] = []
+    for key, tier in tiers.items():
+        if key not in options:
+            continue
+        value = _NODE_OPTION_SUMMARY_RENDERERS[key](options[key])
+        if value:
+            summary.append({"key": key, "value": value, "tier": tier})
+    return summary
+
+
+def public_node_option_keys(plugin: str | None) -> frozenset[str]:
+    """Return the exact option-key authority exposed for one node plugin.
+
+    The review projection is deliberately lossy display text, so callers must
+    never reconstruct private options from it.  This closed key set is the
+    only authority a selected-node correction may use when overlaying a
+    provider candidate onto the server-held predecessor.
+    """
+
+    if plugin is not None and type(plugin) is not str:
+        raise TypeError("plugin must be an exact string or None")
+    return frozenset(_NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", {}).keys())
+
+
+def _node_options_summary_error(value: object, path: str, *, plugin: str | None) -> str | None:
+    """Reject any option pair outside the plugin's server-owned allowlist."""
+
+    items, error = _current_sequence(value, path)
+    if error is not None:
+        return error
+    assert items is not None
+    allowed = _node_option_display_tiers(plugin)
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        item_path = f"{path}[{index}]"
+        # A stored pair may LACK tier (pre-tier durable turns replay here) but
+        # may never carry an unknown key or a non-tier value. Both shapes are
+        # tried through _exact_nested_mapping, which owns the Mapping parse —
+        # this validator never re-asserts it (same delegation as the
+        # _current_sequence call above) — and a pair matching neither shape is
+        # reported against the canonical pre-tier key set.
+        pair, tier_error = _exact_nested_mapping(item, _NODE_OPTION_SUMMARY_PAIR_KEYS_WITH_TIER, item_path)
+        if tier_error is not None:
+            pair, error = _exact_nested_mapping(item, _NODE_OPTION_SUMMARY_PAIR_KEYS, item_path)
+            if error is not None:
+                return error
+        assert pair is not None
+        if "tier" in pair and pair["tier"] not in ("essential", "common", "advanced"):
+            return f"{item_path}.tier is not a composer field tier"
+        # ``allowed`` is a mapping and ``seen`` a set, so the key must be
+        # proven hashable-by-type before either membership test: the pair
+        # parse above proves the KEY SET of the pair, not the value types.
+        if type(pair["key"]) is not str or pair["key"] not in allowed:
+            return f"{item_path}.key is outside the node option summary allowlist"
+        if pair["key"] in seen:
+            return f"{item_path}.key duplicates another projected option"
+        seen.add(pair["key"])
+        if (error := _current_text_error(pair["value"], f"{item_path}.value", nonempty=True)) is not None:
+            return error
+        if len(cast(str, pair["value"])) > _node_option_summary_value_bound(pair["key"]):
+            return f"{item_path}.value exceeds the bounded option summary length"
+    return None
+
+
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping value or an inexact key set, and None only when "
+        "``value`` is a Mapping whose key set equals ``expected`` exactly; never coerces, never raises. "
+        "The Mapping ABC check is the parse: guided payloads reach this helper deep-frozen "
+        "(contracts/freeze.py renders every mapping as MappingProxyType), so an exact-dict test would "
+        "reject every durable-load and replay turn"
+    ),
+    non_raising=True,
+)
 def _exact_nested_keys(value: object, expected: frozenset[str], path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping (got {type(value).__name__})"
@@ -730,6 +1180,21 @@ def _exact_nested_keys(value: object, expected: frozenset[str], path: str) -> st
     if unexpected:
         return f"{path} has unexpected keys: {sorted(unexpected)}"
     return None
+
+
+def _exact_nested_mapping(value: object, expected: frozenset[str], path: str) -> tuple[Mapping[str, Any] | None, str | None]:
+    """Exact-key check that also hands the caller the narrowed mapping.
+
+    Callers used to re-assert ``isinstance(value, Mapping)`` after a successful
+    :func:`_exact_nested_keys` purely so the subsequent subscripts type-check —
+    a runtime re-check of a fact this module already proved. Returning the
+    narrowed value converges those call sites on the ``(value, error)`` idiom
+    :func:`_sequence_of_mappings` and :func:`_current_sequence` already use,
+    so the shape is proven in exactly one place.
+    """
+    if (error := _exact_nested_keys(value, expected, path)) is not None:
+        return None, error
+    return cast(Mapping[str, Any], value), None
 
 
 def _canonical_uuid_error(value: object, path: str) -> str | None:
@@ -744,6 +1209,21 @@ def _canonical_uuid_error(value: object, path: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns (None, error) for anything that is not a non-textual sequence of mappings and "
+        "(the same object, None) otherwise; never coerces, never copies, never raises. The Sequence/Mapping "
+        "ABC checks are the parse and must stay ABC-shaped: deep_freeze renders wire lists as tuple "
+        "(FrozenJsonArray, a tuple subclass) and wire objects as MappingProxyType, so exact-type tests would "
+        "reject every durable-load and replay turn. The str/bytes exclusion is what stops a string being "
+        "admitted as a sequence of its characters"
+    ),
+    non_raising=True,
+)
 def _sequence_of_mappings(value: object, path: str) -> tuple[Sequence[Mapping[str, Any]] | None, str | None]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return None, f"{path} must be a sequence"
@@ -753,6 +1233,19 @@ def _sequence_of_mappings(value: object, path: str) -> tuple[Sequence[Mapping[st
     return cast(Sequence[Mapping[str, Any]], value), None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns (None, error) for anything that is not a non-textual sequence of exact strings and "
+        "(a materialised tuple copy, None) otherwise; never coerces, never raises. The Sequence ABC check is "
+        "the parse — deep_freeze renders wire lists as a tuple subclass, so an exact-list test would reject "
+        "every durable-load and replay turn — while the elements are held to exact ``str`` by ``type(item) is str``"
+    ),
+    non_raising=True,
+)
 def _sequence_of_strings(value: object, path: str) -> tuple[tuple[str, ...] | None, str | None]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return None, f"{path} must be a sequence"
@@ -794,6 +1287,20 @@ def _current_text_error(value: object, path: str, *, nullable: bool = False, non
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns (None, error) for anything that is not a non-textual sequence or that exceeds the bounded "
+        "item count, and (the same object, None) otherwise; never coerces, never raises. The Sequence ABC "
+        "check is the parse — deep_freeze renders wire lists as a tuple subclass, so an exact-list test would "
+        "reject every durable-load and replay turn — and the str/bytes exclusion stops a string being admitted "
+        "as a sequence of its characters"
+    ),
+    non_raising=True,
+)
 def _current_sequence(
     value: object,
     path: str,
@@ -825,6 +1332,21 @@ def _current_string_sequence(
     return tuple(decoded), None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for any value outside the bounded public JSON projection "
+        "(over-deep, non-finite float, over-long text, over-wide container, non-JSON leaf) and None otherwise; "
+        "never coerces and never falls back to ``str(value)``. Scalars are held to exact types "
+        "(``type(value) in (bool, int)`` / ``is float`` / ``is str``) while the container arm stays an "
+        "``isinstance`` Mapping test, because deep_freeze renders wire objects as MappingProxyType and an "
+        "exact-dict test would send every durable-load and replay payload down the sequence arm"
+    ),
+    non_raising=True,
+)
 def _public_json_error(value: object, path: str, *, depth: int = 0) -> str | None:
     """Validate a bounded JSON projection without coercion or object fallback."""
 
@@ -863,26 +1385,44 @@ def _validate_options(value: object, path: str) -> tuple[tuple[str, ...] | None,
     option_ids: list[str] = []
     for index, item in enumerate(items):
         item_path = f"{path}[{index}]"
-        if (error := _exact_nested_keys(item, frozenset({"id", "label", "hint"}), item_path)) is not None:
+        option, error = _exact_nested_mapping(item, frozenset({"id", "label", "hint"}), item_path)
+        if error is not None:
             return None, error
-        assert isinstance(item, Mapping)
-        if (error := _current_text_error(item["id"], f"{item_path}.id", nonempty=True)) is not None:
+        assert option is not None
+        if (error := _current_text_error(option["id"], f"{item_path}.id", nonempty=True)) is not None:
             return None, error
-        if (error := _current_text_error(item["label"], f"{item_path}.label", nonempty=True)) is not None:
+        if (error := _current_text_error(option["label"], f"{item_path}.label", nonempty=True)) is not None:
             return None, error
-        if (error := _current_text_error(item["hint"], f"{item_path}.hint", nullable=True)) is not None:
+        if (error := _current_text_error(option["hint"], f"{item_path}.hint", nullable=True)) is not None:
             return None, error
-        option_ids.append(cast(str, item["id"]))
+        option_ids.append(cast(str, option["id"]))
     if len(option_ids) != len(set(option_ids)):
         return None, f"{path} must not contain duplicate option ids"
     return tuple(option_ids), None
 
 
+@trust_boundary(
+    tier=3,
+    source="one externally derived sample row from an inspect-and-confirm wire payload",
+    source_param="sample",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error for a non-mapping sample or non-JSON contents, and None otherwise; "
+        "accepts frozen replay mappings without coercing a scalar or sequence into a row"
+    ),
+    non_raising=True,
+)
+def _validate_inspect_sample(sample: object, path: str) -> str | None:
+    if not isinstance(sample, Mapping):
+        return f"{path} must be a mapping"
+    return _public_json_error(sample, path)
+
+
 def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
-    observed = payload["observed"]
-    if (error := _exact_nested_keys(observed, frozenset({"columns", "samples", "warnings"}), "payload.observed")) is not None:
+    observed, error = _exact_nested_mapping(payload["observed"], frozenset({"columns", "samples", "warnings"}), "payload.observed")
+    if error is not None:
         return error
-    assert isinstance(observed, Mapping)
+    assert observed is not None
     if (error := _current_string_sequence(observed["columns"], "payload.observed.columns", unique=True)[1]) is not None:
         return error
     samples, error = _current_sequence(observed["samples"], "payload.observed.samples")
@@ -890,20 +1430,43 @@ def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
         return error
     assert samples is not None
     for index, sample in enumerate(samples):
-        if not isinstance(sample, Mapping):
-            return f"payload.observed.samples[{index}] must be a mapping"
-        if (error := _public_json_error(sample, f"payload.observed.samples[{index}]")) is not None:
+        if (error := _validate_inspect_sample(sample, f"payload.observed.samples[{index}]")) is not None:
             return error
     return _current_string_sequence(observed["warnings"], "payload.observed.warnings")[1]
 
 
+@trust_boundary(
+    tier=3,
+    source="guided single_select turn payload: LLM tool-call output or client-submitted wire payload, of unknown interior shape",
+    source_param="payload",
+    suppresses=("R1",),
+    invariant=(
+        "returns a path-rooted error string for a malformed question, options collection, allow_custom flag, "
+        "or source_blob_compatible_option_ids sequence, and None otherwise; never coerces, never raises. "
+        "``source_blob_compatible_option_ids`` is declared optional (absent from _REQUIRED_KEYS, present in "
+        "_ALLOWED_KEYS, both verified by validate_payload before dispatch), so the defaulted read preserves "
+        "the schema-defined absence semantics — an empty sequence — rather than fabricating an asserted value"
+    ),
+    non_raising=True,
+)
 def _validate_single_select_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _current_text_error(payload["question"], "payload.question", nonempty=True)) is not None:
         return error
-    if (error := _validate_options(payload["options"], "payload.options")[1]) is not None:
+    option_ids, error = _validate_options(payload["options"], "payload.options")
+    if error is not None:
         return error
     if type(payload["allow_custom"]) is not bool:
         return "payload.allow_custom must be a bool"
+    compatible_ids, error = _current_string_sequence(
+        payload.get("source_blob_compatible_option_ids", ()),
+        "payload.source_blob_compatible_option_ids",
+        unique=True,
+    )
+    if error is not None:
+        return error
+    assert option_ids is not None and compatible_ids is not None
+    if not set(compatible_ids).issubset(option_ids):
+        return "payload.source_blob_compatible_option_ids must reference declared option ids"
     return None
 
 
@@ -939,18 +1502,19 @@ def _validate_component_review_payload(payload: Mapping[str, Any]) -> str | None
     expected_item_keys = frozenset({"stable_id", "name", "plugin", "status"})
     for index, item in enumerate(items):
         path = f"payload.items[{index}]"
-        if (error := _exact_nested_keys(item, expected_item_keys, path)) is not None:
+        reviewed, error = _exact_nested_mapping(item, expected_item_keys, path)
+        if error is not None:
             return error
-        assert isinstance(item, Mapping)
-        if (error := _canonical_uuid_error(item["stable_id"], f"{path}.stable_id")) is not None:
+        assert reviewed is not None
+        if (error := _canonical_uuid_error(reviewed["stable_id"], f"{path}.stable_id")) is not None:
             return error
         for key in ("name", "plugin"):
-            if (error := _current_text_error(item[key], f"{path}.{key}", nonempty=True)) is not None:
+            if (error := _current_text_error(reviewed[key], f"{path}.{key}", nonempty=True)) is not None:
                 return error
-        if type(item["status"]) is not str or item["status"] != "reviewed":
+        if type(reviewed["status"]) is not str or reviewed["status"] != "reviewed":
             return f"{path}.status must be 'reviewed'"
-        stable_ids.append(cast(str, item["stable_id"]))
-        names.append(cast(str, item["name"]))
+        stable_ids.append(cast(str, reviewed["stable_id"]))
+        names.append(cast(str, reviewed["name"]))
     if len(stable_ids) != len(set(stable_ids)):
         return "payload.items must not contain duplicate stable ids"
     if len(names) != len(set(names)):
@@ -968,18 +1532,44 @@ def _validate_component_review_payload(payload: Mapping[str, Any]) -> str | None
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a knob-schema fragment carried on a guided turn payload: LLM tool-call output or client-submitted "
+        "wire value, of unknown interior shape"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for any deviation from the closed field grammar — a non-mapping "
+        "schema or field entry, missing/unexpected keys, a kind outside the closed vocabulary, or malformed "
+        "per-kind attributes — and None otherwise; never coerces, never raises. The Mapping ABC checks are "
+        "the parse (durable-load and replay values arrive deep-frozen as MappingProxyType); the name pre-pass "
+        "drops malformed entries only for forward-reference collection, and the per-field loop below rejects "
+        "every one of them"
+    ),
+    non_raising=True,
+)
 def _validate_knob_schema(value: object, path: str) -> str | None:
-    if (error := _exact_nested_keys(value, frozenset({"fields"}), path)) is not None:
+    schema, error = _exact_nested_mapping(value, frozenset({"fields"}), path)
+    if error is not None:
         return error
-    assert isinstance(value, Mapping)
-    fields, error = _current_sequence(value["fields"], f"{path}.fields")
+    assert schema is not None
+    fields, error = _current_sequence(schema["fields"], f"{path}.fields")
     if error is not None:
         return error
     assert fields is not None
     seen_names: set[str] = set()
     visibility_gated: set[str] = set()
+    # ``required_when`` targets may be declared LATER in the field list, so the
+    # whole name set is collected up front rather than accumulated as we go
+    # (``collision_policy`` lives on ``LocalFileSinkConfig`` while its target
+    # ``mode`` lives on the concrete sink subclass and therefore lowers after
+    # it). Malformed entries are dropped here and rejected by the per-field
+    # checks below.
+    all_names = {item["name"] for item in fields if isinstance(item, Mapping) and "name" in item and type(item["name"]) is str}
     required = frozenset({"name", "label", "kind", "required", "nullable"})
-    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when"})
+    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder", "required_when"})
     for index, item in enumerate(fields):
         field_path = f"{path}.fields[{index}]"
         if not isinstance(item, Mapping):
@@ -1002,6 +1592,8 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
         if type(item["required"]) is not bool or type(item["nullable"]) is not bool:
             return f"{field_path}.required and nullable must be bools"
         if "description" in item and (error := _current_text_error(item["description"], f"{field_path}.description")) is not None:
+            return error
+        if "placeholder" in item and (error := _current_text_error(item["placeholder"], f"{field_path}.placeholder")) is not None:
             return error
         if "tier" in item and (type(item["tier"]) is not str or item["tier"] not in _FIELD_TIERS):
             return f"{field_path}.tier is outside the closed tier vocabulary"
@@ -1026,17 +1618,45 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
             predicate = item["visible_when"]
             if (error := _exact_nested_keys(predicate, frozenset({"field", "equals"}), f"{field_path}.visible_when")) is not None:
                 return error
-            assert isinstance(predicate, Mapping)
             target = predicate["field"]
             if type(target) is not str or target not in seen_names or target in visibility_gated:
                 return f"{field_path}.visible_when.field must reference one ungated earlier field"
             if (error := _public_json_error(predicate["equals"], f"{field_path}.visible_when.equals")) is not None:
                 return error
             visibility_gated.add(name)
+        if "required_when" in item:
+            predicate = item["required_when"]
+            if (error := _exact_nested_keys(predicate, frozenset({"field", "equals"}), f"{field_path}.required_when")) is not None:
+                return error
+            target = predicate["field"]
+            # Deliberately weaker than the visible_when rule above: no
+            # earlier-field and no ungated requirement. required_when never
+            # gates RENDERING — the field is always drawn and the form reads
+            # sibling state — so declaration order carries no meaning here, and
+            # enforcing it would reject the only shape this key exists for.
+            if type(target) is not str or target not in all_names or target == name:
+                return f"{field_path}.required_when.field must reference another field on this schema"
+            if (error := _public_json_error(predicate["equals"], f"{field_path}.required_when.equals")) is not None:
+                return error
         seen_names.add(name)
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided schema_form turn payload: LLM tool-call output or client-submitted wire payload, of unknown shape",
+    source_param="payload",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a mode other than plugin_options, an absent or non-catalog "
+        "plugin id, a knob schema outside the closed field grammar, or a prefilled value that is not a bounded "
+        "public JSON object, and None otherwise; never coerces, never raises. The Mapping ABC check on "
+        "``prefilled`` is the parse that stops a list or scalar being admitted where an object is declared — "
+        "_public_json_error alone would accept either — and it stays ABC-shaped because durable-load and replay "
+        "payloads arrive deep-frozen as MappingProxyType"
+    ),
+    non_raising=True,
+)
 def _validate_schema_form_payload(payload: Mapping[str, Any]) -> str | None:
     if payload["mode"] != "plugin_options":
         return "payload.mode must be 'plugin_options'"
@@ -1046,11 +1666,26 @@ def _validate_schema_form_payload(payload: Mapping[str, Any]) -> str | None:
         return error
     if (error := _validate_knob_schema(payload["knobs"], "payload.knobs")) is not None:
         return error
+    # _public_json_error admits any JSON value, so this Mapping parse is what
+    # stops a list or scalar being accepted where an object is declared.
     if not isinstance(payload["prefilled"], Mapping):
         return "payload.prefilled must be a mapping"
     return _public_json_error(payload["prefilled"], "payload.prefilled")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-turn payload fragment: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping value, an over-wide mapping, or any non-empty-string "
+        "key or value, and None otherwise; never coerces, never raises. The Mapping ABC check is the parse: "
+        "durable-load and replay payloads arrive deep-frozen as MappingProxyType, which an exact-dict test "
+        "would reject"
+    ),
+    non_raising=True,
+)
 def _validate_string_mapping(value: object, path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
@@ -1064,6 +1699,26 @@ def _validate_string_mapping(value: object, path: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "guided confirm_wiring turn payload: LLM tool-call output or client-submitted wire content whose "
+        "top-level key set validate_payload has already proven, leaving every nested value of unknown shape"
+    ),
+    source_param="payload",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for any malformed nested value — including a semantic_contracts, "
+        "warnings, or blockers element that is not a Mapping — and None only when every projected component, "
+        "connection, contract, and confirmation flag is exactly shaped; never coerces, never raises. The "
+        "Mapping ABC element check is the parse, not a redundant guard: _current_sequence proves only the "
+        "container and returns that same sequence, and _public_json_error admits JSON scalars and sequences, "
+        "so an unchecked element would reach the item walk untyped. Every closed-vocabulary membership test "
+        "reachable from here is type-guarded before its frozenset/mapping lookup, so an authored list or "
+        "mapping is answered with that path's error string rather than raising TypeError: unhashable type"
+    ),
+    non_raising=True,
+)
 def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _canonical_uuid_error(payload["proposal_id"], "payload.proposal_id")) is not None:
         return error
@@ -1072,19 +1727,42 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         return "payload.draft_hash must be 64 lowercase hexadecimal characters"
     cardinality_keys = frozenset({"input", "output", "expected_output_count"})
     cardinality_inputs = frozenset({"none", "one", "batch", "branches", "many_producers"})
-    cardinality_outputs = frozenset({"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count"})
+    cardinality_outputs = frozenset(
+        {"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"}
+    )
 
-    def validate_cardinality(value: object, path: str) -> str | None:
-        if (nested_error := _exact_nested_keys(value, cardinality_keys, path)) is not None:
+    def validate_cardinality(
+        value: object,
+        path: str,
+        *,
+        owner_node_type: object | None = None,
+    ) -> str | None:
+        cardinality, nested_error = _exact_nested_mapping(value, cardinality_keys, path)
+        if nested_error is not None:
             return nested_error
-        assert isinstance(value, Mapping)
-        if value["input"] not in cardinality_inputs or value["output"] not in cardinality_outputs:
+        assert cardinality is not None
+        # The exact-key parse proves the KEYS only, never the value types, so
+        # both vocabulary tests are type-guarded first: a frozenset membership
+        # test on an authored list or mapping raises TypeError (unhashable),
+        # and this validator's contract is to return an error string.
+        if (
+            type(cardinality["input"]) is not str
+            or type(cardinality["output"]) is not str
+            or cardinality["input"] not in cardinality_inputs
+            or cardinality["output"] not in cardinality_outputs
+        ):
             return f"{path} is outside the closed cardinality vocabulary"
-        count = value["expected_output_count"]
+        count = cardinality["expected_output_count"]
         if count is not None and (nested_error := _canonical_integer_string_error(count, f"{path}.expected_output_count", positive=False)):
             return nested_error
-        if (count is not None) != (value["output"] == "expected_count"):
+        if (count is not None) != (cardinality["output"] == "expected_count"):
             return f"{path}.expected_output_count must exactly bind expected_count"
+        if cardinality["output"] == "one_per_branch" and owner_node_type != "row_union":
+            return f"{path}.output 'one_per_branch' is only valid for row_union nodes"
+        if owner_node_type == "row_union" and cardinality["input"] != "branches":
+            return f"{path}.input must be 'branches' for row_union nodes"
+        if owner_node_type == "row_union" and cardinality["output"] != "one_per_branch":
+            return f"{path}.output must be 'one_per_branch' for row_union nodes"
         return None
 
     sources, error = _current_sequence(payload["sources"], "payload.sources")
@@ -1101,23 +1779,24 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     source_keys = frozenset({"stable_id", "label", "plugin", "on_validation_failure", "guaranteed_fields", "row_cardinality"})
     for index, source in enumerate(sources):
         path = f"payload.sources[{index}]"
-        if (error := _exact_nested_keys(source, source_keys, path)) is not None:
+        wire_source, error = _exact_nested_mapping(source, source_keys, path)
+        if error is not None:
             return error
-        assert isinstance(source, Mapping)
-        if (error := _canonical_uuid_error(source["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_source is not None
+        if (error := _canonical_uuid_error(wire_source["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if source["stable_id"] in component_ids:
+        if wire_source["stable_id"] in component_ids:
             return f"{path}.stable_id duplicates another component"
-        component_ids[source["stable_id"]] = "source"
-        if (error := _current_text_error(source["label"], f"{path}.label", nonempty=True)) is not None:
+        component_ids[wire_source["stable_id"]] = "source"
+        if (error := _current_text_error(wire_source["label"], f"{path}.label", nonempty=True)) is not None:
             return error
-        if (error := _catalog_plugin_id_error(source["plugin"], f"{path}.plugin")) is not None:
+        if (error := _catalog_plugin_id_error(wire_source["plugin"], f"{path}.plugin")) is not None:
             return error
-        if error := _current_text_error(source["on_validation_failure"], f"{path}.on_validation_failure", nonempty=True):
+        if error := _current_text_error(wire_source["on_validation_failure"], f"{path}.on_validation_failure", nonempty=True):
             return error
-        if (error := _current_string_sequence(source["guaranteed_fields"], f"{path}.guaranteed_fields")[1]) is not None:
+        if (error := _current_string_sequence(wire_source["guaranteed_fields"], f"{path}.guaranteed_fields")[1]) is not None:
             return error
-        if (error := validate_cardinality(source["row_cardinality"], f"{path}.row_cardinality")) is not None:
+        if (error := validate_cardinality(wire_source["row_cardinality"], f"{path}.row_cardinality")) is not None:
             return error
 
     node_keys = frozenset(
@@ -1131,52 +1810,69 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
             "guaranteed_fields",
             "row_cardinality",
             "structured_output_fields",
+            "node_options_summary",
         }
     )
     for index, node in enumerate(nodes):
         path = f"payload.nodes[{index}]"
-        if (error := _exact_nested_keys(node, node_keys, path)) is not None:
+        wire_node, error = _exact_nested_mapping(node, node_keys, path)
+        if error is not None:
             return error
-        assert isinstance(node, Mapping)
-        if (error := _canonical_uuid_error(node["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_node is not None
+        if (error := _canonical_uuid_error(wire_node["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if node["stable_id"] in component_ids:
+        if wire_node["stable_id"] in component_ids:
             return f"{path}.stable_id duplicates another component"
-        component_ids[node["stable_id"]] = "node"
-        if (error := _current_text_error(node["label"], f"{path}.label", nonempty=True)) is not None:
+        component_ids[wire_node["stable_id"]] = "node"
+        if (error := _current_text_error(wire_node["label"], f"{path}.label", nonempty=True)) is not None:
             return error
-        if node["plugin"] is not None and (error := _catalog_plugin_id_error(node["plugin"], f"{path}.plugin")) is not None:
+        if wire_node["plugin"] is not None and (error := _catalog_plugin_id_error(wire_node["plugin"], f"{path}.plugin")) is not None:
             return error
-        if (error := _validate_node_behavior(node["node_type"], node["behavior"], path)) is not None:
+        if (error := _validate_node_behavior(wire_node["node_type"], wire_node["behavior"], path)) is not None:
             return error
         for name in ("required_fields", "guaranteed_fields"):
-            if (error := _current_string_sequence(node[name], f"{path}.{name}")[1]) is not None:
+            if (error := _current_string_sequence(wire_node[name], f"{path}.{name}")[1]) is not None:
                 return error
-        if (error := validate_cardinality(node["row_cardinality"], f"{path}.row_cardinality")) is not None:
+        if (
+            error := validate_cardinality(
+                wire_node["row_cardinality"],
+                f"{path}.row_cardinality",
+                owner_node_type=wire_node["node_type"],
+            )
+        ) is not None:
             return error
-        if (error := _public_json_error(node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
+        if (error := _public_json_error(wire_node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
+            return error
+        if (
+            error := _node_options_summary_error(
+                wire_node["node_options_summary"],
+                f"{path}.node_options_summary",
+                plugin=wire_node["plugin"] if type(wire_node["plugin"]) is str else None,
+            )
+        ) is not None:
             return error
 
     output_keys = frozenset({"stable_id", "label", "plugin", "on_write_failure", "required_fields", "business_schema"})
     schema_keys = frozenset({"mode", "fields", "guaranteed_fields", "required_fields"})
     for index, output in enumerate(outputs):
         path = f"payload.outputs[{index}]"
-        if (error := _exact_nested_keys(output, output_keys, path)) is not None:
+        wire_output, error = _exact_nested_mapping(output, output_keys, path)
+        if error is not None:
             return error
-        assert isinstance(output, Mapping)
-        if (error := _canonical_uuid_error(output["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_output is not None
+        if (error := _canonical_uuid_error(wire_output["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if output["stable_id"] in component_ids:
+        if wire_output["stable_id"] in component_ids:
             return f"{path}.stable_id duplicates another component"
-        component_ids[output["stable_id"]] = "output"
+        component_ids[wire_output["stable_id"]] = "output"
         for name in ("label", "on_write_failure"):
-            if (error := _current_text_error(output[name], f"{path}.{name}", nonempty=True)) is not None:
+            if (error := _current_text_error(wire_output[name], f"{path}.{name}", nonempty=True)) is not None:
                 return error
-        if (error := _catalog_plugin_id_error(output["plugin"], f"{path}.plugin")) is not None:
+        if (error := _catalog_plugin_id_error(wire_output["plugin"], f"{path}.plugin")) is not None:
             return error
-        if (error := _current_string_sequence(output["required_fields"], f"{path}.required_fields")[1]) is not None:
+        if (error := _current_string_sequence(wire_output["required_fields"], f"{path}.required_fields")[1]) is not None:
             return error
-        schema = output["business_schema"]
+        schema = wire_output["business_schema"]
         if (error := _exact_nested_keys(schema, schema_keys, f"{path}.business_schema")) is not None:
             return error
         if (error := _public_json_error(schema, f"{path}.business_schema")) is not None:
@@ -1191,32 +1887,37 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     seen_connections: set[str] = set()
     for index, connection in enumerate(connections):
         path = f"payload.connections[{index}]"
-        if (error := _exact_nested_keys(connection, connection_keys, path)) is not None:
+        wire_connection, error = _exact_nested_mapping(connection, connection_keys, path)
+        if error is not None:
             return error
-        assert isinstance(connection, Mapping)
-        if (error := _canonical_uuid_error(connection["stable_id"], f"{path}.stable_id")) is not None:
+        assert wire_connection is not None
+        if (error := _canonical_uuid_error(wire_connection["stable_id"], f"{path}.stable_id")) is not None:
             return error
-        if connection["stable_id"] in seen_connections:
+        if wire_connection["stable_id"] in seen_connections:
             return f"{path}.stable_id duplicates another connection"
-        seen_connections.add(connection["stable_id"])
-        if error := _validate_proposal_endpoint(connection["from_endpoint"], f"{path}.from_endpoint", allow_discard=False):
+        seen_connections.add(wire_connection["stable_id"])
+        if error := _validate_proposal_endpoint(wire_connection["from_endpoint"], f"{path}.from_endpoint", allow_discard=False):
             return error
-        if error := _validate_proposal_endpoint(connection["to_endpoint"], f"{path}.to_endpoint", allow_discard=True):
+        if error := _validate_proposal_endpoint(wire_connection["to_endpoint"], f"{path}.to_endpoint", allow_discard=True):
             return error
-        assert isinstance(connection["from_endpoint"], Mapping) and isinstance(connection["to_endpoint"], Mapping)
         for endpoint_name in ("from_endpoint", "to_endpoint"):
-            endpoint = connection[endpoint_name]
-            if endpoint.get("kind") != "discard" and component_ids.get(endpoint.get("stable_id")) != endpoint.get("kind"):
+            # Both endpoints were proven to be exact-key mappings by
+            # _validate_proposal_endpoint immediately above; a discard endpoint
+            # carries ONLY "kind", so the stable_id read must stay inside the
+            # non-discard arm rather than being hoisted above the condition.
+            endpoint = wire_connection[endpoint_name]
+            if endpoint["kind"] != "discard" and (
+                endpoint["stable_id"] not in component_ids or component_ids[endpoint["stable_id"]] != endpoint["kind"]
+            ):
                 return f"{path}.{endpoint_name} does not resolve to its advertised component kind"
-        if (error := _validate_proposal_flow(connection["flow"], f"{path}.flow")) is not None:
+        if (error := _validate_proposal_flow(wire_connection["flow"], f"{path}.flow")) is not None:
             return error
-        contract = connection["schema_contract"]
+        contract = wire_connection["schema_contract"]
         if contract is None:
             continue
         contract_path = f"{path}.schema_contract"
         if (error := _exact_nested_keys(contract, contract_keys, contract_path)) is not None:
             return error
-        assert isinstance(contract, Mapping)
         for key in ("from", "to"):
             if (error := _current_text_error(contract[key], f"{contract_path}.{key}", nonempty=True)) is not None:
                 return error
@@ -1252,12 +1953,13 @@ def _catalog_plugin_id_error(value: object, path: str) -> str | None:
 
 
 def _validate_plugin_ref(value: object, path: str, expected_kind: Literal["source", "transform", "sink"]) -> str | None:
-    if (error := _exact_nested_keys(value, frozenset({"kind", "id"}), path)) is not None:
+    reference, error = _exact_nested_mapping(value, frozenset({"kind", "id"}), path)
+    if error is not None:
         return error
-    assert isinstance(value, Mapping)
-    if value["kind"] != expected_kind:
+    assert reference is not None
+    if reference["kind"] != expected_kind:
         return f"{path}.kind must be {expected_kind!r}"
-    return _catalog_plugin_id_error(value["id"], f"{path}.id")
+    return _catalog_plugin_id_error(reference["id"], f"{path}.id")
 
 
 def _structural_alias_error(value: object, kind: Literal["route", "branch"], path: str) -> str | None:
@@ -1291,10 +1993,14 @@ def _validate_alias_sequence(
 
 
 def _finite_positive_number_error(value: object, path: str) -> str | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
+    # Exact-type, matching _public_json_error's JSON scalar arms: a wire number
+    # decodes to exactly int or float, and the exact test subsumes the bool
+    # special case for free (``type(True) is int`` is False). The exact-type
+    # form does not narrow the negative branch for mypy, hence the cast.
+    if type(value) not in (int, float):
         return f"{path} must be a finite positive number or null"
     try:
-        numeric = float(value)
+        numeric = float(cast(int | float, value))
     except OverflowError:
         return f"{path} must be a finite positive number"
     if not math.isfinite(numeric) or numeric <= 0:
@@ -1313,27 +2019,68 @@ def _canonical_integer_string_error(value: object, path: str, *, positive: bool)
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="guided proposal node behavior: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="behavior",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping behavior or any behavior whose key set and field "
+        "values do not exactly match the closed schema for ``node_type``, and None otherwise; never coerces, "
+        "never raises. The Mapping ABC check is the parse: durable-load and replay proposals arrive deep-frozen "
+        "as MappingProxyType, which an exact-dict test would reject"
+    ),
+    non_raising=True,
+)
 def _validate_node_behavior(node_type: object, behavior: object, path: str) -> str | None:
-    if node_type not in _NODE_TYPES:
+    # Type-guarded before the frozenset test: ``node_type`` is an authored
+    # wire value, and a membership test on an unhashable list or mapping
+    # raises TypeError instead of returning this validator's error string.
+    if type(node_type) is not str or node_type not in _NODE_TYPES:
         return f"{path}.node_type is not in the closed node vocabulary"
     if not isinstance(behavior, Mapping):
         return f"{path}.behavior must be a mapping"
     if "kind" not in behavior:
         return f"{path}.behavior missing required keys: ['kind']"
-    if behavior.get("kind") != node_type:
+    if behavior["kind"] != node_type:
         return f"{path}.behavior.kind must match node_type"
     behavior_path = f"{path}.behavior"
     if node_type in ("transform", "queue"):
         return _exact_nested_keys(behavior, frozenset({"kind"}), behavior_path)
     if node_type == "gate":
-        expected = frozenset({"kind", "route_aliases", "fork_branches"})
+        expected = frozenset({"kind", "condition", "route_aliases", "routes", "fork_branches"})
         if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        # The authored predicate is bounded non-empty text and NOTHING MORE:
+        # no re-parsing or classification here — expression validity and
+        # route/condition parity are validated upstream at candidate
+        # validation (state.py), and a third ExpressionParser site would
+        # drift (elspeth-224fab9702).
+        if (error := _current_text_error(behavior["condition"], f"{behavior_path}.condition", nonempty=True)) is not None:
             return error
         route_aliases, error = _validate_alias_sequence(
             behavior["route_aliases"], kind="route", path=f"{behavior_path}.route_aliases", minimum=1
         )
         if error is not None:
             return error
+        assert route_aliases is not None
+        # ``routes`` binds each ordinal alias to its author-visible route key,
+        # bijective with ``route_aliases`` in the same order (fork gates
+        # included — both lists derive from the same ordered route walk).
+        route_bindings, error = _sequence_of_mappings(behavior["routes"], f"{behavior_path}.routes")
+        if error is not None:
+            return error
+        assert route_bindings is not None
+        if len(route_bindings) != len(route_aliases):
+            return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+        for index, binding in enumerate(route_bindings):
+            binding_path = f"{behavior_path}.routes[{index}]"
+            if (error := _exact_nested_keys(binding, frozenset({"alias", "key"}), binding_path)) is not None:
+                return error
+            if binding["alias"] != route_aliases[index]:
+                return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+            if (error := _current_text_error(binding["key"], f"{binding_path}.key", nonempty=True)) is not None:
+                return error
         fork_branches, error = _sequence_of_mappings(behavior["fork_branches"], f"{behavior_path}.fork_branches")
         if error is not None:
             return error
@@ -1398,30 +2145,89 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         ):
             return error
         return None
-    expected = frozenset({"kind", "branch_aliases", "policy", "merge"})
+    if node_type == "row_union":
+        expected = frozenset({"kind", "branch_aliases", "policy", "timeout_seconds"})
+        if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        _, error = _validate_alias_sequence(
+            behavior["branch_aliases"],
+            kind="branch",
+            path=f"{behavior_path}.branch_aliases",
+            minimum=2,
+        )
+        if error is not None:
+            return error
+        if behavior["policy"] != "require_all":
+            return f"{behavior_path}.policy must be 'require_all'"
+        timeout_seconds = behavior["timeout_seconds"]
+        if (
+            timeout_seconds is not None
+            and (error := _finite_positive_number_error(timeout_seconds, f"{behavior_path}.timeout_seconds")) is not None
+        ):
+            return error
+        return None
+    if node_type == "collector":
+        expected = frozenset({"kind", "opener_stable_id", "policy"})
+        if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        if (error := _canonical_uuid_error(behavior["opener_stable_id"], f"{behavior_path}.opener_stable_id")) is not None:
+            return error
+        if behavior["policy"] not in ("require_all", "best_effort"):
+            return f"{behavior_path}.policy is outside the closed vocabulary"
+        return None
+    expected = frozenset({"kind", "branch_aliases", "policy", "merge", "timeout_seconds"})
     if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
         return error
     _, error = _validate_alias_sequence(behavior["branch_aliases"], kind="branch", path=f"{behavior_path}.branch_aliases", minimum=2)
     if error is not None:
         return error
-    if behavior["policy"] not in _COALESCE_POLICIES:
+    # Same type guard as the node_type vocabulary test above: the exact-key
+    # parse proves neither value's type, and an unhashable one would raise.
+    if type(behavior["policy"]) is not str or behavior["policy"] not in _COALESCE_POLICIES:
         return f"{behavior_path}.policy is outside the closed vocabulary"
-    if behavior["merge"] not in _COALESCE_MERGES:
+    if type(behavior["merge"]) is not str or behavior["merge"] not in _COALESCE_MERGES:
         return f"{behavior_path}.merge is outside the closed vocabulary"
+    timeout_seconds = behavior["timeout_seconds"]
+    if (
+        timeout_seconds is not None
+        and (
+            error := _finite_positive_number_error(
+                timeout_seconds,
+                f"{behavior_path}.timeout_seconds",
+            )
+        )
+        is not None
+    ):
+        return error
     return None
 
 
 def _validate_component_target(value: object, path: str) -> str | None:
-    error = _exact_nested_keys(value, frozenset({"kind", "stable_id"}), path)
+    target, error = _exact_nested_mapping(value, frozenset({"kind", "stable_id"}), path)
     if error is not None:
         return error
-    target = value
-    assert isinstance(target, Mapping)
+    assert target is not None
     if target["kind"] not in _COMPONENT_KINDS:
         return f"{path}.kind is not in the closed component vocabulary"
     return _canonical_uuid_error(target["stable_id"], f"{path}.stable_id")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided proposal/wire edge endpoint: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping endpoint, a discard endpoint where discard is not "
+        "allowed, an inexact key set, a kind outside the closed source/node/output vocabulary, or a non-canonical "
+        "stable_id, and None otherwise; never coerces, never raises. The discriminator read is ``value.get('kind')`` "
+        "rather than a subscript because the key set has not been proven yet at that point — a mapping with no "
+        "``kind`` must fall through to the exact-key check and be reported as a missing key, not crash this "
+        "non-raising validator. The Mapping ABC check is the parse: durable-load and replay endpoints arrive "
+        "deep-frozen as MappingProxyType"
+    ),
+    non_raising=True,
+)
 def _validate_proposal_endpoint(value: object, path: str, *, allow_discard: bool) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
@@ -1436,13 +2242,29 @@ def _validate_proposal_endpoint(value: object, path: str, *, allow_discard: bool
     return _canonical_uuid_error(value["stable_id"], f"{path}.stable_id")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided proposal/wire edge flow: LLM tool-call output or client-submitted wire value, of unknown shape",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a path-rooted error string for a non-mapping flow, a kind outside the closed _FLOW_KINDS "
+        "vocabulary, or a key set that does not exactly match the one that kind declares, and None otherwise; "
+        "never coerces, never raises. The discriminator read is ``value.get('kind')`` because the key set is "
+        "kind-dependent and therefore unproven at that point — an absent ``kind`` yields None, and a ``kind`` "
+        "of any non-string type is rejected by the type guard that precedes the _FLOW_KINDS test, so neither "
+        "reaches a frozenset membership test that would raise TypeError on an unhashable authored value. The "
+        "Mapping ABC check is the parse: durable-load and replay flows arrive deep-frozen as MappingProxyType"
+    ),
+    non_raising=True,
+)
 def _validate_proposal_flow(value: object, path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
     kind = value.get("kind")
-    if kind not in _FLOW_KINDS:
+    if type(kind) is not str or kind not in _FLOW_KINDS:
         return f"{path}.kind is outside the closed flow vocabulary"
-    if kind in ("source_success", "node_success", "queue_continue", "coalesce_success"):
+    if kind in ("source_success", "node_success", "queue_continue", "coalesce_success", "row_union_success"):
         if (error := _exact_nested_keys(value, frozenset({"kind", "branch"}), path)) is not None:
             return error
         branch = value["branch"]
@@ -1468,6 +2290,20 @@ def _validate_proposal_flow(value: object, path: str) -> str | None:
     return _structural_alias_error(value["branch"], "branch", f"{path}.branch")
 
 
+@trust_boundary(
+    tier=3,
+    source="guided propose_pipeline turn payload: LLM tool-call output or client-submitted wire payload, of unknown interior shape",
+    source_param="payload",
+    suppresses=("R1",),
+    invariant=(
+        "returns a path-rooted error string for any deviation from the proposal projection grammar and None "
+        "otherwise; never coerces, never raises. The branch-lineage walk's node_by_id lookup treats a "
+        "producer id absent from the payload's node-only index as the meaningful result 'not exclusively "
+        "branch-derived' (sources are legal producers but are indexed separately), not as a hidden "
+        "missing-key default"
+    ),
+    non_raising=True,
+)
 def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _canonical_uuid_error(payload["proposal_id"], "payload.proposal_id")) is not None:
         return error
@@ -1487,7 +2323,6 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     counts = payload["component_counts"]
     if error := _exact_nested_keys(counts, frozenset({"sources", "nodes", "edges", "outputs"}), "payload.component_counts"):
         return error
-    assert isinstance(counts, Mapping)
     for kind, maximum in (
         ("sources", _MAX_PROPOSAL_COMPONENTS),
         ("nodes", _MAX_PROPOSAL_COMPONENTS),
@@ -1503,7 +2338,6 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     graph = payload["graph"]
     if (error := _exact_nested_keys(graph, frozenset({"sources", "edges"}), "payload.graph")) is not None:
         return error
-    assert isinstance(graph, Mapping)
     sources, error = _sequence_of_mappings(graph["sources"], "payload.graph.sources")
     if error is not None:
         return error
@@ -1566,7 +2400,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     assert nodes is not None
     for index, node in enumerate(nodes):
         path = f"payload.nodes[{index}]"
-        expected = frozenset({"stable_id", "label", "node_type", "plugin", "behavior"})
+        expected = frozenset({"stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary"})
         if (error := _exact_nested_keys(node, expected, path)) is not None:
             return error
         if (error := _canonical_uuid_error(node["stable_id"], f"{path}.stable_id")) is not None:
@@ -1575,11 +2409,24 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.label must be the exact server ordinal label"
         if (error := _validate_node_behavior(node["node_type"], node["behavior"], path)) is not None:
             return error
-        if node["node_type"] in ("transform", "aggregation"):
+        # _validate_plugin_ref proves the exact {kind, id} key set AND that id
+        # is a catalog-shaped string, so the summary plugin is read straight
+        # out of the arm that validated it rather than re-probed here.
+        summary_plugin: str | None = None
+        if node["node_type"] in ("transform", "aggregation", "collector"):
             if (error := _validate_plugin_ref(node["plugin"], f"{path}.plugin", "transform")) is not None:
                 return error
+            summary_plugin = cast(str, node["plugin"]["id"])
         elif node["plugin"] is not None:
             return f"{path}.plugin must be null for a structural node"
+        if (
+            error := _node_options_summary_error(
+                node["node_options_summary"],
+                f"{path}.node_options_summary",
+                plugin=summary_plugin,
+            )
+        ) is not None:
+            return error
 
     outputs, error = _sequence_of_mappings(payload["outputs"], "payload.outputs")
     if error is not None:
@@ -1639,12 +2486,19 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     adjacency: dict[str, set[str]] = {stable_id: set() for stable_id in component_kind_by_id}
     adjacency[discard_id] = set()
     reverse_adjacency: dict[str, set[str]] = {stable_id: set() for stable_id in adjacency}
-    outgoing_flows: dict[str, list[Mapping[str, Any]]] = {}
-    incoming_edges: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
-    gate_routes: dict[str, list[str]] = {}
-    gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+    # Seeded DENSE over the domain each index is written on, the way adjacency
+    # and reverse_adjacency above already are, so every read below is a total
+    # lookup and a broken domain invariant surfaces as a crash instead of being
+    # relabelled "no flows" by a default. The write domains are proven in the
+    # edge loop: from_stable_id resolves in component_kind_by_id, to_stable_id
+    # resolves there or is discard_id, and gate_routes/gate_forks are written
+    # only for flow kinds whose expected_from_kind is "node".
+    outgoing_flows: dict[str, list[Mapping[str, Any]]] = {stable_id: [] for stable_id in component_kind_by_id}
+    incoming_edges: dict[str, list[tuple[str, Mapping[str, Any]]]] = {stable_id: [] for stable_id in adjacency}
+    gate_routes: dict[str, list[str]] = {stable_id: [] for stable_id in node_by_id}
+    gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {stable_id: [] for stable_id in node_by_id}
     branch_origins: dict[str, list[str]] = {}
-    branch_adjacency: dict[str, dict[str, set[str]]] = {}
+    branch_origin_gates: dict[str, list[str]] = {}
     branch_uses: list[tuple[str, str, str, str]] = []
 
     for index, edge in enumerate(edges):
@@ -1652,7 +2506,6 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         from_endpoint = edge["from_endpoint"]
         to_endpoint = edge["to_endpoint"]
         flow = edge["flow"]
-        assert isinstance(from_endpoint, Mapping) and isinstance(to_endpoint, Mapping) and isinstance(flow, Mapping)
         from_stable_id = from_endpoint["stable_id"]
         from_kind = from_endpoint["kind"]
         if component_kind_by_id.get(from_stable_id) != from_kind:
@@ -1677,14 +2530,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow is not legal for its from_endpoint kind"
         if from_kind == "node":
             node_type = node_by_id[from_stable_id]["node_type"]
-            legal_node_flows = {
-                "transform": frozenset({"node_success", "node_error"}),
-                "aggregation": frozenset({"node_success", "node_error"}),
-                "gate": frozenset({"gate_route", "gate_fork"}),
-                "queue": frozenset({"queue_continue"}),
-                "coalesce": frozenset({"coalesce_success"}),
-            }
-            if flow_kind not in legal_node_flows[node_type]:
+            if node_type not in _LEGAL_NODE_FLOWS:
+                # Typed verdict instead of a bare KeyError: a node kind with
+                # no legal flows on this surface must fail validation, not
+                # crash it.
+                return f"{path}.flow references node kind {node_type!r}, which has no legal flows on this surface"
+            if node_type == "collector" and flow_kind == "node_error":
+                return (
+                    f"{path}.flow declares unsupported collector on_error; collector failures are "
+                    "whole-group verdicts settled through scope policy and nesting"
+                )
+            if flow_kind not in _LEGAL_NODE_FLOWS[node_type]:
                 return f"{path}.flow is not legal for its node_type"
         legal_to_kinds = {
             "source_success": frozenset({"node", "output"}),
@@ -1695,54 +2551,140 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             "gate_fork": frozenset({"node", "output"}),
             "queue_continue": frozenset({"node", "output"}),
             "coalesce_success": frozenset({"node", "output"}),
+            "row_union_success": frozenset({"node"}),
             "output_write_failure": frozenset({"output", "discard"}),
         }
+        if flow_kind == "row_union_success" and to_kind != "node":
+            return f"{path}.row_union_success must target an ordinary processing or queue node"
         if to_kind not in legal_to_kinds[flow_kind]:
             return f"{path}.flow is not legal for its to_endpoint kind"
         if from_stable_id == to_stable_id:
             return f"{path} is a self-loop"
         branch = flow.get("branch")
-        if to_kind == "node" and node_by_id[to_stable_id]["node_type"] == "coalesce" and branch is None:
-            return f"{path}.flow into a coalesce node requires a branch alias"
+        if to_kind == "node" and node_by_id[to_stable_id]["node_type"] in ("coalesce", "row_union") and branch is None:
+            return f"{path}.flow into a correlated barrier node requires a branch alias"
         adjacency[from_stable_id].add(to_stable_id)
         reverse_adjacency[to_stable_id].add(from_stable_id)
-        outgoing_flows.setdefault(from_stable_id, []).append(flow)
-        incoming_edges.setdefault(to_stable_id, []).append((from_stable_id, flow))
+        outgoing_flows[from_stable_id].append(flow)
+        incoming_edges[to_stable_id].append((from_stable_id, flow))
         if flow_kind == "gate_route":
-            gate_routes.setdefault(from_stable_id, []).append(flow["route"])
+            gate_routes[from_stable_id].append(flow["route"])
         elif flow_kind == "gate_fork":
-            gate_forks.setdefault(from_stable_id, []).append((tuple(flow["routes"]), flow["branch"]))
+            gate_forks[from_stable_id].append((tuple(flow["routes"]), flow["branch"]))
             branch_origins.setdefault(flow["branch"], []).append(to_stable_id)
+            branch_origin_gates.setdefault(flow["branch"], []).append(from_stable_id)
         if branch is not None:
-            branch_graph = branch_adjacency.setdefault(branch, {})
-            branch_graph.setdefault(from_stable_id, set()).add(to_stable_id)
-            branch_graph.setdefault(to_stable_id, set())
             branch_uses.append((branch, from_stable_id, flow_kind, path))
+
+    def branch_downstream_ids(branch: str) -> set[str]:
+        """Components reachable from ``branch``'s authoritative gate_fork origin.
+
+        The origin is already the branch-specific target of its gate_fork edge.
+        From there, follow all directed routing, including descendant forks.
+        Outer siblings remain excluded because their gate_fork edges leave the
+        shared parent gate and are not reachable backwards from this origin.
+
+        Precondition: ``branch`` resolves in ``branch_origins``. Every caller
+        must prove that first; the sole call site does, immediately above it.
+        """
+
+        frontier = list(branch_origins[branch])
+        visited = set(frontier)
+        while frontier:
+            current = frontier.pop()
+            routed: set[str] = adjacency[current]
+            for target_id in routed - visited:
+                visited.add(target_id)
+                frontier.append(target_id)
+        return visited
+
+    def branch_producer_is_compatible(
+        branch: str,
+        producer_id: str,
+        *,
+        visiting: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Return whether one projected producer is exclusively branch-derived.
+
+        Ordinary nodes have one authoritative input, so one compatible
+        predecessor proves lineage. Queues and correlated barriers are fan-in
+        boundaries: every predecessor must derive from the branch, recursively.
+        This mirrors state._runtime_connection_is_downstream() and prevents one
+        valid queue path from hiding unrelated traffic.
+
+        Precondition: ``branch`` resolves in ``branch_origins`` (and therefore
+        in ``branch_origin_gates``, which is written in the same gate_fork
+        arm). The sole call site proves that immediately above it.
+        """
+
+        if producer_id in visiting:
+            return False
+        if producer_id not in node_by_id:
+            # Sources are legal producers but are indexed separately from the
+            # node-only index, so absence here is the meaningful result "not
+            # exclusively branch-derived", made explicit as a membership test.
+            return False
+        node = node_by_id[producer_id]
+        predecessors = incoming_edges[producer_id]
+        if not predecessors:
+            return False
+        next_visiting = visiting | {producer_id}
+        origin_gates = branch_origin_gates[branch]
+        origins = branch_origins[branch]
+
+        def predecessor_is_compatible(predecessor_id: str, flow: Mapping[str, Any]) -> bool:
+            if flow["kind"] == "gate_fork" and flow["branch"] == branch and predecessor_id in origin_gates and producer_id in origins:
+                return True
+            return branch_producer_is_compatible(
+                branch,
+                predecessor_id,
+                visiting=next_visiting,
+            )
+
+        compatibility = (predecessor_is_compatible(predecessor_id, flow) for predecessor_id, flow in predecessors)
+        if node["node_type"] in ("queue", "coalesce", "row_union"):
+            return all(compatibility)
+        return any(compatibility)
 
     for node in nodes:
         behavior = node["behavior"]
-        assert isinstance(behavior, Mapping)
         stable_id = node["stable_id"]
-        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows.get(stable_id, ()))
+        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows[stable_id])
         if node["node_type"] in ("transform", "aggregation"):
             if flow_kinds.count("node_success") != 1 or flow_kinds.count("node_error") != 1 or len(flow_kinds) != 2:
                 return "payload transform and aggregation nodes require exact success and error flows"
+        elif node["node_type"] == "collector":
+            if flow_kinds != ("node_success",):
+                return "payload collector node requires exactly one success flow and no error flow"
+            opener = node_by_id.get(cast(str, node["behavior"]["opener_stable_id"]))
+            if opener is None:
+                return "payload collector scope opener must reference a node in the payload"
         elif node["node_type"] == "gate":
-            direct_routes = gate_routes.get(stable_id, ())
+            direct_routes = gate_routes[stable_id]
             if len(direct_routes) != len(set(direct_routes)):
                 return "payload gate direct route aliases must each resolve exactly once"
-            fork_routes = tuple(route for routes, _ in gate_forks.get(stable_id, ()) for route in routes)
+            fork_routes = tuple(route for routes, _ in gate_forks[stable_id] for route in routes)
             if set(direct_routes) & set(fork_routes):
                 return "payload gate route alias cannot select both a direct target and a fork fanout"
             projected_routes = tuple(dict.fromkeys([*direct_routes, *fork_routes]))
             if projected_routes != tuple(behavior["route_aliases"]):
                 return "payload gate route aliases do not match its projected flows"
-            if tuple(gate_forks.get(stable_id, ())) != tuple((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"]):
+            # Bind each fork branch by ALIAS, not by edge position. A row_union
+            # releases in its authored ``branches`` order, so planning.py orders
+            # the barrier's incoming edges by that order — and when a gate forks
+            # STRAIGHT into the row_union those are the very gate_fork edges read
+            # here. Both orderings are authored and legitimate, and one edge list
+            # cannot express both, so compare the fork set by identity. The
+            # behavior's own ``fork_branches`` order still carries the authored
+            # ``fork_to`` order; only this cross-check stops reading position.
+            projected_forks = sorted(gate_forks[stable_id])
+            declared_forks = sorted((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"])
+            if projected_forks != declared_forks:
                 return "payload gate fork branches do not match its projected flows"
         elif node["node_type"] == "queue":
             if flow_kinds != ("queue_continue",):
                 return "payload queue node requires exactly one queue_continue flow"
-            if not incoming_edges.get(stable_id):
+            if not incoming_edges[stable_id]:
                 return "payload queue node requires at least one authoritative producer flow"
             queue_target = next(iter(adjacency[stable_id]))
             if queue_target not in node_by_id or node_by_id[queue_target]["node_type"] == "queue":
@@ -1750,26 +2692,56 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         elif node["node_type"] == "coalesce":
             if flow_kinds != ("coalesce_success",):
                 return "payload coalesce node requires exactly one coalesce_success flow"
-            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
+            # Every inbound flow carries a branch alias: the edge loop's
+            # correlated-barrier check ("flow into a correlated barrier node
+            # requires a branch alias") already rejected any edge into a
+            # coalesce or row_union node whose flow resolved no branch, so
+            # reading the key as a member here reports a broken invariant
+            # instead of silently dropping the flow from the comparison.
+            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges[stable_id])
             if incoming_branches != tuple(behavior["branch_aliases"]):
                 return "payload coalesce branch aliases do not match its incoming flows"
+        elif node["node_type"] == "row_union":
+            if flow_kinds != ("row_union_success",):
+                return "payload row_union node requires exactly one row_union_success flow"
+            # Same correlated-barrier guarantee as the coalesce arm above.
+            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges[stable_id])
+            if incoming_branches != tuple(behavior["branch_aliases"]):
+                return "payload row_union branch aliases do not match its incoming flows"
+            target_ids = adjacency[stable_id]
+            if len(target_ids) != 1:
+                return "payload row_union node requires exactly one ordinary processing or queue target"
+            target_id = next(iter(target_ids))
+            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in (
+                "transform",
+                "gate",
+                "aggregation",
+                "queue",
+                "collector",
+            ):
+                return "payload row_union success must target one ordinary processing or queue node"
+            origin_gates = {
+                gate_id for branch in behavior["branch_aliases"] if branch in branch_origin_gates for gate_id in branch_origin_gates[branch]
+            }
+            if len(origin_gates) != 1:
+                return "payload row_union branches must originate under one gate_fork"
 
     for source in sources:
-        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows.get(source["stable_id"], ()))
+        flow_kinds = tuple(flow["kind"] for flow in outgoing_flows[source["stable_id"]])
         if flow_kinds.count("source_success") != 1 or flow_kinds.count("source_validation_failure") != 1 or len(flow_kinds) != 2:
             return "payload source requires exact success and validation-failure flows"
 
     output_failure_targets: dict[str, str] = {}
     for output in outputs:
         stable_id = output["stable_id"]
-        output_flows = outgoing_flows.get(stable_id, ())
+        output_flows = outgoing_flows[stable_id]
         if len(output_flows) != 1 or output_flows[0]["kind"] != "output_write_failure":
             return "payload output requires exactly one write-failure flow"
         failure_targets = adjacency[stable_id]
         assert len(failure_targets) == 1
         output_failure_targets[stable_id] = next(iter(failure_targets))
     for target_id in output_failure_targets.values():
-        if target_id in component_ids["output"] and output_failure_targets.get(target_id) != discard_id:
+        if target_id in component_ids["output"] and output_failure_targets[target_id] != discard_id:
             return "payload output write-failure flows cannot form a failure chain"
 
     all_route_aliases = [alias for node in nodes if node["node_type"] == "gate" for alias in node["behavior"]["route_aliases"]]
@@ -1784,54 +2756,33 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     if branch_aliases != expected_branches or any(len(origins) != 1 for origins in branch_origins.values()):
         return "payload fork branch aliases must be globally unique server ordinals"
 
-    branch_coalesce_owner: dict[str, str] = {}
+    branch_barrier_owner: dict[str, str] = {}
     for node in nodes:
-        if node["node_type"] != "coalesce":
+        if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
-        assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
-            existing_owner = branch_coalesce_owner.get(branch)
-            if existing_owner is not None and existing_owner != node["stable_id"]:
-                return "payload fork branch alias cannot be consumed by more than one coalesce node"
-            branch_coalesce_owner[branch] = node["stable_id"]
+            if branch in branch_barrier_owner and branch_barrier_owner[branch] != node["stable_id"]:
+                return "payload fork branch alias cannot be consumed by more than one coalesce/row_union node"
+            branch_barrier_owner[branch] = node["stable_id"]
 
     for branch, from_stable_id, flow_kind, path in branch_uses:
-        origins = branch_origins.get(branch)
-        if origins is None or len(origins) != 1:
+        if branch not in branch_origins or len(branch_origins[branch]) != 1:
             return f"{path}.flow branch alias has no unique authoritative gate_fork origin"
         if flow_kind == "gate_fork":
             continue
-        branch_graph = branch_adjacency[branch]
-        frontier = list(origins)
-        visited = set(frontier)
-        while frontier:
-            current = frontier.pop()
-            for target_id in branch_graph.get(current, set()) - visited:
-                visited.add(target_id)
-                frontier.append(target_id)
-        if from_stable_id not in visited:
+        if not branch_producer_is_compatible(branch, from_stable_id):
             return f"{path}.flow branch alias is not downstream of its authoritative gate_fork origin"
 
     for node in nodes:
-        if node["node_type"] != "coalesce":
+        if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
-        assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
-            origins = branch_origins.get(branch)
-            if origins is None:
-                return "payload coalesce branch alias has no authoritative gate_fork origin"
-            branch_graph = branch_adjacency[branch]
-            frontier = list(origins)
-            visited = set(frontier)
-            while frontier:
-                current = frontier.pop()
-                for target_id in branch_graph.get(current, set()) - visited:
-                    visited.add(target_id)
-                    frontier.append(target_id)
-            if node["stable_id"] not in visited:
-                return "payload coalesce branch is not connected to its gate_fork origin"
+            if branch not in branch_origins:
+                return "payload correlated barrier branch alias has no authoritative gate_fork origin"
+            if node["stable_id"] not in branch_downstream_ids(branch):
+                return "payload correlated barrier branch is not connected to its gate_fork origin"
 
     indegree = dict.fromkeys(component_kind_by_id, 0)
     for from_id, target_ids in adjacency.items():
@@ -1934,7 +2885,6 @@ def validate_proposal_catalog_refs(
     if set(catalog_plugin_ids) != {"source", "transform", "sink"}:
         return "proposal catalog authority must provide exact source, transform, and sink sets"
     graph = payload["graph"]
-    assert isinstance(graph, Mapping)
     references: list[tuple[str, Mapping[str, Any]]] = []
     for source in cast(Sequence[Mapping[str, Any]], graph["sources"]):
         references.append(("payload.graph.sources", source["plugin"]))

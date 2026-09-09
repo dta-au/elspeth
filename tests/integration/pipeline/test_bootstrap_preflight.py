@@ -37,6 +37,8 @@ def _raw_sink_effect_preflight_boundary() -> Iterator[None]:
 class _GraphStub:
     """Minimal validated graph surface consumed by bootstrap/context wiring tests."""
 
+    escalation_fixpoint_bound = 1_000
+
     def validate(self) -> None:
         return None
 
@@ -107,6 +109,9 @@ def _make_bootstrap_config() -> SimpleNamespace:
         collection_probes=[],
         gates=[],
         coalesce=[],
+        row_unions=[],
+        scopes=[],
+        max_bound_region_depth=5,
         queues={},
         checkpoint=SimpleNamespace(enabled=True),
         rate_limit=SimpleNamespace(),

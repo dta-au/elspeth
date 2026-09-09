@@ -8,6 +8,8 @@ SDA-029 implementation for validation error audit trail.
 
 from datetime import UTC
 
+import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from tests.fixtures.factories import make_context
 
@@ -19,6 +21,8 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.lineage import explain
 from elspeth.core.landscape.schema import (
+    rows_table,
+    tokens_table,
     transform_errors_table,
     validation_errors_table,
 )
@@ -478,6 +482,71 @@ class TestErrorEventExplainQuery:
 
         assert lineage is not None
         assert [record.error_id for record in lineage.validation_errors] == [error_token.error_id]
+
+    def test_quarantine_link_failure_rolls_back_row_and_token(self, landscape_db: LandscapeDB) -> None:
+        """A failed validation-error link must roll back the quarantine row and token."""
+        factory = RecorderFactory(landscape_db)
+        run = factory.run_lifecycle.begin_run(config={"test": True}, canonical_version="1.0")
+        source_node = factory.data_flow.register_node(
+            run_id=run.run_id,
+            plugin_name="json_source",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0.0",
+            config={},
+            sequence=0,
+            schema_config=DYNAMIC_SCHEMA,
+        )
+        error_id = factory.data_flow.record_validation_error(
+            run_id=run.run_id,
+            node_id=source_node.node_id,
+            row_data={"raw": "invalid"},
+            error="invalid source row",
+            schema_mode="observed",
+            destination="quarantine_sink",
+        )
+
+        def fail_validation_error_link(
+            _conn: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            if statement.lstrip().upper().startswith("UPDATE VALIDATION_ERRORS"):
+                raise RuntimeError("injected validation-error linkage failure")
+
+        sqlalchemy_event.listen(landscape_db.engine, "before_cursor_execute", fail_validation_error_link)
+        try:
+            manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
+            with pytest.raises(RuntimeError, match="injected validation-error linkage failure"):
+                manager.create_quarantine_token(
+                    run_id=run.run_id,
+                    source_node_id=source_node.node_id,
+                    row_index=0,
+                    source_row=SourceRow.quarantined(
+                        row={"raw": "invalid"},
+                        error="invalid source row",
+                        destination="quarantine_sink",
+                        source_row_index=0,
+                    ),
+                    validation_error_id=error_id,
+                    source_row_index=0,
+                    ingest_sequence=0,
+                )
+        finally:
+            sqlalchemy_event.remove(landscape_db.engine, "before_cursor_execute", fail_validation_error_link)
+
+        with landscape_db.connection() as conn:
+            rows = conn.execute(select(rows_table.c.row_id).where(rows_table.c.run_id == run.run_id)).all()
+            tokens = conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == run.run_id)).all()
+            linked_row_id = conn.execute(
+                select(validation_errors_table.c.row_id).where(validation_errors_table.c.error_id == error_id)
+            ).scalar_one()
+
+        assert rows == []
+        assert tokens == []
+        assert linked_row_id is None
 
     def test_explain_includes_transform_errors(self, landscape_db: LandscapeDB) -> None:
         """explain() should return transform errors for queried token."""

@@ -22,6 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.composer_mcp.server import create_server
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.dependencies import create_catalog_service
 
@@ -113,7 +114,7 @@ async def test_success_path_records_before_return() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         await _call_handler(server.request_handlers, "new_session", {"name": "AuditTest"})
     assert len(probe.invocations) == 1
     inv = probe.invocations[0]
@@ -132,7 +133,7 @@ async def test_arg_error_path_records_before_return() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, "load_session", {"session_id": "NOT_HEX"})
     assert response.root.isError is True
     assert "session_id" in response.root.content[0].text
@@ -146,6 +147,96 @@ async def test_arg_error_path_records_before_return() -> None:
     assert inv.version_after is None
 
 
+@pytest.mark.asyncio
+async def test_composer_tool_schema_validation_is_enforced_without_audit_hash() -> None:
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td)
+        probe = _ProbeRecorder()
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        response = await _call_handler(
+            server.request_handlers,
+            "get_pipeline_state",
+            {"unexpected": "secret-value"},
+        )
+
+    _assert_tool_argument_error_response_and_audit(
+        response,
+        probe,
+        tool_name="get_pipeline_state",
+    )
+
+
+@pytest.mark.asyncio
+async def test_schema_invalid_collision_violation_records_arg_error_before_handler() -> None:
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td)
+        probe = _ProbeRecorder()
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        with patch("elspeth.composer_mcp.server.execute_tool") as mock_execute:
+            response = await _call_handler(
+                server.request_handlers,
+                "set_output",
+                {
+                    "sink_name": "main",
+                    "plugin": "csv",
+                    "options": {
+                        "path": "outputs/out.csv",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                    },
+                    "on_write_failure": "discard",
+                    "unexpected": "schema-invalid",
+                },
+            )
+
+    mock_execute.assert_not_called()
+    assert len(probe.invocations) == 1
+    _assert_tool_argument_error_response_and_audit(
+        response,
+        probe,
+        tool_name="set_output",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_preview_args_do_not_run_runtime_preflight_or_handler() -> None:
+    catalog = create_catalog_service()
+    preflight_calls = 0
+
+    async def probing_preflight(_state) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return object()
+
+    with tempfile.TemporaryDirectory() as td:
+        scratch = Path(td)
+        probe = _ProbeRecorder()
+        server = create_server(
+            catalog,
+            scratch,
+            recorder=probe,
+            runtime_preflight=probing_preflight,
+            runtime_preflight_settings_hash="settings-hash",
+        )
+        with patch("elspeth.composer_mcp.server.execute_tool") as mock_execute:
+            response = await _call_handler(
+                server.request_handlers,
+                "preview_pipeline",
+                {"unexpected": "schema-invalid"},
+            )
+
+    assert preflight_calls == 0
+    mock_execute.assert_not_called()
+    assert len(probe.invocations) == 1
+    _assert_tool_argument_error_response_and_audit(
+        response,
+        probe,
+        tool_name="preview_pipeline",
+    )
+
+
 @pytest.mark.parametrize("bad_name", [123, {"x": "y"}])
 @pytest.mark.asyncio
 async def test_new_session_rejects_non_string_name_as_arg_error(bad_name: object) -> None:
@@ -154,7 +245,7 @@ async def test_new_session_rejects_non_string_name_as_arg_error(bad_name: object
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, "new_session", {"name": bad_name})
         session_files = list(scratch.glob("*.json"))
 
@@ -178,7 +269,7 @@ async def test_arg_error_payload_recorded_for_audit_replay() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, "load_session", {"session_id": "NOT_HEX"})
     assert response.root.isError is True
     inv = probe.invocations[0]
@@ -193,6 +284,33 @@ async def test_arg_error_payload_recorded_for_audit_replay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reflectively_corrupted_tool_argument_error_is_safe_in_mcp_and_audit() -> None:
+    """MCP's existing args consumer sees the closed read projection."""
+    canary = "MCP_TOOL_ARGUMENT_PRIVATE_CANARY_sk_live_4Nf7_/etc/private"
+    exc = ToolArgumentError(
+        argument="session_id",
+        expected="a 12-character lowercase hex string",
+        actual_type="invalid_session_id",
+    )
+    for name in ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code"):
+        BaseException.__setattr__(exc, name, canary)
+    BaseException.__setattr__(exc, "_tool_argument_error_sealed", False)
+
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        probe = _ProbeRecorder()
+        server = create_server(catalog, Path(td), recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        with patch("elspeth.composer_mcp.server._dispatch_tool", side_effect=exc):
+            response = await _call_handler(server.request_handlers, "load_session", {"session_id": "bad"})
+
+    response_text = response.root.content[0].text
+    audit_text = probe.invocations[0].result_canonical
+    assert canary not in response_text
+    assert audit_text is not None
+    assert canary not in audit_text
+
+
+@pytest.mark.asyncio
 async def test_argument_canonicalization_failure_records_arg_error() -> None:
     """Non-finite arguments are malformed MCP client input, not success.
 
@@ -204,7 +322,7 @@ async def test_argument_canonicalization_failure_records_arg_error() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(
             server.request_handlers,
             "set_source",
@@ -231,6 +349,42 @@ async def test_argument_canonicalization_failure_records_arg_error() -> None:
     assert inv.result_canonical is not None
 
 
+@pytest.mark.asyncio
+async def test_result_canonicalization_failure_is_plugin_crash_never_sentinel() -> None:
+    """Un-canonicalizable SUCCESS output crashes; no synthesized evidence.
+
+    ``result_dict`` is our own handler's output, so a non-finite float in it
+    is a bug in our code (contrast the *arguments* path, which is Tier-3 LLM
+    input and takes the bounded sentinel). The finally block must reclassify
+    to PLUGIN_CRASH, record ``result_canonical is None`` — never a sentinel
+    hash masquerading as the real result — and re-raise so the client does
+    not receive an unaudited success.
+    """
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        probe = _ProbeRecorder()
+        server = create_server(catalog, Path(td), recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        with patch(
+            "elspeth.composer_mcp.server._dispatch_tool",
+            return_value={"success": True, "data": {"non_finite": float("inf")}},
+        ):
+            response = await _call_handler(server.request_handlers, "get_pipeline_state", {})
+
+    # The MCP SDK frames the re-raised canonicalization failure as an
+    # isError CallToolResult AFTER the inner finally recorded the audit row.
+    assert response.root.isError is True
+
+    assert len(probe.invocations) == 1
+    inv = probe.invocations[0]
+    assert inv.status == ComposerToolStatus.PLUGIN_CRASH
+    assert inv.error_class == "ValueError"
+    # Class-name-only echo — pins the redaction discipline for this path.
+    assert inv.error_message == "ValueError"
+    assert inv.result_canonical is None
+    assert inv.result_hash is None
+    assert inv.version_after is None
+
+
 @pytest.mark.parametrize(
     ("tool_name", "arguments"),
     [
@@ -250,7 +404,7 @@ async def test_malformed_mutation_args_before_collision_check_record_arg_error(
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, tool_name, arguments)
 
     assert len(probe.invocations) == 1
@@ -264,7 +418,7 @@ async def test_patch_output_options_missing_patch_records_arg_error_after_existi
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         seeded = await _call_handler(server.request_handlers, "set_output", _valid_csv_output_args())
         response = await _call_handler(server.request_handlers, "patch_output_options", {"sink_name": "main"})
 
@@ -281,12 +435,12 @@ async def test_set_pipeline_output_without_options_preserves_collision_control_e
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(
             server.request_handlers,
             "set_pipeline",
             {
-                "source": None,
+                "source": {"plugin": "null", "on_success": "rows"},
                 "nodes": [],
                 "edges": [],
                 "outputs": [
@@ -319,7 +473,7 @@ async def test_audit_records_in_order_across_session() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         await _call_handler(server.request_handlers, "new_session", {"name": "T"})
         await _call_handler(server.request_handlers, "list_sessions", {})
         await _call_handler(server.request_handlers, "load_session", {"session_id": "NOT_HEX"})
@@ -365,7 +519,7 @@ async def test_plugin_crash_path_records_before_reraise() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         # Patch the dispatcher seam to raise a plain RuntimeError —
         # the canonical "plugin bug" shape per CLAUDE.md "Plugin
         # Ownership". Anything other than ToolArgumentError /
@@ -416,7 +570,7 @@ async def test_bare_dispatch_value_error_is_plugin_crash_not_arg_error() -> None
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         with patch(
             "elspeth.composer_mcp.server._dispatch_tool",
             side_effect=ValueError("synthetic internal bug"),
@@ -448,7 +602,7 @@ async def test_response_json_serialization_failure_is_plugin_crash_not_success()
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
 
         bad_result = {
             "success": True,
@@ -615,7 +769,7 @@ async def test_delete_session_persists_deletion_audit_record() -> None:
         # Use the production JsonlEventRecorder so we can verify the file state.
         # We need the same session_id_ref as create_server, but create_server
         # makes it internally. Instead, drive the API and confirm cleanup.
-        server = create_server(catalog, scratch)  # default JsonlEventRecorder
+        server = create_server(catalog, scratch, runtime_preflight=None, runtime_preflight_settings_hash=None)  # default JsonlEventRecorder
         # Create + save + delete.
         r = await _call_handler(server.request_handlers, "new_session", {"name": "X"})
         import json as _json

@@ -189,7 +189,7 @@ class TestLineageTreeWidget:
         assert missing is None
 
     def test_gate_aggregation_coalesce_labels(self) -> None:
-        """Gate, aggregation, and coalesce nodes display with correct type labels."""
+        """Gate, aggregation, coalesce, and row-union nodes display with correct type labels."""
         from elspeth.tui.widgets.lineage_tree import LineageTree
 
         lineage_data: LineageData = {
@@ -200,6 +200,7 @@ class TestLineageTreeWidget:
                 NodeInfo(name="threshold_check", node_id="node-003", node_type="gate"),
                 NodeInfo(name="batch_agg", node_id="node-004", node_type="aggregation"),
                 NodeInfo(name="merge_results", node_id="node-005", node_type="coalesce"),
+                NodeInfo(name="union_rows", node_id="node-007", node_type="row_union"),
             ],
             "sinks": [NodeInfo(name="output", node_id="node-006", node_type="sink")],
             "tokens": [],
@@ -214,6 +215,7 @@ class TestLineageTreeWidget:
         assert "Gate: threshold_check" in labels
         assert "Aggregation: batch_agg" in labels
         assert "Coalesce: merge_results" in labels
+        assert "Row union: union_rows" in labels
         assert "Sink: output" in labels
 
         # Verify node_type is propagated to tree nodes
@@ -221,6 +223,7 @@ class TestLineageTreeWidget:
         assert node_types["Gate: threshold_check"] == "gate"
         assert node_types["Aggregation: batch_agg"] == "aggregation"
         assert node_types["Coalesce: merge_results"] == "coalesce"
+        assert node_types["Row union: union_rows"] == "row_union"
 
     def test_graph_view_renders_multiple_sources_without_dropping_second_source(self) -> None:
         """Graph-backed view preserves multi-source topology and branch labels."""
@@ -249,6 +252,28 @@ class TestLineageTreeWidget:
         assert "Coalesce: coalesce" in labels
         assert "Branch: a" in labels
         assert "Branch: b" in labels
+
+    def test_graph_view_renders_row_union_node_label(self) -> None:
+        """Graph-backed view labels row_union nodes instead of crashing."""
+        from elspeth.tui.lineage_view import build_lineage_view_model
+        from elspeth.tui.widgets.lineage_tree import LineageTree
+
+        view = build_lineage_view_model(
+            run_id="run-1",
+            nodes=[
+                _node("src", "csv", NodeType.SOURCE, sequence=0),
+                _node("union", "row_union", NodeType.ROW_UNION, sequence=1),
+                _node("sink", "json_sink", NodeType.SINK, sequence=2),
+            ],
+            edges=[
+                _edge("edge-src", "src", "union", "default"),
+                _edge("edge-sink", "union", "sink", "default"),
+            ],
+        )
+
+        labels = [node["label"] for node in LineageTree(view).get_tree_nodes()]
+
+        assert "Row union: row_union" in labels
 
     def test_graph_view_orders_unsorted_edges_deterministically(self) -> None:
         """Graph renderer sorts outgoing edges by label then destination."""

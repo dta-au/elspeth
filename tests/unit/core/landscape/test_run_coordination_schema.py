@@ -10,7 +10,7 @@ tests pin the *schema-level* invariants:
   run_coordination_events,
 - run_coordination_events.seq strict monotonicity (AUTOINCREMENT took, so
   seq values are never reused after deletion),
-- coalesce_branch_losses natural-key idempotency.
+- group_losses natural-key idempotency.
 """
 
 from __future__ import annotations
@@ -26,11 +26,12 @@ from sqlalchemy.schema import CreateTable
 
 from elspeth.core.landscape.schema import (
     active_worker_fence_clause,
-    coalesce_branch_losses_table,
+    group_losses_table,
     metadata,
     run_coordination_events_table,
     run_coordination_table,
     run_workers_table,
+    tokens_table,
 )
 
 NOW = datetime(2026, 6, 12, 0, 0, 0, tzinfo=UTC)
@@ -255,17 +256,32 @@ class TestRunCoordinationEvents:
         assert context == "{}"
 
 
-class TestCoalesceBranchLossesNaturalKey:
+class TestGroupLossesNaturalKey:
+    """Raw-insert DB-level witness (spec §6.2): kills the index-dropped
+    mutant independently of the record_group_loss ON CONFLICT path."""
+
     @staticmethod
-    def _insert_loss(engine: Engine, *, loss_id: str, branch_name: str = "branch-a", token_id: str = "tok-1") -> None:
+    def _seed_token(engine: Engine, *, token_id: str) -> None:
         with engine.begin() as conn:
             conn.execute(
-                coalesce_branch_losses_table.insert().values(
+                tokens_table.insert().values(
+                    token_id=token_id,
+                    row_id="row-1",
+                    run_id="run-1",
+                    created_at=NOW,
+                )
+            )
+
+    @staticmethod
+    def _insert_loss(engine: Engine, *, loss_id: str, member_key: str = "branch-a", token_id: str = "tok-1") -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                group_losses_table.insert().values(
                     loss_id=loss_id,
                     run_id="run-1",
-                    coalesce_name="merge-1",
-                    row_id="row-1",
-                    branch_name=branch_name,
+                    closer_name="merge-1",
+                    group_id="fg-1",
+                    member_key=member_key,
                     token_id=token_id,
                     reason="failed",
                     recorded_by="worker:run-1:aaa",
@@ -274,18 +290,22 @@ class TestCoalesceBranchLossesNaturalKey:
             )
 
     def test_duplicate_natural_key_is_rejected(self, engine: Engine) -> None:
-        """uq_coalesce_branch_losses_natural: (run_id, coalesce_name, row_id, branch_name)."""
+        """uq_group_losses_natural: (run_id, closer_name, group_id, member_key)."""
+        self._seed_token(engine, token_id="tok-1")
+        self._seed_token(engine, token_id="tok-2")
         self._insert_loss(engine, loss_id="loss-1")
         with pytest.raises(IntegrityError):
             self._insert_loss(engine, loss_id="loss-2", token_id="tok-2")
 
     def test_distinct_branch_is_accepted(self, engine: Engine) -> None:
-        self._insert_loss(engine, loss_id="loss-1", branch_name="branch-a")
-        self._insert_loss(engine, loss_id="loss-2", branch_name="branch-b")
+        self._seed_token(engine, token_id="tok-1")
+        self._insert_loss(engine, loss_id="loss-1", member_key="branch-a")
+        self._insert_loss(engine, loss_id="loss-2", member_key="branch-b")
 
     def test_adopted_epoch_defaults_to_null(self, engine: Engine) -> None:
         """NULL = not yet replayed into leader memory (slice-3 replay verb stamps it)."""
+        self._seed_token(engine, token_id="tok-1")
         self._insert_loss(engine, loss_id="loss-1")
         with engine.connect() as conn:
-            adopted = conn.execute(select(coalesce_branch_losses_table.c.adopted_epoch)).scalar_one()
+            adopted = conn.execute(select(group_losses_table.c.adopted_epoch)).scalar_one()
         assert adopted is None

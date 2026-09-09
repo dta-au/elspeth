@@ -9,7 +9,7 @@ leaves the run resumable as *source-exhausted engine work*:
   the EOF flush runs (source_iteration.py finalize_source_iteration), so a
   flush crash is distinguishable from a mid-source interruption;
 - the resume path accepts exhausted sources (resume.py
-  ``_SOURCE_COMPLETE_LIFECYCLE_STATES``) and drains the restored EOF
+  ``SOURCE_COMPLETE_LIFECYCLE_STATES``) and drains the restored EOF
   aggregation work to the sink;
 - the source plugin is NOT re-invoked on resume (rows replay from persisted
   payloads, never from the source — load() invocation count stays 1);
@@ -45,8 +45,9 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from elspeth.contracts import Determinism, PipelineRow, RunStatus
+from elspeth.contracts import Determinism, PipelineRow, ResumePoint, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -55,7 +56,7 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.schema import run_sources_table, runs_table, token_work_items_table
+from elspeth.core.landscape.schema import run_sources_table, runs_table, token_outcomes_table, token_work_items_table
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -206,7 +207,7 @@ class TestExhaustedSourceEOFResume:
 
         Invariants proven:
         - ``lifecycle_state='exhausted'`` sources are ACCEPTED by the public
-          resume path (resume.py ``_SOURCE_COMPLETE_LIFECYCLE_STATES``) — the
+          resume path (resume.py ``SOURCE_COMPLETE_LIFECYCLE_STATES``) — the
           run resumes instead of raising IncompleteSourceResumeError;
         - the restored EOF aggregation work drains: the count-100 trigger
           never fired in-run, so the only flush is the resume's end-of-input
@@ -280,7 +281,13 @@ class TestExhaustedSourceEOFResume:
         # Reshape the interruption into the exhausted-then-crashed-EOF-flush
         # state: 'exhausted' is exactly what finalize_source_iteration records
         # before the EOF flush runs; FAILED is what the failure ceremony
-        # records when that flush crashes.
+        # records when that flush crashes. The ADR-038 abandonment rows must
+        # go too: the graceful interrupt above finalized with the source
+        # still incomplete, so its fenced ceremony correctly recorded
+        # (NULL, ABANDONED) — but the state being synthesized here (crash
+        # AFTER exhaustion) is one where the sweep does not fire (see
+        # test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens),
+        # so a faithful reshape carries no abandonment records.
         with db.engine.begin() as conn:
             conn.execute(
                 run_sources_table.update()
@@ -288,6 +295,11 @@ class TestExhaustedSourceEOFResume:
                 .values(lifecycle_state="exhausted")
             )
             conn.execute(runs_table.update().where(runs_table.c.run_id == run_id).values(status=RunStatus.FAILED))
+            conn.execute(
+                token_outcomes_table.delete()
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.path == TerminalPath.ABANDONED.value)
+            )
         assert _run_sources_states(db, run_id) == {"primary": "exhausted"}
 
         recovery = RecoveryManager(db, checkpoint_mgr)
@@ -498,9 +510,20 @@ class TestExhaustedSourceEOFResume:
         assert _run_sources_states(db, run_id) == {"primary": "interrupted"}
         assert output_sink.results == []
 
+        # elspeth-1f5b83cd28: the advisory gate agrees with the enforcing
+        # guard — no false green for a run every resume attempt would refuse.
         recovery = RecoveryManager(db, checkpoint_mgr)
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
+        check = recovery.can_resume(run_id, graph)
+        assert check.can_resume is False
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
+        assert recovery.get_resume_point(run_id, graph) is None
+
+        # resume() is advisory-independent: a hand-built ResumePoint that
+        # skips can_resume must still be refused by the enforcing guard.
+        checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert checkpoint is not None
+        resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number)
 
         with pytest.raises(IncompleteSourceResumeError, match=r"primary.*interrupted"):
             orchestrator.resume(

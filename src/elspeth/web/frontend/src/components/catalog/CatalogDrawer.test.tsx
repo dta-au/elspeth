@@ -1,11 +1,15 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { CatalogDrawer } from "./CatalogDrawer";
 import * as api from "@/api/client";
 import { useAuthStore } from "@/stores/authStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
 
 vi.mock("@/api/client", () => ({
   fetchPluginPolicy: vi.fn().mockResolvedValue({
@@ -77,6 +81,7 @@ vi.mock("@/api/client", () => ({
         properties: { path: { type: "string", description: "File path" } },
         required: ["path"],
       },
+      knob_schema: { fields: [] },
     },
     snapshotFingerprint: "catalog-test-snapshot",
   }),
@@ -84,6 +89,8 @@ vi.mock("@/api/client", () => ({
 
 // Import the mocked client so we can assert on call counts.
 import { listSources, listTransforms, listSinks } from "@/api/client";
+
+beforeEach(() => resetStore(usePreferencesStore));
 
 describe("CatalogDrawer", () => {
   beforeEach(() => {
@@ -97,6 +104,7 @@ describe("CatalogDrawer", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });
@@ -105,7 +113,7 @@ describe("CatalogDrawer", () => {
 
   it("renders nothing when closed", () => {
     render(<CatalogDrawer isOpen={false} onClose={vi.fn()} />);
-    expect(screen.queryByText("Plugin Catalog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Plugin catalog")).not.toBeInTheDocument();
   });
 
   it("fetches catalog on first open", async () => {
@@ -120,7 +128,7 @@ describe("CatalogDrawer", () => {
   it("announces the open drawer as a modal dialog", async () => {
     render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
 
-    const dialog = screen.getByRole("dialog", { name: "Plugin Catalog" });
+    const dialog = screen.getByRole("dialog", { name: "Plugin catalog" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(screen.getByText("Reference")).toBeInTheDocument();
     expect(
@@ -264,6 +272,14 @@ describe("CatalogDrawer", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  // Pins the contract directly rather than only self-referentially (a caller
+  // that hardcodes the same expression as the assertion could drift silently
+  // with it): the composite wire id's "kind:" prefix must be dropped before
+  // humanising, not humanised in place.
+  it("unavailablePluginDisplayName drops the kind prefix before humanising", () => {
+    expect(unavailablePluginDisplayName("transform:legacy_llm")).toBe("Legacy LLM");
+  });
+
   it("renders disabled saved components with keyboard and screen-reader repair actions", async () => {
     useSessionStore.setState({
       compositionState: {
@@ -291,11 +307,15 @@ describe("CatalogDrawer", () => {
       name: /unavailable saved components/i,
     });
     expect(repairRegion).toHaveTextContent("legacy_transform");
-    expect(repairRegion).toHaveTextContent("transform:legacy_llm");
+    expect(repairRegion).toHaveTextContent(unavailablePluginDisplayName("transform:legacy_llm"));
     expect(repairRegion).toHaveTextContent("Not enabled");
+    expect(within(repairRegion).getAllByTitle("transform:legacy_llm").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", {
-        name: /remove disabled component legacy_transform.*transform:legacy_llm/i,
+        name: new RegExp(
+          `remove disabled component legacy_transform.*${unavailablePluginDisplayName("transform:legacy_llm")}`,
+          "i",
+        ),
       }),
     ).toBeInTheDocument();
 
@@ -367,6 +387,11 @@ const azure = {
 
 describe("CatalogDrawer — Phase 7B reshape", () => {
   beforeEach(() => {
+    // This block's capability-tag filter chips (elspeth-8555a6a9e0: hidden
+    // by default) are the feature under test here, not the detail-level
+    // gate — set the flag on so the pre-existing filter-chip assertions
+    // still exercise the mechanism they were written to pin.
+    usePreferencesStore.setState({ showAdvanced: true });
     usePluginCatalogStore.getState().clear();
     useSessionStore.setState({ compositionState: null } as never);
     vi.mocked(api.listSources).mockResolvedValue({
@@ -617,5 +642,172 @@ describe("CatalogDrawer — Alt+1-3 tab shortcuts", () => {
     render(<CatalogDrawer isOpen={false} onClose={() => {}} />);
     // No keydown handler registered when closed — this must not throw.
     fireEvent.keyDown(document, { key: "1", altKey: true });
+  });
+});
+
+// elspeth-06566208b3: the resume-only `null` source is internal machinery,
+// not a capability an operator can browse toward. It was surfacing on the
+// Sources tab as "Resume Placeholder" with code `null` and the description
+// "A source that yields no rows". Filtering happens where the arrays enter
+// the drawer so the tab COUNT and the rendered cards can never disagree.
+describe("CatalogDrawer — internal plugins", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    usePluginCatalogStore.getState().clear();
+    useAuthStore.setState({
+      token: "catalog-test-token",
+      user: {
+        user_id: "alice",
+        username: "alice",
+        display_name: "Alice",
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+      isLoading: false,
+    });
+    useSessionStore.setState({ compositionState: null } as never);
+    vi.mocked(listSources).mockResolvedValue({
+      data: [
+        {
+          name: "csv",
+          plugin_type: "source",
+          description: "CSV file source",
+          config_fields: [],
+          usage_when_to_use: null,
+          usage_when_not_to_use: null,
+          example_use: null,
+          capability_tags: [],
+          audit_characteristics: [],
+        },
+        {
+          name: "null",
+          plugin_type: "source",
+          description: "A source that yields no rows.",
+          config_fields: [],
+          usage_when_to_use: null,
+          usage_when_not_to_use: null,
+          example_use: null,
+          capability_tags: [],
+          audit_characteristics: [],
+        },
+      ],
+      snapshotFingerprint: "catalog-test-snapshot",
+    } as never);
+  });
+
+  it("omits the internal resume placeholder from the Sources list", async () => {
+    render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+    await screen.findByText("CSV file source");
+    expect(
+      screen.queryByText("A source that yields no rows."),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Resume Placeholder")).not.toBeInTheDocument();
+  });
+
+  it("excludes it from the Sources tab count too", async () => {
+    render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+    await screen.findByText("CSV file source");
+    expect(
+      screen.getByRole("tab", { name: /^Sources/ }).textContent,
+    ).toContain("1");
+  });
+
+  it("does not surface it via search either", async () => {
+    render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+    await screen.findByText("CSV file source");
+    await userEvent.type(screen.getByLabelText("Search plugins"), "null");
+    await waitFor(() => {
+      expect(
+        screen.queryByText("A source that yields no rows."),
+      ).not.toBeInTheDocument();
+    });
+  });
+});
+
+// elspeth-98757e13ae: the unavailable-components notice used to render in the
+// drawer FRAME, above the only band that can shrink. `.catalog-list` is
+// `flex: 1 1 0%` with `overflow-y: auto` (catalog.css) so its automatic
+// minimum resolves to 0, while the header, search wrapper, chip strip and tab
+// strip all carry `flex-shrink: 0` — an unbounded notice therefore squeezed
+// the plugin list towards nothing and could not scroll itself. These tests
+// pin the DOM containment that fixes it; jsdom has no layout engine, so the
+// squeeze itself is not measurable here.
+describe("CatalogDrawer — unavailable-components notice placement", () => {
+  const FINDING = {
+    component_id: "legacy_sink",
+    plugin_id: "sink:retired",
+    reason_code: "plugin_not_installed",
+    snapshot_fingerprint: "catalog-test-snapshot",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    usePluginCatalogStore.getState().clear();
+    useAuthStore.setState({
+      token: "catalog-test-token",
+      user: {
+        user_id: "alice",
+        username: "alice",
+        display_name: "Alice",
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+      isLoading: false,
+    });
+    useSessionStore.setState({
+      compositionState: { plugin_policy_findings: [FINDING] },
+    } as never);
+  });
+
+  it("renders the notice inside the scrollable tabpanel, not the drawer frame", async () => {
+    render(<CatalogDrawer isOpen onClose={() => {}} />);
+    // Present FIRST — the notice is gated on the finding's
+    // snapshot_fingerprint matching the loaded catalog's, so a fixture whose
+    // fingerprint drifted would render nothing and make containment vacuous.
+    const banner = await screen.findByRole("region", {
+      name: "Unavailable saved components",
+    });
+    const panel = screen.getByRole("tabpanel");
+    expect(panel).toContainElement(banner);
+    // And it is the panel's own first child, so it scrolls with the body
+    // rather than competing with it for the drawer's fixed height.
+    expect(banner.parentElement).toBe(panel);
+    expect(panel.firstElementChild).toBe(banner);
+  });
+
+  it("keeps the notice when search or filters empty the plugin list", async () => {
+    render(<CatalogDrawer isOpen onClose={() => {}} />);
+    await screen.findByRole("region", { name: "Unavailable saved components" });
+    await userEvent.type(
+      screen.getByLabelText("Search plugins"),
+      "zzzzznomatch",
+    );
+    await screen.findByText("No plugins available.");
+    // The notice sits OUTSIDE the fetchError -> loading -> empty -> list
+    // ladder, so an empty result set cannot take it away.
+    const banner = screen.getByRole("region", {
+      name: "Unavailable saved components",
+    });
+    expect(screen.getByRole("tabpanel")).toContainElement(banner);
+  });
+
+  it("default DOM of the unavailable-components section passes the shared pin with the button names exempted", async () => {
+    const { container } = render(<CatalogDrawer isOpen onClose={() => {}} />);
+    // Present FIRST. The notice is gated on catalog load AND on the finding's
+    // snapshot_fingerprint matching, so a synchronous pin would scan an empty
+    // DOM and pass vacuously — the same trap the sibling tests in this
+    // describe guard against.
+    await screen.findByRole("region", { name: "Unavailable saved components" });
+    expectNoIdentifiersInDefaultDom(container, {
+      // SELF-only on the two buttons that carry the author-chosen component
+      // id in their names. The `.import-yaml-actions` SUBTREE form this
+      // replaces exempted the container and everything under it, so any
+      // aria-labelled control added inside later was silently exempt too —
+      // the growth channel defaultDomPins.ts's own docs warn about, and these
+      // two calls were the in-repo copy-paste source for the lazy form.
+      allowAriaLabelSelfSelectors: [".import-yaml-actions button"],
+    });
   });
 });

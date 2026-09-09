@@ -15,11 +15,24 @@ from elspeth.web.sessions.models import composition_proposals_table, guided_oper
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import _current_sink
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
+_GOAL_FIRST_INTENT = "Combine both uploads and write one JSON file per region"
+
 
 def _create_session(client: TestClient) -> str:
+    """Create a session rooted in a goal (goal-first, elspeth-378cfa0e18).
+
+    These walks all end at the Step-2 finish, which refuses without an intent.
+    """
+
     response = client.post("/api/sessions", json={"title": "plural source/output review"})
     assert response.status_code == 201, response.json()
-    return response.json()["id"]
+    session_id = response.json()["id"]
+    started = client.post(
+        f"/api/sessions/{session_id}/guided/start",
+        json={"profile": "live", "intent": _GOAL_FIRST_INTENT, "operation_id": str(uuid4())},
+    )
+    assert started.status_code == 200, started.json()
+    return session_id
 
 
 def _get(client: TestClient, session_id: str) -> dict:
@@ -53,14 +66,14 @@ def _respond(client: TestClient, session_id: str, **response_fields: object) -> 
     return response.json()
 
 
-def _output_path(client: TestClient, filename: str) -> str:
-    path = Path(client.app.state.settings.data_dir) / "outputs" / filename
+def _output_path(client: TestClient, session_id: str, filename: str) -> str:
+    path = Path(client.app.state.settings.data_dir) / "outputs" / session_id / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
 
 
-def _source_path(client: TestClient, filename: str) -> str:
-    path = Path(client.app.state.settings.data_dir) / "blobs" / filename
+def _source_path(client: TestClient, session_id: str, filename: str) -> str:
+    path = Path(client.app.state.settings.data_dir) / "blobs" / session_id / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("id,label\n1,reviewed\n", encoding="utf-8")
     return str(path)
@@ -71,13 +84,18 @@ def _review_items(body: dict) -> list[dict]:
     return body["next_turn"]["payload"]["items"]
 
 
-def _stage_minimal_plural_proposal(client: TestClient, *, suffix: str) -> tuple[str, dict]:
-    """Stage a fresh ordered 2-source/2-output proposal through public HTTP."""
+def _stage_minimal_plural_proposal(
+    client: TestClient,
+    *,
+    suffix: str,
+    source_count: int = 2,
+) -> tuple[str, dict]:
+    """Stage an ordered multi-source/2-output proposal through public HTTP."""
 
     session_id = _create_session(client)
     source_ids: list[str] = []
-    for index in (1, 2):
-        if index == 2:
+    for index in range(1, source_count + 1):
+        if index > 1:
             _respond(client, session_id, component_action={"action": "add", "component_kind": "source"})
         _respond(client, session_id, chosen=["csv"])
         reviewed = _respond(
@@ -86,7 +104,7 @@ def _stage_minimal_plural_proposal(client: TestClient, *, suffix: str) -> tuple[
             edited_values={
                 "plugin": "csv",
                 "options": {
-                    "path": f"{suffix}-input-{index}.csv",
+                    "path": _source_path(client, session_id, f"{suffix}-input-{index}.csv"),
                     "schema": {"mode": "observed"},
                     "on_validation_failure": "discard",
                 },
@@ -115,7 +133,7 @@ def _stage_minimal_plural_proposal(client: TestClient, *, suffix: str) -> tuple[
             edited_values={
                 "plugin": "json",
                 "options": {
-                    "path": _output_path(client, f"{suffix}-output-{index}.jsonl"),
+                    "path": _output_path(client, session_id, f"{suffix}-output-{index}.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",
@@ -146,8 +164,8 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
 ) -> None:
     client = composer_test_client
     session_id = _create_session(client)
-    source_a_path = _source_path(client, "input-a.csv")
-    source_b_path = _source_path(client, "input-b.csv")
+    source_a_path = _source_path(client, session_id, "input-a.csv")
+    source_b_path = _source_path(client, session_id, "input-b.csv")
 
     # Source A resolves but remains in source review.
     _respond(client, session_id, chosen=["csv"])
@@ -216,9 +234,7 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
     old_app = client.app
     old_service = client.app.state.session_service
     old_engine = client.app.state.session_engine
-    restart_test_client = getattr(client.app.state, "restart_test_client", None)
-    assert callable(restart_test_client), "guided integration fixture must support a literal app/service restart"
-    client = restart_test_client()
+    client = client.app.state.restart_test_client()
     assert client.app is not old_app
     assert client.app.state.session_service is not old_service
     assert client.app.state.session_engine is not old_engine
@@ -233,7 +249,7 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
     )
     assert editing["next_turn"]["type"] == "schema_form"
     assert editing["next_turn"]["payload"]["prefilled"]["path"] == source_b_path
-    revised_source_b_path = _source_path(client, "input-b-revised.csv")
+    revised_source_b_path = _source_path(client, session_id, "input-b-revised.csv")
     source_review = _respond(
         client,
         session_id,
@@ -261,7 +277,7 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
     assert [item["stable_id"] for item in _review_items(source_review)] == [source_b]
     _respond(client, session_id, component_action={"action": "add", "component_kind": "source"})
     _respond(client, session_id, chosen=["csv"])
-    source_c_path = _source_path(client, "input-c.csv")
+    source_c_path = _source_path(client, session_id, "input-c.csv")
     source_review = _respond(
         client,
         session_id,
@@ -286,14 +302,14 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
 
     # Repeat the same controller lifecycle for two outputs.
     _respond(client, session_id, chosen=["json"])
-    output_c_path = _output_path(client, "output-c.jsonl")
+    output_c_path = _output_path(client, session_id, "output-c.jsonl")
     _respond(
         client,
         session_id,
         edited_values={
             "plugin": "json",
             "options": {
-                "path": _output_path(client, "output-a.jsonl"),
+                "path": _output_path(client, session_id, "output-a.jsonl"),
                 "schema": {"mode": "observed"},
                 "mode": "write",
                 "collision_policy": "auto_increment",
@@ -312,7 +328,7 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
         edited_values={
             "plugin": "json",
             "options": {
-                "path": _output_path(client, "output-b.jsonl"),
+                "path": _output_path(client, session_id, "output-b.jsonl"),
                 "schema": {"mode": "observed"},
                 "mode": "write",
                 "collision_policy": "auto_increment",
@@ -343,7 +359,7 @@ def test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal(
         component_action={"action": "edit", "target": {"kind": "output", "stable_id": output_b}},
     )
     assert editing["next_turn"]["payload"]["prefilled"]["on_write_failure"] == "discard"
-    revised_path = _output_path(client, "output-b-revised.jsonl")
+    revised_path = _output_path(client, session_id, "output-b-revised.jsonl")
     _respond(
         client,
         session_id,

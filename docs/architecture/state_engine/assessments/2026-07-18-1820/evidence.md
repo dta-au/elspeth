@@ -45,7 +45,7 @@ process.
 
 | Fact | Captured value |
 | --- | --- |
-| Python | 3.13.1; `/home/john/elspeth/.venv/bin/python`; build `main`, 2024-12-19 |
+| Python | 3.13.1; `.venv/bin/python` under the repository root; build `main`, 2024-12-19 |
 | pytest / uv / Git | 9.0.3 / 0.10.2 / 2.43.0 |
 | SQLite / SQLAlchemy | 3.47.1 / 2.0.45 |
 | Kernel | Linux 6.8.0-124-generic x86_64 |

@@ -47,6 +47,8 @@ import pathlib
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 
 def _repo_root() -> pathlib.Path:
     """Locate the repository root from this test file's location.
@@ -81,19 +83,13 @@ def _names_imported_from_facade() -> set[str]:
         branch_root = root / branch
         if not branch_root.is_dir():
             continue
-        for py_path in branch_root.rglob("*.py"):
+        for parsed in iter_gate_sources(branch_root):
             # The facade re-exports its own names; an import there is not
             # an external consumer.
-            rel = py_path.relative_to(root).as_posix()
+            rel = parsed.path.relative_to(root).as_posix()
             if rel.endswith("src/elspeth/web/composer/tools/__init__.py"):
                 continue
-            try:
-                tree = ast.parse(py_path.read_text())
-            except SyntaxError:
-                # Malformed test fixtures (deliberately broken Python) are
-                # not consumers of the facade.
-                continue
-            for node in ast.walk(tree):
+            for node in ast.walk(parsed.tree):
                 if isinstance(node, ast.ImportFrom) and node.module == pkg:
                     for alias in node.names:
                         referenced.add(alias.name)
@@ -133,12 +129,14 @@ def test_tools_all_entries_resolve() -> None:
 
     from elspeth.web.composer import tools
 
-    missing = []
-    for name in tools.__all__:
-        try:
-            getattr(tools, name)
-        except AttributeError:
-            missing.append(name)
+    # Module-dict inspection rather than attribute resolution. The facade
+    # defines no PEP 562 module ``__getattr__``, so its ``vars()`` IS its
+    # attribute surface and the set difference states the invariant directly.
+    # The precondition is asserted so a future lazy-export facade fails here
+    # loudly instead of turning every entry into a phantom "missing".
+    assert "__getattr__" not in vars(tools), "facade grew a lazy module __getattr__; this test must be reworked to match"
+
+    missing = sorted(set(tools.__all__) - set(vars(tools)))
 
     assert not missing, f"__all__ declares names that are not attributes of the module: {missing}"
 

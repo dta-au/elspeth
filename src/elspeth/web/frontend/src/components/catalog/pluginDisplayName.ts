@@ -25,12 +25,14 @@ const ACRONYMS: ReadonlySet<string> = new Set([
   "api",
   "csv",
   "db",
+  "gpt",
   "http",
   "https",
   "id",
   "io",
   "json",
   "llm",
+  "pdf",
   "rag",
   "sql",
   "url",
@@ -46,16 +48,20 @@ const DISPLAY_NAME_OVERRIDES: ReadonlyMap<string, string> = new Map([
   ["dataverse", "Microsoft Dataverse"],
   ["chroma_sink", "Chroma Vector Store"],
   ["batch_top_k", "Batch Top-K"],
-  // The resume-only placeholder source. Its id is literally "null"; the
-  // display name says what it is for instead of echoing a developer value
-  // at end users (the card also carries the internal badge below).
-  ["null", "Resume Placeholder"],
 ]);
 
 /**
  * Plugin ids that exist for internal/resume machinery rather than for
- * end-user pipelines. The catalog keeps them visible (it is a reference,
- * not a picker) but badges them so first-run users do not reach for them.
+ * end-user pipelines. The catalog OMITS these (elspeth-06566208b3):
+ * "reference, not a picker" governs what you can DO in the catalog
+ * (browse/read, never pick/wire) — it does not oblige the reference to list
+ * machinery that answers no question an operator can ask of it. The
+ * resume-only `null` source was surfacing on the Sources tab as a source
+ * that "yields no rows", which reads as a broken entry.
+ *
+ * Backend listings are unaffected: CatalogServiceImpl.list_sources still
+ * returns `null` because composer and MCP discovery need it for resume.
+ * The filter is applied by CatalogDrawer.
  */
 const INTERNAL_PLUGIN_IDS: ReadonlySet<string> = new Set(["null"]);
 
@@ -64,16 +70,33 @@ function titleCaseWord(word: string): string {
   return word.charAt(0).toUpperCase() + word.slice(1);
 }
 
+/**
+ * Acronym-aware Title Case for a snake/space-delimited label
+ * ("json_explode" → "JSON Explode", "fetch_url" → "Fetch URL").
+ *
+ * THE frontend's single title-casing implementation (elspeth-d2de348437):
+ * `pluginDisplayName`'s humanised fallback builds on it, and non-plugin
+ * labels (author-chosen node ids in chat/interpretationStepLabel.ts,
+ * tutorial result-table column keys) import it directly so acronyms render
+ * identically on every surface. Curated DISPLAY_NAME_OVERRIDES deliberately
+ * do NOT apply here — they are plugin-id vocabulary, and rewriting a user's
+ * own label (a node the author happened to call "dataverse") would put
+ * words in their mouth.
+ */
+export function titleCaseLabel(value: string): string {
+  return value
+    .split(/[_\s]+/)
+    .filter((word) => word.length > 0)
+    .map(titleCaseWord)
+    .join(" ");
+}
+
 /** Human display name for a plugin id. Presentation only — never sent back
  *  to the backend; the raw id remains the wire identifier. */
 export function pluginDisplayName(pluginId: string): string {
   const override = DISPLAY_NAME_OVERRIDES.get(pluginId);
   if (override !== undefined) return override;
-  return pluginId
-    .split(/[_\s]+/)
-    .filter((word) => word.length > 0)
-    .map(titleCaseWord)
-    .join(" ");
+  return titleCaseLabel(pluginId);
 }
 
 /** True for plugins that are internal machinery (badged in the catalog). */

@@ -33,6 +33,7 @@ from elspeth.contracts.hashing import CANONICAL_VERSION as CANONICAL_VERSION
 from elspeth.contracts.hashing import canonical_json as _primitive_canonical_json
 from elspeth.contracts.hashing import stable_hash as _primitive_stable_hash
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from elspeth.core.dag import ExecutionGraph
@@ -120,8 +121,10 @@ def _normalize_value(obj: Any) -> Any:
             return obj.tz_localize("UTC").isoformat()
         return obj.tz_convert("UTC").isoformat()
 
-    # Intentional missing values (NOT NaN - that's rejected above)
-    if obj is pd.NA or (isinstance(obj, type(pd.NaT)) and obj is pd.NaT):
+    # Intentional missing values (NOT NaN - that's rejected above).
+    # Both are singletons, so identity IS the type check: ``obj is pd.NaT``
+    # already implies ``isinstance(obj, type(pd.NaT))``.
+    if obj is pd.NA or obj is pd.NaT:
         return None
 
     # Standard library types
@@ -296,6 +299,20 @@ def _edge_to_canonical_dict(
     }
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "external row data on the quarantine path — already-malformed values being normalized so they "
+        "can pass through canonical_json/stable_hash for the quarantine record"
+    ),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "replaces non-finite floats with None inside recognized dict/ndarray/list/tuple shapes and "
+        "returns every other value unchanged; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def sanitize_for_canonical(obj: Any) -> Any:
     """Recursively replace non-finite floats (NaN, Infinity) with None.
 

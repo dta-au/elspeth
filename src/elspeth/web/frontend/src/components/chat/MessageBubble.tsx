@@ -1,11 +1,12 @@
 // src/components/chat/MessageBubble.tsx
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import type {
   ChatMessage,
   CompositionProposal,
   CompositionState,
   InlineSourceSummary,
 } from "@/types/api";
+import { Button } from "@/components/ui";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
@@ -57,6 +58,13 @@ export function MessageBubble({
   const [toolsExpanded, setToolsExpanded] = useState(false);
   const hasToolCalls = !!(message.tool_calls && message.tool_calls.length > 0);
   const hasSourcesCreated = !!(sourcesCreated && sourcesCreated.length > 0);
+  const visibleSegments = useMemo(
+    () =>
+      message.segments ?? [
+        { kind: "text" as const, content: message.content },
+      ],
+    [message.content, message.segments],
+  );
   const [copied, setCopied] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
@@ -69,13 +77,20 @@ export function MessageBubble({
 
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(message.content);
+      const plainText = visibleSegments
+        .map((segment) =>
+          segment.kind === "trusted_system_notice"
+            ? `System note: ${segment.content}`
+            : segment.content,
+        )
+        .join("\n\n");
+      await navigator.clipboard.writeText(plainText);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
       // Clipboard API may fail in insecure contexts
     }
-  }, [message.content]);
+  }, [visibleSegments]);
 
   const handleEditStart = useCallback(() => {
     setEditContent(message.content);
@@ -140,9 +155,31 @@ export function MessageBubble({
             copy button below is an absolutely-positioned overlay, so this stays
             the first thing announced. */}
         <span className="sr-only">{authorLabel}</span>
-        {/* Copy button — visible on hover via CSS, always accessible on touch */}
+        {/* Copy button — visible on hover via CSS, always accessible on touch.
+
+            The confirmation is a GLYPH, not the word "Copied!"
+            (elspeth-091695b241). This button is `position: absolute; right: 0`
+            over the message prose with a `min-width` of
+            --size-control-compact (chat.css .bubble-action-overlay), so a
+            label wider than that floor can only grow LEFTWARD, over the
+            prose. The word rendered ~50-56px
+            including padding, so it covered the first line of the text the
+            user had just copied — at full opacity (the inline `opacity: 1`
+            below) for the whole 2000ms confirmation window, which is long
+            enough to read as a rendering glitch rather than a confirmation.
+
+            A single glyph stays well inside that floor, so the control's
+            footprint is identical in both states. Nothing is lost for
+            assistive tech: the button's aria-label already flips to "Copied to
+            clipboard", and an aria-label overrides the element's text content,
+            so the word was never the accessible-name channel. U+2713 is the
+            product's success mark — the vocabulary audit.css documents and
+            AuditReadinessPanel / PipelineValidationSummary render. Dropping
+            the word also retires the "Copied!" vs "Copied" voice mismatch
+            against MarkdownRenderer's code-block copy affordance. */}
         {!isSystem && (
-          <button
+          <Button
+            variant="bare"
             onClick={handleCopy}
             aria-label={copied ? "Copied to clipboard" : "Copy message"}
             className="bubble-copy-btn bubble-action-overlay bubble-action-overlay--copy"
@@ -150,8 +187,8 @@ export function MessageBubble({
               opacity: copied ? 1 : undefined,
             }}
           >
-            {copied ? "Copied!" : "\u2398"}
-          </button>
+            {copied ? "\u2713" : "\u2398"}
+          </Button>
         )}
 
         {isUser && isEditing ? (
@@ -168,39 +205,65 @@ export function MessageBubble({
                 }
               }}
               aria-label="Edit message"
+              /* Size to the message being edited (mirrors the ChatInput
+                 read-only formula): the content is always present at mount,
+                 so content-aware rows work here — unlike the composer, where
+                 a placeholder has no scroll height and the count must be
+                 static. Without this the browser default of 2 rows hid all
+                 but the first lines of the message. */
+              rows={Math.min(10, Math.max(4, editContent.split("\n").length + 1))}
               className="message-edit-textarea"
             />
             <div className="message-edit-actions">
-              <button
+              <Button
+                variant="bare"
                 onClick={handleEditCancel}
                 className="message-edit-cancel"
               >
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="bare"
                 onClick={handleForkSubmit}
                 disabled={!editContent.trim()}
                 className="message-edit-fork"
               >
                 Fork
-              </button>
+              </Button>
             </div>
           </div>
-        ) : isUser ? (
-          message.content
         ) : (
-          <MarkdownRenderer content={message.content} />
+          visibleSegments.map((segment, index) =>
+            segment.kind === "trusted_system_notice" ? (
+              <div
+                key={`trusted-system-notice-${index}`}
+                className="trusted-system-notice"
+                role="status"
+              >
+                <span className="sr-only">System note:</span>
+                <MarkdownRenderer content={segment.content} />
+              </div>
+            ) : isUser ? (
+              <span key={`message-text-${index}`}>{segment.content}</span>
+            ) : (
+              <MarkdownRenderer
+                key={`message-text-${index}`}
+                content={segment.content}
+              />
+            ),
+          )
         )}
 
         {/* Edit/fork button — user messages only, not pending/failed */}
         {isUser && !isEditing && !message.local_status && onFork && (
-          <button
+          <Button
+            variant="bare"
             onClick={handleEditStart}
             aria-label="Edit and fork from this message"
             className="bubble-edit-btn bubble-action-overlay bubble-action-overlay--edit"
           >
             &#9998;
-          </button>
+          </Button>
         )}
 
         {isUser && message.local_status === "failed" && onRetry && (
@@ -208,12 +271,23 @@ export function MessageBubble({
             <span className="message-failed-text">
               {message.local_error ?? "Failed to send message. Please try again."}
             </span>
-            <button
-              onClick={() => onRetry(message.id)}
-              className="message-retry-btn"
-            >
-              Retry
-            </button>
+            {/* S1: ``policy_blocked`` is permanent by construction — a
+                deployment policy refused the pipeline (see the F13-D guided
+                precedent in sessionStore.ts) — so keep the failed text but
+                never render a retry invitation for it. */}
+            {message.local_failure_code !== "policy_blocked" && (
+              <Button
+                variant="bare"
+                onClick={() => onRetry(message.id)}
+                className="message-retry-btn"
+                // Retry is a compose entry point: the store admission gate
+                // (elspeth-3f38ebb1b5) refuses a second compose while one is
+                // in flight, and the affordance must say so.
+                disabled={isComposing}
+              >
+                Retry
+              </Button>
+            )}
           </div>
         )}
 
@@ -226,7 +300,8 @@ export function MessageBubble({
         {/* Tool calls section (assistant messages only) */}
         {message.tool_calls && message.tool_calls.length > 0 && (
           <div className="message-tools">
-            <button
+            <Button
+              variant="bare"
               onClick={() => setToolsExpanded(!toolsExpanded)}
               aria-expanded={showToolCalls}
               aria-label={`Tool calls (${message.tool_calls.length})`}
@@ -234,7 +309,7 @@ export function MessageBubble({
             >
               {showToolCalls ? "\u25BC" : "\u25B6"} Tool calls (
               {message.tool_calls.length})
-            </button>
+            </Button>
             {showToolCalls && (
               <div className="message-tools-list">
                 {message.tool_calls.map((tc, i) => (

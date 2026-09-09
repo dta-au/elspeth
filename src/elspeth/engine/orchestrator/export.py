@@ -19,18 +19,22 @@ LandscapeDB is typed but imported conditionally to avoid circular imports.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol
+    from elspeth.contracts.audit import Run, SinkEffect
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.config import ElspethSettings
     from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.engine.orchestrator.schema_reconstruction import (
     _create_schema_model as _create_schema_model,
 )
@@ -74,26 +78,22 @@ def prepare_audit_export_binding(
 def _probe_audit_export_publication(
     settings: ElspethSettings,
     *,
-    sink_name: str,
-    sink: SinkProtocol,
+    binding: SinkEffectRuntimeBinding,
 ) -> None:
     """Run the sole bounded non-declarative export probe before snapshot I/O."""
-    from pathlib import Path
-
     from elspeth.contracts.errors import SinkEffectCapabilityError
     from elspeth.contracts.sink_effects import AuditExportFormat
     from elspeth.engine.orchestrator.preflight import validate_audit_export_sink_type_capability
 
+    sink = cast("SinkProtocol", binding.sink)
     export_format = AuditExportFormat(settings.landscape.export.format)
     validate_audit_export_sink_type_capability(type(sink), export_format)
     if export_format is not AuditExportFormat.CSV:
         return
-    raw_path = settings.sinks[sink_name].options.get("path")
-    if type(raw_path) is not str or not raw_path.strip():
-        raise SinkEffectCapabilityError("CSV audit export requires an explicit local bundle target path")
-    from elspeth.plugins.sinks._audit_export_bundle_effects import preflight_audit_export_bundle
-
-    preflight_audit_export_bundle(Path(raw_path))
+    publication_preflight = binding.audit_export_publication_preflight
+    if publication_preflight is None:
+        raise SinkEffectCapabilityError("CSV audit export requires a runtime-bound publication preflight")
+    publication_preflight()
 
 
 def _validate_audit_export_binding_provenance(
@@ -132,10 +132,15 @@ def export_landscape(
     audit_export_content_store: AuditExportContentStore,
     audit_export_content_store_resolver: AuditExportContentStoreResolver,
     worker_id: str,
+    coordination_token: CoordinationToken,
     prepared_binding: SinkEffectRuntimeBinding | None = None,
     sink_effect_admission: object | None = None,
 ) -> None:
     """Export audit trail to configured sink after run completion.
+
+    ``coordination_token`` is the seat the caller holds on ``run_id`` — the
+    run's leader token from the export phase, or the export seat a resume
+    takes (ADR-048 §4) — and every durable sink-effect write fences on it.
 
     For JSON format: writes all records to a single sink (records are
     heterogeneous but JSON handles that naturally).
@@ -155,7 +160,7 @@ def export_landscape(
         ValueError: If signing requested but ELSPETH_SIGNING_KEY not set,
                    or if sink_factory raises for the configured sink name
     """
-    from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.audit_export import AuditExportContentStoreResolver
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
 
@@ -163,9 +168,20 @@ def export_landscape(
 
     if type(worker_id) is not str or not worker_id.strip():
         raise ValueError("audit export worker_id must be a non-empty exact string")
+    # ADR-048 §2: the snapshot registry write is fenced against the seat this
+    # token names, so a run_id that is not the token's run would fence one run
+    # and write another. Fail closed before any export effect.
+    if run_id != coordination_token.run_id:
+        raise ValueError(f"audit export for run {run_id!r} attempted under a leader token for run {coordination_token.run_id!r}")
 
-    if not isinstance(audit_export_content_store, AuditExportContentStore):
-        raise TypeError("audit_export_content_store must implement AuditExportContentStore")
+    # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
+    # Protocol, so the check admits any object carrying the right attribute names
+    # and rejects honest dynamic-attribute ones (ADR-032 rule 3). The binding
+    # controls are this durability proof, the resolver's own identifier and
+    # namespace assertions in register(), and the two equality checks below that
+    # bind the resolved store to the configured content_store policy. The
+    # resolver argument keeps its type test because
+    # AuditExportContentStoreResolver is a concrete class ELSPETH owns.
     if not audit_export_content_store.is_durable():
         raise ValueError("audit_export_content_store must prove durability")
     if type(audit_export_content_store_resolver) is not AuditExportContentStoreResolver:
@@ -191,7 +207,7 @@ def export_landscape(
         required_input_kind=SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT,
         admission=sink_effect_admission,
     )
-    _probe_audit_export_publication(settings, sink_name=sink_name, sink=sink)
+    _probe_audit_export_publication(settings, binding=prepared_binding)
 
     # Get signing key from environment if signing enabled
     signing_key: bytes | None = None
@@ -209,7 +225,7 @@ def export_landscape(
 
     snapshot = prepare_audit_export_snapshot(
         db,
-        run_id=run_id,
+        coordination_token=coordination_token,
         config=export_config,
         signing_key=signing_key,
         content_store=audit_export_content_store,
@@ -221,6 +237,8 @@ def export_landscape(
     from elspeth.contracts import NodeType
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.contracts.schema import SchemaConfig
+    from elspeth.core.canonical import canonical_json, stable_hash
+    from elspeth.core.config import sanitize_node_config_for_audit
 
     # Snapshot first: export audit rows can never recurse into their own bytes.
     factory = RecorderFactory(db, payload_store=payload_store)
@@ -229,28 +247,44 @@ def export_landscape(
     # publication response finds the row a prior attempt registered. Reuse it
     # so the retry reaches SinkEffectCoordinator reconciliation of the durable
     # effect instead of crashing on the nodes composite primary key. Fail
-    # closed if the registered identity is not the audit-export sink node this
-    # attempt would register.
-    existing_node = factory.data_flow.get_node(sink.node_id, run_id)
-    if existing_node is None:
-        factory.data_flow.register_node(
-            run_id=run_id,
-            node_id=sink.node_id,
-            plugin_name=sink.name,
-            node_type=NodeType.SINK,
-            plugin_version=sink.plugin_version,
-            config=dict(sink.config),
-            schema_config=SchemaConfig.from_dict({"mode": "observed"}),
-            determinism=Determinism.IO_WRITE,
-            source_file_hash=sink.source_file_hash,
-        )
-    elif existing_node.node_type is not NodeType.SINK or existing_node.plugin_name != sink.name:
-        raise AuditIntegrityError(
-            f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "
-            f"with divergent identity ({existing_node.node_type.value!r}/{existing_node.plugin_name!r}); "
-            f"refusing to reuse it for export sink {sink.name!r}"
-        )
+    # closed if the registered provenance is not exactly what this attempt
+    # would register. A partial identity match would let a changed retry run
+    # under stale audit attribution.
     try:
+        existing_node = factory.data_flow.get_node(sink.node_id, run_id)
+        if existing_node is None:
+            factory.data_flow.register_node(
+                run_id=run_id,
+                node_id=sink.node_id,
+                plugin_name=sink.name,
+                node_type=NodeType.SINK,
+                plugin_version=sink.plugin_version,
+                config=dict(sink.config),
+                schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+                determinism=Determinism.IO_WRITE,
+                source_file_hash=sink.source_file_hash,
+            )
+        else:
+            audit_safe_config = sanitize_node_config_for_audit(dict(sink.config), plugin_name=sink.name)
+            provenance_fields = (
+                ("plugin_name", existing_node.plugin_name, sink.name),
+                ("node_type", existing_node.node_type, NodeType.SINK),
+                ("plugin_version", existing_node.plugin_version, sink.plugin_version),
+                ("determinism", existing_node.determinism, Determinism.IO_WRITE),
+                ("config_hash", existing_node.config_hash, stable_hash(audit_safe_config)),
+                ("config_json", existing_node.config_json, canonical_json(audit_safe_config)),
+                ("source_file_hash", existing_node.source_file_hash, sink.source_file_hash),
+                ("schema_hash", existing_node.schema_hash, None),
+                ("sequence_in_pipeline", existing_node.sequence_in_pipeline, None),
+                ("schema_mode", existing_node.schema_mode, "observed"),
+                ("schema_fields", existing_node.schema_fields, None),
+            )
+            divergent_fields = [field_name for field_name, observed, expected in provenance_fields if observed != expected]
+            if divergent_fields:
+                raise AuditIntegrityError(
+                    f"audit export node {sink.node_id!r} for run {run_id!r} is already registered "
+                    f"with divergent provenance fields {divergent_fields!r}; refusing to reuse it for export sink {sink.name!r}"
+                )
         execute_audit_export_effect(
             factory=factory,
             snapshot=snapshot,
@@ -258,6 +292,7 @@ def export_landscape(
             sink_node_id=sink.node_id,
             target_config=dict(settings.sinks[sink_name].options),
             worker_id=worker_id,
+            coordination_token=coordination_token,
         )
     finally:
         sink.close()
@@ -280,6 +315,35 @@ def audit_export_resume_refusal(run: object | None, run_id: str) -> str | None:
         return f"run {run_id!r} has status {status.value!r}, which is not export-terminal; audit export resume requires a finalized run"
     if run.export_status is ExportStatus.COMPLETED:  # type: ignore[attr-defined]
         return f"run {run_id!r} audit export already completed; refusing to re-run publication"
+    return None
+
+
+def _audit_export_resume_target_refusal(
+    run: Run,
+    settings: ElspethSettings,
+    effects: Sequence[SinkEffect],
+) -> str | None:
+    """Refuse a resume whose settings diverge from its durable target identity."""
+    from elspeth.contracts.sink_effects import SinkEffectInputKind
+    from elspeth.core.landscape.execution.sink_effect_identity import compute_sink_effect_target_hash
+
+    export_config = settings.landscape.export
+    if run.export_format is not None and run.export_format != export_config.format:
+        return "audit export target identity differs from the persisted export format"
+    if run.export_sink is not None and run.export_sink != export_config.sink:
+        return "audit export target identity differs from the persisted export sink"
+    sink_name = export_config.sink
+    if sink_name is None:
+        return None
+    target_hash = compute_sink_effect_target_hash(dict(settings.sinks[sink_name].options))
+    audit_effects = tuple(effect for effect in effects if effect.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT)
+    if not audit_effects:
+        return None
+    if len(audit_effects) != 1:
+        return "audit export target identity is ambiguous because multiple durable export effects exist for the run"
+    effect = audit_effects[0]
+    if effect.sink_node_id != f"export:{sink_name}" or effect.config_hash != target_hash:
+        return "audit export target identity differs from the existing durable effect"
     return None
 
 
@@ -313,7 +377,6 @@ def resume_audit_export(
             is not export-terminal, or its export already completed.
         Exception: Re-raises any export failure after recording FAILED status.
     """
-    from elspeth.contracts import ExportStatus
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine._best_effort import best_effort
 
@@ -326,13 +389,63 @@ def resume_audit_export(
     refusal = audit_export_resume_refusal(run, run_id)
     if refusal is not None:
         raise ValueError(refusal)
+    assert run is not None
+    refusal = _audit_export_resume_target_refusal(
+        run,
+        settings,
+        factory.execution.sink_effects.get_effects_for_run(run_id),
+    )
+    if refusal is not None:
+        raise ValueError(refusal)
 
-    factory.run_lifecycle.set_export_status(
-        run_id,
-        status=ExportStatus.PENDING,
+    # ADR-048 §4: an operator action that cannot take the seat must not write
+    # the row. The export seat is a leader seat on a finalized run — no status
+    # flip, refused while a live leader holds it — vacated after the export.
+    coordination_token = factory.run_coordination.acquire_export_leadership(
+        run_id=run_id,
+        worker_id=worker_id,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    )
+    try:
+        _resume_audit_export_led(
+            db,
+            factory,
+            settings,
+            sink_factory,
+            payload_store=payload_store,
+            audit_export_content_store=audit_export_content_store,
+            audit_export_content_store_resolver=audit_export_content_store_resolver,
+            coordination_token=coordination_token,
+        )
+    finally:
+        with best_effort("Export seat release", run_id=run_id):
+            factory.run_coordination.release_seat(token=coordination_token)
+
+
+def _resume_audit_export_led(
+    db: LandscapeDB,
+    factory: RecorderFactory,
+    settings: ElspethSettings,
+    sink_factory: Callable[[str], SinkEffectRuntimeBinding],
+    *,
+    payload_store: PayloadStore,
+    audit_export_content_store: AuditExportContentStore,
+    audit_export_content_store_resolver: AuditExportContentStoreResolver,
+    coordination_token: CoordinationToken,
+) -> None:
+    """The export-resume body, under the seat ``coordination_token`` proves."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine._best_effort import best_effort
+
+    export_config = settings.landscape.export
+    run_id = coordination_token.run_id
+    pending_recorded = factory.run_lifecycle.set_export_pending_unless_completed(
         export_format=export_config.format,
         export_sink=export_config.sink,
+        coordination_token=coordination_token,
     )
+    if not pending_recorded:
+        return
     try:
         export_landscape(
             db,
@@ -342,18 +455,23 @@ def resume_audit_export(
             payload_store=payload_store,
             audit_export_content_store=audit_export_content_store,
             audit_export_content_store_resolver=audit_export_content_store_resolver,
-            worker_id=worker_id,
+            worker_id=coordination_token.worker_id,
+            coordination_token=coordination_token,
         )
     except Exception as export_error:
+        from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld
+
+        failure_recorded: bool | None = None
         with best_effort(
             "Export status FAILED recording on resume",
             run_id=run_id,
             original_error=type(export_error).__name__,
         ):
-            factory.run_lifecycle.set_export_status(
-                run_id,
-                status=ExportStatus.FAILED,
+            failure_recorded = factory.run_lifecycle.set_export_failed_unless_completed(
                 error=str(export_error),
+                coordination_token=coordination_token,
             )
+        if failure_recorded is False and isinstance(export_error, SinkEffectLeaseHeld):
+            return
         raise
-    factory.run_lifecycle.set_export_status(run_id, status=ExportStatus.COMPLETED)
+    factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=coordination_token)

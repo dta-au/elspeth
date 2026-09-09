@@ -15,6 +15,7 @@ from collections.abc import Mapping
 
 import pytest
 
+from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 
 
@@ -23,7 +24,21 @@ def _discovered_builtin_plugins() -> list[tuple[str, type]]:
     return [(plugin_type.rstrip("s"), plugin_cls) for plugin_type, plugin_classes in discovered.items() for plugin_cls in plugin_classes]
 
 
-@pytest.mark.parametrize(("plugin_type", "plugin_cls"), _discovered_builtin_plugins(), ids=lambda value: getattr(value, "name", str(value)))
+def _plugin_param_id(value: object) -> str:
+    """Parametrise ID for one element of a ``(plugin_type, plugin_cls)`` pair.
+
+    The plugin kind is already a string; a plugin class is a registered
+    built-in, so ``name`` is a real class attribute and is read directly rather
+    than probed with a sentinel default (ADR-032).
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, type) and issubclass(value, (BaseSource, BaseTransform, BaseSink)):
+        return value.name
+    return str(value)
+
+
+@pytest.mark.parametrize(("plugin_type", "plugin_cls"), _discovered_builtin_plugins(), ids=_plugin_param_id)
 def test_builtin_plugin_publishes_discovery_hints(plugin_type: str, plugin_cls: type) -> None:
     """Every discovered builtin plugin returns a non-empty composer_hints tuple."""
     assistance = plugin_cls.get_agent_assistance(issue_code=None)
@@ -38,7 +53,7 @@ def test_builtin_plugin_publishes_discovery_hints(plugin_type: str, plugin_cls: 
         assert len(hint) <= 280, f"{label}: composer_hint exceeds 280 chars: {hint!r}"
 
 
-@pytest.mark.parametrize(("plugin_type", "plugin_cls"), _discovered_builtin_plugins(), ids=lambda value: getattr(value, "name", str(value)))
+@pytest.mark.parametrize(("plugin_type", "plugin_cls"), _discovered_builtin_plugins(), ids=_plugin_param_id)
 def test_builtin_plugin_publishes_summary(plugin_type: str, plugin_cls: type) -> None:
     """Every discovered builtin plugin returns a non-empty summary."""
     assistance = plugin_cls.get_agent_assistance(issue_code=None)

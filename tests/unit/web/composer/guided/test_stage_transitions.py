@@ -7,14 +7,17 @@ through its legal phases without constructing executable topology.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 from uuid import UUID
 
 import pytest
 
+from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, TurnType
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
+from elspeth.web.composer.guided.stage_subjects import StableSubject, StatedGateRoutingConstraint
 from elspeth.web.composer.guided.stage_transitions import (
     AnsweredTurn,
     FieldSelectionResponse,
@@ -31,11 +34,21 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_sink_plugin_selection,
     transition_sink_schema_form,
     transition_source_inspection_review,
+    transition_source_plugin_reselection,
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
-from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent, TurnRecord
+from elspeth.web.composer.guided.state_machine import (
+    ComponentTarget,
+    DeferredStageIntent,
+    GuidedSession,
+    SinkIntent,
+    SourceIntent,
+    TurnRecord,
+)
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_to_dict
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 
 SOURCE_A = "11111111-1111-4111-8111-111111111111"
 SOURCE_B = "22222222-2222-4222-8222-222222222222"
@@ -297,6 +310,114 @@ def test_source_selection_reuses_target_and_preserves_multi_source_order() -> No
     assert result.source_order == (SOURCE_A, SOURCE_B)
     assert result.pending_source_intents[SOURCE_B].name == "source_2"
     assert result.reviewed_sources[SOURCE_A] == session.reviewed_sources[SOURCE_A]
+
+
+def test_source_plugin_reselection_preserves_stable_identity_and_rebinds_matching_inspection() -> None:
+    session, turn = _source_options_session(facts=None)
+    facts = replace(
+        _inspection(),
+        source_kind="json",
+        redacted_identity={
+            "filename": "input.json",
+            "mime_type": "application/json",
+            "blob_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        },
+    )
+
+    result = transition_source_plugin_reselection(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        plugin="json",
+        permitted_plugins=("csv", "json"),
+        inspection_facts=facts,
+    )
+
+    assert result.source_order == (SOURCE_A,)
+    assert list(result.pending_source_intents) == [SOURCE_A]
+    intent = result.pending_source_intents[SOURCE_A]
+    assert (intent.name, intent.phase, intent.plugin) == ("source", "plugin_options", "json")
+    assert facts_to_dict(intent.inspection_facts) == facts_to_dict(facts)  # type: ignore[arg-type]
+
+
+def test_source_plugin_reselection_rejects_noop_unpermitted_and_mismatched_facts() -> None:
+    session, turn = _source_options_session(facts=None)
+    with pytest.raises(ValueError):
+        transition_source_plugin_reselection(
+            session,
+            target_id=SOURCE_A,
+            turn=turn,
+            plugin="csv",
+            permitted_plugins=("csv", "json"),
+            inspection_facts=None,
+        )
+    with pytest.raises(ValueError):
+        transition_source_plugin_reselection(
+            session,
+            target_id=SOURCE_A,
+            turn=turn,
+            plugin="blocked",
+            permitted_plugins=("csv", "json"),
+            inspection_facts=None,
+        )
+    with pytest.raises(ValueError, match="inspection"):
+        transition_source_plugin_reselection(
+            session,
+            target_id=SOURCE_A,
+            turn=turn,
+            plugin="json",
+            permitted_plugins=("csv", "json"),
+            inspection_facts=_inspection(),
+        )
+    with pytest.raises(ValueError, match="inspection"):
+        transition_source_plugin_reselection(
+            session,
+            target_id=SOURCE_A,
+            turn=turn,
+            plugin="json",
+            permitted_plugins=("csv", "json"),
+            inspection_facts=replace(_inspection(), source_kind="unknown"),
+        )
+
+
+def test_source_selection_accepts_profiled_s3_from_server_permitted_set() -> None:
+    session, turn = _with_unanswered_turn(GuidedSession.initial(), TurnType.SINGLE_SELECT)
+
+    result = transition_source_plugin_selection(
+        session,
+        turn=turn,
+        response=PluginSelectionResponse(chosen=("aws_s3",)),
+        permitted_plugins=("aws_s3", "csv", "json"),
+        inspection_facts=None,
+        new_stable_id=UUID(SOURCE_A),
+    )
+
+    assert result.pending_source_intents[SOURCE_A].plugin == "aws_s3"
+
+
+def test_source_plugin_reselection_accepts_profiled_s3_from_server_permitted_set() -> None:
+    session, turn = _source_options_session(facts=None)
+
+    result = transition_source_plugin_reselection(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        plugin="aws_s3",
+        permitted_plugins=("aws_s3", "csv", "json"),
+        inspection_facts=None,
+    )
+
+    assert result.pending_source_intents[SOURCE_A].plugin == "aws_s3"
+
+
+def test_trained_operator_authority_still_offers_raw_s3_source() -> None:
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+    assert snapshot.is_trained_operator is True
+    assert PluginId("source", "aws_s3") in snapshot.available
+    assert all(availability.reason is not PluginUnavailableReason.WEB_SURFACE_PROHIBITED for availability in snapshot.unavailable)
+    for transition in (transition_source_plugin_selection, transition_source_plugin_reselection):
+        assert "plugin_snapshot" not in inspect.signature(transition).parameters
 
 
 @pytest.mark.parametrize("chosen", [(), ("csv", "json"), ("blocked",)])
@@ -565,10 +686,11 @@ def test_sink_selection_allocates_stable_id_and_reuses_pending_target() -> None:
         response=PluginSelectionResponse(chosen=("json",)),
         permitted_plugins=("json",),
         new_stable_id=UUID(OUTPUT_A),
+        prefill_name="high_value",
     )
     assert result.output_order == (OUTPUT_A,)
     assert result.pending_output_intents[OUTPUT_A] == SinkIntent(
-        name="output",
+        name="high_value",
         phase="plugin_options",
         plugin="json",
         options=None,
@@ -579,7 +701,7 @@ def test_sink_selection_allocates_stable_id_and_reuses_pending_target() -> None:
         result,
         history=(),
         output_order=(OUTPUT_A, OUTPUT_B),
-        reviewed_outputs={OUTPUT_A: _output("output")},
+        reviewed_outputs={OUTPUT_A: _output("high_value")},
         pending_output_intents={OUTPUT_B: pending},
     )
     resumed, resumed_turn = _with_unanswered_turn(resumed, TurnType.SINGLE_SELECT)
@@ -589,9 +711,97 @@ def test_sink_selection_allocates_stable_id_and_reuses_pending_target() -> None:
         turn=resumed_turn,
         response=PluginSelectionResponse(chosen=("json",)),
         permitted_plugins=("json",),
+        prefill_name="standard",
     )
     assert resumed_result.output_order == (OUTPUT_A, OUTPUT_B)
-    assert resumed_result.reviewed_outputs[OUTPUT_A].name == "output"
+    assert resumed_result.reviewed_outputs[OUTPUT_A].name == "high_value"
+    assert resumed_result.pending_output_intents[OUTPUT_B].name == "standard"
+
+
+def test_sink_selection_uses_grounded_deferred_route_targets_for_wizard_created_outputs() -> None:
+    routing = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_A),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+    deferred = DeferredStageIntent.create(
+        intent_id="55555555-5555-4555-8555-555555555555",
+        receiving_stage="source",
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Retained route targets.",
+        originating_message_id="66666666-6666-4666-8666-666666666666",
+        message_content_hash=stable_hash("route amount to high_value, everything else to standard"),
+        constraints=(routing,),
+    )
+    base = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(SOURCE_A,),
+        reviewed_sources={SOURCE_A: _source("source", ("amount",))},
+        deferred_intents=(deferred,),
+    )
+    session, turn = _with_unanswered_turn(base, TurnType.SINGLE_SELECT)
+    first = transition_sink_plugin_selection(
+        session,
+        turn=turn,
+        response=PluginSelectionResponse(chosen=("json",)),
+        permitted_plugins=("json",),
+        new_stable_id=UUID(OUTPUT_A),
+        prefill_name="standard",
+    )
+    assert first.pending_output_intents[OUTPUT_A].name == "standard"
+
+    pending_second = replace(
+        first,
+        history=(),
+        reviewed_outputs={OUTPUT_A: _output("standard")},
+        pending_output_intents={OUTPUT_B: SinkIntent(name="output_2", phase="plugin_selection", plugin=None, options=None)},
+        output_order=(OUTPUT_A, OUTPUT_B),
+    )
+    pending_second, second_turn = _with_unanswered_turn(pending_second, TurnType.SINGLE_SELECT)
+    second = transition_sink_plugin_selection(
+        pending_second,
+        target_id=OUTPUT_B,
+        turn=second_turn,
+        response=PluginSelectionResponse(chosen=("json",)),
+        permitted_plugins=("json",),
+    )
+    assert second.pending_output_intents[OUTPUT_B].name == "high_value"
+
+
+def test_sink_selection_rejects_prefill_name_that_collides_with_a_source() -> None:
+    base = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(SOURCE_A,),
+        reviewed_sources={SOURCE_A: _source("high_value", ("amount",))},
+    )
+    session, turn = _with_unanswered_turn(base, TurnType.SINGLE_SELECT)
+
+    with pytest.raises(ValueError, match="guided component"):
+        transition_sink_plugin_selection(
+            session,
+            turn=turn,
+            response=PluginSelectionResponse(chosen=("json",)),
+            permitted_plugins=("json",),
+            new_stable_id=UUID(OUTPUT_A),
+            prefill_name="high_value",
+        )
+
+
+def test_guided_session_rejects_cross_kind_component_name_collision() -> None:
+    with pytest.raises(InvariantError, match="globally unique"):
+        GuidedSession(
+            step=GuidedStep.STEP_2_SINK,
+            source_order=(SOURCE_A,),
+            reviewed_sources={SOURCE_A: _source("shared", ("amount",))},
+            output_order=(OUTPUT_A,),
+            reviewed_outputs={OUTPUT_A: _output("shared")},
+        )
 
 
 def test_sink_selection_rejects_any_unreviewed_ordered_source() -> None:
@@ -655,6 +865,77 @@ def test_schema_forms_reject_wrong_knob_types() -> None:
             response=SchemaFormResponse(plugin="json", options={"indent": "not-an-int"}),
             authority=SchemaFormAuthority(knobs=SINK_KNOBS, model_validated_options={}),
         )
+
+
+@pytest.mark.parametrize(
+    ("component_kind", "plugin", "credential_field"),
+    [
+        ("source", "csv", "connection_string"),
+        ("sink", "json", "client_secret"),
+        ("sink", "database", "url"),
+    ],
+)
+def test_schema_forms_reject_literal_credentials_before_guided_state_persistence(
+    component_kind: str,
+    plugin: str,
+    credential_field: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    canary = "guided-literal-credential-canary-7f3a9d"
+    knobs = {
+        "fields": [
+            {
+                "name": credential_field,
+                "kind": "text",
+                "required": False,
+                "nullable": False,
+            }
+        ]
+    }
+    authority = SchemaFormAuthority(
+        knobs=knobs,
+        model_validated_options={credential_field: canary},
+    )
+    response = SchemaFormResponse(plugin=plugin, options={credential_field: canary})
+
+    if component_kind == "source":
+        session, turn = _source_options_session(facts=None)
+        source_pending = dict(session.pending_source_intents)
+        source_pending[SOURCE_A] = replace(source_pending[SOURCE_A], plugin=plugin)
+        session = replace(session, pending_source_intents=source_pending)
+
+        def submit() -> GuidedSession:
+            return transition_source_schema_form(
+                session,
+                target_id=SOURCE_A,
+                turn=turn,
+                response=response,
+                authority=authority,
+            )
+
+    else:
+        session, turn = _sink_options_session()
+        sink_pending = dict(session.pending_output_intents)
+        sink_pending[OUTPUT_A] = replace(sink_pending[OUTPUT_A], plugin=plugin)
+        session = replace(session, pending_output_intents=sink_pending)
+
+        def submit() -> GuidedSession:
+            return transition_sink_schema_form(
+                session,
+                target_id=OUTPUT_A,
+                turn=turn,
+                response=response,
+                authority=authority,
+            )
+
+    persisted_before = session.to_dict()
+    with pytest.raises(ValueError, match=credential_field) as exc_info:
+        submit()
+
+    assert session.to_dict() == persisted_before
+    assert canary not in repr(session.to_dict())
+    assert canary not in str(exc_info.value)
+    assert canary not in caplog.text
 
 
 def _sink_schema_form_with_path(path: str) -> GuidedSession:
@@ -842,6 +1123,70 @@ def test_sink_field_review_resolves_same_id_and_stays_in_output_stage() -> None:
     assert output.schema_mode == "observed"
     with pytest.raises(AttributeError):
         _ = result.topology
+
+
+def _sink_review_session_with_schema(schema: dict) -> tuple[GuidedSession, AnsweredTurn]:
+    """A field-review-phase session whose sink intent carries an explicit schema."""
+    session = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(SOURCE_A, SOURCE_B),
+        reviewed_sources={
+            SOURCE_A: _source("source", ("id", "name")),
+            SOURCE_B: _source("source_2", ("name", "email")),
+        },
+        output_order=(OUTPUT_A,),
+        pending_output_intents={
+            OUTPUT_A: SinkIntent(
+                name="output",
+                phase="field_review",
+                plugin="json",
+                options={"path": "/data/out.jsonl", "on_write_failure": "discard", "schema": schema},
+            )
+        },
+    )
+    return _with_unanswered_turn(session, TurnType.MULTI_SELECT_WITH_CUSTOM)
+
+
+def test_sink_field_review_rejects_chosen_field_undeclared_by_explicit_sink_schema() -> None:
+    """elspeth-398f150859: a source-observed column absent from the sink's own
+    fixed schema passed review and died later as an unrepairable
+    plugin_options_invalid at candidate validation. Review time is where the
+    operator can still change the selection, so the cross-check lives here."""
+    session, turn = _sink_review_session_with_schema({"mode": "fixed", "fields": ["id: str", "label: str"]})
+
+    with pytest.raises(ValueError, match=r"not declared by the sink's explicit 'fixed' schema.*name"):
+        transition_sink_field_review(
+            session,
+            target_id=OUTPUT_A,
+            turn=turn,
+            response=FieldSelectionResponse(chosen=("id", "name"), custom_inputs=(), control_signal=None),
+        )
+
+
+def test_sink_field_review_rejects_custom_field_undeclared_by_flexible_sink_schema() -> None:
+    session, turn = _sink_review_session_with_schema({"mode": "flexible", "fields": ["id: str"]})
+
+    with pytest.raises(ValueError, match=r"not declared by the sink's explicit 'flexible' schema.*derived"):
+        transition_sink_field_review(
+            session,
+            target_id=OUTPUT_A,
+            turn=turn,
+            response=FieldSelectionResponse(chosen=("id",), custom_inputs=("derived",), control_signal=None),
+        )
+
+
+def test_sink_field_review_accepts_selection_declared_by_explicit_sink_schema() -> None:
+    session, turn = _sink_review_session_with_schema({"mode": "fixed", "fields": ["id: str", "label: str", "derived: str"]})
+
+    resolved = transition_sink_field_review(
+        session,
+        target_id=OUTPUT_A,
+        turn=turn,
+        response=FieldSelectionResponse(chosen=("id",), custom_inputs=("derived",), control_signal=None),
+    ).reviewed_outputs[OUTPUT_A]
+
+    assert resolved.required_fields == ("id", "derived")
+    assert resolved.schema_mode == "fixed"
 
 
 def test_sink_field_review_explicit_passthrough_is_the_only_empty_selection() -> None:
@@ -1391,3 +1736,95 @@ def test_finish_component_review_rejects_cross_kind_empty_and_pending_collection
     pending = add_component_intent(source_session, "source", UUID("55555555-5555-4555-8555-555555555555"))
     with pytest.raises(InvariantError, match="pending"):
         finish_component_review(pending, "source")
+
+
+def test_inspection_review_records_content_identity_anchor() -> None:
+    """Blob-backed review must pin the inspected content's hash prefix.
+
+    ``resolve_reviewed_source_authority`` uses the recorded prefix to refuse
+    settlement when the blob's bytes changed after review — location and
+    lifecycle checks alone cannot see an in-place update_blob
+    (elspeth-b3feba9a7c).  A review that read the bytes therefore records
+    the ``content_hash_prefix`` its inspection facts carry.
+    """
+    facts = _inspection()
+    anchored = SourceInspectionFacts(
+        source_kind=facts.source_kind,
+        redacted_identity={**dict(facts.redacted_identity), "content_hash_prefix": "deadbeef"},
+        byte_range_inspected=facts.byte_range_inspected,
+        sample_row_count=facts.sample_row_count,
+        observed_headers=facts.observed_headers,
+        inferred_types=dict(facts.inferred_types) if facts.inferred_types is not None else None,
+        url_candidates=facts.url_candidates,
+        warnings=facts.warnings,
+    )
+    session = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(SOURCE_A,),
+        pending_source_intents={
+            SOURCE_A: SourceIntent(
+                name="source",
+                phase="inspection_review",
+                plugin="csv",
+                options={
+                    "path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "on_validation_failure": "discard",
+                },
+                inspection_facts=anchored,
+                observed_columns=anchored.observed_headers or (),
+                sample_rows=(),
+            )
+        },
+    )
+    session, turn = _with_unanswered_turn(session, TurnType.INSPECT_AND_CONFIRM)
+
+    result = transition_source_inspection_review(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        response=InspectionResponse(columns=("record_id",)),
+    )
+
+    reviewed = result.reviewed_sources[SOURCE_A]
+    assert reviewed.content_hash_prefix == "deadbeef"
+    roundtrip = SourceResolved.from_dict(reviewed.to_dict())
+    assert roundtrip.content_hash_prefix == "deadbeef"
+
+
+def test_inspection_review_without_content_anchor_records_none() -> None:
+    """Facts lacking a hash prefix (non-blob inspection) record None."""
+    session, turn = _source_review_session()
+
+    result = transition_source_inspection_review(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        response=InspectionResponse(columns=("record_id",)),
+    )
+
+    reviewed = result.reviewed_sources[SOURCE_A]
+    assert reviewed.content_hash_prefix is None
+    assert SourceResolved.from_dict(reviewed.to_dict()).content_hash_prefix is None
+
+
+def test_source_resolved_from_dict_accepts_legacy_records_without_anchor() -> None:
+    """Persisted pre-anchor guided sessions must still deserialize (anchor=None)."""
+    legacy = {
+        "name": "source",
+        "plugin": "csv",
+        "options": {"path": "rows.csv"},
+        "observed_columns": ["id"],
+        "sample_rows": [],
+        "on_validation_failure": "discard",
+    }
+    assert SourceResolved.from_dict(legacy).content_hash_prefix is None
+
+
+def test_reorder_reviewed_components_rejects_non_sequence_and_non_uuid_stable_ids() -> None:
+    """The wire-facing stable_ids parse rejects, never coerces or partially reorders."""
+    session = _review_session(step=GuidedStep.STEP_1_SOURCE)
+
+    with pytest.raises(TypeError, match="sequence of UUID"):
+        reorder_reviewed_components(session, "source", "a-str-is-a-character-sequence-trap")
+    with pytest.raises(TypeError, match="exact UUID"):
+        reorder_reviewed_components(session, "source", (UUID(SOURCE_A), "not-a-uuid"))

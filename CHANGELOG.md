@@ -4,7 +4,481 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.7.1 - 2026-07-23 (Recoverable effects and Composer parity)
+## 0.8.0 - 2026-09-07 (Unified lineage and production hardening)
+
+0.8.0 unifies ELSPETH's group-lineage and settlement model while carrying
+forward the production-path hardening prepared after 0.7.1. It adds
+scope-bound collectors, first-class document and multimodal primitives,
+stronger Composer data contracts and reader-focused review surfaces, a
+contributor-focused repository and Composer training package, and critical
+security and recovery fixes. The notes below intentionally cover only major
+changes and critical correctness or security fixes.
+
+**Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
+to 53. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+completed guided-plan decline contract, epoch 38 adds the decline result
+message locator that pins the exact assistant message a decline replays, and
+epoch 39 adds the `policy_blocked` guided-operation failure code so a
+deployment-policy refusal settles as a permanent failure instead of being
+misattributed to the model provider. Epoch 40 makes the explicit coalesce
+`timeout_seconds` key required in persisted proposal payloads, including
+`null`, so epoch-39 sessions fail at startup instead of during guided replay.
+Epoch 41 does the same for the `node_options_summary` key the proposal and
+wiring review cards render, so an epoch-40 session cannot reach a stored
+payload whose projection no longer verifies. Epoch 42 retains the reviewed
+unproducible-output field gap on failed guided operations so retries replay the
+original closed HTTP failure envelope exactly. Epoch 43 adds the
+`run_diagnostics` chat writer principal so run-diagnostics LLM audit rows are
+attributed to their real writer instead of the compose loop. Epoch 44 adds
+the `planner_repair_exhausted` guided-operation failure code so planner
+repair exhaustion settles under its own honest classification instead of the
+provider-blaming invalid-response envelope. Epoch 45 moves web Textract
+authoring onto operator document profiles (ADR-036): sessions authored
+against the removed `bucket_field` projection or the old `deployment` alias
+no longer validate or replay. Epoch 46 makes no SQL-shape change; it advances
+in lockstep with the guided checkpoint schema cut from 10 to 11, whose
+`composer_meta` chat-history entries gain the occurrence-binding `turn_token`
+key so a guided Retry resubmits the exact persisted occurrence it answers
+instead of matching on content. Epoch 47 adds the `auto_commit.revoked`
+proposal-event type so an auto-commit blocked by the settlement-boundary
+trust-mode recheck leaves a durable audit record instead of silently falling
+back to the review path. Epoch 48 adds the `superseded` interpretation-event
+choice so a composition-state commit that extinguishes a reviewed site
+terminally retires the persisted pending review in the same transaction
+instead of leaving a zombie card that gates Run forever. Epoch 49 adds the
+`composition_rejection_events` table so a composer mutation-tool rejection's
+reason — the exact payload the planner saw — persists durably as session
+data instead of reaching the operator nowhere (elspeth-3e28029d2f). Epoch 50
+adds the `proposal.rebased` proposal-event type so a guided settlement that
+carries a still-pending proposal across the checkpoint it writes can move the
+proposal's anchor there and record the move, instead of leaving it anchored to
+a superseded checkpoint — which made the session unreadable through the guided
+route and killed the wire-review "edit this component" affordance
+(elspeth-ed67eb9d0d). Epoch 51 adds the multi-replica coordination substrate's
+schema. Three parts of it are written in production: the persistent
+session-operation authority (fenced, database-clock leases), monotonic
+user-secret row versions, and durable proposal blob-effect receipts. The
+`web_instances` membership table gained its typed writer in 0.8.0
+(elspeth-66a19780b1): every PostgreSQL-backed replica registers itself
+through `WebInstanceMembershipAuthority` after the startup sweeps, under the
+same instance id it fences with, renews its lease from the database clock,
+records `draining` as the first act of shutdown (readiness fails at once)
+and `stopped` after its executor drains; a peer's fence takeover and
+orphan-run recovery join that row before acting on a dead owner. The
+remaining epoch-51 tables — run-start permits, cross-replica
+websocket tickets, rate-limit state and bounded cleanup claims — are schema
+only: no production writer exists yet (follow-ups on elspeth-6f8c1714d5).
+Epoch 50 cannot represent those authorities or receipts and is rejected
+outright; no migration exists. That substrate carried the
+number 44 and then 48 on its original lane and shipped under neither — both of
+those integers already name different schemas on this release line, and the
+epoch sentinel is enforced by exact equality, so one integer must name exactly
+one shape. Epoch 52 carries the pluggable-SSO identity substrate: the auth
+provider discriminator widens from three values to five on both `sessions` and
+`user_secrets`, and the identity, org-tree and workflow-governance tables land
+in the same epoch so the sprint costs exactly one cutover window rather than
+two (elspeth-07cd19ba73). Epoch 53 adds `session_read_admissions`: one row per
+live shareable blob-read admission, written only by the session operation
+authority, so a released or expired read context is refused on its next proof
+instead of keeping read authority until the session is archived or deleted
+(elspeth-f98e0ae8b2); a writer advancing the fence epoch does not invalidate a
+shareable read.
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 38. Epoch 30 adds durable
+row-union barrier attribution, epoch 31 closes scheduler status over the public
+six-state vocabulary, epoch 32 atomically records aggregation results and their
+ordered members, and epoch 33 adds the composite `(run_id, token_id)` outcome
+access path. Epoch 34 adds the unified-lineage groundwork:
+`token_lineage_frames`, `group_records`, `group_losses`, and journal-carried
+`lineage_path_json`. Epoch 35 retires the legacy fork, expand, and branch
+lineage columns and makes lineage frames and paths the sole lineage truth.
+Epoch 36 adds `coalesce_effects.group_id`, allowing sibling fork groups that
+share a row id to restore their independent merge receipts without a false
+audit-integrity failure. Epoch 37 widens the auth provider CHECK constraints
+on `auth_events` and `run_attributions` to admit `vanguard` and `google`; the
+constraint only widens, but Landscape compares declared CHECK text against the
+reflected constraint structurally, so it is a schema change like any other and
+cuts over in the same service-stop window as session epoch 52 — one window,
+two stores. Epoch 38 gives `scheduler_events` an auto-incrementing `seq`
+primary key that is the authoritative replay order; `event_id` becomes a
+non-unique content digest of the transition. Database-stamped events tie on
+`recorded_at` inside one SQLite second or one PostgreSQL transaction, so the
+old `(recorded_at, event_id)` key replayed them in hash order and two identical
+transitions of one work item in one second collided on the primary key.
+
+ELSPETH does not migrate either predecessor database in place before 1.0.
+Archive or export required evidence, stop the old service, recreate stale
+session and Landscape stores, then install 0.8.0. A Landscape database below
+epoch 38 is not current and must be recreated. Do not roll older code back over
+the recreated databases; keep the service drained and repair this release
+forward.
+
+**Breaking operator setting rename:** `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`
+becomes `ELSPETH_WEB__DEFAULT_LLM_PROFILE`, and `WebSettings.tutorial_llm_profile`
+becomes `default_llm_profile`. The setting never designated a tutorial-owned
+profile; it names the deployment's standard profile, which the first-run
+tutorial happens to use. There is no compatibility alias, so any deployment
+setting the old variable must change its environment before upgrading, and the
+protected AWS acceptance env-var contract moves with it or the scenario binding
+hash no longer matches the deployed task definition. Leaving
+`default_llm_profile` unset is a supported degraded-readiness state — ordinary
+pipelines and explicit profile authoring remain available while the first-run
+tutorial reports that no standard profile is configured — but a default that
+names an unconfigured profile is rejected at startup.
+
+**Breaking API rename:** `WebLLMProfileSettings` becomes `LLMProfileSettings`
+and `RuntimeWebLLMProfile` becomes `RuntimeLLMProfile`, with the alias and
+secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
+`SECRET_REF_PATTERN`. No compatibility aliases or re-exports remain.
+
+### Major changes
+
+- **Deployment and packaging have maintained production profiles** — the
+  release adds Docker Compose/PostgreSQL and native Linux systemd bundles,
+  retains the AWS ECS acceptance controller, and builds a pinned non-root image
+  with its Web Composer assets and selected dependency extras. A
+  provider-neutral `elspeth doctor` runs deployment readiness checks against a
+  target before it goes live.
+- **The cross-platform deployment contract is stated** — documentation now
+  names the supported set: Docker Compose, AWS ECS, native Linux, one Azure
+  Ubuntu VM, and Kubernetes BYO. A new AWS stack comes from the tracked AWS ECS
+  Terraform cold-install package, while the separate release acceptance
+  controller and the existing-service redeploy path use operator-supplied
+  task-definition ARNs; the Azure Container Apps Bicep bundle ships in
+  `deploy/azure-container-apps/` with provider-scoped receipts, replica > 1
+  probes and runbooks, and its live acceptance on dev hardware is an
+  operator-run step (elspeth-5ec3befc1a) that the support claim waits on.
+- **AWS and PostgreSQL paths align with their production contracts** — Composer
+  can use Bedrock through the AWS default credential chain, the packaged
+  PostgreSQL extra supports both locked SQLAlchemy driver paths, and acceptance
+  evidence is bound before release decisions.
+- **Composer evidence and validation are current-state bound** — durable retries
+  retain provider, prompt, failure, source, and fork evidence, while runtime
+  preflight and approved tutorial execution are keyed to the composition that
+  produced them.
+- **Correlated row unions are first-class Composer topology** — freeform,
+  guided, import/export, validation, and graph surfaces can author and inspect
+  plugin-free, require-all `row_union` barriers that release branch rows
+  unchanged in declared order for long-format processing. Canonical
+  configuration, build, runtime, and guided coverage is present; broader audit,
+  recovery, concurrency, browser-backed round-trip, and scale acceptance
+  remains deferred under the open row-union work.
+- **Forks, expansions, and barriers share one durable lineage model** — tokens
+  carry typed lineage-frame paths, while Landscape records group rosters,
+  settlement, and losses through one set of tables. New `scopes:` and
+  `collectors:` configuration closes expansion groups under explicit
+  `require_all` or `best_effort` policy. Bound-region validation, ordered
+  collector flushing, crash recovery, resume protection, MCP forensics, and
+  freeform and guided Composer authoring all use the same model.
+- **Document and multimodal pipelines gain first-class transforms** —
+  `pdf_rasterize` emits one PNG-and-text row per PDF page through an isolated
+  worker; `blob_json_expand` and `blob_text_expand` turn stored or inline
+  content into bounded row groups; and `reference_join` enriches rows from a
+  configuration-bound reference table. LLM sources and transforms support
+  typed structured output, and LLM transforms can consume bounded
+  payload-store images without persisting image bytes in audit metadata.
+- **Composer exposes data contracts and technical depth deliberately** — known
+  uploaded content supplies `guaranteed_fields`; unverifiable sources receive
+  an explicit user-reviewed data-contract question; and structural preflight
+  findings remain visible while interpretation reviews are pending. A
+  per-user `show_advanced` setting keeps the default interface outcome-focused
+  while retaining technical options, schemas, diagnostics, identifiers, and
+  YAML import behind disclosure.
+- **Composer's reader view uses plain language without hiding forensic detail**
+  — chat cards, Spec routing, run confirmation and history, validation, audit,
+  recovery, blob, and secret surfaces use display names, component
+  descriptions, and humanised reasons by default. Advanced mode exposes raw
+  identifiers and codes as visible secondary text on the main technical
+  surfaces instead of leaving them hover-only; unknown values remain verbatim
+  rather than becoming false prose. The graph, keyboard component list, Spec
+  tab, and decoder share one topology model, dangling routes say
+  `(not connected)`, and keyboard selection moves focus to the component's
+  configuration. GET and PATCH preferences decode against a closed,
+  parity-tested field set so server/client drift fails closed.
+- **The public repository separates contribution guidance from maintainer
+  working state** — `AGENTS.md` is a harness-neutral covenant,
+  `CONTRIBUTING.md` owns durable whole-tree gate guidance, and
+  `docs/maintainer/toolchain.md` describes optional maintainer automation.
+  Active plans and specifications use stable `docs/plans/` and `docs/specs/`
+  paths; implemented plans remain available through git history;
+  project-control registers remain local rather than published; and
+  machine-local provenance, personal identifiers, and the LFS-tracked demo
+  video no longer ship in repository clones. The demo remains available from
+  GitHub Releases.
+- **Project-owned skills and design assets have canonical locations** —
+  reusable agent skills live once under `.agents/skills/`, with compatibility
+  links for `.claude/skills/`, while the branded component library, design
+  tokens, examples, and UI kits live under top-level `design/`. This removes
+  copied skill trees and keeps the `elspeth-design` guidance independent of a
+  particular agent harness.
+- **Composer gains a one-hour training package** — a draft 37-slide,
+  minute-by-minute instructor guide and self-contained HTML deck take new users
+  from Sense, Decide, Act, and Audit through guided and freeform authoring,
+  proposal and decision review, validation, advanced graph shapes, execution,
+  YAML exchange, version history, and review sharing. The deck includes
+  speaker notes, exact UI language, hands-on exercises, and print support.
+- **Textract document locations bind through operator profiles on the web
+  surface** (ADR-036) — the transform gains a static `bucket` + `key_prefix`
+  location mode (mutually exclusive with `bucket_field`), web deployments
+  grant document locations through a dedicated operator-declared
+  `aws_textract_profiles` settings section, and the authoring projection flips
+  from a denylist to an allowlist so `bucket`, `bucket_field`, and `key_prefix`
+  are all web-inexpressible. Profiled runs persist `{profile, relative key}` in
+  AWS call records so operator-private bucket names never reach the audit
+  trail. No database table shape changed. CLI/YAML `bucket_field` pipelines are
+  unchanged.
+- **ADR numbering collisions are repaired** — two ADRs numbered 025 and two
+  numbered 026 are renumbered to `034-audited-inline-blob-content` and
+  `035-audit-hash-raw-vs-stored-asymmetry`, so every ADR number again names
+  exactly one decision. The record now runs 000–048, with 044 and 045 unused.
+  Twelve new ADRs are accepted this release: 032 (validate by trust domain),
+  033 (deferred-intent admission contract), 036 (Textract profile-bound
+  bucket), 037 (interpretation caps govern LLM churn only), 038 (non-terminal
+  ABANDONED path), 039 (unconstrained text framing), 040 (Composer/runtime
+  validation posture), 041 (state-engine supported profiles), 042 (group
+  settlement vocabulary and observability), 043 (project tooling), 046 (audit
+  grade is a product characteristic), and 047 (Landscape database-clock
+  authority). One ships as **Proposed** — 048 (required coordination token for
+  Landscape mutations), whose remaining threading lands in 0.8.1. Both
+  coordination decisions are described below.
+- **Pluggable single sign-on and one identity substrate** (elspeth-07cd19ba73,
+  design in `docs/specs/2026-09-02-pluggable-sso-design.md`) — the web service
+  exchanges the authorization code itself as a confidential client, hands the
+  browser a single-use code in the URL fragment, and resolves every login,
+  local or SSO, to one `identities` row that carries admission and quota.
+  Token validation has one decode path: the accepted signature algorithms are
+  fixed at construction from the identity-provider profile, and the header-
+  driven bearer decoder is removed (elspeth-e8a9973c37). Bearer tokens
+  presented by the legacy `oidc` and `entra` providers are therefore held to
+  the same envelope as an ID token — `exp`, `iat`, `iss`, `sub` and `aud` are
+  all required, with a 60-second clock-skew allowance — so a provider that
+  omits `iat` or `sub` from its access tokens is refused where it was accepted
+  before. The Cognito access-token mode (`oidc_audience_claim="client_id"`)
+  is removed and refused at startup; Cognito registers as a confidential
+  client through the SSO profile. Deleting a local account from the CLI now
+  retires its identity exactly as the web service does, so a re-created
+  username starts with a fresh identity rather than inheriting the old one's
+  admission and quota.
+- **Landscape custody, liveness and takeover decisions read the Landscape
+  database's clock** (ADR-047, elspeth-0ff11aa42e) — every lease deadline,
+  expiry comparison and takeover predicate under `core/landscape`,
+  `core/checkpoint` and the orchestrator used to be decided against whichever
+  process asked: either a `now` the caller passed into the repository verb, or
+  a process clock the repository read for itself. One process per Landscape
+  has one clock, so that was harmless; two or more replicas against one
+  Landscape are not. A replica whose clock runs ahead extends its own leader
+  seat further into the future than its peers believe, one whose clock runs
+  behind judges a live seat expired and takes it over, and nothing in the
+  schema or the fence can detect either, because every predicate compares a
+  stored deadline against a caller-supplied instant. The first leader fence,
+  worker liveness, scheduler leases and dispositions, barrier completion and
+  adoption, source-completion reconciliation, and sink-effect leases now take
+  their "now" from the Landscape database's own `CURRENT_TIMESTAMP` inside the
+  deciding transaction, after the locks that make the decision exclusive —
+  read once and bound into every predicate and deadline of that transaction, or
+  written in SQL at the leader fence itself. The `now` parameter is gone from
+  the coordination API and no injection seam replaces it; the absence of the
+  seam is the safety property. The Landscape and Sessions clocks remain
+  separate authorities that never cross: with the Sessions clock pinned to
+  2040, every Landscape family's written deadline still lands within a second
+  of Landscape database time, and a takeover cannot be won on the foreign
+  clock. Forensic timestamps (`created_at`, `recorded_at`) keep the process
+  clock — they are recorded, never compared.
+- **A Landscape mutation carries the authority it is written under**
+  (ADR-048, restoring ADR-030 D4's fence split; elspeth-43ddb79074) — a
+  mutation verb took `run_id: str`, a plain string minted by whoever called
+  it, so a replica that had lost leadership (evicted, drained, partitioned, or
+  resumed after a pause) still held a valid-looking run id and could still
+  write node states, outcomes, calls and the run's terminal status. Nothing in
+  the signature or the transaction could refuse it, because nothing in the
+  write path carried leadership. **This model is not complete in 0.8.0. It
+  completes in 0.8.1, and ADR-048 stays Proposed until it does.** What ships
+  here is the first tranche of it, and each piece stands on its own:
+  leadership travels as a value into the run-lifecycle, sink-effect,
+  checkpoint and audit-export verbs, which take a required, keyword-only,
+  exactly-typed `CoordinationToken`, put the verify-and-extend leader fence
+  first in the transaction that writes, and derive the run from the token
+  rather than from a second parameter that could disagree with it. A worker's
+  own liveness and departure writes take a distinct owned type,
+  `WorkerMembershipToken`, fenced against that worker's `run_workers`
+  registration in the same verify-UPDATE form so the row lock is held rather
+  than a snapshot read: requiring the leader token there would either stop a
+  follower making writes it legitimately makes, or hand it an authority it
+  does not hold, and one type meaning both would make that confusion
+  unprovable. A refused member write raises `RunMembershipLostError` with no
+  payload written and records a `fence_refusal` carrying no epoch, so the
+  ledger tells it apart from a leader refusal. The data-flow, execution and
+  scheduler repository families carry most of the threading that remains, and
+  a mutation they own is still written under a plain run id until 0.8.1
+  converts it. That remainder is measured rather than drifting: the four
+  frozen caller inventories are green, and the fencing gate names each
+  outstanding site instead of failing the build on it.
+- **Composer pipeline recipes are removed** — the `list_recipes` and
+  `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
+  slot-schema contracts behind them. The server-side prose-to-recipe matcher
+  had already been excised; what remained shipped two tool declarations in
+  every composer request and, across 141 sessions and 707 tool calls,
+  produced no pipeline. The `recipe.index` planner information class is
+  retired with them — it was still advertised to the planner as discoverable
+  while no tool could resolve it. Pipeline structure is authored by the
+  planner through `set_pipeline` and the graph-mutation tools, per the
+  standing composer invariant that the LLM does the job.
+
+### Critical fixes
+
+- **Commit-disclosure correction (audit trail):** two 2026-08-07 commits
+  carry production fixes their subjects do not mention, an artifact of
+  concurrent agents staging broadly on a shared checkout. `6106365b9`
+  ("test(value_transform): …") also lands `_edge_field_type_conflict` in
+  `web/composer/state.py` — the whole of elspeth-f2eb8fef9f, the Stage-1
+  edge field-type conflict check. `2b4bbeb29` ("fix(composer): record the
+  preflight verdict…") also lands the Stage-2 accumulate-both-verdicts fix
+  in `core/dag/schema_validation.py` plus its integration test. Both fixes
+  are real and independently verified; this entry restores their
+  discoverability for `git log`/`blame` readers.
+- **Blob deletion cleanup remains retryable after metadata commit** — the
+  session store retains the exact staged tombstone until its unlink and parent
+  directory fsync both succeed, allowing direct and failed-fork cleanup to
+  resume safely after a process restart.
+- **Untrusted model and provider data stays inside its trust boundary** —
+  bounded ingress, source custody, protected-field propagation, and audit
+  redaction keep provider, pipeline, and tool payloads out of unapproved
+  surfaces.
+- **Guided source custody fails closed without bricking the session** — custody
+  correlation now uses raw source state before generic redaction, eliminating
+  false mismatches on fork-rehydrated sources. Exited and completed sessions
+  whose retained review no longer binds remain readable through a fully masked
+  `custody_unavailable` projection instead of a 500, without exposing private
+  source paths. Active writes are rejected inside the composition-state
+  transaction before the tip advances, legacy invalid tips return a named 409,
+  and guided re-entry refuses before settlement while leaving the reviewed tip
+  available for recovery by reverting to a bindable version. A byte-stability
+  corpus protects every previously valid projection and stored guided-response
+  hash.
+- **A wired secret requires both destination authorization and user approval**
+  — the server denies every secret-to-plugin-option wiring unless a
+  deployment rule matches the exact destination. Immediately before execution,
+  the authenticated caller must acknowledge the disclosed wiring set with a
+  token bound to the exact composition; planner prose and Composer tool calls
+  cannot approve it. Redirected and error-path `web_scrape` URLs are also
+  fingerprinted before they reach rows or audit evidence.
+- **Build and Composer preflight reject contracts the runtime cannot satisfy**
+  — validation follows declared value-preserving paths through observed
+  producers, treats every `field_mapper` mapping source as a required input,
+  derives environment-placeholder protection from each plugin's
+  output-affecting options, and asks the publication authority which nodes
+  require mandatory controls. Pipelines that previously validated and then
+  failed every row now stop before execution with an attributable remedy.
+- **Composer's review surfaces reflect the actual graph and run data** — CSV
+  previews honour quoting, coalesce diagrams and text alternatives show every
+  inbound branch, missing output records carry an explanation, guided replies
+  may retain several deferred intents, and advisor and share messages
+  distinguish pending review, withheld prose, skipped checks, and terminal
+  verdicts.
+- **Composer preflight cannot silently reuse stale meaning** — the runtime
+  preflight cache is keyed by composition content, including unsaved state.
+- **Every token reaches a lifecycle answer when a run dies** (ADR-038) — a
+  contract violation raised mid-load previously stranded its buffered tokens
+  at `closure='open'` on a run no resume could recover. Non-resumable runs now
+  record `(outcome=NULL, path=ABANDONED)` inside the fenced terminal
+  transaction, accounting separates abandoned from pending tokens, and closure
+  gains an `abandoned` state. Resumable runs keep buffered tokens honestly
+  open.
+- **Resume advice matches the gate resume enforces** — `can_resume` evaluates
+  the same source-lifecycle gate as `resume()`, and the CLI suggests resuming
+  after an interrupt only when that gate says it can succeed.
+- **Authentication and deployment state fail closed** — local auth files,
+  external identity keys, token expiry, JWT secrets, deployment roots, and ECS
+  PostgreSQL transport must pass their admission checks before use.
+- **Generated multiline text is no longer silently discarded** (ADR-039) — the
+  `text` sink refuses any value carrying a CR or LF record separator, so an LLM
+  answer spanning paragraphs was diverted row by row and published as a
+  zero-byte artifact while the run reported success. A producer whose framing
+  cannot be decided statically now declares `TextFraming.UNCONSTRAINED` rather
+  than abstaining, which turns that composition into a build-time contract
+  conflict instead of a runtime diversion. A new `document` sink publishes a
+  single unframed value, and the `line_explode` and `report_assemble` remedies
+  the refusal names are authorized on the web surface, so the repair it
+  recommends is one the Composer can actually take.
+- **A doubly-violating sink edge states both verdicts, not whichever raised
+  first** — a sink can simultaneously miss a required field and refuse an
+  undeclared one, and only the extras half used to survive. Its remedies
+  ("add the extra fields", "relax to flexible", "drop the extras") cannot
+  supply a field nothing guarantees, so the author — often an LLM authoring
+  loop — was handed a repair that leaves the graph invalid. Both verdicts are
+  now accumulated into one error carrying both field sets.
+- **A locked consumer narrower than what its upstream provably delivers is now
+  a build-time error** — a `mode: fixed` schema admits exactly its declared
+  fields, and edge validation now checks that lock against every field the
+  graph proves the producer delivers (`guaranteed_fields`), not only against
+  the fields the producer's own schema declares. Pipelines that previously
+  validated green and then killed every row at the consumer's input preflight
+  — a pass-through transform forwarding more than it declares, or a union
+  coalesce merging under-declared branches — are rejected at build with both
+  field lists, and the Web Composer reports the same verdict at authoring time
+  (its guarantee walk now sees through union coalesces instead of abstaining).
+  Narrowing a wide stream on purpose needs a projection, not a schema edit:
+  insert a `field_mapper` with `select_only: true` ahead of the locked
+  consumer — declaring fewer fields on the consumer cannot drop fields an
+  upstream guarantees will arrive.
+- **A guarantee-forgiven field with a conflicting ancestor type is now a
+  build-time error** — the guarantee channel proves a field's presence without
+  its type, so a consumer-required field the producer never declared used to
+  pass build on presence alone even when an ancestor DID type it (a `fixed`
+  source declaring `id: int` four nodes upstream) and the consumer demands an
+  incompatible type (`id: str`): the build stayed green and every row died
+  typed at the consumer's input preflight. Edge validation now walks the
+  guarantee topology for the nearest ancestor declaration and rejects on a
+  unanimous, concrete, incompatible type — the same verdict declaring the
+  field on the producing branches would have produced, attributed to the
+  declaring node. Where the type is genuinely unknowable (observed ancestors,
+  `any` declarations, branches that disagree) the forgiveness stands and the
+  per-row preflight keeps the verdict. Re-typing a stream on purpose needs a
+  declared conversion: insert a `type_coerce` transform declaring the target
+  type in its `schema.fields` ahead of the consumer. In support of this,
+  `type_coerce` with a declaring (non-observed) schema now includes its
+  conversion targets in its output schema declaration even when the input
+  schema omits them — the transform rewrites those fields' types either way,
+  and leaving the rewrite undeclared hid it from build-time validation (and
+  from this check's ancestor walk, which would otherwise enforce a stale
+  upstream type in both directions).
+- **A deposed leader could still clear the barrier markers its successor had
+  just set** (elspeth-ee18e446ff) — `reset_adoption_marker_to_pending`, the
+  crash-window recovery that clears `barrier_adopted_epoch` on BLOCKED coalesce
+  rows so the new leader's first intake re-adopts them properly, ran on a bare
+  write transaction. Its own docstring argued it needed no epoch fence because
+  a concurrent old-leader adoption attempt would fail the CAS — but that CAS
+  guards a different verb, and this one has none, so nothing it did was
+  protected by the sentence excusing it. One takeover is enough to break it: a
+  leader still inside journal restore, whose lease has lapsed and whose seat a
+  successor has taken, reaches the write with nothing to refuse it and clears
+  the markers under a live successor, leaving no refusal record. The second
+  instance is worse — leader A stalls in restore, B takes the seat at the next
+  epoch and begins adopting, and A's in-flight restore then resets exactly the
+  markers B has just set. The verb now takes the leader token and fences
+  first, so a deposed epoch is refused with zero mutation of the marker and a
+  durable `fence_refusal`; an empty work-item list still returns before the
+  fence, because there is no database effect to fence.
+- **Blob custody holds its own PostgreSQL advisory-lock class** — the
+  session-level lock a blob write holds across its reservation, file write and
+  finalize (`_blob_custody_session_lock`) now uses
+  `ELSPETH_BLOB_CUSTODY_LOCK_CLASSID` (`0x424C4F42`, "BLOB") instead of
+  sharing `ELSPETH_SESSIONS_LOCK_CLASSID` with the session-operation fence.
+  Session- and transaction-level advisory locks share one lock space, so
+  under the shared class every fence acquire, renew and release on a session
+  queued behind that session's filesystem persistence; on a multi-replica
+  deployment a renew starved past the lease window becomes a spurious
+  takeover. The transaction-scoped phase locks inside the reservation and
+  finalize transactions keep the sessions class. Pinned by the PostgreSQL
+  proof that a lease renew completes while a blob persist for the same
+  session is paused inside its rename
+  (`tests/testcontainer/web/test_blob_custody_lock_isolation_postgres.py`).
+  The class is internal to PostgreSQL advisory locking: no schema, bundle or
+  operator action. Replicas of different versions serialise custody on
+  different keys; every maintained platform's rollout contract is zero-overlap
+  replacement (`docs/reference/deployment-platforms.md`), and an overlap of
+  old and new replicas is outside it. elspeth-ee9861baf6.
+
+## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 
 0.7.1 makes both pipeline publication and web authoring recoverable. It adds a
 durable external-effect protocol for built-in sinks and audit exports, closes
@@ -24,16 +498,22 @@ service drained and repair this release forward.
 
 - **Durable, replay-safe external effects** — built-in file, object, database,
   Dataverse, and Chroma sinks now reserve and persist an immutable publication
-  plan before I/O, fence the active worker, and reconcile uncertain outcomes
-  before retrying. Audit exports use the same effect coordinator and sealed
-  snapshots. The protocol prevents a crash or lost response from silently
-  duplicating publication; an unprovable result remains explicitly blocked.
-- **Guided/freeform Composer parity for complex DAGs** — guided authoring can
-  build and revise plural components, structural queues, gates, forks,
-  coalesces, and deferred intent through the same canonical proposal contract
-  used by freeform authoring. A candidate remains separate from committed state
-  until review and wire confirmation, and closed rejection codes feed bounded,
-  auditable repair rather than silent replanning.
+  plan before external publication, fence the active worker, and reconcile
+  uncertain outcomes before retrying. Audit exports use the same effect
+  coordinator and sealed snapshots. The protocol prevents a crash or lost
+  response from silently duplicating publication; an unprovable result remains
+  explicitly blocked. Operators resume a recovered export with
+  `elspeth export-resume <run-id> --execute`; see the
+  [sink-effect recovery runbook](docs/runbooks/sink-effect-recovery.md).
+- **Shared Composer proposal and validation contract** — guided-staged
+  authoring covers seven of nine maintained parity fixtures through the
+  shared proposal and validation contract used by freeform and guided-full
+  authoring.
+  The current code-proven limitations are cross-sink write-failure fallback and
+  require-all coalesce; freeform and guided-full can author those shapes. A
+  candidate remains separate from committed state until review and wire
+  confirmation, and closed rejection codes feed bounded, auditable repair
+  rather than silent replanning.
 - **Durable Composer operations** — guided planning, start admission, failed
   operation evidence, fork replay, and proposal confirmation are persisted and
   fenced. Competing mutations receive a fast conflict, stale responses settle
@@ -79,7 +559,6 @@ service drained and repair this release forward.
   providers return closed rejection codes, remote OTLP endpoints require TLS,
   malformed ODBC brace syntax fails closed, and auth state compensates when its
   audit write cannot be persisted.
-
 ## 0.7.0 - 2026-07-09 (LLM-primary guided pipeline creation)
 
 Guided pipeline creation becomes LLM-primary. The guided composer is
@@ -288,8 +767,8 @@ separately (the same precedent as 0.5.4 into 0.6.0).
   `routes/composer.py` is decomposed into a `routes/composer/` area package,
   splitting the route module without changing its HTTP surface.
 - **Release documentation cleanout completed** — the remaining implemented
-  plans and design specs under `docs/plans/`, `docs/superpowers/plans/`, and
-  `docs/superpowers/specs/` were removed from tracked active docs while
+  plans and design specs under `docs/plans/`, `docs/plans/`, and
+  `docs/specs/` were removed from tracked active docs while
   keeping `docs/` focused on current user, operator, architecture, and release
   documentation. Maintainers may preserve the removed files in a local ignored
   archive; public provenance remains available through git history.
@@ -1708,7 +2187,7 @@ Major feature release: Dataverse and RAG retrieval plugins, output schema contra
 - Historical design specs and implementation plans from this era are no longer
   active docs. They are preserved in git history or the dated docs archives;
   start from the current ADRs, contracts, and archive manifests rather than old
-  `docs/superpowers/` paths.
+  `docs/` paths.
 
 ---
 
@@ -2021,11 +2500,11 @@ RC-2 fragment files were removed during the repository cleanout because their
 useful history is represented here and in git history.
 
 <!-- Comparison links — tags created at release time -->
-[0.5.1]: https://github.com/tachyon-beep/elspeth/compare/v0.5.0-rc5.0...v0.5.1-rc5.1
-[0.5.0]: https://github.com/tachyon-beep/elspeth/compare/v0.4.1-rc4.1...v0.5.0-rc5.0
-[0.4.1]: https://github.com/tachyon-beep/elspeth/compare/v0.4.0-rc4.0...v0.4.1-rc4.1
-[0.4.0]: https://github.com/tachyon-beep/elspeth/compare/v0.3.4-rc3.4...v0.4.0-rc4.0
-[0.3.4]: https://github.com/tachyon-beep/elspeth/compare/v0.3.3-rc3.3...v0.3.4-rc3.4
-[0.3.3]: https://github.com/tachyon-beep/elspeth/compare/v0.3.0-rc3.2...v0.3.3-rc3.3
-[0.3.0]: https://github.com/tachyon-beep/elspeth/compare/v0.1.0-phase1...v0.3.0-rc3.2
-[0.1.0]: https://github.com/tachyon-beep/elspeth/releases/tag/v0.1.0-phase1
+[0.5.1]: https://github.com/dta-au/elspeth/compare/v0.5.0-rc5.0...v0.5.1-rc5.1
+[0.5.0]: https://github.com/dta-au/elspeth/compare/v0.4.1-rc4.1...v0.5.0-rc5.0
+[0.4.1]: https://github.com/dta-au/elspeth/compare/v0.4.0-rc4.0...v0.4.1-rc4.1
+[0.4.0]: https://github.com/dta-au/elspeth/compare/v0.3.4-rc3.4...v0.4.0-rc4.0
+[0.3.4]: https://github.com/dta-au/elspeth/compare/v0.3.3-rc3.3...v0.3.4-rc3.4
+[0.3.3]: https://github.com/dta-au/elspeth/compare/v0.3.0-rc3.2...v0.3.3-rc3.3
+[0.3.0]: https://github.com/dta-au/elspeth/compare/v0.1.0-phase1...v0.3.0-rc3.2
+[0.1.0]: https://github.com/dta-au/elspeth/releases/tag/v0.1.0-phase1

@@ -1,0 +1,51 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: fork_input
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: fork_gate
+    input: fork_input
+    condition: "True"
+    routes: {"true": fork, "false": discard}
+    fork_to: [path_a, path_c, path_b]
+transforms:
+  - name: lose_a
+    plugin: dag_corpus_always_error
+    input: path_a
+    on_success: merge_a
+    on_error: discard
+    options:
+      schema: {mode: observed}
+  - name: lose_c
+    plugin: dag_corpus_always_error
+    input: path_c
+    on_success: merge_c
+    on_error: discard
+    options:
+      schema: {mode: observed}
+  - name: lose_b
+    plugin: dag_corpus_always_error
+    input: path_b
+    on_success: merge_b
+    on_error: discard
+    options:
+      schema: {mode: observed}
+coalesce:
+  - name: merge_paths
+    branches: {path_a: merge_a, path_b: merge_b, path_c: merge_c}
+    policy: best_effort
+    timeout_seconds: 60
+    merge: nested
+    on_success: output
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}

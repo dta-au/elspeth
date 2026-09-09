@@ -16,7 +16,7 @@ from typing import Any, Literal, NewType, Self, cast
 from urllib.parse import quote
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import Connection, Table, create_engine, event, text
+from sqlalchemy import Connection, create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.reflection import Inspector
 from sqlalchemy.engine.url import make_url
@@ -24,6 +24,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS, _scrub_odbc_connect_value
 from elspeth.core.landscape.journal import LandscapeJournal
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, metadata, schema_identity_table
@@ -117,7 +118,7 @@ def verify_sqlite_tier1_pragmas(engine: Engine, *, owner: str) -> None:
     if engine.dialect.name != "sqlite":
         return
 
-    with engine.connect() as conn:
+    with _maybe_serialize_shared_connection(engine), engine.connect() as conn:
         fk_result = conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one_or_none()
         jm_result = conn.exec_driver_sql("PRAGMA journal_mode").scalar_one_or_none()
 
@@ -158,6 +159,20 @@ def _query_base_param_name(key: str) -> str:
     return key.split("[", 1)[0].split(".", 1)[0]
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an operator-supplied database connection string — external configuration whose parsed query "
+        "mapping carries SQLAlchemy's declared str | tuple[str, ...] value union"
+    ),
+    source_param="connection_string",
+    suppresses=("R5",),
+    invariant=(
+        "returns a credential-scrubbed diagnostic URL; an unparseable string returns the redacted "
+        "sentinel '<unparseable database URL redacted>'; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _safe_database_descriptor(connection_string: str) -> str:
     """Return a diagnostic database URL with credentials removed."""
     try:
@@ -285,7 +300,11 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_web_plugin_policy", "plugin_code_identities_json"),
     ("run_web_plugin_policy", "binding_generation_fingerprint"),
     ("run_web_plugin_policy", "decision_codes_json"),
-    ("tokens", "expand_group_id"),
+    # Epoch 35 flip: lineage lives on token_lineage_frames + group_records now.
+    ("token_lineage_frames", "member_key"),
+    ("group_records", "member_count"),
+    # META-38 (epoch 36, pre-release: no migration): the written release fact.
+    ("group_records", "closes_group_id"),
     # Added for run ownership — prevents cross-run contamination of token-linked records
     ("tokens", "run_id"),
     # Token ancestry belongs to exactly one run; both endpoints are composite-FK scoped.
@@ -296,8 +315,6 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("runs", "source_schema_json"),
     # Field resolution audit trail - captures original→final header mapping
     ("runs", "source_field_resolution_json"),
-    # Fork/expand branch contract - enables recovery validation
-    ("token_outcomes", "expected_branches_json"),
     # Transform success reason audit trail - captures why transform succeeded
     ("node_states", "success_reason_json"),
     # Operation call linkage - enables source/sink call tracking
@@ -391,12 +408,14 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("token_work_items", "pending_path"),
     ("token_work_items", "pending_error_hash"),
     ("token_work_items", "pending_error_message"),
-    ("token_work_items", "branch_name"),
-    ("token_work_items", "fork_group_id"),
     ("token_work_items", "join_group_id"),
-    ("token_work_items", "expand_group_id"),
+    ("token_work_items", "lineage_path_json"),
     ("token_work_items", "coalesce_node_id"),
     ("token_work_items", "coalesce_name"),
+    # Epoch 30: row_union barrier attribution, the sibling of coalesce_name.
+    ("token_work_items", "row_union_name"),
+    # WS4 Task 6: collector barrier attribution, the sibling of row_union_name.
+    ("token_work_items", "collector_name"),
     ("token_work_items", "attempt"),
     ("token_work_items", "lease_owner"),
     ("token_work_items", "lease_expires_at"),
@@ -405,6 +424,32 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     # Epoch 20: F1 durability unification.
     # barrier_blocked_at records when a work item was blocked at a barrier (Task 1.3).
     ("token_work_items", "barrier_blocked_at"),
+    # Epoch 34: unified lineage groundwork (WS1a).
+    ("token_work_items", "lineage_path_json"),
+    ("token_lineage_frames", "token_id"),
+    ("token_lineage_frames", "run_id"),
+    ("token_lineage_frames", "depth"),
+    ("token_lineage_frames", "kind"),
+    ("token_lineage_frames", "group_id"),
+    ("token_lineage_frames", "member_key"),
+    ("group_records", "run_id"),
+    ("group_records", "group_id"),
+    ("group_records", "kind"),
+    ("group_records", "opener_token_id"),
+    ("group_records", "member_count"),
+    ("group_records", "created_at"),
+    ("group_losses", "loss_id"),
+    ("group_losses", "run_id"),
+    ("group_losses", "closer_name"),
+    ("group_losses", "group_id"),
+    ("group_losses", "member_key"),
+    ("group_losses", "token_id"),
+    ("group_losses", "reason"),
+    ("group_losses", "recorded_by"),
+    ("group_losses", "recorded_at"),
+    ("group_losses", "adopted_epoch"),
+    # Epoch 38: authoritative replay order and row identity (AUTOINCREMENT).
+    ("scheduler_events", "seq"),
     ("scheduler_events", "event_id"),
     ("scheduler_events", "run_id"),
     ("scheduler_events", "token_id"),
@@ -449,16 +494,6 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_coordination_events", "leader_epoch"),
     ("run_coordination_events", "recorded_at"),
     ("run_coordination_events", "context_json"),
-    ("coalesce_branch_losses", "loss_id"),
-    ("coalesce_branch_losses", "run_id"),
-    ("coalesce_branch_losses", "coalesce_name"),
-    ("coalesce_branch_losses", "row_id"),
-    ("coalesce_branch_losses", "branch_name"),
-    ("coalesce_branch_losses", "token_id"),
-    ("coalesce_branch_losses", "reason"),
-    ("coalesce_branch_losses", "recorded_by"),
-    ("coalesce_branch_losses", "recorded_at"),
-    ("coalesce_branch_losses", "adopted_epoch"),
 )
 
 _EPOCH_26_REQUIRED_TABLES = (
@@ -483,6 +518,17 @@ _REQUIRED_COLUMNS += tuple(
     (table_name, column.name) for table_name in _EPOCH_27_REQUIRED_TABLES for column in metadata.tables[table_name].columns
 )
 
+_EPOCH_32_REQUIRED_TABLES = ("aggregation_results", "aggregation_result_outputs", "aggregation_result_members")
+_REQUIRED_COLUMNS += tuple(
+    (table_name, column.name) for table_name in _EPOCH_32_REQUIRED_TABLES for column in metadata.tables[table_name].columns
+)
+
+# Epoch 37: every auth event carries the identity it concerns. Nullable — a
+# login that fails before an identity is resolved has none — but startup
+# verified, so an epoch-36 store fails HERE, naming the column, instead of
+# raising an opaque SQL error the first time an admin opens the audit view.
+_REQUIRED_COLUMNS += (("auth_events", "identity_id"),)
+
 # Required foreign keys for audit integrity (Tier 1 trust).
 # Format: (table_name, column_name, referenced_table)
 # Use this only for exact single-column contracts. Run-scoped contracts belong in
@@ -496,12 +542,13 @@ _REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
     ("run_coordination", "run_id", "runs"),
     ("run_workers", "run_id", "runs"),
     ("run_coordination_events", "run_id", "runs"),
-    ("coalesce_branch_losses", "run_id", "runs"),
+    ("group_losses", "run_id", "runs"),
     ("operations", "sink_effect_id", "sink_effects"),
     ("audit_export_snapshot_chunks", "snapshot_id", "audit_export_snapshots"),
     ("sink_effect_export_snapshots", "snapshot_id", "audit_export_snapshots"),
     ("sink_effect_attempts", "effect_id", "sink_effects"),
     ("coalesce_effects", "run_id", "runs"),
+    ("aggregation_results", "run_id", "runs"),
 )
 
 # Required composite foreign keys for run-scoped audit integrity.
@@ -528,6 +575,37 @@ _REQUIRED_COMPOSITE_FOREIGN_KEYS: tuple[tuple[str, tuple[str, ...], str, tuple[s
     ("batches", ("retry_of_batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("batch_members", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("batch_members", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
+    ("aggregation_results", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
+    (
+        "aggregation_results",
+        ("aggregation_state_id", "run_id"),
+        "node_states",
+        ("state_id", "run_id"),
+    ),
+    (
+        "aggregation_results",
+        ("expansion_parent_token_id", "run_id"),
+        "tokens",
+        ("token_id", "run_id"),
+    ),
+    (
+        "aggregation_result_outputs",
+        ("batch_id", "run_id"),
+        "aggregation_results",
+        ("batch_id", "run_id"),
+    ),
+    (
+        "aggregation_result_members",
+        ("batch_id", "run_id"),
+        "aggregation_results",
+        ("batch_id", "run_id"),
+    ),
+    (
+        "aggregation_result_members",
+        ("token_id", "run_id"),
+        "tokens",
+        ("token_id", "run_id"),
+    ),
     ("token_work_items", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("token_work_items", ("row_id", "run_id"), "rows", ("row_id", "run_id")),
     ("token_work_items", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
@@ -594,6 +672,7 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("run_attributions", "ck_run_attributions_auth_provider_type"),
     ("run_web_plugin_policy", "ck_run_web_plugin_policy_schema_version"),
     ("run_sources", "ck_run_sources_lifecycle_state"),
+    ("token_work_items", "ck_token_work_items_status"),
     ("token_work_items", "ck_token_work_items_lease_owner_required_when_leased"),
     ("scheduler_events", "ck_scheduler_events_event_type"),
     ("scheduler_events", "ck_scheduler_events_from_status"),
@@ -654,6 +733,15 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("coalesce_effects", "ck_coalesce_effects_effect_hash_hex"),
     ("coalesce_effects", "ck_coalesce_effects_payload_ref_hex"),
     ("coalesce_effect_members", "ck_coalesce_effect_members_ordinal"),
+    ("aggregation_results", "ck_aggregation_results_output_mode"),
+    ("aggregation_results", "ck_aggregation_results_output_shape"),
+    ("aggregation_results", "ck_aggregation_results_mode_shape_parent"),
+    ("aggregation_results", "ck_aggregation_results_output_hash_hex"),
+    ("aggregation_result_outputs", "ck_aggregation_result_outputs_ordinal"),
+    ("aggregation_result_outputs", "ck_aggregation_result_outputs_ref_hex"),
+    ("aggregation_result_members", "ck_aggregation_result_members_ordinal"),
+    ("aggregation_result_members", "ck_aggregation_result_members_action"),
+    ("aggregation_result_members", "ck_aggregation_result_members_error_hash_hex"),
 )
 
 # Required indexes (including partial unique indexes) for audit integrity.
@@ -674,7 +762,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("token_work_items", "ix_token_work_items_recovery"),
     ("token_work_items", "ix_token_work_items_pending_sink_token"),
     ("token_work_items", "uq_token_work_items_terminal_identity"),
-    ("scheduler_events", "ix_scheduler_events_run_token_time"),
+    ("scheduler_events", "ix_scheduler_events_run_token_seq"),
     ("scheduler_events", "ix_scheduler_events_work_item"),
     ("validation_errors", "ix_validation_errors_run_row"),
     ("artifacts", "uq_artifacts_run_idempotency_key"),
@@ -682,7 +770,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("run_workers", "ix_run_workers_liveness"),
     ("run_coordination_events", "uq_run_coordination_events_event_id"),
     ("run_coordination_events", "ix_run_coordination_events_run"),
-    ("coalesce_branch_losses", "uq_coalesce_branch_losses_natural"),
+    ("group_losses", "uq_group_losses_natural"),
     ("runs", "uq_runs_export_witness"),
     ("tokens", "uq_tokens_identity_row_run"),
     ("tokens", "uq_tokens_coalesce_result_identity"),
@@ -693,6 +781,8 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("audit_export_snapshots", "uq_audit_export_snapshots_registry_key"),
     ("audit_export_snapshots", "ix_audit_export_snapshots_registry_key_hash"),
     ("audit_export_snapshot_chunks", "uq_audit_export_snapshot_chunks_terminal"),
+    ("aggregation_results", "ix_aggregation_results_run"),
+    ("aggregation_result_outputs", "ix_aggregation_result_outputs_ref"),
 )
 
 _REQUIRED_TRIGGERS: tuple[str, ...] = (
@@ -762,7 +852,7 @@ def _missing_additive_indexes(inspector: Inspector, present_tables: set[str]) ->
         if table_name not in present_tables:
             missing.add(index_name)
             continue
-        found = {str(index["name"]) for index in inspector.get_indexes(table_name) if index.get("name") is not None}
+        found = {str(index["name"]) for index in inspector.get_indexes(table_name) if "name" in index and index["name"] is not None}
         if index_name not in found:
             missing.add(index_name)
     return frozenset(missing)
@@ -1092,6 +1182,24 @@ class LandscapeDB:
             )
 
     @staticmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "an operator-supplied SQLite database URL — external configuration whose parsed query "
+            "mapping carries SQLAlchemy's declared str | tuple[str, ...] value union, a tuple encoding "
+            "a repeated parameter"
+        ),
+        source_param="url",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError before create_engine, and therefore before the creator callback can "
+            "open or create the database file, when a query parameter occurs more than once or when a "
+            "boolean connect option is not a SQLAlchemy true/false spelling; never selects one "
+            "occurrence of a repeated parameter and never substitutes a default for a malformed value"
+        ),
+        test_ref="tests/unit/core/landscape/test_database_sqlcipher.py::TestSQLCipherCreateAndRead::test_repeated_query_parameter_rejected_by_the_engine_boundary",
+        test_fingerprint="5ae47b055575fa9536683396a3ef178314149483b4672eea0c51566c53e479be",
+    )
     def _create_sqlcipher_engine(url: str, passphrase: str, *, read_only: bool = False) -> Engine:
         """Create a SQLAlchemy engine backed by SQLCipher (AES-256 encryption).
 
@@ -1158,10 +1266,17 @@ class LandscapeDB:
         uri_params: dict[str, str] = {}
 
         for key, raw_value in parsed.query.items():
-            value = raw_value if isinstance(raw_value, str) else raw_value[0]
+            # URL.query preserves repeated parameters as tuples. Selecting one
+            # occurrence would discard an authored connection/storage setting.
+            if not isinstance(raw_value, str):
+                raise ValueError("SQLCipher URL query parameters must occur exactly once")
+            value = raw_value
             if key in _CONNECT_KWARGS:
                 if key in ("check_same_thread", "uri"):
-                    connect_kwargs[key] = value.lower() in ("true", "1", "yes")
+                    normalized = value.strip().lower()
+                    if normalized not in ("true", "1", "yes", "on", "y", "t", "false", "0", "no", "off", "n", "f"):
+                        raise ValueError(f"SQLCipher URL query parameter {key!r} must be a boolean")
+                    connect_kwargs[key] = normalized in ("true", "1", "yes", "on", "y", "t")
                 elif key == "timeout":
                     connect_kwargs[key] = float(value)
                 elif key in ("detect_types", "cached_statements"):
@@ -1401,19 +1516,12 @@ class LandscapeDB:
         allowed_missing_tables = frozenset() if self._require_existing_schema else _ADDITIVE_TABLE_NAMES
         missing_tables = sorted((expected_tables - existing_tables) - allowed_missing_tables) if present_landscape_tables else []
 
-        # Some focused guard tests replace metadata with a name-only sentinel
-        # so they can isolate the legacy high-signal diagnostics. Real
-        # application metadata always contains SQLAlchemy Table objects.
-        shape_issues = (
-            collect_metadata_shape_issues(
-                inspector,
-                validation_metadata,
-                dialect=self.engine.dialect,
-                present_tables=present_landscape_tables,
-                allowed_missing_index_names=_ADDITIVE_INDEX_NAMES,
-            )
-            if all(isinstance(table, Table) for table in validation_metadata.tables.values())
-            else ()
+        shape_issues = collect_metadata_shape_issues(
+            inspector,
+            validation_metadata,
+            dialect=self.engine.dialect,
+            present_tables=present_landscape_tables,
+            allowed_missing_index_names=_ADDITIVE_INDEX_NAMES,
         )
 
         # Full shape validation already covers every predecessor column. The

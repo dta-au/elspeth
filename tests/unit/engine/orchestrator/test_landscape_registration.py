@@ -189,6 +189,8 @@ def test_resolve_node_audit_metadata_covers_plugin_and_structural_nodes() -> Non
         config_gate_node_ids={NodeID("gate")},
         aggregation_node_ids={NodeID("agg")},
         coalesce_node_ids={NodeID("coalesce")},
+        collector_id_map={},
+        collector_transforms={},
     )
 
     assert metadata[NodeID("src")] == NodeAuditMetadata(
@@ -223,6 +225,8 @@ def test_resolve_node_audit_metadata_fails_closed_on_unmapped_plugin_node() -> N
             config_gate_node_ids=set(),
             aggregation_node_ids=set(),
             coalesce_node_ids=set(),
+            collector_id_map={},
+            collector_transforms={},
         )
 
 

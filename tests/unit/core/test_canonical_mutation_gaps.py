@@ -281,24 +281,26 @@ class TestTopologyHashEdgeKeys:
 
 
 class TestNonePassthroughAndNaTDetection:
-    """Kill survivors on lines 68 and 113 of _normalize_value.
+    """Kill survivors on the passthrough and missing-value arms of _normalize_value.
 
-    Line 68: ``obj is None or isinstance(obj, str | int | bool)``
+    Primitive-passthrough arm: ``obj is None or isinstance(obj, str | int | bool)``
         Mutant: ``or`` → ``and``. None would fail the isinstance check and
-        fall through to ``return obj`` at line 130. Currently equivalent
-        (returns None either way), but fragile — any new type check added
-        between lines 68-130 could intercept None and change behavior.
+        fall through to the trailing ``return obj``. Currently equivalent
+        (returns None either way), but fragile — any type check added between
+        that arm and the fall-through could intercept None and change behavior.
 
-    Line 113: ``obj is pd.NA or (isinstance(obj, type(pd.NaT)) and obj is pd.NaT)``
-        Mutant: ``and`` → ``or``. Would make any NaTType instance return None,
-        not just the pd.NaT singleton. Currently equivalent since pd.NaT is
-        the only instance, but pins the intended semantic.
+    Missing-value arm: ``obj is pd.NA or obj is pd.NaT``
+        Mutant: either identity test deleted. Both sentinels must normalize to
+        None; dropping an arm sends that sentinel to the ``return obj``
+        fall-through, which then reaches rfc8785 as an unserializable object.
+        Identity IS the type check here — both are singletons, so ``obj is
+        pd.NaT`` already implies ``isinstance(obj, type(pd.NaT))``.
     """
 
     def test_none_returns_none_directly(self) -> None:
-        """None must be caught at line 68, not fall through to line 130.
+        """None must be caught by the passthrough arm, not fall through to ``return obj``.
 
-        Kills mutant: ``or`` → ``and`` on line 68.
+        Kills mutant: ``or`` → ``and`` on the primitive-passthrough arm.
         """
         from elspeth.core.canonical import _normalize_value
 
@@ -308,7 +310,7 @@ class TestNonePassthroughAndNaTDetection:
     def test_pd_nat_returns_none(self) -> None:
         """pd.NaT must be normalized to None (intentional missing value).
 
-        Kills mutant: ``and`` → ``or`` on line 113.
+        Kills mutant: deletion of the ``obj is pd.NaT`` arm.
         """
         from elspeth.core.canonical import _normalize_value
 

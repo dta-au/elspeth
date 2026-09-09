@@ -24,8 +24,10 @@ from sqlalchemy import insert, select
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.scheduler import BarrierEmission, SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import BarrierEmission, BarrierTerminalOutcomeSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -36,9 +38,54 @@ from elspeth.core.landscape.schema import (
     run_coordination_table,
     runs_table,
     scheduler_events_table,
+    token_outcomes_table,
     token_work_items_table,
     tokens_table,
 )
+
+
+def test_complete_barrier_rolls_back_terminal_outcomes_with_journal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fault during empty-output outcomes exposes neither half of completion."""
+    from elspeth.core.landscape.scheduler import barrier as barrier_module
+
+    engine, repo = _make_repo()
+    _seed_three_blocked(engine, repo)
+    real_record = barrier_module.record_terminal_outcome_guarded
+    calls = 0
+
+    def fail_during_second_outcome(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        real_record(*args, **kwargs)
+        if calls == 2:
+            raise RuntimeError("injected terminal-outcome failure")
+
+    monkeypatch.setattr(barrier_module, "record_terminal_outcome_guarded", fail_during_second_outcome)
+    terminal_outcomes = tuple(
+        BarrierTerminalOutcomeSpec(
+            token_id=token_id,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.FILTER_DROPPED,
+        )
+        for token_id in ("t1", "t2", "t3")
+    )
+
+    with pytest.raises(RuntimeError, match="injected terminal-outcome failure"):
+        repo.complete_barrier(
+            run_id=RUN_ID,
+            barrier_key=BARRIER_KEY,
+            consumed_token_ids=["t1", "t2", "t3"],
+            emitted_pending_sink=[],
+            emitted_ready=[],
+            intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
+            coordination_token=COORD_TOKEN,
+            terminal_outcomes=terminal_outcomes,
+        )
+
+    assert _statuses(engine, ["t1", "t2", "t3"]) == {TokenWorkStatus.BLOCKED.value}
+    with engine.connect() as conn:
+        assert tuple(conn.execute(select(token_outcomes_table.c.token_id))) == ()
+
 
 RUN_ID = "R"
 BARRIER_KEY = "agg-1"
@@ -175,7 +222,6 @@ def _enqueue_and_block(
     row_id: str,
     ingest_sequence: int,
     payload: str,
-    now: datetime,
     barrier_key: str = BARRIER_KEY,
 ) -> None:
     """Enqueue one READY item, claim it, and block it at the barrier."""
@@ -186,17 +232,15 @@ def _enqueue_and_block(
         node_id="normalize",
         step_index=1,
         ingest_sequence=ingest_sequence,
-        available_at=now,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w1", lease_seconds=30, now=now + timedelta(seconds=1))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w1", lease_seconds=30)
     assert claimed is not None
     assert claimed.work_item_id == item.work_item_id
     repo.mark_blocked(
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        now=now + timedelta(seconds=2),
         expected_lease_owner="w1",
     )
 
@@ -209,7 +253,7 @@ def _seed_three_blocked(engine: Tier1Engine, repo, *, extra_tokens: list[tuple[s
         now=NOW,
     )
     for ingest_sequence, (row_id, token_id) in enumerate([("r1", "t1"), ("r2", "t2"), ("r3", "t3")]):
-        _enqueue_and_block(repo, token_id=token_id, row_id=row_id, ingest_sequence=ingest_sequence, payload=payload, now=NOW)
+        _enqueue_and_block(repo, token_id=token_id, row_id=row_id, ingest_sequence=ingest_sequence, payload=payload)
     return payload
 
 
@@ -278,7 +322,6 @@ def test_complete_barrier_consumes_and_emits_atomically() -> None:
             )
         ],
         emitted_ready=[],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -325,7 +368,6 @@ def test_complete_barrier_refuses_partial_consumed_set() -> None:
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -343,7 +385,6 @@ def test_complete_barrier_refuses_consumed_tokens_missing_from_blocked_set() -> 
             consumed_token_ids=["t1", "t2", "t3", "t4"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -368,7 +409,6 @@ def test_complete_barrier_crash_atomicity() -> None:
         node_id=None,
         step_index=4,
         ingest_sequence=3,
-        available_at=NOW,
         row_payload_json=payload,
     )
     events_before = len(_events(engine))
@@ -392,7 +432,6 @@ def test_complete_barrier_crash_atomicity() -> None:
                 )
             ],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -422,7 +461,6 @@ def test_complete_barrier_passthrough_handoff_counts_toward_blocked_coverage() -
             )
         ],
         emitted_ready=[],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -453,7 +491,6 @@ def test_complete_barrier_snapshot_equal_to_durable_is_n1_parity() -> None:
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
         coordination_token=COORD_TOKEN,
     )
@@ -492,7 +529,6 @@ def test_complete_barrier_late_arrival_outside_snapshot_stays_blocked() -> None:
                 ingest_sequence=3,
             )
         ],
-        now=NOW,
         intake_snapshot_token_ids=frozenset({"t1", "t2"}),
         coordination_token=COORD_TOKEN,
     )
@@ -524,7 +560,6 @@ def test_complete_barrier_snapshot_minus_durable_is_tier1() -> None:
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2", "t3", "t-ghost"}),
             coordination_token=COORD_TOKEN,
         )
@@ -544,7 +579,6 @@ def test_complete_barrier_consumed_outside_snapshot_is_tier1() -> None:
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2"}),
             coordination_token=COORD_TOKEN,
         )
@@ -572,7 +606,6 @@ def test_complete_barrier_handed_off_outside_snapshot_is_tier1() -> None:
                 )
             ],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2"}),
             coordination_token=COORD_TOKEN,
         )
@@ -594,7 +627,6 @@ def test_complete_barrier_snapshot_orphan_within_snapshot_is_tier1() -> None:
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
             coordination_token=COORD_TOKEN,
         )
@@ -623,7 +655,6 @@ def test_complete_barrier_explicit_none_snapshot_is_durable_universe_exhaustiven
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=None,
             coordination_token=COORD_TOKEN,
         )
@@ -635,7 +666,6 @@ def test_complete_barrier_explicit_none_snapshot_is_durable_universe_exhaustiven
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         intake_snapshot_token_ids=None,
         coordination_token=COORD_TOKEN,
     )
@@ -660,7 +690,6 @@ def test_complete_barrier_leased_exclusion_token_id_parameter_is_deleted() -> No
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             leased_exclusion_token_id="t3",
             coordination_token=COORD_TOKEN,
         )
@@ -687,7 +716,6 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
                 ingest_sequence=3,
             )
         ],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -702,9 +730,83 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
     assert json.loads(emission_enqueues[0]["context_json"]) == {"barrier_key": BARRIER_KEY, "consumed_count": 3}
 
     # The emitted READY continuation is claimable like any other.
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-next", lease_seconds=30, now=NOW + timedelta(seconds=3))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-next", lease_seconds=30)
     assert claimed is not None
     assert claimed.token_id == "t-next"
+
+
+def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> None:
+    """Same-row row_union continuations must not fall through to token-hash order."""
+    engine, repo = _make_repo()
+    payload = _seed_run_grouped(
+        engine,
+        run_id=RUN_ID,
+        rows=[("r1", 0)],
+        tokens=[
+            ("r1", "held-a"),
+            ("r1", "held-b"),
+            ("r1", "token-a"),
+            ("r1", "token-b"),
+        ],
+        now=NOW,
+    )
+    _enqueue_and_block(
+        repo,
+        token_id="held-a",
+        row_id="r1",
+        ingest_sequence=0,
+        payload=payload,
+        barrier_key="variant_union",
+    )
+    _enqueue_and_block(
+        repo,
+        token_id="held-b",
+        row_id="r1",
+        ingest_sequence=0,
+        payload=payload,
+        barrier_key="variant_union",
+    )
+
+    repo.complete_barrier(
+        run_id=RUN_ID,
+        barrier_key="variant_union",
+        consumed_token_ids=["held-a", "held-b"],
+        emitted_pending_sink=[],
+        emitted_ready=[
+            BarrierEmission(
+                token_id="token-a",
+                row_id="r1",
+                row_payload_json=payload,
+                node_id="normalize",
+                step_index=2,
+                ingest_sequence=0,
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant-union", member_key="control"),),
+            ),
+            BarrierEmission(
+                token_id="token-b",
+                row_id="r1",
+                row_payload_json=payload,
+                node_id="normalize",
+                step_index=2,
+                ingest_sequence=0,
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant-union", member_key="treatment"),),
+            ),
+        ],
+        scope_row_id="r1",
+        coordination_token=COORD_TOKEN,
+    )
+
+    first_row = _row_for_token(engine, "token-a")
+    second_row = _row_for_token(engine, "token-b")
+    assert first_row["work_item_id"] > second_row["work_item_id"], (
+        "test tokens must collide against declared order under the hash tiebreaker"
+    )
+
+    claimed = [
+        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30),
+        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30),
+    ]
+    assert [item.token_id if item is not None else None for item in claimed] == ["token-a", "token-b"]
 
 
 def test_complete_barrier_rejects_duplicate_consumed_token_ids() -> None:
@@ -718,7 +820,6 @@ def test_complete_barrier_rejects_duplicate_consumed_token_ids() -> None:
             consumed_token_ids=["t1", "t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -744,7 +845,6 @@ def test_complete_barrier_rejects_consumed_token_also_emitted() -> None:
                 )
             ],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -776,7 +876,6 @@ def test_wrappers_delegate_preserving_legacy_partial_release() -> None:
                 error_message=None,
             )
         },
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
     assert transitioned == 1
@@ -788,7 +887,6 @@ def test_wrappers_delegate_preserving_legacy_partial_release() -> None:
         run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         token_ids=("t2",),  # t3 left blocked: legacy partial release
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
     assert terminalized == 1
@@ -822,7 +920,6 @@ def _seed_two_coalesce_groups(engine: Tier1Engine, repo, *, extra_tokens: list[t
             row_id=row_id,
             ingest_sequence=ingest_sequence,
             payload=payload,
-            now=NOW,
             barrier_key=COALESCE_KEY,
         )
     return payload
@@ -843,7 +940,6 @@ def test_complete_barrier_scope_row_id_isolates_coalesce_group() -> None:
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         scope_row_id="r1",
         coordination_token=COORD_TOKEN,
     )
@@ -866,7 +962,6 @@ def test_complete_barrier_scoped_group_still_catches_cross_group_consumed_token(
             consumed_token_ids=["t1a", "t1b", "t2a"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             coordination_token=COORD_TOKEN,
         )
@@ -886,7 +981,6 @@ def test_complete_barrier_scoped_group_still_catches_uncovered_blocked_row() -> 
             consumed_token_ids=["t1a"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             coordination_token=COORD_TOKEN,
         )
@@ -906,7 +1000,6 @@ def test_complete_barrier_scope_row_id_requires_exhaustive_release() -> None:
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             require_exhaustive_release=False,
             coordination_token=COORD_TOKEN,
@@ -955,7 +1048,6 @@ def test_complete_barrier_combined_lanes_one_call() -> None:
                 ingest_sequence=4,
             )
         ],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -1005,7 +1097,6 @@ def test_complete_barrier_scoped_coalesce_fire_emits_merged_ready_child() -> Non
                 ingest_sequence=0,
             )
         ],
-        now=NOW,
         scope_row_id="r1",
         coordination_token=COORD_TOKEN,
     )
@@ -1022,7 +1113,7 @@ def test_complete_barrier_scoped_coalesce_fire_emits_merged_ready_child() -> Non
     assert len(enqueue_events) == 1
     assert json.loads(enqueue_events[0]["context_json"]) == {"barrier_key": COALESCE_KEY, "consumed_count": 2}
     # The merged continuation is claimable like any other.
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-merged", lease_seconds=30, now=NOW + timedelta(seconds=3))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-merged", lease_seconds=30)
     assert claimed is not None
     assert claimed.token_id == "t1-merged"
 
@@ -1048,7 +1139,6 @@ def test_complete_barrier_scoped_fire_rejects_emission_outside_scope_group() -> 
                     ingest_sequence=1,
                 )
             ],
-            now=NOW,
             scope_row_id="r1",
             coordination_token=COORD_TOKEN,
         )
@@ -1068,7 +1158,6 @@ def test_complete_barrier_snapshot_requires_exhaustive_release() -> None:
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2"}),
             require_exhaustive_release=False,
             coordination_token=COORD_TOKEN,
@@ -1091,7 +1180,6 @@ def test_complete_barrier_cross_group_snapshot_token_is_tier1() -> None:
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             intake_snapshot_token_ids=frozenset({"t1a", "t1b", "t2a"}),
             coordination_token=COORD_TOKEN,
@@ -1114,7 +1202,6 @@ def test_complete_barrier_snapshot_isolates_sibling_coalesce_group() -> None:
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         scope_row_id="r1",
         intake_snapshot_token_ids=frozenset({"t1a", "t1b"}),
         coordination_token=COORD_TOKEN,
@@ -1131,7 +1218,6 @@ def test_complete_barrier_snapshot_isolates_sibling_coalesce_group() -> None:
         consumed_token_ids=["t2a", "t2b"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         scope_row_id="r2",
         intake_snapshot_token_ids=frozenset({"t2a", "t2b"}),
         coordination_token=COORD_TOKEN,
@@ -1152,7 +1238,6 @@ def test_mark_blocked_barrier_terminal_release_context_merged_into_event() -> No
         run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         token_ids=("t3",),
-        now=NOW,
         coordination_token=COORD_TOKEN,
         release_context={
             "late_arrival": True,
@@ -1207,7 +1292,6 @@ def test_complete_barrier_rejects_duplicate_ready_emissions() -> None:
                     ingest_sequence=3,
                 ),
             ],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 

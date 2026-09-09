@@ -1,0 +1,9 @@
+id,ticket,baseline_quality,treatment_delta
+1,Password reset loop on SSO login,60,14
+2,Invoice PDF renders blank in Safari,72,9
+3,Bulk import times out above 5k rows,45,21
+4,Webhook retries fire twice per event,81,-6
+5,Search ignores hyphenated terms,53,17
+6,Export drops the last column,67,4
+7,Session expires during long uploads,74,-3
+8,Timezone shown in UTC not local,58,11

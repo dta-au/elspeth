@@ -45,7 +45,8 @@ the same Composer state and validators.
 
 | Concept or endpoint | Purpose |
 |---|---|
-| `POST /guided/start` | Creates or resumes a guided session entry point and seeds the closed-enum `WorkflowProfile`. |
+| `POST /guided/start` | Creates or resumes a guided session entry point, seeds the closed-enum `WorkflowProfile`, and records the author's required `intent` as the session's durable root goal. |
+| `POST /guided/convert` | Moves a freeform session into a fresh guided wizard; also requires an `intent`, and 409s `guided_already_started` on a session that is already guided. |
 | `WorkflowProfile` | Distinguishes normal guided sessions from tutorial-guided sessions; tutorial profile state is stripped on fork. |
 | `/guided/chat` | Applies the operator's stage instruction through the source, sink, transform, or wiring driver. |
 | `STEP_4_WIRE` | Final guided stage that renders the proposed wiring and contract overlay. |
@@ -64,11 +65,11 @@ tool-driven editing or custom topology.
 
 ### `list_sources`
 
-List available source plugins with name and summary.
+List available source plugins with their full catalog summaries.
 
 **Parameters:** None
 
-**Returns:** Array of `{name, summary}` for each registered source plugin.
+**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any source banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
 
 **When to use:** At the start of composition to discover what source types are available, or when the user asks what data formats are supported.
 
@@ -76,11 +77,11 @@ List available source plugins with name and summary.
 
 ### `list_transforms`
 
-List available transform plugins with name and summary.
+List available transform plugins with their full catalog summaries.
 
 **Parameters:** None
 
-**Returns:** Array of `{name, summary}` for each registered transform plugin.
+**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any transform banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
 
 **When to use:** When exploring what processing steps are available — field mapping, LLM classification, content safety, RAG retrieval, etc.
 
@@ -88,11 +89,11 @@ List available transform plugins with name and summary.
 
 ### `list_sinks`
 
-List available sink plugins with name and summary.
+List available sink plugins with their full catalog summaries.
 
 **Parameters:** None
 
-**Returns:** Array of `{name, summary}` for each registered sink plugin.
+**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any sink banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
 
 **When to use:** When the user describes where output should go — CSV files, databases, vector stores, cloud storage.
 
@@ -119,7 +120,7 @@ Get the gate expression syntax reference.
 
 **Parameters:** None
 
-**Returns:** Text reference for valid expression constructs in gate conditions.
+**Returns:** `grammar` — the text reference for valid expression constructs in gate conditions.
 
 **When to use:** Before writing any gate `condition` expression. Expressions are security-validated — only a restricted subset of Python is allowed.
 
@@ -145,21 +146,30 @@ Preview the current pipeline configuration — validation status, source summary
 
 **Parameters:** None
 
-**Returns:** Structured summary of the pipeline's current state including:
-- `is_valid`
-- structured validation `errors`, `warnings`, and `suggestions`
+**Returns:** The authoring check rides on the envelope's `validation` and the
+runtime check on its top-level `runtime_preflight`; `data` carries only the
+preview stage's own facts:
+- `preview_is_valid` — true only when the authoring check, the runtime check, and the source proof all pass (false when no runtime check ran)
+- `preview_errors` — entries the preview stage itself produces (`runtime_preflight_not_run` when no runtime check was wired); authoring errors stay on `validation.errors`
 - `edge_contracts` for declared producer/consumer field contracts
-- source, node, and output summary data
+- `proof_diagnostics` — the source proof against the bound blob; a `blocking` entry forces `preview_is_valid` false
+- `structural_preview` when a tolerant structural check ran
+- source, node, and output summary data (`sources`, `nodes`, `outputs`, `node_count`, `output_count`)
 
-Each `edge_contracts` entry reports:
-- `from` / `to`
+One entry per producer/consumer pair that was checked, and a pair is checked
+only where the consumer requires fields — through `required_fields`, through a
+fixed/flexible schema's declared fields, or, for a sink, through an option
+naming the field it writes from.
+Each entry reports:
+- `from` / `to` (`to` is `output:<sink name>` for a sink)
 - `producer_guarantees`
 - `consumer_requires`
+- `missing_fields` — the `consumer_requires` names the producer does not guarantee
 - `satisfied`
 
 **When to use:** After making a series of changes, to confirm the pipeline is set up correctly before responding to the user or calling `generate_yaml`.
 
-**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contracts were declared. Also treat skipped contract-check warnings as unresolved rather than satisfied.
+**Important:** `edge_contracts: []` is not positive contract evidence. It means no field contract was checked. Also treat skipped contract-check warnings as unresolved rather than satisfied.
 
 ---
 
@@ -219,23 +229,28 @@ Set or replace the pipeline source.
 
 ### `upsert_node`
 
-Add or update a pipeline node — transforms, gates, aggregations, or coalesces.
+Add or update a pipeline node — transforms, gates, aggregations, coalesces,
+row unions, queues, or collectors.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | **Yes** | Unique node identifier (e.g. `"classifier"`, `"quality_gate"`) |
-| `node_type` | string | **Yes** | `"transform"`, `"gate"`, `"aggregation"`, or `"coalesce"` |
+| `node_type` | string | **Yes** | `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` |
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
-| `plugin` | string | No | Plugin name. Required for transforms and aggregations. Null for gates and coalesces. |
-| `on_success` | string | No | Output connection name. Required for transforms. Null for gates (which use routes). |
-| `on_error` | string | No | Error output — a sink name or `"discard"` |
+| `plugin` | string | No | Plugin name. Required for transforms, aggregations, and collectors. Null for gates, coalesces, row unions, and queues. |
+| `on_success` | string | No | Output connection name. Required for transforms, row unions, and collectors. Null for gates and queues. |
+| `on_error` | string | No | Row-error output — a sink name or `"discard"`; for gates this handles expression-evaluation failures, and omission preserves fail-fast execution. Collectors reject this field because their failures are whole-group verdicts. |
 | `options` | object | No | Plugin-specific configuration |
 | `condition` | string | No | Gate expression (gates only) |
 | `routes` | object | No | Gate route mapping to a sink name, downstream connection name, `"fork"`, or virtual `"discard"` target, e.g. `{"true": "sink_name", "false": "discard"}` (gates only) |
 | `fork_to` | array | No | Fork destination connection names (fork gates only) |
-| `branches` | array | No | Branch input connection names (coalesce only, min 2) |
+| `branches` | array or object | No | Ordered branch inputs for coalesces and row unions (min 2). List form is shorthand for an identity mapping; object form maps each branch name to its input connection. |
 | `policy` | string | No | Coalesce policy: `"require_all"`, `"quorum"`, `"best_effort"`, `"first"` |
 | `merge` | string | No | Coalesce merge strategy: `"union"`, `"nested"`, `"select"` |
+| `timeout_seconds` | number | No | Optional finite positive structural-barrier timeout for `coalesce` or `row_union`; this is a top-level node field, not `trigger.timeout_seconds`. |
+| `scope_name` | string | No | Scope identifier for the EXPAND group this collector closes (collectors only) |
+| `scope_opener` | string | No | Node id of the multi-row transform that opens the collector's EXPAND group (collectors only) |
+| `scope_policy` | string | No | Group arrival policy, `"require_all"` or `"best_effort"` (collectors only) — **required for collectors**, there is no default |
 
 **Behaviour:** If a node with the given `id` already exists, it is replaced. The `id` must be unique across all node types.
 
@@ -243,21 +258,32 @@ Add or update a pipeline node — transforms, gates, aggregations, or coalesces.
 
 | Type | Required fields | Key behaviour |
 |------|----------------|---------------|
-| `transform` | `plugin`, `on_success` | Processes rows, emits to on_success |
-| `gate` | `condition`, `routes` | Evaluates condition, routes by result |
+| `transform` | `plugin`, `on_success` | Processes rows, emits to `on_success` |
+| `gate` | `condition`, `routes` | Evaluates condition, routes by result; optional `on_error` handles row-scoped evaluation failures |
 | `aggregation` | `plugin` | Batches rows until trigger fires |
-| `coalesce` | `branches` | Merges tokens from parallel fork paths |
+| `coalesce` | `branches`, `policy` | Waits according to `policy`, then merges correlated branch payloads according to `merge` |
+| `row_union` | `branches`, `on_success` | A plugin-free, fixed `require_all` N-to-N barrier that releases every original row unchanged in declared branch order |
+| `queue` | `id == input` | Declares a shared pass-through connection for multiple producers; omit plugin and routing fields, and use only an optional `options.description` |
+| `collector` | `plugin`, `on_success`, `scope_name`, `scope_opener`, `scope_policy` | Closes a declared EXPAND scope with a batch-aware plugin. `scope_opener` names the multi-row transform that opens the group and `scope_policy` decides whether a lost member fails it. A collector flushes on end of group only and accepts neither `trigger` nor `on_error`; plugin failure is a structural whole-group verdict. |
 
-**Not yet representable: queue fan-in.** The runtime supports multi-producer
-fan-in through pass-through queue nodes — a top-level `queues:` section in
-settings YAML (see [ADR-025](../architecture/adr/025-multi-source-ingestion.md)
-and [Queue Settings](configuration.md#queue-settings)) — but composer state has
-no `queue` node type. `upsert_node` and `set_pipeline` cannot create one, and
-YAML import drops a `queues:` section before validation, which then reports the
-fan-in as a duplicate-producer error. Until composer queue support lands
-(tracked as elspeth-a5b86149d4 and elspeth-6421ffa028), fan-in inside the
-composer is limited to sinks; cross-branch statistics need the wide-row pattern
-instead (fork → coalesce or multi-query LLM → per-field aggregations).
+For `row_union`, branch order is significant. Mapping keys must match the
+upstream gate's `fork_to` names and mapping values name the connection published
+by each branch's final transform. `input` must equal the first branch connection
+(it is a serialization placeholder), and `on_success` must name a downstream
+processing connection, never a sink. A row union does not accept `policy`,
+`merge`, `options`, or routing fields.
+
+**Structural fan-in choices.** Composer represents all three:
+
+- A `queue` is a pass-through coordination point for multiple producers feeding
+  one shared connection. It does not wait for correlated fork branches or merge
+  their payloads. Set the queue's `id` and `input` to that connection name; see
+  [Queue Settings](configuration.md#queue-settings).
+- A `row_union` reconverges correlated fork branches N-to-N: it waits for every
+  branch in the group, then releases all original rows to downstream processing.
+- A `coalesce` reconverges correlated fork branches N-to-1: its `policy` controls
+  which arrivals are sufficient and its `merge` strategy combines them into one
+  payload. See [Coalesce Settings](configuration.md#coalesce-settings).
 
 ---
 
@@ -280,7 +306,7 @@ Add or update a connection between nodes.
 | Type | Meaning |
 |------|---------|
 | `on_success` | Normal data flow from one node to the next |
-| `on_error` | Error routing (rows that fail processing) |
+| `on_error` | Error-sink edge for transform/aggregation processing failures. Gate expression-evaluation failures use the gate node's `on_error` field; Composer rejects an `on_error` edge from a gate. |
 | `route_true` | Gate route when condition evaluates to `True` |
 | `route_false` | Gate route when condition evaluates to `False` |
 | `fork` | Gate fork to parallel paths |
@@ -387,7 +413,7 @@ Atomically replace the entire pipeline in one call.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure?}` |
-| `nodes` | array | **Yes** | Array of node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?}]` |
+| `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?, scope_name?, scope_opener?, scope_policy?}]` |
 | `edges` | array | **Yes** | Array of edge specs: `[{id, from_node, to_node, edge_type}]` |
 | `outputs` | array | **Yes** | Array of output specs: `[{name, plugin, options, on_write_failure?}]` |
 | `metadata` | object | No | `{name?, description?}` |
@@ -463,7 +489,7 @@ Wire a ready blob into a plugin option as audited inline content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `field_path` | string | **Yes** | Canonical target path such as `source.options.<field>`, `node:<node_id>.options.<field>`, or `output:<name>.options.<field>` |
+| `field_path` | string | **Yes** | Canonical target path such as `source.options.<field>`, `node:<node_id>.options.<field>` for a transform, aggregation, or collector, or `output:<name>.options.<field>` |
 | `blob_id` | string | **Yes** | Ready blob ID to wire |
 | `encoding` | string | No | One of `utf-8`, `utf-8-sig`, `utf-16`, or `latin-1`; defaults to `utf-8` |
 
@@ -514,7 +540,12 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 
 ## Tool Result Format
 
-Every tool returns a `ToolResult` with this structure:
+Every tool returns a `ToolResult`. The model receives it serialized verbatim;
+the audit row receives the redaction manifest's projection of the same object.
+The key vocabulary is one registry (`src/elspeth/web/composer/tool_result_envelope.py`)
+that the producer, the redaction manifest, and the planner's closed discovery
+twin all derive from, and this section is pinned to it by
+`tests/unit/web/composer/test_tool_result_envelope_gate.py`.
 
 ```json
 {
@@ -522,24 +553,50 @@ Every tool returns a `ToolResult` with this structure:
   "validation": {
     "is_valid": true,
     "errors": [],
-    "warnings": ["Source schema mode is 'observed' — consider 'fixed' for stricter validation"],
-    "suggestions": []
+    "warnings": [
+      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low", "error_code": "source_schema_mode_observed"}
+    ],
+    "suggestions": [],
+    "semantic_contracts": [],
+    "graph_repair_suggestions": []
   },
   "affected_nodes": ["classifier", "quality_gate"],
   "version": 3,
-  "data": null
+  "applied_component": {"nodes": [{"id": "classifier", "node_type": "transform", "plugin": "llm_classifier", "input": "source"}]},
+  "validation_delta": {"new_errors": [], "resolved_errors": [], "new_warnings": [], "resolved_warnings": []}
 }
 ```
+
+Always present:
 
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Current pipeline validation state after this change |
-| `affected_nodes` | Node IDs that were changed or have changed edges |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
+| `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
-| `data` | Discovery tool payload (plugin lists, schemas, etc.) — null for mutations |
 
-**Validation drives the loop.** After each mutation, check `validation.errors`. If there are errors, fix them before responding to the user. The LLM should not present a pipeline as complete until `is_valid` is `true`.
+Present only when set:
+
+| Field | When | Description |
+|-------|------|-------------|
+| `data` | most tools | The tool-specific payload; each tool's description names its keys. A failure carries `error`, and `error_code` when the failure has a closed code; a credential-wiring failure adds `credential_fields`, `components`, and `repair`; a proposal under approval custody carries `status: "APPROVAL_REQUIRED"` with `proposal_id`; a prevalidation rejection carries `status: "PREVALIDATION_REJECTED"` with `applied: false` |
+| `runtime_preflight` | `preview_pipeline` | Runtime readiness check: `is_valid`, `checks`, `readiness`, `errors`, `warnings`, `semantic_contracts` |
+| `validation_delta` | successful mutations | `new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings` relative to the state before the call |
+| `post_call_hints` | successful mutations whose plugin returns them | Plugin-authored next steps |
+| `plugin_schemas` | failed option-shape mutations | `"<kind>/<plugin>"` → the plugin's schema (`json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, …) |
+| `validation_guidance` | failed mutations | `codes`: each `error_code` → `explanation` and `suggested_fix`; `explain_tool` when a code had no catalogue entry |
+| `applied_component` | successful incremental mutations | The stored `source` / `sources` / `nodes` / `outputs` / `edges` the call touched — the authoritative post-change state, so no confirming read is needed |
+
+`set_pipeline` results additionally carry `pipeline_content_hash_schema` and
+`pipeline_content_hash`, attached after dispatch for recovery.
+
+**Validation drives the loop.** After each mutation, check `validation.errors`
+and `validation_delta`. If there are errors, fix them before responding to the
+user. The LLM should not present a pipeline as complete until `preview_pipeline`
+returns `preview_is_valid: true` — the authoring check passing is necessary but
+not sufficient, because that verdict also folds in the runtime check and the
+source proof.
 
 ---
 

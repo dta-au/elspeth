@@ -12,12 +12,13 @@ from __future__ import annotations
 import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from pydantic import JsonValue
-from sqlalchemy import Engine
+from sqlalchemy import Connection, Engine
 
 from elspeth.contracts.blobs import (
     AllowedMimeType,
@@ -28,13 +29,23 @@ from elspeth.contracts.blobs import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.core.canonical import stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.service import (
     BlobServiceImpl,
+    _normalized_inline_custody_fields,
     content_hash,
     inline_custody_blob_id,
+    inline_custody_storage_path,
+    persist_inline_custody_blob_on_connection,
+    publish_inline_custody_publication,
     sanitize_filename,
 )
+from elspeth.web.blobs.service import (
+    InlineCustodyPublication as InlineCustodyPublication,
+)
+from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.tools._common import PendingCustodyBlobView
+from elspeth.web.sessions.locking import _run_lock_cleanup
 
 if TYPE_CHECKING:
     from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
@@ -121,13 +132,24 @@ def _contains_inline_blob(value: Any) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class PipelineCustodyPreparation:
-    """Pure result produced before custody performs filesystem or DB I/O."""
+    """Pure result produced before custody performs filesystem or DB I/O.
+
+    ``max_storage_per_session`` is the storage ceiling the plan authorized
+    this preparation under. Finalization — whether mid-plan or deferred
+    into a later staging settlement — refuses to enforce any other value:
+    the plan-time and settle-time quotas are plumbed from independent
+    sources (planner custody config vs route settings read), and without
+    this recorded ceiling nothing would trip if they diverged.
+    """
 
     arguments: Mapping[str, Any]
     request: InlineCustodyRequest
     blob_id: UUID
+    max_storage_per_session: int
 
     def __post_init__(self) -> None:
+        if type(self.max_storage_per_session) is not int or self.max_storage_per_session <= 0:
+            raise AuditIntegrityError("Pipeline custody max_storage_per_session must be a positive exact integer")
         freeze_fields(self, "arguments")
 
 
@@ -172,6 +194,7 @@ def prepare_pipeline_custody(
     prepared: _PreparedBlobCreate,
     *,
     session_id: str,
+    max_storage_per_session: int,
 ) -> PipelineCustodyPreparation:
     """Replace the one supported inline source with a deterministic blob id.
 
@@ -179,6 +202,9 @@ def prepare_pipeline_custody(
     identity.  The safe arguments must contain the UUID before their hash can
     be computed, so the request is first used only to derive that UUID and is
     then rebound to the hash of the final, custody-safe arguments.
+
+    ``max_storage_per_session`` is stamped onto the preparation as the
+    ceiling this plan authorized; finalization refuses any other value.
     """
     try:
         session_uuid = UUID(session_id)
@@ -225,7 +251,7 @@ def prepare_pipeline_custody(
     source["blob_id"] = str(blob_id)
     if _contains_inline_blob(safe_arguments):
         raise AuditIntegrityError("Pipeline custody rewrite left an inline_blob member in proposal arguments")
-    safe_arguments_hash = stable_hash(safe_arguments)
+    safe_arguments_hash = composer_authority_hash(safe_arguments)
     final_arguments_hash = safe_arguments_hash if prepared.creation_modality is not CreationModality.VERBATIM else None
     request = replace(
         provisional_request,
@@ -237,6 +263,108 @@ def prepare_pipeline_custody(
         arguments=safe_arguments,
         request=request,
         blob_id=blob_id,
+        max_storage_per_session=max_storage_per_session,
+    )
+
+
+def finalize_pipeline_custody_on_connection(
+    preparation: PipelineCustodyPreparation,
+    *,
+    conn: Connection,
+    data_dir: str | Path,
+    max_storage_per_session: int,
+    write_fence: BlobGuidedOperationWriteFence | None,
+) -> InlineCustodyPublication:
+    """Materialize a prepared inline source inside a caller-owned transaction.
+
+    The guided-full staging settlement calls this AFTER inserting the
+    originating chat message on the same connection, so the blob row's
+    composite lineage FK (created_from_message_id, session_id) is satisfiable
+    — the mid-planning :func:`finalize_pipeline_custody` path cannot order
+    those writes and fails the FK on every inline guided-full plan
+    (elspeth-1e3ad83d89).
+    """
+    if type(preparation) is not PipelineCustodyPreparation:
+        raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    if max_storage_per_session != preparation.max_storage_per_session:
+        raise AuditIntegrityError("Pipeline custody enforcement ceiling diverges from the plan-time ceiling")
+    if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
+        raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
+    if write_fence is not None and write_fence.session_id != preparation.request.session_id:
+        raise AuditIntegrityError("Pipeline custody write fence targets a different session")
+    row, publication = persist_inline_custody_blob_on_connection(
+        conn,
+        data_dir=Path(data_dir),
+        max_storage_per_session=max_storage_per_session,
+        request=preparation.request,
+        write_fence=write_fence,
+    )
+    if str(row.id) != str(preparation.blob_id):
+        raise AuditIntegrityError("Inline custody settled a blob id different from the prepared proposal")
+    return publication
+
+
+def publish_pipeline_custody(engine: Engine, publication: InlineCustodyPublication) -> None:
+    """Publish staged inline bytes after the owning transaction commits."""
+    publish_inline_custody_publication(engine, publication)
+
+
+def reconcile_pipeline_custody_after_transaction_failure(
+    engine: Engine,
+    publication: InlineCustodyPublication,
+    *,
+    primary_exc: BaseException,
+) -> None:
+    """Resolve a failed transaction without guessing its commit outcome."""
+    _run_lock_cleanup(
+        lambda: publish_inline_custody_publication(engine, publication),
+        label="Inline custody transaction-outcome reconciliation",
+        primary_exc=primary_exc,
+    )
+
+
+def pending_custody_blob_view(
+    preparation: PipelineCustodyPreparation,
+    *,
+    data_dir: str | Path,
+) -> PendingCustodyBlobView:
+    """Settlement-equivalent view of the one blob this plan defers.
+
+    Guided-full defers :func:`finalize_pipeline_custody_on_connection` into
+    the atomic staging settlement, so at custody-safe revalidation time the
+    rewritten ``source.blob_id`` names a blob with no row and no file yet
+    (elspeth-282f392fae). This derives every field the resolver needs through
+    the SAME normalization and storage-path formula the settlement insert
+    uses, so the sealed candidate state and the eventually-settled row cannot
+    disagree.
+    """
+    if type(preparation) is not PipelineCustodyPreparation:
+        raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    fields = _normalized_inline_custody_fields(preparation.request)
+    blob_id = str(preparation.blob_id)
+    storage = inline_custody_storage_path(
+        Path(data_dir),
+        session_id=fields["session_id"],
+        blob_id=blob_id,
+        filename=fields["filename"],
+    )
+    return PendingCustodyBlobView(
+        blob_id=blob_id,
+        session_id=fields["session_id"],
+        filename=fields["filename"],
+        mime_type=fields["mime_type"],
+        size_bytes=len(preparation.request.content),
+        content_hash=content_hash(preparation.request.content),
+        storage_path=str(storage),
+        source_description=fields["source_description"],
+        creation_modality=fields["creation_modality"].value,
+        created_from_message_id=fields["created_from_message_id"],
+        creating_model_identifier=fields["creating_model_identifier"],
+        creating_model_version=fields["creating_model_version"],
+        creating_provider=fields["creating_provider"],
+        creating_composer_skill_hash=fields["creating_composer_skill_hash"],
+        creating_arguments_hash=fields["creating_arguments_hash"],
+        content=preparation.request.content,
     )
 
 
@@ -249,6 +377,8 @@ async def finalize_pipeline_custody(
     write_fence: BlobGuidedOperationWriteFence | None = None,
 ) -> BlobRecord:
     """Materialize a prepared inline source through the shared blob service."""
+    if max_storage_per_session != preparation.max_storage_per_session:
+        raise AuditIntegrityError("Pipeline custody enforcement ceiling diverges from the plan-time ceiling")
     if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
         raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
     if write_fence is not None and write_fence.session_id != preparation.request.session_id:
@@ -261,4 +391,77 @@ async def finalize_pipeline_custody(
     record = await service.reserve_inline_custody(preparation.request, write_fence=write_fence)
     if record.id != preparation.blob_id:
         raise AuditIntegrityError("Inline custody returned a blob id different from the prepared proposal")
+    await run_sync_in_worker(verify_finalized_pipeline_custody, preparation, record, data_dir=data_dir)
     return record
+
+
+def verify_finalized_pipeline_custody(
+    preparation: PipelineCustodyPreparation,
+    record: BlobRecord,
+    *,
+    data_dir: str | Path,
+) -> None:
+    """Verify publication returned the exact row the preparation promised.
+
+    Agreeing on the blob id shows only that the write was addressed correctly;
+    it cannot show that the persisted row and the file on disk carry the bytes
+    and provenance this plan authorized. Every field is re-derived through the
+    SAME normalization and path formula the settlement insert uses, then
+    compared on exact runtime type as well as value — a ``size_bytes`` of
+    ``8.0`` equals ``8`` and must still not settle.
+
+    Two deliberate narrowings:
+
+    ``created_at`` is checked for shape only. The column is
+    ``DateTime(timezone=True)`` and the write stamps an aware value, but the
+    SQLite round-trip returns it naive, so awareness is not a property this
+    storage layer can promise on every backend.
+
+    The symbolic-link guard tests the settled file itself, not its ancestors:
+    ``inline_custody_storage_path`` already resolves ``data_dir``, so a link
+    planted at the blob path is the reachable case, while walking the operator's
+    configured parents would reject legitimate deployments.
+    """
+    if type(preparation) is not PipelineCustodyPreparation:
+        raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    if type(record) is not BlobRecord:
+        raise TypeError("record must be an exact BlobRecord")
+    request = preparation.request
+    fields = _normalized_inline_custody_fields(request)
+    storage_path = inline_custody_storage_path(
+        Path(data_dir),
+        session_id=fields["session_id"],
+        blob_id=str(preparation.blob_id),
+        filename=fields["filename"],
+    )
+    settled: tuple[tuple[str, object, object], ...] = (
+        ("id", record.id, preparation.blob_id),
+        ("session_id", record.session_id, request.session_id),
+        ("filename", record.filename, fields["filename"]),
+        ("mime_type", record.mime_type, fields["mime_type"]),
+        ("size_bytes", record.size_bytes, fields["size_bytes"]),
+        ("content_hash", record.content_hash, fields["content_hash"]),
+        ("storage_path", record.storage_path, str(storage_path)),
+        ("created_by", record.created_by, "assistant"),
+        ("source_description", record.source_description, fields["source_description"]),
+        ("status", record.status, "ready"),
+        ("creation_modality", record.creation_modality, fields["creation_modality"]),
+        ("created_from_message_id", record.created_from_message_id, fields["created_from_message_id"]),
+        ("creating_model_identifier", record.creating_model_identifier, fields["creating_model_identifier"]),
+        ("creating_model_version", record.creating_model_version, fields["creating_model_version"]),
+        ("creating_provider", record.creating_provider, fields["creating_provider"]),
+        ("creating_composer_skill_hash", record.creating_composer_skill_hash, fields["creating_composer_skill_hash"]),
+        ("creating_arguments_hash", record.creating_arguments_hash, fields["creating_arguments_hash"]),
+    )
+    for field_name, actual, expected in settled:
+        if type(actual) is not type(expected) or actual != expected:
+            raise AuditIntegrityError(f"Inline custody finalization returned mismatched {field_name}")
+    if type(record.created_at) is not datetime:
+        raise AuditIntegrityError("Inline custody finalization returned mismatched created_at")
+    if storage_path.is_symlink():
+        raise AuditIntegrityError("Inline custody finalization returned a symbolic-link storage path")
+    if not storage_path.is_file():
+        raise AuditIntegrityError("Inline custody finalization returned a missing storage file")
+    stored_bytes = storage_path.read_bytes()
+    if not hmac.compare_digest(stored_bytes, request.content):
+        raise AuditIntegrityError("Inline custody finalization returned mismatched storage bytes")

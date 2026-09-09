@@ -105,6 +105,14 @@ export function describeError(err: unknown): DisplayedError {
       };
     }
     if (err.status === 422) {
+      if (err.error_type === "interpretation_source_data_contract_drift") {
+        return {
+          heading: "Source data contract changed",
+          body:
+            err.detail ||
+            "The source data contract changed. Reload the session and review the current contract.",
+        };
+      }
       if (err.error_type === "interpretation_placeholder_unavailable") {
         return {
           heading: "Stale review",
@@ -156,7 +164,7 @@ export function describeError(err: unknown): DisplayedError {
 /**
  * Sub-view modes for the widget.
  *
- *   "choose"   → two primary buttons (Use mine / Change it).
+ *   "choose"   → two primary buttons (Acknowledge / Change…).
  *   "amend"    → textarea + Submit / Cancel.
  */
 export type ReviewMode = "choose" | "amend";

@@ -1,10 +1,20 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { InlineRunResults } from "./InlineRunResults";
+import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useAuthStore } from "@/stores/authStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import {
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
 import { _resetNarrativeModeCacheForTesting } from "@/hooks/useNarrativeMode";
 import * as apiClient from "@/api/client";
 
@@ -22,8 +32,44 @@ vi.mock("@/components/composer/NarrativeResults", () => ({
   NarrativeResults: () => <div data-testid="narrative-results-stub" />,
 }));
 
+const productionLoadRuns = useExecutionStore.getState().loadRuns;
+
+/** Every class name any stylesheet in the tree declares a rule for.
+ *  Deliberately over-approximating (it scans whole files, not parsed
+ *  selectors), so it can only ever be too permissive — a class it reports as
+ *  defined might be a false positive, but a class it omits is genuinely
+ *  undefined. cwd-relative "src" per the repo idiom: vitest runs from the
+ *  frontend root, and styles/tokenReferences.test.ts reads stylesheets the
+ *  same way. */
+function definedCssClassNames(root = "src"): Set<string> {
+  const found = new Set<string>();
+  for (const entry of readdirSync(root)) {
+    const path = join(root, entry);
+    if (statSync(path).isDirectory()) {
+      for (const name of definedCssClassNames(path)) found.add(name);
+    } else if (entry.endsWith(".css")) {
+      const css = readFileSync(path, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+      for (const selector of css.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)) {
+        found.add(selector[1]);
+      }
+    }
+  }
+  return found;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("InlineRunResults", () => {
   beforeEach(() => {
+    resetStore(usePreferencesStore);
     _resetNarrativeModeCacheForTesting();
     vi.restoreAllMocks();
     // Default: empty catalog so useNarrativeMode resolves to false unless
@@ -73,6 +119,7 @@ describe("InlineRunResults", () => {
       isExecuting: false,
       wsDisconnected: false,
       error: null,
+      loadRuns: productionLoadRuns,
     } as never);
     useSessionStore.setState({
       activeSessionId: "sess-1",
@@ -81,8 +128,342 @@ describe("InlineRunResults", () => {
 
   it("renders nothing when there are no runs", () => {
     const { container } = render(<InlineRunResults />);
-    expect(container.querySelector("[data-testid='progress-view-stub']")).toBeNull();
-    expect(container.querySelector("[data-testid='run-outputs-stub']")).toBeNull();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders the artifact empty state only when explicitly requested", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+    } as never);
+    render(<InlineRunResults showEmptyState />);
+
+    await waitFor(() => {
+      expect(screen.getByText("No runs yet.")).toHaveClass("empty-state");
+    });
+    // Without runAvailable there is no run affordance — the tutorial shell
+    // mounts no REQUEST_RUN_EVENT owner, so a button here would dispatch
+    // into a zero-listener surface (elspeth-553a6fb81d).
+    expect(
+      screen.queryByRole("button", { name: "Run pipeline" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the inline Run affordance when runAvailable and routes it through REQUEST_RUN_EVENT", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+      // runAvailable only proves the REQUEST_RUN_EVENT owner is MOUNTED; the
+      // owner still drops an inadmissible run, so the button additionally
+      // requires the readiness fact that owner gates on.
+      validationResult: makeValidationResult(),
+    } as never);
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    render(<InlineRunResults showEmptyState runAvailable />);
+
+    const runButton = await screen.findByRole("button", {
+      name: "Run pipeline",
+    });
+    expect(
+      screen.getByText("No runs yet. Run the pipeline to see its results here."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(runButton);
+
+    // The dispatch is the whole affordance: gating, egress disclosure, and
+    // execute() all stay with the single REQUEST_RUN_EVENT owner
+    // (ExecuteButton — see 'routes an external run intent through the
+    // egress disclosure' in ExecuteButton.test.tsx).
+    expect(onRequestRun).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  // runAvailable gates the LISTENER, execution_ready gates ADMISSION. The
+  // affordance needs both: the REQUEST_RUN_EVENT owner (ExecuteButton)
+  // requires `readiness.execution_ready === true` inside canExecute and
+  // silently drops the event otherwise, so a button rendered on mount-alone
+  // would be a dead control that reports nothing back to the operator.
+  it.each([
+    ["no validation has run", null],
+    [
+      "validation ran but execution is blocked",
+      makeValidationResult({
+        is_valid: false,
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+    ],
+  ])(
+    "offers directional copy instead of a dead Run button when %s",
+    async (_label, validationResult) => {
+      useExecutionStore.setState({
+        loadRuns: vi.fn().mockResolvedValue("loaded"),
+        validationResult,
+      } as never);
+      const onRequestRun = vi.fn();
+      window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+      render(<InlineRunResults showEmptyState runAvailable />);
+
+      await waitFor(() => {
+        expect(
+          screen.getByText(
+            "No runs yet. Once validation passes, use Run pipeline to start one.",
+          ),
+        ).toHaveClass("empty-state");
+      });
+      // The copy names the control, never a place: there is no "sidebar" in
+      // this layout (the run control is in the sticky bottom action bar of
+      // this same pane), and a location word re-opens the defect class.
+      expect(screen.queryByText(/sidebar|side panel|side rail/i)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Run pipeline" }),
+      ).not.toBeInTheDocument();
+      expect(onRequestRun).not.toHaveBeenCalled();
+      window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    },
+  );
+
+  it("keeps the plain empty state when runAvailable is explicitly false (tutorial shell)", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+    } as never);
+    render(<InlineRunResults showEmptyState runAvailable={false} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("No runs yet.")).toHaveClass("empty-state");
+    });
+    expect(
+      screen.queryByRole("button", { name: "Run pipeline" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows neutral loading until the current session's empty history settles", async () => {
+    const history = deferred<"loaded">();
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockReturnValue(history.promise),
+    } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toHaveClass("empty-state");
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      history.resolve("loaded");
+      await history.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toHaveClass("empty-state");
+  });
+
+  // elspeth-0ee1973592. `.artifact-empty` shipped at five call sites in this
+  // component while NO stylesheet defined it, so every empty and loading
+  // state in the Run panel rendered as a bare UA paragraph. The assertions
+  // above are existence tests — they pin the class NAME and would have passed
+  // unchanged against the defect. This one reads the CSS corpus from disk
+  // (the styles/tokenReferences.test.ts idiom; vitest runs with `css: false`,
+  // so a computed-style assertion is impossible in jsdom) and requires every
+  // class these states render to be DEFINED somewhere in the barrel.
+  it("renders every empty and loading state through classes the stylesheets define", async () => {
+    const definedClasses = definedCssClassNames();
+    // Guards the parser itself: a regex that matched nothing would make the
+    // assertions below vacuous rather than failing.
+    expect(definedClasses.has("empty-state")).toBe(true);
+
+    function assertClassesDefined(root: Element | null): void {
+      expect(root).not.toBeNull();
+      const elements = [root as Element, ...root!.querySelectorAll("[class]")];
+      const rendered = new Set(
+        elements.flatMap((element) => [...element.classList]),
+      );
+      expect(rendered.size).toBeGreaterThan(0);
+      expect(
+        [...rendered].filter((name) => !definedClasses.has(name)),
+        "classes rendered by an InlineRunResults empty/loading state that no " +
+          "stylesheet defines — render the designed primitive instead of a " +
+          "name only the TSX knows about",
+      ).toEqual([]);
+    }
+
+    // 1. Loading: history request in flight.
+    const pending = deferred<"loaded">();
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockReturnValue(pending.promise),
+    } as never);
+    let view = render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    assertClassesDefined(view.container.firstElementChild);
+    await act(async () => {
+      pending.resolve("loaded");
+      await pending.promise;
+    });
+    view.unmount();
+
+    // 2. Unavailable: message plus a Retry action.
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("unavailable"),
+    } as never);
+    view = render(<InlineRunResults showEmptyState />);
+    await screen.findByText("Run history unavailable.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+
+    // 3. Settled with no runs and no run affordance.
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+    } as never);
+    view = render(<InlineRunResults showEmptyState />);
+    await screen.findByText("No runs yet.");
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+
+    // 4. Settled with the inline Run affordance (message plus action).
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+      validationResult: makeValidationResult(),
+    } as never);
+    view = render(<InlineRunResults showEmptyState runAvailable />);
+    await screen.findByRole("button", { name: "Run pipeline" });
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+
+    // 5. Settled with directional copy instead of a dead Run button.
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+      validationResult: null,
+    } as never);
+    view = render(<InlineRunResults showEmptyState runAvailable />);
+    await screen.findByText(
+      "No runs yet. Once validation passes, use Run pipeline to start one.",
+    );
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+  });
+
+  it("renders loaded history without flashing the empty state", async () => {
+    const history = deferred<void>();
+    const loadRuns = vi.fn(async () => {
+      await history.promise;
+      useExecutionStore.setState({
+        runs: [
+          { id: "run-loaded", session_id: "sess-1", status: "completed" },
+        ],
+      } as never);
+      return "loaded" as const;
+    });
+    useExecutionStore.setState({ loadRuns } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    await act(async () => {
+      history.resolve();
+      await history.promise;
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("run-outputs-stub")).toHaveAttribute(
+        "data-run-id",
+        "run-loaded",
+      );
+    });
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+  });
+
+  it("shows unavailable with Retry when the initial history request fails", async () => {
+    vi.spyOn(apiClient, "fetchRuns").mockRejectedValue(new Error("offline"));
+    useExecutionStore.setState({ loadRuns: productionLoadRuns } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText("Run history unavailable.")).toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+  });
+
+  it("retries an unavailable history request through loading to empty", async () => {
+    const retry = deferred<"loaded">();
+    const loadRuns = vi
+      .fn()
+      .mockResolvedValueOnce("unavailable")
+      .mockReturnValueOnce(retry.promise);
+    useExecutionStore.setState({ loadRuns } as never);
+    const user = userEvent.setup();
+    render(<InlineRunResults showEmptyState />);
+    expect(
+      await screen.findByText("Run history unavailable."),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      retry.resolve("loaded");
+      await retry.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toBeInTheDocument();
+  });
+
+  it("does not let a stale session load mark the new session as settled", async () => {
+    const first = deferred<"stale">();
+    const second = deferred<"loaded">();
+    const loadRuns = vi.fn((sessionId: string) =>
+      sessionId === "sess-1" ? first.promise : second.promise,
+    );
+    useExecutionStore.setState({ loadRuns } as never);
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "sess-2" } as never);
+    });
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    await act(async () => {
+      first.resolve("stale");
+      await first.promise;
+    });
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      second.resolve("loaded");
+      await second.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toBeInTheDocument();
+  });
+
+  it("continues to render cached runs when a refresh is unavailable", async () => {
+    useExecutionStore.setState({
+      runs: [
+        { id: "run-cached", session_id: "sess-1", status: "completed" },
+      ],
+      loadRuns: vi.fn().mockResolvedValue("unavailable"),
+    } as never);
+
+    render(<InlineRunResults showEmptyState />);
+
+    expect(screen.getByTestId("run-outputs-stub")).toHaveAttribute(
+      "data-run-id",
+      "run-cached",
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("Loading runs…")).not.toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText("Run history unavailable."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the default embedded mode empty when history is unavailable", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("unavailable"),
+    } as never);
+    const { container } = render(<InlineRunResults />);
+
+    await waitFor(() => {
+      expect(useExecutionStore.getState().loadRuns).toHaveBeenCalled();
+    });
+    expect(container).toBeEmptyDOMElement();
   });
 
   it("renders ProgressView for an active running run", () => {
@@ -112,7 +493,48 @@ describe("InlineRunResults", () => {
     );
   });
 
-  it("warns when an empty run discarded source-validation rows", () => {
+  it("warns when an empty run discarded source-validation rows", async () => {
+    // Source-validation discards have no token trail, so the banner fetches
+    // the recorded reasons from the diagnostics discards section
+    // (elspeth-43f52d69a4) instead of pointing at a page that used to hold
+    // nothing for this stage.
+    vi.spyOn(apiClient, "fetchRunDiagnostics").mockResolvedValue({
+      run_id: "run-empty",
+      landscape_run_id: "run-empty",
+      run_status: "empty",
+      cancel_requested: false,
+      summary: {
+        token_count: 0,
+        preview_limit: 50,
+        preview_truncated: false,
+        discard_count: 2,
+        state_counts: {},
+        operation_counts: {},
+        latest_activity_at: null,
+      },
+      tokens: [],
+      operations: [],
+      artifacts: [],
+      discards: [
+        {
+          stage: "source_validation",
+          node_id: "source_csv_upload",
+          schema_mode: "fixed",
+          error:
+            "1 validation error: amount: Input should be a valid integer [int_parsing]",
+          created_at: "2026-05-24T08:00:00.500Z",
+        },
+        {
+          stage: "source_validation",
+          node_id: "source_csv_upload",
+          schema_mode: "fixed",
+          error:
+            "1 validation error: amount: Input should be a valid integer [int_parsing]",
+          created_at: "2026-05-24T08:00:00.600Z",
+        },
+      ],
+      failure_detail: null,
+    });
     useExecutionStore.setState({
       activeRunId: null,
       progress: null,
@@ -125,6 +547,7 @@ describe("InlineRunResults", () => {
             total: 2,
             validation_errors: 2,
             transform_errors: 0,
+            gate_errors: 0,
             sink_discards: 0,
             stages: [
               {
@@ -144,6 +567,12 @@ describe("InlineRunResults", () => {
     expect(warning).toHaveTextContent(/2 rows discarded at source validation/i);
     expect(warning).toHaveTextContent(/source_csv_upload/i);
     expect(warning).toHaveTextContent(/run terminated empty/i);
+    // The recorded (already-scrubbed) reason renders once the diagnostics
+    // fetch resolves; identical reasons collapse to one entry.
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/recorded rejection reason:/i);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/int_parsing/);
   });
 
   it("warns with the transform node when transform validation discards rows", () => {
@@ -159,6 +588,7 @@ describe("InlineRunResults", () => {
             total: 1,
             validation_errors: 0,
             transform_errors: 1,
+            gate_errors: 0,
             sink_discards: 0,
             stages: [
               {
@@ -177,6 +607,41 @@ describe("InlineRunResults", () => {
     const warning = screen.getByRole("alert");
     expect(warning).toHaveTextContent(/1 row discarded at transform validation/i);
     expect(warning).toHaveTextContent(/normalize_url/i);
+  });
+
+  it("warns with the gate node when expression evaluation discards rows", () => {
+    useExecutionStore.setState({
+      activeRunId: null,
+      progress: null,
+      runs: [
+        {
+          id: "run-gate-error-discard",
+          session_id: "sess-1",
+          status: "completed_with_failures",
+          discard_summary: {
+            total: 1,
+            validation_errors: 0,
+            transform_errors: 0,
+            gate_errors: 1,
+            sink_discards: 0,
+            stages: [
+              {
+                stage: "gate_evaluation",
+                node_id: "threshold",
+                count: 1,
+              },
+            ],
+          },
+        } as never,
+      ],
+    } as never);
+
+    render(<InlineRunResults />);
+
+    const warning = screen.getByRole("alert");
+    expect(warning).toHaveTextContent(/1 row discarded at gate evaluation/i);
+    expect(warning).toHaveTextContent(/threshold/i);
+    expect(warning).toHaveTextContent(/incompatible runtime types/i);
   });
 
   it("does not warn for an empty run with zero discard rows", () => {
@@ -252,6 +717,7 @@ describe("InlineRunResults", () => {
   });
 
   it("includes the current terminal run in the runs drawer when other runs exist", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: "run-done",
       progress: {
@@ -294,6 +760,7 @@ describe("InlineRunResults", () => {
   // this tab — reload race, or a run started from another tab) must reach the
   // drawer, where the REST-backed Cancel works without in-memory state.
   it("routes an unattached live run into the past-runs drawer so it stays cancellable", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: null,
       progress: null,
@@ -308,11 +775,12 @@ describe("InlineRunResults", () => {
 
     expect(screen.getByText("run-orphan")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /cancel run run-orphan/i }),
+      screen.getByRole("button", { name: /^Cancel Run 1 · /i }),
     ).toBeInTheDocument();
   });
 
   it("shows only terminal runs in the past-runs drawer while another run is active", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: "run-active",
       progress: {
@@ -342,8 +810,8 @@ describe("InlineRunResults", () => {
           session_id: "sess-1",
           status: "completed",
           accounting: {
-            source: { rows_processed: 3 },
-            sources: { source: { rows_processed: 3 } },
+            source: { rows_processed: 3, rows_rejected: 0, rows_read: 3 },
+            sources: { source: { rows_processed: 3, rows_rejected: 0, rows_read: 3 } },
             tokens: {
               emitted: 3,
               terminal: 3,
@@ -351,6 +819,7 @@ describe("InlineRunResults", () => {
               failed: 0,
               structural: 0,
               pending: 0,
+              abandoned: 0,
             },
             routing: {
               routed_success: 0,
@@ -388,6 +857,7 @@ describe("InlineRunResults", () => {
   });
 
   it("opens and closes the runs drawer", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     useExecutionStore.setState({
       activeRunId: null,
       runs: [
@@ -433,7 +903,7 @@ describe("InlineRunResults", () => {
   });
 
   it("loads the active session's runs when mounted", async () => {
-    const loadRuns = vi.fn().mockResolvedValue(undefined);
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
     useExecutionStore.setState({ loadRuns } as never);
 
     render(<InlineRunResults />);
@@ -441,6 +911,28 @@ describe("InlineRunResults", () => {
     await waitFor(() => {
       expect(loadRuns).toHaveBeenCalledWith("sess-1");
     });
+  });
+
+  it("stops polling run history when its owner unmounts", async () => {
+    vi.useFakeTimers();
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
+    useExecutionStore.setState({
+      loadRuns,
+      runs: [
+        { id: "run-live", session_id: "sess-1", status: "running" } as never,
+      ],
+    } as never);
+    const view = render(<InlineRunResults />);
+
+    await act(async () => Promise.resolve());
+    expect(loadRuns).toHaveBeenCalledTimes(1);
+    act(() => vi.advanceTimersByTime(3000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+    act(() => vi.advanceTimersByTime(6000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 
   // ==========================================================================

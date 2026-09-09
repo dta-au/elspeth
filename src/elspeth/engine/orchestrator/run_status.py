@@ -18,21 +18,58 @@ testable without constructing an Orchestrator instance.
 
 from __future__ import annotations
 
-from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunCompletionStatus
 from elspeth.contracts.run_result import derive_terminal_run_status
+from elspeth.core.checkpoint.recovery import check_group_satisfiability_resumable, group_binding_view_from_graph
 from elspeth.engine.orchestrator.counter_classification import TERMINAL_PAIR_COUNTER_EFFECTS, apply_counter_increments
 from elspeth.engine.orchestrator.types import ExecutionCounters
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit import TokenOutcome
     from elspeth.contracts.run_result import RunResult
+    from elspeth.core.dag import ExecutionGraph
+    from elspeth.core.landscape import LandscapeDB
     from elspeth.core.landscape.factory import RecorderFactory
+
+
+def assert_bound_groups_settled_from_audit(db: LandscapeDB, run_id: str, graph: ExecutionGraph) -> None:
+    """End-of-run post-condition: every bound group settled, judged from the audit DB.
+
+    The end-of-input drain (``leader_drain.run_end_of_input_barrier_flush``)
+    keeps looping while ``has_blocked_barrier_work()`` is true — a proxy that
+    is only accidentally correlated with "did every group close": a buffered
+    sibling holds a BLOCKED row, so a multi-member group with one missing
+    member fails closed there, but a group whose EVERY member was removed
+    without a ``group_losses`` row leaves nothing buffered, the proxy reads
+    false, and the run converged quietly with the group never closed
+    (elspeth-76e936568e; the single-member group is the minimal shape).
+
+    This asks the durable question instead, and asks it of the ONE existing
+    authority: the spec §8 group-satisfiability gate
+    (:func:`check_group_satisfiability_resumable`), which already serves the
+    advisory ``can_resume`` surface and the enforcing ``resume()`` entry
+    guard — every minted member of every bound group must be live, arrived at
+    its closer, or named in ``group_losses``. The verdict text is the gate's
+    own (``check.reason``), not restated here. Runs on both terminal paths
+    (fresh run and successful resume) BEFORE the terminal status is derived,
+    while the run is still RUNNING, so a refusal takes the same failure
+    ceremony as ``sweep_deferred_invariants_or_crash``: the run finalizes
+    FAILED and the exception propagates. Unbound groups never refuse; a
+    pipeline with no bound groups issues no member queries at all.
+    """
+    gate = check_group_satisfiability_resumable(db, run_id, group_binding_view_from_graph(graph))
+    if gate.unsatisfiable_members:
+        raise OrchestrationInvariantError(
+            f"Run '{run_id}' reached end of run with bound-group members that never settled: "
+            f"{gate.check.reason}. The end-of-input drain saw no BLOCKED hold because no sibling was "
+            "buffered; the loss ledger, not leader memory, decides whether a group closed "
+            "(elspeth-76e936568e)."
+        )
 
 
 def _require_routed_sink_name(outcome_record: TokenOutcome, pair: tuple[TerminalOutcome | None, TerminalPath]) -> str:
@@ -164,6 +201,21 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     counters.rows_coalesce_failed = factory.run_status_projection.count_failed_coalesce_barrier_rows(run_id)
     for outcome_record in outcomes:
         if not outcome_record.completed:
+            if outcome_record.path is TerminalPath.ABANDONED:
+                # ADR-038 fail-closed belt. This derive runs on BOTH the
+                # normal completion arm and the resume arms (ADR-030 §D —
+                # see the module docstring), but neither should ever see an
+                # ABANDONED record: the sweep writes them only AFTER the
+                # terminal stamp (normal arm derives before finalize), and a
+                # swept run trips the resume gates before either resume arm
+                # derives. Reading one here means a state those gates should
+                # already have refused — crash rather than count.
+                raise AuditIntegrityError(
+                    f"Status derive for run {run_id!r} read an ABANDONED record "
+                    f"for token {outcome_record.token_id!r}: the audit trail declares "
+                    "this run non-resumable and already finalized, so a live derive "
+                    "over it is an audit contradiction — refusing to continue."
+                )
             if (outcome_record.outcome, outcome_record.path) == (None, TerminalPath.BUFFERED):
                 apply_counter_increments(counters, TERMINAL_PAIR_COUNTER_EFFECTS[(None, TerminalPath.BUFFERED)])
             continue
@@ -221,14 +273,19 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 #
 # routed_destinations is compared separately as a plain dict below because
 # RunResult stores a frozen Mapping while ExecutionCounters stores a Counter.
-_PARITY_EXCLUDED_FIELDS: frozenset[str] = frozenset(
-    {
-        "rows_coalesce_failed",
-        "routed_destinations",
-    }
-)
-_PARITY_STRICT_FIELDS: tuple[str, ...] = tuple(
-    field.name for field in fields(ExecutionCounters) if field.name not in _PARITY_EXCLUDED_FIELDS
+_PARITY_EXCLUDED_FIELDS: frozenset[str] = frozenset({"rows_coalesce_failed", "routed_destinations"})
+_PARITY_STRICT_FIELDS: tuple[str, ...] = (
+    "rows_processed",
+    "rows_succeeded",
+    "rows_failed",
+    "rows_routed_success",
+    "rows_routed_failure",
+    "rows_quarantined",
+    "rows_forked",
+    "rows_coalesced",
+    "rows_expanded",
+    "rows_buffered",
+    "rows_diverted",
 )
 
 
@@ -237,17 +294,29 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
 
     ADR-030 §D: the audit-derived counters ARE the terminal record; the live
     accumulator survives only as this assertion. Any divergence outside the
-    two documented ``rows_coalesce_failed`` arms (see
-    ``_PARITY_STRICT_FIELDS``) means one of the two bookkeepers is broken —
+    two documented ``rows_coalesce_failed`` arms means one of the two bookkeepers is broken —
     crash loudly rather than record an unexplained terminal status.
 
     Raises:
         OrchestrationInvariantError: on any strict-field mismatch.
     """
-    mismatches = {
-        field: {"live": getattr(live, field), "audit": getattr(audit, field)}
-        for field in _PARITY_STRICT_FIELDS
-        if getattr(live, field) != getattr(audit, field)
+    strict_fields = (
+        ("rows_processed", live.rows_processed, audit.rows_processed),
+        ("rows_succeeded", live.rows_succeeded, audit.rows_succeeded),
+        ("rows_failed", live.rows_failed, audit.rows_failed),
+        ("rows_routed_success", live.rows_routed_success, audit.rows_routed_success),
+        ("rows_routed_failure", live.rows_routed_failure, audit.rows_routed_failure),
+        ("rows_quarantined", live.rows_quarantined, audit.rows_quarantined),
+        ("rows_forked", live.rows_forked, audit.rows_forked),
+        ("rows_coalesced", live.rows_coalesced, audit.rows_coalesced),
+        ("rows_expanded", live.rows_expanded, audit.rows_expanded),
+        ("rows_buffered", live.rows_buffered, audit.rows_buffered),
+        ("rows_diverted", live.rows_diverted, audit.rows_diverted),
+    )
+    mismatches: dict[str, dict[str, object]] = {
+        field_name: {"live": live_value, "audit": audit_value}
+        for field_name, live_value, audit_value in strict_fields
+        if live_value != audit_value
     }
     if dict(live.routed_destinations) != dict(audit.routed_destinations):
         mismatches["routed_destinations"] = {

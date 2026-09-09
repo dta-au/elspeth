@@ -52,16 +52,21 @@ from sqlalchemy import delete, insert, select
 
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.contracts.scheduler import BranchLossSpec, SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.results import FailureInfo
+from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import NodeID
+from elspeth.contracts.types import CollectorName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_workers_table,
+    runs_table,
     scheduler_events_table,
     token_parents_table,
     token_work_items_table,
@@ -71,7 +76,8 @@ from elspeth.engine.processor import SCHEDULER_MAINTENANCE_INTERVAL, DAGTraversa
 from elspeth.engine.scheduler_drain import ProcessorMode
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
-from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import RecorderSetup, expire_lease, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.helpers.tree_gate import iter_gate_sources
 
 NODE_ID = "normalize"
 LEADER_OWNER = "leader-a"
@@ -82,11 +88,18 @@ _PAYLOAD = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 1},
 
 
 class _RecordingScheduler:
-    """Delegating wrapper over the real scheduler repository.
+    """Explicit delegating wrapper over the real scheduler repository.
 
     Records ``(verb, kwargs)`` for the drain-relevant verbs in invocation
     order, then delegates to the real repository — the durable behavior is
-    exactly the real repository's. Everything else passes straight through.
+    exactly the real repository's.
+
+    Every delegated member is written out. There is deliberately no catch-all
+    ``__getattr__``: a scheduler member this wrapper does not name raises
+    ``AttributeError`` at the call site, so a drain path that starts using a
+    new verb shows up here instead of slipping past unrecorded. Only keyword
+    arguments are recorded, which is what every ``calls_for(...)`` assertion in
+    this module reads.
     """
 
     _RECORDED = frozenset(
@@ -102,6 +115,7 @@ class _RecordingScheduler:
             "heartbeat_lease",
             "enqueue_ready_claimed",
             "enqueue_ready_claimed_legacy_unfenced",
+            "enqueue_ready",
         }
     )
 
@@ -109,21 +123,92 @@ class _RecordingScheduler:
         self._inner = inner
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._inner, name)
-        if name in self._RECORDED:
+    def _record(self, verb: str, kwargs: dict[str, Any]) -> None:
+        assert verb in self._RECORDED, f"{verb!r} is recorded but missing from _RECORDED"
+        self.calls.append((verb, dict(kwargs)))
 
-            def recorded(*args: Any, _attr: Any = attr, _name: str = name, **kwargs: Any) -> Any:
-                self.calls.append((_name, dict(kwargs)))
-                return _attr(*args, **kwargs)
+    # -- recorded drain verbs -------------------------------------------
 
-            return recorded
-        return attr
+    def recover_expired_leases(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("recover_expired_leases", kwargs)
+        return self._inner.recover_expired_leases(*args, **kwargs)
+
+    def terminalize_pending_sinks_with_terminal_outcomes(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("terminalize_pending_sinks_with_terminal_outcomes", kwargs)
+        return self._inner.terminalize_pending_sinks_with_terminal_outcomes(*args, **kwargs)
+
+    def claim_pending_sink(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("claim_pending_sink", kwargs)
+        return self._inner.claim_pending_sink(*args, **kwargs)
+
+    def claim_ready(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("claim_ready", kwargs)
+        return self._inner.claim_ready(*args, **kwargs)
+
+    def mark_pending_sink(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_pending_sink", kwargs)
+        return self._inner.mark_pending_sink(*args, **kwargs)
+
+    def mark_failed(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_failed", kwargs)
+        return self._inner.mark_failed(*args, **kwargs)
+
+    def mark_terminal(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_terminal", kwargs)
+        return self._inner.mark_terminal(*args, **kwargs)
+
+    def mark_blocked(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("mark_blocked", kwargs)
+        return self._inner.mark_blocked(*args, **kwargs)
+
+    def heartbeat_lease(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("heartbeat_lease", kwargs)
+        return self._inner.heartbeat_lease(*args, **kwargs)
+
+    def enqueue_ready_claimed(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("enqueue_ready_claimed", kwargs)
+        return self._inner.enqueue_ready_claimed(*args, **kwargs)
+
+    def enqueue_ready_claimed_legacy_unfenced(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("enqueue_ready_claimed_legacy_unfenced", kwargs)
+        return self._inner.enqueue_ready_claimed_legacy_unfenced(*args, **kwargs)
+
+    def enqueue_ready(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("enqueue_ready", kwargs)
+        return self._inner.enqueue_ready(*args, **kwargs)
+
+    # -- unrecorded members the drain paths still reach ------------------
+
+    # The atomic disposition-plus-child-enqueue verbs are deliberately NOT in
+    # ``_RECORDED``: several tests assert ``calls_for("mark_terminal") == []``
+    # precisely to prove the drain took the atomic variant instead of the plain
+    # one, so recording them here would not change any assertion but would blur
+    # that distinction. This mirrors the previous wrapper's behaviour exactly.
+    def mark_terminal_with_ready_children(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.mark_terminal_with_ready_children(*args, **kwargs)
+
+    def mark_failed_with_ready_children(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.mark_failed_with_ready_children(*args, **kwargs)
+
+    def mark_pending_sink_with_ready_children(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.mark_pending_sink_with_ready_children(*args, **kwargs)
+
+    def peer_active_leases(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.peer_active_leases(*args, **kwargs)
+
+    @staticmethod
+    def serialize_row_payload(row: Any) -> str:
+        return TokenSchedulerRepository.serialize_row_payload(row)
+
+    @staticmethod
+    def deserialize_row_payload(row_payload_json: str) -> Any:
+        return TokenSchedulerRepository.deserialize_row_payload(row_payload_json)
 
     def verbs(self) -> list[str]:
         return [name for name, _ in self.calls]
 
     def calls_for(self, verb: str) -> list[dict[str, Any]]:
+        assert verb in self._RECORDED, f"{verb!r} is not a recorded verb — calls_for would be vacuously empty"
         return [kwargs for name, kwargs in self.calls if name == verb]
 
 
@@ -132,8 +217,10 @@ def _build(
     lease_owner: str | None,
     register_leader: str | None = LEADER_OWNER,
     bind_leader_token: bool = False,
+    bind_run_coordination: bool = False,
     heartbeat_seconds: int = 60,
     mode: ProcessorMode = ProcessorMode.LEADER,
+    span_factory: SpanFactory | None = None,
 ) -> tuple[RowProcessor, _RecordingScheduler, RecorderSetup, MockClock]:
     """Real RowProcessor over a real scheduler DB behind the recording wrapper."""
     setup = make_recorder_with_run(
@@ -147,7 +234,7 @@ def _build(
     processor = RowProcessor(
         execution=setup.execution,
         data_flow=setup.data_flow,
-        span_factory=SpanFactory(),
+        span_factory=span_factory if span_factory is not None else SpanFactory(),
         run_id=setup.run_id,
         source_node_id=NodeID(setup.source_node_id),
         source_on_success="default",
@@ -163,6 +250,15 @@ def _build(
         scheduler_lease_owner=lease_owner,
         scheduler_heartbeat_seconds=heartbeat_seconds,
         coordination_token=(leader_coordination_token(setup.factory, setup.run_id) if bind_leader_token else None),
+        # ADR-030 D4 type split: a FOLLOWER carries exactly its membership
+        # authority for its registered lease owner (harness construction — no
+        # membership-fenced verb is reached from this processor yet).
+        member_token=(
+            WorkerMembershipToken(run_id=setup.run_id, worker_id=lease_owner)
+            if mode is ProcessorMode.FOLLOWER and lease_owner is not None
+            else None
+        ),
+        run_coordination=(setup.factory.run_coordination if bind_run_coordination else None),
         clock=clock,
         mode=mode,
     )
@@ -195,8 +291,14 @@ def _enqueue_ready(
     clock: MockClock,
     *,
     sequence: int,
+    lineage_path: tuple[LineageFrame, ...] = (),
 ) -> tuple[str, TokenInfo]:
-    """Enqueue a READY continuation; return (work_item_id, token)."""
+    """Enqueue a READY continuation; return (work_item_id, token).
+
+    ``lineage_path`` (spec §6.2): the claim guard authenticates a staged
+    group-loss spec against the CLAIMED item's own lineage_path, so tests
+    staging a loss must enqueue one carrying the matching frame.
+    """
     row, token = setup.data_flow.create_row_with_token(
         run_id=setup.run_id,
         source_node_id=setup.source_node_id,
@@ -212,14 +314,14 @@ def _enqueue_ready(
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=clock.now_utc(),
         row_payload_json=_PAYLOAD,
+        lineage_path=lineage_path,
     )
     token_info = TokenInfo(row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT))
     return item.work_item_id, token_info
 
 
-def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int) -> WorkItem:
+def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int, collector_name: CollectorName | None = None) -> WorkItem:
     row, token = setup.data_flow.create_row_with_token(
         run_id=setup.run_id,
         source_node_id=setup.source_node_id,
@@ -228,9 +330,17 @@ def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int) -> WorkItem:
         source_row_index=sequence,
         ingest_sequence=sequence,
     )
+    # A collector cursor always accompanies an EXPAND member (the compound
+    # barrier_key is derived from the cursor AND the innermost EXPAND frame).
+    lineage_path = (
+        () if collector_name is None else (LineageFrame(kind=FrameKind.EXPAND, group_id=f"eg-{sequence}", member_key=token.token_id),)
+    )
     return WorkItem(
-        token=TokenInfo(row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT)),
+        token=TokenInfo(
+            row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT), lineage_path=lineage_path
+        ),
         current_node_id=NodeID(NODE_ID),
+        collector_name=collector_name,
     )
 
 
@@ -244,7 +354,7 @@ def _park_pending_sink(
 ) -> tuple[str, TokenInfo]:
     """Claim a READY row under ``owner`` and park it PENDING_SINK (crash image)."""
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=sequence)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=owner, lease_seconds=300, now=clock.now_utc())
+    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=owner, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == work_item_id
     scheduler.mark_pending_sink(
         work_item_id=work_item_id,
@@ -254,7 +364,6 @@ def _park_pending_sink(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=clock.now_utc(),
         expected_lease_owner=owner,
     )
     return work_item_id, token
@@ -304,6 +413,17 @@ def _sink_bound_result(token: TokenInfo) -> RowResult:
         outcome=TerminalOutcome.SUCCESS,
         path=TerminalPath.DEFAULT_FLOW,
         sink_name="default",
+    )
+
+
+def _error_sink_bound_result(token: TokenInfo) -> RowResult:
+    return RowResult(
+        token=token,
+        final_data=token.row_data,
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.ON_ERROR_ROUTED,
+        sink_name="errors",
+        error=FailureInfo(exception_type="TransformResultError", message="handled transform failure"),
     )
 
 
@@ -371,6 +491,35 @@ def test_recovery_drain_requires_token_before_lease_recovery() -> None:
     assert spy.calls_for("recover_expired_leases") == []
 
 
+def test_barrier_intake_pass_entry_refuses_a_stale_pending_group_loss() -> None:
+    """Ruling 44 (R2): take_pending_group_losses() — the callable every
+    barrier-intake-pass arm now drains through (Ruling 43) — has no frame
+    authentication against a claimed token, unlike take_claim_group_losses.
+    That is safe only because nothing is staged when an out-of-claim arm
+    runs; this was true by construction across Rulings 38/39/42/43 but
+    never actually asserted. A stale spec left behind by an in-claim path
+    that staged without draining before releasing its claim must be loud at
+    the very next intake pass, not silently swept up by the next
+    out-of-claim drain."""
+    processor, spy, setup, _clock = _build(lease_owner=LEADER_OWNER, bind_leader_token=True)
+    processor._pending_group_losses.append(
+        GroupLossSpec(
+            closer_name="merge",
+            group_id="fg-merge",
+            member_key="left",
+            token_id="tok-stale",
+            reason="leaked across a claim boundary",
+        )
+    )
+
+    spy.calls.clear()
+    with pytest.raises(OrchestrationInvariantError, match="Barrier-intake pass entry"):
+        processor.drain_scheduled_work(_ctx(setup))
+
+    # The guard fires before any claim is attempted.
+    assert spy.calls_for("claim_ready") == []
+
+
 def test_sink_bound_result_parks_pending_sink_with_fenced_owner_and_tags_result() -> None:
     """A sink-bound success parks the claim PENDING_SINK: lease owner kept,
     membership fence worker_id threaded, parked metadata mirrors the result,
@@ -432,6 +581,62 @@ def test_claimed_token_failure_marks_failed_with_fence() -> None:
     assert spy.calls_for("mark_terminal") == []
     status, _owner = _row_status(setup, work_item_id)
     assert status == TokenWorkStatus.FAILED.value
+
+
+def test_error_sink_pending_disposition_marks_row_span_error() -> None:
+    """A handled failure is an ERROR row even when durably routed to an error sink."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def handled_failure(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        return _error_sink_bound_result(kwargs["token"]), []
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(
+            processor,
+            "_process_single_token",
+            new=handled_failure,
+        ),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    status, _owner = _row_status(setup, work_item_id)
+    assert status == TokenWorkStatus.PENDING_SINK.value
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "RowResultError"
+
+
+def test_failed_disposition_marks_row_span_error() -> None:
+    """A handled failure is an ERROR row after its ordinary FAILED disposition commits."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def handled_failure(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        return _failed_result(kwargs["token"]), []
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(
+            processor,
+            "_process_single_token",
+            new=handled_failure,
+        ),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    status, _owner = _row_status(setup, work_item_id)
+    assert status == TokenWorkStatus.FAILED.value
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "RowResultError"
 
 
 def test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced() -> None:
@@ -518,29 +723,64 @@ def test_child_ready_enqueue_rolls_back_when_parent_terminal_event_fails() -> No
     assert child_events == []
 
 
+def test_row_span_covers_terminal_disposition_failure() -> None:
+    """A durable disposition write is part of the claimed row operation."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    _work_item_id, _parent_token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def dropped(**kwargs: Any) -> tuple[RowResult, list[WorkItem]]:
+        return _dropped_result(kwargs["token"]), []
+
+    real_record = setup.factory.scheduler.events.record
+
+    def reject_terminal_event(conn: Any, *, event_type: SchedulerEventType, **kwargs: Any) -> None:
+        if event_type is SchedulerEventType.MARK_TERMINAL:
+            raise RuntimeError("injected row disposition failure")
+        real_record(conn, event_type=event_type, **kwargs)
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(processor, "_process_single_token", new=dropped),
+        patch.object(setup.factory.scheduler.events, "record", new=reject_terminal_event),
+        pytest.raises(RuntimeError, match="injected row disposition failure"),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "RuntimeError"
+
+
 def test_child_and_parent_disposition_roll_back_when_branch_loss_write_fails() -> None:
-    """The child, parent event, and §E.5 loss share one commit boundary."""
+    """The child, parent event, and §6.2 loss share one commit boundary."""
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
-    parent_work_item_id, parent_token = _enqueue_ready(setup, spy, clock, sequence=0)
+    loss_frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-merge", member_key="left")
+    parent_work_item_id, parent_token = _enqueue_ready(setup, spy, clock, sequence=0, lineage_path=(loss_frame,))
     child_item = _unscheduled_work_item(setup, sequence=1)
-    processor._pending_branch_losses.append(
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id=parent_token.row_id,
-            branch_name="left",
-            token_id=parent_token.token_id,
-            reason="test branch loss",
-            recorded_by=LEADER_OWNER,
-        )
-    )
 
     def produce_child(**kwargs: Any) -> tuple[RowResult, list[WorkItem]]:
+        # Staged HERE, inside the simulated processing of the claimed item —
+        # matching real production ordering (Ruling 44's barrier-intake-pass
+        # entry guard now refuses a loss staged before this iteration's
+        # intake pass has even run).
+        processor._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name="merge",
+                group_id=loss_frame.group_id,
+                member_key=loss_frame.member_key,
+                token_id=parent_token.token_id,
+                reason="test branch loss",
+            )
+        )
         return _dropped_result(kwargs["token"]), [child_item]
 
     with (
         patch.object(processor, "_process_single_token", new=produce_child),
         patch(
-            "elspeth.core.landscape.scheduler.dispositions.record_coalesce_branch_loss",
+            "elspeth.core.landscape.scheduler.dispositions.record_group_loss",
             side_effect=RuntimeError("injected branch-loss write failure"),
         ),
         pytest.raises(RuntimeError, match="injected branch-loss write failure"),
@@ -652,7 +892,7 @@ def test_expansion_restart_reuses_children_and_delivers_each_once() -> None:
                     row_id=child.row_id,
                     token_id=child.token_id,
                     row_data=PipelineRow(payload, _CONTRACT),
-                    expand_group_id=child.expand_group_id,
+                    lineage_path=child.lineage_path,
                 ),
                 current_node_id=NodeID(NODE_ID),
             )
@@ -699,10 +939,12 @@ def test_expansion_restart_reuses_children_and_delivers_each_once() -> None:
 
     # Model the successor process's lease reap through the repository's named
     # crash-image adapter, then enter through the production recovery drain.
+    # The crashed parent's lease is aged into the database's past (ADR-047):
+    # advancing the process MockClock cannot expire a database-time lease.
     clock.advance(1_000)
+    expire_lease(setup.db.engine, parent_work_item_id)
     recovered = setup.factory.scheduler.recover_expired_leases_legacy_unfenced(
         run_id=setup.run_id,
-        now=clock.now_utc(),
         caller_owner="restart-reaper",
     )
     assert recovered == 1
@@ -745,18 +987,24 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
     mark_* disposition is issued for the abandoned claim."""
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
-    processor._pending_branch_losses.append(
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id=token.row_id,
-            branch_name="left",
-            token_id=token.token_id,
-            reason="staged before the lease was lost",
-            recorded_by=LEADER_OWNER,
-        )
-    )
 
     def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        # Staged HERE, inside the simulated processing of the claimed item —
+        # matching real production ordering (Ruling 44's barrier-intake-pass
+        # entry guard now refuses a loss staged before this iteration's
+        # intake pass has even run). The lease-lost abandonment clears the
+        # staging list unconditionally (scheduler_drain.py's abandonment
+        # arms), never reaching the claim guard — a real frame match is not
+        # required here.
+        processor._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-merge",
+                member_key="left",
+                token_id=token.token_id,
+                reason="staged before the lease was lost",
+            )
+        )
         raise SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=setup.run_id)
 
     spy.calls.clear()
@@ -764,7 +1012,7 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
         results = processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
 
     assert results == []
-    assert processor._pending_branch_losses == [], "staged §E.5 losses are discarded with the abandoned claim"
+    assert processor._pending_group_losses == [], "staged §6.2 losses are discarded with the abandoned claim"
     verbs = spy.verbs()
     assert "mark_failed" not in verbs
     assert "mark_terminal" not in verbs
@@ -774,6 +1022,28 @@ def test_lease_lost_mid_processing_abandons_result_and_writes_no_disposition() -
     status, owner = _row_status(setup, work_item_id)
     assert status == TokenWorkStatus.LEASED.value
     assert owner == LEADER_OWNER
+
+
+def test_handled_scheduler_lease_loss_marks_row_span_error() -> None:
+    """Clean abandonment is handled control flow but not a successful row claim."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def lose_claim(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        raise SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=setup.run_id)
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(processor, "_process_single_token", new=lose_claim),
+    ):
+        assert processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False) == []
+
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "SchedulerLeaseLostError"
 
 
 @pytest.mark.parametrize("surviving_peer", [False, True], ids=["sole-row-deletion", "n-greater-than-zero-absence"])
@@ -789,19 +1059,22 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
     if surviving_peer:
         _register_worker(setup, "worker-peer")
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
-    processor._pending_branch_losses.append(
-        BranchLossSpec(
-            coalesce_name="merge",
-            row_id=token.row_id,
-            branch_name="left",
-            token_id=token.token_id,
-            reason="staged before membership loss",
-            recorded_by=LEADER_OWNER,
-        )
-    )
     refused_image: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
 
     def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        # Staged HERE, inside the simulated processing of the claimed item —
+        # matching real production ordering (Ruling 44's barrier-intake-pass
+        # entry guard now refuses a loss staged before this iteration's
+        # intake pass has even run).
+        processor._pending_group_losses.append(
+            GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-merge",
+                member_key="left",
+                token_id=token.token_id,
+                reason="staged before membership loss",
+            )
+        )
         with setup.db.engine.begin() as conn:
             deleted = conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == LEADER_OWNER))
         assert deleted.rowcount == 1
@@ -819,7 +1092,7 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
 
     assert exc_info.value.worker_id == LEADER_OWNER
     assert exc_info.value.run_id == setup.run_id
-    assert processor._pending_branch_losses == []
+    assert processor._pending_group_losses == []
     assert len(refused_image) == 1
     assert _durable_claim_image(setup, work_item_id) == refused_image[0]
     assert len(spy.calls_for("heartbeat_lease")) == 1
@@ -877,8 +1150,77 @@ def test_non_recovery_drains_run_maintenance_every_interval() -> None:
     processor._drain_scheduler_claims(ctx=ctx, pending_items={}, recover_pending_sinks=False)
     recoveries = spy.calls_for("recover_expired_leases")
     assert len(recoveries) == 1
-    assert set(recoveries[0]) == {"now", "coordination_token"}
+    assert set(recoveries[0]) == {"coordination_token"}
     assert recoveries[0]["coordination_token"].worker_id == LEADER_OWNER
+
+
+def test_production_maintenance_evicts_only_stale_same_run_follower() -> None:
+    processor, _spy, setup, clock = _build(
+        lease_owner=LEADER_OWNER,
+        bind_leader_token=True,
+        bind_run_coordination=True,
+    )
+    now = clock.now_utc()
+    same_run_target = "stale-same-run-follower"
+    leader_role_target = "stale-leader-role"
+    foreign_run_id = "run-drain-char-foreign"
+    foreign_target = "stale-foreign-run-follower"
+    with setup.db.engine.begin() as conn:
+        conn.execute(
+            insert(runs_table).values(
+                run_id=foreign_run_id,
+                started_at=now,
+                config_hash="config",
+                settings_json="{}",
+                canonical_version="v1",
+                status="running",
+                openrouter_catalog_sha256="0" * 64,
+                openrouter_catalog_source="bundled",
+            )
+        )
+        for worker_id, run_id, role in (
+            (same_run_target, setup.run_id, "follower"),
+            (leader_role_target, setup.run_id, "leader"),
+            (foreign_target, foreign_run_id, "follower"),
+        ):
+            conn.execute(
+                insert(run_workers_table).values(
+                    worker_id=worker_id,
+                    run_id=run_id,
+                    role=role,
+                    status="active",
+                    registered_at=now,
+                    heartbeat_expires_at=now - timedelta(hours=1),
+                )
+            )
+
+    assert processor.reap_expired_peer_leases() == 0
+
+    with setup.db.engine.connect() as conn:
+        statuses = dict(
+            conn.execute(
+                select(run_workers_table.c.worker_id, run_workers_table.c.status).where(
+                    run_workers_table.c.worker_id.in_((same_run_target, leader_role_target, foreign_target))
+                )
+            ).all()
+        )
+        evicted_worker_ids = (
+            conn.execute(
+                select(run_coordination_events_table.c.worker_id).where(
+                    run_coordination_events_table.c.run_id == setup.run_id,
+                    run_coordination_events_table.c.event_type == "worker_evict",
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert statuses == {
+        same_run_target: "evicted",
+        leader_role_target: "active",
+        foreign_target: "active",
+    }
+    assert evicted_worker_ids == [same_run_target]
 
 
 def test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_to_explicit_legacy() -> None:
@@ -911,6 +1253,110 @@ def test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_t
     assert legacy_item.work_item_id in legacy_pending
 
 
+def test_enqueue_work_item_forwards_collector_name_claimed() -> None:
+    """WS3 drain-forwarding pin: a WorkItem carrying collector_name survives
+    the REAL enqueue_work_item -> enqueue_ready_claimed call (:1178). This
+    drives the actual coordinator method (no monkeypatch of enqueue_work_item
+    or _process_single_token) and spies at the scheduler boundary, unlike the
+    existing ready-emission parity test whose enqueue capture is behind a
+    monkeypatched drain call and so cannot see a forwarding gap here."""
+    processor, spy, setup, _clock = _build(lease_owner=LEADER_OWNER)
+    pending: dict[str, WorkItem] = {}
+    spy.calls.clear()
+
+    processor._scheduler_drain.enqueue_work_item(
+        _unscheduled_work_item(setup, sequence=30, collector_name=CollectorName("intake")),
+        pending,
+        claim_immediately=True,
+    )
+
+    [kwargs] = spy.calls_for("enqueue_ready_claimed")
+    assert kwargs["collector_name"] == "intake"
+
+
+def test_enqueue_work_item_forwards_collector_name_unclaimed() -> None:
+    """Same pin as above for the claim_immediately=False branch (:1201's
+    plain enqueue_ready call)."""
+    processor, spy, setup, _clock = _build(lease_owner=LEADER_OWNER)
+    pending: dict[str, WorkItem] = {}
+    spy.calls.clear()
+
+    processor._scheduler_drain.enqueue_work_item(
+        _unscheduled_work_item(setup, sequence=31, collector_name=CollectorName("intake")),
+        pending,
+        claim_immediately=False,
+    )
+
+    [kwargs] = spy.calls_for("enqueue_ready")
+    assert kwargs["collector_name"] == "intake"
+
+
+def test_drain_claims_forwards_row_union_metadata_from_pending_items() -> None:
+    """WS4 Task 12 drain-forwarding pin (preflight-t8-13.md §3, the ":256"
+    Protocol-signature/":638" re-dispatch coupled pair): a pending in-memory
+    WorkItem carrying row_union_node_id/row_union_name survives
+    drain_claims's fast re-dispatch path (:609's ``claimed.work_item_id in
+    pending_items`` branch) into ``_process_single_token`` unchanged.
+    ``TestReadyEmissionEnqueueParity`` does not cover this — that class
+    derives its enqueue side from a monkeypatched call inside
+    ``enqueue_work_item``, and ``drain_claims`` is never invoked by it; this
+    drives the real ``drain_claims`` coordinator method directly (no
+    monkeypatch of ``drain_claims`` itself), only ``_process_single_token``
+    is faked, to observe exactly what it was called with."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, bind_leader_token=True)
+    work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=40)
+
+    row_union_node_id = NodeID("row_union::variant_union")
+    row_union_name = RowUnionName("variant_union")
+    pending_item = WorkItem(
+        token=token,
+        current_node_id=NodeID(NODE_ID),
+        row_union_node_id=row_union_node_id,
+        row_union_name=row_union_name,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        captured.update(kwargs)
+        return _dropped_result(kwargs["token"]), []
+
+    with patch.object(processor, "_process_single_token", new=fake_process):
+        processor._scheduler_drain.drain_claims(
+            ctx=_ctx(setup),
+            pending_items={work_item_id: pending_item},
+            recover_pending_sinks=False,
+        )
+
+    assert captured["row_union_node_id"] == row_union_node_id
+    assert captured["row_union_name"] == row_union_name
+
+
+def test_drain_claims_forwards_collector_name_from_pending_items() -> None:
+    """Integration item 17: the collector cursor survives drain_claims's fast
+    re-dispatch path (the ``claimed.work_item_id in pending_items`` branch)
+    into ``_process_single_token`` unchanged — the mirror of the row_union
+    pin above; only ``_process_single_token`` is faked."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, bind_leader_token=True)
+    work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=41)
+    pending_item = WorkItem(token=token, current_node_id=NodeID(NODE_ID), collector_name=CollectorName("stitch"))
+
+    captured: dict[str, Any] = {}
+
+    def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        captured.update(kwargs)
+        return _dropped_result(kwargs["token"]), []
+
+    with patch.object(processor, "_process_single_token", new=fake_process):
+        processor._scheduler_drain.drain_claims(
+            ctx=_ctx(setup),
+            pending_items={work_item_id: pending_item},
+            recover_pending_sinks=False,
+        )
+
+    assert captured["collector_name"] == CollectorName("stitch")
+
+
 def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     drain_path = repo_root / "src/elspeth/engine/scheduler_drain.py"
@@ -928,8 +1374,9 @@ def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinn
     assert ast.unparse(route.test) == "self._scheduler_lease_owner_registered"
 
     legacy_references: list[tuple[str, str]] = []
-    for source_path in (repo_root / "src/elspeth").rglob("*.py"):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    for parsed in iter_gate_sources(repo_root / "src/elspeth"):
+        source_path = parsed.path
+        tree = parsed.tree
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute) or node.attr != "enqueue_ready_claimed_legacy_unfenced":

@@ -8,25 +8,51 @@ so the assertions here are load-bearing for the bulk-promotion wave.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Annotated
+from types import MappingProxyType
+from typing import Annotated, Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
 from elspeth.web.composer.redaction import (
     MANIFEST,
     REDACTED_BLOB_SOURCE_PATH,
     Sensitive,
     SetSourceArgumentsModel,
+    _coerce_stringified_json_object,
     _redact_via_schema,
     _summarize_set_source_options,
+    normalize_set_pipeline_redacted_arguments,
     redact_guided_snapshot_storage_paths,
     redact_source_storage_path,
     redact_tool_call_arguments,
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+
+
+def _option_shape_summary(
+    *,
+    mapping: int = 0,
+    sequence: int = 0,
+    set_: int = 0,
+    scalar: int = 0,
+) -> dict[str, object]:
+    return {
+        "_option_shape": "mapping",
+        "entry_count": mapping + sequence + set_ + scalar,
+        "value_shape_counts": {
+            "mapping": mapping,
+            "scalar": scalar,
+            "sequence": sequence,
+            "set": set_,
+        },
+    }
 
 
 def test_set_source_manifest_entry_is_type_driven() -> None:
@@ -110,10 +136,7 @@ def test_redact_substitutes_options_via_summarizer() -> None:
     assert redacted["on_validation_failure"] == "discard"
     # Sensitive substitution: options is now the summarizer's str output.
     assert isinstance(redacted["options"], str)
-    assert json.loads(redacted["options"]) == {
-        "blob_ref": "<redacted-option-value>",
-        "path": "<redacted-option-value>",
-    }
+    assert json.loads(redacted["options"]) == _option_shape_summary(scalar=2)
     # The original internal path MUST NOT appear in the summary.
     assert "/internal/blob/path.csv" not in redacted["options"]
     # Telemetry recorded the manifest dispatch with the type-driven shape.
@@ -288,6 +311,91 @@ def test_redact_guided_snapshot_projects_canonical_blob_sentinel_by_exact_name()
     assert real_path not in str((sources_out, meta_out))
     assert meta_out["implicit_decisions"]["entries"][0]["value"] == sentinel
     assert composer_meta["guided_session"]["reviewed_sources"]["22222222-2222-4222-8222-222222222222"]["options"]["path"] == sentinel
+
+
+def test_redact_guided_snapshot_projects_plural_canonical_sentinels_by_exact_carrier() -> None:
+    first_path = "/internal/blobs/session/first.csv"
+    second_path = "/internal/blobs/session/second.csv"
+    first_sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    second_sentinel = "blob:22222222-2222-4222-8222-222222222222"
+    sources = {
+        "first": {"options": {"path": first_path}},
+        "second": {"options": {"file": second_path}},
+    }
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "33333333-3333-4333-8333-333333333333": {
+                    "name": "first",
+                    "options": {"path": first_sentinel},
+                },
+                "44444444-4444-4444-8444-444444444444": {
+                    "name": "second",
+                    "options": {"file": second_sentinel},
+                },
+            },
+            "pending_source_intents": {},
+        }
+    }
+
+    sources_out, meta_out = redact_guided_snapshot_storage_paths(sources, composer_meta)
+
+    assert sources_out["first"]["options"]["path"] == first_sentinel
+    assert sources_out["second"]["options"]["file"] == second_sentinel
+    assert first_path not in repr((sources_out, meta_out))
+    assert second_path not in repr((sources_out, meta_out))
+
+
+def test_redact_guided_snapshot_rejects_sentinel_mixed_with_private_file_before_projection() -> None:
+    private_path = "/internal/blobs/session/source.csv"
+    private_file = "/internal/blobs/secret.csv"
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    sources = {"source": {"options": {"path": private_path, "file": private_file}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "source",
+                    "options": {"path": sentinel, "file": private_file},
+                }
+            },
+            "pending_source_intents": {},
+        }
+    }
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        redact_guided_snapshot_storage_paths(sources, composer_meta)
+
+    assert sources["source"]["options"]["file"] == private_file
+    reviewed = composer_meta["guided_session"]["reviewed_sources"]["22222222-2222-4222-8222-222222222222"]
+    assert reviewed["options"]["file"] == private_file
+
+
+def test_redact_guided_snapshot_rejects_live_blob_ref_conflicting_with_reviewed_sentinel() -> None:
+    reviewed_blob_id = "11111111-1111-4111-8111-111111111111"
+    conflicting_blob_id = "33333333-3333-4333-8333-333333333333"
+    sources = {
+        "source": {
+            "options": {
+                "path": "/internal/blobs/session/source.csv",
+                "blob_ref": conflicting_blob_id,
+            }
+        }
+    }
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "source",
+                    "options": {"path": f"blob:{reviewed_blob_id}"},
+                }
+            },
+            "pending_source_intents": {},
+        }
+    }
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        redact_guided_snapshot_storage_paths(sources, composer_meta)
 
 
 def test_redact_guided_snapshot_accepts_matching_fork_sentinel_and_blob_ref() -> None:
@@ -752,6 +860,32 @@ def test_summarize_set_source_options_accepts_coerced_datetime() -> None:
     assert isinstance(result, str)
 
 
+def test_summarize_set_source_options_never_serializes_untrusted_key_names() -> None:
+    """Open option keys are data, not trusted audit-schema field names."""
+    secret_key = "api-key=SUPER-SECRET-CANARY"
+    nested_key = "nested-secret-key=PROMPT-INJECTION-CANARY"
+    unicode_key = "秘密🔐キー"
+    long_key = "LONG-KEY-CANARY-" + ("x" * 20_000)
+    options = {
+        secret_key: {nested_key: "value"},
+        unicode_key: ["first", "second"],
+        long_key: {"set-member-a", "set-member-b"},
+    }
+    equivalent_shape = {
+        "different-mapping-key": {"different-nested-key": "different-value"},
+        "different-sequence-key": [1, 2, 3, 4],
+        "different-set-key": {1},
+    }
+
+    summary = _summarize_set_source_options(options)
+
+    assert json.loads(summary) == _option_shape_summary(mapping=1, sequence=1, set_=1)
+    assert summary == _summarize_set_source_options(equivalent_shape)
+    assert len(summary) < 256
+    for canary in (secret_key, nested_key, unicode_key, long_key, "set-member-a"):
+        assert canary not in summary
+
+
 _CANARY = "CANARY-SENSITIVE-PATH-DO-NOT-LEAK"
 
 
@@ -829,3 +963,649 @@ def test_redact_via_schema_substitutes_nested_sensitive_path() -> None:
     assert result["payload"]["inner_secret"] == "<fixed-sum>"
     assert result["payload"]["public_field"] == "shown"
     assert "RAW_SECRET" not in str(result)
+
+
+# ---------------------------------------------------------------------------
+# Tier-model burn-down (B36) pins: every guard below was rewritten from a
+# ``.get()`` / ABC ``isinstance`` form to a nominal ``type() is dict`` or
+# membership-form read. These tests hold the redaction behaviour fixed across
+# that rewrite — a value that MUST be redacted still is, and a malformed
+# first-party shape fails closed instead of passing an un-redacted path.
+# ---------------------------------------------------------------------------
+
+
+def test_redact_source_storage_path_rejects_non_dict_source_shape() -> None:
+    """A present, non-dict source is a corrupted Tier-1 serializer output.
+
+    ``_redact_one`` checks ``type(source) is dict`` nominally: every producer
+    feeding this surface (``CompositionState.to_dict``, ``deep_thaw`` in the
+    session routes, the JSON-decoded MCP result) emits plain dicts, so even a
+    read-only ``Mapping`` here is a shape nothing first-party produces.
+    """
+    from types import MappingProxyType
+
+    proxied = MappingProxyType({"options": {"path": "/internal/blob/x.csv", "blob_ref": "abc"}})
+    with pytest.raises(AuditIntegrityError, match="non-Mapping source value"):
+        redact_source_storage_path({"source": proxied})
+    with pytest.raises(AuditIntegrityError, match="non-Mapping source value"):
+        redact_source_storage_path({"source": "not-a-mapping"})
+
+
+def test_redact_source_storage_path_rejects_non_dict_options_carrying_blob_path() -> None:
+    """A non-dict ``options`` value must fail closed, never pass through.
+
+    Before the burn-down a non-``Mapping`` options value returned the source
+    unchanged; a read-only ``Mapping`` was redacted. Both now raise: silently
+    returning a malformed options carrier is exactly the leak this surface
+    exists to prevent, and the private path must not appear in the error.
+    """
+    from types import MappingProxyType
+
+    private_path = "/internal/blob/secret-storage.csv"
+    proxied_options = MappingProxyType({"path": private_path, "blob_ref": "abc"})
+    with pytest.raises(AuditIntegrityError, match=r"non-dict source\.options") as excinfo:
+        redact_source_storage_path({"source": {"options": proxied_options}})
+    assert private_path not in str(excinfo.value)
+    with pytest.raises(AuditIntegrityError, match=r"non-dict source\.options"):
+        redact_source_storage_path({"sources": {"s": {"options": [private_path, "blob_ref"]}}})
+
+
+def test_redact_source_storage_path_none_options_and_missing_blob_ref_pass_through() -> None:
+    """The documented first-party no-op shapes are unchanged by the rewrite."""
+    states: list[dict[str, Any]] = [
+        {"source": {"options": None}},
+        {"source": {}},
+        {"source": None},
+        {"source": {"options": {"path": "/tmp/user.csv"}}},
+    ]
+    for state in states:
+        assert redact_source_storage_path(state) == state
+
+
+def test_coerce_stringified_json_object_never_raises_on_hostile_text() -> None:
+    """``_coerce_stringified_json_object`` is an observation boundary: it never raises.
+
+    Depth is bounded by ``bounded_json_loads`` (``RecursionError`` becomes a
+    ``JsonBoundaryError``, a ``ValueError``), so the previously documented
+    unbounded-recursion exposure is closed and every non-object outcome is
+    returned untouched for pydantic to reject.
+    """
+    deep = "[" * 20_000
+    assert _coerce_stringified_json_object(deep) is deep
+    for untouched in ("not json", "[1, 2]", "null", '"str"', "42", 7, None, ["x"], {"already": "dict"}):
+        assert _coerce_stringified_json_object(untouched) is untouched
+    assert _coerce_stringified_json_object('{"k": 1}') == {"k": 1}
+
+
+def test_normalize_set_pipeline_redacted_arguments_membership_shapes() -> None:
+    """Only ``source.inline_blob is None`` is dropped; every other shape is untouched."""
+    assert normalize_set_pipeline_redacted_arguments("scalar") == "scalar"
+    no_source: dict[str, Any] = {"nodes": []}
+    assert normalize_set_pipeline_redacted_arguments(no_source) is no_source
+    non_dict_source = {"source": ["x"]}
+    assert normalize_set_pipeline_redacted_arguments(non_dict_source) is non_dict_source
+    absent = {"source": {"plugin": "csv"}}
+    assert normalize_set_pipeline_redacted_arguments(absent) is absent
+    present = {"source": {"plugin": "csv", "inline_blob": "<redacted>"}}
+    assert normalize_set_pipeline_redacted_arguments(present) is present
+    null_blob = {"source": {"plugin": "csv", "inline_blob": None}, "nodes": []}
+    normalized = normalize_set_pipeline_redacted_arguments(null_blob)
+    assert normalized == {"source": {"plugin": "csv"}, "nodes": []}
+    assert null_blob["source"] == {"plugin": "csv", "inline_blob": None}
+
+
+def _frozen_set_pipeline_arguments(source_block: dict[str, Any]) -> Mapping[str, Any]:
+    """Return a set_pipeline-shaped mapping frozen by a real freezing producer.
+
+    ``PipelineProposal.__post_init__`` deep-freezes ``pipeline``, so the
+    mapping and every nested block come back as ``mappingproxy``. Building the
+    frozen form here rather than calling ``deep_freeze`` on a literal is what
+    makes the pins below fail if that authority ever stops freezing — a
+    literal would stay green and prove nothing.
+
+    It is the NEAREST real producer rather than the owner of this exact value:
+    nothing in the tree freezes the *redacted* projection, which reaches the
+    normaliser through ``json.loads`` / ``redact_tool_call_arguments``. What
+    the proposal contributes is a genuinely frozen set_pipeline-shaped
+    mapping, which is the input class under test.
+    """
+    proposal = PipelineProposal.create(
+        pipeline={"source": source_block, "nodes": []},
+        base=AbsentBase(),
+        reviewed_facts={},
+        surface=PlannerSurface.GUIDED_FULL,
+        repair_count=0,
+        skill_hash=stable_hash("planner-skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+    frozen = proposal.pipeline
+    assert type(frozen) is MappingProxyType
+    assert type(frozen["source"]) is MappingProxyType
+    return frozen
+
+
+def test_normalize_set_pipeline_redacted_arguments_reads_the_frozen_authority_form() -> None:
+    """Frozen and thawed spellings of one proposal must normalise identically.
+
+    ``normalize_set_pipeline_redacted_arguments`` answers "nothing to
+    normalise" by returning its argument unchanged, so a mapping it fails to
+    RECOGNISE is indistinguishable from one that needed no work — the two
+    spellings of "no inline blob" then persist as different redacted authority
+    projections. ``_create_composition_proposal`` compares that projection to
+    the manifest's and raises ``AuditIntegrityError`` on a mismatch, and
+    ``ComposerToolInvocation`` banks ``semantic_arguments_hash =
+    stored_authority_hash`` whenever the normaliser returned its input
+    identically — so an unrecognised frozen mapping is banked under a hash for
+    a projection that was never produced.
+    """
+    null_blob_source: dict[str, Any] = {"plugin": "csv", "inline_blob": None}
+    frozen = _frozen_set_pipeline_arguments(null_blob_source)
+    thawed = deep_thaw(frozen)
+
+    from_frozen = normalize_set_pipeline_redacted_arguments(frozen)
+    from_thawed = normalize_set_pipeline_redacted_arguments(thawed)
+
+    # Normalise-then-thaw and thaw-then-normalise must commute: the frozen and
+    # thawed spellings of one authority carry the same redacted projection.
+    # (The frozen result keeps its frozen carriers — ``nodes`` stays a tuple —
+    # so the comparison is on thawed content, not container identity.)
+    assert from_thawed == {"source": {"plugin": "csv"}, "nodes": []}
+    assert deep_thaw(from_frozen) == from_thawed
+    # The nested arm is the reachable one: a shallow thaw of the authority
+    # leaves a real outer dict whose ``source`` is still frozen, which passes
+    # ComposerToolInvocation's outer exact-dict reject-gate untouched.
+    shallow = dict(frozen)
+    assert type(shallow["source"]) is MappingProxyType
+    assert deep_thaw(normalize_set_pipeline_redacted_arguments(shallow)) == from_thawed
+
+
+def test_normalize_set_pipeline_redacted_arguments_leaves_a_frozen_redacted_blob_alone() -> None:
+    """The untouched arm: recognising the frozen form must not drop a real blob."""
+    redacted_source: dict[str, Any] = {"plugin": "csv", "inline_blob": "<redacted>"}
+    frozen = _frozen_set_pipeline_arguments(redacted_source)
+
+    assert normalize_set_pipeline_redacted_arguments(frozen) is frozen
+    shallow = dict(frozen)
+    assert normalize_set_pipeline_redacted_arguments(shallow) is shallow
+    assert normalize_set_pipeline_redacted_arguments(deep_thaw(frozen)) == {
+        "source": {"plugin": "csv", "inline_blob": "<redacted>"},
+        "nodes": [],
+    }
+
+
+def _sentinel_projection_meta(real_path: str, sentinel: str, entries: object) -> dict[str, Any]:
+    return {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "source",
+                    "options": {"path": sentinel, "schema": {"mode": "observed"}},
+                }
+            },
+            "pending_source_intents": {},
+        },
+        "implicit_decisions": {"schema_version": 1, "entries": entries, "normalization_events": []},
+    }
+
+
+def test_redact_guided_snapshot_implicit_decision_entries_use_membership_reads() -> None:
+    """Entries lacking ``path``/``value``, or with a non-projected value, are untouched.
+
+    The projection lookup is membership-form on the owned
+    ``private_path_projections`` dict; a private path that IS projected must
+    still be replaced by its sentinel, and nothing else in the entry changes.
+    """
+    real_path = "/internal/blobs/session/source.csv"
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    entries = [
+        {"path": "source.path", "value": real_path, "category": "source"},
+        {"path": "source.file", "value": "/tmp/other.csv", "category": "source"},
+        {"path": "source.path", "category": "source"},
+        {"value": real_path, "category": "source"},
+        {"path": "source.path", "value": 3, "category": "source"},
+    ]
+    _sources_out, meta_out = redact_guided_snapshot_storage_paths(sources, _sentinel_projection_meta(real_path, sentinel, entries))
+    assert meta_out is not None
+    projected = meta_out["implicit_decisions"]["entries"]
+    assert projected[0] == {"path": "source.path", "value": sentinel, "category": "source"}
+    assert projected[1:] == entries[1:]
+    assert real_path not in str(projected[0])
+
+
+def test_redact_guided_snapshot_implicit_decision_report_without_entries_fails_closed() -> None:
+    real_path = "/internal/blobs/session/source.csv"
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    meta = _sentinel_projection_meta(real_path, sentinel, [])
+    del meta["implicit_decisions"]["entries"]
+    with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed"):
+        redact_guided_snapshot_storage_paths(sources, meta)
+
+
+_FORK_EXPLICIT_BLOB_REF = "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
+_FORK_EXPLICIT_PATH = "/srv/elspeth/data/blobs/child/50f5b3e9_colours.csv"
+
+
+def _fork_explicit_shape() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fork-rehydrated explicit-blob_ref shape: reviewed snapshot and live source
+    both carry the SAME private path and the SAME blob_ref (elspeth-75d320fb25)."""
+    sources = {"source": {"plugin": "csv", "options": {"path": _FORK_EXPLICIT_PATH, "blob_ref": _FORK_EXPLICIT_BLOB_REF}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": _FORK_EXPLICIT_PATH, "blob_ref": _FORK_EXPLICIT_BLOB_REF},
+                }
+            },
+            "pending_source_intents": {},
+        }
+    }
+    return sources, composer_meta
+
+
+def test_redact_guided_snapshot_correlates_on_raw_sources_after_generic_redaction() -> None:
+    """Projection order (elspeth-75d320fb25): ``redact_source_storage_path`` runs
+    first and masks the live carrier, so a correlation on the generic-redacted copy
+    compares the reviewed private path against the redacted literal and raises.
+    Passing the raw sources as ``raw_sources`` correlates on the persisted values
+    and applies the guided masks onto the generic-redacted copy."""
+    raw_sources, composer_meta = _fork_explicit_shape()
+    generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
+    assert generic_sources["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+
+    raw_out, raw_meta = redact_guided_snapshot_storage_paths(raw_sources, composer_meta)
+    projected_out, projected_meta = redact_guided_snapshot_storage_paths(generic_sources, composer_meta, raw_sources=raw_sources)
+
+    assert projected_out == raw_out
+    assert projected_meta == raw_meta
+    assert projected_out["source"]["options"] == {"path": REDACTED_BLOB_SOURCE_PATH, "blob_ref": _FORK_EXPLICIT_BLOB_REF}
+    assert _FORK_EXPLICIT_PATH not in str((projected_out, projected_meta))
+    assert raw_sources["source"]["options"]["path"] == _FORK_EXPLICIT_PATH
+
+
+def test_redact_guided_snapshot_projection_order_without_raw_sources_still_raises() -> None:
+    """The defect shape stays a raise when the caller withholds the raw sources:
+    the generic-redacted copy carries no reviewed path to correlate on."""
+    raw_sources, composer_meta = _fork_explicit_shape()
+    generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        redact_guided_snapshot_storage_paths(generic_sources, composer_meta)
+
+
+def test_redact_guided_snapshot_raw_correlation_stamps_sentinel_over_generic_mask() -> None:
+    """Fork sentinel shape: the live source carries blob_ref (generic masks it) and
+    the reviewed snapshot carries the sentinel. The sentinel is projected, exactly as
+    the pre-raw-correlation order produced."""
+    blob_id = "11111111-1111-4111-8111-111111111111"
+    sentinel = f"blob:{blob_id}"
+    real_path = "/internal/blobs/child/source.csv"
+    raw_sources = {"source": {"options": {"path": real_path, "blob_ref": blob_id}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {"name": "source", "options": {"path": sentinel, "blob_ref": blob_id}}
+            },
+            "pending_source_intents": {},
+        }
+    }
+    composer_meta["implicit_decisions"] = {
+        "schema_version": 1,
+        "entries": [{"path": "source.path", "value": real_path, "category": "source"}],
+        "normalization_events": [],
+    }
+    generic_sources = redact_source_storage_path({"sources": raw_sources})["sources"]
+
+    sources_out, meta_out = redact_guided_snapshot_storage_paths(generic_sources, composer_meta, raw_sources=raw_sources)
+
+    assert sources_out["source"]["options"] == {"path": sentinel, "blob_ref": blob_id}
+    # The raw-path correlation also masks the implicit-decision echo of the raw
+    # carrier value — at base the projection map was keyed on the generic
+    # literal, so this entry leaked the private path (accepted leak fix,
+    # fix round 1 F-A5).
+    assert meta_out["implicit_decisions"]["entries"][0]["value"] == sentinel
+    assert real_path not in str((sources_out, meta_out))
+
+
+def test_redact_guided_snapshot_rejects_raw_sources_that_disagree_in_shape() -> None:
+    raw_sources, composer_meta = _fork_explicit_shape()
+    with pytest.raises(AuditIntegrityError, match="raw_sources"):
+        redact_guided_snapshot_storage_paths({"other": raw_sources["source"]}, composer_meta, raw_sources=raw_sources)
+
+
+_EXITED_TERMINAL = {"kind": "exited_to_freeform", "reason": "user_pressed_exit", "pipeline_yaml": None}
+_COMPLETED_TERMINAL = {"kind": "completed", "reason": None, "pipeline_yaml": "sources: {}\n"}
+_TERMINALS = pytest.mark.parametrize("terminal", [_EXITED_TERMINAL, _COMPLETED_TERMINAL], ids=["exited", "completed"])
+
+_PRIVATE_A = "/srv/elspeth/data/blobs/s1/aaaaaaaa-0000-4000-8000-000000000001_a.csv"
+_PRIVATE_B = "/srv/elspeth/data/blobs/s1/bbbbbbbb-0000-4000-8000-000000000002_b.csv"
+_REPOINTED_BLOB_REF = "cccccccc-0000-4000-8000-000000000003"
+_PRIVATE_REPOINTED = f"/srv/elspeth/data/blobs/s1/{_REPOINTED_BLOB_REF}_c.csv"
+
+
+def _two_guided_committed_sources_repointed_after_exit(terminal: object) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Two guided-committed sentinel-form reviewed sources ``a`` and ``b``; both live
+    sources carry the private path with NO blob_ref (guided set_source strips it);
+    after the terminal, freeform re-pointed ``b`` at a different blob (explicit
+    blob_ref). The strict binding fails on ``b``; ``a`` still carries its private
+    path and is masked today only by the sentinel-stamping arm that never runs
+    once the function raises (adversary Critical 1)."""
+    sources = {
+        "a": {"plugin": "csv", "options": {"path": _PRIVATE_A}},
+        "b": {"plugin": "csv", "options": {"path": _PRIVATE_REPOINTED, "blob_ref": _REPOINTED_BLOB_REF}},
+    }
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "a",
+                    "plugin": "csv",
+                    "options": {"path": "blob:aaaaaaaa-0000-4000-8000-000000000001"},
+                },
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "b",
+                    "plugin": "csv",
+                    "options": {"path": "blob:bbbbbbbb-0000-4000-8000-000000000002"},
+                },
+            },
+            "pending_source_intents": {
+                "33333333-3333-4333-8333-333333333333": {
+                    "name": "c",
+                    "options": {"file": _PRIVATE_B, "blob_ref": "bbbbbbbb-0000-4000-8000-000000000002"},
+                }
+            },
+            "terminal": terminal,
+        },
+        "implicit_decisions": {
+            "schema_version": 1,
+            "entries": [
+                {"path": "source.path", "value": _PRIVATE_A, "category": "source"},
+                {"path": "source.file", "value": _PRIVATE_B, "category": "source"},
+                {"path": "output.path", "value": "outputs/out.jsonl", "category": "output"},
+            ],
+            "normalization_events": [],
+        },
+    }
+    return sources, composer_meta
+
+
+def _project(sources: dict[str, Any], composer_meta: dict[str, Any]) -> tuple[Any, Any]:
+    generic = redact_source_storage_path({"sources": sources})["sources"]
+    return redact_guided_snapshot_storage_paths(generic, composer_meta, raw_sources=sources)
+
+
+@_TERMINALS
+def test_redact_guided_snapshot_terminal_degrades_and_masks_every_carrier(terminal: dict[str, Any]) -> None:
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(terminal)
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    projected = json.dumps((sources_out, meta_out))
+    for private in (_PRIVATE_A, _PRIVATE_B, _PRIVATE_REPOINTED):
+        assert private not in projected
+    assert "blob:" not in json.dumps(sources_out), "the degraded branch never stamps a sentinel on a live source"
+    assert sources_out["a"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert sources_out["b"]["options"] == {"path": REDACTED_BLOB_SOURCE_PATH, "blob_ref": _REPOINTED_BLOB_REF}
+    guided = meta_out["guided_session"]
+    assert guided["custody_unavailable"] is True
+    assert guided["terminal"] == terminal
+    pending = guided["pending_source_intents"]["33333333-3333-4333-8333-333333333333"]["options"]
+    assert pending["file"] == REDACTED_BLOB_SOURCE_PATH
+    entries = meta_out["implicit_decisions"]["entries"]
+    assert [entry["value"] for entry in entries] == [REDACTED_BLOB_SOURCE_PATH, REDACTED_BLOB_SOURCE_PATH, "outputs/out.jsonl"]
+    # Inputs are never mutated: the degraded projection is projection-only.
+    assert sources["a"]["options"]["path"] == _PRIVATE_A
+    assert "custody_unavailable" not in composer_meta["guided_session"]
+
+
+def test_redact_guided_snapshot_active_session_still_raises_on_the_degrade_shape() -> None:
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(None)
+    with pytest.raises(AuditIntegrityError, match="guided blob"):
+        _project(sources, composer_meta)
+
+
+def test_redact_guided_snapshot_active_session_without_terminal_key_still_raises() -> None:
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(None)
+    del composer_meta["guided_session"]["terminal"]
+    with pytest.raises(AuditIntegrityError, match="guided blob"):
+        _project(sources, composer_meta)
+
+
+@_TERMINALS
+def test_redact_guided_snapshot_incident_v13_shape_projects_degraded(terminal: dict[str, Any]) -> None:
+    """elspeth-201903a286 v13: the retained sentinel review of ``source`` (blob
+    360e1583) re-attached to a planner-authored ``source`` bound to blob 50f5b3e9."""
+    private = "/srv/elspeth/data/blobs/s1/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+    sources = {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"},
+                }
+            },
+            "pending_source_intents": {},
+            "terminal": terminal,
+        }
+    }
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    assert private not in json.dumps((sources_out, meta_out))
+    assert sources_out["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert meta_out["guided_session"]["custody_unavailable"] is True
+
+
+@_TERMINALS
+def test_redact_guided_snapshot_bound_terminal_projection_is_byte_identical_to_active(terminal: dict[str, Any]) -> None:
+    """Mutation cases D (nothing authored) and E (exact blob reuse) do not raise, so
+    a terminal must not change their projection: no ``custody_unavailable`` key,
+    output equal to the active-session projection (stored guided_response_hash)."""
+    private = "/srv/elspeth/data/blobs/s1/360e1583-ae3c-4135-9240-0a26a14cf22f_colours.csv"
+    reviewed = {
+        "11111111-1111-4111-8111-111111111111": {
+            "name": "source",
+            "plugin": "csv",
+            "options": {"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"},
+        }
+    }
+    for sources in (
+        {},
+        {"source": {"plugin": "csv", "options": {"path": private}}},
+        {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "360e1583-ae3c-4135-9240-0a26a14cf22f"}}},
+    ):
+        active_meta = {"guided_session": {"reviewed_sources": reviewed, "pending_source_intents": {}, "terminal": None}}
+        terminal_meta = {"guided_session": {"reviewed_sources": reviewed, "pending_source_intents": {}, "terminal": terminal}}
+        active_out = _project(sources, active_meta)
+        terminal_out = _project(sources, terminal_meta)
+        assert "custody_unavailable" not in terminal_out[1]["guided_session"]
+        assert terminal_out[0] == active_out[0]
+        assert {k: v for k, v in terminal_out[1]["guided_session"].items() if k != "terminal"} == {
+            k: v for k, v in active_out[1]["guided_session"].items() if k != "terminal"
+        }
+
+
+@_TERMINALS
+def test_redact_guided_snapshot_case_c_is_out_of_scope_in_terminal_sessions(terminal: dict[str, Any]) -> None:
+    """Mutation case C (elspeth-201903a286): the live source drops ``blob_ref`` and
+    re-authors a plain path under the reviewed name. Nothing raises, so the
+    sentinel is stamped over the re-authored path in active AND terminal sessions
+    — a provider-visible false custody claim tracked by elspeth-c72a3d09e5 /
+    elspeth-24bf6a047a. Narrowing it here would alter a non-raising projection
+    and drift stored guided_response_hash values, so this pins the current
+    behaviour deliberately."""
+    sentinel = "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"
+    sources = {"source": {"plugin": "csv", "options": {"path": "data.csv"}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {"name": "source", "plugin": "csv", "options": {"path": sentinel}}
+            },
+            "pending_source_intents": {},
+            "terminal": terminal,
+        }
+    }
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    assert sources_out["source"]["options"]["path"] == sentinel
+    assert "custody_unavailable" not in meta_out["guided_session"]
+
+
+def test_redact_guided_snapshot_rejects_malformed_terminal_before_degrading() -> None:
+    from elspeth.web.composer.guided.errors import InvariantError
+
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit({"kind": "exited_to_freeform"})
+    with pytest.raises(InvariantError, match=r"TerminalState\.from_dict"):
+        _project(sources, composer_meta)
+
+
+def _incident_active_shape() -> tuple[dict[str, Any], dict[str, Any]]:
+    private = "/srv/elspeth/data/blobs/s1/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+    sources = {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f"},
+                }
+            },
+            "pending_source_intents": {},
+            "terminal": None,
+        }
+    }
+    return sources, composer_meta
+
+
+def test_assert_guided_custody_persistable_passes_without_a_guided_snapshot() -> None:
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sources, _meta = _incident_active_shape()
+    assert_guided_custody_persistable(sources, None)
+    assert_guided_custody_persistable(sources, {"repair_turns_used": 0})
+    assert_guided_custody_persistable(None, None)
+
+
+def test_assert_guided_custody_persistable_rejects_an_active_unbindable_pair() -> None:
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sources, composer_meta = _incident_active_shape()
+    with pytest.raises(AuditIntegrityError, match="guided blob"):
+        assert_guided_custody_persistable(sources, composer_meta)
+
+
+@_TERMINALS
+def test_assert_guided_custody_persistable_passes_terminal_pairs_that_project_degraded(terminal: dict[str, Any]) -> None:
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    sources, composer_meta = _incident_active_shape()
+    composer_meta["guided_session"]["terminal"] = terminal
+    assert_guided_custody_persistable(sources, composer_meta)
+    assert _project(sources, composer_meta)[1]["guided_session"]["custody_unavailable"] is True
+
+
+def test_assert_guided_custody_persistable_agrees_with_projection_on_the_fork_shape() -> None:
+    """Gate and projection consume the same raw inputs, so the fork-rehydrated
+    explicit-blob_ref shape that the projection accepts is also persistable, and
+    the shape the projection rejects in an active session is not."""
+    from elspeth.web.composer.redaction import assert_guided_custody_persistable
+
+    raw_sources, composer_meta = _fork_explicit_shape()
+    composer_meta["guided_session"]["terminal"] = None
+    assert_guided_custody_persistable(raw_sources, composer_meta)
+    assert _project(raw_sources, composer_meta)[0]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+
+    renamed = {"renamed": raw_sources["source"]}
+    with pytest.raises(AuditIntegrityError):
+        assert_guided_custody_persistable(renamed, composer_meta)
+    with pytest.raises(AuditIntegrityError):
+        _project(renamed, composer_meta)
+
+
+def test_redact_guided_snapshot_non_custody_integrity_raise_escapes_the_terminal_branch() -> None:
+    """The terminal branch degrades CUSTODY failures only (fix round 1 F-A3): a
+    projected/raw shape disagreement is a programming error and must surface."""
+    private = "/srv/elspeth/data/blobs/s1/shape.csv"
+    raw_sources = {"source": {"plugin": "csv", "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"}}}
+    projected = {"source": {"plugin": "csv"}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "11111111-1111-4111-8111-111111111111": {
+                    "name": "source",
+                    "plugin": "csv",
+                    "options": {"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"},
+                }
+            },
+            "pending_source_intents": {},
+            "terminal": _EXITED_TERMINAL,
+        }
+    }
+    with pytest.raises(AuditIntegrityError, match="mirror the raw source shape") as excinfo:
+        redact_guided_snapshot_storage_paths(projected, composer_meta, raw_sources=raw_sources)
+    assert not isinstance(excinfo.value, GuidedCustodyIntegrityError)
+
+
+@pytest.mark.parametrize("terminal", [None, _EXITED_TERMINAL], ids=["active", "exited"])
+def test_redact_guided_snapshot_malformed_implicit_decisions_is_not_a_custody_condition(terminal: object) -> None:
+    """A malformed implicit_decisions report is a serializer defect, not a
+    custody condition (fix round 1 F-A3): it must raise plain
+    AuditIntegrityError on active AND terminal tips — never the custody type
+    the 409 arms name, never the degraded projection."""
+    real_path = "/internal/blobs/session/source.csv"
+    sources = {"source": {"options": {"path": real_path, "schema": {"mode": "observed"}}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {"name": "source", "options": {"path": "blob:11111111-1111-4111-8111-111111111111"}}
+            },
+            "pending_source_intents": {},
+            "terminal": terminal,
+        },
+        "implicit_decisions": {"schema_version": 1, "entries": "not-a-list"},
+    }
+    with pytest.raises(AuditIntegrityError, match="implicit-decision projection is malformed") as excinfo:
+        _project(sources, composer_meta)
+    assert not isinstance(excinfo.value, GuidedCustodyIntegrityError)
+
+
+def test_redact_guided_snapshot_degrade_value_sweeps_planted_private_paths() -> None:
+    """Degrade branch only (fix round 1 F-B1): after key-masking, any string in
+    the projected sources or composer_meta EQUAL to a raw live carrier value is
+    masked too, so a private path planted under a non-carrier key (options.glob,
+    an implicit_decisions entry labeled outside source.path/file) cannot ride
+    out on the degraded projection. The branch is new at this fix, so the sweep
+    carries no stored-hash risk."""
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(_EXITED_TERMINAL)
+    sources["a"]["options"]["glob"] = _PRIVATE_A
+    composer_meta["implicit_decisions"]["entries"].append({"path": "source.nested.path", "value": _PRIVATE_A, "category": "source"})
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    projected = json.dumps((sources_out, meta_out))
+    assert _PRIVATE_A not in projected
+    assert sources_out["a"]["options"]["glob"] == REDACTED_BLOB_SOURCE_PATH
+    assert meta_out["guided_session"]["custody_unavailable"] is True
+
+
+def test_redact_guided_snapshot_degrade_value_sweeps_snapshot_and_pending_carrier_values() -> None:
+    """Fix round 2 F-B1b: the degrade sweep's needles also include the reviewed-
+    snapshot and pending-intent carrier string values, so a private path known
+    only to a pending intent (absent from every live source) cannot ride out
+    under a non-carrier label."""
+    sources, composer_meta = _two_guided_committed_sources_repointed_after_exit(_EXITED_TERMINAL)
+    assert _PRIVATE_B not in json.dumps(sources), "the adversarial value must be pending-intent-only"
+    composer_meta["implicit_decisions"]["entries"].append({"path": "note", "value": _PRIVATE_B, "category": "source"})
+
+    sources_out, meta_out = _project(sources, composer_meta)
+
+    projected = json.dumps((sources_out, meta_out))
+    assert _PRIVATE_B not in projected
+    assert meta_out["guided_session"]["custody_unavailable"] is True

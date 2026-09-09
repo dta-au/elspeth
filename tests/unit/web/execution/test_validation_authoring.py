@@ -1,0 +1,934 @@
+"""Direct tests for authored-state execution-validation phases."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from elspeth.contracts import Determinism
+from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.transforms.blob_fetch import BlobFetch
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution._validation_authoring import (
+    SecretValidatedState,
+    _ParsedResourceLimit,
+    lower_plugin_policy,
+    review_interpretations,
+    validate_batch_options,
+    validate_path_policy,
+    validate_secret_evidence,
+    validate_semantic_evidence,
+    validate_web_network_policy,
+    validate_web_resource_policy,
+)
+from elspeth.web.execution._validation_model import (
+    AuthoredValidatedState,
+    InterpretationValidatedState,
+    PhaseFailure,
+    PhaseReport,
+    PolicyLoweredState,
+)
+from elspeth.web.execution.schemas import SemanticEdgeContractResponse, ValidationError
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.secrets.service import ScopedSecretResolver
+from elspeth.web.secrets.wiring_policy import SecretWiringComponentType, SecretWiringPolicy, SecretWiringRule
+
+
+def _authorizing_policy(secret: str, component_type: str, plugin: str, option_key: str) -> SecretWiringPolicy:
+    return SecretWiringPolicy(
+        rules=(
+            SecretWiringRule(
+                secret=secret,
+                component_type=cast(SecretWiringComponentType, component_type),
+                plugin=plugin,
+                option_key=option_key,
+            ),
+        )
+    )
+
+
+def _source(options: dict[str, object] | None = None, *, plugin: str = "csv", on_success: str = "node_in") -> SourceSpec:
+    return SourceSpec(
+        plugin=plugin,
+        on_success=on_success,
+        options=options or {},
+        on_validation_failure="discard",
+    )
+
+
+def _node(
+    *,
+    node_id: str = "node",
+    plugin: str = "value_transform",
+    node_type: str = "transform",
+    input_name: str = "node_in",
+    on_success: str = "primary",
+    options: dict[str, object] | None = None,
+) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type=cast(Any, node_type),
+        plugin=plugin,
+        input=input_name,
+        on_success=on_success,
+        on_error="discard",
+        options=options or {},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _output(options: dict[str, object] | None = None, *, name: str = "primary", plugin: str = "csv") -> OutputSpec:
+    return OutputSpec(name=name, plugin=plugin, options=options or {}, on_write_failure="discard")
+
+
+def _state(
+    *,
+    source: SourceSpec | None = None,
+    nodes: tuple[NodeSpec, ...] = (),
+    outputs: tuple[OutputSpec, ...] = (),
+) -> CompositionState:
+    return CompositionState(
+        source=source or _source(),
+        nodes=nodes,
+        edges=(),
+        outputs=outputs,
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _trained_snapshot() -> PluginAvailabilitySnapshot:
+    return PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+
+def _web_snapshot() -> PluginAvailabilitySnapshot:
+    unrestricted = _trained_snapshot()
+    return PluginAvailabilitySnapshot.create(
+        policy_hash="authoring-phase-test",
+        principal_scope="local:alice",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="authoring-phase-test-generation",
+    )
+
+
+def _policy(state: CompositionState) -> PolicyLoweredState:
+    return PolicyLoweredState(
+        authored_state=state,
+        state=state,
+        profiled_s3_audit_identities=(),
+        profiled_textract_audit_identities=(),
+        operator_resolved_model_node_ids=frozenset(),
+    )
+
+
+def _authored(state: CompositionState, *, contracts: tuple[SemanticEdgeContractResponse, ...] = ()) -> AuthoredValidatedState:
+    return AuthoredValidatedState(
+        policy=_policy(state),
+        all_secret_refs=(),
+        env_ref_names=frozenset(),
+        semantic_contracts=contracts,
+    )
+
+
+def _contract() -> SemanticEdgeContractResponse:
+    return SemanticEdgeContractResponse(
+        from_id="producer",
+        to_id="consumer",
+        consumer_plugin="line_explode",
+        producer_plugin="web_scrape",
+        producer_field="content",
+        consumer_field="content",
+        outcome="satisfied",
+        requirement_code="line_explode.source_field.line_framed_text",
+    )
+
+
+@dataclass
+class _SecretService:
+    available: frozenset[str]
+
+    def list_refs(self, user_id: str) -> list[SecretInventoryItem]:
+        return [SecretInventoryItem(name=name, scope="user", available=True, reason=None) for name in sorted(self.available)]
+
+    def has_ref(self, user_id: str, name: str) -> bool:
+        return name in self.available
+
+    def resolve(self, user_id: str, name: str) -> ResolvedSecret | None:
+        if name not in self.available:
+            return None
+        return ResolvedSecret(name=name, value="test", scope="user", fingerprint="a" * 64)
+
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None:
+        del scope
+        return self.resolve(user_id, name)
+
+
+class _OwnedScopedSecretService(ScopedSecretResolver):
+    def __init__(self, available: frozenset[str]) -> None:
+        self.available = available
+
+    def list_refs(self, user_id: str) -> list[SecretInventoryItem]:
+        return [SecretInventoryItem(name=name, scope="server", available=True, reason=None) for name in sorted(self.available)]
+
+    def has_ref(self, user_id: str, name: str) -> bool:
+        return name in self.available
+
+    def resolve(self, user_id: str, name: str) -> ResolvedSecret | None:
+        return self.resolve_scoped(user_id, name, "server")
+
+    def resolve_scoped(self, user_id: str, name: str, scope: str) -> ResolvedSecret | None:
+        if name not in self.available:
+            return None
+        return ResolvedSecret(name=name, value="test", scope=scope, fingerprint="a" * 64)
+
+
+def test_scoped_secret_marker_rejects_miswired_owned_resolver_loudly() -> None:
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY", "secret_scope": "server"}}))
+
+    with pytest.raises(TypeError, match="resolve_scoped"):
+        validate_secret_evidence(
+            _policy(state),
+            secret_service=_SecretService(frozenset({"API_KEY"})),
+            user_id="alice",
+        )
+
+
+def test_scoped_secret_marker_accepts_owned_nominal_resolver() -> None:
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY", "secret_scope": "server"}}))
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_OwnedScopedSecretService(frozenset({"API_KEY"})),
+        user_id="alice",
+        secret_wiring_policy=_authorizing_policy("API_KEY", "source", "csv", "api_key"),
+    )
+
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.all_secret_refs == (("API_KEY", "server"),)
+
+
+@pytest.mark.parametrize("bad_path", (123, {"nested": "path"}, "bad\x00path"))
+def test_path_phase_returns_typed_failure_for_malformed_authored_paths(bad_path: object) -> None:
+    result = validate_path_policy(
+        _policy(_state(source=_source({"path": bad_path}))),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "path_allowlist"
+    assert result.errors[0].component_id == "source"
+
+
+def test_policy_lowering_returns_typed_state_and_four_canonical_checks() -> None:
+    state = _state(outputs=(_output(),))
+
+    report = lower_plugin_policy(
+        state,
+        plugin_snapshot=_trained_snapshot(),
+        profile_registry=None,
+        catalog=create_catalog_service(),
+    )
+
+    assert isinstance(report, PhaseReport)
+    assert isinstance(report.artifact, PolicyLoweredState)
+    assert report.artifact.state == state
+    assert report.artifact.operator_resolved_model_node_ids == frozenset()
+    assert [check.name for check in report.checks] == [
+        "plugin_enablement",
+        "operator_profile_options",
+        "required_control_availability",
+        "required_control_coverage",
+    ]
+    assert all(check.passed for check in report.checks)
+
+
+def test_policy_artifact_composition_state_is_deeply_frozen_and_detached() -> None:
+    caller_options: dict[str, object] = {"nested": {"values": ["original"]}}
+    state = _state(source=_source(caller_options))
+    report = PhaseReport(artifact=_policy(state), checks=())
+
+    nested = cast(dict[str, object], caller_options["nested"])
+    values = cast(list[str], nested["values"])
+    values.append("mutated")
+
+    frozen_nested = cast(dict[str, object], report.artifact.state.sources["source"].options["nested"])
+    assert frozen_nested["values"] == ("original",)
+    with pytest.raises(TypeError):
+        report.artifact.state.sources["source"].options["nested"] = {"values": ()}
+
+
+def test_authored_artifact_snapshots_semantic_contract_evidence() -> None:
+    contract = _contract()
+
+    authored = _authored(_state(), contracts=(contract,))
+    contract.outcome = "conflict"
+
+    assert authored.semantic_contracts[0].outcome == "satisfied"
+
+
+@pytest.mark.parametrize(
+    ("state", "detail", "affected_nodes", "component_id", "component_type"),
+    [
+        (
+            _state(source=_source({"path": "/outside/source.csv"})),
+            "Source 'source' path '/outside/source.csv' is outside allowed source directories",
+            ("source",),
+            "source",
+            "source",
+        ),
+        (
+            _state(outputs=(_output({"path": "/outside/sink.csv"}, name="sink"),)),
+            "Sink 'sink' path '/outside/sink.csv' is outside allowed output directories",
+            (),
+            "sink",
+            "sink",
+        ),
+        (
+            _state(
+                nodes=(
+                    _node(
+                        node_id="rag",
+                        plugin="rag_retrieval",
+                        options={"provider": "chroma", "provider_config": {"persist_directory": "/outside/chroma"}},
+                    ),
+                )
+            ),
+            "Transform 'rag' persist_directory '/outside/chroma' is outside allowed output directories",
+            (),
+            "rag",
+            "transform",
+        ),
+    ],
+    ids=("source", "sink", "nested-transform"),
+)
+def test_path_phase_preserves_each_failure_shape(
+    state: CompositionState,
+    detail: str,
+    affected_nodes: tuple[str, ...],
+    component_id: str,
+    component_type: str,
+) -> None:
+    result = validate_path_policy(
+        _policy(state),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.passed_checks == ()
+    assert result.failed_check.name == "path_allowlist"
+    assert result.failed_check.detail == detail
+    assert result.failed_check.affected_nodes == affected_nodes
+    assert result.errors[0].component_id == component_id
+    assert result.errors[0].component_type == component_type
+    assert result.readiness.blockers[0].code == "path_allowlist"
+
+
+def test_web_network_phase_returns_typed_failure() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="web_scrape",
+                options={"http": {"allowed_hosts": "allow_private"}},
+            ),
+        )
+    )
+
+    result = validate_web_network_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_scrape_network_policy"
+    assert result.failed_check.affected_nodes == ("node",)
+    assert result.errors[0].error_code == "web_scrape_private_network_not_allowed"
+
+
+def test_web_network_phase_derives_future_fetchers_from_plugin_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FutureHTTPFetcher(BlobFetch):
+        name = "future_http_fetcher"
+        determinism = Determinism.EXTERNAL_CALL
+        fetches_http = True
+
+    manager = get_shared_plugin_manager()
+    registered = tuple(manager.get_transforms())
+    monkeypatch.setattr(manager, "get_transforms", lambda: (*registered, FutureHTTPFetcher))
+    state = _state(
+        nodes=(
+            _node(
+                plugin=FutureHTTPFetcher.name,
+                options={"http": {"allowed_hosts": "allow_private"}},
+            ),
+        )
+    )
+
+    result = validate_web_network_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_scrape_network_policy"
+    assert result.errors[0].error_code == "web_fetch_private_network_not_allowed"
+
+
+def test_web_resource_phase_returns_typed_failure() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="blob_fetch",
+                options={"http": {"timeout": 31, "max_body_bytes": 10 * 1024 * 1024 + 1}},
+            ),
+        )
+    )
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_fetch_resource_policy"
+    assert result.failed_check.affected_nodes == ("node", "node")
+    assert [error.error_code for error in result.errors] == [
+        "web_fetch_resource_limit_exceeded",
+        "web_fetch_resource_limit_exceeded",
+    ]
+
+
+def test_web_resource_phase_caps_web_scrape() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="web_scrape",
+                options={"http": {"timeout": 31, "max_body_bytes": 10 * 1024 * 1024 + 1}},
+            ),
+        )
+    )
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_fetch_resource_policy"
+    assert result.failed_check.affected_nodes == ("node", "node")
+    assert [error.error_code for error in result.errors] == [
+        "web_fetch_resource_limit_exceeded",
+        "web_fetch_resource_limit_exceeded",
+    ]
+    assert all("web_scrape.http" in error.message for error in result.errors)
+
+
+def test_resource_limit_outcome_rejects_ambiguous_state() -> None:
+    error = ValidationError(
+        component_id="node",
+        component_type="transform",
+        message="bad limit",
+        suggestion=None,
+        error_code="web_fetch_resource_config_invalid",
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _ParsedResourceLimit(value=None, error=None)
+    with pytest.raises(ValueError, match="exactly one"):
+        _ParsedResourceLimit(value=1, error=error)
+
+
+def test_web_resource_phase_accumulates_conversion_and_limit_errors_in_option_order() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="blob_fetch",
+                options={"http": {"timeout": "not-an-int", "max_body_bytes": 10 * 1024 * 1024 + 1}},
+            ),
+        )
+    )
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert [error.error_code for error in result.errors] == [
+        "web_fetch_resource_config_invalid",
+        "web_fetch_resource_limit_exceeded",
+    ]
+
+
+def test_secret_phase_returns_typed_evidence() -> None:
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY"}}))
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"API_KEY"})),
+        user_id="alice",
+        secret_wiring_policy=_authorizing_policy("API_KEY", "source", "csv", "api_key"),
+    )
+
+    assert isinstance(result, PhaseReport)
+    assert isinstance(result.artifact, SecretValidatedState)
+    assert result.artifact.all_secret_refs == (("API_KEY", None),)
+    assert result.artifact.env_ref_names == frozenset({"API_KEY"})
+    assert result.checks[0].name == "secret_refs"
+    assert result.checks[0].outcome_code == "secret_refs.resolved"
+
+
+def test_secret_phase_denies_unauthorized_wiring_by_default() -> None:
+    """A wired secret with no allowlist rule fails closed — however the
+    marker entered the composition (elspeth-f3c1aafd25)."""
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY"}}))
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"API_KEY"})),
+        user_id="alice",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "secret_refs"
+    assert [error.error_code for error in result.errors] == ["unauthorized_secret_ref"]
+    assert "API_KEY" in result.errors[0].message
+    assert "secret_wiring_allowlist" in result.errors[0].message
+
+
+def test_secret_phase_denies_near_miss_rule_on_node_and_output() -> None:
+    """The rule must match the exact component/plugin/option — near-miss denies."""
+    state = _state(
+        source=_source({"path": "/data/in.csv"}),
+        nodes=(_node(options={"api_key": {"secret_ref": "API_KEY"}}),),
+        outputs=(_output({"token": {"secret_ref": "SINK_TOKEN"}}),),
+    )
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"API_KEY", "SINK_TOKEN"})),
+        user_id="alice",
+        # Authorizes the node wiring only — the sink wiring stays denied.
+        secret_wiring_policy=_authorizing_policy("API_KEY", "transform", "value_transform", "api_key"),
+    )
+
+    assert isinstance(result, PhaseFailure)
+    unauthorized = [error for error in result.errors if error.error_code == "unauthorized_secret_ref"]
+    assert [error.component_id for error in unauthorized] == ["primary"]
+    assert "SINK_TOKEN" in unauthorized[0].message
+
+
+def test_secret_phase_authorizes_exact_rules_across_all_components() -> None:
+    state = _state(
+        source=_source({"api_key": {"secret_ref": "SRC_KEY"}}),
+        nodes=(_node(options={"api_key": {"secret_ref": "NODE_KEY"}}),),
+        outputs=(_output({"token": {"secret_ref": "SINK_TOKEN"}}),),
+    )
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset({"SRC_KEY", "NODE_KEY", "SINK_TOKEN"})),
+        user_id="alice",
+        secret_wiring_policy=SecretWiringPolicy(
+            rules=(
+                SecretWiringRule(secret="SRC_KEY", component_type="source", plugin="csv", option_key="api_key"),
+                SecretWiringRule(secret="NODE_KEY", component_type="transform", plugin="value_transform", option_key="api_key"),
+                SecretWiringRule(secret="SINK_TOKEN", component_type="sink", plugin="csv", option_key="token"),
+            )
+        ),
+    )
+
+    assert isinstance(result, PhaseReport)
+    assert result.checks[0].outcome_code == "secret_refs.resolved"
+
+
+def test_secret_phase_preserves_missing_reference_failure() -> None:
+    state = _state(source=_source({"api_key": {"secret_ref": "MISSING"}}))
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_SecretService(frozenset()),
+        user_id="alice",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "secret_refs"
+    assert result.failed_check.outcome_code == "secret_refs.unresolved"
+    assert result.errors[0].error_code == "missing_secret_ref"
+
+
+def test_semantic_phase_returns_serialized_evidence_on_failure() -> None:
+    state = _web_scrape_line_explode_state()
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "semantic_contracts"
+    assert result.semantic_contracts
+    assert result.semantic_contracts[0].consumer_plugin == "line_explode"
+    assert result.semantic_contracts[0].outcome == "conflict"
+
+
+def test_batch_phase_returns_typed_failure_with_semantic_evidence() -> None:
+    batch_node = _node(
+        node_id="stats",
+        plugin="batch_stats",
+        node_type="aggregation",
+        input_name="stats",
+        options={"value_field": "amount", "required_input_fields": ["amount"]},
+    )
+    state = _state(source=_source(on_success="stats"), nodes=(batch_node,), outputs=(_output(),))
+    contract = _contract()
+
+    result = validate_batch_options(_authored(state, contracts=(contract,)))
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "batch_transform_options"
+    assert result.errors[0].component_id == "stats"
+    assert "required_input_fields" in result.errors[0].message
+    assert result.semantic_contracts == (contract,)
+
+
+def test_interpretation_phase_preserves_pending_readiness_axes_and_semantics() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="llm",
+                options={
+                    "prompt_template": "Rate pending interpretation: {{ row.text }}",
+                    PROMPT_TEMPLATE_PARTS_KEY: [
+                        {"kind": "text", "text": "Rate "},
+                        {"kind": "interpretation_ref", "requirement_id": "coolness"},
+                        {"kind": "text", "text": ": {{ row.text }}"},
+                    ],
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "id": "coolness",
+                            "kind": "vague_term",
+                            "user_term": "coolness",
+                            "status": "pending",
+                            "draft": "well-designed and useful",
+                            "event_id": "event-1",
+                            "accepted_value": None,
+                            "accepted_artifact_hash": None,
+                            "resolved_prompt_template_hash": None,
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+    contract = _contract()
+
+    result = review_interpretations(_authored(state, contracts=(contract,)), allow_pending_placeholders=False)
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "interpretation_review"
+    assert result.readiness.authoring_valid is True
+    assert result.readiness.execution_ready is False
+    assert result.readiness.completion_ready is True
+    assert result.semantic_contracts == (contract,)
+    assert all(error.error_code == "interpretation_review_pending" for error in result.errors)
+
+
+def test_interpretation_phase_selects_authoring_materialized_state_without_mutating_policy_state() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="llm",
+                options={"prompt_template": "Rate how {{ interpretation: cool }} this row is."},
+            ),
+        )
+    )
+
+    result = review_interpretations(_authored(state), allow_pending_placeholders=True)
+
+    assert isinstance(result, PhaseReport)
+    assert isinstance(result.artifact, InterpretationValidatedState)
+    assert result.artifact.materialized_state.nodes[0].options["prompt_template"] == "Rate how pending interpretation this row is."
+    assert result.artifact.authored.policy.state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
+    assert result.checks[0].name == "interpretation_review"
+    assert result.checks[0].passed is True
+
+
+def _web_scrape_line_explode_state() -> CompositionState:
+    return _state(
+        source=_source(
+            {
+                "path": "/tmp/test_data/blobs/test-session/urls.txt",
+                "column": "url",
+                "schema": {"mode": "fixed", "fields": ["url: str"]},
+            },
+            plugin="text",
+            on_success="scrape_in",
+        ),
+        nodes=(
+            _node(
+                node_id="scrape_page",
+                plugin="web_scrape",
+                input_name="scrape_in",
+                on_success="explode_in",
+                options={
+                    "schema": {"mode": "flexible", "fields": ["url: str"]},
+                    "required_input_fields": ["url"],
+                    "url_field": "url",
+                    "content_field": "content",
+                    "fingerprint_field": "content_fingerprint",
+                    "format": "text",
+                    "fingerprint_mode": "content",
+                    "http": {
+                        "abuse_contact": "pipeline@example.com",
+                        "scraping_reason": "test scrape",
+                        "allowed_hosts": "public_only",
+                    },
+                },
+            ),
+            _node(
+                node_id="split_lines",
+                plugin="line_explode",
+                input_name="explode_in",
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["url: str", "content: str", "content_fingerprint: str"],
+                    },
+                    "required_input_fields": ["content"],
+                    "source_field": "content",
+                    "output_field": "line",
+                    "include_index": True,
+                    "index_field": "line_index",
+                },
+            ),
+        ),
+        outputs=(_output({"path": "/tmp/test_data/outputs/test-session/lines.json"}, plugin="json"),),
+    )
+
+
+def _llm_to_text_sink_state() -> CompositionState:
+    """The g11 shape: a generative producer routed straight at the text sink.
+
+    Fully configured on purpose — a draft sink config makes the semantic probe
+    abstain, and an abstaining probe emits no finding at all, which would make
+    every assertion below pass for the wrong reason.
+    """
+    return _state(
+        source=_source(
+            {
+                "path": "/tmp/test_data/blobs/test-session/topics.csv",
+                "schema": {"mode": "fixed", "fields": ["topic: str"]},
+            },
+            on_success="generate_in",
+        ),
+        nodes=(
+            _node(
+                node_id="generate",
+                plugin="llm",
+                input_name="generate_in",
+                on_success="announcement",
+                options={
+                    "schema": {"mode": "fixed", "fields": ["topic: str"]},
+                    "required_input_fields": ["topic"],
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-3.7-sonnet",
+                    "api_key": "sk-test-key",
+                    "prompt_template": "Write an announcement about {{ row['topic'] }}",
+                    "temperature": 0,
+                    "response_field": "announcement_text",
+                    "pool_size": 1,
+                    "max_tokens": 300,
+                },
+            ),
+        ),
+        outputs=(
+            _output(
+                {
+                    "path": "/tmp/test_data/outputs/test-session/announcement.txt",
+                    "field": "announcement_text",
+                    "schema": {"mode": "fixed", "fields": ["announcement_text: str"]},
+                },
+                name="announcement",
+                plugin="text",
+            ),
+        ),
+    )
+
+
+def test_semantic_phase_attributes_a_sink_violation_to_the_sink() -> None:
+    """A sink finding must not be reported as a transform node that does not exist.
+
+    ``component_type`` was hardcoded to "transform" and the component id was
+    stripped with ``removeprefix("node:")``, so a sink entry (``output:<name>``)
+    landed in the ledger as a transform whose id still carried the prefix.
+    """
+    state = _llm_to_text_sink_state()
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert isinstance(result, PhaseFailure), "llm -> text must block at the authoring gate (ADR-039)"
+    assert result.failed_check.name == "semantic_contracts"
+
+    sink_contracts = [contract for contract in result.semantic_contracts if contract.to_id == "output:announcement"]
+    assert len(sink_contracts) == 1, "the sink edge must be evaluated, or this test is vacuous"
+    assert sink_contracts[0].outcome == "conflict"
+    assert sink_contracts[0].consumer_plugin == "text"
+    assert sink_contracts[0].requirement_code == "text.field.single_line_text"
+
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error.component_type == "sink", "a sink violation must be typed as a sink"
+    assert error.component_id == "announcement", "the output: qualifier must be stripped, like node: is for a node"
+
+
+def test_semantic_phase_surfaces_the_sinks_own_remedy_for_a_sink_violation() -> None:
+    """Assistance must route to the SINK registry, and name both repairs.
+
+    ``assistance_suggestion_for`` looked the consumer up with
+    get_transform_by_name unconditionally; the two registries are separate, so
+    that raised for every sink consumer. A prohibition with no alternative is
+    what produced g11 in the first place, so the arm has to actually arrive.
+    """
+    state = _llm_to_text_sink_state()
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert isinstance(result, PhaseFailure)
+    suggestion = result.errors[0].suggestion
+    assert suggestion is not None, "the text sink owns a remedy for this requirement_code and it must reach the ledger"
+    assert "line_explode" in suggestion
+    assert "document" in suggestion
+
+
+def test_semantic_phase_keeps_the_output_qualifier_on_a_sink_advisory() -> None:
+    """``affected_nodes`` has no type column, so a sink advisory keeps ``output:``.
+
+    Stripping it would make a sink advisory indistinguishable from a node
+    advisory, and would silently merge a sink with a same-named node.
+    """
+    state = _state(
+        source=_source(
+            {
+                "path": "/tmp/test_data/blobs/test-session/rows.csv",
+                "schema": {"mode": "fixed", "fields": ["value: str"]},
+            },
+            on_success="map_in",
+        ),
+        nodes=(
+            _node(
+                node_id="rename",
+                plugin="field_mapper",
+                input_name="map_in",
+                on_success="lines",
+                options={"schema": {"mode": "observed"}, "mapping": {"value": "line_text"}},
+            ),
+        ),
+        outputs=(
+            _output(
+                {
+                    "path": "/tmp/test_data/outputs/test-session/lines.txt",
+                    "field": "line_text",
+                    "schema": {"mode": "fixed", "fields": ["line_text: str"]},
+                },
+                name="lines",
+                plugin="text",
+            ),
+        ),
+    )
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert not isinstance(result, PhaseFailure), "an undeclared producer must not block the text sink"
+    check = result.checks[0]
+    assert check.name == "semantic_contracts"
+    assert check.affected_nodes == ("output:lines",)
+    assert "text.field.single_line_text" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# Node-kind widening of the path-traversal gate (elspeth-df8082552d, site c).
+#
+# ``validate_path_policy`` pre-filtered to ``node_type == "transform"``. It is
+# an OPTION-shaped gate — it keys on ``provider_config`` presence, never on a
+# plugin name — so ``node_type`` was the sole limiter and a collector or
+# aggregation carrying a traversal ``persist_directory`` passed it silently.
+#
+# Containment was incidental and LATE, not structural: a batch-aware plugin's
+# config model is ``extra="forbid"`` with no ``provider_config`` field, so
+# such a composition dies at ``validate_runtime_plugins`` — two phases AFTER
+# this gate, with an unrelated error. The gate itself never looked.
+# ---------------------------------------------------------------------------
+
+_TRAVERSAL = "../../../../../../etc/elspeth-pwned"
+
+
+def _provider_config_node(node_type: str, path_value: str) -> NodeSpec:
+    return _node(
+        node_id="n1",
+        plugin="rag_retrieval" if node_type == "transform" else "batch_stats",
+        node_type=node_type,
+        options={"provider_config": {"persist_directory": path_value}},
+    )
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_path_gate_blocks_traversal_on_every_plugin_bearing_node_kind(node_type: str, tmp_path: Path) -> None:
+    """``transform`` is the control: it fired before this fix and must still
+    fire. ``aggregation`` and ``collector`` are the defect — measured SILENT
+    before the widening, with the traversal path admitted.
+    """
+    result = validate_path_policy(
+        _policy(_state(nodes=(_provider_config_node(node_type, _TRAVERSAL),))),
+        data_dir=tmp_path,
+        session_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "path_allowlist"
+    assert result.errors[0].component_id == "n1"
+    # The finding names the node kind the operator authored, not "transform"
+    # for all three — a security finding that mislabels its subject invites
+    # the reader to dismiss it as being about some other node.
+    assert node_type in result.errors[0].message
+
+
+@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
+def test_path_gate_admits_a_legitimate_in_subtree_path_on_every_kind(node_type: str, tmp_path: Path) -> None:
+    """The widening cannot over-reject: the gate keys on the RESOLVED PATH,
+    not on the presence of the option. A node carrying a legitimate
+    persist_directory inside the session subtree passes on every node kind.
+    """
+    from elspeth.web.paths import allowed_sink_directories
+
+    session_id = "11111111-1111-1111-1111-111111111111"
+    legit = str(Path(allowed_sink_directories(str(tmp_path), session_id=session_id)[0]) / "chroma_data")
+
+    result = validate_path_policy(
+        _policy(_state(nodes=(_provider_config_node(node_type, legit),))),
+        data_dir=tmp_path,
+        session_id=session_id,
+    )
+
+    assert isinstance(result, PhaseReport)
+
+
+def test_path_gate_still_skips_plugin_less_structural_nodes(tmp_path: Path) -> None:
+    """The subject set is ``node.plugin is not None``, NOT every node.
+
+    gate/queue/coalesce can carry an inert ``provider_config`` through
+    composer validation today (only ``row_union`` rejects non-empty options),
+    and nothing reads it for a plugin-less kind. Gating it would newly reject
+    a nonsense-but-harmless composition that passes today — a behaviour
+    change with no security benefit, since no plugin can act on the value.
+    """
+    gate_node = _node(node_id="g1", plugin=None, node_type="gate", options={"provider_config": {"persist_directory": _TRAVERSAL}})
+
+    result = validate_path_policy(
+        _policy(_state(nodes=(gate_node,))),
+        data_dir=tmp_path,
+        session_id="11111111-1111-1111-1111-111111111111",
+    )
+
+    assert isinstance(result, PhaseReport)

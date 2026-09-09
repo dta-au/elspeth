@@ -12,7 +12,7 @@ import pytest
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.sources.aws_s3_source import AWSS3Source
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.slow, pytest.mark.integration, pytest.mark.live_aws, pytest.mark.live_provider]
 
 
 @dataclass
@@ -38,7 +38,7 @@ class _Context:
 def test_real_s3_default_chain_round_trip(source_format: str, data: bytes, expected: dict[str, Any]) -> None:
     bucket = os.environ.get("ELSPETH_TEST_S3_BUCKET")
     if not bucket:
-        pytest.skip("ELSPETH_TEST_S3_BUCKET is required for the real AWS S3 acceptance")
+        pytest.fail("ELSPETH_TEST_S3_BUCKET is required for the real AWS S3 acceptance", pytrace=False)
     key = f"elspeth-plan06/{uuid.uuid4()}/input.{source_format}"
     client = build_s3_client(None, None)
     client.put_object(Bucket=bucket, Key=key, Body=data)

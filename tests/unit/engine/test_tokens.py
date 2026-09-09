@@ -8,8 +8,9 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import SourceRow
-from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.testing import make_field
@@ -161,7 +162,7 @@ class TestTokenManagerCoalesce:
             _make_pipeline_row({"value": 42, "label": "A"}),
         )
 
-        merged = manager.coalesce_tokens(
+        merged, _join_group_id = manager.coalesce_tokens(
             parents=[stats_token, classifier_token],
             merged_data=_make_pipeline_row({"value": 42, "mean": 10.5, "label": "A"}),
             node_id=NodeID("coalesce_node"),
@@ -633,44 +634,6 @@ class TestTokenManagerEdgeCases:
 
         assert updated.expand_group_id == expand_group_id, "expand_group_id must be preserved"
 
-    def test_update_preserves_join_group_id(self) -> None:
-        from elspeth.engine.tokens import TokenManager
-
-        setup = make_recorder_with_run()
-        run_id, source_node_id = setup.run_id, setup.source_node_id
-
-        manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
-        initial = manager.create_initial_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=_make_source_row({"value": 42}),
-            source_row_index=0,
-            ingest_sequence=0,
-        )
-
-        children, _fork_group_id = manager.fork_token(
-            parent_token=initial,
-            branches=["a", "b"],
-            node_id=NodeID("gate_node"),
-            run_id=run_id,
-        )
-
-        merged = manager.coalesce_tokens(
-            parents=children,
-            merged_data=_make_pipeline_row({"value": 42, "merged": True}),
-            node_id=NodeID("coalesce_node"),
-            run_id=run_id,
-        )
-
-        assert merged.join_group_id is not None
-
-        updated = merged.with_updated_data(
-            _make_pipeline_row({"value": 42, "merged": True, "enriched": "yes"}),
-        )
-
-        assert updated.join_group_id == merged.join_group_id, "join_group_id must be preserved"
-
     def test_multiple_rows_different_tokens(self) -> None:
         from elspeth.engine.tokens import TokenManager
 
@@ -756,7 +719,7 @@ class TestTokenManagerStepInPipeline:
             run_id=run_id,
         )
 
-        merged = manager.coalesce_tokens(
+        merged, _join_group_id = manager.coalesce_tokens(
             parents=children,
             merged_data=_make_pipeline_row({"value": 42, "merged": True}),
             node_id=NodeID("coalesce_node"),
@@ -884,15 +847,133 @@ class TestTokenManagerExpand:
             assert db_token.step_in_pipeline == 5
 
 
+class TestTokenManagerRegisterExpandGroup:
+    """WS3 Task 5 step 3b: expand_token's mint-path registration.
+
+    GroupBindingRegistry.register_expand_group's own behaviour (declared vs
+    undeclared opener, idempotent re-registration, reject-under-a-different-
+    opener) is already pinned at the registry level in
+    tests/unit/core/dag/test_group_bindings.py — these tests exercise the NEW
+    wiring instead: does calling expand_token actually resolve the minting
+    node_id to the right opener_name and register the runtime-minted
+    group_id, so binding_for resolves on the child's ACTUAL minted EXPAND
+    frame (not a hand-built one)."""
+
+    @staticmethod
+    def _scope_registry() -> Any:
+        from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
+
+        binding = GroupBinding(
+            kind=FrameKind.EXPAND,
+            opener_node_id=NodeID("transform_explode_abc"),
+            opener_name="explode",
+            closer_node_id=NodeID("collector_page_stitcher_def"),
+            closer_name="page_stitcher",
+            closer_kind=CloserKind.COLLECTOR,
+            policy="require_all",
+            member_roster=(),
+        )
+        return GroupBindingRegistry(bindings=(binding,))
+
+    def test_declared_scope_opener_registers_and_binding_for_resolves_on_the_minted_frame(self) -> None:
+        from elspeth.engine.tokens import TokenManager
+
+        setup = make_recorder_with_run()
+        factory, run_id, source_node_id = setup.factory, setup.run_id, setup.source_node_id
+        registry = self._scope_registry()
+
+        manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver(), group_bindings=registry)
+        parent = manager.create_initial_token(
+            run_id=run_id,
+            source_node_id=source_node_id,
+            row_index=0,
+            source_row=_make_source_row({"x": 1}),
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+
+        children, expand_group_id = manager.expand_token(
+            parent_token=parent,
+            expanded_rows=[{"a": 1}, {"a": 2}],
+            output_contract=_make_observed_contract("a"),
+            node_id=NodeID("transform_explode_abc"),  # the declared opener's node_id
+            run_id=run_id,
+        )
+
+        minted_frame = children[0].lineage_path[-1]
+        assert minted_frame.kind is FrameKind.EXPAND
+        assert minted_frame.group_id == expand_group_id
+        assert registry.binding_for(minted_frame) is registry.bindings[0]
+
+    def test_undeclared_expand_stays_inert(self) -> None:
+        from elspeth.engine.tokens import TokenManager
+
+        setup = make_recorder_with_run()
+        factory, run_id, source_node_id = setup.factory, setup.run_id, setup.source_node_id
+        registry = self._scope_registry()
+
+        manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver(), group_bindings=registry)
+        parent = manager.create_initial_token(
+            run_id=run_id,
+            source_node_id=source_node_id,
+            row_index=0,
+            source_row=_make_source_row({"x": 1}),
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+
+        children, _expand_group_id = manager.expand_token(
+            parent_token=parent,
+            expanded_rows=[{"a": 1}],
+            output_contract=_make_observed_contract("a"),
+            node_id=NodeID("plain_batch_transform"),  # NOT a declared scope opener
+            run_id=run_id,
+        )
+
+        minted_frame = children[0].lineage_path[-1]
+        assert minted_frame.kind is FrameKind.EXPAND
+        assert registry.binding_for(minted_frame) is None
+
+    def test_none_group_bindings_disables_registration_without_erroring(self) -> None:
+        """CoalesceExecutor's own internal TokenManager never passes
+        group_bindings (never calls expand_token in practice, but must not
+        crash construction or a hypothetical call)."""
+        from elspeth.engine.tokens import TokenManager
+
+        setup = make_recorder_with_run()
+        factory, run_id, source_node_id = setup.factory, setup.run_id, setup.source_node_id
+
+        manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver())
+        parent = manager.create_initial_token(
+            run_id=run_id,
+            source_node_id=source_node_id,
+            row_index=0,
+            source_row=_make_source_row({"x": 1}),
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+
+        children, _expand_group_id = manager.expand_token(
+            parent_token=parent,
+            expanded_rows=[{"a": 1}],
+            output_contract=_make_observed_contract("a"),
+            node_id=NodeID("transform_explode_abc"),
+            run_id=run_id,
+        )
+        assert len(children) == 1
+
+
 class TestTokenManagerBoundaryPaths:
     """Coverage for error guards and quarantine/resume token paths."""
 
     def test_source_identity_parameters_are_required_by_signature(self) -> None:
         from elspeth.engine.tokens import TokenManager
 
-        for method_name in ("create_initial_token", "create_quarantine_token"):
-            signature = inspect.signature(getattr(TokenManager, method_name))
-            type_hints = get_type_hints(getattr(TokenManager, method_name))
+        # Iterate the method objects themselves: a renamed or deleted method is a
+        # NameError at collection instead of a silently skipped signature check.
+        for method in (TokenManager.create_initial_token, TokenManager.create_quarantine_token):
+            signature = inspect.signature(method)
+            type_hints = get_type_hints(method)
             for parameter_name in ("source_row_index", "ingest_sequence"):
                 parameter = signature.parameters[parameter_name]
                 assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -1133,7 +1214,7 @@ class TestExpandTokenStrictZip:
                 row_id=parent.row_id,
                 run_id=setup.run_id,
                 created_at=datetime.now(UTC),
-                expand_group_id="eg-1",
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key=f"fake-child-{i}"),),
             )
             for i in range(2)  # Recorder returns 2 children
         ]

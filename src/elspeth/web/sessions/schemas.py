@@ -22,8 +22,14 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
+from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.composer.guided.protocol import GUIDED_MAX_COMPONENTS_PER_KIND
-from elspeth.web.execution.schemas import DiscardSummary, RunAccounting
+from elspeth.web.execution.schemas import (
+    DiscardSummary,
+    RunAccounting,
+    RunAccountingCorruption,
+    check_discard_summary_reconciliation,
+)
 from elspeth.web.sessions.protocol import (
     ComposerDensityDefault,
     ComposerTrustMode,
@@ -151,6 +157,13 @@ type ToolCallObject = dict[str, JsonValue]
 type ToolCallList = list[ToolCallObject]
 
 
+class ChatMessageSegmentResponse(_StrictResponse):
+    """One provenance-bearing visible segment in a chat message."""
+
+    kind: Literal["text", "trusted_system_notice"]
+    content: str
+
+
 class ChatMessageResponse(_StrictResponse):
     """Response for a single chat message.
 
@@ -173,6 +186,7 @@ class ChatMessageResponse(_StrictResponse):
     role: str
     content: str
     raw_content: str | None = None
+    segments: list[ChatMessageSegmentResponse]
     tool_calls: ToolCallList | None = None
     created_at: datetime
     composition_state_id: str | None = None
@@ -194,9 +208,14 @@ class MessageWithStateResponse(_StrictResponse):
 
 
 class ValidationEntryResponse(_StrictResponse):
-    """Structured validation entry preserving component attribution.
+    """A four-key projection of ``ValidationEntry.to_dict()`` for the HTTP surface.
 
-    Mirrors ``ValidationEntry.to_dict()`` from the composer state module.
+    Carries ``component`` / ``message`` / ``severity`` / ``error_code`` only;
+    the detail payloads (``contract``, ``row_union_schema``,
+    ``coalesce_union_type``) and ``rejected_component`` are deliberately not
+    on this surface. Constructed field by field in ``routes/_helpers``, so a
+    new ``to_dict`` key never reaches it by accident — and never widens it
+    either (elspeth-e405ad7cd2, systems ledger #44).
     """
 
     component: str
@@ -249,6 +268,27 @@ class CompositionProposalResponse(_StrictResponse):
     pipeline_metadata: PipelineProposalMetadataResponse | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class GuidedPlanDeclinedResponse(_StrictResponse):
+    """Response for POST /api/sessions/{id}/guided/plan on an honest decline.
+
+    The planner answered in text instead of proposing a pipeline: either
+    an ordinary manifest-satisfied turn whose reply led with the taught
+    ``DECLINE:`` marker, or the escape-hatch advisor turn, which accepts any
+    text. No proposal was created. ``message`` is the ordinary
+    assistant chat message persisted from the model's own words —
+    same wire shape as ``MessageWithStateResponse.message`` on the
+    freeform surface, which handles the identical ``PlannerDeclined``
+    outcome the same way. Distinguished from ``CompositionProposalResponse``
+    (the same endpoint's other outcome) structurally: this shape's
+    ``outcome`` field never appears on a proposal response, and a proposal
+    response's ``id``/``status``/... fields never appear here, so FastAPI's
+    ``response_model`` union serializes each outcome unambiguously.
+    """
+
+    outcome: Literal["declined"]
+    message: ChatMessageResponse
 
 
 class AcceptProposalRequest(_RequestModel):
@@ -393,7 +433,22 @@ class GuidedPlanRequest(_GuidedOperationRequest):
 
 
 class ConvertGuidedRequest(_GuidedOperationRequest):
-    """Request body for POST /api/sessions/{id}/guided/convert."""
+    """Request body for POST /api/sessions/{id}/guided/convert.
+
+    ``intent`` is the author's goal for the converted session and is REQUIRED,
+    exactly as it is on ``StartGuidedRequest``: a conversion seeds a fresh
+    wizard, and a wizard with no root intent cannot reach the planner (the
+    Step-2 finish refuses with ``guided_planner_intent_required``). It is also
+    the durable root row the conversion writes, so it participates in the
+    canonical request hash the custody helpers re-derive.
+    """
+
+    intent: str = pydantic.Field(min_length=1, max_length=4096)
+
+    @field_validator("intent")
+    @classmethod
+    def _validate_intent(cls, value: str) -> str:
+        return _require_visible_content(value, field_label="Guided intent")
 
 
 class ReenterGuidedRequest(_GuidedOperationRequest):
@@ -407,11 +462,32 @@ class RunResponse(_StrictResponse):
     session_id: str
     status: SessionRunStatus
     accounting: RunAccounting | None = None
+    # Explicit per-run integrity failure (elspeth-d5578ccd98): when the run's
+    # recorded token outcomes fail canonical validation, the list surface
+    # ships this marker INSTEAD of accounting so the corrupt run stays
+    # visible — and visibly corrupt — while healthy runs keep theirs.
+    accounting_corruption: RunAccountingCorruption | None = None
     error: str | None = None
     started_at: datetime
     finished_at: datetime | None = None
     composition_version: int
     discard_summary: DiscardSummary | None = None
+
+    @model_validator(mode="after")
+    def _check_discard_reconciliation(self) -> RunResponse:
+        """Session-list carrier of the accounting/discard-summary pair.
+
+        This surface attaches ``discard_summary`` on its own path
+        (``sessions/routes/runs.py``), independent of the ``/api/runs/*``
+        carriers — a validator there does not protect this one
+        (elspeth-43f52d69a4).
+        """
+        check_discard_summary_reconciliation(self.accounting, self.discard_summary)
+        if self.accounting_corruption is not None and self.accounting is not None:
+            # The corruption marker exists to REPLACE accounting; carrying
+            # both would let a corrupt run present validated-looking numbers.
+            raise ValueError("accounting_corruption and accounting are mutually exclusive")
+        return self
 
 
 class TurnRecordResponse(_StrictResponse):
@@ -446,6 +522,14 @@ class ChatTurnResponse(_StrictResponse):
     :class:`elspeth.web.composer.guided.protocol.ChatTurn`: both are ``None``
     only for user turns; assistant turns always carry a kind, and synthetic
     failures always carry a closed reason.
+
+    ``turn_token`` is the occurrence the user message was submitted under
+    (elspeth-ea80e34fdc): the Retry affordance must resend it verbatim so a
+    historical retry is rejected by the ordinary stale-turn 409 instead of
+    borrowing the current token. Non-null only on user turns recorded through
+    the chat submission path; assistant turns and transcript-only user turns
+    (respond-path revision instructions/corrections, which have no retry
+    affordance) carry ``None``.
     """
 
     role: str
@@ -454,7 +538,8 @@ class ChatTurnResponse(_StrictResponse):
     step: str
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied"] | None
+    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None
+    turn_token: str | None
 
 
 class WorkflowProfileResponse(_StrictResponse):
@@ -467,6 +552,43 @@ class WorkflowProfileResponse(_StrictResponse):
 
     coaching: bool
     bookends: bool
+
+
+class GuidedReviewedComponentResponse(_StrictResponse):
+    """One settled component in the server-projected reviewed ledger.
+
+    The field set is CLOSED at identity + display: ``stable_id``, ``name``,
+    ``plugin``, and the constant ``status``.  It is exactly what the
+    ``review_components`` card already publishes (both are projected from
+    :func:`elspeth.web.composer.guided.state_machine.reviewed_component_ledger`),
+    which makes this model a redaction boundary rather than a convenience
+    projection: authored option values (``on_validation_failure``,
+    ``on_write_failure``, ``schema.mode`` — all of them schema-form knobs),
+    inspected ``observed_columns`` / ``sample_rows``, storage paths, and
+    content-identity anchors are Tier-3-bearing reviewed custody and stay
+    under ``composition_state.composer_meta.guided_session``.  Widening this
+    model is a deliberate egress decision, and the pins in
+    ``tests/unit/web/sessions/test_guided_reviewed_components.py`` fail until
+    it is made deliberately.
+    """
+
+    stable_id: str
+    name: str
+    plugin: str
+    status: Literal["reviewed"]
+
+
+class GuidedReviewedComponentsResponse(_StrictResponse):
+    """Server-projected reviewed-component ledger, in authored order.
+
+    The frontend used to re-fold this ledger from ``next_turn`` alone, so a
+    reload mid-stage and every completed session (``next_turn`` is ``None``)
+    saw an empty ledger.  Projecting it on the guided response makes the
+    server the single authority for "what has been settled so far".
+    """
+
+    sources: list[GuidedReviewedComponentResponse]
+    outputs: list[GuidedReviewedComponentResponse]
 
 
 class GuidedSessionResponse(_StrictResponse):
@@ -484,6 +606,13 @@ class GuidedSessionResponse(_StrictResponse):
     # standard, that is evidence tampering.
     chat_history: list[ChatTurnResponse]
     chat_turn_seq: int
+    # Server-projected reviewed-component ledger. Required for the same
+    # reason ``chat_history`` is: a default of empty lists here would let a
+    # route that forgot to project the live reviewed custody return a
+    # truthful-looking "nothing settled yet" while the server held two
+    # reviewed sources — the decision sheets read this field, so a silent
+    # empty is a false record of what the user agreed to.
+    reviewed_components: GuidedReviewedComponentsResponse
     # Server-owned WorkflowProfile (wire-visible subset). ``None`` for the
     # empty/live-guided profile. Defaulted to ``None`` because most
     # GuidedSessionResponse construction sites carry the empty profile; the
@@ -653,6 +782,7 @@ class GuidedRespondRequest(_GuidedOperationRequest):
 
     turn_token: str | None = pydantic.Field(min_length=64, max_length=64, pattern=r"[0-9a-f]{64}")
     chosen: list[str] | None = None
+    source_blob_id: UUID | None = None
     edited_values: dict[str, Any] | None = None
     custom_inputs: list[str] | None = None
     control_signal: str | None = None
@@ -664,6 +794,13 @@ class GuidedRespondRequest(_GuidedOperationRequest):
     edit_target: GuidedEditTargetRequest | None = None
     correction_feedback: str | None = pydantic.Field(default=None, min_length=1, max_length=4096)
     component_action: GuidedComponentAction | None = None
+
+    @field_validator("source_blob_id", mode="before")
+    @classmethod
+    def _validate_source_blob_id(cls, value: object) -> UUID | None:
+        if value is None:
+            return None
+        return _parse_canonical_uuid(value, field_name="source_blob_id")
 
     @field_validator("correction_feedback")
     @classmethod
@@ -687,7 +824,11 @@ class GuidedRespondRequest(_GuidedOperationRequest):
         )
         response_fields = (*turn_response_fields, *proposal_fields, self.component_action)
         if self.turn_token is None:
-            if self.control_signal != "exit_to_freeform" or any(value is not None for value in response_fields):
+            if (
+                self.control_signal != "exit_to_freeform"
+                or self.source_blob_id is not None
+                or any(value is not None for value in response_fields)
+            ):
                 raise ValueError("turn_token is required for live-turn actions")
             return self
         if self.component_action is not None:
@@ -782,7 +923,7 @@ class GuidedChatResponse(_StrictResponse):
 # All field caps are documented in spec lines 1428-1459.
 
 
-class InterpretationEventResponse(BaseModel):
+class InterpretationEventResponse(_StrictResponse):
     """Wire mirror of :class:`InterpretationEventRecord`.
 
     Read-side wire schema for a single row of the
@@ -819,7 +960,7 @@ class InterpretationEventResponse(BaseModel):
     # hash_domain_version='v2'.
     composition_state_id: UUID | None = None
     affected_node_id: str | None = Field(default=None, max_length=256)
-    tool_call_id: str | None = Field(default=None, max_length=256)
+    tool_call_id: str | None = Field(default=None, max_length=PROVIDER_TOOL_CALL_ID_MAX_LENGTH)
     user_term: str | None = Field(default=None, max_length=8192)
     kind: InterpretationKind | None = None
     llm_draft: str | None = Field(default=None, max_length=8192)
@@ -919,7 +1060,7 @@ class InterpretationResolveRequest(BaseModel):
         return v
 
 
-class InterpretationResolveResponse(BaseModel):
+class InterpretationResolveResponse(_StrictResponse):
     """Response for POST /api/sessions/{id}/interpretations/{event_id}/resolve.
 
     The resolved event row PLUS the new composition state produced by
@@ -937,7 +1078,7 @@ class InterpretationResolveResponse(BaseModel):
     new_state: CompositionStateResponse
 
 
-class InterpretationOptOutResponse(BaseModel):
+class InterpretationOptOutResponse(_StrictResponse):
     """Response for POST /api/sessions/{id}/interpretations/opt_out.
 
     The opt-out route has no body fields beyond the implicit actor
@@ -960,7 +1101,7 @@ class InterpretationOptOutResponse(BaseModel):
     opted_out_at: datetime
 
 
-class ListInterpretationEventsResponse(BaseModel):
+class ListInterpretationEventsResponse(_StrictResponse):
     """Response for GET /api/sessions/{id}/interpretations.
 
     Wraps the list in an envelope object rather than returning a bare
@@ -974,7 +1115,7 @@ class ListInterpretationEventsResponse(BaseModel):
     events: list[InterpretationEventResponse]
 
 
-class OptOutSummaryResponse(BaseModel):
+class OptOutSummaryResponse(_StrictResponse):
     """Response for GET /api/sessions/{id}/interpretations/opt_out_summary.
 
     Per F-22 of the Phase 5b backend spec: after a session has opted out

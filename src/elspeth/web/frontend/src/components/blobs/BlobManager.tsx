@@ -2,6 +2,7 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { Button, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
@@ -37,6 +38,10 @@ const CATEGORY_ORDER: BlobCategory[] = ["source", "sink", "other"];
  */
 export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  // Use-as-input is a compose entry point: disable it while a freeform
+  // compose is in flight (elspeth-3f38ebb1b5) so the manager cannot offer a
+  // second compose the store admission gate would refuse.
+  const isComposing = useSessionStore((s) => s.isComposing);
   const { blobs, isLoading, error, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -122,14 +127,22 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         <span className="blob-manager-title">
           Files ({blobs.length})
         </span>
-        <button
+        {/* Label-only, and its accessible name IS its visible text
+            (elspeth-29eef452a8). The label used to read "+ Upload" against an
+            aria-label of "Upload file": a typed plus sign is a glyph drawn in
+            the 12px UI font, so it matched neither the weight nor the optical
+            size of the stroked SVGs in the rows directly below it, and the
+            accessible name did not contain the visible label, which breaks
+            voice-control targeting by visible text (WCAG 2.5.3). Dropping the
+            redundant aria-label is what keeps the two in step — do not
+            reintroduce one that says something else. */}
+        <Button
           onClick={() => fileInputRef.current?.click()}
-          className="btn blob-manager-upload-btn"
-          aria-label="Upload file"
+          className="blob-manager-upload-btn"
         >
-          + Upload
-        </button>
-        <input
+          Upload
+        </Button>
+        <Input
           ref={fileInputRef}
           type="file"
           onChange={handleUpload}
@@ -176,6 +189,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     onDownload={handleDownload}
                     onDelete={handleRequestDelete}
                     onUseAsInput={onUseAsInput}
+                    useAsInputDisabled={isComposing}
                   />
                 ))}
               </div>

@@ -1,4 +1,4 @@
-"""NodeStateGuard — structural guarantee that node states reach terminal status.
+"""NodeStateGuard — structural control over node-state terminal status.
 
 The invariant "every token reaches exactly one terminal state" is central to
 ELSPETH's audit integrity.  Before this guard, the invariant was enforced by
@@ -6,8 +6,10 @@ manually-scoped try/except blocks in each executor.  The problem: post-processin
 code (output hashing, contract evolution) lived OUTSIDE those blocks, so failures
 there left node_states permanently OPEN — violating the audit trail.
 
-NodeStateGuard encodes the invariant structurally: any unhandled exception within
-the ``with`` block automatically completes the state as FAILED before propagating.
+NodeStateGuard encodes the invariant structurally: an unhandled exception within
+the ``with`` block automatically completes the state as FAILED before propagating,
+except for explicit scheduler ownership loss. That narrow crash-image path leaves
+the stale attempt OPEN because a replacement generation owns terminal audit writes.
 """
 
 from __future__ import annotations
@@ -21,10 +23,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts import ExecutionError, NodeStateOpen
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
-from elspeth.contracts.enums import NodeStateStatus
+from elspeth.contracts.enums import NodeStateStatus, OutputMode, TriggerType
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
+    RunWorkerEvictedError,
+    SchedulerLeaseLostError,
 )
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 from elspeth.core.canonical import canonical_json
@@ -32,12 +36,42 @@ from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRec
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from elspeth.contracts import AggregationResultMember, PipelineRow
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
     from elspeth.contracts.node_state_context import NodeStateContext
 
 logger = logging.getLogger(__name__)
 
+type NodeStateAutoFailPhase = Literal[
+    "aggregation_flush",
+    "collector_flush",
+    "gate_evaluation_routing",
+    "retry_pre_attempt_shutdown",
+    "transform_execution",
+]
+
+_NODE_STATE_AUTO_FAIL_PHASES: frozenset[NodeStateAutoFailPhase] = frozenset(
+    {
+        "aggregation_flush",
+        "collector_flush",
+        "gate_evaluation_routing",
+        "retry_pre_attempt_shutdown",
+        "transform_execution",
+    }
+)
 _GUARD_TERMINAL_NODE_STATE_STATUSES = frozenset({NodeStateStatus.COMPLETED, NodeStateStatus.FAILED})
+
+
+def _validate_auto_fail_phase(value: object) -> NodeStateAutoFailPhase:
+    """Validate runtime callers without weakening the constructor's static contract."""
+    if type(value) is not str or value not in _NODE_STATE_AUTO_FAIL_PHASES:
+        raise OrchestrationInvariantError(
+            f"NodeStateGuard auto_fail_phase must be one of {sorted(_NODE_STATE_AUTO_FAIL_PHASES)}; got {value!r}."
+        )
+    return value
+
 
 # Attribute name for the node-state id stamped onto exceptions that cross a
 # NodeStateGuard. Executors scope ctx.state_id per operation (it is restored
@@ -64,10 +98,13 @@ def stamp_node_state_id(exc: BaseException, state_id: str) -> None:
 def stamped_node_state_id(exc: BaseException) -> str | None:
     """Return the node-state id stamped on ``exc``, or None if unstamped."""
     try:
-        stamped = vars(exc).get(_EXCEPTION_NODE_STATE_ID_ATTR)
+        attributes = vars(exc)
     except TypeError:
         return None
-    return stamped if isinstance(stamped, str) else None
+    if _EXCEPTION_NODE_STATE_ID_ATTR not in attributes:
+        return None
+    stamped = attributes[_EXCEPTION_NODE_STATE_ID_ATTR]
+    return stamped if type(stamped) is str else None
 
 
 def _render_exception_message(exc_type: type[BaseException], exc_val: BaseException | None) -> str:
@@ -95,26 +132,40 @@ def _render_exception_message(exc_type: type[BaseException], exc_val: BaseExcept
 
 
 class NodeStateGuard:
-    """Context manager that guarantees a node state reaches terminal status.
+    """Context manager that controls a node state's terminal status.
 
     Opens a node state in ``__enter__`` and, if the caller has not explicitly
     completed it before an exception triggers ``__exit__``, auto-completes the
-    state as FAILED with the exception details.
+    state as FAILED with the exception details and the caller-supplied guarded
+    scope. The sole exception is an explicitly abandoned stale attempt
+    accompanied by ``SchedulerLeaseLostError`` or ``RunWorkerEvictedError``;
+    that attempt remains OPEN as crash evidence.
 
     Usage::
 
-        with NodeStateGuard(recorder, token_id=..., node_id=..., ...) as guard:
+        with NodeStateGuard(
+            recorder,
+            token_id=...,
+            node_id=...,
+            run_id=...,
+            step_index=...,
+            input_data=...,
+            auto_fail_phase="transform_execution",
+        ) as guard:
             ctx.state_id = guard.state_id
             # ... processing ...
             guard.complete(NodeStateStatus.COMPLETED, output_data=..., ...)
 
     If an exception is raised before ``guard.complete()`` is called, the state
-    is automatically completed as FAILED.  If ``guard.complete()`` was already
-    called, ``__exit__`` is a no-op (the state is already terminal).
+    is automatically completed as FAILED unless the scheduler ownership-loss
+    carve-out applies. If ``guard.complete()`` was already called, ``__exit__``
+    is a no-op (the state is already terminal).
     """
 
     __slots__ = (
+        "_abandoned",
         "_attempt",
+        "_auto_fail_phase",
         "_completed",
         "_enter_time",
         "_execution",
@@ -139,7 +190,9 @@ class NodeStateGuard:
         input_data: dict[str, Any],  # Row data (Tier 2 pipeline data)
         attempt: int = 0,
         resume_checkpoint_id: str | None = None,
+        auto_fail_phase: NodeStateAutoFailPhase,
     ) -> None:
+        validated_auto_fail_phase = _validate_auto_fail_phase(auto_fail_phase)
         self._execution = execution
         self._token_id = token_id
         self._node_id = node_id
@@ -148,8 +201,10 @@ class NodeStateGuard:
         self._input_data = input_data
         self._attempt = attempt
         self._resume_checkpoint_id = resume_checkpoint_id
+        self._auto_fail_phase = validated_auto_fail_phase
         self._enter_time: float = 0.0
         self._state: NodeStateOpen | None = None
+        self._abandoned = False
         self._completed = False
         self._terminal_persisted = False
 
@@ -179,6 +234,13 @@ class NodeStateGuard:
             # complete(FAILED)-then-reraise path must stamp too, since the
             # caller's ctx.state_id is scope-restored during unwind.
             stamp_node_state_id(exc_val, self.state_id)
+
+        if self._abandoned:
+            if not isinstance(exc_val, (SchedulerLeaseLostError, RunWorkerEvictedError)):
+                raise OrchestrationInvariantError(
+                    f"NodeStateGuard for state {self.state_id} was abandoned without a nominal ownership-loss exception."
+                )
+            return
 
         if self._completed:
             return
@@ -239,7 +301,7 @@ class NodeStateGuard:
         exc_error = ExecutionError(
             exception=exc_message,
             exception_type=exc_type.__name__,
-            phase="executor_post_process",
+            phase=self._auto_fail_phase,
             context=context,
         )
         try:
@@ -293,6 +355,21 @@ class NodeStateGuard:
         """Whether the caller has explicitly completed this state."""
         return self._completed
 
+    def abandon_open_state(self) -> None:
+        """Leave this attempt OPEN after an external ownership-loss verdict.
+
+        A recovered scheduler claim has moved to a new work-item generation.
+        Its old in-flight process must not forge COMPLETED or FAILED evidence
+        after that point; the OPEN attempt is the honest crash/abandonment
+        image. The caller must immediately propagate the ownership-loss
+        exception, which ``__exit__`` enforces.
+        """
+        if self._state is None:
+            raise OrchestrationInvariantError("Cannot abandon a NodeStateGuard before __enter__.")
+        if self._completed or self._terminal_persisted:
+            raise OrchestrationInvariantError(f"Cannot abandon terminal node state {self.state_id}.")
+        self._abandoned = True
+
     def complete(
         self,
         status: Literal[NodeStateStatus.COMPLETED, NodeStateStatus.FAILED],
@@ -312,7 +389,7 @@ class NodeStateGuard:
         """
         if status not in _GUARD_TERMINAL_NODE_STATE_STATUSES:
             valid = ", ".join(member.name for member in sorted(_GUARD_TERMINAL_NODE_STATE_STATUSES, key=lambda item: item.value))
-            status_name = status.name if isinstance(status, NodeStateStatus) else repr(status)
+            status_name = status.name if type(status) is NodeStateStatus else repr(status)
             raise OrchestrationInvariantError(
                 f"NodeStateGuard.complete() only accepts terminal node states ({valid}); got {status_name}. "
                 "Use ExecutionRepository.complete_node_state() directly for non-terminal state transitions."
@@ -320,7 +397,9 @@ class NodeStateGuard:
 
         # The repository signature takes Mapping-typed rows; rebuilding the
         # list widens the invariant element type (dict[str, Any] stays the
-        # runtime type either way).
+        # runtime type either way). isinstance, not an exact-type test: only
+        # isinstance narrows list OUT of the non-list arm, which is what makes
+        # the mapping arm assignable without a cast.
         normalized_output: Mapping[str, object] | list[Mapping[str, object]] | None = (
             list(output_data) if isinstance(output_data, list) else output_data
         )
@@ -353,6 +432,47 @@ class NodeStateGuard:
             self._terminal_persisted = True
             raise
 
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_aggregation_result(
+        self,
+        *,
+        batch_id: str,
+        run_id: str,
+        aggregation_node_id: str,
+        trigger_type: TriggerType,
+        output_mode: OutputMode,
+        output_rows: Sequence[PipelineRow],
+        output_shape: str,
+        output_hash: str,
+        members: Sequence[AggregationResultMember],
+        expansion_parent_token_id: str | None,
+        duration_ms: float,
+        success_reason: TransformSuccessReason | None,
+        context_after: NodeStateContext,
+    ) -> None:
+        """Complete node, batch, and transform output receipt atomically."""
+        try:
+            self._execution.complete_aggregation_result(
+                batch_id=batch_id,
+                run_id=run_id,
+                aggregation_node_id=aggregation_node_id,
+                state_id=self.state_id,
+                trigger_type=trigger_type,
+                output_mode=output_mode,
+                output_rows=output_rows,
+                output_shape=output_shape,
+                output_hash=output_hash,
+                members=members,
+                expansion_parent_token_id=expansion_parent_token_id,
+                duration_ms=duration_ms,
+                success_reason=success_reason,
+                context_after=context_after,
+            )
+        except LandscapePostCommitError:
+            self._terminal_persisted = True
+            raise
         self._terminal_persisted = True
         self._completed = True
 

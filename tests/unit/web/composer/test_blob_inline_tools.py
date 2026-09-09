@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -23,7 +24,9 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import ToolResult, get_tool_definitions
 from elspeth.web.composer.tools import execute_tool as _execute_tool
+from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
@@ -230,7 +233,19 @@ def _create_blob(
     filename: str = "prompt.txt",
     mime_type: str = "text/plain",
     content: str = "System prompt",
+    llm_authored: bool = False,
 ) -> ToolResult:
+    provenance_kwargs = (
+        {
+            "composer_model_identifier": "test-model",
+            "composer_model_version": "test-model-v1",
+            "composer_provider": "test-provider",
+            "composer_skill_hash": "a" * 64,
+            "tool_arguments_hash": "b" * 64,
+        }
+        if llm_authored
+        else {}
+    )
     return execute_tool(
         "create_blob",
         {"filename": filename, "mime_type": mime_type, "content": content},
@@ -240,7 +255,8 @@ def _create_blob(
         session_engine=blob_env["engine"],
         session_id=blob_env["session_id"],
         user_message_id="user-message-1",
-        user_message_content=f"Use this exact content:\n{content}",
+        user_message_content="Generate a source for me." if llm_authored else f"Use this exact content:\n{content}",
+        **provenance_kwargs,
     )
 
 
@@ -292,6 +308,126 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    @pytest.mark.parametrize(
+        ("node_type", "overrides"),
+        (
+            ("gate", {"condition": "True", "routes": {"true": "classified", "false": "classified"}}),
+            ("coalesce", {"branches": ("left", "right"), "policy": "require_all", "merge": "union", "on_success": "classified"}),
+            ("row_union", {"input": "left", "branches": {"left": "left", "right": "right"}, "on_success": "unioned"}),
+            ("queue", {"input": "structural"}),
+        ),
+    )
+    def test_rejects_structural_node_without_runtime_plugin_options(
+        self,
+        blob_env: dict[str, Any],
+        node_type: str,
+        overrides: dict[str, Any],
+    ) -> None:
+        """A successful wire must survive into the canonical runtime dict.
+
+        Structural nodes do not have plugin options in runtime YAML. Before
+        this guard, gate/coalesce markers vanished during lowering while
+        row_union/queue markers left an invalid state behind after the tool
+        had already reported success.
+        """
+        blob = _create_blob(blob_env, content="structural-node marker")
+        fields: dict[str, Any] = {
+            "id": "structural",
+            "node_type": node_type,
+            "plugin": None,
+            "input": "rows",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        state = replace(_inline_ref_state(), nodes=(NodeSpec(**{**fields, **overrides}),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:structural.options.payload",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.nodes[0].options == {}
+        assert result.data["error"] == (
+            "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
+        )
+
+    def test_candidate_runs_canonical_review_invariant_before_publication(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(blob_env, content="replacement prompt")
+        base = _inline_ref_state()
+        node = base.nodes[0]
+        state = replace(
+            base,
+            nodes=(
+                replace(
+                    node,
+                    options={
+                        **node.options,
+                        INTERPRETATION_REQUIREMENTS_KEY: [
+                            {
+                                "id": "duplicate",
+                                "kind": "vague_term",
+                                "user_term": "alpha",
+                                "draft": "first",
+                                "status": "pending",
+                                "event_id": None,
+                                "accepted_value": None,
+                                "accepted_artifact_hash": None,
+                                "resolved_prompt_template_hash": None,
+                            },
+                            {
+                                "id": "duplicate",
+                                "kind": "pipeline_decision",
+                                "user_term": "beta",
+                                "draft": "sk-sensitive-wire-review",
+                                "status": "pending",
+                                "event_id": None,
+                                "accepted_value": None,
+                                "accepted_artifact_hash": None,
+                                "resolved_prompt_template_hash": None,
+                            },
+                        ],
+                    },
+                ),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:classify.options.prompt_template",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data["error_code"] == "interpretation_requirements_invalid"
+        assert "sk-sensitive-wire-review" not in result.data["error"]
+
     @pytest.mark.parametrize("field_path", ["source.options.endpoint_url", "output:main.options.endpoint_url"])
     def test_aws_s3_endpoint_url_field_is_rejected_without_mutating_state(
         self,
@@ -462,6 +598,10 @@ class TestWireBlobInlineRef:
         assert result.updated_state is state
         assert "resolved_prompt_template_hash" in result.data["error"]
         assert "runtime-owned" in result.data["error"]
+        assert "field_path" in result.data["error"]
+        assert "patch_node_options" in result.data["error"]
+        assert "upsert_node" in result.data["error"]
+        assert "retry wire_blob_inline_ref" not in result.data["error"]
 
     def test_rejects_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -482,7 +622,147 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
+
+    def test_rejects_non_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="forged review metadata")
+        llm_state = _inline_ref_state()
+        passthrough = replace(
+            llm_state.nodes[0],
+            plugin="passthrough",
+            options={"schema": {"mode": "observed"}},
+        )
+        state = replace(llm_state, nodes=(passthrough,))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:classify.options.interpretation_requirements",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
+
+    def test_rejects_source_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="forged review metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "source.options.interpretation_requirements",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
+
+    @pytest.mark.parametrize("field_name", sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    def test_rejects_source_server_owned_root_field_path(
+        self,
+        blob_env: dict[str, Any],
+        field_name: str,
+    ) -> None:
+        blob = _create_blob(blob_env, content="forged source metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": f"source.options.{field_name}",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert field_name in result.data["error"]
+        assert "set_source_from_blob" in result.data["error"]
+
+    def test_rejects_output_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
+        blob = _create_blob(blob_env, content="forged review metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "output:classified.options.interpretation_requirements",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
+
+    def test_unrelated_wire_rejects_preexisting_output_interpretation_requirements(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(blob_env, content="replacement prompt")
+        base = _inline_ref_state()
+        output = base.outputs[0]
+        state = replace(
+            base,
+            outputs=(
+                replace(
+                    output,
+                    options={
+                        **output.options,
+                        INTERPRETATION_REQUIREMENTS_KEY: [
+                            {
+                                "poison": "sk-sensitive-output-review",
+                            }
+                        ],
+                    },
+                ),
+            ),
+        )
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:classify.options.prompt_template",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.data["error_code"] == "interpretation_requirements_invalid"
+        assert "sk-sensitive-output-review" not in result.data["error"]
 
     def test_rejects_invalid_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="prompt")
@@ -523,6 +803,109 @@ class TestWireBlobInlineRef:
 
 
 class TestSetSourceFromBlobMode:
+    def test_rebind_preserves_trusted_existing_source_requirement_id(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(
+            blob_env,
+            filename="input.csv",
+            mime_type="text/csv",
+            content="name\nAda",
+        )
+        trusted_id = "trusted-source-review-id"
+        requirement = {
+            "id": trusted_id,
+            "kind": "invented_source",
+            "user_term": "trusted_source_assumption",
+            "draft": "Review the source assumption.",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        }
+        base = _inline_ref_state()
+        source = base.sources["source"]
+        state = base.with_named_source(
+            "source",
+            replace(
+                source,
+                options={
+                    **source.options,
+                    INTERPRETATION_REQUIREMENTS_KEY: [requirement],
+                },
+            ),
+        )
+
+        result = execute_tool(
+            "set_source_from_blob",
+            {
+                "blob_id": blob.data["blob_id"],
+                "on_success": "rows",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": requirement["kind"],
+                            "user_term": requirement["user_term"],
+                            "draft": requirement["draft"],
+                        }
+                    ],
+                },
+            },
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success, result.to_dict()
+        retained = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
+        assert retained[0]["id"] == trusted_id
+
+    def test_source_blob_stager_rejects_different_kind_projecting_same_source_review_id(
+        self,
+        blob_env: dict[str, Any],
+    ) -> None:
+        blob = _create_blob(
+            blob_env,
+            filename="input.csv",
+            mime_type="text/csv",
+            content="name\nAda",
+            llm_authored=True,
+        )
+        state = _empty_state()
+
+        result = execute_tool(
+            "set_source_from_blob",
+            {
+                "blob_id": blob.data["blob_id"],
+                "on_success": "rows",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": "vague_term",
+                            "user_term": "inline_source_data",
+                            "draft": "sk-sensitive-source-review",
+                        }
+                    ],
+                },
+            },
+            state,
+            _catalog(),
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "interpretation_requirements_invalid" in result.data["error"]
+        assert "sk-sensitive-source-review" not in result.data["error"]
+
     def test_set_source_from_blob_emits_explicit_bind_source_mode(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, filename="input.csv", mime_type="text/csv", content="name\nAda")
 
@@ -577,3 +960,161 @@ def test_tool_definitions_include_inline_blob_authoring_tools() -> None:
     assert definitions["wire_blob_inline_ref"]["parameters"]["required"] == ["field_path", "blob_id"]
     assert definitions["wire_blob_inline_ref"]["parameters"]["additionalProperties"] is False
     assert definitions["delete_blob"]["parameters"]["additionalProperties"] is False
+
+
+def test_set_nested_option_rejects_non_object_segment_collision() -> None:
+    """A field_path segment that collides with an existing non-object value in the
+    web-authored container must be rejected, never coerced into an object."""
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"segment 'a' already exists and is not an object"):
+        _set_nested_option({"a": 5}, ["a", "b"], "marker")
+
+
+def test_set_nested_option_rejects_empty_field_path() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"at least one \.options\.<field> segment"):
+        _set_nested_option({}, [], "marker")
+
+
+def test_state_options_reference_blob_crashes_on_non_str_blob_ref() -> None:
+    """A present-but-non-str blob_ref in frozen state options is audited-state
+    corruption: the reference guard must escalate, not read it as unbound."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    with pytest.raises(AuditIntegrityError, match="non-str blob_ref"):
+        _state_options_reference_blob(
+            {"blob_ref": 7},
+            "0be5905a-3e69-49a5-a8e9-9617b691c665",
+            "blobs/session/file.csv",
+            owner="source 'input'",
+        )
+
+
+def test_state_options_reference_blob_finds_nested_reference() -> None:
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    blob_id = "0be5905a-3e69-49a5-a8e9-9617b691c665"
+    options = {"outer": {"items": ({"blob_ref": blob_id},)}}
+    assert _state_options_reference_blob(options, blob_id, "blobs/session/file.csv", owner="node 'n1'")
+
+
+_GUARD_BLOB_ID = "0be5905a-3e69-49a5-a8e9-9617b691c665"
+_GUARD_STORAGE_PATH = "blobs/session/file.csv"
+
+
+def _state_options_reference(options: Mapping[str, Any]) -> bool:
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    return _state_options_reference_blob(options, _GUARD_BLOB_ID, _GUARD_STORAGE_PATH, owner="source 'input'")
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        pytest.param({"blob_id": _GUARD_BLOB_ID}, True, id="blob_id-top-level"),
+        pytest.param({"custody": {"upload_blob_id": _GUARD_BLOB_ID}}, True, id="suffix-_blob_id-nested"),
+        pytest.param({"provider_config": {"source_blob_id": _GUARD_BLOB_ID}}, True, id="suffix-_blob_id-provider-config"),
+        pytest.param({"blob_id": "11111111-2222-3333-4444-555555555555"}, False, id="blob_id-other-blob"),
+        pytest.param({"blob_identifier": _GUARD_BLOB_ID}, False, id="not-vocabulary-blob_identifier"),
+        pytest.param({"blob_ids": [_GUARD_BLOB_ID]}, False, id="not-vocabulary-plural-scalar-list"),
+        pytest.param({"blob_id": None}, False, id="blob_id-none-is-unbound"),
+    ],
+)
+def test_state_options_reference_blob_recognises_blob_id_vocabulary(options: Mapping[str, Any], expected: bool) -> None:
+    """``blob_id`` and ``*_blob_id`` are binding vocabulary for every other walker.
+
+    Regression for elspeth-4f3cd4155b: the retention guard recognised only
+    ``blob_ref``/``path``/``file``. A blob bound through the ``blob_id`` /
+    ``*_blob_id`` custody vocabulary, which
+    ``guided/stage_transitions._option_blob_ids`` honours, read as unbound
+    here and became updatable/deletable under an accepted composition.
+    Negative rows pin that the vocabulary is exact: a near-miss key is not
+    a binding, and neither is the id as a bare list element.
+    """
+    assert _state_options_reference(options) is expected
+
+
+_GUARD_BLOB_ID_UPPER = _GUARD_BLOB_ID.upper()
+_INLINE_MARKER_UPPER = {
+    "blob_ref": _GUARD_BLOB_ID_UPPER,
+    "mode": "inline_content",
+    "sha256": "0" * 64,
+    "encoding": "utf-8",
+}
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        pytest.param({"blob_ref": _GUARD_BLOB_ID_UPPER}, True, id="blob_ref-upper"),
+        pytest.param({"blob_id": _GUARD_BLOB_ID_UPPER}, True, id="blob_id-upper"),
+        pytest.param({"custody": {"upload_blob_id": _GUARD_BLOB_ID_UPPER}}, True, id="suffix-_blob_id-upper"),
+        pytest.param({"prompt": _INLINE_MARKER_UPPER}, True, id="nested-inline-marker-upper"),
+        pytest.param({"path": f"blob:{_GUARD_BLOB_ID_UPPER}"}, True, id="blob-sentinel-upper"),
+        pytest.param({"file": f"BLOB:{_GUARD_BLOB_ID}"}, False, id="sentinel-prefix-is-case-exact"),
+        pytest.param({"blob_id": "not-a-uuid"}, False, id="unparseable-id-is-a-non-match"),
+        pytest.param({"blob_ref": "{" + _GUARD_BLOB_ID + "}"}, False, id="braced-spelling-is-not-bindable"),
+        pytest.param({"blob_ref": _GUARD_BLOB_ID.replace("-", "")}, False, id="unhyphenated-spelling-is-not-bindable"),
+        pytest.param({"blob_id": _GUARD_BLOB_ID_UPPER.replace("0BE5", "1BE5")}, False, id="other-blob-upper"),
+        pytest.param({"path": _GUARD_STORAGE_PATH.upper()}, False, id="storage-path-is-case-exact"),
+    ],
+)
+def test_state_options_reference_blob_compares_ids_by_uuid_identity(options: Mapping[str, Any], expected: bool) -> None:
+    """A bound blob is the same blob whichever hex case names it.
+
+    Review finding A1 on elspeth-4f3cd4155b: ``is_widened_blob_ref`` accepts
+    a ``blob_ref`` in either case (``_UUID_PATTERN`` is ``[0-9a-fA-F]``),
+    prevalidation strips such a marker as a valid deferred field, and the
+    runtime binds it through ``UUID(...)`` — so an upper-case marker the LLM
+    authored IS bound, while the guard's exact string compare read it as
+    unbound and let update/delete proceed with every test green. Fails on
+    ffe3a8b2b, passes on the repair.
+
+    The comparison admits exactly the variance the contract admits — hex
+    case in the hyphenated form — and nothing more: a braced or unhyphenated
+    spelling is rejected by ``is_widened_blob_ref`` and so can never be
+    bound, the ``blob:`` prefix and the storage path are ordinary strings
+    and stay case-exact, and a non-UUID string names no blob.
+    """
+    assert _state_options_reference(options) is expected
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        pytest.param({"inputs": [[{"blob_ref": _GUARD_BLOB_ID}]]}, True, id="list-of-lists-mapping"),
+        pytest.param({"inputs": ([({"path": _GUARD_STORAGE_PATH},)],)}, True, id="tuple-list-tuple-mapping"),
+        pytest.param({"inputs": [["x", 1, None, {"nested": {"file": f"blob:{_GUARD_BLOB_ID}"}}]]}, True, id="scalars-then-deep-mapping"),
+        pytest.param({"inputs": [[_GUARD_STORAGE_PATH]]}, False, id="bare-string-in-nested-list-is-not-a-binding"),
+        pytest.param({"inputs": [[{"blob_ref": "11111111-2222-3333-4444-555555555555"}]]}, False, id="deep-other-blob"),
+    ],
+)
+def test_state_options_reference_blob_descends_every_sequence_level(options: Mapping[str, Any], expected: bool) -> None:
+    """Sequence recursion is unconditional and shape-dispatched at every depth.
+
+    Regression for elspeth-4f3cd4155b: the walker descended one level into
+    a list/tuple and only into mapping elements, so a binding inside a
+    list of lists was invisible while the DB-side twin
+    ``_option_value_references_blob`` recursed into every list child.
+    """
+    assert _state_options_reference(options) is expected
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"blob_id": 7}, id="blob_id-int"),
+        pytest.param({"custody": {"upload_blob_id": ["not", "a", "str"]}}, id="suffix-_blob_id-list"),
+        pytest.param({"inputs": [[{"source_blob_id": 3.5}]]}, id="deep-suffix-_blob_id-float"),
+    ],
+)
+def test_state_options_reference_blob_crashes_on_non_str_blob_id_vocabulary(options: Mapping[str, Any]) -> None:
+    """The same escalation ``blob_ref`` already had: a non-str binding value is
+    audited-state corruption, and reading it as unbound would defeat the guard."""
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    with pytest.raises(AuditIntegrityError, match=r"non-str [a-z_]*blob_id"):
+        _state_options_reference(options)

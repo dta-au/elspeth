@@ -17,6 +17,7 @@ import {
   fetchAuditReadiness,
   fetchAuditReadinessExplain,
 } from "../api/auditReadiness";
+import { matchingAuditReadinessSnapshot } from "../lib/auditReadinessFreshness";
 import type {
   AuditReadinessSnapshot,
   AuditReadinessExplain,
@@ -59,13 +60,23 @@ export interface AuditReadinessState {
     compositionVersion: number,
     options?: LoadSnapshotOptions,
   ) => Promise<void>;
+  /** Re-stamp the cached snapshot onto a version whose authored content is
+   *  identical to the one it was fetched for (elspeth-986801d218). */
+  carrySnapshotForward: (
+    sessionId: string,
+    fromVersion: number,
+    toVersion: number,
+  ) => void;
   loadExplain: (sessionId: string, compositionVersion: number) => Promise<void>;
   clearSession: (sessionId: string) => void;
   reset: () => void;
   setUserExpanded: (sessionId: string, value: boolean) => void;
 }
 
-export const getInitialState = (): Omit<AuditReadinessState, "loadSnapshot" | "loadExplain" | "clearSession" | "reset" | "setUserExpanded"> => ({
+export const getInitialState = (): Omit<
+  AuditReadinessState,
+  "loadSnapshot" | "carrySnapshotForward" | "loadExplain" | "clearSession" | "reset" | "setUserExpanded"
+> => ({
   snapshotsBySession: {},
   explainsBySession: {},
   abortControllers: {},
@@ -86,7 +97,14 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
     options: LoadSnapshotOptions = { force: false },
   ) {
     const cached = get().snapshotsBySession[sessionId];
-    if (!options.force && cached && cached.composition_version === compositionVersion) {
+    if (
+      !options.force &&
+      matchingAuditReadinessSnapshot(
+        cached,
+        sessionId,
+        compositionVersion,
+      ) !== undefined
+    ) {
       return;
     }
 
@@ -102,9 +120,54 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
 
     try {
       const snapshot = await fetchAuditReadiness(sessionId, controller.signal);
+      if (
+        matchingAuditReadinessSnapshot(
+          snapshot,
+          sessionId,
+          compositionVersion,
+        ) === undefined
+      ) {
+        set((state) => {
+          if (state.abortControllers[sessionId] !== controller) {
+            return state;
+          }
+          const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
+          const current = state.snapshotsBySession[sessionId];
+          let snapshotsBySession = state.snapshotsBySession;
+          if (
+            current === cached &&
+            matchingAuditReadinessSnapshot(
+              current,
+              sessionId,
+              compositionVersion,
+            ) !== undefined
+          ) {
+            const { [sessionId]: _quarantined, ...restSnapshots } =
+              state.snapshotsBySession;
+            snapshotsBySession = restSnapshots;
+          }
+          return {
+            snapshotsBySession,
+            abortControllers: restCtrl,
+            isLoadingBySession: {
+              ...state.isLoadingBySession,
+              [sessionId]: false,
+            },
+            errorBySession: {
+              ...state.errorBySession,
+              [sessionId]:
+                "Audit readiness response did not match the requested composition.",
+            },
+          };
+        });
+        return;
+      }
       // Monotonic write guard: discard the response if a newer version has
       // already been stored while this fetch was in flight.
       set((state) => {
+        if (state.abortControllers[sessionId] !== controller) {
+          return state;
+        }
         const current = state.snapshotsBySession[sessionId];
         if (current && current.composition_version > snapshot.composition_version) {
           // Stale response arrived after a newer one was already cached —
@@ -152,6 +215,9 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       }
       const apiErr = err as ApiError;
       set((state) => {
+        if (state.abortControllers[sessionId] !== controller) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
         return {
           abortControllers: restCtrl,
@@ -185,7 +251,39 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
 
     try {
       const explain = await fetchAuditReadinessExplain(sessionId, explainController.signal);
+      if (
+        explain.session_id !== sessionId ||
+        explain.composition_version !== compositionVersion
+      ) {
+        set((state) => {
+          if (
+            state.explainAbortControllers[sessionId] !== explainController
+          ) {
+            return state;
+          }
+          const { [sessionId]: _ctrl, ...restCtrl } =
+            state.explainAbortControllers;
+          return {
+            explainAbortControllers: restCtrl,
+            isLoadingExplainBySession: {
+              ...state.isLoadingExplainBySession,
+              [sessionId]: false,
+            },
+            explainErrorBySession: {
+              ...state.explainErrorBySession,
+              [sessionId]:
+                "Audit explain response did not match the requested composition.",
+            },
+          };
+        });
+        return;
+      }
       set((state) => {
+        if (
+          state.explainAbortControllers[sessionId] !== explainController
+        ) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.explainAbortControllers;
         return {
           explainsBySession: {
@@ -222,6 +320,11 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       }
       const apiErr = err as ApiError;
       set((state) => {
+        if (
+          state.explainAbortControllers[sessionId] !== explainController
+        ) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.explainAbortControllers;
         return {
           explainAbortControllers: restCtrl,
@@ -233,6 +336,40 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
         };
       });
     }
+  },
+
+  carrySnapshotForward(sessionId: string, fromVersion: number, toVersion: number) {
+    // A version bump that authored NOTHING (a post-completion guided chat
+    // persists a byte-identical composition row) leaves the cached readiness
+    // exactly as true as it was, but every consumer matches on
+    // `composition_version`: without this the Checks badge flips to
+    // "Checking", ExecuteButton's advisory snapshot goes undefined, and the
+    // server runs a second full validation + audit projection — once per
+    // question, forever, on a surface that never used to bump the version.
+    //
+    // Guarded on `fromVersion` the way the auto-validate subscriber guards on
+    // "landed": only the snapshot fetched FOR the content-equal predecessor
+    // may move. A snapshot from some older version is not known to describe
+    // this content, and stamping it forward would assert a readiness the
+    // server never gave. The caller owns the content-equality proof
+    // (`compositionContentEqual`); this owns the identity check.
+    set((state) => {
+      const cached = state.snapshotsBySession[sessionId];
+      if (
+        cached === undefined ||
+        cached.session_id !== sessionId ||
+        cached.composition_version !== fromVersion ||
+        fromVersion === toVersion
+      ) {
+        return state;
+      }
+      return {
+        snapshotsBySession: {
+          ...state.snapshotsBySession,
+          [sessionId]: { ...cached, composition_version: toVersion },
+        },
+      };
+    });
   },
 
   clearSession(sessionId: string) {

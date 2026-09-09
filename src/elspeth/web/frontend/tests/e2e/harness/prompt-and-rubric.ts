@@ -31,9 +31,9 @@ export const FIXED_PROMPT =
   "Fetch each of these three synthetic project-brief pages and have an LLM " +
   "write a short summary of each page. Drop the raw HTML and write the rows " +
   "to a JSON file.\n" +
-  "https://johnm-dta.github.io/elspeth/tutorial-site/project-1.html\n" +
-  "https://johnm-dta.github.io/elspeth/tutorial-site/project-2.html\n" +
-  "https://johnm-dta.github.io/elspeth/tutorial-site/project-3.html";
+  "https://dta-au.github.io/elspeth/tutorial-site/project-1.html\n" +
+  "https://dta-au.github.io/elspeth/tutorial-site/project-2.html\n" +
+  "https://dta-au.github.io/elspeth/tutorial-site/project-3.html";
 
 // Dimension (c): which interpretation kinds the composer SHOULD raise vs NOT.
 // Graded on kind, not exact wording. InterpretationKind values come from the

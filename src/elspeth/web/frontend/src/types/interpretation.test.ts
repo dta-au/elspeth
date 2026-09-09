@@ -28,10 +28,15 @@ import type { TurnType } from "./guided";
 type Equals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
 describe("interpretation protocol types", () => {
-  it("InterpretationChoice union has exactly 5 values matching the Python enum", () => {
+  it("InterpretationChoice union has exactly 6 values matching the Python enum", () => {
     const _exact: Equals<
       InterpretationChoice,
-      "pending" | "accepted_as_drafted" | "amended" | "opted_out" | "abandoned"
+      | "pending"
+      | "accepted_as_drafted"
+      | "amended"
+      | "opted_out"
+      | "abandoned"
+      | "superseded"
     > = true;
     const all: InterpretationChoice[] = [
       "pending",
@@ -39,9 +44,10 @@ describe("interpretation protocol types", () => {
       "amended",
       "opted_out",
       "abandoned",
+      "superseded",
     ];
     expect(_exact).toBe(true);
-    expect(all).toHaveLength(5);
+    expect(all).toHaveLength(6);
   });
 
   it("InterpretationSource union has exactly 3 values matching the Python enum", () => {
@@ -58,7 +64,7 @@ describe("interpretation protocol types", () => {
     expect(all).toHaveLength(3);
   });
 
-  it("InterpretationKind union has exactly 5 values matching the Python enum", () => {
+  it("InterpretationKind union has exactly 6 values matching the Python enum", () => {
     const _exact: Equals<
       InterpretationKind,
       | "vague_term"
@@ -66,6 +72,7 @@ describe("interpretation protocol types", () => {
       | "llm_prompt_template"
       | "pipeline_decision"
       | "llm_model_choice"
+      | "source_data_contract"
     > = true;
     const all: InterpretationKind[] = [
       "vague_term",
@@ -73,10 +80,11 @@ describe("interpretation protocol types", () => {
       "llm_prompt_template",
       "pipeline_decision",
       "llm_model_choice",
+      "source_data_contract",
     ];
     expect(_exact).toBe(true);
     expect(INTERPRETATION_KIND_VALUES).toEqual(all);
-    expect(all).toHaveLength(5);
+    expect(all).toHaveLength(6);
   });
 
   it("InterpretationKind rejects unknown runtime values", () => {

@@ -2,12 +2,14 @@
   "knob_schema": {
     "fields": [
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
         "nullable": false,
-        "required": true
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Dataverse environment URL (e.g., https://myorg.crm.dynamics.com)",
@@ -15,7 +17,8 @@
         "label": "Environment URL",
         "name": "environment_url",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Authentication configuration",
@@ -23,7 +26,8 @@
         "label": "Auth",
         "name": "auth",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "v9.2",
@@ -32,15 +36,17 @@
         "label": "API Version",
         "name": "api_version",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
-        "description": "Target entity logical name",
+        "description": "Target Dataverse EntitySetName used in the OData collection path",
         "kind": "text",
         "label": "Entity",
         "name": "entity",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "upsert",
@@ -52,7 +58,8 @@
         "label": "Mode",
         "name": "mode",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Pipeline field \u2192 Dataverse column mapping",
@@ -60,7 +67,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Business key field for upsert (PATCH with alternate key)",
@@ -68,7 +76,8 @@
         "label": "Alternate Key",
         "name": "alternate_key",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -77,7 +86,8 @@
         "label": "Lookups",
         "name": "lookups",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -87,7 +97,8 @@
         "label": "Additional Domains",
         "name": "additional_domains",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

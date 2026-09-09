@@ -22,12 +22,17 @@ from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLim
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import SourceDataConfig
+from elspeth.plugins.infrastructure.config_base import (
+    NormalizedFieldMappingOption,
+    SourceDataConfig,
+    declared_source_schema_field_names,
+)
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
+    check_declared_fields_reachable,
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
@@ -87,7 +92,7 @@ class JSONSourceConfig(SourceDataConfig):
         description="Optional top-level object key containing the array of records to read from a JSON document.",
     )
     encoding: str = Field(default="utf-8", description="Text encoding used to decode the JSON or JSONL file.")
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Optional mapping from observed JSON object keys to normalized pipeline field names.",
     )
@@ -130,6 +135,27 @@ class JSONSourceConfig(SourceDataConfig):
             validate_field_names(list(self.field_mapping.values()), "field_mapping values")
         return self
 
+    @model_validator(mode="after")
+    def _validate_declared_field_reachability(self) -> "JSONSourceConfig":
+        """Reject declared schema names no row can ever carry (elspeth-3664e213c4).
+
+        JSON object keys are normalized to lowercase identifiers at the source
+        boundary while declared names are used verbatim — the same seam as the
+        CSV source. Sparse records (require_all_mapping_keys=False at load) do
+        not change reachability: field_mapping is applied after normalization
+        on every path that introduces a key, so a mapping key never survives as
+        a final name and mapping values stay reachable.
+        """
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            check_declared_fields_reachable(
+                declared,
+                columns=None,
+                field_mapping=self.field_mapping,
+                header_kind="JSON object keys",
+            )
+        return self
+
 
 class JSONSource(BaseSource):
     """Load rows from a JSON file.
@@ -150,10 +176,30 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:dfb31604c97ebab8"
+    source_file_hash: str | None = "sha256:9f0b0a653e365a0b"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
+
+    usage_when_to_use: str = (
+        "Use for a bounded JSON array or JSONL file; prefer JSONL for large or naturally line-oriented input, and use data_key "
+        "only to select a wrapped array in a JSON document."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for plain text or CSV, JSON arrays too large to load as one document, or JSONL combined with data_key."
+    )
+    example_use: str = """sources:
+  json_input:
+    plugin: json
+    on_success: output
+    options:
+      path: data/input.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("json", "jsonl", "file", "batch")
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
@@ -683,6 +729,7 @@ class JSONSource(BaseSource):
                     "Format auto-detects from extension (.json vs .jsonl); set 'format' explicitly only if extension is misleading.",
                     "JSON arrays nested under a key require 'data_key'; otherwise the top-level value must be an array.",
                     "Same schema-mode rules as csv: default to 'observed' unless the user asked to project to a smaller schema.",
+                    "JSON object keys are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid). Declare the normalized form, or keep an original key via field_mapping: {normalized: Original}; other declared names are rejected at config time.",
                     "JSONL is resumable, line-by-line; JSON-array is loaded into memory in one pass — pick JSONL for large inputs.",
                     "If you have been asked to generate JSON rows yourself (the invented_source path): emit a top-level JSON array of objects (or JSONL with one object per line). Every object must carry the same keys you intend downstream nodes to consume.",
                     'Declare generated JSON keys in `schema.fields` or `schema.guaranteed_fields`. Do not wrap generated content in `{"results": [...]}` or any other envelope — emit the bare array so `data_key` is unnecessary.',

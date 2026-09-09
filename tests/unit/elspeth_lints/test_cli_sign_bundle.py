@@ -1,14 +1,19 @@
 """``sign-bundle`` -- the operator (key-bearing) firing command.
 
 ``sign-bundle`` is the *only* place a judge signature is minted from a staged
-review bundle. It re-verifies every staged claim against the live tree (the
-atomicity gate -- abort before any write), then fires per-action:
+review bundle. It re-verifies every staged claim against the live tree, fires
+actions into a durable private copy, and publishes the coherent directory only
+after final re-verification:
 
 * ``drift_repair`` re-runs the real judge through the ``sign-judge-signatures``
   ceremony (re-judging prevents laundering a stale verdict over drifted content);
 * ``new_judgment`` runs the real judge inside the keyed step;
 * ``rotation`` mechanically re-binds a *non-judge-gated* key (no judge);
 * ``stale_delete`` removes an orphaned entry (no judge).
+
+Deterministic actions run first. A BLOCK/exception/interruption preserves the
+active allowlist byte-for-byte and prints a resume command; resume reuses only
+authoritatively re-verified signatures.
 
 These tests run with the operator HMAC key PRESENT (so diagnose is authoritative,
 unlike the keyless ``test_bundle_verify`` suite); the signing key the fixtures
@@ -23,12 +28,19 @@ Fixtures are replicated locally (rather than imported from
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -44,6 +56,7 @@ from elspeth_lints.core.review_bundle import (
     ReviewBundle,
     write_bundle,
 )
+from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 _HMAC_KEY = "x" * 32
@@ -198,6 +211,7 @@ def _stale_rotation_key(finding: Any, *, fp: str = "deadbeefdeadbeef") -> str:
 # (a bare ``allow_hits:`` with no items is rejected by the loader). It is never a
 # bundle action key, so verify ignores it.
 _SPARE_PRE_JUDGE_KEY = "plugins/spare.py:R1:Widget:lookup:fp=feedface00000000"
+_TRAILING_SPARE_PRE_JUDGE_KEY = "plugins/trailing.py:R1:Widget:lookup:fp=feedface11111111"
 
 
 def _write_signed_entry_with_spare(
@@ -207,10 +221,10 @@ def _write_signed_entry_with_spare(
     finding: Any,
     scope_fingerprint: str | None = None,
 ) -> str:
-    """Write a YAML with a leading spare pre-judge entry then the (drifted) signed entry.
+    """Write a YAML with the (drifted) signed entry between two spare entries.
 
-    The signed entry is LAST, so a pop->restore round-trip re-appends it to the
-    same position and the file stays byte-identical (the block_not_laundered pin).
+    Keeping the signed entry in the middle makes sequence position observable:
+    drift repair must replace or restore it in place rather than appending it.
     """
     key = _canonical_key(finding)
     stored_scope = finding.scope_fingerprint if scope_fingerprint is None else scope_fingerprint
@@ -218,6 +232,7 @@ def _write_signed_entry_with_spare(
         "allow_hits:",
         *_pre_judge_entry_lines(_SPARE_PRE_JUDGE_KEY),
         *_signed_entry_lines(key, ast_path=finding.ast_path, scope_fingerprint=stored_scope),
+        *_pre_judge_entry_lines(_TRAILING_SPARE_PRE_JUDGE_KEY),
     ]
     (allowlist_dir / yaml_name).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return key
@@ -235,15 +250,31 @@ def _bundle(
     *,
     bundle_id: str = "sign-bundle-under-test",
 ) -> ReviewBundle:
+    repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    if (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    ):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "sign-bundle@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Sign Bundle Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
     return ReviewBundle(
         bundle_id=bundle_id,
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root=str(root),
         allowlist_dir=str(allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=binding.source_rev,
+        source_dirty=binding.source_dirty,
+        source_snapshot_sha256=binding.source_snapshot_sha256,
         actions=actions,
     )
 
@@ -252,7 +283,13 @@ def _write_bundle_file(tmp_path: Path, bundle: ReviewBundle) -> Path:
     return write_bundle(bundle, staged_dir=tmp_path / "staged")
 
 
-def _new_judgment_action(finding: Any, rel: str, *, preview: ActionPreview | None = None) -> BundleAction:
+def _new_judgment_action(
+    finding: Any,
+    rel: str,
+    *,
+    preview: ActionPreview | None = None,
+    draft_rationale: str | None = "payload is Tier-3 external data from upstream tool-call",
+) -> BundleAction:
     key = _canonical_key(finding)
     return BundleAction(
         lane="new_judgment",
@@ -262,7 +299,7 @@ def _new_judgment_action(finding: Any, rel: str, *, preview: ActionPreview | Non
         symbol="Widget.lookup",
         rule="R1",
         fingerprint=key.rsplit(":fp=", 1)[1],
-        draft_rationale="payload is Tier-3 external data from upstream tool-call",
+        draft_rationale=draft_rationale,
         preview=preview,
     )
 
@@ -275,6 +312,23 @@ def _argv(
     owner: str = "test-operator",
     extra: tuple[str, ...] = (),
 ) -> list[str]:
+    """Build a ``sign-bundle`` argv bound to this test's tmp_path.
+
+    ``--rotation-log`` defaults to the CWD-relative ``.elspeth/rotations.log``,
+    which ``create_transaction`` resolves against the *process* CWD -- under
+    pytest that is the checkout, so an unqualified invocation binds the
+    repository's own tracked rotation manifest: the transaction snapshots its
+    bytes into ``rotation-base.bin``, ``assert_rotation_log_unchanged`` gates on
+    them, and a rotation that reaches ``finalize_rotation_log`` appends a
+    tmp-dir record to a tracked file. Bind every invocation to the test's
+    tmp_path instead (``allowlist_dir.parent``: ``_build_allowlist_dir`` always
+    returns ``tmp_path / <name>``), which is the same ``tmp_path /
+    "rotations.log"`` the rotation tests already pass explicitly. Callers that
+    supply their own ``--rotation-log`` in ``extra`` keep it -- resume runs
+    authenticate ``rotation_log`` against the transaction manifest
+    (``assert_resume_identity``), so both legs must select the same path.
+    """
+    rotation_log = () if "--rotation-log" in extra else ("--rotation-log", str(allowlist_dir.parent / "rotations.log"))
     return [
         "sign-bundle",
         str(bundle_path),
@@ -284,17 +338,24 @@ def _argv(
         str(allowlist_dir),
         "--owner",
         owner,
+        *rotation_log,
         *extra,
     ]
 
 
 @contextmanager
-def _patch_judge(verdict_for: Callable[[str], JudgeVerdict]) -> Iterator[list[str]]:
+def _patch_judge(
+    verdict_for: Callable[[str], JudgeVerdict],
+    *,
+    request_log: list[Any] | None = None,
+) -> Iterator[list[str]]:
     """Patch the real judge at the lazy-import seam; dispatch verdict by file_path."""
     calls: list[str] = []
 
     def _fake(request: Any, **kwargs: Any) -> JudgeResponse:
         calls.append(request.file_path)
+        if request_log is not None:
+            request_log.append(request)
         verdict = verdict_for(request.file_path)
         return JudgeResponse(
             verdict=verdict,
@@ -327,9 +388,53 @@ def _diagnose(root: Path, allowlist_dir: Path) -> Any:
     return diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
 
 
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+# The distinctive line ``_emit_sign_bundle_recovery`` prints. Asserting on
+# ``--resume`` alone cannot discriminate: ``_run_sign_bundle`` also names the
+# flag when it announces a freshly created transaction, and that line is correct.
+_RECOVERY_GUIDANCE = "re-verify and resume with"
+
+
+def _recovery_path(stderr: str) -> Path:
+    """Extract a transaction directory from any ``--resume`` mention in stderr.
+
+    NOT evidence that recovery guidance was offered: this also matches the
+    creation-time "if interrupted, resume with --resume <dir>" line, which is
+    printed on the SUCCESS path too. Assert ``_RECOVERY_GUIDANCE`` for that.
+    """
+    match = re.search(r"--resume\s+('([^']+)'|(\S+))", stderr)
+    if match is None:
+        raise AssertionError(f"no recovery command in stderr:\n{stderr}")
+    return Path(match.group(2) or match.group(3))
+
+
 # =========================================================================== #
 # Task 2.1 -- subparser, dispatch, fail-closed key hoist, load + integrity
 # =========================================================================== #
+
+
+def test_argv_never_selects_the_repository_rotation_manifest(tmp_path: Path) -> None:
+    """No sign-bundle invocation may bind the checkout's tracked rotations.log.
+
+    Regression for the CWD-relative ``--rotation-log`` default: a leaked
+    binding lets a rotation append a tmp-dir record to a tracked file, which
+    dirties the tree and trips pre-commit dirty-checks. Asserted at ``_argv``
+    because that is the single chokepoint every test invocation passes through.
+    """
+    from elspeth_lints.core.cli import _build_parser
+
+    repo_manifest = (Path.cwd() / ".elspeth" / "rotations.log").resolve()
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    explicit = str(tmp_path / "explicit-rotations.log")
+    for extra in ((), ("--yes",), ("--yes", "--resume", str(tmp_path / "tx")), ("--yes", "--rotation-log", explicit)):
+        argv = _argv(tmp_path / "bundle.json", tmp_path / "src_root", allowlist_dir, extra=extra)
+        assert argv.count("--rotation-log") == 1, f"{extra!r} produced a duplicate/missing --rotation-log: {argv!r}"
+        selected = _build_parser().parse_args(argv).rotation_log.resolve()
+        assert selected != repo_manifest, f"{extra!r} selected the repository rotation manifest"
+        assert tmp_path.resolve() in selected.parents, f"{extra!r} selected {selected} outside tmp_path"
 
 
 def test_sign_bundle_fails_closed_without_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -420,6 +525,26 @@ def test_sign_bundle_aborts_on_tree_drift_mismatch(tmp_path: Path, capsys: pytes
     assert yaml_path.read_text(encoding="utf-8") == before  # no write
 
 
+def test_sign_bundle_aborts_before_transaction_when_target_census_is_incomplete(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, ()))
+    before = _tree_bytes(allowlist_dir)
+
+    with _patch_judge(_accept_all) as judge_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert exit_code == 2
+    assert judge_calls == []
+    assert _tree_bytes(allowlist_dir) == before
+    assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
+    assert "target census missing justify action" in capsys.readouterr().err
+
+
 # =========================================================================== #
 # Task 2.3 -- resign lane (drift_repair re-judges; rotation/stale_delete no judge)
 # =========================================================================== #
@@ -441,26 +566,107 @@ def _drift_repair_ast_path_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     return root, allowlist_dir, key
 
 
-def test_sign_bundle_drift_repair_rejudges(tmp_path: Path) -> None:
+@pytest.mark.parametrize("revised_rationale", [None, "Widget.lookup validates the externally supplied payload name."])
+def test_sign_bundle_drift_repair_rejudges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revised_rationale: str | None) -> None:
+    import yaml
+
+    from elspeth_lints.mcp import server as judge_server
+
     root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    original_yaml = (allowlist_dir / "plugins.yaml").read_bytes()
+    original_reason = next(entry["reason"] for entry in yaml.safe_load(original_yaml)["allow_hits"] if entry["key"] == key)
     # Sanity: the tree genuinely reports the claimed status.
     assert any(i.status == "AST_PATH_BINDING_DRIFT" for i in _diagnose(root, allowlist_dir).items)
     bundle = _bundle(
         root, allowlist_dir, (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT"),)
     )
     bundle_path = _write_bundle_file(tmp_path, bundle)
+    if revised_rationale is not None:
+        ctx = judge_server._ServerContext(root=root, allowlist_dir=allowlist_dir, staged_dir=bundle_path.parent)
+        with monkeypatch.context() as keyless:
+            keyless.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+            outcome = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle.bundle_id, "rationales": {key: revised_rationale}})
+        assert not outcome.is_error, outcome.text
+        assert (allowlist_dir / "plugins.yaml").read_bytes() == original_yaml
 
-    with _patch_judge(_accept_all) as calls:
+    requests: list[Any] = []
+    with _patch_judge(_accept_all, request_log=requests) as calls:
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc == 0
     assert calls == ["plugins/widget.py"]  # the real judge WAS re-run
+    assert requests[0].rationale == (original_reason if revised_rationale is None else revised_rationale)
     post = _diagnose(root, allowlist_dir)
     assert not any(i.status == "AST_PATH_BINDING_DRIFT" for i in post.items)
     assert any(i.status == "OK_AUTHORITATIVE" for i in post.items)
+    repaired_key = next(i.key for i in post.items if i.status == "OK_AUTHORITATIVE")
+    written = yaml.safe_load((allowlist_dir / "plugins.yaml").read_text(encoding="utf-8"))
+    repaired_entry = next(entry for entry in written["allow_hits"] if entry["key"] == repaired_key)
+    assert requests[0].rationale in repaired_entry["reason"]
+    assert [entry["key"] for entry in written["allow_hits"]] == [
+        _SPARE_PRE_JUDGE_KEY,
+        repaired_key,
+        _TRAILING_SPARE_PRE_JUDGE_KEY,
+    ]
 
 
-def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path) -> None:
+def test_sign_bundle_blank_drift_rationale_refuses_before_judging(tmp_path: Path) -> None:
+    root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    before = (allowlist_dir / "plugins.yaml").read_bytes()
+    action = BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT", draft_rationale=" \n")
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, (action,)))
+
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert calls == []
+    assert (allowlist_dir / "plugins.yaml").read_bytes() == before
+
+
+def test_sign_bundle_stale_drift_repair_claim_offers_no_resume_recovery(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A drift_repair the fresh diagnosis can no longer sign is re-staged, not resumed.
+
+    The abort happens before any write, and a resume re-derives the same fresh
+    diagnosis and stops in the same place, so the paste-ready ``--resume``
+    command would contradict the "re-run stage_scan" line it follows. The
+    unrepairable set is the guard's own input, so it is supplied at that seam --
+    reaching this branch through the tree would require a diagnosis that flipped
+    to unsignable while still satisfying the whole-bundle re-verification.
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root, allowlist_dir, (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT"),)
+        ),
+    )
+    real_specs = cli_module._signing_specs_from_diagnosis
+
+    def _unsignable(report: Any) -> Any:
+        specs, stale_keys, unrepairable = real_specs(report)
+        stale = SimpleNamespace(key=key)
+        return specs, stale_keys, (*unrepairable, stale)
+
+    with (
+        _patch_judge(_accept_all) as calls,
+        patch.object(cli_module, "_signing_specs_from_diagnosis", side_effect=_unsignable),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert calls == []  # aborted before any paid judge call
+    assert _tree_bytes(allowlist_dir) == before
+    err = capsys.readouterr().err
+    assert "no longer signable" in err
+    assert _RECOVERY_GUIDANCE not in err
+
+
+@pytest.mark.parametrize("draft_rationale", [None, "Widget.lookup rejects malformed external names."])
+def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path, draft_rationale: str | None) -> None:
     """§5.5/§7: an honest SCOPE drift that the judge BLOCKs is not laundered.
 
     The reused ceremony pops the stale row before judging and re-appends it on
@@ -476,20 +682,29 @@ def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path) -> None:
     before = yaml_path.read_text(encoding="utf-8")
     assert any(i.status == "SCOPE_BINDING_DRIFT" for i in _diagnose(root, allowlist_dir).items)
     bundle = _bundle(
-        root, allowlist_dir, (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="SCOPE_BINDING_DRIFT"),)
+        root,
+        allowlist_dir,
+        (
+            BundleAction(
+                lane="resign", kind="drift_repair", key=key, diagnosis_status="SCOPE_BINDING_DRIFT", draft_rationale=draft_rationale
+            ),
+        ),
     )
     bundle_path = _write_bundle_file(tmp_path, bundle)
 
-    with _patch_judge(_block_all) as calls:
+    requests: list[Any] = []
+    with _patch_judge(_block_all, request_log=requests) as calls:
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc != 0
     assert calls == ["plugins/widget.py"]  # judge ran and BLOCKed
+    if draft_rationale is not None:
+        assert requests[0].rationale == draft_rationale
     assert yaml_path.read_text(encoding="utf-8") == before  # restored intact -- NOT deleted, NOT re-signed
     assert "b" * 64 in before  # the original drifted scope binding is still on disk
 
 
-def test_sign_bundle_drift_repair_block_records_override_rate_event(tmp_path: Path) -> None:
+def test_sign_bundle_drift_repair_block_records_override_rate_event(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A BLOCKed drift_repair must leave its ``blocked_without_override`` record in
     the override-rate decision-events trail -- the governance SIDE EFFECT, sibling
     of the rotation-manifest pin.
@@ -527,11 +742,9 @@ def test_sign_bundle_drift_repair_block_records_override_rate_event(tmp_path: Pa
     assert calls == ["plugins/widget.py"]  # judge ran and BLOCKed
     assert yaml_path.read_text(encoding="utf-8") == before  # YAML restored -> live recompute sees no block
 
-    events_path = judge_decision_events_path(allowlist_dir)
-    assert events_path.exists(), (
-        "drift_repair BLOCKED but wrote no override-rate decision event -- "
-        "compute_override_rate's blocked_without_override counter will undercount the judge block"
-    )
+    transaction = _recovery_path(capsys.readouterr().err)
+    events_path = judge_decision_events_path(next(path for path in transaction.rglob("enforce_tier_model") if path.is_dir()))
+    assert events_path.exists(), "drift_repair BLOCKED but preserved no override-rate decision event in the recovery transaction"
     events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert any(
         event["entry_key"] == key
@@ -582,7 +795,9 @@ def test_sign_bundle_rotation_records_rotation_manifest(tmp_path: Path) -> None:
     bundle = _bundle(root, allowlist_dir, (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),))
     bundle_path = _write_bundle_file(tmp_path, bundle)
 
+    publish_window_start = datetime.now(UTC)
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rot_log))))
+    publish_window_end = datetime.now(UTC)
 
     assert rc == 0
     assert f"- key: {live_key}" in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
@@ -590,20 +805,580 @@ def test_sign_bundle_rotation_records_rotation_manifest(tmp_path: Path) -> None:
     records = [json.loads(line) for line in rot_log.read_text(encoding="utf-8").splitlines() if line.strip()]
     rotations = [item for rec in records for item in rec.get("rotations", [])]
     assert {"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in rotations
+    rotation_recorded_at = datetime.fromisoformat(records[0]["recorded_at"])
+    assert publish_window_start <= rotation_recorded_at <= publish_window_end
 
 
-def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path: Path) -> None:
-    """Third-consumer regression: no unfiltered re-scan at execute + no over-application.
+def test_sign_bundle_rotation_log_conflict_fails_before_active_publish(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import elspeth_lints.core.cli as cli_module
 
-    Populations: (1) a judge-gated, fp-SHIFTED NON-action entry in the scanned
-    dir (would crash an unfiltered whole-dir scan at ``plan_rotations``);
-    (2) ONE non-judge-gated rotation that IS the staged action; (3) a SECOND,
-    surveyed-but-UNSTAGED non-judge-gated rotation. Against the pre-fix lane that
-    copies ``_run_rotate``'s default unfiltered ``scan_for_rotations`` this would
-    ``RuntimeError`` at execute (population 1) and/or over-apply population (3);
-    the fixed lane reuses the carried filtered plan and applies a one-``Rotation``
-    minimal plan, so it neither raises nor touches population (3).
-    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    before = _tree_bytes(allowlist_dir)
+    rotation_log = tmp_path / "rotations.log"
+    rotation_log.write_text('{"base":true}\n', encoding="utf-8")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_rotation = cli_module._execute_rotation_action
+
+    def _rotate_then_conflict(action: Any, *, rotation_plan: Any, args: Any) -> int:
+        code = real_rotation(action, rotation_plan=rotation_plan, args=args)
+        rotation_log.write_text('{"external":true}\n', encoding="utf-8")
+        return code
+
+    with patch.object(cli_module, "_execute_rotation_action", side_effect=_rotate_then_conflict):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert _recovery_path(capsys.readouterr().err).is_dir()
+
+
+def test_sign_bundle_aborts_before_transaction_judge_or_write_on_harmless_source_drift(tmp_path: Path) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, ()))
+    before = _tree_bytes(allowlist_dir)
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless comment\n", encoding="utf-8")
+
+    with (
+        patch.object(sign_bundle_transaction, "create_transaction") as create_transaction,
+        patch("elspeth_lints.core.judge.call_judge") as call_judge,
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    create_transaction.assert_not_called()
+    call_judge.assert_not_called()
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_resume_replays_rotation_interrupted_before_audit_record(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from elspeth_lints.rules.trust_tier.tier_model import rotate
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    before = _tree_bytes(allowlist_dir)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+
+    with patch.object(rotate, "_append_rotation_manifest", side_effect=KeyboardInterrupt()):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+
+    assert rc == 130
+    assert _tree_bytes(allowlist_dir) == before
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 0
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in rotation_log.read_text(encoding="utf-8").splitlines()]
+    assert any({"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in record["rotations"] for record in records)
+    assert all(record["allowlist_dir"] == str(allowlist_dir.resolve()) for record in records)
+
+
+def test_sign_bundle_resume_finalizes_rotation_audit_after_published_interruption(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+
+    with patch.object(
+        sign_bundle_transaction,
+        "finalize_rotation_log",
+        side_effect=KeyboardInterrupt(),
+    ):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+
+    assert rc == 130
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+    assert not rotation_log.exists()
+    transaction = _recovery_path(capsys.readouterr().err)
+    # The exchange committed, then the process died before the audit append.
+    # A coordinated writer legitimately mutates the newly active tree before
+    # resume; recovery must preserve it and still finalize the committed audit.
+    import elspeth_lints.core.cli as cli_module
+
+    cli_module._append_entry_to_yaml(
+        allowlist_dir / "later.yaml",
+        "\n".join(_pre_judge_entry_lines(_SPARE_PRE_JUDGE_KEY)) + "\n",
+    )
+    rotation_log.write_text('{"kind":"external_append"}\n', encoding="utf-8")
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 0
+    records = [json.loads(line) for line in rotation_log.read_text(encoding="utf-8").splitlines()]
+    assert {"kind": "external_append"} in records
+    assert any(
+        {"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in record.get("rotations", []) for record in records
+    )
+    rotation_records = [record for record in records if record.get("kind") == "tier_model_rotation"]
+    assert all(record["allowlist_dir"] == str(allowlist_dir.resolve()) for record in rotation_records)
+    assert _SPARE_PRE_JUDGE_KEY in (allowlist_dir / "later.yaml").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("published_before_interrupt", [False, True])
+def test_sign_bundle_resume_migrates_legacy_pending_publication_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    published_before_interrupt: bool,
+) -> None:
+    """Schema-v1 journals without the new field recover in either orientation."""
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _interrupt_publish(transaction: Path, manifest: dict[str, Any]) -> None:
+        if published_before_interrupt:
+            real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _interrupt_publish)
+    assert (
+        main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+        == 130
+    )
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    # Simulate an authenticated pre-upgrade schema-v1 journal. The historic
+    # manifest had publish_started_at but no explicit source-validation field.
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    manifest.pop("source_validation_state")
+    sign_bundle_transaction.save_manifest(transaction, manifest)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 0
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in rotation_log.read_text(encoding="utf-8").splitlines()]
+    assert any({"source_file": "gadget.yaml", "old_key": stale_key, "new_key": live_key} in record["rotations"] for record in records)
+
+
+def test_sign_bundle_resume_does_not_roll_back_completed_legacy_rotation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rotation_log)))) == 0
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    manifest.pop("source_validation_state")
+    sign_bundle_transaction.save_manifest(transaction, manifest)
+    before_allowlist = _tree_bytes(allowlist_dir)
+    before_rotation = rotation_log.read_bytes()
+
+    _write_source(root, "plugins/gadget.py", "gadget", active=False)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before_allowlist
+    assert rotation_log.read_bytes() == before_rotation
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+
+
+def test_publication_disposition_rejects_preexchange_writer_and_base_mimic(
+    tmp_path: Path,
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+    from elspeth_lints.core import sign_bundle_transaction
+
+    active = _build_allowlist_dir(tmp_path)
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "_defaults.yaml").write_text(
+        (candidate / "_defaults.yaml").read_text(encoding="utf-8") + "# candidate\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+        "base_directory_identity": sign_bundle_transaction.directory_identity(active),
+        "candidate_directory_identity": sign_bundle_transaction.directory_identity(candidate),
+        "publish_started_at": datetime.now(UTC).isoformat(),
+    }
+    # Mimic post-publish bytes without exchanging directory identities: a
+    # scratch writer restores base bytes in-place while a coordinated writer
+    # advances the still-old active tree.
+    for child in candidate.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    shutil.copytree(active, candidate, dirs_exist_ok=True)
+    cli_module._append_entry_to_yaml(
+        active / "later.yaml",
+        "\n".join(_pre_judge_entry_lines(_SPARE_PRE_JUDGE_KEY)) + "\n",
+    )
+
+    with pytest.raises(
+        sign_bundle_transaction.SignBundleTransactionError,
+        match="cannot reconcile transaction publication",
+    ):
+        sign_bundle_transaction.publication_disposition(manifest)
+
+
+def test_publish_rejects_byte_identical_active_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    active = _build_allowlist_dir(tmp_path)
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "_defaults.yaml").write_text(
+        (candidate / "_defaults.yaml").read_text(encoding="utf-8") + "# candidate\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+        "base_directory_identity": sign_bundle_transaction.directory_identity(active),
+        "candidate_directory_identity": sign_bundle_transaction.directory_identity(candidate),
+    }
+
+    displaced = tmp_path / "displaced-active"
+    active.rename(displaced)
+    shutil.copytree(displaced, active)
+    assert sign_bundle_transaction.tree_snapshot(active) == manifest["base_snapshot"]
+    assert sign_bundle_transaction.directory_identity(active) != manifest["base_directory_identity"]
+
+    with pytest.raises(sign_bundle_transaction.SignBundleTransactionError, match="directory identity"):
+        sign_bundle_transaction.publish_candidate(tx_path, manifest)
+
+
+def test_transaction_lock_rejects_symlinked_transaction_root(tmp_path: Path) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    external = tmp_path / "external-transaction-storage"
+    external.mkdir()
+    sign_bundle_transaction.transaction_root(allowlist_dir).symlink_to(external, target_is_directory=True)
+
+    with (
+        pytest.raises(sign_bundle_transaction.SignBundleTransactionError, match="not a directory"),
+        sign_bundle_transaction.transaction_lock(allowlist_dir, create=True),
+    ):
+        pytest.fail("symlinked transaction root must not be entered")
+
+    assert list(external.iterdir()) == []
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(sign_bundle_transaction.SignBundleTransactionError, match="not a directory"):
+        sign_bundle_transaction.create_transaction(
+            bundle_path=bundle_path,
+            verified_bundle_sha256=sign_bundle_transaction.file_sha256(bundle_path),
+            bundle_id="symlink-root",
+            root=root,
+            allowlist_dir=allowlist_dir,
+            rotation_log=tmp_path / "rotations.log",
+            signing_policy={"operator_override": False},
+        )
+    assert list(external.iterdir()) == []
+
+
+def test_create_transaction_fsyncs_each_new_parent_directory_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    fsynced: list[Path] = []
+    real_fsync_directory = sign_bundle_transaction._fsync_directory
+
+    def _record_fsync(path: Path) -> None:
+        fsynced.append(path.resolve())
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(sign_bundle_transaction, "_fsync_directory", _record_fsync)
+    _tx_path, manifest = sign_bundle_transaction.create_transaction(
+        bundle_path=bundle_path,
+        verified_bundle_sha256=sign_bundle_transaction.file_sha256(bundle_path),
+        bundle_id="fsync-order",
+        root=root,
+        allowlist_dir=allowlist_dir,
+        rotation_log=tmp_path / "rotations.log",
+        signing_policy={"operator_override": False},
+    )
+
+    active_parent = allowlist_dir.resolve().parent
+    tx_root = sign_bundle_transaction.transaction_root(allowlist_dir).resolve()
+    candidate_parent = Path(manifest["candidate_dir"]).resolve().parent
+    assert fsynced.index(active_parent) < fsynced.index(tx_root) < fsynced.index(candidate_parent)
+
+
+def test_sign_bundle_rejects_bundle_replaced_after_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The recovery transaction must bind the exact bundle the operator confirmed."""
+    import io
+
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    gadget_finding = _live_finding(root, "plugins/gadget.py")
+    gadget_stale = _stale_rotation_key(gadget_finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=gadget_stale)
+
+    _write_source(root, "plugins/sprocket.py", "sprocket")
+    sprocket_finding = _live_finding(root, "plugins/sprocket.py")
+    sprocket_live = _canonical_key(sprocket_finding)
+    sprocket_stale = _stale_rotation_key(sprocket_finding, fp="cafebabecafebabe")
+    _write_pre_judge_entry(allowlist_dir, "sprocket.yaml", key=sprocket_stale)
+
+    approved = _bundle(
+        root,
+        allowlist_dir,
+        (
+            BundleAction(lane="resign", kind="rotation", key=gadget_stale, source_file="gadget.yaml"),
+            BundleAction(lane="resign", kind="rotation", key=sprocket_stale, source_file="sprocket.yaml"),
+        ),
+    )
+    replacement = _bundle(
+        root,
+        allowlist_dir,
+        (
+            BundleAction(lane="resign", kind="rotation", key=sprocket_stale, source_file="sprocket.yaml"),
+            BundleAction(lane="resign", kind="rotation", key=gadget_stale, source_file="gadget.yaml"),
+        ),
+    )
+    bundle_path = _write_bundle_file(tmp_path, approved)
+    approved_bytes = bundle_path.read_bytes()
+    rotation_log = tmp_path / "rotations.log"
+
+    class _ReplaceAtConfirmation(io.StringIO):
+        def readline(self, *args: Any, **kwargs: Any) -> str:
+            _write_bundle_file(tmp_path, replacement)
+            return super().readline(*args, **kwargs)
+
+    real_run_transaction = sign_bundle_transaction.run_sign_bundle_transaction
+    monkeypatch.setattr("sys.stdin", _ReplaceAtConfirmation("yes\n"))
+    monkeypatch.setattr(
+        sign_bundle_transaction,
+        "run_sign_bundle_transaction",
+        lambda **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    first_rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--rotation-log", str(rotation_log)),
+        )
+    )
+    first_stderr = capsys.readouterr().err
+
+    if first_rc != 2:
+        transaction = _recovery_path(first_stderr)
+        manifest = json.loads((transaction / "transaction.json").read_text(encoding="utf-8"))
+        replacement_bytes = bundle_path.read_bytes()
+        bound_replacement = manifest["bundle_sha256"] == hashlib.sha256(replacement_bytes).hexdigest()
+        monkeypatch.setattr(sign_bundle_transaction, "run_sign_bundle_transaction", real_run_transaction)
+        resume_rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+            )
+        )
+        replacement_executed = sprocket_live in (allowlist_dir / "sprocket.yaml").read_text(encoding="utf-8")
+        pytest.fail(
+            "bundle replacement crossed the confirmation boundary: "
+            f"first_rc={first_rc}, manifest_bound_replacement={bound_replacement}, "
+            f"resume_rc={resume_rc}, replacement_executed={replacement_executed}"
+        )
+
+    assert "bundle bytes changed after verification" in first_stderr
+    assert bundle_path.read_bytes() != approved_bytes
+    assert gadget_stale in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+    assert sprocket_stale in (allowlist_dir / "sprocket.yaml").read_text(encoding="utf-8")
+
+
+def test_manifest_rejects_authenticated_non_integer_directory_identity(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    tx_path, manifest = sign_bundle_transaction.create_transaction(
+        bundle_path=bundle_path,
+        verified_bundle_sha256=sign_bundle_transaction.file_sha256(bundle_path),
+        bundle_id="identity-type",
+        root=root,
+        allowlist_dir=allowlist_dir,
+        rotation_log=tmp_path / "rotations.log",
+        signing_policy={"operator_override": False},
+    )
+    manifest["base_directory_identity"]["st_ino"] = True
+    sign_bundle_transaction.save_manifest(tx_path, manifest)
+
+    with pytest.raises(
+        sign_bundle_transaction.SignBundleTransactionError,
+        match="strict directory identity",
+    ):
+        sign_bundle_transaction.load_manifest(tx_path)
+
+
+def test_sign_bundle_rejects_incomplete_rotation_inventory_before_execute(tmp_path: Path) -> None:
+    """The complete census rejects omitted drift and rotation work before writes."""
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
 
@@ -616,9 +1391,9 @@ def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path
     # (2) staged non-judge-gated rotation.
     _write_source(root, "plugins/gadget.py", "gadget")
     gadget_finding = _live_finding(root, "plugins/gadget.py")
-    gadget_live = _canonical_key(gadget_finding)
     gadget_stale = _stale_rotation_key(gadget_finding, fp="deadbeefdeadbeef")
     _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=gadget_stale)
+    gadget_before = (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
 
     # (3) surveyed-but-unstaged non-judge-gated rotation.
     _write_source(root, "plugins/sprocket.py", "sprocket")
@@ -632,11 +1407,8 @@ def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path
 
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(tmp_path / "rotations.log"))))
 
-    assert rc == 0  # (a) did NOT raise on the judge-gated fp-shifted non-action
-    gadget_text = (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
-    assert f"- key: {gadget_live}" in gadget_text  # staged key rotated
-    assert gadget_stale not in gadget_text
-    # (b) the unstaged surveyed rotation is byte-untouched -> a minimal one-Rotation plan was built.
+    assert rc == 2
+    assert (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8") == gadget_before
     assert (allowlist_dir / "sprocket.yaml").read_text(encoding="utf-8") == sprocket_before
 
 
@@ -664,6 +1436,151 @@ def test_sign_bundle_stale_delete_removes_entry(tmp_path: Path) -> None:
     assert sibling_before in gadget_before
 
 
+def test_sign_bundle_resume_rejects_unrelated_same_yaml_stale_delete(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_entry_with_spare(
+        allowlist_dir,
+        "widget.yaml",
+        finding=finding,
+    )
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                BundleAction(
+                    lane="resign",
+                    kind="stale_delete",
+                    key=orphan_key,
+                    source_file="widget.yaml",
+                ),
+            ),
+        ),
+    )
+    real_delete = cli_module._execute_stale_delete_action
+
+    def _delete_target_and_sibling(
+        action: Any,
+        *,
+        source_file: str,
+        args: Any,
+    ) -> int:
+        assert real_delete(action, source_file=source_file, args=args) == 0
+        cli_module._pop_allow_hits_entry(
+            args.allowlist_dir / source_file,
+            _SPARE_PRE_JUDGE_KEY,
+        )
+        raise KeyboardInterrupt
+
+    with patch.object(
+        cli_module,
+        "_execute_stale_delete_action",
+        side_effect=_delete_target_and_sibling,
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+@pytest.mark.parametrize(
+    "duplicate_header",
+    (
+        "allow_hits: # duplicate",
+        "allow_hits :",
+        '"allow_hits":',
+    ),
+)
+def test_sign_bundle_resume_rejects_duplicate_allow_hits_block(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    duplicate_header: str,
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_entry_with_spare(
+        allowlist_dir,
+        "widget.yaml",
+        finding=finding,
+    )
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                BundleAction(
+                    lane="resign",
+                    kind="stale_delete",
+                    key=orphan_key,
+                    source_file="widget.yaml",
+                ),
+            ),
+        ),
+    )
+    real_delete = cli_module._execute_stale_delete_action
+
+    def _delete_then_duplicate_block(
+        action: Any,
+        *,
+        source_file: str,
+        args: Any,
+    ) -> int:
+        assert real_delete(action, source_file=source_file, args=args) == 0
+        target = args.allowlist_dir / source_file
+        current = target.read_text(encoding="utf-8")
+        duplicate = current.replace("allow_hits:", duplicate_header, 1)
+        target.write_text(current + "\n" + duplicate, encoding="utf-8")
+        raise KeyboardInterrupt
+
+    with patch.object(
+        cli_module,
+        "_execute_stale_delete_action",
+        side_effect=_delete_then_duplicate_block,
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
 # =========================================================================== #
 # Task 2.4 -- new-judgment lane (real judge + sign) + BLOCK + override
 # =========================================================================== #
@@ -684,6 +1601,27 @@ def test_sign_bundle_new_judgment_runs_real_judge(tmp_path: Path) -> None:
     assert calls == ["plugins/gadget.py"]
     post = _diagnose(root, allowlist_dir)
     assert any(i.status == "OK_AUTHORITATIVE" and i.key == _canonical_key(finding) for i in post.items)
+
+
+def test_sign_bundle_refreshes_override_snapshot_only_after_active_publish(tmp_path: Path) -> None:
+    from elspeth_lints.core.override_rate import default_counter_snapshot_path
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+
+    with _patch_judge(_accept_all):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 0
+    assert default_counter_snapshot_path(allowlist_dir.parent).is_file()
+    tx_root = allowlist_dir.parent / ".sign-bundle-transactions"
+    assert not any(path.name == ".judge-metrics" for path in tx_root.rglob(".judge-metrics"))
 
 
 def test_sign_bundle_block_contradicting_preview_not_signed(tmp_path: Path) -> None:
@@ -723,20 +1661,21 @@ def test_sign_bundle_override_token_required(tmp_path: Path, capsys: pytest.Capt
     assert not (allowlist_dir / "plugins.yaml").exists()
 
 
-def test_sign_bundle_partial_block_writes_accepted_and_reports(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """Per-action non-transactional contract: A is written, B blocked, M/K reported."""
+def test_sign_bundle_partial_block_preserves_active_allowlist_and_reports_recovery(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An accepted action followed by BLOCK is recoverable without partial publish."""
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
     _write_source(root, "alpha/mod.py", "alpha")
     _write_source(root, "beta/mod.py", "beta")
-    alpha_finding = _live_finding(root, "alpha/mod.py")
-    beta_finding = _live_finding(root, "beta/mod.py")
     bundle = _bundle(
         root,
         allowlist_dir,
         (
-            _new_judgment_action(alpha_finding, "alpha/mod.py"),
-            _new_judgment_action(beta_finding, "beta/mod.py"),
+            _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+            _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
         ),
     )
     bundle_path = _write_bundle_file(tmp_path, bundle)
@@ -748,14 +1687,1514 @@ def test_sign_bundle_partial_block_writes_accepted_and_reports(tmp_path: Path, c
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc != 0
-    # A written, B not.
-    assert (allowlist_dir / "alpha.yaml").exists()
-    assert not (allowlist_dir / "beta.yaml").exists()
-    post = _diagnose(root, allowlist_dir)
-    assert any(i.key == _canonical_key(alpha_finding) and i.status == "OK_AUTHORITATIVE" for i in post.items)
-    assert all(i.key != _canonical_key(beta_finding) for i in post.items)
+    assert _tree_bytes(allowlist_dir) == before
     err = capsys.readouterr().err
-    assert "succeeded" in err and "failed" in err
+    transaction = _recovery_path(err)
+    assert transaction.is_dir()
+    assert "preserved" in err.lower()
+
+
+def test_sign_bundle_continue_on_block_publishes_survivors_and_reports_worklist(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A judged BLOCK is journalled and skipped; the accepted action still publishes.
+
+    Exit 3 (published-with-blocks) so a partially signed run never reads as a
+    clean one, and the blocked key is printed as the remediation worklist.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    beta = _live_finding(root, "beta/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(beta, "beta/mod.py"),
+            ),
+        ),
+    )
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 3
+    assert (allowlist_dir / "alpha.yaml").is_file()
+    assert not (allowlist_dir / "beta.yaml").exists()
+    out = capsys.readouterr().out
+    assert "coherent publish" in out
+    assert "BLOCKED" in out
+    assert _canonical_key(beta) in out
+
+
+def test_sign_bundle_continue_on_block_all_blocked_signs_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Every action BLOCKED: nothing is signed and the active allowlist is untouched."""
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),)),
+    )
+
+    with _patch_judge(_block_all):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 1
+    assert _tree_bytes(allowlist_dir) == before
+    captured = capsys.readouterr()
+    assert "no action was signed" in captured.err
+    assert "BLOCKED" in captured.out
+    # Nothing was signed and every selected action is journalled BLOCKED, so the
+    # transaction has no work a resume could advance: "Remediate and re-stage"
+    # must not be contradicted by a paste-ready resume command two lines later.
+    assert _RECOVERY_GUIDANCE not in captured.err
+
+
+def test_sign_bundle_continue_on_block_all_blocked_publishes_nothing_under_enforce_layout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """All-blocked signs nothing even though the BLOCK itself moved candidate bytes.
+
+    Sibling of ``..._all_blocked_signs_nothing`` on the CANONICAL layout. In an
+    ``enforce_*`` directory each judged BLOCK appends its
+    ``blocked_without_override`` decision event to the candidate's
+    ``.judge-metrics`` log, so the candidate snapshot diverges from the base with
+    zero actions completed. A publish gate that reads "did the bytes move?"
+    instead of "did an action complete?" therefore publishes an audit-only
+    candidate, refreshes the counter snapshot, and reports the partial-publish
+    exit 3 for a run that signed nothing. The neutral-name sibling cannot catch
+    that: ``append_judge_decision_event`` no-ops outside ``enforce_*``, so the
+    candidate there really is byte-identical.
+
+    The blocked decision event still owes its record — it stays in the preserved
+    private transaction, exactly as it does for a BLOCK without
+    ``--continue-on-block``.
+    """
+    from elspeth_lints.core.override_rate import judge_decision_events_path
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, (_new_judgment_action(alpha, "alpha/mod.py"),)))
+
+    with _patch_judge(_block_all):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert _tree_bytes(allowlist_dir) == before  # no audit-only publish, no counter refresh
+    assert "no action was signed" in captured.err
+    assert _RECOVERY_GUIDANCE not in captured.err
+
+    transaction = _recovery_path(captured.err)
+    events_path = judge_decision_events_path(next(path for path in transaction.rglob("enforce_tier_model") if path.is_dir()))
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [event["write_disposition"] for event in events] == ["blocked_without_override"]
+
+    # Second entry path, same gate: a resume loads the journalled BLOCK, still
+    # completes nothing, and must not publish the candidate it inherits either.
+    with _patch_judge(_block_all):
+        resumed = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert resumed == 1
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_continue_on_block_publishes_the_blocked_decision_event_with_survivors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A partial publish carries the blocked action's decision event into the active dir.
+
+    The asymmetry is the invariant: when NOTHING completed the block's event stays
+    private to the transaction, but when a survivor publishes, the whole coherent
+    candidate publishes — including the ``blocked_without_override`` event the
+    override-rate gate counts. A publish gate keyed on "did a judge event appear?"
+    rather than "did an action complete?" satisfies the all-blocked sibling and
+    breaks here.
+    """
+    from elspeth_lints.core.override_rate import judge_decision_events_path
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    beta = _live_finding(root, "beta/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (_new_judgment_action(alpha, "alpha/mod.py"), _new_judgment_action(beta, "beta/mod.py")),
+        ),
+    )
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 3
+    assert (allowlist_dir / "alpha.yaml").is_file()
+    assert not (allowlist_dir / "beta.yaml").exists()
+    capsys.readouterr()
+
+    events = [
+        json.loads(line) for line in judge_decision_events_path(allowlist_dir).read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert {(event["entry_key"], event["write_disposition"]) for event in events} == {
+        (_canonical_key(alpha), "written"),
+        (_canonical_key(beta), "blocked_without_override"),
+    }
+
+
+def test_sign_bundle_published_with_blocks_offers_no_resume_recovery(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Exit 3 is a COMPLETED publish, so the generic recovery path must not fire.
+
+    ``_run_sign_bundle`` treated every nonzero code as an unsuccessful action and
+    printed a paste-ready ``--resume`` command. Exit 3 is reached only *after* the
+    coherent publish, so following that command re-enters at the published
+    disposition, returns 3 again, and re-emits the same guidance indefinitely.
+    Proven terminal here rather than merely muted: the resume is executed and must
+    stay silent too. The creation-time ``if interrupted, resume with`` line is a
+    different statement about a then-unfinished transaction and survives.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "private transaction created at" in err
+    assert _RECOVERY_GUIDANCE not in err
+    assert "private decisions preserved at" not in err
+
+    transaction = _recovery_path(err)
+    with _patch_judge(_verdict):
+        resumed = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert resumed == 3
+    assert _RECOVERY_GUIDANCE not in capsys.readouterr().err
+
+
+def test_sign_bundle_continue_on_block_still_stops_on_infrastructure_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--continue-on-block skips ONLY judged BLOCKs (exit 1); exit 2 still stops."""
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _fail_beta(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        if action.file_path.startswith("beta/"):
+            return 2
+        return real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_execute_new_judgment_action", side_effect=_fail_beta),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    err = capsys.readouterr().err
+    assert "transaction stopped" in err
+    # Control for the two "no recovery guidance" assertions above: an
+    # infrastructure failure leaves genuinely resumable work, so suppressing the
+    # guidance outright (rather than on the terminal outcomes) must fail here.
+    assert _RECOVERY_GUIDANCE in err
+    assert _recovery_path(err).is_dir()
+
+
+def test_sign_bundle_resume_skips_recorded_blocked_actions(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A journalled BLOCK stays skipped on resume — no verdict shopping.
+
+    First run: alpha BLOCKED (journalled, skipped), beta fails exit-2 → stop.
+    Resume with an accept-all judge: only beta is judged; alpha is never
+    re-judged even though the judge would now accept it, and the publish
+    reports it as still blocked (exit 3).
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(alpha, "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _fail_beta(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        if action.file_path.startswith("beta/"):
+            return 2
+        return real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+
+    def _block_alpha(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.BLOCKED if file_path.startswith("alpha/") else JudgeVerdict.ACCEPTED
+
+    with (
+        _patch_judge(_block_alpha),
+        patch.object(cli_module, "_execute_new_judgment_action", side_effect=_fail_beta),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+    assert rc == 2
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all) as resume_calls:
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 3
+    assert resume_calls == ["beta/mod.py"]
+    assert (allowlist_dir / "beta.yaml").is_file()
+    assert not (allowlist_dir / "alpha.yaml").exists()
+    out = capsys.readouterr().out
+    assert _canonical_key(alpha) in out
+
+
+def test_sign_bundle_resume_never_rejudges_an_interrupted_block(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A BLOCK interrupted before it was journalled must not be re-judged on resume.
+
+    ``execute_action`` records the authoritative BLOCK durably (the
+    ``blocked_without_override`` decision event) *before* the transaction commits
+    ``blocked_actions``. A kill in that window used to leave the journal showing a
+    running, incomplete action, and recovery restored it as un-attempted — so the
+    resume re-judged it and a second-opinion ACCEPT got signed and published. That
+    is verdict shopping across a crash boundary.
+
+    The ``enforce_`` dir name is load-bearing: the decision event that carries the
+    BLOCK is only appended inside that layout.
+    """
+    import elspeth_lints.core.sign_bundle_transaction as tx_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(alpha, "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    real_assert = tx_module._assert_action_scoped_candidate_changes
+
+    def _kill_after_the_block_is_recorded(action: Any, **kwargs: Any) -> None:
+        real_assert(action, **kwargs)
+        if kwargs["verify_semantics"] is False:
+            raise KeyboardInterrupt("operator kill between the judged BLOCK and its journal entry")
+
+    def _block_alpha(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.BLOCKED if file_path.startswith("alpha/") else JudgeVerdict.ACCEPTED
+
+    with (
+        _patch_judge(_block_alpha) as first_calls,
+        patch.object(tx_module, "_assert_action_scoped_candidate_changes", side_effect=_kill_after_the_block_is_recorded),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 130
+    assert first_calls == ["alpha/mod.py"]
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    # Pin the window: the kill landed with the action still journalled as
+    # running and NOT yet recorded as blocked. Without this, a change that
+    # journals the block earlier would leave the test green while testing
+    # nothing.
+    interrupted_manifest = json.loads((transaction / "transaction.json").read_text(encoding="utf-8"))
+    assert interrupted_manifest["running_action"] == 0
+    assert not interrupted_manifest.get("blocked_actions")
+
+    with _patch_judge(_accept_all) as resume_calls:
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--continue-on-block", "--resume", str(transaction)),
+            )
+        )
+
+    assert resume_calls == ["beta/mod.py"], "the interrupted BLOCK was re-judged: verdict shopping across the crash"
+    assert not (allowlist_dir / "alpha.yaml").exists(), "a re-judged ACCEPT signed an entry the judge had already BLOCKED"
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert _canonical_key(alpha) in out
+
+
+def test_sign_bundle_plain_resume_never_rejudges_a_recorded_block(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A BLOCK stops the run; resuming it must not buy a second opinion.
+
+    No crash is needed for this one. Before the fix, a plain (no
+    ``--continue-on-block``) BLOCK cleared ``running_action`` and journalled
+    nothing, so the resume re-judged the same action, signed the ACCEPT, and
+    exited **0** — a laundered verdict that read as a clean run.
+
+    The BLOCK is now journalled when it is authoritative, and without the flag it
+    stays terminal: the resume stops on the recorded verdict without calling the
+    judge at all, and nothing is published.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(alpha, "alpha/mod.py"),)),
+    )
+
+    with _patch_judge(_block_all) as first_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 1
+    assert first_calls == ["alpha/mod.py"]
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all) as resume_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert resume_calls == [], "the recorded BLOCK was re-judged on resume: verdict shopping"
+    assert rc == 1
+    assert not (allowlist_dir / "alpha.yaml").exists()
+    assert _tree_bytes(allowlist_dir) == before
+    captured = capsys.readouterr()
+    assert _canonical_key(alpha) in captured.out
+    # The operator is told the one move that is not verdict shopping.
+    assert "--continue-on-block" in captured.err
+
+
+def test_sign_bundle_resume_without_the_flag_stops_on_a_journalled_block(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Dropping ``--continue-on-block`` on resume stops; it does not publish survivors.
+
+    The flag governs the future, not the past: a transaction created WITH it
+    holds journalled blocks, and resuming WITHOUT it must not silently inherit
+    the partial (exit 3) publish the operator never opted into on this run. The
+    blocked action is still never re-judged.
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(alpha, "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _fail_beta(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        if action.file_path.startswith("beta/"):
+            return 2
+        return real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+
+    def _block_alpha(file_path: str) -> JudgeVerdict:
+        return JudgeVerdict.BLOCKED if file_path.startswith("alpha/") else JudgeVerdict.ACCEPTED
+
+    with (
+        _patch_judge(_block_alpha),
+        patch.object(cli_module, "_execute_new_judgment_action", side_effect=_fail_beta),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--continue-on-block")))
+
+    assert rc == 2
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all) as resume_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 1
+    assert resume_calls == []
+    assert _tree_bytes(allowlist_dir) == before
+    assert _canonical_key(alpha) in capsys.readouterr().out
+
+
+def test_sign_bundle_lanes_resign_only_never_judges_and_publishes_deterministic_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--lanes resign fires the deterministic lane and never touches the judge.
+
+    The unselected new_judgment action is not attempted: no judge call, no
+    entry written, and the run publishes coherently over the selected lane.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    widget_finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),
+            ),
+        ),
+    )
+
+    with _patch_judge(_accept_all) as judge_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--lanes", "resign")))
+
+    assert rc == 0
+    assert judge_calls == []
+    assert orphan_key not in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert not (allowlist_dir / "alpha.yaml").exists()
+    out = capsys.readouterr().out
+    assert "1 action(s) outside the selected lane(s)" in out
+
+
+def test_sign_bundle_lanes_summary_counts_only_selected_actions(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The pre-confirmation summary is scoped to --lanes.
+
+    A resign-only probe must not present the unselected new_judgment action --
+    or the operator override it would carry -- as planned work: the operator
+    confirms exactly what will be attempted.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    widget_finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),
+            ),
+        ),
+    )
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--dry-run", "--operator-override", "--lanes", "resign")))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sign-bundle: 1 action(s) -- new_judgment=0, drift_repair=0, rotation=0, stale_delete=1" in out
+    assert "planned operator-override actions: 0" in out
+    assert "+0 override action(s) staged" in out
+    assert "1 action(s) outside the selected lane(s)" in out
+
+
+def test_sign_bundle_lanes_rejects_unknown_lane(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),)),
+    )
+
+    with pytest.raises(SystemExit):
+        main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--lanes", "drift_repair")))
+
+    assert "valid lanes" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_keeps_and_inherits_the_journalled_lane_scope(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Resume inherits the transaction's lane scope; an explicit mismatch refuses.
+
+    First run: --lanes resign with the stale_delete forced to exit 2 → stop.
+    Resuming with --lanes new_judgment is refused; resuming with no --lanes
+    inherits resign, completes the delete, and still never judges the
+    unselected justify action.
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    widget_finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),
+            ),
+        ),
+    )
+
+    with patch.object(cli_module, "_execute_stale_delete_action", return_value=2):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--lanes", "resign")))
+    assert rc == 2
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--lanes", "new_judgment", "--resume", str(transaction)),
+        )
+    )
+    assert rc == 2
+    assert "--lanes mismatch" in capsys.readouterr().err
+
+    with _patch_judge(_accept_all) as judge_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert judge_calls == []
+    assert orphan_key not in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert not (allowlist_dir / "alpha.yaml").exists()
+
+
+def test_sign_bundle_resume_reuses_accepted_judgment_and_publishes_coherently(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A resume re-judges only what has no authoritative verdict yet.
+
+    The first run is stopped by an exit-2 infrastructure failure on beta, NOT by
+    a judged BLOCK: a BLOCK is an authoritative verdict, journalled and never
+    re-judged (see the verdict-shopping regressions above), so it cannot be used
+    here as a generic "stop the run" mechanism. Alpha's accepted signature is
+    reused on resume rather than re-judged; only beta reaches the judge.
+    """
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    alpha = _live_finding(root, "alpha/mod.py")
+    beta = _live_finding(root, "beta/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(alpha, "alpha/mod.py"),
+                _new_judgment_action(beta, "beta/mod.py"),
+            ),
+        ),
+    )
+
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _fail_beta(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        if action.file_path.startswith("beta/"):
+            return 2
+        return real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_execute_new_judgment_action", side_effect=_fail_beta),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 2
+    transaction = _recovery_path(capsys.readouterr().err)
+    assert _tree_bytes(allowlist_dir) == before
+
+    with _patch_judge(_accept_all) as resumed_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert resumed_calls == ["beta/mod.py"]
+    post = _diagnose(root, allowlist_dir)
+    assert any(item.key == _canonical_key(alpha) and item.status == "OK_AUTHORITATIVE" for item in post.items)
+    assert any(item.key == _canonical_key(beta) and item.status == "OK_AUTHORITATIVE" for item in post.items)
+
+
+def test_sign_bundle_resume_finishes_interruption_after_atomic_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A kill after the exchange is recovered from bytes, not a stale state flag."""
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    publish_candidate = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, object]) -> None:
+        publish_candidate(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    with _patch_judge(_accept_all):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 130
+    assert any(item.key == _canonical_key(finding) and item.status == "OK_AUTHORITATIVE" for item in _diagnose(root, allowlist_dir).items)
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", publish_candidate)
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("published recovery must not repeat accepted judge work"))):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 0
+    assert any(item.key == _canonical_key(finding) and item.status == "OK_AUTHORITATIVE" for item in _diagnose(root, allowlist_dir).items)
+
+
+def test_sign_bundle_resume_rejects_changed_signing_policy(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    with _patch_judge(lambda file_path: JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED):
+        assert main(_argv(bundle_path, root, allowlist_dir, owner="operator-a", extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("policy mismatch must not call judge"))):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                owner="operator-b",
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "policy" in capsys.readouterr().err.lower()
+
+
+def test_sign_bundle_stale_delete_runs_before_judge_work(tmp_path: Path) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "old/mod.py", "old")
+    orphan = _write_signed_v2_entry(allowlist_dir, "old.yaml", finding=_live_finding(root, "old/mod.py"))
+    _write_source(root, "old/mod.py", "old", active=False)
+    _write_source(root, "new/mod.py", "new")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "new/mod.py"), "new/mod.py"),
+                BundleAction(lane="resign", kind="stale_delete", key=orphan, source_file="old.yaml"),
+            ),
+        ),
+    )
+    order: list[str] = []
+    real_delete = cli_module._execute_stale_delete_action
+
+    def _record_delete(action: Any, *, source_file: str, args: Any) -> int:
+        order.append("stale_delete")
+        return real_delete(action, source_file=source_file, args=args)
+
+    with (
+        patch.object(cli_module, "_execute_stale_delete_action", side_effect=_record_delete),
+        _patch_judge(lambda _file_path: order.append("judge") or JudgeVerdict.ACCEPTED),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 0
+    assert order == ["stale_delete", "judge"]
+
+
+def test_sign_bundle_does_not_publish_until_every_action_succeeds(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+
+    def _accept_while_active_is_unchanged(_file_path: str) -> JudgeVerdict:
+        assert _tree_bytes(allowlist_dir) == before
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_accept_while_active_is_unchanged):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 0
+    assert (allowlist_dir / "alpha.yaml").is_file()
+    assert (allowlist_dir / "beta.yaml").is_file()
+
+
+def test_sign_bundle_rejects_unrelated_candidate_mutation(tmp_path: Path) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _execute_then_tamper(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        code = real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+        (args.allowlist_dir / "unrelated.yaml").write_text(
+            "allow_hits: []\n",
+            encoding="utf-8",
+        )
+        return code
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_execute_new_judgment_action",
+            side_effect=_execute_then_tamper,
+        ),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("unrelated_record", "impossible_verdict_pair", "naive_timestamp"),
+)
+def test_sign_bundle_rejects_judge_decision_event_rewrite(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _execute_then_rewrite_events(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        code = real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
+        event_path = args.allowlist_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+        record = json.loads(event_path.read_text(encoding="utf-8"))
+        if tamper == "impossible_verdict_pair":
+            record["effective_verdict"] = "ACCEPTED"
+            record["model_verdict"] = "BLOCKED"
+        elif tamper == "naive_timestamp":
+            record["recorded_at"] = "2026-01-01T00:00:00"
+        else:
+            record = {
+                "schema_version": 1,
+                "source_file": "unrelated.py",
+                "entry_key": "unrelated.py:R1:X:y:fp=deadbeefdeadbeef",
+                "rule_id": "R1",
+                "effective_verdict": "ACCEPTED",
+                "model_verdict": "ACCEPTED",
+                "recorded_at": "2026-01-01T00:00:00+00:00",
+                "write_disposition": "written",
+            }
+        event_path.write_text(
+            json.dumps(record, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return code
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_execute_new_judgment_action",
+            side_effect=_execute_then_rewrite_events,
+        ),
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_resume_rejects_written_event_for_incomplete_action(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_execute = cli_module._execute_new_judgment_action
+
+    def _execute_then_remove_written_entry(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        assert (
+            real_execute(
+                action,
+                args=args,
+                defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+            )
+            == 0
+        )
+        cli_module._pop_allow_hits_entry(
+            args.allowlist_dir / "plugins.yaml",
+            action.key,
+        )
+        raise KeyboardInterrupt
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_execute_new_judgment_action",
+            side_effect=_execute_then_remove_written_entry,
+        ),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_resume_reconstructs_missing_event_without_rejudging(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(
+            cli_module,
+            "_append_judge_decision_event_after_judge",
+            side_effect=KeyboardInterrupt(),
+        ),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("authoritatively signed decision must not be re-judged"))):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 0
+    event_path = allowlist_dir / ".judge-metrics" / "judge-decision-events.jsonl"
+    records = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["entry_key"] == _canonical_key(finding)
+    assert records[0]["write_disposition"] == "written"
+
+
+def test_sign_bundle_resume_rejects_success_event_that_contradicts_signed_entry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_emit_justify_output", side_effect=KeyboardInterrupt()),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    event_path = next(transaction.rglob("judge-decision-events.jsonl"))
+    event = json.loads(event_path.read_text(encoding="utf-8"))
+    event["effective_verdict"] = "OVERRIDDEN_BY_OPERATOR"
+    event["model_verdict"] = "BLOCKED"
+    event_path.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("completed signed decision must not be re-judged"))):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--resume", str(transaction)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "contradicts its authoritative signed entry" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tamper", ("unrelated_record", "naive_timestamp"))
+def test_sign_bundle_rejects_unrelated_staged_rotation_record(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    before = _tree_bytes(allowlist_dir)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                BundleAction(
+                    lane="resign",
+                    kind="rotation",
+                    key=stale_key,
+                    source_file="gadget.yaml",
+                ),
+            ),
+        ),
+    )
+    real_rotation = cli_module._execute_rotation_action
+
+    def _rotate_then_append_unrelated(
+        action: Any,
+        *,
+        rotation_plan: Any,
+        args: Any,
+    ) -> int:
+        code = real_rotation(action, rotation_plan=rotation_plan, args=args)
+        records = [json.loads(line) for line in args.rotation_log.read_text(encoding="utf-8").splitlines()]
+        if tamper == "naive_timestamp":
+            records[-1]["recorded_at"] = "2026-01-01T00:00:00"
+        else:
+            records.append(
+                {
+                    "schema_version": 1,
+                    "kind": "tier_model_rotation",
+                    "recorded_at": "2026-01-01T00:00:00+00:00",
+                    "allowlist_dir": str(args.allowlist_dir),
+                    "rotations": [
+                        {
+                            "source_file": "other.yaml",
+                            "old_key": "other.py:R1:X:y:fp=deadbeefdeadbeef",
+                            "new_key": "other.py:R1:X:y:fp=feedfacefeedface",
+                        }
+                    ],
+                    "stale_entries_removed": [],
+                    "applied": {
+                        "other.yaml": {
+                            "rotations_applied": 1,
+                            "stale_entries_removed": 0,
+                        }
+                    },
+                }
+            )
+        args.rotation_log.write_text(
+            "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return code
+
+    with patch.object(
+        cli_module,
+        "_execute_rotation_action",
+        side_effect=_rotate_then_append_unrelated,
+    ):
+        rc = main(
+            _argv(
+                bundle_path,
+                root,
+                allowlist_dir,
+                extra=("--yes", "--rotation-log", str(rotation_log)),
+            )
+        )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert not rotation_log.exists()
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_rc"),
+    [(RuntimeError("judge exploded"), 2), (KeyboardInterrupt(), 130)],
+)
+def test_sign_bundle_unexpected_exception_or_interrupt_preserves_recovery(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    raised: BaseException,
+    expected_rc: int,
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    calls = 0
+
+    def _accept_then_raise(_file_path: str) -> JudgeVerdict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return JudgeVerdict.ACCEPTED
+        raise raised
+
+    with _patch_judge(_accept_then_raise):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == expected_rc
+    assert _tree_bytes(allowlist_dir) == before
+    assert _recovery_path(capsys.readouterr().err).is_dir()
+
+
+def test_sign_bundle_resume_rejects_stale_source_before_publish(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    beta_path = _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    with _patch_judge(lambda file_path: JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+    beta_path.write_text("_SHIM = 1\n\n" + beta_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("stale resume must not call judge"))):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "staged claims no longer match" in capsys.readouterr().err
+
+
+def test_sign_bundle_source_observation_oserror_is_normal_verify_failure_without_write(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/widget.py"),)),
+    )
+    before = _tree_bytes(allowlist_dir)
+
+    with (
+        patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")),
+        patch("elspeth_lints.core.sign_bundle_transaction.create_transaction") as create_transaction,
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    stderr = capsys.readouterr().err
+    assert rc == 2
+    assert "sign-bundle: verify error:" in stderr
+    assert "Traceback" not in stderr
+    create_transaction.assert_not_called()
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_rolls_back_if_source_changes_at_directory_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source_path = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_exchange = sign_bundle_transaction._rename_exchange
+
+    def _change_source_at_exchange(source: Path, destination: Path) -> None:
+        if source.resolve() == allowlist_dir.resolve():
+            source_path.write_text(_src("widget"), encoding="utf-8")
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(sign_bundle_transaction, "_rename_exchange", _change_source_at_exchange)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert "source tree or bundle bindings changed during coherent publish" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("legacy_manifest", [False, True])
+def test_sign_bundle_resume_rolls_back_pending_publish_if_source_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    legacy_manifest: bool,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source_path = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    if legacy_manifest:
+        manifest = sign_bundle_transaction.load_manifest(transaction)
+        manifest.pop("source_validation_state")
+        sign_bundle_transaction.save_manifest(transaction, manifest)
+    source_path.write_text(_src("widget"), encoding="utf-8")
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert "staged claims no longer match" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rolls_back_pending_publish_if_source_root_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    shutil.rmtree(root)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert "verify error" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_tampered_transaction_signature(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    with _patch_judge(lambda file_path: JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+    signed_yaml = next(transaction.rglob("alpha.yaml"))
+    signed_yaml.write_text(
+        signed_yaml.read_text(encoding="utf-8").replace("judge_metadata_signature: '", "judge_metadata_signature: 'tampered"),
+        encoding="utf-8",
+    )
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("tampered resume must not call judge"))):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "signature" in capsys.readouterr().err.lower()
+
+
+def test_sign_bundle_resume_restores_drift_entry_after_interrupt_between_pop_and_judge(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT"),),
+        ),
+    )
+
+    with patch.object(cli_module, "_run_justify", side_effect=KeyboardInterrupt()):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 130
+    assert _tree_bytes(allowlist_dir) == before
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    with _patch_judge(_accept_all) as resumed_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert resumed_calls == ["plugins/widget.py"]
+    assert any(item.status == "OK_AUTHORITATIVE" for item in _diagnose(root, allowlist_dir).items)
 
 
 # =========================================================================== #
@@ -779,8 +3218,60 @@ def test_sign_bundle_dry_run_writes_nothing(tmp_path: Path, capsys: pytest.Captu
 
     assert rc == 0
     assert not (allowlist_dir / "plugins.yaml").exists()
+    assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
     out = capsys.readouterr().out
     assert "new_judgment" in out
+
+
+def test_sign_bundle_resume_dry_run_never_rolls_back_published_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    live_key = _canonical_key(finding)
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _interrupt_after_publish(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _interrupt_after_publish)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(rotation_log)))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
+
+    _write_source(root, "plugins/gadget.py", "gadget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--dry-run", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert live_key in (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
 
 
 def test_sign_bundle_dry_run_reports_planned_override_count(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -836,13 +3327,12 @@ def _dup_key_signed_block(key: str) -> list[str]:
 
 
 def test_sign_bundle_dup_key_bundle_aborts(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """Dup-key dataloss trap: apply_plan refuses span!=1 -> caught -> return 2, both copies intact.
+    """A duplicate-key bundle fails closed before either action can mutate it.
 
     The same key K appears twice -- once judge-gated (filtered out of the
-    non-judge-gated rotation survey, so verify still sees ONE clean rotation) and
-    once non-judge-gated (the staged rotation). At write time ``apply_plan`` finds
-    K twice in the text and raises 'occurs 2x'; the narrow catch converts it to a
-    clean return 2 rather than deleting both copies.
+    non-judge-gated rotation survey) and once non-judge-gated (the staged
+    rotation). The full worklist also sees the signed copy as an orphan, so a
+    rotation-only bundle is rejected before transaction creation.
     """
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
@@ -860,7 +3350,7 @@ def test_sign_bundle_dup_key_bundle_aborts(tmp_path: Path, capsys: pytest.Captur
 
     assert rc == 2
     assert yaml_path.read_text(encoding="utf-8").count(f"- key: {stale_key}") == 2  # both copies preserved
-    assert "occurs" in capsys.readouterr().err.lower()
+    assert "missing stale_delete action" in capsys.readouterr().err
 
 
 def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(
@@ -890,5 +3380,732 @@ def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc == 0
-    assert calls == []  # never shelled the regen script
+    assert not any("regen_fingerprint_baseline.py" in str(call) for call in calls)
     assert "canonical-allowlist-only" in capsys.readouterr().out
+
+
+def test_sign_bundle_resume_rejects_candidate_and_manifest_co_tamper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A keyless attacker cannot bless modified scratch bytes by editing hashes."""
+    from elspeth_lints.core.sign_bundle_transaction import tree_snapshot
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "alpha/mod.py", "alpha")
+    _write_source(root, "beta/mod.py", "beta")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
+                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
+            ),
+        ),
+    )
+    with _patch_judge(lambda file_path: JudgeVerdict.ACCEPTED if file_path.startswith("alpha/") else JudgeVerdict.BLOCKED):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    manifest_path = transaction / "transaction.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate = Path(manifest["candidate_dir"])
+    signed_yaml = candidate / "alpha.yaml"
+    signed_yaml.write_text(signed_yaml.read_text(encoding="utf-8") + "# keyless tamper\n", encoding="utf-8")
+    manifest["candidate_snapshot"] = tree_snapshot(candidate)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("tampered journal must not call judge"))):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "authentication failed" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_checkpoint_staged_and_manifest_co_tamper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Checkpoint/staged before-images cannot be replaced by a keyless attacker."""
+    from elspeth_lints.core import sign_bundle_transaction
+    from elspeth_lints.rules.trust_tier.tier_model import rotate
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    with patch.object(rotate, "_append_rotation_manifest", side_effect=KeyboardInterrupt()):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+
+    manifest_path = transaction / "transaction.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forged = b'{"kind":"tier_model_rotation","rotations":[]}\n'
+    checkpoint_staged = transaction / "checkpoint" / "rotation-staged.log"
+    checkpoint_staged.write_bytes(checkpoint_staged.read_bytes() + forged)
+    staged = transaction / "rotation-staged.log"
+    staged.write_bytes(staged.read_bytes() + forged)
+    manifest["checkpoint_snapshot"] = sign_bundle_transaction.tree_snapshot(transaction / "checkpoint")
+    manifest["rotation_staged_sha256"] = sign_bundle_transaction.file_sha256(staged)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "authentication failed" in capsys.readouterr().err
+
+
+def test_publish_waits_for_active_writer_then_rechecks_without_stranding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer paused inside the stable lock lands before publish rechecks."""
+    from elspeth_lints.core import cli as cli_module
+    from elspeth_lints.core import sign_bundle_transaction
+
+    active = _build_allowlist_dir(tmp_path)
+    target = active / "plugins.yaml"
+    target.write_text("allow_hits: []\n", encoding="utf-8")
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "plugins.yaml").write_text("allow_hits: []\n# candidate\n", encoding="utf-8")
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+    }
+
+    writer_paused = threading.Event()
+    release_writer = threading.Event()
+    real_atomic_update = cli_module.atomic_update_text
+
+    def _paused_update(*args: Any, **kwargs: Any) -> None:
+        writer_paused.set()
+        assert release_writer.wait(timeout=5)
+        real_atomic_update(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "atomic_update_text", _paused_update)
+    writer = threading.Thread(
+        target=cli_module._append_entry_to_yaml,
+        args=(target, "- key: plugins/x.py:R1:X:fp=1\n  owner: writer\n"),
+        daemon=True,
+    )
+    writer.start()
+    assert writer_paused.wait(timeout=5)
+
+    publish_error: list[BaseException] = []
+
+    def _publish() -> None:
+        try:
+            sign_bundle_transaction.publish_candidate(tx_path, manifest)
+        except BaseException as exc:
+            publish_error.append(exc)
+
+    publisher = threading.Thread(target=_publish, daemon=True)
+    publisher.start()
+    assert publisher.is_alive()
+    release_writer.set()
+    writer.join(timeout=5)
+    publisher.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not publisher.is_alive()
+    assert len(publish_error) == 1
+    assert "publish precondition failed" in str(publish_error[0])
+    assert "plugins/x.py" in target.read_text(encoding="utf-8")
+    assert "# candidate" in (candidate / "plugins.yaml").read_text(encoding="utf-8")
+
+
+def test_sign_bundle_resume_rejects_duplicate_manifest_json_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    with _patch_judge(_block_all):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 1
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest_path = transaction / "transaction.json"
+    text = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        text.replace('"schema_version": 1,', '"schema_version": 1,\n  "schema_version": 1,', 1),
+        encoding="utf-8",
+    )
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "duplicate JSON object key" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_duplicate_judge_event_json_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_tier_model")
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    with (
+        _patch_judge(_accept_all),
+        patch.object(cli_module, "_emit_justify_output", side_effect=KeyboardInterrupt()),
+    ):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    event_path = next(transaction.rglob("judge-decision-events.jsonl"))
+    text = event_path.read_text(encoding="utf-8")
+    event_path.write_text(
+        text.replace('"entry_key":', f'"entry_key": "{_canonical_key(finding)}", "entry_key":', 1),
+        encoding="utf-8",
+    )
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 2
+    assert "valid JSONL" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_rejects_duplicate_rotation_event_json_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_execute = cli_module._execute_rotation_action
+    rotation_log = tmp_path / "rotations.log"
+
+    def _execute_then_interrupt(action: Any, *, rotation_plan: Any, args: Any) -> int:
+        assert real_execute(action, rotation_plan=rotation_plan, args=args) == 0
+        raise KeyboardInterrupt
+
+    with patch.object(cli_module, "_execute_rotation_action", side_effect=_execute_then_interrupt):
+        assert (
+            main(
+                _argv(
+                    bundle_path,
+                    root,
+                    allowlist_dir,
+                    extra=("--yes", "--rotation-log", str(rotation_log)),
+                )
+            )
+            == 130
+        )
+    transaction = _recovery_path(capsys.readouterr().err)
+    staged = transaction / "rotation-staged.log"
+    text = staged.read_text(encoding="utf-8")
+    staged.write_text(
+        text.replace('"kind":', '"kind": "tier_model_rotation", "kind":', 1),
+        encoding="utf-8",
+    )
+
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log), "--resume", str(transaction)),
+        )
+    )
+
+    assert rc == 2
+    assert "staged rotation audit" in capsys.readouterr().err
+
+
+def test_sign_bundle_final_reconciliation_rejects_extra_rotation_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = _stale_rotation_key(finding)
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    before = _tree_bytes(allowlist_dir)
+    rotation_log = tmp_path / "rotations.log"
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        ),
+    )
+    real_verify = sign_bundle_transaction._verify_completed_actions
+    calls = 0
+
+    def _verify_then_inject(*args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        real_verify(*args, **kwargs)
+        calls += 1
+        if calls == 2:
+            staged = kwargs["tx_path"] / "rotation-staged.log"
+            record = staged.read_text(encoding="utf-8").splitlines()[-1]
+            staged.write_text(staged.read_text(encoding="utf-8") + record + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(sign_bundle_transaction, "_verify_completed_actions", _verify_then_inject)
+    rc = main(
+        _argv(
+            bundle_path,
+            root,
+            allowlist_dir,
+            extra=("--yes", "--rotation-log", str(rotation_log)),
+        )
+    )
+
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert "exactly match completed rotations" in capsys.readouterr().err
+
+
+def test_sign_bundle_resume_tolerates_checkpoint_created_before_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_save = sign_bundle_transaction.save_manifest
+    saves = 0
+
+    def _interrupt_second_save(*args: Any, **kwargs: Any) -> None:
+        nonlocal saves
+        saves += 1
+        if saves == 2:
+            raise KeyboardInterrupt
+        real_save(*args, **kwargs)
+
+    monkeypatch.setattr(sign_bundle_transaction, "save_manifest", _interrupt_second_save)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    assert (transaction / "checkpoint").is_dir()
+
+    monkeypatch.setattr(sign_bundle_transaction, "save_manifest", real_save)
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert calls == ["plugins/gadget.py"]
+
+
+def test_sign_bundle_resume_tolerates_checkpoint_retired_after_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/gadget.py"),)),
+    )
+    real_clear = sign_bundle_transaction.clear_action_checkpoint
+
+    def _interrupt_before_delete(_tx_path: Path) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "clear_action_checkpoint", _interrupt_before_delete)
+    with _patch_judge(_accept_all):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest = json.loads((transaction / "transaction.json").read_text(encoding="utf-8"))
+    assert manifest["running_action"] is None
+    assert manifest["completed_actions"] == [0]
+    assert manifest["checkpoint_snapshot"] is None
+    assert (transaction / "checkpoint").is_dir()
+
+    monkeypatch.setattr(sign_bundle_transaction, "clear_action_checkpoint", real_clear)
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("journaled accepted action must not be re-judged"))):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert rc == 0
+    assert _canonical_key(finding) in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
+
+
+def test_reaudit_sidecar_writer_blocks_publish_and_is_not_stranded(
+    tmp_path: Path,
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+    from elspeth_lints.core.reaudit_sidecar import SidecarHeader, SidecarWriter
+
+    active = _build_allowlist_dir(tmp_path)
+    tx_path = tmp_path / "tx"
+    candidate = tx_path / "candidate" / active.name
+    candidate.parent.mkdir(parents=True)
+    shutil.copytree(active, candidate)
+    (candidate / "_defaults.yaml").write_text(
+        (candidate / "_defaults.yaml").read_text(encoding="utf-8") + "# candidate\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "allowlist_dir": str(active),
+        "candidate_dir": str(candidate),
+        "base_snapshot": sign_bundle_transaction.tree_snapshot(active),
+        "candidate_snapshot": sign_bundle_transaction.tree_snapshot(candidate),
+    }
+    run_id = "a" * 32
+    sidecar = active / ".reaudit-state" / f"{run_id}.jsonl"
+    header = SidecarHeader(
+        run_id=run_id,
+        started_at=datetime.now(UTC),
+        total_entries=0,
+        allowlist_path=str(active),
+        allowlist_hash="0" * 64,
+        judge_transport="openrouter",
+        rule_filter="trust_tier.tier_model",
+        since_iso=None,
+        limit=None,
+        include_pre_judge=False,
+    )
+    publish_error: list[BaseException] = []
+    publish_done = threading.Event()
+
+    def _publish() -> None:
+        try:
+            sign_bundle_transaction.publish_candidate(tx_path, manifest)
+        except BaseException as exc:
+            publish_error.append(exc)
+        finally:
+            publish_done.set()
+
+    with SidecarWriter(sidecar, header):
+        publisher = threading.Thread(target=_publish, daemon=True)
+        publisher.start()
+        assert not publish_done.wait(timeout=0.1)
+
+    publisher.join(timeout=5)
+    assert len(publish_error) == 1
+    assert "publish precondition failed" in str(publish_error[0])
+    assert sidecar.is_file()
+    assert not (candidate / ".reaudit-state").exists()
+
+
+# --- --judge-concurrency: judge ahead, write in order -------------------------
+
+
+def _transaction_manifest(allowlist_dir: Path) -> tuple[Path, dict[str, Any]]:
+    tx_root = allowlist_dir.parent / ".sign-bundle-transactions"
+    tx_dirs = [p for p in tx_root.iterdir() if p.is_dir()]
+    assert len(tx_dirs) == 1, tx_dirs
+    return tx_dirs[0], json.loads((tx_dirs[0] / "transaction.json").read_text(encoding="utf-8"))
+
+
+def test_sign_bundle_judge_concurrency_overlaps_judge_calls_and_writes_in_bundle_order(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Up to N judge calls run at once; every write still lands one at a time in bundle order.
+
+    The fake judge blocks each call until N-1 others are also in flight, so the
+    test proves the overlap rather than hoping for it; the verdict output on
+    stdout (written after the gate) must come out in bundle order.
+    """
+    import time
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    names = ("alpha", "beta", "gamma", "delta")
+    for name in names:
+        _write_source(root, f"{name}/mod.py", name)
+    findings = {name: _live_finding(root, f"{name}/mod.py") for name in names}
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            tuple(
+                _new_judgment_action(
+                    findings[name],
+                    f"{name}/mod.py",
+                    draft_rationale=f"{name} payload is Tier-3 external data from upstream tool-call",
+                )
+                for name in names
+            ),
+        ),
+    )
+
+    lock = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def _verdict(_file_path: str) -> JudgeVerdict:
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        # Hold the call long enough for the other workers to arrive.
+        time.sleep(0.3)
+        with lock:
+            in_flight -= 1
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_verdict) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", "3")))
+
+    assert rc == 0
+    assert sorted(calls) == sorted(f"{name}/mod.py" for name in names)
+    assert peak >= 2, f"judge calls never overlapped (peak in flight = {peak})"
+    assert peak <= 3
+    for name in names:
+        assert (allowlist_dir / f"{name}.yaml").is_file()
+    out = capsys.readouterr().out
+    positions = [out.index(_canonical_key(findings[name])) for name in names]
+    assert positions == sorted(positions), "verdict output (post-gate writes) left bundle order"
+
+
+def test_sign_bundle_judge_concurrency_preserves_serial_duplicate_rationale_evidence(tmp_path: Path) -> None:
+    """Same-rationale judges observe prior accepted writes while an independent rationale still overlaps.
+
+    Alpha waits until another request has reached the fake external judge. The
+    current scheduler fills that slot with beta, so both duplicate-rationale
+    requests have already scanned the pre-bundle allowlist and beta incorrectly
+    carries duplicate count zero. A dependency-aware scheduler instead fills
+    the slot with distinct-rationale gamma; after alpha writes, beta may start
+    and must carry the same evidence it would receive under serial execution.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    names = ("alpha", "beta", "gamma")
+    for name in names:
+        _write_source(root, f"{name}/mod.py", name)
+    findings = {name: _live_finding(root, f"{name}/mod.py") for name in names}
+    effective_fallback = "Staged via sign-bundle; see bundle provenance for the agent rationale."
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(findings["alpha"], "alpha/mod.py", draft_rationale=None),
+                _new_judgment_action(findings["beta"], "beta/mod.py", draft_rationale=effective_fallback),
+                _new_judgment_action(
+                    findings["gamma"],
+                    "gamma/mod.py",
+                    draft_rationale="gamma has an independent Tier-3 boundary rationale",
+                ),
+            ),
+        ),
+    )
+    another_request_started = threading.Event()
+    requests: list[Any] = []
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        if file_path == "alpha/mod.py":
+            assert another_request_started.wait(timeout=30), "no independent judge request filled the second worker slot"
+        else:
+            another_request_started.set()
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_verdict, request_log=requests):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", "2")))
+
+    assert rc == 0
+    request_by_file = {request.file_path: request for request in requests}
+    assert set(request_by_file) == {f"{name}/mod.py" for name in names}
+    assert request_by_file["alpha/mod.py"].rationale_duplicate_count == 0
+    assert request_by_file["alpha/mod.py"].similar_entries == ()
+    assert request_by_file["beta/mod.py"].rationale_duplicate_count == 1
+    assert [entry.key for entry in request_by_file["beta/mod.py"].similar_entries] == [_canonical_key(findings["alpha"])]
+    assert request_by_file["gamma/mod.py"].rationale_duplicate_count == 0
+    assert request_by_file["gamma/mod.py"].similar_entries == ()
+
+
+def test_sign_bundle_judge_concurrency_stop_on_block_discards_prefetched_verdicts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A BLOCK without --continue-on-block stops the loop; a verdict already fetched for a later action is dropped.
+
+    gamma's judge call is forced to complete BEFORE beta's BLOCK returns, so the
+    transaction holds an ACCEPT for gamma in memory when it stops. That verdict
+    must never reach the candidate: only alpha is journalled complete, beta is
+    journalled blocked, and gamma is left un-attempted for a resume to re-judge.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    for name in ("alpha", "beta", "gamma"):
+        _write_source(root, f"{name}/mod.py", name)
+    gamma = _live_finding(root, "gamma/mod.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(
+                    _live_finding(root, "alpha/mod.py"),
+                    "alpha/mod.py",
+                    draft_rationale="alpha has an independent Tier-3 boundary rationale",
+                ),
+                _new_judgment_action(
+                    _live_finding(root, "beta/mod.py"),
+                    "beta/mod.py",
+                    draft_rationale="beta has an independent Tier-3 boundary rationale",
+                ),
+                _new_judgment_action(
+                    gamma,
+                    "gamma/mod.py",
+                    draft_rationale="gamma has an independent Tier-3 boundary rationale",
+                ),
+            ),
+        ),
+    )
+    gamma_judged = threading.Event()
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        if file_path.startswith("gamma/"):
+            gamma_judged.set()
+            return JudgeVerdict.ACCEPTED
+        if file_path.startswith("beta/"):
+            assert gamma_judged.wait(timeout=30), "gamma was never prefetched"
+            return JudgeVerdict.BLOCKED
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_verdict):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", "3")))
+
+    assert rc == 1
+    assert gamma_judged.is_set()
+    assert _tree_bytes(allowlist_dir) == before
+    _tx_path, manifest = _transaction_manifest(allowlist_dir)
+    assert manifest["completed_actions"] == [0]
+    assert manifest["blocked_actions"] == [1]
+    assert manifest["running_action"] is None
+    candidate = Path(manifest["candidate_dir"])
+    assert (candidate / "alpha.yaml").is_file()
+    assert not (candidate / "gamma.yaml").exists()
+    captured = capsys.readouterr()
+    assert _canonical_key(gamma) not in captured.out
+    assert _RECOVERY_GUIDANCE in captured.err
+    assert "--judge-concurrency 3" in captured.err
+
+
+def test_judge_prefetcher_interrupted_submit_registers_and_aborts_write_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt after a worker starts cannot strand it or let it write."""
+    from elspeth_lints.core.sign_bundle_transaction import _JudgePrefetcher, _PrefetchAborted
+
+    action = SimpleNamespace(kind="justify", draft_rationale="same effective rationale")
+    prefetch = _JudgePrefetcher(
+        ordered_pending=[(0, action)],
+        concurrency=1,
+        execute=lambda _action, _args, _before_write: 0,
+        args=argparse.Namespace(),
+    )
+    registered_during_submit: list[bool] = []
+    worker_entered_gate = threading.Event()
+    worker_done = threading.Event()
+    worker_errors: list[BaseException] = []
+
+    def _interrupt_after_worker_start(
+        _execute: Any,
+        _action: Any,
+        _args: Any,
+        before_write: Callable[[], None],
+    ) -> Any:
+        gate_is_registered = prefetch._gates.get(0) is not None
+        registered_during_submit.append(gate_is_registered)
+        if gate_is_registered:
+
+            def _worker() -> None:
+                worker_entered_gate.set()
+                try:
+                    before_write()
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                finally:
+                    worker_done.set()
+
+            threading.Thread(target=_worker, daemon=True).start()
+            assert worker_entered_gate.wait(timeout=5)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(prefetch._pool, "submit", _interrupt_after_worker_start)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            prefetch.release_and_wait(0)
+    finally:
+        prefetch.close(wait=False)
+
+    assert registered_during_submit == [True]
+    assert worker_done.wait(timeout=5), "interrupted submit left a worker stranded at before_write"
+    assert len(worker_errors) == 1
+    assert isinstance(worker_errors[0], _PrefetchAborted)
+    assert prefetch._gates == {}
+    assert prefetch._futures == {}
+    assert prefetch._cohorts_by_index == {}
+    assert prefetch._active_cohorts == set()
+
+
+@pytest.mark.parametrize("value", ["0", "9"])
+def test_sign_bundle_judge_concurrency_out_of_range_is_refused(tmp_path: Path, value: str) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    _write_source(root, "alpha/mod.py", "alpha")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),)),
+    )
+
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", value)))
+
+    assert rc == 2
+    assert calls == []
+    assert _tree_bytes(allowlist_dir) == before

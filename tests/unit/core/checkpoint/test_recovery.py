@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,9 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars
 from elspeth.contracts.contract_records import ContractAuditRecord
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID
@@ -31,6 +34,7 @@ from elspeth.core.checkpoint import CheckpointCorruptionError, CheckpointManager
 from elspeth.core.checkpoint import recovery as recovery_module
 from elspeth.core.checkpoint.manager import IncompatibleCheckpointError
 from elspeth.core.checkpoint.recovery import _DELEGATION_PATHS, IncompleteTokenSpec
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
@@ -43,8 +47,10 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
-from tests.helpers.checkpoint import checkpoint_draft
+from tests.fixtures.factories import make_pipeline_row
+from tests.fixtures.landscape import insert_crashed_leader_seat, make_landscape_db
+from tests.helpers.checkpoint import create_checkpoint
+from tests.helpers.run_coordination import register_run_leader
 
 
 @pytest.fixture
@@ -93,13 +99,13 @@ def _create_checkpoint(
     graph: ExecutionGraph,
     barrier_scalars: BarrierScalars | None = None,
 ) -> Checkpoint:
-    return checkpoint_manager.create_checkpoint(
-        draft=checkpoint_draft(
-            run_id=run_id,
-            sequence_number=sequence_number,
-            graph=graph,
-            barrier_scalars=barrier_scalars,
-        )
+    # Written under the run's own seat, read back (ADR-048 §5).
+    return create_checkpoint(
+        checkpoint_manager,
+        run_id=run_id,
+        sequence_number=sequence_number,
+        graph=graph,
+        barrier_scalars=barrier_scalars,
     )
 
 
@@ -110,8 +116,14 @@ def _insert_run(
     status: RunStatus | str,
     with_contract: bool = False,
     contract_json_override: str | None = None,
+    with_crashed_seat: bool = True,
 ) -> None:
     """Insert a ``runs`` row, plus a ``run_sources`` row when a contract is requested.
+
+    ``with_crashed_seat`` leaves the lapsed ``run_coordination`` seat a
+    crashed leader would have left (a raw-SQL run has none), so checkpoint
+    writes can read the seat back (ADR-048 §5); a test that mints its own
+    seat passes ``False``.
 
     ADR-025 §3 Decision 5 (G6): the schema contract lives exclusively on
     ``run_sources.schema_contract_json``; the run-level singleton columns
@@ -142,6 +154,8 @@ def _insert_run(
             openrouter_catalog_source="bundled",
         )
     )
+    if with_crashed_seat:
+        insert_crashed_leader_seat(conn, run_id=run_id)
 
     if schema_contract_json is not None:
         # Ensure the SOURCE node exists before writing run_sources (FK constraint).
@@ -280,6 +294,7 @@ def _insert_blocked_work_item(
             barrier_blocked_at=now if barrier_key is not None else None,
             created_at=now,
             updated_at=now,
+            lineage_path_json="[]",
         )
     )
 
@@ -343,13 +358,13 @@ def test_can_resume_rejects_running_run_with_live_seat(db: LandscapeDB, recovery
     from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 
     with db.write_connection() as conn:
-        _insert_run(conn, "run-running", status=RunStatus.RUNNING)
+        _insert_run(conn, "run-running", status=RunStatus.RUNNING, with_crashed_seat=False)
     # Register a live leader seat so the guard fires the refusal.
     leader_id = mint_worker_id("run-running")
-    RunCoordinationRepository(db.engine).register_run_leader(
+    register_run_leader(
+        RunCoordinationRepository(db.engine),
         run_id="run-running",
         worker_id=leader_id,
-        now=datetime.now(UTC),
         window_seconds=80.0,
     )
 
@@ -476,6 +491,54 @@ def test_can_resume_true_for_failed_run_with_valid_checkpoint(
     assert check.reason is None
 
 
+@pytest.mark.parametrize("lifecycle_state", ["ready", "loading", "interrupted"])
+def test_can_resume_rejects_incomplete_source_lifecycle(
+    db: LandscapeDB,
+    checkpoint_manager: CheckpointManager,
+    recovery_manager: RecoveryManager,
+    lifecycle_state: str,
+) -> None:
+    """elspeth-1f5b83cd28: the advisory gate must refuse what resume() refuses.
+
+    ``resume()`` raises ``IncompleteSourceResumeError`` for any source whose
+    lifecycle never reached ``SOURCE_COMPLETE_LIFECYCLE_STATES`` — resume
+    replays only persisted row payloads, so unread source rows would be
+    silently lost. ``can_resume`` answering True for such a run is a false
+    green: the operator is told the run is recoverable, then every resume
+    attempt raises.
+    """
+    run_id = f"run-incomplete-source-{lifecycle_state}"
+    graph = _create_failed_run_with_checkpoint(db, checkpoint_manager, run_id)
+    with db.engine.begin() as conn:
+        conn.execute(update(run_sources_table).where(run_sources_table.c.run_id == run_id).values(lifecycle_state=lifecycle_state))
+
+    check = recovery_manager.can_resume(run_id, graph)
+    assert check.can_resume is False
+    assert check.reason is not None
+    assert f"primary={lifecycle_state}" in check.reason
+
+    # get_resume_point delegates to can_resume, so it must refuse too.
+    assert recovery_manager.get_resume_point(run_id, graph) is None
+
+
+@pytest.mark.parametrize("lifecycle_state", ["exhausted", "loaded"])
+def test_can_resume_accepts_complete_source_lifecycle(
+    db: LandscapeDB,
+    checkpoint_manager: CheckpointManager,
+    recovery_manager: RecoveryManager,
+    lifecycle_state: str,
+) -> None:
+    """Both ADR-038 complete states pass the source-lifecycle gate."""
+    run_id = f"run-complete-source-{lifecycle_state}"
+    graph = _create_failed_run_with_checkpoint(db, checkpoint_manager, run_id)
+    with db.engine.begin() as conn:
+        conn.execute(update(run_sources_table).where(run_sources_table.c.run_id == run_id).values(lifecycle_state=lifecycle_state))
+
+    check = recovery_manager.can_resume(run_id, graph)
+    assert check.can_resume is True
+    assert check.reason is None
+
+
 def test_get_resume_point_returns_none_when_run_cannot_resume(recovery_manager: RecoveryManager) -> None:
     assert recovery_manager.get_resume_point("missing", _create_graph()) is None
 
@@ -492,6 +555,32 @@ def test_get_resume_point_returns_none_if_checkpoint_missing_after_can_resume(
     monkeypatch.setattr(recovery_manager._checkpoint_manager, "get_latest_checkpoint", lambda _run_id: None)
 
     assert recovery_manager.get_resume_point("run-race", _create_graph()) is None
+
+
+def test_get_resume_point_propagates_checkpoint_corruption(
+    db: LandscapeDB,
+    recovery_manager: RecoveryManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier 1: persisted-checkpoint corruption CRASHES get_resume_point.
+
+    Pins the elspeth-ca0a7e71b1 fix: the dead ``except IncompatibleCheckpointError``
+    swallow around ``get_latest_checkpoint`` is gone — the raw persistence read
+    raises CheckpointCorruptionError on malformed data and nothing converts a
+    checkpoint-load failure into a silent "no resume point".
+    """
+    with db.write_connection() as conn:
+        _insert_run(conn, "run-corrupt", status=RunStatus.FAILED, with_contract=True)
+
+    monkeypatch.setattr(recovery_manager, "can_resume", lambda _run_id, _graph: type("Check", (), {"can_resume": True})())
+
+    def _corrupt(_run_id: str) -> None:
+        raise CheckpointCorruptionError("Corrupted checkpoint row")
+
+    monkeypatch.setattr(recovery_manager._checkpoint_manager, "get_latest_checkpoint", _corrupt)
+
+    with pytest.raises(CheckpointCorruptionError, match="Corrupted checkpoint row"):
+        recovery_manager.get_resume_point("run-corrupt", _create_graph())
 
 
 def test_get_resume_point_restores_barrier_scalars(
@@ -1585,26 +1674,69 @@ def test_get_unprocessed_rows_excludes_diverted_rows(
 # empty-string identity could produce valid-looking but meaningless audit work.
 # Mirrors TokenInfo.__post_init__ (contracts/identity.py) — see tests/unit/
 # contracts/test_identity.py for the sibling pattern.
+#
+# WS1b flip (ruling 21): branch_name/fork_group_id/expand_group_id are no
+# longer stored fields (or even derived accessors) on IncompleteTokenSpec —
+# the type carries lineage_path directly and reconstruct_token_row builds
+# TokenInfo from it, so the empty-string guard those fields had moved to
+# LineageFrame.__post_init__ (see tests/unit/contracts/test_identity.py's
+# LineageFrame construction tests). join_group_id and token_data_ref are the
+# only remaining optional-string identity fields here.
 
 
 def _valid_incomplete_token_spec_kwargs() -> dict[str, Any]:
     return {
         "token_id": "tok-1",
         "row_id": "row-1",
-        "branch_name": None,
-        "fork_group_id": None,
         "join_group_id": None,
-        "expand_group_id": None,
+        "lineage_path": (),
         "token_data_ref": None,
         "step_in_pipeline": 1,
         "max_attempt": -1,
     }
 
 
+@pytest.mark.parametrize("payload", [b"\xff", b"{", b"[]", b"null", b'{"data": {}}', b'{"contract": {}}'])
+def test_reconstruct_token_row_rejects_corrupt_envelope(
+    recovery_manager: RecoveryManager, payload_store: PayloadStore, payload: bytes
+) -> None:
+    source_row = make_pipeline_row({"id": 1})
+    kwargs = _valid_incomplete_token_spec_kwargs()
+    kwargs["token_data_ref"] = payload_store.store(payload)
+    spec = IncompleteTokenSpec(**kwargs)
+
+    with pytest.raises(AuditIntegrityError) as caught:
+        recovery_manager.reconstruct_token_row(spec, "run-corrupt", source_row, payload_store)
+
+    assert spec.token_id in str(caught.value)
+    assert "run-corrupt" in str(caught.value)
+
+
+def test_reconstruct_token_row_restores_persisted_token_envelope(recovery_manager: RecoveryManager, payload_store: PayloadStore) -> None:
+    source_row = make_pipeline_row({"id": 1})
+    token_row = make_pipeline_row({"id": 2})
+    payload = checkpoint_dumps({"data": token_row.to_dict(), "contract": token_row.contract.to_checkpoint_format()}).encode()
+    kwargs = _valid_incomplete_token_spec_kwargs()
+    kwargs["token_data_ref"] = payload_store.store(payload)
+
+    restored = recovery_manager.reconstruct_token_row(IncompleteTokenSpec(**kwargs), "run-valid", source_row, payload_store)
+
+    assert restored.to_dict() == {"id": 2}
+    assert restored.contract.version_hash() == token_row.contract.version_hash()
+
+
 def test_incomplete_token_spec_accepts_valid_identity() -> None:
     spec = IncompleteTokenSpec(**_valid_incomplete_token_spec_kwargs())
     assert spec.token_id == "tok-1"
     assert spec.row_id == "row-1"
+
+
+def test_incomplete_token_spec_accepts_a_populated_lineage_path() -> None:
+    path = (LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),)
+    kwargs = _valid_incomplete_token_spec_kwargs()
+    kwargs["lineage_path"] = path
+    spec = IncompleteTokenSpec(**kwargs)
+    assert spec.lineage_path == path
 
 
 @pytest.mark.parametrize("field", ["token_id", "row_id"])
@@ -1623,7 +1755,7 @@ def test_incomplete_token_spec_rejects_non_str_identity(field: str) -> None:
         IncompleteTokenSpec(**kwargs)
 
 
-@pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id", "token_data_ref"])
+@pytest.mark.parametrize("field", ["join_group_id", "token_data_ref"])
 def test_incomplete_token_spec_rejects_empty_optional_string(field: str) -> None:
     # NULL is the legitimate "not applicable" value for these columns; an empty
     # string is anomalous. token_data_ref in particular is used as a payload-store
@@ -1635,9 +1767,15 @@ def test_incomplete_token_spec_rejects_empty_optional_string(field: str) -> None
         IncompleteTokenSpec(**kwargs)
 
 
-@pytest.mark.parametrize("field", ["branch_name", "fork_group_id", "join_group_id", "expand_group_id", "token_data_ref"])
-def test_incomplete_token_spec_accepts_none_optional_string(field: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "read_field"),
+    (
+        pytest.param("join_group_id", lambda spec: spec.join_group_id, id="join_group_id"),
+        pytest.param("token_data_ref", lambda spec: spec.token_data_ref, id="token_data_ref"),
+    ),
+)
+def test_incomplete_token_spec_accepts_none_optional_string(field: str, read_field: Callable[[IncompleteTokenSpec], str | None]) -> None:
     kwargs = _valid_incomplete_token_spec_kwargs()
     kwargs[field] = None
     spec = IncompleteTokenSpec(**kwargs)
-    assert getattr(spec, field) is None
+    assert read_field(spec) is None

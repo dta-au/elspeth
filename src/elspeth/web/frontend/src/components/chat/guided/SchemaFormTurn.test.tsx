@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SchemaFormTurn } from "./SchemaFormTurn";
 import type { FieldKind, KnobField, SchemaFormPayload } from "@/types/guided";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
 
 function pluginPayload(fields: KnobField[], prefilled: Record<string, unknown> = {}): SchemaFormPayload {
   return {
@@ -301,6 +303,29 @@ describe("SchemaFormTurn", () => {
       expect(container.querySelector(".guided-schema-required-marker")).toBeNull();
     });
 
+    it("renders the knob placeholder on a JSON textarea (F5-5b)", async () => {
+      const user = userEvent.setup();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload([
+            field({
+              name: "schema",
+              label: "Schema",
+              kind: "json-value",
+              placeholder: '{"mode": "fixed", "fields": ["doc_id: str", "note: str?"]}',
+            }),
+          ])}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      expect(screen.getByRole("textbox", { name: "Schema" })).toHaveAttribute(
+        "placeholder",
+        '{"mode": "fixed", "fields": ["doc_id: str", "note: str?"]}',
+      );
+    });
+
     it("flags invalid JSON inline and blocks Continue until it parses", async () => {
       const user = userEvent.setup();
       const onSubmit = vi.fn();
@@ -423,14 +448,14 @@ describe("SchemaFormTurn", () => {
       const { container } = render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", kind: "text", required: true })], {
-            path: "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+            path: "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
           })}
           onSubmit={vi.fn()}
           isTutorial
         />,
       );
       expect(screen.getByText("project_pages.json")).toBeInTheDocument();
-      expect(screen.queryByText(/\/home\/john\/elspeth\/data\/blobs/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/\/srv\/elspeth\/data\/blobs/)).not.toBeInTheDocument();
       expect(container.querySelector(".guided-schema-input")).toBeNull();
     });
 
@@ -439,7 +464,7 @@ describe("SchemaFormTurn", () => {
       render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", kind: "text", required: true })], {
-            path: "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+            path: "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
           })}
           onSubmit={vi.fn()}
         />,
@@ -449,7 +474,7 @@ describe("SchemaFormTurn", () => {
       // match on the base label.
       const input = screen.getByLabelText(/path/) as HTMLInputElement;
       expect(input.value).toBe(
-        "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
+        "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json",
       );
       expect(input).not.toHaveAttribute("readonly");
     });
@@ -459,7 +484,7 @@ describe("SchemaFormTurn", () => {
       // receive the real storage_path so the run can read the blob.
       const onSubmit = vi.fn();
       const realPath =
-        "/home/john/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json";
+        "/srv/elspeth/data/blobs/sess/cb7f1f46-b724-4472-9acb-1680cefef45e_project_pages.json";
       render(
         <SchemaFormTurn
           payload={pluginPayload([field({ name: "path", kind: "text", required: true })], {
@@ -823,5 +848,301 @@ describe("SchemaFormTurn", () => {
       ).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     });
+  });
+  // ── required_when: conditional requiredness (R2-F2) ────────────────────────
+  //
+  // The knob schema lowered only pydantic field-level requiredness, so the
+  // local file sinks' `collision_policy` (default=None) arrived `required:
+  // false` even though the composer rejects a runnable file sink that omits it
+  // under mode='write'. The form let the user press Continue straight into that
+  // rejection. `required_when` carries the composer's rule to the form.
+  describe("required_when", () => {
+    function collisionPolicyFields(): KnobField[] {
+      return [
+        field({
+          name: "collision_policy",
+          label: "Collision Policy",
+          kind: "enum",
+          enum: ["fail_if_exists", "auto_increment", "append_or_create"],
+          nullable: true,
+          default: null,
+          required_when: { field: "mode", equals: "write" },
+        }),
+        // `mode` is declared AFTER the field that references it — it lives on
+        // the concrete sink subclass while collision_policy lives on
+        // LocalFileSinkConfig. A forward reference must work.
+        field({
+          name: "mode",
+          label: "Mode",
+          kind: "enum",
+          enum: ["write", "append"],
+          default: "write",
+        }),
+      ];
+    }
+
+    it("blocks Continue and names the field when the predicate is met", () => {
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      expect(
+        screen.getByText("1 value needs attention: Collision Policy — open Edit to review."),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    });
+
+    it("keeps the blocking field VISIBLE in the summary as 'Not set'", () => {
+      // Naming a field in the banner that the summary elides would send the
+      // user hunting for a row that is not there (elspeth-eba8820005).
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      expect(screen.getByText("Collision Policy")).toBeInTheDocument();
+      expect(screen.getByText("Not set")).toBeInTheDocument();
+    });
+
+    it("renders the required marker and aria-required while the predicate is met", async () => {
+      const user = userEvent.setup();
+      const { container } = render(
+        <SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      expect(screen.getByRole("combobox", { name: /Collision Policy/ })).toHaveAttribute(
+        "aria-required",
+        "true",
+      );
+      // Exactly one marker: `mode` carries a default and stays optional, so the
+      // visible cue must not spread to every field in the form.
+      const markers = container.querySelectorAll(".guided-schema-required-marker");
+      expect(markers).toHaveLength(1);
+      expect(markers[0].closest("label")?.textContent).toContain("Collision Policy");
+      expect(markers[0].closest("label")?.textContent).toContain("(required)");
+    });
+
+    it("drops the required marker and aria-required once the predicate is unmet", async () => {
+      const user = userEvent.setup();
+      const { container } = render(
+        <SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "append");
+
+      expect(screen.getByRole("combobox", { name: "Collision Policy" })).not.toHaveAttribute(
+        "aria-required",
+      );
+      expect(container.querySelectorAll(".guided-schema-required-marker")).toHaveLength(0);
+    });
+
+    it("releases Continue once the conditionally-required value is chosen", async () => {
+      const onSubmit = vi.fn();
+      const user = userEvent.setup();
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={onSubmit} />);
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: /Collision Policy/ }), "auto_increment");
+      await user.click(screen.getByRole("button", { name: "Done editing" }));
+      const continueButton = screen.getByRole("button", { name: "Continue" });
+      expect(continueButton).toBeEnabled();
+      await user.click(continueButton);
+
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: expect.objectContaining({
+            options: { collision_policy: "auto_increment", mode: "write" },
+          }),
+        }),
+      );
+    });
+
+    it("stays optional while the predicate is unmet", async () => {
+      const user = userEvent.setup();
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "append");
+      await user.click(screen.getByRole("button", { name: "Done editing" }));
+
+      expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+      expect(screen.queryByText(/needs attention/)).not.toBeInTheDocument();
+    });
+
+    it("re-gates Continue when the predicate becomes met again", async () => {
+      const user = userEvent.setup();
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "append");
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "write");
+      await user.click(screen.getByRole("button", { name: "Done editing" }));
+
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    });
+  });
+
+  // A blob uploaded AFTER this form was emitted (elspeth-c70909c13a): the turn
+  // payload is immutable replay authority, so the late upload can only land in
+  // the form's local draft — exactly the value the user would legally type.
+  // Mirrors the backend's upload-first prefill (_merge_inspection_into_prefill):
+  // path = blob:<id> plus on_validation_failure = discard.
+  describe("late-upload path prefill (sourceFormPathPrefill)", () => {
+    const BLOB_ID = "3e80ec24-392f-4862-ad22-ace24502c0bc";
+    const prefillBlob = {
+      id: BLOB_ID,
+      filename: "demo.csv",
+      sizeBytes: 204,
+      createdAt: "2026-07-26T09:00:00Z",
+    };
+
+    function pathFields(): KnobField[] {
+      return [
+        field({ name: "path", label: "Path", kind: "blob-ref", required: true }),
+        field({ name: "on_validation_failure", label: "On Validation Failure", kind: "text", required: true }),
+      ];
+    }
+
+    it("fills an empty path and validation routing from the uploaded blob", async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload(pathFields())}
+          onSubmit={onSubmit}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      const continueButton = screen.getByRole("button", { name: "Continue" });
+      expect(continueButton).toBeEnabled();
+      await user.click(continueButton);
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: {
+            plugin: "example",
+            options: { path: `blob:${BLOB_ID}`, on_validation_failure: "discard" },
+          },
+        }),
+      );
+    });
+
+    it("never overwrites a path the user (or server prefill) already set", async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload(pathFields(), {
+            path: "blob:11111111-1111-4111-8111-111111111111",
+            on_validation_failure: "quarantine",
+          })}
+          onSubmit={onSubmit}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Continue" }));
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: {
+            plugin: "example",
+            options: {
+              path: "blob:11111111-1111-4111-8111-111111111111",
+              on_validation_failure: "quarantine",
+            },
+          },
+        }),
+      );
+    });
+
+    it("leaves an already-answered validation routing alone when filling path", async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload(pathFields(), { on_validation_failure: "quarantine" })}
+          onSubmit={onSubmit}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Continue" }));
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: {
+            plugin: "example",
+            options: { path: `blob:${BLOB_ID}`, on_validation_failure: "quarantine" },
+          },
+        }),
+      );
+    });
+
+    it("ignores the prefill when the form has no path knob", () => {
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload([field({ name: "delimiter", label: "Delimiter", kind: "text", required: true })])}
+          onSubmit={vi.fn()}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    });
+  });
+});
+
+describe("SchemaFormTurn advanced tier", () => {
+  beforeEach(() => resetStore(usePreferencesStore));
+
+  const payload = pluginPayload([
+    field({ name: "prompt_template", label: "Prompt", kind: "text", required: true, tier: "common" }),
+    field({ name: "temperature", label: "Temperature", kind: "number-float", tier: "advanced", default: 0 }),
+  ]);
+
+  it("keeps advanced knobs behind a closed Advanced settings disclosure by default", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const details = screen.getByText("Advanced settings (1)").closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
+    // `Prompt` is required, so its accessible name carries the "(required)"
+    // cue (FieldLabel) — match on the base label, as the file's other
+    // required-field assertions do (e.g. `/Template/` above).
+    expect(screen.getByRole("textbox", { name: /Prompt/ })).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Temperature" })).toBeInTheDocument();
+  });
+
+  it("opens the disclosure when show_advanced is on", async () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+  });
+
+  it("opens the disclosure when the flag flips on an already-mounted form", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={payload} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).not.toHaveAttribute("open");
+    act(() => usePreferencesStore.setState({ showAdvanced: true }));
+    expect(screen.getByText("Advanced settings (1)").closest("details")).toHaveAttribute("open");
+  });
+
+  it("treats a field with no tier as common", async () => {
+    const user = userEvent.setup();
+    render(<SchemaFormTurn payload={pluginPayload([field({ name: "path", label: "Path", kind: "text" })])} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.queryByText(/Advanced settings/)).not.toBeInTheDocument();
+  });
+
+  it("renders a schema whose every field is advanced entirely inside the disclosure", async () => {
+    const user = userEvent.setup();
+    const allAdvanced = pluginPayload([
+      field({ name: "temperature", label: "Temperature", kind: "number-float", tier: "advanced", default: 0 }),
+    ]);
+    render(<SchemaFormTurn payload={allAdvanced} onSubmit={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const details = screen.getByText("Advanced settings (1)").closest("details") as HTMLElement;
+    expect(within(details).getByRole("spinbutton", { name: "Temperature" })).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "Temperature" }).closest("details")).toBe(details);
   });
 });

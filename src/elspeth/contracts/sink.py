@@ -34,6 +34,14 @@ SINK_CAPABILITIES_BY_PLUGIN: Final[Mapping[str, SinkCapabilities]] = MappingProx
             local_recovery_file=True,
             default_file_extension="csv",
         ),
+        "document": SinkCapabilities(
+            requires_path_option=True,
+            # A document holds exactly one value, so it can neither absorb
+            # rejected rows nor stand in as a recovery copy of the run.
+            eligible_as_failsink=False,
+            local_recovery_file=False,
+            default_file_extension="txt",
+        ),
         "json": SinkCapabilities(
             requires_path_option=True,
             eligible_as_failsink=True,

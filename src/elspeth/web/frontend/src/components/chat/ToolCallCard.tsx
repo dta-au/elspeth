@@ -1,9 +1,14 @@
 import { useMemo, useState } from "react";
 
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
+import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
-import { describeToolCall } from "./toolCallDescriptions";
+import {
+  TOOL_CALL_DESCRIPTIONS,
+  describeToolCall,
+  toolCallOutcomeLabelParts,
+} from "./toolCallDescriptions";
 
 /**
  * A button-triggered tooltip explaining what a composer tool call does in
@@ -19,14 +24,14 @@ function ToolCallInfo({
 }) {
   return (
     <span className="tool-call-info">
-      <button
-        type="button"
+      <Button
+        variant="bare"
         className="tool-call-info-trigger"
         aria-label={`What does ${toolName} do?`}
         aria-describedby={describedById}
       >
         i
-      </button>
+      </Button>
       <span
         id={describedById}
         role="tooltip"
@@ -82,29 +87,76 @@ export function ToolCallCard({
     );
   }, [proposal, isStale, currentState]);
   if (!proposal) {
+    // Proposal-less calls carry a server-derived outcome stamped by
+    // GET /messages from the Tier-1 tool rows (elspeth-f5e6723133). In
+    // auto_commit mode mutations execute without proposal rows, so without
+    // the stamp every applied change rendered as a read. "Looked up" is
+    // reserved for names in the read-only description map; a "completed"
+    // stamp on any other name (durable blob/interpretation writes) renders
+    // "Completed", and an unstamped non-read-only row renders "Ran" — no
+    // stamp means no server evidence of success, so no success is claimed.
+    const outcome = toolCall.outcome;
+    const { prefix, qualifier } = toolCallOutcomeLabelParts(
+      toolCall.function.name,
+      outcome,
+    );
+    // Sentence primary, identifier secondary — the ComposingIndicator ruling
+    // (ComposingIndicator.tsx:320-346) applied to the settled ribbon. The
+    // evidential prefix stays attached to the PRIMARY line: a failed mutation
+    // rendered as a bare sentence would claim the mutation happened. An
+    // unmapped name has no honest sentence (describeToolCall's fallback is
+    // generic), so it keeps the raw-name label and no secondary.
+    const sentence: string | undefined =
+      TOOL_CALL_DESCRIPTIONS[toolCall.function.name];
+    const appliedVersion =
+      outcome === "applied" && typeof toolCall.applied_state_version === "number"
+        ? toolCall.applied_state_version
+        : null;
     return (
-      <div className="tool-call-ribbon">
+      <div
+        className={`tool-call-ribbon${outcome ? ` tool-call-ribbon--${outcome}` : ""}`}
+      >
         <ToolCallInfo
           toolName={toolCall.function.name}
           describedById={`tool-call-info-${toolCall.id}`}
         />
-        <span>Looked up: {toolCall.function.name}</span>
+        <span className="tool-call-ribbon-text">
+          {prefix}: {sentence ?? toolCall.function.name}
+          {qualifier}
+        </span>
+        {sentence !== undefined && (
+          <code className="tool-call-ribbon-name">{toolCall.function.name}</code>
+        )}
+        {appliedVersion !== null && (
+          <code
+            className="tool-call-ribbon-version"
+            title={`Pipeline advanced to version ${appliedVersion}`}
+          >
+            v{appliedVersion}
+          </code>
+        )}
       </div>
     );
   }
 
   const isPending = proposal.status === "pending";
-  const heading =
+  const proposalSentence: string | undefined =
+    TOOL_CALL_DESCRIPTIONS[proposal.tool_name];
+  const headingPrefix =
     proposal.status === "pending"
-      ? `Proposed: ${proposal.tool_name}`
+      ? "Proposed"
       : proposal.status === "committed"
-        ? `Applied: ${proposal.tool_name}`
-        : `Rejected: ${proposal.tool_name}`;
+        ? "Applied"
+        : "Rejected";
+  const heading = `${headingPrefix}: ${proposalSentence ?? proposal.tool_name}`;
 
   return (
     <article className={`tool-call-card tool-call-card--${proposal.status}`}>
       <header className="tool-call-card-header">
         <strong>{heading}</strong>
+        {proposalSentence !== undefined && (
+          <code className="tool-call-ribbon-name">{proposal.tool_name}</code>
+        )}
         <ToolCallInfo
           toolName={proposal.tool_name}
           describedById={`tool-call-info-${proposal.id}`}
@@ -129,7 +181,7 @@ export function ToolCallCard({
           per-argument fields. The raw JSON stays available behind the
           details expander below in both cases. */}
       {diffEntries !== null ? (
-        <ProposalChanges entries={diffEntries} />
+        <ProposalChanges diff={diffEntries} />
       ) : (
         <ArgumentFields args={proposal.arguments_redacted_json} />
       )}
@@ -147,29 +199,29 @@ export function ToolCallCard({
       )}
       {isPending && !isStale && (
         <div className="tool-call-actions">
-          <button
-            type="button"
+          <Button
+            variant="primary"
             onClick={() => onAccept(proposal.id)}
             aria-label={`Accept proposal: ${proposal.summary}`}
             disabled={isBusy}
-            className="btn btn-primary btn-small"
+            className="btn-small"
           >
             Accept
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="danger"
             onClick={() => setRejectConfirmOpen(true)}
             aria-label={`Reject proposal: ${proposal.summary}`}
             disabled={isBusy}
-            className="btn btn-danger btn-small"
+            className="btn-small"
           >
             Reject
-          </button>
+          </Button>
         </div>
       )}
       {rejectConfirmOpen && proposal && (
         <ConfirmDialog
-          title="Reject this proposal?"
+          title="Reject proposal"
           message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
           confirmLabel="Reject proposal"
           cancelLabel="Keep open"

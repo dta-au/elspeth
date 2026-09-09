@@ -1,8 +1,21 @@
 // src/components/chat/ComposingIndicator.tsx
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
-import type { ComposerProgressSnapshot, CompositionState } from "@/types/api";
+import { Button } from "@/components/ui";
+import type {
+  ComposerProgressSnapshot,
+  CompositionState,
+  ToolCall,
+} from "@/types/api";
+import {
+  COMPLETION_OUTCOME_LABELS,
+  type CompletionOutcome,
+} from "./completionOutcome";
+import {
+  TOOL_CALL_DESCRIPTIONS,
+  liveToolCallLabel,
+} from "./toolCallDescriptions";
 import { hasSources } from "@/utils/compositionState";
 import { plural } from "@/utils/plural";
 
@@ -10,6 +23,24 @@ interface ComposingIndicatorProps {
   latestRequest?: string | null;
   compositionState?: CompositionState | null;
   composerProgress?: ComposerProgressSnapshot | null;
+  /**
+   * Honest terminal-badge state for a successful completion
+   * (elspeth-bf9c296ee5), derived by the parent from the run gate's own
+   * signals (useCompletionOutcome). Only consulted when phase is
+   * "complete" — failed/cancelled keep their own labels. Omitted/null
+   * falls back to the legacy "Updated" badge (snapshot-only reloads where
+   * the per-turn mutation verdict is unknowable).
+   */
+  completionOutcome?: CompletionOutcome | null;
+  /**
+   * Tool calls of the mid-flight tail turn (elspeth-3c2caf56a7), derived by
+   * ChatPanel from the same inflight-messages poll that feeds the bubbles.
+   * The atomic-reveal gate hides the incomplete turn's bubble, so this list
+   * is the only mid-turn surface naming what the composer is doing. Empty
+   * once the genuine reply lands (the entries roll into the bubble's
+   * "Tool calls (N)" disclosure).
+   */
+  liveToolCalls?: ToolCall[];
 }
 
 interface RequestFocus {
@@ -40,9 +71,17 @@ function isTerminalPhase(
 
 function terminalStatusLabel(
   phase: ComposerProgressSnapshot["phase"] | undefined,
+  completionOutcome: CompletionOutcome | null | undefined,
 ): string {
   if (phase === "failed") return "Failed";
   if (phase === "cancelled") return "Stopped";
+  // A successful completion must not claim more than the run gate would
+  // honour: the outcome distinguishes Response ready / Pipeline updated /
+  // Review required / Pipeline ready (elspeth-bf9c296ee5). "Updated" remains
+  // only as the no-signal fallback.
+  if (completionOutcome != null) {
+    return COMPLETION_OUTCOME_LABELS[completionOutcome];
+  }
   return "Updated";
 }
 
@@ -200,6 +239,8 @@ export function ComposingIndicator({
   latestRequest = null,
   compositionState = null,
   composerProgress = null,
+  completionOutcome = null,
+  liveToolCalls = [],
 }: ComposingIndicatorProps) {
   const workingView =
     backendWorkingView(composerProgress) ??
@@ -207,6 +248,7 @@ export function ComposingIndicator({
   const isTerminal = isTerminalPhase(composerProgress?.phase);
   const isEstimated = workingView.source === "estimated";
   const progressKey = latestRequest ?? composerProgress?.request_id ?? "idle";
+  const toolLogCaptionId = `${useId()}-tool-log`;
   const [detailsOpen, setDetailsOpen] = useState(isTerminal);
 
   useEffect(() => {
@@ -220,7 +262,7 @@ export function ComposingIndicator({
       <div className="composing-bubble">
         {isTerminal ? (
           <div className="composing-terminal-mark" aria-hidden="true">
-            {terminalStatusLabel(composerProgress?.phase)}
+            {terminalStatusLabel(composerProgress?.phase, completionOutcome)}
           </div>
         ) : (
           <div className="composing-pulse" aria-hidden="true">
@@ -254,14 +296,69 @@ export function ComposingIndicator({
             </div>
           </div>
 
-          <button
-            type="button"
+          {/* Live tool-call log: always visible (not behind Show details) and
+              deliberately a SIBLING of the role="status" summary above — an
+              append-per-poll list inside a polite live region would announce
+              every 1.5s poll tick to AT (the aria-hidden ElapsedReadout
+              precedent, WCAG 4.1.3). */}
+          {liveToolCalls.length > 0 && (
+            <>
+              {/* The list had no name of any kind: nothing told the operator
+                  that "Running: set_source" was a log of composer actions
+                  rather than status noise. Visible caption (not just an
+                  aria-label) because it doubles as the plain-language anchor
+                  for the Ran/Running/Looked up vocabulary, and it labels the
+                  list for AT via aria-labelledby. */}
+              <div className="composing-tool-log-caption" id={toolLogCaptionId}>
+                Composer actions in this turn
+              </div>
+              <ul
+                className="composing-tool-log"
+                aria-labelledby={toolLogCaptionId}
+              >
+                {liveToolCalls.map((call) => {
+                  const name = call.function.name;
+                  // The audience-facing sentence was bound to `title` —
+                  // mouse-only, so during the very wait this surface exists to
+                  // fill, a non-engineer got motion without meaning. It is now
+                  // the visually primary line and the machine identifier is
+                  // demoted to the secondary one.
+                  //
+                  // The evidential prefix STAYS attached to the tool name and
+                  // is never dropped: it is the honesty contract of this log
+                  // (Failed / Attempted (not applied) / Cancelled), and a
+                  // failed mutation rendered as a bare description would claim
+                  // the mutation happened. Unmapped names have no honest
+                  // description — describeToolCall's fallback is the generic
+                  // "Composer tool call." — so they keep the bare label rather
+                  // than gaining a line that says nothing.
+                  const description: string | undefined =
+                    TOOL_CALL_DESCRIPTIONS[name];
+                  return (
+                    <li key={call.id}>
+                      {description !== undefined && (
+                        <span className="composing-tool-log-what">
+                          {description}
+                        </span>
+                      )}
+                      <span className="composing-tool-log-call">
+                        {liveToolCallLabel(name, call.outcome)}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
+
+          <Button
+            variant="bare"
             className="composing-details-toggle"
             aria-expanded={detailsOpen}
             onClick={() => setDetailsOpen((open) => !open)}
           >
             {detailsOpen ? "Hide details" : "Show details"}
-          </button>
+          </Button>
 
           {detailsOpen && (
             <div className="composing-details">

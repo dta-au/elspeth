@@ -11,14 +11,30 @@
 #   docker run elspeth --help                                                # Show available commands
 #   docker run elspeth --version                                             # Show version
 #   docker run elspeth run --settings /app/config/pipeline.yaml              # Run batch pipeline
-#   docker run -p 8451:8451 -e ELSPETH_WEB__SECRET_KEY=<key> elspeth web     # Start web server
+#   docker run -p 8451:8451 <required-web-env> elspeth web --host 0.0.0.0   # Start web server
+
+# One canonical build selection is threaded through every stage. The runtime
+# label makes the selected extras inspectable on the final artifact; official
+# generic GHCR/ACR builds set this explicitly to "all".
+ARG INSTALL_EXTRAS="all"
+
+# SHA-256 of the reviewed AWS RDS global trust bundle baked into the image.
+# Must match deploy/aws-ecs/trust/global-bundle.pem.sha256; the builder-stage
+# COPY below fails the build if the checked-in file drifts from this pin.
+ARG RDS_CA_BUNDLE_SHA256="e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
 
 # =============================================================================
 # Stage 1: Frontend Builder
 # =============================================================================
-FROM node:24.13.0-bookworm-slim@sha256:4660b1ca8b28d6d1906fd644abe34b2ed81d15434d26d845ef0aced307cf4b6f AS frontend-builder
+FROM node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS frontend-builder
 
 WORKDIR /frontend
+
+# Keep the package manager as reproducible as the Node base on every target
+# architecture, and fail the build immediately if either runtime drifts.
+RUN npm install --global npm@11.6.2 && \
+    test "$(node --version)" = "v24.18.0" && \
+    test "$(npm --version)" = "11.6.2"
 
 # Install frontend dependencies from the lockfile first (layer caching)
 COPY src/elspeth/web/frontend/package.json src/elspeth/web/frontend/package-lock.json ./
@@ -32,7 +48,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Python Builder
 # =============================================================================
-FROM python:3.13-slim@sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3 AS builder
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS builder
 
 # Install uv for fast, deterministic dependency resolution
 # Using official installer (https://docs.astral.sh/uv/getting-started/installation/)
@@ -47,7 +63,7 @@ COPY elspeth-lints/ ./elspeth-lints/
 
 # Create virtual environment and sync the selected locked dependencies.
 # The default "all" preserves the shared GHCR/ACR image behavior.
-ARG INSTALL_EXTRAS="all"
+ARG INSTALL_EXTRAS
 RUN uv venv /opt/venv && \
     . /opt/venv/bin/activate && \
     test -n "$INSTALL_EXTRAS" && \
@@ -63,7 +79,11 @@ RUN uv venv /opt/venv && \
 
 # Copy source code
 COPY src/ ./src/
-COPY README.md ./
+
+# Hatch requires the project readme while building metadata. Use fixed content
+# and an epoch timestamp so public README edits cannot alter release images.
+RUN printf '%s\n' '# ELSPETH package metadata' > README.md && \
+    touch --date=@0 README.md
 
 # Install the project from the lockfile (non-editable) with the same selected extras.
 RUN . /opt/venv/bin/activate && \
@@ -81,41 +101,85 @@ RUN . /opt/venv/bin/activate && \
 # Copy built SPA assets into the installed package, where app.py looks for
 # elspeth/web/frontend/dist at runtime.
 COPY --from=frontend-builder /frontend/dist /tmp/frontend-dist/
-RUN . /opt/venv/bin/activate && \
+RUN find /tmp/frontend-dist -type d -exec chmod 0755 {} + && \
+    find /tmp/frontend-dist -type f -exec chmod 0644 {} + && \
+    . /opt/venv/bin/activate && \
     python -c 'from pathlib import Path; import shutil; import elspeth.web; target = Path(elspeth.web.__file__).parent / "frontend" / "dist"; shutil.rmtree(target, ignore_errors=True); target.parent.mkdir(parents=True, exist_ok=True); shutil.copytree("/tmp/frontend-dist", target)' && \
     rm -rf /tmp/frontend-dist
+
+# Bake the reviewed AWS RDS global trust bundle into the runtime root,
+# root-owned and read-only, with a build-time digest check so a tampered or
+# stale checked-in bundle fails the build instead of shipping silently.
+ARG RDS_CA_BUNDLE_SHA256
+COPY deploy/aws-ecs/trust/global-bundle.pem /runtime-root/etc/elspeth/rds/global-bundle.pem
+COPY deploy/aws-ecs/trust/global-bundle.pem.sha256 /runtime-root/etc/elspeth/rds/global-bundle.pem.sha256
+RUN test "$(sha256sum /runtime-root/etc/elspeth/rds/global-bundle.pem | cut -d' ' -f1)" = "$RDS_CA_BUNDLE_SHA256" && \
+    chown -R 0:0 /runtime-root/etc/elspeth && \
+    find /runtime-root/etc/elspeth -type d -exec chmod 0755 {} + && \
+    find /runtime-root/etc/elspeth -type f -exec chmod 0444 {} +
+
+# Prepare everything the final stage would otherwise need to manufacture.
+# The debug distroless variant retains BusyBox utilities for the documented
+# Docker smoke and the AWS ECS launch wrapper, while the application identity
+# and writable roots stay unchanged.
+RUN groupadd --gid 1654 elspeth && \
+    useradd --uid 1654 --gid elspeth --shell /bin/sh --home-dir /home/elspeth elspeth && \
+    mkdir -p \
+        /runtime-root/app/config \
+        /runtime-root/app/data/blobs \
+        /runtime-root/app/data/outputs \
+        /runtime-root/app/input \
+        /runtime-root/app/ops \
+        /runtime-root/app/output \
+        /runtime-root/app/secrets \
+        /runtime-root/app/state \
+        /runtime-root/etc \
+        /runtime-root/home/elspeth \
+        /runtime-root/usr/bin && \
+    ln -s /busybox/sh /runtime-root/usr/bin/sh && \
+    cp /etc/passwd /runtime-root/etc/passwd && \
+    cp /etc/group /runtime-root/etc/group && \
+    chown -R 1654:1654 /runtime-root/app /runtime-root/home/elspeth && \
+    sed -i \
+        -e 's#^home = .*#home = /usr/bin#' \
+        -e 's#^executable = .*#executable = /usr/bin/python3.13#' \
+        /opt/venv/pyvenv.cfg && \
+    ln -sfn /usr/bin/python3.13 /opt/venv/bin/python && \
+    ln -sfn python /opt/venv/bin/python3 && \
+    ln -sfn python /opt/venv/bin/python3.13
 
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM python:3.13-slim@sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3 AS runtime
+FROM gcr.io/distroless/python3-debian13:debug-nonroot@sha256:6418f576f2011f5d265d03f53aee812b4efcba5c6646a3f4d855b9fb51cd2d72 AS runtime
+
+ARG INSTALL_EXTRAS
+ARG RDS_CA_BUNDLE_SHA256
 
 # Labels for container registry
 LABEL org.opencontainers.image.title="ELSPETH"
 LABEL org.opencontainers.image.description="Auditable Sense/Decide/Act Pipelines"
-LABEL org.opencontainers.image.source="https://github.com/johnm-dta/elspeth"
+LABEL org.opencontainers.image.source="https://github.com/dta-au/elspeth"
 LABEL org.opencontainers.image.licenses="MIT"
+LABEL io.elspeth.aws-ecs-config-contract="elspeth.aws-ecs.runtime.v1"
+LABEL io.elspeth.install-extras="$INSTALL_EXTRAS"
+LABEL io.elspeth.runtime-uid="1654"
+LABEL io.elspeth.runtime-gid="1654"
+LABEL io.elspeth.rds-ca-bundle-sha256="$RDS_CA_BUNDLE_SHA256"
+LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"
 
-# Create non-root user for security
-RUN groupadd --gid 1000 elspeth && \
-    useradd --uid 1000 --gid elspeth --shell /bin/bash --create-home elspeth
-
-# Copy virtual environment from builder
+# Copy the prepared identity, home, application roots, and virtual environment.
+COPY --from=builder /runtime-root/ /
 COPY --from=builder /opt/venv /opt/venv
 
 # Set up PATH to use venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV HOME="/home/elspeth"
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /app
-
-# Create standard mount point directories
-# These will typically be mounted from host
-# /app/state is for the default audit.db location (sqlite:///./state/audit.db)
-RUN mkdir -p /app/config /app/input /app/ops /app/output /app/state /app/secrets && \
-    chown -R elspeth:elspeth /app
 
 # Switch to non-root user
 USER elspeth
@@ -135,7 +199,7 @@ EXPOSE 8451
 
 # Entry point is the elspeth CLI
 # Arguments after image name are passed directly to elspeth
-ENTRYPOINT ["elspeth"]
+ENTRYPOINT ["/opt/venv/bin/elspeth"]
 
 # Default command shows help - explicit command required for all operations.
 # The web server requires ELSPETH_WEB__SECRET_KEY for non-loopback hosts,

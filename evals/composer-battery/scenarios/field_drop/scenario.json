@@ -1,0 +1,123 @@
+{
+  "case": "field_drop",
+  "example": null,
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "json",
+      "on_success": "in",
+      "options": {
+        "path": "colours.json",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [
+      {
+        "id": "keep_names",
+        "node_type": "transform",
+        "plugin": "field_mapper",
+        "input": "in",
+        "on_success": "out",
+        "on_error": "discard",
+        "options": {
+          "mapping": {
+            "name": "name"
+          },
+          "select_only": true,
+          "schema": {
+            "mode": "observed"
+          }
+        }
+      }
+    ],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "out",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/colours.json",
+          "format": "json",
+          "schema": {
+            "mode": "observed"
+          },
+          "mode": "write",
+          "collision_policy": "auto_increment"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "json",
+        "extras": {}
+      },
+      {
+        "kind": "transform",
+        "plugin": "field_mapper",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ],
+      [
+        1,
+        2,
+        "on_success"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: schemas for json, field_mapper \u2014 one batched call",
+      "data: the invented rows travel with the mutation \u2014 0 extra (observed 2026-08-17: this substrate routes them via a blob resolved by one interpretation-review round; see calibration/README.md)",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors source, the field_mapper node and the sink"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": false,
+    "is_valid": true
+  }
+}

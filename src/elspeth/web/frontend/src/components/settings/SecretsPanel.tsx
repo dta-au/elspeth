@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSecretsStore } from "@/stores/secretsStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import type { SecretInventoryItem } from "@/types/api";
 
 interface SecretsPanelProps {
@@ -16,6 +17,15 @@ interface SecretFormErrorTargets {
   value: boolean;
 }
 
+/** Reader-register names for the closed scope enum; the raw scope stays in
+ *  `title` (elspeth-d74ab492dd). Exhaustive by type: adding a scope without a
+ *  name is a compile error. */
+const SCOPE_LABELS: Record<SecretInventoryItem["scope"], string> = {
+  user: "Yours",
+  server: "Deployment",
+  org: "Organisation",
+};
+
 function ScopeBadge({ scope }: { scope: SecretInventoryItem["scope"] }) {
   const colors: Record<SecretInventoryItem["scope"], { bg: string; text: string }> = {
     user: { bg: "var(--color-accent-muted)", text: "var(--color-accent)" },
@@ -27,8 +37,9 @@ function ScopeBadge({ scope }: { scope: SecretInventoryItem["scope"] }) {
     <span
       className="secrets-scope-badge"
       style={{ backgroundColor: bg, color: text }}
+      title={scope}
     >
-      {scope}
+      {SCOPE_LABELS[scope] ?? scope}
     </span>
   );
 }
@@ -97,7 +108,10 @@ function secretFormErrorTargets(error: string | null): SecretFormErrorTargets {
 }
 
 /**
- * Secrets settings panel — modal overlay.
+ * API keys & secrets panel — modal overlay. The dialog's accessible name
+ * matches the "API keys & secrets" affordances that open it (App.tsx header
+ * shortcut, ChatInput), so what a screen reader announces on open is the
+ * name the user just activated.
  *
  * Write-only entry form for user-scoped secrets plus an inventory display
  * showing all available secret references (metadata only, never values).
@@ -182,12 +196,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
       <div
         role="presentation"
         onClick={onClose}
-        style={{
-          position: "fixed",
-          inset: 0,
-          backgroundColor: "rgba(0,0,0,0.45)",
-          zIndex: 100,
-        }}
+        className="app-dialog-backdrop"
       />
 
       {/* Modal */}
@@ -195,44 +204,34 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
         ref={modalRef}
         role="dialog"
         aria-modal="true"
-        aria-label="Secrets settings"
-        style={{
-          position: "fixed",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          zIndex: 101,
-          width: 480,
-          maxWidth: "calc(100vw - 32px)",
-          maxHeight: "calc(100vh - 64px)",
-          display: "flex",
-          flexDirection: "column",
-          backgroundColor: "var(--color-surface)",
-          borderRadius: 8,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
-          border: "1px solid var(--color-border)",
-          fontSize: 13,
-          overflow: "hidden",
-        }}
+        aria-label="API keys & secrets"
+        className="app-dialog settings-dialog"
       >
         {/* Header */}
         <div className="secrets-panel-header">
-          <h2 className="secrets-panel-title">
-            API Keys &amp; Secrets
-          </h2>
-          <button
+          {/* One name for one destination (elspeth-5deeca7f99): both controls
+              that open this panel — App.tsx's provider-alert action and the
+              ChatInput overflow menu — read "API keys & secrets", so the
+              destination reads the same way rather than title-casing itself
+              on arrival. */}
+          <h2 className="secrets-panel-title">API keys &amp; secrets</h2>
+          <Button
+            variant="bare"
             onClick={onClose}
             aria-label="Close secrets panel"
-            className="secrets-panel-close"
+            className="dialog-close"
           >
             ×
-          </button>
+          </Button>
         </div>
 
         {/* Scrollable body */}
         <div className="secrets-panel-body">
           {/* Entry form */}
-          <section aria-labelledby="secrets-add-heading">
+          <section
+            aria-labelledby="secrets-add-heading"
+            className="secrets-panel-section"
+          >
             <h3
               id="secrets-add-heading"
               className="secrets-section-heading"
@@ -242,13 +241,10 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
             <form onSubmit={handleSubmit} noValidate>
               <div className="secrets-form-fields">
                 <div>
-                  <label
-                    htmlFor="secret-name"
-                    className="secrets-form-label"
-                  >
+                  <label htmlFor="secret-name" className="field-label">
                     Name
                   </label>
-                  <input
+                  <Input
                     id="secret-name"
                     type="text"
                     aria-invalid={formErrorTargets.name ? true : undefined}
@@ -260,19 +256,15 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                     placeholder="e.g. OPENAI_API_KEY"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="secrets-form-input"
                   />
                 </div>
                 <div>
-                  <label
-                    htmlFor="secret-value"
-                    className="secrets-form-label"
-                  >
+                  <label htmlFor="secret-value" className="field-label">
                     Value
                   </label>
                   {/* SECURITY: type="password" — value never displayed in plaintext.
                       No "show" toggle is intentional. */}
-                  <input
+                  <Input
                     id="secret-value"
                     type="password"
                     aria-invalid={formErrorTargets.value ? true : undefined}
@@ -283,16 +275,16 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                     placeholder="Paste your secret value here"
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
-                    className="secrets-form-input"
                   />
                 </div>
-                <button
+                <Button
                   type="submit"
+                  variant="primary"
                   disabled={!name.trim() || !value || isSubmitting}
-                  className="btn btn-primary secrets-submit-btn"
+                  className="secrets-submit-btn"
                 >
                   {isSubmitting ? "Saving…" : "Save secret"}
-                </button>
+                </Button>
               </div>
             </form>
           </section>
@@ -302,21 +294,17 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
             <div
               id={hasFormErrorTarget ? SECRET_FORM_ERROR_ID : undefined}
               role="alert"
-              style={{
-                marginTop: 12,
-                padding: "6px 10px",
-                borderRadius: 4,
-                backgroundColor: "var(--color-error-bg)",
-                color: "var(--color-error)",
-                fontSize: 12,
-              }}
+              className="secrets-form-error"
             >
               {error}
             </div>
           )}
 
           {/* Inventory */}
-          <section aria-labelledby="secrets-inventory-heading" style={{ marginTop: 20 }}>
+          <section
+            aria-labelledby="secrets-inventory-heading"
+            className="secrets-panel-section"
+          >
             <h3
               id="secrets-inventory-heading"
               className="secrets-section-heading"
@@ -363,17 +351,24 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
 
                       <ScopeBadge scope={secret.scope} />
 
-                      {/* Server-scoped and org-scoped secrets are read-only — no delete */}
-                      {secret.scope === "user" && (
-                        <button
-                          onClick={() => setPendingDelete(secret.name)}
-                          aria-label={`Delete secret ${secret.name}`}
-                          title="Delete"
-                          className="secrets-delete-btn"
-                        >
-                          ×
-                        </button>
-                      )}
+                      {/* Server-scoped and org-scoped secrets are read-only — no
+                          delete. The slot is rendered on EVERY row regardless
+                          (elspeth-ca94961ead): without it, read-only rows let
+                          the scope badge run a control-width further right and
+                          the badge column zig-zagged down the list. */}
+                      <span className="secrets-list-action">
+                        {secret.scope === "user" && (
+                          <Button
+                            variant="bare"
+                            onClick={() => setPendingDelete(secret.name)}
+                            aria-label={`Delete secret ${secret.name}`}
+                            title="Delete"
+                            className="secrets-delete-btn"
+                          >
+                            ×
+                          </Button>
+                        )}
+                      </span>
                     </li>
                   );
                 })}
@@ -392,7 +387,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
       {/* WCAG 3.3.4: irreversible delete is gated behind a danger confirmation. */}
       {pendingDelete !== null && (
         <ConfirmDialog
-          title="Delete this secret?"
+          title="Delete secret"
           message={`Delete secret "${pendingDelete}"? Pipelines that reference it will fail.`}
           confirmLabel="Delete secret"
           cancelLabel="Cancel"

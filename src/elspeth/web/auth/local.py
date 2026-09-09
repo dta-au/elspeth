@@ -6,39 +6,238 @@ and validation. The SQLite database is created at db_path on first use.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
+import json
+import os
 import secrets
 import sqlite3
+import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+from urllib.parse import urlencode
 
 import bcrypt
-import jwt
-from jwt.exceptions import PyJWTError
+import structlog
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
-from elspeth.web.validation import has_visible_content
+from elspeth.web.auth.models import (
+    AccessPending,
+    AuthenticationError,
+    IdentityClaims,
+    IdentityDisabled,
+    UserIdentity,
+    UserProfile,
+)
+from elspeth.web.auth.session_token import SessionTokenIssuer
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
+
+# Resolve a local username to the identity row that owns it, admitting the
+# person if this is their first sight. Injected rather than imported: the
+# implementation writes the SESSIONS store, and ``web.auth`` does not depend
+# on ``web.sessions`` (the dependency already runs the other way, in
+# ``sessions/ownership.py``).
+AdmitIdentity = Callable[[IdentityClaims], "EnsureIdentityOutcome"]
+
+# Retire the identity bound to a local username whose credential has been
+# deleted, so the next holder of that username cannot inherit its admission.
+# Injected for the same reason as AdmitIdentity: the write lands in the
+# SESSIONS store, which web.auth does not depend on.
+RetireIdentity = Callable[[str], None]
+
+_slog = structlog.get_logger(__name__)
 
 _EMAIL_VERIFICATION_TOKEN_BYTES = 32
 _EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS = 5 * 60
+_TOKEN_AUDIT_INTENT_GRACE_SECONDS = 5 * 60
+_PENDING_REGISTRATION_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_EMAIL_VERIFICATION_DELIVERY_FIELDS = frozenset(
+    {
+        "delivery_id",
+        "email",
+        "token",
+        "user_id",
+        "verification_url",
+    }
+)
+MAX_BCRYPT_PASSWORD_BYTES = 72
 
 
-def _required_visible_string_claim(payload: dict[str, object], claim_name: str) -> str:
-    """Extract a required local-JWT claim as a visible string."""
-    try:
-        value = payload[claim_name]
-    except KeyError as exc:
-        raise AuthenticationError("Invalid token") from exc
-    if not isinstance(value, str) or not has_visible_content(value):
-        raise AuthenticationError("Invalid token")
-    return value
+class LocalAuthRegistrationConflict(ValueError):
+    """A requested local registration conflicts with an existing account."""
+
+
+@dataclass(frozen=True)
+class LocalUserAccount:
+    """One local-auth account row as listed to the dev-admin surface."""
+
+    user_id: str
+    display_name: str
+    email: str | None
+    email_verified: bool
+
+
+class LocalAuthStorageSecurityError(RuntimeError):
+    """The local credential store failed its owner-only file admission."""
+
+
+class LocalAuthSessionsUnavailable(RuntimeError):
+    """A session operation was attempted on an account-administration provider.
+
+    Not an ``AuthenticationError``: nobody failed to authenticate. This is a
+    wiring mistake — a provider built by
+    :meth:`LocalAuthProvider.for_account_administration` was asked to mint or
+    verify a token — and it must surface as a programming error rather than a
+    401 that would read as a credential problem.
+    """
+
+
+def bcrypt_password_bytes(password: str) -> bytes:
+    """Encode a password after enforcing bcrypt's UTF-8 byte limit."""
+    encoded_password = password.encode("utf-8")
+    if len(encoded_password) > MAX_BCRYPT_PASSWORD_BYTES:
+        raise ValueError(f"password must not exceed {MAX_BCRYPT_PASSWORD_BYTES} bytes")
+    return encoded_password
 
 
 def _verification_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _canonical_email_verification_delivery(
+    record: Mapping[str, object],
+    *,
+    context: str,
+) -> tuple[str, bytes]:
+    """Validate and canonically bind one first-party delivery record."""
+    if "delivery_id" not in record:
+        raise AuditIntegrityError(f"{context} is missing delivery_id")
+    if set(record) != _EMAIL_VERIFICATION_DELIVERY_FIELDS:
+        raise AuditIntegrityError(f"{context} must contain exactly the required delivery fields")
+    for field_name in _EMAIL_VERIFICATION_DELIVERY_FIELDS:
+        value = record[field_name]
+        if type(value) is not str or value == "":
+            raise AuditIntegrityError(f"{context} has an invalid {field_name}")
+    delivery_id = cast(str, record["delivery_id"])
+    canonical = json.dumps(dict(record), sort_keys=True, separators=(",", ":")).encode()
+    return delivery_id, canonical
+
+
+def _read_jsonl_deliveries(fd: int) -> dict[str, bytes]:
+    """Validate a locked verification outbox and normalize its final newline."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(fd, 64 * 1024):
+        chunks.append(chunk)
+    content = b"".join(chunks)
+    if not content:
+        return {}
+
+    deliveries: dict[str, bytes] = {}
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        try:
+            record = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise AuditIntegrityError(f"Email verification outbox line {line_number} is malformed") from exc
+        if type(record) is not dict:
+            raise AuditIntegrityError(f"Email verification outbox line {line_number} must be a JSON object")
+        delivery_id, canonical = _canonical_email_verification_delivery(
+            record,
+            context=f"Email verification outbox line {line_number}",
+        )
+        if delivery_id in deliveries:
+            raise AuditIntegrityError(f"Email verification outbox line {line_number} has a duplicate delivery_id")
+        deliveries[delivery_id] = canonical
+
+    if not content.endswith(b"\n"):
+        os.lseek(fd, 0, os.SEEK_END)
+        if os.write(fd, b"\n") != 1:
+            raise OSError("Email verification outbox newline repair was incomplete")
+        os.fsync(fd)
+    return deliveries
+
+
+def _append_email_verification_record(outbox_path: Path, record: Mapping[str, object]) -> None:
+    """Idempotently append one durable verification delivery record.
+
+    The stable ``delivery_id`` bridges the SQLite outbox intent and JSONL
+    publication. A crash after append but before acknowledgement is recovered
+    by scanning the locked file and acknowledging the already-present ID.
+    """
+    delivery_id, canonical = _canonical_email_verification_delivery(
+        record,
+        context="Email verification delivery",
+    )
+    payload = canonical + b"\n"
+    outbox_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(outbox_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        published = _read_jsonl_deliveries(fd)
+        if delivery_id in published:
+            if published[delivery_id] != canonical:
+                raise AuditIntegrityError("Published email verification delivery does not match the durable intent")
+            return
+        original_size = os.lseek(fd, 0, os.SEEK_END)
+        try:
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError("Email verification outbox append was incomplete")
+            os.fsync(fd)
+        except BaseException:
+            os.ftruncate(fd, original_size)
+            os.fsync(fd)
+            raise
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _open_owner_only_database(path: Path) -> int:
+    """Open or atomically create ``path`` without following a final symlink."""
+    try:
+        nofollow = os.O_NOFOLLOW
+    except AttributeError as exc:
+        raise LocalAuthStorageSecurityError("Local auth storage requires no-follow file admission") from exc
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK | nofollow
+    created = False
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        try:
+            descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise LocalAuthStorageSecurityError("Local auth database must be a regular owner-only file, not a symlink") from exc
+        raise
+
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        identity = os.fstat(descriptor)
+        mode = stat.S_IMODE(identity.st_mode)
+        if not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.geteuid() or identity.st_nlink != 1 or mode != 0o600:
+            raise LocalAuthStorageSecurityError("Local auth database must be a regular owner-only file with mode 0600")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 class LocalAuthProvider:
@@ -53,30 +252,107 @@ class LocalAuthProvider:
     def _get_dummy_hash(cls) -> bytes:
         return cls._dummy_hash
 
+    @classmethod
+    def for_account_administration(cls, db_path: Path, *, retire_identity: RetireIdentity) -> LocalAuthProvider:
+        """Build a provider that manages ACCOUNTS but cannot issue sessions.
+
+        ``create_user``, ``delete_user``, ``list_users`` and ``set_password``
+        never mint a token, so the CLI that does exactly those need not build
+        a token issuer or an admission path. It DOES need the retirer:
+        ``delete_user`` is one of the four, and a credential deleted without
+        its identity retired leaves that username's admission, quota and
+        history to whoever registers it next (elspeth-9c171c00fa). The
+        retirer is therefore required here, not defaulted -- the version that
+        defaulted it to ``None`` is how the CLI shipped without one.
+
+        Every token path refuses on a provider built this way, by name rather
+        than by AttributeError. Reach for this ONLY where no session is
+        issued; anything serving HTTP wants the full constructor.
+        """
+        return cls(db_path, token_issuer=None, admit_identity=None, retire_identity=retire_identity)
+
     def __init__(
         self,
         db_path: Path,
-        secret_key: str,
-        token_expiry_hours: int = 24,
-        max_refresh_chain_hours: int = 168,
+        *,
+        token_issuer: SessionTokenIssuer | None,
+        admit_identity: AdmitIdentity | None,
+        retire_identity: RetireIdentity,
     ) -> None:
+        """Bind the credential store to the token issuer and the identity substrate.
+
+        ``auth.db`` is CREDENTIALS ONLY from here on (D7). It answers "is this
+        password right and is this email verified"; it does not decide who a
+        person is or whether they may act. Those live in the ``identities``
+        substrate, which this provider reaches through ``admit_identity`` and
+        ``retire_identity`` rather than by holding an engine -- so ``web.auth``
+        keeps its one-way dependency on ``web.sessions``.
+
+        The token issuer owns expiry and the refresh bound. They used to be
+        constructor arguments here, which meant every provider that ever
+        wanted a token would have had its own copy of a security bound.
+
+        The issuer and the admission path are OPTIONAL, and the two halves
+        that split apart are visible in the type rather than in a comment: a
+        credential store over ``auth.db``, and a session-issuing half needing
+        the issuer and the identity substrate. Use
+        :meth:`for_account_administration` for the first alone; mypy then
+        forces every token path to say what it does without them. The
+        retirer is NOT optional: both halves delete credentials, and a
+        deletion that cannot retire is the inheritance defect, not a
+        smaller provider.
+        """
         self._db_path = db_path
-        self._secret_key = secret_key
-        self._token_expiry_hours = token_expiry_hours
-        self._max_refresh_chain_hours = max_refresh_chain_hours
+        self._token_issuer = token_issuer
+        self._admit_identity = admit_identity
+        self._retire_identity = retire_identity
         self._ensure_schema()
+        with self._connect(immediate=True) as conn:
+            now = int(time.time())
+            self._reap_stale_pending_registrations(conn, now=now)
+            self._reclaim_stale_token_audit_intents(conn, now=now)
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Open a connection to the SQLite database."""
-        return sqlite3.connect(str(self._db_path))
+        """Open SQLite through a validated, no-follow database descriptor."""
+        descriptor = _open_owner_only_database(self._db_path)
+        try:
+            identity = os.fstat(descriptor)
+            descriptor_root = Path("/proc/self/fd")
+            if not descriptor_root.is_dir():
+                descriptor_root = Path("/dev/fd")
+            if not descriptor_root.is_dir():
+                raise LocalAuthStorageSecurityError("Local auth storage requires a descriptor-backed filesystem path")
+            conn = sqlite3.connect(str(descriptor_root / str(descriptor)))
+            try:
+                current = os.stat(self._db_path, follow_symlinks=False)
+                if not stat.S_ISREG(current.st_mode) or current.st_dev != identity.st_dev or current.st_ino != identity.st_ino:
+                    raise LocalAuthStorageSecurityError("Local auth database path changed during secure open")
+            except BaseException:
+                conn.close()
+                raise
+            return conn
+        finally:
+            os.close(descriptor)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Open a transaction-scoped SQLite connection and always close it."""
+    def _connect(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """Open a transaction-scoped SQLite connection and always close it.
+
+        ``immediate=True`` acquires SQLite's write reservation before the
+        first read. Consistency-sensitive auth workflows use it so validation,
+        mutation, required audit, and commit form one serialized unit.
+        """
         conn = self._get_conn()
         try:
-            with conn:
+            if immediate:
+                conn.execute("BEGIN IMMEDIATE")
+            try:
                 yield conn
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
         finally:
             conn.close()
 
@@ -109,6 +385,38 @@ class LocalAuthProvider:
                 )
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_email_verification_tokens_user_id ON email_verification_tokens (user_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_verification_outbox (
+                    delivery_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    user_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    published_at INTEGER,
+                    FOREIGN KEY (token_hash) REFERENCES email_verification_tokens(token_hash),
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_email_verification_outbox_pending ON email_verification_outbox (published_at, created_at)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS token_audit_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    issuance_path TEXT NOT NULL,
+                    token_hash TEXT,
+                    claimed_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_token_audit_intents_created_at ON token_audit_intents (created_at)")
 
     def create_user(
         self,
@@ -126,7 +434,7 @@ class LocalAuthProvider:
         """
         if not display_name:
             raise ValueError("display_name must not be empty")
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
         with self._connect() as conn:
             try:
                 conn.execute(
@@ -140,20 +448,220 @@ class LocalAuthProvider:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ValueError(f"User already exists: {user_id}") from exc
+                raise LocalAuthRegistrationConflict(f"User already exists: {user_id}") from exc
+
+    def register_open_user_with_audit(
+        self,
+        user_id: str,
+        password: str,
+        display_name: str,
+        email: str | None,
+        *,
+        record_token_issued: Callable[[str], None],
+    ) -> str:
+        """Create and durably commit an open-registration user, then audit it.
+
+        The auth.db transaction commits the user together with a durable
+        ``token_issued`` audit intent, then the Landscape callback delivers
+        the record and the intent is cleared. A failed commit therefore
+        cannot leave a ``token_issued`` record for a user that was never
+        created, and a crash between commit and delivery leaves an intent
+        that the reclaim sweep resolves by quarantining the unaudited
+        account. A failed audit remains fatal: the just-committed user is
+        compensatingly deleted — fenced to this call's intent generation, so
+        a replacement account registered after a reclaim sweep released the
+        user_id is never touched — and the audit error propagates; if cleanup
+        itself fails, the inconsistency surfaces as
+        :class:`AuditIntegrityError` and the surviving intent keeps the
+        account reclaimable. A cancelled async caller may abandon the worker
+        future, but the synchronous critical section itself continues
+        through commit and audit or compensation.
+        """
+        if not display_name:
+            raise ValueError("display_name must not be empty")
+        password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
+        now = int(time.time())
+        intent_id = secrets.token_urlsafe(18)
+        with self._connect(immediate=True) as conn:
+            self._reclaim_stale_token_audit_intents(conn, now=now)
+            try:
+                conn.execute(
+                    "INSERT INTO users (user_id, password_hash, display_name, email, email_verified) VALUES (?, ?, ?, ?, 1)",
+                    (user_id, password_hash, display_name, email),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise LocalAuthRegistrationConflict(f"User already exists: {user_id}") from exc
+            conn.execute(
+                """
+                INSERT INTO token_audit_intents
+                    (intent_id, user_id, issuance_path, token_hash, claimed_at, created_at)
+                VALUES (?, ?, 'register', NULL, NULL, ?)
+                """,
+                (intent_id, user_id, now),
+            )
+        # Minted AFTER the auth.db transaction commits. Admission writes the
+        # SESSIONS store, and the two databases share no transaction: doing it
+        # inside would mean an identity row surviving a rolled-back
+        # registration. Failing here leaves the intent uncleared, which is the
+        # documented crash-between-commit-and-audit case the reclaim sweep
+        # already quarantines.
+        # Registration is an ISSUANCE path, so it meets the same D12 wall as
+        # login. Reachable with consequence: an identity already disabled (or
+        # pre-provisioned pending) whose credential row was deleted can be
+        # re-registered, and without this it would be handed a token.
+        access_token = self._issue_token(self._admitted_identity_id(user_id), user_id)
+        try:
+            record_token_issued(access_token)
+        except BaseException as audit_error:
+            try:
+                self._compensate_open_registration(user_id, intent_id=intent_id)
+            except BaseException as cleanup_error:
+                raise AuditIntegrityError(
+                    f"Open registration for {user_id!r} committed, its required token_issued "
+                    f"audit failed ({audit_error!r}), and the compensating cleanup also failed"
+                ) from cleanup_error
+            raise audit_error
+        try:
+            with self._connect(immediate=True) as conn:
+                delivery_owned = self._clear_token_audit_intent(
+                    conn,
+                    intent_id=intent_id,
+                    user_id=user_id,
+                    issuance_path="register",
+                )
+        except BaseException as mark_error:
+            try:
+                owned = self._compensate_open_registration(user_id, intent_id=intent_id)
+            except BaseException as cleanup_error:
+                raise AuditIntegrityError(
+                    f"Open registration for {user_id!r} was audited but its audit intent could not "
+                    f"be cleared ({mark_error!r}) and the compensating cleanup also failed"
+                ) from cleanup_error
+            if owned:
+                raise AuditIntegrityError(
+                    f"Open registration for {user_id!r} was audited but its audit intent could not be "
+                    "cleared; the account was removed so the reclaim sweep cannot later quarantine an "
+                    "audited account"
+                ) from mark_error
+            raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion") from mark_error
+        if not delivery_owned:
+            # A reclaim sweep already resolved this issuance generation. Do
+            # not compensate by user_id: that could delete a later account
+            # created after the sweep released this identifier.
+            raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion")
+        return access_token
+
+    def _compensate_open_registration(self, user_id: str, *, intent_id: str) -> bool:
+        """Remove a committed open registration while its audit intent is still owned.
+
+        The compensating delete is fenced to the intent generation this call
+        created: once a reclaim sweep has consumed the intent, the same
+        user_id may belong to a replacement registration, which must survive.
+        Returns whether this generation still owned the intent (and therefore
+        removed the account).
+        """
+        with self._connect(immediate=True) as conn:
+            owned = self._clear_token_audit_intent(
+                conn,
+                intent_id=intent_id,
+                user_id=user_id,
+                issuance_path="register",
+            )
+            if owned:
+                self._delete_user_rows(conn, user_id)
+            return owned
+
+    @staticmethod
+    def _delete_user_rows(conn: sqlite3.Connection, user_id: str) -> bool:
+        """Delete a user and every dependent row, including audit intents."""
+        conn.execute("DELETE FROM token_audit_intents WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM email_verification_outbox WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM email_verification_tokens WHERE user_id = ?", (user_id,))
+        cursor = conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def _clear_token_audit_intent(
+        conn: sqlite3.Connection,
+        *,
+        intent_id: str,
+        user_id: str,
+        issuance_path: str,
+    ) -> bool:
+        """Return whether delivery consumed the exact intent it owns."""
+        cleared = conn.execute(
+            """
+            DELETE FROM token_audit_intents
+            WHERE intent_id = ? AND user_id = ? AND issuance_path = ?
+            """,
+            (intent_id, user_id, issuance_path),
+        )
+        return cleared.rowcount == 1
 
     def delete_user(self, user_id: str) -> bool:
-        """Delete a local auth user and any pending verification tokens."""
+        """Delete a local auth user, and retire the identity it was bound to.
+
+        Deleting the credential is not enough. ``identities`` is a separate
+        store keyed on ``(provider, subject)`` — for local auth, the username
+        — and ``ensure_identity`` never upgrades or downgrades an existing
+        row. So without the second step the next holder of a freed username
+        binds to the deleted user's identity and inherits their admission,
+        their quota row and every row FK'd to that identity_id.
+
+        The identity is retired rather than deleted (its history and its
+        foreign keys must survive) and its natural key is retired with it, so
+        a later registration of the same username gets a FRESH identity rather
+        than being permanently refused at the admission wall.
+
+        Order: credential first. A retired identity whose credential deletion
+        then failed would lock out a user who still has a password; a deleted
+        credential whose identity retirement failed leaves an unreachable
+        identity that the next registration would inherit — worse, but it is
+        the ordering that fails safe for the person who is still using the
+        account.
+
+        Retirement runs whether or not a credential row was found. That is
+        what makes the failure above recoverable: an operator who re-runs
+        the removal after a retirement error gets "not found" for the
+        credential and the retirement it owed. Retiring is idempotent (the
+        natural key is rewritten, so a second pass finds nothing), and a
+        username that never logged in has no identity to retire.
+        """
         with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM email_verification_tokens WHERE user_id = ?",
-                (user_id,),
+            deleted = self._delete_user_rows(conn, user_id)
+        self._retire_identity(user_id)
+        return deleted
+
+    def list_users(self) -> list[LocalUserAccount]:
+        """List every local account, ordered by user_id."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT user_id, display_name, email, email_verified FROM users ORDER BY user_id").fetchall()
+        return [
+            LocalUserAccount(
+                user_id=row[0],
+                display_name=row[1],
+                email=row[2],
+                email_verified=bool(row[3]),
             )
-            cursor = conn.execute(
-                "DELETE FROM users WHERE user_id = ?",
-                (user_id,),
+            for row in rows
+        ]
+
+    def set_password(self, user_id: str, password: str) -> None:
+        """Replace a user's password hash (dev-admin reset path).
+
+        Raises ValueError if the user does not exist or the password
+        exceeds bcrypt's byte limit. Outstanding JWTs are NOT revoked --
+        there is no session store to revoke against; they expire on their
+        own schedule.
+        """
+        password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
+        with self._connect() as conn:
+            updated = conn.execute(
+                "UPDATE users SET password_hash = ? WHERE user_id = ?",
+                (password_hash, user_id),
             )
-            return cursor.rowcount > 0
+            if updated.rowcount != 1:
+                raise ValueError(f"User not found: {user_id}")
 
     def create_email_verification_token(
         self,
@@ -188,83 +696,375 @@ class LocalAuthProvider:
             )
         return token
 
-    def verify_email_token(self, token: str) -> UserIdentity:
-        """Consume a verification token and activate the corresponding user."""
+    def _insert_verification_delivery(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        email: str,
+        verification_origin: str,
+        now: int,
+    ) -> None:
+        token = secrets.token_urlsafe(_EMAIL_VERIFICATION_TOKEN_BYTES)
+        token_hash = _verification_token_hash(token)
+        delivery_id = secrets.token_urlsafe(18)
+        record = {
+            "delivery_id": delivery_id,
+            "user_id": user_id,
+            "email": email,
+            "token": token,
+            "verification_url": f"{verification_origin}/?{urlencode({'verify_token': token})}",
+        }
+        conn.execute(
+            """
+            INSERT INTO email_verification_tokens
+                (token_hash, user_id, created_at, expires_at, used_at)
+            VALUES (?, ?, ?, ?, NULL)
+            """,
+            (token_hash, user_id, now, now + _EMAIL_VERIFICATION_TOKEN_TTL_SECONDS),
+        )
+        conn.execute(
+            """
+            INSERT INTO email_verification_outbox
+                (delivery_id, token_hash, user_id, payload_json, created_at, published_at)
+            VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            (delivery_id, token_hash, user_id, json.dumps(record, sort_keys=True), now),
+        )
+
+    def _reap_stale_pending_registrations(self, conn: sqlite3.Connection, *, now: int) -> None:
+        cutoff = now - _PENDING_REGISTRATION_RETENTION_SECONDS
+        stale_users = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT users.user_id
+                FROM users
+                WHERE users.email_verified = 0
+                  AND EXISTS (
+                      SELECT 1 FROM email_verification_tokens AS tokens
+                      WHERE tokens.user_id = users.user_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_verification_tokens AS tokens
+                      WHERE tokens.user_id = users.user_id
+                        AND tokens.expires_at >= ?
+                  )
+                """,
+                (cutoff,),
+            ).fetchall()
+        ]
+        for stale_user_id in stale_users:
+            conn.execute("DELETE FROM email_verification_outbox WHERE user_id = ?", (stale_user_id,))
+            conn.execute("DELETE FROM email_verification_tokens WHERE user_id = ?", (stale_user_id,))
+            conn.execute("DELETE FROM users WHERE user_id = ? AND email_verified = 0", (stale_user_id,))
+
+    def _reclaim_stale_token_audit_intents(self, conn: sqlite3.Connection, *, now: int) -> None:
+        """Resolve ``token_issued`` audit intents that survived a crash.
+
+        An intent that outlives the delivery grace window means the process
+        died between the durable auth.db commit and the Landscape delivery
+        (or between delivery and the intent clear). The Landscape callback is
+        request-bound and cannot be replayed here, so reconciliation restores
+        the pre-issuance auth state instead: an open registration is
+        quarantined by deleting the never-audited account, and an email
+        verification is returned to its retryable unverified state. Either
+        way, no unaudited auth state survives silently.
+        """
+        cutoff = now - _TOKEN_AUDIT_INTENT_GRACE_SECONDS
+        stale = conn.execute(
+            """
+            SELECT intent_id, user_id, issuance_path, token_hash, claimed_at
+            FROM token_audit_intents
+            WHERE created_at <= ?
+            ORDER BY created_at, intent_id
+            """,
+            (cutoff,),
+        ).fetchall()
+        for intent_id, user_id, issuance_path, token_hash, claimed_at in stale:
+            if issuance_path == "register":
+                self._delete_user_rows(conn, user_id)
+                fully_restored = True
+            else:
+                fully_restored = self._restore_retryable_verification(
+                    conn,
+                    user_id=user_id,
+                    token_hash=token_hash,
+                    claimed_at=claimed_at,
+                    now=now,
+                    intent_id=intent_id,
+                )
+            _slog.warning(
+                "token_issued_audit_intent_reclaimed",
+                user_id=user_id,
+                issuance_path=issuance_path,
+                fully_restored=fully_restored,
+            )
+
+    def _restore_retryable_verification(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        user_id: str,
+        token_hash: str | None,
+        claimed_at: int | None,
+        now: int,
+        intent_id: str,
+    ) -> bool:
+        """Return a claimed email verification to unverified, retryable state."""
+        retry_deadline = now + _EMAIL_VERIFICATION_AUDIT_RETRY_SECONDS
+        restored_user = conn.execute(
+            "UPDATE users SET email_verified = 0 WHERE user_id = ? AND email_verified = 1",
+            (user_id,),
+        )
+        restored_token = conn.execute(
+            """
+            UPDATE email_verification_tokens
+            SET used_at = NULL, expires_at = MAX(expires_at, ?)
+            WHERE token_hash = ? AND user_id = ? AND used_at = ?
+            """,
+            (retry_deadline, token_hash, user_id, claimed_at),
+        )
+        conn.execute("DELETE FROM token_audit_intents WHERE intent_id = ?", (intent_id,))
+        return restored_user.rowcount == 1 and restored_token.rowcount == 1
+
+    def _restore_retryable_verification_or_raise(
+        self,
+        user_id: str,
+        *,
+        token_hash: str,
+        claimed_at: int,
+        intent_id: str,
+    ) -> None:
+        """Compensate a delivered-or-failed verification audit, loudly on failure."""
+        try:
+            with self._connect(immediate=True) as conn:
+                restored = self._restore_retryable_verification(
+                    conn,
+                    user_id=user_id,
+                    token_hash=token_hash,
+                    claimed_at=claimed_at,
+                    now=int(time.time()),
+                    intent_id=intent_id,
+                )
+                if not restored:
+                    raise AuditIntegrityError("Email verification audit failure could not restore retryable state")
+        except AuditIntegrityError:
+            raise
+        except BaseException as restore_error:
+            raise AuditIntegrityError("Email verification audit failure could not restore retryable state") from restore_error
+
+    def register_email_verified_user(
+        self,
+        user_id: str,
+        password: str,
+        display_name: str,
+        email: str,
+        *,
+        verification_origin: str,
+        outbox_path: Path,
+    ) -> None:
+        """Persist a resumable pending registration and publish its delivery.
+
+        User, one-use token, and stable outbox intent commit in one SQLite
+        transaction. Publication is idempotent by ``delivery_id``; a retry or
+        process restart can therefore finish an append whose acknowledgement
+        was interrupted without duplicating the message.
+        """
+        if not display_name:
+            raise ValueError("display_name must not be empty")
+        password_bytes = bcrypt_password_bytes(password)
+        password_hash = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
+        now = int(time.time())
+        with self._connect(immediate=True) as conn:
+            self._reap_stale_pending_registrations(conn, now=now)
+            self._reclaim_stale_token_audit_intents(conn, now=now)
+            existing = conn.execute(
+                "SELECT password_hash, display_name, email, email_verified FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO users (user_id, password_hash, display_name, email, email_verified) VALUES (?, ?, ?, ?, 0)",
+                    (user_id, password_hash, display_name, email),
+                )
+            else:
+                existing_hash, existing_name, existing_email, email_verified = existing
+                matches_pending_registration = (
+                    not email_verified
+                    and existing_name == display_name
+                    and existing_email == email
+                    and bcrypt.checkpw(password_bytes, existing_hash.encode())
+                )
+                if not matches_pending_registration:
+                    raise LocalAuthRegistrationConflict(f"User already exists: {user_id}")
+
+            active_delivery = conn.execute(
+                """
+                SELECT 1
+                FROM email_verification_tokens AS tokens
+                JOIN email_verification_outbox AS outbox ON outbox.token_hash = tokens.token_hash
+                WHERE tokens.user_id = ? AND tokens.used_at IS NULL AND tokens.expires_at >= ?
+                LIMIT 1
+                """,
+                (user_id, now),
+            ).fetchone()
+            if active_delivery is None:
+                conn.execute("DELETE FROM email_verification_outbox WHERE user_id = ?", (user_id,))
+                conn.execute("DELETE FROM email_verification_tokens WHERE user_id = ? AND used_at IS NULL", (user_id,))
+                self._insert_verification_delivery(
+                    conn,
+                    user_id=user_id,
+                    email=email,
+                    verification_origin=verification_origin,
+                    now=now,
+                )
+        self.publish_pending_email_verifications(outbox_path)
+
+    def publish_pending_email_verifications(self, outbox_path: Path) -> None:
+        """Publish and acknowledge every durable verification intent."""
+        with self._connect() as conn:
+            pending = conn.execute(
+                """
+                SELECT delivery_id, payload_json
+                FROM email_verification_outbox
+                WHERE published_at IS NULL
+                ORDER BY created_at, delivery_id
+                """
+            ).fetchall()
+        for delivery_id, payload_json in pending:
+            try:
+                record = json.loads(payload_json)
+            except json.JSONDecodeError as exc:
+                raise AuditIntegrityError("Stored email verification outbox payload is malformed") from exc
+            if type(record) is not dict:
+                raise AuditIntegrityError("Stored email verification outbox binding is malformed")
+            try:
+                stored_delivery_id = record["delivery_id"]
+            except KeyError as exc:
+                raise AuditIntegrityError("Stored email verification outbox binding is malformed") from exc
+            if stored_delivery_id != delivery_id:
+                raise AuditIntegrityError("Stored email verification outbox binding is malformed")
+            _append_email_verification_record(outbox_path, record)
+            with self._connect(immediate=True) as conn:
+                conn.execute(
+                    "UPDATE email_verification_outbox SET published_at = ? WHERE delivery_id = ? AND published_at IS NULL",
+                    (int(time.time()), delivery_id),
+                )
+
+    def verify_email_and_issue_token(
+        self,
+        token: str,
+        *,
+        record_token_issued: Callable[[UserIdentity, str], None],
+    ) -> str:
+        """Consume, activate, and commit under one SQLite write fence, then audit.
+
+        Exactly one caller can claim the one-use token. The claim commits
+        together with a durable ``token_issued`` audit intent, then the
+        required Landscape write happens and the intent is cleared. A failed
+        commit therefore cannot leave a ``token_issued`` record for a token
+        that was never consumed, and a crash between commit and delivery
+        leaves an intent that the reclaim sweep resolves by restoring the
+        retryable unverified state. If the Landscape write fails in-process,
+        a compensating transaction performs the same restoration and grants a
+        bounded retry window before the original exception propagates; if
+        that restoration fails, the inconsistency surfaces as
+        :class:`AuditIntegrityError`.
+        """
         token_hash = _verification_token_hash(token)
         now = int(time.time())
-        with self._connect() as conn:
+        intent_id = secrets.token_urlsafe(18)
+        with self._connect(immediate=True) as conn:
+            self._reclaim_stale_token_audit_intents(conn, now=now)
             row = conn.execute(
                 """
-                SELECT user_id, expires_at, used_at
-                FROM email_verification_tokens
-                WHERE token_hash = ?
+                SELECT tokens.user_id, tokens.expires_at, tokens.used_at, users.email_verified
+                FROM email_verification_tokens AS tokens
+                JOIN users ON users.user_id = tokens.user_id
+                WHERE tokens.token_hash = ?
                 """,
                 (token_hash,),
             ).fetchone()
             if row is None:
                 raise AuthenticationError("Invalid email verification token")
-            user_id, expires_at, used_at = row
+            user_id, expires_at, used_at, email_verified = row
             if used_at is not None:
                 raise AuthenticationError("Email verification token already used")
-            if expires_at < now:
+            if expires_at <= now:
                 raise AuthenticationError("Email verification token expired")
-            user_row = conn.execute(
-                "SELECT 1 FROM users WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            if user_row is None:
-                raise AuthenticationError("User not found")
-            conn.execute(
-                "UPDATE users SET email_verified = 1 WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.execute(
-                "UPDATE email_verification_tokens SET used_at = ? WHERE token_hash = ?",
-                (now, token_hash),
-            )
-        return UserIdentity(user_id=user_id, username=user_id)
-
-    def restore_email_verification_token(self, token: str, user_id: str) -> bool:
-        """Compensate a just-completed verification when required audit fails.
-
-        The token and user activation are restored together, guarded by the
-        exact token/user relationship and the consumed marker observed in the
-        same transaction. A successful return makes the original request safe
-        to retry.
-        """
-        token_hash = _verification_token_hash(token)
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT tokens.used_at, users.email_verified
-                FROM email_verification_tokens AS tokens
-                JOIN users ON users.user_id = tokens.user_id
-                WHERE tokens.token_hash = ? AND tokens.user_id = ?
-                """,
-                (token_hash, user_id),
-            ).fetchone()
-            if row is None or row[0] is None or not row[1]:
-                return False
-            used_at = row[0]
-            user_result = conn.execute(
-                "UPDATE users SET email_verified = 0 WHERE user_id = ? AND email_verified = 1",
-                (user_id,),
-            )
+            if email_verified:
+                raise AuthenticationError("Email already verified")
             token_result = conn.execute(
                 """
                 UPDATE email_verification_tokens
-                SET used_at = NULL
-                WHERE token_hash = ? AND user_id = ? AND used_at = ?
+                SET used_at = ?
+                WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
                 """,
-                (token_hash, user_id, used_at),
+                (now, token_hash, now),
             )
-            if user_result.rowcount != 1 or token_result.rowcount != 1:
-                raise RuntimeError("Email verification compensation lost its state precondition")
-        return True
+            user_result = conn.execute(
+                "UPDATE users SET email_verified = 1 WHERE user_id = ? AND email_verified = 0",
+                (user_id,),
+            )
+            if token_result.rowcount != 1 or user_result.rowcount != 1:
+                raise AuditIntegrityError("Email verification claim lost its transaction precondition")
 
-    def issue_token_for_user(self, user_id: str, username: str) -> str:
-        """Issue a local JWT for an already-authorized user."""
-        return self._issue_token(user_id, username)
+            conn.execute(
+                """
+                INSERT INTO token_audit_intents
+                    (intent_id, user_id, issuance_path, token_hash, claimed_at, created_at)
+                VALUES (?, ?, 'email_verification', ?, ?, ?)
+                """,
+                (intent_id, user_id, token_hash, now, now),
+            )
+
+        # Outside the auth.db transaction, for the same reason as the open
+        # registration path: the identity write lands in a different database.
+        # Same wall. This is the path that actually fires in a
+        # ``registration_mode="email_verified"`` deployment, where admission
+        # defaults to pending: without it the user completes verification,
+        # receives a 200 with a token, and then every authenticated route
+        # refuses that token with an error they cannot distinguish from an
+        # expired session.
+        identity_id = self._admitted_identity_id(user_id)
+        identity = UserIdentity(user_id=identity_id, username=user_id)
+        access_token = self._issue_token(identity_id, user_id)
+
+        try:
+            record_token_issued(identity, access_token)
+        except BaseException as audit_error:
+            self._restore_retryable_verification_or_raise(
+                user_id,
+                token_hash=token_hash,
+                claimed_at=now,
+                intent_id=intent_id,
+            )
+            raise audit_error
+        try:
+            with self._connect(immediate=True) as conn:
+                delivery_owned = self._clear_token_audit_intent(
+                    conn,
+                    intent_id=intent_id,
+                    user_id=user_id,
+                    issuance_path="email_verification",
+                )
+        except BaseException as mark_error:
+            self._restore_retryable_verification_or_raise(
+                user_id,
+                token_hash=token_hash,
+                claimed_at=now,
+                intent_id=intent_id,
+            )
+            raise AuditIntegrityError(
+                "Email verification was audited but its audit intent could not be cleared; "
+                "the verification was restored for an audited retry"
+            ) from mark_error
+        if not delivery_owned:
+            # The sweep that removed this exact intent already restored its
+            # auth state. A second compensation could clobber a later retry.
+            raise AuditIntegrityError("Token audit intent ownership was lost before delivery completion")
+        return access_token
 
     async def login(self, username: str, password: str) -> str:
         """Authenticate with username/password and return a JWT.
@@ -286,6 +1086,10 @@ class LocalAuthProvider:
         # credential enumeration.
         if not username or not password:
             raise AuthenticationError("Invalid credentials")
+        try:
+            password_bytes = bcrypt_password_bytes(password)
+        except ValueError as exc:
+            raise AuthenticationError("Invalid credentials") from exc
 
         with self._connect() as conn:
             row = conn.execute(
@@ -295,122 +1099,174 @@ class LocalAuthProvider:
 
         if row is None:
             # Constant-time: hash against dummy to prevent timing oracle
-            bcrypt.checkpw(password.encode(), self._get_dummy_hash())
+            bcrypt.checkpw(password_bytes, self._get_dummy_hash())
             raise AuthenticationError("Invalid credentials")
 
-        if not bcrypt.checkpw(password.encode(), row[0].encode()):
+        if not bcrypt.checkpw(password_bytes, row[0].encode()):
             raise AuthenticationError("Invalid credentials")
 
         if not row[1]:
             raise AuthenticationError("Email verification required")
 
-        return self._issue_token(username, username)
+        # The credential was CORRECT; admission is a separate decision.
+        return self._issue_token(self._admitted_identity_id(username), username)
 
-    def _issue_token(self, user_id: str, username: str, *, issued_at: int | None = None) -> str:
-        now = int(time.time())
-        iat = now if issued_at is None else issued_at
-        payload = {
-            "sub": user_id,
-            "username": username,
-            "iat": iat,
-            "exp": now + self._token_expiry_hours * 3600,
-        }
-        token: str = jwt.encode(payload, self._secret_key, algorithm="HS256")
-        return token
+    @property
+    def _issuer(self) -> SessionTokenIssuer:
+        """The token issuer, or a refusal naming why there isn't one."""
+        if self._token_issuer is None:
+            raise LocalAuthSessionsUnavailable(
+                "This LocalAuthProvider was built for account administration and cannot issue or verify session tokens"
+            )
+        return self._token_issuer
 
-    async def refresh(self, user_id: str, username: str, *, original_iat: int) -> str:
-        """Issue a new JWT for an already-authenticated user.
+    def _admit(self, username: str) -> EnsureIdentityOutcome:
+        """Resolve this local username to its identity row.
 
-        Verifies the user still exists in the database — a deleted
-        user must not be able to obtain fresh tokens via refresh.
+        ``subject`` is the username: for local auth the credential store IS
+        the namespace, so the username is the stable per-provider subject.
 
-        Called by the token refresh route. Does NOT re-verify
-        credentials — the caller (get_current_user middleware)
-        has already validated the existing token.
+        Resolving is NOT admitting. Callers that are about to mint a token
+        must go through :meth:`_admitted_identity_id`, which is the one place
+        the D12 wall stands.
+        """
+        if self._admit_identity is None:
+            raise LocalAuthSessionsUnavailable("This LocalAuthProvider was built for account administration and has no identity substrate")
+        return self._admit_identity(
+            IdentityClaims(
+                provider="local",
+                subject=username,
+                username=username,
+            )
+        )
+
+    def _admitted_identity_id(self, username: str) -> str:
+        """Resolve the identity and refuse unless it may actually act.
+
+        THE SINGLE ADMISSION WALL. Every path that mints a token calls this,
+        not ``_admit``, because D12 is a property of ISSUANCE and not of
+        logging in: registration and email verification hand out a token too,
+        and a wall that only one of the three paths honours is not a wall.
+
+        Getting this wrong is quiet rather than loud. The issued token is
+        inert -- ``principal_is_active`` refuses it at authenticate and
+        refresh -- so the person is handed a credential that never works and
+        an error indistinguishable from an expired session, while a
+        ``token_issued`` row claims a token was issued to a principal that has
+        no admission. A false audit row is worse than a refusal.
+        """
+        admission = self._admit(username)
+        record = admission.record
+        if not record.is_active:
+            # Two states, two messages: the audit classifier keys on these
+            # prefixes, and waiting is a queue an administrator can clear
+            # while disabled is a decision already taken. Naming the state
+            # leaks nothing here -- the caller has already proven the
+            # credential, or just created it.
+            if record.access_state == "disabled":
+                raise IdentityDisabled
+            raise AccessPending
+        return record.identity_id
+
+    def _issue_token(self, identity_id: str, username: str, *, issued_at: int | None = None) -> str:
+        return self._issuer.mint(identity_id=identity_id, username=username, issued_at=issued_at)
+
+    async def refresh(self, token: str) -> str:
+        """Issue a successor token for an already-authenticated caller.
+
+        Takes the TOKEN, not decomposed claims. The chain bound used to be
+        enforced against an ``iat`` the route read from the middleware's
+        unverified decode; the issuer now reads it from its own verified
+        decode, so no unverified value reaches a security bound.
 
         Blocking sqlite work is offloaded to a bounded worker.
         """
-        return await run_sync_in_worker(self._refresh_sync, user_id, username, original_iat)
+        return await run_sync_in_worker(self._refresh_sync, token)
 
-    def _refresh_sync(self, user_id: str, username: str, original_iat: int | None) -> str:
-        """Synchronous refresh — called via run_sync_in_worker."""
-        now = int(time.time())
+    def _refresh_sync(self, token: str) -> str:
+        """Synchronous refresh — called via run_sync_in_worker.
 
-        # Max refresh chain: reject if the original token was issued too
-        # long ago.  This bounds how long a stolen token can be refreshed
-        # indefinitely without re-authentication.  Without a session DB
-        # (Sub-2c/2d), this is the only revocation-like mechanism.
-        if original_iat is None:
-            raise AuthenticationError("Token missing iat — please re-authenticate")
-        chain_age_hours = (now - original_iat) / 3600
-        if chain_age_hours > self._max_refresh_chain_hours:
-            raise AuthenticationError("Token refresh chain expired — please re-authenticate")
+        The issuer owns the chain bound and the identity check; what remains
+        here is the CREDENTIAL half, which only ``auth.db`` can answer: an
+        account deleted or un-verified since the token was minted must not be
+        renewable. Both halves must hold, and neither implies the other.
+        """
+        claims = self._issuer.decode(token)
+        if not self._credential_is_current(claims.username):
+            raise AuthenticationError("Invalid token")
+        return self._issuer.refresh(token)
 
+    def _credential_is_current(self, username: str) -> bool:
+        """Does a verified credential row still back this login?
+
+        Keyed by username, which for local auth IS the identity's ``subject``:
+        the credential store is the namespace, so ``_admit`` writes the same
+        value into both columns and they cannot diverge for this provider.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT email_verified FROM users WHERE user_id = ?",
-                (user_id,),
+                (username,),
             ).fetchone()
-        if row is None:
-            raise AuthenticationError("User not found")
-        if not row[0]:
-            raise AuthenticationError("Email verification required")
-
-        # Carry forward the original iat so the chain age accumulates.
-        # New logins get a fresh iat; refreshes preserve the original.
-        return self._issue_token(user_id, username, issued_at=original_iat)
+        return row is not None and bool(row[0])
 
     async def authenticate(self, token: str) -> UserIdentity:
-        """Validate a JWT and return the authenticated identity.
+        """Verify a session token and return the identity it authorises.
 
-        Raises AuthenticationError("Invalid token") on decode failure, expiry,
-        or if the user has been deleted since the token was issued.
+        THREE things must all hold, and each can fail independently:
+
+        1. the token is genuinely ours and unexpired (issuer);
+        2. the identity may still act -- not pending, not disabled (issuer,
+           through ``principal_is_active``);
+        3. a verified credential row still backs it (``auth.db``, here).
+
+        ``user_id`` on the returned identity is the ``identity_id``, not the
+        username. That is the value every ownership row points at.
+
+        ALL THREE run in ONE worker hop. Check 2 reaches the sessions store
+        through ``principal_is_active``, and that store is PostgreSQL in an
+        external-state deployment -- so leaving it on the event loop would put
+        a network round trip (two, with ``pool_pre_ping``) in front of every
+        authenticated request, and a pool-exhaustion wait would block the
+        whole ASGI worker rather than the one request. The credential read was
+        already offloaded; the identity read joins it rather than paying a
+        second hop. This is the shape ``_refresh_sync`` already uses.
         """
-        try:
-            payload = jwt.decode(token, self._secret_key, algorithms=["HS256"])
-        except PyJWTError as exc:
-            raise AuthenticationError("Invalid token") from exc
+        return await run_sync_in_worker(self._authenticate_sync, token)
 
-        user_id = _required_visible_string_claim(payload, "sub")
-        username = _required_visible_string_claim(payload, "username")
-
-        # Verify user still exists — deleted users must not retain access
-        exists = await run_sync_in_worker(self._user_exists, user_id)
-        if not exists:
+    def _authenticate_sync(self, token: str) -> UserIdentity:
+        """Verify token, admission, and credential together off the loop."""
+        claims = self._issuer.authenticate(token)
+        if not self._credential_is_current(claims.username):
             raise AuthenticationError("Invalid token")
-
         return UserIdentity(
-            user_id=user_id,
-            username=username,
+            user_id=claims.identity_id,
+            username=claims.username,
         )
 
-    def _user_exists(self, user_id: str) -> bool:
-        """Check if a verified user still exists in auth.db."""
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM users WHERE user_id = ? AND email_verified = 1",
-                (user_id,),
-            ).fetchone()
-            return row is not None
-
-    def _query_user(self, user_id: str) -> tuple[str, str | None] | None:
-        """Synchronous DB lookup — called via run_sync_in_worker."""
+    def _query_user(self, username: str) -> tuple[str, str | None] | None:
+        """Synchronous profile lookup by username — via run_sync_in_worker."""
         with self._connect() as conn:
             row: tuple[str, str | None] | None = conn.execute(
                 "SELECT display_name, email FROM users WHERE user_id = ?",
-                (user_id,),
+                (username,),
             ).fetchone()
             return row
 
     async def get_user_info(self, token: str) -> UserProfile:
-        """Decode the JWT, then query the users table for full profile.
+        """Verify the token, then read the profile from ``auth.db``.
+
+        Looked up by USERNAME, not by ``identity.user_id``. Since ``sub``
+        became the identity_id, the two are different values: ``auth.db`` is
+        keyed by username and knows nothing about identity ids, so passing
+        the identity_id here would miss every row.
 
         The DB query is offloaded to a thread to avoid blocking the
         event loop — sqlite3 is synchronous.
         """
         identity = await self.authenticate(token)
 
-        row = await run_sync_in_worker(self._query_user, identity.user_id)
+        row = await run_sync_in_worker(self._query_user, identity.username)
 
         if row is None:
             raise AuthenticationError("User not found")

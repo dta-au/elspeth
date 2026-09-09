@@ -9,10 +9,18 @@ RESTORE_READ_METHODS = {
     "get_live_buffered_outcomes",
 }
 RESTORE_NODE_STATE_READ_METHODS = {
-    "get_completed_row_ids_for_nodes",
+    "find_released_node_state_token_ids",
+    "get_completed_group_ids_for_nodes",  # WS4 T2: group-keyed completed sweep
     "get_max_node_state_attempts",
+    "get_max_node_state_attempts_for_node",  # WS4 T7: node-scoped sibling (META-14.1 opener attempt)
     "get_open_node_state_ids",
-    "has_completed_row_for_node",
+    "get_released_group_ids_for_nodes",  # WS4 T12/F-1: group-keyed released sweep
+    "get_settled_member_token_ids",  # WS4 T7: settled-token twin of has_completed_group_for_node (META-20b)
+    "resolve_group_collector_node",  # WS4 T7: durable node-resolution family anchor (META-22)
+    "has_group_loss",  # WS4 T12: renamed from has_branch_loss_for_group -- queries group_losses directly by group_id
+    "get_group_member_losses",  # WS4 fix round 2: full-ledger (adopted included) rebuild of collector pending.lost at restore
+    "has_completed_group_for_node",  # WS4 T2: group-keyed completed point lookup
+    "has_released_group_for_node",  # WS4 T2: group-keyed released point lookup
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -53,7 +61,15 @@ def test_restore_and_coalesce_node_state_reads_do_not_use_execution_facade() -> 
         ),
         (
             REPO_ROOT / "src/elspeth/engine/journal_restore.py",
-            {"CoalesceJournalRestorer"},
+            {"CoalesceJournalRestorer", "CollectorJournalRestorer"},  # WS4 T7
+        ),
+        (
+            REPO_ROOT / "src/elspeth/engine/row_union_executor.py",
+            {"RowUnionExecutor"},
+        ),
+        (
+            REPO_ROOT / "src/elspeth/engine/executors/collector.py",
+            {"CollectorExecutor"},  # WS4 T7
         ),
     ]
     execution_restore_reads: list[tuple[str, str, str]] = []

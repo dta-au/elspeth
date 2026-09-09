@@ -21,6 +21,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.web.blobs.service import blob_pre_update_sidecar, reconcile_blob_storage_versions
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -35,7 +36,7 @@ from elspeth.web.composer.tools import _execute_create_blob, _execute_update_blo
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import chat_messages_table, sessions_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -205,7 +206,8 @@ class TestPromoteUpdateBlobArgErrorRouting:
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_valid_arguments_dispatch_normally(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("sidecar_retirement_fails", [False, True])
+    def test_valid_arguments_dispatch_normally(self, tmp_path: Path, monkeypatch, sidecar_retirement_fails: bool) -> None:
         """Functional smoke: a valid call updates an existing blob's content."""
         engine, session_id = _session_engine_with_session()
         catalog = _mock_catalog()
@@ -228,6 +230,18 @@ class TestPromoteUpdateBlobArgErrorRouting:
         )
         assert create_result.success is True
         blob_id = create_result.data["blob_id"]
+        with engine.connect() as conn:
+            storage = Path(conn.execute(select(blobs_table.c.storage_path).where(blobs_table.c.id == blob_id)).scalar_one())
+        sidecar = blob_pre_update_sidecar(storage)
+        original_unlink = Path.unlink
+
+        def fail_sidecar_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path == sidecar:
+                raise PermissionError("sidecar retirement unavailable")
+            original_unlink(path, missing_ok=missing_ok)
+
+        if sidecar_retirement_fails:
+            monkeypatch.setattr(Path, "unlink", fail_sidecar_unlink)
 
         update_user_message_content = "Use this exact content:\nnew contents"
         update_user_message_id = _insert_user_message(engine, session_id, update_user_message_content)
@@ -248,6 +262,20 @@ class TestPromoteUpdateBlobArgErrorRouting:
         # update_blob's data payload carries the updated size_bytes /
         # content_hash; we verify byte count matches the new content.
         assert update_result.data["size_bytes"] == len(b"new contents")
+        assert storage.read_bytes() == b"new contents"
+        with engine.connect() as conn:
+            committed = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+        assert committed.content_hash == update_result.data["content_hash"]
+        assert committed.size_bytes == len(b"new contents")
+        if sidecar_retirement_fails:
+            assert sidecar.read_bytes() == b"old"
+            monkeypatch.setattr(Path, "unlink", original_unlink)
+            from elspeth.web.composer.tools.blobs import locked_session_transaction
+
+            with locked_session_transaction(engine, session_id):
+                reconcile_blob_storage_versions(storage, expected_hash=committed.content_hash)
+        assert not sidecar.exists()
+        assert storage.read_bytes() == b"new contents"
 
 
 # ---------------------------------------------------------------------------

@@ -84,6 +84,27 @@ describe("InlineSourceDisambiguationTurn", () => {
     ).toBeInTheDocument();
   });
 
+  // n=1 is the only count that can expose a hardcoded plural: n=0 and n=2+
+  // read correctly whether or not the noun is gated. The region's aria-label
+  // and the confirm button used to spell the rule twice in this one file —
+  // the label hardcoded "rows" while the button branched — so both are
+  // asserted here against the same single-row props.
+  it("says '1 row', not '1 rows', in BOTH the region label and the confirm button", () => {
+    render(
+      <InlineSourceDisambiguationTurn
+        {...makeProps()}
+        userInput="add this row: item-42"
+        proposedRows={["item-42"]}
+      />,
+    );
+    const region = screen.getByRole("region", { name: /row count/i });
+    expect(region.getAttribute("aria-label")).toContain("1 row)");
+    expect(region.getAttribute("aria-label")).not.toContain("1 rows");
+    expect(
+      screen.getByRole("button", { name: /yes\s*—\s*1 row$/i }),
+    ).toBeInTheDocument();
+  });
+
   it("moves focus to the primary action button on mount (F-19)", () => {
     render(<InlineSourceDisambiguationTurn {...makeProps()} />);
     expect(

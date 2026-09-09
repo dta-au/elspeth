@@ -3,7 +3,11 @@ import { readFileSync } from "node:fs";
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MarkdownRenderer, mermaidThemeFromTokens } from "./MarkdownRenderer";
+import {
+  MarkdownRenderer,
+  mermaidThemeFromTokens,
+  verticalisePipelineFlowchart,
+} from "./MarkdownRenderer";
 
 describe("MarkdownRenderer", () => {
   it("renders plain text as a paragraph", () => {
@@ -67,6 +71,21 @@ describe("MarkdownRenderer", () => {
 });
 
 describe("MarkdownRenderer Mermaid theme", () => {
+  it.each([
+    ["graph LR\n  source --> output", "graph TB\n  source --> output"],
+    ["flowchart RL\n  source --> output", "flowchart TB\n  source --> output"],
+    ["  flowchart LR\n  source --> output", "  flowchart TB\n  source --> output"],
+  ])("renders horizontal pipeline flowcharts vertically", (chart, expected) => {
+    expect(verticalisePipelineFlowchart(chart)).toBe(expected);
+  });
+
+  it.each([
+    "flowchart TB\n  source --> output",
+    "sequenceDiagram\n  Alice->>Bob: Hello",
+  ])("leaves non-horizontal Mermaid diagrams unchanged", (chart) => {
+    expect(verticalisePipelineFlowchart(chart)).toBe(chart);
+  });
+
   it("derives Mermaid theme variables from CSS tokens", () => {
     document.documentElement.style.setProperty(
       "--color-surface-elevated",

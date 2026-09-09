@@ -2,12 +2,17 @@ import { useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "r
 import { parseDocument } from "yaml";
 import * as api from "@/api/client";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import {
   OPEN_CATALOG_EVENT,
   OPEN_IMPORT_YAML_MODAL_EVENT,
 } from "@/lib/composer-events";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
+import {
+  UnavailableComponentRow,
+  unavailablePluginDisplayName,
+} from "@/components/catalog/UnavailableComponentRow";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
@@ -15,7 +20,7 @@ import type { ApiError, PluginPolicyFinding } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { plural } from "@/utils/plural";
 
-export const IMPORT_YAML_CONFIRM_TITLE = "Replace the current pipeline?";
+export const IMPORT_YAML_CONFIRM_TITLE = "Replace current pipeline";
 export const IMPORT_YAML_CONFIRM_CONFIRM_LABEL = "Replace pipeline";
 export const IMPORT_YAML_CONFIRM_CANCEL_LABEL = "Keep current pipeline";
 
@@ -57,11 +62,27 @@ export const IMPORT_YAML_422_MESSAGE =
 
 const IMPORT_YAML_GENERIC_ERROR_DETAIL = "Failed to import YAML. Please try again.";
 
+export const IMPORT_YAML_SECTION_KEYS = [
+  "sources",
+  "transforms",
+  "gates",
+  "row_unions",
+  "aggregations",
+  "coalesce",
+  "queues",
+  "collectors",
+  "scopes",
+  "sinks",
+] as const;
+
 // Client-side import preflight mirrors only the backend's first hard gates:
 // syntactically valid YAML, mapping root, and at least one runtime pipeline
 // section. Plugin/schema validation remains server-owned.
 export const IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE =
-  "Pipeline YAML must define at least one pipeline section: sources, source, transforms, gates, aggregations, coalesce, queues, or sinks.";
+  `Pipeline YAML must define at least one pipeline section: ${IMPORT_YAML_SECTION_KEYS.slice(0, -1).join(", ")}, or ${IMPORT_YAML_SECTION_KEYS[IMPORT_YAML_SECTION_KEYS.length - 1]}.`;
+
+export const IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE =
+  'Section "source" was removed by ADR-025. Use the "sources" mapping instead.';
 
 interface ImportErrorInfo {
   title: string;
@@ -162,26 +183,34 @@ export interface ImportYamlSourceBindingCandidate {
   path: string;
 }
 
-type ImportYamlSection =
-  | "aggregations"
-  | "coalesce"
-  | "gates"
-  | "queues"
-  | "sinks"
-  | "source"
-  | "sources"
-  | "transforms";
+type ImportYamlSection = (typeof IMPORT_YAML_SECTION_KEYS)[number];
 
-const IMPORT_YAML_SECTION_ALIASES: Record<string, ImportYamlSection> = {
-  aggregations: "aggregations",
-  coalesce: "coalesce",
-  gates: "gates",
-  queues: "queues",
-  sinks: "sinks",
-  source: "source",
-  sources: "sources",
-  transforms: "transforms",
-};
+type ImportYamlSectionCountTarget = "source" | "step" | "output" | "metadata";
+type ImportYamlSectionContainerShape = "mapping" | "list";
+
+interface ImportYamlSectionMetadata {
+  countTarget: ImportYamlSectionCountTarget;
+  containerShape: ImportYamlSectionContainerShape;
+}
+
+const IMPORT_YAML_SECTION_METADATA = {
+  sources: { countTarget: "source", containerShape: "mapping" },
+  transforms: { countTarget: "step", containerShape: "list" },
+  gates: { countTarget: "step", containerShape: "list" },
+  row_unions: { countTarget: "step", containerShape: "list" },
+  aggregations: { countTarget: "step", containerShape: "list" },
+  coalesce: { countTarget: "step", containerShape: "list" },
+  queues: { countTarget: "step", containerShape: "mapping" },
+  collectors: { countTarget: "step", containerShape: "list" },
+  scopes: { countTarget: "metadata", containerShape: "list" },
+  sinks: { countTarget: "output", containerShape: "mapping" },
+} as const satisfies Readonly<Record<ImportYamlSection, ImportYamlSectionMetadata>>;
+
+function importYamlSection(key: string): ImportYamlSection | undefined {
+  return Object.prototype.hasOwnProperty.call(IMPORT_YAML_SECTION_METADATA, key)
+    ? (key as ImportYamlSection)
+    : undefined;
+}
 
 const IMPORT_YAML_SOURCE_PATH_KEYS = ["path", "file"] as const;
 
@@ -245,13 +274,17 @@ function countParsedSectionEntries(
   section: ImportYamlSection,
   value: unknown,
 ): number | string {
-  if (section === "source") {
-    return isRecord(value) ? 1 : 'Section "source" must be a mapping.';
+  const { containerShape } = IMPORT_YAML_SECTION_METADATA[section];
+  switch (containerShape) {
+    case "mapping":
+      return countRecordEntries(value, section);
+    case "list":
+      return countSequenceEntries(value, section);
+    default: {
+      const exhaustiveShape: never = containerShape;
+      return exhaustiveShape;
+    }
   }
-  if (section === "sources" || section === "queues" || section === "sinks") {
-    return countRecordEntries(value, section);
-  }
-  return countSequenceEntries(value, section);
 }
 
 type ImportYamlParsedDocument = ReturnType<typeof parseDocument>;
@@ -283,10 +316,8 @@ function findImportYamlSourceBindingCandidatesFromParsed(
   const parsedRoot = parsedDraft.root;
   if (!isRecord(parsedRoot)) return [];
 
-  let rawSources = parsedRoot.sources;
-  if (rawSources === undefined && parsedRoot.source !== undefined) {
-    rawSources = { source: parsedRoot.source };
-  }
+  if (Object.prototype.hasOwnProperty.call(parsedRoot, "source")) return [];
+  const rawSources = parsedRoot.sources;
   if (!isRecord(rawSources)) return [];
 
   const candidates: ImportYamlSourceBindingCandidate[] = [];
@@ -366,8 +397,20 @@ function analyseImportYamlDraftFromParsed(
     };
   }
 
+  if (Object.prototype.hasOwnProperty.call(parsedRoot, "source")) {
+    return {
+      hasText: true,
+      canImport: false,
+      sectionsParsed: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+    };
+  }
+
   const parsedSectionKeys = Object.keys(parsedRoot)
-    .map((key) => IMPORT_YAML_SECTION_ALIASES[key])
+    .map(importYamlSection)
     .filter((section): section is ImportYamlSection => section !== undefined);
   if (parsedSectionKeys.length === 0) {
     return {
@@ -385,7 +428,7 @@ function analyseImportYamlDraftFromParsed(
   let parsedStepCount = 0;
   let parsedOutputCount = 0;
   for (const [key, value] of Object.entries(parsedRoot)) {
-    const section = IMPORT_YAML_SECTION_ALIASES[key];
+    const section = importYamlSection(key);
     if (section === undefined) continue;
     const count = countParsedSectionEntries(section, value);
     if (typeof count === "string") {
@@ -399,12 +442,23 @@ function analyseImportYamlDraftFromParsed(
         validationMessage: count,
       };
     }
-    if (section === "source" || section === "sources") {
-      parsedSourceCount += count;
-    } else if (section === "sinks") {
-      parsedOutputCount += count;
-    } else {
-      parsedStepCount += count;
+    const target = IMPORT_YAML_SECTION_METADATA[section].countTarget;
+    switch (target) {
+      case "source":
+        parsedSourceCount += count;
+        break;
+      case "step":
+        parsedStepCount += count;
+        break;
+      case "output":
+        parsedOutputCount += count;
+        break;
+      case "metadata":
+        break;
+      default: {
+        const exhaustiveTarget: never = target;
+        return exhaustiveTarget;
+      }
     }
   }
 
@@ -555,7 +609,7 @@ function ImportYamlSourceBindings({
                   </option>
                 ))}
               </select>
-              <input
+              <Input
                 type="file"
                 className="input"
                 aria-label={`Upload file for source ${candidate.sourceName}`}
@@ -584,7 +638,7 @@ function ImportYamlSourceBindings({
  * Import-YAML modal: paste or load-from-file, confirm when replacing a
  * non-trivial pipeline, submit, and render the outcome. Mounted only while
  * open (by ImportYamlModalHost), so `useFocusTrap`'s `active` is always true:
- * mount IS open, matching ExportYamlModal's focus/Escape/backdrop idiom.
+ * mount IS open, matching the application's focus/Escape/backdrop idiom.
  */
 export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
@@ -932,8 +986,8 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       >
         <header className="yaml-modal-header">
           <h2 id={titleId}>Import YAML</h2>
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="yaml-modal-close"
             onClick={onClose}
             disabled={!canClose}
@@ -941,7 +995,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
             aria-label="Close import YAML"
           >
             ×
-          </button>
+          </Button>
         </header>
         <div className="yaml-modal-body">
           {phase !== "success" && (
@@ -978,7 +1032,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                 <label htmlFor={fileInputId} className="field-label">
                   Or choose a .yaml file
                 </label>
-                <input
+                <Input
                   id={fileInputId}
                   type="file"
                   accept=".yaml,.yml,text/yaml,application/x-yaml"
@@ -1006,22 +1060,16 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                 }}
               />
               <div className="import-yaml-actions">
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={onClose}
-                  disabled={isSubmitting}
-                >
+                <Button onClick={onClose} disabled={isSubmitting}>
                   Cancel
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-primary"
+                </Button>
+                <Button
+                  variant="primary"
                   disabled={!canSubmitYaml || isSubmitting || hasPendingSourceUpload}
                   onClick={handleSubmitClick}
                 >
                   {isSubmitting ? "Importing…" : "Import"}
-                </button>
+                </Button>
               </div>
               {isSubmitting && (
                 <div role="status" aria-live="polite" className="sr-only">
@@ -1077,42 +1125,39 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                   </div>
                   <ul className="validation-banner-fail-list">
                     {successInfo.pluginPolicyFindings.map((finding) => (
-                      <li
+                      <UnavailableComponentRow
                         key={`${finding.component_id}:${finding.plugin_id}`}
-                        className="validation-banner-error-item"
-                      >
-                        <div>
-                          <strong>{finding.component_id}</strong>{" "}
-                          <code>{finding.plugin_id}</code> —{" "}
-                          {unavailableReasonLabel(finding.reason_code)}
-                        </div>
-                        <div className="import-yaml-actions">
-                          <button
-                            type="button"
-                            className="btn btn-small"
-                            aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
-                            onClick={() => requestDisabledComponentRemoval(finding)}
-                          >
-                            Remove
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-small"
-                            aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${pluginKind(finding.plugin_id)}`}
-                            onClick={requestDisabledComponentReplacement}
-                          >
-                            Replace
-                          </button>
-                        </div>
-                      </li>
+                        finding={finding}
+                        reasonLabel={unavailableReasonLabel(finding.reason_code)}
+                        actions={
+                          <>
+                            <Button
+                              className="btn-small"
+                              aria-label={`Remove disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)})`}
+                              title={finding.plugin_id}
+                              onClick={() => requestDisabledComponentRemoval(finding)}
+                            >
+                              Remove
+                            </Button>
+                            <Button
+                              className="btn-small"
+                              aria-label={`Replace disabled component ${finding.component_id} (${unavailablePluginDisplayName(finding.plugin_id)}) with an available ${pluginKind(finding.plugin_id)}`}
+                              title={finding.plugin_id}
+                              onClick={requestDisabledComponentReplacement}
+                            >
+                              Replace
+                            </Button>
+                          </>
+                        }
+                      />
                     ))}
                   </ul>
                 </section>
               )}
               <div className="import-yaml-actions">
-                <button ref={successCloseRef} type="button" className="btn btn-primary" onClick={onClose}>
+                <Button ref={successCloseRef} variant="primary" onClick={onClose}>
                   Close
-                </button>
+                </Button>
               </div>
             </div>
           )}

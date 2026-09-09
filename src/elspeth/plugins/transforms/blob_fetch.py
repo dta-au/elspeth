@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+from dataclasses import dataclass
 from ipaddress import IPv4Network, IPv6Network
 from typing import Annotated, Any, Literal, cast
 
@@ -15,8 +16,10 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.security.web import NetworkError as SSRFNetworkError
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
@@ -200,8 +203,36 @@ def _final_response_ip(response: httpx.Response) -> str:
     return final_host
 
 
-def _normalized_content_type(response: httpx.Response) -> str:
-    return cast(str, response.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
+@dataclass(frozen=True, slots=True)
+class _ContentType:
+    """The response's content-type header, parsed once at the HTTP boundary.
+
+    ``raw`` preserves absence as ``None`` so routed error metadata reports a
+    missing header as missing rather than as an externally supplied empty
+    string; ``normalized`` is the bare media type the allow-list decision uses.
+    """
+
+    raw: str | None
+    normalized: str
+
+
+@trust_boundary(
+    tier=3,
+    source="HTTP response headers returned by an external server via httpx",
+    source_param="response",
+    suppresses=("R1",),
+    invariant=(
+        "parses the content-type header into an owned _ContentType; an absent "
+        "header is preserved as raw=None and normalizes to the empty string, "
+        "which cannot match any configured allowed content type and so surfaces "
+        "as the row's unsupported_content_type error — never raises, never "
+        "fabricates a type"
+    ),
+    non_raising=True,
+)
+def _parse_content_type(response: httpx.Response) -> _ContentType:
+    raw = cast("str | None", response.headers.get("content-type"))
+    return _ContentType(raw=raw, normalized="" if raw is None else raw.split(";", 1)[0].strip().lower())
 
 
 def _blob_fetch_added_output_fields(cfg: BlobFetchConfig) -> tuple[FieldDefinition, ...]:
@@ -239,12 +270,51 @@ def _build_blob_fetch_output_schema_config(schema_config: SchemaConfig, cfg: Blo
 class BlobFetch(BaseTransform):
     """Fetch an HTTP(S) URL into the run payload store and emit a blob reference."""
 
+    # url_field is the INPUT column (the URL to fetch); every option below is
+    # "Output field receiving ..." per its own config description.
+    output_naming_config_keys = frozenset(
+        {
+            "blob_ref_field",
+            "content_type_field",
+            "size_bytes_field",
+            "sha256_field",
+            "fetch_status_field",
+            "fetch_url_final_field",
+            "fetch_url_final_ip_field",
+        }
+    )
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2c5a53cc0e54a008"
+    source_file_hash: str | None = "sha256:a7ec5ed8ed9cd12d"
     config_model = BlobFetchConfig
     passes_through_input = True
+    fetches_http = True
+    content_trust = ContentTrust.UNTRUSTED
+    capability_tags: tuple[str, ...] = ("http", "network", "blob")
+
+    usage_when_to_use = (
+        "Use when each row contains an authorized HTTP(S) file URL and the run must preserve the "
+        "original response bytes in the payload store with MIME type, size, and SHA-256 metadata. "
+        "Fetched bytes and later parser output remain untrusted before LLM consumption."
+    )
+    usage_when_not_to_use = (
+        "Not for semantic extraction or authenticated origins: blob_fetch has no origin-auth option. "
+        "Use web_scrape for public HTML page extraction, then a format-specific parser for stored bytes."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: blob_fetch\n"
+        "  options:\n"
+        "    url_field: document_url\n"
+        "    blob_ref_field: document_blob_ref\n"
+        "    allowed_content_types: [text/csv, application/json]\n"
+        "    http:\n"
+        "      abuse_contact: catalogue-ops@example.org\n"
+        "      fetch_reason: Preserve approved public reference files\n"
+        "      allowed_hosts: public_only\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -305,12 +375,89 @@ class BlobFetch(BaseTransform):
                 summary="Fetch an HTTP(S) URL into the run payload store and emit a blob reference plus fetch metadata.",
                 composer_hints=(
                     "Use blob_fetch when rows contain document URLs and downstream parser transforms should consume blob_ref, not raw bytes.",
-                    "blob_fetch does not parse content; chain blob_csv_expand, future blob_json_expand, or another blob parser after it.",
+                    "blob_fetch does not parse content; chain a registered parser after it — blob_csv_expand for CSV, blob_json_expand for JSON or JSONL, blob_text_expand for plain text.",
                     "allowed_content_types is a strict exact MIME allowlist; add operator-approved types explicitly.",
                     "http.abuse_contact and http.fetch_reason are mandatory and sent as wire-visible headers.",
                 ),
             )
         return None
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject a deterministic public-IP URL for invariant probing.
+
+        Without this the probe row never carries ``url_field``, ``process()``
+        returns ``validation_failed`` on the ``KeyError``, and ADR-009's forward
+        invariant — which treats a non-success probe as a legitimate processing
+        error and moves on — reports green while asserting nothing
+        (elspeth-6244cb5472). The address matches the ``allowed_hosts`` entry in
+        ``probe_config()``, so SSRF validation resolves without DNS.
+        """
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name=self._url_field,
+                value="https://93.184.216.34/invariant-probe",
+            )
+        ]
+
+    def execute_forward_invariant_probe(
+        self,
+        probe_rows: list[PipelineRow],
+        ctx: TransformContext,
+    ) -> TransformResult:
+        """Drive the real process path with a hermetic no-network fetch seam.
+
+        Both seams must be stubbed for the probe to reach the enrichment path:
+        ``_fetch_url`` would otherwise open a socket, and ``_payload_store`` is
+        bound in ``on_start()``, which the isolated invariant harness never runs.
+        The stub response carries an allowlisted content-type and an IP-pinned
+        request URL because ``process()`` checks both — a probe that skipped
+        either would exercise less of the production path than it appears to.
+        """
+
+        class _InvariantPayloadStore:
+            def store(self, payload: bytes) -> str:
+                return "probe-processed-hash"
+
+        class _InvariantCall:
+            request_ref = "probe-request-hash"
+            response_ref = "probe-response-hash"
+
+        def _fake_fetch_url(
+            safe_request: SSRFSafeRequest,
+            probe_ctx: TransformContext,
+        ) -> tuple[httpx.Response, str, _InvariantCall]:
+            del probe_ctx
+            return (
+                httpx.Response(
+                    200,
+                    content=b"col_a,col_b\n1,2\n",
+                    headers={"content-type": "text/csv"},
+                    request=httpx.Request("GET", safe_request.connection_url),
+                ),
+                safe_request.original_url,
+                _InvariantCall(),
+            )
+
+        had_payload_store = "_payload_store" in self.__dict__
+        original_payload_store: Any = None
+        if had_payload_store:
+            original_payload_store = self.__dict__["_payload_store"]
+        had_fetch_override = "_fetch_url" in self.__dict__
+        original_fetch = self._fetch_url
+        try:
+            self.__dict__["_payload_store"] = _InvariantPayloadStore()
+            self.__dict__["_fetch_url"] = _fake_fetch_url
+            return super().execute_forward_invariant_probe(probe_rows, ctx)
+        finally:
+            if had_payload_store:
+                self.__dict__["_payload_store"] = original_payload_store
+            else:
+                delattr(self, "_payload_store")
+            if had_fetch_override:
+                self.__dict__["_fetch_url"] = original_fetch
+            else:
+                delattr(self, "_fetch_url")
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
@@ -363,17 +510,17 @@ class BlobFetch(BaseTransform):
                 }
             )
 
-        content_type = _normalized_content_type(response)
+        content_type = _parse_content_type(response)
         safe_url = fingerprint_url(safe_request.original_url)
-        if content_type not in self._allowed_content_types:
+        if content_type.normalized not in self._allowed_content_types:
             return TransformResult.error(
                 {
                     "reason": "unsupported_content_type",
                     "error": (
-                        f"content-type {response.headers.get('content-type', '')!r} returned by {safe_url}; "
+                        f"content-type {content_type.raw!r} returned by {safe_url}; "
                         f"allowed values are {sorted(self._allowed_content_types)!r}"
                     ),
-                    "content_type": response.headers.get("content-type", ""),
+                    "content_type": content_type.raw,
                     "url": safe_url,
                 }
             )
@@ -400,7 +547,7 @@ class BlobFetch(BaseTransform):
 
         output = row.to_dict()
         output[self._blob_ref_field] = blob_ref
-        output[self._content_type_field] = content_type
+        output[self._content_type_field] = content_type.normalized
         output[self._size_bytes_field] = body_size
         output[self._sha256_field] = blob_ref
         output[self._fetch_status_field] = response.status_code

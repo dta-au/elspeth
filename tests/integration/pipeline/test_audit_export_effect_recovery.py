@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import cast
+from typing import Any, BinaryIO, cast
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +22,8 @@ from elspeth.contracts.audit_export import (
     IterableBoundAuditExportContentReader,
     RegisteredAuditExportContent,
 )
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -31,12 +33,14 @@ from elspeth.contracts.sink_effects import (
     SinkEffectAuditExportSnapshotInput,
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
+    SinkEffectInputKind,
     SinkEffectInspection,
     SinkEffectInspectionMode,
     SinkEffectInspectionRequest,
     SinkEffectPlan,
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
+    SinkEffectState,
 )
 from elspeth.core.audit_export_content_store import FilesystemAuditExportContentStore
 from elspeth.core.config import AuditExportContentStoreSettings, LandscapeExportSettings
@@ -45,7 +49,13 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import audit_export_snapshots_table, runs_table, sink_effects_table
 from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkEffectInjectedFault
 from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import (
+    expire_sink_effect_lease,
+    insert_crashed_leader_seat,
+    leader_coordination_token,
+    leader_token_for,
+    register_test_node,
+)
 
 _COMPLETED_AT = datetime(2026, 7, 16, 7, 8, 9, 123456, tzinfo=UTC)
 
@@ -177,6 +187,25 @@ def _insert_terminal_run(db: LandscapeDB, run_id: str = "run-export") -> None:
                 openrouter_catalog_source="bundled",
             )
         )
+        # A run written by raw SQL has no seat; the export re-drive takes the
+        # lapsed seat a crashed leader leaves (ADR-048 §4), so mint that image.
+        insert_crashed_leader_seat(connection, run_id=run_id)
+
+
+def _export_seat(db: LandscapeDB, *, worker_id: str, run_id: str = "run-export") -> CoordinationToken:
+    """Take the export seat a direct ``execute_audit_export_effect`` acts under.
+
+    Production reaches that verb through ``resume_audit_export``, which claims
+    this same seat first (ADR-048 §4); a test that drives the verb directly
+    owes the same claim, so the token is read from the CAS rather than minted.
+    One seat covers a scenario's fault run and its re-drive: both act as the
+    same export worker.
+    """
+    return RecorderFactory(db).run_coordination.acquire_export_leadership(
+        run_id=run_id,
+        worker_id=worker_id,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    )
 
 
 def _config(**overrides: object) -> LandscapeExportSettings:
@@ -231,7 +260,7 @@ def test_configured_total_limits_fail_before_content_store_or_registry_writes(
         with pytest.raises(ValueError, match=error):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(**overrides),
                 signing_key=None,
                 content_store=store,
@@ -282,7 +311,7 @@ def test_candidate_verification_reads_run_outside_the_write_transaction(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -320,7 +349,7 @@ def test_cleanup_failure_does_not_mask_primary_export_exception(
         with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="primary export failure"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -330,13 +359,83 @@ def test_cleanup_failure_does_not_mask_primary_export_exception(
         db.close()
 
 
-def test_spool_close_failure_does_not_fail_a_registered_export(
+def test_cleanup_logging_failure_preserves_pending_integrity_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.engine.orchestrator import audit_export_effects
+
+    primary = AuditIntegrityError("primary audit corruption")
+
+    def fail_cleanup() -> None:
+        raise OSError("cleanup failed")
+
+    def fail_logging(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("logging failed")
+
+    monkeypatch.setattr(audit_export_effects.logger, "exception", fail_logging)
+    with pytest.raises(AuditIntegrityError) as raised:
+        try:
+            raise primary
+        except AuditIntegrityError:
+            audit_export_effects._contain_cleanup_failure(fail_cleanup, "test spool", pending_exc=primary)
+            raise
+
+    assert raised.value is primary
+    assert primary.__notes__ == ["Audit-export cleanup failed: test spool; cleanup_error=OSError; diagnostic_error=RuntimeError"]
+
+
+def test_fatal_orphan_marking_still_closes_private_spool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.engine.orchestrator import audit_export_effects
+
+    failure = AuditIntegrityError("orphan registry corruption")
+    primary = OSError("object write failed")
+    spools: list[BinaryIO] = []
+    real_temporary_file = audit_export_effects.TemporaryFile
+
+    def tracked_temporary_file(*args: Any, **kwargs: Any) -> BinaryIO:
+        spool = cast(BinaryIO, real_temporary_file(*args, **kwargs))
+        spools.append(spool)
+        return spool
+
+    class FailingStore(_MemoryContentStore):
+        def put_immutable(self, content: bytes, *, candidate_id: str, object_kind: str) -> str:
+            raise primary
+
+        def mark_candidate_orphans(self, candidate_id: str, descriptors: tuple[AuditExportContentDescriptor, ...]) -> None:
+            raise failure
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(audit_export_effects, "TemporaryFile", tracked_temporary_file)
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'orphan-fatal.db'}")
+    try:
+        _insert_terminal_run(db)
+        with pytest.raises(AuditIntegrityError) as raised:
+            prepare_audit_export_snapshot(
+                db,
+                coordination_token=leader_token_for(db, "run-export"),
+                config=_config(),
+                signing_key=None,
+                content_store=FailingStore(),
+            )
+        assert raised.value is failure
+        assert failure.__context__ is primary
+        assert len(spools) == 1
+        assert spools[0].closed
+    finally:
+        for spool in spools:
+            spool.close()
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [OSError("spool close failure"), AuditIntegrityError("spool integrity failed"), FrameworkBugError("spool invariant failed")],
+)
+def test_spool_close_failure_preserves_integrity_priority_after_registration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    close_error: Exception,
 ) -> None:
-    """A failing spool close is contained and recorded; the registered winner
-    still binds and returns (elspeth-1c31195f26)."""
+    """Ordinary close failures are contained; integrity failures still raise."""
     from elspeth.engine.orchestrator import audit_export_effects
 
     monkeypatch.chdir(tmp_path)
@@ -344,27 +443,63 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
     store = _MemoryContentStore()
 
     class _ExplodingCloseSpool:
-        def __init__(self, inner: object) -> None:
+        """Explicit ``BinaryIO``-shaped spool whose ``close()`` fails.
+
+        Every member the derivation and read-back paths use is written out and
+        delegates to the real temporary file. There is deliberately no
+        catch-all ``__getattr__``: a spool path that starts using a new file
+        member raises ``AttributeError`` here instead of being forwarded
+        silently, which would let this test drift away from the real shape.
+        """
+
+        def __init__(self, inner: BinaryIO) -> None:
             self._inner = inner
 
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._inner, name)
+        def tell(self) -> int:
+            return self._inner.tell()
+
+        def write(self, data: Any) -> int:
+            return self._inner.write(data)
+
+        def seek(self, offset: int, whence: int = 0) -> int:
+            return self._inner.seek(offset, whence)
+
+        def read(self, size: int = -1) -> bytes:
+            return self._inner.read(size)
+
+        def flush(self) -> None:
+            self._inner.flush()
+
+        def fileno(self) -> int:
+            return self._inner.fileno()
 
         def close(self) -> None:
-            raise OSError("spool close failure")
+            self._inner.close()
+            raise close_error
 
     real_temporary_file = audit_export_effects.TemporaryFile
 
     def exploding_temporary_file(*args: object, **kwargs: object) -> _ExplodingCloseSpool:
-        return _ExplodingCloseSpool(real_temporary_file(*args, **kwargs))
+        return _ExplodingCloseSpool(cast(BinaryIO, real_temporary_file(*args, **kwargs)))
 
     monkeypatch.setattr(audit_export_effects, "TemporaryFile", exploding_temporary_file)
     try:
         _insert_terminal_run(db)
+        if isinstance(close_error, AuditIntegrityError | FrameworkBugError):
+            with pytest.raises(type(close_error)) as raised:
+                prepare_audit_export_snapshot(
+                    db,
+                    coordination_token=leader_token_for(db, "run-export"),
+                    config=_config(),
+                    signing_key=None,
+                    content_store=store,
+                )
+            assert raised.value is close_error
+            return
         with caplog.at_level("ERROR"):
             snapshot = prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -385,7 +520,7 @@ def test_registry_hit_reuses_verified_winner_without_rewriting_content(tmp_path:
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -397,7 +532,7 @@ def test_registry_hit_reuses_verified_winner_without_rewriting_content(tmp_path:
         ):
             second = prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -426,7 +561,7 @@ def test_production_filesystem_store_materializes_and_reopens_snapshot(
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=config,
             signing_key=None,
             content_store=store,
@@ -434,7 +569,7 @@ def test_production_filesystem_store_materializes_and_reopens_snapshot(
         )
         second = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=config,
             signing_key=None,
             content_store=store,
@@ -459,7 +594,7 @@ def test_hmac_snapshot_streaming_derivation_and_production_verification(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
@@ -488,7 +623,7 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
         _insert_terminal_run(db)
         prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
@@ -502,7 +637,7 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
         with pytest.raises(ValueError, match="single_export"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(
                     signing_mode="hmac_sha256",
                     signer_key_id="audit-key-v2",
@@ -532,7 +667,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=old_store,
@@ -540,7 +675,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         )
         second = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=new_store,
@@ -554,7 +689,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         with pytest.raises(LookupError, match=r"audit-store-v1.*unresolvable"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=new_store,
@@ -570,6 +705,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         SinkEffectExecutionSeam.BEFORE_EFFECT,
         SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN,
         SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE,
+        SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE,
     ),
 )
 def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
@@ -582,9 +718,13 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): the export seat is claimed first and
+        # every export write runs under it — see the csv scenario for why the
+        # crashed leader's token must not be used here.
+        export_token = _export_seat(db, worker_id="audit-export-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=export_token,
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -614,8 +754,24 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
                 sink_node_id=sink_node_id,
                 target_config={"path": "audit-export.json"},
                 worker_id="audit-export-worker",
+                coordination_token=export_token,
                 fault_hook=fail_once,
             )
+
+        factory = RecorderFactory(db)
+        (effect_before,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        (operation_before,) = tuple(
+            operation for operation in factory.execution.get_operations_for_run("run-export") if operation.sink_effect_id is not None
+        )
+        assert operation_before.sink_effect_id == effect_before.effect_id
+        if seam is SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE:
+            assert effect_before.state is SinkEffectState.FINALIZED
+            assert operation_before.status == "completed"
+            assert operation_before.completed_at is not None
+        else:
+            assert effect_before.state is SinkEffectState.IN_FLIGHT
+            assert operation_before.status == "open"
+            assert operation_before.completed_at is None
 
         result = execute_audit_export_effect(
             factory=RecorderFactory(db),
@@ -624,11 +780,24 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
             sink_node_id=sink_node_id,
             target_config={"path": "audit-export.json"},
             worker_id="audit-export-worker",
+            coordination_token=export_token,
         )
 
         assert target.publication_count == 1
         assert result.artifact.sink_effect_id == target.effect_id
         assert result.state_ids == () and result.outcome_ids == ()
+        factory = RecorderFactory(db)
+        (effect_after,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        (operation_after,) = tuple(
+            operation for operation in factory.execution.get_operations_for_run("run-export") if operation.sink_effect_id is not None
+        )
+        assert effect_after.state is SinkEffectState.FINALIZED
+        assert effect_after.effect_id == effect_before.effect_id
+        assert effect_after.artifact_id == effect_before.artifact_id
+        assert operation_after.operation_id == operation_before.operation_id
+        assert operation_after.sink_effect_id == effect_after.effect_id
+        assert operation_after.status == "completed"
+        assert operation_after.completed_at is not None
     finally:
         db.close()
 
@@ -647,9 +816,13 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): the export seat is claimed first and
+        # every export write runs under it — see the csv scenario for why the
+        # crashed leader's token must not be used here.
+        export_token = _export_seat(db, worker_id="audit-export-json-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=export_token,
             config=_config(
                 format="json",
                 signing_mode="hmac_sha256" if signed else "unsigned",
@@ -682,6 +855,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
                 sink_node_id=sink_node_id,
                 target_config=sink_options,
                 worker_id="audit-export-json-worker",
+                coordination_token=export_token,
                 fault_hook=lambda seam: (
                     (_ for _ in ()).throw(SinkEffectInjectedFault(seam))
                     if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE
@@ -696,6 +870,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
             sink_node_id=sink_node_id,
             target_config=sink_options,
             worker_id="audit-export-json-worker",
+            coordination_token=export_token,
         )
 
         assert output.read_bytes() == expected
@@ -718,9 +893,15 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): resume_audit_export CLAIMS the export
+        # seat first, and every export write then runs under it. Preparing under
+        # the CRASHED leader's token instead fences with that dead seat's own
+        # identity, and the fence's verify-and-extend then EXTENDS it — reviving
+        # the leader this scenario's takeover exists to depose.
+        export_token = _export_seat(db, worker_id="audit-export-csv-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=export_token,
             config=_config(format="csv"),
             signing_key=None,
             content_store=store,
@@ -751,6 +932,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
                 sink_node_id=sink_node_id,
                 target_config=sink_options,
                 worker_id="audit-export-csv-worker",
+                coordination_token=export_token,
                 fault_hook=lambda seam: (
                     (_ for _ in ()).throw(SinkEffectInjectedFault(seam))
                     if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE
@@ -765,6 +947,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
             sink_node_id=sink_node_id,
             target_config=sink_options,
             worker_id="audit-export-csv-worker",
+            coordination_token=export_token,
         )
 
         assert (target / _audit_export_bundle_effects.AUDIT_MANIFEST_NAME).read_bytes() == snapshot.reader.read_verified_signed_manifest()
@@ -818,6 +1001,9 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
     effect is reconciled without republication, and export status converges
     to COMPLETED."""
     from elspeth.contracts import ExportStatus
+    from elspeth.core.landscape.execution import sink_effect_lifecycle
+    from elspeth.engine.clock import MockClock
+    from elspeth.engine.orchestrator import audit_export_effects
     from elspeth.engine.orchestrator.export import resume_audit_export
     from elspeth.plugins.sinks import _local_file_effects
 
@@ -840,6 +1026,34 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         }
         settings = _resume_settings_bundle(sink_options, _config())
         sink_factory = _json_sink_factory(sink_options)
+        lease_ttl = timedelta(seconds=2)
+        clock = MockClock(start=datetime.now(UTC).timestamp())
+        poll_sleeps: list[float] = []
+        original_execute = audit_export_effects.execute_audit_export_effect
+        # The crashed attempt's lease lapses on the Landscape database clock
+        # (ADR-047), which the mock clock cannot move: once the resume has
+        # polled for a TTL, the deadline is written into the database's past
+        # exactly where it would have lapsed on the resume's own clock.
+        held_lease: list[str] = []
+
+        def advance_clock(seconds: float) -> None:
+            assert seconds > 0.0
+            poll_sleeps.append(seconds)
+            clock.advance(seconds)
+            if held_lease and sum(poll_sleeps) >= lease_ttl.total_seconds():
+                expire_sink_effect_lease(db.engine, held_lease.pop())
+
+        def execute_with_deterministic_lease(**kwargs: object):  # type: ignore[no-untyped-def]
+            return original_execute(
+                **kwargs,
+                lease_ttl=lease_ttl,
+                clock=clock,
+                sleep=advance_clock,
+                poll_interval=0.25,
+            )
+
+        monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
+        monkeypatch.setattr(audit_export_effects, "execute_audit_export_effect", execute_with_deterministic_lease)
 
         # Attempt 1: the publication lands durably but the response is lost.
         def lose_response(_target: Path) -> None:
@@ -862,21 +1076,17 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert run is not None
         assert run.export_status is ExportStatus.FAILED
         assert run.export_error is not None and "publication response lost" in run.export_error
-
-        # The crashed worker never released its effect lease; model the
-        # production recovery window by letting the lease lapse (a live lease
-        # correctly refuses takeover — SinkEffectLeaseHeld).
-        with db.engine.begin() as connection:
-            connection.execute(
-                sink_effects_table.update()
-                .where(sink_effects_table.c.run_id == "run-export")
-                .values(
-                    lease_expires_at=datetime(2020, 1, 1, tzinfo=UTC),
-                    lease_heartbeat_at=datetime(2020, 1, 1, tzinfo=UTC),
-                )
-            )
+        factory = RecorderFactory(db)
+        (effect_before,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        assert effect_before.state is SinkEffectState.IN_FLIGHT
+        assert effect_before.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT
+        assert effect_before.required_snapshot_slot == 0
+        assert effect_before.required_member_ordinal is None
+        assert effect_before.lease_expires_at is not None
+        assert effect_before.lease_expires_at.replace(tzinfo=UTC) > clock.now_utc()
 
         # Attempt 2: resume reconciles the applied effect without republishing.
+        held_lease.append(effect_before.effect_id)
         republications: list[Path] = []
         monkeypatch.setattr(_local_file_effects, "_after_replace", lambda path: republications.append(path))
         resume_audit_export(
@@ -894,16 +1104,258 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert run is not None
         assert run.export_status is ExportStatus.COMPLETED
         assert republications == [], "reconciled effect must not republish"
+        factory = RecorderFactory(db)
+        (effect_after,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        assert effect_after.state is SinkEffectState.FINALIZED
+        assert effect_after.effect_id == effect_before.effect_id
+        assert effect_after.artifact_id == effect_before.artifact_id
+        assert effect_after.input_kind is effect_before.input_kind
+        assert effect_after.config_hash == effect_before.config_hash
+        assert effect_after.membership_or_manifest_hash == effect_before.membership_or_manifest_hash
+        assert effect_after.group_payload_hash == effect_before.group_payload_hash
+        assert effect_after.target_json == effect_before.target_json
+        assert poll_sleeps
+        assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
+        assert sum(poll_sleeps) <= lease_ttl.total_seconds() + 0.25
+        # Both resume attempts released the export seat on the way out
+        # (ADR-048 §4), so this re-derivation takes the seat the way a third
+        # export leader would rather than reading a vacant one back.
+        assertion_token = RecorderFactory(db).run_coordination.acquire_export_leadership(
+            run_id="run-export",
+            worker_id="audit-export-assertion-worker",
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        )
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=assertion_token,
             config=_config(),
             signing_key=None,
             content_store=store,
             content_store_resolver=resolver,
         )
+        assert effect_after.group_payload_hash == snapshot.snapshot_hash
+        assert effect_after.membership_or_manifest_hash == snapshot.manifest_hash
         expected = b"".join(snapshot.reader.iter_verified_chunks()) + snapshot.reader.read_verified_signed_manifest()
         assert output.read_bytes() == expected
+    finally:
+        db.close()
+
+
+def test_resume_audit_export_adopts_completion_won_during_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed resume worker cannot regress COMPLETED after its stale read."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine.orchestrator import export as export_module
+
+    monkeypatch.chdir(tmp_path)
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'resume-admission-race.db'}")
+    store = _MemoryContentStore()
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    sink_options: dict[str, object] = {
+        "path": str(tmp_path / "audit.jsonl"),
+        "format": "jsonl",
+        "mode": "write",
+        "schema": {"mode": "observed"},
+    }
+    try:
+        _insert_terminal_run(db)
+        _set_export_status_row(db, "run-export", "pending")
+
+        def complete_during_target_check(*_args: object, **_kwargs: object) -> None:
+            # The peer that wins is an export leader in its own right: it takes
+            # the lapsed seat, completes under it, and vacates it (ADR-048 §4).
+            # The delayed loser then takes the vacant seat and must adopt.
+            repositories = RecorderFactory(db)
+            peer_token = repositories.run_coordination.acquire_export_leadership(
+                run_id="run-export",
+                worker_id="audit-export-peer",
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            )
+            repositories.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=peer_token)
+            repositories.run_coordination.release_seat(token=peer_token)
+            return None
+
+        monkeypatch.setattr(export_module, "_audit_export_resume_target_refusal", complete_during_target_check)
+        monkeypatch.setattr(
+            export_module,
+            "export_landscape",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("completed loser must not export")),
+        )
+
+        export_module.resume_audit_export(
+            db,
+            "run-export",
+            _resume_settings_bundle(sink_options, _config()),
+            _json_sink_factory(sink_options),
+            payload_store=object(),
+            audit_export_content_store=store,
+            audit_export_content_store_resolver=resolver,
+            worker_id="audit-export-loser",
+        )
+
+        run = RecorderFactory(db).run_lifecycle.get_run("run-export")
+        assert run is not None
+        assert run.export_status is ExportStatus.COMPLETED
+        assert run.exported_at is not None
+        assert run.export_error is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("lease_contention", (True, False))
+def test_resume_audit_export_only_adopts_peer_completion_for_lease_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_contention: bool,
+) -> None:
+    """Peer completion is equivalent success only for the typed lease loser."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld
+    from elspeth.engine.orchestrator import export as export_module
+
+    monkeypatch.chdir(tmp_path)
+    db = LandscapeDB(f"sqlite:///{tmp_path / f'resume-failure-race-{lease_contention}.db'}")
+    store = _MemoryContentStore()
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    sink_options: dict[str, object] = {
+        "path": str(tmp_path / "audit.jsonl"),
+        "format": "jsonl",
+        "mode": "write",
+        "schema": {"mode": "observed"},
+    }
+    try:
+        _insert_terminal_run(db)
+        _set_export_status_row(db, "run-export", "failed", "retry me")
+
+        def completed_peer_then_fail(*_args: object, **_kwargs: object) -> None:
+            RecorderFactory(db).run_lifecycle.set_export_status(
+                ExportStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), "run-export")
+            )
+            if lease_contention:
+                raise SinkEffectLeaseHeld("peer still owns the sink-effect lease")
+            raise RuntimeError("unrelated export corruption")
+
+        monkeypatch.setattr(export_module, "export_landscape", completed_peer_then_fail)
+        call = lambda: export_module.resume_audit_export(  # noqa: E731
+            db,
+            "run-export",
+            _resume_settings_bundle(sink_options, _config()),
+            _json_sink_factory(sink_options),
+            payload_store=object(),
+            audit_export_content_store=store,
+            audit_export_content_store_resolver=resolver,
+            worker_id="audit-export-loser",
+        )
+        if lease_contention:
+            call()
+        else:
+            with pytest.raises(RuntimeError, match="unrelated export corruption"):
+                call()
+
+        run = RecorderFactory(db).run_lifecycle.get_run("run-export")
+        assert run is not None
+        assert run.export_status is ExportStatus.COMPLETED
+        assert run.exported_at is not None
+        assert run.export_error is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("mutation", ("path", "bucket", "key", "options", "format"))
+def test_resume_audit_export_refuses_a_different_persisted_target_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """A lost publication response may only reconcile the original target."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine.orchestrator.export import resume_audit_export
+    from elspeth.plugins.sinks import _local_file_effects
+
+    monkeypatch.chdir(tmp_path)
+    db = LandscapeDB(f"sqlite:///{tmp_path / f'resume-target-{mutation}.db'}")
+    store = _MemoryContentStore()
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    try:
+        _insert_terminal_run(db)
+        _set_export_status_row(db, "run-export", "pending")
+        original_output = tmp_path / "audit-original.jsonl"
+        original_options: dict[str, object] = {
+            "path": str(original_output),
+            "format": "jsonl",
+            "mode": "write",
+            "schema": {"mode": "observed"},
+        }
+
+        monkeypatch.setattr(
+            _local_file_effects,
+            "_after_replace",
+            lambda _target: (_ for _ in ()).throw(RuntimeError("publication response lost")),
+        )
+        with pytest.raises(RuntimeError, match="publication response lost"):
+            resume_audit_export(
+                db,
+                "run-export",
+                _resume_settings_bundle(original_options, _config()),
+                _json_sink_factory(original_options),
+                payload_store=object(),
+                audit_export_content_store=store,
+                audit_export_content_store_resolver=resolver,
+                worker_id="audit-export-original-worker",
+            )
+
+        with db.engine.begin() as connection:
+            connection.execute(
+                sink_effects_table.update().values(
+                    lease_expires_at=datetime(2020, 1, 1, tzinfo=UTC),
+                    lease_heartbeat_at=datetime(2020, 1, 1, tzinfo=UTC),
+                )
+            )
+
+        changed_output = tmp_path / "audit-changed.jsonl"
+        changed_options = dict(original_options)
+        changed_config = _config()
+        if mutation == "path":
+            changed_options["path"] = str(changed_output)
+        elif mutation == "bucket":
+            changed_options["bucket"] = "different-bucket"
+        elif mutation == "key":
+            changed_options["key"] = "different/audit.jsonl"
+        elif mutation == "options":
+            changed_options["schema"] = {"mode": "strict"}
+        else:
+            changed_config = _config(format="csv")
+
+        def unexpected_sink_factory(_sink_name: str):  # type: ignore[no-untyped-def]
+            raise AssertionError("target mismatch must be refused before sink construction")
+
+        monkeypatch.setattr(_local_file_effects, "_after_replace", lambda _target: None)
+        with pytest.raises(ValueError, match="target identity"):
+            resume_audit_export(
+                db,
+                "run-export",
+                _resume_settings_bundle(changed_options, changed_config),
+                unexpected_sink_factory,
+                payload_store=object(),
+                audit_export_content_store=store,
+                audit_export_content_store_resolver=resolver,
+                worker_id="audit-export-changed-worker",
+            )
+
+        run = RecorderFactory(db).run_lifecycle.get_run("run-export")
+        assert run is not None
+        assert run.export_status is ExportStatus.FAILED
+        assert run.export_format == "json"
+        assert run.export_sink == "output"
+        assert original_output.exists()
+        assert not changed_output.exists()
+        with db.read_only_connection() as connection:
+            assert connection.scalar(select(func.count()).select_from(sink_effects_table)) == 1
     finally:
         db.close()
 

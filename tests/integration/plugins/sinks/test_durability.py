@@ -24,7 +24,7 @@ from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from tests.fixtures.base_classes import create_observed_contract
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 
@@ -144,6 +144,7 @@ class TestSinkDurability:
             span_factory=SpanFactory(),
             run_id=run.run_id,
             factory=factory,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create row and token in database
@@ -202,6 +203,7 @@ class TestSinkDurability:
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="write",
                 on_token_written=checkpoint_callback,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
         # Verify: Checkpoint was NOT created
@@ -240,6 +242,7 @@ class TestSinkDurability:
             span_factory=SpanFactory(),
             run_id=run.run_id,
             factory=factory,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create row and token in database
@@ -283,6 +286,7 @@ class TestSinkDurability:
                 pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
                 effect_mode="write",
                 on_token_written=failing_checkpoint_callback,
+                join_group_id_by_token={t.token_id: None for t in tokens},
             )
 
     def test_effect_commit_called_before_checkpoint_callback(
@@ -313,6 +317,7 @@ class TestSinkDurability:
             span_factory=SpanFactory(),
             run_id=run.run_id,
             factory=factory,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create row and token in database
@@ -373,6 +378,7 @@ class TestSinkDurability:
             pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
             effect_mode="write",
             on_token_written=tracking_checkpoint_callback,
+            join_group_id_by_token={t.token_id: None for t in tokens},
         )
 
         assert call_order == ["commit", "checkpoint"]

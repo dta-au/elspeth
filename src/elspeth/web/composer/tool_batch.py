@@ -18,16 +18,25 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedToolBatch,
+    _AdmittedToolCall,
+    _AdmittedToolFunction,
+    _AdvisorCallSuccess,
+    _AdvisorFirstPartyFailure,
+    _AdvisorProviderFailure,
     _CallModelOutcome,
     _DispatchOutcome,
     _ToolBatchCancellationRequested,
@@ -48,6 +57,8 @@ from elspeth.web.composer.audit import (
     finish_success,
     rebind_dispatch_arguments,
 )
+from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
 )
@@ -69,11 +80,21 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     tool_result_mutated_composition_state as _tool_result_mutated_composition_state,
 )
-from elspeth.web.composer.llm_response_parsing import safe_response_model
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
     finalize_pipeline_custody,
     inline_custody_audit_projection,
     prepare_pipeline_custody,
+)
+from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PipelineProposal,
+    PlannerSurface,
+    PresentBase,
+    composition_content_hash,
+    owned_composition_state_authority,
+    owned_composition_state_review_arguments,
 )
 from elspeth.web.composer.progress import (
     emit_progress,
@@ -83,15 +104,26 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
-    ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerRuntimePreflightError,
     ComposerServiceError,
     ToolArgumentError,
 )
+from elspeth.web.composer.required_controls import (
+    merge_required_control_affected_components,
+    wire_required_controls,
+    wire_required_controls_state,
+)
 from elspeth.web.composer.state import CompositionState, ValidationSummary
-from elspeth.web.composer.tool_error_payloads import arg_error_payload as _arg_error_payload
+from elspeth.web.composer.tool_error_payloads import (
+    INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+    unknown_tool_arguments_redaction,
+)
+from elspeth.web.composer.tool_error_payloads import (
+    arg_error_payload as _arg_error_payload,
+)
 from elspeth.web.composer.tools import (
+    _MUTATION_TOOLS,
     RuntimePreflight,
     ToolContext,
     ToolResult,
@@ -107,6 +139,7 @@ from elspeth.web.composer.tools import (
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._common import _failure_result
+from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -124,6 +157,151 @@ if TYPE_CHECKING:
 
 
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
+
+
+class _ProposalPayload(TypedDict):
+    """The ``data`` payload of an APPROVAL_REQUIRED tool result, in wire order.
+
+    No ``success`` inside the payload: the envelope's own ``success`` already
+    says it, and ``status`` is the discriminator a reader keys on
+    (elspeth-e405ad7cd2, F1).
+
+    Constructed inline as the ``data=`` argument in ``run_tool_batch`` and never
+    bound to a name: that — not the type — is what stops a later re-shaping,
+    because there is no local, alias, ``cast`` widening or callee for a store to
+    travel through (verify-gate VG-F1 measured all three escaping both mypy and
+    the previous name-based gate). The type's own job is the constructor call:
+    mypy refuses an extra, missing or mistyped key there. The envelope gate pins
+    the call's keyword order to the wire order and to this class's keys.
+    """
+
+    status: Literal["APPROVAL_REQUIRED"]
+    proposal_id: str
+    tool_name: str
+    summary: str
+    message: str
+
+
+class _PrevalidationRejectedStatus(TypedDict):
+    """The status fields merged onto a PREVALIDATION_REJECTED payload, in wire order.
+
+    The payload itself is the candidate's own ``data`` (its ``error`` /
+    ``error_code``) plus these; they are merged through a TypedDict constructor
+    rather than a bare dict literal so mypy refuses an extra key at the merge —
+    a ``"success": True`` added here is the F1 twin returning eleven lines from
+    the payload that pins it out, and nothing in the tree killed that mutant
+    (red-team RED-R3-2, mutant G6).
+
+    No ``applied_version``. The result now carries the unapplied state on its
+    envelope, so the envelope's ``version`` IS the applied version and a second
+    copy under ``data`` would be a twin (systems seat SYS-R3-3).
+    ``candidate_version`` stays: it is the only carrier of a fact the envelope
+    does not have.
+    """
+
+    status: Literal["PREVALIDATION_REJECTED"]
+    applied: Literal[False]
+    candidate_version: int
+    message: str
+
+
+_MISSING_TOOL_CALL_FIELD = object()
+
+
+def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
+    """Copy and validate provider calls before the first await or side effect.
+
+    Field presence is probed with ``getattr(..., _MISSING_TOOL_CALL_FIELD)``
+    and NEVER with a ``runtime_checkable`` ``Protocol`` ``isinstance()``
+    check. Since Python 3.12 a runtime-checkable Protocol's
+    ``__instancecheck__`` resolves members through
+    ``inspect.getattr_static``, which deliberately bypasses ``__getattr__``.
+    Real provider tool calls do not survive that: LiteLLM's
+    ``litellm.types.utils.ChatCompletionMessageToolCall`` declares NO
+    pydantic model fields at all — ``id``/``type``/``function`` live in
+    ``__pydantic_extra__`` and resolve only through ``BaseModel.__getattr__``
+    — so a Protocol ``isinstance()`` rejects every genuine tool call from
+    every provider (elspeth-9ea866438b). Do not "harden" this back into a
+    Protocol check.
+
+    The Tier-3 posture is unchanged and lives entirely in the value
+    assertions below plus the read-once copy into the frozen
+    ``_AdmittedToolCall``/``_AdmittedToolFunction``: a missing field, a
+    non-``str`` field, a blank/oversized/duplicate ID are each still a hard
+    ``AuditIntegrityError``, and every field is read exactly once and
+    snapshotted, so nothing downstream can be re-resolved to a different
+    value. What is deliberately NOT asserted is the *mechanism* by which a
+    provider object resolves those fields — that is unobservable at this
+    boundary once the values are snapshotted, and demanding static
+    resolution is precisely what broke against reality.
+
+    ``getattr`` absorbs only ``AttributeError``. A provider object whose
+    ``__getattr__`` raises something else propagates that exception rather
+    than converting it to ``AuditIntegrityError``; that matches the
+    behaviour this guard had before the Protocol experiment, and widening
+    to ``except Exception`` would turn this into the permissive duck-type
+    the boundary exists to prevent.
+    """
+    admitted_calls: list[_AdmittedToolCall] = []
+    call_ids: set[str] = set()
+    for tool_call in tool_calls:
+        call_id = getattr(tool_call, "id", _MISSING_TOOL_CALL_FIELD)
+        if call_id is _MISSING_TOOL_CALL_FIELD:
+            raise AuditIntegrityError("Composer tool batch is missing a provider tool-call ID")
+        if type(call_id) is not str:
+            raise AuditIntegrityError("Composer tool batch contains a non-string provider tool-call ID")
+        if not call_id.strip():
+            raise AuditIntegrityError("Composer tool batch contains a blank provider tool-call ID")
+        if len(call_id) > PROVIDER_TOOL_CALL_ID_MAX_LENGTH:
+            raise AuditIntegrityError("Composer tool batch contains an oversized provider tool-call ID")
+        if call_id in call_ids:
+            raise AuditIntegrityError("Composer tool batch contains duplicate provider tool-call IDs")
+
+        function = getattr(tool_call, "function", _MISSING_TOOL_CALL_FIELD)
+        function_name = getattr(function, "name", _MISSING_TOOL_CALL_FIELD)
+        function_arguments = getattr(function, "arguments", _MISSING_TOOL_CALL_FIELD)
+        if type(function_name) is not str or type(function_arguments) is not str:
+            raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+
+        call_ids.add(call_id)
+        admitted_calls.append(
+            _AdmittedToolCall(
+                id=call_id,
+                function=_AdmittedToolFunction(
+                    name=function_name,
+                    arguments=function_arguments,
+                ),
+            )
+        )
+    return _AdmittedToolBatch(
+        calls=tuple(admitted_calls),
+        call_ids=frozenset(call_ids),
+    )
+
+
+async def _preflight_session_tool_call_ids(
+    batch: _AdmittedToolBatch,
+    *,
+    sessions_service: SessionServiceProtocol | None,
+    session_id: UUID | None,
+) -> None:
+    """Reject IDs already owned by durable rows before current-turn effects."""
+    if sessions_service is None or session_id is None:
+        return
+
+    prior_messages = await sessions_service.get_messages(session_id, limit=None)
+    prior_tool_call_ids = {
+        message.tool_call_id for message in prior_messages if message.role == "tool" and message.tool_call_id is not None
+    }
+    prior_proposals = await sessions_service.list_composition_proposals(session_id)
+    prior_tool_call_ids.update(proposal.tool_call_id for proposal in prior_proposals)
+    prior_interpretations = await sessions_service.list_interpretation_events(
+        session_id,
+        status="all",
+    )
+    prior_tool_call_ids.update(event.tool_call_id for event in prior_interpretations if event.tool_call_id is not None)
+    if not batch.call_ids.isdisjoint(prior_tool_call_ids):
+        raise AuditIntegrityError("Composer tool batch reuses a provider tool-call ID already persisted in this session")
 
 
 async def _try_finalize_proposal_custody(
@@ -146,6 +324,47 @@ async def _try_finalize_proposal_custody(
     return "ready"
 
 
+@trust_boundary(
+    tier=3,
+    source="frozen ToolResult.data of a prevalidation-rejected candidate (external authorship retained through freezing)",
+    source_param="candidate_data",
+    suppresses=("R5",),
+    invariant=(
+        "never raises on malformed input: a Mapping is returned as-is, None yields an empty seed, and any "
+        "other shape is carried structurally under the 'candidate_data' key rather than dropped or coerced"
+    ),
+    non_raising=True,
+)
+def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
+    """Seed the PREVALIDATION_REJECTED feedback payload from a candidate's data.
+
+    ``candidate_data`` is ``ToolResult.data``, and ``ToolResult`` is a frozen
+    dataclass whose ``__post_init__`` runs ``freeze_fields(self, "data")``
+    whenever it is not None. A mapping therefore arrives here as a
+    ``mappingproxy``, for which BOTH ``type(x) is dict`` **and**
+    ``isinstance(x, dict)`` are False — only ``isinstance(x, Mapping)`` is
+    True. The membership test MUST stay ABC-shaped: an exact-dict form makes
+    the first arm unreachable, sends every rejection to the fallback, and stops
+    the composer model seeing the candidate's own ``error``/``error_code`` keys
+    at the top level of the feedback it is asked to repair from. Tracing the
+    producers does not establish otherwise — the container freezes the field
+    after they built it.
+
+    The fallback carries an unexpected shape structurally rather than letting
+    ``dict()`` raise: the caller invokes this from inside a ``try``'s ``else:``
+    clause, which none of its handlers catch, so a raise would escape
+    ``run_tool_batch`` instead of degrading into feedback.
+
+    Returns a read-only seed; the caller copies it into the mutable payload it
+    then updates with the status fields.
+    """
+    if isinstance(candidate_data, Mapping):
+        return candidate_data
+    if candidate_data is None:
+        return {}
+    return {"candidate_data": candidate_data}
+
+
 def _replace_llm_tool_call_arguments(
     llm_messages: Sequence[Mapping[str, Any]],
     *,
@@ -157,8 +376,9 @@ def _replace_llm_tool_call_arguments(
     The compose loop appends the provider-authored assistant message before
     dispatch.  A subsequent provider turn must not receive raw inline bytes
     from that history after ELSPETH has intercepted them for proposal custody.
+    ``arguments`` are always the flat internal semantic shape; set_pipeline is
+    re-enveloped only while serializing the provider transcript.
     """
-    encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     for message in reversed(llm_messages):
         if "role" not in message or message["role"] != "assistant":
             continue
@@ -173,20 +393,148 @@ def _replace_llm_tool_call_arguments(
             function = call["function"] if "function" in call else None
             if type(function) is not dict:
                 raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            if "name" not in function or type(function["name"]) is not str:
+                raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            function_name = function["name"]
+            provider_arguments: Mapping[str, Any] = {"pipeline": arguments} if function_name == "set_pipeline" else arguments
+            encoded = json.dumps(provider_arguments, sort_keys=True, separators=(",", ":"))
             function["arguments"] = encoded
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
 
 
-def _remove_inline_blob_redaction_defaults(value: Any) -> Any:
-    """Remove schema defaults that would recreate intercepted custody fields."""
-    if type(value) is dict:
-        return {
-            key: _remove_inline_blob_redaction_defaults(item) for key, item in value.items() if not (key == "inline_blob" and item is None)
-        }
-    if type(value) is list:
-        return [_remove_inline_blob_redaction_defaults(item) for item in value]
-    return value
+@dataclass(slots=True)
+class _SetPipelineFinalization:
+    """Pure candidate-finalization outcome before custody or publication.
+
+    Deliberately NOT ``frozen=True``. ``arguments`` is a plain mutable
+    ``dict`` — the caller's own tool arguments on the no-op paths, or the
+    canonicalized rewrite — which the dispatch loop rebinds as
+    ``dict[str, Any]`` and then hands to custody preparation, redaction, and
+    the JSON re-serialization of the LLM tool call. ``frozen=True`` would
+    claim a deep immutability this field cannot honour, and deep-freezing it
+    to earn the claim would put a ``MappingProxyType`` on a ``json.dumps``
+    path. The struct is constructed and immediately destructured at its two
+    call sites; nothing hashes it, ``replace``s it, or uses it as a key, so
+    the frozen marker was never load-bearing.
+    """
+
+    arguments: Mapping[str, Any]
+    context: ToolContext
+    candidate: Any
+    changed: bool
+
+
+async def _finalize_complete_set_pipeline_candidate(
+    arguments: Mapping[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: PolicyCatalogView,
+) -> _SetPipelineFinalization:
+    """Auto-wire only an already-acceptable atomic set_pipeline draft."""
+    candidate = await run_sync_in_worker(
+        build_set_pipeline_candidate,
+        arguments,
+        state,
+        context,
+    )
+    if not candidate.acceptable:
+        return _SetPipelineFinalization(arguments, context, candidate, False)
+
+    finalized = await run_sync_in_worker(
+        wire_required_controls,
+        arguments,
+        plugin_snapshot,
+        policy_catalog,
+    )
+    if finalized is arguments:
+        return _SetPipelineFinalization(arguments, context, candidate, False)
+
+    detached = deep_thaw(finalized)
+    if type(detached) is not dict:
+        raise AuditIntegrityError("Required-control finalization must return an exact argument mapping")
+    compact_arguments = cast(dict[str, Any], detached)
+
+    # First admit the nominal server-staged compact disclosure. This preserves
+    # the public-boundary rejection of a provider-authored plain-string copy of
+    # the reserved term.
+    compact_candidate = await run_sync_in_worker(
+        build_set_pipeline_candidate,
+        compact_arguments,
+        state,
+        context,
+    )
+    if not compact_candidate.acceptable:
+        raise AuditIntegrityError("Required-control finalization produced an unacceptable compact candidate")
+
+    canonical_arguments = canonicalize_authored_node_review_requirements(
+        compact_arguments,
+        current_state=state,
+    )
+    audit_arguments = inline_custody_audit_projection(canonical_arguments)
+    internal_context = replace(
+        context,
+        tool_arguments_hash=composer_authority_hash(audit_arguments),
+        _interpretation_requirements_are_internal=True,
+    )
+    canonical_candidate = await run_sync_in_worker(
+        build_set_pipeline_candidate,
+        canonical_arguments,
+        state,
+        internal_context,
+    )
+    if not canonical_candidate.acceptable:
+        raise AuditIntegrityError("Required-control finalization produced an unacceptable set_pipeline candidate")
+    return _SetPipelineFinalization(
+        canonical_arguments,
+        internal_context,
+        canonical_candidate,
+        True,
+    )
+
+
+async def _finalize_completed_incremental_mutation(
+    result: ToolResult,
+    prior_state: CompositionState,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: PolicyCatalogView,
+) -> ToolResult:
+    """Wire controls when one incremental mutation makes the graph valid.
+
+    The mutation has already completed in memory, but its audit success and P4
+    state publication have not happened yet. Invalid/half-built results remain
+    untouched; owned state is finalized directly so public set_pipeline schema
+    limitations cannot become a fail-open path.
+    """
+    if not result.success or result.updated_state.version <= prior_state.version or not result.validation.is_valid:
+        return result
+    finalized_state = await run_sync_in_worker(
+        wire_required_controls_state,
+        result.updated_state,
+        plugin_snapshot,
+        policy_catalog,
+    )
+    if finalized_state is result.updated_state:
+        return result
+    finalized_validation = await run_sync_in_worker(
+        policy_catalog.validate_composition_state,
+        finalized_state,
+    )
+    if not finalized_validation.validation.is_valid:
+        raise AuditIntegrityError("Required-control state finalization produced an invalid composition")
+    return replace(
+        result,
+        updated_state=finalized_validation.authored_state,
+        validation=finalized_validation.validation,
+        affected_nodes=merge_required_control_affected_components(
+            result.affected_nodes,
+            result.updated_state,
+            finalized_validation.authored_state,
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +555,7 @@ class ToolBatchContext:
     discovery_cache: dict[str, _CachedDiscoveryPayload]
     runtime_preflight_cache: _RuntimePreflightCache
     session_id: str | None
+    session_operation_context: SessionOperationContext | None
     user_id: str | None
     user_message_id: str | None
     user_message_content: str | None
@@ -291,15 +640,41 @@ async def run_tool_batch(
     last_runtime_preflight = acc.last_runtime_preflight
     advisor_calls_used = acc.advisor_calls_used
 
-    assistant_message = call_model.assistant_message
-    raw_assistant_content = call_model.raw_assistant_content
-    assistant_tool_calls = call_model.assistant_tool_calls
-    response = call_model.response
+    completion = call_model.completion
+    assistant_message = completion.message
+    raw_assistant_content = assistant_message.content
+    admitted_batch = completion.tool_batch
+    assistant_tool_calls = admitted_batch.calls
+    provider_model_version = completion.provider_metadata.model_returned or ctx.service._model
+    if (
+        turn_sessions_service is not None
+        and turn_session_uuid is not None
+        and turn_preferences is not None
+        and turn_preferences.trust_mode == "explicit_approve"
+        and sum(
+            1
+            for tool_call in assistant_tool_calls
+            if is_mutation_tool(tool_call.function.name)
+            and (
+                not is_blob_store_only_mutation_tool(tool_call.function.name)
+                or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
+            )
+        )
+        > _MAX_PENDING_PROPOSALS_PER_TURN
+    ):
+        raise ComposerServiceError(
+            f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
+        )
+    await _preflight_session_tool_call_ids(
+        admitted_batch,
+        sessions_service=turn_sessions_service,
+        session_id=turn_session_uuid,
+    )
 
     await emit_progress(
         progress,
         tool_batch_progress_event(
-            tuple(tool_call.function.name for tool_call in assistant_message.tool_calls),
+            tuple(tool_call.function.name for tool_call in assistant_tool_calls),
         ),
     )
 
@@ -317,7 +692,7 @@ async def run_tool_batch(
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in assistant_message.tool_calls
+                for tc in assistant_tool_calls
             ],
         }
     )
@@ -336,13 +711,16 @@ async def run_tool_batch(
     tool_outcomes: list[_ToolOutcome] = []
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
+    advisor_failure: Exception | None = None
+    advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     ctx.service._phase3_last_expected_current_state_id = pre_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
     proposals_this_turn = 0
     mutation_success_observed = False
+    from elspeth.web.composer.redaction import MANIFEST
 
-    for tool_call in assistant_message.tool_calls:
+    for tool_call in assistant_tool_calls:
         if ctx.cancellation_requested.is_set():
             # The enclosing compose-loop critical section has observed a
             # cancellation. If no tool started, abort without publishing a
@@ -355,6 +733,20 @@ async def run_tool_batch(
             break
         tool_name = tool_call.function.name
         pre_version = state.version
+        unknown_audit_arguments: dict[str, Any] | None = None
+        if tool_name not in MANIFEST:
+            if is_discovery_tool(tool_name) or is_mutation_tool(tool_name) or is_session_aware_tool(tool_name):
+                raise AuditIntegrityError(f"Registered composer tool {tool_name!r} is missing from the redaction manifest")
+            unknown_audit_arguments = cast(
+                dict[str, Any],
+                unknown_tool_arguments_redaction(telemetry=ctx.service._redaction_telemetry),
+            )
+            decoded_args_by_call_id[tool_call.id] = unknown_audit_arguments
+            _replace_llm_tool_call_arguments(
+                llm_messages,
+                tool_call_id=tool_call.id,
+                arguments=unknown_audit_arguments,
+            )
 
         def _append_tool_outcome(
             *,
@@ -378,8 +770,8 @@ async def run_tool_batch(
             )
 
         try:
-            decoded_arguments = json.loads(tool_call.function.arguments)
-        except (json.JSONDecodeError, TypeError) as exc:
+            decoded_arguments = bounded_json_loads(tool_call.function.arguments, label=f"{tool_name} arguments")
+        except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError) as exc:
             # Track budget class even when args are unparseable.
             if is_discovery_tool(tool_name):
                 turn_has_discovery = True
@@ -391,10 +783,24 @@ async def run_tool_batch(
             # wasn't valid JSON. ``error_message`` is class-name only
             # because ``str(exc)`` for JSONDecodeError can echo column
             # offsets that reference the un-truncated raw bytes.
+            audit_arguments: Mapping[str, Any] | str = (
+                unknown_audit_arguments if unknown_audit_arguments is not None else tool_call.function.arguments
+            )
+            if isinstance(exc, JsonBoundaryError) and unknown_audit_arguments is None:
+                audit_arguments = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": type(exc).__name__,
+                }
+                decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
+                _replace_llm_tool_call_arguments(
+                    llm_messages,
+                    tool_call_id=tool_call.id,
+                    arguments=audit_arguments,
+                )
             audit = begin_dispatch(
                 tool_call.id,
                 tool_name,
-                tool_call.function.arguments,
+                audit_arguments,
                 version_before=state.version,
                 actor=actor,
             )
@@ -424,7 +830,12 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        if not isinstance(decoded_arguments, dict):
+        # Exact-type: bounded_json_loads is called with no object_hook /
+        # object_pairs_hook, so json.loads builds a plain dict, and its own
+        # _validate_decoded_json has already held every node to exactly
+        # dict/list/str/bool/int/float/None. A Mapping that is not a dict
+        # cannot reach this line.
+        if type(decoded_arguments) is not dict:
             if is_discovery_tool(tool_name):
                 turn_has_discovery = True
             else:
@@ -437,7 +848,7 @@ async def run_tool_batch(
             audit, canonicalization_failed = begin_dispatch_or_arg_error(
                 tool_call.id,
                 tool_name,
-                {"_decoded_non_object": decoded_arguments},
+                unknown_audit_arguments if unknown_audit_arguments is not None else {"_decoded_non_object": decoded_arguments},
                 version_before=state.version,
                 actor=actor,
             )
@@ -475,8 +886,61 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        arguments = cast(dict[str, Any], decoded_arguments)
-        audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments)) if tool_name == "set_pipeline" else arguments
+        if tool_name == "set_pipeline":
+            pipeline_arguments = decoded_arguments["pipeline"] if "pipeline" in decoded_arguments else None
+            if set(decoded_arguments) != {"pipeline"} or type(pipeline_arguments) is not dict:
+                turn_has_mutation = True
+                audit_arguments = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": "TypeError",
+                }
+                decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
+                _replace_llm_tool_call_arguments(
+                    llm_messages,
+                    tool_call_id=tool_call.id,
+                    arguments=audit_arguments,
+                )
+                audit = begin_dispatch(
+                    tool_call.id,
+                    tool_name,
+                    audit_arguments,
+                    version_before=state.version,
+                    actor=actor,
+                )
+                error_payload = {"error": "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."}
+                recorder.record(
+                    finish_arg_error(
+                        audit,
+                        error_class="TypeError",
+                        error_message="invalid provider argument envelope",
+                        error_payload=error_payload,
+                    )
+                )
+                _append_tool_outcome(
+                    response=None,
+                    error_class="TypeError",
+                    error_message="invalid provider argument envelope",
+                    post_version=state.version,
+                )
+                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                llm_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(error_payload),
+                    }
+                )
+                all_cache_hits = False
+                continue
+            arguments = cast(dict[str, Any], pipeline_arguments)
+        else:
+            arguments = cast(dict[str, Any], decoded_arguments)
+        if unknown_audit_arguments is not None:
+            audit_arguments = unknown_audit_arguments
+        elif tool_name == "set_pipeline":
+            audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
+        else:
+            audit_arguments = arguments
         decoded_args_by_call_id[tool_call.id] = audit_arguments
 
         # Open the audit envelope ONCE per dispatch — the cache,
@@ -633,7 +1097,12 @@ async def run_tool_batch(
 
         prevalidated_unapplied_result: ToolResult | None = None
         preproposal_exception: BaseException | None = None
-        if (
+        candidate_prior_validation: ValidationSummary | None = None
+        candidate_context: ToolContext | None = None
+        candidate: Any = None
+        pipeline_custody_result: Literal["not_required", "ready"] = "not_required"
+        interpretation_requirements_are_internal = False
+        explicit_approval_required = (
             turn_sessions_service is not None
             and turn_session_uuid is not None
             and turn_preferences is not None
@@ -643,7 +1112,70 @@ async def run_tool_batch(
             # later composition proposal may reference. Destructive blob-only
             # writes such as update_blob/delete_blob still require approval.
             and (not is_blob_store_only_mutation_tool(tool_name) or is_approval_required_blob_store_only_mutation_tool(tool_name))
-        ):
+        )
+
+        # The freeform compose loop is a second authoring surface beside the
+        # shared planner. Its atomic set_pipeline call is the equivalent
+        # terminal candidate seam: validate the provider draft first, then
+        # splice deployment-REQUIRED controls exactly once before proposal
+        # custody or auto-commit. Incomplete/invalid drafts remain byte-exact
+        # and continue through the ordinary repair path; in particular, the
+        # server never launders a provider-authored reserved disclosure into
+        # an internal one merely by attempting finalization.
+        if tool_name == "set_pipeline" and not explicit_approval_required:
+            try:
+                candidate_prior_validation = (
+                    last_validation if last_validation is not None else ctx.policy_catalog.validate_composition_state(state).validation
+                )
+                candidate_context = ToolContext(
+                    catalog=ctx.policy_catalog,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    data_dir=ctx.service._data_dir,
+                    require_data_dir_for_paths=True,
+                    session_engine=ctx.service._session_engine,
+                    session_id=session_id,
+                    secret_service=ctx.service._secret_service,
+                    secret_wiring_policy=ctx.service._secret_wiring_policy,
+                    user_id=user_id,
+                    current_validation=candidate_prior_validation,
+                    max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                    user_message_id=user_message_id,
+                    user_message_content=user_message_content,
+                    composer_model_identifier=ctx.service._model,
+                    composer_model_version=provider_model_version,
+                    composer_provider=ctx.service._availability.provider or "unknown",
+                    composer_skill_hash=ctx.service._composer_skill_hash,
+                    tool_arguments_hash=audit.binding_arguments_hash,
+                )
+                finalization = await _finalize_complete_set_pipeline_candidate(
+                    arguments,
+                    state,
+                    candidate_context,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    policy_catalog=ctx.policy_catalog,
+                )
+                arguments = cast(dict[str, Any], finalization.arguments)
+                candidate_context = finalization.context
+                candidate = finalization.candidate
+                if finalization.changed:
+                    audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
+                    audit = rebind_dispatch_arguments(audit, audit_arguments)
+                    decoded_args_by_call_id[tool_call.id] = audit_arguments
+                    _replace_llm_tool_call_arguments(
+                        llm_messages,
+                        tool_call_id=tool_call.id,
+                        arguments=audit_arguments,
+                    )
+                    interpretation_requirements_are_internal = True
+            except BaseException as exc:
+                # Re-raise exactly once from inside dispatch_with_audit so the
+                # established ARG_ERROR / PLUGIN_CRASH authority records the
+                # failure without any proposal, blob, or state publication.
+                preproposal_exception = exc
+
+        if explicit_approval_required:
+            assert turn_sessions_service is not None
+            assert turn_session_uuid is not None
             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
                 raise ComposerServiceError(
                     f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
@@ -651,7 +1183,7 @@ async def run_tool_batch(
 
             from pydantic import ValidationError as PydanticValidationError
 
-            from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
+            from elspeth.web.composer.redaction import redact_tool_call_arguments
 
             # The LLM may produce arguments that fail the redaction
             # MANIFEST's argument_model — most commonly a misplaced
@@ -670,200 +1202,356 @@ async def run_tool_batch(
             # frontend rendered a generic ApiError as a bare
             # "retry" button with no diagnostic).
             redacted_arguments: Mapping[str, Any] | None
-            if tool_name in MANIFEST:
+            try:
+                redacted_arguments = redact_tool_call_arguments(
+                    tool_name,
+                    arguments,
+                    telemetry=ctx.service._redaction_telemetry,
+                )
+            except PydanticValidationError:
+                redacted_arguments = None
+
+            proposal_tool_name = tool_name
+            proposal_arguments: Mapping[str, Any] = arguments
+            proposal_summary_arguments: Mapping[str, Any] = arguments
+            proposal_redacted_arguments = redacted_arguments
+
+            if redacted_arguments is not None and tool_name == "set_pipeline":
+                if preproposal_exception is not None:
+                    redacted_arguments = None
+                else:
+                    try:
+                        candidate_prior_validation = (
+                            last_validation
+                            if last_validation is not None
+                            else ctx.policy_catalog.validate_composition_state(state).validation
+                        )
+                        candidate_context = ToolContext(
+                            catalog=ctx.policy_catalog,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            data_dir=ctx.service._data_dir,
+                            require_data_dir_for_paths=True,
+                            session_engine=ctx.service._session_engine,
+                            session_id=session_id,
+                            secret_service=ctx.service._secret_service,
+                            secret_wiring_policy=ctx.service._secret_wiring_policy,
+                            user_id=user_id,
+                            current_validation=candidate_prior_validation,
+                            max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            user_message_id=user_message_id,
+                            user_message_content=user_message_content,
+                            composer_model_identifier=ctx.service._model,
+                            composer_model_version=provider_model_version,
+                            composer_provider=ctx.service._availability.provider or "unknown",
+                            composer_skill_hash=ctx.service._composer_skill_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
+                        )
+                        finalization = await _finalize_complete_set_pipeline_candidate(
+                            arguments,
+                            state,
+                            candidate_context,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            policy_catalog=ctx.policy_catalog,
+                        )
+                        arguments = cast(dict[str, Any], finalization.arguments)
+                        candidate_context = finalization.context
+                        candidate = finalization.candidate
+                        if finalization.changed:
+                            audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
+                            audit = rebind_dispatch_arguments(audit, audit_arguments)
+                            decoded_args_by_call_id[tool_call.id] = audit_arguments
+                            _replace_llm_tool_call_arguments(
+                                llm_messages,
+                                tool_call_id=tool_call.id,
+                                arguments=audit_arguments,
+                            )
+                            interpretation_requirements_are_internal = True
+                            redacted_arguments = redact_tool_call_arguments(
+                                tool_name,
+                                arguments,
+                                telemetry=ctx.service._redaction_telemetry,
+                            )
+                        finalized_candidate_result = finalize_tool_result(
+                            candidate.result,
+                            tool_name=tool_name,
+                            catalog=ctx.policy_catalog,
+                            context=candidate_context,
+                            prior_validation=candidate_prior_validation,
+                        )
+                        proposal_acceptable = candidate.acceptable
+                        if proposal_acceptable and candidate.prepared_inline_blob is not None:
+                            if session_id is None or ctx.service._session_engine is None:
+                                raise AuditIntegrityError("Inline proposal custody requires session context")
+                            custody = prepare_pipeline_custody(
+                                arguments,
+                                candidate.prepared_inline_blob,
+                                session_id=session_id,
+                                max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            )
+
+                            # From this point forward every authority-bearing
+                            # and externally visible copy uses source.blob_id.
+                            arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
+                            audit = rebind_dispatch_arguments(audit, arguments)
+                            decoded_args_by_call_id[tool_call.id] = arguments
+                            _replace_llm_tool_call_arguments(
+                                llm_messages,
+                                tool_call_id=tool_call.id,
+                                arguments=arguments,
+                            )
+                            safe_candidate_context = replace(
+                                candidate_context,
+                                tool_arguments_hash=audit.binding_arguments_hash,
+                            )
+                            custody_outcome = await _try_finalize_proposal_custody(
+                                custody,
+                                engine=ctx.service._session_engine,
+                                data_dir=ctx.service._data_dir,
+                                max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            )
+                            if custody_outcome == "quota_exceeded":
+                                proposal_acceptable = False
+                                finalized_candidate_result = finalize_tool_result(
+                                    _failure_result(
+                                        state,
+                                        "Session blob quota exceeded while reserving inline proposal custody.",
+                                        error_code="BLOB_QUOTA_EXCEEDED",
+                                    ),
+                                    tool_name=tool_name,
+                                    catalog=ctx.policy_catalog,
+                                    context=safe_candidate_context,
+                                    prior_validation=candidate_prior_validation,
+                                )
+                            else:
+                                pipeline_custody_result = "ready"
+                                candidate = await run_sync_in_worker(
+                                    build_set_pipeline_candidate,
+                                    arguments,
+                                    state,
+                                    safe_candidate_context,
+                                )
+                                finalized_candidate_result = finalize_tool_result(
+                                    candidate.result,
+                                    tool_name=tool_name,
+                                    catalog=ctx.policy_catalog,
+                                    context=safe_candidate_context,
+                                    prior_validation=candidate_prior_validation,
+                                )
+                                proposal_acceptable = candidate.acceptable
+
+                            # Re-run the manifest against the final safe shape.
+                            redacted_arguments = redact_tool_call_arguments(
+                                tool_name,
+                                arguments,
+                                telemetry=ctx.service._redaction_telemetry,
+                            )
+                    except BaseException as exc:
+                        # Candidate finalization is one-time pre-proposal work.
+                        # Re-raise it inside dispatch_with_audit below without
+                        # rerunning the operation.
+                        preproposal_exception = exc
+                        redacted_arguments = None
+                    else:
+                        if not proposal_acceptable:
+                            # ToolResult.data is deep-frozen by __post_init__, so
+                            # the membership test must accept a mappingproxy. See
+                            # _prevalidation_feedback_seed for the full contract.
+                            feedback_data = dict(_prevalidation_feedback_seed(finalized_candidate_result.data))
+                            feedback_data.update(
+                                _PrevalidationRejectedStatus(
+                                    status="PREVALIDATION_REJECTED",
+                                    applied=False,
+                                    candidate_version=finalized_candidate_result.updated_state.version,
+                                    message=(
+                                        "The candidate pipeline failed prevalidation, was not applied, and was not "
+                                        "submitted for approval. Repair the reported validation errors and retry."
+                                    ),
+                                )
+                            )
+                            # ``updated_state=state``: nothing was applied, so the
+                            # envelope's ``version`` — which the skill teaches as
+                            # "the state version after the call" — must be the
+                            # unapplied one. Keeping the candidate's state made the
+                            # wire say the mutation landed while the audit
+                            # (``_version_after``), the loop (which refuses the
+                            # candidate state) and ``_append_tool_outcome`` all
+                            # recorded that it had not (systems seat SYS-R3-3).
+                            # Contained to this result: it reaches only
+                            # ``_do_dispatch`` -> ``dispatch_with_audit`` ->
+                            # ``_serialize_tool_result`` / ``_append_tool_outcome``,
+                            # and ``pipeline_commit`` builds its own candidate from
+                            # the proposal rather than reading this one.
+                            #
+                            # ``prior_validation=None`` and ``affected_nodes=()``
+                            # for the same reason: both describe CHANGES, and
+                            # nothing changed. ``to_dict`` emits
+                            # ``validation_delta`` only when ``prior_validation``
+                            # is set, and the delta it emitted was measurably
+                            # false — on a real compose loop it reported
+                            # ``resolved_errors`` naming the two errors the
+                            # unapplied state still had, next to a ``version``
+                            # saying nothing was applied, while the skill tells
+                            # the model to act on the delta and never re-read
+                            # state to check it (LLM seat LLM-R3B-1). The
+                            # candidate's own ``affected_nodes`` said the same
+                            # thing in the other direction: components touched by
+                            # a state that was discarded. ``validation`` stays the
+                            # candidate's — it is the rejection the model repairs
+                            # from, and the skill says whose it is. This is now
+                            # the APPROVAL_REQUIRED envelope's shape on the same
+                            # path: unapplied state, empty affected_nodes, no
+                            # delta.
+                            prevalidated_unapplied_result = replace(
+                                finalized_candidate_result,
+                                data=feedback_data,
+                                updated_state=state,
+                                prior_validation=None,
+                                affected_nodes=(),
+                            )
+                            # Route the rejected result through canonical
+                            # dispatch/outcome without proposal publication.
+                            redacted_arguments = None
+
+            proposal_redacted_arguments = redacted_arguments
+            if redacted_arguments is not None and tool_name in _MUTATION_TOOLS and tool_name != "set_pipeline":
                 try:
-                    redacted_arguments = redact_tool_call_arguments(
+                    preview_result = await run_sync_in_worker(
+                        execute_tool,
                         tool_name,
                         arguments,
-                        telemetry=ctx.service._redaction_telemetry,
-                    )
-                except PydanticValidationError:
-                    redacted_arguments = None
-            else:
-                redacted_arguments = arguments
-
-            candidate_prior_validation: ValidationSummary | None = None
-            if redacted_arguments is not None and tool_name == "set_pipeline":
-                try:
-                    candidate_prior_validation = (
-                        last_validation if last_validation is not None else ctx.policy_catalog.validate_composition_state(state).validation
-                    )
-                    candidate_context = ToolContext(
-                        catalog=ctx.policy_catalog,
+                        state,
+                        ctx.policy_catalog,
                         plugin_snapshot=ctx.plugin_snapshot,
                         data_dir=ctx.service._data_dir,
-                        require_data_dir_for_paths=True,
                         session_engine=ctx.service._session_engine,
                         session_id=session_id,
                         secret_service=ctx.service._secret_service,
+                        secret_wiring_policy=ctx.service._secret_wiring_policy,
                         user_id=user_id,
-                        current_validation=candidate_prior_validation,
+                        prior_validation=last_validation,
+                        runtime_preflight=None,
                         max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
                         user_message_id=user_message_id,
                         user_message_content=user_message_content,
                         composer_model_identifier=ctx.service._model,
-                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_model_version=provider_model_version,
                         composer_provider=ctx.service._availability.provider or "unknown",
                         composer_skill_hash=ctx.service._composer_skill_hash,
-                        tool_arguments_hash=audit.arguments_hash,
+                        tool_arguments_hash=audit.binding_arguments_hash,
+                        validate_arguments=True,
+                        require_data_dir_for_paths=True,
+                        raise_schema_argument_errors=True,
                     )
-                    candidate = await run_sync_in_worker(
-                        build_set_pipeline_candidate,
-                        arguments,
-                        state,
-                        candidate_context,
-                    )
-                    finalized_candidate_result = finalize_tool_result(
-                        candidate.result,
-                        tool_name=tool_name,
-                        catalog=ctx.policy_catalog,
-                        context=candidate_context,
-                        prior_validation=candidate_prior_validation,
-                    )
-                    proposal_acceptable = candidate.acceptable
-                    if proposal_acceptable and candidate.prepared_inline_blob is not None:
-                        if session_id is None or ctx.service._session_engine is None:
-                            raise AuditIntegrityError("Inline proposal custody requires session context")
-                        custody = prepare_pipeline_custody(
-                            arguments,
-                            candidate.prepared_inline_blob,
-                            session_id=session_id,
+                    if (
+                        preview_result.success
+                        and preview_result.updated_state.version > state.version
+                        and preview_result.validation.is_valid
+                    ):
+                        finalized_state = await run_sync_in_worker(
+                            wire_required_controls_state,
+                            preview_result.updated_state,
+                            ctx.plugin_snapshot,
+                            ctx.policy_catalog,
                         )
-
-                        # From this point forward every authority-bearing and
-                        # externally visible copy uses only source.blob_id.
-                        # This happens before custody I/O so a reservation
-                        # failure cannot leave raw content in the dispatch
-                        # audit, persisted turn manifest, or next LLM request.
-                        arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
-                        audit = rebind_dispatch_arguments(audit, arguments)
-                        decoded_args_by_call_id[tool_call.id] = arguments
-                        _replace_llm_tool_call_arguments(
-                            llm_messages,
-                            tool_call_id=tool_call.id,
-                            arguments=arguments,
-                        )
-                        safe_candidate_context = replace(
-                            candidate_context,
-                            tool_arguments_hash=audit.arguments_hash,
-                        )
-                        custody_outcome = await _try_finalize_proposal_custody(
-                            custody,
-                            engine=ctx.service._session_engine,
-                            data_dir=ctx.service._data_dir,
-                            max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
-                        )
-                        if custody_outcome == "quota_exceeded":
-                            proposal_acceptable = False
-                            finalized_candidate_result = finalize_tool_result(
-                                _failure_result(
-                                    state,
-                                    "Session blob quota exceeded while reserving inline proposal custody.",
-                                    error_code="BLOB_QUOTA_EXCEEDED",
-                                ),
-                                tool_name=tool_name,
-                                catalog=ctx.policy_catalog,
-                                context=safe_candidate_context,
-                                prior_validation=candidate_prior_validation,
+                        if finalized_state is not preview_result.updated_state:
+                            finalized_validation = await run_sync_in_worker(
+                                ctx.policy_catalog.validate_composition_state,
+                                finalized_state,
                             )
-                        else:
-                            candidate = await run_sync_in_worker(
-                                build_set_pipeline_candidate,
-                                arguments,
-                                state,
-                                safe_candidate_context,
+                            if not finalized_validation.validation.is_valid:
+                                raise AuditIntegrityError("Required-control proposal finalization produced an invalid composition")
+                            proposal_arguments = owned_composition_state_authority(finalized_validation.authored_state)
+                            proposal_summary_arguments = owned_composition_state_review_arguments(proposal_arguments)
+                            proposal_tool_name = "set_pipeline"
+                            proposal_redacted_arguments = redact_tool_call_arguments(
+                                proposal_tool_name,
+                                cast(dict[str, Any], proposal_summary_arguments),
+                                telemetry=ctx.service._redaction_telemetry,
                             )
-                            finalized_candidate_result = finalize_tool_result(
-                                candidate.result,
-                                tool_name=tool_name,
-                                catalog=ctx.policy_catalog,
-                                context=safe_candidate_context,
-                                prior_validation=candidate_prior_validation,
-                            )
-                            proposal_acceptable = candidate.acceptable
-
-                        # Re-run the manifest against the final safe shape;
-                        # neither proposal summary nor public arguments may be
-                        # derived from the original inline-content payload.
-                        redacted_arguments = cast(
-                            dict[str, Any],
-                            _remove_inline_blob_redaction_defaults(
-                                redact_tool_call_arguments(
-                                    tool_name,
-                                    arguments,
-                                    telemetry=ctx.service._redaction_telemetry,
-                                )
-                            ),
-                        )
+                except ToolArgumentError:
+                    # Preserve the established explicit-approval contract for
+                    # ordinary incremental proposals: semantic tool-argument
+                    # rejection occurs only if the user approves execution.
+                    pass
                 except BaseException as exc:
-                    # Candidate construction and finalization are one-time
-                    # pre-proposal work. Re-raise the exact exception from
-                    # inside ``dispatch_with_audit`` below so its existing
-                    # ARG_ERROR / PLUGIN_CRASH classification remains the
-                    # single authority without rerunning either operation.
                     preproposal_exception = exc
-                    redacted_arguments = None
-                else:
-                    if not proposal_acceptable:
-                        if isinstance(finalized_candidate_result.data, Mapping):
-                            feedback_data = dict(finalized_candidate_result.data)
-                        elif finalized_candidate_result.data is None:
-                            feedback_data = {}
-                        else:
-                            feedback_data = {"candidate_data": finalized_candidate_result.data}
-                        feedback_data.update(
-                            {
-                                "status": "PREVALIDATION_REJECTED",
-                                "applied": False,
-                                "applied_version": state.version,
-                                "candidate_version": finalized_candidate_result.updated_state.version,
-                                "message": (
-                                    "The candidate pipeline failed prevalidation, was not applied, and was not "
-                                    "submitted for approval. Repair the reported validation errors and retry."
-                                ),
-                            }
-                        )
-                        prevalidated_unapplied_result = replace(
-                            finalized_candidate_result,
-                            data=feedback_data,
-                        )
-                        # Skip proposal creation, then route the rejected result
-                        # through the canonical dispatch/outcome path below.
-                        redacted_arguments = None
+                    proposal_redacted_arguments = None
 
-            if redacted_arguments is not None:
+            if proposal_redacted_arguments is not None and proposal_tool_name == tool_name:
+                proposal_arguments = arguments
+                proposal_summary_arguments = arguments
+
+            if proposal_redacted_arguments is not None:
                 proposal_summary = build_tool_proposal_summary(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    redacted_arguments=redacted_arguments,
+                    tool_name=proposal_tool_name,
+                    arguments=proposal_summary_arguments,
+                    redacted_arguments=proposal_redacted_arguments,
                 )
-                proposal = await turn_sessions_service.create_composition_proposal(
-                    session_id=turn_session_uuid,
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_name,
-                    summary=proposal_summary.summary,
-                    rationale=proposal_summary.rationale,
-                    affects=proposal_summary.affects,
-                    arguments_json=arguments,
-                    arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                    base_state_id=UUID(current_state_id) if current_state_id is not None else None,
-                    actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                    user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                    composer_model_identifier=ctx.service._model,
-                    composer_model_version=safe_response_model(response) or ctx.service._model,
-                    composer_provider=ctx.service._availability.provider or "unknown",
-                    composer_skill_hash=ctx.service._composer_skill_hash,
-                    tool_arguments_hash=audit.arguments_hash,
-                )
+                if proposal_tool_name == "set_pipeline":
+                    proposal_base = (
+                        PresentBase(
+                            state_id=UUID(current_state_id),
+                            composition_content_hash=composition_content_hash(state),
+                        )
+                        if current_state_id is not None
+                        else AbsentBase()
+                    )
+                    pipeline_proposal = PipelineProposal.create(
+                        pipeline=proposal_arguments,
+                        base=proposal_base,
+                        reviewed_facts={},
+                        surface=PlannerSurface.FREEFORM,
+                        repair_count=0,
+                        skill_hash=ctx.service._composer_skill_hash,
+                        covered_deferred_intent_ids=(),
+                        supersedes_draft_hash=None,
+                    )
+                    if type(ctx.session_operation_context) is not SessionOperationContext:
+                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+                    proposal = await turn_sessions_service.create_pipeline_composition_proposal(
+                        session_id=turn_session_uuid,
+                        session_operation_context=ctx.session_operation_context,
+                        plan=PipelinePlanResult(
+                            proposal=pipeline_proposal,
+                            tool_call_id=tool_call.id,
+                            custody_result=pipeline_custody_result,
+                            model_identifier=ctx.service._model,
+                            model_version=provider_model_version,
+                            provider=ctx.service._availability.provider or "unknown",
+                        ),
+                        summary=proposal_summary.summary,
+                        rationale=proposal_summary.rationale,
+                        affects=proposal_summary.affects,
+                        arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                        user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                        composer_model_identifier=ctx.service._model,
+                        composer_model_version=provider_model_version,
+                        composer_provider=ctx.service._availability.provider or "unknown",
+                    )
+                else:
+                    if type(ctx.session_operation_context) is not SessionOperationContext:
+                        raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
+                    proposal = await turn_sessions_service.create_composition_proposal(
+                        session_id=turn_session_uuid,
+                        session_operation_context=ctx.session_operation_context,
+                        tool_call_id=tool_call.id,
+                        tool_name=proposal_tool_name,
+                        summary=proposal_summary.summary,
+                        rationale=proposal_summary.rationale,
+                        affects=proposal_summary.affects,
+                        arguments_json=proposal_arguments,
+                        arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                        base_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                        user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                        composer_model_identifier=ctx.service._model,
+                        composer_model_version=provider_model_version,
+                        composer_provider=ctx.service._availability.provider or "unknown",
+                        composer_skill_hash=ctx.service._composer_skill_hash,
+                        tool_arguments_hash=audit.binding_arguments_hash,
+                    )
                 proposals_this_turn += 1
-                proposal_payload = {
-                    "success": True,
-                    "status": "APPROVAL_REQUIRED",
-                    "proposal_id": str(proposal.id),
-                    "tool_name": tool_name,
-                    "summary": proposal.summary,
-                    "message": "The requested pipeline change is pending human approval and has not been applied.",
-                }
                 proposal_result = ToolResult(
                     success=True,
                     updated_state=state,
@@ -877,7 +1565,19 @@ async def run_tool_batch(
                         )
                     ),
                     affected_nodes=(),
-                    data=proposal_payload,
+                    # Built inline and never bound to a name, so nothing stands between
+                    # construction and the freeze in ``ToolResult.__post_init__``: there is no
+                    # local, alias, ``cast`` widening or callee that could re-shape it.
+                    # No ``success`` inside the payload: the envelope's own ``success`` already
+                    # says it, and ``status`` is the discriminator a reader keys on
+                    # (elspeth-e405ad7cd2, F1).
+                    data=_ProposalPayload(
+                        status="APPROVAL_REQUIRED",
+                        proposal_id=str(proposal.id),
+                        tool_name=proposal_tool_name,
+                        summary=proposal.summary,
+                        message="The requested pipeline change is pending human approval and has not been applied.",
+                    ),
                 )
                 recorder.record(
                     finish_success(
@@ -1028,14 +1728,8 @@ async def run_tool_batch(
                     error_message=None,
                     post_version=state.version,
                 )
-                raise ComposerConvergenceError.capture(
-                    max_turns=0,
-                    budget_exhausted="timeout",
-                    state=state,
-                    initial_version=initial_version,
-                    tool_invocations=recorder.invocations,
-                    llm_calls=recorder.llm_calls,
-                )
+                advisor_compose_timeout = "pre_call"
+                break
 
             elif remaining < _MIN_USEFUL_ADVISOR_SECONDS:
                 deadline_payload = {
@@ -1082,7 +1776,7 @@ async def run_tool_batch(
             advisor_calls_used += 1
 
             try:
-                guidance, advisor_meta = await ctx.service._call_advisor_with_audit(
+                advisor_outcome = await ctx.service._call_advisor_for_tool(
                     arguments,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
@@ -1116,14 +1810,8 @@ async def run_tool_batch(
                         error_message=None,
                         post_version=state.version,
                     )
-                    raise ComposerConvergenceError.capture(
-                        max_turns=0,
-                        budget_exhausted="timeout",
-                        state=state,
-                        initial_version=initial_version,
-                        tool_invocations=recorder.invocations,
-                        llm_calls=recorder.llm_calls,
-                    ) from None
+                    advisor_compose_timeout = "in_flight"
+                    break
                 # Advisor-specific timeout with compose budget still
                 # remaining: return structured tool feedback so the
                 # composer can continue within its global deadline.
@@ -1157,20 +1845,16 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
-            except Exception as advisor_exc:
-                # Tier 3 boundary: outbound LLM call failed. Convert
-                # to a structured tool-result error so the composer
-                # LLM gets feedback rather than a silent stall. The
-                # inner ComposerLLMCall record was already fired by
-                # _call_advisor_with_audit's finally block, so the
-                # audit trail captures the failure mode regardless.
-                # Budget was already consumed above (F2) — the
-                # outbound call attempt counts whether or not it
-                # produced guidance.
+
+            if type(advisor_outcome) is _AdvisorProviderFailure:
+                # The service owns the Tier-3 provider taxonomy and returns
+                # this explicit recoverable outcome. Budget was already
+                # consumed above: the outbound attempt counts whether or not
+                # it produced guidance.
                 advisor_error_payload = {
                     "status": "ADVISOR_ERROR",
                     "error": "Advisor call failed; no guidance returned.",
-                    "error_class": type(advisor_exc).__name__,
+                    "error_class": advisor_outcome.error_class,
                     "budget_used": advisor_calls_used,
                     "budget_remaining": budget - advisor_calls_used,
                 }
@@ -1202,6 +1886,27 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
+
+            if type(advisor_outcome) is _AdvisorFirstPartyFailure:
+                # A controlled-code fault is not provider feedback. Close the
+                # outer dispatch truthfully, carry it through P4, and let the
+                # driver re-raise this exact exception object after the tool
+                # row has been published.
+                first_party_exc = advisor_outcome.original_exc
+                recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
+                _append_tool_outcome(
+                    response=None,
+                    error_class=type(first_party_exc).__name__,
+                    error_message=type(first_party_exc).__name__,
+                    post_version=state.version,
+                )
+                advisor_failure = first_party_exc
+                break
+
+            if type(advisor_outcome) is not _AdvisorCallSuccess:
+                raise AuditIntegrityError("Advisor call returned an unknown owned outcome")
+            guidance = advisor_outcome.guidance
+            advisor_meta = advisor_outcome.metadata
 
             success_payload = {
                 "status": "SUCCESS",
@@ -1262,20 +1967,55 @@ async def run_tool_batch(
         # ``_SESSION_AWARE_TOOL_HANDLERS`` and the per-tool
         # kwarg-build dict below; no new dispatch branch is needed.
         if is_session_aware_tool(tool_name):
-            session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
-                tool_name=tool_name,
-                tool_call_id=tool_call.id,
-                arguments=arguments,
-                state=state,
-                audit=audit,
-                recorder=recorder,
-                session_id=session_id,
-                current_state_id=current_state_id,
-                response=response,
-                llm_messages=llm_messages,
-                anti_anchor=anti_anchor,
-                policy_catalog=ctx.policy_catalog,
-            )
+            try:
+                session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
+                    tool_name=tool_name,
+                    tool_call_id=tool_call.id,
+                    arguments=arguments,
+                    state=state,
+                    audit=audit,
+                    recorder=recorder,
+                    session_id=session_id,
+                    session_operation_context=ctx.session_operation_context,
+                    current_state_id=current_state_id,
+                    composer_model_version=provider_model_version,
+                    llm_messages=llm_messages,
+                    anti_anchor=anti_anchor,
+                    policy_catalog=ctx.policy_catalog,
+                )
+            except (AssertionError, MemoryError, RecursionError, SystemError):
+                # Same narrow-class discipline as the sync execute_tool
+                # handler below: interpreter/Tier-1 invariant states must
+                # unwind, never be laundered into a recoverable envelope.
+                raise
+            except AuditIntegrityError:
+                # Tier-1 audit invariant — same passthrough as the sync path.
+                raise
+            except Exception as tool_exc:
+                # elspeth-9c01c943a5: the session-aware dispatch converts
+                # ToolArgumentError internally, so any exception reaching
+                # here is a plugin/service bug. Without this capture it
+                # escaped run_tool_batch and surfaced as an uncoded 500
+                # with the accumulated turn state silently dropped. Route
+                # it through the same plugin-crash carrier as the sync
+                # path so the turn persists and the route layer answers
+                # with the coded envelope.
+                recorder.record(finish_plugin_crash(audit, exc=tool_exc))
+                _append_tool_outcome(
+                    response=None,
+                    error_class=type(tool_exc).__name__,
+                    error_message=type(tool_exc).__name__,
+                    post_version=state.version,
+                )
+                plugin_crash = ComposerPluginCrashError.capture(
+                    tool_exc,
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                )
+                plugin_crash_cause = tool_exc
+                break
             all_cache_hits = False
             _append_tool_outcome(
                 response=session_aware_outcome.result,
@@ -1297,6 +2037,7 @@ async def run_tool_batch(
         # execute_tool() synchronous and bounds the async I/O cost
         # before it enters the worker thread pool.
         runtime_preflight_callback: RuntimePreflight | None = None
+        structural_preflight_callback: RuntimePreflight | None = None
         if tool_name == "preview_pipeline":
             try:
                 preview_preflight = await ctx.service._cached_runtime_preflight(
@@ -1307,6 +2048,7 @@ async def run_tool_batch(
                     initial_version=initial_version,
                     session_scope=session_scope,
                     llm_calls=recorder.llm_calls,
+                    plugin_snapshot=ctx.plugin_snapshot,
                 )
             except ComposerRuntimePreflightError as preflight_exc:
                 recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
@@ -1327,6 +2069,51 @@ async def run_tool_batch(
                 return _callback
 
             runtime_preflight_callback = _make_preflight_callback()
+
+            # elspeth-229e9e8195: while an interpretation review is pending
+            # the strict verdict above is handoff-shaped and every stage past
+            # ``review_interpretations`` is SKIPPED_AFTER_FAILURE — so also
+            # precompute the interpretation-tolerant preflight and let the
+            # preview surface its structural findings during authoring
+            # instead of first at completion. Same cache and snapshot as the
+            # completion path's ``_pending_handoff_outstanding_findings``, so
+            # the two tolerant lookups share one engine run per state. A
+            # tolerant-pass infrastructure failure propagates exactly like
+            # the strict one (the completion path takes the same position):
+            # an explicit failure beats silently withholding findings this
+            # turn claimed to check for.
+            if is_pending_interpretation_handoff(preview_preflight):
+                try:
+                    structural_preflight_result = await ctx.service._cached_runtime_preflight(
+                        state,
+                        user_id=user_id,
+                        session_id=session_id,
+                        cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        llm_calls=recorder.llm_calls,
+                        plugin_snapshot=ctx.plugin_snapshot,
+                        interpretation_tolerant=True,
+                    )
+                except ComposerRuntimePreflightError as preflight_exc:
+                    recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
+                    raise ComposerRuntimePreflightError.capture(
+                        preflight_exc.original_exc,
+                        state=state,
+                        initial_version=initial_version,
+                        tool_invocations=recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                    ) from preflight_exc.original_exc
+
+                def _make_structural_callback(
+                    _result: ValidationResult = structural_preflight_result,
+                ) -> RuntimePreflight:
+                    def _callback(_state: CompositionState) -> ValidationResult:
+                        return _result
+
+                    return _callback
+
+                structural_preflight_callback = _make_structural_callback()
 
         # All tool calls are offloaded to a worker to avoid blocking
         # the event loop.
@@ -1389,13 +2176,15 @@ async def run_tool_batch(
             _state: CompositionState = state,
             _last_validation: ValidationSummary | None = last_validation,
             _runtime_preflight_callback: RuntimePreflight | None = runtime_preflight_callback,
+            _structural_preflight_callback: RuntimePreflight | None = structural_preflight_callback,
             _user_message_id: str | None = user_message_id,
             _user_message_content: str | None = user_message_content,
             _composer_model_identifier: str = ctx.service._model,
-            _composer_model_version: str = safe_response_model(response) or ctx.service._model,
+            _composer_model_version: str = provider_model_version,
             _composer_provider: str = ctx.service._availability.provider or "unknown",
             _composer_skill_hash: str = ctx.service._composer_skill_hash,
-            _tool_arguments_hash: str = audit.arguments_hash,
+            _tool_arguments_hash: str = audit.binding_arguments_hash,
+            _interpretation_requirements_are_internal: bool = interpretation_requirements_are_internal,
             _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
             _preproposal_exception: BaseException | None = preproposal_exception,
         ) -> Any:
@@ -1403,7 +2192,7 @@ async def run_tool_batch(
                 raise _preproposal_exception
             if _prevalidated_unapplied_result is not None:
                 return _prevalidated_unapplied_result
-            return await run_sync_in_worker(
+            dispatched_result = await run_sync_in_worker(
                 execute_tool,
                 _tool_name,
                 _arguments,
@@ -1414,9 +2203,11 @@ async def run_tool_batch(
                 session_engine=ctx.service._session_engine,
                 session_id=session_id,
                 secret_service=ctx.service._secret_service,
+                secret_wiring_policy=ctx.service._secret_wiring_policy,
                 user_id=user_id,
                 prior_validation=_last_validation,
                 runtime_preflight=_runtime_preflight_callback,
+                structural_preflight=_structural_preflight_callback,
                 max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
                 user_message_id=_user_message_id,
                 user_message_content=_user_message_content,
@@ -1425,8 +2216,25 @@ async def run_tool_batch(
                 composer_provider=_composer_provider,
                 composer_skill_hash=_composer_skill_hash,
                 tool_arguments_hash=_tool_arguments_hash,
+                validate_arguments=True,
+                require_data_dir_for_paths=True,
                 raise_schema_argument_errors=True,
+                _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
             )
+            if (
+                _tool_name != "set_pipeline"
+                and is_mutation_tool(_tool_name)
+                and dispatched_result.success
+                and dispatched_result.updated_state.version > _state.version
+                and dispatched_result.validation.is_valid
+            ):
+                dispatched_result = await _finalize_completed_incremental_mutation(
+                    dispatched_result,
+                    _state,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    policy_catalog=ctx.policy_catalog,
+                )
+            return dispatched_result
 
         # ``_arg_error_payload`` is a module-level helper (F2 — testable
         # without spinning up the full compose loop). The nested
@@ -1709,6 +2517,8 @@ async def run_tool_batch(
         all_cache_hits=all_cache_hits,
         plugin_crash=plugin_crash,
         plugin_crash_cause=plugin_crash_cause,
+        advisor_failure=advisor_failure,
+        advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,
         assistant_tool_calls=assistant_tool_calls,

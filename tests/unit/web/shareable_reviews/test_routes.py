@@ -62,6 +62,7 @@ def _app_with_share_service(shareable_review_service: object, *, session_id: UUI
     app = FastAPI()
     app.state.settings = _settings()
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
+    app.state.write_rate_limiter = ComposerRateLimiter(limit=100)
     app.state.shareable_review_service = shareable_review_service
     app.state.session_service = _SessionService(session=_SessionRecord(id=session_id, user_id="alice", auth_provider_type="local"))
     app.dependency_overrides[get_current_user] = _mock_user

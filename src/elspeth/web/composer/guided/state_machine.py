@@ -1,6 +1,6 @@
 """Guided-mode state-machine data: GuidedSession, TerminalState, TurnRecord.
 
-See docs/superpowers/specs/2026-05-11-composer-guided-mode-design.md §5.
+See docs/specs/2026-05-11-composer-guided-mode-design.md §5.
 
 Trust tier: Tier 1 (audit). Coercion forbidden — every field crashes on
 malformed input. The freeze_fields contract applies because these structures
@@ -39,17 +39,16 @@ from elspeth.web.composer.guided.resolved import (
     SinkOutputResolved as SinkOutputResolved,
 )
 from elspeth.web.composer.guided.resolved import (
-    SinkResolved as SinkResolved,
-)
-from elspeth.web.composer.guided.resolved import (
     SourceResolved as SourceResolved,
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PresentBase, ProposalBase, reviewed_anchor_hash
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 
-# Schema 10 is a pre-release hard cut. There is no older-schema decoder or
-# converter: session epoch 34 owns the current store recreation boundary.
-GUIDED_SESSION_SCHEMA_VERSION = 10
+# Schema 11 is a pre-release hard cut (chat_history entries gain the
+# occurrence-binding ``turn_token`` key, elspeth-ea80e34fdc). There is no
+# older-schema decoder or converter: the lockstep session epoch in
+# ``web/sessions/models.py`` owns the store recreation boundary.
+GUIDED_SESSION_SCHEMA_VERSION = 11
 GUIDED_MAX_DEFERRED_INTENTS = 256
 GUIDED_MAX_CONSTRAINTS_PER_INTENT = 64
 GUIDED_MAX_TOTAL_CONSTRAINTS = 4_096
@@ -211,6 +210,7 @@ def _chat_turn_from_guided_dict(entry: Any) -> ChatTurn:
                 "ts_iso",
                 "assistant_message_kind",
                 "synthetic_failure_reason",
+                "turn_token",
             }
         ),
         "GuidedSession.from_dict: chat_history entry",
@@ -234,6 +234,9 @@ def _chat_turn_from_guided_dict(entry: Any) -> ChatTurn:
     synthetic_failure_reason_raw = entry["synthetic_failure_reason"]
     if synthetic_failure_reason_raw is not None and type(synthetic_failure_reason_raw) is not str:
         raise InvariantError("GuidedSession.from_dict: chat_history.synthetic_failure_reason must be str or None")
+    turn_token_raw = entry["turn_token"]
+    if turn_token_raw is not None and type(turn_token_raw) is not str:
+        raise InvariantError("GuidedSession.from_dict: chat_history.turn_token must be str or None")
     return ChatTurn(
         role=ChatRole(role_raw),
         content=content_raw,
@@ -242,6 +245,7 @@ def _chat_turn_from_guided_dict(entry: Any) -> ChatTurn:
         ts_iso=ts_iso_raw,
         assistant_message_kind=cast(Any, assistant_message_kind_raw),
         synthetic_failure_reason=cast(Any, synthetic_failure_reason_raw),
+        turn_token=turn_token_raw,
     )
 
 
@@ -433,6 +437,7 @@ class SourceIntent:
                 "SourceIntent.inspection_facts",
             )
             object.__setattr__(self, "inspection_facts", facts_from_dict(cast(Mapping[str, Any], deep_thaw(frozen_facts))))
+        freeze_fields(self, "options", "observed_columns", "sample_rows")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain JSON-serialisable dict."""
@@ -526,6 +531,7 @@ class SinkIntent:
             raise ValueError("SinkIntent field_review phase requires plugin and options")
         if self.options is not None:
             object.__setattr__(self, "options", freeze_guided_json_mapping(self.options, "SinkIntent.options"))
+        freeze_fields(self, "options")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain JSON-serialisable dict."""
@@ -645,7 +651,7 @@ class GuidedProposalRef:
             "GuidedProposalRef.from_dict",
         )
         base_raw = _require_str_mapping(record["base"], "GuidedProposalRef.base")
-        kind = base_raw.get("kind")
+        kind = base_raw["kind"] if "kind" in base_raw else None
         if kind == "absent":
             _require_exact_dict(base_raw, frozenset({"kind"}), "GuidedProposalRef.base")
             base: ProposalBase = AbsentBase()
@@ -801,6 +807,8 @@ class DeferredStageIntent:
             stage_subjects.SubjectPresenceConstraint,
             stage_subjects.OptionValueConstraint,
             stage_subjects.ComponentCountConstraint,
+            stage_subjects.StatedGateRoutingConstraint,
+            stage_subjects.StatedPredicateConstraint,
             stage_subjects.EdgeRouteConstraint,
             stage_subjects.FailureRouteConstraint,
         }
@@ -985,6 +993,8 @@ class GuidedSession:
             raise InvariantError("GuidedSession.chat_turn_seq must be the exact next unused persisted chat seq")
         if self.root_intent_message_id is not None:
             _canonical_uuid_text(self.root_intent_message_id, "GuidedSession.root_intent_message_id")
+        if self.active_edit_target is not None and type(self.active_edit_target) is not ComponentTarget:
+            raise TypeError("active_edit_target must be ComponentTarget or None")
         if type(self.correction_messages) is not tuple or any(
             type(reference) is not GuidedCorrectionMessageRef for reference in self.correction_messages
         ):
@@ -1036,7 +1046,7 @@ class GuidedSession:
         object.__setattr__(self, "pending_output_intents", pending_outputs)
         source_overlap = set(reviewed_sources) & set(pending_sources)
         output_overlap = set(reviewed_outputs) & set(pending_outputs)
-        active_target = self.active_edit_target if type(self.active_edit_target) is ComponentTarget else None
+        active_target = self.active_edit_target
         if active_target is not None and active_target.kind == "source":
             if pending_outputs or (pending_sources and set(pending_sources) != {active_target.stable_id}):
                 raise InvariantError("GuidedSession active source edit may only coexist with its own inspection_review intent")
@@ -1091,6 +1101,8 @@ class GuidedSession:
             raise InvariantError("GuidedSession source names must be unique")
         if len(set(output_names)) != len(output_names):
             raise InvariantError("GuidedSession output names must be unique")
+        if set(source_names) & set(output_names):
+            raise InvariantError("GuidedSession component names must be globally unique across sources and outputs")
 
         if type(self.deferred_intents) is not tuple or any(type(intent) is not DeferredStageIntent for intent in self.deferred_intents):
             raise TypeError("deferred_intents must be tuple[DeferredStageIntent, ...]")
@@ -1140,8 +1152,6 @@ class GuidedSession:
                 previous = positions[intent_id]
 
         if self.active_edit_target is not None:
-            if type(self.active_edit_target) is not ComponentTarget:
-                raise TypeError("active_edit_target must be ComponentTarget or None")
             target = self.active_edit_target
             if target.kind == "source" and target.stable_id not in reviewed_sources:
                 raise InvariantError("GuidedSession active_edit_target source does not resolve")
@@ -1207,6 +1217,7 @@ class GuidedSession:
                     "ts_iso": t.ts_iso,
                     "assistant_message_kind": t.assistant_message_kind,
                     "synthetic_failure_reason": t.synthetic_failure_reason,
+                    "turn_token": t.turn_token,
                 }
                 for t in self.chat_history
             ],
@@ -1226,7 +1237,7 @@ class GuidedSession:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuidedSession:
-        """Restore and revalidate one exact schema-10 checkpoint."""
+        """Restore and revalidate one exact schema-11 checkpoint."""
         try:
             if type(d) is not dict:
                 raise InvariantError("GuidedSession.from_dict: record must be an exact dict")
@@ -1368,3 +1379,66 @@ class GuidedSession:
             raise
         except (KeyError, ValueError, TypeError) as exc:
             raise InvariantError(f"GuidedSession.from_dict: malformed record {d!r}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedComponentEntry:
+    """One settled component's identity: exactly what a reviewed card shows.
+
+    Deliberately narrow. This entry is the single derivation behind both the
+    ``review_components`` turn payload (``emitters.build_component_review_turn``)
+    and the ``reviewed_components`` wire ledger published on every guided
+    response (``guided_replay.project_reviewed_components``), so it is a
+    redaction boundary: it carries component identity, the display name and
+    the plugin id, and nothing else. Authored option values, inspected
+    ``sample_rows``, storage paths, and content-identity anchors stay inside
+    the schema-8 checkpoint under ``composition_state.composer_meta`` and out
+    of the top-level projection (the invariant recorded on
+    ``tests/integration/web/composer/guided/test_respond.py::_full_guided_session``).
+    """
+
+    stable_id: str
+    name: str
+    plugin: str
+    status: Literal["reviewed"] = "reviewed"
+
+    def __post_init__(self) -> None:
+        _canonical_uuid_text(self.stable_id, "ReviewedComponentEntry.stable_id")
+        _require_nonempty_str(self.name, "ReviewedComponentEntry.name")
+        _require_nonempty_str(self.plugin, "ReviewedComponentEntry.plugin")
+        if self.status != "reviewed":
+            raise InvariantError("ReviewedComponentEntry.status must be 'reviewed'")
+
+
+def reviewed_component_ledger(guided: GuidedSession, kind: Literal["source", "output"]) -> tuple[ReviewedComponentEntry, ...]:
+    """Project the settled components of one kind, in their authored order.
+
+    Pure read of reviewed custody. Unlike ``build_component_review_turn`` this
+    imposes no completeness invariant: the ledger is published on every guided
+    response, including mid-stage states where one kind still holds pending
+    intents (a reviewed source while an output is being configured) and
+    including a terminal session, whose reviewed mappings survive commit. The
+    order is the session's own ``source_order`` / ``output_order`` filtered to
+    the settled ids, so pending components are absent rather than half-named.
+    """
+
+    if type(guided) is not GuidedSession:
+        raise TypeError("reviewed_component_ledger requires an exact GuidedSession")
+    reviewed: Mapping[str, SourceResolved | SinkOutputResolved]
+    if kind == "source":
+        order = guided.source_order
+        reviewed = guided.reviewed_sources
+    elif kind == "output":
+        order = guided.output_order
+        reviewed = guided.reviewed_outputs
+    else:
+        raise InvariantError("reviewed_component_ledger kind must be 'source' or 'output'")
+    return tuple(
+        ReviewedComponentEntry(
+            stable_id=stable_id,
+            name=reviewed[stable_id].name,
+            plugin=reviewed[stable_id].plugin,
+        )
+        for stable_id in order
+        if stable_id in reviewed
+    )

@@ -1,0 +1,76 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MutateRegionScopedProviderResources",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:ModifyMountTargetSecurityGroups",
+        "elasticloadbalancing:SetRulePriorities"
+      ],
+      "Resource": [
+        "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
+        "arn:aws:elasticloadbalancing:${aws_region}:${aws_account_id}:listener-rule/app/${scenario_a_namespace}-alb/*/*/*",
+        "arn:aws:elasticloadbalancing:${aws_region}:${aws_account_id}:listener-rule/app/${scenario_b_namespace}-alb/*/*/*",
+        "arn:aws:elasticloadbalancing:${aws_region}:${aws_account_id}:listener-rule/app/${scenario_c_namespace}-alb/*/*/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ListTasksInRunScenarioClusters",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:ListTasks"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:container-instance/acceptance-${scenario_a_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:container-instance/acceptance-${scenario_b_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:container-instance/acceptance-${scenario_c_namespace}-cluster/*"
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": [
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster"
+          ]
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ExecuteCommandsInRunScenarioTasks",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:ExecuteCommand"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_a_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_c_namespace}-cluster/*"
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": [
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster"
+          ]
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}",
+          "ecs:container-name": "elspeth-web"
+        }
+      }
+    }
+  ]
+}

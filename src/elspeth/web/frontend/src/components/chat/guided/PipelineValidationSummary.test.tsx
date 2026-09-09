@@ -9,7 +9,8 @@ import { makeComposition } from "@/test/composerFixtures";
 import type { ValidationReadiness, ValidationResult } from "@/types/index";
 
 // Seed a source→llm→csv composition so component_ids map to plain phrases:
-//   "source" → "read your data", "rater" → "rate each row", "out" → "write a CSV".
+//   "source" → "read your data", "rater" → "Rater" (author-meaningful id,
+//   title-cased — elspeth-9f21f3c57d), "out" → "write a CSV".
 function seedComposition() {
   useSessionStore.setState({
     compositionState: makeComposition(1, {
@@ -73,7 +74,10 @@ describe("PipelineValidationSummary", () => {
       ],
     });
     render(<PipelineValidationSummary />);
-    expect(screen.getByText(/rate each row/)).toBeInTheDocument();
+    // "rater" is an author-meaningful id, so the phrase ladder title-cases it
+    // (elspeth-9f21f3c57d) — the same name the acknowledgement card shows —
+    // instead of the generic "rate each row" plugin gloss.
+    expect(screen.getByText(/'Rater':/)).toBeInTheDocument();
     expect(screen.getByText(/review the prompt wording/i)).toBeInTheDocument();
     // The raw component_id must NOT be surfaced.
     expect(screen.queryByText(/rater/)).toBeNull();
@@ -184,6 +188,7 @@ describe("PipelineValidationSummary", () => {
           message: "Cannot resolve secret references: OPENROUTER_API_KEY",
           suggestion:
             "Add the missing secrets via the Secrets panel before executing.",
+          error_code: "missing_secret_ref",
         },
       ],
       warnings: [],
@@ -192,6 +197,51 @@ describe("PipelineValidationSummary", () => {
     expect(
       screen.getByText(/part of the full composer, outside this tutorial/i),
     ).toBeInTheDocument();
+  });
+
+  // The note is keyed on the finding's closed error_code, not on its prose
+  // (elspeth-e405ad7cd2 SYS-R3-4): a reworded backend suggestion must keep the
+  // note, and a suggestion that merely mentions the words must not gain one.
+  it("keeps the tutorial note when the Secrets-panel suggestion is reworded", () => {
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: null,
+          component_type: null,
+          message: "Cannot resolve secret references: OPENROUTER_API_KEY",
+          suggestion: "Store OPENROUTER_API_KEY as a secret before executing.",
+          error_code: "fabricated_secret",
+        },
+      ],
+      warnings: [],
+    });
+    render(<PipelineValidationSummary isTutorial />);
+    expect(
+      screen.getByText(/part of the full composer, outside this tutorial/i),
+    ).toBeInTheDocument();
+  });
+
+  it("does not add the tutorial note to a finding that is not a secret-reference failure", () => {
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: null,
+          component_type: null,
+          message: "Output 'rows' is misconfigured",
+          suggestion: "Open the Secrets panel documentation for context.",
+          error_code: "plugin_options_invalid",
+        },
+      ],
+      warnings: [],
+    });
+    render(<PipelineValidationSummary isTutorial />);
+    expect(
+      screen.queryByText(/part of the full composer, outside this tutorial/i),
+    ).not.toBeInTheDocument();
   });
 
   // ── elspeth-3b35abf148 error-rendering: contract dumps are humanised ────────
@@ -218,7 +268,7 @@ describe("PipelineValidationSummary", () => {
     // gloss ("rate each row" / "write a CSV"), never the raw dump.
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/rate each row/);
+    expect(status.textContent).toMatch(/the "Rater" step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Schema contract violation/);
     // The verbatim dump survives behind the expander for the engineer read.
@@ -254,7 +304,7 @@ describe("PipelineValidationSummary", () => {
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/rate each row/);
+    expect(status.textContent).toMatch(/the "Rater" step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Schema contract violation/);
     expect(screen.getByText("Technical details")).toBeInTheDocument();
@@ -489,6 +539,70 @@ describe("PipelineValidationSummary", () => {
     expect(status.textContent).not.toMatch(/the "write a CSV" step's output/i);
   });
 
+  // ── elspeth-9f21f3c57d: the session-2e0c8ea3 banner names the real steps ──
+  it("names both real steps for compiled edge ids when the composition carries descriptions (session 2e0c8ea3)", () => {
+    useSessionStore.setState({
+      compositionState: makeComposition(1, {
+        sources: {},
+        nodes: [
+          {
+            id: "fan_out",
+            node_type: "gate",
+            plugin: null,
+            input: "source",
+            on_success: null,
+            on_error: null,
+            options: {},
+            condition: "row.kind == 'colour'",
+            description: "Send each colour down both branches.",
+          },
+          {
+            id: "recommend_pairing",
+            node_type: "transform",
+            plugin: "llm",
+            input: "fan_out",
+            on_success: null,
+            on_error: null,
+            options: {},
+            description: "Ask the LLM for a complementary colour pairing for this colour.",
+          },
+        ],
+        outputs: [],
+      }),
+    } as never);
+    const rawDump =
+      "Schema contract violation: edge 'config_gate_fan_out_5176d9a61403' → 'transform_recommend_pairing_5176d9a61403'\n" +
+      "  Consumer (llm) requires fields: ['colour']\n" +
+      "  Producer (gate) guarantees: ['kind']\n" +
+      "  Missing fields: ['colour']";
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: "transform_recommend_pairing_5176d9a61403",
+          component_type: "transform",
+          message: rawDump,
+          suggestion: null,
+        },
+      ],
+      warnings: [],
+    });
+    render(<PipelineValidationSummary />);
+    const status = screen.getByRole("status");
+    // Compiled ids strip back to the composer nodes, whose descriptions name
+    // the steps — never the old "this step" / "rate each row" mislabels.
+    expect(status.textContent).toContain(
+      'the "Send each colour down both branches" step\'s output',
+    );
+    expect(status.textContent).toContain(
+      'what "Ask the LLM for a complementary colour pairing for this colour" expects',
+    );
+    expect(status.textContent).not.toMatch(/"this step"/);
+    expect(status.textContent).not.toMatch(/rate each row/);
+    expect(screen.getByText("Technical details")).toBeInTheDocument();
+  });
+
   it("humanises the edge-contract preflight dump (Edge contract violation between producer node …)", () => {
     // web/execution/validation.py _format_edge_contract_failure format.
     const rawDump =
@@ -512,7 +626,7 @@ describe("PipelineValidationSummary", () => {
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
     expect(status.textContent).toMatch(/aren't connected correctly/i);
-    expect(status.textContent).toMatch(/rate each row/);
+    expect(status.textContent).toMatch(/the "Rater" step's output/);
     expect(status.textContent).toMatch(/write a CSV/);
     expect(status.textContent).not.toMatch(/Edge contract violation/);
     expect(screen.getByText("Technical details")).toBeInTheDocument();
@@ -532,7 +646,7 @@ describe("PipelineValidationSummary", () => {
           component_id: "rater",
           component_type: "transform",
           message: rawDump,
-          suggestion: "Resolve the pending interpretation review before running.",
+          suggestion: "Resolve the pending interpretation review before running. If no review card is shown, send a composer message so the pending reviews are surfaced.",
           error_code: "interpretation_review_pending",
         },
       ],
@@ -540,11 +654,14 @@ describe("PipelineValidationSummary", () => {
     });
     render(<PipelineValidationSummary />);
     const status = screen.getByRole("status");
-    // "Summarise" is the SAME label the acknowledgement card renders for the
-    // llm plugin (stepLabelForPlugin) — the strip and the card must agree.
-    expect(status.textContent).toMatch(/The Summarise step is waiting for your review\./);
+    // "rater" is a user-meaningful node id, so stepLabelForNodeId title-cases
+    // it to "Rater" — the SAME resolution the acknowledgement card uses
+    // (R2-F8b) — rather than the generic "Summarise" plugin verb; the strip
+    // and the card must agree either way.
+    expect(status.textContent).toMatch(/The Rater step is waiting for your review\./);
     expect(status.textContent).not.toMatch(/pipeline_decision/);
     expect(status.textContent).not.toMatch(/rater/);
+    expect(status.textContent).not.toMatch(/'rater'/);
     // The verbatim dump survives behind the expander for the operator read.
     expect(screen.getByText("Technical details")).toBeInTheDocument();
     expect(screen.getByText(rawDump)).toBeInTheDocument();
@@ -602,5 +719,74 @@ describe("PipelineValidationSummary", () => {
     expect(status.textContent).not.toMatch(/ElspethSettings|Field required|pydantic/i);
     // A clean settings finding carries no raw dump, so no expander appears.
     expect(screen.queryByText("Technical details")).toBeNull();
+  });
+  // ── elspeth-8c1d49dcf0: one status-glyph vocabulary ───────────────────────
+  //
+  // audit.css documents the vocabulary — "Row status accents are a 3px
+  // left-edge stripe whose colour reinforces the glyph (✓ ⚠ ✗ —). The glyph
+  // stays the primary status channel" — and AuditReadinessPanel /
+  // SharedAuditReadinessPanel render from it. This surface already agreed on
+  // ✓ and ⚠; the error mark was the outlier (U+2715 MULTIPLICATION X, a
+  // heavier and more geometric mark than U+2717 BALLOT X), so the one status a
+  // user most needs to recognise instantly was drawn at a different weight
+  // here than everywhere else.
+  //
+  // Asserted by CODEPOINT, not by eye: ✕ and ✗ are visually similar enough
+  // that a text comparison written from a screenshot would pass on either.
+  it("draws the error status with the same U+2717 the audit readiness rows use", () => {
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: "rater",
+          component_type: "transform",
+          message: "Review the prompt wording",
+          suggestion: null,
+        },
+      ],
+      warnings: [],
+    });
+    const { container } = render(<PipelineValidationSummary />);
+    const glyph = container.querySelector(
+      ".pipeline-validation-summary-glyph",
+    );
+    expect(glyph).not.toBeNull();
+    expect(glyph!.textContent).toBe("\u2717");
+    expect(glyph!.textContent!.codePointAt(0)).toBe(0x2717);
+    // The old freelanced mark must not come back.
+    expect(glyph!.textContent).not.toBe("\u2715");
+    // The glyph is decoration: colour alone must not carry status, but the
+    // mark must not be announced twice either.
+    expect(glyph!.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("keeps the success and warning marks the rest of the product already agrees on", () => {
+    setValidation({ is_valid: true, checks: [], errors: [], warnings: [] });
+    const ok = render(<PipelineValidationSummary />);
+    expect(
+      ok.container.querySelector(".pipeline-validation-summary-glyph")!
+        .textContent!.codePointAt(0),
+    ).toBe(0x2713);
+    ok.unmount();
+
+    setValidation({
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [
+        {
+          component_id: "rater",
+          component_type: "transform",
+          message: "Review the prompt wording",
+          suggestion: null,
+        },
+      ],
+    });
+    const warned = render(<PipelineValidationSummary />);
+    expect(
+      warned.container.querySelector(".pipeline-validation-summary-glyph")!
+        .textContent!.codePointAt(0),
+    ).toBe(0x26a0);
   });
 });

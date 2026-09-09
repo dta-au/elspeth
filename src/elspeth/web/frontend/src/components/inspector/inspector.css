@@ -1,10 +1,31 @@
 /* inspector.css — Version selector, graph view, and React Flow theming.
-   Owners: .version-selector*, :root .react-flow.react-flow (token overrides
-   scoped to the react-flow canvas — kept here NOT in tokens.css because
-   they are selector-scoped, not global; src/components/inspector/GraphView.test.tsx
-   reads this file by path), [data-theme="light"] .react-flow.react-flow,
-   .react-flow__controls-button:focus-visible, .graph-view*, .graph-node*,
-   .graph-validation-dot, .graph-config* + responsive media query. */
+   Owners: .version-selector*, the --xy-* token overrides on
+   `:root .react-flow.react-flow, :root .graph-view-canvas` and their
+   [data-theme="light"] counterpart (kept here NOT in tokens.css because they
+   are selector-scoped, not global; src/components/inspector/GraphView.test.tsx
+   and reactFlowThemeScope.test.tsx read this file by path), the @xyflow
+   element overrides (.react-flow__controls-button, .react-flow__panel,
+   .react-flow__edge-textbg, .react-flow__edge-text), .graph-view*,
+   .graph-node*, .graph-validation-dot, .graph-config* + responsive media
+   query. Tenant: .yaml-view-display (emitted by inspector/YamlDisplay.tsx;
+   the rest of the .yaml-view* family lives in styles/common.css). */
+
+/* Flex-chain link for the YamlDisplay primitive (elspeth-b486ab259c): the
+   class was emitted with no definition anywhere in the barrel, so this
+   in-between box defaulted to a content-height block and common.css's
+   `.yaml-view-content { flex: 1; min-height: 0; overflow: auto }` was inert —
+   the scroll fell through to .artifact-workspace-panel and the Copy/Download
+   toolbar (flex-shrink: 0, i.e. a pinned band by its own declarations)
+   scrolled away with the code it acts on. Restoring the chain makes the
+   content region the scroller and the toolbar a pinned band again. flex: 1
+   engages under YamlView's flex-column .yaml-view; in SharedInspectView's
+   block <section> it is inert and harmless. */
+.yaml-view-display {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
 
 /* ---------------------------------------------------------------------------
    Version Selector (Inspector Panel)
@@ -17,8 +38,15 @@
   padding: var(--space-xs) var(--space-sm);
   font-size: var(--font-size-xs);
   font-weight: 600;
-  line-height: 20px;
-  border-radius: var(--radius-xl);
+  /* Was a raw 20px (1.667 at the 12px font). --line-height-relaxed (1.7,
+     20.4px) is the nearest rung; the 0.4px drift is invisible in a
+     flex-centred control whose height is governed by .btn-compact's
+     min-height, and a unitless value tracks any future font-size change. */
+  line-height: var(--line-height-relaxed);
+  /* No border-radius override: the trigger composes .btn-compact and takes its
+     --radius-md, like every sibling control in the header row. It was the only
+     --radius-xl (12px) element in the product — a pill among rectangles
+     (elspeth-8c66192e65). */
   display: inline-flex;
   align-items: center;
   gap: var(--space-xs);
@@ -29,7 +57,11 @@
   top: 100%;
   left: 0;
   margin-top: var(--space-xs);
-  min-width: 260px;
+  /* 360, not 260 (operator request 2026-08-16): a row reads
+     "v16 (current) · 3 nodes · no visible change · 22h ago", ~330px at the
+     xs font, so at 260 the count wrapped to two lines and the operation
+     label ellipsized to "no visible c…" on every current row. */
+  min-width: 360px;
   max-height: 240px;
   overflow-y: auto;
   background-color: var(--color-surface-elevated);
@@ -70,7 +102,9 @@
 }
 
 .version-selector-item-label {
+  flex: 0 0 auto;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .version-selector-item-tag {
@@ -79,8 +113,37 @@
   margin-left: var(--space-xs);
 }
 
+/* Every cell of a row stays on one line. The node count and the timestamp are
+   short fixed phrases and never give way; the operation label below is the
+   ONE cell that absorbs a tight row, by ellipsis — so a long tool name
+   shortens itself instead of pushing "3 nodes" onto a second line. */
 .version-selector-item-meta {
+  flex: 0 0 auto;
   color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+/* Operation label ("Applied: upsert_edge", "Reverted to v2", …) — kept to
+   one line so long tool names cannot wrap the dropdown rows; it is the row's
+   only shrinking cell (min-width: 0 lets a flex item shrink below its
+   nowrap content, which is what makes the ellipsis reachable). */
+.version-selector-item-op {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Bookkeeping snapshots (content identical to the previous version): de-
+   emphasized but fully interactive — they remain legitimate revert targets. */
+.version-selector-item--snapshot .version-selector-item-label {
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+.version-selector-item--snapshot .version-selector-item-op {
+  font-style: italic;
 }
 
 .version-selector-actions {
@@ -108,7 +171,20 @@
 /* ---------------------------------------------------------------------------
    Graph View
    --------------------------------------------------------------------------- */
-:root .react-flow.react-flow {
+/* React Flow theming, declared on BOTH the flow element and the canvas
+   wrapper. <Controls> and <MiniMap> mount as SIBLINGS of the role="img"
+   diagram (GraphView.tsx, elspeth-37f6f13132), i.e. OUTSIDE .react-flow, and
+   @xyflow declares every --xy-*-default on .react-flow itself. A custom
+   property that never reaches an element is invalid-at-computed-value-time,
+   not an error — so the controls painted transparent with no border and no
+   elevation, and the minimap mask fell to the SVG initial (BLACK).
+   .graph-view-canvas is the common ancestor of the diagram AND both panels,
+   so declaring the block there reaches all three. The .react-flow.react-flow
+   half must STAY: @xyflow's own defaults are declared on that element and
+   would beat a value merely inherited from an ancestor
+   (elspeth-1adf90c933, elspeth-525d335cbc). */
+:root .react-flow.react-flow,
+:root .graph-view-canvas {
   --xy-background-color-default: var(--color-bg);
   --xy-background-pattern-dots-color-default: var(--color-border-strong);
   --xy-background-pattern-lines-color-default: var(--color-border-strong);
@@ -126,7 +202,10 @@
   --xy-minimap-node-stroke-color-default: var(--color-border-strong);
   --xy-edge-stroke-default: var(--color-text-muted);
   --xy-edge-stroke-selected-default: var(--color-focus-ring);
-  --xy-edge-label-background-color-default: var(--color-surface);
+  /* Elevated, not --color-surface: the plate sits on the --color-bg canvas
+     three sRGB units away, so it read as a hole punched through the connector
+     rather than as a label chip (elspeth-f6da810e06). */
+  --xy-edge-label-background-color-default: var(--color-surface-elevated);
   --xy-edge-label-color-default: var(--color-text);
   --xy-handle-background-color-default: var(--color-accent);
   --xy-handle-border-color-default: var(--color-surface);
@@ -135,7 +214,11 @@
   --xy-attribution-background-color-default: transparent;
 }
 
-[data-theme="light"] .react-flow.react-flow {
+/* Same two-selector scope as the base block above — without the
+   .graph-view-canvas half this entire light-theme override was dead, because
+   the only elements it themes (Controls, MiniMap) live outside .react-flow. */
+[data-theme="light"] .react-flow.react-flow,
+[data-theme="light"] .graph-view-canvas {
   --xy-minimap-mask-background-color-default: rgba(15, 45, 53, 0.12);
   --xy-selection-background-color-default: rgba(138, 90, 192, 0.10);
   /* --xy-controls-box-shadow-default needs no override here: --shadow-dropdown
@@ -148,10 +231,115 @@
   outline-offset: 2px;
 }
 
+/* @xyflow ships its controls buttons at 26×26 — the smallest interactive
+   control in the product. Lift them to the compact chrome rung. min-* rather
+   than width/height so the vendor's own width/height lose on the used-value
+   rules whatever the stylesheet order turns out to be. */
+:root .react-flow__controls-button {
+  min-width: var(--size-control-compact);
+  min-height: var(--size-control-compact);
+}
+
+/* Both floating panels (Controls, MiniMap) inset from the canvas edge at
+   @xyflow's raw 15px; put them on the spacing scale instead. Every rule in
+   this group is :root-prefixed because the vendor rules are bare classes —
+   an equal-specificity tie whose winner depends on whether
+   @xyflow/react/dist/style.css (imported by GraphView.tsx) or this file (the
+   styles/index.css barrel) lands later in the bundle. Specificity settles it
+   deterministically; source order would not. */
+:root .react-flow__panel {
+  margin: var(--space-lg);
+}
+
+/* The edge-label plate is opaque — it cuts the connector line — so it has to
+   read as a deliberate chip rather than a gap. The fill does that work
+   (--xy-edge-label-background-color-default above); this rule only softens the
+   corner, which is not expressible from the component side because
+   ParallelLaneEdge does not forward labelBgStyle / labelBgPadding
+   (GraphView.tsx) and would drop them silently. rx AND ry are both set:
+   @xyflow puts ry="2" on the rect as a presentation attribute, and a CSS rx
+   alone would leave elliptical corners. No stroke: a 1px border straddles the
+   rect edge, so it would widen the very gap in the connector this ticket is
+   about — a call for a visual pass, not a blind one (elspeth-f6da810e06). */
+:root .react-flow__edge-textbg {
+  rx: var(--radius-sm);
+  ry: var(--radius-sm);
+}
+
+/* The edge label is the only piece of text on the canvas and it carries real
+   information (the edge's outcome condition), but the --xy-* theming block
+   above never sets a size, so @xyflow's unthemed 10px default stood — 2px
+   below the tokens.css type floor ("do not lower --font-size-xs below 12px",
+   elspeth-5836435926 / elspeth-859eae4480). :root-prefixed like every other
+   vendor override in this group so it beats the vendor's bare-class rule on
+   specificity, not bundle order. The label's background rect
+   (.react-flow__edge-textbg) needs no companion change: React Flow sizes it
+   from the text metrics, so it follows the type size. */
+:root .react-flow__edge-text {
+  font-size: var(--font-size-xs);
+}
+
 .graph-view-shell {
   position: relative;
   width: 100%;
   height: 100%;
+}
+
+/* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
+   register (shared.css), which centres content within its own box — but the
+   box was content-height, so the one-line message pinned to the top edge of
+   a ~950px void and the first screen inside the product read as unfinished
+   layout. height: 100% stretches the box to the workspace panel (a definite
+   flex height — .artifact-workspace-panel is flex: 1 1 auto; min-height: 0),
+   so the base register's centring actually lands mid-void; column direction
+   stacks the lead line over its guidance. Type treatment mirrors the
+   .empty-landing register (header.css): an --font-size-xl lead in body
+   colour over a muted guidance line. */
+.graph-view-empty {
+  height: 100%;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.graph-view-empty-title {
+  margin: 0;
+  color: var(--color-text);
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-heading);
+}
+
+.graph-view-empty-hint {
+  margin: 0;
+}
+
+/* Guided pre-commit drawing (elspeth-9f0873426a, IA-1/V-1): GuidedGraphPane
+   replaces the empty state above while a guided build has something reviewed
+   or proposed but nothing committed. Same panel box as the canvas (fills the
+   tabpanel, scrolls its own overflow) with a one-line caption over the
+   read-only SVG. The SVG scales with its viewBox, so left unbounded in the
+   wide pane a three-node drawing would blow up to poster size: the canvas is
+   capped at reading width and centred — roughly twice the width the
+   proposal card used to give it, so the labels V-1 measured at 8px read at
+   body size without the nodes turning into billboards. */
+.graph-view-guided {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  box-sizing: border-box;
+  height: 100%;
+  padding: var(--space-md);
+  overflow: auto;
+}
+
+.graph-view-guided__caption {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.graph-view-guided .guided-readonly-graph {
+  width: min(100%, 44rem);
+  margin-inline: auto;
 }
 
 .graph-view-canvas {
@@ -201,7 +389,10 @@
   background-color: var(--color-surface-elevated);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  /* Mini floating panel = the --shadow-popover tier. The raw
+     0 4px 16px rgba(0,0,0,0.3) it carried was heavier than any named tier and
+     never softened in the light theme (elspeth-6c3223c76e). */
+  box-shadow: var(--shadow-popover);
 }
 
 .graph-a11y-list li {
@@ -241,10 +432,17 @@
   background-color: var(--color-accent-muted);
 }
 
+/* The card's box is fixed (NODE_HEIGHT = 80, set inline on .react-flow__node),
+   so without height/justify-content the content sat top-aligned with ~9px
+   above and ~26px below it — and the edge connectors, which attach at the
+   box's vertical midpoint, appeared to leave from empty space rather than from
+   the text (elspeth-c91c7b714e). */
 .graph-node-content {
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: var(--space-xs);
+  height: 100%;
   padding: var(--space-sm) var(--space-md);
 }
 
@@ -254,11 +452,23 @@
   gap: var(--space-xs);
 }
 
+/* Carries the shared .type-badge typographic identity (shared.css) — mono,
+   --font-weight-semibold, 2/8px padding, the tracking — because the node card
+   and the selected-node TypeBadge render the SAME type label side by side, and
+   two typographic identities for one concept read as two different facts
+   (elspeth-2b34488bd6). Kept as its own rule rather than composing .type-badge
+   because the canvas resolves its background/foreground inline per node kind.
+   The base .type-badge carries no border; the borders live on its
+   .type-badge-* variants, so none is added here. */
 .graph-node-badge {
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.5px;
+  line-height: 1.4;
   text-transform: uppercase;
-  padding: var(--space-2xs) var(--space-xs);
+  white-space: nowrap;
+  padding: var(--space-2xs) var(--space-sm);
   border-radius: var(--radius-sm);
 }
 
@@ -298,8 +508,16 @@
   overflow: auto;
   padding: var(--space-md);
   border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
+  /* --radius-lg, matching the node cards' corner (GraphView.tsx node style):
+     at --radius-md this panel rounded SHARPER than the 8px cards it floats
+     over, inverting the concentric outer-≥-inner relationship
+     (elspeth-37cc8b5310). Both surfaces now read the same token, so a retune
+     of the card rank reaches the panel too. */
+  border-radius: var(--radius-lg);
   background-color: var(--color-surface-paper);
+  /* Raw shadow is DELIBERATE (elspeth-6c3223c76e): covered by the
+     tokens.css "oversized config panels" carve-out — do not map it onto the
+     three shadow tiers. */
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
 }
 
@@ -324,15 +542,32 @@
   font-size: var(--font-size-xs);
 }
 
+/* Geometry copied from .btn-compact (shared.css) rather than the bespoke
+   32×32 / --radius-sm box this carried: 32px matched neither control rung, and
+   a --radius-sm corner inside the (now --radius-lg) panel breaks the
+   concentric relationship with its own container (elspeth-5724ae8378) —
+   --radius-md keeps the inner corner softer than --radius-sm while staying
+   inside the panel's larger radius. Composing
+   .btn-compact on the element itself would be better still, but the class list
+   lives in GraphView.tsx. The × glyph it renders is the shared close glyph. */
 .graph-config-close {
   flex: 0 0 auto;
-  min-width: 32px;
-  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--size-control-compact);
+  min-height: var(--size-control-compact);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   cursor: pointer;
+  font-size: var(--font-size-sm);
+}
+
+.graph-config-close:hover {
+  background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
 }
 
 .graph-config-section {
@@ -411,6 +646,50 @@
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
   font-style: italic;
+}
+
+/* Node inspector reorder (elspeth-a6ea581e8a): "Connections & schema" moved
+   from an always-open .graph-config-section (h4 label) to a collapsed
+   <details> carrying that class alongside this one, so it keeps the grid
+   rhythm but needs its own <summary> treatment — the same uppercase small-caps
+   label register .graph-config-section h4 used, plus the pointer cursor a
+   disclosure trigger needs. */
+.graph-config-connections > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: var(--line-height-tight);
+  text-transform: uppercase;
+}
+
+/* OptionRows (elspeth-a6ea581e8a): the shared essential / advanced / raw
+   options renderer, used here and reused by the Spec tab (elspeth-b9ebdf9011)
+   so the two views cannot drift. The wrapper is a grid so the essential
+   ConfigRows block and the two disclosures below it share the same vertical
+   rhythm as every other .graph-config-section child. */
+.option-rows {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+/* Advanced settings / Raw options (JSON) disclosures — same idiom as
+   .guided-schema-advanced and .wire-stage__raw: a top rule separates the
+   disclosure from the essential rows above it, and the summary picks up the
+   pointer cursor plus the file's secondary-text register instead of
+   inheriting raw UA <summary> chrome. */
+.option-rows-advanced,
+.option-rows-raw {
+  margin-top: var(--space-2xs);
+  padding-top: var(--space-xs);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-xs);
+}
+
+.option-rows-advanced > summary,
+.option-rows-raw > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
 }
 
 @media (max-width: 760px) {

@@ -58,6 +58,17 @@ def _error_for(path: TerminalPath) -> FailureInfo | None:
     return None
 
 
+def _join_group_id_for(path: TerminalPath) -> str | None:
+    """Return a join_group_id for COALESCED; None otherwise.
+
+    RowResult.__post_init__ requires join_group_id exactly for COALESCED
+    results (Task 9, ruling 20) — mirror _error_for's per-path supply.
+    """
+    if path == TerminalPath.COALESCED:
+        return "jg-1"
+    return None
+
+
 # =============================================================================
 # Negative Properties: sink-targeting outcomes reject missing sink_name
 # =============================================================================
@@ -107,6 +118,7 @@ class TestSinkTargetingOutcomeAcceptsSinkName:
             path=path,
             sink_name=sink_name,
             error=_error_for(path),
+            join_group_id=_join_group_id_for(path),
         )
         assert result.sink_name == sink_name
 

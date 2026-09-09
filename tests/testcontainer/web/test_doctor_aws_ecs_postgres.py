@@ -17,14 +17,16 @@ from typing import Any
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL, make_url
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from elspeth.cli import app
 from elspeth.web.schema_probe import SchemaState, probe_landscape_schema, probe_session_schema
 from elspeth.web.sessions.engine import create_session_engine
 
-pytestmark = pytest.mark.testcontainer
+pytestmark = [
+    pytest.mark.testcontainer,
+    pytest.mark.usefixtures("aws_rds_trust_test_override"),
+]
 
 _SAFE_IDENTIFIER = re.compile(r"[a-z0-9_]+\Z")
 _PROCESS_TIMEOUT_SECONDS = 120.0
@@ -41,12 +43,6 @@ def _render_url(base_url: str | URL, *, database: str) -> str:
     return make_url(base_url).set(database=database).render_as_string(hide_password=False)
 
 
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
-
-
 @dataclass(frozen=True, slots=True)
 class _DatabasePair:
     session_url: str
@@ -54,20 +50,20 @@ class _DatabasePair:
 
 
 @pytest.fixture
-def database_pair(postgres_url: str) -> Iterator[_DatabasePair]:
+def database_pair(external_deployment_postgres_url: str) -> Iterator[_DatabasePair]:
     session_database = _identifier("doctor_session")
     landscape_database = _identifier("doctor_landscape")
     assert session_database != landscape_database
 
-    admin = create_engine(postgres_url)
+    admin = create_engine(external_deployment_postgres_url)
     with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.exec_driver_sql(f'CREATE DATABASE "{session_database}"')
         connection.exec_driver_sql(f'CREATE DATABASE "{landscape_database}"')
 
     try:
         yield _DatabasePair(
-            session_url=_render_url(postgres_url, database=session_database),
-            landscape_url=_render_url(postgres_url, database=landscape_database),
+            session_url=_render_url(external_deployment_postgres_url, database=session_database),
+            landscape_url=_render_url(external_deployment_postgres_url, database=landscape_database),
         )
     finally:
         with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
@@ -134,6 +130,15 @@ def _assert_all_green_report(stdout: str) -> list[dict[str, Any]]:
     return report
 
 
+def _assert_trust_and_transport_green(report: list[dict[str, Any]]) -> None:
+    checks = {item["name"]: item for item in report}
+    assert checks["rds_trust_root"]["ok"] is True
+    assert checks["session_tls"]["ok"] is True
+    assert checks["landscape_tls"]["ok"] is True
+    assert "TLSv" in checks["session_tls"]["detail"]
+    assert "TLSv" in checks["landscape_tls"]["detail"]
+
+
 def _assert_schemas_current(databases: _DatabasePair) -> None:
     session_engine = create_session_engine(databases.session_url)
     landscape_engine = create_engine(databases.landscape_url)
@@ -178,7 +183,8 @@ def test_doctor_init_schema_cli_succeeds_against_fresh_postgres(
     )
 
     assert result.exit_code == 0, result.output
-    _assert_all_green_report(result.stdout)
+    report = _assert_all_green_report(result.stdout)
+    _assert_trust_and_transport_green(report)
     _assert_private_database_values_absent(result.stdout + result.stderr, database_pair, environment)
     _assert_schemas_current(database_pair)
 
@@ -200,8 +206,14 @@ def _stop_processes(processes: list[subprocess.Popen[str]]) -> None:
 def test_concurrent_doctor_init_schema_cli_runs_are_safe(
     tmp_path: Path,
     database_pair: _DatabasePair,
+    aws_rds_trust_subprocess_env: dict[str, str],
 ) -> None:
     environment = _doctor_environment(tmp_path, database_pair)
+    overrides = dict(aws_rds_trust_subprocess_env)
+    existing_pythonpath = environment.get("PYTHONPATH")
+    if existing_pythonpath:
+        overrides["PYTHONPATH"] = overrides["PYTHONPATH"] + os.pathsep + existing_pythonpath
+    environment.update(overrides)
     command = [
         sys.executable,
         "-m",
@@ -230,7 +242,8 @@ def test_concurrent_doctor_init_schema_cli_runs_are_safe(
 
         for returncode, stdout, stderr in completed:
             assert returncode == 0, stderr or stdout
-            _assert_all_green_report(stdout)
+            report = _assert_all_green_report(stdout)
+            _assert_trust_and_transport_green(report)
             _assert_private_database_values_absent(stdout + stderr, database_pair, environment)
         _assert_schemas_current(database_pair)
     finally:

@@ -15,6 +15,7 @@ import {
 } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import { relativeTime } from "@/utils/time";
 import type { Session } from "@/types/index";
 
@@ -246,9 +247,9 @@ export function HeaderSessionSwitcher(): JSX.Element {
   return (
     <>
       <div ref={wrapperRef} className="header-session-switcher">
-        <button
+        <Button
           ref={triggerRef}
-          type="button"
+          compact
           aria-haspopup="menu"
           aria-expanded={open}
           aria-controls={MENU_ID}
@@ -267,19 +268,30 @@ export function HeaderSessionSwitcher(): JSX.Element {
               return !v;
             });
           }}
-          className="btn-compact header-session-switcher-trigger"
+          className="header-session-switcher-trigger"
         >
           <span aria-hidden="true">Session:</span>{" "}
           <strong>{triggerLabel}</strong>
           <span aria-hidden="true"> ▾</span>
-        </button>
+        </Button>
         {archiveError !== null && (
           <div role="alert" className="header-session-switcher-archive-error">
             {archiveError}
           </div>
         )}
         {open && (
-          <>
+          /*
+            Floating popover (elspeth-8c7ac37d49): the controls strip used to
+            render IN FLOW inside the header wrapper, growing it to ~60px
+            inside the 41px header (10px clipped above the viewport, 9px
+            spilling below the seam) and shoving the separator + model chip
+            314px right — and the menu, positioned against the wrapper,
+            dropped below the STRIP rather than below its trigger. Strip and
+            menu now share one absolutely-positioned surface hung off the
+            trigger, so the wrapper's in-flow content is the trigger alone
+            and the header keeps its height contract.
+          */
+          <div className="header-session-switcher-popover">
             {/*
               Filter input and show-archived toggle are NOT menu items —
               they control the menu's contents.  They previously sat
@@ -297,7 +309,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
               aria-label="Filter sessions"
               className="header-session-switcher-controls"
             >
-              <input
+              <Input
                 type="text"
                 aria-label="Find a session…"
                 value={filterText}
@@ -307,7 +319,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
                 placeholder="Find a session…"
               />
               <label className="header-session-switcher-show-archived">
-                <input
+                <Input
                   type="checkbox"
                   aria-label="Show archived"
                   checked={showArchived}
@@ -336,8 +348,28 @@ export function HeaderSessionSwitcher(): JSX.Element {
             </li>
             {/* Semantic + visual break between the create ACTION and the
                 session ENTRIES, so a session whose title resembles the
-                action can never be conflated with it (elspeth-ef8c18a6cb). */}
-            <li role="separator" className="header-session-switcher-separator" />
+                action can never be conflated with it (elspeth-ef8c18a6cb).
+                Suppressed when there is nothing beneath it: a rule drawn
+                under the last row read as a truncated list, and the panel
+                (action, rule, void) was indistinguishable from a load
+                failure (elspeth-0774112acd). */}
+            {filteredSessions.length > 0 && (
+              <li role="separator" className="header-session-switcher-separator" />
+            )}
+            {/* Zero-length branch. role="none" keeps <ul role="menu"> free of
+                non-menuitem owned children — the same aria-required-children
+                constraint that hoisted the filter strip out of the menu. It
+                is not registered in itemRefs and not counted by itemCount, so
+                it is never a roving-focus stop. .empty-state is the shared
+                empty register (shared.css:475); no new class name is minted
+                here, because an undefined one would ship unstyled. */}
+            {filteredSessions.length === 0 && (
+              <li role="none" className="empty-state">
+                {sessions.length === 0
+                  ? "No sessions yet."
+                  : "No sessions match the current filter."}
+              </li>
+            )}
             {filteredSessions.map((session, idx) => {
               const title = session.title || `Session ${session.id.slice(0, 8)}`;
               const selectIndex = 1 + idx * 3;
@@ -355,9 +387,10 @@ export function HeaderSessionSwitcher(): JSX.Element {
                         void saveRename();
                       }}
                     >
-                      <input
+                      <Input
                         ref={renameInputRef}
                         type="text"
+                        className="header-session-switcher-rename-input"
                         value={renameText}
                         onChange={(e) => setRenameText(e.target.value)}
                         onKeyDown={(e) => {
@@ -374,23 +407,23 @@ export function HeaderSessionSwitcher(): JSX.Element {
                         }
                         disabled={renamePending}
                       />
-                      <button
+                      <Button
                         type="submit"
-                        className="btn-compact"
+                        compact
                         aria-label="Save session name"
                         disabled={renamePending || !trimmedRename}
                       >
                         Save
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         type="button"
-                        className="btn-compact"
+                        compact
                         aria-label="Cancel session rename"
                         onClick={cancelRename}
                         disabled={renamePending}
                       >
                         Cancel
-                      </button>
+                      </Button>
                     </form>
                     {renameError !== null && (
                       <div
@@ -406,16 +439,22 @@ export function HeaderSessionSwitcher(): JSX.Element {
               }
               return (
                 <li key={session.id} role="none" className="header-session-switcher-row">
-                  <button
+                  <Button
                     ref={(el) => {
                       itemRefs.current[selectIndex] = el;
                     }}
-                    type="button"
+                    variant="bare"
                     role="menuitem"
                     tabIndex={focusIndex === selectIndex ? 0 : -1}
                     aria-current={session.id === activeSessionId ? "page" : undefined}
                     onClick={() => onSelect(session.id)}
-                    className="header-session-switcher-item header-session-switcher-item-session"
+                    // Just the styled base class: a `-item-session` discriminator
+                    // token used to ride along here, but nothing defined or
+                    // consumed it — an undefined class name is a dangling
+                    // cross-file reference (elspeth-8c7ac37d49), and
+                    // headerSessionSwitcherChrome.test.ts now fails on any
+                    // emitted class the barrel does not define.
+                    className="header-session-switcher-item"
                     // Explicit name: the visual layout renders title and
                     // last-modified as adjacent spans whose computed accname
                     // would mush together ("First48d ago"); the label keeps
@@ -431,12 +470,12 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     >
                       {relativeTime(session.updated_at)}
                     </span>
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     ref={(el) => {
                       itemRefs.current[renameIndex] = el;
                     }}
-                    type="button"
+                    variant="bare"
                     role="menuitem"
                     tabIndex={focusIndex === renameIndex ? 0 : -1}
                     aria-label={`Rename ${title}`}
@@ -444,12 +483,12 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     className="header-session-switcher-action"
                   >
                     Rename
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     ref={(el) => {
                       itemRefs.current[archiveIndex] = el;
                     }}
-                    type="button"
+                    variant="bare"
                     role="menuitem"
                     tabIndex={focusIndex === archiveIndex ? 0 : -1}
                     aria-label={`Archive ${title}`}
@@ -457,12 +496,12 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     className="header-session-switcher-action"
                   >
                     Archive
-                  </button>
+                  </Button>
                 </li>
               );
             })}
             </ul>
-          </>
+          </div>
         )}
       </div>
       {archiveTarget && (

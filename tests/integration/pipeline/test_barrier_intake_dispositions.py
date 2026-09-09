@@ -41,16 +41,17 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import TokenInfo
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
-from elspeth.core.landscape.scheduler_repository import record_coalesce_branch_loss
+from elspeth.core.landscape.scheduler_repository import record_group_loss
 from elspeth.core.landscape.schema import (
-    coalesce_branch_losses_table,
+    group_losses_table,
     node_states_table,
     run_coordination_table,
     scheduler_events_table,
@@ -66,10 +67,12 @@ from elspeth.engine.spans import SpanFactory
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.group_lineage import ensure_fork_group_record
 from tests.unit.engine.test_processor import (
     _make_factory,
     _make_processor,
     _persist_blocked_scheduler_work,
+    _persist_token_for_scheduler,
 )
 
 _T0 = 1_750_000_000.0
@@ -145,12 +148,19 @@ def _coalesce_processor(
     )
 
 
-def _branch_token(branch: str, *, token_id: str | None = None, row_id: str = "row-1") -> TokenInfo:
+def _branch_token(branch: str, *, token_id: str | None = None, row_id: str = "row-1", fork_group_id: str = "fg-row-1") -> TokenInfo:
+    """Fabricate a fork-branch token carrying a REAL FORK lineage frame.
+
+    ``fork_group_id`` defaults to a fixed value so sibling branches minted by
+    separate ``_branch_token`` calls within one test share the same fork
+    group — exactly what coalesce_tokens' strict pop (rulings 24/28) expects
+    of true siblings.
+    """
     return TokenInfo(
         row_id=row_id,
         token_id=token_id or f"tok-branch-{branch}",
         row_data=make_row({f"field_{branch}": 1}),
-        branch_name=branch,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch),),
     )
 
 
@@ -167,7 +177,12 @@ def _arrive_via_intake(factory: Any, processor: Any, token: TokenInfo, *, ingest
         ingest_sequence=ingest_sequence,
         coalesce_name="merge",
     )
-    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+    # META-38: the crafted FORK frame's group gets the group_records row a real
+    # fork mints (the merge reads the written release fact for it).
+    ensure_fork_group_record(factory, run_id=RUN_ID, group_id=token.lineage_path[-1].group_id, opener_token_id=token.token_id)
+    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+        token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+    )
     return processor.run_barrier_intake(ctx)
 
 
@@ -189,17 +204,27 @@ def _release_events(db: LandscapeDB, token_id: str) -> list[dict[str, Any]]:
         ]
 
 
-def _record_foreign_loss(db: LandscapeDB, clock: MockClock, *, branch: str, token_id: str, reason: str) -> None:
-    """A follower-recorded durable loss (production verb, ``adopted_epoch IS NULL``)."""
+def _record_foreign_loss(db: LandscapeDB, clock: MockClock, factory: Any, *, branch: str, token_id: str, reason: str) -> None:
+    """A follower-recorded durable loss (production verb, ``adopted_epoch IS NULL``).
+
+    Covers the all-members-lost shape (spec §6.2): the lost member's token
+    is minted durably (a fork child always is) even though it never arrived
+    at the closer — ``group_losses.token_id`` carries an FK to ``tokens``,
+    so the loss row needs a real token to reference.
+    """
+    _persist_token_for_scheduler(factory, _branch_token(branch, token_id=token_id))
+    ensure_fork_group_record(factory, run_id=RUN_ID, group_id="fg-row-1", opener_token_id=token_id)
     with begin_write(db.engine) as conn:
-        assert record_coalesce_branch_loss(
+        assert record_group_loss(
             conn,
             run_id=RUN_ID,
-            coalesce_name="merge",
-            row_id="row-1",
-            branch_name=branch,
-            token_id=token_id,
-            reason=reason,
+            spec=GroupLossSpec(
+                closer_name="merge",
+                group_id="fg-row-1",
+                member_key=branch,
+                token_id=token_id,
+                reason=reason,
+            ),
             recorded_by="worker-follower",
             now=clock.now_utc(),
         )
@@ -207,7 +232,7 @@ def _record_foreign_loss(db: LandscapeDB, clock: MockClock, *, branch: str, toke
 
 def _loss_rows(db: LandscapeDB) -> list[dict[str, Any]]:
     with db.connection() as conn:
-        return [dict(row) for row in conn.execute(select(coalesce_branch_losses_table)).mappings()]
+        return [dict(row) for row in conn.execute(select(group_losses_table)).mappings()]
 
 
 def _assert_quiescent_and_finalize_ready(processor: Any) -> None:
@@ -274,6 +299,109 @@ class TestLateBranchRelease:
 
         # (4) Run finalize-ready: no stranded BLOCKED row, journal quiesced.
         _assert_quiescent_and_finalize_ready(processor)
+
+    def test_late_arrival_after_successful_merge_keeps_late_arrival_reason(self) -> None:
+        """Group closed by MERGE: the late sibling's reason is the enum's
+        LATE_ARRIVAL_AFTER_MERGE member (ADR-042 D1), on the wire byte-for-byte."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor = _real_coalesce_executor(factory, clock, policy="first")
+        processor = _coalesce_processor(factory, executor, clock)
+
+        # policy=first: branch a's arrival completes the group by MERGE.
+        results = _arrive_via_intake(factory, processor, _branch_token("a"))
+        assert len(results) == 1
+        assert results[0].scheduler_pending_sink is True  # merged, not failed
+
+        clock.advance(2.0)
+        _arrive_via_intake(factory, processor, _branch_token("b"), ingest_sequence=1)
+        events = _release_events(db, "tok-branch-b")
+        assert len(events) == 1
+        context = json.loads(str(events[0]["context_json"]))
+        assert context["late_arrival"] is True
+        assert context["reason"] == GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value == "late_arrival_after_merge"
+
+    def test_survivor_arriving_after_group_failure_gets_scope_group_failed(self) -> None:
+        """Group closed by FAILURE: a member arriving after it must carry
+        scope_group_failed — NEVER late_arrival_after_merge (spec §2, ADR-042).
+
+        The discriminator is the in-memory closure flavor here (the same
+        executor that failed the group sees the straggler); the restore /
+        cache-miss twins below prove the DURABLE discriminator agrees."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor = _real_coalesce_executor(factory, clock, policy="require_all")
+        processor = _coalesce_processor(factory, executor, clock)
+
+        # Branch b is durably lost; branch a's arrival completes the group as
+        # FAILURE (the must-fail-within-replay-iteration shape).
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined")
+        failed_results = _arrive_via_intake(factory, processor, _branch_token("a"))
+        assert [(r.outcome, r.path) for r in failed_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+
+        # The lost member's token is re-presented late (lease-expiry
+        # redelivery) against the FAILED-completed key. (Its token row already
+        # exists for the loss row's FK; the fixture's token persist is
+        # idempotent, so only the journal deposit is new.)
+        clock.advance(2.0)
+        late_token = _branch_token("b")
+        late_results = _arrive_via_intake(factory, processor, late_token, ingest_sequence=1)
+        assert [(r.outcome, r.path) for r in late_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+        events = _release_events(db, "tok-branch-b")
+        assert len(events) == 1
+        context = json.loads(str(events[0]["context_json"]))
+        assert context["late_arrival"] is True
+        assert context["reason"] == GroupSettlementReason.SCOPE_GROUP_FAILED.value == "scope_group_failed"
+
+    def test_takeover_leader_discriminates_failed_group_straggler_durably(self) -> None:
+        """A FRESH executor (no in-memory flavor) meets a straggler of a group
+        the dead leader FAILED closed: the released-status Landscape lookup —
+        not the plain-completion one — must yield scope_group_failed. This is
+        the seam a restore-seeded or FIFO-evicted key reaches in production."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor_a = _real_coalesce_executor(factory, clock, policy="require_all")
+        processor_a = _coalesce_processor(factory, executor_a, clock)
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined")
+        failed_results = _arrive_via_intake(factory, processor_a, _branch_token("a"))
+        assert [(r.outcome, r.path) for r in failed_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+
+        # Leader B knows nothing in memory; the key is discovered from the
+        # Landscape on the straggler's arrival (cache-miss path).
+        _usurp_seat(db, clock)
+        executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
+        processor_b = _coalesce_processor(factory, executor_b, clock)
+        assert executor_b._completed_keys == {}
+        clock.advance(2.0)
+        late_results = _arrive_via_intake(factory, processor_b, _branch_token("b"), ingest_sequence=1)
+        assert [(r.outcome, r.path) for r in late_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+        events = _release_events(db, "tok-branch-b")
+        assert len(events) == 1
+        context = json.loads(str(events[0]["context_json"]))
+        assert context["reason"] == GroupSettlementReason.SCOPE_GROUP_FAILED.value
+        # The flavor is now cached as FAILED (False), not merely "completed".
+        assert executor_b._completed_keys[("merge", "fg-row-1")] is False
+
+    def test_takeover_leader_discriminates_merged_group_straggler_durably(self) -> None:
+        """The merged twin of the test above: a fresh executor's cache-miss
+        lookup yields late_arrival_after_merge for a RELEASED group."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor_a = _real_coalesce_executor(factory, clock, policy="first")
+        processor_a = _coalesce_processor(factory, executor_a, clock)
+        results = _arrive_via_intake(factory, processor_a, _branch_token("a"))
+        assert results[0].scheduler_pending_sink is True
+
+        _usurp_seat(db, clock)
+        executor_b = _real_coalesce_executor(factory, clock, policy="first")
+        processor_b = _coalesce_processor(factory, executor_b, clock)
+        clock.advance(2.0)
+        _arrive_via_intake(factory, processor_b, _branch_token("b"), ingest_sequence=1)
+        events = _release_events(db, "tok-branch-b")
+        assert len(events) == 1
+        context = json.loads(str(events[0]["context_json"]))
+        assert context["reason"] == GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value
+        assert executor_b._completed_keys[("merge", "fg-row-1")] is True
 
     def test_fresh_leader_releases_follower_blocked_late_branch(self) -> None:
         """A normal-run leader adopts a follower-blocked row from the journal."""
@@ -359,7 +487,7 @@ class TestLateBranchRelease:
         # Restore left the intake-pending row for the journal-first intake
         # and reconstructed the completed key from the Landscape.
         assert processor_b.has_blocked_barrier_work() is True
-        assert ("merge", "row-1") in executor_b._completed_keys
+        assert ("merge", "fg-row-1") in executor_b._completed_keys
 
         ctx = make_context(landscape=factory.plugin_audit_writer())
         late_results = processor_b.run_barrier_intake(ctx)
@@ -447,7 +575,63 @@ class TestLateBranchRelease:
         assert context["late_arrival"] is True
         assert context["restore_reconcile"] is True
         assert context["scope_row_id"] == "row-1"
+        # ADR-042: the key RELEASED (merge), so the reconcile reason is merge.
+        assert context["reason"] == GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value
 
+        _assert_quiescent_and_finalize_ready(processor_b)
+
+    def test_restore_reconcile_of_failed_group_straggler_says_scope_group_failed(self) -> None:
+        """The FAILED twin of the restore reconcile above (ADR-042 / spec §2):
+        the key is Landscape-COMPLETED but never RELEASED (require_all group
+        failed closed on a durable loss), so the adopted-holdless straggler
+        is journal-released with ``scope_group_failed`` — the restore path's
+        released-set discrimination, not the executor's in-memory flavor."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor_a = _real_coalesce_executor(factory, clock, policy="require_all")
+        processor_a = _coalesce_processor(factory, executor_a, clock)
+
+        # b lost durably; a's arrival FAILS the group (completed, not released).
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined")
+        failed_results = _arrive_via_intake(factory, processor_a, _branch_token("a"))
+        assert [(r.outcome, r.path) for r in failed_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+
+        # b re-presented and ADOPTED under leader A, which dies before the
+        # late release runs (the §E.3a crash window).
+        clock.advance(2.0)
+        _persist_blocked_scheduler_work(
+            factory,
+            processor_a,
+            _branch_token("b"),
+            node_id=COALESCE_NODE,
+            barrier_key="merge",
+            adopted=True,
+            ingest_sequence=1,
+            coalesce_name="merge",
+        )
+        assert _work_item_row(db, "tok-branch-b")["status"] == TokenWorkStatus.BLOCKED.value
+
+        _usurp_seat(db, clock)
+        executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
+        processor_b = _coalesce_processor(
+            factory,
+            executor_b,
+            clock,
+            barrier_restore=BarrierJournalRestoreContext(
+                resume_checkpoint_id="ckpt-takeover",
+                barrier_scalars=None,
+                batch_id_remap={},
+            ),
+            stamp_blocked_rows_adopted=False,
+        )
+
+        assert _work_item_row(db, "tok-branch-b")["status"] == TokenWorkStatus.TERMINAL.value
+        events = _release_events(db, "tok-branch-b")
+        assert len(events) == 1
+        context = json.loads(str(events[0]["context_json"]))
+        assert context["late_arrival"] is True
+        assert context["restore_reconcile"] is True
+        assert context["reason"] == GroupSettlementReason.SCOPE_GROUP_FAILED.value
         _assert_quiescent_and_finalize_ready(processor_b)
 
     def test_restore_recovers_adopted_holdless_row_against_incomplete_key(self) -> None:
@@ -513,7 +697,7 @@ class TestLateBranchRelease:
         assert b_row_after_restore["barrier_adopted_epoch"] is None, (
             "crash-window recovery must reset adopted epoch to NULL for intake re-processing"
         )
-        key = ("merge", "row-1")
+        key = ("merge", "fg-row-1")
         assert key in executor_b._pending, "branch a must be in _pending from normal restore"
         assert "a" in executor_b._pending[key].branches
 
@@ -544,7 +728,7 @@ class TestBranchLossReplay:
         # Branch a held (live arrival); branch b's loss recorded follower-style.
         held_results = _arrive_via_intake(factory, processor, _branch_token("a"))
         assert held_results == []
-        _record_foreign_loss(db, clock, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
 
         # ONE leader intake pass: adopt-the-loss (journal-first) -> replay
         # through notify_branch_lost -> require_all fails the group NOW,
@@ -571,7 +755,7 @@ class TestBranchLossReplay:
 
         held_results = _arrive_via_intake(factory, processor, _branch_token("a"))
         assert held_results == []
-        _record_foreign_loss(db, clock, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
 
         ctx = make_context(landscape=factory.plugin_audit_writer())
         results = processor.run_barrier_intake(ctx)
@@ -622,7 +806,7 @@ class TestBranchLossReplay:
         # BEFORE the replay (adopted_epoch stays NULL).
         held_results = _arrive_via_intake(factory, processor_a, _branch_token("a"))
         assert held_results == []
-        _record_foreign_loss(db, clock, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
+        _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
         (loss_row,) = _loss_rows(db)
         assert loss_row["adopted_epoch"] is None
 
@@ -640,7 +824,7 @@ class TestBranchLossReplay:
         )
 
         # Restore seeded lost_branches from the durable ledger.
-        pending = executor_b._pending[("merge", "row-1")]
+        pending = executor_b._pending[("merge", "fg-row-1")]
         assert dict(pending.lost_branches) == {"b": "quarantined:boom"}
         assert set(pending.branches) == {"a"}
 

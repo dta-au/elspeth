@@ -132,6 +132,7 @@ def _json_schema_to_python_type(
     - Nullable ref: {"anyOf": [{"$ref": "#/$defs/M"}, {"type": "null"}]} -> M
     - list[T]: {"type": "array", "items": {...}}
     - dict: {"type": "object"} without properties
+    - fixed any/object: {"title": "Field Name"}
 
     Args:
         field_name: Field name (for error messages)
@@ -164,17 +165,26 @@ def _json_schema_to_python_type(
 
         # Pattern 2: Nullable - {"anyOf": [{"type": "T", ...}, {"type": "null"}]}
         #   or with $ref:  {"anyOf": [{"$ref": "#/$defs/M"}, {"type": "null"}]}
+        #   or fixed any: {"anyOf": [{}, {"type": "null"}]}
         # Extract the non-null type and recursively resolve it
         if has_null and len(non_null_items) == 1:
             # Recursively resolve the non-null type, then wrap as Optional.
             # Returning T | None (not bare T) is critical: Pydantic model types
             # reject None unless the type annotation explicitly includes it.
-            inner_type = _json_schema_to_python_type(
-                field_name,
-                non_null_items[0],
-                schema_defs=schema_defs,
-                create_model=create_model,
-                schema_base=schema_base,
+            # Pydantic emits the unconstrained arm of ``Any | None`` as the
+            # canonical empty JSON Schema. It is safe to recognize only here,
+            # where the surrounding two-arm nullable shape supplies the type
+            # semantics; a bare typeless field still fails closed below.
+            inner_type = (
+                object
+                if not non_null_items[0]
+                else _json_schema_to_python_type(
+                    field_name,
+                    non_null_items[0],
+                    schema_defs=schema_defs,
+                    create_model=create_model,
+                    schema_base=schema_base,
+                )
             )
             return inner_type | None
 
@@ -207,7 +217,16 @@ def _json_schema_to_python_type(
             schema_base=schema_base,
         )
 
-    # Get basic type - required for all non-anyOf fields
+    # ELSPETH's declared ``any`` contract maps to Python ``object``. Pydantic
+    # serializes that annotation as an unconstrained JSON Schema containing
+    # only its generated title, with no ``type``. Accept exactly that canonical
+    # producer form; typeless schemas with constraints or malformed annotations
+    # still fail closed below because reconstructing them as ``object`` would
+    # silently discard behavior.
+    if set(field_info) == {"title"} and type(field_info["title"]) is str and bool(field_info["title"]):
+        return object
+
+    # Get basic type - required for all other non-anyOf fields
     if "type" not in field_info:
         raise AuditIntegrityError(
             f"Resume failed: Field '{field_name}' has no 'type' in schema. "

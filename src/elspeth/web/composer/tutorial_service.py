@@ -13,11 +13,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
+import structlog
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
 
 from elspeth.contracts import CallType
+from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.schema import (
     artifacts_table,
@@ -39,6 +44,9 @@ from elspeth.web.composer.tutorial_models import (
     TutorialRunResponse,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.outputs import filesystem_path_candidates
 from elspeth.web.execution.protocol import ExecutionService
@@ -58,6 +66,8 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.titles import abandoned_tutorial_session_title
 
+slog = structlog.get_logger()
+
 _TUTORIAL_RUN_POLL_SECONDS = 0.25
 # Mirrors HELLO_WORLD_PENDING_SESSION_TITLE in the frontend tutorial copy
 # (src/elspeth/web/frontend/src/components/tutorial/copy.ts). Sessions carry
@@ -75,6 +85,28 @@ _TUTORIAL_BASE_TRANSFORMS = frozenset(
         PluginId("transform", "field_mapper"),
     }
 )
+# Capabilities a deployment may declare `required` (WebSettings.plugin_control_modes).
+# The tutorial scrapes untrusted remote pages into an LLM, so it is exactly the
+# shape those controls exist for.
+_TUTORIAL_CONTROL_CAPABILITIES = frozenset({PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY})
+
+
+def _tutorial_control_transforms(snapshot: PluginAvailabilitySnapshot) -> frozenset[PluginId]:
+    """Control transforms a tutorial pipeline may carry beyond its base set.
+
+    A deployment that sets prompt_shield/content_safety to ``required``
+    (the AWS scenario module does) makes coverage a launch condition, while
+    a fixed three-transform contract makes satisfying it impossible: adding
+    the shield trips ``tutorial_plugin_set``, omitting it trips
+    ``required_control_coverage``. The tutorial admits whichever control
+    plugins THIS deployment selected, so a compliant pipeline exists
+    wherever the controls do — and where they do not, the run proceeds and
+    the composer's standing prompt-injection recommendation teaches why the
+    exposure matters.
+    """
+    return frozenset(
+        plugin_id for capability, plugin_id in snapshot.selected if capability in _TUTORIAL_CONTROL_CAPABILITIES and plugin_id is not None
+    )
 
 
 class TutorialRunIntegrityError(RuntimeError):
@@ -100,6 +132,68 @@ class _VerifiedArtifactBytes:
     content: bytes
 
 
+async def _close_tutorial_execute_lease_before_transfer(
+    lease: SessionOperationLease, *, cancellation: asyncio.CancelledError | None = None
+) -> None:
+    """Join exact lease cleanup even when request cancellation repeats."""
+    close_task = asyncio.create_task(
+        lease.close(),
+        name="tutorial-execution-pretransfer-lease-close",
+    )
+    while not close_task.done():
+        try:
+            # Waiting observes completion without propagating the task's error
+            # or cancelling lease cleanup when the request is cancelled.
+            await asyncio.wait({close_task})
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    try:
+        close_task.result()
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except BaseException as close_error:
+        if cancellation is None:
+            raise
+        fence = lease.context.fence
+        try:
+            slog.error(
+                "execution_pretransfer_lease_close_failed",
+                session_id=fence.session_id,
+                operation_id=fence.operation_id,
+                operation_epoch=fence.operation_epoch,
+                error_type=type(close_error).__name__,
+                primary_error_type=type(cancellation).__name__,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as logging_error:
+            cancellation.add_note(f"Lease-close failure logging also failed with {type(logging_error).__name__}.")
+        cancellation.add_note(f"Tutorial execution pre-transfer lease close also failed with {type(close_error).__name__}.")
+    if cancellation is not None:
+        raise cancellation from None
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "the saved tutorial draft's CompositionState: node plugin options are free-form configuration "
+        "authored through the composer and stored verbatim, never schema-validated by the composer, so a "
+        "persisted llm node may omit the optional 'profile' option or carry one that predates the "
+        "currently configured tutorial profile"
+    ),
+    source_param="state",
+    suppresses=("R1",),
+    invariant=(
+        "returns one sanitized (code, message) blocker for a draft it refuses and None only for a draft it "
+        "accepts; an llm node with no authored profile option reads as None, which cannot equal the "
+        "non-None configured tutorial_profile checked immediately above, so it is refused with "
+        "tutorial_profile_unavailable rather than substituting a usable profile; never raises on a "
+        "malformed or incomplete saved draft"
+    ),
+    non_raising=True,
+)
 def _tutorial_launch_blocker(
     *,
     state: CompositionState,
@@ -130,11 +224,15 @@ def _tutorial_launch_blocker(
             "tutorial_transforms_missing",
             "The saved tutorial pipeline has no transform steps — it wires the source directly to the sink.",
         )
+    # The base three are mandatory; this deployment's own control transforms are
+    # additionally admitted so a control-required policy stays satisfiable.
+    transform_set = set(transform_ids)
     if (
         not source_valid
         or not output_valid
-        or len(transform_ids) != len(_TUTORIAL_BASE_TRANSFORMS)
-        or set(transform_ids) != _TUTORIAL_BASE_TRANSFORMS
+        or len(transform_ids) != len(transform_set)
+        or not transform_set >= _TUTORIAL_BASE_TRANSFORMS
+        or not (transform_set - _TUTORIAL_BASE_TRANSFORMS) <= _tutorial_control_transforms(snapshot)
         or any(node.plugin is None for node in state.nodes)
     ):
         return ("tutorial_plugin_set", "The saved tutorial pipeline does not match the supported tutorial plugin set.")
@@ -184,7 +282,7 @@ async def _require_tutorial_launch_readiness(
     session_id: Any,
     settings: WebSettings,
     session_service: SessionServiceProtocol,
-) -> None:
+) -> UUID:
     """Recheck the principal-scoped tutorial candidate immediately pre-run."""
     record = await session_service.get_current_state(session_id)
     if record is None:
@@ -198,7 +296,7 @@ async def _require_tutorial_launch_readiness(
         state=state,
         policy=request.app.state.web_plugin_policy,
         snapshot=snapshot,
-        tutorial_profile=settings.tutorial_llm_profile,
+        tutorial_profile=settings.default_llm_profile,
         profile_registry=request.app.state.operator_profile_registry,
         catalog=request.app.state.catalog_service,
     )
@@ -208,6 +306,7 @@ async def _require_tutorial_launch_readiness(
             status_code=409,
             detail={"error_type": "tutorial_not_ready", "code": code, "detail": detail},
         )
+    return record.id
 
 
 async def run_tutorial_pipeline(
@@ -231,15 +330,13 @@ async def run_tutorial_pipeline(
     the same backend path a real composed pipeline takes (tutorial backend
     parity), so what the learner sees is what the system actually does.
     """
-    from uuid import UUID
-
     session_uuid = UUID(session_id)
     await verify_session_ownership(session_uuid, user, request)
 
     settings: WebSettings = request.app.state.settings
     session_service: SessionServiceProtocol = request.app.state.session_service
 
-    await _require_tutorial_launch_readiness(
+    approved_state_id = await _require_tutorial_launch_readiness(
         request=request,
         user=user,
         session_id=session_uuid,
@@ -251,6 +348,7 @@ async def run_tutorial_pipeline(
         request=request,
         user=user,
         session_id=session_uuid,
+        state_id=approved_state_id,
         settings=settings,
         session_service=session_service,
     )
@@ -262,16 +360,32 @@ async def _run_live_tutorial(
     request: Request,
     user: UserIdentity,
     session_id: Any,
+    state_id: UUID,
     settings: WebSettings,
     session_service: SessionServiceProtocol,
 ) -> _LiveTutorialRun:
     execution_service: ExecutionService = request.app.state.execution_service
+    lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+    )
+    transferred = False
+    cancellation: asyncio.CancelledError | None = None
     try:
         run_id = await execution_service.execute(
             session_id,
+            state_id=state_id,
+            session_operation_lease=lease,
             user_id=user.user_id,
             auth_provider_type=settings.auth_provider,
         )
+        transferred = True
+    except asyncio.CancelledError as error:
+        cancellation = error
+        raise
     except UnresolvedInterpretationPlaceholderError as exc:
         # A pending interpretation review (e.g. the planner-authored LLM
         # prompt awaiting its Accept card) is a launch blocker in the
@@ -294,6 +408,9 @@ async def _run_live_tutorial(
                 ),
             },
         ) from exc
+    finally:
+        if not transferred:
+            await _close_tutorial_execute_lease_before_transfer(lease, cancellation=cancellation)
     run_timeout_seconds = settings.composer_transport_idle_ceiling_seconds - settings.composer_transport_headroom_seconds
     run_record = await _wait_for_terminal_run(
         session_service,
@@ -621,8 +738,6 @@ async def cancel_tutorial_run(
     Idempotent: when no active run exists (never started, already terminal)
     the response is ``cancelled=False``, never an error.
     """
-    from uuid import UUID
-
     session_uuid = UUID(session_id)
     await verify_session_ownership(session_uuid, user, request)
 
@@ -682,10 +797,33 @@ async def cleanup_tutorial_orphans(
             break
         for session in sessions:
             if session.title == _TUTORIAL_PENDING_SESSION_TITLE and str(session.id) != resumable_session_id:
-                await session_service.update_session_title(
-                    session.id,
-                    abandoned_title,
-                )
+                # The rename is a fenced session write (P4-D6 family A2b):
+                # it holds the same COMPOSE operation the message writers
+                # hold, so a session mid-compose is not renamed underneath
+                # its owner. A session that cannot be claimed is SKIPPED
+                # rather than allowed to abort the sweep: a live operation
+                # means the session is in use, not abandoned, and a fence
+                # that vanished between the listing and the claim means the
+                # session is already gone. Neither is a cleanup failure, and
+                # neither may cost the remaining orphans their sweep --
+                # letting either propagate would turn one busy session into a
+                # 409/404 on fresh tutorial entry.
+                try:
+                    lease = await SessionOperationLease.acquire(
+                        session_service.session_operation_authority,
+                        session_id=session.id,
+                        operation_kind=SessionOperationKind.COMPOSE,
+                        owner_instance_id=session_service.session_operation_owner_instance_id,
+                        lease_seconds=session_service.session_operation_lease_seconds,
+                    )
+                except (SessionOperationConflictError, SessionOperationFenceLost):
+                    continue
+                async with lease as compose_operation_lease:
+                    await session_service.update_session_title(
+                        session.id,
+                        abandoned_title,
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 deleted_count += 1
         if len(sessions) < limit:
             break

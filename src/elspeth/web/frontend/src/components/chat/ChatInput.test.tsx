@@ -14,15 +14,22 @@ import { readFileSync } from "node:fs";
 
 import { useRef, useState, type RefObject } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatInput } from "./ChatInput";
+import {
+  ACKNOWLEDGEMENT_ACCEPT_LABEL,
+  ACKNOWLEDGEMENT_AMEND_LABEL,
+  ACKNOWLEDGEMENT_APPROVE_LABEL,
+  ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+} from "./acknowledgementLabels";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
 import type { ChatMessage, CompositionState } from "@/types";
+import type { BlobMetadata } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
@@ -295,6 +302,195 @@ describe("ChatInput composing cancel", () => {
   });
 });
 
+describe("ChatInput upload identity", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  it("reports the exact uploaded blob metadata to the owning guided turn", async () => {
+    const sessionId = "00000000-0000-4000-8000-000000000811";
+    const uploaded = {
+      id: "00000000-0000-4000-8000-000000000812",
+      session_id: sessionId,
+      filename: "intended.csv",
+      mime_type: "text/csv",
+      size_bytes: 12,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user" as const,
+      source_description: null,
+      status: "ready" as const,
+      creation_modality: "verbatim" as const,
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockResolvedValue(uploaded) });
+    const onBlobUploaded = vi.fn();
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploaded={onBlobUploaded}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+
+    await userEvent.upload(fileInput!, new File(["id\n1\n"], "intended.csv", { type: "text/csv" }));
+
+    await waitFor(() => expect(onBlobUploaded).toHaveBeenCalledWith(uploaded));
+  });
+
+  it("does not publish or append a completion rejected by its owner fence", async () => {
+    let resolveUpload: (blob: BlobMetadata) => void = () => undefined;
+    const uploadPromise = new Promise<BlobMetadata>((resolve) => {
+      resolveUpload = resolve;
+    });
+    const sessionId = "00000000-0000-4000-8000-000000000821";
+    const uploaded: BlobMetadata = {
+      id: "00000000-0000-4000-8000-000000000822",
+      session_id: sessionId,
+      filename: "stale.csv",
+      mime_type: "text/csv",
+      size_bytes: 12,
+      content_hash: "f".repeat(64),
+      created_at: "2026-07-26T09:00:00Z",
+      created_by: "user",
+      source_description: null,
+      status: "ready",
+      creation_modality: "verbatim",
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+    const onBlobUploaded = vi.fn();
+    const onBlobUploadStarted = vi.fn();
+    const onBlobUploadCompleted = vi.fn().mockReturnValue(false);
+    const onBlobUploadSettled = vi.fn();
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockReturnValue(uploadPromise) });
+
+    function ControlledUploadHarness() {
+      const [value, setValue] = useState("");
+      return (
+        <ChatInput
+          onSend={vi.fn()}
+          disabled={false}
+          inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+          value={value}
+          onChange={setValue}
+          onBlobUploaded={onBlobUploaded}
+          onBlobUploadStarted={onBlobUploadStarted}
+          onBlobUploadCompleted={onBlobUploadCompleted}
+          onBlobUploadSettled={onBlobUploadSettled}
+        />
+      );
+    }
+
+    render(<ControlledUploadHarness />);
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "stale.csv", { type: "text/csv" }),
+    );
+    expect(onBlobUploadStarted).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      resolveUpload(uploaded);
+      await uploadPromise;
+    });
+    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
+
+    expect(onBlobUploadCompleted).toHaveBeenCalledOnce();
+    expect(onBlobUploaded).not.toHaveBeenCalled();
+    expect(screen.getByLabelText(/message input/i)).toHaveValue("");
+  });
+
+  it("does not show a late upload failure rejected by its owner fence", async () => {
+    let rejectUpload: (reason?: unknown) => void = () => undefined;
+    const uploadPromise = new Promise<BlobMetadata>((_resolve, reject) => {
+      rejectUpload = reject;
+    });
+    const sessionId = "00000000-0000-4000-8000-000000000831";
+    const onBlobUploadRejected = vi.fn().mockReturnValue(false);
+    const onBlobUploadSettled = vi.fn();
+    useSessionStore.setState({ activeSessionId: sessionId });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockReturnValue(uploadPromise) });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploadRejected={onBlobUploadRejected}
+        onBlobUploadSettled={onBlobUploadSettled}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "stale.csv", { type: "text/csv" }),
+    );
+
+    await act(async () => {
+      rejectUpload(new Error("late upload failure"));
+    });
+    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
+
+    expect(onBlobUploadRejected).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByText("Upload failed. Check the file manager for details."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows a current upload failure accepted by its owner fence", async () => {
+    const uploadError = new Error("current upload failure");
+    const onBlobUploadRejected = vi.fn().mockReturnValue(true);
+    const onBlobUploadSettled = vi.fn();
+    useSessionStore.setState({ activeSessionId: "session-current" });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockRejectedValue(uploadError) });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+        onBlobUploadRejected={onBlobUploadRejected}
+        onBlobUploadSettled={onBlobUploadSettled}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "current.csv", { type: "text/csv" }),
+    );
+
+    await waitFor(() => expect(onBlobUploadSettled).toHaveBeenCalledOnce());
+    expect(onBlobUploadRejected).toHaveBeenCalledOnce();
+    expect(
+      screen.getByText("Upload failed. Check the file manager for details."),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("ChatInput max length", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
@@ -323,6 +519,12 @@ describe("ChatInput max length", () => {
 
 describe("ChatInput mobile density CSS", () => {
   const chatCss = readFileSync("src/components/chat/chat.css", "utf8");
+
+  it("bounds textarea growth against the desktop dynamic viewport", () => {
+    expect(chatCss).toMatch(
+      /\.chat-input-textarea\s*\{[^}]*max-height:\s*min\(28dvh, 240px\);[^}]*overflow-y:\s*auto;/s,
+    );
+  });
 
   // chat.css has FOUR separate `@media (max-width: 760px)` blocks (inline
   // run-results, this composer-density block, inline-source-fallback, and
@@ -458,7 +660,190 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
     // different column in the guided workspace, so the cue names the card
     // rather than pointing "above".
     expect(textarea.placeholder).toBe(
-      'Reviewing your interpretation of "cool" — pick Use mine or Change it on the review card to continue.',
+      'Reviewing your interpretation of "cool" — pick Acknowledge or Change… on the review card to continue.',
+    );
+  });
+
+  it("names the card's exact button labels in the cue (anti-drift, elspeth-0a9f77dd75)", () => {
+    // Truth test via the shared constants: the cue must name the buttons the
+    // card actually renders, and the retired inline-review vocabulary must
+    // not resurface.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({ user_term: "cool" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toContain(ACKNOWLEDGEMENT_ACCEPT_LABEL);
+    expect(textarea.placeholder).toContain(ACKNOWLEDGEMENT_AMEND_LABEL);
+    expect(textarea.placeholder).not.toContain("Use mine");
+    expect(textarea.placeholder).not.toContain("Change it");
+  });
+
+  it("prompt-template cue names View prompt then Approve, never the vague-term buttons (kind-aware, ux-review 2026-08-13)", () => {
+    // Prompt-template cards render "View prompt" + "Approve" — neither
+    // "Acknowledge" nor "Change…" exists on them, so the cue must not name
+    // absent controls.  The machine-facing user_term
+    // ("llm_prompt_template:<node id>") is deliberately not echoed.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-1",
+      llm_draft: "Summarise {{ row.body }} for an auditor.",
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      "Reviewing an LLM-drafted prompt — pick " +
+        `${ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}, then ` +
+        `${ACKNOWLEDGEMENT_APPROVE_LABEL} on the review card to continue.`,
+    );
+    expect(textarea.placeholder).not.toContain(ACKNOWLEDGEMENT_ACCEPT_LABEL);
+    expect(textarea.placeholder).not.toContain(ACKNOWLEDGEMENT_AMEND_LABEL);
+    expect(textarea.placeholder).not.toContain("llm_prompt_template:node-1");
+  });
+
+  it("drops the Change… half for kinds without the amend affordance (kind-aware, ux-review 2026-08-13)", () => {
+    // supportsAmendment gates "Change…" to vague_term / legacy-null cards;
+    // a model-choice card renders Acknowledge alone, so the cue must too.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({
+      kind: "llm_model_choice",
+      user_term: "a good model",
+      llm_draft: "anthropic/claude-sonnet-4.6",
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    // The NOUN is kind-branched too (ux-review 2026-08-13): an
+    // llm_model_choice is the composer's pick, not "your interpretation".
+    expect(textarea.placeholder).toBe(
+      "Reviewing the model the composer picked — pick " +
+        `${ACKNOWLEDGEMENT_ACCEPT_LABEL} on the review card to continue.`,
+    );
+    expect(textarea.placeholder).not.toContain(ACKNOWLEDGEMENT_AMEND_LABEL);
+  });
+
+  // ── Per-kind subject noun (ux-review 2026-08-13) ─────────────────────────
+  //
+  // The fallback branch used to call EVERY kind "your interpretation of X".
+  // That is a category error, not a loose synonym: a pipeline_decision, an
+  // llm_model_choice and an invented_source are things the COMPOSER chose,
+  // and telling an operator they are their own interpretation reassigns
+  // authorship at the moment they are asked to attest.  Only vague_term /
+  // legacy-null echo the term, because only there is the term the user's.
+  it.each([
+    [
+      "pipeline_decision" as const,
+      "Reviewing a decision the composer made",
+    ],
+    [
+      "invented_source" as const,
+      "Reviewing source data the composer invented",
+    ],
+  ])("names %s as the composer's choice, not the user's interpretation", (
+    kind,
+    expectedSubject,
+  ) => {
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({ kind, user_term: "the fast path" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      `${expectedSubject} — pick ${ACKNOWLEDGEMENT_ACCEPT_LABEL} ` +
+        "on the review card to continue.",
+    );
+    // The authorship claim is the whole point of the fix.
+    expect(textarea.placeholder).not.toContain("your interpretation");
+  });
+
+  // ── Set-aware cue (ux-review 2026-08-13) ─────────────────────────────────
+  //
+  // The selector used to return on the FIRST pending event carrying a
+  // user_term and speak in the singular, so a mixed pending set named
+  // controls some visible cards do not render — the elspeth-0a9f77dd75
+  // defect surviving in this sibling surface.  subscriptions.ts already
+  // solved it; both callers now share characterisePendingControls.
+  it("names no control and pluralises when the pending set is mixed", () => {
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    // A prompt review plus a term review from the same turn — routine.
+    const promptEvent = makePendingEvent({
+      id: "evt-prompt",
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-1",
+    });
+    const termEvent = makePendingEvent({ id: "evt-term", user_term: "cool" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        [ACTIVE_SESSION_ID]: {
+          [promptEvent.id]: promptEvent,
+          [termEvent.id]: termEvent,
+        },
+      },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      "Reviewing 2 composer choices — use the buttons on the review cards " +
+        "to continue.",
+    );
+    // No single control name is true of both cards, so name none of them.
+    for (const label of [
+      ACKNOWLEDGEMENT_ACCEPT_LABEL,
+      ACKNOWLEDGEMENT_AMEND_LABEL,
+      ACKNOWLEDGEMENT_APPROVE_LABEL,
+      ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+    ]) {
+      expect(textarea.placeholder).not.toContain(label);
+    }
+  });
+
+  it("keeps naming the shared controls when every pending card is the same kind", () => {
+    // The mixed-set fallback must not swallow the case it does NOT apply to:
+    // two prompt cards still render View prompt + Approve on each.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const first = makePendingEvent({
+      id: "evt-a",
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-1",
+    });
+    const second = makePendingEvent({
+      id: "evt-b",
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-2",
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        [ACTIVE_SESSION_ID]: { [first.id]: first, [second.id]: second },
+      },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      "Reviewing 2 LLM-drafted prompts — pick " +
+        `${ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}, then ` +
+        `${ACKNOWLEDGEMENT_APPROVE_LABEL} on each review card to continue.`,
     );
   });
 
@@ -567,7 +952,7 @@ describe("ChatInput — tutorial readOnly lock (prepopulated + locked prompt)", 
     expect(
       screen.queryByLabelText(/show file manager|hide file manager/i),
     ).toBeNull();
-    expect(screen.queryByLabelText(/open secrets settings/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
   });
 
   it("Send submits the locked value (the learner presses Send, types nothing)", async () => {
@@ -633,5 +1018,444 @@ describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => 
     ).toBeInTheDocument();
     expect(screen.queryByText(/connecting to the composer/i)).toBeNull();
     expect(screen.getByLabelText(/send message/i)).toBeDisabled();
+  });
+});
+
+describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
+  // The file-manager toggle and secrets entry fold behind one "More"
+  // trigger so the textarea keeps a usable width in the 360px authoring
+  // column. Upload stays persistent — it is the core "give the composer
+  // your data" action.
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  function renderInput(overrides?: {
+    onToggleBlobManager?: () => void;
+    onOpenSecrets?: () => void;
+    readOnly?: boolean;
+  }) {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    return render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        onToggleBlobManager={overrides?.onToggleBlobManager}
+        onOpenSecrets={overrides?.onOpenSecrets}
+        readOnly={overrides?.readOnly}
+      />,
+    );
+  }
+
+  it("keeps only Upload persistent — folder and key live behind More", () => {
+    renderInput({
+      onToggleBlobManager: vi.fn(),
+      onOpenSecrets: vi.fn(),
+    });
+    expect(screen.getByLabelText(/upload file/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/more actions/i)).toBeInTheDocument();
+    // Closed menu: neither rare action renders as a top-level row button.
+    expect(
+      screen.queryByLabelText(/show file manager|hide file manager/i),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
+  });
+
+  it("opens the menu, dispatches each action, and closes on selection", async () => {
+    const onToggleBlobManager = vi.fn();
+    const onOpenSecrets = vi.fn();
+    renderInput({ onToggleBlobManager, onOpenSecrets });
+
+    const trigger = screen.getByLabelText(/more actions/i);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(screen.getByLabelText(/show file manager/i));
+    expect(onToggleBlobManager).toHaveBeenCalledTimes(1);
+    // Selection closes the menu.
+    expect(screen.queryByLabelText(/show file manager/i)).toBeNull();
+
+    await userEvent.click(trigger);
+    await userEvent.click(screen.getByRole("button", { name: /API keys & secrets/i }));
+    expect(onOpenSecrets).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
+  });
+
+  it("closes on Escape without dispatching", async () => {
+    const onToggleBlobManager = vi.fn();
+    renderInput({ onToggleBlobManager, onOpenSecrets: vi.fn() });
+
+    await userEvent.click(screen.getByLabelText(/more actions/i));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByLabelText(/show file manager/i)).toBeNull();
+    expect(onToggleBlobManager).not.toHaveBeenCalled();
+  });
+
+  it("renders no More trigger when both rare actions are absent or locked", () => {
+    renderInput();
+    expect(screen.queryByLabelText(/more actions/i)).toBeNull();
+
+    renderInput({
+      onToggleBlobManager: vi.fn(),
+      onOpenSecrets: vi.fn(),
+      readOnly: true,
+    });
+    expect(screen.queryByLabelText(/more actions/i)).toBeNull();
+  });
+
+  it("pins the narrow-pane wrap mechanics in chat.css (container query, break, floor)", () => {
+    // The wrap rule keys off the PANE's width (container query), not the
+    // viewport — 360px is the shipped default pane width at 1280-1535px
+    // viewports, which no viewport media query can see. The min-width floor
+    // is the backstop that makes a wrap-rule regression visible.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    expect(css).toMatch(/\.chat-input\s*\{[^}]*container-type:\s*inline-size/s);
+    const textareaRule = css.match(/\.chat-input-textarea\s*\{([^}]*)\}/s)?.[1];
+    expect(textareaRule).toMatch(/min-width:\s*160px/);
+    const containerBlock = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(containerBlock).toBeDefined();
+    expect(containerBlock).toMatch(
+      /\.chat-input-row-break\s*\{[^}]*flex-basis:\s*100%/s,
+    );
+    expect(containerBlock).toMatch(
+      /\.chat-input-upload-btn,\s*\.chat-input-more\s*\{[^}]*order:\s*2/s,
+    );
+  });
+});
+
+// ============================================================================
+// ChatInput — placeholder legibility and the overflow glyph.
+// ============================================================================
+
+describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  function renderInput(props?: { readOnly?: boolean; value?: string }) {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    return render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        readOnly={props?.readOnly}
+        value={props?.value}
+        onChange={() => undefined}
+      />,
+    );
+  }
+
+  // A placeholder produces NO scroll overflow — no scrollbar, no ellipsis — so
+  // a placeholder taller than the box is simply cut mid-word with no cue that
+  // anything is missing. Every shipped placeholder here is a full sentence
+  // (the four guided per-step nudges, the empty-state priming line, the
+  // pending-interpretation cue), and two rows clipped them in the 360px
+  // authoring pane. Autosizing cannot rescue this: there is no scrollHeight to
+  // measure when the box is empty. The row count IS the fix, so pin it.
+  it("gives the editable composer four rows", () => {
+    renderInput();
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "4");
+  });
+
+  it("still sizes the read-only tutorial prompt to its content", () => {
+    // The locked worked-example prompt is static and multi-line; it is sized
+    // to the content (capped at 10) rather than to the editable row count.
+    renderInput({ readOnly: true, value: "a\nb\nc\nd\ne" });
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "6");
+  });
+
+  it("caps read-only growth at ten rows", () => {
+    renderInput({ readOnly: true, value: Array(40).fill("line").join("\n") });
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute(
+      "rows",
+      "10",
+    );
+  });
+
+  // The growth ceiling pinned above ("bounds textarea growth against the
+  // desktop dynamic viewport") is NOT dead code and must not be "cleaned up"
+  // on the grounds that nothing autosizes into it: `resize: vertical` is what
+  // reaches it, and the ceiling is what bounds the box the user drags.
+  it("keeps the user-drag affordance the growth ceiling exists to bound", () => {
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rule = css.match(/\.chat-input-textarea\s*\{([^}]*)\}/s)?.[1];
+    expect(rule).toMatch(/resize:\s*vertical/);
+  });
+});
+
+describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  it("renders the hint as the row's last child, still wired to the textarea", () => {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    render(
+      <ChatInput onSend={() => undefined} disabled={false} inputRef={inputRef} />,
+    );
+    const textarea = screen.getByLabelText(/message input/i);
+    const hint = screen.getByText(/shift\+enter for new line/i);
+    // The relocation must not sever the description linkage.
+    expect(textarea.getAttribute("aria-describedby")).toBe(hint.id);
+    // Only as a flex CHILD of the row can flex-basis/order place the hint —
+    // its own full-width line at ordinary pane widths, the wrapped Upload
+    // row's dead gutter under the narrow-pane container query. As a row
+    // SIBLING (the old arrangement) both rules are inert.
+    const row = textarea.closest(".chat-input-row");
+    expect(row).not.toBeNull();
+    expect(hint.parentElement).toBe(row);
+    expect(row!.lastElementChild).toBe(hint);
+  });
+
+  it("omits the hint in read-only mode, where Shift+Enter is a false affordance", () => {
+    // A read-only textarea (the tutorial's frozen prompt is the shipped case)
+    // accepts no typed input, so "Shift+Enter for new line" describes a
+    // keyboard action that does nothing. Rendering it anyway also overlapped
+    // the frozen prompt: the positioned hint assumes the Upload/More/Send
+    // cluster (~180px) beneath it, but read-only mode renders only the 68px
+    // Send button, so the hint's text hung ~50px over the textarea.
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        readOnly
+      />,
+    );
+    expect(screen.queryByText(/shift\+enter for new line/i)).toBeNull();
+    // No hint element means no describedby target — the reference must go
+    // with it, or AT chases a dangling id.
+    const textarea = screen.getByLabelText(/message input/i);
+    expect(textarea.getAttribute("aria-describedby")).toBeNull();
+  });
+
+  it("seats the hint above the buttons inside the textarea's height at ordinary pane widths", () => {
+    // Operator request 2026-08-16: the composer region ends flush with the
+    // textarea. The hint used to be a full-width flex line of its own BELOW
+    // the controls — one text row of region height under the box. Now it is
+    // positioned inside the row, right-aligned above the buttons, and the
+    // row is the textarea's height. The three parts have to agree: the row
+    // is the containing block, the hint is positioned against its bottom by
+    // one control height, and the row carries a floor so a user-shortened
+    // textarea cannot let the hint escape the row's top.
+    //
+    // Anchored to the line start: the base rules are unindented, while the
+    // container-query `.chat-input-row .chat-input-hint` rule also ends in
+    // this class name and must not be the one inspected here.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rowRule = css.match(/\n\.chat-input-row\s*\{([^}]*)\}/s)?.[1];
+    expect(rowRule).toMatch(/position:\s*relative/);
+    expect(rowRule).toMatch(/min-height:\s*calc\([^;]*var\(--size-control\)/s);
+    const hintRule = css.match(/\n\.chat-input-hint\s*\{([^}]*)\}/s)?.[1];
+    expect(hintRule).toMatch(/position:\s*absolute/);
+    expect(hintRule).toMatch(/right:\s*0/);
+    expect(hintRule).toMatch(/bottom:\s*calc\(var\(--size-control\)/);
+    // Still carries its own-line basis for the regimes that put it back in
+    // flow (below); inert while positioned.
+    expect(hintRule).toMatch(/flex-basis:\s*100%/);
+  });
+
+  it("puts the hint back in flow wherever the buttons already take a second line", () => {
+    // Two regimes: the narrow-pane container query (the hint fills the wrapped
+    // attachment row's gutter) and the ≤760px viewport regime (the buttons
+    // are on their own line and the positioned placement would land on the
+    // textarea's bottom-right corner). Each must reset BOTH halves — the
+    // hint's position and the row's floor — or the row would keep a 74px
+    // floor for a hint that no longer needs it.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const container = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(container).toMatch(
+      /\.chat-input-row \.chat-input-hint\s*\{[^}]*position:\s*static/s,
+    );
+    expect(container).toMatch(/\.chat-input-row\s*\{[^}]*min-height:\s*0/s);
+    const blocks = Array.from(
+      css.matchAll(/@media \(max-width: 760px\)\s*\{([\s\S]*?)\n\}/g),
+      (m) => m[1],
+    );
+    const composerBlock = blocks.find((b) => b.includes(".chat-input-textarea"));
+    expect(composerBlock).toMatch(
+      /\.chat-input-row \.chat-input-hint\s*\{[^}]*position:\s*static/s,
+    );
+    expect(composerBlock).toMatch(/\.chat-input-row\s*\{[^}]*min-height:\s*0/s);
+  });
+
+  it("sends the hint onto the wrapped attachment row's own flex line", () => {
+    // The hint fills what was ~344px of dead gutter beside a lone 44px
+    // Upload button, so it must join the SAME order group the attachment
+    // buttons are wrapped with — equality with the buttons' order, not a
+    // pinned number.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const container = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(container).toBeDefined();
+    const buttonsOrder = container!.match(
+      /\.chat-input-upload-btn,\s*\.chat-input-more\s*\{[^}]*order:\s*(\d+)/s,
+    )?.[1];
+    const hintRule = container!.match(
+      /\.chat-input-row \.chat-input-hint\s*\{([^}]*)\}/s,
+    )?.[1];
+    expect(hintRule).toBeDefined();
+    expect(hintRule!.match(/order:\s*(\d+)/)?.[1]).toBe(buttonsOrder);
+    // Auto basis + grow is what lets it FILL the gutter instead of forcing
+    // yet another line.
+    expect(hintRule).toMatch(/flex:\s*1 1 auto/);
+  });
+
+  it("pays the wrapped row's inter-line gap exactly once", () => {
+    // The forced .chat-input-row-break is a zero-height flex LINE of its
+    // own, so a plain row-gap is paid on BOTH sides of it — the declared 8px
+    // rendered as 16px. The constraint: inside the container block the row's
+    // row-gap is zero, and every item ordered onto the attachment row
+    // carries ONE base-gap margin — the same token the row's own gap uses.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const container = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(container).toMatch(/\.chat-input-row\s*\{[^}]*row-gap:\s*0/s);
+    const baseGap = css
+      .match(/\.chat-input-row\s*\{[^}]*?[^-]gap:\s*([^;]+);/s)?.[1]
+      ?.trim();
+    expect(baseGap).toBeDefined();
+    const margins = Array.from(
+      container!.matchAll(/margin-top:\s*([^;]+);/g),
+      (m) => m[1].trim(),
+    );
+    // One declaration for the attachment buttons, one for the hint.
+    expect(margins.length).toBeGreaterThanOrEqual(2);
+    for (const margin of margins) {
+      expect(margin, "attachment-row margin must equal the row's own gap").toBe(
+        baseGap,
+      );
+    }
+  });
+
+  it("keeps the ≤760px regime's own gap from stacking with those margins", () => {
+    // The phone regime restores its own row gap (its `gap` shorthand wins
+    // the container block by source order), so the single-paid-gap margins
+    // must come off there or the two mechanisms stack to gap+8.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const blocks = Array.from(
+      css.matchAll(/@media \(max-width: 760px\)\s*\{([\s\S]*?)\n\}/g),
+      (m) => m[1],
+    );
+    const composerBlock = blocks.find((b) => b.includes(".chat-input-textarea"));
+    expect(composerBlock).toBeDefined();
+    expect(composerBlock).toMatch(
+      /\.chat-input-upload-btn,\s*\.chat-input-more\s*\{[^}]*margin-top:\s*0/s,
+    );
+    expect(composerBlock).toMatch(
+      /\.chat-input-row \.chat-input-hint\s*\{[^}]*margin-top:\s*0/s,
+    );
+  });
+});
+
+describe("chat-input controls consume the motion tokens (elspeth-616a236fc3)", () => {
+  it("eases every input-row control from the shared token, never a raw duration", () => {
+    // The same hover gesture snapped on these three controls while every
+    // .btn eased at 100ms — and a raw literal, even a numerically identical
+    // one, is invisible to any future motion-scale change.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    for (const selector of [
+      ".chat-input-icon-btn",
+      ".chat-input-cancel-btn",
+      ".chat-input-send-btn",
+    ]) {
+      // `\n` anchor: the base rule is unindented; the same class names also
+      // appear indented inside the reduced-motion enumeration, whose
+      // `transition: none` must not satisfy this check.
+      const start = css.indexOf(`\n${selector} {`);
+      expect(start, `${selector} base rule must exist`).toBeGreaterThan(-1);
+      const base = css.slice(start);
+      const rule = base.slice(0, base.indexOf("}"));
+      const transition = rule.match(/transition:([^;]+);/s)?.[1];
+      expect(transition, `${selector} must declare a transition`).toBeDefined();
+      expect(transition).toContain("var(--transition-");
+      expect(
+        /\d+(\.\d+)?m?s\b/.test(transition!),
+        `${selector} transition must not carry a raw duration: ${transition}`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("ChatInput overflow glyph (elspeth-b720e0b932)", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  function renderInput() {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    return render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        onToggleBlobManager={() => undefined}
+        onOpenSecrets={() => undefined}
+      />,
+    );
+  }
+
+  // The "…" trigger used to be three ZERO-LENGTH path segments
+  // ("M5 12h.01M12 12h.01M19 12h.01") relying on `stroke-linecap: round` to
+  // become dots. At 20px on a 24-unit viewBox that cap is 1.5px, which cannot
+  // rasterise round and carries roughly an order of magnitude less ink than
+  // the Upload glyph in the identically-sized button beside it — so the
+  // control read as disabled. Explicit filled circles are the fix.
+  it("draws the overflow trigger as filled circles, not zero-length strokes", () => {
+    renderInput();
+    const svg = screen
+      .getByLabelText(/more actions/i)
+      .querySelector("svg.chat-input-icon");
+    expect(svg).not.toBeNull();
+
+    const circles = Array.from(svg!.querySelectorAll("circle"));
+    expect(circles).toHaveLength(3);
+    for (const circle of circles) {
+      // A presentation attribute ON the circle beats the `fill: none` it would
+      // otherwise INHERIT from .chat-input-icon, and currentColor keeps the
+      // glyph tracking --color-text in both themes.
+      expect(circle.getAttribute("fill")).toBe("currentColor");
+      expect(Number(circle.getAttribute("r"))).toBeGreaterThan(0);
+    }
+    // Distinct centres — three dots, not one drawn three times.
+    expect(new Set(circles.map((c) => c.getAttribute("cx"))).size).toBe(3);
+
+    // No stroked path survives on this glyph, so the zero-length-segment
+    // idiom cannot creep back in beside the circles.
+    expect(svg!.querySelector("path")).toBeNull();
+  });
+
+  it("leaves the sibling Upload glyph a stroked path", () => {
+    renderInput();
+    const svg = screen
+      .getByLabelText(/upload file/i)
+      .querySelector("svg.chat-input-icon");
+    expect(svg!.querySelectorAll("path")).toHaveLength(1);
+    expect(svg!.querySelectorAll("circle")).toHaveLength(0);
+  });
+
+  it("keeps the round-cap stroke settings the other glyphs in the family rely on", () => {
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rule = css.match(/\.chat-input-icon\s*\{([^}]*)\}/s)?.[1];
+    expect(rule).toMatch(/stroke:\s*currentColor/);
+    expect(rule).toMatch(/fill:\s*none/);
   });
 });

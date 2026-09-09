@@ -22,6 +22,7 @@ from elspeth.contracts.schema_contract import FieldContract, PipelineRow, Schema
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import ScalarBucketKey, scalar_bucket_key
 
 type BatchStatsAggregateRow = dict[str, object]
@@ -97,9 +98,10 @@ class BatchStats(BaseTransform):
     when an aggregation trigger fires. Without group_by, it emits one
     aggregate row for the full batch. With group_by, it emits one aggregate
     row per distinct group value. It computes:
-    - count: Number of rows in the batch
-    - sum: Sum of the value_field across all rows
-    - mean: Average of value_field (if compute_mean=True)
+    - count: Number of finite, non-missing valid numeric values
+    - sum: Sum of those finite, non-missing valid numeric values
+    - mean: Average of those values (if compute_mean=True)
+    - batch_size: Number of input rows before missing or non-finite values are skipped
 
     Config options:
         schema: Required. Schema for input validation
@@ -124,9 +126,36 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1e2bb450d2ce2c35"
+    source_file_hash: str | None = "sha256:f288b3e52978198d"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    usage_when_to_use: str = (
+        "Use to replace a window of rows with count, sum, and optional mean statistics over one numeric field. "
+        "Omit trigger or use trigger: {} for one bounded whole-source end-of-source aggregate; a count, timeout, "
+        "or condition trigger creates independent windows. "
+        "When configured, group_by partitions one flushed batch and never accumulates a group across windows."
+    )
+    usage_when_not_to_use: str = (
+        "Not for pass-through enrichment or unbounded whole-source buffering: original rows are replaced. Configure "
+        "an early trigger when the source cannot be safely held until end-of-source."
+    )
+    example_use: str = """aggregations:
+  - name: category_totals
+    plugin: batch_stats
+    input: sales_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: amount
+      group_by: category
+      compute_mean: true
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "aggregation", "statistics")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -218,6 +247,24 @@ class BatchStats(BaseTransform):
             adds_fields=True,
         )
         self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: the demotion set is every key the aggregate may WRITE.
+
+        WIDER than ``declared_output_fields`` (elspeth-d6eeb3a71d): the
+        conditional ``skipped_missing`` / ``skipped_non_finite`` diagnostics are
+        written but not guaranteed, so the base default would leave them
+        demanded on input.
+
+        It also includes ``group_by``, which IS read from the input rows — that
+        is deliberate here, because ``consumed_input_fields`` subtracts every
+        column named by a config option (``group_by`` and ``value_field``
+        included) before anything is demoted. Creation and consumption are
+        tracked separately on purpose; this property answers only "what may this
+        transform write".
+        """
+        return self._all_possible_output_keys
 
     def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
         """Override (elspeth-f5f798f797): aggregation output is independent of input shape.
@@ -328,10 +375,19 @@ class BatchStats(BaseTransform):
             # Tier 2 pipeline data - wrong types indicate upstream bug
             # Use type() instead of isinstance() to reject bool (bool is subclass of int)
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip. The two branches around this
+                # one skip-and-report deliberately (a missing value and a
+                # non-finite float are documented as recoverable); a wrong TYPE
+                # is not, and John's ruling (elspeth-d5034647f0) fails the whole
+                # batch rather than publishing a statistic over a set the
+                # operator never specified. Raised here and converted in
+                # `process` because this helper returns values, not results —
+                # the shape `reference_join._coerce_key` already uses.
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             # NaN/Inf are type-valid floats but operation-unsafe — they produce
@@ -489,7 +545,6 @@ class BatchStats(BaseTransform):
 
         Raises:
             KeyError: If value_field is missing from any row (upstream bug)
-            TypeError: If value_field is not numeric (upstream bug)
         """
         if not rows:
             # Empty batch is an anomaly — return error, not fabricated statistics.
@@ -503,6 +558,18 @@ class BatchStats(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
+        try:
+            return self._aggregate_all_groups(rows)
+        except BatchRowTypeError as exc:
+            # Requirement 2 of the ruling: the batch records that it failed and
+            # WHY — which row, which field, what was found where a number was
+            # required. The structural caller owns disposition: an aggregation
+            # applies its declared error route, while a collector turns this
+            # into a whole-group failure settled by scope policy and nesting.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+
+    def _aggregate_all_groups(self, rows: list[PipelineRow]) -> TransformResult:
+        """Group, aggregate and assemble — the body `process` guards."""
         results: list[BatchStatsAggregateRow] = []
         for group_value, grouped_rows in self._group_rows(rows):
             aggregate, error = self._aggregate_group(grouped_rows, group_value)

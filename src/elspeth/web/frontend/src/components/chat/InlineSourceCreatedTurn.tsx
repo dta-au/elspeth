@@ -36,6 +36,7 @@
 
 import { useState } from "react";
 import type { InlineSourceSummary, InlineSourceProvenance } from "@/types/api";
+import { Button } from "@/components/ui";
 import { describeRowCount } from "@/utils/contentStructure";
 
 /**
@@ -50,6 +51,16 @@ const EDITABLE_PROVENANCES: ReadonlySet<InlineSourceProvenance> = new Set([
   "llm-generated",
   "llm-generated-then-amended",
 ]);
+
+/** Reader-register labels for the closed provenance enum; the raw value
+ *  stays in `title` (elspeth-d74ab492dd). Exhaustive by type: adding a
+ *  provenance without a label is a compile error. */
+const INLINE_SOURCE_PROVENANCE_LABELS: Record<InlineSourceProvenance, string> = {
+  verbatim: "Typed by you",
+  "llm-generated": "Drafted by the composer",
+  disambiguated: "Chosen by you from the options offered",
+  "llm-generated-then-amended": "Drafted by the composer, then edited by you",
+};
 
 /** Max chars in the visible preview, INCLUDING the trailing ellipsis. */
 const PREVIEW_MAX_LENGTH = 280;
@@ -124,13 +135,17 @@ export function InlineSourceCreatedTurn({
 
       {showEdit && (
         <div className="inline-source-created-turn-actions">
-          <button
-            type="button"
-            className="inline-source-created-turn-edit"
+          {/* .link-button carries the visible affordance: this bare Button
+              previously held only its bespoke token, which no stylesheet
+              defines, so it rendered as a raw UA-default button
+              (elspeth-729872658a). */}
+          <Button
+            variant="bare"
+            className="link-button inline-source-created-turn-edit"
             onClick={() => onEdit(summary)}
           >
             Edit the list
-          </button>
+          </Button>
         </div>
       )}
 
@@ -184,7 +199,9 @@ export function InlineSourceCreatedTurn({
             </div>
             <div>
               <dt>Provenance</dt>
-              <dd>{summary.provenance}</dd>
+              <dd title={summary.provenance}>
+                {INLINE_SOURCE_PROVENANCE_LABELS[summary.provenance]}
+              </dd>
             </div>
           </dl>
         )}

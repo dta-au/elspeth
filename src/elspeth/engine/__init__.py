@@ -16,14 +16,16 @@ Example:
 
     config = PipelineConfig(
         sources={"primary": csv_source},
-        transforms=[transform1, gate1],
+        transforms=[transform1],
+        gates=[gate1],
         sinks={"default": output_sink},
     )
 
     graph = ExecutionGraph.from_plugin_instances(
         sources={"primary": csv_source},
         source_settings_map={"primary": csv_source_settings},
-        transforms=[transform1, gate1],
+        transforms=[transform1],
+        gates=[gate1],
         sinks={"default": output_sink},
     )
 

@@ -19,6 +19,7 @@ from elspeth.contracts import (
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
+    SinkEffectContract,
     SinkEffectDescriptorMode,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
         TransformProtocol,
         TransformResult,
     )
+    from elspeth.contracts.schema import SchemaConfig
     from elspeth.contracts.schema_contract import SchemaContract
 
 
@@ -69,6 +71,10 @@ class _TestSourceBase:
     _on_validation_failure: str = "discard"
     on_success: str = "default"
     declared_guaranteed_fields: frozenset[str] = frozenset()
+    _output_schema_config: SchemaConfig | None = None
+    # SourceProtocol structural observed-cell type (elspeth-e6e552ce34).
+    # None = no structural fact; the builder threads this onto NodeInfo.
+    observed_value_type: str | None = None
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}
@@ -155,7 +161,7 @@ class CallbackSource(_TestSourceBase):
                 self._after_yield_callback(i)
 
 
-class _TestSinkBase:
+class _TestSinkBase(SinkEffectContract):
     """Base class for test sinks implementing SinkProtocol."""
 
     name: str
@@ -172,6 +178,7 @@ class _TestSinkBase:
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+    effect_mode_remediation: str | None = None
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}
@@ -190,6 +197,14 @@ class _TestSinkBase:
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def _reset_diversion_log(self) -> None:
         self._diversion_log = []

@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from azure.core.exceptions import ResourceNotFoundError
 
 from elspeth.contracts import SourceRow
 from elspeth.contracts.plugin_context import PluginContext
@@ -1027,27 +1028,19 @@ class TestBug4_4_RuntimeErrorOnLoadFailure:
     """
 
     def test_azure_sdk_error_raises_runtime_error(self, mock_blob_client, ctx: PluginContext) -> None:
-        """Azure SDK error in load() wraps as RuntimeError with original chained."""
+        """Azure SDK error in load() becomes a static, unchained RuntimeError."""
         source = AzureBlobSource(make_config())
 
-        # Simulate an Azure SDK error with a complex constructor
-        class AzureResourceNotFoundError(Exception):
-            def __init__(self, message: str, *, status_code: int = 404) -> None:
-                super().__init__(message)
-                self.status_code = status_code
-
-        mock_blob_client.return_value = _BlobClientDouble(read_error=AzureResourceNotFoundError("Blob not found", status_code=404))
+        mock_blob_client.return_value = _BlobClientDouble(read_error=ResourceNotFoundError("Blob not found"))
 
         with pytest.raises(RuntimeError) as exc_info:
             list(source.load(ctx))
 
-        # Should be RuntimeError, not AzureResourceNotFoundError
         assert type(exc_info.value) is RuntimeError
         assert "Failed to download blob" in str(exc_info.value)
         assert TEST_BLOB_PATH in str(exc_info.value)
-        # Original exception is chained via `from e`
-        assert exc_info.value.__cause__ is not None
-        assert isinstance(exc_info.value.__cause__, AzureResourceNotFoundError)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
 
 
 class TestBug4_5_UnicodeDecodeErrorInJSONL:

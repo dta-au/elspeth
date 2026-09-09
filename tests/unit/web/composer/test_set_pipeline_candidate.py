@@ -7,6 +7,7 @@ inline-blob effects, not private control flow.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
@@ -24,12 +25,13 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
+from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import (
     SetPipelineCandidate,
     ToolContext,
@@ -37,9 +39,14 @@ from elspeth.web.composer.tools import (
     build_set_pipeline_candidate,
     execute_tool,
 )
+from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
+    SOURCE_AUTHORING_KEY,
+)
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
     PluginAvailabilitySnapshot,
@@ -54,6 +61,8 @@ from elspeth.web.plugin_policy.validation import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
 def _empty_state() -> CompositionState:
@@ -98,9 +107,236 @@ def test_build_set_pipeline_candidate_constructs_without_publishing(tmp_path: Pa
     assert state == _empty_state()
 
 
+def test_omitted_on_error_defaults_to_discard_for_transform_and_aggregation_but_not_gate(
+    tmp_path: Path,
+) -> None:
+    """Pin the ``on_error`` defaulting expression at the set_pipeline boundary.
+
+    ``build_set_pipeline_candidate`` defaults an omitted ``on_error`` to
+    ``"discard"`` for exactly the node families the YAML generator refuses to
+    lower without one (transform, aggregation), and for no other family — a
+    gate's omitted ``on_error`` stays ``None`` (fail-fast, not discard).
+    Nothing else pinned this expression: every other node dict in this module
+    supplies ``on_error`` explicitly. Deleting the default, narrowing the
+    tuple to transform-only, or widening it to gates each fails one arm.
+    """
+    transform_args = _linear_args(tmp_path)
+    del transform_args["nodes"][0]["on_error"]
+    candidate = build_set_pipeline_candidate(transform_args, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert candidate.acceptable is True
+    assert candidate.result.updated_state.nodes[0].on_error == "discard"
+
+    aggregation_args = _aggregation_args(tmp_path)
+    del aggregation_args["nodes"][0]["on_error"]
+    candidate = build_set_pipeline_candidate(aggregation_args, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert candidate.acceptable is True
+    assert candidate.result.updated_state.nodes[0].on_error == "discard"
+
+    gate_args = _gate_args(tmp_path)
+    assert "on_error" not in gate_args["nodes"][0]
+    candidate = build_set_pipeline_candidate(gate_args, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert candidate.acceptable is True
+    assert candidate.result.updated_state.nodes[0].on_error is None
+
+
+def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path: Path) -> None:
+    """elspeth-e89e6bf47a: a candidate with valid source/outputs whose llm node
+    omits ``provider`` is rejected with ``plugin_options_invalid`` alone — not
+    the empty pre-mutation state's ``no_source_configured`` /
+    ``no_sinks_configured``, which misroute repair loops on the raw-result
+    surfaces (freeform chat tool messages, composer MCP responses).
+    """
+    args = _linear_args(tmp_path)
+    args["nodes"] = [
+        {
+            "id": "enrich",
+            "node_type": "transform",
+            "plugin": "llm",
+            "input": "rows",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+    ]
+    args["edges"] = [
+        {
+            "id": "source_to_enrich",
+            "from_node": "source",
+            "to_node": "enrich",
+            "edge_type": "on_success",
+            "label": None,
+        }
+    ]
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), _trained_context(data_dir=tmp_path))
+    result = candidate.result
+
+    assert candidate.acceptable is False
+    assert result.data["error_code"] == "plugin_options_invalid"
+    assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
+    assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected_container", "expects_blob_advice", "expects_round_trip_gap"),
+    [
+        pytest.param(
+            {
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "inputs/orders.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            "`source` configuration",
+            False,
+            False,
+            id="singular-plugin-backed",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "inputs/orders.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
+            False,
+            id="named-plugin-backed",
+        ),
+        pytest.param(
+            {
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "`source` configuration",
+            True,
+            False,
+            id="singular-blob-bound",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
+            True,
+            id="named-blob-backed-round-trip-unavailable",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="order_rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "customers": SourceSpec(
+                    plugin="csv",
+                    on_success="customer_rows",
+                    options={"path": "inputs/customers.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                ),
+            },
+            "named `sources` map",
+            False,
+            True,
+            id="multiple-sources-with-blob-round-trip-unavailable",
+        ),
+    ],
+)
+def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    sources: dict[str, SourceSpec],
+    expected_container: str,
+    expects_blob_advice: bool,
+    expects_round_trip_gap: bool,
+) -> None:
+    """The handler's defensive branch stays accurate behind schema admission."""
+    validated_without_source = sessions_tools.SetPipelineArgumentsModel.model_construct(
+        source=None,
+        sources=None,
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata=None,
+    )
+    monkeypatch.setattr(
+        sessions_tools.SetPipelineArgumentsModel,
+        "model_validate",
+        classmethod(lambda cls, value: validated_without_source),
+    )
+    state = CompositionState(
+        sources=sources,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    candidate = build_set_pipeline_candidate(
+        {"nodes": [], "edges": [], "outputs": []},
+        state,
+        _trained_context(),
+    )
+
+    error = candidate.result.data["error"]
+    assert expected_container in error
+    assert ("blob_id" in error) is expects_blob_advice
+    assert ("inline_blob" in error) is expects_blob_advice
+    if expects_round_trip_gap:
+        assert error == (
+            "set_pipeline requires exactly one non-null source or sources object. "
+            "This tool is a full replacement; omission or null never keeps existing source configuration. "
+            "The existing named `sources` map cannot be represented as lossless set_pipeline arguments: "
+            "get_pipeline_state(component='set_pipeline_arguments') returns error_code `round_trip_unavailable`. "
+            "Inspect the current configuration with get_pipeline_state(component='source'); do not fabricate source fields "
+            "or blob identities, and do not rebind any source. If the requested change is limited to existing source options, "
+            "use patch_source_options with the current source_name; use the matching narrow patch tool for node/output-only "
+            "changes. For a true full rebuild, surface the `round_trip_unavailable` gap and stop instead of guessing."
+        )
+        assert "Re-supply the complete existing" not in error
+    else:
+        assert "complete existing" in error
+        assert "round_trip_unavailable" not in error
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in error
+        assert "get_pipeline_state(component='source')" not in error
+
+
 def _trained_context(*, data_dir: Path | None = None, **kwargs: Any) -> ToolContext:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    if data_dir is not None and "session_id" not in kwargs:
+        kwargs["session_id"] = "test-session"
     return ToolContext(
         catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
         plugin_snapshot=snapshot,
@@ -126,6 +362,7 @@ def _blocked_context(plugin_id: PluginId, *, data_dir: Path) -> ToolContext:
         catalog=PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)),
         plugin_snapshot=snapshot,
         data_dir=str(data_dir),
+        session_id="test-session",
     )
 
 
@@ -133,17 +370,21 @@ class _ProfileRejectingCatalog(PolicyCatalogView):
     """Real catalog projection with one deterministic profile finding."""
 
     def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
-        finding = PluginPolicyFinding(
-            stage="operator_profile_options",
-            component_id="profile_prevalidation",
-            component_type="transform",
-            error_code="profile_unavailable",
-            message="The requested operator profile is unavailable.",
-        )
+        findings = ()
+        if state.nodes:
+            findings = (
+                PluginPolicyFinding(
+                    stage="operator_profile_options",
+                    component_id="profile_prevalidation",
+                    component_type="transform",
+                    error_code="profile_unavailable",
+                    message="The requested operator profile is unavailable.",
+                ),
+            )
         return ProfileAwareValidationResult(
             authored_state=state,
             executable_state=state,
-            policy_findings=(finding,),
+            policy_findings=findings,
             validation=state.validate(),
         )
 
@@ -152,7 +393,7 @@ def _profile_rejecting_context(*, data_dir: Path) -> ToolContext:
     full = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(full)
     catalog = _ProfileRejectingCatalog(full, snapshot, MagicMock(spec=OperatorProfileRegistry))
-    return ToolContext(catalog=catalog, plugin_snapshot=snapshot, data_dir=str(data_dir))
+    return ToolContext(catalog=catalog, plugin_snapshot=snapshot, data_dir=str(data_dir), session_id="test-session")
 
 
 class _FinalValidationRejectingCatalog(PolicyCatalogView):
@@ -194,7 +435,10 @@ def _final_validation_rejecting_context(*, data_dir: Path) -> tuple[ToolContext,
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(full)
     catalog = _FinalValidationRejectingCatalog.for_trained_operator(full, snapshot)
     catalog.validated_states = []
-    return ToolContext(catalog=catalog, plugin_snapshot=snapshot, data_dir=str(data_dir)), catalog
+    return (
+        ToolContext(catalog=catalog, plugin_snapshot=snapshot, data_dir=str(data_dir), session_id="test-session"),
+        catalog,
+    )
 
 
 def _file_options(path: Path) -> dict[str, Any]:
@@ -212,7 +456,7 @@ def _linear_args(tmp_path: Path) -> dict[str, Any]:
             "plugin": "csv",
             "on_success": "rows",
             "options": {
-                "path": str(tmp_path / "blobs" / "input.csv"),
+                "path": str(tmp_path / "blobs" / "test-session" / "input.csv"),
                 "schema": {"mode": "observed"},
             },
             "on_validation_failure": "discard",
@@ -241,7 +485,7 @@ def _linear_args(tmp_path: Path) -> dict[str, Any]:
             {
                 "sink_name": "main",
                 "plugin": "json",
-                "options": _file_options(tmp_path / "outputs" / "result.jsonl") | {"format": "jsonl"},
+                "options": _file_options(Path("outputs/result.jsonl")) | {"format": "jsonl"},
                 "on_write_failure": "discard",
             }
         ],
@@ -272,26 +516,39 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
                 )
             )
     service = BlobServiceImpl(engine, tmp_path)
-    first_blob = asyncio.run(
-        service.create_blob(
-            UUID(first_session),
-            "first.csv",
-            b"name,score\nAda,42\n",
-            "text/csv",
+    with fenced_operation_context(engine, first_session, operation_kind=SessionOperationKind.CREATE) as first_context:
+        first_blob = asyncio.run(
+            service.create_blob(
+                UUID(first_session),
+                "first.csv",
+                _FIRST_REVIEWED_BLOB_CONTENT,
+                "text/csv",
+                session_operation_context=first_context,
+            )
         )
-    )
-    second_blob = asyncio.run(
-        service.create_blob(
-            UUID(second_session),
-            "second.csv",
-            b"name,score\nGrace,99\n",
-            "text/csv",
+    with fenced_operation_context(engine, second_session, operation_kind=SessionOperationKind.CREATE) as second_context:
+        second_blob = asyncio.run(
+            service.create_blob(
+                UUID(second_session),
+                "second.csv",
+                b"name,score\nGrace,99\n",
+                "text/csv",
+                session_operation_context=second_context,
+            )
         )
-    )
     return engine, first_session, second_session, (first_blob, second_blob)
 
 
-def _reviewed_source_facts(*, blob_id: str, source_name: str = "source", path: str | None = None) -> dict[str, Any]:
+_FIRST_REVIEWED_BLOB_CONTENT = b"name,score\nAda,42\n"
+
+
+def _reviewed_source_facts(
+    *,
+    blob_id: str,
+    source_name: str = "source",
+    path: str | None = None,
+    authoring_content_hash: str | None = None,
+) -> dict[str, Any]:
     stable_id = str(uuid4())
     return {
         "source_order": [stable_id],
@@ -305,7 +562,12 @@ def _reviewed_source_facts(*, blob_id: str, source_name: str = "source", path: s
                     "schema": {"mode": "observed"},
                     SOURCE_AUTHORING_KEY: {
                         "modality": "llm_generated",
-                        "content_hash": "a" * 64,
+                        # The content-identity binding verifies this pin
+                        # against the live blob row, so it must be the real
+                        # hash of the harness blob's bytes.
+                        "content_hash": (
+                            authoring_content_hash if authoring_content_hash is not None else content_hash(_FIRST_REVIEWED_BLOB_CONTENT)
+                        ),
                         "review_event_id": "review-event",
                         "resolved_kind": "invented_source",
                     },
@@ -333,6 +595,41 @@ def _named_reviewed_pipeline(tmp_path: Path, facts: dict[str, Any]) -> dict[str,
     )
     pipeline["sources"] = {reviewed["name"]: source}
     return pipeline
+
+
+def test_reviewed_source_authority_rejects_non_mapping_reviewed_sources() -> None:
+    """Present-but-malformed reviewed_sources is corruption, not absence."""
+    facts = {"reviewed_sources": "not-a-mapping"}
+    with pytest.raises(AuditIntegrityError, match="reviewed_sources must be a mapping"):
+        resolve_reviewed_source_authority(
+            engine=None,
+            session_id="session",
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+        )
+
+
+def test_reviewed_source_authority_returns_none_for_absent_reviewed_sources() -> None:
+    facts: dict[str, object] = {"other": "facts"}
+    assert (
+        resolve_reviewed_source_authority(
+            engine=None,
+            session_id="session",
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+        )
+        is None
+    )
+
+
+def test_authoring_content_hash_rejects_non_mapping_authoring_metadata() -> None:
+    from elspeth.web.composer.reviewed_source_authority import _authoring_content_hash
+    from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+
+    with pytest.raises(AuditIntegrityError, match="source authoring metadata must be a mapping"):
+        _authoring_content_hash({SOURCE_AUTHORING_KEY: "bad"}, stable_id="s1")
 
 
 def test_reviewed_source_authority_resolves_only_ready_owned_current_anchor(tmp_path: Path) -> None:
@@ -456,7 +753,7 @@ def test_reviewed_source_authority_checks_owner_without_recognized_blob(tmp_path
 
 def test_exact_reviewed_non_blob_path_remains_subject_to_candidate_path_policy(tmp_path: Path) -> None:
     engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
-    reviewed_path = str(tmp_path / "blobs" / "operator-reviewed.csv")
+    reviewed_path = str(tmp_path / "blobs" / session_id / "operator-reviewed.csv")
     facts = _reviewed_source_facts(blob_id=str(blobs[0].id), path=reviewed_path)
     options = next(iter(facts["reviewed_sources"].values()))["options"]
     options.pop("blob_ref")
@@ -544,6 +841,74 @@ def test_exact_reviewed_source_authority_allows_private_blob_resolution(tmp_path
     assert candidate.result.updated_state.sources["source"].options["path"] == blob.storage_path
 
 
+def test_reviewed_source_rehydrates_trusted_options_and_runs_b_before_plugin_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    facts = _reviewed_source_facts(blob_id=str(blobs[0].id))
+    reviewed = next(iter(facts["reviewed_sources"].values()))
+    reviewed["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
+        {
+            "id": "duplicate-review-id",
+            "kind": "vague_term",
+            "user_term": "alpha",
+            "draft": "sk-sensitive-reviewed-source",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        },
+        {
+            "id": "duplicate-review-id",
+            "kind": "pipeline_decision",
+            "user_term": "beta",
+            "draft": "second draft",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+        },
+    ]
+    authority = resolve_reviewed_source_authority(
+        engine=engine,
+        session_id=session_id,
+        user_id="review-owner",
+        reviewed_facts=facts,
+        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+    )
+
+    # Scoped to the SOURCE's own plugin validation: since a rejected component
+    # no longer stops the node and output sections (elspeth-4fad98a453), a
+    # blanket stub would fire on the unrelated transform node and prove
+    # nothing about this ordering.
+    real_validate_plugin_name = sessions_tools._validate_plugin_name
+
+    def _source_plugin_validation_must_not_run(context: Any, kind: str, plugin_name: str) -> Any:
+        if kind == "source":
+            raise AssertionError("source plugin validation ran before canonical invariant B")
+        return real_validate_plugin_name(context, kind, plugin_name)
+
+    monkeypatch.setattr(sessions_tools, "_validate_plugin_name", _source_plugin_validation_must_not_run)
+    candidate = build_set_pipeline_candidate(
+        _named_reviewed_pipeline(tmp_path, facts),
+        _empty_state(),
+        _trained_context(
+            data_dir=tmp_path,
+            session_engine=engine,
+            session_id=session_id,
+            user_id="review-owner",
+            reviewed_source_authority=authority,
+        ),
+    )
+
+    assert candidate.acceptable is False
+    assert candidate.result.data["error_code"] == "interpretation_requirements_invalid"
+    assert "sk-sensitive-reviewed-source" not in candidate.result.data["error"]
+
+
 @pytest.mark.parametrize("mutation", ["name", "plugin", "options", "failure_policy"])
 def test_reviewed_source_authority_requires_every_candidate_field_to_match(tmp_path: Path, mutation: str) -> None:
     engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
@@ -597,7 +962,10 @@ def test_generic_cross_session_and_filesystem_callers_cannot_reuse_reviewed_auth
     )
     assert generic.acceptable is False
 
-    other_facts = _reviewed_source_facts(blob_id=str(second_blob.id))
+    other_facts = _reviewed_source_facts(
+        blob_id=str(second_blob.id),
+        authoring_content_hash=content_hash(b"name,score\nGrace,99\n"),
+    )
     other_authority = resolve_reviewed_source_authority(
         engine=engine,
         session_id=other_session,
@@ -788,7 +1156,7 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "url_field": "url",
                     "content_field": "page_content",
                     "fingerprint_field": "page_fingerprint",
-                    "http": {"abuse_contact": "ops@foundryside.dev", "scraping_reason": "Tutorial demo"},
+                    "http": {"abuse_contact": "ops@example.gov.au", "scraping_reason": "Tutorial demo"},
                 },
             },
             {
@@ -803,7 +1171,8 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ page_content }}",
+                    "prompt_template": "Summarise {{ row.page_content }}",
+                    "required_input_fields": ["page_content"],
                     "interpretation_requirements": [_short_form_shield_review()],
                 },
             },
@@ -979,7 +1348,7 @@ def test_guided_shape_malformed_review_row_is_repairable_not_a_keyerror(tmp_path
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ url }}",
+                    "prompt_template": "Summarise {{ row.url }}",
                     # The live crash shape: no user_term, nothing to synthesize
                     # an id from.
                     "interpretation_requirements": [{"kind": "pipeline_decision", "draft": "Recommend a prompt-injection shield."}],
@@ -1034,14 +1403,15 @@ def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) 
 
     assert candidate.result.success is True
     assert candidate.result.updated_state.validate().is_valid is True
-    assert (candidate.acceptable, len(catalog.validated_states)) == (False, 1)
-    assert catalog.validated_states[0] is candidate.result.updated_state
+    assert (candidate.acceptable, len(catalog.validated_states)) == (False, 2)
+    assert set(catalog.validated_states[0].sources) == {"source"}
+    assert catalog.validated_states[1] is candidate.result.updated_state
     assert candidate.result.validation.errors[0].error_code == "profile_complete_state_rejected"
 
     normalized_again = normalize_tool_result_validation(candidate.result, catalog)
 
     assert normalized_again is candidate.result
-    assert len(catalog.validated_states) == 1
+    assert len(catalog.validated_states) == 2
     assert "_validation_snapshot_hash" not in candidate.result.to_dict()
     assert "_validation_snapshot_hash" not in repr(candidate.result)
 
@@ -1053,14 +1423,16 @@ def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) 
         catalog,
         plugin_snapshot=context.plugin_snapshot,
         data_dir=str(tmp_path),
+        session_id="test-session",
     )
 
     assert public_result.updated_state == candidate.result.updated_state
     assert public_result.validation == candidate.result.validation
     assert public_result.validation.is_valid is False
-    assert len(catalog.validated_states) == 2
+    assert len(catalog.validated_states) == 3
     assert catalog.validated_states[0] is state
-    assert catalog.validated_states[1] is public_result.updated_state
+    assert set(catalog.validated_states[1].sources) == {"source"}
+    assert catalog.validated_states[2] is public_result.updated_state
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=("success", "rejection"))
@@ -1074,6 +1446,7 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
     args["nodes"] = []
     args["edges"] = []
     if rejected:
+        del args["source"]
         args["sources"] = {}
     state = _empty_state()
     context, catalog = _final_validation_rejecting_context(data_dir=tmp_path)
@@ -1085,16 +1458,32 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
         catalog,
         plugin_snapshot=context.plugin_snapshot,
         data_dir=str(tmp_path),
+        session_id="test-session",
     )
 
     assert result.success is not rejected
-    assert len(catalog.validated_states) == 2
+    assert len(catalog.validated_states) == (1 if rejected else 3)
     assert catalog.validated_states[0] is state
-    assert catalog.validated_states[1] is result.updated_state
+    if rejected:
+        # The withheld rejection envelope is never re-derived from the
+        # unchanged state (elspeth-e89e6bf47a), so only the entry-time
+        # current-state validation runs.
+        assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
+    else:
+        assert set(catalog.validated_states[1].sources) == {"source"}
+        assert catalog.validated_states[2] is result.updated_state
 
 
-def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection(tmp_path: Path) -> None:
+def test_normalizer_skips_revalidation_for_a_withheld_rejection_across_snapshots(tmp_path: Path) -> None:
+    """A snapshot change must not reattach the withheld stale-state errors.
+
+    elspeth-e89e6bf47a: the set_pipeline rejection envelope deliberately
+    withholds the unchanged state's validate() entries, so the normalizer
+    honors ``_state_validation_withheld`` instead of re-deriving validation
+    from the untouched ``updated_state`` under the new snapshot.
+    """
     args = _linear_args(tmp_path)
+    del args["source"]
     args["sources"] = {}
     state = _empty_state()
     context, _catalog = _final_validation_rejecting_context(data_dir=tmp_path)
@@ -1113,6 +1502,7 @@ def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection
         selected_profile_aliases=original.selected_profile_aliases,
         control_modes=original.control_modes,
         binding_generation_fingerprint=original.binding_generation_fingerprint,
+        authority=original.authority,
     )
     other_catalog = _FinalValidationRejectingCatalog.for_trained_operator(full, other_snapshot)
     other_catalog.validated_states = []
@@ -1123,8 +1513,9 @@ def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection
     assert revalidated is not candidate.result
     assert revalidated == candidate.result
     assert revalidated.updated_state is candidate.result.updated_state
-    assert other_catalog.validated_states == [candidate.result.updated_state]
+    assert other_catalog.validated_states == []
     assert tuple(entry for entry in revalidated.validation.errors if entry.component == "rejected_mutation") == (rejection,)
+    assert [entry.component for entry in revalidated.validation.errors] == ["rejected_mutation"]
     assert revalidated._validation_snapshot_hash == other_snapshot.snapshot_hash
 
 
@@ -1135,7 +1526,7 @@ def _named_multi_source_queue_args(tmp_path: Path) -> dict[str, Any]:
                 "plugin": "csv",
                 "on_success": "inbound",
                 "options": {
-                    "path": str(tmp_path / "blobs" / "orders.csv"),
+                    "path": str(tmp_path / "blobs" / "test-session" / "orders.csv"),
                     "schema": {"mode": "observed"},
                 },
             },
@@ -1143,7 +1534,7 @@ def _named_multi_source_queue_args(tmp_path: Path) -> dict[str, Any]:
                 "plugin": "csv",
                 "on_success": "inbound",
                 "options": {
-                    "path": str(tmp_path / "blobs" / "refunds.csv"),
+                    "path": str(tmp_path / "blobs" / "test-session" / "refunds.csv"),
                     "schema": {"mode": "observed"},
                 },
             },
@@ -1170,7 +1561,7 @@ def _named_multi_source_queue_args(tmp_path: Path) -> dict[str, Any]:
             {
                 "sink_name": "main",
                 "plugin": "json",
-                "options": _file_options(tmp_path / "outputs" / "queued.jsonl") | {"format": "jsonl"},
+                "options": _file_options(Path("outputs/queued.jsonl")) | {"format": "jsonl"},
                 "on_write_failure": "discard",
             }
         ],
@@ -1183,7 +1574,10 @@ def _fork_coalesce_args(tmp_path: Path) -> dict[str, Any]:
     args["source"]["on_success"] = "rows"
     args["nodes"] = [
         {
-            "id": "fork",
+            # ``fork`` is a reserved edge label; the runtime rejects it as a
+            # gate NAME (``GateSettings.validate_name``) and Stage 1 now
+            # mirrors that (elspeth-2ed41f0a4a).
+            "id": "fork_gate",
             "node_type": "gate",
             "input": "rows",
             "condition": "'all'",
@@ -1217,7 +1611,7 @@ def _fork_coalesce_args(tmp_path: Path) -> dict[str, Any]:
             "merge": "nested",
             "on_success": "main",
             "on_error": "discard",
-            "options": {"schema": {"mode": "observed"}},
+            "options": {},
         },
     ]
     args["edges"] = []
@@ -1241,7 +1635,7 @@ def _gate_args(tmp_path: Path) -> dict[str, Any]:
         {
             "sink_name": name,
             "plugin": "json",
-            "options": _file_options(tmp_path / "outputs" / f"{name}.jsonl") | {"format": "jsonl"},
+            "options": _file_options(Path("outputs") / f"{name}.jsonl") | {"format": "jsonl"},
             "on_write_failure": "discard",
         }
         for name in ("high", "low")
@@ -1270,6 +1664,14 @@ def _aggregation_args(tmp_path: Path) -> dict[str, Any]:
 
 def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
     args = _linear_args(tmp_path)
+    # The llm node's prompt_template reads ``row.text``, so its
+    # required_input_fields names ``text`` and the source must guarantee it.
+    # Same shape as ``_secret_bearing_structured_fork_coalesce_args``.
+    args["source"]["options"]["schema"] = {
+        "mode": "flexible",
+        "fields": ["text: str"],
+        "guaranteed_fields": ["text"],
+    }
     args["nodes"] = [
         {
             "id": "classify",
@@ -1283,7 +1685,8 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                 "deployment_name": "candidate-test",
                 "endpoint": "https://candidate-test.openai.azure.com",
                 "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
-                "prompt_template": "Classify {{ text }}",
+                "prompt_template": "Classify {{ row.text }}",
+                "required_input_fields": ["text"],
                 # Multi-query execution must use the pooled path so capacity
                 # retries are bounded by the configured pool controller.
                 "pool_size": 2,
@@ -1291,7 +1694,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                     {
                         "name": "colour",
                         "input_fields": {"text": "text"},
-                        "template": "Classify {{ text }}",
+                        "template": "Classify {{ row.text }}",
                         "response_format": "structured",
                         "output_fields": [
                             {"suffix": "label", "type": "string"},
@@ -1328,14 +1731,14 @@ def _secret_bearing_structured_fork_coalesce_args(tmp_path: Path) -> dict[str, A
             "deployment_name": "candidate-test",
             "endpoint": "https://candidate-test.openai.azure.com",
             "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
-            "prompt_template": "Classify {{ text }}",
+            "prompt_template": "Classify {{ row.text }}",
             "required_input_fields": ["text"],
             "pool_size": 2,
             "queries": [
                 {
                     "name": "colour",
                     "input_fields": {"text": "text"},
-                    "template": "Classify {{ text }}",
+                    "template": "Classify {{ row.text }}",
                     "response_format": "structured",
                     "output_fields": [
                         {"suffix": "label", "type": "string"},
@@ -1384,13 +1787,13 @@ def _multi_output_args(tmp_path: Path) -> dict[str, Any]:
         {
             "sink_name": "main",
             "plugin": "json",
-            "options": _file_options(tmp_path / "outputs" / "main.jsonl") | {"format": "jsonl"},
+            "options": _file_options(Path("outputs/main.jsonl")) | {"format": "jsonl"},
             "on_write_failure": "discard",
         },
         {
             "sink_name": "quarantine",
             "plugin": "csv",
-            "options": _file_options(tmp_path / "outputs" / "quarantine.csv"),
+            "options": _file_options(Path("outputs/quarantine.csv")),
             "on_write_failure": "discard",
         },
     ]
@@ -1400,36 +1803,58 @@ def _multi_output_args(tmp_path: Path) -> dict[str, Any]:
 
 
 _EXPECTED_STATE_HASHES = {
-    "linear": "7a9e54170c34e1e4672d7b2969860b35fedb35a73fc437d8e25f527712b322b9",
-    "named_multi_source_queue": "bebdc72124a73cd5ebb5ddd1c7660345004c4276b289b4651980131d133ff61b",
-    "fork_coalesce": "b1383d953ab65ab7339daf6223be072c8084ab7d59af4713bc9f8dfc85a52727",
-    "gate": "4c8954595ad404c45adcf43cdaf7ce1a5c6e1154afa7e5f64b21e44d7fc19cb5",
-    "aggregation": "ef2ecf5c7f1d7ff9f00709175102e4777563b43cc3d06edaac29b9d87d06073b",
-    "structured_llm": "3815378a23c396501b91809644b330c423367ea26d20ec63bb0d64caed39a1ee",
-    "multi_output": "50e5c9c2b421bdaa2db73585d569ae9b1f21d2f79c6a8d9adfb184420a8a0065",
+    "linear": "21dbf5afc36a0cc402394e1c59bfbb58304ea5564930998ab8b1b8851b78d1e9",
+    "named_multi_source_queue": "965e2b3991d2347b633baf4e54e71e37995c10bc386356b547b7a207f8b65f9c",
+    # Structural coalesces carry no plugin options; the gate is named
+    # fork_gate because the bare token "fork" is reserved.
+    "fork_coalesce": "21fef020c5ef5d8c9d9b5319446795a57c257ef366d6ddb1c63cfee24d5a4315",
+    "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
+    "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
+    "structured_llm": "c324e56c54db6abba0c1eac06fd720ef3cbbd84502b389c0285b32371ecbf31f",
+    "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
 _EXPECTED_WARNINGS = {
-    "named_multi_source_queue": (
-        {
-            "component": "node:inbound",
-            "message": "Node 'inbound' has no outgoing edges — its output is not connected to any downstream node or sink.",
-            "severity": "medium",
-        },
-    ),
+    # `named_multi_source_queue` deliberately has NO entry. It used to pin a
+    # W3 "node 'inbound' has no outgoing edges" warning against the queue
+    # node — a false positive this file had locked in as expected. `inbound`
+    # is a queue whose id IS its connection name, and `consume_inbound`
+    # reads it (`input: "inbound"`); the composition was always fully wired.
+    # W3 now derives the answer from published_success_connection rather than
+    # testing `on_success is not None` by hand, so the accusation is gone.
+    #
+    # ``_structured_llm_args`` builds ONE llm node and no declared untrusted-
+    # content producer, so a producer-specific draft would be false for this
+    # graph. The advisory is chosen by provenance (interpretation_state.py
+    # ``_llm_untrusted_content_producers``), so the local-content sibling
+    # is the correct one here. Referenced, never re-typed: this table inlining
+    # the prose is what let it drift silently past the constant it mirrors.
     "structured_llm": (
         {
             "component": "node:classify",
             "message": (
-                "LLM node 'classify' has no authorized prompt-injection shield in front of it. Recommend inserting "
-                "azure_prompt_shield (or the deployment equivalent prompt-injection shield) between the external-content "
-                "fetch step and this LLM. The current draft routes internet-controlled text directly into the LLM without "
-                "that shield, which is a prompt-injection exposure on untrusted remote content, but continuing without it "
-                "is allowed. [user_term: prompt_injection_shield_recommendation]"
+                "LLM node 'classify' has no authorized prompt-injection shield in front of it. " + PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT
             ),
             "severity": "medium",
         },
     ),
+}
+
+# S1 (elspeth-0aace271b4 I5): on_error="discard" no longer counts as error
+# routing, so every discard-only fixture (which is what set_pipeline's
+# default-fill produces) now carries the advisory retention nudge. Cases with
+# a gate (`fork_coalesce`, `gate`) stay quiet via the has_gate arm.
+_S1_RETENTION_SUGGESTION = {
+    "component": "pipeline",
+    "message": "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+    "severity": "low",
+}
+_EXPECTED_SUGGESTIONS = {
+    "linear": (_S1_RETENTION_SUGGESTION,),
+    "named_multi_source_queue": (_S1_RETENTION_SUGGESTION,),
+    "aggregation": (_S1_RETENTION_SUGGESTION,),
+    "structured_llm": (_S1_RETENTION_SUGGESTION,),
+    "multi_output": (_S1_RETENTION_SUGGESTION,),
 }
 
 
@@ -1485,7 +1910,7 @@ def test_current_executor_normalizes_supported_pipeline_shapes(
     assert result.validation.is_valid is True
     assert result.validation.errors == ()
     assert tuple(item.to_dict() for item in result.validation.warnings) == _EXPECTED_WARNINGS.get(case, ())
-    assert result.validation.suggestions == ()
+    assert tuple(item.to_dict() for item in result.validation.suggestions) == _EXPECTED_SUGGESTIONS.get(case, ())
     assert result.validation.semantic_contracts == ()
     assert result.to_dict()["validation"]["is_valid"] is True
     assert result.to_dict()["validation"]["graph_repair_suggestions"] == []
@@ -1565,7 +1990,8 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
     credential_error = (
         "Credential field(s) contain literal value(s): classify:api_key. Literal credential values were not stored. "
         "Set `<field>: {secret_ref: NAME}` directly in the node's options when calling set_pipeline / upsert_node. "
-        "(The marker is stripped before option validation and resolved at execution time.) This rejection left pipeline "
+        "(The marker is handled without resolving its value during option validation and resolved at execution time.) "
+        "This rejection left pipeline "
         "state unchanged: repair by re-issuing only the rejected call with the marker substituted for the literal value "
         "— do not rebuild the pipeline from scratch. For a component already in state, patching just that component "
         "(patch_source_options / patch_node_options / patch_output_options) with the marker is the minimal correction. "
@@ -1610,7 +2036,7 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             escaping_path,
             _trained_context(data_dir=tmp_path),
             "Output 'main': Path violation (S2): 'path' value '/etc/candidate-escape.json' is outside the allowed "
-            f"directories. Sink output paths must be under {tmp_path / 'outputs'}/ or this session's own "
+            f"directories. Sink output paths must be under this session's {tmp_path / 'outputs'}/<session>/ or "
             f"{tmp_path / 'blobs'}/<session>/ subtree.",
             None,
         ),
@@ -1625,7 +2051,7 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "manual_blob_ref",
             manual_blob_ref,
             _trained_context(data_dir=tmp_path),
-            "Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
+            "Source 'source': Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
             "must not be called with 'blob_ref' in source.options because it cannot enforce that 'path' equals the "
             "blob's canonical storage_path.",
             None,
@@ -1642,9 +2068,11 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             stale_review,
             _trained_context(data_dir=tmp_path),
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
-            "'resolved'. Composer tool input may stage pending review requirements only; resolved review metadata may "
-            "only be written by resolve_interpretation_event.",
-            None,
+            "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
+            "and retry set_pipeline with exactly kind, user_term, and draft. Then call request_interpretation_review "
+            "for an authorable staged site; backend-owned review kinds are surfaced automatically. The user resolves "
+            "the card and ELSPETH writes resolved review metadata.",
+            "interpretation_requirements_invalid",
         ),
     ]
 
@@ -1733,14 +2161,14 @@ def test_current_executor_reopens_stale_authoritative_review(tmp_path: Path) -> 
         nodes=(replace(original_node, options={**original_options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),),
     )
     changed_args = _structured_llm_args(tmp_path)
-    changed_args["nodes"][0]["options"]["prompt_template"] = "Reclassify {{ text }}"
+    changed_args["nodes"][0]["options"]["prompt_template"] = "Reclassify {{ row.text }}"
 
     result = _execute_set_pipeline(changed_args, previous, _trained_context(data_dir=tmp_path))
 
     assert result.success and result.validation.is_valid
     reconciled = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
     current = next(item for item in reconciled if item["kind"] == "llm_prompt_template")
-    assert current["draft"] == "Reclassify {{ text }}"
+    assert current["draft"] == "Reclassify {{ row.text }}"
     assert current["status"] == "pending"
     assert current["event_id"] is None
     assert current["accepted_value"] is None
@@ -1778,21 +2206,17 @@ def test_structured_llm_probe_failure_abstains_and_blocks_downstream_field_mappe
     original_manager = get_shared_plugin_manager()
     secret_canary = "RAW-PROBE-ERROR-SECRET-CANARY"
 
-    class _FailingLlmProbeManager:
-        def __getattr__(self, name: str):
-            return getattr(original_manager, name)
+    class _FailingLlmProbeManager(DelegatingPluginManagerDouble):
+        """Breaks exactly the ``llm`` transform probe; every other call is real."""
 
-        def get_transforms(self):
-            return original_manager.get_transforms()
-
-        def create_transform(self, plugin_name: str, options: dict[str, Any]):
-            if plugin_name == "llm":
+        def create_transform(self, transform_type: str, config: dict[str, Any]) -> Any:
+            if transform_type == "llm":
                 raise TemplateError(secret_canary)
-            return original_manager.create_transform(plugin_name, options)
+            return super().create_transform(transform_type, config)
 
     monkeypatch.setattr(
         "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
-        lambda: _FailingLlmProbeManager(),
+        lambda: _FailingLlmProbeManager(original_manager),
     )
 
     result = _execute_set_pipeline(args, _empty_state(), context)
@@ -1852,6 +2276,137 @@ def _session_with_user_message() -> tuple[Any, str, str]:
             )
         )
     return engine, session_id, message_id
+
+
+def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Path) -> None:
+    engine, session_id, message_id = _session_with_user_message()
+    content = "name,score\nada,42\n"
+    args = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "kind": "vague_term",
+                        "user_term": "inline_source_data",
+                        "draft": "sk-sensitive-inline-review",
+                    }
+                ],
+            },
+            "inline_blob": {
+                "filename": "ada.csv",
+                "mime_type": "text/csv",
+                "content": content,
+            },
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    state = _empty_state()
+    context = _trained_context(
+        data_dir=tmp_path,
+        session_engine=engine,
+        session_id=session_id,
+        user_message_id=message_id,
+        user_message_content="Generate a CSV source.",
+        composer_model_identifier="test-model",
+        composer_model_version="test-model-v1",
+        composer_provider="test-provider",
+        composer_skill_hash="a" * 64,
+        tool_arguments_hash="b" * 64,
+    )
+
+    result = _execute_set_pipeline(args, state, context)
+
+    with engine.begin() as conn:
+        blob_rows = conn.execute(select(func.count()).select_from(blobs_table)).scalar_one()
+    blob_files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data["error_code"] == "interpretation_requirements_invalid"
+    assert "sk-sensitive-inline-review" not in result.data["error"]
+    assert blob_rows == 0
+    assert blob_files == ()
+
+
+def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_id(tmp_path: Path) -> None:
+    engine, session_id, message_id = _session_with_user_message()
+    content = "name,score\nada,42\n"
+    trusted_id = "trusted-inline-source-id"
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "path": "/tmp/existing.csv",
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "id": trusted_id,
+                        "kind": "invented_source",
+                        "user_term": "inline_source_data",
+                        "draft": content,
+                        "status": "pending",
+                        "event_id": None,
+                        "accepted_value": None,
+                        "accepted_artifact_hash": None,
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    args = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {"mode": "observed"},
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "kind": "invented_source",
+                        "user_term": "inline_source_data",
+                        "draft": content,
+                    }
+                ],
+            },
+            "inline_blob": {
+                "filename": "ada.csv",
+                "mime_type": "text/csv",
+                "content": content,
+            },
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    context = _trained_context(
+        data_dir=tmp_path,
+        session_engine=engine,
+        session_id=session_id,
+        user_message_id=message_id,
+        user_message_content="Generate a CSV source.",
+        composer_model_identifier="test-model",
+        composer_model_version="test-model-v1",
+        composer_provider="test-provider",
+        composer_skill_hash="a" * 64,
+        tool_arguments_hash="b" * 64,
+    )
+
+    result = _execute_set_pipeline(args, state, context)
+
+    assert result.success, result.to_dict()
+    requirements = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert requirements[0]["id"] == trusted_id
 
 
 @pytest.mark.asyncio
@@ -1972,12 +2527,18 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         "mime_type": "text/csv",
         "size_bytes": len(content.encode("utf-8")),
         "content_hash": content_hash(content.encode("utf-8")),
+        # Self-authorship marker (elspeth-47eba5cced): the blob's bytes came
+        # from this call's own inline_blob argument.
+        "originated_in": "this_tool_call",
     }
     assert deep_thaw(result.data) == {"inline_blob": expected_inline_payload}
     assert result.updated_state.to_dict()["sources"]["source"] == {
         "plugin": "csv",
         "on_success": "rows",
         "options": {
+            # VERBATIM inline content (echoed in the user message) never
+            # auto-declares guaranteed_fields — the stamp is scoped to
+            # LLM-authored blobs (John's ruling 2026-08-27, elspeth-da68332faf).
             "schema": {"mode": "observed"},
             "path": rows[0]["storage_path"],
             "blob_ref": rows[0]["id"],
@@ -2016,6 +2577,7 @@ def _operator_profile_view(tmp_path: Path) -> ToolContext:
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="sonnet",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -2046,7 +2608,7 @@ def _operator_profile_view(tmp_path: Path) -> ToolContext:
         generation_key=b"profile-test-key",
     )
     view = PolicyCatalogView(create_catalog_service(), snapshot, profiles)
-    return ToolContext(catalog=view, plugin_snapshot=snapshot, data_dir=str(tmp_path))
+    return ToolContext(catalog=view, plugin_snapshot=snapshot, data_dir=str(tmp_path), session_id="test-session")
 
 
 def _ab_multi_query_args(tmp_path: Path) -> dict[str, Any]:
@@ -2056,7 +2618,7 @@ def _ab_multi_query_args(tmp_path: Path) -> dict[str, Any]:
             "plugin": "csv",
             "on_success": "rows",
             "options": {
-                "path": str(tmp_path / "blobs" / "colours.csv"),
+                "path": str(tmp_path / "blobs" / "test-session" / "colours.csv"),
                 "schema": {"mode": "flexible", "fields": ["color_name: str", "hex: str"]},
             },
             "on_validation_failure": "discard",
@@ -2095,7 +2657,7 @@ def _ab_multi_query_args(tmp_path: Path) -> dict[str, Any]:
                 "sink_name": "assessed",
                 "plugin": "json",
                 "options": {
-                    "path": str(tmp_path / "outputs" / "colour_ab.json"),
+                    "path": "outputs/colour_ab.json",
                     "schema": {"mode": "observed"},
                     "format": "json",
                     "mode": "write",
@@ -2158,6 +2720,21 @@ def test_parent_traversal_sink_path_still_rejected(tmp_path: Path) -> None:
 
     assert candidate.acceptable is False
     assert ".." in ((candidate.result.data or {}).get("error") or "")
+
+
+@pytest.mark.parametrize("path", [".", "./"])
+def test_current_directory_sink_path_returns_validation_failure(tmp_path: Path, path: str) -> None:
+    args = _ab_multi_query_args(tmp_path)
+    args["outputs"][0]["options"]["path"] = path
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    context = _operator_profile_view(tmp_path)
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+    assert candidate.acceptable is False
+    assert candidate.result.success is False
+    assert (candidate.result.data or {}).get("error_code") == "plugin_options_invalid"
+    assert "current directory" in ((candidate.result.data or {}).get("error") or "")
 
 
 def _scrape_cleanup_args(tmp_path: Path) -> dict[str, Any]:
@@ -2317,8 +2894,8 @@ def test_unknown_llm_provider_is_a_coded_rejection_not_an_escape(tmp_path: Path)
     # raised (e.g. unknown LLM provider) — surface it"). Tier-3 input must
     # never escape the candidate boundary: planner path degraded it to the
     # unrepairable CANDIDATE_CONSTRUCTION_ERROR; non-planner tool paths 500'd.
-    (tmp_path / "blobs").mkdir(exist_ok=True)
-    csv_path = tmp_path / "blobs" / "in.csv"
+    csv_path = tmp_path / "blobs" / "test-session" / "in.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text("a\n1\n")
     args = _linear_args(tmp_path)
     args["source"]["options"]["path"] = str(csv_path)
@@ -2358,8 +2935,8 @@ def test_private_profile_option_rejection_names_the_real_cause(tmp_path: Path) -
     # included an option the operator layer owns. The finding must say so,
     # or no planner can repair it.
     context = _operator_profile_view(tmp_path)
-    (tmp_path / "blobs").mkdir(exist_ok=True)
-    csv_path = tmp_path / "blobs" / "in.csv"
+    csv_path = tmp_path / "blobs" / "test-session" / "in.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text("a\n1\n")
     args = _linear_args(tmp_path)
     args["source"]["options"]["path"] = str(csv_path)
@@ -2402,8 +2979,8 @@ def test_query_template_interpretation_token_is_rejected_at_the_compose_gate(tmp
     # operator review resolution (the resolver rewrites only the node-level
     # template; no delivery mechanism exists for per-query slots).
     context = _operator_profile_view(tmp_path)
-    (tmp_path / "blobs").mkdir(exist_ok=True)
-    csv_path = tmp_path / "blobs" / "in.csv"
+    csv_path = tmp_path / "blobs" / "test-session" / "in.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_text("a\n1\n")
     args = _linear_args(tmp_path)
     args["source"]["options"]["path"] = str(csv_path)
@@ -2440,3 +3017,334 @@ def test_query_template_interpretation_token_is_rejected_at_the_compose_gate(tmp
     assert lead.component == "rejected_mutation"
     assert lead.error_code == "plugin_options_invalid"
     assert "interpretation" in lead.message
+
+
+def _live_blob_hash(engine: Any, blob_id: str) -> str:
+    with engine.begin() as conn:
+        stored = conn.execute(select(blobs_table.c.content_hash).where(blobs_table.c.id == blob_id)).scalar_one()
+    assert isinstance(stored, str)
+    return stored
+
+
+def _content_bound_reviewed_facts(engine: Any, blob_id: str) -> dict[str, Any]:
+    """Reviewed facts whose content identity anchors match the live blob."""
+    live_hash = _live_blob_hash(engine, blob_id)
+    facts = _reviewed_source_facts(blob_id=blob_id)
+    reviewed = next(iter(facts["reviewed_sources"].values()))
+    reviewed["content_hash_prefix"] = live_hash[:8]
+    reviewed["options"][SOURCE_AUTHORING_KEY]["content_hash"] = live_hash
+    return facts
+
+
+def _mutate_blob_content_in_place(engine: Any, blob_record: Any, new_content: bytes) -> None:
+    """Model update_blob's effect: same id/path, new bytes and content_hash."""
+    Path(blob_record.storage_path).write_bytes(new_content)
+    with engine.begin() as conn:
+        conn.execute(
+            update(blobs_table)
+            .where(blobs_table.c.id == str(blob_record.id))
+            .values(content_hash=content_hash(new_content), size_bytes=len(new_content))
+        )
+
+
+def test_reviewed_source_authority_accepts_unchanged_reviewed_content(tmp_path: Path) -> None:
+    """Control: content identity anchors matching the live blob resolve."""
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    blob = blobs[0]
+    facts = _content_bound_reviewed_facts(engine, str(blob.id))
+
+    authority = resolve_reviewed_source_authority(
+        engine=engine,
+        session_id=session_id,
+        user_id="review-owner",
+        reviewed_facts=facts,
+        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+    )
+
+    assert authority is not None
+    assert authority.verified_blob_paths == {f"blob:{blob.id}": blob.storage_path}
+
+
+def test_reviewed_source_authority_rejects_content_changed_after_review(tmp_path: Path) -> None:
+    """review -> update_blob -> settle must fail: authority binds content identity.
+
+    The blob keeps its id, path, session, and ready status after an in-place
+    update — every pre-fix custody check still passes — but the reviewed
+    ``content_hash_prefix`` no longer matches the live row, so stale reviewed
+    facts must not auto-authorize the new bytes (elspeth-b3feba9a7c).
+    """
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    blob = blobs[0]
+    facts = _content_bound_reviewed_facts(engine, str(blob.id))
+    anchor = reviewed_anchor_hash(facts)
+
+    _mutate_blob_content_in_place(engine, blob, b"name,score\nMallory,0\n")
+
+    with pytest.raises(AuditIntegrityError, match="re-review"):
+        resolve_reviewed_source_authority(
+            engine=engine,
+            session_id=session_id,
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=anchor,
+        )
+
+
+def test_reviewed_source_authority_rejects_stale_authoring_content_hash(tmp_path: Path) -> None:
+    """The source_authoring full-hash pin must also match the live blob row."""
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    blob = blobs[0]
+    facts = _content_bound_reviewed_facts(engine, str(blob.id))
+    reviewed = next(iter(facts["reviewed_sources"].values()))
+    # Keep the prefix consistent with the (stale) authoring pin so THIS test
+    # isolates the full-hash check rather than the prefix check.
+    stale_hash = "b" * 64
+    reviewed["options"][SOURCE_AUTHORING_KEY]["content_hash"] = stale_hash
+    reviewed["content_hash_prefix"] = stale_hash[:8]
+    anchor = reviewed_anchor_hash(facts)
+
+    with pytest.raises(AuditIntegrityError, match="re-review"):
+        resolve_reviewed_source_authority(
+            engine=engine,
+            session_id=session_id,
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=anchor,
+        )
+
+
+def _multi_defect_args(tmp_path: Path) -> dict[str, Any]:
+    """A candidate whose source, transform node, and sink are each misconfigured.
+
+    Three independent option-shape defects — the shape that used to cost three
+    repair turns because validation returned at the first one
+    (elspeth-4fad98a453).
+    """
+    args = _linear_args(tmp_path)
+    args["source"]["options"]["bogus_source_option"] = True
+    args["nodes"][0]["options"]["bogus_node_option"] = True
+    args["outputs"][0]["options"]["bogus_sink_option"] = True
+    return args
+
+
+def test_every_defective_component_is_reported_in_one_rejection(tmp_path: Path) -> None:
+    candidate = build_set_pipeline_candidate(
+        _multi_defect_args(tmp_path),
+        _empty_state(),
+        _trained_context(data_dir=tmp_path),
+    )
+
+    assert candidate.acceptable is False
+    messages = [entry.message for entry in candidate.result.validation.errors]
+    assert len(messages) == 3, messages
+    assert any(message.startswith("Source 'source':") or "Invalid options for source" in message for message in messages)
+    assert any(message.startswith("Node 'copy':") for message in messages)
+    assert any(message.startswith("Output 'main':") for message in messages)
+    assert all(entry.error_code == "plugin_options_invalid" for entry in candidate.result.validation.errors)
+
+
+def test_multi_component_rejection_keeps_the_first_failure_first(tmp_path: Path) -> None:
+    """Ordering is stable: the component that failed first still leads."""
+    candidate = build_set_pipeline_candidate(
+        _multi_defect_args(tmp_path),
+        _empty_state(),
+        _trained_context(data_dir=tmp_path),
+    )
+
+    messages = [entry.message for entry in candidate.result.validation.errors]
+    assert "bogus_source_option" in messages[0] or "Invalid options for source" in messages[0]
+    assert messages[1].startswith("Node 'copy':")
+    assert messages[2].startswith("Output 'main':")
+    # The leading rejection's own envelope is untouched, so a single-defect
+    # candidate and a multi-defect candidate agree on the `error` payload.
+    assert candidate.result.data["error"] == messages[0]
+
+
+def test_one_defective_component_is_reported_exactly_once(tmp_path: Path) -> None:
+    """Component granularity: a failed component runs none of its later checks."""
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"]["bogus_node_option"] = True
+    args["nodes"][0]["options"]["provider_config"] = {"persist_directory": "/etc"}
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    entries = candidate.result.validation.errors
+    assert len(entries) == 1, [entry.message for entry in entries]
+    assert entries[0].message.startswith("Node 'copy':")
+    # Exactly one rejection means the envelope is byte-identical to the
+    # pre-collection single-rejection shape: no withheld counter rides along.
+    assert "components_withheld" not in candidate.result.data
+
+
+def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path: Path) -> None:
+    # Only the ELEVEN outputs are defective: the source and the transform are
+    # left valid (the node is repointed at a sink that exists). Nodes are
+    # validated before outputs, so a node defect would lead the entry list and
+    # the per-index assertion below would fail — the eight entries being
+    # outputs 1..8 is by construction, not by ordering luck.
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["on_success"] = "main1"
+    args["outputs"] = [
+        {
+            "sink_name": f"main{index}",
+            "plugin": "json",
+            "options": _file_options(Path(f"outputs/result{index}.jsonl")) | {"format": "jsonl", "bogus_sink_option": True},
+            "on_write_failure": "discard",
+        }
+        for index in range(1, 12)
+    ]
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    entries = candidate.result.validation.errors
+    assert len(entries) == 8
+    assert [entry.message.split(":", 1)[0] for entry in entries] == [f"Output 'main{index}'" for index in range(1, 9)]
+    # Truncation is reported, never silent: eleven components failed, eight
+    # are listed, and the remaining three are counted.
+    assert candidate.result.data["components_withheld"] == 3
+
+
+# The validation-component ref each semantic-failure case's rejection is
+# about, keyed by case name. Every case's message may or may not carry a
+# ``Node 'x': `` prefix — ``manual_blob_ref`` and ``credential_policy`` do
+# not — and the subject must arrive structurally either way.
+_REJECTED_COMPONENT_BY_CASE: dict[str, str] = {
+    "unknown_plugin": "node:copy",
+    "blocked_plugin": "node:copy",
+    "profile_validation": "node:copy",
+    "invalid_options": "node:copy",
+    "escaping_path": "output:main",
+    "invalid_gate": "node:threshold",
+    "manual_blob_ref": "source",
+    "credential_policy": "node:classify",
+    "resolver_owned_interpretation_review": "node:classify",
+}
+
+
+@pytest.mark.parametrize("case_index", range(9))
+def test_component_rejection_carries_its_subject_structurally(tmp_path: Path, case_index: int) -> None:
+    """A ``rejected_mutation`` entry names WHICH component was rejected in ``rejected_component``.
+
+    ``component`` stays the literal ``rejected_mutation`` discriminator; the
+    subject used to live only in the message prefix, which the planner parsed
+    back with a regex and the model had to match by prose on a
+    multi-component rejection (elspeth-e405ad7cd2, F10). The set_pipeline
+    component loop stamps it from its loop variable, so it is present whether
+    or not the producer prefixed the message — two of these cases do not.
+    """
+    case, args, context, _expected_error, _expected_error_code = _semantic_failure_cases(tmp_path)[case_index]
+
+    result = _execute_set_pipeline(args, _empty_state(), context)
+
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component == _REJECTED_COMPONENT_BY_CASE[case], (case, entry)
+    wire = result.to_dict()["validation"]["errors"][0]
+    assert wire["rejected_component"] == _REJECTED_COMPONENT_BY_CASE[case]
+
+
+def test_two_component_rejection_names_each_subject_structurally(tmp_path: Path) -> None:
+    """One merged rejection envelope, one ``rejected_component`` per defective component.
+
+    Wire sample 12 on elspeth-e405ad7cd2: both entries carried
+    ``component: "rejected_mutation"`` and only the message text (one
+    prefixed, one not) said which component each was about, while
+    ``data.error`` carried only the first. The model repairs by
+    ``rejected_component`` now, never by prose.
+    """
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"] = {}
+    args["outputs"][0]["options"]["path"] = "/etc/candidate-escape.json"
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    rejections = [entry for entry in result.validation.errors if entry.component == "rejected_mutation"]
+    assert [entry.rejected_component for entry in rejections] == ["node:copy", "output:main"]
+    wire = [entry for entry in result.to_dict()["validation"]["errors"] if entry["component"] == "rejected_mutation"]
+    assert [entry["rejected_component"] for entry in wire] == ["node:copy", "output:main"]
+
+
+def test_rejection_outside_a_component_loop_is_not_stamped(tmp_path: Path) -> None:
+    """A rejection with no component subject carries no ``rejected_component``.
+
+    Fail-closed contract: consumers treat absence as "unattributable" rather
+    than parsing the message, so the stamp must never be invented for a
+    whole-candidate rejection.
+    """
+    args = _linear_args(tmp_path)
+    args["sources"] = {}
+    args.pop("source", None)
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component is None
+    assert "rejected_component" not in result.to_dict()["validation"]["errors"][0]
+
+
+def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
+    """Every rejection-constructor call in ``build_set_pipeline_candidate``.
+
+    Returns ``(callee, call, inside_component_body)`` where the third value is
+    True when the call sits lexically inside a ``for`` loop body or inside the
+    ``_legacy_source_rejection`` helper — the two places a rejection is about
+    ONE component.
+    """
+    tree = ast.parse(Path(sessions_tools.__file__).read_text(encoding="utf-8"))
+    builder = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "build_set_pipeline_candidate")
+    calls: list[tuple[str, ast.Call, bool]] = []
+
+    def visit(node: ast.AST, in_component: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_in_component = in_component
+            if isinstance(child, (ast.For, ast.AsyncFor)):
+                child_in_component = True
+            if isinstance(child, ast.FunctionDef) and child.name == "_legacy_source_rejection":
+                child_in_component = True
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in {"_failure_result", "_plugin_policy_failure"}
+            ):
+                calls.append((child.func.id, child, in_component))
+            visit(child, child_in_component)
+
+    visit(builder, False)
+    return calls
+
+
+def test_every_component_rejection_names_its_subject_and_no_other_rejection_does() -> None:
+    """The structural tripwire behind ``rejected_component`` (elspeth-e405ad7cd2, F10 round 2).
+
+    The subject is carried EXPLICITLY at every rejection constructor call —
+    the keyword is required, so mypy refuses a call that omits it — but a
+    required keyword can be satisfied with ``None``. This pins the rule the
+    keyword exists for: a rejection built inside a per-component loop body
+    (or the legacy single-source helper) names its subject with a non-None
+    expression, and a rejection built anywhere else says ``None`` out loud.
+    The closure this replaced left a fifth per-node loop unattributed and
+    stamped a stale subject when a reset was dropped; neither can recur
+    without this test naming the exact call.
+    """
+    calls = _builder_rejection_calls()
+    assert len(calls) >= 40, f"expected the builder's rejection sites, found {len(calls)}"
+    # The one rejection inside a component body with nothing to name: a blank
+    # ``sources`` key. Its subject IS the missing name, so ``None`` is the
+    # honest value; listed by message so a second such site cannot hide here.
+    subjectless_in_body = {"set_pipeline sources keys must be non-empty source names."}
+    wrong: list[str] = []
+    for callee, call, in_component in calls:
+        keyword = next((kw for kw in call.keywords if kw.arg == "rejected_component"), None)
+        assert keyword is not None, f"{callee} at line {call.lineno} passes no rejected_component="
+        says_none = isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+        message = call.args[1] if len(call.args) > 1 else None
+        if in_component and says_none and isinstance(message, ast.Constant) and message.value in subjectless_in_body:
+            continue
+        if in_component and says_none:
+            wrong.append(f"line {call.lineno}: {callee} inside a component body says rejected_component=None")
+        if not in_component and not says_none:
+            wrong.append(f"line {call.lineno}: {callee} outside any component body names a subject")
+    assert not wrong, "\n".join(wrong)

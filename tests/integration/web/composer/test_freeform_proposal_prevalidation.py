@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.blobs.protocol import BlobPendingProposalError
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -24,10 +25,11 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
@@ -38,6 +40,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -47,6 +50,8 @@ from tests.unit.web.composer.conftest import (
     _make_settings,
     build_test_sessions_service,
 )
+
+_PROPOSAL_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +73,12 @@ class _ScriptedLLM:
         if not self._responses:
             return _fake_llm_response(content="Done.")
         return self._responses.pop(0)
+
+
+async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+    """Keep proposal-prevalidation tests independent of the real advisor."""
+
+    return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
 
 class _FinalRejectingCatalog(PolicyCatalogView):
@@ -103,13 +114,16 @@ class _PreproposalBaseSignal(BaseException):
     """Test-only shutdown-style signal outside the ``Exception`` hierarchy."""
 
 
-def _incremental_base_state() -> CompositionState:
+def _incremental_base_state(tmp_path: Path) -> CompositionState:
     """Non-empty base keeps these legacy incremental-prevalidation tests scoped."""
     return CompositionState(
         source=SourceSpec(
             plugin="csv",
             on_success="existing_rows",
-            options={"path": "/tmp/existing.csv", "schema": {"mode": "observed"}},
+            options={
+                "path": str(tmp_path / "blobs" / _PROPOSAL_SESSION_ID / "existing.csv"),
+                "schema": {"mode": "observed"},
+            },
             on_validation_failure="discard",
         ),
         nodes=(),
@@ -128,7 +142,7 @@ def _harness(tmp_path: Path) -> _Harness:
     )
     initialize_session_schema(engine)
     sessions = build_test_sessions_service(engine=engine, data_dir=tmp_path)
-    session_id = str(uuid4())
+    session_id = _PROPOSAL_SESSION_ID
     user_message_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
@@ -171,6 +185,7 @@ def _harness(tmp_path: Path) -> _Harness:
             sessions_service=sessions,
             session_engine=engine,
         )
+    service._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
     return _Harness(
         engine=engine,
         sessions=sessions,
@@ -181,7 +196,7 @@ def _harness(tmp_path: Path) -> _Harness:
 
 
 def _valid_pipeline_args(tmp_path: Path, *, metadata_name: str = "proposal-valid") -> dict[str, Any]:
-    source_path = tmp_path / "blobs" / "input.csv"
+    source_path = tmp_path / "blobs" / _PROPOSAL_SESSION_ID / "input.csv"
     source_path.parent.mkdir(parents=True, exist_ok=True)
     source_path.write_text("value\n1\n", encoding="utf-8")
     return {
@@ -198,7 +213,7 @@ def _valid_pipeline_args(tmp_path: Path, *, metadata_name: str = "proposal-valid
                 "sink_name": "main",
                 "plugin": "json",
                 "options": {
-                    "path": str(tmp_path / "outputs" / "result.jsonl"),
+                    "path": str(tmp_path / "outputs" / _PROPOSAL_SESSION_ID / "result.jsonl"),
                     "schema": {"mode": "observed"},
                     "format": "jsonl",
                     "mode": "write",
@@ -260,7 +275,7 @@ def _persisted_tool_content(harness: _Harness, tool_call_id: str) -> str:
 @pytest.mark.asyncio
 async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_one_proposal(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     invalid = _valid_pipeline_args(tmp_path, metadata_name="invalid-plugin")
     invalid["source"]["plugin"] = "not_installed"
     repaired = _valid_pipeline_args(tmp_path, metadata_name="repaired")
@@ -298,19 +313,21 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
     invalid_payload = json.loads(invalid_feedback["content"])
     assert invalid_payload["success"] is False
     assert invalid_payload["version"] == state.version
+    # The rejected candidate's OWN data keys are SPREAD into the feedback
+    # payload, never nested. ToolResult.__post_init__ runs
+    # freeze_fields(self, "data"), so `.data` is a mappingproxy by the time
+    # run_tool_batch reads it — and both `type(x) is dict` and
+    # `isinstance(x, dict)` are False for one. An exact-dict guard there
+    # silently sends every rejection down the wrap arm, which is invisible
+    # to a status-only assertion. Pins that regression.
+    assert invalid_payload["data"]["error_code"] == "plugin_not_installed"
+    assert "candidate_data" not in invalid_payload["data"]
     assert invalid_payload["data"]["status"] == "PREVALIDATION_REJECTED"
     assert invalid_payload["data"]["applied"] is False
     assert invalid_payload["validation"]["errors"][0]["component"] == "rejected_mutation"
     assert "not_installed" in invalid_feedback["content"]
-    with harness.engine.connect() as conn:
-        persisted_tool_content = tuple(
-            conn.execute(
-                select(chat_messages_table.c.content)
-                .where(chat_messages_table.c.session_id == harness.session_id)
-                .where(chat_messages_table.c.role == "tool")
-            ).scalars()
-        )
-    assert any("not_installed" in content for content in persisted_tool_content)
+    persisted_invalid_feedback = _persisted_tool_content(harness, "call_invalid")
+    assert "not_installed" not in persisted_invalid_feedback
 
     assert len(result.tool_invocations) == 2
     assert result.tool_invocations[0].version_after == state.version
@@ -320,7 +337,7 @@ async def test_semantic_rejection_reaches_next_model_turn_then_repair_creates_on
 @pytest.mark.asyncio
 async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     invalid = _valid_pipeline_args(tmp_path, metadata_name="final-profile-reject")
     repaired = _valid_pipeline_args(tmp_path, metadata_name="profile-repaired")
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.service._catalog)
@@ -381,15 +398,34 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
     assert invalid_payload["data"] == {
         "status": "PREVALIDATION_REJECTED",
         "applied": False,
-        "applied_version": state.version,
         "candidate_version": state.version + 1,
         "message": (
             "The candidate pipeline failed prevalidation, was not applied, and was not submitted for approval. "
             "Repair the reported validation errors and retry."
         ),
     }
-    assert invalid_payload["version"] == state.version + 1
+    # The envelope's version is the UNAPPLIED state, so it agrees with the audit
+    # rather than contradicting it, and there is no `applied_version` twin under
+    # `data` (SYS-R3-3). `candidate_version` is the one fact the envelope lacks.
+    assert invalid_payload["version"] == state.version
     assert tuple(invocation.version_after for invocation in result.tool_invocations) == (state.version, state.version)
+    assert invalid_payload["data"]["candidate_version"] == invalid_payload["version"] + 1
+    # Nothing was applied, so no field may describe a change. Both of these came
+    # from the DISCARDED candidate while ``version`` named the unchanged state:
+    # ``affected_nodes`` listed the components the candidate would have touched,
+    # and the delta against the candidate's prior validation reported
+    # ``resolved_errors`` naming errors the unapplied state still has — the
+    # field the skill tells the model to act on instead of re-reading state
+    # (LLM seat LLM-R3B-1). This is now the APPROVAL_REQUIRED envelope's shape.
+    assert invalid_payload["affected_nodes"] == []
+    assert "validation_delta" not in invalid_payload
+    assert set(invalid_payload) == {"success", "validation", "affected_nodes", "version", "data"}
+    # ``validation`` deliberately stays the candidate's: it is the rejection the
+    # model repairs from, and the skill now says whose it is. The unapplied
+    # state has two errors of its OWN, which is what the departed delta used to
+    # report as ``resolved_errors``.
+    assert [error["error_code"] for error in invalid_payload["validation"]["errors"]] == ["profile_complete_state_rejected"]
+    assert {entry.error_code for entry in state.validate().errors} == {"no_sinks_configured", "source_on_success_dangling"}
     files_after = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()))
     assert files_after == files_before
 
@@ -400,7 +436,8 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     harness = _harness(tmp_path)
-    existing_path = tmp_path / "existing.csv"
+    existing_path = tmp_path / "blobs" / _PROPOSAL_SESSION_ID / "existing.csv"
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
     existing_path.write_text("value\n1\n", encoding="utf-8")
     state = CompositionState(
         source=SourceSpec(
@@ -423,21 +460,47 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
         _fake_llm_response(content="The inline pipeline proposal is pending approval."),
     )
 
-    with (
-        patch.object(harness.service, "_call_llm", new=llm),
-        patch(
-            "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
-            wraps=real_build_set_pipeline_candidate,
-        ) as builder,
-    ):
-        result = await harness.service.compose(
-            "Build a reviewed pipeline with generated CSV content.",
-            [],
-            state,
-            session_id=harness.session_id,
-            user_id="proposal-prevalidation-user",
-            user_message_id=harness.user_message_id,
+    seeded_at = datetime.now(UTC)
+    with harness.engine.begin() as conn:
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=harness.session_id,
+                operation_id=str(uuid4()),
+                lease_token=f"seed-{uuid4()}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id="proposal-prevalidation-seed",
+                operation_epoch=1,
+                lease_expires_at=seeded_at,
+                released_at=seeded_at,
+            )
         )
+
+    compose_lease = await SessionOperationLease.acquire(
+        harness.sessions.session_operation_authority,
+        session_id=UUID(harness.session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+        lease_seconds=harness.sessions.session_operation_lease_seconds,
+    )
+    try:
+        with (
+            patch.object(harness.service, "_call_llm", new=llm),
+            patch(
+                "elspeth.web.composer.tool_batch.build_set_pipeline_candidate",
+                wraps=real_build_set_pipeline_candidate,
+            ) as builder,
+        ):
+            result = await harness.service.compose(
+                "Build a reviewed pipeline with generated CSV content.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+                session_operation_context=compose_lease.context,
+            )
+    finally:
+        await compose_lease.close()
 
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert len(proposals) == 1
@@ -498,36 +561,74 @@ async def test_inline_candidate_materializes_one_custody_safe_proposal_without_r
 
     blob_service = BlobServiceImpl(harness.engine, tmp_path)
     blob_id = UUID(safe_arguments["source"]["blob_id"])
-    with pytest.raises(BlobPendingProposalError):
-        await blob_service.delete_blob(blob_id)
-    rejected = await harness.sessions.reject_composition_proposal(
+    pending_delete_lease = await SessionOperationLease.acquire(
+        harness.sessions.session_operation_authority,
         session_id=UUID(harness.session_id),
-        proposal_id=proposals[0].id,
-        actor="composer-parity-test",
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+        lease_seconds=harness.sessions.session_operation_lease_seconds,
     )
+    try:
+        with pytest.raises(BlobPendingProposalError):
+            await blob_service.delete_blob(
+                blob_id,
+                session_operation_context=pending_delete_lease.context,
+            )
+    finally:
+        await pending_delete_lease.close()
+    proposal_context = await harness.sessions._run_sync(
+        lambda: harness.sessions.session_operation_authority.acquire(
+            session_id=UUID(harness.session_id),
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+            lease_seconds=harness.sessions.session_operation_lease_seconds,
+        )
+    )
+    try:
+        rejected = await harness.sessions.reject_composition_proposal(
+            session_id=UUID(harness.session_id),
+            proposal_id=proposals[0].id,
+            actor="composer-parity-test",
+            session_operation_context=proposal_context,
+        )
+    finally:
+        await harness.sessions._run_sync(harness.sessions.session_operation_authority.release, proposal_context)
     assert rejected.status == "rejected"
     assert Path(blob_row.storage_path).exists()
-    await blob_service.delete_blob(blob_id)
+    final_delete_lease = await SessionOperationLease.acquire(
+        harness.sessions.session_operation_authority,
+        session_id=UUID(harness.session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=harness.sessions.session_operation_owner_instance_id,
+        lease_seconds=harness.sessions.session_operation_lease_seconds,
+    )
+    try:
+        await blob_service.delete_blob(
+            blob_id,
+            session_operation_context=final_delete_lease.context,
+        )
+    finally:
+        await final_delete_lease.close()
     assert not Path(blob_row.storage_path).exists()
 
 
 @pytest.mark.asyncio
 async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charge(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     arguments = _inline_pipeline_args(tmp_path)
     raw_content = "proposal-gap-private-value-2f16\n42\n"
     arguments["source"]["inline_blob"]["content"] = raw_content
     captured_safe_arguments: list[dict[str, Any]] = []
 
     async def _interrupt_before_proposal(**kwargs: Any) -> Any:
-        captured_safe_arguments.append(deepcopy(kwargs["arguments_json"]))
+        captured_safe_arguments.append(deepcopy(deep_thaw(kwargs["plan"].proposal.pipeline)))
         raise RuntimeError("simulated interruption before proposal creation")
 
     first_llm = _ScriptedLLM(_tool_turn("call_gap", "set_pipeline", arguments))
     with (
         patch.object(harness.service, "_call_llm", new=first_llm),
-        patch.object(harness.sessions, "create_composition_proposal", new=_interrupt_before_proposal),
+        patch.object(harness.sessions, "create_pipeline_composition_proposal", new=_interrupt_before_proposal),
         pytest.raises(RuntimeError, match="simulated interruption before proposal creation"),
     ):
         await harness.service.compose(
@@ -569,8 +670,10 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert len(proposals) == 1
     retry_arguments = deep_thaw(proposals[0].arguments_json)
+    retry_redacted_arguments = deep_thaw(proposals[0].arguments_redacted_json)
     assert retry_arguments["source"]["blob_id"] == first_blob.id
     assert "inline_blob" not in retry_arguments["source"]
+    assert "inline_blob" not in retry_redacted_arguments["source"]
     assert raw_content not in json.dumps(retry_arguments)
     assert _count_rows(harness.engine, blobs_table) == 1
     with harness.engine.connect() as conn:
@@ -590,7 +693,7 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
     [
         (
             "disallowed_mime",
-            "arguments.source.inline_blob.mime_type must be one of the declared values",
+            "must be object conforming to SetPipelineArgumentsModel",
             "application/octet-stream",
             0,
         ),
@@ -605,7 +708,7 @@ async def test_inline_candidate_argument_error_is_audited_once_and_repairable(
     expected_invalid_builder_calls: int,
 ) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     invalid = _inline_pipeline_args(tmp_path)
     inline_blob = invalid["source"]["inline_blob"]
     if case == "disallowed_mime":
@@ -694,7 +797,7 @@ async def test_malformed_inline_blob_never_survives_full_compose_surfaces(
     malformed_shape: str,
 ) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     invalid = _inline_pipeline_args(tmp_path)
     private_value = f"private malformed {malformed_shape} value 71b2"
     if malformed_shape == "scalar":
@@ -744,9 +847,10 @@ async def test_malformed_inline_blob_never_survives_full_compose_surfaces(
 @pytest.mark.asyncio
 async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_repairable(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     invalid = _inline_pipeline_args(tmp_path)
-    rejected_content = "bad\udc80private"
+    private_canary = "PRIVATE-SURROGATE-INLINE-CANARY"
+    rejected_content = f"bad\udc80{private_canary}"
     invalid["source"]["inline_blob"]["content"] = rejected_content
     repaired = _inline_pipeline_args(tmp_path)
     responses = [
@@ -795,13 +899,17 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
     assert len(arg_error_invocations) == 1
     arg_error_invocation = arg_error_invocations[0]
     assert arg_error_invocation.tool_call_id == "call_surrogate"
-    assert arg_error_invocation.error_class == "ToolArgumentError"
+    assert arg_error_invocation.error_class == "JsonBoundaryError"
     assert arg_error_invocation.version_before == state.version
     assert arg_error_invocation.version_after is None
-    assert rejected_content not in arg_error_invocation.arguments_canonical
-    assert rejected_content not in json.dumps(message_snapshots[1])
+    assert json.loads(arg_error_invocation.arguments_canonical) == {
+        "_redaction_status": "invalid_tool_arguments",
+        "error_class": "JsonBoundaryError",
+    }
+    assert private_canary not in arg_error_invocation.arguments_canonical
+    assert private_canary not in json.dumps(message_snapshots[1])
 
-    arg_error_outcomes = [outcome for outcome in invalid_turn_outcomes if outcome.error_class == "ToolArgumentError"]
+    arg_error_outcomes = [outcome for outcome in invalid_turn_outcomes if outcome.error_class == "JsonBoundaryError"]
     assert len(arg_error_outcomes) == 1
     assert arg_error_outcomes[0].pre_version == state.version
     assert arg_error_outcomes[0].post_version == state.version
@@ -809,18 +917,27 @@ async def test_surrogate_inline_content_fails_closed_at_canonicalization_and_is_
 
     feedback = next(message for message in message_snapshots[1] if message.get("tool_call_id") == "call_surrogate")
     feedback_payload = json.loads(feedback["content"])
-    assert "object conforming to SetPipelineArgumentsModel" in feedback_payload["error"]
-    assert rejected_content not in feedback["content"]
+    assert "not valid UTF-8" in feedback_payload["error"]
+    assert private_canary not in feedback["content"]
 
     persisted_feedback = _persisted_tool_content(harness, "call_surrogate")
-    assert json.loads(persisted_feedback)["error_class"] == "ToolArgumentError"
-    assert rejected_content not in persisted_feedback
+    assert json.loads(persisted_feedback)["error_class"] == "JsonBoundaryError"
+    assert private_canary not in persisted_feedback
+    with harness.engine.connect() as conn:
+        persisted_messages = tuple(
+            conn.execute(
+                select(chat_messages_table.c.content, chat_messages_table.c.raw_content, chat_messages_table.c.tool_calls).where(
+                    chat_messages_table.c.session_id == harness.session_id
+                )
+            )
+        )
+    assert private_canary not in json.dumps(tuple(tuple(row) for row in persisted_messages))
 
 
 @pytest.mark.asyncio
 async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_and_wrapper(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     args = _inline_pipeline_args(tmp_path)
     llm = _ScriptedLLM(_tool_turn("call_finalizer_crash", "set_pipeline", args))
     unexpected = RuntimeError("candidate finalizer internal failure with private detail")
@@ -864,8 +981,9 @@ async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_
     assert exc_info.value.failed_turn.tool_calls_attempted == 1
     persisted_feedback = _persisted_tool_content(harness, "call_finalizer_crash")
     assert json.loads(persisted_feedback) == {
+        "_redaction_status": "plugin_crash",
         "error_class": "RuntimeError",
-        "error_message": "RuntimeError",
+        "error_message": "<redacted-failure-message>",
     }
     assert str(unexpected) not in persisted_feedback
 
@@ -873,7 +991,7 @@ async def test_unexpected_candidate_finalizer_exception_uses_plugin_crash_audit_
 @pytest.mark.asyncio
 async def test_preproposal_base_exception_is_audited_once_and_propagated_unchanged(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     args = _inline_pipeline_args(tmp_path)
     llm = _ScriptedLLM(_tool_turn("call_finalizer_base_signal", "set_pipeline", args))
     signal = _PreproposalBaseSignal("shutdown-style private detail")
@@ -926,7 +1044,7 @@ async def test_preproposal_base_exception_is_audited_once_and_propagated_unchang
 @pytest.mark.asyncio
 async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_and_wrapper(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     response = _tool_turn("call_prior_runtime_crash", "set_pipeline", _inline_pipeline_args(tmp_path))
     failure = RuntimeError("candidate-prior validation private detail")
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.service._catalog)
@@ -995,7 +1113,7 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
 @pytest.mark.asyncio
 async def test_candidate_prior_validation_base_exception_is_audited_once_and_propagated_unchanged(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     response = _tool_turn("call_prior_base_signal", "set_pipeline", _inline_pipeline_args(tmp_path))
     signal = _PreproposalBaseSignal("candidate-prior shutdown-style private detail")
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.service._catalog)
@@ -1076,7 +1194,7 @@ async def test_non_pipeline_explicit_approval_behavior_is_unchanged(
     expected_error_class: str | None,
 ) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     llm = _ScriptedLLM(
         _tool_turn("call_metadata", "set_metadata", arguments),
         _fake_llm_response(content="Done."),
@@ -1107,7 +1225,7 @@ async def test_non_pipeline_explicit_approval_behavior_is_unchanged(
 @pytest.mark.asyncio
 async def test_auto_commit_set_pipeline_uses_candidate_builder_once(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
-    state = _incremental_base_state()
+    state = _incremental_base_state(tmp_path)
     await harness.sessions.update_composer_preferences(
         UUID(harness.session_id),
         trust_mode="auto_commit",

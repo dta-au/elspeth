@@ -9,12 +9,13 @@
  * §"The Explain view".
  *
  * Modal pattern matches SecretsPanel: backdrop and dialog are siblings
- * inside a fragment, Escape is handled at the document level via a
- * useEffect-registered listener (more robust than onKeyDown on the
- * dialog div — fires even if focus escapes the trap).
+ * inside a fragment. Escape is handled at the dialog boundary and backed up
+ * by a document listener for focus-drift cases.
  */
 import { useEffect, useId, useRef } from "react";
 
+import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
+import { Button } from "@/components/ui";
 import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
@@ -57,12 +58,13 @@ export function ExplainDialog({
     void loadExplain(sessionId, compositionVersion);
   }, [sessionId, compositionVersion, loadExplain]);
 
-  // Escape closes the dialog. Registered on `document` (not on the
-  // dialog div via onKeyDown) so it fires even if focus has escaped
-  // the trap — defence against focus drift bugs in nested content.
+  // The dialog boundary consumes Escape before a containing inspector can
+  // act on it. The document listener remains as a defence against focus drift.
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
@@ -84,20 +86,26 @@ export function ExplainDialog({
         aria-modal="true"
         aria-labelledby={titleId}
         className="explain-dialog"
+        onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          onClose();
+        }}
       >
         <div className="explain-dialog-content">
           <header className="explain-dialog-header">
             <h2 id={titleId} className="explain-dialog-title">
               What this pipeline will record
             </h2>
-            <button
+            <Button
+              variant="bare"
               type="button"
               className="explain-dialog-close"
               onClick={onClose}
               aria-label="Close"
             >
               ×
-            </button>
+            </Button>
           </header>
 
           {isLoading && !explain && (
@@ -111,7 +119,9 @@ export function ExplainDialog({
           )}
 
           {explain && (
-            <pre className="explain-dialog-narrative">{explain.narrative}</pre>
+            <div className="explain-dialog-narrative">
+              <MarkdownRenderer content={explain.narrative} />
+            </div>
           )}
         </div>
       </div>

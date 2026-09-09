@@ -27,14 +27,16 @@ from elspeth.contracts.schema import SchemaConfig
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
     from elspeth.contracts.data import PluginSchema
-    from elspeth.contracts.diversion import SinkWriteResult
+    from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.contracts.sink_effects import (
+        ResolvedSinkEffectMode,
         RestrictedSinkEffectContext,
         SinkEffectCommitResult,
+        SinkEffectExecutionPurpose,
         SinkEffectInputKind,
         SinkEffectInspection,
         SinkEffectInspectionRequest,
@@ -194,6 +196,21 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # Producer-guarantee declaration surface (ADR-016).
     # Set from the source's effective SchemaConfig guarantees at construction.
     declared_guaranteed_fields: frozenset[str]
+
+    # Structural observed-cell type (elspeth-e6e552ce34). Non-None means every
+    # cell this source emits under an OBSERVED schema has this SchemaConfig
+    # base type by construction of the parsed format (csv: "str"). Sources
+    # whose observed values carry format-native types (json, database) stay
+    # None. Consumed by resolve_guaranteed_field_type's structural source arm.
+    observed_value_type: ClassVar[str | None]
+
+    # Plugin-computed output contract, recorded by
+    # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
+    # prefers this over re-parsing raw options so source-specific schema
+    # rewrites (e.g. the LLM source's guaranteed-field augmentation) reach
+    # build-time graph validation (elspeth-db98d3f660). None = the source
+    # computes no output contract; the builder parses raw options instead.
+    _output_schema_config: SchemaConfig | None
 
     # Lifecycle guards (set by BaseSource.on_start()/on_complete()).
     # All sources must inherit BaseSource which manages these. Contract tests
@@ -391,6 +408,25 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # PassThroughContractViolation (TIER_1).
     passes_through_input: bool
 
+    # Field-forwarding declaration for the extras direction (elspeth-15c72686f2).
+    # When True, every SUCCESS row carries every field on its input row EXCEPT
+    # removed_input_fields. Weaker than passes_through_input in two ways it must
+    # stay weaker in: it tolerates a named removal set, and it says nothing
+    # about WHICH rows are emitted. With an extras-allowing output contract,
+    # presence and definite-emits walks both propagate predecessor lower bounds
+    # through the named subtraction; a fixed contract is a firewall.
+    forwards_input_fields: bool
+    removed_input_fields: frozenset[str]
+
+    # Value-preservation declaration (elspeth-e6e552ce34). The presence flags
+    # above say which fields survive; this one says the plugin never CHANGES a
+    # surviving field's value (adding new fields is fine). When True, the
+    # build-time type-resolution walk (resolve_guaranteed_field_type) may
+    # recurse through this transform even when its schema config declares no
+    # fields, instead of abstaining. Rewriting declarers (type_coerce,
+    # value_transform, truncate) must keep this False.
+    preserves_input_values: bool
+
     # ADR-012 empty-emission governance declaration.
     # True means the transform may intentionally emit zero rows on success.
     can_drop_rows: bool
@@ -406,6 +442,15 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # Normalized from TransformDataConfig.required_input_fields at construction
     # time. Empty frozenset = no required-input declaration.
     declared_input_fields: frozenset[str]
+
+    # Fail-closed string-scan declaration surface (elspeth-b19dfe41fb).
+    # Fields the transform requires to be present AND string-valued on every
+    # arriving row, failing the row closed otherwise. Set at construction by
+    # the text-scanning family from their own scan-field options; empty
+    # frozenset for everything else. Consumed only at build time by
+    # validate_transform_string_typed_input_fields — there is no runtime
+    # dispatch, the plugins enforce the contract in their own process paths.
+    declared_string_input_fields: frozenset[str]
 
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
     # instead of probing for optional methods, preserving a closed lifecycle
@@ -592,13 +637,53 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # Mis-annotation raises PassThroughContractViolation (TIER_1).
     passes_through_input: bool
 
+    # Field-forwarding declaration for the extras direction (elspeth-15c72686f2).
+    # See TransformProtocol above for the contract; batch-aware declarers
+    # (batch_outlier_annotator) use it to say that a SURVIVING row keeps every
+    # input field even though whole rows may be dropped.
+    forwards_input_fields: bool
+    removed_input_fields: frozenset[str]
+
+    # Value-preservation declaration (elspeth-e6e552ce34). See
+    # TransformProtocol above for the contract. The two protocols must not
+    # diverge on data members (elspeth-8783933d99): every conformer is a
+    # BaseTransform subclass carrying the full transform surface, and a
+    # member declared on TransformProtocol but missing here describes a
+    # narrower contract than reality
+    # (test_plugin_protocol_fields.py pins the parity).
+    preserves_input_values: bool
+
+    # ADR-012 empty-emission governance declaration. See TransformProtocol.
+    can_drop_rows: bool
+
+    # Field collision enforcement (centralized in TransformExecutor). See
+    # TransformProtocol.
+    declared_output_fields: frozenset[str]
+
     # ADR-013 pre-emission declaration surface.
     declared_input_fields: frozenset[str]
+
+    # Fail-closed string-scan declaration surface (elspeth-b19dfe41fb).
+    # Mirrors TransformProtocol: the batch-aware Azure safety pair populates
+    # this from its named `fields` list, and the builder projects it when the
+    # plugin is wired as a row-mode transform. Build-time consumer only.
+    declared_string_input_fields: frozenset[str]
 
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
     # instead of probing for optional methods, preserving a closed lifecycle
     # surface.
     requires_runtime_preflight: bool
+
+    # DAG contract: output schema for transforms that declare output fields.
+    # See TransformProtocol.
+    _output_schema_config: SchemaConfig | None
+
+    def effective_static_contract(self) -> frozenset[str]:
+        """Return the transform's static output guarantee surface.
+
+        See :meth:`TransformProtocol.effective_static_contract`.
+        """
+        ...
 
     # Error routing configuration
     # Injected by runtime_factory.py bridge from AggregationSettings/TransformSettings.
@@ -746,6 +831,10 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
         """Clear diversion log before each write() call."""
         ...
 
+    def _get_diversions(self) -> tuple["RowDiversion", ...]:
+        """Return the exact in-memory diversion log after a write."""
+        ...
+
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialize with configuration."""
         ...
@@ -881,12 +970,40 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
 
 
 class SinkEffectProtocol(SinkProtocol, Protocol):
-    """Explicit opt-in contract for recoverable sink publication effects."""
+    """Explicit opt-in contract for recoverable sink publication effects.
+
+    Optional execution authorities are nominal, not structural. A sink that
+    publishes one effect per member must inherit
+    ``MemberSinkEffectCapability``; a sink that can rebuild a missing stage
+    must inherit ``RestagingSinkEffectCapability``. Merely exposing methods or
+    legacy boolean flags never grants either authority. Admission,
+    fingerprinting, and execution all use those same nominal identities.
+    """
 
     effect_protocol_version: ClassVar[str]
     effect_call_type: ClassVar[CallType]
     supported_effect_modes: ClassVar[frozenset[str]]
     supported_effect_input_kinds: ClassVar[frozenset["SinkEffectInputKind"]]
+    effect_mode_remediation: ClassVar[str | None]
+
+    @classmethod
+    def _resolve_sink_effect_mode(
+        cls,
+        config: Mapping[str, object],
+        *,
+        purpose: "SinkEffectExecutionPurpose",
+    ) -> "ResolvedSinkEffectMode | None":
+        """Resolve the adapter-owned effect mode from validated options."""
+        raise NotImplementedError
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: "SinkEffectInputKind",
+    ) -> None:
+        """Validate instance configuration against the admitted effect mode."""
+        raise NotImplementedError
 
     def inspect_effect(
         self,

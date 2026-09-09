@@ -9,8 +9,8 @@ from hashlib import sha256
 
 import pytest
 from sqlalchemy import Column, Integer, MetaData, Table, Text, create_engine, func, insert, select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.base_classes import inject_write_failure
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import (
@@ -35,8 +35,8 @@ _CTX = RestrictedSinkEffectContext(
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 def _member(ordinal: int, row: dict[str, object]) -> SinkEffectMember:
@@ -92,7 +92,9 @@ def test_postgres_marker_rows_and_result_partition_commit_atomically(postgres_ur
     plan = sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id="d" * 64,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         _CTX,

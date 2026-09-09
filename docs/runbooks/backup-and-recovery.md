@@ -26,7 +26,7 @@ CLI runs usually take their Landscape URL from the `landscape.url` setting:
 ```bash
 python - <<'PY'
 from pathlib import Path
-from elspeth.core.config import load_settings
+from elspeth.config_loading import load_settings
 settings = load_settings(Path("settings.yaml"))
 print(settings.landscape.url)
 print(settings.payload_store.base_path)

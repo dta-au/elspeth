@@ -26,7 +26,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
 from elspeth.contracts.token_usage import TokenUsage
@@ -128,10 +128,12 @@ def _require_messages_tuple(value: object) -> None:
 
 def _require_http_status_code(value: object, field_name: str, *, optional: bool = False) -> None:
     require_int(value, field_name, optional=optional, min_value=100)
-    if value is not None:
-        assert isinstance(value, int)
-    if value is not None and value > 999:
-        raise ValueError(f"{field_name} must be <= 999, got {value!r}")
+    # require_int already proved value is int (or permitted None) — cast()
+    # records that proof for the type checker without a redundant runtime
+    # re-check of the first-party Tier-1 validation guarantee.
+    checked = cast("int | None", value)
+    if checked is not None and checked > 999:
+        raise ValueError(f"{field_name} must be <= 999, got {checked!r}")
 
 
 @dataclass(frozen=True, slots=True)

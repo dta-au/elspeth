@@ -86,6 +86,24 @@ describe("YamlView", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces a pending pipeline proposal instead of an empty YAML panel", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: null,
+      compositionProposals: [makeProposal()],
+    });
+
+    render(<YamlView />);
+
+    expect(screen.getByText(/Pending YAML change/)).toBeInTheDocument();
+    expect(screen.getByText(/not been applied yet/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Accept YAML proposal: Replace the pipeline.",
+      }),
+    ).toBeEnabled();
+  });
+
   it("does not fetch YAML for a metadata-only guided exit state", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockResolvedValue({
@@ -226,6 +244,48 @@ describe("YamlView", () => {
     });
   });
 
+  it("explains the deployment-owned scope above every exported YAML", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    vi.mocked(fetchYaml).mockResolvedValue({
+      yaml: "source:\n  plugin: text\n",
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(),
+    });
+
+    render(<YamlView />);
+
+    const note = await screen.findByTestId("yaml-export-scope-note");
+    expect(note).toHaveTextContent(
+      "This is the pipeline definition only. Deployment-owned configuration — including the landscape audit destination — is supplied by the environment at run time and is never written here.",
+    );
+    const display = screen.getByRole("button", {
+      name: "Copy YAML to clipboard",
+    });
+    expect(
+      note.compareDocumentPosition(display) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  });
+
+  it("adds the blob-binding note only for the active session's exported binding", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    vi.mocked(fetchYaml).mockResolvedValue({
+      yaml: "source:\n  plugin: text\n",
+      source_blob_ids: { source: "22222222-2222-2222-2222-222222222222" },
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(),
+    });
+
+    render(<YamlView />);
+
+    expect(await screen.findByTestId("yaml-export-blob-note")).toHaveTextContent(
+      "Source data is session-bound: this pipeline reads an uploaded file held in this session, so the path is not in the YAML. To run it elsewhere, bind an uploaded file on import.",
+    );
+  });
+
   it("renders pending YAML change summary when proposals affect yaml", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockResolvedValue({
@@ -300,6 +360,54 @@ describe("YamlView", () => {
       yaml: "source:\n  plugin: text\n",
       sourceBlobIds: { source: "22222222-2222-2222-2222-222222222222" },
     });
+  });
+
+  it("clears a same-session blob binding when a replacement YAML fetch fails", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    const replacementFetch = deferred<{
+      yaml: string;
+      source_blob_ids?: Record<string, string>;
+    }>();
+    vi.mocked(fetchYaml)
+      .mockResolvedValueOnce({
+        yaml: "source:\n  plugin: old_text\n",
+        source_blob_ids: { source: "22222222-2222-2222-2222-222222222222" },
+      })
+      .mockReturnValueOnce(replacementFetch.promise);
+
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+
+    render(<YamlView />);
+    await screen.findByRole("button", { name: "Copy YAML to clipboard" });
+    expect(useSessionStore.getState().exportedYamlBlobBinding).not.toBeNull();
+
+    act(() => {
+      useSessionStore.setState({ compositionState: makeState(2) });
+    });
+
+    // A replacement request invalidates the old YAML/sidecar pair as soon as
+    // it is admitted; a failed response must not revive or retain that pair.
+    expect(useSessionStore.getState().exportedYamlBlobBinding).toBeNull();
+
+    await act(async () => {
+      replacementFetch.reject({
+        status: 409,
+        detail: "Current composition state is invalid.",
+      });
+      try {
+        await replacementFetch.promise;
+      } catch {
+        // The component owns the rendered error; this await only flushes it.
+      }
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "YAML export is blocked by validation errors.",
+    );
+    expect(useSessionStore.getState().exportedYamlBlobBinding).toBeNull();
   });
 
   it("clears a stale sidecar binding when the export fetch returns no source_blob_ids", async () => {

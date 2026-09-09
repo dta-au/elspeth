@@ -1,0 +1,173 @@
+{
+  "schema_version": 2,
+  "producer": "elspeth-state-engine-profile-reporter-v2",
+  "profile_case_id": "sqlite-wal-same-host-leader-plus-claim-only-followers",
+  "state_store": "sqlite-wal",
+  "deployment": "same-host-leader-plus-claim-only-followers",
+  "backend_version": "3.47.1",
+  "backend_probe": {
+    "kind": "sqlite-connection-query",
+    "dialect": "sqlite",
+    "query": "SELECT sqlite_version()"
+  },
+  "deployment_probe": {
+    "kind": "trusted-test-runtime-assertion",
+    "node_id": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_same_host_leader_plus_claim_only_followers_profile_covers_sink_effect_process_death_matrix"
+  },
+  "probe_node_id": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_same_host_leader_plus_claim_only_followers_profile_covers_sink_effect_process_death_matrix",
+  "node_ids": [
+    "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_same_host_leader_plus_claim_only_followers_profile_covers_sink_effect_process_death_matrix",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_follower_cannot_claim_another_workers_leased_row",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_evicted_follower_claim_refused_before_insert",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_two_followers_claim_disjoint_rows_no_collision",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_clean_audit_attribution_per_follower",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_leader_follower_race_exactly_one_claim_wins_per_row",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_follower_crash_lease_lapses_reaper_recovers",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_follower_joins_then_heartbeat_latch_fires_eviction",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_slow_follower_registry_live_reaper_skips_item",
+    "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_slow_follower_empty_drain_batch_idle_poll_exits_cleanly",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_when_run_terminal_completed",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_when_run_terminal_failed",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_on_config_hash_mismatch",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_when_no_live_leader",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_on_filesystem_preflight_permission_fail",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_terminal_disposition_marks_terminal",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_barrier_node_marks_blocked_no_inmemory_accept",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_lossy_coalesce_branch_writes_branch_loss_record_in_same_txn",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_sink_bound_marks_pending_sink_handoff_never_writes_sink",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_idle_backoff_rechecks_status_and_snapshot",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_run_terminal_departs_and_exits_zero",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_dead_seat_finishes_then_exits_naming_resume",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_sigint_finishes_or_abandons_departs_exits",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerEnqueueFence::test_active_follower_enqueue_ready_child_inserted",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerEnqueueFence::test_evicted_follower_enqueue_ready_raises_before_insert",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_transform_success_hands_off_sink_without_sink_io",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_gate_traversal_can_terminalize_without_leader_authority",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_transform_failure_records_one_failed_disposition",
+    "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_scheduler_heartbeat_loss_abandons_result_without_disposition",
+    "tests/e2e/recovery/test_run_coordination_uniformity.py::TestRunCoordinationUniformity::test_single_worker_run_is_leader_of_its_own_run"
+  ],
+  "outcomes": [
+    {
+      "node_id": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_same_host_leader_plus_claim_only_followers_profile_covers_sink_effect_process_death_matrix",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_follower_cannot_claim_another_workers_leased_row",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_evicted_follower_claim_refused_before_insert",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_two_followers_claim_disjoint_rows_no_collision",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerIsolation::test_clean_audit_attribution_per_follower",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_leader_follower_race_exactly_one_claim_wins_per_row",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_follower_crash_lease_lapses_reaper_recovers",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_follower_joins_then_heartbeat_latch_fires_eviction",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_slow_follower_registry_live_reaper_skips_item",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_coordination_chaos.py::TestFollowerChaos::test_slow_follower_empty_drain_batch_idle_poll_exits_cleanly",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_when_run_terminal_completed",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_when_run_terminal_failed",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_on_config_hash_mismatch",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_when_no_live_leader",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestJoinRunAdmissionRefusals::test_join_refused_on_filesystem_preflight_permission_fail",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_terminal_disposition_marks_terminal",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_barrier_node_marks_blocked_no_inmemory_accept",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_lossy_coalesce_branch_writes_branch_loss_record_in_same_txn",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerDispositions::test_follower_sink_bound_marks_pending_sink_handoff_never_writes_sink",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_idle_backoff_rechecks_status_and_snapshot",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_run_terminal_departs_and_exits_zero",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_dead_seat_finishes_then_exits_naming_resume",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerLifecycle::test_follower_sigint_finishes_or_abandons_departs_exits",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerEnqueueFence::test_active_follower_enqueue_ready_child_inserted",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::TestFollowerEnqueueFence::test_evicted_follower_enqueue_ready_raises_before_insert",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_transform_success_hands_off_sink_without_sink_io",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_gate_traversal_can_terminalize_without_leader_authority",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_transform_failure_records_one_failed_disposition",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_follower_join_and_drain.py::test_real_follower_scheduler_heartbeat_loss_abandons_result_without_disposition",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_run_coordination_uniformity.py::TestRunCoordinationUniformity::test_single_worker_run_is_leader_of_its_own_run",
+      "outcome": "passed"
+    }
+  ],
+  "warnings": []
+}

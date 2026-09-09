@@ -139,6 +139,10 @@ function validateSharedInspectResponse(body: unknown, status: number): SharedIns
     !isCompositionSnapshot(body.composition_snapshot) ||
     typeof body.yaml !== "string" ||
     typeof body.created_by_user_id !== "string" ||
+    // Nullable on the wire: the backend sends null for snapshots minted
+    // before it froze the username into the blob. The key itself is always
+    // present, so an absent key is still a shape rejection.
+    !(typeof body.created_by_username === "string" || body.created_by_username === null) ||
     typeof body.created_at !== "string" ||
     typeof body.expires_at !== "string"
   ) {
@@ -166,6 +170,7 @@ function validateSharedInspectResponse(body: unknown, status: number): SharedIns
     yaml: body.yaml,
     audit_readiness,
     created_by_user_id: body.created_by_user_id,
+    created_by_username: body.created_by_username,
     created_at: body.created_at,
     expires_at: body.expires_at,
   };

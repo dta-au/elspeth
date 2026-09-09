@@ -39,6 +39,19 @@ class PluginId:
             raise ValueError("invalid kind-qualified plugin id")
         return cls(cast(PluginKind, match.group(1)), match.group(2))
 
+    @classmethod
+    def for_name(cls, kind: PluginKind, name: object) -> PluginId | None:
+        """Return the id for an untrusted authored plugin name, else ``None``.
+
+        The grammar lives on the type that owns it, so a caller holding a
+        web-authored ``name`` of unknown type gets an owned ``PluginId`` or an
+        explicit absence instead of having to drive ``__post_init__``'s
+        ``ValueError`` as control flow.
+        """
+        if type(name) is not str or _PLUGIN_ID.fullmatch(f"{kind}:{name}") is None:
+            return None
+        return cls(kind, name)
+
     def __str__(self) -> str:
         return f"{self.kind}:{self.name}"
 
@@ -49,6 +62,19 @@ class PluginUnavailableReason(StrEnum):
     LOCAL_REQUIREMENT_MISSING = "plugin_unavailable"
     CREDENTIAL_MISSING = "credential_unavailable"
     PROFILE_UNAVAILABLE = "profile_unavailable"
+    # Installed AND authorized for this deployment, but categorically prohibited
+    # on the WEB authoring surface by security policy: no operator credential,
+    # profile, or allowlist entry can clear it. Distinct from every other reason
+    # precisely because there is nothing to repair — the declared authorization
+    # stays visible as a *declined* authorization carrying this reason instead of
+    # the plugin appearing selectable everywhere and only failing at the far end
+    # of the authoring flow.
+    WEB_SURFACE_PROHIBITED = "plugin_not_allowed_on_web"
+
+
+class PluginSnapshotAuthority(StrEnum):
+    RESTRICTED = "restricted"
+    TRAINED_OPERATOR = "trained_operator"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -115,7 +141,13 @@ class PluginAvailabilitySnapshot:
     selected_profile_aliases: tuple[tuple[PluginId, str | None], ...]
     control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
     binding_generation_fingerprint: str
+    authority: PluginSnapshotAuthority
     snapshot_hash: str
+
+    @property
+    def is_trained_operator(self) -> bool:
+        """Return whether this snapshot carries explicit local-MCP authority."""
+        return self.authority is PluginSnapshotAuthority.TRAINED_OPERATOR
 
     @classmethod
     def for_trained_operator(cls, full_catalog: CatalogService) -> PluginAvailabilitySnapshot:
@@ -145,6 +177,7 @@ class PluginAvailabilitySnapshot:
             usable_profile_aliases=(),
             selected_profile_aliases=(),
             binding_generation_fingerprint=_canonical_hash({"binding_generation": "trained-operator"}),
+            authority=PluginSnapshotAuthority.TRAINED_OPERATOR,
         )
 
     @classmethod
@@ -160,6 +193,7 @@ class PluginAvailabilitySnapshot:
         selected_profile_aliases: tuple[tuple[PluginId, str | None], ...],
         binding_generation_fingerprint: str,
         control_modes: tuple[tuple[PluginCapability, ControlMode], ...] = (),
+        authority: PluginSnapshotAuthority = PluginSnapshotAuthority.RESTRICTED,
     ) -> PluginAvailabilitySnapshot:
         canonical = {
             "policy_hash": policy_hash,
@@ -171,6 +205,7 @@ class PluginAvailabilitySnapshot:
             "selected_profile_aliases": [(str(plugin_id), alias) for plugin_id, alias in selected_profile_aliases],
             "control_modes": [(capability.value, mode.value) for capability, mode in control_modes],
             "binding_generation_fingerprint": binding_generation_fingerprint,
+            "authority": authority.value,
         }
         return cls(
             policy_hash=policy_hash,
@@ -182,5 +217,6 @@ class PluginAvailabilitySnapshot:
             selected_profile_aliases=selected_profile_aliases,
             control_modes=control_modes,
             binding_generation_fingerprint=binding_generation_fingerprint,
+            authority=authority,
             snapshot_hash=_canonical_hash(canonical),
         )

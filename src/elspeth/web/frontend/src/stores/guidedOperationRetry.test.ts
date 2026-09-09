@@ -384,6 +384,15 @@ describe("guided operation retry custody", () => {
         error_type: "guided_operation_terminal_failure",
       }),
     ).toBe(false);
+    // F7b: a server-invariant 500 is a deterministic pre-reservation
+    // rejection, never transport ambiguity — retaining custody wedges the
+    // page load (inv-f6 fix 4b).
+    expect(
+      isAmbiguousGuidedRetryFailure({
+        status: 500,
+        error_type: "server_invariant_violated",
+      }),
+    ).toBe(false);
     expect(isAmbiguousGuidedRetryFailure({ status: 409 })).toBe(false);
     expect(isAmbiguousGuidedRetryFailure(new Error("application error"))).toBe(false);
   });

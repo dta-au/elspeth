@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -25,6 +25,12 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
 )
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttempt,
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
+)
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
@@ -35,11 +41,15 @@ from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction, D
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.intent_management import deferred_intent_management_option
 from elspeth.web.composer.guided.protocol import ChatRole, ChatTurn, GuidedStep, TurnType
+from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint
 from elspeth.web.composer.guided.state_machine import (
     DeferredStageIntent,
     GuidedProposalRef,
     GuidedSession,
+    TerminalKind,
+    TerminalReason,
+    TerminalState,
     TurnRecord,
     guided_reviewed_anchor_hash,
 )
@@ -67,6 +77,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
+    GuidedPendingProposalInvalidation,
     GuidedReplayPolicyFinding,
     GuidedReplayTurn,
     GuidedResponseDescriptor,
@@ -78,6 +89,8 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import _payload as _advisory_proposal_payload
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _empty_composition_state() -> CompositionState:
@@ -128,6 +141,252 @@ def _empty_wire_payload(
         "blockers": [],
         "can_confirm": True,
     }
+
+
+def _proposal_ref_for_advisory_payload(
+    payload: Mapping[str, object],
+    *,
+    covered_intent_ids: tuple[str, ...] = (),
+) -> GuidedProposalRef:
+    return GuidedProposalRef(
+        proposal_id=UUID(cast(str, payload["proposal_id"])),
+        draft_hash=cast(str, payload["draft_hash"]),
+        base=AbsentBase(),
+        reviewed_anchor_hash=guided_reviewed_anchor_hash(
+            source_order=(),
+            reviewed_sources={},
+            output_order=(),
+            reviewed_outputs={},
+        ),
+        covered_deferred_intent_ids=covered_intent_ids,
+        creation_event_schema="pipeline_proposal_created.v1",
+    )
+
+
+def test_guided_chat_advisory_authority_binds_exact_durable_turn_payload() -> None:
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    chat_solver = importlib.import_module("elspeth.web.composer.guided.chat_solver")
+    payload = _advisory_proposal_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    covered_intent_id = "11111111-1111-4111-8111-111111111111"
+    active_proposal = _proposal_ref_for_advisory_payload(payload, covered_intent_ids=(covered_intent_id,))
+
+    authority = guided_chat._guided_advisory_graph_authority(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        guided=SimpleNamespace(active_proposal=active_proposal),
+        current_turn={"type": TurnType.PROPOSE_PIPELINE.value, "step_index": 2, "payload": payload},
+        current_payload=prepared,
+    )
+
+    assert type(authority) is chat_solver.GuidedAdvisoryGraphAuthority
+    assert authority.payload_id == prepared.payload_id
+    assert authority.payload == prepared.payload
+    assert authority.proposal_id == str(active_proposal.proposal_id)
+    assert authority.draft_hash == active_proposal.draft_hash
+    assert authority.covered_deferred_intent_ids == (covered_intent_id,)
+
+
+def test_guided_chat_advisory_authority_binds_exact_confirm_wiring_payload() -> None:
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    payload = _empty_wire_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    active_proposal = _proposal_ref_for_advisory_payload(payload)
+
+    authority = guided_chat._guided_advisory_graph_authority(
+        step=GuidedStep.STEP_4_WIRE,
+        guided=SimpleNamespace(active_proposal=active_proposal),
+        current_turn={"type": TurnType.CONFIRM_WIRING.value, "step_index": 3, "payload": payload},
+        current_payload=prepared,
+    )
+
+    assert authority.turn_type is TurnType.CONFIRM_WIRING
+    assert authority.payload_id == prepared.payload_id
+    assert authority.payload == prepared.payload
+
+
+@pytest.mark.parametrize("mismatch", ["turn_payload", "turn_type", "step_index", "proposal", "draft", "payload_hash"])
+def test_guided_chat_advisory_authority_fails_closed_on_binding_mismatch(mismatch: str) -> None:
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    payload = _advisory_proposal_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    current_turn = {"type": TurnType.PROPOSE_PIPELINE.value, "step_index": 2, "payload": payload}
+    active_proposal = _proposal_ref_for_advisory_payload(payload)
+    if mismatch == "turn_payload":
+        current_turn = {**current_turn, "payload": {**payload, "summary": "changed"}}
+    elif mismatch == "turn_type":
+        current_turn = {**current_turn, "type": TurnType.CONFIRM_WIRING.value}
+    elif mismatch == "step_index":
+        current_turn = {**current_turn, "step_index": 3}
+    elif mismatch == "proposal":
+        active_proposal = replace(active_proposal, proposal_id=UUID("00000000-0000-4000-8000-000000000999"))
+    elif mismatch == "draft":
+        active_proposal = replace(active_proposal, draft_hash="e" * 64)
+    else:
+        # Deliberately corrupt the frozen custody object after construction so
+        # the boundary must exercise its independent hash recomputation rather
+        # than merely reject an inexact stand-in type.
+        object.__setattr__(prepared, "payload", {**payload, "summary": "changed"})
+
+    with pytest.raises(AuditIntegrityError):
+        guided_chat._guided_advisory_graph_authority(
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            guided=SimpleNamespace(active_proposal=active_proposal),
+            current_turn=current_turn,
+            current_payload=prepared,
+        )
+
+
+_COMMITTED_CONFIRMATION_HASH = "c" * 64
+
+
+def _completed_wire_guided(**overrides: object) -> GuidedSession:
+    """A COMPLETED session whose final record answered the empty wire turn."""
+
+    return replace(
+        GuidedSession(
+            step=GuidedStep.STEP_4_WIRE,
+            history=(
+                TurnRecord(
+                    step=GuidedStep.STEP_4_WIRE,
+                    turn_type=TurnType.CONFIRM_WIRING,
+                    payload_hash=guided_json_payload_id("turn", _empty_wire_payload()),
+                    response_hash=_COMMITTED_CONFIRMATION_HASH,
+                    emitter="server",
+                    summary="Guided pipeline wiring confirmed.",
+                ),
+            ),
+            terminal=TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}\n"),
+        ),
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def test_guided_committed_graph_authority_binds_the_confirmed_wire_record() -> None:
+    """Post-commit advice is bound to the record the user actually confirmed."""
+
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    chat_solver = importlib.import_module("elspeth.web.composer.guided.chat_solver")
+    payload = _empty_wire_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+
+    authority = guided_chat._guided_committed_graph_authority(
+        guided=_completed_wire_guided(),
+        current_payload=prepared,
+    )
+
+    assert type(authority) is chat_solver.GuidedAdvisoryGraphAuthority
+    assert authority.turn_type is TurnType.CONFIRM_WIRING
+    assert authority.payload_id == prepared.payload_id
+    assert authority.payload == prepared.payload
+    assert authority.proposal_id == str(_GUIDED_PROPOSAL_ID)
+    assert authority.draft_hash == _GUIDED_PROPOSAL_DRAFT_HASH
+    # Confirmation refuses while any retained instruction remains, so nothing
+    # is pending for a graph decision to be attributed to.
+    assert authority.covered_deferred_intent_ids == ()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "unanswered",
+        "wrong_turn_type",
+        "wrong_step",
+        "empty_history",
+        "record_payload_hash",
+        "payload_tampered_after_load",
+        "active_proposal",
+        "terminal_absent",
+        "terminal_exited",
+        "inexact_session",
+        "inexact_payload",
+        "wrong_payload_purpose",
+    ],
+)
+def test_guided_committed_graph_authority_fails_closed_on_binding_mismatch(mismatch: str) -> None:
+    """Every way the committed binding can be wrong must refuse, not degrade.
+
+    The authority is what makes a post-commit answer honest: it is the sole
+    proof that the frozen payload about to be described to the provider is the
+    one this session's confirmation settled on. A soft failure here would let a
+    tampered or substituted record be explained to the user as their pipeline.
+    """
+
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    payload = _empty_wire_payload()
+    prepared: Any = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    guided: Any = _completed_wire_guided()
+    record = guided.history[-1]
+    if mismatch == "unanswered":
+        guided = _completed_wire_guided(history=(replace(record, response_hash=None),))
+    elif mismatch == "wrong_turn_type":
+        guided = _completed_wire_guided(history=(replace(record, turn_type=TurnType.REVIEW_COMPONENTS),))
+    elif mismatch == "wrong_step":
+        guided = _completed_wire_guided(history=(replace(record, step=GuidedStep.STEP_3_TRANSFORMS),))
+    elif mismatch == "empty_history":
+        guided = _completed_wire_guided(history=())
+    elif mismatch == "record_payload_hash":
+        guided = _completed_wire_guided(history=(replace(record, payload_hash="f" * 64),))
+    elif mismatch == "payload_tampered_after_load":
+        # Corrupt the frozen custody object AFTER construction so the boundary
+        # must exercise its own content re-derivation rather than merely reject
+        # an inexact stand-in type.
+        object.__setattr__(prepared, "payload", {**payload, "can_confirm": False})
+    elif mismatch == "active_proposal":
+        # GuidedSession's own invariant forbids this pairing, so it is forced
+        # in after construction: the authority must not rely on that invariant
+        # having run.
+        object.__setattr__(guided, "active_proposal", _guided_proposal_ref())
+    elif mismatch == "terminal_absent":
+        guided = _completed_wire_guided(terminal=None)
+    elif mismatch == "terminal_exited":
+        guided = _completed_wire_guided(
+            terminal=TerminalState(
+                kind=TerminalKind.EXITED_TO_FREEFORM,
+                reason=TerminalReason.USER_PRESSED_EXIT,
+                pipeline_yaml=None,
+            )
+        )
+    elif mismatch == "inexact_session":
+        guided = SimpleNamespace(
+            terminal=TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}\n"),
+            active_proposal=None,
+            history=(record,),
+        )
+    elif mismatch == "inexact_payload":
+        prepared = SimpleNamespace(
+            payload_id=prepared.payload_id,
+            purpose="turn",
+            payload=payload,
+        )
+    else:
+        prepared = PreparedGuidedJsonPayload(
+            payload_id=guided_json_payload_id("turn_response", payload),
+            purpose="turn_response",
+            payload=payload,
+        )
+
+    with pytest.raises(AuditIntegrityError):
+        guided_chat._guided_committed_graph_authority(guided=guided, current_payload=prepared)
 
 
 _MALFORMED_CURRENT_TURNS: tuple[tuple[GuidedStep, TurnType, Mapping[str, object]], ...] = (
@@ -225,6 +484,7 @@ def _audit_evidence() -> tuple[ComposerToolInvocation, ComposerLLMCall, Composer
         status=ComposerChatTurnStatus.SUCCESS,
         started_at=now,
         finished_at=now,
+        turn_token="e" * 64,
     )
     return invocation, llm_call, chat_turn
 
@@ -424,7 +684,123 @@ def test_schema8_projected_next_turn_validates_before_history(monkeypatch) -> No
             catalog=cast(Any, object()),
             shield_available=False,
             new_stable_id=uuid4(),
+            data_dir="/unused-step1-single-select",
+            session_id="unused-step1-single-select",
         )
+
+
+def test_direct_source_selection_rechecks_current_catalog_before_transitioning_stale_turn() -> None:
+    guided_route = importlib.import_module("elspeth.web.sessions.routes.composer.guided")
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+    from elspeth.web.sessions.schemas import GuidedRespondRequest
+
+    current_turn = {
+        "type": TurnType.SINGLE_SELECT.value,
+        "step_index": 0,
+        "payload": {
+            "question": "Choose a source",
+            "options": [{"id": "aws_s3", "label": "Amazon S3", "hint": None}],
+            "allow_custom": False,
+        },
+    }
+    guided, _record, _turn_type, _payload_hash = guided_route._append_server_turn_record(
+        GuidedSession.initial(),
+        current_step=GuidedStep.STEP_1_SOURCE,
+        turn=current_turn,
+    )
+
+    class _CurrentCatalog:
+        available = False
+
+        def unavailable_reason(self, plugin_id: PluginId) -> PluginUnavailableReason | None:
+            assert plugin_id == PluginId("source", "aws_s3")
+            return None if self.available else PluginUnavailableReason.PROFILE_UNAVAILABLE
+
+        def get_schema(self, plugin_type: str, plugin_name: str) -> None:
+            raise AssertionError(f"unavailable {plugin_type}:{plugin_name} must fail before schema lookup")
+
+    current_catalog = _CurrentCatalog()
+
+    body = GuidedRespondRequest.model_validate(
+        {
+            "operation_id": str(uuid4()),
+            "turn_token": "a" * 64,
+            "chosen": ["aws_s3"],
+        },
+        strict=True,
+    )
+
+    with pytest.raises(WebSurfacePolicyRejectedError, match="profile_unavailable"):
+        guided_route._schema8_transition(
+            guided,
+            current_turn,
+            body,
+            catalog=cast(Any, current_catalog),
+            new_stable_id=uuid4(),
+        )
+
+    assert guided.source_order == ()
+    assert guided.pending_source_intents == {}
+    assert guided.history[-1].response_hash is None
+
+    current_catalog.available = True
+    retried, _ = guided_route._schema8_transition(
+        guided,
+        current_turn,
+        body,
+        catalog=cast(Any, current_catalog),
+        new_stable_id=uuid4(),
+    )
+    assert retried.source_order
+    assert next(iter(retried.pending_source_intents.values())).plugin == "aws_s3"
+
+
+def test_chat_source_reselection_uses_current_catalog_not_stale_form_plugin_set() -> None:
+    guided_route = importlib.import_module("elspeth.web.sessions.routes.composer.guided")
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    from elspeth.web.composer.guided.state_machine import SourceIntent
+
+    stable_id = str(uuid4())
+    prospective = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(stable_id,),
+        pending_source_intents={
+            stable_id: SourceIntent(
+                name="source",
+                phase="plugin_options",
+                plugin="csv",
+                options=None,
+                inspection_facts=None,
+                observed_columns=(),
+                sample_rows=(),
+            )
+        },
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.SCHEMA_FORM,
+                payload_hash="b" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+    )
+    current_catalog = SimpleNamespace(list_sources=lambda: (SimpleNamespace(name="csv"),))
+
+    with pytest.raises(ValueError, match="permitted"):
+        guided_chat._prepare_step_1_source_plugin_reselection(
+            guided_route=guided_route,
+            current_state=_empty_composition_state(),
+            prospective=prospective,
+            plugin="aws_s3",
+            inspection_facts=None,
+            catalog=current_catalog,
+            shield_available=False,
+            payload_store=cast(Any, object()),
+        )
+
+    assert prospective.pending_source_intents[stable_id].plugin == "csv"
+    assert prospective.history[-1].response_hash is None
 
 
 def test_durable_current_turn_rejects_wrong_step_type_matrix(tmp_path: Path) -> None:
@@ -760,6 +1136,70 @@ def test_payload_preparation_rejects_store_that_retrieves_altered_bytes() -> Non
         )
 
 
+def test_load_guided_json_payload_rejects_a_store_that_lies_about_its_content_bytes(tmp_path: Path) -> None:
+    """The replay read re-derives the content address instead of trusting the store.
+
+    Every other invalid-content case reaches ``load_guided_json_payload``
+    through a real ``FilesystemPayloadStore``, whose own ``retrieve`` already
+    verifies the hash — so the re-derivation inside the loader is only ever
+    exercised by a store that lies, and without this test the line survives
+    being deleted. It is also the control the loader relies on in place of the
+    ``runtime_checkable`` Protocol ``isinstance`` ADR-032 withdrew: this fake
+    would pass that check, and is rejected on its bytes instead.
+    """
+    replay = importlib.import_module("elspeth.web.sessions.guided_replay")
+    honest = FilesystemPayloadStore(tmp_path / "lying-store-source")
+    payload_id = honest.store(b'{"schema":"guided.json-payload.v1","purpose":"turn","payload":{"question":"Choose"}}')
+
+    class _LyingStore:
+        def store(self, content: bytes) -> str:
+            return payload_id
+
+        def retrieve(self, content_hash: str) -> bytes:
+            return b'{"schema":"guided.json-payload.v1","purpose":"turn","payload":{"question":"SUBSTITUTED"}}'
+
+        def exists(self, content_hash: str) -> bool:
+            return True
+
+        def delete(self, content_hash: str) -> bool:
+            return False
+
+    with pytest.raises(AuditIntegrityError, match="bytes do not match the content id"):
+        replay.load_guided_json_payload(_LyingStore(), payload_id=payload_id, purpose="turn")
+
+
+def test_payload_settlement_verification_rejects_a_store_whose_content_changed(tmp_path: Path) -> None:
+    """The pre-SQL re-read compares bytes, not merely that a store is configured.
+
+    ``verify_guided_json_payloads`` runs immediately before settlement so a
+    payload that was durable at prepare time but has since been substituted
+    cannot be committed against. The sibling test
+    ``test_settlement_requires_store_retrieval_for_every_payload_and_can_retry``
+    pins only the "no store configured" arm; this one pins the byte comparison,
+    which is the control that replaced the withdrawn Protocol ``isinstance``.
+    """
+    preparation = importlib.import_module("elspeth.web.sessions.guided_payloads")
+    honest = FilesystemPayloadStore(tmp_path / "settlement-verify")
+    prepared = preparation.prepare_guided_json_payload(honest, purpose="turn", payload={"question": "Choose"})
+
+    class _SubstitutedStore:
+        def store(self, content: bytes) -> str:
+            return prepared.payload_id
+
+        def retrieve(self, content_hash: str) -> bytes:
+            return b'{"schema":"guided.json-payload.v1","purpose":"turn","payload":{"question":"SUBSTITUTED"}}'
+
+        def exists(self, content_hash: str) -> bool:
+            return True
+
+        def delete(self, content_hash: str) -> bool:
+            return False
+
+    preparation.verify_guided_json_payloads(honest, (prepared,))
+    with pytest.raises(AuditIntegrityError, match="content differs from the prepared payload"):
+        preparation.verify_guided_json_payloads(_SubstitutedStore(), (prepared,))
+
+
 def test_next_turn_payload_requires_turn_purpose() -> None:
     payload = PreparedGuidedJsonPayload(
         payload_id=guided_json_payload_id("turn_response", {"question": "Choose"}),
@@ -867,6 +1307,64 @@ def test_audit_preparation_uses_real_typed_evidence_and_omits_hidden_provider_da
     assert "RAW-VALIDATION-CANARY" not in persisted
     assert "UNKNOWN-SUCCESS-CREDENTIAL" not in persisted
     assert "UNKNOWN-SUCCESS-DIAGNOSTIC" not in persisted
+
+
+def test_guided_audit_interleaves_planner_attempt_after_its_physical_response() -> None:
+    preparation = importlib.import_module("elspeth.web.sessions.guided_audit")
+    _invocation, llm_call, _chat_turn = _audit_evidence()
+    failed_call = replace(
+        llm_call,
+        model_returned=None,
+        status=ComposerLLMCallStatus.API_ERROR,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        error_class="ProviderFailure",
+        error_message="PRIVATE-PROVIDER-FAILURE",
+        max_completion_tokens_requested=8192,
+        planner_policy_hash="a" * 64,
+        planner_call_ordinal=1,
+    )
+    response_call = replace(
+        llm_call,
+        max_completion_tokens_requested=8192,
+        planner_policy_hash="a" * 64,
+        planner_call_ordinal=2,
+    )
+    attempt = ComposerPlannerAttempt(
+        ordinal=1,
+        planner_call_ordinal=2,
+        phase=ComposerPlannerAttemptPhase.CANDIDATE,
+        outcome=ComposerPlannerAttemptOutcome.ACCEPTED,
+        planner_code=None,
+        selected_tools=("emit_pipeline_proposal",),
+        requested_information=(),
+        new_information=(),
+        rejection_codes=(),
+        candidate_shape_hash="b" * 64,
+        repeated_fingerprint=False,
+        led_to=ComposerPlannerAttemptLedTo.DONE,
+    )
+
+    rows = preparation.prepare_guided_audit_rows(
+        invocations=(),
+        llm_calls=(failed_call, response_call),
+        chat_turns=(),
+        planner_attempts=(attempt,),
+    )
+
+    assert [row.kind for row in rows] == ["llm", "llm", "planner"]
+    assert [row.envelope["_kind"] for row in rows] == [
+        "llm_call_audit",
+        "llm_call_audit",
+        "planner_attempt_audit",
+    ]
+    assert "PRIVATE-PROVIDER-FAILURE" not in repr(rows)
+
+
+def test_guided_audit_evidence_rejects_non_tuple_planner_attempts() -> None:
+    with pytest.raises(AuditIntegrityError, match="planner_attempts"):
+        GuidedAuditEvidence(planner_attempts=[])  # type: ignore[arg-type]
 
 
 def test_intent_cancellation_is_allowlisted_only_for_the_exact_structural_schema() -> None:
@@ -984,6 +1482,7 @@ def _replay_record(
     descriptor: GuidedResponseDescriptor,
     guided: GuidedSession,
     validation_errors: list[str] | None = None,
+    sources: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> CompositionStateRecord:
     replay = importlib.import_module("elspeth.web.sessions.guided_replay")
     state = replay.with_guided_response_descriptor(
@@ -998,7 +1497,7 @@ def _replay_record(
         id=uuid4(),
         session_id=uuid4(),
         version=1,
-        sources=None,
+        sources=sources,
         source=None,
         nodes=None,
         edges=None,
@@ -1010,6 +1509,68 @@ def _replay_record(
         derived_from_state_id=None,
         composer_meta=state.composer_meta,
     )
+
+
+def _guided_with_replay_source(options: Mapping[str, object]) -> GuidedSession:
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    return replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options=options,
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+
+
+def test_guided_replay_rejects_mixed_sentinel_before_private_composer_meta_can_project() -> None:
+    replay = importlib.import_module("elspeth.web.sessions.guided_replay")
+    private_path = "/internal/blobs/source.csv"
+    private_file = "/internal/blobs/private-file.csv"
+    descriptor = GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None)
+    guided = _guided_with_replay_source(
+        {
+            "path": "blob:22222222-2222-4222-8222-222222222222",
+            "file": private_file,
+        }
+    )
+    record = _replay_record(
+        descriptor=descriptor,
+        guided=guided,
+        sources={"source": {"plugin": "csv", "options": {"path": private_path, "file": private_file}}},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        replay.project_guided_response(record, payloads=())
+
+
+def test_guided_replay_redacts_canonical_sentinel_in_sources_and_persisted_composer_meta() -> None:
+    replay = importlib.import_module("elspeth.web.sessions.guided_replay")
+    private_path = "/internal/blobs/source.csv"
+    blob_id = "22222222-2222-4222-8222-222222222222"
+    sentinel = f"blob:{blob_id}"
+    descriptor = GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None)
+    guided = _guided_with_replay_source({"path": sentinel})
+    record = _replay_record(
+        descriptor=descriptor,
+        guided=guided,
+        sources={"source": {"plugin": "csv", "options": {"path": private_path}}},
+    )
+
+    response = replay.project_guided_response(record, payloads=())
+
+    state = response.composition_state
+    assert state is not None and state.sources is not None and state.composer_meta is not None
+    assert state.sources["source"]["options"]["path"] == sentinel
+    reviewed = state.composer_meta["guided_session"]["reviewed_sources"]["11111111-1111-4111-8111-111111111111"]
+    assert reviewed["options"]["path"] == sentinel
+    assert private_path not in repr(response)
 
 
 def test_replay_rejects_descriptor_step_index_that_disagrees_with_turn_record() -> None:
@@ -1202,7 +1763,7 @@ def test_replay_requires_final_turn_to_be_current_and_unanswered(response_kind: 
 def service_and_engine(tmp_path: Path):
     engine = create_session_engine(f"sqlite:///{tmp_path / 'guided-atomic.db'}")
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided-atomic"),
@@ -1214,7 +1775,10 @@ def service_and_engine(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohort(service_and_engine) -> None:
+async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohort(
+    service_and_engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service, engine = service_and_engine
     session_id = (await service.create_session("alice", "guided atomic", "local")).id
     claimed = await service.reserve_guided_operation(
@@ -1252,6 +1816,16 @@ async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohor
             chat_turns=(chat_turn,),
         ),
     )
+    projected: list[tuple[tuple[ComposerLLMCall, ...], int]] = []
+
+    def capture_provider_calls(calls: tuple[ComposerLLMCall, ...], *, surface: str) -> None:
+        assert surface == "guided"
+        with engine.connect() as conn:
+            durable_count = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+        projected.append((calls, durable_count))
+
+    service_module = importlib.import_module("elspeth.web.sessions.service")
+    monkeypatch.setattr(service_module, "record_settled_composer_provider_calls", capture_provider_calls)
 
     settlement = await service.settle_guided_state_operation(command)
 
@@ -1269,6 +1843,7 @@ async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohor
         operation = conn.execute(select(guided_operations_table).where(guided_operations_table.c.session_id == str(session_id))).one()
     assert [row.id for row in states] == [str(state_id)]
     assert [row.role for row in messages] == ["audit", "audit", "audit"]
+    assert projected == [((llm_call,), 3)]
     assert [row.composition_state_id for row in messages] == [str(state_id)] * 3
     assert operation.status == "completed"
     assert operation.result_state_id == str(state_id)
@@ -1417,6 +1992,12 @@ async def test_late_projection_failure_rolls_back_inserted_cohort_and_same_fence
     )
     service_module = importlib.import_module("elspeth.web.sessions.service")
     projector = service_module.project_guided_response
+    projected: list[tuple[ComposerLLMCall, ...]] = []
+    monkeypatch.setattr(
+        service_module,
+        "record_settled_composer_provider_calls",
+        lambda calls, *, surface: projected.append(calls),
+    )
 
     def _wrong_purpose_after_writes(*_args, **_kwargs):
         raise AuditIntegrityError("injected next-turn purpose=turn_response failure")
@@ -1433,10 +2014,12 @@ async def test_late_projection_failure_rolls_back_inserted_cohort_and_same_fence
     assert operation.status == "in_progress"
     assert operation.result_state_id is None
     assert operation.response_hash is None
+    assert projected == []
 
     monkeypatch.setattr(service_module, "project_guided_response", projector)
     settlement = await service.settle_guided_state_operation(command)
     assert settlement.result_state.id == command.state_id
+    assert projected == [(llm_call,)]
 
 
 @pytest.mark.asyncio
@@ -1456,13 +2039,17 @@ async def test_failure_after_operation_complete_rolls_back_bind_terminal_and_all
     )
     assert isinstance(claimed, GuidedOperationClaimed)
     command = _empty_respond_command(claimed.fence)
-    complete = service.complete_guided_operation_on_connection
+    # The lane's settlement writes the terminal row through the guided
+    # mutation capability; inject the failure after that exact write.
+    from elspeth.web.sessions.service import _GuidedSessionMutations
 
-    def _complete_then_fail(*args, **kwargs):
-        complete(*args, **kwargs)
+    complete = _GuidedSessionMutations.complete
+
+    def _complete_then_fail(self, *args, **kwargs):
+        complete(self, *args, **kwargs)
         raise AuditIntegrityError("injected failure after terminal update")
 
-    monkeypatch.setattr(service, "complete_guided_operation_on_connection", _complete_then_fail)
+    monkeypatch.setattr(_GuidedSessionMutations, "complete", _complete_then_fail)
     with pytest.raises(AuditIntegrityError, match="after terminal"):
         await service.settle_guided_state_operation(command)
 
@@ -1611,7 +2198,7 @@ async def test_deferred_intent_delta_rejects_every_untyped_or_non_append_mutatio
     )
     if mutation == "omitted_addition":
         candidate = (appended,)
-        sideband = None
+        sideband: tuple[UUID, ...] = ()
     elif mutation == "replacement_same_id":
         candidate = (
             _deferred_intent(
@@ -1621,26 +2208,26 @@ async def test_deferred_intent_delta_rejects_every_untyped_or_non_append_mutatio
                 summary="Changed existing intent under the same id.",
             ),
         )
-        sideband = UUID(first.intent_id)
+        sideband = (UUID(first.intent_id),)
     elif mutation == "reorder":
         candidate = (second, first)
-        sideband = None
+        sideband = ()
     elif mutation == "removal":
         candidate = (first,)
-        sideband = None
+        sideband = ()
     elif mutation == "extra_append":
         candidate = (first, appended, _deferred_intent())
-        sideband = UUID(appended.intent_id)
+        sideband = (UUID(appended.intent_id),)
     else:
         candidate = (first, appended)
-        sideband = uuid4()
+        sideband = (uuid4(),)
     command = replace(
         command,
         state=replace(
             command.state,
             composer_meta={"guided_session": replace(GuidedSession.initial(), deferred_intents=candidate).to_dict()},
         ),
-        retained_deferred_intent_id=sideband,
+        retained_deferred_intent_ids=sideband,
     )
     with engine.connect() as connection:
         events_before = connection.execute(
@@ -1728,7 +2315,7 @@ async def test_deferred_intent_delta_allows_one_typed_terminal_append(service_an
             command.state,
             composer_meta={"guided_session": replace(GuidedSession.initial(), deferred_intents=candidate).to_dict()},
         ),
-        retained_deferred_intent_id=UUID(appended.intent_id),
+        retained_deferred_intent_ids=(UUID(appended.intent_id),),
     )
 
     settlement = await service.settle_guided_state_operation(command)
@@ -1736,6 +2323,64 @@ async def test_deferred_intent_delta_allows_one_typed_terminal_append(service_an
     result_guided = state_from_record(settlement.result_state).guided_session
     assert result_guided is not None
     assert result_guided.deferred_intents == candidate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["exact", "wrong_order", "undersized_claim"])
+async def test_deferred_intent_delta_verifies_multi_append_custody(service_and_engine, mutation: str) -> None:
+    """elspeth-3a21f09f09: K appends settle only as the exact claimed ids in order.
+
+    One Send may append several intents (one per retain call). The custody
+    check must accept the exact ordered claim and reject a candidate whose
+    appends are reordered against the claim or exceed it."""
+    service, _engine = service_and_engine
+    session_id = (await service.create_session("alice", f"guided deferred multi append {mutation}", "local")).id
+    prior = (_deferred_intent(),)
+    predecessor = await _seed_guided_predecessor_with_intents(service, session_id, prior)
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id=f"respond-deferred-multi-append-{mutation}",
+        kind="guided_respond",
+        request_hash="a" * 64,
+        actor="worker",
+        lease_seconds=60,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+    command = _present_respond_command(claimed.fence, predecessor)
+    originating = command.originating_message
+    assert originating is not None
+    appended_first = _deferred_intent(
+        originating_message_id=originating.message_id,
+        message_content=originating.content,
+    )
+    appended_second = _deferred_intent(
+        originating_message_id=originating.message_id,
+        message_content=originating.content,
+    )
+    candidate = (*prior, appended_first, appended_second)
+    if mutation == "wrong_order":
+        sideband = (UUID(appended_second.intent_id), UUID(appended_first.intent_id))
+    elif mutation == "undersized_claim":
+        sideband = (UUID(appended_first.intent_id),)
+    else:
+        sideband = (UUID(appended_first.intent_id), UUID(appended_second.intent_id))
+    command = replace(
+        command,
+        state=replace(
+            command.state,
+            composer_meta={"guided_session": replace(GuidedSession.initial(), deferred_intents=candidate).to_dict()},
+        ),
+        retained_deferred_intent_ids=sideband,
+    )
+
+    if mutation == "exact":
+        settlement = await service.settle_guided_state_operation(command)
+        result_guided = state_from_record(settlement.result_state).guided_session
+        assert result_guided is not None
+        assert result_guided.deferred_intents == candidate
+    else:
+        with pytest.raises(AuditIntegrityError, match="deferred intent"):
+            await service.settle_guided_state_operation(command)
 
 
 @pytest.mark.asyncio
@@ -1874,7 +2519,7 @@ async def test_settlement_rechecks_plural_intent_user_authority_and_rolls_back(
         ),
     )
 
-    with pytest.raises(AuditIntegrityError, match="one matching UUID"):
+    with pytest.raises(AuditIntegrityError, match="matching exact action-specific user authority"):
         await service.settle_guided_state_operation(command)
 
     with engine.connect() as connection:
@@ -1996,7 +2641,7 @@ def test_cancellation_audit_is_forbidden_without_exact_cancel_sideband(non_cance
         originating_message=GuidedOriginatingUserMessageDraft(message_id=uuid4(), content="private non-cancel request"),
     )
     if non_cancel_sideband == "append":
-        command = replace(command, retained_deferred_intent_id=uuid4())
+        command = replace(command, retained_deferred_intent_ids=(uuid4(),))
     elif non_cancel_sideband == "edit":
         command = replace(
             command,
@@ -2055,7 +2700,10 @@ async def test_deferred_intent_delta_allows_stable_id_edit_with_new_private_mess
         redacted_summary="model text is not durable authority",
         constraints=existing.constraints,
     )
-    private_revision = GuidedOriginatingUserMessageDraft(message_id=uuid4(), content="private revised instruction")
+    private_revision = GuidedOriginatingUserMessageDraft(
+        message_id=uuid4(),
+        content=f"Edit exact intent {existing.intent_id}: use the private revised instruction.",
+    )
     from elspeth.web.composer.guided.deferred_intents import create_deferred_stage_intent
 
     replacement = create_deferred_stage_intent(
@@ -2409,3 +3057,142 @@ async def test_opted_out_interpretation_resolves_and_binds_derived_result_in_sam
         events = conn.execute(select(interpretation_events_table)).all()
     assert operation.result_state_id == str(settlement.result_state.id)
     assert len(events) == 2  # one durable opt-out marker and one resolved surface
+
+
+def _pending_proposal_invalidation() -> GuidedPendingProposalInvalidation:
+    return GuidedPendingProposalInvalidation(
+        proposal_id=uuid4(),
+        draft_hash="a" * 64,
+        reviewed_facts={},
+        reason="guided_exit",
+    )
+
+
+def _terminal_exit_command(composer_meta: Mapping[str, Any]) -> GuidedStateOperationCommand:
+    """Build the terminal-exit invalidation command over an arbitrary composer_meta."""
+
+    return GuidedStateOperationCommand(
+        fence=GuidedOperationFence(session_id=uuid4(), operation_id="op", lease_token="lease", attempt=1),
+        expected_current_state_id=None,
+        expected_current_state_version=None,
+        expected_current_content_hash=None,
+        state_id=uuid4(),
+        state=CompositionStateData(is_valid=False, composer_meta=composer_meta),
+        provenance="convergence_persist",
+        actor="worker",
+        response=GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None),
+        invalidated_pending_proposal=_pending_proposal_invalidation(),
+    )
+
+
+def test_terminal_exit_checkpoint_authorizes_pending_proposal_invalidation() -> None:
+    """The terminal walk reads the FROZEN composer_meta CompositionStateData produces.
+
+    ``CompositionStateData.__post_init__`` calls ``freeze_fields`` on
+    ``composer_meta``, so both the mapping and its nested ``guided_session``
+    reach ``_validate_deferred_intent_sidebands`` as ``mappingproxy``. Built
+    through the real producers (``TerminalState`` -> ``GuidedSession.to_dict``
+    -> ``CompositionStateData``) so the pin cannot pass on a dict literal that
+    the freeze no longer touches.
+    """
+
+    terminal = TerminalState(
+        kind=TerminalKind.EXITED_TO_FREEFORM,
+        reason=TerminalReason.USER_PRESSED_EXIT,
+        pipeline_yaml=None,
+    )
+    exited = replace(GuidedSession.initial(), terminal=terminal)
+
+    command = _terminal_exit_command({"guided_session": exited.to_dict()})
+
+    # The accept arm only holds if the guard recognises the frozen form; a
+    # bare ``type(x) is dict`` here would reject the real producer's output.
+    assert type(command.state.composer_meta) is MappingProxyType
+    assert type(command.state.composer_meta["guided_session"]) is MappingProxyType
+    assert command.invalidated_pending_proposal is not None
+
+
+@pytest.mark.parametrize(
+    ("label", "composer_meta"),
+    [
+        ("no_terminal", {"guided_session": GuidedSession.initial().to_dict()}),
+        ("no_guided_session", {"other": "meta"}),
+    ],
+)
+def test_pending_proposal_invalidation_requires_a_terminal_or_deferred_action(
+    label: str,
+    composer_meta: Mapping[str, Any],
+) -> None:
+    """The reject arm: no terminal checkpoint and no deferred action fails closed."""
+
+    with pytest.raises(AuditIntegrityError, match="requires a deferred intent action or a terminal exit checkpoint"):
+        _terminal_exit_command(composer_meta)
+
+
+def test_pending_proposal_invalidation_rejects_a_non_mapping_guided_session() -> None:
+    """A malformed guided_session raises precisely rather than reading as absent."""
+
+    with pytest.raises(AuditIntegrityError, match="Guided session composer metadata must be an exact mapping"):
+        _terminal_exit_command({"guided_session": ["not", "a", "mapping"]})
+
+
+def test_schema8_transition_rejects_a_non_mapping_schema_form_options_payload() -> None:
+    """The SCHEMA_FORM arm's shape gate rejects client-authored malformed input.
+
+    ``body.edited_values`` is Tier-3 request data: ``GuidedRespondRequest``
+    admits any ``dict[str, Any]``, so the closed ``{plugin, options}`` shape and
+    the element types are this boundary's to prove. A non-mapping ``options``
+    must be refused with ``ValueError`` before the value is promoted into the
+    owned ``SchemaFormResponse``, whose ``__post_init__`` re-validates and
+    freezes it. This is the honesty test for the ``@trust_boundary`` metadata on
+    ``_schema8_transition``.
+    """
+    guided_route = importlib.import_module("elspeth.web.sessions.routes.composer.guided")
+    from elspeth.web.sessions.schemas import GuidedRespondRequest
+
+    current_turn = {
+        "type": TurnType.SCHEMA_FORM.value,
+        "step_index": 0,
+        "payload": {"mode": "plugin_options", "plugin": "csv", "knobs": {"fields": []}, "prefilled": {}},
+    }
+    guided, _record, _turn_type, _payload_hash = guided_route._append_server_turn_record(
+        GuidedSession.initial(),
+        current_step=GuidedStep.STEP_1_SOURCE,
+        turn=current_turn,
+    )
+
+    body = GuidedRespondRequest.model_validate(
+        {
+            "operation_id": str(uuid4()),
+            "turn_token": "a" * 64,
+            "edited_values": {"plugin": "csv", "options": "path=/tmp/x.csv"},
+        },
+        strict=True,
+    )
+
+    with pytest.raises(ValueError, match="schema_form plugin and options have invalid types"):
+        guided_route._schema8_transition(
+            guided,
+            current_turn,
+            body=body,
+            catalog=cast(Any, object()),
+            new_stable_id=uuid4(),
+        )
+
+    body_bad_plugin = GuidedRespondRequest.model_validate(
+        {
+            "operation_id": str(uuid4()),
+            "turn_token": "a" * 64,
+            "edited_values": {"plugin": ["csv"], "options": {}},
+        },
+        strict=True,
+    )
+
+    with pytest.raises(ValueError, match="schema_form plugin and options have invalid types"):
+        guided_route._schema8_transition(
+            guided,
+            current_turn,
+            body=body_bad_plugin,
+            catalog=cast(Any, object()),
+            new_stable_id=uuid4(),
+        )

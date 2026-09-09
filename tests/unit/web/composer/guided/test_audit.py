@@ -213,6 +213,31 @@ class TestEmitIntentCancelled:
 
         assert rec.invocations == []
 
+    def test_projects_valid_owned_intent_without_reparsing_its_invariants(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The exact frozen carrier is the authority at this downstream seam."""
+        from elspeth.web.composer.guided import audit as guided_audit
+
+        def reject_reparse(_value: object) -> object:
+            raise AssertionError("owned intent was reparsed")
+
+        real_uuid4 = guided_audit.uuid.uuid4
+
+        class UUIDProbe:
+            UUID = staticmethod(reject_reparse)
+            uuid4 = staticmethod(real_uuid4)
+
+        monkeypatch.setattr(guided_audit, "uuid", UUIDProbe)
+        rec = _FakeRecorder()
+
+        emit_intent_cancelled(
+            rec,
+            intent=_cancelled_intent(),
+            composition_version=4,
+            actor="test-actor",
+        )
+
+        assert len(rec.invocations) == 1
+
 
 class TestArgumentsHashInvariant:
     """Tier-1 audit invariant: arguments_hash == sha256(arguments_canonical)."""

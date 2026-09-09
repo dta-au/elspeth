@@ -4,7 +4,7 @@ The LLMProvider protocol defines the narrow interface between LLMTransform
 (shared logic) and provider-specific transport (Azure SDK, OpenRouter HTTP).
 
 Providers are responsible for:
-1. Client lifecycle (creation, caching per state_id, cleanup)
+1. Client lifecycle (creation, caching per audit parent, cleanup)
 2. LLM API calls (transport-specific)
 3. Tier 3 boundary validation (response parsing, NaN rejection)
 4. Error classification (raising typed exceptions)
@@ -18,11 +18,129 @@ via their Audited*Client (D2 from architecture remediation).
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypedDict, runtime_checkable
 
+from elspeth.contracts import Call, CallStatus, CallType
+from elspeth.contracts.audit_protocols import CallRecorder
+from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
+
+
+class _AuditClientKwargs(TypedDict):
+    state_id: str | None
+    token_id: str | None
+    operation_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LLMAuditParent:
+    """Validated audit parent for an LLM provider call."""
+
+    state_id: str | None = None
+    token_id: str | None = None
+    operation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("state_id", self.state_id),
+            ("token_id", self.token_id),
+            ("operation_id", self.operation_id),
+        ):
+            if value is not None and type(value) is not str:
+                raise TypeError(f"{field_name} must be a string, got {type(value).__name__}")
+
+        row_parent = self.state_id is not None or self.token_id is not None
+        operation_parent = self.operation_id is not None
+        if row_parent == operation_parent:
+            raise ValueError("LLMAuditParent requires exactly one row or operation parent")
+        if row_parent and (not self.state_id or not self.state_id.strip() or not self.token_id or not self.token_id.strip()):
+            raise ValueError("row audit parent requires non-empty state_id and token_id")
+        if operation_parent and (not self.operation_id or not self.operation_id.strip()):
+            raise ValueError("operation audit parent requires a non-empty operation_id")
+
+    @classmethod
+    def for_row(cls, *, state_id: str, token_id: str) -> LLMAuditParent:
+        return cls(state_id=state_id, token_id=token_id)
+
+    @classmethod
+    def for_operation(cls, *, operation_id: str) -> LLMAuditParent:
+        return cls(operation_id=operation_id)
+
+    @property
+    def cache_key(self) -> str:
+        if self.operation_id is not None:
+            return f"operation:{self.operation_id}"
+        if self.state_id is None:
+            raise RuntimeError("validated row parent lost state_id")
+        return f"state:{self.state_id}"
+
+    def client_kwargs(self) -> _AuditClientKwargs:
+        return {
+            "state_id": self.state_id,
+            "token_id": self.token_id,
+            "operation_id": self.operation_id,
+        }
+
+    def tracing_metadata(self) -> dict[str, str]:
+        """Return the validated tracing identity without fabricating token ids."""
+        if self.operation_id is not None:
+            return {"operation_id": self.operation_id}
+        if self.state_id is None or self.token_id is None:
+            raise RuntimeError("validated row parent lost tracing identity")
+        return {"state_id": self.state_id, "token_id": self.token_id}
+
+    def allocate_call_index(self, recorder: CallRecorder) -> int:
+        """Allocate the next semantic-call index under this parent."""
+        if self.operation_id is not None:
+            return recorder.allocate_operation_call_index(self.operation_id)
+        if self.state_id is None:
+            raise RuntimeError("validated row parent lost state_id")
+        return recorder.allocate_call_index(self.state_id)
+
+    def record_call(
+        self,
+        recorder: CallRecorder,
+        *,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        error: CallPayload | None = None,
+        latency_ms: float | None = None,
+        resolved_prompt_template_hash: str | None = None,
+    ) -> Call:
+        """Record a semantic call under this validated parent."""
+        if self.operation_id is not None:
+            return recorder.record_operation_call(
+                operation_id=self.operation_id,
+                call_index=call_index,
+                call_type=call_type,
+                status=status,
+                request_data=request_data,
+                response_data=response_data,
+                error=error,
+                latency_ms=latency_ms,
+                resolved_prompt_template_hash=resolved_prompt_template_hash,
+            )
+        if self.state_id is None:
+            raise RuntimeError("validated row parent lost state_id")
+        return recorder.record_call(
+            state_id=self.state_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            request_data=request_data,
+            response_data=response_data,
+            error=error,
+            latency_ms=latency_ms,
+            resolved_prompt_template_hash=resolved_prompt_template_hash,
+        )
 
 
 class FinishReason(StrEnum):
@@ -55,6 +173,51 @@ class UnrecognizedFinishReason:
 ParsedFinishReason = FinishReason | UnrecognizedFinishReason | None
 
 
+@dataclass(frozen=True, slots=True)
+class FinishReasonFailure:
+    """Provider-neutral failure verdict for a non-success finish reason."""
+
+    reason: str
+    finish_reason: str
+    error_message: str
+
+
+_FINISH_REASON_FAILURES: dict[FinishReason, FinishReasonFailure] = {
+    FinishReason.LENGTH: FinishReasonFailure(
+        reason="response_truncated",
+        finish_reason=FinishReason.LENGTH.value,
+        error_message="Response truncated (finish_reason=length)",
+    ),
+    FinishReason.CONTENT_FILTER: FinishReasonFailure(
+        reason="content_filtered",
+        finish_reason=FinishReason.CONTENT_FILTER.value,
+        error_message="Response blocked by provider content filter",
+    ),
+}
+
+
+def classify_finish_reason_failure(finish_reason: ParsedFinishReason) -> FinishReasonFailure | None:
+    """Return a bounded failure verdict, or ``None`` for accepted completion forms.
+
+    Explicit ``stop`` and an absent finish reason are accepted. Every other
+    value fails closed. The returned description is independent of transform
+    row/query context so source and transform plugins can share the verdict.
+    """
+    if finish_reason is None or finish_reason == FinishReason.STOP:
+        return None
+    if isinstance(finish_reason, FinishReason):
+        if finish_reason in _FINISH_REASON_FAILURES:
+            return _FINISH_REASON_FAILURES[finish_reason]
+        raw_value = finish_reason.value
+    else:
+        raw_value = finish_reason.raw
+    return FinishReasonFailure(
+        reason="unexpected_finish_reason",
+        finish_reason=raw_value,
+        error_message=f"Unexpected finish reason: {raw_value}",
+    )
+
+
 def parse_finish_reason(raw: str | None) -> ParsedFinishReason:
     """Parse raw finish_reason string into validated enum.
 
@@ -77,6 +240,41 @@ def parse_finish_reason(raw: str | None) -> ParsedFinishReason:
         return FinishReason(raw)
     except ValueError:
         return UnrecognizedFinishReason(raw)
+
+
+@trust_boundary(
+    tier=3,
+    source="SDK-deserialized chat-completion envelope carried as LLMResponse.raw_response (externally derived)",
+    source_param="raw_response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the parsed finish_reason of the first choice when the envelope carries one and None on an absent "
+        "envelope or any shape failure; never raises on the envelope and reads no other member"
+    ),
+    non_raising=True,
+)
+def finish_reason_from_raw_response(raw_response: Mapping[str, Any] | None) -> ParsedFinishReason:
+    """Read only ``choices[0].finish_reason`` from an SDK provider's raw envelope.
+
+    The envelope is the SDK's deserialized API response, deep-frozen by
+    ``LLMResponse`` (lists arrive as tuples, dicts as mapping proxies), so the
+    shape is discriminated structurally rather than by exact builtin type.
+    Missing/empty choices or an absent envelope yield ``None``. The full
+    envelope is already recorded in the audit trail via
+    ``AuditedLLMClient.record_call()``, so anomalies are diagnosable there.
+    """
+    if raw_response is None:
+        return None
+    choices = raw_response.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
+        return None
+    first_choice = choices[0]
+    if not isinstance(first_choice, Mapping):
+        return None
+    raw_finish_reason = first_choice.get("finish_reason")
+    if raw_finish_reason is None:
+        return None
+    return parse_finish_reason(str(raw_finish_reason))
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,13 +329,12 @@ class LLMProvider(Protocol):
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult: ...
 

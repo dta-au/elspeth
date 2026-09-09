@@ -24,11 +24,14 @@ import {
   fetchRunOutputs,
 } from "@/api/client";
 import {
+  Button,
   PreviewTable,
   StructuredJsonPreview,
   type PreviewTableModel,
 } from "@/components/ui";
+import { parseCsvRows } from "@/utils/contentStructure";
 import { absoluteTime } from "@/utils/time";
+import { plural } from "@/utils/plural";
 import type {
   ApiError,
   RunOutputArtifact,
@@ -83,6 +86,14 @@ interface PreviewState {
 }
 
 const HASH_DISPLAY_LENGTH = 12;
+
+/**
+ * Gap between an artifact row and the preview block beneath it. Named once and
+ * expressed as the token rather than the raw `6` it was repeated as at five
+ * sites: --space-1-5 IS 6px, so the spacing now moves with the scale instead of
+ * being invisible to it (elspeth-cda90fbb49).
+ */
+const PREVIEW_BLOCK_MARGIN_TOP = "var(--space-1-5)";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -152,6 +163,19 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
   const activeRunIdRef = useRef(runId);
   const manifestRequestSeqRef = useRef(0);
   const previewRunGenerationRef = useRef(0);
+  // Which run OWNS the manifest currently in state. On a runId prop change
+  // A→B the auto-expand effect fires in the same commit with the NEW runId
+  // but the render-time manifest still run A's — acting on that pair would
+  // consume run B's auto-expand budget on run A's artifact ids (a cross-run
+  // /preview fetch that 404s). The effect therefore only acts when the
+  // manifest provably belongs to the current runId.
+  const manifestRunIdRef = useRef<string | null>(null);
+  // Runs that have already had their single previewable artifact
+  // auto-expanded (elspeth-3a7b7c7b37). Once-per-run so a manual collapse or
+  // a Refresh of the same run is never overridden — a SET, not a single id,
+  // so an A→B→A run flip can never re-arm run A's auto-expand over the
+  // operator's collapse.
+  const autoExpandedRunIdsRef = useRef<Set<string>>(new Set());
 
   const loadManifest = async (
     targetRunId: string,
@@ -161,6 +185,7 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
     activeRunIdRef.current = targetRunId;
     if (options.clearRunScopedState) {
       previewRunGenerationRef.current += 1;
+      manifestRunIdRef.current = null;
       setManifest(null);
       setPreviewByArtifactId({});
       setExpandedArtifactIds(new Set());
@@ -175,6 +200,7 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
       ) {
         return;
       }
+      manifestRunIdRef.current = targetRunId;
       setManifest(response);
     } catch (err) {
       if (
@@ -212,6 +238,30 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
     void loadManifest(runId, { clearRunScopedState: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
+
+  // Auto-expand the single-previewable-artifact common case: previews were
+  // opt-in only, so the routine one-output run landed collapsed
+  // (elspeth-3a7b7c7b37). Routed through togglePreview so the lazy /preview
+  // fetch keeps its request-sequencing guards (manifestRequestSeqRef /
+  // previewRunGenerationRef) — never a parallel fetch path. Multi-artifact
+  // manifests stay collapsed.
+  useEffect(() => {
+    if (
+      manifest === null ||
+      manifestRunIdRef.current !== runId ||
+      autoExpandedRunIdsRef.current.has(runId)
+    ) {
+      return;
+    }
+    const previewable = manifest.artifacts.filter(
+      (artifact) =>
+        isFileArtifact(artifact) && artifact.exists_now && artifact.downloadable,
+    );
+    if (previewable.length !== 1) return;
+    autoExpandedRunIdsRef.current.add(runId);
+    void togglePreview(previewable[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manifest, runId]);
 
   const togglePreview = async (artifact: RunOutputArtifact) => {
     const next = new Set(expandedArtifactIds);
@@ -279,14 +329,13 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
     >
       <div className="run-outputs-panel-header">
         <span className="run-outputs-panel-title">Outputs</span>
-        <button
-          type="button"
-          className="btn-compact"
+        <Button
+          compact
           onClick={() => void loadManifest(runId)}
           disabled={isLoading}
         >
           {isLoading ? "Loading…" : "Refresh"}
-        </button>
+        </Button>
       </div>
 
       {error && (
@@ -296,7 +345,12 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
       )}
 
       {!manifest && !error && isLoading && (
-        <div className="run-outputs-panel-muted">Loading outputs…</div>
+        <div className="run-outputs-panel-muted">
+          {/* The shared .spinner, same as LoginPage / AuthGuard / ExecuteButton
+              / PluginCard: static text cannot tell an operator whether the
+              panel is working or stalled (elspeth-cda90fbb49). */}
+          <span className="spinner" aria-hidden="true" /> Loading outputs…
+        </div>
       )}
 
       {manifest && manifest.artifacts.length === 0 && !isLoading && (
@@ -427,21 +481,19 @@ function ArtifactActions({ artifact, expanded, onTogglePreview, onDownload }: Ar
   }
   return (
     <span className="run-output-artifact-actions">
-      <button
-        type="button"
-        className="btn-compact"
+      <Button
+        compact
         onClick={onTogglePreview}
         aria-expanded={expanded}
       >
         {expanded ? "Hide preview" : "Preview"}
-      </button>
-      <button
-        type="button"
-        className="btn-compact"
+      </Button>
+      <Button
+        compact
         onClick={onDownload}
       >
         Download
-      </button>
+      </Button>
     </span>
   );
 }
@@ -459,19 +511,26 @@ function ArtifactPreviewView({
 }: ArtifactPreviewViewProps) {
   if (!previewState || previewState.status === "loading") {
     return (
-      <div style={{ marginTop: 6, color: "var(--color-text-muted)" }}>Loading preview…</div>
+      <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-text-muted)" }}>
+        {/* The shared .spinner, same as LoginPage / AuthGuard / ExecuteButton /
+            PluginCard. This is the only genuinely IN-FLIGHT state in this
+            view — purged / error / binary below are terminal outcomes, and a
+            spinner on one of those would claim work that is not happening
+            (elspeth-cda90fbb49). */}
+        <span className="spinner" aria-hidden="true" /> Loading preview…
+      </div>
     );
   }
   if (previewState.status === "purged") {
     return (
-      <div style={{ marginTop: 6, color: "var(--color-text-muted)", fontStyle: "italic" }}>
+      <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-text-muted)", fontStyle: "italic" }}>
         File is no longer available on disk (purged or moved between manifest fetch and preview).
       </div>
     );
   }
   if (previewState.status === "error") {
     return (
-      <div role="alert" style={{ marginTop: 6, color: "var(--color-error)" }}>
+      <div role="alert" style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-error)" }}>
         {previewState.error ?? "Preview failed"}
       </div>
     );
@@ -480,20 +539,24 @@ function ArtifactPreviewView({
   if (!preview) return null;
   if (preview.content_type === "binary") {
     return (
-      <div style={{ marginTop: 6, color: "var(--color-text-muted)", fontStyle: "italic" }}>
+      <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-text-muted)", fontStyle: "italic" }}>
         Binary file — no inline preview available. Use the Download button to inspect.
       </div>
     );
   }
   return (
-    <div style={{ marginTop: 6 }}>
+    <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP }}>
       {preview.content_type === "json" ? (
         <StructuredJsonPreview
           text={preview.preview_text}
           truncated={preview.truncated}
         />
       ) : preview.content_type === "csv" || preview.content_type === "jsonl" ? (
-        <TabularPreview text={preview.preview_text} contentType={preview.content_type} />
+        <TabularPreview
+          text={preview.preview_text}
+          contentType={preview.content_type}
+          truncated={preview.truncated}
+        />
       ) : (
         <pre
           style={{
@@ -513,26 +576,26 @@ function ArtifactPreviewView({
       )}
       {preview.truncated && (
         <div
-          style={{ marginTop: 4, color: "var(--color-text-muted)", fontSize: 11 }}
+          style={{
+            marginTop: "var(--space-xs)",
+            color: "var(--color-text-muted)",
+            fontSize: 11,
+          }}
         >
+          {/* row_count_preview is the count of complete logical records the
+              backend included (a CSV header remains one record). Byte-cut
+              fragments are withheld rather than counted. */}
           Preview truncated
-          {preview.row_count_preview != null && ` to ${preview.row_count_preview} rows`}
+          {preview.row_count_preview != null &&
+            ` to ${plural(preview.row_count_preview, "row")}${
+              preview.content_type === "csv" && preview.row_count_preview > 0
+                ? " including header"
+                : ""
+            }`}
           {" — "}
-          <button
-            type="button"
-            onClick={onDownload}
-            style={{
-              background: "none",
-              border: "none",
-              padding: 0,
-              color: "var(--color-link)",
-              textDecoration: "underline",
-              cursor: "pointer",
-              font: "inherit",
-            }}
-          >
+          <Button variant="bare" className="link-button" onClick={onDownload}>
             download for full file
-          </button>
+          </Button>
           {" "}({formatBytes(preview.total_size_bytes)} total).
         </div>
       )}
@@ -542,23 +605,55 @@ function ArtifactPreviewView({
 
 // ── TabularPreview ─────────────────────────────────────────────────────────
 
+/**
+ * A rendered table plus the reason a record is missing from it, if one is.
+ *
+ * Local, not a widening of the shared `PreviewTableModel`: the caveat is a
+ * property of reading CSV/JSONL text, and StructuredJsonPreview — the other
+ * consumer of that shared type — has nothing to say through it.
+ */
+interface TabularPreviewModel extends PreviewTableModel {
+  caveat: string | null;
+}
+
 interface TabularPreviewProps {
   text: string;
   contentType: "csv" | "jsonl";
+  /** Whether the backend cut the preview short. Governs how an unterminated
+   *  final field is explained — see buildTabularPreviewModel. */
+  truncated: boolean;
 }
 
 /**
  * Builds a headers+rows model for the shared PreviewTable out of raw
- * csv/jsonl preview text. Tolerant of malformed rows — this is
- * deliberately not a full CSV parser (no quoted-comma handling); preview
- * is best-effort, not a data-loading path.
+ * csv/jsonl preview text.
  *
  * Two content types feed this:
- *   * csv  — backend tags both `.csv` and `.tsv` files as content_type
- *            "csv" (see web/execution/preview._CSV_EXTENSIONS), so we
- *            sniff the first line for tab vs comma rather than
- *            hardcoding `,`. Without this, TSV rows collapse into a
- *            single column. The first line is the real header row.
+ *   * csv  — parsed with the shared `parseCsvRows` reader
+ *            (`utils/contentStructure.ts`), which honours RFC4180 quoting:
+ *            a delimiter or a newline INSIDE a quoted field is data, and
+ *            `""` is one literal quote. This used to be a bare
+ *            `line.split(delimiter)`, which shredded every quoted value
+ *            containing a comma — universal in practice, because every
+ *            transform:llm emits `<response_field>_usage` as a dict repr
+ *            full of them. Body rows then parsed wider than the header, so
+ *            `columnCount` grew to the body width and the header was
+ *            right-padded with EMPTY strings: real values rendered under
+ *            nameless columns with no signal anything was wrong
+ *            (elspeth-7f1e148ed6).
+ *
+ *            The backend tags both `.csv` and `.tsv` files as content_type
+ *            "csv" (see web/execution/preview._CSV_EXTENSIONS), so we still
+ *            sniff the first physical line for tab vs comma rather than
+ *            hardcoding `,`. Without this, TSV rows collapse into a single
+ *            column. The first parsed row is the real header row.
+ *
+ *            Quote handling stays ON for the tab delimiter, deliberately:
+ *            the sink writes through `csv.DictWriter(delimiter=...)`
+ *            (plugins/sinks/csv_sink.py), which quotes a field containing
+ *            the delimiter, a quote, or a newline whatever the delimiter
+ *            is. Reading TSV with quoting disabled would therefore
+ *            misparse ELSPETH's own tab-separated output.
  *   * jsonl — each line is a JSON object that must NOT be split on
  *             commas (that fragments the JSON across cells). Each line
  *             is rendered as a single-column row under one synthetic
@@ -566,41 +661,112 @@ interface TabularPreviewProps {
  *             but every PreviewTable still gets a real th scope="col"
  *             header cell rather than the old bold-td fake header
  *             (elspeth-611a05668e).
+ *
+ * Still deliberately tolerant of ragged rows: short rows are padded and
+ * over-wide rows widen the header, because a preview should render what is
+ * there rather than refuse. Synthetic columns get explicit labels and a
+ * visible caveat. What this no longer does is MANUFACTURE raggedness out of
+ * correctly-quoted input.
  */
 function buildTabularPreviewModel(
   text: string,
   contentType: "csv" | "jsonl",
-): PreviewTableModel | null {
-  const lines = text.split("\n").filter((line) => line.length > 0);
-  if (lines.length === 0) {
-    return null;
-  }
+  truncated: boolean,
+): TabularPreviewModel | null {
   if (contentType === "jsonl") {
+    const lines = text
+      .split("\n")
+      .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
+      .filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      return null;
+    }
     return {
       headers: ["value"],
       rows: lines.map((line) => [line]),
+      caveat: null,
     };
   }
-  const firstLine = lines[0];
+
+  // Legacy best-effort while the preview contract carries no dialect: choose
+  // only between built-in comma CSV and .tsv tab output. Header values may
+  // themselves contain commas/newlines, so ambiguous or custom delimiters need
+  // dialect metadata rather than another sniff heuristic.
+  const firstLine = text.split("\n", 1)[0] ?? "";
   const tabCount = (firstLine.match(/\t/g) ?? []).length;
   const commaCount = (firstLine.match(/,/g) ?? []).length;
   const delimiter = tabCount > commaCount ? "\t" : ",";
-  const [headerRow, ...bodyRows] = lines.map((line) => line.split(delimiter));
+
+  const { rows: parsed, endedInQuotes } = parseCsvRows(text, delimiter);
+  // An unterminated quoted field means the text stopped mid-record. That
+  // trailing row is a fragment, not a record, so rendering it would show the
+  // operator data that does not exist — drop it. But dropping it SILENTLY is
+  // the defect this once had: the reason the record vanished has to be on
+  // screen, and the two reasons are not the same.
+  //
+  // `truncated` is what distinguishes them, which is why it is threaded in
+  // here rather than assumed. This function used to justify the silent drop
+  // by pointing at the "Preview truncated" notice — a notice it could not
+  // see, gated on a flag it was never given, and absent entirely on the
+  // malformed-artifact path. summarizeCsv (utils/contentStructure.ts) reads
+  // the SAME endedInQuotes flag and has always reported the malformed case
+  // as a caveat; this is that rule, applied to the second consumer.
+  const rows_ = endedInQuotes ? parsed.slice(0, -1) : parsed;
+  const incompleteRecordCaveat = endedInQuotes
+    ? truncated
+      // Defensive for stale servers or captured responses: the current
+      // backend withholds byte-cut fragments at a complete record boundary.
+      ? "The last record was cut off by the preview limit and is not shown — download for the full file."
+      : "Content has an unterminated quoted field — the final record could not be read."
+    : null;
+  if (rows_.length === 0) {
+    return incompleteRecordCaveat === null
+      ? null
+      : { headers: [], rows: [], caveat: incompleteRecordCaveat };
+  }
+
+  const [headerRow = [], ...bodyRows] = rows_;
   const columnCount =
     bodyRows.length === 0
       ? headerRow.length
       : Math.max(headerRow.length, ...bodyRows.map((row) => row.length));
-  const headers = Array.from({ length: columnCount }, (_, i) => headerRow[i] ?? "");
+  const hasExtraFields = columnCount > headerRow.length;
+  const headers = Array.from(
+    { length: columnCount },
+    (_, i) => headerRow[i] ?? `Unnamed column ${i + 1}`,
+  );
   const rows = bodyRows.map((row) =>
     Array.from({ length: columnCount }, (_, i) => row[i] ?? ""),
   );
-  return { headers, rows };
+  const extraFieldsCaveat = hasExtraFields
+    ? "Some rows contain more fields than the header; extra columns are labelled for review."
+    : null;
+  const caveat =
+    incompleteRecordCaveat !== null && extraFieldsCaveat !== null
+      ? `${incompleteRecordCaveat} ${extraFieldsCaveat}`
+      : incompleteRecordCaveat ?? extraFieldsCaveat;
+  return { headers, rows, caveat };
 }
 
-function TabularPreview({ text, contentType }: TabularPreviewProps) {
-  const table = buildTabularPreviewModel(text, contentType);
+function TabularPreview({ text, contentType, truncated }: TabularPreviewProps) {
+  const table = buildTabularPreviewModel(text, contentType, truncated);
   if (!table) {
     return null;
   }
-  return <PreviewTable table={table} />;
+  return (
+    <>
+      {table.headers.length > 0 && <PreviewTable table={table} />}
+      {table.caveat !== null && (
+        <div
+          style={{
+            marginTop: "var(--space-xs)",
+            color: "var(--color-text-muted)",
+            fontSize: 11,
+          }}
+        >
+          {table.caveat}
+        </div>
+      )}
+    </>
+  );
 }

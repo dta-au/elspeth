@@ -21,6 +21,8 @@ from typing import Annotated, Any, TypeVar, Union, get_args, get_origin
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic.fields import FieldInfo
 
+from elspeth.contracts.schema import FIELD_TYPE_MAP
+
 T = TypeVar("T", bound="PluginSchema")
 
 
@@ -193,6 +195,8 @@ def _check_field_constraints(
 def check_compatibility(
     producer_schema: type[PluginSchema],
     consumer_schema: type[PluginSchema],
+    *,
+    producer_guaranteed: frozenset[str] = frozenset(),
 ) -> CompatibilityResult:
     """Check if producer output is compatible with consumer input.
 
@@ -207,9 +211,41 @@ def check_compatibility(
     - If consumer has extra="forbid", producer must not have extra fields
     - If consumer has strict=True, no type coercion is allowed (int->float rejected)
 
+    ``producer_guaranteed`` carries the OTHER knowledge channel: fields the
+    graph proves present on every row even though the producer never typed
+    them (an under-declaring pass-through, a union coalesce merging
+    under-declared branches). A consumer-required field found there is not
+    missing — reporting it was a false reject of runnable pipelines
+    (elspeth-7d68b04878). Two deliberate limits keep the forgiveness sound:
+
+    - It applies only when the producer's CONTRACT admits undeclared fields
+      (``extra='allow'``). A ``forbid`` producer's rows are exactly its
+      declared fields (emission-side strict validation rejects extras), so a
+      guarantee naming anything else describes what it CONSUMED, not what
+      arrives — the same extras-firewall discriminator the guaranteed-extras
+      check uses — and the field stays missing. ``ignore`` is held to the
+      same verdict on deliberately conservative grounds: its runtime today
+      forwards undeclared fields (emission-side validation is check-only, the
+      row dict is never filtered), but that is an implementation detail of
+      the executor, not a contract, so no forgiveness is built on it. The
+      reject side of this gate is sound by construction; the FORGIVE side is
+      an inventory fact about current node kinds (today's reductive plugins
+      all publish ``mode: observed`` outputs, which bypass this function
+      entirely). A future reductive plugin emitting a FLEXIBLE output schema
+      alongside a consumed-field guarantee would reopen the hole here —
+      re-derive this argument before adding one.
+    - The guarantee channel carries names without types, so a forgiven field's
+      type is checked per-row at the consumer preflight rather than here —
+      the standard the dynamic/observed bypass paths already set, where no
+      build-time type check runs at all. A field the producer DOES declare is
+      never forgiven: the type-mismatch arm keeps its verdict.
+
     Args:
         producer_schema: Output schema of upstream plugin
         consumer_schema: Input schema of downstream plugin
+        producer_guaranteed: Fields the graph proves the producer delivers;
+            empty when the caller has no graph context (pairwise structural
+            checks, direct API use), which preserves the declared-only verdict
 
     Returns:
         CompatibilityResult indicating compatibility and any issues
@@ -223,6 +259,12 @@ def check_compatibility(
     # Direct access is correct per Tier 1 trust model - missing key would be our bug.
     consumer_strict = consumer_schema.model_config["strict"]
 
+    # The extras firewall, missing-arm direction: only a producer that admits
+    # undeclared fields can deliver a guaranteed-but-undeclared one.
+    # NOTE: We control all schemas via PluginSchema base class which sets model_config["extra"].
+    # Direct access is correct per Tier 1 trust model - missing key would be our bug.
+    producer_admits_undeclared = producer_schema.model_config["extra"] == "allow"
+
     missing: list[str] = []
     mismatches: list[tuple[str, str, str]] = []
     constraint_mismatches: list[tuple[str, str]] = []
@@ -232,8 +274,8 @@ def check_compatibility(
         is_required = consumer_field.is_required()
 
         if field_name not in producer_fields:
-            # Missing field - only a problem if required
-            if is_required:
+            # Missing field - only a problem if required and not proven present
+            if is_required and not (producer_admits_undeclared and field_name in producer_guaranteed):
                 missing.append(field_name)
         else:
             producer_field = producer_fields[field_name]
@@ -390,3 +432,38 @@ def _types_compatible(
             return all(any(_types_compatible(a, e, consumer_strict=consumer_strict) for e in expected_args) for a in actual_args)
 
     return False
+
+
+def resolved_guarantee_type_mismatch(
+    field_type: str,
+    consumer_annotation: Any,
+    *,
+    consumer_strict: bool,
+) -> tuple[str, str] | None:
+    """Compare a guarantee-channel ancestor declaration against a consumer field.
+
+    The guarantee walk proves a field's PRESENCE without its type; when the
+    nearest ancestor declaration IS knowable (``ResolvedGuaranteeType``,
+    ``core.dag.guarantees``), this applies the declared type-mismatch arm's
+    compatibility policy — same ``FIELD_TYPE_MAP`` materialization, same
+    ``_types_compatible`` coercion rules, same ``_type_name`` spelling — on
+    the BASE type alone. Nullability is deliberately excluded: the two
+    declared-arm materializations disagree about it (the coalesce factory
+    folds ``nullable``/optional into ``| None``, the plugin factory reads
+    ``required`` alone), so consulting it here would reject pipelines whose
+    fully-declared control builds green. Comparing bare base types is never
+    stricter than either materialization, which is what keeps the
+    declare-more monotonicity invariant true.
+
+    Returns ``(expected_name, actual_name)`` on a provable conflict, ``None``
+    when compatible — or when ``field_type`` is ``"any"``, which is an
+    ABSTENTION: ``_types_compatible`` treats ``Any`` as universal only on the
+    expected side, so letting an ``any`` declaration through as the actual
+    type would manufacture rejections for a type nobody stated.
+    """
+    if field_type == "any":
+        return None
+    actual = FIELD_TYPE_MAP[field_type]
+    if _types_compatible(actual, consumer_annotation, consumer_strict=consumer_strict):
+        return None
+    return (_type_name(consumer_annotation), _type_name(actual))

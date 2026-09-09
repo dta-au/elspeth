@@ -208,9 +208,6 @@ def _valid_constraint_fields(pair: tuple[TerminalOutcome | None, TerminalPath]) 
     field_values = {
         "sink_name": "sink-0",
         "batch_id": "batch-1",
-        "fork_group_id": "fork-1",
-        "join_group_id": "join-1",
-        "expand_group_id": "expand-1",
         "error_hash": _ERROR_HASH,
     }
     fields: dict[str, str] = {}
@@ -482,14 +479,12 @@ class TestRecordTokenOutcomeTwoAxis:
                 sink_name="sink-0",
             )
 
-    def test_record_expand_parent_requires_expand_group_id(self) -> None:
-        _db, repo, _fac, _row, tok = _make_repo_with_token()
-        with pytest.raises(ValueError, match="expand_group_id"):
-            repo.record_token_outcome(
-                ref=TokenRef(token_id=tok, run_id="run-1"),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.EXPAND_PARENT,
-            )
+    # test_record_expand_parent_requires_expand_group_id retired (D2 flip):
+    # expand_group_id is no longer a token_outcomes field to require —
+    # (TRANSIENT, EXPAND_PARENT) now forbids every discriminator field, and
+    # the roster of record lives in group_records + the children's own
+    # lineage_path frames. See test_record_accepts_every_constraint_pair
+    # below, which already exercises this pair with zero extra fields.
 
     def test_record_sink_discarded_requires_exact_discard_sink_name(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
@@ -1160,9 +1155,6 @@ class TestValidateOutcomeFieldsExhaustive:
                 TerminalPath.DEFAULT_FLOW,
                 sink_name=None,
                 batch_id=None,
-                fork_group_id=None,
-                join_group_id=None,
-                expand_group_id=None,
                 error_hash=None,
             )
 
@@ -1705,12 +1697,18 @@ class TestAdr019DeferredInvariantSweep:
         row_id: str,
         token_id: str,
     ) -> None:
-        """Record an orphan FORK_PARENT outcome with no child witness."""
+        """Record an orphan FORK_PARENT outcome with no child witness.
+
+        D2 flip: fork_group_id is retired from token_outcomes — (TRANSIENT,
+        FORK_PARENT) now forbids every discriminator field. The roster of
+        record moved to group_records + the children's own lineage_path
+        frames, which is exactly what makes this outcome "orphan": no child
+        token carries an innermost FORK frame minted by this parent.
+        """
         repo.record_token_outcome(
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
-            fork_group_id=f"fg_{token_id}",
         )
 
     @staticmethod

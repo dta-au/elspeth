@@ -83,6 +83,37 @@ describe("ReadinessRowDetail", () => {
     }
   });
 
+  it("uses workspace component navigation without selecting or opening the legacy modal", async () => {
+    const user = userEvent.setup();
+    const onSelectComponent = vi.fn();
+    const selectNode = vi.fn();
+    const onOpenGraph = vi.fn();
+    useSessionStore.setState({ selectNode } as never);
+    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+    try {
+      render(
+        <ReadinessRowDetail
+          row={ROW_WITH_NODE}
+          onClose={() => {}}
+          onSelectComponent={onSelectComponent}
+        />,
+      );
+      await user.click(
+        screen.getByRole("button", {
+          name: /Jump to the "pick the columns you need" step/,
+        }),
+      );
+
+      expect(onSelectComponent).toHaveBeenCalledExactlyOnceWith(
+        "select_columns",
+      );
+      expect(selectNode).not.toHaveBeenCalled();
+      expect(onOpenGraph).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+    }
+  });
+
   it("renders unresolved ids as plain text (no jump button)", () => {
     render(<ReadinessRowDetail row={ROW_WITHOUT_RESOLVABLE_ID} onClose={() => {}} />);
     expect(screen.getByText("api_key")).toBeInTheDocument();

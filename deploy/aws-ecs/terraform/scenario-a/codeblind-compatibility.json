@@ -1,0 +1,11 @@
+{
+  "schema": "elspeth.aws-ecs-codeblind-compatibility.v1",
+  "scenario_id": "A",
+  "purpose": "Tracked package facts for standalone cold-install inventory compatibility; not acceptance evidence.",
+  "terraform_root": "scenario-a",
+  "tfvars_example": "examples/scenario-a.tfvars.example",
+  "transaction_search_baseline": {
+    "state": "not-captured",
+    "reason": "Standalone first-account installation has no pre-existing transaction-search baseline."
+  }
+}

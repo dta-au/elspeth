@@ -12,10 +12,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Row
 
 from elspeth.contracts import (
@@ -32,8 +31,10 @@ from elspeth.contracts import (
     TerminalPath,
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
-from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.freeze import deep_freeze, freeze_fields
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import NodeID
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
@@ -42,11 +43,18 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler import BarrierJournalRepository, SchedulerEventStore
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.schema import (
+    SOURCE_COMPLETE_LIFECYCLE_STATES,
+    group_losses_table,
+    group_records_table,
     node_states_table,
     rows_table,
+    run_sources_table,
     runs_table,
+    token_lineage_frames_table,
     token_outcomes_table,
+    token_work_items_table,
     tokens_table,
 )
 
@@ -69,13 +77,21 @@ def _reject_source_row_json_constant(constant: str) -> Any:
 
 
 __all__ = [
+    "GroupBindingView",
+    "GroupSatisfiabilityResumeGate",
+    "GroupUnsatisfiableResumeError",
     "IncompleteTokenSpec",
     "NonResumableRunError",
     "RecoveryManager",
     "ResumeCheck",  # Re-exported from contracts for convenience
     "ResumePoint",  # Re-exported from contracts for convenience
     "ResumeWorkSet",
+    "SourceLifecycleResumeGate",
+    "UnsatisfiableGroupMember",
+    "check_group_satisfiability_resumable",
     "check_run_status_resumable",
+    "check_source_lifecycle_resumable",
+    "group_binding_view_from_graph",
 ]
 
 
@@ -154,7 +170,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         # Lives in the SHARED implementation so the advisory can_resume() and
         # the enforcing resume() entry guard produce the SAME verdict
         # (the elspeth-2f23292372 parity contract).
-        leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id, now=datetime.now(UTC))
+        leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
         if leader is not None and leader.seat_live:
             reason = (
                 f"Run is in progress under live leader {leader.leader_worker_id!r} "
@@ -172,6 +188,374 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
 
 
 @dataclass(frozen=True, slots=True)
+class SourceLifecycleResumeGate:
+    """Facts + verdict from the shared source-lifecycle resume gate.
+
+    ``lifecycle_by_source`` carries every declared source (name → state);
+    ``incomplete_sources`` is the subset outside
+    ``SOURCE_COMPLETE_LIFECYCLE_STATES`` — the exact payload
+    ``IncompleteSourceResumeError`` requires. ``check`` is the advisory
+    verdict: ``can_resume=False`` iff ``incomplete_sources`` is non-empty.
+    An empty ``lifecycle_by_source`` passes this gate vacuously; the
+    no-recorded-work refuse (``EmptyResumeStateError``) stays with its
+    existing owners.
+    """
+
+    lifecycle_by_source: Mapping[str, str]
+    incomplete_sources: Mapping[str, str]
+    check: ResumeCheck
+
+    def __post_init__(self) -> None:
+        # Both mappings are built fresh per gate call from one SQL read, and
+        # ``incomplete_sources`` is a derived subset of ``lifecycle_by_source``
+        # — so the two share str values but no container. Freezing them keeps
+        # the gate's evidence identical between the advisory ``can_resume()``
+        # read and the enforcing ``resume()`` guard, which is the whole point
+        # of the elspeth-1f5b83cd28 parity contract. Both readers are
+        # read-only: ``resume()`` truth-tests ``lifecycle_by_source`` and hands
+        # ``incomplete_sources`` to ``IncompleteSourceResumeError``, which
+        # copies it via ``dict(source_states)``.
+        freeze_fields(self, "lifecycle_by_source", "incomplete_sources")
+
+
+def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLifecycleResumeGate:
+    """Source-lifecycle portion of :meth:`RecoveryManager.can_resume`.
+
+    SINGLE shared implementation for the advisory ``can_resume`` surface and
+    the enforcing ``IncompleteSourceResumeError`` guard in
+    ``ResumeCoordinator.resume()`` — the two must never drift
+    (elspeth-1f5b83cd28; same parity contract as
+    :func:`check_run_status_resumable`, elspeth-2f23292372). Resume replays
+    only persisted row payloads through NullSource, so a source that never
+    reached a complete lifecycle state (``SOURCE_COMPLETE_LIFECYCLE_STATES``)
+    may have unread rows that no resume can recover.
+    """
+    with db.engine.connect() as conn:
+        rows = conn.execute(
+            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
+        ).fetchall()
+    lifecycle_by_source = {str(row.source_name): str(row.lifecycle_state) for row in rows}
+    incomplete_sources = {name: state for name, state in lifecycle_by_source.items() if state not in SOURCE_COMPLETE_LIFECYCLE_STATES}
+    if incomplete_sources:
+        source_summary = ", ".join(f"{source}={state}" for source, state in sorted(incomplete_sources.items()))
+        reason = (
+            f"source lifecycle is incomplete ({source_summary}) — resume replays only "
+            "persisted row payloads, so unread source rows may exist; start a fresh run"
+        )
+        return SourceLifecycleResumeGate(
+            lifecycle_by_source=lifecycle_by_source,
+            incomplete_sources=incomplete_sources,
+            check=ResumeCheck(can_resume=False, reason=reason),
+        )
+    return SourceLifecycleResumeGate(
+        lifecycle_by_source=lifecycle_by_source,
+        incomplete_sources=incomplete_sources,
+        check=ResumeCheck(can_resume=True),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GroupBindingView:
+    """Config-derived binding facts for the group-satisfiability gate.
+
+    Built from the builder's group-binding registry by
+    :func:`group_binding_view_from_graph` (the ONE seam coupling this gate to
+    the DAG layer); unit tests construct it directly. Boundness is a config
+    fact, never a durable one — ``group_records`` deliberately carries no
+    binding column (spec §4.3).
+    """
+
+    fork_branch_closers: Mapping[str, str]
+    fork_branch_rosters: Mapping[str, tuple[str, ...]]
+    scope_opener_closers: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "fork_branch_closers", "fork_branch_rosters", "scope_opener_closers")
+
+
+@dataclass(frozen=True, slots=True)
+class UnsatisfiableGroupMember:
+    """One minted member of a bound group that no resume can ever settle."""
+
+    closer_name: str
+    group_id: str
+    member_key: str
+    kind: FrameKind
+
+
+@dataclass(frozen=True, slots=True)
+class GroupSatisfiabilityResumeGate:
+    """Facts + verdict from the shared group-satisfiability resume gate.
+
+    SINGLE shared implementation for the advisory ``can_resume`` surface and
+    the enforcing entry guard in ``ResumeCoordinator.resume()`` — the two
+    must never drift (the check_source_lifecycle_resumable precedent,
+    elspeth-1f5b83cd28; spec §8).
+    """
+
+    unsatisfiable_members: tuple[UnsatisfiableGroupMember, ...]
+    check: ResumeCheck
+
+
+# TIER-2: same operator-refusal register as NonResumableRunError above — the
+# audit DB is intact; the durable group state proves the roster can never
+# close, so resuming would wedge at the barrier forever (the B3 dishonesty
+# spec §5 names). Carries the members so CLI/API callers surface the exact
+# scope/group/member without parsing text.
+class GroupUnsatisfiableResumeError(Exception):
+    """Raised by ``ResumeCoordinator.resume()`` when a bound group can never settle."""
+
+    def __init__(self, run_id: str, members: Sequence[UnsatisfiableGroupMember]) -> None:
+        if not members:
+            raise ValueError("GroupUnsatisfiableResumeError requires at least one member")
+        self.run_id = run_id
+        self.members = tuple(members)
+        summary = "; ".join(f"closer {m.closer_name!r} group {m.group_id!r} member {m.member_key!r}" for m in self.members)
+        super().__init__(
+            f"Cannot resume run {run_id!r}: {len(self.members)} bound-group member(s) are terminal "
+            f"without settlement — neither arrived at their closer nor named in group_losses ({summary}). "
+            "The group roster can never close; investigate the audit evidence instead of resuming over it."
+        )
+
+
+def _group_member_is_settled_or_live(
+    conn: Any,
+    *,
+    run_id: str,
+    closer_name: str,
+    group_id: str,
+    member_key: str,
+) -> bool:
+    """The three-limb satisfiability check for one minted member (spec §8).
+
+    Lost: named in ``group_losses``. Live: a frame-bearing token with no
+    completed terminal. Arrived: a journal row for the member that was HELD
+    at this closer's barrier — the address columns name the barrier and
+    ``barrier_blocked_at`` proves the hold. The address alone is not
+    arrival: ``coalesce_name`` / ``row_union_name`` / ``collector_name`` /
+    ``barrier_key`` are the member's barrier BINDING address (schema, spec
+    §4.3), stamped on every in-region work item from the moment it is
+    created, so a member that died inside the region before reaching its
+    closer carries the same address as one the closer consumed. Only
+    ``mark_blocked`` writes ``barrier_blocked_at`` (Task 1.3); a released
+    or failed-group member keeps its stamp after the hold resolves, a
+    diverted or dropped member never gets one (elspeth-76e936568e).
+    """
+    lost = conn.execute(
+        select(group_losses_table.c.loss_id)
+        .where(
+            group_losses_table.c.run_id == run_id,
+            group_losses_table.c.closer_name == closer_name,
+            group_losses_table.c.group_id == group_id,
+            group_losses_table.c.member_key == member_key,
+            # NO adopted_epoch filter: §6.2 full-table-read discipline —
+            # adoption is a leader-memory cursor, not a truth filter.
+        )
+        .limit(1)
+    ).fetchone()
+    if lost is not None:
+        return True
+
+    frames = token_lineage_frames_table
+    live = conn.execute(
+        select(frames.c.token_id)
+        .where(
+            frames.c.run_id == run_id,
+            frames.c.group_id == group_id,
+            frames.c.member_key == member_key,
+            ~select(token_outcomes_table.c.outcome_id)
+            .where(
+                token_outcomes_table.c.run_id == run_id,
+                token_outcomes_table.c.token_id == frames.c.token_id,
+                token_outcomes_table.c.completed == 1,
+            )
+            .exists(),
+        )
+        .limit(1)
+    ).fetchone()
+    if live is not None:
+        return True
+
+    arrived = conn.execute(
+        select(token_work_items_table.c.work_item_id)
+        .select_from(
+            token_work_items_table.join(
+                frames,
+                (token_work_items_table.c.token_id == frames.c.token_id) & (token_work_items_table.c.run_id == frames.c.run_id),
+            )
+        )
+        .where(
+            token_work_items_table.c.run_id == run_id,
+            frames.c.group_id == group_id,
+            frames.c.member_key == member_key,
+            token_work_items_table.c.barrier_blocked_at.is_not(None),
+            or_(
+                token_work_items_table.c.coalesce_name == closer_name,
+                token_work_items_table.c.row_union_name == closer_name,
+                # Collector rows: collector_name is the address column; their
+                # barrier_key is the compound "collector:<name>:<group-id>"
+                # (WS4 Task 6), so the bare-equality barrier_key disjunct
+                # below cannot match them — do not drop this disjunct.
+                token_work_items_table.c.collector_name == closer_name,
+                token_work_items_table.c.barrier_key == closer_name,
+                # The compound collector address itself, built by THE single
+                # construction site (never re-derived inline; the interlock
+                # canary pins this call).
+                token_work_items_table.c.barrier_key == collector_barrier_key(closer_name, group_id),
+            ),
+        )
+        .limit(1)
+    ).fetchone()
+    return arrived is not None
+
+
+def check_group_satisfiability_resumable(
+    db: LandscapeDB,
+    run_id: str,
+    bindings: GroupBindingView,
+) -> GroupSatisfiabilityResumeGate:
+    """Group-satisfiability portion of :meth:`RecoveryManager.can_resume` (spec §8).
+
+    SINGLE shared implementation for the advisory ``can_resume`` surface and
+    the enforcing ``GroupUnsatisfiableResumeError`` guard in
+    ``ResumeCoordinator.resume()`` — the two must never drift (the
+    check_source_lifecycle_resumable two-surface precedent). Every minted
+    member of every bound group must be non-terminal, arrived at its closer,
+    or named in ``group_losses``; otherwise refuse with closer, group, and
+    member named. Unbound groups are inert provenance and never refuse.
+    """
+    unsatisfiable: list[UnsatisfiableGroupMember] = []
+    with db.engine.connect() as conn:
+        # --- FORK groups: roster authority is the declared branch list. ---
+        fork_rows = conn.execute(
+            select(token_lineage_frames_table.c.group_id, token_lineage_frames_table.c.member_key)
+            .where(
+                token_lineage_frames_table.c.run_id == run_id,
+                token_lineage_frames_table.c.kind == FrameKind.FORK.value,
+            )
+            .distinct()
+        ).fetchall()
+        fork_member_pairs = [(str(row.group_id), str(row.member_key)) for row in fork_rows]
+
+        for group_id in sorted({pair_group_id for pair_group_id, _ in fork_member_pairs}):
+            seen = {member_key for pair_group_id, member_key in fork_member_pairs if pair_group_id == group_id}
+            bound = {member for member in seen if member in bindings.fork_branch_closers}
+            if not bound:
+                continue  # fully unbound fork: pure fan-out, no roster watching
+            if bound != seen:
+                raise AuditIntegrityError(
+                    f"Fork group {group_id!r} in run {run_id!r} violates whole-roster closure "
+                    f"(ruling 23): members {sorted(seen - bound)} are unbound while "
+                    f"{sorted(bound)} bind a closer. Config/audit disagreement."
+                )
+            sample = next(iter(bound))
+            closer_name = bindings.fork_branch_closers[sample]
+            roster = bindings.fork_branch_rosters[sample]
+            for member_key in roster:
+                if not _group_member_is_settled_or_live(
+                    conn, run_id=run_id, closer_name=closer_name, group_id=group_id, member_key=member_key
+                ):
+                    unsatisfiable.append(
+                        UnsatisfiableGroupMember(closer_name=closer_name, group_id=group_id, member_key=member_key, kind=FrameKind.FORK)
+                    )
+
+        # --- EXPAND groups: roster authority is group_records + frames. ---
+        if bindings.scope_opener_closers:
+            expand_rows = conn.execute(
+                select(
+                    group_records_table.c.group_id,
+                    group_records_table.c.member_count,
+                    node_states_table.c.node_id,
+                )
+                .select_from(
+                    group_records_table.join(
+                        node_states_table,
+                        (group_records_table.c.opener_token_id == node_states_table.c.token_id)
+                        & (group_records_table.c.run_id == node_states_table.c.run_id),
+                    )
+                )
+                .where(
+                    group_records_table.c.run_id == run_id,
+                    group_records_table.c.kind == FrameKind.EXPAND.value,
+                    node_states_table.c.node_id.in_(sorted(bindings.scope_opener_closers)),
+                )
+                .distinct()
+            ).fetchall()
+            for row in expand_rows:
+                group_id = str(row.group_id)
+                closer_name = bindings.scope_opener_closers[str(row.node_id)]
+                minted = {
+                    str(r.member_key)
+                    for r in conn.execute(
+                        select(token_lineage_frames_table.c.member_key)
+                        .where(
+                            token_lineage_frames_table.c.run_id == run_id,
+                            token_lineage_frames_table.c.group_id == group_id,
+                            token_lineage_frames_table.c.kind == FrameKind.EXPAND.value,
+                        )
+                        .distinct()
+                    )
+                }
+                if len(minted) != int(row.member_count):
+                    raise AuditIntegrityError(
+                        f"Expand group {group_id!r} in run {run_id!r}: group_records.member_count="
+                        f"{int(row.member_count)} but {len(minted)} distinct member frames exist. "
+                        "Roster cross-check failed (spec §5)."
+                    )
+                for member_key in sorted(minted):
+                    if not _group_member_is_settled_or_live(
+                        conn, run_id=run_id, closer_name=closer_name, group_id=group_id, member_key=member_key
+                    ):
+                        unsatisfiable.append(
+                            UnsatisfiableGroupMember(
+                                closer_name=closer_name, group_id=group_id, member_key=member_key, kind=FrameKind.EXPAND
+                            )
+                        )
+
+    if unsatisfiable:
+        shown = unsatisfiable[:5]
+        detail = "; ".join(f"{m.kind.value} group {m.group_id!r} member {m.member_key!r} at closer {m.closer_name!r}" for m in shown)
+        suffix = "" if len(unsatisfiable) <= 5 else f" (+{len(unsatisfiable) - 5} more)"
+        reason = (
+            f"{len(unsatisfiable)} bound-group member(s) can never settle — each is terminal without "
+            f"arriving at its closer and without a group_losses record: {detail}{suffix}"
+        )
+        return GroupSatisfiabilityResumeGate(
+            unsatisfiable_members=tuple(unsatisfiable),
+            check=ResumeCheck(can_resume=False, reason=reason),
+        )
+    return GroupSatisfiabilityResumeGate(unsatisfiable_members=(), check=ResumeCheck(can_resume=True))
+
+
+def group_binding_view_from_graph(graph: ExecutionGraph) -> GroupBindingView:
+    """Project the builder's group-binding registry into the gate's input.
+
+    THE single seam coupling the satisfiability gate to the DAG layer: a
+    FORK binding contributes every declared branch (whole-roster, ruling
+    23); an EXPAND binding contributes its opener node. The discriminator
+    is ``GroupBinding.kind`` — an EXPAND binding's ``member_roster`` is
+    ``()`` by contract (runtime roster authority is ``group_records``),
+    so roster emptiness must never be used to tell the kinds apart.
+    """
+    fork_branch_closers: dict[str, str] = {}
+    fork_branch_rosters: dict[str, tuple[str, ...]] = {}
+    scope_opener_closers: dict[str, str] = {}
+    for binding in graph.get_group_bindings().bindings:
+        if binding.kind is FrameKind.FORK:
+            roster = tuple(binding.member_roster)
+            for branch in roster:
+                fork_branch_closers[branch] = binding.closer_name
+                fork_branch_rosters[branch] = roster
+        else:  # FrameKind.EXPAND
+            scope_opener_closers[str(binding.opener_node_id)] = binding.closer_name
+    return GroupBindingView(
+        fork_branch_closers=fork_branch_closers,
+        fork_branch_rosters=fork_branch_rosters,
+        scope_opener_closers=scope_opener_closers,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class IncompleteTokenSpec:
     """A non-delegation child token that lacks a terminal outcome on a resumed run.
 
@@ -182,29 +566,34 @@ class IncompleteTokenSpec:
 
     token_id: str
     row_id: str
-    branch_name: str | None
-    fork_group_id: str | None
     join_group_id: str | None
-    expand_group_id: str | None
+    lineage_path: tuple[LineageFrame, ...]
     token_data_ref: str | None
     step_in_pipeline: int | None
     max_attempt: int
 
     def __post_init__(self) -> None:
         """Validate Tier-1 identity invariants at construction time."""
-        for field_name in ("token_id", "row_id"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str):
-                raise TypeError(f"IncompleteTokenSpec.{field_name} must be str, got {type(value).__name__}: {value!r}")
-            if not value:
+        for field_name, identity_value in (
+            ("token_id", self.token_id),
+            ("row_id", self.row_id),
+        ):
+            if not isinstance(identity_value, str):
+                raise TypeError(f"IncompleteTokenSpec.{field_name} must be str, got {type(identity_value).__name__}: {identity_value!r}")
+            if not identity_value:
                 raise ValueError(f"IncompleteTokenSpec.{field_name} must not be empty")
-        for field_name in ("branch_name", "fork_group_id", "join_group_id", "expand_group_id", "token_data_ref"):
-            value = getattr(self, field_name)
-            if value is not None:
-                if not isinstance(value, str):
-                    raise TypeError(f"IncompleteTokenSpec.{field_name} must be str or None, got {type(value).__name__}: {value!r}")
-                if not value:
-                    raise ValueError(f"IncompleteTokenSpec.{field_name} must be None or non-empty string, got {value!r}")
+        for field_name, optional_identity_value in (
+            ("join_group_id", self.join_group_id),
+            ("token_data_ref", self.token_data_ref),
+        ):
+            if optional_identity_value is not None:
+                if not isinstance(optional_identity_value, str):
+                    raise TypeError(
+                        f"IncompleteTokenSpec.{field_name} must be str or None, "
+                        f"got {type(optional_identity_value).__name__}: {optional_identity_value!r}"
+                    )
+                if not optional_identity_value:
+                    raise ValueError(f"IncompleteTokenSpec.{field_name} must be None or non-empty string, got {optional_identity_value!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +715,12 @@ class RecoveryManager:
         - Its status is "failed" (not "completed" or "running")
         - At least one checkpoint exists for recovery
         - The checkpoint's upstream topology is compatible with current graph
+        - Every declared source reached a complete lifecycle state
+          (``SOURCE_COMPLETE_LIFECYCLE_STATES``) — the same precondition
+          ``resume()`` enforces via ``IncompleteSourceResumeError``
+        - Every minted member of every bound group is satisfiable (spec §8) —
+          the same precondition ``resume()`` enforces via
+          ``GroupUnsatisfiableResumeError``
         - The stored schema contract passes integrity verification (if present)
 
         Args:
@@ -368,6 +763,22 @@ class RecoveryManager:
         if not topology_check.can_resume:
             return topology_check
 
+        # Source-lifecycle completeness (elspeth-1f5b83cd28): the same shared
+        # gate resume() enforces via IncompleteSourceResumeError. A clean,
+        # interpretable refuse, so it precedes the contract-corruption raise.
+        lifecycle_gate = check_source_lifecycle_resumable(self._db, run_id)
+        if not lifecycle_gate.check.can_resume:
+            return lifecycle_gate.check
+
+        # Group satisfiability (spec §8; ADR-038 amendment, ADR-042 D4):
+        # every minted member of every bound group must be non-terminal,
+        # arrived at its closer, or named in group_losses — otherwise no
+        # resume can ever close the roster and the run would wedge at the
+        # barrier. Same shared implementation as resume()'s enforcing guard.
+        group_gate = check_group_satisfiability_resumable(self._db, run_id, group_binding_view_from_graph(graph))
+        if not group_gate.check.can_resume:
+            return group_gate.check
+
         # Verify schema contract integrity (Tier 1 - raises on corruption)
         # This must happen AFTER topology validation passes, as contract
         # corruption is a more serious failure than config mismatch.
@@ -395,10 +806,11 @@ class RecoveryManager:
         if not check.can_resume:
             return None
 
-        try:
-            checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
-        except IncompatibleCheckpointError:
-            return None
+        # get_latest_checkpoint is a raw persistence read: it returns a
+        # checkpoint or None and raises CheckpointCorruptionError on malformed
+        # data — it never raises IncompatibleCheckpointError (compatibility is
+        # the validator's job, below). No handler: corruption propagates.
+        checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:
             return None
 
@@ -632,10 +1044,7 @@ class RecoveryManager:
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
-                    tokens_table.c.branch_name,
-                    tokens_table.c.fork_group_id,
                     tokens_table.c.join_group_id,
-                    tokens_table.c.expand_group_id,
                     tokens_table.c.token_data_ref,
                     tokens_table.c.step_in_pipeline,
                     max_attempt_sq.label("max_attempt"),
@@ -647,6 +1056,24 @@ class RecoveryManager:
             )
             incomplete_rows = conn.execute(incomplete_query).fetchall()
 
+            frames_by_token: dict[str, list[tuple[int, LineageFrame]]] = {}
+            frame_rows = conn.execute(
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.depth,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                ).where(token_lineage_frames_table.c.run_id == run_id)
+            ).fetchall()
+            for frame_row in frame_rows:
+                frames_by_token.setdefault(frame_row.token_id, []).append(
+                    (
+                        int(frame_row.depth),
+                        LineageFrame(kind=FrameKind(frame_row.kind), group_id=frame_row.group_id, member_key=frame_row.member_key),
+                    )
+                )
+
         row_to_incomplete_tokens: dict[str, set[str]] = {}
         by_row: dict[str, list[IncompleteTokenSpec]] = {}
         for row in incomplete_rows:
@@ -657,10 +1084,10 @@ class RecoveryManager:
                 IncompleteTokenSpec(
                     token_id=row.token_id,
                     row_id=row.row_id,
-                    branch_name=row.branch_name,
-                    fork_group_id=row.fork_group_id,
                     join_group_id=row.join_group_id,
-                    expand_group_id=row.expand_group_id,
+                    lineage_path=(
+                        tuple(frame for _depth, frame in sorted(frames_by_token[row.token_id])) if row.token_id in frames_by_token else ()
+                    ),
                     token_data_ref=row.token_data_ref,
                     step_in_pipeline=row.step_in_pipeline,
                     max_attempt=-1 if row.max_attempt is None else int(row.max_attempt),
@@ -691,6 +1118,44 @@ class RecoveryManager:
             incomplete non-delegation token continuations grouped by row_id,
             and the barrier-buffered token IDs used to derive both.
         """
+        # ADR-038: ABANDONED is an explicit declaration that no resume may
+        # ever decide the token.  The ordinary resume entry gates reject the
+        # finalized run before reaching this read, but this projection is also
+        # a public recovery surface and must not classify ABANDONED as pending
+        # work.  A completed outcome on the same token is the stronger audit
+        # contradiction: both images fail closed here before any replay set is
+        # returned.
+        abandoned = token_outcomes_table.alias("abandoned_outcomes")
+        decided = token_outcomes_table.alias("decided_outcomes")
+        with self._db.engine.connect() as conn:
+            abandoned_rows = conn.execute(
+                select(abandoned.c.token_id, func.count(decided.c.outcome_id).label("decided_count"))
+                .select_from(
+                    abandoned.outerjoin(
+                        decided,
+                        (decided.c.run_id == abandoned.c.run_id)
+                        & (decided.c.token_id == abandoned.c.token_id)
+                        & (decided.c.completed == 1),
+                    )
+                )
+                .where(abandoned.c.run_id == run_id)
+                .where(abandoned.c.path == TerminalPath.ABANDONED.value)
+                .group_by(abandoned.c.token_id)
+                .order_by(abandoned.c.token_id)
+            ).all()
+        if abandoned_rows:
+            contradictions = tuple(str(row.token_id) for row in abandoned_rows if int(row.decided_count) > 0)
+            if contradictions:
+                raise AuditIntegrityError(
+                    f"Resume work-set for run {run_id!r} found token(s) both terminally decided and marked "
+                    f"ABANDONED: {contradictions!r}; refusing an ADR-038 audit contradiction."
+                )
+            abandoned_ids = tuple(str(row.token_id) for row in abandoned_rows)
+            raise AuditIntegrityError(
+                f"Resume work-set for run {run_id!r} found ABANDONED token(s) {abandoned_ids!r}; "
+                "ABANDONED is non-resumable and cannot be returned as pending replay work."
+            )
+
         checkpoint = self._get_latest_checkpoint_for_resume_workset(run_id)
         if checkpoint is None:
             return ResumeWorkSet(row_ids=(), incomplete_by_row={}, buffered_token_ids=frozenset())
@@ -846,7 +1311,12 @@ class RecoveryManager:
                 f"(token_data_ref={spec.token_data_ref!r}) — cannot resume; re-run instead."
             ) from exc
 
-        envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
+        try:
+            envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuditIntegrityError(
+                f"Corrupt token payload for token {spec.token_id} (run {run_id}): invalid UTF-8 or checkpoint JSON"
+            ) from exc
         if not isinstance(envelope, dict) or "data" not in envelope or "contract" not in envelope:
             raise AuditIntegrityError(
                 f"token_data_ref payload for token {spec.token_id} (run {run_id}) is not a "

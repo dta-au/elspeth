@@ -1,0 +1,1165 @@
+"""Bounded AWS orphan discovery and cleanup ownership."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import math
+import os
+import uuid
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, cast
+
+from botocore.exceptions import ClientError
+
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+
+from .contracts import AcceptanceCheckError, CheckFailureRecord, _sha256, _task_definition_family, _utc_timestamp, close_failure
+from .manifest_schema import _load_retained_evidence, _read_control_manifest
+from .receipt_contracts import _validate_bounded_receipt_document
+from .scenario_inventory import _ORPHAN_MAX_ITEMS, _load_bound_scenario_inventory
+
+_ORPHAN_SURFACES = (
+    "tagging",
+    "ecs",
+    "elbv2",
+    "rds",
+    "efs",
+    "secretsmanager",
+    "iam",
+    "logs",
+    "cloudwatch",
+    "xray",
+    "events",
+    "bedrock",
+    "cognito",
+    "ecr",
+)
+_ORPHAN_MAX_PAGES = 100
+
+
+@dataclass(frozen=True)
+class OrphanSweepClients:
+    """Closed AWS client bundle used by the cleanup-only orphan sweep."""
+
+    tagging: Any
+    ecs: Any
+    elbv2: Any
+    rds: Any
+    efs: Any
+    secretsmanager: Any
+    iam: Any
+    logs: Any
+    cloudwatch: Any
+    xray: Any
+    events: Any
+    bedrock: Any
+    cognito: Any
+    ecr: Any
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(
+            (
+                self.tagging,
+                self.ecs,
+                self.elbv2,
+                self.rds,
+                self.efs,
+                self.secretsmanager,
+                self.iam,
+                self.logs,
+                self.cloudwatch,
+                self.xray,
+                self.events,
+                self.bedrock,
+                self.cognito,
+                self.ecr,
+            )
+        )
+
+
+def _build_orphan_sweep_clients(region: str) -> OrphanSweepClients:
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError:
+        raise AcceptanceCheckError("orphan_sweep_runtime") from None
+    config = Config(
+        connect_timeout=10,
+        read_timeout=30,
+        retries={"mode": "standard", "total_max_attempts": 3},
+    )
+
+    created: list[Any] = []
+
+    def client(service: str) -> Any:
+        result = boto3.client(service, region_name=region, config=config)
+        created.append(result)
+        return result
+
+    try:
+        return OrphanSweepClients(
+            tagging=client("resourcegroupstaggingapi"),
+            ecs=client("ecs"),
+            elbv2=client("elbv2"),
+            rds=client("rds"),
+            efs=client("efs"),
+            secretsmanager=client("secretsmanager"),
+            iam=client("iam"),
+            logs=client("logs"),
+            cloudwatch=client("cloudwatch"),
+            xray=client("xray"),
+            events=client("events"),
+            bedrock=client("bedrock"),
+            cognito=client("cognito-idp"),
+            ecr=client("ecr"),
+        )
+    except Exception:
+        for created_client in reversed(created):
+            with contextlib.suppress(Exception):
+                created_client.close()
+        raise AcceptanceCheckError("orphan_sweep_runtime") from None
+
+
+@observation_boundary(
+    tier=3,
+    source="exception raised by a boto3 client call, and the Error envelope a botocore ClientError carries",
+    source_param="exc",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the provider error code only when the exception is a botocore ClientError carrying a string "
+        "Error.Code, and None for every other exception or response shape; never raises and never invents a code"
+    ),
+)
+def _aws_error_code(exc: Exception) -> str | None:
+    if not isinstance(exc, ClientError):
+        return None
+    response = exc.response
+    error = response.get("Error")
+    if not isinstance(error, Mapping):
+        return None
+    code = error.get("Code")
+    return code if isinstance(code, str) else None
+
+
+_ORPHAN_NOT_FOUND_CODES = frozenset(
+    {
+        "AccessPointNotFound",
+        "ClusterNotFoundException",
+        "DBClusterNotFoundFault",
+        "DBInstanceNotFound",
+        "FileSystemNotFound",
+        "ImageNotFoundException",
+        "LoadBalancerNotFound",
+        "ListenerNotFound",
+        "NoSuchEntity",
+        "RepositoryNotFoundException",
+        "ResourceNotFoundException",
+        "RuleNotFound",
+        "SecretNotFoundException",
+        "ServiceNotFoundException",
+        "TargetGroupNotFound",
+        "UserPoolNotFoundException",
+    }
+)
+
+
+@trust_boundary(
+    tier=3,
+    source="one bound boto3 client operation and the response object it returns",
+    source_param="method",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any provider error other than the closed set of "
+        "not-found codes, and on a response that is not a mapping; returns None only for a resource the provider "
+        "reports absent"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_orphan_sweep_botocore.py::test_unmodelled_client_error_code_is_projected_as_a_sweep_api_failure"
+    ),
+    test_fingerprint="5531925bb912eeb5c1f4d11ba4233b388dbf99819c464681d5f26f29c0619008",
+)
+def _orphan_call(method: Callable[..., object], **kwargs: object) -> Mapping[str, object] | None:
+    try:
+        response = method(**kwargs)
+    except Exception as exc:
+        if _aws_error_code(exc) in _ORPHAN_NOT_FOUND_CODES:
+            return None
+        raise AcceptanceCheckError("orphan_sweep_api") from None
+    else:
+        if not isinstance(response, Mapping):
+            raise AcceptanceCheckError("orphan_sweep_api")
+    return response
+
+
+@trust_boundary(
+    tier=3,
+    source="one AWS list-operation response envelope returned through _orphan_call",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') when the named collection is not a list or carries more "
+        "than the bounded item ceiling; returns an empty list only for an absent resource"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_orphan_response_items_rejects_unbounded_or_non_list_collections",
+    test_fingerprint="8dc14be0d08f6b20f15e7db576e2eb40ab1d6e35a47cfca548431ee5d7d4fd51",
+)
+def _orphan_response_items(response: Mapping[str, object] | None, field: str) -> list[object]:
+    if response is None:
+        return []
+    items = response.get(field)
+    if not isinstance(items, list) or len(items) > _ORPHAN_MAX_ITEMS:
+        raise AcceptanceCheckError("orphan_sweep_api")
+    return items
+
+
+@trust_boundary(
+    tier=3,
+    source="one bound boto3 paginated client operation and the continuation tokens its responses carry",
+    source_param="method",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on a continuation token that is neither None, the empty "
+        "string nor a string (the None and empty-string tests run before any hashing so an unhashable token reaches "
+        "the type test rather than raising TypeError), on a token the provider has already served, and on a page "
+        "walk that exceeds the bounded page or item ceiling; never follows a cycle and never returns an unbounded "
+        "collection"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_orphan_paged_items_rejects_repeated_and_non_string_continuation_tokens",
+    test_fingerprint="53586ce7b79e9fd31c3b58b3b068b96182b06811572bfc8e159649455c094448",
+)
+def _orphan_paged_items(
+    method: Callable[..., object],
+    *,
+    item_field: str,
+    request_token: str,
+    response_token: str,
+    kwargs: Mapping[str, object],
+    allow_missing_items: bool = False,
+) -> list[object]:
+    token: str | None = None
+    seen_tokens: set[str] = set()
+    collected: list[object] = []
+    for _page in range(_ORPHAN_MAX_PAGES):
+        request = dict(kwargs)
+        if token is not None:
+            request[request_token] = token
+        response = _orphan_call(method, **request)
+        if response is None:
+            return collected
+        page_items = [] if allow_missing_items and item_field not in response else _orphan_response_items(response, item_field)
+        collected.extend(page_items)
+        if len(collected) > _ORPHAN_MAX_ITEMS:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        continuation = response.get(response_token)
+        if continuation is None or continuation == "":
+            return collected
+        if type(continuation) is not str or continuation in seen_tokens:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        seen_tokens.add(continuation)
+        token = continuation
+    raise AcceptanceCheckError("orphan_sweep_api")
+
+
+def _orphan_inventory_values(inventory: Mapping[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+    values = cast(dict[str, object], inventory["values"])
+    orphan = cast(dict[str, object], inventory["orphan_sweep"])
+    return values, orphan
+
+
+@trust_boundary(
+    tier=3,
+    source="ECS client whose DescribeTaskDefinition response carries the task definition's provider-held tag set",
+    source_param="client",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_binding') unless the described task definition carries a tag "
+        "list holding an ACCEPTANCE_RUN_ID tag whose value is this run; never treats an absent or malformed tag "
+        "list as ownership"
+    ),
+    test_ref=(
+        "tests/unit/web/aws_ecs_acceptance/test_orphan_sweep_botocore.py::test_describe_task_definition_without_the_run_tag_refuses_ownership"
+    ),
+    test_fingerprint="6a2a2a229d07c094885d2cb140b138889622b49a7eb41b1de16d1eba7658302c",
+)
+def _task_definition_owned(
+    client: Any,
+    task_definition_arn: str,
+    *,
+    family: str,
+    acceptance_run_id: str,
+) -> None:
+    if _task_definition_family(task_definition_arn) != family:
+        raise AcceptanceCheckError("orphan_sweep_binding")
+    described = _orphan_call(
+        client.describe_task_definition,
+        taskDefinition=task_definition_arn,
+        include=["TAGS"],
+    )
+    tags_payload = described.get("tags") if described is not None else None
+    if not isinstance(tags_payload, list) or not any(
+        isinstance(tag, Mapping) and tag.get("key") == "ACCEPTANCE_RUN_ID" and tag.get("value") == acceptance_run_id for tag in tags_payload
+    ):
+        raise AcceptanceCheckError("orphan_sweep_binding")
+
+
+@trust_boundary(
+    tier=3,
+    source="X-Ray GetIndexingRules response items projected into the transaction-search baseline",
+    source_param="indexing_rules",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on a destination that is neither None nor one of the "
+        "strings XRay and CloudWatchLogs (the str type test runs before set membership so an unhashable destination "
+        "raises the named error, not TypeError), on a rule that is not a mapping carrying exactly Name and Rule "
+        "(optionally ModifiedAt), on a duplicate or oversized rule name, on a Rule that is not exactly a "
+        "Probabilistic mapping, and on a sampling percentage that is not a finite number in 0..100"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_transaction_search_projection_rejects_malformed_indexing_rules",
+    test_fingerprint="7e7043e096ff0bbe060f7d3678f211ff89dcb5feb053069fad06cc5471b5ac9a",
+)
+def _transaction_search_projection(
+    *,
+    destination: object,
+    indexing_rules: list[object],
+    spans_log_group_present: bool,
+) -> dict[str, object]:
+    if destination is not None and (type(destination) is not str or destination not in {"XRay", "CloudWatchLogs"}):
+        raise AcceptanceCheckError("orphan_sweep_api")
+    if type(spans_log_group_present) is not bool:
+        raise AcceptanceCheckError("orphan_sweep_api")
+    projected_rules: list[dict[str, object]] = []
+    seen_names: set[str] = set()
+    for item in indexing_rules:
+        if not isinstance(item, Mapping) or not {"Name", "Rule"} <= set(item) or not set(item) <= {"Name", "Rule", "ModifiedAt"}:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        name = item["Name"]
+        rule = item["Rule"]
+        if (
+            type(name) is not str
+            or not name
+            or len(name) > 128
+            or name in seen_names
+            or not isinstance(rule, Mapping)
+            or set(rule) != {"Probabilistic"}
+        ):
+            raise AcceptanceCheckError("orphan_sweep_api")
+        probabilistic = rule["Probabilistic"]
+        if (
+            not isinstance(probabilistic, Mapping)
+            or "DesiredSamplingPercentage" not in probabilistic
+            or not set(probabilistic) <= {"DesiredSamplingPercentage", "ActualSamplingPercentage"}
+        ):
+            raise AcceptanceCheckError("orphan_sweep_api")
+        desired = probabilistic["DesiredSamplingPercentage"]
+        actual = probabilistic.get("ActualSamplingPercentage")
+        if type(desired) not in {int, float} or not math.isfinite(float(desired)) or not 0 <= float(desired) <= 100:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        if actual is not None and (type(actual) not in {int, float} or not math.isfinite(float(actual)) or not 0 <= float(actual) <= 100):
+            raise AcceptanceCheckError("orphan_sweep_api")
+        seen_names.add(name)
+        projected_rules.append({"name": name, "desired_sampling_percentage": float(desired)})
+    return {
+        "destination": destination,
+        "indexing_rules": sorted(projected_rules, key=lambda item: cast(str, item["name"])),
+        "spans_log_group_present": spans_log_group_present,
+    }
+
+
+@observation_boundary(
+    tier=3,
+    source="items of one AWS list-operation page, each expected to name a resource under a known field",
+    source_param="items",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "counts only items that are mappings whose named field holds a str equal to one of the expected values; "
+        "every other shape - a non-mapping item, an absent field, or a field holding a non-str value including an "
+        "unhashable list or mapping - counts as no match, and the str type test runs before set membership so "
+        "nothing raises"
+    ),
+)
+def _named_item_count(items: list[object], *, field: str, expected: frozenset[str]) -> int:
+    """Count page items whose ``field`` names one of the expected resources."""
+
+    matches = 0
+    for item in items:
+        name = item.get(field) if isinstance(item, Mapping) else None
+        if type(name) is str and name in expected:
+            matches += 1
+    return matches
+
+
+@trust_boundary(
+    tier=3,
+    source="IAM GetRole response for a role the inventory claims this run owns",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') unless the response carries a Role mapping whose RoleName "
+        "is exactly the role the sweep asked about; never accepts a response describing a different role"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_iam_role_identity_rejects_a_response_describing_another_role",
+    test_fingerprint="36b809ab9daa439bad11a3f60fa003c6f8367b4d149c44b06bc1f04b01b151e1",
+)
+def _assert_iam_role_identity(response: Mapping[str, object], *, role_name: str) -> None:
+    """Reject an IAM GetRole response that does not describe the requested role."""
+
+    role = response.get("Role")
+    if not isinstance(role, Mapping) or role.get("RoleName") != role_name:
+        raise AcceptanceCheckError("orphan_sweep_api")
+
+
+@trust_boundary(
+    tier=3,
+    source="CloudWatch Logs DescribeResourcePolicies page items",
+    source_param="policies",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any policy that is not a mapping carrying a string "
+        "policyName, then counts only the policies the inventory expected this run to own"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_resource_policy_count_rejects_policies_without_a_string_name",
+    test_fingerprint="25f7f2f3ccbc2020cb2a083ea87e85ca6be5869613732c75b8fbd7ff53bab889",
+)
+def _expected_resource_policy_count(policies: list[object], *, expected: frozenset[str]) -> int:
+    """Count surviving log resource policies this run is responsible for."""
+
+    survivors = 0
+    for policy in policies:
+        if not isinstance(policy, Mapping) or type(policy.get("policyName")) is not str:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        if policy["policyName"] in expected:
+            survivors += 1
+    return survivors
+
+
+@observation_boundary(
+    tier=3,
+    source="the Dimensions list of one CloudWatch ListMetrics page item",
+    source_param="dimensions",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the dimensions projected to {Name, Value} dicts sorted by (Name, Value) only when the value is a "
+        "list whose every entry is a mapping carrying exactly Name and Value, both str; returns None for every "
+        "other shape - a non-list, a non-mapping entry, an absent or extra key, or a non-str Name or Value - so the "
+        "sort only ever compares str pairs and never raises"
+    ),
+)
+def _metric_dimension_projection(dimensions: object) -> list[dict[str, str]] | None:
+    """Project one metric's dimension list into the shape the inventory pins, or None when it has another shape."""
+
+    if not isinstance(dimensions, list):
+        return None
+    projected: list[dict[str, str]] = []
+    for dimension in dimensions:
+        if not isinstance(dimension, Mapping) or set(dimension) != {"Name", "Value"}:
+            return None
+        name = dimension["Name"]
+        value = dimension["Value"]
+        if type(name) is not str or type(value) is not str:
+            return None
+        projected.append({"Name": name, "Value": value})
+    return sorted(projected, key=lambda item: (item["Name"], item["Value"]))
+
+
+@observation_boundary(
+    tier=3,
+    source="CloudWatch ListMetrics page items for one retained metric series",
+    source_param="metrics",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "counts only metrics that are mappings carrying exactly Namespace, MetricName and Dimensions, whose "
+        "namespace and name equal the retained query's and whose Dimensions project through "
+        "_metric_dimension_projection to exactly the expected sorted {Name, Value} list; every other shape - "
+        "including a dimension entry that is not a mapping, carries an absent or extra key, or holds a non-str "
+        "Name or Value - counts as no match, and no comparison runs on untyped values so nothing raises"
+    ),
+)
+def _exact_metric_count(
+    metrics: list[object],
+    *,
+    namespace: object,
+    metric_name: object,
+    expected_dimensions: list[dict[str, str]],
+) -> int:
+    """Count ListMetrics entries that are exactly the retained series the inventory pins."""
+
+    return sum(
+        isinstance(metric, Mapping)
+        and set(metric) == {"Namespace", "MetricName", "Dimensions"}
+        and metric.get("Namespace") == namespace
+        and metric.get("MetricName") == metric_name
+        and _metric_dimension_projection(metric.get("Dimensions")) == expected_dimensions
+        for metric in metrics
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="X-Ray GetSamplingRules page records",
+    source_param="records",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "counts only records that are mappings carrying a SamplingRule mapping whose RuleName is a str equal to one "
+        "this run owns; every other shape - a non-mapping record or rule, an absent RuleName, or a RuleName holding "
+        "a non-str value including an unhashable list or mapping - counts as no match, and the str type test runs "
+        "before set membership so nothing raises"
+    ),
+)
+def _sampling_rule_match_count(records: list[object], *, expected: frozenset[str]) -> int:
+    """Count surviving X-Ray sampling rules this run is responsible for."""
+
+    matches = 0
+    for record in records:
+        rule = record.get("SamplingRule") if isinstance(record, Mapping) else None
+        name = rule.get("RuleName") if isinstance(rule, Mapping) else None
+        if type(name) is str and name in expected:
+            matches += 1
+    return matches
+
+
+@observation_boundary(
+    tier=3,
+    source="X-Ray BatchGetTraces page traces",
+    source_param="traces",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the Id of every trace that is a mapping carrying a string Id, and silently omits any other "
+        "shape; the caller compares the returned ids against the ids it requested, so an omission shows up as a "
+        "survivor rather than as a pass"
+    ),
+)
+def _observed_trace_ids(traces: list[object]) -> list[str]:
+    """Project the trace ids a BatchGetTraces page actually returned."""
+
+    return [
+        trace_id for trace in traces if isinstance(trace, Mapping) and type(trace.get("Id")) is str for trace_id in [cast(str, trace["Id"])]
+    ]
+
+
+@trust_boundary(
+    tier=3,
+    source="X-Ray GetTraceSegmentDestination response",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any Destination that is neither None nor one of the "
+        "strings XRay and CloudWatchLogs (the str type test runs before set membership so an unhashable value raises "
+        "the named error, not TypeError); never projects an unrecognised destination into the transaction-search "
+        "baseline"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_trace_segment_destination_rejects_an_unrecognised_destination",
+    test_fingerprint="c66e9f195dc2bdffc8e27594ddd683b97629c88c546d67e0a483a85455df7658",
+)
+def _trace_segment_destination(response: Mapping[str, object]) -> object:
+    """Admit the X-Ray trace segment destination the account currently reports."""
+
+    destination = response.get("Destination")
+    if destination is not None and (type(destination) is not str or destination not in {"XRay", "CloudWatchLogs"}):
+        raise AcceptanceCheckError("orphan_sweep_api")
+    return destination
+
+
+@trust_boundary(
+    tier=3,
+    source="Resource Groups Tagging API GetResources page items for this run's tag",
+    source_param="mappings",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AcceptanceCheckError('orphan_sweep_api') on any mapping that is not a mapping carrying a string "
+        "ResourceARN, then counts every tagged ARN outside the set the sweep has already proved is deleting"
+    ),
+    test_ref="tests/unit/web/aws_ecs_acceptance/test_orphan_sweep.py::test_tagged_resource_count_rejects_entries_without_a_string_arn",
+    test_fingerprint="c59fde703a1be67aa36eaa05fd6da9271de1e54b973675ca7e872e2ea9c5c35e",
+)
+def _unapproved_tagged_resource_count(mappings: list[object], *, allowed: set[str]) -> int:
+    """Count tagged resources that survived outside the approved deleting set."""
+
+    survivors = 0
+    for mapping in mappings:
+        if not isinstance(mapping, Mapping) or type(mapping.get("ResourceARN")) is not str:
+            raise AcceptanceCheckError("orphan_sweep_api")
+        if mapping["ResourceARN"] not in allowed:
+            survivors += 1
+    return survivors
+
+
+def orphan_sweep(
+    manifest_path: Path,
+    *,
+    acceptance_run_id: str,
+    clients: OrphanSweepClients | None = None,
+    environ: Mapping[str, str] = os.environ,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> dict[str, object]:
+    """Delete the two run-scoped ECR tags and prove all owned AWS surfaces empty."""
+
+    try:
+        uuid.UUID(acceptance_run_id)
+    except ValueError:
+        raise AcceptanceCheckError("orphan_sweep_binding") from None
+    if any(name == "AWS_ENDPOINT_URL" or name.startswith("AWS_ENDPOINT_URL_") for name in environ):
+        raise AcceptanceCheckError("orphan_sweep_environment")
+    manifest = _read_control_manifest(manifest_path)
+    if manifest["acceptance_run_id"] != acceptance_run_id or manifest["cleanup_required"] is not True:
+        raise AcceptanceCheckError("orphan_sweep_binding")
+    inventories = (
+        _load_bound_scenario_inventory(manifest, "A"),
+        _load_bound_scenario_inventory(manifest, "B"),
+    )
+    evidence = cast(Mapping[str, object], manifest["evidence"])
+    if evidence["retained_evidence_path"] is None:
+        retained_scenarios: dict[str, object] = {
+            scenario_id: {
+                "cloudwatch_retained_metrics": [],
+                "xray_retained_trace_ids": [],
+                "expected_retained_metric_series": 0,
+                "expected_retained_trace_ids": 0,
+            }
+            for scenario_id in ("A", "B")
+        }
+    else:
+        retained_evidence = _load_retained_evidence(manifest)
+        retained_scenarios = cast(dict[str, object], retained_evidence["scenarios"])
+    aws = cast(dict[str, object], manifest["aws"])
+    ecr_manifest = cast(dict[str, object], manifest["ecr"])
+    if clients is None:
+        clients = _build_orphan_sweep_clients(str(aws["region"]))
+    counts = {surface: {"queried": 0, "unapproved_survivors": 0} for surface in _ORPHAN_SURFACES}
+    delete_in_progress_receipts: list[dict[str, object]] = []
+    retained_metrics = 0
+    retained_traces = 0
+    observed_retained_metrics = 0
+    observed_retained_traces = 0
+    # Client close failures are recorded here (cause class only). On the
+    # unwind path close_failure additionally attaches a PEP 678 note to the
+    # in-flight exception, so an ExitStack teardown fault is never dropped
+    # even when the sweep itself is already failing.
+    failures: list[CheckFailureRecord] = []
+
+    def close_client(client: Any) -> None:
+        record = close_failure(client, check="orphan_sweep_resource_close")
+        if record is not None:
+            failures.append(record)
+
+    with contextlib.ExitStack() as stack:
+        for client in clients:
+            stack.callback(close_client, client)
+        try:
+            repository = ecr_manifest["repository"]
+            tags = (ecr_manifest["baseline_tag"], ecr_manifest["candidate_tag"])
+            if type(repository) is not str or not repository or any(type(tag) is not str or not tag for tag in tags):
+                raise AcceptanceCheckError("orphan_sweep_binding")
+            for tag in tags:
+                counts["ecr"]["queried"] += 1
+                before = _orphan_call(
+                    clients.ecr.describe_images,
+                    registryId=aws["account_id"],
+                    repositoryName=repository,
+                    imageIds=[{"imageTag": tag}],
+                )
+                image_details = _orphan_response_items(before, "imageDetails")
+                if image_details:
+                    deleted = _orphan_call(
+                        clients.ecr.batch_delete_image,
+                        registryId=aws["account_id"],
+                        repositoryName=repository,
+                        imageIds=[{"imageTag": tag}],
+                    )
+                    if deleted is None or _orphan_response_items(deleted, "failures"):
+                        raise AcceptanceCheckError("orphan_sweep_api")
+                after = _orphan_call(
+                    clients.ecr.describe_images,
+                    registryId=aws["account_id"],
+                    repositoryName=repository,
+                    imageIds=[{"imageTag": tag}],
+                )
+                if _orphan_response_items(after, "imageDetails"):
+                    counts["ecr"]["unapproved_survivors"] += 1
+
+            tagged = _orphan_paged_items(
+                clients.tagging.get_resources,
+                item_field="ResourceTagMappingList",
+                request_token="PaginationToken",
+                response_token="PaginationToken",
+                kwargs={
+                    "TagFilters": [{"Key": "ACCEPTANCE_RUN_ID", "Values": [acceptance_run_id]}],
+                    "ResourcesPerPage": 100,
+                    "IncludeComplianceDetails": False,
+                },
+            )
+            counts["tagging"]["queried"] = 1
+            allowed_deleting_task_definitions: set[str] = set()
+
+            for scenario_id, inventory in zip(("A", "B"), inventories, strict=True):
+                values, orphan = _orphan_inventory_values(inventory)
+                scenario_retained = cast(dict[str, object], retained_scenarios[scenario_id])
+                orphan = {**orphan, **scenario_retained}
+                retained_metric_count = cast(int, orphan["expected_retained_metric_series"])
+                retained_trace_count = cast(int, orphan["expected_retained_trace_ids"])
+                retained_metrics += retained_metric_count
+                retained_traces += retained_trace_count
+                cluster = values["ECS_CLUSTER"]
+                service = values["ECS_SERVICE"]
+                services = _orphan_call(
+                    clients.ecs.describe_services,
+                    cluster=cluster,
+                    services=[service],
+                    include=["TAGS"],
+                )
+                counts["ecs"]["queried"] += 1
+                counts["ecs"]["unapproved_survivors"] += len(_orphan_response_items(services, "services"))
+                for desired_status in ("RUNNING", "PENDING"):
+                    task_arns = _orphan_paged_items(
+                        clients.ecs.list_tasks,
+                        item_field="taskArns",
+                        request_token="nextToken",
+                        response_token="nextToken",
+                        kwargs={
+                            "cluster": cluster,
+                            "serviceName": service,
+                            "desiredStatus": desired_status,
+                            "maxResults": 100,
+                        },
+                    )
+                    counts["ecs"]["queried"] += 1
+                    counts["ecs"]["unapproved_survivors"] += len(task_arns)
+                families = cast(list[str], orphan["ecs_task_definition_families"])
+                for family in families:
+                    for desired_status in ("RUNNING", "PENDING"):
+                        family_tasks = _orphan_paged_items(
+                            clients.ecs.list_tasks,
+                            item_field="taskArns",
+                            request_token="nextToken",
+                            response_token="nextToken",
+                            kwargs={
+                                "cluster": cluster,
+                                "family": family,
+                                "desiredStatus": desired_status,
+                                "maxResults": 100,
+                            },
+                        )
+                        counts["ecs"]["queried"] += 1
+                        counts["ecs"]["unapproved_survivors"] += len(family_tasks)
+                    by_status: dict[str, list[object]] = {}
+                    for status_value in ("ACTIVE", "INACTIVE", "DELETE_IN_PROGRESS"):
+                        by_status[status_value] = _orphan_paged_items(
+                            clients.ecs.list_task_definitions,
+                            item_field="taskDefinitionArns",
+                            request_token="nextToken",
+                            response_token="nextToken",
+                            kwargs={
+                                "familyPrefix": family,
+                                "status": status_value,
+                                "sort": "ASC",
+                                "maxResults": 100,
+                            },
+                        )
+                        counts["ecs"]["queried"] += 1
+                        for task_definition_arn in by_status[status_value]:
+                            if _task_definition_family(task_definition_arn) != family:
+                                raise AcceptanceCheckError("orphan_sweep_binding")
+                    verified_task_definitions: set[str] = set()
+                    inactive = list(by_status["INACTIVE"])
+                    for item in by_status["ACTIVE"]:
+                        task_definition_arn = cast(str, item)
+                        _task_definition_owned(
+                            clients.ecs,
+                            task_definition_arn,
+                            family=family,
+                            acceptance_run_id=acceptance_run_id,
+                        )
+                        verified_task_definitions.add(task_definition_arn)
+                        deregistered = _orphan_call(
+                            clients.ecs.deregister_task_definition,
+                            taskDefinition=task_definition_arn,
+                        )
+                        if deregistered is None:
+                            raise AcceptanceCheckError("orphan_sweep_api")
+                        inactive.append(task_definition_arn)
+                    for item in by_status["DELETE_IN_PROGRESS"]:
+                        task_definition_arn = cast(str, item)
+                        _task_definition_owned(
+                            clients.ecs,
+                            task_definition_arn,
+                            family=family,
+                            acceptance_run_id=acceptance_run_id,
+                        )
+                        verified_task_definitions.add(task_definition_arn)
+                        allowed_deleting_task_definitions.add(task_definition_arn)
+                    for offset in range(0, len(inactive), 10):
+                        batch = inactive[offset : offset + 10]
+                        for item in batch:
+                            task_definition_arn = cast(str, item)
+                            if task_definition_arn not in verified_task_definitions:
+                                _task_definition_owned(
+                                    clients.ecs,
+                                    task_definition_arn,
+                                    family=family,
+                                    acceptance_run_id=acceptance_run_id,
+                                )
+                                verified_task_definitions.add(task_definition_arn)
+                        deleted = _orphan_call(clients.ecs.delete_task_definitions, taskDefinitions=batch)
+                        if deleted is None or _orphan_response_items(deleted, "failures"):
+                            raise AcceptanceCheckError("orphan_sweep_api")
+                        allowed_deleting_task_definitions.update(cast(list[str], batch))
+                    active_after = _orphan_paged_items(
+                        clients.ecs.list_task_definitions,
+                        item_field="taskDefinitionArns",
+                        request_token="nextToken",
+                        response_token="nextToken",
+                        kwargs={"familyPrefix": family, "status": "ACTIVE", "sort": "ASC", "maxResults": 100},
+                    )
+                    inactive_after = _orphan_paged_items(
+                        clients.ecs.list_task_definitions,
+                        item_field="taskDefinitionArns",
+                        request_token="nextToken",
+                        response_token="nextToken",
+                        kwargs={"familyPrefix": family, "status": "INACTIVE", "sort": "ASC", "maxResults": 100},
+                    )
+                    deleting_after = _orphan_paged_items(
+                        clients.ecs.list_task_definitions,
+                        item_field="taskDefinitionArns",
+                        request_token="nextToken",
+                        response_token="nextToken",
+                        kwargs={
+                            "familyPrefix": family,
+                            "status": "DELETE_IN_PROGRESS",
+                            "sort": "ASC",
+                            "maxResults": 100,
+                        },
+                    )
+                    counts["ecs"]["queried"] += 3
+                    for task_definition_arn in (*active_after, *inactive_after, *deleting_after):
+                        if _task_definition_family(task_definition_arn) != family:
+                            raise AcceptanceCheckError("orphan_sweep_binding")
+                    counts["ecs"]["unapproved_survivors"] += len(active_after) + len(inactive_after)
+                    for item in deleting_after:
+                        task_definition_arn = cast(str, item)
+                        if task_definition_arn not in verified_task_definitions:
+                            _task_definition_owned(
+                                clients.ecs,
+                                task_definition_arn,
+                                family=family,
+                                acceptance_run_id=acceptance_run_id,
+                            )
+                            verified_task_definitions.add(task_definition_arn)
+                        allowed_deleting_task_definitions.add(task_definition_arn)
+                        identity_hash = _sha256(task_definition_arn.encode())
+                        delete_in_progress_receipts.append(
+                            {
+                                "resource_sha256": identity_hash,
+                                "deregistration_receipt_sha256": _sha256(f"{identity_hash}:INACTIVE".encode()),
+                                "deletion_receipt_sha256": _sha256(f"{identity_hash}:DELETE_REQUESTED".encode()),
+                                "owner_sha256": _sha256(str(orphan["cleanup_owner"]).encode()),
+                                "poll_receipt_sha256": _sha256(f"{identity_hash}:DELETE_IN_PROGRESS".encode()),
+                                "follow_up_deadline": _utc_timestamp(now() + timedelta(hours=24)),
+                                "zero_dependency_count": 0,
+                            }
+                        )
+
+                for field, method, argument_name, response_field, surface in (
+                    ("ALB_ARN", clients.elbv2.describe_load_balancers, "LoadBalancerArns", "LoadBalancers", "elbv2"),
+                    ("TARGET_GROUP_ARN", clients.elbv2.describe_target_groups, "TargetGroupArns", "TargetGroups", "elbv2"),
+                    ("FIRST_DEPLOY_LISTENER_RULE_ARN", clients.elbv2.describe_rules, "RuleArns", "Rules", "elbv2"),
+                    ("DB_CLUSTER_IDENTIFIER", clients.rds.describe_db_clusters, "DBClusterIdentifier", "DBClusters", "rds"),
+                ):
+                    identity = values[field]
+                    if identity:
+                        argument: object = [identity] if argument_name.endswith("Arns") else identity
+                        response = _orphan_call(method, **{argument_name: argument})
+                        counts[surface]["queried"] += 1
+                        counts[surface]["unapproved_survivors"] += len(_orphan_response_items(response, response_field))
+                listener_arns = cast(list[object], orphan["elbv2_listener_arns"])
+                for listener_arn in listener_arns:
+                    response = _orphan_call(clients.elbv2.describe_listeners, ListenerArns=[listener_arn])
+                    counts["elbv2"]["queried"] += 1
+                    counts["elbv2"]["unapproved_survivors"] += len(_orphan_response_items(response, "Listeners"))
+                db_instances = cast(list[object], orphan["rds_db_instance_identifiers"])
+                for identifier in db_instances:
+                    response = _orphan_call(clients.rds.describe_db_instances, DBInstanceIdentifier=identifier)
+                    counts["rds"]["queried"] += 1
+                    counts["rds"]["unapproved_survivors"] += len(_orphan_response_items(response, "DBInstances"))
+                for creation_token in cast(list[str], orphan["efs_creation_tokens"]):
+                    response = _orphan_call(clients.efs.describe_file_systems, CreationToken=creation_token)
+                    counts["efs"]["queried"] += 1
+                    counts["efs"]["unapproved_survivors"] += len(_orphan_response_items(response, "FileSystems"))
+                for file_system_id in cast(list[str], orphan["efs_file_system_ids"]):
+                    response = _orphan_call(clients.efs.describe_file_systems, FileSystemId=file_system_id)
+                    counts["efs"]["queried"] += 1
+                    counts["efs"]["unapproved_survivors"] += len(_orphan_response_items(response, "FileSystems"))
+                    access_points = _orphan_paged_items(
+                        clients.efs.describe_access_points,
+                        item_field="AccessPoints",
+                        request_token="NextToken",
+                        response_token="NextToken",
+                        kwargs={"FileSystemId": file_system_id, "MaxResults": 100},
+                    )
+                    mount_targets = _orphan_paged_items(
+                        clients.efs.describe_mount_targets,
+                        item_field="MountTargets",
+                        request_token="Marker",
+                        response_token="NextMarker",
+                        kwargs={"FileSystemId": file_system_id, "MaxItems": 100},
+                    )
+                    counts["efs"]["queried"] += 2
+                    counts["efs"]["unapproved_survivors"] += len(access_points) + len(mount_targets)
+                for access_point_id in cast(list[str], orphan["efs_access_point_ids"]):
+                    response = _orphan_call(clients.efs.describe_access_points, AccessPointId=access_point_id, MaxResults=100)
+                    counts["efs"]["queried"] += 1
+                    counts["efs"]["unapproved_survivors"] += len(_orphan_response_items(response, "AccessPoints"))
+                for secret_id in cast(list[str], orphan["secret_ids"]):
+                    response = _orphan_call(clients.secretsmanager.describe_secret, SecretId=secret_id)
+                    counts["secretsmanager"]["queried"] += 1
+                    if response is not None:
+                        counts["secretsmanager"]["unapproved_survivors"] += 1
+                for role_name in cast(list[str], orphan["iam_role_names"]):
+                    response = _orphan_call(clients.iam.get_role, RoleName=role_name)
+                    counts["iam"]["queried"] += 1
+                    if response is not None:
+                        _assert_iam_role_identity(response, role_name=role_name)
+                        counts["iam"]["unapproved_survivors"] += 1
+                resource_policies = _orphan_paged_items(
+                    clients.logs.describe_resource_policies,
+                    item_field="resourcePolicies",
+                    request_token="nextToken",
+                    response_token="nextToken",
+                    kwargs={"limit": 50},
+                )
+                expected_resource_policies = frozenset(cast(list[str], orphan["log_resource_policy_names"]))
+                counts["logs"]["queried"] += 1
+                counts["logs"]["unapproved_survivors"] += _expected_resource_policy_count(
+                    resource_policies,
+                    expected=expected_resource_policies,
+                )
+                log_group_names = {
+                    str(values[field]) for field in ("WEB_LOG_GROUP", "DOCTOR_LOG_GROUP", "ECS_DEPLOYMENT_EVENT_LOG_GROUP") if values[field]
+                } | set(cast(list[str], orphan["log_group_names"]))
+                for log_group_name in sorted(log_group_names):
+                    groups = _orphan_paged_items(
+                        clients.logs.describe_log_groups,
+                        item_field="logGroups",
+                        request_token="nextToken",
+                        response_token="nextToken",
+                        kwargs={"logGroupNamePrefix": log_group_name, "limit": 50},
+                    )
+                    counts["logs"]["queried"] += 1
+                    counts["logs"]["unapproved_survivors"] += _named_item_count(
+                        groups,
+                        field="logGroupName",
+                        expected=frozenset({log_group_name}),
+                    )
+                for dashboard_name in cast(list[str], orphan["cloudwatch_dashboard_names"]):
+                    dashboards = _orphan_paged_items(
+                        clients.cloudwatch.list_dashboards,
+                        item_field="DashboardEntries",
+                        request_token="NextToken",
+                        response_token="NextToken",
+                        kwargs={"DashboardNamePrefix": dashboard_name},
+                    )
+                    counts["cloudwatch"]["queried"] += 1
+                    counts["cloudwatch"]["unapproved_survivors"] += _named_item_count(
+                        dashboards,
+                        field="DashboardName",
+                        expected=frozenset({dashboard_name}),
+                    )
+                for alarm_name in cast(list[str], orphan["cloudwatch_alarm_names"]):
+                    response = _orphan_call(clients.cloudwatch.describe_alarms, AlarmNames=[alarm_name], MaxRecords=100)
+                    counts["cloudwatch"]["queried"] += 1
+                    counts["cloudwatch"]["unapproved_survivors"] += (
+                        len(_orphan_response_items(response, "MetricAlarms"))
+                        + len(_orphan_response_items(response, "CompositeAlarms"))
+                        + len(_orphan_response_items(response, "LogAlarms"))
+                    )
+                for metric_query in cast(list[dict[str, object]], orphan["cloudwatch_retained_metrics"]):
+                    dimensions = cast(list[dict[str, str]], metric_query["dimensions"])
+                    metrics = _orphan_paged_items(
+                        clients.cloudwatch.list_metrics,
+                        item_field="Metrics",
+                        request_token="NextToken",
+                        response_token="NextToken",
+                        kwargs={
+                            "Namespace": metric_query["namespace"],
+                            "MetricName": metric_query["metric_name"],
+                            "Dimensions": [{"Name": dimension["name"], "Value": dimension["value"]} for dimension in dimensions],
+                            "IncludeLinkedAccounts": False,
+                        },
+                    )
+                    counts["cloudwatch"]["queried"] += 1
+                    expected_dimensions = sorted(
+                        ({"Name": dimension["name"], "Value": dimension["value"]} for dimension in dimensions),
+                        key=lambda item: (item["Name"], item["Value"]),
+                    )
+                    exact_matches = _exact_metric_count(
+                        metrics,
+                        namespace=metric_query["namespace"],
+                        metric_name=metric_query["metric_name"],
+                        expected_dimensions=expected_dimensions,
+                    )
+                    if len(metrics) != 1 or exact_matches != 1:
+                        counts["cloudwatch"]["unapproved_survivors"] += max(1, abs(len(metrics) - 1))
+                    else:
+                        observed_retained_metrics += 1
+                groups = _orphan_paged_items(
+                    clients.xray.get_groups,
+                    item_field="Groups",
+                    request_token="NextToken",
+                    response_token="NextToken",
+                    kwargs={},
+                )
+                expected_groups = frozenset(cast(list[str], orphan["xray_group_names"]))
+                counts["xray"]["queried"] += 1
+                counts["xray"]["unapproved_survivors"] += _named_item_count(groups, field="GroupName", expected=expected_groups)
+                sampling_rules = _orphan_paged_items(
+                    clients.xray.get_sampling_rules,
+                    item_field="SamplingRuleRecords",
+                    request_token="NextToken",
+                    response_token="NextToken",
+                    kwargs={},
+                )
+                expected_sampling_rules = frozenset(cast(list[str], orphan["xray_sampling_rule_names"]))
+                counts["xray"]["queried"] += 1
+                counts["xray"]["unapproved_survivors"] += _sampling_rule_match_count(
+                    sampling_rules,
+                    expected=expected_sampling_rules,
+                )
+                trace_ids = cast(list[str], orphan["xray_retained_trace_ids"])
+                for offset in range(0, len(trace_ids), 5):
+                    requested_trace_ids = trace_ids[offset : offset + 5]
+                    response = _orphan_call(clients.xray.batch_get_traces, TraceIds=requested_trace_ids)
+                    if response is None:
+                        raise AcceptanceCheckError("orphan_sweep_api")
+                    traces = _orphan_response_items(response, "Traces")
+                    if _orphan_response_items(response, "UnprocessedTraceIds"):
+                        raise AcceptanceCheckError("orphan_sweep_api")
+                    counts["xray"]["queried"] += 1
+                    observed_trace_ids = _observed_trace_ids(traces)
+                    if len(traces) != len(requested_trace_ids) or sorted(observed_trace_ids) != sorted(requested_trace_ids):
+                        counts["xray"]["unapproved_survivors"] += max(1, abs(len(traces) - len(requested_trace_ids)))
+                    else:
+                        observed_retained_traces += len(traces)
+                destination_response = _orphan_call(clients.xray.get_trace_segment_destination)
+                if destination_response is None:
+                    raise AcceptanceCheckError("orphan_sweep_api")
+                destination = _trace_segment_destination(destination_response)
+                indexing_rules = _orphan_paged_items(
+                    clients.xray.get_indexing_rules,
+                    item_field="IndexingRules",
+                    request_token="NextToken",
+                    response_token="NextToken",
+                    kwargs={},
+                    allow_missing_items=True,
+                )
+                spans_groups = _orphan_paged_items(
+                    clients.logs.describe_log_groups,
+                    item_field="logGroups",
+                    request_token="nextToken",
+                    response_token="nextToken",
+                    kwargs={"logGroupNamePrefix": "aws/spans", "limit": 50},
+                )
+                transaction_projection = _transaction_search_projection(
+                    destination=destination,
+                    indexing_rules=indexing_rules,
+                    spans_log_group_present=_named_item_count(spans_groups, field="logGroupName", expected=frozenset({"aws/spans"})) > 0,
+                )
+                counts["xray"]["queried"] += 2
+                counts["logs"]["queried"] += 1
+                if (
+                    _sha256(json.dumps(transaction_projection, sort_keys=True, separators=(",", ":")).encode())
+                    != orphan["transaction_search_baseline_sha256"]
+                ):
+                    counts["xray"]["unapproved_survivors"] += 1
+                event_rules = list(cast(list[dict[str, object]], orphan["event_rules"]))
+                if values["ECS_DEPLOYMENT_EVENT_RULE"]:
+                    event_rules.append(
+                        {
+                            "event_bus_name": "default",
+                            "rule_name": values["ECS_DEPLOYMENT_EVENT_RULE"],
+                            "target_ids": [values["ECS_DEPLOYMENT_EVENT_TARGET_ID"]] if values["ECS_DEPLOYMENT_EVENT_TARGET_ID"] else [],
+                        }
+                    )
+                for event_rule in event_rules:
+                    response = _orphan_call(
+                        clients.events.describe_rule,
+                        Name=event_rule["rule_name"],
+                        EventBusName=event_rule["event_bus_name"],
+                    )
+                    counts["events"]["queried"] += 1
+                    if response is not None:
+                        counts["events"]["unapproved_survivors"] += 1
+                    targets = _orphan_paged_items(
+                        clients.events.list_targets_by_rule,
+                        item_field="Targets",
+                        request_token="NextToken",
+                        response_token="NextToken",
+                        kwargs={
+                            "Rule": event_rule["rule_name"],
+                            "EventBusName": event_rule["event_bus_name"],
+                            "Limit": 100,
+                        },
+                    )
+                    counts["events"]["queried"] += 1
+                    counts["events"]["unapproved_survivors"] += len(targets)
+                for guardrail in cast(list[dict[str, object]], orphan["bedrock_guardrails"]):
+                    guardrails = _orphan_paged_items(
+                        clients.bedrock.list_guardrails,
+                        item_field="guardrails",
+                        request_token="nextToken",
+                        response_token="nextToken",
+                        kwargs={"guardrailIdentifier": guardrail["identifier"], "maxResults": 1000},
+                    )
+                    counts["bedrock"]["queried"] += 1
+                    if any(not isinstance(item, Mapping) for item in guardrails):
+                        raise AcceptanceCheckError("orphan_sweep_api")
+                    counts["bedrock"]["unapproved_survivors"] += len(guardrails)
+                user_pool_id = values["COGNITO_USER_POOL_ID"]
+                if user_pool_id and orphan["cognito_pool_owned"] is True:
+                    response = _orphan_call(clients.cognito.describe_user_pool, UserPoolId=user_pool_id)
+                    counts["cognito"]["queried"] += 1
+                    if response is not None:
+                        counts["cognito"]["unapproved_survivors"] += 1
+                subject_sub = orphan["cognito_subject_sub"]
+                if user_pool_id and subject_sub:
+                    users = _orphan_paged_items(
+                        clients.cognito.list_users,
+                        item_field="Users",
+                        request_token="PaginationToken",
+                        response_token="PaginationToken",
+                        kwargs={
+                            "UserPoolId": user_pool_id,
+                            "Filter": f'sub = "{subject_sub}"',
+                            "AttributesToGet": ["sub"],
+                            "Limit": 60,
+                        },
+                    )
+                    counts["cognito"]["queried"] += 1
+                    counts["cognito"]["unapproved_survivors"] += len(users)
+            counts["tagging"]["unapproved_survivors"] += _unapproved_tagged_resource_count(
+                tagged,
+                allowed=allowed_deleting_task_definitions,
+            )
+        except AcceptanceCheckError:
+            raise
+        except Exception:
+            raise AcceptanceCheckError("orphan_sweep_api") from None
+    total_survivors = sum(surface["unapproved_survivors"] for surface in counts.values())
+    receipt: dict[str, object] = {
+        "schema": "elspeth.aws-ecs-orphan-sweep.v1",
+        "checked_at": _utc_timestamp(now()),
+        "acceptance_run_id_sha256": _sha256(acceptance_run_id.encode()),
+        "surfaces": counts,
+        "expected_retained": {"metric_series": retained_metrics, "trace_ids": retained_traces},
+        "observed_retained": {"metric_series": observed_retained_metrics, "trace_ids": observed_retained_traces},
+        "delete_in_progress_receipts": delete_in_progress_receipts,
+        "total_unapproved_survivors": total_survivors,
+        "ok": total_survivors == 0,
+    }
+    _validate_bounded_receipt_document(receipt)
+    if total_survivors:
+        raise AcceptanceCheckError("orphan_sweep_survivors")
+    if failures:
+        raise AcceptanceCheckError("orphan_sweep_resource_close", cause_class=failures[0].exception_type)
+    return receipt

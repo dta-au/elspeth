@@ -8,9 +8,11 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
+from pydantic import SecretStr
+from sqlalchemy.engine import make_url
 from structlog.testing import capture_logs
 
 import elspeth.web.readiness as readiness
@@ -365,11 +367,11 @@ class TestReadinessCache:
             calls += 1
             return self._report(str(calls))
 
-        assert (await cache.get(compute)).checks[0].detail == "1"
+        assert (await cache.get_or_compute(compute)).checks[0].detail == "1"
         now = 101.999
-        assert (await cache.get(compute)).checks[0].detail == "1"
+        assert (await cache.get_or_compute(compute)).checks[0].detail == "1"
         now = 102.001
-        assert (await cache.get(compute)).checks[0].detail == "2"
+        assert (await cache.get_or_compute(compute)).checks[0].detail == "2"
         assert calls == 2
 
     @pytest.mark.asyncio
@@ -384,7 +386,7 @@ class TestReadinessCache:
             await release.wait()
             return self._report()
 
-        tasks = [asyncio.create_task(cache.get(compute)) for _ in range(50)]
+        tasks = [asyncio.create_task(cache.get_or_compute(compute)) for _ in range(50)]
         await asyncio.sleep(0)
         release.set()
         results = await asyncio.gather(*tasks)
@@ -403,13 +405,13 @@ class TestReadinessCache:
             await release.wait()
             return self._report()
 
-        leader = asyncio.create_task(cache.get(compute))
+        leader = asyncio.create_task(cache.get_or_compute(compute))
         await asyncio.sleep(0)
         leader.cancel()
         with pytest.raises(asyncio.CancelledError):
             await leader
 
-        follower = asyncio.create_task(cache.get(compute))
+        follower = asyncio.create_task(cache.get_or_compute(compute))
         await asyncio.sleep(0)
         assert calls == 1
         release.set()
@@ -429,14 +431,14 @@ class TestReadinessCache:
             await release.wait()
             return self._report()
 
-        leader = asyncio.create_task(cache.get(compute))
+        leader = asyncio.create_task(cache.get_or_compute(compute))
         await started.wait()
         leader.cancel()
         await asyncio.gather(leader, return_exceptions=True)
         release.set()
         await asyncio.sleep(0.01)
 
-        assert await cache.get(compute) == self._report()
+        assert await cache.get_or_compute(compute) == self._report()
         assert calls == 1
 
     @pytest.mark.asyncio
@@ -448,19 +450,19 @@ class TestReadinessCache:
         async def good() -> ReadinessReport:
             return self._report("prior")
 
-        assert await cache.get(good) == self._report("prior")
+        assert await cache.get_or_compute(good) == self._report("prior")
         now = 4.0
 
         async def fail() -> ReadinessReport:
             raise RuntimeError("credential=secret")
 
         with pytest.raises(RuntimeError):
-            await cache.get(fail)
+            await cache.get_or_compute(fail)
 
         async def recovered() -> ReadinessReport:
             return self._report("recovered")
 
-        assert await cache.get(recovered) == self._report("recovered")
+        assert await cache.get_or_compute(recovered) == self._report("recovered")
 
     @pytest.mark.asyncio
     async def test_follower_does_not_wait_for_two_sequential_computations(self) -> None:
@@ -474,8 +476,8 @@ class TestReadinessCache:
             await release.wait()
             raise RuntimeError("failed")
 
-        leader = asyncio.create_task(cache.get(fail))
-        follower = asyncio.create_task(cache.get(fail))
+        leader = asyncio.create_task(cache.get_or_compute(fail))
+        follower = asyncio.create_task(cache.get_or_compute(fail))
         await asyncio.sleep(0)
         release.set()
         results = await asyncio.gather(leader, follower, return_exceptions=True)
@@ -510,7 +512,7 @@ class _FakeEngine:
         url: str = "postgresql+psycopg://redacted.invalid/db",
     ) -> None:
         self.dialect = SimpleNamespace(name=dialect)
-        self.url = url
+        self.url = make_url(url)
         self.connection = connection or _FakeConnection()
         self.connect_calls = 0
         self.disposed = False
@@ -523,24 +525,58 @@ class _FakeEngine:
         self.disposed = True
 
 
+# What EVERY IdP deployment needs, whichever profile is selected. Shared by
+# the readiness cases so a change to the common set is made in one place.
+_IDP_COMMON: dict[str, object] = {
+    "sso_client_id": "client",
+    # SecretStr, not str: WebSettings holds these as secrets, and a stub that
+    # holds plain strings would let readiness pass here while failing against
+    # the real model.
+    "sso_client_secret": SecretStr("secret"),
+    "sso_transaction_secret": SecretStr("transaction-secret"),
+    "public_base_url": "https://elspeth.example.gov.au",
+    "compartment_id": "compartment-a",
+    "quota_default_tokens_per_day": 100_000,
+    "quota_default_storage_bytes": 1_000_000,
+}
+
+
 def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
     data_dir = tmp_path / "data"
     payload_dir = tmp_path / "payloads"
     blob_dir = data_dir / "blobs"
-    data_dir.mkdir(exist_ok=True)
+    data_dir.mkdir(mode=0o700, exist_ok=True)
     payload_dir.mkdir(mode=0o700, exist_ok=True)
-    blob_dir.mkdir(exist_ok=True)
+    blob_dir.mkdir(mode=0o700, exist_ok=True)
+    # mkdir's mode is masked by umask; enforce the private mode explicitly so
+    # this fixture stays a safe (group/world-unwritable) baseline regardless
+    # of the process umask.
+    data_dir.chmod(0o700)
+    payload_dir.chmod(0o700)
+    blob_dir.chmod(0o700)
     values: dict[str, object] = {
         "deployment_target": "default",
+        "deployment_state_mode": "auto",
         "auth_provider": "local",
         "session_db_url": None,
         "landscape_url": None,
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
-        "oidc_issuer": None,
-        "oidc_audience": None,
-        "oidc_client_id": None,
         "entra_tenant_id": None,
+        # Every name auth_setting_values() reads. The stub has to carry all
+        # of them or it stops modelling WebSettings: a missing attribute
+        # would surface as AttributeError from a readiness probe whose whole
+        # job is to be total.
+        "sso_client_id": None,
+        "sso_client_secret": None,
+        "sso_transaction_secret": None,
+        "sso_issuer": None,
+        "sso_endpoint_origins": (),
+        "google_hosted_domain": None,
+        "public_base_url": None,
+        "compartment_id": None,
+        "quota_default_tokens_per_day": None,
+        "quota_default_storage_bytes": None,
     }
     values.update(overrides)
     settings = SimpleNamespace(**values)
@@ -551,14 +587,25 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
 
 
 class TestReadinessDatabaseChecks:
-    def test_aws_session_uses_raw_url_isolated_factory_and_same_connection(
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_session_uses_raw_url_isolated_factory_and_same_connection(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
     ) -> None:
         raw_url = "postgresql+psycopg://runtime@db.internal/session"
-        settings = _settings_stub(tmp_path, deployment_target="aws-ecs", session_db_url=raw_url)
-        settings.get_session_db_url = lambda: pytest.fail("fallback getter must not run in AWS mode")
+        settings = _settings_stub(
+            tmp_path,
+            deployment_target=deployment_target,
+            deployment_state_mode="external-postgresql",
+            session_db_url=raw_url,
+            landscape_url="postgresql+psycopg://runtime@db.internal/landscape",
+        )
+        settings.get_session_db_url = lambda: pytest.fail("fallback getter must not supply external session URL")
         live_engine = _FakeEngine()
         owned = _FakeEngine()
         captured: dict[str, object] = {}
@@ -575,7 +622,7 @@ class TestReadinessDatabaseChecks:
             lambda conn: probe_connections.append(conn) or SchemaState.CURRENT,
         )
 
-        checks = _check_session_database(settings, live_engine)
+        checks = _check_session_database(settings, live_engine, "external-postgresql")
 
         assert captured == {
             "url": raw_url,
@@ -596,14 +643,25 @@ class TestReadinessDatabaseChecks:
             ReadinessCheck("session_schema", True, "schema state: CURRENT"),
         )
 
-    def test_aws_landscape_uses_raw_url_and_landscape_factory(
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_landscape_uses_raw_url_and_landscape_factory(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        deployment_target: str,
     ) -> None:
         raw_url = "postgresql+psycopg://runtime@db.internal/landscape"
-        settings = _settings_stub(tmp_path, deployment_target="aws-ecs", landscape_url=raw_url)
-        settings.get_landscape_url = lambda: pytest.fail("fallback getter must not run in AWS mode")
+        settings = _settings_stub(
+            tmp_path,
+            deployment_target=deployment_target,
+            deployment_state_mode="external-postgresql",
+            session_db_url="postgresql+psycopg://runtime@db.internal/session",
+            landscape_url=raw_url,
+        )
+        settings.get_landscape_url = lambda: pytest.fail("fallback getter must not supply external Landscape URL")
         owned = _FakeEngine()
         captured: dict[str, object] = {}
 
@@ -614,7 +672,7 @@ class TestReadinessDatabaseChecks:
         monkeypatch.setattr(readiness, "create_engine", factory)
         monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
 
-        checks = _check_landscape_database(settings)
+        checks = _check_landscape_database(settings, "external-postgresql")
 
         assert captured["url"] == raw_url
         assert captured["kwargs"] == {
@@ -674,12 +732,14 @@ class TestReadinessDatabaseChecks:
         settings = _settings_stub(
             tmp_path,
             deployment_target="aws-ecs",
+            deployment_state_mode="external-postgresql",
+            session_db_url="postgresql+psycopg://runtime@db.invalid/session",
             landscape_url="postgresql+psycopg://runtime@db.invalid/landscape",
         )
         owned = _FakeEngine(connection=_FakeConnection(failure=failure))
         monkeypatch.setattr(readiness, "create_engine", lambda *_a, **_kw: owned)
         with pytest.raises(type(failure)):
-            _check_landscape_database(settings)
+            _check_landscape_database(settings, "external-postgresql")
         assert owned.disposed is True
 
     @pytest.mark.asyncio
@@ -691,6 +751,7 @@ class TestReadinessDatabaseChecks:
         settings = _settings_stub(
             tmp_path,
             deployment_target="aws-ecs",
+            deployment_state_mode="external-postgresql",
             session_db_url="postgresql+psycopg://runtime@db.invalid/session",
             landscape_url="postgresql+psycopg://runtime@db.invalid/landscape",
         )
@@ -703,7 +764,7 @@ class TestReadinessDatabaseChecks:
         runner = ReadinessProbeRunner()
         try:
             with capture_logs() as logs:
-                report = await readiness_report(settings, _FakeEngine(), runner)
+                report = await readiness_report(settings, _FakeEngine(), runner, instance_draining=threading.Event())
         finally:
             runner.close()
         rendered = repr((report, logs))
@@ -741,6 +802,22 @@ class TestReadinessFilesystemChecks:
         payload.chmod(payload.stat().st_mode | stat.S_IWGRP)
         assert _check_payload_store(settings)[0].detail == "payload_store group/world-writable directory is not allowed"
 
+    @pytest.mark.parametrize(
+        "deployment_target",
+        ["default", "docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
+    )
+    def test_external_payload_uses_raw_explicit_path(self, tmp_path: Path, deployment_target: str) -> None:
+        settings = _settings_stub(
+            tmp_path,
+            deployment_target=deployment_target,
+            deployment_state_mode="external-postgresql",
+            session_db_url="postgresql+psycopg://runtime@db/session",
+            landscape_url="postgresql+psycopg://runtime@db/landscape",
+        )
+        settings.get_payload_store_path = lambda: pytest.fail("fallback getter must not supply external payload path")
+
+        assert _check_payload_store(settings, "external-postgresql") == (ReadinessCheck("payload_store", True, "directory is writable"),)
+
     def test_blob_rejects_symlink(self, tmp_path: Path) -> None:
         settings = _settings_stub(tmp_path)
         blob = Path(settings.data_dir) / "blobs"
@@ -753,6 +830,38 @@ class TestReadinessFilesystemChecks:
 
         assert check.ok is False
         assert check.detail == "blob_dir directory must not be a symlink"
+
+    @pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+    def test_data_dir_rejects_group_or_world_writable_mode(self, tmp_path: Path, mode: int) -> None:
+        settings = _settings_stub(tmp_path)
+        data_dir = Path(settings.data_dir)
+        data_dir.chmod(mode)
+
+        check = _check_data_dir(settings)[0]
+
+        assert check.ok is False
+        assert check.detail == "data_dir group/world-writable directory is not allowed"
+
+    @pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+    def test_blob_dir_rejects_group_or_world_writable_mode(self, tmp_path: Path, mode: int) -> None:
+        settings = _settings_stub(tmp_path)
+        blob = Path(settings.data_dir) / "blobs"
+        blob.chmod(mode)
+
+        check = _check_blob_dir(settings)[0]
+
+        assert check.ok is False
+        assert check.detail == "blob_dir group/world-writable directory is not allowed"
+
+    def test_data_dir_and_blob_dir_private_mode_still_passes(self, tmp_path: Path) -> None:
+        settings = _settings_stub(tmp_path)
+        data_dir = Path(settings.data_dir)
+        blob = data_dir / "blobs"
+        data_dir.chmod(0o700)
+        blob.chmod(0o700)
+
+        assert _check_data_dir(settings)[0].ok is True
+        assert _check_blob_dir(settings)[0].ok is True
 
     def test_probe_uses_exclusive_create_immediate_unlink_and_same_fd(
         self,
@@ -803,14 +912,28 @@ class TestReadinessAuthAndReport:
         ("provider", "fields", "ok"),
         [
             ("local", {}, True),
-            ("oidc", {"oidc_issuer": "https://issuer.invalid", "oidc_audience": "aud", "oidc_client_id": "client"}, True),
-            ("oidc", {"oidc_audience": "aud", "oidc_client_id": "client"}, False),
-            ("oidc", {"oidc_issuer": "https://issuer.invalid", "oidc_client_id": "client"}, False),
-            ("oidc", {"oidc_issuer": "https://issuer.invalid", "oidc_audience": "aud"}, False),
-            ("entra", {"entra_tenant_id": "tenant", "oidc_audience": "aud", "oidc_client_id": "client"}, True),
-            ("entra", {"oidc_audience": "aud", "oidc_client_id": "client"}, False),
-            ("entra", {"entra_tenant_id": "tenant", "oidc_client_id": "client"}, False),
-            ("entra", {"entra_tenant_id": "tenant", "oidc_audience": "aud"}, False),
+            # Every IdP needs the common confidential-client settings; the
+            # provider-specific one is what varies.
+            ("oidc", {**_IDP_COMMON, "sso_issuer": "https://issuer.invalid"}, True),
+            ("oidc", _IDP_COMMON, False),
+            ("vanguard", {**_IDP_COMMON, "sso_issuer": "https://vanguard.invalid"}, True),
+            ("vanguard", _IDP_COMMON, False),
+            ("entra", {**_IDP_COMMON, "entra_tenant_id": "tenant"}, True),
+            ("entra", _IDP_COMMON, False),
+            ("google", {**_IDP_COMMON, "google_hosted_domain": "example.gov.au"}, True),
+            ("google", _IDP_COMMON, False),
+            # A blank string is "configured" to anything checking for None,
+            # and is exactly how a task definition ships a broken deployment.
+            ("google", {**_IDP_COMMON, "google_hosted_domain": "   "}, False),
+            # Each common setting is individually load-bearing.
+            *(
+                (provider, {**_IDP_COMMON, **specific, missing: None}, False)
+                for provider, specific in (
+                    ("oidc", {"sso_issuer": "https://issuer.invalid"}),
+                    ("google", {"google_hosted_domain": "example.gov.au"}),
+                )
+                for missing in _IDP_COMMON
+            ),
             ("unknown", {}, False),
         ],
     )
@@ -820,6 +943,26 @@ class TestReadinessAuthAndReport:
         assert check.name == "auth_mode"
         assert check.ok is ok
 
+    def test_auth_mode_names_every_missing_field(self, tmp_path: Path) -> None:
+        """An operator reading a not-ready response has no other way to look.
+
+        The previous form said only "OIDC configuration incomplete", which
+        does not distinguish eight settings from one.
+        """
+        settings = _settings_stub(tmp_path, auth_provider="google", sso_client_id="client")
+        check = _check_auth_mode(settings)
+        assert check.ok is False
+        assert "google_hosted_domain" in check.detail
+        assert "sso_client_secret" in check.detail
+        # Already supplied, so it must NOT be named.
+        assert "sso_client_id, " not in check.detail
+
+    def test_auth_mode_names_the_registered_providers_when_one_is_unknown(self, tmp_path: Path) -> None:
+        check = _check_auth_mode(_settings_stub(tmp_path, auth_provider="saml"))
+        assert check.ok is False
+        for registered in ("local", "oidc", "entra", "vanguard", "google"):
+            assert registered in check.detail
+
     @pytest.mark.asyncio
     async def test_report_has_exact_order_and_unique_names(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = _settings_stub(tmp_path)
@@ -828,16 +971,16 @@ class TestReadinessAuthAndReport:
         monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
         runner = ReadinessProbeRunner()
         try:
-            report = await readiness_report(settings, session_engine, runner)
+            report = await readiness_report(settings, session_engine, runner, instance_draining=threading.Event())
         finally:
             runner.close()
             session_engine.dispose()
         assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
-        assert len({check.name for check in report.checks}) == 8
+        assert len({check.name for check in report.checks}) == 9
         assert report.ready is True
 
     @pytest.mark.asyncio
-    async def test_unexpected_gather_error_becomes_static_eight_check_report(self, tmp_path: Path) -> None:
+    async def test_unexpected_gather_error_becomes_static_nine_check_report(self, tmp_path: Path) -> None:
         settings = _settings_stub(tmp_path)
 
         class BrokenRunner:
@@ -845,7 +988,7 @@ class TestReadinessAuthAndReport:
                 raise RuntimeError("RAW_URL_SENTINEL /private/path")
 
         with capture_logs() as logs:
-            report = await readiness_report(settings, _FakeEngine(), BrokenRunner())
+            report = await readiness_report(settings, _FakeEngine(), BrokenRunner(), instance_draining=threading.Event())
         assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
         assert all(not check.ok and check.detail == "readiness evaluation failed (RuntimeError)" for check in report.checks)
         assert "RAW_URL_SENTINEL" not in repr((report, logs))
@@ -857,5 +1000,51 @@ class TestReadinessAuthAndReport:
         assert report.ready is False
         assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
         assert all(check.detail == "readiness request timed out" for check in report.checks)
-        assert len(logs) == 8
+        assert len(logs) == 9
         assert all(set(log) >= {"check", "detail"} for log in logs)
+
+
+class TestInstanceMembershipCheck:
+    """The draining gate: not ready once the lifespan has begun draining."""
+
+    @pytest.mark.parametrize("state_mode", ["sqlite-single", "external-postgresql"])
+    def test_draining_signal_fails_readiness_on_both_database_modes(
+        self, state_mode: Literal["sqlite-single", "external-postgresql"]
+    ) -> None:
+        draining = threading.Event()
+        draining.set()
+        check = readiness._check_instance_membership(state_mode, draining)
+        assert check == ReadinessCheck("instance_membership", False, "instance draining; new work refused")
+
+    def test_not_draining_is_ready_and_names_the_mode(self) -> None:
+        assert readiness._check_instance_membership("sqlite-single", threading.Event()) == ReadinessCheck(
+            "instance_membership", True, "single-process deployment; no membership lease"
+        )
+        assert readiness._check_instance_membership("external-postgresql", threading.Event()) == ReadinessCheck(
+            "instance_membership", True, "instance not draining"
+        )
+
+    @pytest.mark.parametrize("impostor", [None, True, object(), asyncio.Event()])
+    def test_signal_must_be_an_exact_threading_event(self, impostor: object) -> None:
+        with pytest.raises(TypeError, match=r"threading\.Event"):
+            readiness._check_instance_membership("sqlite-single", impostor)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_report_is_not_ready_while_draining_and_names_only_that_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings_stub(tmp_path)
+        session_engine = create_session_engine(f"sqlite:///{tmp_path / 'session.db'}")
+        monkeypatch.setattr(readiness, "probe_session_schema", lambda conn: SchemaState.CURRENT)
+        monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
+        draining = threading.Event()
+        draining.set()
+        runner = ReadinessProbeRunner()
+        try:
+            report = await readiness_report(settings, session_engine, runner, instance_draining=draining)
+        finally:
+            runner.close()
+            session_engine.dispose()
+        assert report.ready is False
+        assert [check.name for check in report.checks if not check.ok] == ["instance_membership"]
+        assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)

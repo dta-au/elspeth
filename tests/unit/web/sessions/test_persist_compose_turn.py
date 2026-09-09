@@ -6,18 +6,96 @@ Uses the shared ``engine`` fixture and ``_make_session`` helper from
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid5
 
 import pytest
 import structlog
-from sqlalchemy import text
+from sqlalchemy import insert, text
 
-from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._persist_payload import StatePayload
+from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.conftest import _make_session
+from tests.unit.web.conftest import _make_session as _make_session_row
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+
+_TEST_FENCE_NAMESPACE = UUID("6794cf0c-4b9d-40b9-ad19-d6f9afff30dd")
+
+
+def _test_compose_context(session_id: str) -> SessionOperationContext:
+    operation_id = str(uuid5(_TEST_FENCE_NAMESPACE, session_id))
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=session_id,
+            operation_id=operation_id,
+            lease_token=f"test-compose-token-{operation_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+
+
+def _make_session(conn, *, session_id: str) -> None:
+    """Create the legacy fixture row plus one live exact COMPOSE fence."""
+    _make_session_row(conn, session_id=session_id)
+    context = _test_compose_context(session_id)
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=context.fence.operation_id,
+            lease_token=context.fence.lease_token,
+            operation_kind=context.operation_kind.value,
+            owner_instance_id="persist-compose-turn-test-owner",
+            operation_epoch=context.fence.operation_epoch,
+            lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            released_at=None,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_transition_response_takeover_rolls_back_state_and_assistant(service) -> None:
+    """A stale COMPOSE owner must not publish either half of the response."""
+    from uuid import uuid4
+
+    from sqlalchemy import update
+
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session_id = uuid4()
+    stale_context = _test_compose_context(str(session_id))
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id))
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id == str(session_id))
+            .values(
+                operation_id="successor-operation",
+                lease_token="successor-token",
+                operation_epoch=2,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+
+    with pytest.raises(SessionOperationFenceLost):
+        await service.commit_transition_response(
+            session_id=session_id,
+            expected_current_state_id=None,
+            state=CompositionStateData(
+                composer_meta={"guided_session": {"transition_consumed": True}},
+            ),
+            assistant_content="must not persist",
+            raw_content=None,
+            session_operation_context=stale_context,
+        )
+
+    assert await service.get_current_state(session_id) is None
+    assert await service.get_messages(session_id, limit=None) == []
 
 
 @pytest.fixture
@@ -31,12 +109,21 @@ def service(engine, tmp_path) -> SessionServiceImpl:
     fixture — without it, the fixture's untyped parameters poison the
     return type to ``Any`` and helper-method calls return ``Any``.
     """
-    return SessionServiceImpl(
+    instance = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
+    persist = instance.persist_compose_turn
+
+    def _persist_with_test_authority(**kwargs):
+        if "session_operation_context" not in kwargs:
+            kwargs["session_operation_context"] = _test_compose_context(kwargs["session_id"])
+        return persist(**kwargs)
+
+    instance.persist_compose_turn = _persist_with_test_authority  # type: ignore[method-assign]
+    return instance
 
 
 def test_advisory_lock_sqlite_is_noop(service):
@@ -76,8 +163,8 @@ def test_shared_sqlite_session_lock_is_reused_by_session_service(service) -> Non
     assert service._sqlite_lock_for_session("shared-session") is sqlite_session_mutex(service._engine, "shared-session")
 
 
-def test_postgres_session_advisory_lock_spans_transactions_and_unlocks() -> None:
-    from elspeth.web.sessions.locking import postgres_session_advisory_lock
+def test_postgres_blob_custody_advisory_lock_spans_transactions_and_unlocks() -> None:
+    from elspeth.web.sessions.locking import postgres_blob_custody_advisory_lock
 
     calls: list[tuple[str, tuple[object, ...]]] = []
 
@@ -97,19 +184,19 @@ def test_postgres_session_advisory_lock_spans_transactions_and_unlocks() -> None
             return False
 
     connection = _Connection()
-    with postgres_session_advisory_lock(connection, "session-across-phases"):
+    with postgres_blob_custody_advisory_lock(connection, "session-across-phases"):
         calls.append(("PHASES", ()))
 
     assert calls == [
         (
             "SELECT pg_catalog.pg_advisory_lock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_SESSIONS_LOCK_CLASSID, "session-across-phases"),
+            (ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, "session-across-phases"),
         ),
         ("COMMIT", ()),
         ("PHASES", ()),
         (
             "SELECT pg_catalog.pg_advisory_unlock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_SESSIONS_LOCK_CLASSID, "session-across-phases"),
+            (ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, "session-across-phases"),
         ),
         ("COMMIT", ()),
     ]
@@ -289,7 +376,7 @@ def test_file_backed_sqlite_sequence_allocator_smoke(tmp_path):
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -319,7 +406,7 @@ def test_file_backed_sqlite_lock_serializes_independent_connections(tmp_path):
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service: SessionServiceImpl = SessionServiceImpl(
+    service: SessionServiceImpl = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -395,6 +482,7 @@ def test_insert_chat_message_returns_id_and_persists_row(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=now,
+                session_operation_context=_test_compose_context("s3"),
             )
         assert isinstance(msg_id, str) and len(msg_id) > 0
         rows = conn.execute(text("SELECT id, role, sequence_no, raw_content FROM chat_messages WHERE session_id='s3'")).fetchall()
@@ -428,6 +516,7 @@ def test_insert_chat_message_persists_raw_content(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=now,
+                session_operation_context=_test_compose_context("s3_raw"),
             )
         row = conn.execute(text("SELECT content, raw_content FROM chat_messages WHERE session_id='s3_raw'")).first()
         assert row.content == "redacted output"
@@ -470,6 +559,7 @@ def test_insert_chat_message_rejects_blank_assistant_without_raw_or_tool_calls(
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=now,
+                session_operation_context=_test_compose_context(session_id),
             )
 
         rows = conn.execute(text("SELECT id FROM chat_messages WHERE session_id=:session_id"), {"session_id": session_id}).fetchall()
@@ -495,6 +585,7 @@ def test_insert_chat_message_allows_empty_assistant_with_tool_calls(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=now,
+                session_operation_context=_test_compose_context("s3_tool_call_assistant"),
             )
 
         row = conn.execute(
@@ -528,6 +619,7 @@ def test_insert_chat_message_requires_session_write_lock(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=datetime.now(UTC),
+                session_operation_context=_test_compose_context("s3_no_lock"),
             )
 
 
@@ -570,6 +662,7 @@ def test_insert_chat_message_rejects_tool_parent_that_is_not_assistant(service):
                 tool_call_id="tc_1",
                 parent_assistant_id="u_parent",
                 created_at=now,
+                session_operation_context=_test_compose_context("s3_parent_role"),
             )
 
 
@@ -608,6 +701,7 @@ def test_insert_composition_state_returns_id(service):
                     derived_from_state_id=None,
                 ),
                 provenance="tool_call",
+                session_operation_context=_test_compose_context("s4"),
             )
         assert isinstance(state_id, str)
         rows = conn.execute(
@@ -645,6 +739,7 @@ def test_insert_composition_state_allocates_contiguous_versions(service):
                             derived_from_state_id=None,
                         ),
                         provenance="session_seed",
+                        session_operation_context=_test_compose_context("s4_seq"),
                     )
                 )
         rows = conn.execute(text("SELECT id, version FROM composition_states WHERE session_id='s4_seq' ORDER BY version")).fetchall()
@@ -676,7 +771,7 @@ def test_file_backed_sqlite_lock_serializes_same_session_state_version_allocatio
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service: SessionServiceImpl = SessionServiceImpl(
+    service: SessionServiceImpl = DualFencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -698,6 +793,7 @@ def test_file_backed_sqlite_lock_serializes_same_session_state_version_allocatio
                         derived_from_state_id=None,
                     ),
                     provenance="session_seed",
+                    session_operation_context=_test_compose_context("s4_state_lock"),
                 )
                 time.sleep(0.01)
                 row = conn.execute(
@@ -741,6 +837,7 @@ def test_insert_composition_state_versions_are_per_session(service):
                         derived_from_state_id=None,
                     ),
                     provenance="session_seed",
+                    session_operation_context=_test_compose_context("s_ver_a"),
                 )
 
     # New transaction; new session. Allocation should restart at 1
@@ -755,6 +852,7 @@ def test_insert_composition_state_versions_are_per_session(service):
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s_ver_b"),
             )
         row = conn.execute(text("SELECT version FROM composition_states WHERE session_id='s_ver_b'")).first()
     assert row.version == 1, (
@@ -778,6 +876,7 @@ def test_insert_composition_state_requires_session_write_lock(service):
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s4_no_lock"),
             )
 
 
@@ -801,6 +900,7 @@ def test_insert_composition_state_rejects_unknown_provenance(service):
                     derived_from_state_id=None,
                 ),
                 provenance="rogue_value",
+                session_operation_context=_test_compose_context("s5"),
             )
 
 
@@ -828,7 +928,25 @@ async def test_add_message_preserves_assert_state_in_session_guard(service):
         _make_session(conn, session_id=str(sid_a))
         _make_session(conn, session_id=str(sid_b))
 
-    state_a = await service.save_composition_state(sid_a, CompositionStateData(), provenance="session_seed")
+    for seeded_context in (_test_compose_context(str(sid_a)), _test_compose_context(str(sid_b))):
+        await service._run_sync(service.session_operation_authority.release, seeded_context)
+    compose_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=sid_a,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        state_a = await service.save_composition_state(
+            sid_a,
+            CompositionStateData(),
+            provenance="session_seed",
+            session_operation_context=compose_context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, compose_context)
 
     with pytest.raises(RuntimeError, match="cross-session reference"):
         await service.add_message(
@@ -859,7 +977,9 @@ async def test_add_message_preserves_updated_at_write(service):
 
     await asyncio.sleep(0.001)
 
-    await service.add_message(sid, "user", "hi", writer_principal="route_user_message")
+    await service.add_message(
+        sid, "user", "hi", writer_principal="route_user_message", session_operation_context=_test_compose_context(str(sid))
+    )
 
     with service._engine.begin() as conn:
         after = conn.execute(select(models.sessions_table.c.updated_at).where(models.sessions_table.c.id == str(sid))).scalar_one()
@@ -888,6 +1008,7 @@ async def test_add_message_preserves_raw_content(service):
         "redacted",
         raw_content="original LLM output",
         writer_principal="compose_loop",
+        session_operation_context=_test_compose_context(str(sid)),
     )
     assert record.raw_content == "original LLM output"
 
@@ -911,7 +1032,9 @@ async def test_add_message_returns_chat_message_record(service):
     with service._engine.begin() as conn:
         _make_session(conn, session_id=str(sid))
 
-    result = await service.add_message(sid, "user", "hi", writer_principal="route_user_message")
+    result = await service.add_message(
+        sid, "user", "hi", writer_principal="route_user_message", session_operation_context=_test_compose_context(str(sid))
+    )
     assert isinstance(result, ChatMessageRecord)
     assert result.session_id == sid
     assert result.role == "user"
@@ -929,7 +1052,7 @@ async def test_add_message_requires_writer_principal(service):
     with service._engine.begin() as conn:
         _make_session(conn, session_id=str(sid))
     with pytest.raises(TypeError, match="writer_principal"):
-        await service.add_message(sid, "user", "hi")  # type: ignore[call-arg]
+        await service.add_message(sid, "user", "hi", session_operation_context=_test_compose_context(str(sid)))  # type: ignore[call-arg]
 
 
 @pytest.mark.asyncio
@@ -963,6 +1086,7 @@ async def test_get_messages_orders_same_timestamp_rows_by_sequence_no(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=same_ts,
+                session_operation_context=_test_compose_context(str(sid)),
             )
             id_first = service._insert_chat_message(
                 conn,
@@ -977,6 +1101,7 @@ async def test_get_messages_orders_same_timestamp_rows_by_sequence_no(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=same_ts,
+                session_operation_context=_test_compose_context(str(sid)),
             )
             id_second = service._insert_chat_message(
                 conn,
@@ -991,6 +1116,7 @@ async def test_get_messages_orders_same_timestamp_rows_by_sequence_no(service):
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=same_ts,
+                session_operation_context=_test_compose_context(str(sid)),
             )
 
     messages = await service.get_messages(sid, limit=None)
@@ -1012,13 +1138,155 @@ async def test_add_message_rejects_unknown_writer_principal(service):
     with service._engine.begin() as conn:
         _make_session(conn, session_id=str(sid))
     with pytest.raises(IntegrityError, match="ck_chat_messages_writer_principal"):
-        await service.add_message(sid, "user", "hi", writer_principal="rogue_writer")
+        await service.add_message(
+            sid, "user", "hi", writer_principal="rogue_writer", session_operation_context=_test_compose_context(str(sid))
+        )
 
 
 # ---------------------------------------------------------------------------
 # Task 11 tests: persist_compose_turn happy path + transcript validation +
 # commit-wins async contract.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_persists_cohort_in_one_sequence_block(service):
+    """All drafts land with contiguous sequence numbers and one updated_at bump."""
+    from uuid import uuid4 as _uuid4
+
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+
+    session_uuid = _uuid4()
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_uuid))
+
+    await service.add_messages_atomic(
+        session_uuid,
+        (
+            AuditMessageDraft(role="audit", content="a", tool_calls=({"_kind": "llm_call_audit"},)),
+            AuditMessageDraft(role="audit", content="b", tool_calls=({"_kind": "llm_call_audit"},)),
+            AuditMessageDraft(role="audit", content="c", tool_calls=({"_kind": "audit"},)),
+        ),
+        writer_principal="compose_loop",
+        session_operation_context=_test_compose_context(str(session_uuid)),
+    )
+
+    messages = await service.get_messages(session_uuid, limit=None)
+    assert [m.content for m in messages] == ["a", "b", "c"]
+    sequence_numbers = [m.sequence_no for m in messages]
+    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + 3))
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_mid_cohort_failure_persists_nothing(service, monkeypatch):
+    """elspeth-90231248dc: a failure on any draft rolls back the whole cohort."""
+    from uuid import uuid4 as _uuid4
+
+    from sqlalchemy.exc import OperationalError
+
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+
+    session_uuid = _uuid4()
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_uuid))
+
+    original_insert = service._insert_chat_message
+    calls = {"count": 0}
+
+    def flaky_insert(conn, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
+        return original_insert(conn, **kwargs)
+
+    monkeypatch.setattr(service, "_insert_chat_message", flaky_insert)
+
+    with pytest.raises(OperationalError):
+        await service.add_messages_atomic(
+            session_uuid,
+            (
+                AuditMessageDraft(role="audit", content="first"),
+                AuditMessageDraft(role="audit", content="second"),
+            ),
+            writer_principal="compose_loop",
+            session_operation_context=_test_compose_context(str(session_uuid)),
+        )
+
+    assert calls["count"] == 2
+    assert await service.get_messages(session_uuid, limit=None) == []
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_honors_per_draft_state_id_override(service):
+    """One turn's tool rows (post-compose state) and LLM sidecars (pre-send
+    state) settle as ONE cohort: each draft's ``composition_state_id``
+    override wins over the cohort-level value, and ``None`` falls back."""
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session = await service.create_session("alice", "Pipeline", "local")
+    pre_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    post_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+
+    await service.add_messages_atomic(
+        session.id,
+        (
+            AuditMessageDraft(role="audit", content="tool row", composition_state_id=str(post_state.id)),
+            AuditMessageDraft(role="audit", content="llm row", composition_state_id=str(pre_state.id)),
+            AuditMessageDraft(role="audit", content="fallback row"),
+        ),
+        composition_state_id=pre_state.id,
+        writer_principal="compose_loop",
+    )
+
+    by_content = {m.content: m for m in await service.get_messages(session.id, limit=None)}
+    assert by_content["tool row"].composition_state_id == post_state.id
+    assert by_content["llm row"].composition_state_id == pre_state.id
+    assert by_content["fallback row"].composition_state_id == pre_state.id
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_rejects_foreign_per_draft_state_id_atomically(service):
+    """A cross-session override state id is refused BEFORE any insert, so
+    the well-formed sibling drafts in the same cohort persist nothing."""
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session = await service.create_session("alice", "Pipeline", "local")
+    other_session = await service.create_session("alice", "Other", "local")
+    foreign_state = await service.save_composition_state(other_session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+
+    with pytest.raises(RuntimeError, match=r"add_messages_atomic.*cross-session"):
+        await service.add_messages_atomic(
+            session.id,
+            (
+                AuditMessageDraft(role="audit", content="clean row"),
+                AuditMessageDraft(role="audit", content="foreign row", composition_state_id=str(foreign_state.id)),
+            ),
+            writer_principal="compose_loop",
+        )
+
+    assert await service.get_messages(session.id, limit=None) == []
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_empty_cohort_is_a_noop(service):
+    """An empty drafts sequence writes nothing and bumps nothing."""
+    from uuid import uuid4 as _uuid4
+
+    session_uuid = _uuid4()
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_uuid))
+        before = conn.execute(text(f"SELECT updated_at FROM sessions WHERE id='{session_uuid}'")).scalar_one()
+
+    await service.add_messages_atomic(
+        session_uuid, (), writer_principal="compose_loop", session_operation_context=_test_compose_context(str(session_uuid))
+    )
+
+    assert await service.get_messages(session_uuid, limit=None) == []
+    with service._engine.begin() as conn:
+        after = conn.execute(text(f"SELECT updated_at FROM sessions WHERE id='{session_uuid}'")).scalar_one()
+    assert after == before
 
 
 def test_persist_compose_turn_happy_path(service):
@@ -1076,6 +1344,76 @@ def test_persist_compose_turn_happy_path(service):
         assert len(states) == 1
         assert states[0].version == 1
         assert states[0].provenance == "tool_call"
+
+
+def test_persist_compose_turn_rederives_predecessor_lineage(service):
+    """Regression for elspeth-7536e5d919: compose-created state revisions
+    were persisted with ``derived_from_state_id=None`` verbatim, recording
+    every audited mutation as an independent root. The primitive must fill
+    lineage under the held session write lock: the first inserted revision
+    derives from the pre-turn session head, each subsequent revision from
+    the one inserted just before it.
+    """
+    from elspeth.web.sessions._persist_payload import (
+        RedactedToolRow,
+        StatePayload,
+    )
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id="s_lineage")
+
+    def _state_row(tool_call_id: str) -> RedactedToolRow:
+        return RedactedToolRow(
+            tool_call_id=tool_call_id,
+            content='{"ok": true}',
+            composition_state_payload=StatePayload(
+                data=CompositionStateData(),
+                derived_from_state_id=None,
+            ),
+        )
+
+    # Turn 1: two state-advancing tool calls in one turn, empty session.
+    service.persist_compose_turn(
+        session_id="s_lineage",
+        assistant_content="turn 1",
+        redacted_assistant_tool_calls=(
+            {"id": "tc_1", "function": {"name": "set_source"}},
+            {"id": "tc_2", "function": {"name": "upsert_node"}},
+        ),
+        redacted_tool_rows=(_state_row("tc_1"), _state_row("tc_2")),
+        parent_composition_state_id=None,
+        expected_current_state_id=None,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+
+    with service._engine.begin() as conn:
+        states = conn.execute(
+            text("SELECT id, version, derived_from_state_id FROM composition_states WHERE session_id='s_lineage' ORDER BY version")
+        ).fetchall()
+    assert [s.version for s in states] == [1, 2]
+    # First revision of an empty session is a genuine root; the second
+    # derives from the first even though both were inserted in one turn.
+    assert states[0].derived_from_state_id is None
+    assert states[1].derived_from_state_id == states[0].id
+
+    # Turn 2: the next turn's revision derives from the persisted head —
+    # the "original current state" seen by that turn.
+    service.persist_compose_turn(
+        session_id="s_lineage",
+        assistant_content="turn 2",
+        redacted_assistant_tool_calls=({"id": "tc_3", "function": {"name": "upsert_node"}},),
+        redacted_tool_rows=(_state_row("tc_3"),),
+        parent_composition_state_id=states[1].id,
+        expected_current_state_id=states[1].id,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+
+    with service._engine.begin() as conn:
+        turn2 = conn.execute(text("SELECT derived_from_state_id FROM composition_states WHERE session_id='s_lineage' AND version=3")).one()
+    assert turn2.derived_from_state_id == states[1].id
 
 
 def test_persist_compose_turn_zero_tool_rows(service):
@@ -1216,6 +1554,7 @@ def test_persist_compose_turn_rejects_cross_session_parent_state(service):
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s_A"),
             )
 
     with pytest.raises(
@@ -1257,6 +1596,7 @@ def test_persist_compose_turn_accepts_valid_same_session_parent_state(service):
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s_C"),
             )
 
     outcome = service.persist_compose_turn(
@@ -1298,6 +1638,7 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s_stale"),
             )
             current_state_id = service._insert_composition_state(
                 conn,
@@ -1307,6 +1648,7 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
                     derived_from_state_id=stale_state_id,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s_stale"),
             )
 
     with pytest.raises(
@@ -1333,6 +1675,74 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
     assert latest == current_state_id
 
 
+def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(service):
+    """A stale-state conflict on the crash-unwind path must NOT raise.
+
+    When ``plugin_crash_pending=True`` the caller holds a captured plugin
+    crash with possible partial effects. Raising ``StaleComposeStateError``
+    here would replace that non-retryable primary failure with a misleading
+    retryable stale-state response (elspeth-45f72a949c). The disposition
+    must mirror the ``OperationalError`` unwind arm: record the audit
+    failure and return ``AuditOutcome(unwind_audit_failed=True)`` so the
+    driver re-raises the captured crash.
+    """
+    from elspeth.web.sessions._persist_payload import StatePayload
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id="s_stale_unwind")
+        with service._session_write_lock(conn, "s_stale_unwind"):
+            stale_state_id = service._insert_composition_state(
+                conn,
+                session_id="s_stale_unwind",
+                payload=StatePayload(
+                    data=CompositionStateData(),
+                    derived_from_state_id=None,
+                ),
+                provenance="session_seed",
+                session_operation_context=_test_compose_context("s_stale_unwind"),
+            )
+            current_state_id = service._insert_composition_state(
+                conn,
+                session_id="s_stale_unwind",
+                payload=StatePayload(
+                    data=CompositionStateData(),
+                    derived_from_state_id=stale_state_id,
+                ),
+                provenance="session_seed",
+                session_operation_context=_test_compose_context("s_stale_unwind"),
+            )
+
+    from elspeth.web.sessions.telemetry import observed_value
+
+    starting = observed_value(service._telemetry.tool_row_persist_failed_during_unwind_total)
+    outcome = service.persist_compose_turn(
+        session_id="s_stale_unwind",
+        assistant_content="crash unwind",
+        redacted_assistant_tool_calls=(),
+        redacted_tool_rows=(),
+        parent_composition_state_id=stale_state_id,
+        expected_current_state_id=stale_state_id,
+        writer_principal="compose_loop",
+        plugin_crash_pending=True,
+    )
+
+    assert outcome.unwind_audit_failed is True
+    assert outcome.assistant_id is None
+    # The secondary reconciliation context the ticket requires: the stale
+    # audit failure is retained via the unwind-failure counter (and slog),
+    # not silently dropped once crash primacy wins (elspeth-45f72a949c).
+    assert observed_value(service._telemetry.tool_row_persist_failed_during_unwind_total) == starting + 1
+
+    with service._engine.begin() as conn:
+        rows = conn.execute(text("SELECT role FROM chat_messages WHERE session_id='s_stale_unwind'")).fetchall()
+        latest = conn.execute(
+            text("SELECT id FROM composition_states WHERE session_id='s_stale_unwind' ORDER BY version DESC LIMIT 1")
+        ).scalar_one()
+    assert rows == []
+    assert latest == current_state_id
+
+
 def test_persist_compose_turn_accepts_matching_expected_current_state(service):
     from elspeth.web.sessions._persist_payload import StatePayload
     from elspeth.web.sessions.protocol import CompositionStateData
@@ -1348,6 +1758,7 @@ def test_persist_compose_turn_accepts_matching_expected_current_state(service):
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
+                session_operation_context=_test_compose_context("s_current_ok"),
             )
 
     outcome = service.persist_compose_turn(
@@ -1405,6 +1816,7 @@ async def test_persist_compose_turn_async_protocol_dispatch_succeeds_from_async(
         expected_current_state_id=None,
         writer_principal="compose_loop",
         plugin_crash_pending=False,
+        session_operation_context=_test_compose_context("s_run_sync"),
     )
     assert outcome.assistant_id is not None
     assert outcome.unwind_audit_failed is False
@@ -1608,6 +2020,7 @@ async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(ser
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=False,
+            session_operation_context=_test_compose_context("s_cancel"),
         )
 
     inner = asyncio.create_task(_do_persist())

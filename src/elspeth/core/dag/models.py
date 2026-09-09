@@ -76,6 +76,12 @@ class EdgeContractError(GraphValidationError):
             ``missing_fields``, ``type_mismatches[(field, expected, actual)]``,
             ``extra_fields``, and ``constraint_mismatches``. The error-message
             formatter walks this to produce actionable per-field guidance.
+        from_component_type: The PRODUCER's node type (e.g. ``'row_union'``),
+            when known at the raise site. The suggestion builder needs it to
+            pick producer-shaped advice (a plugin-free row_union has no
+            schema options to patch) even when the failure fires during graph
+            BUILD, where no graph exists to map the DAG id back to a composer
+            component (elspeth-41bcaa882e).
     """
 
     def __init__(
@@ -88,6 +94,7 @@ class EdgeContractError(GraphValidationError):
         consumer_schema_name: str,
         compatibility_result: CompatibilityResult,
         component_type: str | None = None,
+        from_component_type: str | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -99,6 +106,7 @@ class EdgeContractError(GraphValidationError):
         self.producer_schema_name: str = producer_schema_name
         self.consumer_schema_name: str = consumer_schema_name
         self.compatibility_result: CompatibilityResult = compatibility_result
+        self.from_component_type: str | None = from_component_type
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,12 +204,103 @@ class NodeInfo:
     # fields a sink requires. Empty frozenset for all non-sink nodes.
     declared_required_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_output_fields — the fields the transform ADDS
+    # to each row. Used for build-time detection of the field collision the
+    # TransformExecutor preflight otherwise raises per-row
+    # (elspeth-cfcd333f83). Empty frozenset for all non-transform nodes.
+    #
+    # NOT derivable from output_schema_config: a pass-through transform's
+    # effective guaranteed fields include the input fields it forwards, so
+    # deriving this from guarantees would report every pass-through transform
+    # as colliding with its own upstream. Declaration only.
+    declared_output_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_input_fields — the fields the transform
+    # REQUIRES on each arriving row. Used for build-time detection of the
+    # violation DeclaredRequiredFieldsContract.pre_emission_check otherwise
+    # raises per-row, before process() ever runs (elspeth-ada5a60249). Empty
+    # frozenset for all non-transform nodes.
+    #
+    # Input-side sibling of declared_output_fields above, and NOT derivable
+    # from input_schema/input_schema_config for the same class of reason: six
+    # transform configs compute this as a property over their own options
+    # (web_scrape's url_field, blob_csv_expand's blob_ref_field, textract's
+    # key_field plus optionally bucket_field/version_field, ...), and the
+    # generated input model is built from the `schema:` block, which never
+    # folds those in. Declaration only.
+    #
+    # Deliberately a SEPARATE field rather than a widening of
+    # declared_required_fields: that one is SINK-only and fails closed at
+    # construction for every other node type (guard below), because sinks
+    # derive it from output_schema_config while transforms have no such
+    # derivation. Projecting transform input declarations onto it would trip
+    # that invariant at graph construction.
+    declared_input_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_string_input_fields — the fields the transform
+    # requires to be PRESENT and STRING-VALUED on every arriving row, failing
+    # the row closed otherwise (the text-scanning family: Bedrock/Azure
+    # guardrails' `fields`, keyword_filter's named `fields`, document
+    # intelligence's `source_field`). Used for build-time detection of the
+    # provable 100%-fatal shape where a producer's schema declares such a field
+    # as int/float/bool (elspeth-b19dfe41fb). Empty frozenset for all
+    # non-transform nodes.
+    #
+    # Type-side sibling of declared_input_fields above, and NOT derivable from
+    # input_schema/input_schema_config for the same reason: the scan-field
+    # options never fold into the `schema:` block, which the auto-wire
+    # hard-codes to observed-mode anyway. Unlike declared_input_fields this
+    # surface has NO runtime consumer — the plugins enforce the contract in
+    # their own process paths — so it is not scoped by ADR-013's batch
+    # exclusion and batch-aware family members (the Azure pair) declare too.
+    declared_string_input_fields: frozenset[str] = field(default_factory=frozenset)
+
     # Pass-through contract flag (ADR-007). Populated only for TRANSFORM nodes
     # by the builder from TransformProtocol.passes_through_input. When True,
     # the validator walk propagates predecessor guarantees through this node
     # when computing effective guaranteed fields. Always False for non-TRANSFORM
     # nodes; non-False value on any non-TRANSFORM node raises GraphValidationError.
     passes_through_input: bool = False
+
+    # Field-forwarding declaration (elspeth-15c72686f2).
+    # Populated for TRANSFORM and AGGREGATION nodes by the builder from
+    # TransformProtocol.forwards_input_fields / removed_input_fields. Both the
+    # presence and definite-emits walks propagate predecessor lower bounds
+    # through the named subtraction when the node's output contract allows
+    # extras; a fixed contract is a firewall. This is sound for permission
+    # consumers: every SUCCESS row carries those fields even when the transform
+    # may drop whole rows; it is not a completeness claim.
+    #
+    # Scoped like passes_through_input (TRANSFORM+AGGREGATION) rather than like
+    # declared_output_fields (TRANSFORM-only): batch_outlier_annotator is wired
+    # under `aggregations:` in YAML and is one of the four declarers.
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = field(default_factory=frozenset)
+
+    # Value-preservation declaration (elspeth-e6e552ce34). Populated for the
+    # plugin-bearing kinds — TRANSFORM, AGGREGATION, COLLECTOR — by the builder
+    # from TransformProtocol.preserves_input_values. True means process() never
+    # changes the VALUE of a surviving input field (adding NEW fields and the
+    # declared removals are fine) — the promise that lets
+    # resolve_guaranteed_field_type recurse through an undeclaring
+    # pass-through or forwarding node instead of abstaining. Scoped like
+    # passes_through_input rather than like declared_output_fields: the walk's
+    # abstention guard reads it at every pass-through-capable kind
+    # (elspeth-48aeea6ad9 widened it from TRANSFORM-only, where an
+    # AGGREGATION/COLLECTOR pass-through recursed unguarded).
+    preserves_input_values: bool = False
+
+    # Structural observed-cell type (elspeth-e6e552ce34). Populated only for
+    # SOURCE nodes by the builder from SourceProtocol.observed_value_type.
+    # Non-None means: under an OBSERVED schema this source emits every cell as
+    # this SchemaConfig base type by construction (csv: "str" — parsed cells
+    # are never coerced when no fields are declared). Consumed by
+    # resolve_guaranteed_field_type's structural source arm, which answers the
+    # type only for fields in the source's own guaranteed set.
+    observed_value_type: str | None = None
 
     def __post_init__(self) -> None:
         component_type = self.node_type.name.lower()
@@ -233,16 +332,130 @@ class NodeInfo:
                 component_id=self.node_id,
                 component_type=component_type,
             )
-        # Offensive programming: passes_through_input is for nodes that execute
-        # a TransformProtocol plugin — TRANSFORM and AGGREGATION. Aggregations
-        # (including BatchReplicate wired under `aggregations:` in YAML) execute
-        # transform-class plugins and share the propagation semantics per
-        # ADR-007. Setting it on source/coalesce/sink/gate indicates a builder
-        # bug or misrouted attribute assignment; surface at construction.
-        if self.passes_through_input and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION):
+        # Offensive programming: declared_output_fields mirrors the
+        # declared_required_fields guard above. It is TRANSFORM-only rather
+        # than TRANSFORM+AGGREGATION (as passes_through_input is) because its
+        # only consumer — validate_transform_output_field_collisions — is
+        # scoped to TRANSFORM nodes, so an aggregation node would carry data
+        # with no reader.
+        #
+        # This boundary is a SCOPE decision, not a claim that aggregations
+        # cannot collide. BatchReplicate — which the passes_through_input
+        # comment below correctly notes is wired under `aggregations:` in YAML
+        # — hand-rolls the identical collision check in its own body
+        # (batch_replicate.py:273-279), as does batch_outlier_annotator. The
+        # reason for not widening is that aggregations are reductive: an
+        # upstream node's guarantees describe the rows entering the batch, not
+        # the row leaving it, so the intersection this check relies on is not
+        # sound there. See validate_transform_output_field_collisions'
+        # docstring for the full argument (elspeth-cfcd333f83).
+        if self.declared_output_fields and self.node_type != NodeType.TRANSFORM:
             raise GraphValidationError(
-                f"NodeInfo.passes_through_input is only meaningful for TRANSFORM or "
-                f"AGGREGATION nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                f"NodeInfo.declared_output_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_output_fields={sorted(self.declared_output_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_input_fields mirrors the
+        # declared_output_fields guard above and is TRANSFORM-only for the same
+        # reason — its only consumer, validate_transform_declared_input_fields,
+        # is scoped to TRANSFORM nodes, so any other node type would carry data
+        # with no reader.
+        #
+        # Sinks are not merely out of scope here, they are served by a
+        # different field: SINK input requirements live on
+        # declared_required_fields and are checked by
+        # validate_sink_required_fields. Aggregations are excluded because they
+        # are reductive — the executor's per-row declared-input contract does
+        # not apply to a batch flush the same way — so admitting them would
+        # need its own soundness argument (elspeth-ada5a60249).
+        if self.declared_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_input_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_input_fields={sorted(self.declared_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_string_input_fields mirrors the
+        # declared_input_fields guard above and is TRANSFORM-only for the same
+        # reason — its only consumer,
+        # validate_transform_string_typed_input_fields, is scoped to TRANSFORM
+        # nodes, so any other node type would carry data with no reader
+        # (elspeth-b19dfe41fb).
+        if self.declared_string_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_string_input_fields={sorted(self.declared_string_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: passes_through_input is for nodes that execute
+        # a TransformProtocol plugin — TRANSFORM, AGGREGATION, and COLLECTOR.
+        # Aggregations (including BatchReplicate wired under `aggregations:` in
+        # YAML) execute transform-class plugins and share the propagation
+        # semantics per ADR-007; a collector reuses that same batch-transform
+        # plugin contract (barrier-scopes spec §3) and shares it too. Setting
+        # it on source/coalesce/sink/gate indicates a builder bug or
+        # misrouted attribute assignment; surface at construction.
+        if self.passes_through_input and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR):
+            raise GraphValidationError(
+                f"NodeInfo.passes_through_input is only meaningful for TRANSFORM, "
+                f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: preserves_input_values mirrors the
+        # passes_through_input guard above — it is a promise about plugin
+        # process() behaviour, so it is meaningful exactly on the kinds that
+        # execute a TransformProtocol plugin: TRANSFORM, AGGREGATION,
+        # COLLECTOR. resolve_guaranteed_field_type's abstention guard reads it
+        # at all three (elspeth-e6e552ce34; widened by elspeth-48aeea6ad9).
+        if self.preserves_input_values and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION, NodeType.COLLECTOR):
+            raise GraphValidationError(
+                f"NodeInfo.preserves_input_values is only meaningful for TRANSFORM, "
+                f"AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: observed_value_type is the structural
+        # observed-cell type of a SOURCE plugin; any other node type carrying
+        # it indicates misrouted attribute threading (elspeth-e6e552ce34).
+        if self.observed_value_type is not None and self.node_type != NodeType.SOURCE:
+            raise GraphValidationError(
+                f"NodeInfo.observed_value_type is only meaningful for SOURCE nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with observed_value_type={self.observed_value_type!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the forwarding declaration shares
+        # passes_through_input's scope and rationale above — it too describes a
+        # node executing a TransformProtocol plugin. Checking removed_input_fields
+        # independently rather than only behind the flag catches a stray removal
+        # set left on a node that forwards nothing, which would otherwise sit
+        # unread until a future validator widened its scope.
+        if (self.forwards_input_fields or self.removed_input_fields) and self.node_type not in (
+            NodeType.TRANSFORM,
+            NodeType.AGGREGATION,
+            NodeType.COLLECTOR,
+        ):
+            raise GraphValidationError(
+                f"NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for "
+                f"TRANSFORM, AGGREGATION, or COLLECTOR nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # A removal set names fields subtracted from what this node FORWARDS, so
+        # it is meaningless — and silently misleading — without the flag that
+        # turns forwarding on.
+        if self.removed_input_fields and not self.forwards_input_fields:
+            raise GraphValidationError(
+                f"NodeInfo.removed_input_fields on node {self.node_id!r} requires "
+                f"forwards_input_fields=True; got removed_input_fields="
+                f"{sorted(self.removed_input_fields)!r} with the flag unset.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

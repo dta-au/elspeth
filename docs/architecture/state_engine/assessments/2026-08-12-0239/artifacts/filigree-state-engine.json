@@ -1,0 +1,131 @@
+{
+  "items": [
+    {
+      "issue_id": "elspeth-aafba3b298",
+      "title": "[state engine] Close the TS-02 to source-COMPLETED crash seam",
+      "status": "closed",
+      "priority": 1,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-d8e172676c",
+      "title": "[state engine] Reject malformed PENDING_SINK rows during claim",
+      "status": "closed",
+      "priority": 1,
+      "type": "bug"
+    },
+    {
+      "issue_id": "elspeth-51a4b5c771",
+      "title": "[state engine] Characterize a plugin call beyond lease TTL and stall budget",
+      "status": "closed",
+      "priority": 1,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-f8f9272b68",
+      "title": "[state engine] Refuse normal dispositions for sink-redrive leases",
+      "status": "closed",
+      "priority": 1,
+      "type": "bug"
+    },
+    {
+      "issue_id": "elspeth-7cdc4da434",
+      "title": "[state engine] Close the child-enqueue before parent-disposition crash seam",
+      "status": "closed",
+      "priority": 1,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-b8d0c9b40a",
+      "title": "[state engine] Make release_seat CAS and membership departure atomic and run-scoped",
+      "status": "closed",
+      "priority": 1,
+      "type": "bug"
+    },
+    {
+      "issue_id": "elspeth-33c1793a26",
+      "title": "[state engine] Enforce non-leader same-run target in evict_worker",
+      "status": "closed",
+      "priority": 1,
+      "type": "bug"
+    },
+    {
+      "issue_id": "elspeth-41466a3eb6",
+      "title": "[state engine] Preserve non-sink aggregation continuation across barrier completion",
+      "status": "closed",
+      "priority": 1,
+      "type": "bug"
+    },
+    {
+      "issue_id": "elspeth-61350c4744",
+      "title": "[state engine] Runtime-VAL manifest normalization fails on Python 3.14 member descriptors",
+      "status": "triage",
+      "priority": 1,
+      "type": "bug"
+    },
+    {
+      "issue_id": "elspeth-c0d4a28e11",
+      "title": "[state engine] Prove TS-00 and TS-01 queue atomicity and replay contracts",
+      "status": "open",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-9cd07962c7",
+      "title": "[state engine] Prove source ingress composition and scheduler exclusion paths",
+      "status": "open",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-9a52eb80f9",
+      "title": "[state engine] Extend multiprocess proof to registered orchestration and sink redrive",
+      "status": "open",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-76bb92bc7d",
+      "title": "[state engine] Prove TS-04 and TS-06 preserve the full sink bundle",
+      "status": "closed",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-2aba594afb",
+      "title": "[state engine] Integrate heartbeat success and lease-loss abandonment proof",
+      "status": "open",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-1076e2716a",
+      "title": "[state engine] Complete the TS-07 through TS-10 disposition proof matrix",
+      "status": "closed",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-2e66723070",
+      "title": "[state engine] Prove transform and gate plugins through scheduler disposition",
+      "status": "open",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-6f6bbbec00",
+      "title": "[state engine] Exercise real follower build drain and plugin traversal",
+      "status": "open",
+      "priority": 2,
+      "type": "task"
+    },
+    {
+      "issue_id": "elspeth-d8aac9e05a",
+      "title": "[state engine] Build a reproducible live assessment program",
+      "status": "closed",
+      "priority": 2,
+      "type": "task"
+    }
+  ],
+  "has_more": false
+}

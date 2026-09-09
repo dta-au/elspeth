@@ -11,6 +11,7 @@ from elspeth.web.blobs.protocol import (
     AllowedMimeType,
     BlobCreator,
     BlobStatus,
+    StorageMimeType,
 )
 from elspeth.web.blobs.service import sanitize_filename
 
@@ -58,7 +59,7 @@ class BlobMetadataResponse(_StrictResponse):
     id: str
     session_id: str
     filename: str
-    mime_type: AllowedMimeType
+    mime_type: StorageMimeType
     size_bytes: int
     content_hash: str | None
     created_at: datetime

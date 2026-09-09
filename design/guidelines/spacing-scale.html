@@ -1,0 +1,27 @@
+<!-- @dsCard group="Spacing" viewport="700x150" name="Spacing scale" subtitle="2 · 4 · 8 · 12 · 16 · 24 · 32px" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 18px 16px; background: var(--color-bg); font-family: var(--font-sans); }
+  .row { display: flex; align-items: flex-end; gap: 18px; }
+  .item { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .bar { background: var(--color-accent); border-radius: var(--radius-sm); width: 100%; }
+  .tok { font-family: var(--font-mono); font-size: 10px; color: var(--color-text-muted); }
+  .nm { font-size: 11px; color: var(--color-text-secondary); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="item"><div class="bar" style="height:2px;width:2px"></div><div class="nm">2xs</div><div class="tok">2</div></div>
+    <div class="item"><div class="bar" style="height:4px;width:4px"></div><div class="nm">xs</div><div class="tok">4</div></div>
+    <div class="item"><div class="bar" style="height:8px;width:8px"></div><div class="nm">sm</div><div class="tok">8</div></div>
+    <div class="item"><div class="bar" style="height:12px;width:12px"></div><div class="nm">md</div><div class="tok">12</div></div>
+    <div class="item"><div class="bar" style="height:16px;width:16px"></div><div class="nm">lg</div><div class="tok">16</div></div>
+    <div class="item"><div class="bar" style="height:24px;width:24px"></div><div class="nm">xl</div><div class="tok">24</div></div>
+    <div class="item"><div class="bar" style="height:32px;width:32px"></div><div class="nm">2xl</div><div class="tok">32</div></div>
+  </div>
+</body>
+</html>

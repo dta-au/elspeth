@@ -35,6 +35,8 @@ class DependencyRunResult:
 class CommencementGateResult:
     """Result of a successful commencement gate evaluation.
 
+    ``condition`` is the structural audit rendering: map keys are retained,
+    while non-key string literals are redacted at evaluation time.
     The ``result`` field is always ``True`` - gate failures raise
     ``CommencementGateFailedError`` instead of returning ``result=False``.
     The field exists so the audit trail records an explicit pass verdict,

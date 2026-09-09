@@ -20,6 +20,9 @@ from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
 )
 from elspeth.web.composer.no_tool_policy import (
+    carries_build_action as _carries_build_action,
+)
+from elspeth.web.composer.no_tool_policy import (
     compose_empty_state_message as _compose_empty_state_message,
 )
 from elspeth.web.composer.no_tool_policy import (
@@ -39,9 +42,6 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty as _state_is_structurally_empty,
-)
-from elspeth.web.composer.no_tool_policy import (
-    user_request_expects_pipeline_mutation as _user_request_expects_pipeline_mutation,
 )
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState
@@ -79,8 +79,9 @@ async def finalize_no_tool_response(
     ``routes._composer_history_content`` discriminator depends on the
     ``content`` / ``raw_assistant_content`` relationship below):
 
-    1. **No-mutation empty-state augmentation** — user asked for a
-       build-style action, no successful mutation has been seen this
+    1. **No-mutation empty-state augmentation** — the user's message
+       carried a build action (``carries_build_action``), no successful
+       mutation has been seen this
        turn, and the state is structurally empty. The model's prose
        is passed through verbatim with an operator-facing suffix
        appended (concrete blocker if a tool failed). ``content``
@@ -121,6 +122,11 @@ async def finalize_no_tool_response(
       run ``_cached_runtime_preflight`` for the current state.
     - Otherwise, reuse ``last_runtime_preflight`` from the most recent
       ``preview_pipeline`` call (may be ``None``).
+    - When that leaves the verdict unknown (``None``) on a WIRED state
+      (sources and outputs present) whose own Stage-1 ``state.validate()``
+      is invalid, run the preflight anyway (elspeth-ac85b0ab0e): a build
+      damaged on a prior turn must not finalize as a bare pass-through.
+      Half-built intermediates keep the bare passthrough.
     - Whichever of the two paths populated ``runtime_result``, the
       state-claim grounding check runs after preflight-invalid
       branches are dispatched. The grounding check's regex
@@ -141,7 +147,8 @@ async def finalize_no_tool_response(
         session_scope: Scope identifier for cache + telemetry.
         user_message: The user's message that triggered this turn.
             Used to detect "build-style" requests for the
-            no-mutation empty-state augmentation path.
+            no-mutation empty-state augmentation path; a purely
+            conversational message suppresses that path.
         mutation_success_seen: Whether any mutating tool call
             succeeded this turn. Suppresses the no-mutation
             augmentation path.
@@ -157,7 +164,7 @@ async def finalize_no_tool_response(
     path — they are not caught here.
     """
     if (
-        _user_request_expects_pipeline_mutation(user_message)
+        _carries_build_action(user_message)
         and not mutation_success_seen
         and _state_is_structurally_empty(state)
         and not _last_mutation_was_pending_proposal(tool_invocations)
@@ -171,6 +178,41 @@ async def finalize_no_tool_response(
         # output from both the user and (via routes._composer_history_content)
         # from the model itself on subsequent turns
         # (cf. elspeth-861b0c58f5).
+        #
+        # Disclosure is gated on _carries_build_action, NOT on the
+        # mutation-intent enum (issue elspeth-a6a2ed6b1d). This branch
+        # previously required EXPLICIT_MUTATION, which is a packaging
+        # verdict — the grammar fullmatches the whole normalised message
+        # from character 0 and treats a single "?" anywhere as a hard
+        # disqualifier. Over the acceptance corpus that split
+        # otherwise-identical requests: 14 of 18 phrasings classified
+        # AMBIGUOUS and silently lost the explanation of why nothing got
+        # built. Whether a user is owed that explanation cannot turn on
+        # the article after the verb.
+        #
+        # Gating on "is not CONVERSATIONAL" instead was tried and
+        # rejected on review: AMBIGUOUS is also reached by two early
+        # returns that never test content (the input-size ceiling and
+        # the unbalanced-quote guard), so an oversize or
+        # unbalanced-quote greeting failed OPEN into a build-failure
+        # notice. The named predicate always runs the content test, so
+        # neither short-circuit decides disclosure. Routing is
+        # unaffected: the surface-selection call sites read
+        # classify_pipeline_mutation_intent, which this path no longer
+        # consults.
+        #
+        # Known consequence: taking this branch pre-empts
+        # check_state_claim_grounding below. For prose that falsely
+        # claims work was done, the operator gets this notice (empty
+        # state plus the concrete blocker) instead of the sharper
+        # grounding correction naming the contradiction. Both contradict
+        # the false claim, so this is not a safety regression, and the
+        # blocker cause is the more actionable half. Composing the two
+        # was considered and deferred: _canonical_trusted_suffix_segments
+        # recognises a CLOSED set of suffix shapes, so a naively
+        # concatenated suffix would fail closed to a single untrusted
+        # text segment and lose the trusted chrome entirely. Composing
+        # therefore needs a new canonical shape, not a bigger f-string.
         #
         # Exception: APPROVAL_REQUIRED proposals are not failures. Under
         # explicit_approve trust mode the build SUCCEEDED — the work is
@@ -197,18 +239,26 @@ async def finalize_no_tool_response(
             llm_calls=llm_calls,
         )
 
-    runtime_result: ValidationResult | None = last_runtime_preflight
-    if state.version > initial_version:
-        runtime_result = await service._cached_runtime_preflight(
-            state,
-            user_id=user_id,
-            session_id=session_id,
-            cache=runtime_preflight_cache,
-            initial_version=initial_version,
-            session_scope=session_scope,
-            llm_calls=llm_calls,
-            plugin_snapshot=plugin_snapshot,
-        )
+    # The reuse/recompute rule AND the cross-turn arm (elspeth-ac85b0ab0e)
+    # live in ``_reuse_or_recompute_runtime_preflight`` — the same method the
+    # repair and advisor gates consume via ``_turn_runtime_preflight`` — so
+    # this finalize observes the SAME verdict by construction. The one
+    # divergence is deliberate: no structurally-empty guard here, because the
+    # empty-state finalize branches above own that population and a MUTATED
+    # empty state (e.g. a cleared source) must still pay the preflight so the
+    # ``preflight_invalid_empty_state_augmentation`` branch below can carry
+    # the real validator objection.
+    runtime_result: ValidationResult | None = await service._reuse_or_recompute_runtime_preflight(
+        state=state,
+        user_id=user_id,
+        session_id=session_id,
+        last_runtime_preflight=last_runtime_preflight,
+        runtime_preflight_cache=runtime_preflight_cache,
+        initial_version=initial_version,
+        session_scope=session_scope,
+        llm_calls=llm_calls,
+        plugin_snapshot=plugin_snapshot,
+    )
 
     if runtime_result is not None and not runtime_result.is_valid and not _is_pending_interpretation_handoff(runtime_result):
         # Two finalize shapes for invalid preflight, dispatched on

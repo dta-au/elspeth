@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  AUDIT_CHARACTERISTICS,
   lookupAuditCharacteristic,
   KNOWN_AUDIT_FLAGS,
 } from "./auditCharacteristics";
@@ -32,15 +33,40 @@ describe("auditCharacteristics metadata", () => {
     expect(lookupAuditCharacteristic("signed")).not.toBeNull();
   });
 
+  it("describes coerce as typed-schema capability, not observed-mode behavior", () => {
+    const meta = lookupAuditCharacteristic("coerce");
+    expect(meta).not.toBeNull();
+    expect(meta?.label).toBe("can coerce types");
+    expect(meta?.tooltip).toMatch(/fixed.*flexible.*declared/i);
+    expect(meta?.tooltip).toMatch(/observed.*string/i);
+  });
+
   it("io_write has informational tone (not attention)", () => {
     const meta = lookupAuditCharacteristic("io_write");
     expect(meta).not.toBeNull();
     expect(meta?.tone).toBe("informational");
   });
 
+  // elspeth-cfa3faad35: all twelve chips wrap into ONE row at wide viewports,
+  // so a lone capitalised label reads as a proper noun or as a more important
+  // characteristic than its neighbours. "Network call" was the only offender.
+  // Asserted as the constraint rather than as a list of literals: a label's
+  // leading alphabetic run must be all-lower (sentence case) or all-upper (an
+  // acronym such as "HMAC-signed"), never Mixed.
+  it("labels are sentence case, apart from leading acronyms", () => {
+    const offenders = AUDIT_CHARACTERISTICS.filter((meta) => {
+      const leading = /^[A-Za-z]+/.exec(meta.label)?.[0] ?? "";
+      return (
+        leading !== leading.toLowerCase() && leading !== leading.toUpperCase()
+      );
+    }).map((meta) => `${meta.flag}: ${meta.label}`);
+    expect(offenders).toEqual([]);
+  });
+
   it("returns null for an unknown flag rather than crashing", () => {
     // Future flags added on the backend without a frontend metadata
-    // entry should render as a small grey "unknown" chip, not crash.
+    // entry should render nothing (PluginCard filters them out before
+    // render), not crash.
     expect(lookupAuditCharacteristic("future_flag_2027")).toBeNull();
   });
 

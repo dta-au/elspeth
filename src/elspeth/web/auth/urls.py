@@ -1,4 +1,4 @@
-"""URL validation helpers for browser-facing OIDC auth flows."""
+"""URL validation helpers for the OIDC endpoints ELSPETH itself contacts."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _canonical_host(parsed: SplitResult, *, field_name: str) -> str:
 
 
 def _parse_https_url(raw_value: str, *, field_name: str) -> tuple[str, SplitResult, _Origin]:
-    if not isinstance(raw_value, str):
+    if type(raw_value) is not str:
         raise _static_error(field_name, "string")
     if any(ord(char) < 32 or ord(char) == 127 for char in raw_value):
         raise _static_error(field_name, "control-character")
@@ -136,59 +136,107 @@ def _parse_browser_endpoint(raw_value: str, *, field_name: str) -> tuple[str, _O
     return value, origin
 
 
-def validate_oidc_browser_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
-    """Validate and canonicalize a closed set of exact HTTPS origins."""
-    normalized: list[str] = []
-    seen: set[_Origin] = set()
-    for raw_origin in origins:
-        value, origin = _parse_bare_origin(raw_origin, field_name="OIDC browser allowed origin")
-        if origin in seen:
-            raise ValueError("OIDC browser allowed origin failed duplicate check")
-        seen.add(origin)
-        normalized.append(value)
-    return tuple(normalized)
-
-
-def oidc_browser_endpoint_origin(endpoint: str) -> str:
-    """Return the canonical origin of an already validated browser endpoint."""
-    _value, origin = _parse_browser_endpoint(endpoint, field_name="browser_endpoint")
+def _canonical_origin(origin: _Origin) -> str:
     host = f"[{origin.host}]" if ":" in origin.host else origin.host
     port = "" if origin.port == _HTTPS_DEFAULT_PORT else f":{origin.port}"
     return f"https://{host}{port}"
 
 
-def validate_oidc_browser_endpoints(
-    authorization_endpoint: str,
-    token_endpoint: str,
+def https_url_origin(value: str, *, field_name: str = "issuer") -> str:
+    """Return the canonical origin of any HTTPS URL, path or no path.
+
+    An ISSUER is not an endpoint: ``https://accounts.google.com`` is a
+    perfectly good issuer and has no path, while ``_parse_browser_endpoint``
+    deliberately refuses a root path because an endpoint with no path is a
+    misconfiguration. Per-profile origin policy needs the origin of the
+    issuer itself, so it needs this instead — running the SAME parse, so the
+    control-character, backslash, percent-encoding, embedded-credential,
+    scheme and host canonicalisation checks all still apply. Extracting the
+    origin with ``urlsplit`` at the call site would have skipped every one of
+    them.
+    """
+    _value, _parsed, origin = _parse_https_url(value, field_name=field_name)
+    return _canonical_origin(origin)
+
+
+class DiscoveredEndpoints(NamedTuple):
+    """The endpoints a discovery document supplies, all validated together.
+
+    A NamedTuple rather than a mapping so that FORGETTING one is a type error
+    rather than an endpoint that silently skips validation. A
+    ``Mapping[str, str | None]`` would have let a caller omit ``jwks_uri`` and
+    still get a clean return — the shape of fail-open guard this codebase is
+    trying to stop building.
+
+    ``userinfo_endpoint`` is the one genuinely optional member: profiles that
+    take every claim from the ID token never call it, and a provider that does
+    not publish one is not misconfigured. Optionality is expressed in the type,
+    not in a convention about empty strings.
+    """
+
+    authorization_endpoint: str
+    token_endpoint: str
+    jwks_uri: str
+    userinfo_endpoint: str | None
+
+
+def validate_discovered_endpoints(
+    endpoints: DiscoveredEndpoints,
     *,
-    issuer: str,
-    allowed_origins: tuple[str, ...] = (),
-) -> tuple[str, str]:
-    """Return a validated authorization/token pair bound to one exact origin."""
-    authorization_value, authorization_origin = _parse_browser_endpoint(
-        authorization_endpoint,
-        field_name="authorization_endpoint",
+    expected_origins: frozenset[str],
+) -> DiscoveredEndpoints:
+    """Validate every discovered endpoint against one closed set of origins.
+
+    Discovery documents are fetched from a remote IdP, so every URL in one is
+    attacker-reachable if the IdP is compromised or impersonated. Each is put
+    through the same parse as a configured endpoint — HTTPS, no embedded
+    credentials, canonical ASCII host, literal-IP SSRF block, no browser/parser
+    disagreement, no dot segments, no query or fragment — and is then required
+    to sit on an origin the PROFILE expects.
+
+    WHAT CHANGED, AND WHY IT IS STRICTER
+    ------------------------------------
+    The rule this replaces was "same origin as the issuer, or in the operator's
+    allowlist". Origin policy is a property of the identity provider, not of
+    the deployment: Google serves authorization from ``accounts.google.com``
+    and tokens from ``oauth2.googleapis.com``, so a same-origin rule refuses a
+    correct Google deployment, and the operator allowlist existed to let a
+    human widen it back — by hand, per deployment, with no way to be sure the
+    widening was minimal.
+
+    So the issuer's origin is no longer privileged. An endpoint is accepted
+    only if its origin is in ``expected_origins``, which the profile computes.
+    A profile whose expected origins do not include the issuer's own origin
+    will now REFUSE an endpoint served from it — deliberately, and unlike the
+    rule this replaces.
+
+    Nor do the endpoints have to agree with each other any more. The old pair
+    check required authorization and token to share an origin, which is the
+    same same-origin assumption wearing a different hat. The closed set is the
+    control; agreement between endpoints was only ever a proxy for it.
+
+    An empty ``expected_origins`` refuses everything. That is the fail-closed
+    reading: a profile that computed no origins has not authorised any, and
+    treating "no constraint recorded" as "no constraint" is how origin checks
+    stop being checks.
+    """
+    allowed = {_parse_bare_origin(value, field_name="expected origin")[1] for value in sorted(expected_origins)}
+
+    def _checked(raw_value: str, *, field_name: str) -> str:
+        value, origin = _parse_browser_endpoint(raw_value, field_name=field_name)
+        if origin not in allowed:
+            # Static message: the endpoint came from a remote document and its
+            # host must not be echoed into a log line or an error page.
+            raise _static_error(field_name, "expected-origin")
+        return value
+
+    userinfo_endpoint = endpoints.userinfo_endpoint
+    return DiscoveredEndpoints(
+        authorization_endpoint=_checked(endpoints.authorization_endpoint, field_name="authorization_endpoint"),
+        token_endpoint=_checked(endpoints.token_endpoint, field_name="token_endpoint"),
+        jwks_uri=_checked(endpoints.jwks_uri, field_name="jwks_uri"),
+        userinfo_endpoint=None if userinfo_endpoint is None else _checked(userinfo_endpoint, field_name="userinfo_endpoint"),
     )
-    token_value, token_origin = _parse_browser_endpoint(token_endpoint, field_name="token_endpoint")
-    _issuer_value, _issuer_parsed, issuer_origin = _parse_https_url(issuer, field_name="issuer")
-
-    normalized_allowed = validate_oidc_browser_origins(allowed_origins)
-    allowed = {_parse_bare_origin(value, field_name="OIDC browser allowed origin")[1] for value in normalized_allowed}
-
-    if authorization_origin != token_origin:
-        raise ValueError("authorization_endpoint and token_endpoint must use the same origin")
-    if authorization_origin != issuer_origin and authorization_origin not in allowed:
-        raise ValueError("browser endpoint origin is not allowed")
-    return authorization_value, token_value
-
-
-def validate_oidc_authorization_endpoint(endpoint: str, *, issuer: str) -> str:
-    """Compatibility validator for the historical same-origin endpoint API."""
-    endpoint_value, endpoint_origin = _parse_browser_endpoint(endpoint, field_name="authorization_endpoint")
-    _issuer_value, _issuer_parsed, issuer_origin = _parse_https_url(issuer, field_name="issuer")
-    if endpoint_origin != issuer_origin:
-        raise ValueError("authorization_endpoint must use the same origin as issuer")
-    return endpoint_value
 
 
 def validate_oidc_issuer(issuer: str) -> str:

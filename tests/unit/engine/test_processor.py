@@ -30,10 +30,13 @@ import pytest
 # For node registration
 from elspeth.contracts import NodeType, RouteDestination, RowResult, SourceRow, TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, WorkerMembershipToken
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.declaration_contracts import _attach_contract_name_from_dispatcher
+from elspeth.contracts.engine import CommittedAggregationOutputReceipt
 from elspeth.contracts.enums import (
     BatchStatus,
+    FrameKind,
     NodeStateStatus,
     RoutingMode,
     RunStatus,
@@ -44,21 +47,33 @@ from elspeth.contracts.enums import (
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CapacityError,
+    ExecutionError,
     FrameworkBugError,
     MaxRetriesExceeded,
     OrchestrationInvariantError,
+    PluginContractViolation,
+    SinkTransactionalInvariantError,
     SourceGuaranteedFieldsViolation,
+)
+from elspeth.contracts.identity import (
+    LineageFrame,
+    lineage_path_from_json,
+    path_branch_name,
+    path_expand_group_id,
+    path_fork_group_id,
 )
 from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, SinkName
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, GateName, NodeID, RowUnionName, SinkName
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
+from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
 from elspeth.engine.executors import GateOutcome
@@ -70,18 +85,27 @@ from elspeth.engine.processor import (
     SCHEDULER_MAINTENANCE_INTERVAL,
     BarrierJournalRestoreContext,
     DAGTraversalContext,
+    ProcessorMode,
     RowProcessor,
     _FlushContext,
     _LiveBarrierHold,
+    _TransformTerminal,
 )
 from elspeth.engine.retry import RetryManager
+from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
 from elspeth.plugins.transforms.batch_replicate import BatchReplicateConfig
 from elspeth.testing import make_contract, make_pipeline_row, make_row, make_source_row, make_token_info
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
+from tests.fixtures.landscape import (
+    age_barrier_hold,
+    await_database_time,
+    landscape_database_now,
+    leader_coordination_token,
+    make_recorder_with_run,
+)
 
 # =============================================================================
 # Helpers
@@ -145,12 +169,30 @@ def _persist_token_for_scheduler(
             data=token.row_data.to_dict(),
         )
     if factory.query.get_token(token.token_id) is None:
+        # A fabricated branch token models a fork child — mint the matching
+        # lineage frame(s) durably via the create_token(..., lineage_path=)
+        # seam so coalesce_tokens' durable strict pop (spec rulings 24/28) has
+        # a frame to pop. Never weaken the pop to accommodate a raw-seeded
+        # fixture; fix the fixture instead.
+        #
+        # Prefer the token's OWN lineage_path when the fixture set one — that
+        # is the real (possibly multi-frame) in-memory path threaded straight
+        # through, per the create_token seam contract. Fall back to a
+        # synthetic single-FORK reconstruction from branch_name for older
+        # fixtures that never populated lineage_path.
+        lineage_path = (
+            token.lineage_path
+            if token.lineage_path
+            else (
+                (LineageFrame(kind=FrameKind.FORK, group_id=f"test-fork:{token.row_id}", member_key=token.branch_name),)
+                if token.branch_name is not None
+                else ()
+            )
+        )
         factory.data_flow.create_token(
             token.row_id,
             token_id=token.token_id,
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id or (f"test-fork:{token.row_id}" if token.branch_name is not None else None),
-            join_group_id=token.join_group_id,
+            lineage_path=lineage_path,
         )
 
 
@@ -164,12 +206,15 @@ def _persist_blocked_scheduler_work(
     ingest_sequence: int = 0,
     adopted: bool = True,
     coalesce_name: str | None = None,
-) -> None:
-    """Persist BLOCKED scheduler work matching a fabricated buffered token.
+    collector_name: str | None = None,
+) -> str:
+    """Persist BLOCKED scheduler work matching a fabricated buffered token; return its work_item_id.
 
     Uses the production journal verbs (enqueue+claim, then mark_blocked) so
     the BLOCKED row carries ``barrier_blocked_at`` exactly as a live barrier
-    hold would (F1: the journal is the only barrier-buffer truth).
+    hold would (F1: the journal is the only barrier-buffer truth), stamped
+    from Landscape database time (ADR-047); a test that needs an older hold
+    ages it with ``age_barrier_hold``.
 
     ``adopted=True`` (the default) stamps ``barrier_adopted_epoch`` — the
     post-adoption journal image (ADR-030 §E.2). Tests that fabricate executor
@@ -178,7 +223,6 @@ def _persist_blocked_scheduler_work(
     fabricate an intake-pending deposit instead.
     """
     _persist_token_for_scheduler(factory, token, ingest_sequence=ingest_sequence)
-    now = processor._clock.now_utc()
     item = processor._scheduler.enqueue_ready_claimed_legacy_unfenced(
         run_id=processor.run_id,
         token_id=token.token_id,
@@ -187,25 +231,21 @@ def _persist_blocked_scheduler_work(
         step_index=processor.resolve_node_step(node_id),
         ingest_sequence=factory.data_flow.resolve_row_ingest_sequence(token.row_id),
         row_payload_json=processor._scheduler.serialize_row_payload(token.row_data),
-        available_at=now,
         lease_owner="test-harness",
         lease_seconds=60,
-        now=now,
-        branch_name=token.branch_name,
-        fork_group_id=token.fork_group_id,
-        join_group_id=token.join_group_id,
-        expand_group_id=token.expand_group_id,
+        lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
+        collector_name=collector_name,
     )
     processor._scheduler.mark_blocked(
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        now=now,
         expected_lease_owner="test-harness",
     )
     if adopted:
         _stamp_blocked_rows_adopted(processor._scheduler, work_item_id=item.work_item_id)
+    return item.work_item_id
 
 
 def _stamp_blocked_rows_adopted(
@@ -297,6 +337,74 @@ def _register_test_worker(
         )
 
 
+def _synthesize_group_bindings_from_legacy_maps(
+    *,
+    branch_to_coalesce: dict[BranchName, CoalesceName] | None,
+    coalesce_node_ids: dict[CoalesceName, NodeID] | None,
+    branch_to_row_union: dict[BranchName, RowUnionName] | None,
+    row_union_node_ids: dict[RowUnionName, NodeID] | None,
+) -> GroupBindingRegistry:
+    """Build a real GroupBindingRegistry from the legacy per-branch maps this
+    test module's callers already pass, so `_settle_member_losses` (which
+    reads ONLY `self._group_bindings`, never the legacy maps) resolves the
+    same bindings the hundreds of pre-WS3 tests here already set up via
+    `branch_to_coalesce`/`branch_to_row_union` — without editing each of
+    them individually. Only `_make_processor` synthesizes; RowProcessor
+    itself never falls back to the legacy maps (see its `group_bindings`
+    docstring). `member_roster` must be REAL (not `()`) — GroupBindingRegistry
+    keys `binding_for`'s FORK resolution off it.
+    """
+    from elspeth.core.dag.group_bindings import CloserKind, GroupBinding
+
+    bindings: list[GroupBinding] = []
+    coalesce_members: dict[CoalesceName, list[str]] = {}
+    for branch, coalesce_name in (branch_to_coalesce or {}).items():
+        coalesce_members.setdefault(coalesce_name, []).append(str(branch))
+    for coalesce_name, members in coalesce_members.items():
+        # .get with a synthetic fallback, not direct indexing: callers that
+        # set branch_to_coalesce without coalesce_node_ids already exercise
+        # a path that never reads _coalesce_node_ids (e.g. a token without a
+        # branch, or one whose branch resolves to no bound frame), so the
+        # synthesized registry must not require an entry the real production
+        # wiring wouldn't either.
+        closer_node_id = (coalesce_node_ids or {}).get(coalesce_name, NodeID(f"__synth_closer__coalesce__{coalesce_name}"))
+        bindings.append(
+            GroupBinding(
+                kind=FrameKind.FORK,
+                opener_node_id=NodeID(f"__synth_opener__coalesce__{coalesce_name}"),
+                opener_name=f"__synth_opener__coalesce__{coalesce_name}",
+                closer_node_id=closer_node_id,
+                closer_name=str(coalesce_name),
+                closer_kind=CloserKind.COALESCE,
+                policy="require_all",
+                member_roster=tuple(members),
+            )
+        )
+    row_union_members: dict[RowUnionName, list[str]] = {}
+    for branch, row_union_name in (branch_to_row_union or {}).items():
+        row_union_members.setdefault(row_union_name, []).append(str(branch))
+    for row_union_name, members in row_union_members.items():
+        # .get with a synthetic fallback (see the coalesce loop above): the
+        # old _row_union_group_released already tolerated a missing
+        # row_union_node_ids entry (defensive `if row_union_name not in
+        # self._row_union_node_ids: return False`), so several pre-WS3 tests
+        # here set branch_to_row_union without row_union_node_ids.
+        closer_node_id = (row_union_node_ids or {}).get(row_union_name, NodeID(f"__synth_closer__row_union__{row_union_name}"))
+        bindings.append(
+            GroupBinding(
+                kind=FrameKind.FORK,
+                opener_node_id=NodeID(f"__synth_opener__row_union__{row_union_name}"),
+                opener_name=f"__synth_opener__row_union__{row_union_name}",
+                closer_node_id=closer_node_id,
+                closer_name=str(row_union_name),
+                closer_kind=CloserKind.ROW_UNION,
+                policy="require_all",
+                member_roster=tuple(members),
+            )
+        )
+    return GroupBindingRegistry(bindings=tuple(bindings))
+
+
 def _make_processor(
     factory: RecorderFactory,
     *,
@@ -313,6 +421,13 @@ def _make_processor(
     coalesce_executor: Any = None,
     coalesce_node_ids: dict[CoalesceName, NodeID] | None = None,
     branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
+    row_union_executor: Any = None,
+    row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
+    branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
+    collector_executor: Any = None,
+    collector_node_ids: dict[CollectorName, NodeID] | None = None,
+    collector_on_success_map: dict[CollectorName, str] | None = None,
+    group_bindings: GroupBindingRegistry | None = None,
     branch_to_sink: dict[BranchName, str] | None = None,
     node_step_map: dict[NodeID, int] | None = None,
     coalesce_on_success_map: dict[CoalesceName, str] | None = None,
@@ -327,10 +442,22 @@ def _make_processor(
     clock: Any = None,
     stamp_blocked_rows_adopted: bool = True,
     structural_node_ids: frozenset[NodeID] | None = None,
+    mode: ProcessorMode = ProcessorMode.LEADER,
 ) -> RowProcessor:
-    """Create a RowProcessor with sensible defaults."""
+    """Create a RowProcessor with sensible defaults.
+
+    ``mode=ProcessorMode.FOLLOWER`` builds the follower half of a real
+    multi-worker composition over the same DB: membership authority for the
+    REQUIRED registered ``scheduler_lease_owner`` and no leader token.
+    RowProcessor validates both authority and identity at construction.
+    """
     if scheduler_lease_owner is not None:
         _register_test_worker(factory, scheduler_lease_owner, run_id=run_id)
+    member_token = None
+    if mode is ProcessorMode.FOLLOWER:
+        if scheduler_lease_owner is None:
+            raise ValueError("_make_processor(mode=FOLLOWER) requires a registered scheduler_lease_owner")
+        member_token = WorkerMembershipToken(run_id=run_id, worker_id=scheduler_lease_owner)
 
     coalesce_nodes = dict(coalesce_node_ids or {})
     traversal_steps = dict(node_step_map or {})
@@ -358,6 +485,8 @@ def _make_processor(
     node_ids_to_register.update(traversal_next)
     node_ids_to_register.update(node_id for node_id in traversal_next.values() if node_id is not None)
     node_ids_to_register.update(coalesce_nodes.values())
+    node_ids_to_register.update((row_union_node_ids or {}).values())
+    node_ids_to_register.update((collector_node_ids or {}).values())
     node_ids_to_register.update((aggregation_settings or {}).keys())
 
     for node_id in sorted(node_ids_to_register, key=str):
@@ -369,15 +498,29 @@ def _make_processor(
         if node_id in coalesce_nodes.values():
             node_type = NodeType.COALESCE
             plugin_name = "coalesce"
+        elif node_id in (row_union_node_ids or {}).values():
+            node_type = NodeType.ROW_UNION
+            plugin_name = "row_union"
+        elif node_id in (collector_node_ids or {}).values():
+            node_type = NodeType.COLLECTOR
+            plugin_name = "collector"
         elif node_id in (aggregation_settings or {}):
             node_type = NodeType.AGGREGATION
             plugin_name = "aggregation"
         elif isinstance(plugin, GateSettings):
             node_type = NodeType.GATE
             plugin_name = "gate"
-        else:
+        elif isinstance(plugin, TransformProtocol):
             node_type = NodeType.TRANSFORM
-            plugin_name = getattr(plugin, "name", "transform")
+            plugin_name = plugin.name
+        else:
+            # Bare traversal nodes (no plugin) and non-conforming
+            # transform-shaped fakes register under the generic name. This is
+            # harness-side registration bookkeeping only — the engine's own
+            # dispatch is nominal on GateSettings (elspeth-8783933d99) and
+            # never re-measures protocol conformance.
+            node_type = NodeType.TRANSFORM
+            plugin_name = "transform"
         factory.data_flow.register_node(
             run_id=run_id,
             plugin_name=str(plugin_name),
@@ -396,6 +539,8 @@ def _make_processor(
         node_to_plugin=traversal_node_to_plugin,
         node_to_next=traversal_next,
         coalesce_node_map=coalesce_nodes,
+        row_union_node_map=dict(row_union_node_ids or {}),
+        collector_node_map=dict(collector_node_ids or {}),
         structural_node_ids=traversal_structural,
     )
 
@@ -415,7 +560,10 @@ def _make_processor(
         run_id=run_id,
         # Slice 3 (ADR-030 §E.2): the journal-first barrier intake's adoption
         # verbs are leader-fenced; bind the run's own epoch-1 seat token.
-        coordination_token=leader_coordination_token(factory, run_id),
+        # A follower never carries one.
+        coordination_token=leader_coordination_token(factory, run_id) if mode is ProcessorMode.LEADER else None,
+        member_token=member_token,
+        mode=mode,
         source_node_id=NodeID(source_node_id),
         source_on_success=source_on_success,
         source_plugin=source_plugin,
@@ -426,15 +574,65 @@ def _make_processor(
         retry_manager=retry_manager,
         coalesce_executor=coalesce_executor,
         branch_to_coalesce=branch_to_coalesce,
+        row_union_executor=row_union_executor,
+        branch_to_row_union=branch_to_row_union,
+        collector_executor=collector_executor,
+        collector_on_success_map=collector_on_success_map,
+        group_bindings=(
+            group_bindings
+            if group_bindings is not None
+            else _synthesize_group_bindings_from_legacy_maps(
+                branch_to_coalesce=branch_to_coalesce,
+                coalesce_node_ids=coalesce_node_ids,
+                branch_to_row_union=branch_to_row_union,
+                row_union_node_ids=row_union_node_ids,
+            )
+        ),
         branch_to_sink={BranchName(k): SinkName(v) for k, v in (branch_to_sink or {}).items()},
         coalesce_on_success_map=coalesce_on_success_map,
         barrier_restore=barrier_restore,
         barrier_restore_reads=factory.barrier_restore,
+        payload_store=factory.payload_store,
         telemetry_manager=telemetry_manager,
         sink_names=sink_names,
         scheduler=factory.scheduler if scheduler is _DEFAULT_SCHEDULER else scheduler,
         scheduler_lease_owner=scheduler_lease_owner,
         clock=clock,
+    )
+
+
+def _make_claimed_work_item(
+    *,
+    token_id: str = "tok-claimed",
+    lineage_path: tuple[LineageFrame, ...] = (),
+    run_id: str = "test-run",
+    row_id: str = "row-1",
+    node_id: str | None = "transform-1",
+    lease_owner: str = "worker-1",
+) -> Any:
+    """A minimal LEASED TokenWorkItem stand-in for the group-loss claim guard
+    (spec §6.2): callers only need ``token_id``/``lineage_path`` to shape, so
+    every other field carries a harmless placeholder."""
+    from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+
+    now = datetime.now(UTC)
+    return TokenWorkItem(
+        work_item_id=f"wi-{token_id}",
+        run_id=run_id,
+        token_id=token_id,
+        row_id=row_id,
+        node_id=node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json="{}",
+        status=TokenWorkStatus.LEASED,
+        attempt=1,
+        available_at=now,
+        created_at=now,
+        updated_at=now,
+        lineage_path=lineage_path,
+        lease_owner=lease_owner,
+        lease_expires_at=now + timedelta(seconds=60),
     )
 
 
@@ -512,6 +710,7 @@ class TestConstructorErrorEdgeMap:
         _, factory = _make_factory()
         nav = SimpleNamespace()
         coalesce_on_success = {CoalesceName("merge"): "out"}
+        collector_on_success = {CollectorName("stitch"): "out"}
         sink_names = frozenset({"out", "error"})
 
         with patch("elspeth.engine.processor.DAGNavigator.from_traversal_context", return_value=nav) as from_traversal:
@@ -519,6 +718,7 @@ class TestConstructorErrorEdgeMap:
                 factory,
                 scheduler=factory.scheduler,
                 coalesce_on_success_map=coalesce_on_success,
+                collector_on_success_map=collector_on_success,
                 sink_names=sink_names,
             )
 
@@ -527,6 +727,7 @@ class TestConstructorErrorEdgeMap:
         assert from_traversal.call_args.args == (processor._traversal,)
         assert from_traversal.call_args.kwargs == {
             "coalesce_on_success_map": coalesce_on_success,
+            "collector_on_success_map": collector_on_success,
             "sink_names": sink_names,
         }
 
@@ -648,7 +849,6 @@ class TestConstructorErrorEdgeMap:
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
         )
-        now = datetime.now(UTC)
         batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
         tokens: list[TokenInfo] = []
         for ordinal, token_id in enumerate(["t1", "t2"]):
@@ -682,21 +882,27 @@ class TestConstructorErrorEdgeMap:
                 step_index=1,
                 ingest_sequence=ordinal,
                 row_payload_json=factory.scheduler.serialize_row_payload(payload),
-                available_at=now,
             )
-            claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+            claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
             assert claimed is not None and claimed.token_id == token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key=str(agg_node),
-                now=now,
                 expected_lease_owner="seeder",
             )
+            # The hold is two database seconds old at restore (ADR-047): the
+            # restored trigger latch's elapsed age must cover the 1.5 s
+            # count_fire_offset the checkpoint carries.
+            age_barrier_hold(db.engine, claimed.work_item_id, seconds_ago=2.0)
 
         with db.connection() as conn:
             rows_before = conn.execute(select(func.count()).select_from(token_work_items_table)).scalar_one()
 
+        # The resuming processor's own clock sits in 2023 (ADR-047 control):
+        # the restored latch's age must come from the database, or the
+        # drifted clock would report a negative age and refuse the 1.5 s
+        # count_fire_offset the checkpoint carries.
         processor = _make_processor(
             factory,
             aggregation_settings={
@@ -705,9 +911,10 @@ class TestConstructorErrorEdgeMap:
                     plugin="test-plugin",
                     input="agg_in",
                     on_error="discard",
-                    trigger={"count": 3},
+                    trigger={"count": 2},
                 ),
             },
+            clock=MockClock(start=1_700_000_000.0),
             barrier_restore=BarrierJournalRestoreContext(
                 resume_checkpoint_id="ckpt-resume-1",
                 barrier_scalars=BarrierScalars(
@@ -739,7 +946,7 @@ class TestConstructorErrorEdgeMap:
         payload = make_row({"value": 7})
         token = TokenInfo(row_id="row-ghost", token_id="tok-ghost", row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=0)
-        ghost_now = datetime.now(UTC)
+        datetime.now(UTC)
         ghost_item = factory.scheduler.enqueue_ready_claimed_legacy_unfenced(
             run_id="test-run",
             token_id="tok-ghost",
@@ -748,16 +955,13 @@ class TestConstructorErrorEdgeMap:
             step_index=0,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=ghost_now,
             lease_owner="test-harness",
             lease_seconds=60,
-            now=ghost_now,
         )
         factory.scheduler.mark_blocked(
             work_item_id=ghost_item.work_item_id,
             queue_key=None,
             barrier_key="ghost-barrier",
-            now=ghost_now,
             expected_lease_owner="test-harness",
         )
 
@@ -784,7 +988,7 @@ class TestConstructorErrorEdgeMap:
 
         db, factory = _make_factory()
         agg_node = NodeID("agg-1")
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         payload = make_row({"value": 9})
         token = TokenInfo(row_id="row-q", token_id="tok-q", row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=0)
@@ -796,15 +1000,13 @@ class TestConstructorErrorEdgeMap:
             step_index=0,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=now,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key="queue-1",
             barrier_key=None,
-            now=now,
             expected_lease_owner="seeder",
         )
 
@@ -885,7 +1087,7 @@ class TestConstructorErrorEdgeMap:
         payload = make_row({"value": ordinal})
         token = TokenInfo(row_id=f"row-{ordinal}", token_id=token_id, row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id=token_id,
@@ -894,15 +1096,13 @@ class TestConstructorErrorEdgeMap:
             step_index=1,
             ingest_sequence=ordinal,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=now,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None and claimed.token_id == token_id
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key=str(agg_node),
-            now=now,
             expected_lease_owner="seeder",
         )
         return token
@@ -1248,8 +1448,12 @@ class TestGetGateDestinations:
         """GateOutcome with discarded=False reports fork paths."""
         _, factory = _make_factory()
         processor = _make_processor(factory)
-        child_a = make_token_info(data={"value": 1}, branch_name="path_a")
-        child_b = make_token_info(data={"value": 2}, branch_name="path_b")
+        child_a = make_token_info(
+            data={"value": 1}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),)
+        )
+        child_b = make_token_info(
+            data={"value": 2}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_b", member_key="path_b"),)
+        )
         outcome = GateOutcome(
             result=GateResult(row={"value": 1}, action=RoutingAction.fork_to_paths(["path_a", "path_b"])),
             updated_token=make_token_info(data={"value": 1}),
@@ -1315,7 +1519,6 @@ class TestProcessRowNoTransforms:
 
         _row, _token, work_item = factory.scheduler.ingest_row_with_initial_claim(
             coordination_token=coordination_token,
-            now=observed_at,
             insert_row_and_token=insert_pre_fix_ingress,
             token_id=token_id,
             row_id=row_id,
@@ -1513,7 +1716,6 @@ class TestProcessRowNoTransforms:
         """A fully witnessed TS-02 image never overwrites conflicting evidence."""
         _db, factory = _make_factory()
         coordination_token = leader_coordination_token(factory, "test-run")
-        observed_at = datetime.now(UTC)
         source_data = {"value": 42}
         pipeline_row = _make_source_row(source_data).to_pipeline_row()
 
@@ -1532,7 +1734,6 @@ class TestProcessRowNoTransforms:
 
         factory.scheduler.ingest_row_with_initial_claim(
             coordination_token=coordination_token,
-            now=observed_at,
             insert_row_and_token=insert_pre_fix_ingress,
             token_id="token-conflicting-source-state",
             row_id="row-conflicting-source-state",
@@ -1557,7 +1758,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
 
     def test_source_completion_reconciliation_rejects_duplicate_claim_witness(self) -> None:
@@ -1588,15 +1788,15 @@ class TestProcessRowNoTransforms:
                 .mappings()
                 .one()
             )
-            values = dict(claim)
-            values["event_id"] = "duplicate-claim-event"
+            # A duplicate witness is the same transition recorded twice: same
+            # content id, a fresh epoch-38 seq assigned by the database.
+            values = {column: value for column, value in claim.items() if column != "seq"}
             conn.execute(scheduler_events_table.insert().values(**values))
 
         with pytest.raises(AuditIntegrityError, match="exactly two scheduler events"):
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() == []
@@ -1633,7 +1833,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() == []
@@ -1661,7 +1860,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() == []
@@ -1698,7 +1896,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() != []
@@ -1744,7 +1941,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
 
     def test_source_boundary_violation_records_failed_outcome_and_failed_source_state(self) -> None:
@@ -2236,6 +2432,7 @@ class TestProcessRowNoTransforms:
         processor._live_barrier_holds["token-a"] = _LiveBarrierHold(
             token=make_token_info(row_id="row-a", token_id="token-a", data={"value": 1}),
             barrier_key="aggregation_a",
+            arrived_monotonic=processor._clock.monotonic(),
         )
         assert processor._barrier_key_for_live_hold("token-a") == "aggregation_a"
 
@@ -2333,8 +2530,8 @@ class TestProcessRowNoTransforms:
         assert attempted_refs == ["token-a", "token-b"]
         assert isinstance(exc_info.value.__cause__, LandscapeRecordError)
 
-    def test_empty_batch_flush_telemetry_failure_does_not_interrupt_dropped_outcomes(self) -> None:
-        """Zero-row batch flush must still terminalize every buffered token if telemetry fails."""
+    def test_empty_batch_flush_plans_dropped_outcomes_without_early_audit_writes(self) -> None:
+        """Zero-row routing stays pure until the atomic barrier completion."""
         _db, factory = _make_factory()
         telemetry_manager = create_autospec(TelemetryManagerProtocol, instance=True)
         telemetry_manager.handle_event.side_effect = RuntimeError("telemetry down")
@@ -2365,10 +2562,8 @@ class TestProcessRowNoTransforms:
         with patch.object(factory.data_flow, "record_token_outcome") as mock_record_token_outcome:
             results, child_items = processor._route_empty_emission_results(fctx)
 
-        assert mock_record_token_outcome.call_count == 3
-        recorded_refs = {call.kwargs["ref"].token_id for call in mock_record_token_outcome.call_args_list}
-        assert recorded_refs == {"token-a", "token-b", "token-c"}
-        assert telemetry_manager.handle_event.call_count == 3
+        mock_record_token_outcome.assert_not_called()
+        telemetry_manager.handle_event.assert_not_called()
         assert child_items == []
         assert tuple((result.outcome, result.path) for result in results) == (
             (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
@@ -2376,8 +2571,8 @@ class TestProcessRowNoTransforms:
             (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
         )
 
-    def test_empty_batch_flush_recorder_failure_raises_audit_integrity_error(self) -> None:
-        """Typed recorder failures during zero-row batch terminalization must outrank success."""
+    def test_empty_batch_flush_does_not_reach_non_atomic_recorder(self) -> None:
+        """The legacy per-token recorder is outside zero-row routing."""
         _db, factory = _make_factory()
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="aggregate-1", name="batch-transform")
@@ -2402,16 +2597,12 @@ class TestProcessRowNoTransforms:
             coalesce_name=None,
         )
 
-        with (
-            patch.object(factory.data_flow, "record_token_outcome", side_effect=LandscapeRecordError("audit DB down")),
-            pytest.raises(
-                AuditIntegrityError,
-                match=r"Failed to record DROPPED_BY_FILTER outcome for token 'token-a'",
-            ) as exc_info,
-        ):
-            processor._route_empty_emission_results(fctx)
+        with patch.object(factory.data_flow, "record_token_outcome", side_effect=LandscapeRecordError("audit DB down")) as recorder:
+            results, child_items = processor._route_empty_emission_results(fctx)
 
-        assert isinstance(exc_info.value.__cause__, LandscapeRecordError)
+        recorder.assert_not_called()
+        assert child_items == []
+        assert [result.token.token_id for result in results] == ["token-a", "token-b"]
 
     def test_success_empty_recorder_failure_raises_audit_integrity_error(self) -> None:
         """Typed recorder failures during single-row success_empty terminalization must outrank success."""
@@ -2720,7 +2911,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return (
                 TransformResult.error({"reason": "flush_failed"}, retryable=False),
                 [captured["token"]],
@@ -2767,7 +2958,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return (
                 TransformResult.error({"reason": "flush_failed"}, retryable=False),
                 [captured["token"]],
@@ -2812,7 +3003,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return bad_result, [captured["token"]], "batch-1"
 
         with (
@@ -2847,7 +3038,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             other_token = make_token_info(data={"value": 20})
             return mismatch_result, [captured["token"], other_token], "batch-1"
 
@@ -2977,17 +3168,16 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [valid_buffered_token, captured["token"]], "batch-1"
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
-            patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),
-            patch.object(processor._token_manager, "expand_token", return_value=([], "expand-group-1")),
+            patch.object(processor._token_manager, "expand_token", return_value=([], "expand-group-1")) as expand_token,
         ):
             results = processor.process_row(
                 row_index=1,
@@ -3009,11 +3199,11 @@ class TestAggregationFailureMatrix:
         triggering_token_id = captured["token"].token_id
         recorded = [
             (
-                call.kwargs["ref"].token_id,
-                call.kwargs["outcome"],
-                call.kwargs["path"],
+                disposition.parent_ref.token_id,
+                disposition.outcome,
+                disposition.path,
             )
-            for call in record_outcome.call_args_list
+            for disposition in expand_token.call_args.kwargs["aggregation_parent_dispositions"]
         ]
         assert (triggering_token_id, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE) in recorded
         assert (triggering_token_id, TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED) not in recorded
@@ -3038,7 +3228,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
         with (
@@ -3096,7 +3286,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [valid_buffered_token, captured["token"]], "batch-1"
 
         with (
@@ -3271,7 +3461,7 @@ class TestTransformModeOutcomeOrdering:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
         with (
@@ -3319,7 +3509,7 @@ class TestTransformModeOutcomeOrdering:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
         with (
@@ -3353,10 +3543,9 @@ class TestTransformModeOutcomeOrdering:
 
     def test_parent_terminal_outcome_recorder_failure_raises_audit_integrity_error(self) -> None:
         """Recorder failure after expansion must surface as audit corruption, not a raw DB error."""
-        _db, factory, processor, transform, agg_node = self._setup_batch_processor()
+        _db, _factory, processor, transform, agg_node = self._setup_batch_processor()
         first_token = make_token_info(row_id="row-a", token_id="token-a", data={"value": 10})
         second_token = make_token_info(row_id="row-b", token_id="token-b", data={"value": 20})
-        child_token = make_token_info(row_id="row-child", token_id="token-child", data={"value": 999})
         fctx = _FlushContext(
             node_id=agg_node,
             transform=transform,
@@ -3388,15 +3577,10 @@ class TestTransformModeOutcomeOrdering:
             patch.object(
                 processor._token_manager,
                 "expand_token",
-                return_value=([child_token], "expand-group-1"),
-            ),
-            patch.object(
-                factory.data_flow,
-                "record_token_outcome",
                 side_effect=LandscapeRecordError("audit DB down"),
             ),
             patch.object(processor, "_emit_token_completed"),
-            pytest.raises(AuditIntegrityError, match="Failed to record batch parent terminal outcome") as exc_info,
+            pytest.raises(AuditIntegrityError, match="Failed to atomically record aggregation expansion") as exc_info,
         ):
             processor._route_transform_results(fctx, flush_result)
 
@@ -3485,13 +3669,15 @@ class TestProcessRowGateBranching:
 
         inherited_sinks: list[str | None] = []
 
-        def continuation_side_effect(*, token, current_node_id, coalesce_name=None, on_success_sink=None):
+        def continuation_side_effect(*, token, current_node_id, coalesce_name=None, row_union_name=None, on_success_sink=None):
             inherited_sinks.append(on_success_sink)
             return WorkItem(
                 token=token,
                 current_node_id=None,
                 coalesce_node_id=None,
                 coalesce_name=coalesce_name,
+                row_union_node_id=NodeID(f"row_union::{row_union_name}") if row_union_name is not None else None,
+                row_union_name=row_union_name,
                 on_success_sink=on_success_sink,
             )
 
@@ -3602,7 +3788,7 @@ class TestProcessRowGateBranching:
             row_id="row-1",
             token_id="token-branch-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         processor = _make_processor(
@@ -3693,13 +3879,13 @@ class TestProcessRowGateBranching:
                 row_id=token.row_id,
                 token_id="token-fork-a",
                 row_data=token.row_data,
-                branch_name="sink_a",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-sink_a", member_key="sink_a"),),
             )
             child_b = TokenInfo(
                 row_id=token.row_id,
                 token_id="token-fork-b",
                 row_data=token.row_data,
-                branch_name="sink_b",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-sink_b", member_key="sink_b"),),
             )
             _persist_token_for_scheduler(factory, child_a)
             _persist_token_for_scheduler(factory, child_b)
@@ -3880,6 +4066,124 @@ class TestProcessRowMultiRowOutput:
                 output_rows,
                 success_reason={"action": "expand"},
             )
+
+    def test_row_union_binding_survives_expansion_on_a_branch(self) -> None:
+        """token_traversal.py:254-273 — the row_union binding must survive expansion.
+
+        Direct processor-level witness of the fail-closed seam
+        elspeth-a5b86149d4 fixed, modeled on
+        TestGateSinkRoutingNotifiesCoalesce (hand-built TokenInfo/work-item
+        context driving the real code path, no DAG builder involved).
+
+        Ruling 28 (spec §7 rule 5) now rejects this exact TOPOLOGY at BUILD
+        time when it reaches ``build_execution_graph`` — an undeclared
+        multi-row transform inside a row_union-bound region — which is why
+        ``test_row_union_branch_cardinality.py::
+        test_expanding_transform_in_a_branch_does_not_bypass_the_barrier``
+        was reclassified as a build-rejection test (Task 8). But the RUNTIME
+        seam this test pins is a different, still-live fact: IF a fork-branch
+        token reaches an expanding transform with row_union context threaded
+        through (the only way that could happen post-ruling-28 is a topology
+        the build-time check does not yet see, or a pre-ruling-28 persisted/
+        resumed run), the binding must not be dropped. Dropping it is
+        precisely how the ORIGINAL bug let expanded children walk straight
+        through the row_union node instead of being adjudicated by it.
+
+        This test asserts ONLY the plumbing (each expanded child's WorkItem
+        carries the union binding forward) — it does NOT re-verify that
+        RowUnionExecutor.accept() then correctly rejects a surplus arrival
+        under that binding; that adjudication lives one layer further out
+        (barrier_coordination.py, scheduler drain) and is already covered by
+        RowUnionExecutor's own suite (test_row_union_executor.py) with no
+        dependency on expansion. Driving THAT layer here would require
+        reconstructing scheduler-drain machinery this unit test does not
+        otherwise touch — out of scope for a processor-level plumbing
+        witness; flagging rather than forcing a mock of it, per the
+        controller's own instruction.
+
+        WS3 Task 5 supersession note: this pins ``token_traversal.py:260-282``
+        (the SUCCESSFUL, non-empty expansion branch — child WorkItems get
+        ``row_union_name``/``coalesce_name`` threaded via
+        ``_work_items.create_continuation``). It is companion to, not
+        rewritten by, the settle-member seam: `_settle_member_losses` only
+        fires on the ADJACENT empty-expansion branch a few lines earlier
+        (``token_traversal.py:224``, the `TransformResult.success_empty()`
+        path — a plain filter/deaggregation-to-nothing, not a lost fork
+        branch). The mechanism this test pins — binding survives a
+        SUCCESSFUL expansion so the barrier can later adjudicate it — is
+        unchanged by Task 5's fold of the four branch-loss notifiers;
+        mutation-verified green after that fold with no edits needed here
+        beyond this note.
+        """
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+
+        contract = _make_contract()
+        output_rows = [
+            make_row({"value": 1}, contract=contract),
+            make_row({"value": 2}, contract=contract),
+        ]
+        multi_result = TransformResult.success_multi(
+            output_rows,
+            success_reason={"action": "expand"},
+        )
+
+        transform = _make_mock_transform(node_id="explode-1", name="explode_treatment", creates_tokens=True, on_success="treatment_scored")
+        source_node = NodeID("source-0")
+        transform_node = NodeID(transform.node_id)
+        union_node = NodeID("row_union::variant_union")
+
+        processor = _make_processor(
+            factory,
+            node_step_map={source_node: 0, transform_node: 1},
+            node_to_next={source_node: transform_node, transform_node: None},
+            node_to_plugin={transform_node: transform},
+            row_union_node_ids={RowUnionName("variant_union"): union_node},
+            branch_to_row_union={BranchName("treatment_branch"): RowUnionName("variant_union")},
+        )
+
+        # A fork-branch token — the innermost FORK frame's member_key IS the
+        # declared branch name (spec §4.1), which is what token.branch_name
+        # derives from (ruling 21: derived accessors are the only read path).
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-treatment",
+            row_data=make_row({"value": 10}, contract=contract),
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-treatment_branch", member_key="treatment_branch"),),
+        )
+        # expand_token() re-checks Tier-1 token ownership against the audit
+        # DB (data_flow/ownership.py) before minting children — a fabricated
+        # token needs the same durable row+token rows a real fork would have
+        # written, same helper the coalesce-side fixtures in this file use.
+        _persist_token_for_scheduler(factory, token, ingest_sequence=0)
+
+        def executor_side_effect(*, transform, token, ctx, attempt=0):
+            return (multi_result, token, None)
+
+        with patch.object(processor._transform_executor, "execute_transform", side_effect=executor_side_effect):
+            result, child_items = processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=transform_node,
+                row_union_node_id=union_node,
+                row_union_name=RowUnionName("variant_union"),
+            )
+
+        # Parent is EXPANDED (transient — the real outcome rides expand_token()).
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.TRANSIENT, TerminalPath.EXPAND_PARENT)
+
+        # Both expanded children carry the union binding forward — the fix's
+        # exact claim (token_traversal.py:268-272): "the barrier binding must
+        # survive expansion... carrying it makes an unsatisfiable expansion
+        # fail closed at the barrier." Losing it here is exactly the bug
+        # elspeth-a5b86149d4 fixed (children walking through the union
+        # structurally, unbound, instead of arriving at it).
+        assert len(child_items) == 2
+        for item in child_items:
+            assert item.row_union_name == RowUnionName("variant_union")
+            assert item.row_union_node_id == union_node
+            assert item.token.branch_name == "treatment_branch"
 
 
 # =============================================================================
@@ -4137,7 +4441,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -4212,10 +4515,9 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         _register_test_worker(factory, "crashed-worker")
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="crashed-worker", lease_seconds=300, now=datetime.now(UTC))
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="crashed-worker", lease_seconds=300)
         assert claimed is not None
         persisted_error_hash = error_hash if error_hash is not None else "valid-before-corruption"
         factory.scheduler.mark_pending_sink(
@@ -4228,7 +4530,6 @@ class TestDurableSchedulerResumeDrain:
             # EMPTY original message: the class where a recomputed replay
             # hash diverges from the originally-audited one.
             error_message="",
-            now=datetime.now(UTC),
             expected_lease_owner="crashed-worker",
         )
         if error_hash is None:
@@ -4324,7 +4625,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -4398,7 +4698,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -4476,7 +4775,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         first_processor = _make_processor(
@@ -4563,7 +4861,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         crashed_processor = _make_processor(
@@ -4671,7 +4968,6 @@ class TestDurableSchedulerResumeDrain:
                 step_index=1,
                 ingest_sequence=idx,
                 row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-                available_at=datetime.now(UTC),
             )
 
         # Stage 1: fabricate the durable image left by a leader that drove the
@@ -4792,7 +5088,6 @@ class TestDurableSchedulerResumeDrain:
                 step_index=1,
                 ingest_sequence=idx,
                 row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-                available_at=datetime.now(UTC),
             )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -4844,7 +5139,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=99,
             row_payload_json=factory.scheduler.serialize_row_payload(fresh_payload),
-            available_at=datetime.now(UTC),
         )
 
         # Stage 3: a fresh recovery processor drains everything in one call.
@@ -4898,8 +5192,16 @@ class TestDurableSchedulerResumeDrain:
         # transition without a subsequent claim).
         assert sorted(statuses_after) == ["leased", "leased", "pending_sink"]
 
-    def test_drain_scheduler_transitions_use_injected_clock(self) -> None:
-        """Durable scheduler state transitions must be deterministic under MockClock."""
+    def test_drain_scheduler_transitions_stamp_database_time_not_the_injected_clock(self) -> None:
+        """C6 stage 3 control (ADR-047): a disposition's stamp is Landscape database time.
+
+        The processor's injected MockClock sits in 2023; the durable
+        transition it drives must carry the database's own instant, so a
+        worker whose process clock is wrong cannot mis-stamp the scheduler
+        ledger.
+        """
+        from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
+
         db, factory = _make_factory()
         clock = MockClock(start=1_700_000_000.0)
         transform_node = NodeID("transform-1")
@@ -4930,7 +5232,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=clock.now_utc(),
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -4952,8 +5253,10 @@ class TestDurableSchedulerResumeDrain:
             clock.advance(5.0)
             return (success_result, token, None)
 
+        drained_from = landscape_database_now(db.engine)
         with patch.object(processor._transform_executor, "execute_transform", side_effect=executor_side_effect):
             processor.drain_scheduled_work(ctx)
+        drained_until = landscape_database_now(db.engine)
 
         from sqlalchemy import select
 
@@ -4966,7 +5269,8 @@ class TestDurableSchedulerResumeDrain:
                 )
             ).one()
         assert status == "pending_sink"
-        assert updated_at.replace(tzinfo=UTC) == clock.now_utc()
+        assert_stamped_between(updated_at, start=drained_from, end=drained_until, tolerance=timedelta(0))
+        assert updated_at.replace(tzinfo=UTC) != clock.now_utc()
 
     def test_recovers_expired_lease_then_drains_without_source_replay(self) -> None:
         """Expired LEASED scheduler work is recovered and advanced by a fresh processor."""
@@ -4991,7 +5295,6 @@ class TestDurableSchedulerResumeDrain:
             data=source_payload.to_dict(),
         )
         token = factory.data_flow.create_token(row.row_id, token_id="token-expired")
-        past = datetime.now(UTC) - timedelta(hours=1)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id=token.token_id,
@@ -5000,16 +5303,26 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=past,
         )
-        _register_test_worker(factory, "dead-worker")
+        # The owner is registry-DEAD on the Landscape database clock (ADR-047):
+        # its heartbeat lapsed more than the liveness grace window ago, so the
+        # sweep's dead-owner arm reaps its lease once that lease has expired
+        # on the same clock.
+        _register_test_worker(
+            factory,
+            "dead-worker",
+            heartbeat_expires_at=landscape_database_now(db.engine) - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS + 1),
+        )
         claimed = factory.scheduler.claim_ready(
             run_id="test-run",
             lease_owner="dead-worker",
             lease_seconds=1,
-            now=past,
         )
-        assert claimed is not None
+        assert claimed is not None and claimed.lease_expires_at is not None
+        # The drain reconciles the row against its CLAIM_READY witness, so the
+        # one-second lease must expire the way it does in production: by
+        # database time passing.
+        await_database_time(db.engine, claimed.lease_expires_at)
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5077,7 +5390,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -5118,10 +5430,10 @@ class TestDurableSchedulerResumeDrain:
             row_id=row.row_id,
             token_id="token-direct-branch",
             row_data=source_payload,
-            branch_name="direct",
-            fork_group_id="fork-1",
-            join_group_id="join-1",
-            expand_group_id="expand-1",
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="direct"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="direct"),
+            ),
         )
         factory.data_flow.create_token(row.row_id, token_id=token.token_id)
         factory.scheduler.enqueue_ready(
@@ -5132,12 +5444,8 @@ class TestDurableSchedulerResumeDrain:
             step_index=99,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
             on_success_sink="source_sink",
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
-            join_group_id=token.join_group_id,
-            expand_group_id=token.expand_group_id,
+            lineage_path=token.lineage_path,
         )
 
         processor = _make_processor(
@@ -5154,7 +5462,6 @@ class TestDurableSchedulerResumeDrain:
         assert results[0].sink_name == "branch_sink"
         assert results[0].token.branch_name == "direct"
         assert results[0].token.fork_group_id == "fork-1"
-        assert results[0].token.join_group_id == "join-1"
         assert results[0].token.expand_group_id == "expand-1"
 
     def test_durable_scheduler_failure_result_marks_work_failed(self) -> None:
@@ -5188,7 +5495,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5257,7 +5563,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default", on_error="errors")
         processor = _make_processor(
@@ -5340,7 +5645,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5410,7 +5714,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5486,7 +5789,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5536,8 +5838,7 @@ class TestDurableSchedulerResumeDrain:
             row_id=row.row_id,
             token_id="token-held-branch",
             row_data=source_payload,
-            branch_name="path_a",
-            fork_group_id="fork-2",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-2", member_key="path_a"),),
         )
         factory.data_flow.create_token(row.row_id, token_id=token.token_id)
         factory.scheduler.enqueue_ready(
@@ -5548,9 +5849,7 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
-            branch_name=token.branch_name,
-            fork_group_id=token.fork_group_id,
+            lineage_path=token.lineage_path,
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
@@ -5634,7 +5933,9 @@ class TestDurableSchedulerResumeDrain:
             node_id=str(coalesce_node),
             schema_config=_DYNAMIC_SCHEMA,
         )
-        factory.data_flow.create_token(row.row_id, token_id="token-held-a", branch_name="path_a", fork_group_id="fork-1")
+        factory.data_flow.create_token(
+            row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
+        )
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id="token-held-a",
@@ -5643,9 +5944,7 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
-            branch_name="path_a",
-            fork_group_id="fork-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
@@ -5667,7 +5966,9 @@ class TestDurableSchedulerResumeDrain:
 
         db, factory = _make_factory()
         coalesce_node = NodeID("coalesce::merge")
-        row_id = self._seed_held_coalesce_branch(factory, coalesce_node)
+        # Return value (row_id) is unused: both restore and live-accept keys
+        # are fork_group_id-based now (WS4 Task 8/10) — see "fork-1" below.
+        self._seed_held_coalesce_branch(factory, coalesce_node)
         arrange_executor = self._make_real_coalesce_executor(factory, coalesce_node)
         processor_kwargs: dict[str, Any] = {
             "coalesce_node_ids": {CoalesceName("merge"): coalesce_node},
@@ -5680,7 +5981,10 @@ class TestDurableSchedulerResumeDrain:
 
         results = processor1.drain_scheduled_work(ctx)
         assert results == []
-        assert ("merge", row_id) in arrange_executor._pending
+        # Live accept() path is fork_group_id-keyed (WS4 Task 8); the token's
+        # fork_group_id is "fork-1" (see the resume assertion below, which
+        # independently confirms it via entry.token.fork_group_id).
+        assert ("merge", "fork-1") in arrange_executor._pending
 
         # The hold node_state written by accept() — the state_id the restore must rediscover.
         held_states = [
@@ -5714,7 +6018,10 @@ class TestDurableSchedulerResumeDrain:
             **processor_kwargs,
         )
 
-        pending = resumed_executor._pending[("merge", row_id)]
+        # restore_from_journal now groups by fork_group_id too (WS4 Task 10) —
+        # both the live accept() path and the restore path agree on the key
+        # shape, closing the premise-break window T8-alone would have left.
+        pending = resumed_executor._pending[("merge", "fork-1")]
         assert set(pending.branches) == {"path_a"}
         entry = pending.branches["path_a"]
         assert entry.token.token_id == "token-held-a"
@@ -5759,17 +6066,16 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         coalesce_node = NodeID("coalesce::merge")
         self._seed_held_coalesce_branch(factory, coalesce_node)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         # Block the row through the production claim path WITHOUT the
         # accept()-written hold node_state (simulates a crash between adoption
         # CAS commit and accept() in _intake_adopt_coalesce_row).
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner="seeder",
         )
 
@@ -5924,7 +6230,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=99,
             row_payload_json=factory.scheduler.serialize_row_payload(stray_payload),
-            available_at=datetime.now(UTC),
             barrier_key=str(agg_node),
         )
         _register_test_worker(factory, "test-worker")
@@ -5932,7 +6237,6 @@ class TestDurableSchedulerResumeDrain:
             run_id="test-run",
             lease_owner="test-worker",
             lease_seconds=30,
-            now=datetime.now(UTC),
         )
         assert stray_claim is not None
         assert stray_claim.work_item_id == stray_work.work_item_id
@@ -5940,7 +6244,6 @@ class TestDurableSchedulerResumeDrain:
             work_item_id=stray_work.work_item_id,
             queue_key=None,
             barrier_key=str(agg_node),
-            now=datetime.now(UTC),
             expected_lease_owner="test-worker",
         )
 
@@ -6192,18 +6495,15 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         # Peer worker A claims the row under its own lease_owner. Lease window
         # is wide enough that ``peer_active_leases`` sees it as unexpired.
-        peer_claim_now = datetime.now(UTC)
         _register_test_worker(factory, "peer-worker-A")
         peer_claim = factory.scheduler.claim_ready(
             run_id="test-run",
             lease_owner="peer-worker-A",
             lease_seconds=600,
-            now=peer_claim_now,
         )
         assert peer_claim is not None
         assert peer_claim.lease_owner == "peer-worker-A"
@@ -6277,17 +6577,21 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=clock.now_utc(),
         )
 
         # Crashed peer A held a short lease that has since expired.
         _register_test_worker(factory, "crashed-peer", heartbeat_expires_at=clock.now_utc() - timedelta(seconds=120))
-        factory.scheduler.claim_ready(
+        crashed_claim = factory.scheduler.claim_ready(
             run_id="test-run",
             lease_owner="crashed-peer",
-            lease_seconds=30,
-            now=clock.now_utc(),
+            lease_seconds=1,
         )
+        assert crashed_claim is not None and crashed_claim.lease_expires_at is not None
+        # The drain reconciles the row against its CLAIM_READY witness, so the
+        # one-second lease must expire the way it does in production: on the
+        # Landscape database clock (ADR-047). Advancing the process MockClock
+        # cannot expire a database-time lease.
+        await_database_time(_db.engine, crashed_claim.lease_expires_at)
         clock.advance(60.0)
 
         success_result = TransformResult.success(
@@ -6351,7 +6655,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         # The caller's lease_owner pre-claims the row before the drain entry.
@@ -6359,7 +6662,6 @@ class TestDurableSchedulerResumeDrain:
             run_id="test-run",
             lease_owner=_TEST_LEADER_WORKER_ID,
             lease_seconds=600,
-            now=datetime.now(UTC),
         )
 
         worker_processor = _make_processor(
@@ -6764,7 +7066,7 @@ class TestExecuteTransformNoRetry:
         routing_reason_payload = json.loads(payload_store.retrieve(routing_events[0].reason_ref).decode("utf-8"))
         assert routing_reason_payload["error"] == "<redacted-secret>"
 
-        factory.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
         export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
         exported_error_payload = json.loads(transform_error_export["error_details_json"])
@@ -6859,7 +7161,7 @@ class TestExecuteTransformNoRetry:
 
         with setup.db.engine.begin() as conn:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.run_id == setup.run_id).values(status="terminal"))
-        factory.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
         export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
         exported_error_payload = json.loads(transform_error_export["error_details_json"])
@@ -6987,7 +7289,7 @@ class TestExecuteTransformNoRetry:
         routing_reason_payload = json.loads(payload_store.retrieve(routing_events[0].reason_ref).decode("utf-8"))
         assert routing_reason_payload == result.reason
 
-        factory.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
         export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
         exported_error_payload = json.loads(transform_error_export["error_details_json"])
@@ -7066,6 +7368,94 @@ class TestExecuteTransformNoRetry:
         record_event.assert_called_once()
         assert record_event.call_args.kwargs["state_id"] == "state-attempt-0"
 
+    def test_tier_2_contract_violation_returns_row_scoped_error(self) -> None:
+        """A Tier-2 PluginContractViolation is routed, not propagated.
+
+        Regression for elspeth-181db83da7. ADR-008 §"TIER_1 registration is
+        load-bearing" states the registration is what stops ``on_error`` from
+        absorbing a violation — so the deliberately UNREGISTERED base class
+        must reach ``on_error``. It used to escape every conversion clause
+        here and abort the whole run with a raw traceback, leaving the row
+        uncounted and the error sink unwritten.
+        """
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+
+        violation = PluginContractViolation("transform emitted a colliding field")
+        stamp_node_state_id(violation, "state-123")
+        with patch.object(
+            processor._transform_executor,
+            "execute_transform",
+            side_effect=violation,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert error_sink == "discard"
+        assert result.reason is not None
+        assert result.reason["reason"] == "contract_violation"
+
+    def test_tier_2_contract_violation_reaches_named_error_sink(self) -> None:
+        """The routed violation diverts to the configured sink, not to discard."""
+        _, factory, processor = self._setup()
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context(state_id="stale-previous-state")
+
+        violation = PluginContractViolation("input validation failed")
+        stamp_node_state_id(violation, "state-attempt-0")
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=violation),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert result.status == "error"
+        assert error_sink == "quarantine"
+        record_event.assert_called_once()
+        assert record_event.call_args.kwargs["state_id"] == "state-attempt-0"
+
+    def test_tier_1_contract_violation_subclass_still_propagates(self) -> None:
+        """The Tier-1 registration must survive the Tier-2 conversion clause.
+
+        ``SinkTransactionalInvariantError`` inherits ``PluginContractViolation``
+        but is ``@tier_1_error``-registered precisely so it "must crash, never
+        be absorbed by on_error". A conversion keyed on the class rather than
+        on tier membership would route it to a quarantine sink — the exact
+        failure ADR-008 says the registry exists to prevent.
+        """
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+
+        with (
+            patch.object(
+                processor._transform_executor,
+                "execute_transform",
+                side_effect=SinkTransactionalInvariantError("commit boundary diverged"),
+            ),
+            pytest.raises(SinkTransactionalInvariantError),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
 
 # =============================================================================
 # _execute_transform_with_retry: With retry manager
@@ -7074,6 +7464,369 @@ class TestExecuteTransformNoRetry:
 
 class TestExecuteTransformWithRetry:
     """Tests for _execute_transform_with_retry when retry_manager IS configured."""
+
+    def test_exhaustion_returns_named_error_route_with_final_attempt_evidence(self) -> None:
+        """Exhausted retryable attempts retain the transform's on_error route.
+
+        Regression for elspeth-454892147c: MaxRetriesExceeded used to escape
+        this processor seam before ``on_error`` was returned, so traversal
+        could only terminalize the row as FAILURE/UNROUTED.
+        """
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        seen_attempts: list[int] = []
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            seen_attempts.append(attempt)
+            error = ConnectionError(f"connection reset on attempt {attempt}")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert seen_attempts == [0, 1]
+        assert out_token is token
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "retry_exhausted",
+            "error": "connection reset on attempt 1",
+            "attempts": 2,
+        }
+        assert result.retryable is False
+        assert error_sink == "error-sink"
+        record_event.assert_called_once()
+        assert record_event.call_args.kwargs["state_id"] == "state-attempt-1"
+
+    def test_exhaustion_scrubs_final_error_before_result_and_audit(self) -> None:
+        """The underlying final exception is scrubbed before any durable use."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        raw_secret = "https://blob.example/path?sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError(f"provider failed: {raw_secret}")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert result.reason == {
+            "reason": "retry_exhausted",
+            "error": "<redacted-secret>",
+            "attempts": 2,
+        }
+        assert error_sink == "error-sink"
+        assert raw_secret not in str(result.reason)
+        assert raw_secret not in str(record_event.call_args.kwargs["reason"])
+
+    def test_exhaustion_with_named_sink_and_missing_state_fails_closed(self) -> None:
+        """A named route may not fabricate DIVERT attribution without a state."""
+        _, factory = _make_factory()
+        retry_manager = Mock(spec=RetryManager)
+        retry_manager.execute_with_retry.side_effect = MaxRetriesExceeded(2, ConnectionError("connection reset"))
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+
+        with pytest.raises(OrchestrationInvariantError, match="state_id is required"):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+    def test_exhaustion_does_not_misattribute_unstamped_final_attempt(self) -> None:
+        """A prior attempt's state cannot stand in for the final failure."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        processor = _make_processor(
+            factory,
+            retry_manager=RetryManager(
+                RuntimeRetryConfig(
+                    max_attempts=2,
+                    base_delay=0.01,
+                    max_delay=0.1,
+                    jitter=0.0,
+                    exponential_base=2.0,
+                )
+            ),
+        )
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError(f"connection reset on attempt {attempt}")
+            if attempt == 0:
+                stamp_node_state_id(error, "state-attempt-0")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            pytest.raises(OrchestrationInvariantError, match="state_id is required"),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+    def test_exhaustion_with_named_sink_and_missing_edge_fails_closed(self) -> None:
+        """A named route may not emit half of its required audit pair."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError("connection reset")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            pytest.raises(OrchestrationInvariantError, match="no DIVERT edge"),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+    @pytest.mark.parametrize(
+        ("on_error", "expected_path", "expected_sink"),
+        [
+            ("error-sink", TerminalPath.ON_ERROR_ROUTED, "error-sink"),
+            ("discard", TerminalPath.QUARANTINED_AT_SOURCE, None),
+        ],
+    )
+    def test_exhaustion_routes_fork_branch_through_existing_loss_seam(
+        self,
+        on_error: str,
+        expected_path: TerminalPath,
+        expected_sink: str | None,
+    ) -> None:
+        """Every exhausted terminal route notifies coalesce instead of hanging."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        coalesce = create_autospec(CoalesceExecutor, instance=True)
+        coalesce.notify_branch_lost.return_value = None
+        coalesce_name = CoalesceName("merge")
+        processor = _make_processor(
+            factory,
+            retry_manager=retry_manager,
+            coalesce_executor=coalesce,
+            branch_to_coalesce={BranchName("path_a"): coalesce_name},
+            coalesce_node_ids={coalesce_name: NodeID("coalesce::merge")},
+        )
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error=on_error)
+        token = make_token_info(
+            data={"value": 42}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),)
+        )
+        _persist_token_for_scheduler(factory, token)
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError("connection reset")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event"),
+        ):
+            outcome = processor._handle_transform_node(
+                transform=transform,
+                current_token=token,
+                ctx=make_context(),
+                node_id=NodeID("t1"),
+                child_items=[],
+                coalesce_node_id=NodeID("coalesce::merge"),
+                coalesce_name=coalesce_name,
+                current_on_success_sink="default",
+            )
+
+        assert isinstance(outcome, _TransformTerminal)
+        assert isinstance(outcome.result, RowResult)
+        assert (outcome.result.outcome, outcome.result.path, outcome.result.sink_name) == (
+            TerminalOutcome.FAILURE,
+            expected_path,
+            expected_sink,
+        )
+        coalesce.notify_branch_lost.assert_called_once_with(
+            coalesce_name="merge",
+            fork_group_id=token.fork_group_id,
+            lost_branch=token.branch_name,
+            reason="max_retries_exceeded",
+        )
+        assert len(processor._pending_group_losses) == 1
+
+    def test_retry_configuration_does_not_change_named_error_destination(self) -> None:
+        """Retry-off and exhausted-retry paths produce the same route triple."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, no_retry_factory = _make_factory(run_id="run-no-retry")
+        no_retry = _make_processor(
+            no_retry_factory,
+            run_id="run-no-retry",
+            retry_manager=None,
+        )
+        _, retry_factory = _make_factory(run_id="run-with-retry")
+        with_retry = _make_processor(
+            retry_factory,
+            run_id="run-with-retry",
+            retry_manager=RetryManager(
+                RuntimeRetryConfig(
+                    max_attempts=2,
+                    base_delay=0.01,
+                    max_delay=0.1,
+                    jitter=0.0,
+                    exponential_base=2.0,
+                )
+            ),
+        )
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        token = make_token_info(data={"value": 42})
+
+        def route_triple(processor: RowProcessor, factory: RecorderFactory) -> tuple[TerminalOutcome | None, TerminalPath, str | None]:
+            processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+
+            def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+                attempt = kwargs["attempt"]
+                error = ConnectionError("same connection failure")
+                stamp_node_state_id(error, f"state-attempt-{attempt}")
+                raise error
+
+            with (
+                patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+                patch.object(factory.execution, "record_routing_event"),
+            ):
+                outcome = processor._handle_transform_node(
+                    transform=transform,
+                    current_token=token,
+                    ctx=make_context(run_id=processor.run_id),
+                    node_id=NodeID("t1"),
+                    child_items=[],
+                    coalesce_node_id=None,
+                    coalesce_name=None,
+                    current_on_success_sink="default",
+                )
+            assert isinstance(outcome, _TransformTerminal)
+            assert isinstance(outcome.result, RowResult)
+            return outcome.result.outcome, outcome.result.path, outcome.result.sink_name
+
+        assert (
+            route_triple(no_retry, no_retry_factory)
+            == route_triple(with_retry, retry_factory)
+            == (
+                TerminalOutcome.FAILURE,
+                TerminalPath.ON_ERROR_ROUTED,
+                "error-sink",
+            )
+        )
+
+    def test_non_retryable_exception_still_propagates_unchanged(self) -> None:
+        """The new exhaustion arm does not intercept non-retryable failures."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        processor = _make_processor(
+            factory,
+            retry_manager=RetryManager(
+                RuntimeRetryConfig(
+                    max_attempts=2,
+                    base_delay=0.01,
+                    max_delay=0.1,
+                    jitter=0.0,
+                    exponential_base=2.0,
+                )
+            ),
+        )
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        non_retryable = TypeError("plugin contract bug")
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=non_retryable),
+            pytest.raises(TypeError, match="plugin contract bug") as exc_info,
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+        assert exc_info.value is non_retryable
 
     def test_delegates_to_retry_manager(self) -> None:
         """With retry_manager, delegates to execute_with_retry."""
@@ -7141,6 +7894,11 @@ class TestExecuteTransformWithRetry:
         assert is_retryable(CapacityError(429, "rate limited")) is True
         assert is_retryable(AttributeError("bug")) is False
         assert is_retryable(TypeError("bug")) is False
+        # Bare OSError is a plugin bug-class (FileNotFoundError, PermissionError)
+        # and must NOT be engine-classified retryable — only the canonical
+        # transport signals above are (see PluginRetryableError's contract).
+        assert is_retryable(FileNotFoundError("missing input")) is False
+        assert is_retryable(PermissionError("denied")) is False
 
     def test_shutdown_during_backoff_diverts_with_last_attempt_state_id(self) -> None:
         """InterruptedError born in RetryManager backoff carries no stamp; the
@@ -7244,6 +8002,123 @@ class TestExecuteTransformWithRetry:
         assert state.status is NodeStateStatus.FAILED
         assert state.node_id == "t1"
         assert state.attempt == 0
+        assert state.error_json is not None
+        assert json.loads(state.error_json)["phase"] == "retry_pre_attempt_shutdown"
+
+    def test_pre_attempt_shutdown_auto_fail_keeps_shutdown_phase(self) -> None:
+        """A failure while building the explicit shutdown error keeps site attribution."""
+        _, factory = _make_factory()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        processor = _make_processor(
+            factory,
+            node_step_map={NodeID("t1"): 1},
+            node_to_plugin={NodeID("t1"): transform},
+        )
+        token = make_token_info(data={"value": 42})
+        _persist_token_for_scheduler(factory, token)
+
+        with (
+            patch("elspeth.engine.processor.scrub_text_for_audit", side_effect=RuntimeError("shutdown audit preparation failed")),
+            pytest.raises(RuntimeError, match="shutdown audit preparation failed"),
+        ):
+            processor._record_pre_attempt_shutdown_state(
+                exc=InterruptedError("shutdown requested before retry attempt"),
+                transform=transform,
+                token=token,
+                attempt=0,
+            )
+
+        states = factory.query.get_node_states_for_token(token.token_id)
+        assert len(states) == 1
+        assert states[0].status is NodeStateStatus.FAILED
+        assert states[0].error_json is not None
+        error = json.loads(states[0].error_json)
+        assert error["type"] == "RuntimeError"
+        assert error["phase"] == "retry_pre_attempt_shutdown"
+
+    def test_tier_2_contract_violation_is_routed_without_retrying(self) -> None:
+        """The RetryManager branch needs the same Tier-2 conversion.
+
+        Regression for elspeth-181db83da7. ``is_retryable`` rejects a
+        PluginContractViolation, so tenacity re-raises the ORIGINAL exception
+        rather than wrapping it in MaxRetriesExceeded — it slipped past both
+        clauses guarding this call and aborted the run. A contract violation
+        is deterministic, so it must be converted after exactly one attempt.
+        """
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=3,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        attempts: list[int] = []
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempts.append(kwargs["attempt"])
+            violation = PluginContractViolation("would overwrite existing input fields {'notes'}")
+            stamp_node_state_id(violation, f"state-attempt-{kwargs['attempt']}")
+            raise violation
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert attempts == [0], "a deterministic contract violation must not be retried"
+        assert result.status == "error"
+        assert result.retryable is False
+        assert error_sink == "quarantine"
+        record_event.assert_called_once()
+        assert record_event.call_args.kwargs["state_id"] == "state-attempt-0"
+
+    def test_tier_1_contract_violation_subclass_still_propagates_with_retry(self) -> None:
+        """Tier-1 registration outranks the Tier-2 conversion on this branch too."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        transform = _make_mock_transform(node_id="t1", on_error="quarantine")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+
+        with (
+            patch.object(
+                processor._transform_executor,
+                "execute_transform",
+                side_effect=SinkTransactionalInvariantError("commit boundary diverged"),
+            ),
+            pytest.raises(SinkTransactionalInvariantError),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
 
 
 # =============================================================================
@@ -7287,7 +8162,6 @@ class TestMaybeCoalesceToken:
             row_id=token.row_id,
             token_id=token.token_id,
             row_data=token.row_data,
-            branch_name=None,
         )
 
         handled, _result = processor._maybe_coalesce_token(
@@ -7314,7 +8188,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         handled, _result = processor._maybe_coalesce_token(
@@ -7342,7 +8216,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         handled, result = processor._maybe_coalesce_token(
@@ -7356,8 +8230,13 @@ class TestMaybeCoalesceToken:
         assert handled is True
         assert result is None
 
-    def test_coalesce_failure_with_outcomes_recorded_does_not_duplicate_recording(self) -> None:
-        """When executor already recorded FAILED outcome, the intake must not record again.
+    def test_coalesce_failure_always_records_through_settlement_channel(self) -> None:
+        """Task 6 (spec §6.1): the executor never records a consumed sibling's
+        terminal outcome itself anymore — the caller always does, through the
+        settlement channel; there is structurally only one write site now.
+        Fix round 1 (Ruling 37) deleted `CoalesceOutcome.outcomes_recorded`
+        entirely — it was constant-False with zero consumers once this task
+        landed — so this outcome no longer carries the field at all.
 
         Slice 3 re-pin (ADR-030 §E.2): the accept-time failure surfaces from
         the journal-first intake (the arrival blocked first, then the
@@ -7368,7 +8247,7 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.accept.return_value = CoalesceOutcome(
@@ -7376,7 +8255,6 @@ class TestMaybeCoalesceToken:
             merged_token=None,
             failure_reason="merge_failed:path_b_lost",
             consumed_tokens=(token,),
-            outcomes_recorded=True,
         )
         processor = _make_processor(
             factory,
@@ -7386,7 +8264,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         with (
             patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
@@ -7399,7 +8279,8 @@ class TestMaybeCoalesceToken:
         assert child_items == []
         assert len(results) == 1
         _assert_outcome_pair(results[0], TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
-        record_outcome.assert_not_called()
+        record_outcome.assert_called_once()
+        assert record_outcome.call_args.kwargs["ref"].token_id == "token-1"
         emit_token_completed.assert_called_once()
         # Backdated accept timing (§H 476): the intake passed an explicit
         # monotonic arrival anchor derived from barrier_blocked_at.
@@ -7429,10 +8310,12 @@ class TestMaybeCoalesceToken:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
-        coalesce.accept.return_value = CoalesceOutcome(held=False, merged_token=merged_token, consumed_tokens=(token,))
+        coalesce.accept.return_value = CoalesceOutcome(
+            held=False, merged_token=merged_token, consumed_tokens=(token,), join_group_id="join-1"
+        )
         processor = _make_processor(
             factory,
             coalesce_executor=coalesce,
@@ -7442,7 +8325,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 
@@ -7491,10 +8376,12 @@ class TestMaybeCoalesceToken:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
-        coalesce.accept.return_value = CoalesceOutcome(held=False, merged_token=merged_token, consumed_tokens=(token,))
+        coalesce.accept.return_value = CoalesceOutcome(
+            held=False, merged_token=merged_token, consumed_tokens=(token,), join_group_id="join-1"
+        )
         processor = _make_processor(
             factory,
             coalesce_executor=coalesce,
@@ -7504,7 +8391,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         with pytest.raises(OrchestrationInvariantError, match="Coalesce 'merge' not in on_success map"):
             processor._run_barrier_intake_pass(ctx)
@@ -7540,10 +8429,12 @@ class TestMaybeCoalesceToken:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
-        coalesce.accept.return_value = CoalesceOutcome(held=False, merged_token=merged_token, consumed_tokens=(token,))
+        coalesce.accept.return_value = CoalesceOutcome(
+            held=False, merged_token=merged_token, consumed_tokens=(token,), join_group_id="join-1"
+        )
         processor = _make_processor(
             factory,
             coalesce_executor=coalesce,
@@ -7555,7 +8446,9 @@ class TestMaybeCoalesceToken:
         # Slice 3 re-pin (ADR-030 §E.2): the merge fires from the
         # journal-first intake, not from an in-claim accept.
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 
@@ -7587,7 +8480,6 @@ class TestMaybeCoalesceToken:
             held=False,
             merged_token=None,
             failure_reason=None,
-            outcomes_recorded=False,
             late_arrival=False,
         )
         processor = _make_processor(
@@ -7600,11 +8492,13 @@ class TestMaybeCoalesceToken:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         with pytest.raises(OrchestrationInvariantError, match="invalid state"):
             processor._run_barrier_intake_pass(ctx)
@@ -7649,8 +8543,10 @@ class TestCompleteCoalesceMerge:
         )
         # One held branch, BLOCKED at the coalesce barrier through the
         # production verbs (enqueue -> claim -> mark_blocked).
-        factory.data_flow.create_token(row.row_id, token_id="token-held-a", branch_name="path_a", fork_group_id="fork-1")
-        now = datetime.now(UTC)
+        factory.data_flow.create_token(
+            row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
+        )
+        datetime.now(UTC)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id="token-held-a",
@@ -7659,27 +8555,23 @@ class TestCompleteCoalesceMerge:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=now,
-            branch_name="path_a",
-            fork_group_id="fork-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None and claimed.token_id == "token-held-a"
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner="seeder",
         )
         held_token = TokenInfo(
             row_id=row.row_id,
             token_id="token-held-a",
             row_data=payload,
-            branch_name="path_a",
-            fork_group_id="fork-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
         )
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"value": 7})
         factory.data_flow.create_token(row.row_id, token_id="merged-1", join_group_id="join-1")
@@ -7770,10 +8662,11 @@ class TestResumeIncompleteToken:
         spec = IncompleteTokenSpec(
             token_id="token-expanded-child",
             row_id="row-1",
-            branch_name="path_a",
-            fork_group_id=None,
             join_group_id=None,
-            expand_group_id="expand-1",
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
+                LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-expanded-child"),
+            ),
             token_data_ref="payload-1",
             step_in_pipeline=2,
             max_attempt=0,
@@ -7794,14 +8687,155 @@ class TestResumeIncompleteToken:
         _token_arg, _ctx_arg = process_token.call_args.args
         assert process_token.call_args.kwargs == {"current_node_id": after_expand_node}
 
+    def test_fork_child_branch_to_row_union_resumes_with_row_union_context(self) -> None:
+        """A FORK_CHILD branch bound to a row_union re-drives with row_union context.
+
+        Regression (elspeth-de1941d2bf): the FORK_CHILD arm checked
+        _branch_to_sink, _branch_to_coalesce, and _unbound_branch_first_node,
+        never _branch_to_row_union — a fork-child crashed before its
+        row_union barrier had no resume-start node resolvable and raised.
+        """
+        _, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+
+        branch_first_node = NodeID("branch-first")
+        union_node = NodeID("row_union::variants")
+
+        processor = _make_processor(
+            factory,
+            row_union_node_ids={RowUnionName("variants"): union_node},
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+        spec = IncompleteTokenSpec(
+            token_id="token-fork-child",
+            row_id="row-1",
+            join_group_id=None,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="control"),),
+            token_data_ref="payload-1",
+            step_in_pipeline=1,
+            max_attempt=0,
+        )
+
+        with (
+            patch.object(processor._nav, "resolve_branch_first_node", return_value=branch_first_node),
+            patch.object(processor, "process_token", return_value=[]) as process_token,
+        ):
+            processor.resume_incomplete_token(
+                spec,
+                make_pipeline_row({"value": 42}),
+                ctx,
+                resume_checkpoint_id="checkpoint-1",
+            )
+
+        process_token.assert_called_once()
+        _token_arg, _ctx_arg = process_token.call_args.args
+        assert process_token.call_args.kwargs == {
+            "current_node_id": branch_first_node,
+            "row_union_name": RowUnionName("variants"),
+        }
+
 
 # =============================================================================
-# _notify_coalesce_of_lost_branch
+# _settle_member_losses (COALESCE arm) — WS3 Task 5 settle-member seam.
+# Pre-WS3 these called the retired _notify_coalesce_of_lost_branch directly;
+# renamed onto the unified seam, unchanged args (_make_processor synthesizes
+# a GroupBindingRegistry from the legacy branch_to_coalesce/coalesce_node_ids
+# kwargs these tests already pass — see test_settle_member_seam.py for the
+# seam's own walk/dispatch tests against a real registry).
 # =============================================================================
 
 
 class TestNotifyCoalesceOfLostBranch:
-    """Tests for the branch loss notification to coalesce executor."""
+    """Tests for the branch loss notification to coalesce executor, exercised
+    through `_settle_member_losses` (spec §6.1)."""
+
+    def test_empty_aggregation_commit_failure_cannot_fire_terminal_coalesce(self) -> None:
+        """Fork loss stays staged when the owning aggregation transaction fails."""
+        _, factory = _make_factory()
+        coalesce = create_autospec(CoalesceExecutor, instance=True)
+        processor = _make_processor(
+            factory,
+            coalesce_executor=coalesce,
+            branch_to_coalesce={BranchName("path_a"): CoalesceName("merge")},
+            coalesce_node_ids={CoalesceName("merge"): NodeID("coalesce::merge")},
+            node_step_map={NodeID("coalesce::merge"): 5},
+            coalesce_on_success_map={CoalesceName("merge"): "output"},
+        )
+        token = make_token_info(
+            row_id="row-1",
+            token_id="token-1",
+            data={"value": 1},
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
+        )
+        fctx = _FlushContext(
+            node_id=NodeID("aggregate-1"),
+            transform=_make_mock_transform(node_id="aggregate-1", name="batch-transform"),
+            settings=AggregationSettings(
+                name="agg",
+                plugin="batch-plugin",
+                input="source",
+                on_error="discard",
+                trigger={"count": 1},
+            ),
+            buffered_tokens=(token,),
+            batch_id="batch-1",
+            error_msg="batch flush dropped rows",
+            expand_parent_token=token,
+            triggering_token=token,
+            coalesce_node_id=NodeID("coalesce::merge"),
+            coalesce_name=CoalesceName("merge"),
+        )
+        results, child_items = processor._route_empty_emission_results(fctx)
+
+        coalesce.notify_branch_lost.assert_not_called()
+        assert len(processor._pending_group_losses) == 1
+        with (
+            patch.object(processor._scheduler, "complete_barrier", side_effect=RuntimeError("aggregation commit failed")),
+            patch.object(processor._barrier_intake, "replay_durable_group_losses") as replay,
+            patch.object(processor, "_complete_coalesce_fire") as complete_coalesce,
+            pytest.raises(RuntimeError, match="aggregation commit failed"),
+        ):
+            processor._complete_aggregation_flush(
+                NodeID("aggregate-1"),
+                results,
+                [token],
+                child_items,
+                batch_id="batch-1",
+                output_was_empty=True,
+            )
+
+        coalesce.notify_branch_lost.assert_not_called()
+        replay.assert_not_called()
+        complete_coalesce.assert_not_called()
+        assert len(processor._pending_group_losses) == 1
+
+        ordered_events: list[str] = []
+
+        def committed_barrier(**kwargs: object) -> None:
+            group_losses = kwargs["group_losses"]
+            assert isinstance(group_losses, tuple)
+            assert len(group_losses) == 1
+            ordered_events.append("aggregation_committed")
+
+        def replay_after_commit() -> tuple[object, ...]:
+            ordered_events.append("loss_replayed")
+            return ()
+
+        with (
+            patch.object(processor._scheduler, "complete_barrier", side_effect=committed_barrier),
+            patch.object(processor._barrier_intake, "replay_durable_group_losses", side_effect=replay_after_commit),
+        ):
+            processor._complete_aggregation_flush(
+                NodeID("aggregate-1"),
+                results,
+                [token],
+                child_items,
+                batch_id="batch-1",
+                output_was_empty=True,
+            )
+
+        assert ordered_events == ["aggregation_committed", "loss_replayed"]
+        assert processor._pending_group_losses == []
 
     def test_no_coalesce_executor_returns_empty(self) -> None:
         """Without coalesce_executor, returns empty list."""
@@ -7811,10 +8845,10 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -7831,10 +8865,9 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name=None,
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -7855,10 +8888,10 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="unmapped_branch",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-unmapped_branch", member_key="unmapped_branch"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -7869,7 +8902,14 @@ class TestNotifyCoalesceOfLostBranch:
     def test_lost_branch_with_failure_returns_sibling_results(self) -> None:
         """Branch loss causing coalesce failure returns FAILED sibling results."""
         _, factory = _make_factory()
-        sibling_token = make_token_info(data={"value": 99})
+        # Task 6 (spec §6.1): the settlement channel pops the consumed
+        # sibling's own FORK frame before walking its remaining lineage, so
+        # a crafted consumed token needs real fork lineage — the same
+        # fork event as `token` below, a different (sibling) branch.
+        sibling_token = make_token_info(
+            data={"value": 99},
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_b"),),
+        )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
             held=False,
@@ -7895,10 +8935,10 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -7919,6 +8959,7 @@ class TestNotifyCoalesceOfLostBranch:
             merged_token=merged_token,
             failure_reason=None,
             consumed_tokens=(),
+            join_group_id="join-1",
         )
         processor = _make_processor(
             factory,
@@ -7932,10 +8973,10 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             [],
@@ -7955,6 +8996,7 @@ class TestNotifyCoalesceOfLostBranch:
             merged_token=merged_token,
             failure_reason=None,
             consumed_tokens=(),
+            join_group_id="join-1",
         )
         processor = _make_processor(
             factory,
@@ -7968,11 +9010,11 @@ class TestNotifyCoalesceOfLostBranch:
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         with pytest.raises(OrchestrationInvariantError, match="Coalesce 'merge' not in on_success map"):
-            processor._notify_coalesce_of_lost_branch(
+            processor._settle_member_losses(
                 token,
                 "quarantined:bad_value",
                 [],
@@ -8011,6 +9053,7 @@ class TestNotifyCoalesceOfLostBranch:
             merged_token=merged_token,
             failure_reason=None,
             consumed_tokens=(),
+            join_group_id="join-1",
         )
         child_items: list[WorkItem] = []
         processor = _make_processor(
@@ -8025,10 +9068,10 @@ class TestNotifyCoalesceOfLostBranch:
             row_id=row.row_id,
             token_id="token-1",
             row_data=make_row({}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
-        results = processor._notify_coalesce_of_lost_branch(
+        results = processor._settle_member_losses(
             token,
             "quarantined:bad_value",
             child_items,
@@ -8037,6 +9080,14 @@ class TestNotifyCoalesceOfLostBranch:
         assert results == []
         assert len(child_items) == 1
         assert child_items[0].current_node_id == NodeID("coalesce::merge")
+        # Flat/unnested merge (merged_token has no branch_name): the
+        # continuation's coalesce_name/coalesce_node_id both resolve to the
+        # just-completed barrier — both supplied, restoring
+        # WorkItemFactory.create's mismatch cross-check on this path
+        # (elspeth-0bd2cde19a round-2 F4/N3, same pattern as
+        # _fire_coalesce_merge/complete_coalesce_merge).
+        assert child_items[0].coalesce_name == CoalesceName("merge")
+        assert child_items[0].coalesce_node_id == NodeID("coalesce::merge")
         # The merged child's continuation is already journal-durable (F1/D6).
         from sqlalchemy import select
 
@@ -8052,41 +9103,95 @@ class TestNotifyCoalesceOfLostBranch:
 
 
 # =============================================================================
-# Unknown transform type
+# Committed-aggregation-output routing authority (elspeth-8783933d99)
 # =============================================================================
 
 
-class TestUnknownTransformType:
-    """Tests for the TypeError guard on unknown transform types."""
+class TestCommittedAggregationRoutingAuthority:
+    """Nominal GateSettings rejection at the committed-output recovery seam.
 
-    def test_unknown_type_raises_type_error(self) -> None:
-        """Transform that is neither TransformProtocol nor GateSettings raises TypeError."""
-        _db, factory = _make_factory()
-        source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+    The bare ``cast(TransformProtocol, ...)`` this replaces let a gate at the
+    receipt's aggregation node flow onward as a transform. The rejection is
+    nominal (GateSettings), never protocol conformance — the closed
+    node_to_plugin container makes "not a gate" mean "is a transform".
+    """
 
-        # Create an object that is NOT a transform or gate
-        class FakePlugin:
-            node_id = "fake-node"
-
-        fake_plugin = FakePlugin()
-        source_node = NodeID("source-0")
-        fake_node = NodeID(fake_plugin.node_id)
-        processor = _make_processor(
-            factory,
-            node_step_map={source_node: 0, fake_node: 1},
-            node_to_next={source_node: fake_node, fake_node: None},
-            node_to_plugin={fake_node: fake_plugin},
+    @staticmethod
+    def _receipt(*, output_mode: str) -> CommittedAggregationOutputReceipt:
+        return CommittedAggregationOutputReceipt(
+            batch_id="batch-recov-1",
+            aggregation_node_id="agg-1",
+            aggregation_state_id="state-1",
+            output_mode=output_mode,
+            output_shape="single",
+            output_hash="deadbeef",
+            output_refs=(),
+            member_token_ids=(),
+            members=(),
+            expansion_parent_token_id=None,
         )
 
-        with pytest.raises(TypeError, match="Unknown transform type"):
-            processor.process_row(
-                row_index=0,
-                source_row=source_row,
-                transforms=[fake_plugin],
-                ctx=ctx,
-                source_row_index=0,
-                ingest_sequence=0,
+    @staticmethod
+    def _agg_settings() -> AggregationSettings:
+        return AggregationSettings(
+            name="recov-agg",
+            plugin="test-plugin",
+            input="agg_in",
+            on_error="discard",
+            trigger={"count": 3},
+        )
+
+    def test_gate_routing_authority_raises_audit_integrity(self) -> None:
+        """A GateSettings at the receipt's aggregation node is refused by name.
+
+        Mechanism pin: reverting the rejection to the bare cast lets the gate
+        flow past this seam (it survives the mode check, since a gate has no
+        say in output_mode) — this test then fails on the downstream wreckage
+        instead of the honest AuditIntegrityError.
+        """
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        gate = GateSettings(name="not-a-transform", input="default", condition="True", routes={"true": "default", "false": "default"})
+        settings = self._agg_settings()
+        processor = _make_processor(
+            factory,
+            node_to_plugin={agg_node: gate},
+            aggregation_settings={agg_node: settings},
+        )
+
+        with pytest.raises(AuditIntegrityError, match="resolves to gate"):
+            processor._build_committed_aggregation_output_context(
+                self._receipt(output_mode=settings.output_mode.value),
+                [],
+                [],
+            )
+
+    def test_non_conforming_transform_flows_past_gate_rejection(self) -> None:
+        """Control: a transform missing a protocol member is NOT gate-rejected.
+
+        The fake reaches the NEXT integrity check (output-mode disagreement),
+        proving the rejection keys nominally on GateSettings rather than on
+        TransformProtocol conformance.
+        """
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        _db, factory = _make_factory()
+        agg_node = NodeID("agg-1")
+        transform = NonConformingTransform(node_id="agg-1", is_batch_aware=True)
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
+        settings = self._agg_settings()
+        assert settings.output_mode.value != "passthrough"
+        processor = _make_processor(
+            factory,
+            node_to_plugin={agg_node: transform},
+            aggregation_settings={agg_node: settings},
+        )
+
+        with pytest.raises(AuditIntegrityError, match="disagrees with current graph mode"):
+            processor._build_committed_aggregation_output_context(
+                self._receipt(output_mode="passthrough"),
+                [],
+                [],
             )
 
 
@@ -8254,6 +9359,161 @@ class TestTelemetryEmission:
         event = SimpleNamespace()
         processor._emit_telemetry(event)
         telemetry.handle_event.assert_called_once_with(event)
+
+
+class TestRowUnionBranchLossTelemetry:
+    def test_follower_stages_durable_loss_without_executor(self) -> None:
+        _, factory = _make_factory()
+        lost_token = make_token_info(
+            row_id="row-1",
+            token_id="lost-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
+        processor = _make_processor(
+            factory,
+            row_union_executor=None,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+
+        assert processor._settle_member_losses(lost_token, "error_routed", []) == []
+
+        claimed = _make_claimed_work_item(token_id="lost-token", lineage_path=lost_token.lineage_path)
+        losses = processor._take_claim_group_losses(claimed)
+        assert len(losses) == 1
+        (loss,) = losses
+        assert loss.closer_name == "variants"
+        assert loss.group_id == "fg-control"
+        assert loss.member_key == "control"
+        assert loss.reason == "error_routed"
+
+    def test_failed_siblings_emit_token_completed_after_audit(self) -> None:
+        _, factory = _make_factory()
+        held_sibling = make_token_info(
+            row_id="row-1",
+            token_id="held-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-treatment", member_key="treatment"),),
+        )
+        lost_token = make_token_info(
+            row_id="row-1",
+            token_id="lost-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
+        row_union_executor = create_autospec(RowUnionExecutor, instance=True)
+        row_union_executor.notify_branch_lost.return_value = RowUnionOutcome(
+            held=False,
+            consumed_tokens=(held_sibling,),
+            failure_reason="row_union_branch_lost",
+            row_union_name="variants",
+            outcomes_recorded=True,
+        )
+        telemetry = create_autospec(TelemetryManagerProtocol, instance=True)
+        processor = _make_processor(
+            factory,
+            row_union_executor=row_union_executor,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+            telemetry_manager=telemetry,
+        )
+
+        with patch.object(processor, "_complete_row_union_fire"):
+            results = processor._settle_member_losses(lost_token, "error_routed", [])
+
+        assert [result.token.token_id for result in results] == ["held-token"]
+        telemetry.handle_event.assert_called_once()
+        event = telemetry.handle_event.call_args.args[0]
+        assert event.token_id == "held-token"
+        assert event.outcome is TerminalOutcome.FAILURE
+        assert event.path is TerminalPath.UNROUTED
+
+    def test_released_group_settles_nothing_once_its_fork_frame_is_popped(self) -> None:
+        """WS3 retires `_row_union_group_released` (spec :240) as structurally
+        unneeded, not merely redundant: ruling 27 pops a released group's FORK
+        frame off every released token
+        (`RowUnionExecutor._pop_released_group`, pinned directly by
+        `tests/unit/engine/test_token_lineage_path.py`'s
+        `TestRowUnionReleasePop` — a real post-release token's lineage_path
+        never carries this union's FORK frame again; that class's
+        `test_pops_the_fork_frame_from_beneath_a_surviving_expand_frame`
+        pins the exact shape used here: a mid-branch expand's EXPAND frame
+        survives the pop, stacked where the popped FORK frame used to sit).
+        Once popped, `binding_for` cannot resolve the walk back to this
+        union at all, so a post-release terminal settles nothing —
+        structurally, with no explicit release check, and identically
+        whether or not this worker holds a coalesce/row_union executor.
+
+        A non-empty lineage_path is load-bearing here, not decorative — but
+        honestly scoped (2026-08-24 re-review R1). Every assertion below is
+        negative (`== []`, `assert_not_called()`, `== ()`), so this test
+        alone still passes against a `_settle_member_losses` that returns
+        `[]` unconditionally — no purely negative test rules that out. What
+        the surviving EXPAND frame actually kills is a walk that resolves a
+        frame it should not (a "return the first binding regardless"
+        mutant stages a spec, tripping `notify_branch_lost.assert_not_called()`
+        and `_take_claim_group_losses(...) == ()`); an empty path could
+        never exercise that kill at all, since it has nothing to resolve.
+        The deleted-walk mutant this test cannot kill alone is covered by
+        the seam suite's positive tests and, in THIS class, by the
+        immediately adjacent
+        `test_failure_closed_group_still_stages_durable_loss_follower`,
+        which drives the same shape of registry and a FORK frame that DOES
+        stage — together the pair supplies the differential a single
+        negative test cannot.
+        """
+        _, factory = _make_factory()
+        released_token = make_token_info(
+            row_id="row-1",
+            token_id="released-token",
+            # The union's own FORK frame is popped by release; a frame from
+            # a mid-branch expand the token passed through BEFORE reaching
+            # the union survives above it (test_pops_the_fork_frame_from_beneath_a_surviving_expand_frame's
+            # shape) — an ordinary unbound EXPAND frame, not registered
+            # against any closer here.
+            lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-survivor", member_key="tok-child-1"),),
+        )
+        row_union_executor = create_autospec(RowUnionExecutor, instance=True)
+        processor = _make_processor(
+            factory,
+            row_union_executor=row_union_executor,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+
+        assert processor._settle_member_losses(released_token, "routed_to_sink", []) == []
+
+        row_union_executor.notify_branch_lost.assert_not_called()
+        claimed = _make_claimed_work_item(token_id="released-token", lineage_path=released_token.lineage_path)
+        assert processor._take_claim_group_losses(claimed) == ()
+
+    def test_failure_closed_group_still_stages_durable_loss_follower(self) -> None:
+        # A FAILED closure at the union node is not a release: a later
+        # pre-barrier loss for the same group is still a true loss record.
+        _, factory = _make_factory()
+        union_node = NodeID("row_union::variants")
+        processor = _make_processor(
+            factory,
+            row_union_executor=None,
+            row_union_node_ids={RowUnionName("variants"): union_node},
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+        factory.data_flow.create_row("test-run", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token("row-1", token_id="failed-token")
+        state = factory.execution.begin_node_state("failed-token", str(union_node), "test-run", 1, {"a": 1})
+        factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.FAILED,
+            error=ExecutionError(exception="row_union_timeout", exception_type="RowUnionFailureReason"),
+            duration_ms=1.0,
+        )
+        lost_token = make_token_info(
+            row_id="row-1",
+            token_id="failed-token",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-control", member_key="control"),),
+        )
+
+        assert processor._settle_member_losses(lost_token, "error_routed", []) == []
+
+        claimed = _make_claimed_work_item(token_id="failed-token", lineage_path=lost_token.lineage_path)
+        losses = processor._take_claim_group_losses(claimed)
+        assert len(losses) == 1
+        assert losses[0].member_key == "control"
 
 
 # =============================================================================
@@ -8473,7 +9733,7 @@ class TestCoalesceTraversalInvariant:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         with pytest.raises(OrchestrationInvariantError, match="downstream of coalesce"):
             processor._process_single_token(
@@ -8515,7 +9775,7 @@ class TestCoalesceTraversalInvariant:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 1}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         # Should not raise — at coalesce node, not past it.
         # ADR-030 §B (slice 5): without coalesce_executor (follower mode),
@@ -8532,6 +9792,39 @@ class TestCoalesceTraversalInvariant:
         # Follower coalesce barrier: (None, []) → mark_blocked, not a completion.
         assert result is None
         assert child_items == []
+
+
+class TestRowUnionTraversalInvariant:
+    def test_work_item_downstream_of_row_union_raises_invariant_error(self) -> None:
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        row_union_node = NodeID("row-union-1")
+        downstream_node = NodeID("downstream-2")
+        processor = _make_processor(
+            factory,
+            source_on_success="output",
+            node_step_map={source_node: 0, row_union_node: 1, downstream_node: 2},
+            node_to_next={source_node: row_union_node, row_union_node: downstream_node, downstream_node: None},
+            node_to_plugin={},
+            row_union_node_ids={RowUnionName("variant_union"): row_union_node},
+            structural_node_ids=frozenset({source_node, row_union_node, downstream_node}),
+        )
+        token = make_token_info(
+            row_id="row-1",
+            token_id="tok-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant_a", member_key="variant_a"),),
+        )
+        _persist_token_for_scheduler(factory, token)
+
+        with pytest.raises(OrchestrationInvariantError, match="downstream of row_union"):
+            processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=downstream_node,
+                row_union_node_id=row_union_node,
+                row_union_name=RowUnionName("variant_union"),
+            )
 
 
 class TestTerminalWorkItemInvariant:
@@ -8582,11 +9875,13 @@ class TestGateSinkRoutingNotifiesCoalesce:
     paths (max retries, quarantine, error-routed)."""
 
     def test_gate_sink_route_notifies_coalesce_of_lost_branch(self) -> None:
-        """Gate routing a fork-branch token to a sink must call _notify_coalesce_of_lost_branch.
+        """Gate routing a fork-branch token to a sink must call _settle_member_losses.
 
         Before fix: gate sink routing returned immediately without notifying coalesce,
         causing sibling branches to remain held until timeout/end-of-source.
-        After fix: coalesce is notified with reason 'gate_routed_to_sink:<sink_name>'.
+        After fix: coalesce is notified with the category token 'gate_routed_to_sink'
+        (bare token per elspeth-74b795208f — the reason column is String(64) and the
+        sink name is durably recorded on the ROUTED token outcome instead).
         """
         _db, factory = _make_factory()
         ctx = make_context(landscape=factory.plugin_audit_writer())
@@ -8631,7 +9926,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-branch-a",
             row_data=make_row({"value": 42}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         # Mock gate executor to return a sink routing outcome
@@ -8668,12 +9963,13 @@ class TestGateSinkRoutingNotifiesCoalesce:
             _assert_outcome_pair(result, TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED)
             assert result.sink_name == "error_sink"
 
-        # Coalesce must have been notified of the lost branch
+        # Coalesce must have been notified of the lost branch, keyed on the
+        # token's fork_group_id (WS4 Task 8 re-key), not row_id.
         coalesce.notify_branch_lost.assert_called_once_with(
             coalesce_name=CoalesceName("merge"),
-            row_id="row-1",
+            fork_group_id="fg-path_a",
             lost_branch="path_a",
-            reason="gate_routed_to_sink:error_sink",
+            reason="gate_routed_to_sink",
         )
 
     def test_gate_sink_route_with_coalesce_failure_returns_sibling_results(self) -> None:
@@ -8701,7 +9997,13 @@ class TestGateSinkRoutingNotifiesCoalesce:
             routes={"true": "error_sink", "false": "default"},
         )
 
-        sibling_token = make_token_info(data={"value": 99})
+        # Task 6 (spec §6.1): the settlement channel pops the consumed
+        # sibling's own FORK frame before walking its remaining lineage, so
+        # a crafted consumed token needs real fork lineage.
+        sibling_token = make_token_info(
+            data={"value": 99},
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_b"),),
+        )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
             held=False,
@@ -8732,7 +10034,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-branch-a",
             row_data=make_row({"value": 42}),
-            branch_name="path_a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
 
         sink_outcome = GateOutcome(
@@ -8811,7 +10113,6 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 42}),
-            branch_name=None,
         )
 
         sink_outcome = GateOutcome(
@@ -8881,7 +10182,6 @@ class TestGateSinkRoutingNotifiesCoalesce:
             row_id="row-1",
             token_id="tok-1",
             row_data=make_row({"value": 42}),
-            branch_name=None,
         )
         discard_outcome = GateOutcome(
             result=GateResult(
@@ -9008,7 +10308,7 @@ class TestGateJumpPastCoalesceInvariant:
                 row_id="row-1",
                 token_id="tok-1",
                 data={"value": 42},
-                branch_name="branch_a",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-branch_a", member_key="branch_a"),),
             )
             processor._process_single_token(
                 token=token,
@@ -9016,6 +10316,62 @@ class TestGateJumpPastCoalesceInvariant:
                 current_node_id=gate_node,
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+            )
+
+    def test_gate_jump_past_row_union_raises_invariant_error(self) -> None:
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        row_union_node = NodeID("row-union::variant_union")
+        past_row_union_node = NodeID("transform-3")
+        config_gate = GateSettings(
+            name="router",
+            input="in_conn",
+            condition="'skip_ahead'",
+            routes={"skip_ahead": "skip_conn"},
+        )
+        processor = _make_processor(
+            factory,
+            source_on_success="default",
+            node_step_map={source_node: 0, gate_node: 1, row_union_node: 2, past_row_union_node: 3},
+            node_to_next={
+                source_node: gate_node,
+                gate_node: row_union_node,
+                row_union_node: past_row_union_node,
+                past_row_union_node: None,
+            },
+            node_to_plugin={gate_node: config_gate},
+            row_union_node_ids={RowUnionName("variant_union"): row_union_node},
+            structural_node_ids=frozenset({source_node, row_union_node, past_row_union_node}),
+        )
+        gate_result = GateResult(
+            row={"value": 42},
+            action=RoutingAction.route("skip_ahead"),
+            contract=_make_contract(),
+        )
+
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+            return GateOutcome(result=gate_result, updated_token=token, next_node_id=past_row_union_node)
+
+        token = make_token_info(
+            row_id="row-1",
+            token_id="tok-1",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant_a", member_key="variant_a"),),
+        )
+        _persist_token_for_scheduler(factory, token)
+
+        with (
+            patch.object(processor._gate_executor, "execute_config_gate", side_effect=config_gate_side_effect),
+            patch.object(processor._nav, "resolve_jump_target_sink", return_value="some_sink"),
+            pytest.raises(OrchestrationInvariantError, match=r"Gate jump moved token.*past its row_union node"),
+        ):
+            processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=gate_node,
+                row_union_node_id=row_union_node,
+                row_union_name=RowUnionName("variant_union"),
             )
 
     def test_gate_jump_before_coalesce_is_allowed(self) -> None:
@@ -9116,7 +10472,7 @@ class TestGateJumpPastCoalesceInvariant:
                 row_id="row-1",
                 token_id="tok-1",
                 data={"value": 42},
-                branch_name="branch_a",
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-branch_a", member_key="branch_a"),),
             )
             # Should NOT raise — jump target is before coalesce
             result, _child_items = processor._process_single_token(
@@ -9339,6 +10695,17 @@ class TestReadyEmissionEnqueueParity:
             # node structural (in node_to_next, no plugin) so queue_key derives
             # the node id.
             "structural_queue",
+            # row_union-cursor item: the third barrier kind. Without a flavor
+            # that sets row_union_name non-None, both derivations project the
+            # column as NULL and the parity assertion passes while a drop site
+            # ships (elspeth-a5b86149d4 remediation).
+            "row_union_cursor",
+            # collector-cursor item: the fourth barrier kind (WS4 Task 6).
+            # Same "a NULL-vs-NULL match masks a drop site" risk the
+            # row_union_cursor comment above names — without a flavor that
+            # sets collector_name non-None, the parity assertion would pass
+            # trivially even if _ready_work_item_values silently dropped it.
+            "collector_cursor",
         ],
     )
     def test_ready_emission_mirrors_enqueue_work_item_fields(self, flavor: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9365,9 +10732,10 @@ class TestReadyEmissionEnqueueParity:
                 row_id="row-1",
                 token_id="token-merged-1",
                 row_data=make_pipeline_row({"value": 42}),
-                branch_name="path_a",
-                fork_group_id="fork-1",
-                expand_group_id="expand-1",
+                lineage_path=(
+                    LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="path_a"),
+                ),
             )
             _persist_token_for_scheduler(factory, token)
             item = WorkItem(
@@ -9377,19 +10745,51 @@ class TestReadyEmissionEnqueueParity:
                 coalesce_name=CoalesceName("merge"),
                 on_success_sink="merged_sink",
             )
+        elif flavor == "row_union_cursor":
+            token = TokenInfo(
+                row_id="row-1",
+                token_id="token-merged-1",
+                row_data=make_pipeline_row({"value": 42}),
+                lineage_path=(
+                    LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="path_a"),
+                ),
+            )
+            _persist_token_for_scheduler(factory, token)
+            item = WorkItem(
+                token=token,
+                current_node_id=continue_node,
+                row_union_node_id=NodeID("row_union::variants"),
+                row_union_name=RowUnionName("variants"),
+                on_success_sink="merged_sink",
+            )
+        elif flavor == "collector_cursor":
+            token = TokenInfo(
+                row_id="row-1",
+                token_id="token-merged-1",
+                row_data=make_pipeline_row({"value": 42}),
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-merged-1"),),
+            )
+            _persist_token_for_scheduler(factory, token)
+            item = WorkItem(
+                token=token,
+                current_node_id=continue_node,
+                collector_name=CollectorName("stitch"),
+                on_success_sink="merged_sink",
+            )
         else:
             token = TokenInfo(
                 row_id="row-1",
                 token_id="token-merged-1",
                 row_data=make_pipeline_row({"value": 42}),
-                join_group_id="join-1",
-                expand_group_id="expand-1",
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="token-merged-1"),),
             )
             _persist_token_for_scheduler(factory, token)
             item = WorkItem(
                 token=token,
                 current_node_id=continue_node,
                 on_success_sink="merged_sink",
+                join_group_id="join-1",
             )
 
         emission = processor._work_codec.ready_emission(item)
@@ -9432,18 +10832,26 @@ class TestReadyEmissionEnqueueParity:
             queue_key=emission.queue_key,
             barrier_key=emission.barrier_key,
             on_success_sink=emission.on_success_sink,
-            branch_name=emission.branch_name,
-            fork_group_id=emission.fork_group_id,
             join_group_id=emission.join_group_id,
-            expand_group_id=emission.expand_group_id,
+            lineage_path=emission.lineage_path,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
+            row_union_name=emission.row_union_name,
+            collector_name=emission.collector_name,
         )
 
+        # collector_name was excluded here until scheduler_drain.py's
+        # enqueue_ready / enqueue_ready_claimed call sites forwarded
+        # fields.collector_name — that forwarding landed at 02aa2ba6b (WS3).
+        # Both sides are now real derivations; assert full equality across
+        # the whole column set, collector_name included, so a future
+        # regression on either side (emission or enqueue) fails here.
         assert values_from_emission == values_from_enqueue
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
+        # Epoch 35 flip: tri-column lineage retirement (31 -> 28).
+        # WS4 Task 6: collector_name cursor column (28 -> 29).
         assert len(values_from_emission) == 29
 
         # Spot-check the per-flavor derived keys so a failure localizes.
@@ -9452,15 +10860,49 @@ class TestReadyEmissionEnqueueParity:
             assert values_from_emission["barrier_key"] == "merge"
             assert values_from_emission["coalesce_node_id"] == str(coalesce_node)
             assert values_from_emission["coalesce_name"] == "merge"
-            assert values_from_emission["branch_name"] == "path_a"
-            assert values_from_emission["fork_group_id"] == "fork-1"
+            emitted_path = lineage_path_from_json(values_from_emission["lineage_path_json"])
+            assert path_branch_name(emitted_path) == "path_a"
+            assert path_fork_group_id(emitted_path) == "fork-1"
+            assert values_from_emission["row_union_name"] is None
+        elif flavor == "row_union_cursor":
+            # A barrier-bound item never derives a structural queue key, and
+            # the row_union name IS the durable barrier key.
+            assert values_from_emission["queue_key"] is None
+            assert values_from_emission["barrier_key"] == "variants"
+            assert values_from_emission["row_union_name"] == "variants"
+            assert values_from_emission["coalesce_node_id"] is None
+            assert values_from_emission["coalesce_name"] is None
+            emitted_path = lineage_path_from_json(values_from_emission["lineage_path_json"])
+            assert path_branch_name(emitted_path) == "path_a"
+            assert path_fork_group_id(emitted_path) == "fork-1"
+        elif flavor == "collector_cursor":
+            # A barrier-bound item never derives a structural queue key, and
+            # the collector's durable barrier key is the COMPOUND address
+            # (collector_barrier_key: one collector spans many concurrent
+            # EXPAND groups) built from the cursor and the token's own
+            # innermost EXPAND frame — the writer the WS3+WS4 integration
+            # item 1 landed in _barrier_key_for_blocked_item.
+            #
+            # collector_name forwarding landed at 02aa2ba6b (WS3): both the
+            # emission side (ready_emission/_ready_work_item_values) and the
+            # enqueue side (scheduler_drain.py's enqueue_ready call) now
+            # derive the real value — assert both, not just the emission
+            # side, so a regression on either lane fails here.
+            assert values_from_emission["queue_key"] is None
+            assert values_from_emission["barrier_key"] == collector_barrier_key("stitch", "expand-1")
+            assert values_from_emission["coalesce_node_id"] is None
+            assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["row_union_name"] is None
+            assert values_from_emission["collector_name"] == "stitch"
+            assert values_from_enqueue["collector_name"] == "stitch"
         else:
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["row_union_name"] is None
             assert values_from_emission["join_group_id"] == "join-1"
-        assert values_from_emission["expand_group_id"] == "expand-1"
+        assert path_expand_group_id(lineage_path_from_json(values_from_emission["lineage_path_json"])) == "expand-1"
         assert values_from_emission["step_index"] == 2
 
         # And the live reconciliation accepted the enqueue against the same

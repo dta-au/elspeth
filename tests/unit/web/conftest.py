@@ -38,6 +38,7 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import SecretBytes
 from sqlalchemy import Connection, insert
 from sqlalchemy.pool import StaticPool
 
@@ -54,6 +55,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -107,7 +109,7 @@ def test_client(tmp_path: Path) -> TestClient:
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
-    service = SessionServiceImpl(
+    service = DualFencedSessionServiceHarness(
         eng,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -119,12 +121,20 @@ def test_client(tmp_path: Path) -> TestClient:
     async def mock_user() -> UserIdentity:
         return identity
 
-    async def audit_access_log_write_error_handler(_request, _exc):
+    async def audit_access_log_write_error_handler(request, _exc):
+        # Mirrors ``create_app``'s handler, including the ``request_id``
+        # correlation field. This app has no ``RequestIdMiddleware``, so the
+        # honest value here is None — same lenient read as production.
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_access_log_write_failed",
                 "detail": "Audit-grade transcript access could not be recorded; no audit-grade data returned.",
+                "request_id": (
+                    request.scope["state"]["request_id"]
+                    if type(request.scope.get("state")) is dict and type(request.scope["state"].get("request_id")) is str
+                    else None
+                ),
             },
         )
 
@@ -144,7 +154,7 @@ def test_client(tmp_path: Path) -> TestClient:
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)

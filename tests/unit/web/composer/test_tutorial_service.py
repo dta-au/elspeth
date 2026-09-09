@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,8 +13,10 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from elspeth.contracts import CallStatus, CallType, NodeType
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
@@ -31,6 +34,112 @@ from elspeth.web.composer.tutorial_service import (
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord
 from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["none", "simultaneous", "waiting", "prior"])
+@pytest.mark.parametrize("error_class", [None, RuntimeError, FrameworkBugError, AuditIntegrityError])
+async def test_pretransfer_cleanup_outcome_is_independent_of_cancel_scheduling(timing, error_class) -> None:
+    failure = error_class("private cleanup detail") if error_class is not None else None
+    cancellation = asyncio.CancelledError("request cancelled") if timing == "prior" else None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closing_task: asyncio.Task[None] | None = None
+
+    class Lease:
+        context = make_execute_context(uuid4())
+        closed = False
+
+        async def close(self) -> None:
+            entered.set()
+            if timing == "waiting":
+                await release.wait()
+            if timing == "simultaneous":
+                assert closing_task is not None
+                closing_task.cancel()
+            self.closed = True
+            if failure is not None:
+                raise failure
+
+    lease = Lease()
+    with capture_logs() as logs:
+        closing_task = asyncio.create_task(
+            tutorial_service_module._close_tutorial_execute_lease_before_transfer(lease, cancellation=cancellation)
+        )
+        if timing == "waiting":
+            await entered.wait()
+            closing_task.cancel()
+            await asyncio.sleep(0)
+            assert not lease.closed
+            release.set()
+        if error_class in (FrameworkBugError, AuditIntegrityError) or (timing == "none" and failure is not None):
+            with pytest.raises(error_class) as caught:
+                await closing_task
+            assert caught.value is failure
+        elif timing != "none":
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await closing_task
+            if cancellation is not None:
+                assert caught.value is cancellation
+        else:
+            await closing_task
+    assert lease.closed
+    if error_class is RuntimeError and timing != "none":
+        assert logs == [
+            {
+                "event": "execution_pretransfer_lease_close_failed",
+                "session_id": lease.context.fence.session_id,
+                "operation_id": lease.context.fence.operation_id,
+                "operation_epoch": lease.context.fence.operation_epoch,
+                "error_type": "RuntimeError",
+                "primary_error_type": "CancelledError",
+                "log_level": "error",
+            }
+        ]
+    else:
+        assert logs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_class", [RuntimeError, FrameworkBugError, AuditIntegrityError])
+async def test_pretransfer_cleanup_logging_preserves_integrity_priority(monkeypatch, error_class) -> None:
+    failure = error_class("private logging detail")
+    cancellation = asyncio.CancelledError("request cancelled")
+
+    class Lease:
+        context = make_execute_context(uuid4())
+
+        async def close(self) -> None:
+            raise OSError("private lease detail")
+
+    class Logger:
+        def error(self, event, **fields) -> None:
+            raise failure
+
+    monkeypatch.setattr(tutorial_service_module, "slog", Logger())
+    expected = asyncio.CancelledError if error_class is RuntimeError else error_class
+    with pytest.raises(expected) as caught:
+        await tutorial_service_module._close_tutorial_execute_lease_before_transfer(Lease(), cancellation=cancellation)
+    assert caught.value is (cancellation if error_class is RuntimeError else failure)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+async def test_pretransfer_cleanup_integrity_failure_wins_racing_cancellation(error_class) -> None:
+    failure = error_class("lease cleanup integrity failure")
+    closing_task: asyncio.Task[None] | None = None
+
+    class FailingLease:
+        async def close(self) -> None:
+            assert closing_task is not None
+            closing_task.cancel()
+            raise failure
+
+    closing_task = asyncio.create_task(tutorial_service_module._close_tutorial_execute_lease_before_transfer(FailingLease()))
+    with pytest.raises(error_class) as caught:
+        await closing_task
+    assert caught.value is failure
 
 
 def _make_tutorial_settings(data_dir: Path, **overrides: Any) -> WebSettings:
@@ -57,12 +166,16 @@ def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     """
     from unittest.mock import MagicMock
 
+    from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.state import (
         CompositionState,
         OutputSpec,
         PipelineMetadata,
         SourceSpec,
     )
+    from elspeth.web.plugin_policy import WebPluginPolicy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
     state = CompositionState(
         sources={
@@ -81,11 +194,11 @@ def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     )
     blocker = _tutorial_launch_blocker(
         state=state,
-        policy=MagicMock(),
-        snapshot=MagicMock(),
+        policy=MagicMock(spec=WebPluginPolicy),
+        snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
         tutorial_profile="tutorial-default",
-        profile_registry=MagicMock(),
-        catalog=MagicMock(),
+        profile_registry=MagicMock(spec=OperatorProfileRegistry),
+        catalog=MagicMock(spec=CatalogService),
     )
     assert blocker is not None
     code, detail = blocker
@@ -93,27 +206,233 @@ def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     assert "no transform" in detail.lower()
 
 
-def test_tutorial_recipe_authors_only_opaque_llm_profile() -> None:
-    from elspeth.web.composer.recipes import apply_recipe, get_recipe
+@pytest.mark.parametrize("options", [{}, {"profile": None}, {"profile": "other-profile"}])
+def test_launch_blocker_refuses_missing_or_wrong_profile(options: dict[str, object]) -> None:
+    from unittest.mock import MagicMock
 
-    recipe = get_recipe("web-scrape-llm-rate-jsonl")
-    assert recipe is not None
-    assert "profile" in recipe.slots
-    assert {"provider", "model", "api_key_secret"}.isdisjoint(recipe.slots)
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy import WebPluginPolicy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
-    candidate = apply_recipe(
-        recipe.name,
-        {
-            "source_blob_id": "11111111-1111-1111-1111-111111111111",
-            "source_plugin": "json",
-            "profile": "tutorial-default",
-            "abuse_contact": "noreply@example.test",
-            "scraping_reason": "First-run tutorial",
-        },
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    state = CompositionState(
+        sources={"source": SourceSpec(plugin="csv", on_success="in", options={}, on_validation_failure="discard")},
+        nodes=tuple(
+            NodeSpec(
+                id=f"n{index}",
+                node_type="transform",
+                plugin=plugin,
+                input="in",
+                on_success="out",
+                on_error="discard",
+                options=options if plugin == "llm" else {},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+            for index, plugin in enumerate(("web_scrape", "llm", "field_mapper"))
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
     )
-    llm_options = candidate["nodes"][1]["options"]
-    assert llm_options["profile"] == "tutorial-default"
-    assert {"provider", "model", "api_key", "api_key_secret"}.isdisjoint(llm_options)
+    blocker = _tutorial_launch_blocker(
+        state=state,
+        policy=MagicMock(spec=WebPluginPolicy),
+        snapshot=snapshot,
+        tutorial_profile="tutorial-default",
+        profile_registry=MagicMock(spec=OperatorProfileRegistry),
+        catalog=MagicMock(spec=CatalogService),
+    )
+    assert blocker == ("tutorial_profile_unavailable", "The saved tutorial pipeline does not select the configured tutorial profile.")
+
+
+def test_launch_blocker_admits_this_deployments_control_transforms() -> None:
+    """A control-required deployment can still run the tutorial.
+
+    The AWS scenario module sets prompt_shield/content_safety to
+    ``required``, which makes coverage a launch condition. Against a fixed
+    three-transform contract that was unsatisfiable in both directions:
+    adding the shield tripped ``tutorial_plugin_set``, omitting it tripped
+    ``required_control_coverage`` (live: run 06c9ec49, 2026-07-29). The
+    contract now admits the control plugins THIS snapshot selected, and
+    still rejects any other extra transform.
+    """
+    from unittest.mock import MagicMock
+
+    from elspeth.contracts.plugin_capabilities import PluginCapability
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import (
+        CompositionState,
+        NodeSpec,
+        OutputSpec,
+        PipelineMetadata,
+        SourceSpec,
+    )
+    from elspeth.web.plugin_policy import WebPluginPolicy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+    def node(node_id: str, plugin: str, options: dict[str, object] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin=plugin,
+            input="in",
+            on_success="out",
+            on_error="discard",
+            options=options or {},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def state_with(*plugins: str) -> CompositionState:
+        return CompositionState(
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="in",
+                    options={},
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=tuple(
+                node(f"n{index}", plugin, {"profile": "tutorial-default"} if plugin == "llm" else None)
+                for index, plugin in enumerate(plugins)
+            ),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    shield = PluginId("transform", "aws_bedrock_prompt_shield")
+    snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+    snapshot.selected = ((PluginCapability.PROMPT_SHIELD, shield),)
+    # Fail the NEXT gate so a passing plugin-set check is observable without
+    # standing up the whole policy stack.
+    snapshot.available = frozenset()
+
+    def blocker_for(state: CompositionState) -> tuple[str, str] | None:
+        return _tutorial_launch_blocker(
+            state=state,
+            policy=MagicMock(spec=WebPluginPolicy),
+            snapshot=snapshot,
+            tutorial_profile="tutorial-default",
+            profile_registry=MagicMock(spec=OperatorProfileRegistry),
+            catalog=MagicMock(spec=CatalogService),
+        )
+
+    with_shield = blocker_for(state_with("web_scrape", "llm", "field_mapper", "aws_bedrock_prompt_shield"))
+    assert with_shield is not None and with_shield[0] != "tutorial_plugin_set"
+
+    base_only = blocker_for(state_with("web_scrape", "llm", "field_mapper"))
+    assert base_only is not None and base_only[0] != "tutorial_plugin_set"
+
+    # An extra transform this deployment did NOT select for a control is still rejected.
+    unrelated = blocker_for(state_with("web_scrape", "llm", "field_mapper", "passthrough"))
+    assert unrelated is not None and unrelated[0] == "tutorial_plugin_set"
+
+    # A missing base transform is still rejected.
+    incomplete = blocker_for(state_with("web_scrape", "llm"))
+    assert incomplete is not None and incomplete[0] == "tutorial_plugin_set"
+
+
+@pytest.mark.asyncio
+async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    approved_state_id = uuid4()
+    newer_state_id = uuid4()
+    run_id = uuid4()
+    session_id = uuid4()
+    current_state_reads = 0
+    received_state_ids: list[Any] = []
+    executed_state_ids: list[Any] = []
+
+    class FakeSessionService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "tutorial-test-owner"
+        session_operation_lease_seconds = 60
+
+        async def get_current_state(self, requested_session_id: Any) -> Any:
+            nonlocal current_state_reads
+            assert requested_session_id == session_id
+            current_state_reads += 1
+            state_id = approved_state_id if current_state_reads == 1 else newer_state_id
+            return SimpleNamespace(id=state_id)
+
+        async def get_run(self, requested_run_id: Any) -> Any:
+            assert requested_run_id == run_id
+            return SimpleNamespace(status="cancelled")
+
+    session_service = FakeSessionService()
+
+    class FakeExecutionService:
+        async def execute(
+            self,
+            requested_session_id: Any,
+            state_id: Any = None,
+            *,
+            session_operation_lease: Any = None,
+            user_id: str,
+            auth_provider_type: str,
+        ) -> Any:
+            del user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
+            assert requested_session_id == session_id
+            received_state_ids.append(state_id)
+            if state_id is None:
+                state_id = (await session_service.get_current_state(session_id)).id
+            executed_state_ids.append(state_id)
+            return run_id
+
+    async def fake_verify_session_ownership(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(tutorial_service_module, "verify_session_ownership", fake_verify_session_ownership)
+    monkeypatch.setattr(tutorial_service_module, "state_from_record", lambda _record: SimpleNamespace())
+    monkeypatch.setattr(tutorial_service_module, "_tutorial_launch_blocker", lambda **_kwargs: None)
+
+    settings = _make_tutorial_settings(tmp_path)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                settings=settings,
+                session_service=session_service,
+                execution_service=FakeExecutionService(),
+                plugin_snapshot_factory=lambda _user: SimpleNamespace(),
+                web_plugin_policy=SimpleNamespace(),
+                operator_profile_registry=SimpleNamespace(),
+                catalog_service=SimpleNamespace(),
+            )
+        )
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await tutorial_service_module.run_tutorial_pipeline(
+            request=request,
+            user=SimpleNamespace(user_id="tutorial-user"),
+            session_id=str(session_id),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert received_state_ids == [approved_state_id]
+    assert executed_state_ids == [approved_state_id]
+    assert current_state_reads == 1
 
 
 @pytest.mark.asyncio
@@ -124,11 +443,19 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
     sentinel_error = "INTERNAL_ROW_VALUE_SHOULD_NOT_LEAVE_TUTORIAL_RESPONSE"
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             return run_id
 
     class FakeSessionService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "tutorial-test-owner"
+        session_operation_lease_seconds = 60
+
         async def get_run(self, requested_run_id: Any) -> RunRecord:
             assert requested_run_id == run_id
             now = datetime.now(UTC)
@@ -159,6 +486,7 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
             request=request,
             user=user,
             session_id=session_id,
+            state_id=state_id,
             settings=settings,
             session_service=FakeSessionService(),
         )
@@ -191,8 +519,12 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     session_id = uuid4()
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             raise UnresolvedInterpretationPlaceholderError(
                 sites=(
                     InterpretationReviewSite(
@@ -213,8 +545,13 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
             request=request,
             user=user,
             session_id=session_id,
+            state_id=uuid4(),
             settings=settings,
-            session_service=SimpleNamespace(),
+            session_service=SimpleNamespace(
+                session_operation_authority=RecordingSessionOperationAuthority(),
+                session_operation_owner_instance_id="tutorial-test-owner",
+                session_operation_lease_seconds=60,
+            ),
         )
 
     assert exc_info.value.status_code == 409
@@ -236,11 +573,19 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
     state_id = uuid4()
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             return run_id
 
     class FakeSessionService:
+        session_operation_authority = RecordingSessionOperationAuthority()
+        session_operation_owner_instance_id = "tutorial-test-owner"
+        session_operation_lease_seconds = 60
+
         async def get_run(self, requested_run_id: Any) -> RunRecord:
             assert requested_run_id == run_id
             now = datetime.now(UTC)
@@ -271,6 +616,7 @@ async def test_cancelled_live_tutorial_run_returns_409_with_machine_code(tmp_pat
             request=request,
             user=user,
             session_id=session_id,
+            state_id=state_id,
             settings=settings,
             session_service=FakeSessionService(),
         )
@@ -289,8 +635,12 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
     captured_timeout: list[float | None] = []
 
     class FakeExecutionService:
-        async def execute(self, session_id: Any, *, user_id: str, auth_provider_type: str) -> Any:
-            del session_id, user_id, auth_provider_type
+        async def execute(
+            self, session_id: Any, state_id: Any = None, *, session_operation_lease: Any = None, user_id: str, auth_provider_type: str
+        ) -> Any:
+            del session_id, state_id, user_id, auth_provider_type
+            if session_operation_lease is not None:
+                await session_operation_lease.close()
             return "run-1"
 
     async def fake_wait_for_terminal_run(
@@ -319,8 +669,13 @@ async def test_live_tutorial_wait_uses_transport_ceiling_minus_headroom(
             request=request,
             user=user,
             session_id="session-1",
+            state_id=uuid4(),
             settings=settings,
-            session_service=SimpleNamespace(),
+            session_service=SimpleNamespace(
+                session_operation_authority=RecordingSessionOperationAuthority(),
+                session_operation_owner_instance_id="tutorial-test-owner",
+                session_operation_lease_seconds=60,
+            ),
         )
 
     assert captured_timeout == [270.0]
@@ -610,8 +965,8 @@ def test_rows_from_artifacts_skips_auxiliary_and_returns_row_artifact_rows(tmp_p
     Auxiliary artifacts (.txt, .log) must be skipped without crashing the
     projection — only row-format artifacts contribute to the row sequence.
     """
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     aux = outputs / "debug.txt"
     aux.write_text("composer chain trace", encoding="utf-8")
     rows_file = outputs / "rows.csv"
@@ -627,8 +982,8 @@ def test_rows_from_artifacts_skips_auxiliary_and_returns_row_artifact_rows(tmp_p
 
 
 def test_rows_from_artifacts_skips_auxiliary_before_reading_bytes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     aux = outputs / "debug.bin"
     aux.write_bytes(b"x" * 1024)
     rows_file = outputs / "rows.csv"
@@ -655,8 +1010,8 @@ def test_rows_from_artifacts_skips_legacy_percent_encoded_suffix_auxiliary_befor
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     legacy_aux = outputs / "debug%2Ecsv"
     decoded_decoy = outputs / "debug.csv"
     legacy_aux.write_bytes(b"x" * 1024)
@@ -682,8 +1037,8 @@ def test_rows_from_artifacts_skips_legacy_percent_encoded_suffix_auxiliary_befor
 
 
 def test_rows_from_artifacts_uses_legacy_raw_percent_candidate_when_it_matches_audit(tmp_path: Path) -> None:
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     legacy_raw_file = outputs / "results%3Ftoken=literal.csv"
     decoded_decoy = outputs / "results?token=literal.csv"
     audited_bytes = b"url,rating\nraw.example,5\n"
@@ -707,8 +1062,8 @@ def test_rows_from_artifacts_parses_verified_bytes_when_file_changes_after_verif
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     rows_file = outputs / "rows.csv"
     audited_bytes = b"url,rating\nato.gov.au,5\n"
     rows_file.write_bytes(audited_bytes)
@@ -741,8 +1096,8 @@ def test_rows_from_artifacts_distinguishes_no_row_format_from_all_empty(tmp_path
     read parquet' and 'pipeline emitted rows.csv but it was empty' — the
     prior implementation collapsed both into a single misleading message.
     """
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     only_aux = outputs / "summary.txt"
     only_aux.write_text("freeform", encoding="utf-8")
     artifacts = [_fake_artifact("aux-1", str(only_aux))]
@@ -752,8 +1107,8 @@ def test_rows_from_artifacts_distinguishes_no_row_format_from_all_empty(tmp_path
 
 
 def test_rows_from_artifacts_raises_when_all_row_artifacts_yield_zero_rows(tmp_path: Path) -> None:
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
+    outputs = tmp_path / "outputs" / "sess-t"
+    outputs.mkdir(parents=True)
     empty = outputs / "empty.csv"
     empty.write_text("url,rating\n", encoding="utf-8")
     artifacts = [_fake_artifact("rows-1", str(empty))]

@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable, Mapping
 from threading import Event, Lock
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -26,6 +27,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, TransformContext
 from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, is_capacity_error
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
@@ -33,7 +35,6 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.azure.errors import MalformedResponseError
 from elspeth.plugins.transforms.safety_utils import get_fields_to_scan
 from elspeth.plugins.transforms.safety_utils import validate_fields_not_empty as _validate_fields
@@ -43,9 +44,44 @@ logger = structlog.get_logger(__name__)
 _CAPACITY_RETRY_INITIAL_DELAY_SECONDS = 0.05
 _CAPACITY_RETRY_MAX_DELAY_SECONDS = 1.0
 _AZURE_HTTP_TIMEOUT_SECONDS = 30.0
+_AZURE_CONTENT_SAFETY_ENDPOINT_SUFFIXES = (
+    ".cognitiveservices.azure.com",
+    ".api.cognitive.microsoft.com",
+    ".cognitiveservices.azure.us",
+    ".api.cognitive.microsoft.us",
+)
 
 
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
+
+
+def _validate_azure_content_safety_endpoint(v: str) -> str:
+    """Return a credential-safe Azure Content Safety endpoint URL.
+
+    Azure safety transforms send the configured API key as an
+    ``Ocp-Apim-Subscription-Key`` header.  Constrain user-provided endpoints to
+    Azure AI Services hosts so a server-scoped Content Safety key cannot be
+    exfiltrated to arbitrary HTTPS infrastructure.
+    """
+    stripped = validate_credential_safe_https_url(v, field_name="endpoint")
+    parsed = urlparse(stripped)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("endpoint must include a hostname")
+    normalized = hostname.casefold().rstrip(".")
+    if not any(normalized.endswith(suffix) and bool(normalized.removesuffix(suffix)) for suffix in _AZURE_CONTENT_SAFETY_ENDPOINT_SUFFIXES):
+        raise ValueError("endpoint must be an Azure Content Safety endpoint")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("endpoint must use a valid HTTPS port") from exc
+    if port not in (None, 443):
+        raise ValueError("endpoint must use the standard HTTPS port 443")
+    if parsed.query:
+        raise ValueError("endpoint must not include a query string")
+    if parsed.fragment:
+        raise ValueError("endpoint must not include a fragment")
+    return stripped
 
 
 class BaseAzureSafetyConfig(TransformDataConfig):
@@ -66,7 +102,7 @@ class BaseAzureSafetyConfig(TransformDataConfig):
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint_url(cls, v: str) -> str:
-        return validate_credential_safe_https_url(v, field_name="endpoint")
+        return _validate_azure_content_safety_endpoint(v)
 
     @field_validator("api_key")
     @classmethod
@@ -118,6 +154,11 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         self._endpoint = cfg.endpoint.rstrip("/")
         self._api_key = cfg.api_key
         self._fields = cfg.fields
+        # Explicitly named scan fields fail the row closed when missing or
+        # non-string; "all" mode skips non-strings instead, so it makes no
+        # static type claim (elspeth-b19dfe41fb).
+        if not isinstance(self._fields, str):
+            self.declared_string_input_fields = frozenset(self._fields)
         self._max_capacity_retry_seconds = cfg.max_capacity_retry_seconds
         self._batch_wait_timeout_seconds = cfg.batch_wait_timeout_seconds
         self._effective_batch_wait_timeout_seconds = max(

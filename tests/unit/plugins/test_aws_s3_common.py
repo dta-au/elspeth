@@ -40,9 +40,16 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch) -> _FakeS3ClientFactory:
     return client
 
 
+def _clear_region_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+
 def test_build_s3_client_passes_region_endpoint_and_exact_config(monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.plugins.aws_s3_common import build_s3_client
 
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
     client = _install_fake_sdk(monkeypatch)
 
     result = build_s3_client("ap-southeast-2", "http://localhost:4566")
@@ -62,6 +69,7 @@ def test_build_s3_client_passes_region_endpoint_and_exact_config(monkeypatch: py
 def test_none_args_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.plugins.aws_s3_common import build_s3_client
 
+    _clear_region_environment(monkeypatch)
     client = _install_fake_sdk(monkeypatch)
 
     build_s3_client(None, None)
@@ -80,6 +88,55 @@ def test_no_credential_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _service_name, kwargs = client.calls[0]
     assert set(kwargs) == {"region_name", "endpoint_url", "config"}
+
+
+def test_aws_region_is_forwarded_when_plugin_region_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.aws_s3_common import build_s3_client
+
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    client = _install_fake_sdk(monkeypatch)
+
+    build_s3_client(None, None)
+
+    _service_name, kwargs = client.calls[0]
+    assert kwargs["region_name"] == "ap-southeast-2"
+
+
+def test_matching_aws_region_variables_are_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.aws_s3_common import build_s3_client
+
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-southeast-2")
+    client = _install_fake_sdk(monkeypatch)
+
+    build_s3_client(None, None)
+
+    _service_name, kwargs = client.calls[0]
+    assert kwargs["region_name"] == "ap-southeast-2"
+
+
+def test_conflicting_aws_region_variables_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.aws_s3_common import build_s3_client
+
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    _install_fake_sdk(monkeypatch)
+
+    with pytest.raises(ValueError, match="conflicting AWS region environment"):
+        build_s3_client(None, None)
+
+
+@pytest.mark.parametrize("value", ["", "bad region", "r" * 65])
+def test_invalid_aws_region_environment_is_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    from elspeth.plugins.aws_s3_common import build_s3_client
+
+    monkeypatch.setenv("AWS_REGION", value)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    _install_fake_sdk(monkeypatch)
+
+    with pytest.raises(ValueError, match="AWS_REGION"):
+        build_s3_client(None, None)
 
 
 def test_missing_sdk_error_names_the_aws_extra(monkeypatch: pytest.MonkeyPatch) -> None:

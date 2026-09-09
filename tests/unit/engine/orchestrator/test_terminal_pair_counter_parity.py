@@ -15,7 +15,7 @@ fail first).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -25,7 +25,7 @@ import pytest
 from elspeth.contracts import PendingOutcome, TokenInfo
 from elspeth.contracts.audit import TokenOutcome
 from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.results import FailureInfo
 from elspeth.engine.orchestrator.counter_classification import (
     TERMINAL_PAIR_COUNTER_EFFECTS,
@@ -56,11 +56,35 @@ def _expected_counters(effect: TerminalPairCounterEffect) -> ExecutionCounters:
     return expected
 
 
+def _governed_field_pairs(actual: ExecutionCounters, expected: ExecutionCounters) -> tuple[tuple[str, int, int], ...]:
+    """Explicit ``(field, actual, expected)`` triples for the table-governed counters.
+
+    Written out rather than reflected: a counters object missing a governed field
+    raises ``AttributeError`` here instead of silently skipping the comparison.
+    The assertion keeps the table pinned to ``_TABLE_GOVERNED_FIELDS``, which is
+    still derived from the live ``ExecutionCounters`` dataclass.
+    """
+    pairs: tuple[tuple[str, int, int], ...] = (
+        ("rows_succeeded", actual.rows_succeeded, expected.rows_succeeded),
+        ("rows_failed", actual.rows_failed, expected.rows_failed),
+        ("rows_routed_success", actual.rows_routed_success, expected.rows_routed_success),
+        ("rows_routed_failure", actual.rows_routed_failure, expected.rows_routed_failure),
+        ("rows_quarantined", actual.rows_quarantined, expected.rows_quarantined),
+        ("rows_forked", actual.rows_forked, expected.rows_forked),
+        ("rows_coalesced", actual.rows_coalesced, expected.rows_coalesced),
+        ("rows_expanded", actual.rows_expanded, expected.rows_expanded),
+        ("rows_buffered", actual.rows_buffered, expected.rows_buffered),
+        ("rows_diverted", actual.rows_diverted, expected.rows_diverted),
+    )
+    covered = {name for name, _, _ in pairs}
+    governed = set(_TABLE_GOVERNED_FIELDS)
+    assert covered == governed, f"governed-counter table drifted: missing={governed - covered}, extra={covered - governed}"
+    return pairs
+
+
 def _assert_governed_fields_match(actual: ExecutionCounters, expected: ExecutionCounters, *, context: str) -> None:
-    for field_name in _TABLE_GOVERNED_FIELDS:
-        assert getattr(actual, field_name) == getattr(expected, field_name), (
-            f"{context}: {field_name} diverged from the counter-effect table"
-        )
+    for field_name, actual_value, expected_value in _governed_field_pairs(actual, expected):
+        assert actual_value == expected_value, f"{context}: {field_name} diverged from the counter-effect table"
     assert dict(actual.routed_destinations) == dict(expected.routed_destinations), f"{context}: routed_destinations diverged"
 
 
@@ -131,8 +155,6 @@ def _row_result(
     token: TokenInfo | None = None,
 ) -> Any:
     result_token = token or make_token_info()
-    if path is TerminalPath.COALESCED and result_token.join_group_id is None:
-        result_token = replace(result_token, join_group_id="join-1")
     return SimpleNamespace(
         outcome=outcome,
         path=path,
@@ -141,6 +163,7 @@ def _row_result(
         error=error,
         scheduler_pending_sink=False,
         authoritative_error_hash=None,
+        join_group_id="join-1" if path is TerminalPath.COALESCED else None,
     )
 
 
@@ -165,8 +188,10 @@ class TestTableLockstep:
     def test_terminal_keys_match_legal_pairs(self) -> None:
         assert frozenset(k for k in TERMINAL_PAIR_COUNTER_EFFECTS if k[0] is not None) == _LEGAL_TERMINAL_PAIRS
 
-    def test_only_non_terminal_key_is_buffered(self) -> None:
-        assert frozenset(k for k in TERMINAL_PAIR_COUNTER_EFFECTS if k[0] is None) == frozenset({(None, TerminalPath.BUFFERED)})
+    def test_non_terminal_keys_are_buffered_and_abandoned(self) -> None:
+        assert frozenset(k for k in TERMINAL_PAIR_COUNTER_EFFECTS if k[0] is None) == frozenset(
+            {(None, TerminalPath.BUFFERED), (None, TerminalPath.ABANDONED)}
+        )
 
     def test_increments_name_real_counter_fields(self) -> None:
         counter_fields = frozenset(f.name for f in fields(ExecutionCounters))
@@ -177,7 +202,7 @@ class TestTableLockstep:
 class TestAuditDeriveMatchesTable:
     """derive_terminal_status_from_audit applies exactly the table's effects."""
 
-    @pytest.mark.parametrize("pair", [p for p in _ALL_TABLE_PAIRS if p != (None, TerminalPath.BUFFERED)], ids=str)
+    @pytest.mark.parametrize("pair", [p for p in _ALL_TABLE_PAIRS if p[0] is not None], ids=str)
     def test_terminal_pair_counters_match_table(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         effect = TERMINAL_PAIR_COUNTER_EFFECTS[pair]
         # COALESCED derive counts only the merged output (sink_name set);
@@ -196,6 +221,15 @@ class TestAuditDeriveMatchesTable:
 
         expected = _expected_counters(TERMINAL_PAIR_COUNTER_EFFECTS[(None, TerminalPath.BUFFERED)])
         _assert_governed_fields_match(counters, expected, context="derive (None, BUFFERED)")
+
+    def test_abandoned_record_crashes_the_derive(self) -> None:
+        """ADR-038: an ABANDONED record on a run being re-derived is an audit
+        contradiction — the record asserts no resume can ever run, yet the
+        derive only executes inside a resume. Fail closed, never count."""
+        factory = _fake_factory([_token_outcome(None, TerminalPath.ABANDONED, sink_name=None, completed=False)])
+
+        with pytest.raises(AuditIntegrityError, match="ABANDONED"):
+            derive_terminal_status_from_audit(factory, "run-1")  # type: ignore[arg-type]
 
     def test_coalesced_consumed_input_counts_nothing(self) -> None:
         """A consumed branch input (sink_name None) delegates to the merged token."""
@@ -221,7 +255,7 @@ class TestLiveAccumulatorMatchesTable:
     @pytest.mark.parametrize("pair", _FORBIDDEN_PAIRS, ids=str)
     def test_diversion_pairs_are_forbidden_in_processing_results(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         counters = ExecutionCounters()
-        with pytest.raises(OrchestrationInvariantError, match="Diversion path"):
+        with pytest.raises(OrchestrationInvariantError, match="forbidden in processing results"):
             accumulate_row_outcomes([_row_result(pair[0], pair[1], sink_name=_SINK)], counters, {_SINK: []})
 
 
@@ -237,7 +271,9 @@ class TestReconcileMatchesTable:
             if effect.counts_routed_destination:
                 counters.routed_destinations[_SINK] += 1
         error_hash = "a" * 64 if pair[1] in PendingOutcome._REQUIRES_ERROR_HASH_PATHS else None
-        pending = PendingOutcome(outcome=pair[0], path=pair[1], error_hash=error_hash)
+        pending = PendingOutcome(
+            outcome=pair[0], path=pair[1], error_hash=error_hash, join_group_id=("join-1" if pair[1] is TerminalPath.COALESCED else None)
+        )
 
         reconcile_sink_write_diversions(counters, sink_name=_SINK, pending_outcome=pending, diversion_count=3)
 
@@ -248,13 +284,17 @@ class TestReconcileMatchesTable:
     )
     def test_non_reconcilable_pairs_are_rejected(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         error_hash = "a" * 64 if pair[1] in PendingOutcome._REQUIRES_ERROR_HASH_PATHS else None
-        pending = PendingOutcome(outcome=pair[0], path=pair[1], error_hash=error_hash)
+        pending = PendingOutcome(
+            outcome=pair[0], path=pair[1], error_hash=error_hash, join_group_id=("join-1" if pair[1] is TerminalPath.COALESCED else None)
+        )
         with pytest.raises(OrchestrationInvariantError, match="Unexpected sink-bound pending pair"):
             reconcile_sink_write_diversions(ExecutionCounters(), sink_name=_SINK, pending_outcome=pending, diversion_count=1)
 
     @pytest.mark.parametrize("pair", _RECONCILABLE_PAIRS, ids=str)
     def test_underflow_fails_closed(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         error_hash = "a" * 64 if pair[1] in PendingOutcome._REQUIRES_ERROR_HASH_PATHS else None
-        pending = PendingOutcome(outcome=pair[0], path=pair[1], error_hash=error_hash)
+        pending = PendingOutcome(
+            outcome=pair[0], path=pair[1], error_hash=error_hash, join_group_id=("join-1" if pair[1] is TerminalPath.COALESCED else None)
+        )
         with pytest.raises(OrchestrationInvariantError, match="Cannot subtract"):
             reconcile_sink_write_diversions(ExecutionCounters(), sink_name=_SINK, pending_outcome=pending, diversion_count=1)

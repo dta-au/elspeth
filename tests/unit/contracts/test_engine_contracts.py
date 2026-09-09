@@ -113,6 +113,18 @@ class TestPendingOutcomePostInit:
         po = PendingOutcome(outcome=TerminalOutcome.FAILURE, path=TerminalPath.QUARANTINED_AT_SOURCE, error_hash="abc123")
         assert po.error_hash == "abc123"
 
+    def test_gate_error_discarded_requires_error_hash(self) -> None:
+        with pytest.raises(ValueError, match=r"GATE_ERROR_DISCARDED.*error_hash"):
+            PendingOutcome(outcome=TerminalOutcome.FAILURE, path=TerminalPath.GATE_ERROR_DISCARDED)
+
+    def test_gate_error_discarded_with_error_hash_accepted(self) -> None:
+        po = PendingOutcome(
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.GATE_ERROR_DISCARDED,
+            error_hash="abc123",
+        )
+        assert po.error_hash == "abc123"
+
     def test_completed_without_error_hash_accepted(self) -> None:
         po = PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW)
         assert po.error_hash is None

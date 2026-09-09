@@ -419,10 +419,17 @@ class TestElspethSettingsAlignment:
         "sinks",  # Required - named sink configs
         "gates",  # Optional - config-driven routing
         "coalesce",  # Optional - fork path merging
+        "row_unions",  # Optional - fork-branch UNION ALL barriers
+        "collectors",  # Optional - EXPAND-group closers (barrier-scopes spec §3)
+        "scopes",  # Optional - opener/closer scope bindings (barrier-scopes spec §3)
+        "max_bound_region_depth",  # Supported bound-region nesting depth (barrier-scopes spec §6.3)
+        "max_expand_group_width",  # Expand fan-out width fence (elspeth-258bd49d81)
         "aggregations",  # Optional - config-driven batching
         "depends_on",  # Optional - pipeline dependencies
         "commencement_gates",  # Optional - pre-flight go/no-go conditions
         "collection_probes",  # Optional - vector store readiness checks
+        "llm_profiles",  # Optional - operator-owned LLM provider profile catalog
+        "default_llm_profile",  # Optional - preferred LLM profile alias
     }
 
     # Run mode fields (how to execute)

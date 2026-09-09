@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -16,10 +16,12 @@ import structlog
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 
@@ -174,8 +176,25 @@ CONTEXT_LENGTH_PATTERNS = (
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="provider/SDK exception objects raised by the LLM client library (OpenAI, Azure, LiteLLM, httpx)",
+    source_param="exception",
+    suppresses=("R1",),
+    invariant=(
+        "classifies by message text and by an optional instance-level status_code; "
+        "returns 'unknown' rather than raising when the exception carries neither"
+    ),
+    non_raising=True,
+)
 def _classify_llm_error(exception: Exception) -> str:
-    """Classify an LLM error into a canonical category."""
+    """Classify an LLM error into a canonical category.
+
+    Tier 3 boundary: the exception is constructed by the provider SDK, so its
+    attribute set is not ours to assume. ``status_code`` is read from the
+    instance dict only — a class-level or property ``status_code`` on an SDK
+    exception type is not a per-response fact.
+    """
     error_str = str(exception).lower()
 
     if any(pattern in error_str for pattern in _CONTENT_POLICY_PATTERNS):
@@ -187,7 +206,7 @@ def _classify_llm_error(exception: Exception) -> str:
     if re.search(r"\b429\b", error_str) or any(pattern.search(error_str) for pattern in _RATE_LIMIT_PATTERNS):
         return "rate_limit"
 
-    status_code = vars(exception).get("status_code")
+    status_code = exception.__dict__.get("status_code")
     if type(status_code) is int and status_code in (500, 502, 503, 504, 529):
         return "server"
     if _SERVER_ERROR_CODE_PATTERN.search(error_str):
@@ -199,6 +218,18 @@ def _classify_llm_error(exception: Exception) -> str:
     return "unknown"
 
 
+@trust_boundary(
+    tier=3,
+    source="provider token-usage payloads returned by the LLM client library (OpenAI, Azure, LiteLLM) — an SDK object, a mapping, or a partial aggregate-only payload",
+    source_param="usage",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "normalizes mapping- and attribute-shaped usage payloads through TokenUsage.from_dict; "
+        "an absent payload becomes TokenUsage.unknown() and absent or non-int counters become "
+        "explicit None — never a fabricated zero, never a raise"
+    ),
+    non_raising=True,
+)
 def _extract_usage_from_provider_response(usage: Any) -> TokenUsage:
     """Normalize provider usage objects at the Tier 3 boundary.
 
@@ -259,7 +290,7 @@ class AuditedLLMClient(AuditedClientBase):
 
         response = client.chat_completion(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
+            messages=[ChatMessage(role="user", content="Hello")],
         )
         print(response.content)
     """
@@ -311,30 +342,33 @@ class AuditedLLMClient(AuditedClientBase):
         authoritative Landscape record already succeeded (telemetry primacy
         order). This is the single named best-effort path for the LLM client:
         Tier-1 audit-integrity violations and programming errors re-raise (they
-        are bugs in our code and must crash), and only genuine operational
-        telemetry-transport failures fall through to the last-resort logger.
+        are bugs in our code and must crash). Other callback failures are
+        acknowledged through the last-resort logger without changing the
+        already-audited call outcome.
         The telemetry callback is a bare ``Callable`` supplied by the caller, so
-        the residual catch cannot be narrowed to a typed telemetry error.
+        the residual catch cannot be narrowed to a typed telemetry error. Event
+        construction — hashing included — happens BEFORE the try: a failure
+        there is a first-party bug and crashes without ever entering the
+        best-effort containment below, which wraps only the callback delivery.
         """
+        event = ExternalCallCompleted(
+            timestamp=datetime.now(UTC),
+            run_id=self._run_id,
+            call_type=CallType.LLM,
+            provider=self._provider,
+            status=call_status,
+            latency_ms=latency_ms,
+            state_id=self._telemetry_state_id(),
+            operation_id=self._telemetry_operation_id(),
+            token_id=self._telemetry_token_id(),
+            request_hash=stable_hash(request_data),
+            response_hash=stable_hash(response_data) if response_data is not None else None,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            token_usage=token_usage,
+        )
         try:
-            self._telemetry_emit(
-                ExternalCallCompleted(
-                    timestamp=datetime.now(UTC),
-                    run_id=self._run_id,
-                    call_type=CallType.LLM,
-                    provider=self._provider,
-                    status=call_status,
-                    latency_ms=latency_ms,
-                    state_id=self._telemetry_state_id(),
-                    operation_id=self._telemetry_operation_id(),
-                    token_id=self._telemetry_token_id(),
-                    request_hash=stable_hash(request_data),
-                    response_hash=stable_hash(response_data) if response_data is not None else None,
-                    request_payload=request_payload,
-                    response_payload=response_payload,
-                    token_usage=token_usage,
-                )
-            )
+            self._telemetry_emit(event)
         except contract_errors.TIER_1_ERRORS:
             raise  # System bugs and audit integrity violations must crash
         except (TypeError, AttributeError, KeyError, NameError):
@@ -344,19 +378,17 @@ class AuditedLLMClient(AuditedClientBase):
             # already holds the authoritative record; telemetry is best-effort.
             logger.warning(
                 "telemetry_emit_failed",
-                error=str(tel_err),
                 error_type=type(tel_err).__name__,
                 run_id=self._run_id,
                 state_id=self._telemetry_state_id(),
                 operation_id=self._telemetry_operation_id(),
                 call_type="llm",
-                exc_info=True,
             )
 
     def chat_completion(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
@@ -367,7 +399,9 @@ class AuditedLLMClient(AuditedClientBase):
 
         Args:
             model: Model identifier (e.g., "gpt-4", "gpt-3.5-turbo")
-            messages: List of message dicts with "role" and "content"
+            messages: Ordered chat messages. The SDK sees the wire projection
+                (base64 image data URIs); the audit trail sees the bytes-free
+                projection.
             temperature: Sampling temperature (default: 0.0 for determinism)
             max_tokens: Maximum tokens to generate (optional)
             resolved_prompt_template_hash: Phase 5b Task 9 cross-DB anchor.
@@ -398,7 +432,7 @@ class AuditedLLMClient(AuditedClientBase):
         # DTO stays alive for typed telemetry payload; dict form used for Landscape hashing.
         request_dto = LLMCallRequest(
             model=model,
-            messages=messages,
+            messages=audit_messages(messages),  # bytes-free audit form
             temperature=temperature,
             provider=self._provider,
             max_tokens=max_tokens,
@@ -410,7 +444,7 @@ class AuditedLLMClient(AuditedClientBase):
         # serializing as JSON null (which can trigger provider validation errors)
         sdk_kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": wire_messages(messages),  # wire form to the SDK only
             "temperature": temperature,
             **kwargs,
         }

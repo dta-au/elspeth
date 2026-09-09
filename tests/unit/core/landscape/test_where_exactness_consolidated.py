@@ -31,6 +31,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from tests.fixtures.landscape import leader_coordination_token
 
 if TYPE_CHECKING:
     from tests.fixtures.multi_run import MultiRunFixture
@@ -85,7 +86,7 @@ class TestCompleteRunWhereExactness:
     def test_completes_only_target_run(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        fix.factory.run_lifecycle.complete_run("run-B", RunStatus.COMPLETED)
+        fix.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(fix.factory, "run-B"))
 
         run_b = fix.factory.run_lifecycle.get_run("run-B")
         assert run_b is not None
@@ -105,7 +106,9 @@ class TestUpdateRunStatusWhereExactness:
     def test_updates_only_target_run(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        fix.factory.run_lifecycle.update_run_status("run-B", RunStatus.INTERRUPTED)
+        fix.factory.run_lifecycle.update_run_status(
+            RunStatus.INTERRUPTED, coordination_token=leader_coordination_token(fix.factory, "run-B")
+        )
 
         run_b = fix.factory.run_lifecycle.get_run("run-B")
         assert run_b is not None
@@ -124,7 +127,9 @@ class TestGetSourceFieldResolutionWhereExactness:
     def test_returns_only_target_run_resolution(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        fix.factory.run_lifecycle.record_source_field_resolution("run-B", {"Original Header": "original_header"}, "v1")
+        fix.factory.run_lifecycle.record_source_field_resolution(
+            {"Original Header": "original_header"}, "v1", coordination_token=leader_coordination_token(fix.factory, "run-B")
+        )
 
         resolution = fix.factory.run_lifecycle.get_source_field_resolution("run-B")
         assert resolution is not None
@@ -139,7 +144,9 @@ class TestSetExportStatusWhereExactness:
     def test_updates_only_target_run(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        fix.factory.run_lifecycle.set_export_status("run-B", ExportStatus.COMPLETED)
+        fix.factory.run_lifecycle.set_export_status(
+            ExportStatus.COMPLETED, coordination_token=leader_coordination_token(fix.factory, "run-B")
+        )
 
         run_b = fix.factory.run_lifecycle.get_run("run-B")
         assert run_b is not None
@@ -158,9 +165,15 @@ class TestGetSecretResolutionsForRunWhereExactness:
     def test_returns_only_target_run_resolutions(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        fix.factory.run_lifecycle.record_secret_resolutions("run-A", [_make_secret_resolution("KEY_A", "a")])
-        fix.factory.run_lifecycle.record_secret_resolutions("run-B", [_make_secret_resolution("KEY_B", "b")])
-        fix.factory.run_lifecycle.record_secret_resolutions("run-C", [_make_secret_resolution("KEY_C", "c")])
+        fix.factory.run_lifecycle.record_secret_resolutions(
+            [_make_secret_resolution("KEY_A", "a")], coordination_token=leader_coordination_token(fix.factory, "run-A")
+        )
+        fix.factory.run_lifecycle.record_secret_resolutions(
+            [_make_secret_resolution("KEY_B", "b")], coordination_token=leader_coordination_token(fix.factory, "run-B")
+        )
+        fix.factory.run_lifecycle.record_secret_resolutions(
+            [_make_secret_resolution("KEY_C", "c")], coordination_token=leader_coordination_token(fix.factory, "run-C")
+        )
 
         resolutions = fix.factory.run_lifecycle.get_secret_resolutions_for_run("run-B")
 
@@ -175,7 +188,7 @@ class TestListRunsWhereExactness:
     def test_filters_by_exact_status(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        fix.factory.run_lifecycle.complete_run("run-B", RunStatus.COMPLETED)
+        fix.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(fix.factory, "run-B"))
 
         completed_runs = fix.factory.run_lifecycle.list_runs(status=RunStatus.COMPLETED)
         assert len(completed_runs) == 1

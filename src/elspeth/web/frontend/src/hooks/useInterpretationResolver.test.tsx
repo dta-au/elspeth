@@ -1,6 +1,7 @@
 import { act, render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  describeError,
   useInterpretationResolver,
   type UseInterpretationResolverResult,
 } from "./useInterpretationResolver";
@@ -105,6 +106,26 @@ describe("useInterpretationResolver", () => {
     resetStore(useInterpretationEventsStore);
     vi.mocked(api.resolveInterpretation).mockReset();
     vi.mocked(api.optOutOfInterpretations).mockReset();
+  });
+
+  it("reports source data-contract drift without LLM prompt or node wording", () => {
+    const message =
+      "The demanded-field contract for source 'source' changed from [colour] to [colour, size] " +
+      "after this review was shown. Reload the session and review the current source data contract.";
+
+    const displayed = describeError({
+      status: 422,
+      error_type: "interpretation_source_data_contract_drift",
+      detail: message,
+    });
+
+    expect(displayed).toEqual({
+      heading: "Source data contract changed",
+      body: message,
+    });
+    expect(`${displayed.heading} ${displayed.body}`).not.toMatch(
+      /LLM|prompt|node/i,
+    );
   });
 
   it("preserves event B state when event A resolves late", async () => {

@@ -3,11 +3,17 @@ import { describe, expect, it } from "vitest";
 import { StatusBadge } from "./StatusBadge";
 
 describe("StatusBadge", () => {
-  it("maps completed_with_failures to the completed colour and shows the ⚠ glyph", () => {
+  it("gives completed_with_failures its own warning-family class and the ⚠ glyph (elspeth-cd885f4c4d)", () => {
+    // The badge must agree with the progress bar / toast / Run-tab dot, which
+    // all render this status as a warning — aliasing it to the green
+    // "completed" class reported a partial failure as an unqualified success.
     render(<StatusBadge status="completed_with_failures" data-testid="sb" />);
     const badge = screen.getByTestId("sb");
-    expect(badge).toHaveClass("status-badge", "status-badge-completed");
-    expect(badge).not.toHaveClass("status-badge-completed_with_failures");
+    expect(badge).toHaveClass(
+      "status-badge",
+      "status-badge-completed_with_failures",
+    );
+    expect(badge).not.toHaveClass("status-badge-completed");
     expect(badge).toHaveTextContent("⚠");
   });
   it("renders empty with its own colour and the ∅ glyph", () => {

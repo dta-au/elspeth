@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import structlog
@@ -17,9 +17,10 @@ from fastapi import FastAPI
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.blobs.protocol import fork_blob_id
+from elspeth.web.blobs.protocol import BlobForkWriteFence, fork_blob_id
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.config import WebSettings
@@ -31,6 +32,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -40,6 +42,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
     InvalidForkTargetError,
+    SessionForkParentAuthority,
 )
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes.guided_operations import guided_response_hash
@@ -47,7 +50,9 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _FORK_SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 _FORK_OUTPUT_ID = "22222222-2222-4222-8222-222222222222"
@@ -256,7 +261,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -276,33 +281,57 @@ async def _fork_session(
     parent = await service.get_session(source_session_id)
     assert parent.user_id == user_id
     assert parent.auth_provider_type == auth_provider_type
-    reserved = await service.reserve_guided_operation(
-        session_id=source_session_id,
-        operation_id=str(uuid.uuid4()),
-        kind="session_fork",
-        request_hash="a" * 64,
-        actor="composer_route",
-        lease_seconds=300,
-    )
-    assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
-    staged = await service.fork_session(
-        reserved.fence,
-        fork_message_id=fork_message_id,
-        new_message_content=new_message_content,
-    )
-    active = await service.settle_guided_fork_operation(
-        GuidedForkSettlementCommand(
-            fence=reserved.fence,
-            child_session_id=staged.session.id,
-            expected_current_state_id=staged.state.id if staged.state is not None else None,
-            edited_message_id=staged.messages[-1].id,
-            rewritten_state_id=None,
-            rewritten_state=None,
-            response_hash="b" * 64,
-            actor="composer_route",
+    parent_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=source_session_id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
     )
-    return active, list(staged.messages), staged.state
+    staged = None
+    try:
+        reserved = await service.reserve_guided_operation(
+            session_id=source_session_id,
+            operation_id=str(uuid.uuid4()),
+            kind="session_fork",
+            request_hash="a" * 64,
+            actor="composer_route",
+            lease_seconds=300,
+            session_operation_context=parent_context,
+        )
+        assert type(reserved) in {GuidedOperationClaimed, GuidedOperationTakenOver}
+        parent_authority = SessionForkParentAuthority(
+            parent_context=parent_context,
+            guided_fence=reserved.fence,
+        )
+        staged = await service.fork_session(
+            parent_authority,
+            fork_message_id=fork_message_id,
+            new_message_content=new_message_content,
+        )
+        active = await service.settle_guided_fork_operation(
+            GuidedForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=staged.state.id if staged.state is not None else None,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="b" * 64,
+                actor="composer_route",
+            )
+        )
+        return active, list(staged.messages), staged.state
+    finally:
+        if staged is not None:
+            await service._run_sync(
+                service.session_operation_authority.release,
+                staged.authority.child_context,
+            )
+        await service._run_sync(
+            service.session_operation_authority.release,
+            parent_context,
+        )
 
 
 async def _complete_guided_start_authority(
@@ -315,14 +344,23 @@ async def _complete_guided_start_authority(
 ) -> None:
     """Bind a fixture root and existing guided head through the production start APIs."""
     from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer.guided.profile import kind_for_profile
+    from elspeth.web.sessions.converters import state_from_record
     from elspeth.web.sessions.guided_operations import guided_operation_request_hash
     from elspeth.web.sessions.schemas import StartGuidedRequest
 
+    # Hash under the profile the checkpoint ACTUALLY carries. The custody
+    # helper recovers the discriminator from the start checkpoint rather than
+    # assuming "live" (goal-first, elspeth-378cfa0e18), so a tutorial-profile
+    # checkpoint whose start operation was hashed as live is a state no real
+    # start can produce — and pinning it would pin a fiction.
+    head_guided = state_from_record(state).guided_session
+    assert head_guided is not None
     operation_id = str(uuid.uuid4())
     request = StartGuidedRequest.model_validate(
         {
             "operation_id": operation_id,
-            "profile": "live",
+            "profile": kind_for_profile(head_guided.profile).value,
             "intent": root_message.content,
         },
         strict=True,
@@ -1929,6 +1967,53 @@ class TestForkSession:
 # ── Route-level tests ───────────────────────────────────────────────────
 
 
+def _expire_dead_fork_worker_leases(
+    service: SessionServiceImpl,
+    *,
+    parent_id: uuid.UUID,
+    operation_id: str,
+    child_id: uuid.UUID,
+    expired_at: datetime,
+) -> None:
+    """Age every database-clocked lease a fork worker held past ``expired_at``.
+
+    Three rows, not two: the guided operation row, the parent's live
+    SESSION_FORK fence, and the child's live SESSION_FORK fence, which
+    ``_insert_fork_child`` mints as a shadow of the parent lease (same owner,
+    same expiry). A worker that died holds none of them.
+    """
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(parent_id),
+                guided_operations_table.c.operation_id == operation_id,
+            )
+            .values(lease_expires_at=expired_at)
+        )
+        for session_id in (parent_id, child_id):
+            conn.execute(
+                update(session_operation_fences_table)
+                .where(
+                    session_operation_fences_table.c.session_id == str(session_id),
+                    session_operation_fences_table.c.operation_kind == SessionOperationKind.SESSION_FORK.value,
+                    session_operation_fences_table.c.released_at.is_(None),
+                )
+                .values(lease_expires_at=expired_at)
+            )
+
+
+def _fork_responses_diagnostic(winner_response: Any, stale_response: Any) -> str:
+    """Both responses' status and body, so a red carries the server's own reason.
+
+    The integrity envelope is fixed text; the exception message lives only in
+    the ``session.fork_rewrite_integrity_error`` server log line. The body
+    still names the failure code, which is what distinguishes a takeover
+    refusal from a crash.
+    """
+    return f"winner={winner_response.status_code} {winner_response.text!r}; stale={stale_response.status_code} {stale_response.text!r}"
+
+
 def _make_fork_app(
     tmp_path: Path,
     user_id: str = "alice",
@@ -1940,7 +2025,7 @@ def _make_fork_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = SessionServiceImpl(
+    session_service = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -2000,7 +2085,8 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
-            await blob_service.create_blob(parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv") for index in range(2)
+            await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+            for index in range(2)
         ]
         message = await service.add_message(
             parent.id,
@@ -2072,15 +2158,32 @@ class TestForkEndpoint:
                     ).scalar_one()
                     == 1
                 )
-            with service._engine.begin() as conn:
-                conn.execute(
-                    update(guided_operations_table)
-                    .where(
-                        guided_operations_table.c.session_id == str(parent.id),
-                        guided_operations_table.c.operation_id == operation_id,
-                    )
-                    .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
-                )
+            # A dead worker loses EVERY database-clocked lease it held: the
+            # guided operation row, the parent's SESSION_FORK fence, and the
+            # child's SESSION_FORK fence that was minted as a shadow of that
+            # parent lease (same owner, same expiry). Expire all three so the
+            # takeover winner acquires the parent lease honestly and then takes
+            # the child over as an expired fence.
+            #
+            # Expiring only the parent's two leases made this test a
+            # same-second race: the winner's re-acquired parent lease expires
+            # at CURRENT_TIMESTAMP + lease (one-second resolution on SQLite),
+            # and ``_resume_or_take_over_fork_child`` adopts a still-live child
+            # only when its expiry EQUALS that value -- true exactly when the
+            # stale worker's acquire and the winner's fell in the same clock
+            # second, and false (an ``AuditIntegrityError``, "bound fork child
+            # has an independently live session authority", answered as the
+            # 500 integrity envelope) whenever the box was slow enough for the
+            # two to straddle a boundary. The control below pins that refusal
+            # deterministically.
+            expired_at = datetime.now(UTC) - timedelta(seconds=1)
+            _expire_dead_fork_worker_leases(
+                service,
+                parent_id=parent.id,
+                operation_id=operation_id,
+                child_id=child_id,
+                expired_at=expired_at,
+            )
 
             winner_response = await asyncio.to_thread(
                 client.post,
@@ -2090,8 +2193,8 @@ class TestForkEndpoint:
             await asyncio.to_thread(resume_stale.wait, 5)
             stale_response = await stale_task
 
-        assert winner_response.status_code == stale_response.status_code == 201
-        assert winner_response.content == stale_response.content
+        assert winner_response.status_code == stale_response.status_code == 201, _fork_responses_diagnostic(winner_response, stale_response)
+        assert winner_response.content == stale_response.content, _fork_responses_diagnostic(winner_response, stale_response)
         assert winner_response.json() == {"session_id": str(child_id)}
         assert copy_calls == 2
         assert cleanup_calls == 0
@@ -2117,12 +2220,151 @@ class TestForkEndpoint:
             assert operation.result_session_id == str(child_id)
 
     @pytest.mark.asyncio
+    async def test_a_bound_child_whose_fence_outlives_the_parent_lease_is_refused_not_adopted(self, tmp_path) -> None:
+        """A live child fence the winner's parent lease does not cover is an integrity refusal.
+
+        Deterministic form of the race the takeover test above used to lose:
+        the parent's two leases are expired, the child's fence is left LIVE
+        with an expiry no future acquire can equal (its own value plus an
+        hour). ``_resume_or_take_over_fork_child`` then finds a child that
+        is neither expired nor the shadow of the winner's parent lease and
+        raises ``AuditIntegrityError("bound fork child has an independently
+        live session authority")``; the route settles the winner's attempt as
+        the closed ``integrity_error`` envelope. Under the old two-lease
+        expiry the same refusal fired whenever the stale worker's acquire and
+        the winner's straddled a CURRENT_TIMESTAMP second, so it needed no
+        load to reproduce -- only a slow enough box. No sleep is needed here.
+        """
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        parent = await service.create_session("alice", "Parent", "local")
+        for index in range(2):
+            await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+        message = await service.add_message(
+            parent.id,
+            "user",
+            "fork",
+            writer_principal="route_user_message",
+        )
+        operation_id = str(uuid.uuid4())
+        body = {
+            "operation_id": operation_id,
+            "from_message_id": str(message.id),
+            "new_message_content": "edited",
+        }
+        client = TestClient(app, raise_server_exceptions=False)
+        original_copy = blob_service.copy_blobs_for_fork
+        partial_copied = threading.Barrier(2)
+        resume_stale = threading.Barrier(2)
+        call_guard = threading.Lock()
+        copy_calls = 0
+
+        async def controlled_copy(*args: Any, **kwargs: Any):
+            nonlocal copy_calls
+            with call_guard:
+                copy_calls += 1
+                invocation = copy_calls
+            checkpoint = kwargs["checkpoint"]
+            checkpoint_count = 0
+
+            async def controlled_checkpoint() -> None:
+                nonlocal checkpoint_count
+                await checkpoint()
+                checkpoint_count += 1
+                if invocation == 1 and checkpoint_count == 3:
+                    await asyncio.to_thread(partial_copied.wait, 5)
+                    await asyncio.to_thread(resume_stale.wait, 5)
+
+            return await original_copy(*args, **{**kwargs, "checkpoint": controlled_checkpoint})
+
+        with patch.object(blob_service, "copy_blobs_for_fork", new=controlled_copy):
+            stale_task = asyncio.create_task(
+                asyncio.to_thread(
+                    client.post,
+                    f"/api/sessions/{parent.id}/fork",
+                    json=body,
+                )
+            )
+            await asyncio.to_thread(partial_copied.wait, 5)
+            with service._engine.connect() as conn:
+                operation = conn.execute(
+                    select(guided_operations_table).where(
+                        guided_operations_table.c.session_id == str(parent.id),
+                        guided_operations_table.c.operation_id == operation_id,
+                    )
+                ).one()
+                child_id = uuid.UUID(operation.result_session_id)
+                child_fence = conn.execute(
+                    select(session_operation_fences_table).where(
+                        session_operation_fences_table.c.session_id == str(child_id),
+                        session_operation_fences_table.c.released_at.is_(None),
+                    )
+                ).one()
+            expired_at = datetime.now(UTC) - timedelta(seconds=1)
+            _expire_dead_fork_worker_leases(
+                service,
+                parent_id=parent.id,
+                operation_id=operation_id,
+                child_id=child_id,
+                expired_at=expired_at,
+            )
+            # Revive the child's fence alone, an hour past its minted expiry:
+            # still live, and equal to no lease the winner can acquire. (One
+            # second would NOT do: the winner's lease is CURRENT_TIMESTAMP +
+            # 30 s, so a winner acquiring exactly one second after the stale
+            # worker would match it -- that offset made this control flake
+            # once in three runs before it was widened.)
+            with service._engine.begin() as conn:
+                conn.execute(
+                    update(session_operation_fences_table)
+                    .where(
+                        session_operation_fences_table.c.session_id == str(child_id),
+                        session_operation_fences_table.c.operation_id == child_fence.operation_id,
+                    )
+                    .values(lease_expires_at=child_fence.lease_expires_at + timedelta(hours=1))
+                )
+
+            winner_response = await asyncio.to_thread(
+                client.post,
+                f"/api/sessions/{parent.id}/fork",
+                json=body,
+            )
+            await asyncio.to_thread(resume_stale.wait, 5)
+            stale_response = await stale_task
+
+        diagnostic = _fork_responses_diagnostic(winner_response, stale_response)
+        assert winner_response.status_code == 500, diagnostic
+        assert winner_response.json() == {
+            "detail": {
+                "error_type": "guided_operation_terminal_failure",
+                "failure_code": "integrity_error",
+                "detail": "The operation failed an integrity check.",
+            }
+        }, diagnostic
+        assert copy_calls == 1, diagnostic
+        with service._engine.connect() as conn:
+            operation = conn.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == str(parent.id),
+                    guided_operations_table.c.operation_id == operation_id,
+                )
+            ).one()
+            assert operation.status == "failed", diagnostic
+            fence = conn.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(child_id))
+            ).one()
+            # The refusal adopted nothing: the child's fence is the row the
+            # stale worker minted, untouched.
+            assert fence.operation_id == child_fence.operation_id, diagnostic
+            assert fence.operation_epoch == child_fence.operation_epoch, diagnostic
+
+    @pytest.mark.asyncio
     async def test_successful_fork_lost_response_replays_exact_locator_and_rejects_hash_tamper(self, tmp_path) -> None:
         """A committed response is byte-stable, copy-once, and hash-verified on replay."""
 
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
-        await blob_service.create_blob(parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
+        await create_blob_under_fence(service, blob_service, parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
         message = await service.add_message(
             parent.id,
             "user",
@@ -2188,7 +2430,8 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
-            await blob_service.create_blob(parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv") for index in range(2)
+            await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+            for index in range(2)
         ]
         message = await service.add_message(
             parent.id,
@@ -2295,6 +2538,17 @@ class TestForkEndpoint:
             "fork",
             writer_principal="route_user_message",
         )
+        # The staged child's only blobs are the fork's own copies: its fence
+        # is held by the fork operation, so nothing else can create there.
+        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "staged.csv", b"private staged bytes", "text/csv")
+        parent_context = await service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=parent.id,
+                operation_kind=SessionOperationKind.SESSION_FORK,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
+        )
         claimed = await service.reserve_guided_operation(
             session_id=parent.id,
             operation_id=str(uuid.uuid4()),
@@ -2302,19 +2556,33 @@ class TestForkEndpoint:
             request_hash="a" * 64,
             actor="test",
             lease_seconds=300,
+            session_operation_context=parent_context,
         )
         assert isinstance(claimed, GuidedOperationClaimed)
         staged = await service.fork_session(
-            claimed.fence,
+            SessionForkParentAuthority(parent_context=parent_context, guided_fence=claimed.fence),
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )
-        staged_blob = await blob_service.create_blob(
+
+        async def checkpoint() -> None:
+            return None
+
+        copied = await blob_service.copy_blobs_for_fork(
+            parent.id,
             staged.session.id,
-            "staged.csv",
-            b"private staged bytes",
-            "text/csv",
+            staged.blob_plan,
+            BlobForkWriteFence(
+                source_session_id=parent.id,
+                target_session_id=staged.session.id,
+                operation_id=claimed.fence.operation_id,
+                lease_token=claimed.fence.lease_token,
+                attempt=claimed.fence.attempt,
+            ),
+            checkpoint=checkpoint,
         )
+        staged_blob = copied[parent_blob.id]
+        assert staged_blob.session_id == staged.session.id
         client = TestClient(app)
 
         listed = client.get("/api/sessions?include_archived=true")
@@ -2348,7 +2616,7 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-        parent_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
         stable_id = str(uuid.uuid4())
         guided = GuidedSession(
             step=GuidedStep.STEP_1_SOURCE,
@@ -2439,9 +2707,9 @@ class TestForkEndpoint:
         assert child_intent.options["blob_ref"] == child_blob_id
         assert child_intent.options["path"] == f"blob:{child_blob_id}"
         assert child_intent.sample_rows == ({"id": 1, "name": "Ada"},)
-        child_blob = await blob_service.get_blob(uuid.UUID(child_blob_id))
+        child_blob = await get_blob_under_fence(service, blob_service, child_id, uuid.UUID(child_blob_id))
         assert child_blob.session_id == child_id
-        assert await blob_service.read_blob_content(child_blob.id) == b"id,name\n1,Ada\n"
+        assert await read_blob_content_under_fence(service, blob_service, child_id, child_blob.id) == b"id,name\n1,Ada\n"
 
         committed = transition_source_inspection_review(
             child_guided,
@@ -2462,6 +2730,106 @@ class TestForkEndpoint:
         assert stable_id not in reloaded_guided.pending_source_intents
         assert reloaded_guided.reviewed_sources[stable_id].options["blob_ref"] == child_blob_id
         assert str(parent_blob.id) not in str(reloaded_guided.to_dict())
+
+    @pytest.mark.asyncio
+    async def test_explicit_blob_ref_reviewed_source_fork_child_projects_redacted(self, tmp_path) -> None:
+        """A fork rewrites BOTH the reviewed snapshot and the live source to the
+        child blob's private path plus ``blob_ref``. The projection must correlate
+        that binding on the persisted values and serve the child with the path
+        masked (elspeth-75d320fb25: correlating on the generic-redacted copy
+        rejected this consistent shape as a custody mismatch)."""
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+        from elspeth.web.composer.guided.resolved import SourceResolved
+        from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+        from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+        from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        catalog = create_catalog_service()
+        app.state.catalog_service = catalog
+        app.state.operator_profile_registry = MagicMock(spec=OperatorProfileRegistry)
+        app.state.plugin_snapshot_factory = lambda _user: PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        parent = await service.create_session("alice", "Parent", "local")
+        root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
+        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+        stable_id = str(uuid.uuid4())
+        options = {"path": parent_blob.storage_path, "blob_ref": str(parent_blob.id), "schema": {"mode": "observed"}}
+        guided = GuidedSession(
+            step=GuidedStep.STEP_2_SINK,
+            history=(
+                TurnRecord(
+                    step=GuidedStep.STEP_2_SINK,
+                    turn_type=TurnType.INSPECT_AND_CONFIRM,
+                    payload_hash="a" * 64,
+                    response_hash=None,
+                    emitter="server",
+                ),
+            ),
+            source_order=(stable_id,),
+            reviewed_sources={
+                stable_id: SourceResolved(
+                    name="orders",
+                    plugin="csv",
+                    options=options,
+                    observed_columns=("id", "name"),
+                    sample_rows=({"id": 1, "name": "Ada"},),
+                    on_validation_failure="discard",
+                )
+            },
+            root_intent_message_id=str(root.id),
+        )
+        state_data = CompositionStateData(
+            sources={"orders": {"plugin": "csv", "on_success": "out", "options": dict(options), "on_validation_failure": "discard"}},
+            nodes=[],
+            edges=[],
+            outputs=[],
+            metadata_={"name": "Guided", "description": ""},
+            is_valid=True,
+            composer_meta={"guided_session": guided.to_dict()},
+        )
+        state = await service.save_composition_state(parent.id, state_data, provenance="session_seed")
+        await _complete_guided_start_authority(
+            service,
+            session_id=parent.id,
+            root_message=root,
+            state=state,
+            state_data=state_data,
+        )
+        fork_message = await service.add_message(
+            parent.id,
+            "user",
+            "fork",
+            composition_state_id=state.id,
+            writer_principal="route_user_message",
+        )
+        client = TestClient(app)
+        response = client.post(
+            f"/api/sessions/{parent.id}/fork",
+            json={
+                "operation_id": str(uuid.uuid4()),
+                "from_message_id": str(fork_message.id),
+                "new_message_content": "edited",
+            },
+        )
+        assert response.status_code == 201
+        child_id = uuid.UUID(response.json()["session_id"])
+        child_state = await service.get_current_state(child_id)
+        assert child_state is not None
+        child_options = deep_thaw(child_state.sources)["orders"]["options"]
+        child_reviewed = deep_thaw(child_state.composer_meta)["guided_session"]["reviewed_sources"][stable_id]["options"]
+        assert child_options["blob_ref"] == child_reviewed["blob_ref"] != str(parent_blob.id)
+        assert child_options["path"] == child_reviewed["path"] != parent_blob.storage_path
+
+        projected = client.get(f"/api/sessions/{child_id}/state")
+        assert projected.status_code == 200, projected.text
+        body = projected.json()
+        assert body["sources"]["orders"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+        assert body["composer_meta"]["guided_session"]["reviewed_sources"][stable_id]["options"]["path"] == (REDACTED_BLOB_SOURCE_PATH)
+        assert child_options["path"] not in projected.text
+        assert parent_blob.storage_path not in projected.text
 
     @pytest.mark.asyncio
     async def test_fork_endpoint_creates_session(self, tmp_path) -> None:
@@ -2501,7 +2869,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        blob = await blob_service.create_blob(
+        blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -2618,7 +2988,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b,c\n1,2,3",
@@ -2645,7 +3017,7 @@ class TestForkEndpoint:
         assert new_blobs[0].session_id == new_session_id
 
         # Verify content matches
-        content = await blob_service.read_blob_content(new_blobs[0].id)
+        content = await read_blob_content_under_fence(service, blob_service, new_session_id, new_blobs[0].id)
         assert content == b"a,b,c\n1,2,3"
 
     @pytest.mark.asyncio
@@ -2664,7 +3036,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        original_blob = await blob_service.create_blob(
+        original_blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b,c\n1,2,3",
@@ -2721,7 +3095,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        original_blob = await blob_service.create_blob(
+        original_blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "prompt.txt",
             b"Classify this row.",
@@ -2908,7 +3284,7 @@ class TestForkEndpoint:
             poolclass=StaticPool,
         )
         initialize_session_schema(engine)
-        session_service = SessionServiceImpl(
+        session_service = DualFencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -2946,7 +3322,9 @@ class TestForkEndpoint:
 
         # Create source session with blobs using the generous-quota service
         session = await session_service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            session_service,
+            blob_service,
             session.id,
             "big.csv",
             b"x" * 200,
@@ -3038,7 +3416,9 @@ class TestForkEndpoint:
         )
 
         # Create a blob so blob_map is non-empty (triggers the rewrite path).
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3090,7 +3470,9 @@ class TestForkEndpoint:
             writer_principal="route_user_message",
         )
 
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3123,7 +3505,7 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(session.id, "data.csv", b"a,b\n1,2", "text/csv")
+        await create_blob_under_fence(service, blob_service, session.id, "data.csv", b"a,b\n1,2", "text/csv")
         msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
 
         # Use raise_server_exceptions=False so the 500 is returned as an
@@ -3166,7 +3548,9 @@ class TestForkEndpoint:
         session = await service.create_session("alice", "Original", "local")
 
         # Save a state with a blob_ref so the rewrite path is triggered
-        blob = await blob_service.create_blob(
+        blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3237,14 +3621,14 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(session.id, "data.csv", b"a,b\n1,2", "text/csv")
+        await create_blob_under_fence(service, blob_service, session.id, "data.csv", b"a,b\n1,2", "text/csv")
         msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
 
         primary = RuntimeError("disk I/O error during blob copy")
         cleanup = OSError("permission denied removing blob dir")
 
-        # Default raise_server_exceptions=True propagates the exact
-        # exception object so __notes__ is inspectable.
+        # The route maps the primary to a closed HTTP error. Inspect its
+        # retained notes and the independent operator cleanup record.
         client = TestClient(app)
 
         async def fail_copy_blobs_for_fork(*args: Any, **kwargs: Any) -> None:
@@ -3253,6 +3637,7 @@ class TestForkEndpoint:
         async def fail_cleanup_blobs_for_fork(*args: Any, **kwargs: Any) -> None:
             raise cleanup
 
+        operation_id = str(uuid.uuid4())
         with (
             patch.object(
                 blob_service,
@@ -3264,11 +3649,12 @@ class TestForkEndpoint:
                 "cleanup_blobs_for_fork",
                 new=fail_cleanup_blobs_for_fork,
             ),
+            structlog.testing.capture_logs() as logs,
         ):
             response = client.post(
                 f"/api/sessions/{session.id}/fork",
                 json={
-                    "operation_id": str(uuid.uuid4()),
+                    "operation_id": operation_id,
                     "from_message_id": str(msg.id),
                     "new_message_content": "Go edited",
                 },
@@ -3277,10 +3663,58 @@ class TestForkEndpoint:
         assert response.status_code == 500
 
         # RecoveryFailed[...] note identifies residual copied-blob custody.
-        notes = getattr(primary, "__notes__", [])
+        notes = primary.__notes__
         assert any("RecoveryFailed[OSError]" in note for note in notes), f"expected RecoveryFailed[OSError] note, got: {notes!r}"
-        assert any("permission denied removing blob dir" in note for note in notes)
+        assert all("permission denied removing blob dir" not in note for note in notes)
         assert any("fork blob cleanup failed" in note.lower() for note in notes)
+        records = [record for record in logs if record["event"] == "session.fork_blob_cleanup_failed"]
+        assert len(records) == 1
+        record = records[0]
+        assert record["session_id"] == str(session.id)
+        assert record["operation_id"] == operation_id
+        assert record["exc_class"] == "OSError"
+        child_id = record["child_session_id"]
+        assert child_id != str(session.id)
+        assert any(child_id in note for note in notes)
+        assert "permission denied removing blob dir" not in repr(records)
+        assert "permission denied removing blob dir" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_fork_cleanup_integrity_survives_failure_settlement_fence_loss(self, tmp_path) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        session = await service.create_session("alice", "Original", "local")
+        msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
+        integrity = AuditIntegrityError("fork compensation integrity")
+        fence_loss = SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+        settlements = 0
+
+        async def fail_copy(*args: Any, **kwargs: Any) -> None:
+            raise OSError("copy failed")
+
+        async def fail_cleanup(*args: Any, **kwargs: Any) -> None:
+            raise integrity
+
+        async def fail_settlement(*args: Any, **kwargs: Any) -> None:
+            nonlocal settlements
+            settlements += 1
+            raise fence_loss
+
+        with (
+            patch.object(blob_service, "copy_blobs_for_fork", new=fail_copy),
+            patch.object(blob_service, "cleanup_blobs_for_fork", new=fail_cleanup),
+            patch.object(service, "fail_guided_fork_operation", new=fail_settlement),
+            pytest.raises(AuditIntegrityError) as caught,
+        ):
+            TestClient(app).post(
+                f"/api/sessions/{session.id}/fork",
+                json={"operation_id": str(uuid.uuid4()), "from_message_id": str(msg.id), "new_message_content": "Edited"},
+            )
+        assert caught.value is integrity
+        assert integrity.__cause__ is fence_loss
+        assert settlements == 1
 
     @pytest.mark.asyncio
     async def test_fork_top_level_blob_ref_without_copied_blob_fails_closed(self, tmp_path) -> None:

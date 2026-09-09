@@ -184,13 +184,16 @@ describe("Phase 5b.18b.6 — Part A — 5a-then-5b hydration ordering", () => {
     expect(screen.getByTestId("acknowledgement-card")).toBeInTheDocument();
   });
 
-  it("humanises affected_node_id to the node's plugin label, not the raw id", () => {
+  it("humanises affected_node_id to a title-cased step label, not the raw id (R2-F8b)", () => {
     const event = makePendingEvent();
     // A model-choice card surfaces the step label in its title row.
     seed({ ...event, kind: "llm_model_choice", llm_draft: "gpt-4o" });
     render(<AcknowledgementStack sessionId={SESSION_ID} />);
-    // llm plugin → "Summarise"; the raw node id must NOT leak into copy.
-    expect(screen.getByText("Summarise step · model")).toBeInTheDocument();
+    // llm_rate_coolness is a user-meaningful node id, so it is title-cased
+    // and shown as the author named it; the raw snake_case id must NOT leak.
+    // "LLM", not "Llm": author names share the catalog's acronym set
+    // (elspeth-d2de348437).
+    expect(screen.getByText("LLM Rate Coolness step · model")).toBeInTheDocument();
     expect(screen.queryByText(new RegExp(LLM_NODE_ID))).toBeNull();
   });
 });
@@ -261,7 +264,7 @@ describe("Phase 5b.18b.6 — Part C — Change… + amend", () => {
     render(<AcknowledgementStack sessionId={SESSION_ID} />);
 
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     await user.clear(textarea);

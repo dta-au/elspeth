@@ -1,7 +1,7 @@
 # ELSPETH Platform Architecture
 
-**Document date:** 23 July 2026
-**Release covered:** 0.7.1
+**Document date:** 8 September 2026
+**Release covered:** 0.8.0
 **Audience:** Evaluators, technical leaders, architects, and assurance reviewers
 **Register:** Public-facing / technical
 **Status:** Current architecture overview
@@ -40,7 +40,7 @@ Source plugin
 Validated pipeline row
     |
     v
-Transform / gate / aggregation / queue / fork / coalesce graph
+Transform / gate / aggregation / queue / fork / coalesce / row union / collector graph
     |
     +--> External calls where configured
     |
@@ -144,7 +144,9 @@ stored result instead of silently applying a proposal twice.
 - Secret-resolution events record fingerprints, not raw secret values.
 - Payload hashes use canonical JSON so records can be compared deterministically.
 - Invalid external rows are quarantined rather than silently dropped.
-- Authentication supports local, OpenID Connect, and Microsoft Entra providers.
+- Authentication supports local accounts, OpenID Connect (including AWS
+  Cognito), Microsoft Entra ID, Google Workspace (restricted to one hosted
+  domain), and VANguard (the Australian Government's identity exchange).
 - Shareable review links use signed capability tokens and read-only inspect
   views.
 
@@ -165,7 +167,7 @@ The platform still requires deployment choices by the adopting team:
 
 The supported AWS profile runs one web task on Fargate with Aurora PostgreSQL,
 EFS, task-role S3 access, Cognito, Bedrock, CloudWatch, and X-Ray. ELSPETH is
-still pre-1.0: crossing the 0.7.1 session or Landscape schema boundary requires
+still pre-1.0: crossing the 0.8.0 session or Landscape schema boundary requires
 an archive/export decision and database recreation, not a mixed-version rollout
 or code rollback over the newer stores.
 
@@ -177,5 +179,5 @@ risk appetite or authority-to-operate boundary.
 - [`composer-guide.md`](composer-guide.md) explains the web authoring surface.
 - [`guarantees.md`](guarantees.md) lists the audit and lineage promises the
   system treats as defects if broken.
-- [`assessment-mapping.md`](assessment-mapping.md) maps current evidence to
-  public-sector evaluation touchpoints.
+- The [documentation index](../README.md) routes to the current contracts,
+  operational runbooks, and evaluation material.

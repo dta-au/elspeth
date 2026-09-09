@@ -10,6 +10,7 @@ function session(overrides: Partial<GuidedSession>): GuidedSession {
     terminal: null,
     chat_history: [],
     chat_turn_seq: 0,
+    reviewed_components: { sources: [], outputs: [] },
     profile: null,
     ...overrides,
   } as GuidedSession;
@@ -20,9 +21,9 @@ describe("latestAssistantRationale", () => {
     const s = session({
       step: "step_1_source",
       chat_history: [
-        { role: "user", content: "go", seq: 1, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null },
-        { role: "assistant", content: "Source created as a 3-row CSV.", seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null },
-        { role: "assistant", content: "Sink set.", seq: 4, step: "step_2_sink", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null },
+        { role: "user", content: "go", seq: 1, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null, turn_token: null },
+        { role: "assistant", content: "Source created as a 3-row CSV.", seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null, turn_token: null },
+        { role: "assistant", content: "Sink set.", seq: 4, step: "step_2_sink", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null, turn_token: null },
       ],
     });
     expect(latestAssistantRationale(s)).toBe("Source created as a 3-row CSV.");
@@ -31,7 +32,7 @@ describe("latestAssistantRationale", () => {
   it("returns null when no assistant turn exists for the step", () => {
     const s = session({
       step: "step_2_sink",
-      chat_history: [{ role: "user", content: "go", seq: 1, step: "step_2_sink", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null }],
+      chat_history: [{ role: "user", content: "go", seq: 1, step: "step_2_sink", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null, turn_token: null }],
     });
     expect(latestAssistantRationale(s)).toBeNull();
   });
@@ -47,6 +48,7 @@ describe("latestAssistantRationale", () => {
           ts_iso: "t",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
       ],
     });
@@ -56,7 +58,7 @@ describe("latestAssistantRationale", () => {
   it("rejects an over-long first line (falls back to the static step purpose)", () => {
     const s = session({
       chat_history: [
-        { role: "assistant", content: "x".repeat(300), seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null },
+        { role: "assistant", content: "x".repeat(300), seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null, turn_token: null },
       ],
     });
     expect(latestAssistantRationale(s)).toBeNull();
@@ -73,6 +75,7 @@ describe("latestAssistantRationale", () => {
           ts_iso: "t",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
       ],
     });
@@ -84,9 +87,9 @@ describe("latestAssistantRationale", () => {
   it("skips replies to the Explain question — an explanation is not a build rationale", () => {
     const s = session({
       chat_history: [
-        { role: "assistant", content: "Source created as a 3-row CSV.", seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null },
-        { role: "user", content: GUIDED_EXPLAIN_MESSAGE, seq: 3, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null },
-        { role: "assistant", content: "You're at Step 1 — here's everything set up so far.", seq: 4, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null },
+        { role: "assistant", content: "Source created as a 3-row CSV.", seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null, turn_token: null },
+        { role: "user", content: GUIDED_EXPLAIN_MESSAGE, seq: 3, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null, turn_token: null },
+        { role: "assistant", content: "You're at Step 1 — here's everything set up so far.", seq: 4, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null, turn_token: null },
       ],
     });
     // The headline stays the BUILD rationale (seq 2), not the higher-seq
@@ -97,8 +100,8 @@ describe("latestAssistantRationale", () => {
   it("falls back to the static purpose when the ONLY assistant turn is an explain reply", () => {
     const s = session({
       chat_history: [
-        { role: "user", content: GUIDED_EXPLAIN_MESSAGE, seq: 1, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null },
-        { role: "assistant", content: "You're at Step 1 — nothing configured yet.", seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null },
+        { role: "user", content: GUIDED_EXPLAIN_MESSAGE, seq: 1, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null, turn_token: null },
+        { role: "assistant", content: "You're at Step 1 — nothing configured yet.", seq: 2, step: "step_1_source", ts_iso: "t", assistant_message_kind: "assistant", synthetic_failure_reason: null, turn_token: null },
       ],
     });
     expect(latestAssistantRationale(s)).toBeNull();
@@ -115,6 +118,7 @@ describe("latestAssistantRationale", () => {
           ts_iso: "t",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
       ],
     });
@@ -132,6 +136,7 @@ describe("latestAssistantRationale", () => {
           ts_iso: "t",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "assistant",
@@ -141,6 +146,7 @@ describe("latestAssistantRationale", () => {
           ts_iso: "t",
 assistant_message_kind: "synthetic_failure",
           synthetic_failure_reason: "unavailable",
+          turn_token: null,
         },
       ],
     });
@@ -153,7 +159,7 @@ assistant_message_kind: "synthetic_failure",
     const s = session({
       step: "step_2_sink",
       chat_history: [
-        { role: "user", content: "go", seq: 1, step: "step_2_sink", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null },
+        { role: "user", content: "go", seq: 1, step: "step_2_sink", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null, turn_token: null },
         {
           role: "assistant",
           content: "I'm unavailable right now; you can still use the wizard controls.",
@@ -162,6 +168,7 @@ assistant_message_kind: "synthetic_failure",
           ts_iso: "t",
 assistant_message_kind: "synthetic_failure",
           synthetic_failure_reason: "unavailable",
+          turn_token: null,
         },
       ],
     });
@@ -183,6 +190,7 @@ assistant_message_kind: "synthetic_failure",
           ts_iso: "t",
 assistant_message_kind: "synthetic_failure",
           synthetic_failure_reason: "unavailable",
+          turn_token: null,
         },
       ],
     });
@@ -200,9 +208,143 @@ assistant_message_kind: "synthetic_failure",
           ts_iso: "t",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
       ],
     });
+    expect(latestAssistantRationale(s)).toBe("Source created as a 3-row CSV.");
+  });
+});
+
+// elspeth-bc8a35c1ab: the headline names the DECISION. A conversational
+// lead-in ("Here is an updated proposal.", "Great — you've given me…") names
+// nothing, and echoing chat prose into the h2 duplicates the bubble below it.
+// Rejection is safe: the caller falls back to the static step purpose.
+describe("latestAssistantRationale — conversational openers", () => {
+  function assistantSaying(content: string): GuidedSession {
+    return session({
+      chat_history: [
+        {
+          role: "assistant",
+          content,
+          seq: 2,
+          step: "step_1_source",
+          ts_iso: "t",
+          assistant_message_kind: "assistant",
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+      ],
+    });
+  }
+
+  it.each([
+    "Here is an updated proposal.",
+    "Here's the updated pipeline.",
+    "Great — you've given me the exact rows, so I can picture the data clearly.",
+    "Thanks! I've set that up.",
+    "Sure, that works.",
+    "Perfect.",
+    "Let me set up the source.",
+    "I'll wire the sink next.",
+    "Okay, updating now.",
+  ])("rejects the conversational opener %j", (content) => {
+    expect(latestAssistantRationale(assistantSaying(content))).toBeNull();
+  });
+
+  it("rejects a multi-sentence paragraph — a headline is one sentence", () => {
+    expect(
+      latestAssistantRationale(
+        assistantSaying(
+          "You gave me the exact rows. The source is now a 3-row inline CSV.",
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    "Source created as a 3-row CSV.",
+    "Sink set.",
+    "The source is built.",
+    "Inline CSV source with 3 comment rows.",
+    "Heres-a-weird-id set as the source name.",
+  ])("keeps the decision-naming headline %j", (content) => {
+    expect(latestAssistantRationale(assistantSaying(content))).toBe(content);
+  });
+});
+
+describe("the seeded goal acknowledgement (goal-first, elspeth-378cfa0e18)", () => {
+  // A started session's transcript opens with a user turn carrying the goal
+  // and one server line acknowledging it, BOTH stamped step_1_source. That
+  // assistant line is the newest assistant turn for step 1 the moment the
+  // session opens, so it is a candidate for the decision card's headline —
+  // where it would be wrong twice over: it is a handoff to the source
+  // question, not the name of a decision, and it duplicates the bubble
+  // directly below it.
+  //
+  // No new predicate and no duplicated server constant guard this: the
+  // acknowledgement is deliberately MULTI-SENTENCE, which the existing
+  // conversational-prose rejection already discards. That coupling is what is
+  // pinned here — rewording the server constant to a single sentence would put
+  // it in the h2, and this test is where that shows up.
+  const GOAL_ACKNOWLEDGEMENT =
+    "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?";
+
+  function seededSession(): GuidedSession {
+    return session({
+      step: "step_1_source",
+      chat_history: [
+        {
+          role: "user",
+          content: "Summarise each page and save the results as JSON.",
+          seq: 0,
+          step: "step_1_source",
+          ts_iso: "t",
+          assistant_message_kind: null,
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+        {
+          role: "assistant",
+          content: GOAL_ACKNOWLEDGEMENT,
+          seq: 1,
+          step: "step_1_source",
+          ts_iso: "t",
+          assistant_message_kind: "assistant",
+          synthetic_failure_reason: null,
+          turn_token: null,
+        },
+      ],
+    });
+  }
+
+  it("never becomes the decision headline, so the static step purpose renders", () => {
+    expect(latestAssistantRationale(seededSession())).toBeNull();
+  });
+
+  it("stays multi-sentence — the property the rejection depends on", () => {
+    // Stated as its own assertion so a reworded constant fails HERE, naming
+    // the cause, rather than only failing the assertion above.
+    expect(GOAL_ACKNOWLEDGEMENT.split(/(?<=[.!?])\s+/).length).toBeGreaterThan(1);
+  });
+
+  it("still yields a real step-1 headline once the assistant names a decision", () => {
+    // Non-vacuous counterpart: the seeded pair must not poison the step for
+    // the rest of the build.
+    const s = seededSession();
+    s.chat_history = [
+      ...s.chat_history,
+      {
+        role: "assistant",
+        content: "Source created as a 3-row CSV.",
+        seq: 3,
+        step: "step_1_source",
+        ts_iso: "t",
+        assistant_message_kind: "assistant",
+        synthetic_failure_reason: null,
+        turn_token: null,
+      },
+    ];
     expect(latestAssistantRationale(s)).toBe("Source created as a 3-row CSV.");
   });
 });

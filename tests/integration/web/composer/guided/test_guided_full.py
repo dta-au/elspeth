@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event, func, select, text
+from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import event, func, select
+from sqlalchemy.engine.interfaces import ExecutionContext
+from sqlalchemy.sql.dml import Delete, Insert, Update
+from sqlalchemy.sql.expression import FromClause
 
 from elspeth.contracts.blobs import BlobIntegrityError, BlobStateError
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
@@ -20,6 +25,7 @@ from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.guided_replay import project_composition_proposal
 from elspeth.web.sessions.models import (
+    blobs_table,
     chat_messages_table,
     composition_proposals_table,
     composition_states_table,
@@ -27,7 +33,11 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     proposal_events_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationCompleted
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    GuidedOperationCompleted,
+    GuidedOperationFenceLostError,
+)
 from elspeth.web.sessions.routes._helpers import (
     _composition_proposal_response,
     _state_from_record,
@@ -36,8 +46,30 @@ from elspeth.web.sessions.routes.composer import guided_plan as guided_plan_rout
 from elspeth.web.sessions.routes.composer.guided_plan import (
     _guided_full_failure_code,
 )
+from elspeth.web.sessions.routes.guided_operations import (
+    GuidedOperationExpired,
+    GuidedOperationLease,
+    reserve_or_replay_guided_operation,
+)
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+from tests.helpers.guided_leases import abandon_guided_worker_leases
+from tests.integration.web.composer.guided.test_respond import _assert_compose_context_for
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+
+
+def _dml_target_table(context: ExecutionContext) -> FromClause | None:
+    """Return the table a compiled DML statement writes to, else ``None``.
+
+    ``before_cursor_execute`` also fires for SELECT, DDL, and raw-text
+    execution, none of which carry a DML target; those cases are the honest
+    ``None``, not a missing attribute.
+    """
+    compiled = context.compiled
+    statement = compiled.statement if compiled is not None else None
+    if isinstance(statement, Insert | Update | Delete):
+        return statement.table
+    return None
 
 
 def _record_failed_llm_call(recorder, *, status: ComposerLLMCallStatus, secret: str) -> None:
@@ -63,6 +95,26 @@ def _record_failed_llm_call(recorder, *, status: ComposerLLMCallStatus, secret: 
             seed=None,
         )
     )
+
+
+def _assert_guided_plan_terminal_progress(
+    composer_test_client,
+    *,
+    session: dict[str, object],
+    operation_id: str,
+    phase: str,
+    reason: str,
+) -> None:
+    registry = composer_test_client.app.state.composer_progress_registry
+    session_id = str(session["id"])
+    snapshot = asyncio.run(registry.get_latest(session_id))
+
+    assert snapshot.request_id == operation_id
+    assert snapshot.phase == phase
+    assert snapshot.reason == reason
+    assert snapshot.inflight_requests == 0
+    active = asyncio.run(registry.list_active(user_id=str(session["user_id"])))
+    assert all(candidate.session_id != session_id for candidate in active)
 
 
 def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -> None:
@@ -114,6 +166,13 @@ def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -
         assert operation.proposal_id == payload["id"]
         assert operation.result_state_id == payload["base_state_id"]
         assert operation.originating_message_id is not None
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id="00000000-0000-4000-8000-000000000001",
+        phase="complete",
+        reason="composer_complete",
+    )
 
 
 @pytest.mark.parametrize("reason", ("operator_rejected", "superseded"))
@@ -150,6 +209,81 @@ def test_guided_full_completed_replay_is_exact_after_proposal_terminal_settlemen
     assert replay.json() == payload
 
 
+def test_guided_full_completed_replay_after_restart_restores_terminal_progress(
+    composer_test_client,
+) -> None:
+    session = composer_test_client.post("/api/sessions", json={"title": "guided restart replay progress"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000077"
+    body = {"operation_id": operation_id, "intent": "Persist and replay this exact proposal."}
+    first = composer_test_client.post(f"/api/sessions/{session['id']}/guided/plan", json=body)
+    assert first.status_code == 200, first.text
+
+    restarted = composer_test_client.app.state.restart_test_client()
+    replay = restarted.post(f"/api/sessions/{session['id']}/guided/plan", json=body)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    _assert_guided_plan_terminal_progress(
+        restarted,
+        session=session,
+        operation_id=operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
+
+
+def test_guided_full_completed_replay_cannot_overwrite_a_newer_active_operation(
+    composer_test_client,
+) -> None:
+    original_planner = composer_test_client.app.state.composer_service
+    session = composer_test_client.post("/api/sessions", json={"title": "guided replay progress custody"}).json()
+    older_operation_id = "00000000-0000-4000-8000-000000000078"
+    older_body = {"operation_id": older_operation_id, "intent": "Build the already completed proposal."}
+    completed = composer_test_client.post(f"/api/sessions/{session['id']}/guided/plan", json=older_body)
+    assert completed.status_code == 200, completed.text
+
+    class _BlockingNewerPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The newer guided operation is active.",
+                    evidence=("The exact newer request owns progress custody.",),
+                )
+            )
+            self.started.set()
+            await self.release.wait()
+            return await original_planner.plan_guided_full_pipeline(**kwargs)
+
+    planner = _BlockingNewerPlanner()
+    composer_test_client.app.state.composer_service = planner
+    newer_operation_id = "00000000-0000-4000-8000-000000000079"
+
+    async def replay_during_newer_operation() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            newer_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": newer_operation_id, "intent": "Build the newer active proposal."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            replay = await client.post(f"/api/sessions/{session['id']}/guided/plan", json=older_body)
+            assert replay.status_code == 200, replay.text
+            latest = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
+            assert latest.request_id == newer_operation_id
+            assert latest.phase == "calling_model"
+            planner.release.set()
+            newer = await asyncio.wait_for(newer_task, timeout=3)
+            assert newer.status_code == 200, newer.text
+
+    asyncio.run(replay_during_newer_operation())
+
+
 def test_guided_full_reserved_setup_failure_terminalizes_the_exact_operation(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,
@@ -173,6 +307,13 @@ def test_guided_full_reserved_setup_failure_terminalizes_the_exact_operation(
         )
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "operation_failed"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
+    )
 
 
 def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
@@ -199,6 +340,106 @@ def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
         )
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "operation_failed"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
+    )
+
+
+def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a_failure(
+    composer_test_client,
+) -> None:
+    """PlannerDeclined on the guided-full surface must not become operation_failed.
+
+    Mirrors the freeform surface's PlannerDeclined handling
+    (ComposerServiceImpl.compose): an honest decline from the escape-hatch
+    advisor is a conversational outcome, so the guided-full operation
+    completes with the advisor's own words persisted as an ordinary
+    assistant chat message — never routed through GuidedOperationFailureCode.
+    """
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+    decline_text = "I could not find a source plugin that reads this format."
+
+    class _DecliningPlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+    composer_test_client.app.state.composer_service = _DecliningPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full decline"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000056"
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["outcome"] == "declined"
+    assert payload["message"]["role"] == "assistant"
+    assert payload["message"]["content"] == decline_text
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+        assistant_rows = conn.execute(
+            select(chat_messages_table.c.id, chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(
+                chat_messages_table.c.role == "assistant"
+            )
+        ).all()
+        user_rows = conn.execute(
+            select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "user")
+        ).all()
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(proposal_events_table)) == 0
+
+    # Not a failure: completed, no failure_code, no proposal.
+    assert operation.status == "completed"
+    assert operation.failure_code is None
+    assert operation.result_kind == "declined"
+    assert operation.proposal_id is None
+    assert operation.result_state_id is not None
+    assert len(assistant_rows) == 1
+    decline_message_id = assistant_rows[0].id
+    assert assistant_rows[0].content == decline_text
+    assert assistant_rows[0].writer_principal == "compose_loop"
+    assert user_rows == [("Build a pipeline from an unsupported format.", "route_user_message")]
+
+    # A later assistant turn may legitimately retain the same unchanged
+    # composition-state association. Replay must use the immutable decline
+    # message locator, not scan by that non-unique state.
+    asyncio.run(
+        composer_test_client.app.state.session_service.add_message(
+            UUID(session["id"]),
+            "assistant",
+            "Later assistant turn with unchanged composition.",
+            writer_principal="compose_loop",
+            composition_state_id=UUID(operation.result_state_id),
+        )
+    )
+    replay = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
+    )
+    assert replay.status_code == 200
+    assert replay.json() == payload
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        replay_operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert replay_operation.result_message_id == decline_message_id
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
 
 
 def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkpoint(
@@ -242,6 +483,352 @@ def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkp
     assert secret not in str(audit_rows[0])
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "provider_unavailable"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="provider_unavailable",
+    )
+
+
+def test_guided_full_failure_settlement_error_surfaces_integrity_error(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed durable failure settlement crashes; it is never replaced.
+
+    Tier-remediation web-sessions (bundle sign-2026-08-30-w1): the old
+    behavior preserved the primary provider outcome and reduced the failed
+    ``fail_guided_operation_with_audit`` write to a best-effort log line,
+    leaving the operation row unsettled while the client saw a routine 503.
+    The settlement failure now surfaces as ``AuditIntegrityError``, with the
+    bounded secondary diagnostic still recorded and secret-free.
+    """
+    from structlog.testing import capture_logs
+
+    class _PrimaryFailurePlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            raise PipelinePlannerError("safe primary failure", code="PROVIDER_ERROR")
+
+    secondary_secret = "secondary-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
+
+    # The double carries the real writer's keyword-only fence argument. A
+    # narrower stub raises TypeError inside the route's failure arm, so the
+    # secondary diagnostic below would read that TypeError instead of the
+    # failure this test injects.
+    async def fail_cleanup(_command, *, session_operation_context):
+        raise RuntimeError(secondary_secret)
+
+    composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        fail_cleanup,
+    )
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cleanup primacy"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000074"
+
+    # The bare-FastAPI test fixture carries none of create_app's exception
+    # handlers, so the surfaced AuditIntegrityError propagates to the test
+    # transport verbatim — which pins the mechanism (in production the
+    # registered handler answers it as the audit_integrity_error 500).
+    with capture_logs() as logs, pytest.raises(AuditIntegrityError, match="could not record its terminal failure"):
+        composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={"operation_id": operation_id, "intent": "Preserve the provider failure."},
+        )
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["primary_failure_code"] == "provider_unavailable"
+    assert secondary_events[0]["secondary_exc_class"] == "RuntimeError"
+    assert secondary_secret not in str(secondary_events)
+
+
+def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcome(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _PrimaryFailurePlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            raise PipelinePlannerError("safe primary failure", code="PROVIDER_ERROR")
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def no_winner_lookup(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            return None
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        lose_failure_fence,
+    )
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided no failure winner"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000075"
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={"operation_id": operation_id, "intent": "Preserve the primary failure without a winner."},
+        )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["failure_code"] == "provider_unavailable"
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "fence_lost_no_winner"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="provider_unavailable",
+    )
+
+
+@pytest.mark.parametrize(
+    ("lookup_outcome", "expected_log_site"),
+    (
+        ("none", "main_fence_lost_no_winner"),
+        ("lease", "main_fence_lost_no_winner"),
+        ("expired", "main_fence_lost_no_winner"),
+        ("lookup_error", "main_fence_winner_lookup"),
+    ),
+)
+def test_guided_full_main_fence_loss_without_a_replayable_winner_preserves_the_primary_and_terminalizes_progress(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_outcome: str,
+    expected_log_site: str,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _FenceLosingPlanner:
+        def __init__(self) -> None:
+            self.fence = None
+
+        async def plan_guided_full_pipeline(self, **kwargs):
+            self.fence = kwargs["operation_fence"]
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(self.fence)
+
+    planner = _FenceLosingPlanner()
+    real_reserve = reserve_or_replay_guided_operation
+    reserved_leases: list[GuidedOperationLease] = []
+
+    async def no_replayable_winner(**kwargs):
+        if kwargs.get("reserve_if_absent") is not False:
+            reserved = await real_reserve(**kwargs)
+            if type(reserved) is GuidedOperationLease:
+                reserved_leases.append(reserved)
+            return reserved
+        if lookup_outcome == "lease":
+            # A live claim owns both authorities. The only live session lease
+            # on this session is the route's own reservation (a second acquire
+            # would conflict at the session fence), so the modelled winner
+            # shares it: the route's no-winner arm never touches
+            # ``session_lease`` and the route's own ``finally`` closes that
+            # lease exactly once.
+            assert planner.fence is not None
+            (reserved,) = reserved_leases
+            return GuidedOperationLease(fence=planner.fence, session_lease=reserved.session_lease)
+        if lookup_outcome == "expired":
+            return GuidedOperationExpired(attempt=1)
+        if lookup_outcome == "lookup_error":
+            raise RuntimeError("SENSITIVE_LOOKUP_DETAIL")
+        return None
+
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_replayable_winner)
+    session = composer_test_client.post("/api/sessions", json={"title": f"guided main fence {lookup_outcome}"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000081"
+
+    async def lose_fence() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            with pytest.raises(GuidedOperationFenceLostError, match="fence is no longer current"):
+                await client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Lose the main operation fence."},
+                )
+
+    with capture_logs() as logs:
+        asyncio.run(lose_fence())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["primary_failure_code"] == "operation_failed"
+    assert secondary_events[0]["site"] == expected_log_site
+    assert "SENSITIVE_LOOKUP_DETAIL" not in str(secondary_events)
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
+    )
+
+
+def test_guided_full_main_fence_primary_survives_cancelled_terminal_progress_cleanup(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _FenceLosingPlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(kwargs["operation_fence"])
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def no_winner(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            return None
+        return await real_reserve(**kwargs)
+
+    registry = composer_test_client.app.state.composer_progress_registry
+    real_bind = registry.bind_request
+
+    def bind_with_cancelled_terminal(**kwargs):
+        bound = real_bind(**kwargs)
+
+        async def publish(event):
+            if event.phase == "failed":
+                raise asyncio.CancelledError("terminal progress publisher cancelled")
+            await bound(event)
+
+        return publish
+
+    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner)
+    monkeypatch.setattr(registry, "bind_request", bind_with_cancelled_terminal)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled terminal cleanup"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000082"
+
+    async def lose_fence() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            with pytest.raises(GuidedOperationFenceLostError, match="fence is no longer current"):
+                await client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Preserve this primary fence failure."},
+                )
+
+    with capture_logs() as logs:
+        asyncio.run(lose_fence())
+
+    terminal_cleanup_events = [
+        event
+        for event in logs
+        if event.get("event") == "guided.plan_failure_settlement_secondary_failure" and event.get("site") == "terminal_progress"
+    ]
+    assert len(terminal_cleanup_events) == 1
+    assert terminal_cleanup_events[0]["secondary_exc_class"] == "CancelledError"
+    assert "terminal progress publisher cancelled" not in str(terminal_cleanup_events)
+
+
+@pytest.mark.parametrize("publisher_failure", ("runtime_error", "cancelled_error"))
+def test_guided_full_replayable_winner_survives_terminal_progress_publication_failure(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    publisher_failure: str,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session = composer_test_client.post("/api/sessions", json={"title": f"guided winner {publisher_failure}"}).json()
+    seed = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": "00000000-0000-4000-8000-000000000083", "intent": "Create a replayable winner."},
+    )
+    assert seed.status_code == 200, seed.text
+    winner = CompositionProposalResponse.model_validate_json(seed.text)
+
+    class _FenceLosingPlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(kwargs["operation_fence"])
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def replay_winner(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            return winner
+        return await real_reserve(**kwargs)
+
+    registry = composer_test_client.app.state.composer_progress_registry
+    real_bind = registry.bind_request
+
+    def bind_with_failed_complete(**kwargs):
+        bound = real_bind(**kwargs)
+
+        async def publish(event):
+            if event.phase == "complete":
+                if publisher_failure == "cancelled_error":
+                    raise asyncio.CancelledError("winner progress publisher cancelled")
+                raise RuntimeError("SENSITIVE_WINNER_PROGRESS_DETAIL")
+            await bound(event)
+
+        return publish
+
+    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_winner)
+    monkeypatch.setattr(registry, "bind_request", bind_with_failed_complete)
+    operation_id = "00000000-0000-4000-8000-000000000084"
+
+    async def recover_winner() -> Response:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            return await client.post(
+                f"/api/sessions/{session['id']}/guided/plan",
+                json={"operation_id": operation_id, "intent": "Recover the durable winner response."},
+            )
+
+    with capture_logs() as logs:
+        response = asyncio.run(recover_winner())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == seed.json()
+    terminal_cleanup_events = [
+        event
+        for event in logs
+        if event.get("event") == "guided.plan_failure_settlement_secondary_failure" and event.get("site") == "terminal_progress"
+    ]
+    assert len(terminal_cleanup_events) == 1
+    assert terminal_cleanup_events[0]["primary_failure_code"] == "durable_complete"
+    assert terminal_cleanup_events[0]["secondary_exc_class"] == (
+        "CancelledError" if publisher_failure == "cancelled_error" else "RuntimeError"
+    )
+    assert "winner progress publisher cancelled" not in str(terminal_cleanup_events)
+    assert "SENSITIVE_WINNER_PROGRESS_DETAIL" not in str(terminal_cleanup_events)
 
 
 def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_base(
@@ -250,7 +837,8 @@ def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_bas
     session = composer_test_client.post("/api/sessions", json={"title": "guided full existing"}).json()
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session["id"]),
             CompositionStateData(
                 sources={
@@ -322,7 +910,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     session_id = UUID(session["id"])
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 sources={},
@@ -337,7 +926,7 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     )
     real_stage = service.stage_guided_full_pipeline_proposal
 
-    async def stage_mismatched_state(command):
+    async def stage_mismatched_state(command, *, session_operation_context):
         mismatched_state = replace(command.state, metadata_={"name": "different checkpoint bytes"})
         mismatched_hash = _composition_state_data_content_hash(mismatched_state)
         mismatched_proposal = PipelineProposal.create(
@@ -358,21 +947,33 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
                 command,
                 state=mismatched_state,
                 plan=replace(command.plan, proposal=mismatched_proposal),
-            )
+            ),
+            session_operation_context=session_operation_context,
         )
 
     monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", stage_mismatched_state)
-    response = composer_test_client.post(
-        f"/api/sessions/{session['id']}/guided/plan",
-        json={
-            "operation_id": "00000000-0000-4000-8000-000000000056",
-            "intent": "Reject a mismatched checkpoint before publication.",
-        },
-    )
+    # ADR-008: the settlement's AuditIntegrityError escapes the route TYPED
+    # (never translated into the coded 500 envelope), while the durable row
+    # still records the failure as ``integrity_error`` for replay.
+    with pytest.raises(AuditIntegrityError, match="checkpoint content differs from the observed composition head"):
+        composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000056",
+                "intent": "Reject a mismatched checkpoint before publication.",
+            },
+        )
 
-    assert response.status_code == 500, response.text
-    assert response.json()["detail"]["failure_code"] == "integrity_error"
     with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(
+                select(guided_operations_table).where(guided_operations_table.c.operation_id == "00000000-0000-4000-8000-000000000056")
+            )
+            .mappings()
+            .one()
+        )
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
         states = conn.execute(select(composition_states_table.c.id).where(composition_states_table.c.session_id == session["id"])).all()
         assert states == [(str(existing.id),)]
         assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
@@ -431,15 +1032,15 @@ def test_guided_full_replay_fails_closed_on_persisted_authority_tamper(
     engine = composer_test_client.app.state.session_engine
     service = composer_test_client.app.state.session_service
     if tamper == "response_hash":
-        reserve = service.reserve_guided_operation
+        get_operation = service.get_guided_operation
 
-        async def tampered_reserve(*args, **kwargs):
-            outcome = await reserve(*args, **kwargs)
+        async def tampered_get_operation(*args, **kwargs):
+            outcome = await get_operation(*args, **kwargs)
             if isinstance(outcome, GuidedOperationCompleted):
                 return replace(outcome, response_hash="0" * 64)
             return outcome
 
-        monkeypatch.setattr(service, "reserve_guided_operation", tampered_reserve)
+        monkeypatch.setattr(service, "get_guided_operation", tampered_get_operation)
     else:
         get_messages = service.get_messages
 
@@ -559,7 +1160,9 @@ def test_guided_full_blob_failures_keep_custody_and_integrity_distinct() -> None
         ("PROVIDER_CALLS_EXHAUSTED", "invalid_provider_response"),
         ("TOOL_CALLS_EXHAUSTED", "invalid_provider_response"),
         ("COMPOSITION_EXHAUSTED", "invalid_provider_response"),
-        ("REPAIR_EXHAUSTED", "invalid_provider_response"),
+        # Planner-owned non-convergence answers its own honest code
+        # (elspeth-5904b1683a): the provider responded every repair turn.
+        ("REPAIR_EXHAUSTED", "planner_repair_exhausted"),
         ("DISCOVERY_ONLY", "invalid_provider_response"),
         ("DISCOVERY_EXHAUSTED", "invalid_provider_response"),
         ("DISCOVERY_CYCLE", "invalid_provider_response"),
@@ -573,6 +1176,304 @@ def test_guided_full_planner_failure_mapping_is_closed(
     expected: str,
 ) -> None:
     assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == expected
+
+
+@pytest.mark.parametrize("code", ("VALIDATION_FAILED", "REPAIR_EXHAUSTED", "COMPOSITION_EXHAUSTED"))
+@pytest.mark.parametrize("policy_code", ("aws_s3_source_not_allowed", "plugin_not_allowed_on_web"))
+def test_guided_full_policy_refusal_outranks_the_planner_code(code: str, policy_code: str) -> None:
+    """A categorical policy refusal is permanent, whatever code it exhausted under.
+
+    The same refusal arrives as REPAIR_EXHAUSTED once the model has burnt its
+    repair budget re-authoring the prohibited component (and, historically, as
+    VALIDATION_FAILED from the server-derived pass-through gate that
+    elspeth-b4a286d517 removed — the code stays in the closed map because
+    commit-time re-validation still raises it). Both are permanent, so the
+    classification is keyed on the rejection's closed detail codes rather than the
+    planner code — otherwise the user is told to retry a request that can never
+    succeed (guided S3, 2026-07-31).
+    """
+    exc = PipelinePlannerError("safe", code=code, detail_codes=(policy_code,))
+
+    assert _guided_full_failure_code(exc) == "policy_blocked"
+    # Without the policy code the same planner code stays retryable — the
+    # split must not swallow ordinary exhaustion. REPAIR_EXHAUSTED keeps its
+    # own honest planner-owned code (elspeth-5904b1683a); the rest remain a
+    # provider fault.
+    bare_expected = "planner_repair_exhausted" if code == "REPAIR_EXHAUSTED" else "invalid_provider_response"
+    assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == bare_expected
+
+
+_INLINE_CSV_CONTENT = b"color_name,hex\nred,#f00\n"
+
+
+class _InlineCustodyPlanner:
+    """Deterministic planner that performs REAL inline-custody preparation.
+
+    The provider is scripted, but nothing about custody is mocked: the
+    preparation is the production ``prepare_pipeline_custody`` output and the
+    settlement materializes the blob against the real session database with
+    foreign keys enforced (elspeth-1e3ad83d89's fix_verification demands
+    exactly this shape — the FK defect was invisible to every test that
+    stubbed custody out).
+    """
+
+    async def plan_guided_full_pipeline(self, *, base, recorder, policy_catalog, originating_message, **_kwargs):
+        from elspeth.contracts.enums import CreationModality
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.blobs.service import content_hash
+        from elspeth.web.composer.pipeline_custody import prepare_pipeline_custody
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PlannerSurface
+        from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
+
+        pipeline = {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "results",
+                "on_validation_failure": "discard",
+                "inline_blob": {
+                    "filename": "input.csv",
+                    "mime_type": "text/csv",
+                    "content": _INLINE_CSV_CONTENT.decode("utf-8"),
+                },
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": "results",
+                    "plugin": "json",
+                    "options": {"path": "/data/results.jsonl"},
+                    "on_write_failure": "discard",
+                }
+            ],
+        }
+        prepared = _PreparedBlobCreate(
+            blob_id="00000000-0000-4000-8000-00000000feed",
+            filename="input.csv",
+            mime_type="text/csv",
+            content_bytes=_INLINE_CSV_CONTENT,
+            content_hash=content_hash(_INLINE_CSV_CONTENT),
+            storage_path=Path("unused-provisional-path"),
+            description=None,
+            creation_modality=CreationModality.LLM_GENERATED,
+            created_from_message_id=originating_message.message_id,
+            creating_model_identifier="deterministic-inline-custody-planner",
+            creating_model_version="v1",
+            creating_provider="test",
+            creating_composer_skill_hash=stable_hash("inline-custody-planner-skill"),
+            creating_arguments_hash=stable_hash("inline-custody-planner-arguments"),
+        )
+        preparation = prepare_pipeline_custody(
+            pipeline,
+            prepared,
+            session_id=originating_message.session_id,
+            # Must match the fixture app's WebSettings default: the route
+            # plumbs settings.max_blob_storage_per_session_bytes into the
+            # stage command, and the command trips on divergence from the
+            # plan-time ceiling stamped here.
+            max_storage_per_session=500 * 1024 * 1024,
+        )
+        proposal = PipelineProposal.create(
+            pipeline=deep_thaw(preparation.arguments),
+            base=base,
+            reviewed_facts={},
+            surface=PlannerSurface.GUIDED_FULL,
+            repair_count=0,
+            skill_hash=stable_hash("deterministic-inline-custody-planner"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        )
+        return (
+            PipelinePlanResult(
+                proposal=proposal,
+                tool_call_id=f"guided-full-inline-{proposal.draft_hash[:16]}",
+                custody_result="ready",
+                model_identifier="deterministic-inline-custody-planner",
+                model_version="v1",
+                provider="test",
+                custody_preparation=preparation,
+            ),
+            {
+                "source": frozenset(item.name for item in policy_catalog.list_sources()),
+                "transform": frozenset(item.name for item in policy_catalog.list_transforms()),
+                "sink": frozenset(item.name for item in policy_catalog.list_sinks()),
+            },
+        )
+
+
+def test_guided_full_inline_custody_settles_atomically_with_its_originating_message(composer_test_client) -> None:
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full inline custody"}).json()
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={
+            "operation_id": "00000000-0000-4000-8000-000000000021",
+            "intent": "Load my inline CSV and write it out as JSON.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    engine = composer_test_client.app.state.session_engine
+    with engine.connect() as conn:
+        blob = conn.execute(select(blobs_table)).mappings().one()
+        user_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "user")).mappings().one()
+        proposal_row = conn.execute(select(composition_proposals_table)).mappings().one()
+        # The lineage FK is REAL here (session engines refuse to start
+        # without enforcement); prove the settled graph satisfies it.
+        assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+        assert blob["status"] == "ready"
+        assert blob["session_id"] == session["id"]
+        assert blob["created_from_message_id"] == user_row["id"]
+        assert blob["creation_modality"] == "llm_generated"
+        assert proposal_row["arguments_json"]["source"]["blob_id"] == blob["id"]
+    assert Path(blob["storage_path"]).read_bytes() == _INLINE_CSV_CONTENT
+
+    replay = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={
+            "operation_id": "00000000-0000-4000-8000-000000000021",
+            "intent": "Load my inline CSV and write it out as JSON.",
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.json() == response.json()
+
+
+def test_guided_full_inline_custody_refuses_settle_ceiling_divergent_from_plan(composer_test_client) -> None:
+    """The stage command trips when the route's settings-derived ceiling
+    differs from the ceiling the plan authorized the preparation under —
+    the two are plumbed from independent sources, so divergence must fail
+    closed instead of silently enforcing whichever value arrived, and
+    nothing from the staging cohort may become durable."""
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full ceiling divergence"}).json()
+    # Simulate the settle-time source diverging after plan time: the fake
+    # planner stamps the fixture default (500 MiB) on the preparation.
+    composer_test_client.app.state.settings = composer_test_client.app.state.settings.model_copy(
+        update={"max_blob_storage_per_session_bytes": 123 * 1024 * 1024}
+    )
+
+    # The command __post_init__ trips AuditIntegrityError, which the guided
+    # machinery records as a terminal integrity failure — never a settled
+    # proposal. ADR-008: that Tier-1 exception escapes the route TYPED (never
+    # translated into the coded 500 envelope), while the durable row still
+    # records the failure as ``integrity_error`` for replay.
+    with pytest.raises(AuditIntegrityError, match="custody storage ceiling diverges from the plan-time ceiling"):
+        composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000031",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+
+    engine = composer_test_client.app.state.session_engine
+    with engine.connect() as conn:
+        operation = (
+            conn.execute(
+                select(guided_operations_table).where(guided_operations_table.c.operation_id == "00000000-0000-4000-8000-000000000031")
+            )
+            .mappings()
+            .one()
+        )
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+        assert (
+            conn.execute(select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.role == "user")).scalar_one()
+            == 0
+        )
+
+
+def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(composer_test_client) -> None:
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full inline custody fault"}).json()
+    engine = composer_test_client.app.state.session_engine
+    armed = True
+
+    def inject_fault(_conn, _cursor, _statement, _parameters, context, _executemany):
+        nonlocal armed
+        if not armed:
+            return
+        target_table = _dml_target_table(context)
+        if target_table is blobs_table:
+            armed = False
+            raise RuntimeError("injected blob fault")
+
+    event.listen(engine, "before_cursor_execute", inject_fault)
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000022",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", inject_fault)
+
+    assert response.status_code == 500, response.text
+    assert not armed, "blob fault point was not reached"
+    with engine.connect() as conn:
+        # The blob write joined the atomic cohort: its fault must take the
+        # originating message, checkpoint, and proposal down with it.
+        assert conn.scalar(select(func.count()).select_from(blobs_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(chat_messages_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_states_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+        operation = (
+            conn.execute(
+                select(guided_operations_table).where(guided_operations_table.c.operation_id == "00000000-0000-4000-8000-000000000022")
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["originating_message_id"] is None
+
+
+def test_guided_full_late_fault_removes_inline_custody_artifacts_after_rollback(composer_test_client) -> None:
+    """A later cohort failure must not leave rowless custody bytes behind."""
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full late custody fault"}).json()
+    engine = composer_test_client.app.state.session_engine
+    armed = True
+
+    def inject_fault(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal armed
+        if not armed:
+            return
+        normalized = " ".join(statement.lower().split())
+        if "insert into proposal_events" in normalized:
+            armed = False
+            raise RuntimeError("injected post-custody proposal-event fault")
+
+    event.listen(engine, "before_cursor_execute", inject_fault)
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000032",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", inject_fault)
+
+    assert response.status_code == 500, response.text
+    assert not armed, "late fault point was not reached"
+    with engine.connect() as conn:
+        assert conn.scalar(select(func.count()).select_from(blobs_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(chat_messages_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_states_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+    session_blob_dir = Path(composer_test_client.app.state.settings.data_dir) / "blobs" / session["id"]
+    assert tuple(path for path in session_blob_dir.rglob("*") if path.is_file()) == ()
 
 
 @pytest.mark.parametrize(
@@ -599,8 +1500,7 @@ def test_guided_full_atomic_stage_fault_rolls_back_the_entire_cohort(
         if not armed:
             return
         normalized = " ".join(statement.lower().split())
-        compiled = getattr(context, "compiled", None)
-        target_table = getattr(getattr(compiled, "statement", None), "table", None)
+        target_table = _dml_target_table(context)
         label: str | None = None
         if target_table is composition_states_table:
             label = "checkpoint"
@@ -714,6 +1614,427 @@ def test_guided_full_cancel_before_staging_leaves_no_partial_cohort(composer_tes
     assert audit_rows[0].tool_calls[0]["_kind"] == "llm_call_audit"
     assert audit_rows[0].tool_calls[0]["call"]["error_message"] is None
     assert secret not in str(audit_rows[0])
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="cancelled",
+        reason="client_cancelled",
+    )
+
+
+def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_progress(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = composer_test_client.app.state.session_service
+    real_stage = service.stage_guided_full_pipeline_proposal
+    settlement_committed = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def committed_then_paused(command, *, session_operation_context):
+        result = await real_stage(
+            command,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session["id"]),
+        )
+        settlement_committed.set()
+        await release_settlement.wait()
+        return result
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", committed_then_paused)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided settled cancellation"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000073"
+
+    async def cancel_after_commit() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
+                )
+            )
+            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            release_settlement.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+    asyncio.run(cancel_after_commit())
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert operation["status"] == "completed"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
+
+
+def test_guided_full_cancellation_atomic_settlement_ordinary_failure_keeps_the_cancellation(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ORDINARY settlement failure stays the cause; the cancellation is primary.
+
+    The sibling test below pins the Tier-1 escape. This one pins the other
+    side of the same guard, and it is the half that had no coverage: an
+    adversarial review (2026-09-09) deleted the ``TIER_1_ERRORS`` test
+    entirely — promoting EVERY settlement failure to primary — and all 240
+    tests in the commit's blast radius stayed green. Without this test the
+    discrimination is free to rot.
+
+    ADR-008 registers no ordinary ``RuntimeError``, so the caller's
+    cancellation remains the authoritative outcome and the settlement fault
+    rides as its cause.
+    """
+    service = composer_test_client.app.state.session_service
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def started_then_fails_ordinary(command, *, session_operation_context):
+        _assert_compose_context_for(session_operation_context, session["id"])
+        settlement_started.set()
+        await release_settlement.wait()
+        raise RuntimeError("injected ordinary settlement failure")
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", started_then_fails_ordinary)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled ordinary settlement"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000078"
+    escaped: BaseException | None = None
+
+    async def cancel_during_settlement() -> None:
+        nonlocal escaped
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel while the settlement fails ordinarily."},
+                )
+            )
+            await asyncio.wait_for(settlement_started.wait(), timeout=3)
+            request_task.cancel("primary caller cancellation")
+            await asyncio.sleep(0)
+            release_settlement.set()
+            try:
+                await request_task
+            except BaseException as outcome:  # the escape TYPE is the subject under test
+                escaped = outcome
+
+    asyncio.run(cancel_during_settlement())
+
+    assert isinstance(escaped, asyncio.CancelledError), f"the cancellation must stay primary, got {escaped!r}"
+    assert type(escaped.__cause__) is RuntimeError, "the ordinary settlement failure rides as the cancellation's cause"
+    assert str(escaped.__cause__) == "injected ordinary settlement failure"
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "operation_failed", "an unregistered failure is not an integrity error"
+
+
+def test_guided_full_cancellation_atomic_settlement_integrity_failure_escapes_typed(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Tier-1 failure inside the atomic settlement outranks the cancellation.
+
+    The shielded staging settlement keeps running after the caller cancels
+    and stamps its failure onto the cancellation it re-raises. The route
+    settles the operation row under that failure's own code, but ADR-008
+    requires a registered Tier-1 error to bubble typed: the
+    ``AuditIntegrityError`` escapes as the primary with the cancellation
+    chained beneath it, instead of being demoted to the cause of a routine
+    ``CancelledError``.
+    """
+    service = composer_test_client.app.state.session_service
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def started_then_fails_integrity(command, *, session_operation_context):
+        _assert_compose_context_for(session_operation_context, session["id"])
+        settlement_started.set()
+        await release_settlement.wait()
+        raise AuditIntegrityError("injected atomic settlement integrity failure")
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", started_then_fails_integrity)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled integrity settlement"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000077"
+    escaped: BaseException | None = None
+
+    async def cancel_during_settlement() -> None:
+        nonlocal escaped
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel while the settlement fails integrity."},
+                )
+            )
+            await asyncio.wait_for(settlement_started.wait(), timeout=3)
+            request_task.cancel("primary caller cancellation")
+            await asyncio.sleep(0)
+            release_settlement.set()
+            try:
+                await request_task
+            except BaseException as outcome:  # the escape TYPE is the subject under test
+                escaped = outcome
+
+    asyncio.run(cancel_during_settlement())
+
+    assert type(escaped) is AuditIntegrityError, f"expected the typed integrity failure to escape, got {escaped!r}"
+    assert str(escaped) == "injected atomic settlement integrity failure"
+    assert isinstance(escaped.__cause__, asyncio.CancelledError), "the interrupted cancellation is chained beneath the failure"
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
+    )
+
+
+def test_guided_full_cancellation_settlement_error_surfaces_integrity_error(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed cancellation settlement crashes instead of riding the cancel.
+
+    Tier-remediation web-sessions (bundle sign-2026-08-30-w1): the old
+    behavior kept unwinding the cancellation while the failed
+    ``fail_guided_operation_with_audit`` write was reduced to a log line,
+    leaving the operation row unsettled with no surfaced cause. The
+    settlement failure now surfaces as ``AuditIntegrityError``, with the
+    bounded secondary diagnostic still recorded and secret-free.
+    """
+    from structlog.testing import capture_logs
+
+    secondary_secret = "cancel-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
+
+    class _BlockingPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    # The double carries the real writer's keyword-only fence argument. A
+    # narrower stub raises TypeError inside the route's failure arm, so the
+    # secondary diagnostic below would read that TypeError instead of the
+    # failure this test injects.
+    async def fail_cleanup(_command, *, session_operation_context):
+        raise RuntimeError(secondary_secret)
+
+    planner = _BlockingPlanner()
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        fail_cleanup,
+    )
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancel cleanup"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000076"
+
+    async def cancel_request() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel while surfacing the settlement failure."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            request_task.cancel("primary caller cancellation")
+            # The route consumes the injected cancellation, attempts the
+            # durable failure settlement, and — because that settlement
+            # itself fails — surfaces AuditIntegrityError instead of
+            # completing the unwind as a quiet cancel (the bare-FastAPI
+            # fixture has no exception handlers, so the type propagates).
+            with pytest.raises(AuditIntegrityError, match="could not record its terminal failure"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_request())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["primary_failure_code"] == "request_cancelled"
+    assert secondary_events[0]["secondary_exc_class"] == "RuntimeError"
+    assert secondary_secret not in str(secondary_events)
+
+
+def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preserving_cancellation(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _BlockingPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    planner = _BlockingPlanner()
+    real_reserve = reserve_or_replay_guided_operation
+    winner_lookups = 0
+
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def no_winner_lookup(**kwargs):
+        nonlocal winner_lookups
+        if kwargs.get("reserve_if_absent") is False:
+            winner_lookups += 1
+            return None
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        lose_failure_fence,
+    )
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancel no winner"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000080"
+
+    async def cancel_request() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel after the failure fence is lost."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            request_task.cancel("primary cancellation survives fence loss")
+            with pytest.raises(asyncio.CancelledError, match="primary cancellation survives fence loss"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_request())
+
+    assert winner_lookups == 1
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "fence_lost_no_winner"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="cancelled",
+        reason="client_cancelled",
+    )
+
+
+@pytest.mark.parametrize(
+    ("lookup_failure", "expected_exc_class"),
+    (
+        (AuditIntegrityError("winner replay failed its integrity check"), "AuditIntegrityError"),
+        (RuntimeError("winner rejoin defect"), "RuntimeError"),
+    ),
+    ids=("integrity", "first_party_defect"),
+)
+def test_guided_full_cancellation_fence_loss_propagates_a_failed_winner_lookup(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_failure: Exception,
+    expected_exc_class: str,
+) -> None:
+    """A failed winner rejoin outranks the cancellation it was enriching.
+
+    Parity with the ordinary-failure arm, which already propagates here: this
+    route lost the fence, so it has no durable write of its own in doubt —
+    what is in doubt is the operation record it just failed to read. Noting
+    that and reporting ``cancelled`` filed a Tier-1 corruption signal, or a
+    first-party defect in the rejoin, as a log line under a routine terminal
+    event. The bounded secondary note still lands first.
+    """
+    from structlog.testing import capture_logs
+
+    class _BlockingPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    planner = _BlockingPlanner()
+    real_reserve = reserve_or_replay_guided_operation
+
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def failing_winner_lookup(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise lookup_failure
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        lose_failure_fence,
+    )
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", failing_winner_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancel lookup fault"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000081"
+
+    async def cancel_request() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel into a broken winner rejoin."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            request_task.cancel("cancellation must not outrank a broken rejoin")
+            with pytest.raises(type(lookup_failure)) as exc_info:
+                await request_task
+            assert exc_info.value is lookup_failure
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_request())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "fence_lost_winner_lookup"
+    assert secondary_events[0]["secondary_exc_class"] == expected_exc_class
 
 
 def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
@@ -744,25 +2065,14 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
     body = {"operation_id": operation_id, "intent": "One exact winner."}
     engine = composer_test_client.app.state.session_engine
 
-    async def race():
+    async def race() -> tuple[Response, Response]:
         async with AsyncClient(
             transport=ASGITransport(app=composer_test_client.app),
             base_url="http://test",
         ) as client:
             stale = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.first_started.wait(), timeout=3)
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        "UPDATE guided_operations SET lease_expires_at = :expired "
-                        "WHERE session_id = :session_id AND operation_id = :operation_id"
-                    ),
-                    {
-                        "expired": datetime.now(UTC) - timedelta(seconds=1),
-                        "session_id": session["id"],
-                        "operation_id": operation_id,
-                    },
-                )
+            abandon_guided_worker_leases(engine, session_id=session["id"], operation_id=operation_id)
             winner = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.takeover_started.wait(), timeout=3)
             winner_response = await asyncio.wait_for(winner, timeout=3)
@@ -785,3 +2095,273 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
         )
     assert operation["status"] == "completed"
     assert operation["attempt"] == 2
+
+
+def test_late_older_guided_plan_progress_cannot_overwrite_the_newer_operation(
+    composer_test_client,
+) -> None:
+    original_planner = composer_test_client.app.state.composer_service
+
+    class _OrderedPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **kwargs):
+            self.calls += 1
+            call = self.calls
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            if call == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return await original_planner.plan_guided_full_pipeline(**kwargs)
+
+    planner = _OrderedPlanner()
+    composer_test_client.app.state.composer_service = planner
+    session = composer_test_client.post("/api/sessions", json={"title": "guided progress custody"}).json()
+    older_operation_id = "00000000-0000-4000-8000-000000000071"
+    newer_operation_id = "00000000-0000-4000-8000-000000000072"
+
+    async def race() -> tuple[int, int]:
+        async with (
+            AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client,
+            # The abandoned worker's fence-loss with no winner for ITS operation
+            # escapes the route as production's 500; keep it as a status so the
+            # race can assert on it rather than on a re-raised exception.
+            AsyncClient(
+                transport=ASGITransport(app=composer_test_client.app, raise_app_exceptions=False), base_url="http://test"
+            ) as stale_client,
+        ):
+            older = asyncio.create_task(
+                stale_client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": older_operation_id, "intent": "Build the older proposal."},
+                )
+            )
+            await asyncio.wait_for(planner.first_started.wait(), timeout=3)
+            newer_body = {"operation_id": newer_operation_id, "intent": "Build the newer proposal."}
+            # While the older operation is live it owns the session: the newer
+            # request is refused at the session-operation lease with the
+            # platform's 409 and publishes nothing.
+            refused = await asyncio.wait_for(client.post(f"/api/sessions/{session['id']}/guided/plan", json=newer_body), timeout=3)
+            assert refused.status_code == 409, refused.json()
+            assert refused.json() == {"detail": "Session operation is already active"}
+            latest_after_refusal = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
+            assert latest_after_refusal.request_id == older_operation_id
+            # Once both of the older worker's leases lapse (an abandoned
+            # replica), the newer request acquires the session and completes.
+            abandon_guided_worker_leases(engine, session_id=session["id"], operation_id=older_operation_id)
+            newer = await asyncio.wait_for(client.post(f"/api/sessions/{session['id']}/guided/plan", json=newer_body), timeout=3)
+            latest_after_newer = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
+            assert latest_after_newer.request_id == newer_operation_id
+            assert latest_after_newer.phase == "complete"
+
+            # The older worker's late progress cannot overwrite the newer
+            # operation's terminal state.
+            planner.release_first.set()
+            older_response = await asyncio.wait_for(older, timeout=3)
+            return older_response.status_code, newer.status_code
+
+    engine = composer_test_client.app.state.session_engine
+    older_status, newer_status = asyncio.run(race())
+
+    assert newer_status == 200
+    assert older_status != 200
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=newer_operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
+
+
+def test_guided_full_main_fence_winner_lookup_integrity_failure_aborts_instead_of_being_contained(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Tier-1 failure in the fence-loss winner lookup must bubble, not be noted.
+
+    The lookup validates durable state, so ``reserve_or_replay_guided_operation``
+    can raise ``AuditIntegrityError``. ADR-008 registers that class Tier-1: it
+    outranks the fence-loss primary (an ordinary concurrency outcome with a
+    replayable terminal envelope) and must abort rather than be reduced to a
+    bounded ``guided.plan_failure_settlement_secondary_failure`` diagnostic.
+    """
+    from structlog.testing import capture_logs
+
+    class _FenceLosingPlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(kwargs["operation_fence"])
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def integrity_failure_on_lookup(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise AuditIntegrityError("guided winner lookup could not verify the durable operation row")
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", integrity_failure_on_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided lookup integrity"}).json()
+    operation_id = "00000000-0000-4000-8000-0000000000a1"
+
+    async def lose_fence() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            with pytest.raises(AuditIntegrityError, match="could not verify the durable operation row"):
+                await client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Lose the fence, then fail the lookup."},
+                )
+
+    with capture_logs() as logs:
+        asyncio.run(lose_fence())
+
+    # Contained-and-noted is exactly what must NOT happen for a Tier-1 fault.
+    assert [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"] == []
+
+
+def test_guided_full_settled_cancellation_replay_failure_does_not_publish_a_fabricated_outcome(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed post-settlement replay must not assert an outcome it never read.
+
+    The settlement is durable, so the terminal event stays ``phase="complete"``.
+    But the replay is the only thing that knows whether the planner PROPOSED or
+    DECLINED, so substituting ``joined = None`` and publishing the
+    ``declined=False`` copy would tell the operator "the guided pipeline
+    proposal is ready for review" about a request that may have been declined.
+    The ordinary (non-Tier-1) replay fault stays contained and noted; the copy
+    must simply not claim the outcome.
+    """
+    from structlog.testing import capture_logs
+
+    service = composer_test_client.app.state.session_service
+    real_stage = service.stage_guided_full_pipeline_proposal
+    settlement_committed = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def committed_then_paused(command, *, session_operation_context):
+        result = await real_stage(
+            command,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session["id"]),
+        )
+        settlement_committed.set()
+        await release_settlement.wait()
+        return result
+
+    async def replay_boom(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise RuntimeError("SENSITIVE_REPLAY_DETAIL")
+        return await reserve_or_replay_guided_operation(**kwargs)
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", committed_then_paused)
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_boom)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided settled replay fault"}).json()
+    operation_id = "00000000-0000-4000-8000-0000000000a2"
+
+    async def cancel_after_commit() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
+                )
+            )
+            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            release_settlement.set()
+            # The primary cancellation survives the contained replay fault.
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_after_commit())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "completed_cancellation_replay"
+    assert secondary_events[0]["primary_failure_code"] == "durable_complete"
+    assert "SENSITIVE_REPLAY_DETAIL" not in str(secondary_events)
+
+    registry = composer_test_client.app.state.composer_progress_registry
+    snapshot = asyncio.run(registry.get_latest(str(session["id"])))
+    assert snapshot.phase == "complete"
+    assert snapshot.reason == "composer_complete"
+    # The fabricated "declined=False" copy must not be published.
+    assert snapshot.headline == "The guided pipeline request finished."
+    assert "ready for review" not in snapshot.headline
+
+
+def test_guided_full_settled_cancellation_replay_integrity_failure_aborts_instead_of_being_contained(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier-1 in the post-settlement replay bubbles instead of being noted."""
+    from structlog.testing import capture_logs
+
+    service = composer_test_client.app.state.session_service
+    real_stage = service.stage_guided_full_pipeline_proposal
+    settlement_committed = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def committed_then_paused(command, *, session_operation_context):
+        result = await real_stage(
+            command,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session["id"]),
+        )
+        settlement_committed.set()
+        await release_settlement.wait()
+        return result
+
+    async def replay_integrity_failure(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise AuditIntegrityError("guided replay could not verify the durable operation row")
+        return await reserve_or_replay_guided_operation(**kwargs)
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", committed_then_paused)
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_integrity_failure)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided settled replay integrity"}).json()
+    operation_id = "00000000-0000-4000-8000-0000000000a3"
+
+    async def cancel_after_commit() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
+                )
+            )
+            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            release_settlement.set()
+            with pytest.raises(AuditIntegrityError, match="could not verify the durable operation row"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_after_commit())
+
+    assert [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"] == []

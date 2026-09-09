@@ -30,8 +30,8 @@ Choose your environment:
 
 | Environment | Requirements |
 |-------------|--------------|
-| **Local Python** | Python 3.11+, uv package manager |
-| **Web UI** | Python 3.11+, uv, npm, `.[webui]` extra, local auth user |
+| **Local Python** | Python 3.12+, uv package manager |
+| **Web UI** | Python 3.12+, uv, Node.js 24, npm 11, `webui` extra, local auth user |
 | **Docker** | Docker installed and running |
 
 ---
@@ -42,13 +42,12 @@ Choose your environment:
 
 ```bash
 # Clone the repository
-git clone https://github.com/johnm-dta/elspeth.git
+git clone https://github.com/dta-au/elspeth.git
 cd elspeth
 
-# Create virtual environment and install
-uv venv
+# Create the locked virtual environment and install
+uv sync --frozen --extra dev
 source .venv/bin/activate
-uv pip install -e ".[dev]"
 
 # Verify installation
 elspeth --version
@@ -63,11 +62,13 @@ ls examples/threshold_gate/
 ```
 
 ```
+README.md       # Notes on what this example shows
 input.csv       # Source data
 settings.yaml   # Pipeline configuration
-output/         # Where results go
-runs/           # Audit trail storage
 ```
+
+`output/` (where results go) and `runs/` (audit trail storage) are not tracked -
+the first run creates them.
 
 **Input data** (`examples/threshold_gate/input.csv`):
 
@@ -93,19 +94,20 @@ Open `examples/threshold_gate/settings.yaml`:
 
 ```yaml
 # SENSE: Where data comes from
-source:
-  plugin: csv
-  on_success: gate_in               # Route validated rows to the gate
-  options:
-    path: examples/threshold_gate/input.csv
-    schema:
-      mode: fixed
-      fields:
-        - "id: int"
-        - "name: str"
-        - "amount: int"
-        - "category: str"
-    on_validation_failure: discard
+sources:
+  primary:
+    plugin: csv
+    on_success: gate_in             # Route validated rows to the gate
+    options:
+      path: examples/threshold_gate/input.csv
+      schema:
+        mode: fixed
+        fields:
+          - "id: int"
+          - "name: str"
+          - "amount: int"
+          - "category: str"
+      on_validation_failure: discard
 
 # DECIDE: How to route rows
 gates:
@@ -152,7 +154,7 @@ landscape:
 
 | Section | Purpose |
 |---------|---------|
-| `source` | **SENSE** - Load data from CSV, validate schema |
+| `sources` | **SENSE** - Load data from CSV, validate schema |
 | `gates` | **DECIDE** - Route based on condition |
 | `sinks` | **ACT** - Write to output files |
 | `landscape` | **AUDIT** - Record everything |
@@ -172,12 +174,23 @@ elspeth run --settings examples/threshold_gate/settings.yaml --execute
 **Expected output:**
 
 ```
-Run abc123 completed successfully
-  Rows processed: 8
-  Normal transactions: 4
-  High-value transactions: 4
-  Audit trail: examples/threshold_gate/runs/audit.db
+[DATABASE] Connecting...
+[DATABASE] ✓ Completed in 0.18s
+[GRAPH] Building...
+[GRAPH] ✓ Completed in 0.00s
+[SOURCE] Initializing → csv...
+[SOURCE] ✓ Completed in 0.00s
+[PROCESS] Processing...
+  Processing: 8 rows | 20 rows/sec | ✓8 ✗0 ⚠0 ↪8 ↯0
+[PROCESS] ✓ Completed in 0.41s
+
+✓ Run COMPLETED: 8 rows processed | ✓8 succeeded | ✗0 failed | ⚠0 quarantined | →8 routed (output:4, high_values:4) | 0.43s total
 ```
+
+Timings, the number of `Processing:` progress lines, and the order of the sinks
+in the routed summary vary between runs. The audit trail is written to the
+`landscape.url` path from the configuration - here
+`examples/threshold_gate/runs/audit.db`.
 
 ### Step 5: Check the Results
 
@@ -209,11 +222,17 @@ id,name,amount,category
 
 ### Step 6: Explain a Decision
 
-This is where ELSPETH shines. Ask "why did row 2 (Bob) get routed to high_values?"
+This is where ELSPETH shines. Ask "why did Bob's transaction get routed to high_values?"
+
+`--row` takes a Landscape row ID - a 32-character hexadecimal identifier minted
+at ingest, not the `id` column from the CSV - so look it up first:
 
 ```bash
-# Launch the lineage explorer TUI
-elspeth explain --run latest --row 2 --database examples/threshold_gate/runs/audit.db
+# List the row IDs for the run (row_index is zero-based, so Bob is 1)
+sqlite3 examples/threshold_gate/runs/audit.db "SELECT row_id, row_index FROM rows"
+
+# Launch the lineage explorer TUI for that row
+elspeth explain --run latest --row <row_id> --database examples/threshold_gate/runs/audit.db
 ```
 
 This launches an interactive terminal UI where you can explore:
@@ -225,7 +244,7 @@ This launches an interactive terminal UI where you can explore:
 Use arrow keys to navigate the tree, Enter to update the detail panel, `r` to
 refresh, and `q` to quit.
 
-> **Tip:** Use `--no-tui` for plain text output or `--json` for machine-readable output instead of the interactive TUI.
+> **Tip:** Use `--no-tui` for plain text output or `--json` for machine-readable output instead of the interactive TUI. Both take the same `--row <row_id>` from the query above. Without `--row` the TUI still opens, but it shows only the pipeline structure - no token or outcome for a particular row.
 
 Every decision is traceable. If an auditor asks "why was this transaction flagged?", you have the answer.
 
@@ -255,18 +274,17 @@ Use this path when you want to:
 From the repository root:
 
 ```bash
-uv venv
+uv sync --frozen --extra webui --extra dev
 source .venv/bin/activate
-uv pip install -e ".[webui,dev]"
+node --version  # must report v24.x
+npm --version   # must report 11.x
 ```
 
 ### Step 2: Build the Frontend Bundle
 
 ```bash
-cd src/elspeth/web/frontend
-npm install
-npm run build
-cd ../../../../
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run build
 ```
 
 The FastAPI app serves the built React bundle from
@@ -274,34 +292,25 @@ The FastAPI app serves the built React bundle from
 
 ### Step 3: Create a Local Demo User
 
-Use a non-default signing key and create a local development account:
+Create the required local data roots and generate fresh development-only
+signing keys:
 
 ```bash
-export ELSPETH_WEB__SECRET_KEY="local-dev-secret-key"
+mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 
-python - <<'PY'
-import os
-from pathlib import Path
-from elspeth.web.auth.local import LocalAuthProvider
-
-provider = LocalAuthProvider(
-    db_path=Path("data/auth.db"),
-    secret_key=os.environ["ELSPETH_WEB__SECRET_KEY"],
-)
-try:
-    provider.create_user(
-        user_id="demo",
-        password="demo12345",
-        display_name="Demo User",
-        email="demo@example.com",
-    )
-    print("Created demo user: demo / demo12345")
-except ValueError:
-    print("Demo user already exists: demo / demo12345")
-PY
+elspeth composer users add demo \
+  --display-name "Demo User" \
+  --email demo@example.com
 ```
 
-Do not reuse these credentials outside local development.
+When prompted, enter `demo12345` as the password. Do not reuse these credentials
+or signing keys outside local development.
 
 ### Step 4: Start the Web App
 
@@ -317,7 +326,7 @@ Open <http://127.0.0.1:8451> and sign in with `demo` / `demo12345`.
 2. Keep the default guided mode, or choose **Switch to guided** if your
    account default is freeform.
 3. Upload `examples/threshold_gate/input.csv` through the **Files** panel with
-   **+ Upload**.
+   **Upload**.
 4. Tell the composer:
 
    ```text
@@ -331,9 +340,9 @@ Open <http://127.0.0.1:8451> and sign in with `demo` / `demo12345`.
    as the CLI example: `id: int`, `name: str`, `amount: int`, `category: str`.
 6. When validation passes, use **Run pipeline**.
 
-The completion bar also exposes **Save for review** and **Export YAML**. Use
-**Export YAML** if you want to compare the browser-authored configuration with
-`examples/threshold_gate/settings.yaml`.
+The completion bar also exposes **Save for review**. If you want to compare the
+browser-authored configuration with `examples/threshold_gate/settings.yaml`,
+open **Export YAML** from the command palette (`Ctrl+Shift+Y`).
 
 ### Step 6: Inspect the Browser Run
 
@@ -355,12 +364,21 @@ source CSV -> threshold decision -> normal/high-value outputs -> audit record
 
 ## Option C: Running with Docker
 
+Select a tag that you have confirmed exists in the registry. Do not use a
+moving `latest` tag or infer an image tag from the package version:
+
+```bash
+: "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
+docker buildx imagetools inspect \
+  "ghcr.io/dta-au/elspeth:${IMAGE_TAG}" >/dev/null
+```
+
 ### Step 1: Set Up Directory Structure
 
 Create a working directory with the required structure:
 
 ```bash
-mkdir -p my-pipeline/{config,input,output,state}
+mkdir -p my-pipeline/{config,input,output,data}
 cd my-pipeline
 ```
 
@@ -385,19 +403,20 @@ EOF
 ```bash
 cat > config/pipeline.yaml << 'EOF'
 # SENSE: Load from CSV
-source:
-  plugin: csv
-  on_success: gate_in
-  options:
-    path: /app/input/transactions.csv  # Container path!
-    schema:
-      mode: fixed
-      fields:
-        - "id: int"
-        - "name: str"
-        - "amount: int"
-        - "category: str"
-    on_validation_failure: discard
+sources:
+  primary:
+    plugin: csv
+    on_success: gate_in
+    options:
+      path: /app/input/transactions.csv  # Container path!
+      schema:
+        mode: fixed
+        fields:
+          - "id: int"
+          - "name: str"
+          - "amount: int"
+          - "category: str"
+      on_validation_failure: discard
 
 # DECIDE: Route high-value transactions
 gates:
@@ -449,18 +468,19 @@ EOF
 docker run --rm \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/input:/app/input:ro \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   validate --settings /app/config/pipeline.yaml
 ```
 
 **Expected output:**
 
 ```
-Configuration valid: /app/config/pipeline.yaml
-  Source: csv
+✅ Pipeline configuration valid!
+  Sources: primary=csv
   Transforms: 0
-  Gates: 1 (amount_threshold)
-  Sinks: 2 (output, high_values)
+  Aggregations: 0
+  Sinks: output, high_values
+  Graph: 4 nodes, 3 edges
 ```
 
 ### Step 5: Run the Pipeline
@@ -471,18 +491,28 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   run --settings /app/config/pipeline.yaml --execute
 ```
 
 **Expected output:**
 
 ```
-Run abc123 completed successfully
-  Rows processed: 8
-  Normal transactions: 4
-  High-value transactions: 4
+[DATABASE] Connecting...
+[DATABASE] ✓ Completed in 0.18s
+[GRAPH] Building...
+[GRAPH] ✓ Completed in 0.00s
+[SOURCE] Initializing → csv...
+[SOURCE] ✓ Completed in 0.00s
+[PROCESS] Processing...
+  Processing: 8 rows | 20 rows/sec | ✓8 ✗0 ⚠0 ↪8 ↯0
+[PROCESS] ✓ Completed in 0.41s
+
+✓ Run COMPLETED: 8 rows processed | ✓8 succeeded | ✗0 failed | ⚠0 quarantined | →8 routed (output:4, high_values:4) | 0.43s total
 ```
+
+Timings, the number of `Processing:` progress lines, and the order of the sinks
+in the routed summary vary between runs.
 
 ### Step 6: Check the Results
 
@@ -501,8 +531,16 @@ For Docker environments where TUI isn't available, use non-interactive explain o
 ```bash
 docker run --rm \
   -v $(pwd)/data:/app/data:ro \
-  ghcr.io/johnm-dta/elspeth:latest \
-  explain --run latest --row 2 --no-tui --database /app/data/audit.db
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
+  explain --run latest --row <row_id> --no-tui --database /app/data/audit.db
+```
+
+`--row` takes a Landscape row ID - a 32-character hexadecimal identifier minted
+at ingest, not the `id` column from the CSV. `--no-tui` and `--json` both
+require one. List the IDs for a run from the mounted audit database:
+
+```bash
+sqlite3 data/audit.db "SELECT row_id, row_index FROM rows"
 ```
 
 > **Tip:** Use `--no-tui` for plain text output or `--json` for machine-readable output. The TUI requires an interactive terminal, so use these flags in CI/CD environments.
@@ -517,7 +555,7 @@ For repeated runs, docker-compose is more convenient:
 # docker-compose.yaml
 services:
   elspeth:
-    image: ghcr.io/johnm-dta/elspeth:latest
+    image: ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set the confirmed published tag}
     volumes:
       - ./config:/app/config:ro
       - ./input:/app/input:ro
@@ -533,7 +571,7 @@ docker compose run --rm elspeth validate --settings /app/config/pipeline.yaml
 docker compose run --rm elspeth run --settings /app/config/pipeline.yaml --execute
 
 # Explain (interactive TUI)
-docker compose run -it --rm elspeth explain --run latest --row 2 --database /app/data/audit.db
+docker compose run -it --rm elspeth explain --run latest --row <row_id> --database /app/data/audit.db
 ```
 
 ---
@@ -597,10 +635,11 @@ updated validation result before using **Run pipeline** again.
 Route "premium" transactions (> $2500) separately:
 
 ```yaml
-source:
-  plugin: csv
-  on_success: premium_check_in
-  options: ...
+sources:
+  primary:
+    plugin: csv
+    on_success: premium_check_in
+    options: ...
 
 gates:
   - name: premium_check
@@ -633,25 +672,30 @@ sinks:
 
 ### Add a Transform
 
-Add a field before routing:
+Add a computed field before routing. Computing a value is `value_transform`'s
+job: an ordered list of `operations`, each with a `target` field and an
+`expression` in the restricted expression language. (`field_mapper` is the
+rename/select transform — it cannot compute new values.)
 
 ```yaml
-source:
-  plugin: csv
-  on_success: mapper_in
-  options: ...
+sources:
+  primary:
+    plugin: csv
+    on_success: tier_in
+    options: ...
 
 transforms:
   - name: add_tier
-    plugin: field_mapper
-    input: mapper_in
+    plugin: value_transform
+    input: tier_in
     on_success: tier_gate_in
     on_error: discard
     options:
       schema:
         mode: observed
-      computed:
-        tier: "row['amount'] > 2500 and 'premium' or (row['amount'] > 1000 and 'high' or 'normal')"
+      operations:
+        - target: tier
+          expression: "row['amount'] > 2500 and 'premium' or (row['amount'] > 1000 and 'high' or 'normal')"
 
 gates:
   - name: tier_router
@@ -661,6 +705,13 @@ gates:
       "true": premium
       "false": output
 ```
+
+The `output` sink from the walkthrough declares `mode: fixed` with exactly four
+fields, so it rejects the new `tier` field and the pipeline fails to build with
+a schema contract violation on the `tier_router` -> `output` edge. Add
+`- "tier: str"` to that sink's `schema.fields`, or relax it to `mode: flexible`
+without declaring `tier`, or insert a `field_mapper` with `select_only: true`
+ahead of it. The `premium` sink needs no change - it is `mode: observed`.
 
 ---
 
@@ -692,14 +743,15 @@ schema:
 **Fix:** Ensure the source schema coerces numeric fields. The expression parser does NOT allow function calls like `int()`:
 ```yaml
 # In source config - coerce to int at source
-source:
-  plugin: csv
-  on_success: gate_in
-  options:
-    schema:
-      mode: fixed
-      fields:
-        - "amount: int"  # Coerces "1500" to 1500
+sources:
+  primary:
+    plugin: csv
+    on_success: gate_in
+    options:
+      schema:
+        mode: fixed
+        fields:
+          - "amount: int"  # Coerces "1500" to 1500
 
 # Then in gate condition - amount is already an int
 condition: "row['amount'] > 1000"
@@ -736,21 +788,26 @@ elspeth plugins inspect source csv
 ### Web UI Commands
 
 ```bash
-uv pip install -e ".[webui,dev]"
+uv sync --frozen --extra webui --extra dev
+source .venv/bin/activate
 
-cd src/elspeth/web/frontend
-npm install
-npm run build
-cd ../../../../
+npm --prefix src/elspeth/web/frontend ci
+npm --prefix src/elspeth/web/frontend run build
 
-export ELSPETH_WEB__SECRET_KEY="local-dev-secret-key"
+mkdir -p data/blobs data/outputs
+export ELSPETH_WEB__SECRET_KEY="$(openssl rand -hex 32)"
+export ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="$(openssl rand -base64 32)"
+export ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15
+export ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10
+export ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0
+export ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60
 elspeth web --host 127.0.0.1 --port 8451
 ```
 
 | UI Control | Description |
 |------------|-------------|
 | `+ New session` | Start a new browser composition session |
-| `+ Upload` | Add a session-scoped source file |
+| `Upload` | Add a session-scoped source file |
 | `Run pipeline` | Execute the validated composition |
 | `Export YAML` | Inspect or download generated YAML |
 | `Save for review` | Create a shareable read-only review link when validation passes |
@@ -763,7 +820,7 @@ docker run --rm \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG:?set the confirmed published tag} \
   <command>
 ```
 
@@ -771,7 +828,7 @@ docker run --rm \
 |---------|-------------|
 | `validate --settings /app/config/pipeline.yaml` | Check configuration |
 | `run --settings /app/config/pipeline.yaml --execute` | Run pipeline |
-| `explain --run latest --row N --database <path>` | Explain decision (TUI) |
+| `explain --run latest --row <row_id> --database <path>` | Explain decision (TUI) |
 | `plugins list` | List available plugins |
 | `plugins list --format json` | Emit plugin catalog JSON |
 | `plugins inspect <type> <name>` | Inspect one plugin schema |

@@ -7,7 +7,10 @@
 // ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import {
+  selectApprovedInterpretations,
+  useInterpretationEventsStore,
+} from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
   InterpretationEvent,
@@ -90,6 +93,52 @@ describe("interpretationEventsStore", () => {
       expect(state.resolvedCountBySession).toEqual({});
       expect(state.resolvedBySession).toEqual({});
       expect(state.optedOutBySession).toEqual({});
+    });
+  });
+
+  describe("selectApprovedInterpretations (elspeth-3a8a843c47)", () => {
+    it("admits exactly the two operator-approval choices", () => {
+      const accepted = makePendingEvent({
+        id: "evt-accepted",
+        choice: "accepted_as_drafted",
+        resolved_at: "2026-05-18T00:01:00Z",
+      });
+      const amended = makePendingEvent({
+        id: "evt-amended",
+        choice: "amended",
+        accepted_value: "captivating",
+        resolved_at: "2026-05-18T00:02:00Z",
+      });
+      // The dangerous shape: a surface-specific auto_interpreted_opt_out
+      // row is CHECK-required to carry a non-null user_term and
+      // tool_call_id — field presence must never classify it as approved.
+      const autoBaked = makePendingEvent({
+        id: "evt-auto-baked",
+        choice: "opted_out",
+        interpretation_source: "auto_interpreted_opt_out",
+        accepted_value: "interesting and engaging",
+        resolved_at: "2026-05-18T00:03:00Z",
+        actor: "composer-llm",
+      });
+      const pending = makePendingEvent({ id: "evt-pending" });
+      const abandoned = makePendingEvent({
+        id: "evt-abandoned",
+        choice: "abandoned",
+        resolved_at: "2026-05-18T00:04:00Z",
+      });
+
+      const approved = selectApprovedInterpretations([
+        accepted,
+        amended,
+        autoBaked,
+        pending,
+        abandoned,
+      ]);
+
+      expect(approved.map((event) => event.id)).toEqual([
+        "evt-accepted",
+        "evt-amended",
+      ]);
     });
   });
 
@@ -357,6 +406,104 @@ describe("interpretationEventsStore", () => {
 
       const state = useInterpretationEventsStore.getState();
       expect(state.resolvedBySession["sess-1"]).toEqual([prior, fresh]);
+    });
+
+    // ── elspeth-292505e1c3: refreshAll snapshot vs resolveEvent append ──────
+    //
+    // refreshAll is fired void from compose-completion paths while resolves
+    // fire from click handlers; the backend GET runs unlocked on a separate
+    // thread-pool worker, so BOTH response orderings are schedulable. The
+    // resolved slice must be write-monotonic under either interleaving:
+    // resolution is terminal server-side (audit rows are never deleted), so
+    // a row present locally but missing from a snapshot is NEWER than the
+    // snapshot's GET, not gone.
+
+    it("a stale refreshAll snapshot cannot erase a resolve that landed while its GET was in flight, nor resurrect its pending card (elspeth-292505e1c3 interleaving B)", async () => {
+      // Seed the pending card the operator is looking at.
+      const pendingX = makePendingEvent({ id: "evt-x" });
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([pendingX]);
+      await useInterpretationEventsStore.getState().refreshPending("sess-1");
+
+      // A refreshAll whose GET is serviced PRE-commit: hold its response.
+      let releaseStaleGet!: (rows: InterpretationEvent[]) => void;
+      vi.mocked(api.listInterpretationEvents).mockImplementationOnce(
+        () =>
+          new Promise<InterpretationEvent[]>((resolve) => {
+            releaseStaleGet = resolve;
+          }),
+      );
+      const staleRefresh = useInterpretationEventsStore
+        .getState()
+        .refreshAll("sess-1");
+
+      // The operator resolves the card; the confirmation is now on screen.
+      const resolvedX = makePendingEvent({
+        id: "evt-x",
+        choice: "accepted_as_drafted",
+        accepted_value: "interesting and engaging",
+        resolved_at: "2026-05-18T00:01:00Z",
+      });
+      vi.mocked(api.resolveInterpretation).mockResolvedValue({
+        event: resolvedX,
+        new_state: makeCompositionState(),
+      });
+      await useInterpretationEventsStore
+        .getState()
+        .resolveEvent("sess-1", "evt-x", { choice: "accepted_as_drafted" });
+
+      // The stale snapshot (taken before the commit) now lands.
+      releaseStaleGet([pendingX]);
+      await staleRefresh;
+
+      const state = useInterpretationEventsStore.getState();
+      // The approval survives, exactly once.
+      expect(
+        state.resolvedBySession["sess-1"].map((event) => event.id),
+      ).toEqual(["evt-x"]);
+      // The pending card does not resurrect — re-clicking it would 409
+      // (InterpretationEventAlreadyResolvedError) against the backend.
+      expect(state.pendingBySession["sess-1"]).toEqual({});
+      expect(state.resolvedCountBySession["sess-1"]).toEqual({
+        accepted_as_drafted: 1,
+        amended: 0,
+        opted_out: 0,
+      });
+    });
+
+    it("does not duplicate a row that a post-commit refreshAll snapshot already delivered (elspeth-292505e1c3 interleaving A)", async () => {
+      // A refreshAll GET serviced in the post-commit window already carries
+      // the resolved row, and its set() lands before the POST response's.
+      const resolvedX = makePendingEvent({
+        id: "evt-x",
+        choice: "accepted_as_drafted",
+        accepted_value: "interesting and engaging",
+        resolved_at: "2026-05-18T00:01:00Z",
+      });
+      vi.mocked(api.listInterpretationEvents).mockResolvedValueOnce([
+        resolvedX,
+      ]);
+      await useInterpretationEventsStore.getState().refreshAll("sess-1");
+
+      vi.mocked(api.resolveInterpretation).mockResolvedValue({
+        event: resolvedX,
+        new_state: makeCompositionState(),
+      });
+      await useInterpretationEventsStore
+        .getState()
+        .resolveEvent("sess-1", "evt-x", { choice: "accepted_as_drafted" });
+
+      const state = useInterpretationEventsStore.getState();
+      // Exactly one copy — a duplicate doubles the "Got it" bubble and
+      // collides React keys (tail confirmations key on event.id).
+      expect(
+        state.resolvedBySession["sess-1"].map((event) => event.id),
+      ).toEqual(["evt-x"]);
+      // And exactly one count — the snapshot pass already counted it.
+      expect(state.resolvedCountBySession["sess-1"]).toEqual({
+        accepted_as_drafted: 1,
+        amended: 0,
+        opted_out: 0,
+      });
     });
 
     it("increments the 'amended' counter on amended resolution", async () => {

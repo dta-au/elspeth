@@ -77,6 +77,31 @@ const EMPTY_COUNTS: ResolvedCounts = {
   opted_out: 0,
 };
 
+/**
+ * The resolved rows that represent an operator approval — the ONLY rows a
+ * rendering surface may present as "the operator accepted this
+ * interpretation" (ChatPanel's "Got it — using your interpretation of
+ * <term>." confirmation, NarrativeResults' per-term overlay).
+ *
+ * Classification is by `choice`, never by field presence. The
+ * surface-specific `auto_interpreted_opt_out` shape is REQUIRED by the
+ * backend CHECK constraint (ck_interpretation_events_opt_out_shape) to
+ * carry a non-null `user_term` and `tool_call_id` — the audit trail must
+ * record exactly what was baked without review — so "has a term" marks a
+ * DECLINED review as readily as an approved one (elspeth-3a8a843c47).
+ * `choice` is exact in both directions: the resolve endpoint admits only
+ * `accepted_as_drafted` and `amended`, and every auto_interpreted_* source
+ * is CHECK-forced to `choice='opted_out'`.
+ */
+export function selectApprovedInterpretations(
+  events: readonly InterpretationEvent[],
+): InterpretationEvent[] {
+  return events.filter(
+    (event) =>
+      event.choice === "accepted_as_drafted" || event.choice === "amended",
+  );
+}
+
 interface InterpretationEventsState {
   // ── Primary projections ──────────────────────────────────────────────────
   pendingBySession: Record<string, Record<string, InterpretationEvent>>;
@@ -92,6 +117,14 @@ interface InterpretationEventsState {
    * store does not — keeping ordering responsibilities at the read site
    * means a future schema change (e.g. adding `run_id` to events) only
    * touches the consumer.
+   *
+   * WRITE-MONOTONIC (elspeth-292505e1c3): `refreshAll` union-merges its
+   * snapshot with rows already held locally (by event id) instead of
+   * replacing, and `resolveEvent` dedups its append — resolution is
+   * terminal server-side, so under any GET/POST response interleaving a
+   * row may only ever be added once, never removed or doubled. Rows a
+   * snapshot merges in keep API order; local-only rows (resolved after
+   * the snapshot's GET) follow them.
    */
   resolvedBySession: Record<string, InterpretationEvent[]>;
   optedOutBySession: Record<string, boolean>;
@@ -203,6 +236,13 @@ function incrementResolvedCount(
       throw new Error(
         "incrementResolvedCount: 'abandoned' is not produced by user action",
       );
+    case "superseded":
+      // Superseded is written by the backend state-commit sweep when a
+      // later commit extinguishes the reviewed site — never by a user
+      // resolve action; if we ever see it here, the call site is wrong.
+      throw new Error(
+        "incrementResolvedCount: 'superseded' is not produced by user action",
+      );
     default: {
       // Exhaustiveness check: a future widening of InterpretationChoice
       // turns this into a compile error.
@@ -240,7 +280,6 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
     async refreshAll(sessionId: string) {
       const events = await api.listInterpretationEvents(sessionId, "all");
       const pendingMap: Record<string, InterpretationEvent> = {};
-      const counts: ResolvedCounts = { ...EMPTY_COUNTS };
       // Resolved-event list for the Phase 6B NarrativeResults overlay.
       // Preserves API order (chronological); the consumer (NarrativeResults)
       // owns the wall-clock filter. We include every non-pending choice
@@ -259,22 +298,55 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
           event.choice === "amended" ||
           event.choice === "opted_out"
         ) {
-          // Direct field bump rather than calling incrementResolvedCount
-          // — we're building a fresh ResolvedCounts in one pass, not
-          // accumulating onto a prior store state.
-          counts[event.choice] += 1;
           resolvedList.push(event);
         }
-        // 'abandoned' rows are not counted in this store; the audit-readiness
-        // panel surfaces them via a separate code path if needed.
+        // 'abandoned' and 'superseded' rows are not counted in this store;
+        // the audit-readiness panel surfaces them via a separate code path
+        // if needed.
       }
       set((state) => {
+        // The resolved slice is write-MONOTONIC (elspeth-292505e1c3):
+        // resolution is terminal server-side (resolved rows are audit
+        // records, never deleted), so a row present locally but missing
+        // from this snapshot resolved AFTER the GET was serviced — the
+        // unlocked backend read means this refreshAll (fired void from
+        // compose-completion paths) can race a click-handler resolveEvent
+        // in either direction. Union by id: a stale snapshot may only
+        // fail to add rows, never subtract them. Same idiom as the
+        // sticky optedOutBySession merge below.
+        const snapshotIds = new Set(resolvedList.map((event) => event.id));
+        const localOnlyResolved = (
+          state.resolvedBySession[sessionId] ?? []
+        ).filter((event) => !snapshotIds.has(event.id));
+        const mergedResolved = [...resolvedList, ...localOnlyResolved];
+
+        // Pending and counts DERIVE from the merged resolved set, not the
+        // raw snapshot: a card whose row resolved after this GET must not
+        // resurrect (re-clicking it would 409), and its count must not
+        // drop out of the gauge until the next refresh.
+        const counts: ResolvedCounts = { ...EMPTY_COUNTS };
+        for (const event of mergedResolved) {
+          if (
+            event.choice === "accepted_as_drafted" ||
+            event.choice === "amended" ||
+            event.choice === "opted_out"
+          ) {
+            counts[event.choice] += 1;
+          }
+        }
+        const nextPending: Record<string, InterpretationEvent> = {};
+        for (const [id, event] of Object.entries(pendingMap)) {
+          if (!mergedResolved.some((resolved) => resolved.id === id)) {
+            nextPending[id] = event;
+          }
+        }
+
         const optedOut =
           optedOutFromHistory || state.optedOutBySession[sessionId] === true;
         return {
           pendingBySession: {
             ...state.pendingBySession,
-            [sessionId]: optedOut ? {} : pendingMap,
+            [sessionId]: optedOut ? {} : nextPending,
           },
           resolvedCountBySession: {
             ...state.resolvedCountBySession,
@@ -282,7 +354,7 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
           },
           resolvedBySession: {
             ...state.resolvedBySession,
-            [sessionId]: resolvedList,
+            [sessionId]: mergedResolved,
           },
           optedOutBySession: optedOut
             ? { ...state.optedOutBySession, [sessionId]: true }
@@ -319,19 +391,33 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
         // Append the newly resolved event into the resolved-list slice
         // so NarrativeResults (Phase 6B Task 6) can render it without
         // forcing a refreshAll round-trip after every resolve.
+        //
+        // Dedup by id (elspeth-292505e1c3): a refreshAll whose unlocked
+        // GET was serviced in the post-commit window may have delivered
+        // this row before our POST response landed. If it did, the
+        // snapshot pass already holds the row AND already counted it —
+        // appending or bumping again doubles the "Got it" bubble and
+        // collides React keys (tail confirmations key on event.id).
         const priorResolved = state.resolvedBySession[sessionId] ?? [];
-        const nextResolved = [...priorResolved, resolvedEvent];
+        const alreadyDelivered = priorResolved.some(
+          (event) => event.id === resolvedEvent.id,
+        );
+        const nextResolved = alreadyDelivered
+          ? priorResolved
+          : [...priorResolved, resolvedEvent];
 
         return {
           pendingBySession: {
             ...state.pendingBySession,
             [sessionId]: nextSessionPending,
           },
-          resolvedCountBySession: incrementResolvedCount(
-            state.resolvedCountBySession,
-            sessionId,
-            resolvedChoice,
-          ),
+          resolvedCountBySession: alreadyDelivered
+            ? state.resolvedCountBySession
+            : incrementResolvedCount(
+                state.resolvedCountBySession,
+                sessionId,
+                resolvedChoice,
+              ),
           resolvedBySession: {
             ...state.resolvedBySession,
             [sessionId]: nextResolved,

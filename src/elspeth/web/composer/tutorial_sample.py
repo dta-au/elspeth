@@ -29,7 +29,7 @@ _PAGES = ("project-1.html", "project-2.html", "project-3.html")
 # Canonical public base for the synthetic tutorial pages. Operator-controlled
 # content published to GitHub Pages. A fork republishing its own copy overrides
 # this via ``ELSPETH_WEB__TUTORIAL_SAMPLE_BASE_URL``.
-TUTORIAL_SAMPLE_PAGES_BASE_URL = "https://johnm-dta.github.io/elspeth"
+TUTORIAL_SAMPLE_PAGES_BASE_URL = "https://dta-au.github.io/elspeth"
 
 
 def resolve_tutorial_sample_urls(*, base_url: str) -> tuple[str, str, str]:

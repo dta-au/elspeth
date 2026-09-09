@@ -143,4 +143,11 @@ describe("InlineSourceCreatedTurn", () => {
     render(<InlineSourceCreatedTurn summary={unknown} onEdit={vi.fn()} />);
     expect(screen.getByText(/unknown row count/i)).toBeInTheDocument();
   });
+
+  it("labels provenance in the reader register with the raw enum in title (elspeth-d74ab492dd)", () => {
+    render(<InlineSourceCreatedTurn summary={{ ...llmGenerated, provenance: "llm-generated-then-amended" }} onEdit={vi.fn()} />);
+    fireEvent.click(screen.getByText("Show audit info"));
+    const dd = screen.getByText("Drafted by the composer, then edited by you");
+    expect(dd).toHaveAttribute("title", "llm-generated-then-amended");
+  });
 });

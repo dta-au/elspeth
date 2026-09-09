@@ -2,7 +2,7 @@
 
 Plugins implementing this protocol expose their variant model classes to the
 composer's knob-schema lowering. See
-docs/superpowers/specs/2026-05-14-composer-one-knob-design.md section 5.
+docs/specs/2026-05-14-composer-one-knob-design.md section 5.
 """
 
 from __future__ import annotations

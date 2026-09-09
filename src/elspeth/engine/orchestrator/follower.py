@@ -92,15 +92,17 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
+
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-    CoordinationToken,
+    WorkerMembershipToken,
 )
-from elspeth.contracts.errors import FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
@@ -108,12 +110,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from elspeth.contracts import RowResult
+    from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.dag import ExecutionGraph
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
     from elspeth.engine.clock import Clock
+    from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
     from elspeth.engine.orchestrator.types import PipelineConfig
+    from elspeth.engine.spans import SpanFactory
 
 __all__ = ["FollowerProcessor", "FollowerWorkSource", "build_follower_processor"]
 
@@ -169,10 +174,11 @@ class FollowerProcessor:
         ``ProcessorMode.FOLLOWER`` :class:`RowProcessor` — no source, no
         barrier executors, no checkpoint coordinator). Only the narrow
         :class:`FollowerWorkSource` surface is driven.
-    token:
-        The follower's coordination token (worker_id + run_id, role=follower).
-        Used to start the heartbeat thread and to call ``depart_worker`` on
-        exit.
+    member_token:
+        The follower's :class:`WorkerMembershipToken` — the value
+        ``admit_follower`` returned at admission (ADR-030 D4; ADR-048
+        amendment). Threaded by value into the heartbeat thread and into
+        ``depart_worker`` on exit; never constructed here.
     run_coordination:
         :class:`RunCoordinationRepository` for ``depart_worker`` and run-status
         polling.
@@ -186,38 +192,45 @@ class FollowerProcessor:
         Liveness window for the heartbeat (default 80 s).
     idle_poll_seconds:
         Sleep interval between idle polls (default 2 s).
-    now_fn:
-        Injectable ``datetime.now(UTC)`` supplier for tests.
     wait_fn:
         Injectable sleep function ``wait_fn(seconds)`` for tests.
+    span_factory:
+        Shared engine span factory. The production builder supplies the same
+        instance to the inner row processor and this outer trace scope.
+    trace_started_at:
+        Durable ``runs.started_at`` value used for joined-run trace identity.
+        Optional only for direct no-telemetry test construction.
     """
 
     def __init__(
         self,
         processor: FollowerWorkSource,
         *,
-        token: CoordinationToken,
+        member_token: WorkerMembershipToken,
         run_coordination: RunCoordinationRepository,
         factory: RecorderFactory,
         clock: Clock | None = None,
         heartbeat_seconds: float = DEFAULT_RUN_HEARTBEAT_SECONDS,
         window_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         idle_poll_seconds: float = _IDLE_POLL_SECONDS,
-        now_fn: Callable[[], datetime] | None = None,
         wait_fn: Callable[[float], None] | None = None,
+        span_factory: SpanFactory | None = None,
+        trace_started_at: datetime | None = None,
     ) -> None:
         self._processor = processor
-        self._token = token
+        self._token = member_token
         self._run_coordination = run_coordination
         self._factory = factory
         self._heartbeat_seconds = heartbeat_seconds
         self._window_seconds = window_seconds
         self._idle_poll_seconds = idle_poll_seconds
-        self._now_fn: Callable[[], datetime] = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._wait_fn: Callable[[float], None] = wait_fn if wait_fn is not None else time.sleep
         from elspeth.engine.clock import DEFAULT_CLOCK
+        from elspeth.engine.spans import SpanFactory
 
         self._clock = clock if clock is not None else DEFAULT_CLOCK
+        self._span_factory = span_factory if span_factory is not None else SpanFactory()
+        self._trace_started_at = trace_started_at
 
     # ------------------------------------------------------------------
     # Public API
@@ -247,15 +260,32 @@ class FollowerProcessor:
         ``SIGINT``
             :exc:`KeyboardInterrupt`.  Depart, re-raise (or return if the
             caller catches it).
+
+        Any other exception stops the heartbeat, departs the worker, and
+        propagates unchanged through the common teardown seam.
         """
+        if self._trace_started_at is None:
+            # Direct test construction predates telemetry-backed spans. The
+            # production builder always supplies the durable run start below.
+            self._run_bound(ctx)
+            return
+
+        # Followers do not fabricate a leader/run parent. The scope binds the
+        # joined run's durable trace identity so follower row spans are honest
+        # roots in the same trace even though they execute in another process.
+        with self._span_factory.trace_scope(self._token.run_id, self._trace_started_at):
+            self._run_bound(ctx)
+
+    def _run_bound(self, ctx: PluginContext) -> None:
+        """Drive the follower while any production trace scope is active."""
         heartbeat = RunHeartbeatThread(
             self._run_coordination,
-            token=self._token,
+            member_token=self._token,
             heartbeat_seconds=self._heartbeat_seconds,
             window_seconds=self._window_seconds,
-            now_fn=self._now_fn,
         )
         heartbeat.start()
+        terminal_exit = False
         try:
             self._drain_loop(ctx, heartbeat)
         except RunWorkerEvictedError:
@@ -270,11 +300,10 @@ class FollowerProcessor:
                     self._token.worker_id,
                     self._token.run_id,
                 )
-                self._best_effort_depart()
+                terminal_exit = True
                 return
             # True eviction: leader's housekeeping sweep evicted us while the
             # run is still RUNNING (design case b). Propagate (CLI exit 3).
-            self._best_effort_depart()
             raise
         except KeyboardInterrupt:
             logger.info(
@@ -282,23 +311,34 @@ class FollowerProcessor:
                 self._token.worker_id,
                 self._token.run_id,
             )
-            self._best_effort_depart()
             raise
         except _SeatDeadError:
             # The leader seat expired while we were draining. Depart cleanly,
             # then raise FollowerSeatDeadError so the CLI can surface the
             # "use elspeth resume" guidance and exit with a distinct code
             # (design §B.1 step 5).
-            self._best_effort_depart()
             raise FollowerSeatDeadError(
                 worker_id=self._token.worker_id,
                 run_id=self._token.run_id,
             ) from None
         else:
             # Clean terminal exit.
-            self._best_effort_depart()
+            terminal_exit = True
         finally:
-            heartbeat.stop()
+            try:
+                if terminal_exit:
+                    heartbeat.stop(final_beat=False)
+                else:
+                    heartbeat.stop()
+            finally:
+                # Every exit abandons this single-use worker identity. The
+                # named exception arms above deliberately do not depart on
+                # their own: one teardown seam keeps expected and unexpected
+                # traversal failures from leaving an ACTIVE registry row.
+                try:
+                    self._best_effort_depart()
+                finally:
+                    heartbeat.raise_fatal_failure()
 
     # ------------------------------------------------------------------
     # Internal
@@ -328,15 +368,16 @@ class FollowerProcessor:
             ):
                 return
             last_leader_check_monotonic = monotonic_now
-            now = self._now_fn()
-            seat = self._run_coordination.live_leader(run_id=run_id, now=now)
+            seat = self._run_coordination.live_leader(run_id=run_id)
             if seat is None or not seat.seat_live:
                 raise _SeatDeadError(worker_id, run_id)
 
         def ensure_leader_live_before_claim() -> None:
+            heartbeat.raise_fatal_failure()
             ensure_leader_live(force=True)
 
         while True:
+            heartbeat.raise_fatal_failure()
             # Eviction / finalize-departure discrimination (design §B.1 step 5,
             # §D finalize flip).  The heartbeat latch is set on TWO distinct
             # events that differ in meaning:
@@ -420,15 +461,26 @@ class FollowerProcessor:
         return run.status != RunStatus.RUNNING
 
     def _best_effort_depart(self) -> None:
-        """Call depart_worker, swallowing all exceptions (best-effort hygiene)."""
+        """Call depart_worker, recording operational DB failures during teardown.
+
+        ``depart_worker`` is atomic (one membership-fenced transaction: fence,
+        departure CAS, event insert) and reifies the benign "finalize already
+        departed this row" race as a normal return (the fence's refusal is the
+        verb's declared no-op), so the only residual failure it is entitled to
+        contain is an ``OperationalError`` (including lock contention and
+        connection loss; the class does not prove transience). It is recorded at
+        WARNING and contained: coordination-event writes are loss-tolerant, and
+        a worker whose depart did not persist is reclaimed by lease expiry.
+        Anything else — an ``IntegrityError`` (the CAS and audit-event insert
+        share one transaction, so a constraint failure there is corruption
+        evidence, not an established race), Tier-1 audit-integrity errors,
+        and programming failures — propagates.
+        """
         try:
-            self._run_coordination.depart_worker(
-                worker_id=self._token.worker_id,
-                now=self._now_fn(),
-            )
-        except Exception:
-            logger.debug(
-                "follower %r: best-effort depart_worker raised (idempotent — finalize may have already departed this row)",
+            self._run_coordination.depart_worker(member_token=self._token)
+        except OperationalError:
+            logger.warning(
+                "follower %r: depart_worker hit an operational DB failure; lease expiry will reclaim the seat",
                 self._token.worker_id,
                 exc_info=True,
             )
@@ -437,12 +489,13 @@ class FollowerProcessor:
 def build_follower_processor(
     *,
     factory: RecorderFactory,
-    run_id: str,
-    worker_id: str,
+    member_token: WorkerMembershipToken,
     graph: ExecutionGraph,
     config: PipelineConfig,
     payload_store: PayloadStore,
     clock: Clock | None = None,
+    concurrency_config: RuntimeConcurrencyConfig | None = None,
+    telemetry: TelemetryManagerProtocol | None = None,
     scheduler_lease_seconds: int = 300,
     scheduler_heartbeat_seconds: int = 60,
 ) -> FollowerProcessor:
@@ -464,32 +517,37 @@ def build_follower_processor(
       at those nodes and calls ``mark_blocked`` rather than running them row-wise
     - ``run_coordination=None`` — followers do NOT run the §C.2 housekeeping
       eviction sweep (leader-only)
-    - ``coordination_token=None`` — followers present no epoch fence (they
-      only drive the item-layer CAS verbs, which fence on lease_owner)
-    - ``scheduler_lease_owner=worker_id`` — the registered worker identity IS
-      the scheduler lease_owner (§A.1); also threads the membership fence into
-      ``enqueue_ready`` (task e, slice 5)
+    - ``coordination_token=None`` / ``member_token=<admission token>`` — a
+      follower presents no epoch fence and carries exactly its membership
+      authority (ADR-030 D4; the RowProcessor FOLLOWER guard is this type
+      distinction): it drives the item-layer CAS verbs, which fence on
+      lease_owner, and the membership-fenced verbs, which fence on the token
+    - ``scheduler_lease_owner=member_token.worker_id`` — the registered worker
+      identity IS the scheduler lease_owner (§A.1); also threads the membership
+      fence into ``enqueue_ready`` (task e, slice 5)
 
-    The token/run_coordination Nones remain correct ABSENCES; the explicit
-    mode flag, not their None-ness, now drives follower branch selection, and
-    RowProcessor validates the combination fail-closed at construction.
+    The coordination_token/run_coordination Nones remain correct ABSENCES; the
+    explicit mode flag, not their None-ness, drives follower branch selection,
+    and RowProcessor validates the combination fail-closed at construction.
 
     Args:
         factory: RecorderFactory bound to the run's audit DB.
-        run_id: The run being joined.
-        worker_id: The follower's registered worker identity (from
-            :meth:`Orchestrator.join_run`).
+        member_token: The follower's :class:`WorkerMembershipToken` as returned
+            by :meth:`Orchestrator.join_run` (``admit_follower``'s value). The
+            run being joined IS ``member_token.run_id``; the registered worker
+            identity IS ``member_token.worker_id``.
         graph: The run's :class:`ExecutionGraph` (from the pipeline config).
         config: The run's :class:`PipelineConfig`.
         payload_store: PayloadStore for row payload persistence.
         clock: Optional clock injection for tests.
+        concurrency_config: Runtime worker bounds shared with leader/resume.
+        telemetry: Runtime telemetry manager shared with executor traversal.
         scheduler_lease_seconds: Item lease TTL (default 300 s).
         scheduler_heartbeat_seconds: Item heartbeat cadence (default 60 s).
 
     Returns:
         A :class:`FollowerProcessor` ready to drive via :meth:`FollowerProcessor.run`.
     """
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.engine.orchestrator.graph_wiring import (
         assign_plugin_node_ids,
         build_source_id_map,
@@ -498,6 +556,13 @@ def build_follower_processor(
     from elspeth.engine.orchestrator.processor_factory import build_row_processor
     from elspeth.engine.scheduler_drain import ProcessorMode
     from elspeth.engine.spans import SpanFactory
+
+    run_id = member_token.run_id
+    durable_run = factory.run_lifecycle.get_run(run_id)
+    if durable_run is None:
+        raise AuditIntegrityError(f"Cannot build follower processor: run {run_id!r} not found in Landscape")
+
+    span_factory = SpanFactory(telemetry_emit=telemetry.handle_event) if telemetry is not None else SpanFactory()
 
     # Assign node_id to all plugin instances before building the traversal
     # context.  build_dag_traversal_context (inside build_row_processor)
@@ -531,17 +596,17 @@ def build_follower_processor(
     # path) so GateExecutor has the correct edge_id for routing events.
     edge_map = load_edge_map(factory.data_flow, run_id)
 
-    # Coordination token: followers carry their own token for the heartbeat
-    # thread, but do NOT use it as an epoch fence (no leader-fenced verbs).
-    # coordination_token=None keeps _require_coordination_token unreachable
-    # and derives run_coordination=None (no §C.2 housekeeping sweep) — both
-    # remain correct ABSENCES; ProcessorMode.FOLLOWER, not their None-ness,
-    # drives follower branch selection, and RowProcessor validates the
-    # combination fail-closed.
+    # Authority: a follower carries its WorkerMembershipToken (the value
+    # admit_follower returned) and NO CoordinationToken — it never presents an
+    # epoch fence. coordination_token=None keeps _require_coordination_token
+    # unreachable and derives run_coordination=None (no §C.2 housekeeping
+    # sweep) — both remain correct ABSENCES; ProcessorMode.FOLLOWER, not their
+    # None-ness, drives follower branch selection, and RowProcessor validates
+    # the combination fail-closed (member token present, leader token absent).
     #
     # The follower's run_workers row is required for the membership fence on
     # enqueue_ready / claim_ready — the fence is keyed on scheduler_lease_owner,
-    # which equals worker_id here (§A.1).
+    # which equals member_token.worker_id here (§A.1).
     processor, _coalesce_node_map, _coalesce_executor = build_row_processor(
         graph=graph,
         config=config,
@@ -554,26 +619,25 @@ def build_follower_processor(
         config_gate_id_map=graph.get_config_gate_id_map(),
         coalesce_id_map=graph.get_coalesce_id_map(),
         payload_store=payload_store,
-        span_factory=SpanFactory(),
+        span_factory=span_factory,
         clock=clock,
-        max_workers=None,
-        telemetry=None,
+        max_workers=concurrency_config.max_workers if concurrency_config is not None else None,
+        telemetry=telemetry,
         mode=ProcessorMode.FOLLOWER,
-        scheduler_lease_owner=worker_id,  # §A.1: registered identity = lease owner
+        scheduler_lease_owner=member_token.worker_id,  # §A.1: registered identity = lease owner
         scheduler_lease_seconds=scheduler_lease_seconds,
         scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
         barrier_restore=None,  # follower: never restores barriers
         coordination_token=None,  # follower: no epoch fence
+        member_token=member_token,  # follower: exactly its membership authority
     )
-
-    # Follower token for the heartbeat thread (worker_id, run_id, epoch=0
-    # sentinel — followers have no epoch; heartbeat uses worker_id only).
-    follower_token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=0)
 
     return FollowerProcessor(
         processor=processor,
-        token=follower_token,
+        member_token=member_token,
         run_coordination=factory.run_coordination,
         factory=factory,
         clock=clock,
+        span_factory=span_factory,
+        trace_started_at=durable_run.started_at,
     )

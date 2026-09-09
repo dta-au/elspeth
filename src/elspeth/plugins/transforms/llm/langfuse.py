@@ -9,9 +9,8 @@ returns either an ActiveLangfuseTracer or NoOpLangfuseTracer — both frozen,
 both satisfying the LangfuseTracer protocol.
 
 Follows No Silent Failures: tracing failures are logged at warning level via
-structlog. Tracing failures do NOT go to the ELSPETH telemetry stream because
-TelemetryEmitCallback expects ExternalCallCompleted dataclass instances, and
-tracing failures are a different event class.
+structlog. Langfuse is itself an optional telemetry path, so its failures use
+the process logger as the last-resort observability channel.
 """
 
 from __future__ import annotations
@@ -21,7 +20,10 @@ from typing import Any, Protocol
 
 import structlog
 
+import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.tracing import LangfuseTracingConfig, TracingConfig
 
 logger = structlog.get_logger(__name__)
@@ -32,7 +34,8 @@ class LangfuseTracer(Protocol):
 
     def record_success(
         self,
-        token_id: str,
+        *,
+        parent: LLMAuditParent,
         query_name: str,
         prompt: str,
         response_content: str,
@@ -40,17 +43,20 @@ class LangfuseTracer(Protocol):
         usage: TokenUsage | None = None,
         latency_ms: float | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
     ) -> None: ...
 
     def record_error(
         self,
-        token_id: str,
+        *,
+        parent: LLMAuditParent,
         query_name: str,
         prompt: str,
         error_message: str,
         model: str,
         latency_ms: float | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
     ) -> None: ...
 
     def flush(self) -> None: ...
@@ -66,7 +72,8 @@ class NoOpLangfuseTracer:
 
     def record_success(
         self,
-        token_id: str,
+        *,
+        parent: LLMAuditParent,
         query_name: str,
         prompt: str,
         response_content: str,
@@ -74,18 +81,21 @@ class NoOpLangfuseTracer:
         usage: TokenUsage | None = None,
         latency_ms: float | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         pass
 
     def record_error(
         self,
-        token_id: str,
+        *,
+        parent: LLMAuditParent,
         query_name: str,
         prompt: str,
         error_message: str,
         model: str,
         latency_ms: float | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         pass
 
@@ -102,7 +112,8 @@ class ActiveLangfuseTracer:
 
     def record_success(
         self,
-        token_id: str,
+        *,
+        parent: LLMAuditParent,
         query_name: str,
         prompt: str,
         response_content: str,
@@ -114,9 +125,10 @@ class ActiveLangfuseTracer:
     ) -> None:
         """Record successful LLM call as Langfuse span + generation."""
         # Build metadata and kwargs (OUR CODE — let bugs crash immediately)
-        metadata = {"token_id": token_id, "plugin": self.transform_name, "query": query_name}
+        metadata = {"plugin": self.transform_name, "query": query_name}
         if extra_metadata:
             metadata.update(extra_metadata)
+        metadata.update(parent.tracing_metadata())
 
         update_kwargs: dict[str, Any] = {"output": response_content}
         if usage is not None and usage.has_data:
@@ -131,10 +143,15 @@ class ActiveLangfuseTracer:
             update_kwargs["metadata"] = {"latency_ms": latency_ms}
 
         # Build the full message list — include system prompt if present
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if system_prompt is not None:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            messages.append(ChatMessage(role="system", content=system_prompt))
+        messages.append(ChatMessage(role="user", content=prompt))
+        # First-party projection (OUR CODE) runs BEFORE the try: a failure in
+        # audit_messages is a bug and crashes instead of being contained as a
+        # provider trace failure. Bytes-free — tracing is an audit-adjacent
+        # boundary.
+        traced_input = audit_messages(messages)
 
         # Langfuse SDK calls (EXTERNAL boundary — catch SDK/transport errors)
         try:
@@ -148,16 +165,19 @@ class ActiveLangfuseTracer:
                     as_type="generation",
                     name="llm_call",
                     model=model,
-                    input=messages,
+                    input=traced_input,
                 ) as generation,
             ):
                 generation.update(**update_kwargs)
+        except contract_errors.TIER_1_ERRORS:
+            raise
         except Exception as e:
             _handle_trace_failure("langfuse_trace_failed", self.transform_name, e)
 
     def record_error(
         self,
-        token_id: str,
+        *,
+        parent: LLMAuditParent,
         query_name: str,
         prompt: str,
         error_message: str,
@@ -168,9 +188,10 @@ class ActiveLangfuseTracer:
     ) -> None:
         """Record failed LLM call as Langfuse span + generation with ERROR level."""
         # Build metadata and kwargs (OUR CODE — let bugs crash immediately)
-        metadata = {"token_id": token_id, "plugin": self.transform_name, "query": query_name}
+        metadata = {"plugin": self.transform_name, "query": query_name}
         if extra_metadata:
             metadata.update(extra_metadata)
+        metadata.update(parent.tracing_metadata())
 
         update_kwargs: dict[str, Any] = {
             "level": "ERROR",
@@ -180,10 +201,15 @@ class ActiveLangfuseTracer:
             update_kwargs["metadata"] = {"latency_ms": latency_ms}
 
         # Build the full message list — include system prompt if present
-        messages: list[dict[str, str]] = []
+        messages: list[ChatMessage] = []
         if system_prompt is not None:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            messages.append(ChatMessage(role="system", content=system_prompt))
+        messages.append(ChatMessage(role="user", content=prompt))
+        # First-party projection (OUR CODE) runs BEFORE the try: a failure in
+        # audit_messages is a bug and crashes instead of being contained as a
+        # provider trace failure. Bytes-free — tracing is an audit-adjacent
+        # boundary.
+        traced_input = audit_messages(messages)
 
         # Langfuse SDK calls (EXTERNAL boundary — catch SDK/transport errors)
         try:
@@ -197,10 +223,12 @@ class ActiveLangfuseTracer:
                     as_type="generation",
                     name="llm_call",
                     model=model,
-                    input=messages,
+                    input=traced_input,
                 ) as generation,
             ):
                 generation.update(**update_kwargs)
+        except contract_errors.TIER_1_ERRORS:
+            raise
         except Exception as e:
             _handle_trace_failure("langfuse_error_trace_failed", self.transform_name, e)
 
@@ -208,6 +236,8 @@ class ActiveLangfuseTracer:
         """Flush pending tracing data."""
         try:
             self.client.flush()
+        except contract_errors.TIER_1_ERRORS:
+            raise
         except Exception as e:
             _handle_trace_failure("langfuse_flush_failed", self.transform_name, e)
 
@@ -219,17 +249,20 @@ def _handle_trace_failure(
 ) -> None:
     """Handle trace recording failure — No Silent Failures via structlog.
 
-    Tracing failures go to structlog only, not the ELSPETH telemetry stream.
-    TelemetryEmitCallback expects ExternalCallCompleted (from plugins/clients/base.py),
-    which does not match tracing failure events.
+    Langfuse is itself an optional telemetry path. If it fails, structlog is
+    the independent last-resort channel and the pipeline result remains
+    primary. Only ``TIER_1_ERRORS`` — ELSPETH's own invariant classes — are
+    re-raised ahead of the broad clause. Everything else raised inside the
+    SDK call is a Tier-3 provider failure and is contained here: a
+    ``TypeError`` from a langfuse signature drift cannot be told apart from a
+    programming error by its class, and a row whose provider call is already
+    audited must not fail on its optional trace (elspeth-a1ab69607a).
     """
-    if isinstance(error, (TypeError, AttributeError, NameError)):
-        raise error  # Programming errors must crash — not Langfuse SDK failures
     logger.warning(
         event_name,
         plugin=transform_name,
-        error=str(error),
         error_type=type(error).__name__,
+        exc_info=True,
     )
 
 
@@ -257,12 +290,6 @@ def create_langfuse_tracer(
         client = Langfuse(
             public_key=tracing_config.public_key,
             secret_key=tracing_config.secret_key,
-            host=tracing_config.host,
-            tracing_enabled=tracing_config.tracing_enabled,
-        )
-        logger.info(
-            "Langfuse tracing initialized (v3)",
-            provider="langfuse",
             host=tracing_config.host,
             tracing_enabled=tracing_config.tracing_enabled,
         )

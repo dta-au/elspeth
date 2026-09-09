@@ -109,8 +109,13 @@ class TestValidateCommand:
             f"Expected 'Pipeline configuration valid' in output, got: {result.stdout}"
         )
 
-    def test_validate_allows_export_enabled_post_run_sink(self, tmp_path: Path) -> None:
+    def test_validate_allows_export_enabled_post_run_sink(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Export sink should be excluded from execution-graph validation."""
+        # The export spool/content-store roots are code-owned and CWD-relative
+        # by contract (absolute paths are rejected), so run from tmp_path to
+        # keep .elspeth/audit-export-* out of the checkout.
+        monkeypatch.chdir(tmp_path)
+
         input_csv = tmp_path / "input.csv"
         input_csv.write_text("id,name\n1,Alice\n")
 
@@ -348,3 +353,69 @@ gates:
         # Edges: source→gate, gate→results, gate→flagged = 3 edges
         assert node_count == 4, f"Expected 4 nodes (source+gate+2sinks), got {node_count}"
         assert edge_count == 3, f"Expected 3 edges (source→gate→2sinks), got {edge_count}"
+
+
+class TestValidateCommandRowUnion:
+    """`validate` must build row_union barriers through the production path.
+
+    Regression guard: the production graph-construction sites did not forward
+    ``settings.row_unions`` to ``ExecutionGraph.from_plugin_instances``, so a
+    valid ``row_unions:`` pipeline was rejected with a fork-branch wiring error
+    that blamed the operator's config ("Available row_union branches: []").
+    """
+
+    def test_validate_accepts_row_union_pipeline(self, tmp_path: Path) -> None:
+        input_path = tmp_path / "input.jsonl"
+        input_path.write_text('{"id": 1, "amount": 3}\n{"id": 2, "amount": 5}\n')
+        config_file = tmp_path / "settings.yaml"
+        config_file.write_text(f"""
+sources:
+  rows:
+    plugin: json
+    on_success: routed
+    options:
+      path: {input_path}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+
+gates:
+  - name: variant_fork
+    input: routed
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to: [control_branch, treatment_branch]
+
+row_unions:
+  - name: variant_union
+    branches: [control_branch, treatment_branch]
+    on_success: union_out
+
+transforms:
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+""")
+
+        result = runner.invoke(app, ["validate", "-s", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "row_union branches: []" not in result.output

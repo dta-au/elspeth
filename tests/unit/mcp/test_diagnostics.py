@@ -13,7 +13,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import runs_table
 from elspeth.mcp.analyzers.diagnostics import diagnose
 from elspeth.mcp.types import DiagnosticProblem, DiagnosticReport
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -65,7 +65,7 @@ def _create_completed_run_with_quarantine(
         path=TerminalPath.QUARANTINED_AT_SOURCE,
         error_hash="deadbeef" * 8,
     )
-    factory.run_lifecycle.complete_run(run_id, RunStatus.COMPLETED)
+    factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run_id))
     if started_at is not None:
         _set_run_started_at(db, run_id, started_at)
     return run_id
@@ -138,7 +138,7 @@ def test_diagnose_quarantine_count_excludes_old_runs() -> None:
     )
     # Recent run (1 hour ago) — no quarantines
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="recent-run")
-    factory.run_lifecycle.complete_run("recent-run", RunStatus.COMPLETED)
+    factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "recent-run"))
 
     report = diagnose(db, factory)
 
@@ -219,7 +219,7 @@ def test_diagnose_reports_high_error_completed_with_failures_runs() -> None:
             "observed",
             "quarantine",
         )
-    factory.run_lifecycle.complete_run(run_id, RunStatus.COMPLETED_WITH_FAILURES)
+    factory.run_lifecycle.complete_run(RunStatus.COMPLETED_WITH_FAILURES, coordination_token=leader_coordination_token(factory, run_id))
 
     report = diagnose(db, factory)
 

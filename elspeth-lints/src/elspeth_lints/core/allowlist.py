@@ -31,6 +31,78 @@ _MAX_ALLOWLIST_YAML_BYTES = 5 * 1024 * 1024
 _MIN_AUDIT_ANCHOR_ALNUM_CHARS = 2
 
 
+class NestedAllowlistDocumentError(ValueError):
+    """Raised when an allowlist directory carries a YAML document below its top level.
+
+    Every allowlist reader is non-recursive, so a nested document has no
+    legitimate meaning — but a recursive *enumeration* elsewhere (the
+    judge-coverage baseline used ``git ls-tree -r``) could see it and, keyed
+    by basename, conflate a decoy with the real file (elspeth-3262174e37).
+    Refusing at the single enumerator is how that class stays visible.
+    """
+
+
+def _is_tool_state_path(relative: Path) -> bool:
+    """Dot-prefixed components are tool state (``.reaudit-state``, ``.judge-metrics``,
+    ``.sign-bundle-transactions``), never allowlist content."""
+    return any(part.startswith(".") for part in relative.parts)
+
+
+def iter_allowlist_yaml_paths(directory: Path) -> tuple[Path, ...]:
+    """Return exactly the directory YAML paths consumed by ``load_allowlist``.
+
+    The production loader is intentionally non-recursive and accepts only the
+    canonical ``.yaml`` suffix.  Snapshot binding and the judge-coverage HEAD
+    loader share this iterator so their inventories cannot silently drift to
+    include inert ``.yml`` files or nested documents that the scanner never
+    reads. A YAML document nested below the top level (outside dot-prefixed
+    tool-state directories) is refused with
+    :class:`NestedAllowlistDocumentError` rather than ignored.
+    """
+    nested = sorted(
+        path.relative_to(directory).as_posix()
+        for suffix in ("*.yaml", "*.yml")
+        for path in directory.rglob(suffix)
+        if path.parent != directory and not _is_tool_state_path(path.relative_to(directory))
+    )
+    if nested:
+        raise NestedAllowlistDocumentError(
+            f"{directory}: allowlist YAML must sit directly in the allowlist directory; nested documents are refused: {', '.join(nested)}"
+        )
+    return tuple(sorted(directory.glob("*.yaml")))
+
+
+def iter_allowlist_root_yaml_paths(allowlist_root: Path) -> tuple[Path, ...]:
+    """Return every ``.yaml``/``.yml`` under an allowlist ROOT (``config/cicd``), skipping tool state.
+
+    Root-level gates that aggregate across ``enforce_*`` directories must
+    never read the sign-bundle staging area or metric/sidecar directories:
+    staging materialises basename-colliding candidate allowlists on disk by
+    design, and they are protected only by being untracked unless the walker
+    excludes them explicitly.
+    """
+    candidates = [*allowlist_root.rglob("*.yaml"), *allowlist_root.rglob("*.yml")]
+    return tuple(
+        sorted(
+            (path for path in candidates if not _is_tool_state_path(path.relative_to(allowlist_root))),
+            key=lambda path: path.relative_to(allowlist_root).as_posix(),
+        )
+    )
+
+
+class JudgeMetadataKeyUnavailableError(ValueError):
+    """Raised when judge-metadata verification is requested without the signing key.
+
+    This is an operator-configuration fault, not a defect in the tree under
+    scan, so the CLI renders it as a remedy and an exit code rather than an
+    unhandled traceback. It stays fail-closed: the run still refuses, because
+    downgrading verification is a deliberate act the operator opts into via
+    ``ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE``, never something the CLI
+    decides on its own. Subclasses ``ValueError`` so the existing handlers in
+    the diagnose/sign paths keep treating it exactly as before.
+    """
+
+
 class DanglingAllowlistEntry(ValueError):
     """Raised when a judge-gated allow_hits entry's bound source file no longer exists.
 
@@ -343,7 +415,9 @@ def load_allowlist(
         defaults = _load_defaults(path / "_defaults.yaml")
         entries: list[AllowlistEntry] = []
         per_file_rules: list[PerFileRule] = []
-        for yaml_file in sorted(file for file in path.glob("*.yaml") if file.name != "_defaults.yaml"):
+        for yaml_file in iter_allowlist_yaml_paths(path):
+            if yaml_file.name == "_defaults.yaml":
+                continue
             data = _load_yaml_file(yaml_file)
             entries.extend(_parse_allow_hits(data, source_file=yaml_file.name, source_root=source_root))
             per_file_rules.extend(_parse_per_file_rules(data, valid_rule_ids=valid_rule_ids, source_file=yaml_file.name))
@@ -773,7 +847,11 @@ def compute_judge_metadata_signature(
     }
     if judge_confidence is not None:
         payload["judge_confidence"] = judge_confidence
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    # allow_nan=False only changes behaviour when a non-finite value is
+    # present, so canonical bytes for existing finite payloads — and the
+    # signatures over them — are unchanged. Without it a NaN
+    # judge_confidence would sign bytes no strict verifier can re-parse.
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     digest = hmac.new(hmac_key, canonical, hashlib.sha256).hexdigest()
     return f"{prefix}{digest}"
 
@@ -782,7 +860,7 @@ def _judge_metadata_hmac_key() -> bytes:
     """Load the deployment-held key used to sign judge metadata."""
     raw = os.environ.get(_JUDGE_METADATA_SIGNATURE_ENV_VAR)
     if raw is None or raw == "":
-        raise ValueError(
+        raise JudgeMetadataKeyUnavailableError(
             f"{_JUDGE_METADATA_SIGNATURE_ENV_VAR} is required to verify or write "
             "judge_metadata_signature for post-judge allowlist entries. This key "
             "must be held outside the allowlist YAML; without it, verdict metadata "

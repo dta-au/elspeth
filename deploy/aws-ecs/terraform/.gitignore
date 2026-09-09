@@ -1,0 +1,15 @@
+.terraform/
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/crash.log
+**/crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+*.tfbackend
+!*.tfbackend.example
+*.pem
+*.key
+__pycache__/

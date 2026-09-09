@@ -46,6 +46,8 @@ class _SettingsStub:
 
 
 class _GraphStub:
+    escalation_fixpoint_bound = 1_000
+
     def get_aggregation_id_map(self) -> dict[object, object]:
         return {}
 
@@ -57,6 +59,9 @@ class _GraphStub:
 
     def get_config_gate_id_map(self) -> dict[object, object]:
         return {}
+
+    def get_error_routable_closer_names(self) -> frozenset[str]:
+        return frozenset()
 
 
 def test_assemble_pipeline_config_preserves_resolved_audit_config() -> None:

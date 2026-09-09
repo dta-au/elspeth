@@ -4,21 +4,43 @@ JSONExplode transforms one row containing an array field into multiple rows,
 one for each element in the array. This is the inverse of aggregation.
 
 THREE-TIER TRUST MODEL:
-- JSONExplode TRUSTS that pipeline data types are correct
-- Type violations (missing field, wrong type) indicate UPSTREAM BUGS and crash
-- No TransformResult.error() for type violations - they are bugs to fix
+- A missing array field is an upstream contract violation and raises ``KeyError``
+- A present field with the wrong value type is a row-level data failure
+- Wrong value types return ``TransformResult.error()`` so ``on_error`` can route
+  them without coercing or fabricating array elements
 """
 
 import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+# Observed mode forbids explicit field definitions, so the synthesized
+# output_field/item_index declarations only exist under fixed/flexible mode.
+DECLARED_SCHEMA = {"mode": "fixed", "fields": ["id: int", "payload: any"]}
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="json_explode-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
 
 
 class TestJSONExplodeHappyPath:
@@ -222,12 +244,32 @@ class TestJSONExplodeHappyPath:
         )
         row = PipelineRow({"id": 1, "line_items": ["a", "b"]}, contract)
 
+        assert transform.forwards_input_fields is False
+        assert transform.removed_input_fields == frozenset()
+
         result = transform.process(row, ctx)
 
         assert result.status == "success"
         assert result.rows is not None
         assert result.rows[0].to_dict() == {"id": 1, "item": "a", "item_index": 0}
         assert result.rows[1].to_dict() == {"id": 1, "item": "b", "item_index": 1}
+
+    def test_original_array_header_keeps_runtime_collision_guard(self, ctx: PluginContext) -> None:
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode({"schema": DYNAMIC_SCHEMA, "array_field": "Line Items"})
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("line_items", object, original_name="Line Items"),
+                make_field("item", str, original_name="item"),
+            ),
+            locked=True,
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(PipelineRow({"line_items": ["a"], "item": "existing"}, contract), ctx)
 
     def test_backward_probe_rows_drop_array_field(self, ctx: PluginContext) -> None:
         """Backward invariant probe drives the real deaggregation path."""
@@ -250,12 +292,12 @@ class TestJSONExplodeHappyPath:
 
 
 class TestJSONExplodeTypeViolations:
-    """Tests for type violations - these should CRASH, not return errors.
+    """Distinguish missing-field contract violations from wrong-type row failures.
 
     Per three-tier trust model:
-    - Source validates that array field exists and is a list
-    - Transform trusts source did its job
-    - Type violations are UPSTREAM BUGS that should crash
+    - A missing array field remains an upstream bug and raises ``KeyError``
+    - A present field with the wrong value type returns a non-retryable error
+    - Strings and mappings are rejected rather than iterated into fabricated rows
     """
 
     @pytest.fixture
@@ -279,8 +321,14 @@ class TestJSONExplodeTypeViolations:
         with pytest.raises(KeyError, match="items"):
             transform.process(make_pipeline_row(row), ctx)
 
-    def test_none_value_crashes(self, ctx: PluginContext) -> None:
-        """None value for array field is upstream bug - should crash (TypeError)."""
+    def test_none_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """None for the array field is a ROW-level failure, routed via on_error.
+
+        Re-pointed from asserting a TypeError crash (elspeth-5887fb7928). The
+        concern the old test encoded — never silently produce garbage — is
+        unchanged and still enforced; what changed is that the row now fails
+        ROUTABLY instead of aborting the run with the row uncounted.
+        """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -292,16 +340,23 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": None}
 
-        with pytest.raises(TypeError):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
 
-    def test_string_value_crashes_with_type_error(self, ctx: PluginContext) -> None:
-        """String value is upstream bug - should crash with TypeError.
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "items"
+        assert "got NoneType" in result.reason["error"]
 
-        Strings are iterable in Python, but JSONExplode requires lists.
-        A string where a list was expected indicates a source validation bug
-        or misconfigured pipeline. The transform crashes explicitly to surface
-        this bug rather than producing garbage output (one row per character).
+    def test_string_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """String value is a row-level failure, routed rather than exploded.
+
+        Strings are iterable in Python, but JSONExplode requires lists. The
+        transform must NOT iterate one — that would fabricate a row per
+        character. It rejects the row explicitly, and (elspeth-5887fb7928)
+        does so via a RETURNED error so `on_error` fires and the row is
+        counted, rather than a raised TypeError that aborted the run.
         """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
@@ -314,15 +369,19 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": "abc"}  # String, not array!
 
-        # Should crash with clear error message
-        with pytest.raises(TypeError, match=r"Field 'items' must be a list"):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
 
-    def test_dict_value_crashes_with_type_error(self, ctx: PluginContext) -> None:
-        """Dict value is upstream bug - should crash with TypeError.
+        assert result.status == "error"
+        assert result.reason["error_type"] == "wrong_type"
+        assert "got str" in result.reason["error"]
+        # The failure is the POINT: never one row per character.
+        assert result.rows is None
 
-        Dicts are iterable (over keys) in Python, but JSONExplode requires lists.
-        A dict where a list was expected indicates an upstream validation bug.
+    def test_dict_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """Dict value is a row-level failure, routed rather than exploded.
+
+        Dicts are iterable (over keys) in Python, but JSONExplode requires
+        lists. Same disposition as the string case above (elspeth-5887fb7928).
         """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
@@ -335,8 +394,16 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": {"x": 1, "y": 2}}  # Dict, not list!
 
-        with pytest.raises(TypeError, match=r"Field 'items' must be a list"):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
+
+        assert result.status == "error"
+        assert result.reason["error_type"] == "wrong_type"
+        # PipelineRow deep-freezes dicts to MappingProxyType, so the reported
+        # type name is "mappingproxy" — the same deep-freeze fact that turns
+        # lists into tuples. Asserted verbatim so a change to the freeze
+        # wrapper surfaces here rather than in an operator's quarantine sink.
+        assert "got mappingproxy" in result.reason["error"]
+        assert result.rows is None
 
     def test_tuple_value_accepted_after_deep_freeze(self, ctx: PluginContext) -> None:
         """Tuple value is valid — PipelineRow deep-freezes lists to tuples.
@@ -360,8 +427,8 @@ class TestJSONExplodeTypeViolations:
         assert result.rows is not None
         assert len(result.rows) == 3
 
-    def test_non_iterable_value_crashes(self, ctx: PluginContext) -> None:
-        """Non-iterable value is upstream bug - should crash (TypeError)."""
+    def test_non_iterable_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
+        """A non-iterable value is a row-level failure, routed (elspeth-5887fb7928)."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -373,12 +440,51 @@ class TestJSONExplodeTypeViolations:
 
         row = {"id": 1, "items": 42}  # int is not iterable
 
-        with pytest.raises(TypeError):
-            transform.process(make_pipeline_row(row), ctx)
+        result = transform.process(make_pipeline_row(row), ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason["error_type"] == "wrong_type"
+        assert "got int" in result.reason["error"]
 
 
 class TestJSONExplodeConfiguration:
     """Tests for configuration validation."""
+
+    def test_rejects_array_field_named_item_index_when_include_index(self) -> None:
+        """The auto-generated index would overwrite the column being read.
+
+        ``output_field`` is already guarded against colliding with both
+        ``array_field`` and the generated ``item_index``; ``array_field`` itself
+        was not. The plugin reads ``row[array_field]`` directly, so the collision
+        also let the read column be treated as self-created and demoted off the
+        input contract (elspeth-d6eeb3a71d).
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        with pytest.raises(PluginConfigError, match="item_index"):
+            JSONExplode(
+                {
+                    "schema": DYNAMIC_SCHEMA,
+                    "array_field": "item_index",
+                    "include_index": True,
+                }
+            )
+
+    def test_allows_array_field_named_item_index_without_the_index(self) -> None:
+        """With include_index=False there is no generated column to collide with."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "array_field": "item_index",
+                "include_index": False,
+            }
+        )
+
+        assert transform is not None
 
     def test_no_on_error_attribute(self) -> None:
         """JSONExplode has no on_error - on_error should be None."""
@@ -781,6 +887,126 @@ class TestJSONExplodeHeterogeneousTypes:
         item_field = result.rows[0].contract.get_field("item")
         assert item_field is not None
         assert item_field.python_type is object
+
+
+class TestJSONExplodeDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-38aae1498d).
+
+    Under fixed/flexible mode ``_build_json_explode_output_schema_config``
+    synthesizes required declarations for ``output_field`` and ``item_index``,
+    but the emit path infers both from runtime values as ``required=False``.
+    ADR-014's post-emission check compares the two, so JSONExplode must restamp
+    the declaration on emission the way its sibling LineExplode does.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    def test_fixed_mode_restamps_synthesized_output_field_declarations(self, ctx: PluginContext) -> None:
+        """Synthesized output_field/item_index declarations reach the emitted contract."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DECLARED_SCHEMA,
+                "array_field": "payload",
+                "output_field": "item",
+                "include_index": True,
+            }
+        )
+        row = PipelineRow(
+            {"id": 1, "payload": ["a", "b"]},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("id", int, required=True, source="declared"),
+                    make_field("payload", object, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        for emitted in result.rows:
+            _run_post_emission_check(transform, emitted)
+        contract = result.rows[0].contract
+        assert contract.get_field("item").required is True
+        assert contract.get_field("item_index").required is True
+        assert contract.get_field("item_index").python_type is int
+
+    def test_fixed_mode_without_item_index_restamps_only_the_output_field(self, ctx: PluginContext) -> None:
+        """include_index=False synthesizes no item_index, so none is declared or emitted."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DECLARED_SCHEMA,
+                "array_field": "payload",
+                "output_field": "item",
+                "include_index": False,
+            }
+        )
+        row = PipelineRow(
+            {"id": 1, "payload": ["a", "b"]},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("id", int, required=True, source="declared"),
+                    make_field("payload", object, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        assert transform._output_schema_config is not None
+        assert all(field.name != "item_index" for field in transform._output_schema_config.fields)
+        for emitted in result.rows:
+            _run_post_emission_check(transform, emitted)
+        contract = result.rows[0].contract
+        assert contract.get_field("item").required is True
+        assert contract.find_field("item_index") is None
+
+    def test_fixed_mode_heterogeneous_array_still_types_output_field_as_object(self, ctx: PluginContext) -> None:
+        """Restamping the declaration must not undo the heterogeneous-type widening."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DECLARED_SCHEMA,
+                "array_field": "payload",
+                "output_field": "item",
+            }
+        )
+        row = PipelineRow(
+            {"id": 1, "payload": ["a", {"k": 1}]},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("id", int, required=True, source="declared"),
+                    make_field("payload", object, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        for emitted in result.rows:
+            _run_post_emission_check(transform, emitted)
+        # The synthesized declaration is 'any', which is object — the same
+        # widening the heterogeneity branch applies, so the two agree.
+        assert result.rows[0].contract.get_field("item").python_type is object
 
 
 class TestJSONExplodeCopyIsolation:

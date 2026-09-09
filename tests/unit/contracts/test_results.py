@@ -491,6 +491,7 @@ class TestRowResult:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="output",
+            join_group_id="jg-1",
         )
 
         assert result.outcome == TerminalOutcome.SUCCESS
@@ -1197,6 +1198,29 @@ class TestArtifactDescriptorDeepFreeze:
         )
         assert isinstance(descriptor.metadata, MappingProxyType)
         assert isinstance(descriptor.metadata["tags"], tuple)
+
+    def test_validator_rejects_nested_plain_dict(self) -> None:
+        """The standalone validator recurses into EVERY nested mapping.
+
+        Pins the elspeth-ca0a7e71b1 fix: a plain dict nested inside a
+        MappingProxyType previously slipped past the frozen check (the
+        recursion only entered already-frozen mappings); it must now be
+        rejected as an unfrozen mapping.
+        """
+        from types import MappingProxyType
+
+        from elspeth.contracts.results import _require_artifact_metadata
+
+        with pytest.raises(TypeError, match="must be a frozen mapping"):
+            _require_artifact_metadata(MappingProxyType({"a": {"b": 1}}))
+
+    def test_validator_rejects_non_str_nested_key(self) -> None:
+        from types import MappingProxyType
+
+        from elspeth.contracts.results import _require_artifact_metadata
+
+        with pytest.raises(TypeError, match="key must be str"):
+            _require_artifact_metadata(MappingProxyType({"a": MappingProxyType({1: "x"})}))
 
 
 # ---------------------------------------------------------------------------

@@ -2,8 +2,9 @@
 
 Loads rows from CSV files using csv.reader for proper multiline quoted field support.
 
-IMPORTANT: Sources use allow_coercion=True to normalize external data.
-This is the ONLY place in the pipeline where coercion is allowed.
+IMPORTANT: Sources may use allow_coercion=True to normalize external data.
+For CSV, only fixed and flexible schemas declare types to coerce into;
+observed schemas preserve parsed cells as strings.
 """
 
 import codecs
@@ -39,9 +40,22 @@ class CSVSourceConfig(TabularSourceDataConfig):
     - columns, field_mapping (field normalization is mandatory)
     """
 
-    delimiter: str = Field(default=",", description="Single-character delimiter used to split CSV fields.")
-    encoding: str = Field(default="utf-8", description="Text encoding used to decode the CSV file.")
-    skip_rows: int = Field(default=0, ge=0, description="Number of leading physical rows to skip before reading headers or data.")
+    delimiter: str = Field(
+        default=",",
+        description="Single-character delimiter used to split CSV fields.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    encoding: str = Field(
+        default="utf-8",
+        description="Text encoding used to decode the CSV file.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    skip_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Number of leading physical rows to skip before reading headers or data.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     @field_validator("delimiter")
     @classmethod
@@ -85,46 +99,43 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:da40c7c68226f54a"
+    source_file_hash: str | None = "sha256:5e8324e0e8280e22"
+    # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
+    # strings, and observed schemas preserve parsed cells untouched (module
+    # docstring), so under mode: observed EVERY emitted cell is str by
+    # construction. Fixed/flexible schemas coerce declared columns and are
+    # unaffected — the declaration carries their types.
+    observed_value_type = "str"
     config_model = CSVSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
 
-    # ── Reference content (Phase 7A canonical example) ──────────────────
-    # This block is the canonical pattern for future plugin authors.
-    # Copy this shape; replace the prose with your plugin's specifics.
-    # The catalog drawer renders these fields as a persona-facing
-    # reference card. Empty / None entries fall back to "see the technical
-    # description" rather than blocking display — but the goal for every
-    # plugin is to have these filled in eventually so the catalog is
-    # useful as orientation material (per docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md).
-
-    usage_when_to_use: str | None = (
-        "A reasonably large dataset (more than ~20 rows) that already "
-        "exists as a CSV file. The source validates and coerces types "
-        "at the boundary and quarantines malformed rows to a sink so the "
-        "rest of the pipeline keeps running on the clean rows."
+    usage_when_to_use: str = (
+        "Use for a finite tabular file that should be read incrementally. Observed schemas preserve CSV cells as strings; "
+        "fixed and flexible schemas can coerce declared columns at the source boundary. Invalid records can be quarantined."
     )
-
-    usage_when_not_to_use: str | None = (
-        "Small inline data — type it into chat instead (the composer "
-        "creates a one-row source from your message). Streaming data — "
-        "CSV is batch-only; no row is emitted until the full file is "
-        "read. Data that arrives over HTTP — fetch it first, then point "
-        "the CSV source at the downloaded file."
+    usage_when_not_to_use: str = (
+        "Do not use for inline records, live or unbounded streams, or direct HTTP input; materialize a bounded CSV file first."
     )
-
-    example_use: str | None = "source:\n  plugin: csv\n  options:\n    path: data/input.csv\n    on_validation_failure: quarantine"
-
+    example_use: str = """sources:
+  primary:
+    plugin: csv
+    on_success: output
+    options:
+      path: data/input.csv
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
     capability_tags: tuple[str, ...] = ("csv", "file", "batch", "tabular")
 
     audit_characteristics: DeclaredAuditCharacteristics = frozenset({AuditCharacteristic.COERCE, AuditCharacteristic.QUARANTINE})
     # "io_read" is *inferred* by the catalog service from
     # determinism=IO_READ. "coerce" and "quarantine" are declared here:
-    #   - "coerce" describes the CSV source's Tier-3 boundary behaviour
-    #     (string cells -> typed columns) and cannot be inferred from
-    #     determinism alone.
+    #   - "coerce" describes the CSV source's Tier-3 boundary capability:
+    #     fixed/flexible schemas coerce string cells into declared column
+    #     types, while observed schemas preserve strings. This capability
+    #     cannot be inferred from determinism alone.
     #   - "quarantine" describes the runtime behaviour configured via
     #     `on_validation_failure`. The catalog service cannot infer this
     #     from the class because `_on_validation_failure` is a
@@ -156,8 +167,9 @@ class CSVSource(BaseSource):
         self._on_validation_failure = cfg.on_validation_failure
         # on_success is injected by the instantiation bridge (runtime_factory.py)
 
-        # CRITICAL: allow_coercion=True for sources (external data boundary)
-        # Sources are the ONLY place where type coercion is allowed
+        # CSV may coerce at this Tier-3 source boundary, but only explicit
+        # fixed/flexible fields provide target types. Observed mode has no
+        # declared types, so its cells remain strings.
         self._schema_class: type[PluginSchema] = create_schema_from_config(
             self._schema_config,
             "CSVRowSchema",
@@ -656,13 +668,17 @@ class CSVSource(BaseSource):
             return PluginAssistance(
                 plugin_name="csv",
                 issue_code=None,
-                summary="Load tabular data from a CSV file. Coerces strings to declared types at the Tier-3 boundary; quarantines malformed rows.",
+                summary=(
+                    "Load tabular data from a CSV file. Observed schemas preserve cells as strings; fixed and flexible "
+                    "schemas coerce declared fields at the Tier-3 boundary. Malformed rows can be quarantined."
+                ),
                 composer_hints=(
                     "Default schema.mode to 'observed' unless the user explicitly asked to project to a smaller schema.",
                     "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode silently drops rows that don't match.",
                     "Decide whether the CSV is headered: without columns CSVSource treats the first non-skipped row as headers; for headerless data set columns=[...] so the first data row stays data. Do not copy a header row into inline source data unless it is real headered CSV.",
                     "If you have been asked to generate CSV rows yourself (the invented_source path): always emit a header row as the first non-skipped line of the generated CSV, and always leave the `columns` option unset so CSVSource treats your first row as headers.",
-                    "When generating CSV rows yourself, declare those generated column names in `schema.fields` (or `schema.guaranteed_fields`). The header row, the `columns` decision, and the schema must all agree.",
+                    "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id). Declare the normalized form, or keep an original name via field_mapping: {normalized: Original}; other declared names are rejected at config time.",
+                    "When generating CSV rows yourself, declare the NORMALIZED form of those generated column names in `schema.fields` (or `schema.guaranteed_fields`) — or generate already-lowercase headers. The header row, the `columns` decision, and the schema must all agree.",
                     "Never generate headerless CSV — the audit trail and downstream contracts need the header to be self-describing.",
                     "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a schema guarantee. If transforms consume a CSV column, declare it in schema.guaranteed_fields or explicit schema fields.",
                     "CSV source options do not have url_field; if a downstream web_scrape needs URLs, keep the URL column in the CSV schema and set url_field on the web_scrape node.",

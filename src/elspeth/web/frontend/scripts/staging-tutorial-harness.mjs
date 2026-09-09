@@ -11,7 +11,6 @@ import {
 } from "./staging-tutorial-driver.mjs";
 
 const TOKEN_KEY = "auth_token";
-const DEFAULT_BASE_URL = "https://elspeth.foundryside.dev";
 const DEFAULT_RUNS = 20;
 const DEFAULT_BUILD_TIMEOUT_MS = 420_000;
 // The tutorial seeds an uploaded sample; the guided source binds it via the
@@ -195,7 +194,7 @@ function intEnv(name, fallback) {
   return parsed;
 }
 
-const baseURL = (process.env.STAGING_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+const baseURL = requiredEnv("STAGING_BASE_URL").replace(/\/+$/, "");
 const origin = new URL(baseURL).origin;
 const username = requiredEnv("STAGING_USERNAME");
 const password = requiredEnv("STAGING_PASSWORD");

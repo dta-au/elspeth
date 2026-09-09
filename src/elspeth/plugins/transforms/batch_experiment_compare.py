@@ -123,9 +123,32 @@ class BatchExperimentCompare(BaseTransform):
     name = "batch_experiment_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9b9c77585ce0c57b"
+    source_file_hash: str | None = "sha256:bbd0ab934c88a808"
     config_model = BatchExperimentCompareConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use for an unpaired mean, lift, z-score, and normal-bound comparison of numeric experiment variants within one flushed batch."
+    )
+    usage_when_not_to_use: str = (
+        "Not for inferential significance or paired designs: it does not compute a p-value and does not match observations across variants."
+    )
+    example_use: str = """aggregations:
+  - name: prompt_experiment
+    plugin: batch_experiment_compare
+    input: variant_scores
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      variant_field: prompt_variant
+      score_field: score
+      baseline_variant: control
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "experiment", "comparison")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

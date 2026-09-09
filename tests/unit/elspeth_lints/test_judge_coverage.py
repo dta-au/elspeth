@@ -1944,3 +1944,85 @@ def test_git_commands_force_c_locale(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )
     assert calls
     assert all(call["LC_ALL"] == "C" for call in calls)
+
+
+# =========================================================================
+# HEAD / baseline enumeration symmetry (elspeth-3262174e37)
+# =========================================================================
+
+_PRE_JUDGE_ENTRY = textwrap.dedent("""\
+    allow_hits:
+    - key: web/x.py:R1:fn:fp=aaaaaaaaaaaaaaaa
+      owner: alice
+      reason: legitimate boundary
+      safety: contained
+""")
+
+_UNJUDGED_DECOY = textwrap.dedent("""\
+    allow_hits:
+    - key: web/decoy.py:R1:fn:fp=cccccccccccccccc
+      owner: mallory
+      reason: smuggled without a judge
+      safety: contained
+""")
+
+
+def test_allowlist_enumerator_refuses_nested_documents_but_ignores_tool_state(tmp_path: Path) -> None:
+    """The single enumerator is non-recursive and loud, not non-recursive and blind."""
+    from elspeth_lints.core.allowlist import NestedAllowlistDocumentError, iter_allowlist_yaml_paths
+
+    (tmp_path / "web.yaml").write_text(_PRE_JUDGE_ENTRY)
+    (tmp_path / ".reaudit-state").mkdir()
+    (tmp_path / ".reaudit-state" / "web.yaml").write_text(_UNJUDGED_DECOY)
+    assert [path.name for path in iter_allowlist_yaml_paths(tmp_path)] == ["web.yaml"]
+
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "web.yaml").write_text(_UNJUDGED_DECOY)
+    with pytest.raises(NestedAllowlistDocumentError, match=r"nested/web\.yaml"):
+        iter_allowlist_yaml_paths(tmp_path)
+
+
+def test_e2e_tracked_nested_decoy_with_colliding_basename_is_refused_on_both_sides(tmp_path: Path) -> None:
+    """A nested ``web.yaml`` must never be read as the real ``web.yaml`` by either enumeration."""
+    from elspeth_lints.core.judge_coverage import JudgeCoverageError, check_one_directory
+
+    enforce_dir = _init_git_fixture(tmp_path)
+    (enforce_dir / "web.yaml").write_text(_PRE_JUDGE_ENTRY)
+    baseline = _commit(tmp_path, "baseline")
+
+    nested = enforce_dir / "nested" / "web.yaml"
+    nested.parent.mkdir()
+    nested.write_text(_UNJUDGED_DECOY)
+    head = _commit(tmp_path, "smuggle a nested decoy")
+
+    # HEAD side: the on-disk loader refuses the nested document.
+    with pytest.raises(JudgeCoverageError, match="nested documents are refused"):
+        check_one_directory(allowlist_dir=enforce_dir, baseline_ref=baseline, repo_root=tmp_path)
+
+    # Baseline side: with the decoy in the baseline tree and removed from HEAD,
+    # ``git ls-tree -r`` sees it and must refuse rather than key it by basename.
+    nested.unlink()
+    nested.parent.rmdir()
+    _commit(tmp_path, "remove the decoy from HEAD")
+    with pytest.raises(JudgeCoverageError, match="nested documents are refused"):
+        check_one_directory(allowlist_dir=enforce_dir, baseline_ref=head, repo_root=tmp_path)
+
+
+def test_e2e_sign_bundle_staging_candidates_are_never_enumerated_as_allowlists(tmp_path: Path) -> None:
+    """Staging materialises basename-colliding candidates on disk by design; no gate may read them."""
+    from elspeth_lints.core.judge_coverage import check_judge_coverage
+    from elspeth_lints.core.sign_bundle_transaction import TRANSACTION_DIRNAME
+
+    enforce_dir = _init_git_fixture(tmp_path)
+    (enforce_dir / "web.yaml").write_text(_PRE_JUDGE_ENTRY)
+    baseline = _commit(tmp_path, "baseline")
+
+    candidate = tmp_path / "config" / "cicd" / TRANSACTION_DIRNAME / "txn" / "candidate" / "enforce_tier_model" / "web.yaml"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text(_UNJUDGED_DECOY)
+
+    reports = check_judge_coverage(allowlist_root=tmp_path / "config" / "cicd", baseline_ref=baseline, repo_root=tmp_path)
+
+    assert list(reports) == ["enforce_tier_model"]
+    assert reports["enforce_tier_model"].head_entry_count == 1
+    assert reports["enforce_tier_model"].violations == ()

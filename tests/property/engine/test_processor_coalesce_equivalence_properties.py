@@ -8,16 +8,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from hypothesis import assume, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import NodeType, TokenInfo
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_row
 from tests.fixtures.landscape import make_factory, make_landscape_db
+
+
+@st.composite
+def _reachable_step_states(draw: st.DrawFn) -> tuple[int, int, int]:
+    """Generate ``step_count, coalesce_step, current_step`` in reachable order."""
+    step_count = draw(st.integers(min_value=1, max_value=10))
+    coalesce_step = draw(st.integers(min_value=1, max_value=step_count))
+    current_step = draw(st.integers(min_value=1, max_value=coalesce_step))
+    return step_count, coalesce_step, current_step
 
 
 def _make_processor(
@@ -101,9 +112,7 @@ class TestCoalesceTriggerEquivalence:
     """Compare old step-based predicate vs new node-based predicate."""
 
     @given(
-        step_count=st.integers(min_value=1, max_value=10),
-        coalesce_step=st.integers(min_value=1, max_value=10),
-        current_step=st.integers(min_value=1, max_value=10),
+        step_state=_reachable_step_states(),
         has_executor=st.booleans(),
         has_branch=st.booleans(),
         has_coalesce_name=st.booleans(),
@@ -111,16 +120,13 @@ class TestCoalesceTriggerEquivalence:
     @settings(max_examples=250, deadline=None)
     def test_maybe_coalesce_matches_legacy_step_semantics_for_reachable_states(
         self,
-        step_count: int,
-        coalesce_step: int,
-        current_step: int,
+        step_state: tuple[int, int, int],
         has_executor: bool,
         has_branch: bool,
         has_coalesce_name: bool,
     ) -> None:
         """For reachable states (current_step <= coalesce_step), predicates match."""
-        assume(coalesce_step <= step_count)
-        assume(current_step <= coalesce_step)
+        step_count, coalesce_step, current_step = step_state
 
         coalesce_name = CoalesceName("merge") if has_coalesce_name else None
         coalesce_node_id = NodeID(f"node-{coalesce_step}") if has_coalesce_name else None
@@ -134,11 +140,14 @@ class TestCoalesceTriggerEquivalence:
             coalesce_executor=executor if has_executor else None,
         )
 
+        lineage_path: tuple[LineageFrame, ...] = ()
+        if has_branch:
+            lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
         token = TokenInfo(
             row_id="row-1",
             token_id="token-1",
             row_data=make_row({"v": 1}),
-            branch_name="path_a" if has_branch else None,
+            lineage_path=lineage_path,
         )
 
         handled, result = processor._maybe_coalesce_token(

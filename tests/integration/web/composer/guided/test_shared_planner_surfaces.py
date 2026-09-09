@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_planner
@@ -34,7 +36,20 @@ from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import GuidedOperationFence
+from tests.unit.web.composer.test_planner_authoring_aids import _guardrail_profile_view
+
+
+@pytest.fixture
+def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
+    """Give policy checks an isolated canonical plugin registry."""
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    assert manager.get_source_by_name("llm") is LLMSource
+    monkeypatch.setattr("elspeth.web.plugin_policy.coverage.get_shared_plugin_manager", lambda: manager)
+    monkeypatch.setattr("elspeth.web.composer.required_controls.get_shared_plugin_manager", lambda: manager)
+    return manager
 
 
 def test_guided_full_is_an_explicit_composer_service_surface() -> None:
@@ -48,7 +63,8 @@ def test_guided_full_controller_owns_no_topology_constructor() -> None:
     assert "solve_chain" not in source
 
 
-def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
+@pytest.mark.asyncio
+async def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -82,7 +98,8 @@ def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
         snapshot,
         app.state.operator_profile_registry,
     )
-    session_id = uuid4()
+    session = await app.state.session_service.create_session("alice", "Shared planner", "local")
+    session_id = session.id
     checkpoint_id = uuid4()
     message_id = uuid4()
     state = CompositionState(
@@ -126,28 +143,35 @@ def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
         )
 
     monkeypatch.setattr(service_module, "plan_pipeline", fake_plan_pipeline)
-    result, catalog_ids = asyncio.run(
-        service.plan_guided_full_pipeline(
-            intent="Build a complete pipeline.",
-            current_state=state,
-            originating_message=PlannerOriginatingMessage(
-                session_id=str(session_id),
-                message_id=str(message_id),
-                content="Build a complete pipeline.",
-                user_id="alice",
-            ),
-            base=base,
-            policy_catalog=policy_catalog,
-            plugin_snapshot=snapshot,
-            recorder=BufferingRecorder(),
-            operation_fence=GuidedOperationFence(
-                session_id=session_id,
-                operation_id="00000000-0000-4000-8000-000000000041",
-                lease_token="runtime-identity-proof",
-                attempt=1,
-            ),
-        )
+    operation_lease = await SessionOperationLease.acquire(
+        app.state.session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=app.state.session_service.session_operation_owner_instance_id,
+        lease_seconds=app.state.session_service.session_operation_lease_seconds,
     )
+    result, catalog_ids = await service.plan_guided_full_pipeline(
+        intent="Build a complete pipeline.",
+        current_state=state,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(message_id),
+            content="Build a complete pipeline.",
+            user_id="alice",
+        ),
+        base=base,
+        policy_catalog=policy_catalog,
+        plugin_snapshot=snapshot,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id="00000000-0000-4000-8000-000000000041",
+            lease_token="runtime-identity-proof",
+            attempt=1,
+        ),
+        session_operation_context=operation_lease.context,
+    )
+    await operation_lease.close()
 
     assert result.proposal.surface is PlannerSurface.GUIDED_FULL
     assert len(captured) == 1
@@ -162,6 +186,12 @@ def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
     assert call["rendered_skill"] == build_system_prompt(str(app.state.settings.data_dir))
     assert call["candidate_finalizer"](result.proposal.pipeline) is result.proposal.pipeline
     assert set(catalog_ids) == {"source", "transform", "sink"}
+    # elspeth-1e3ad83d89: guided-full MUST defer inline-custody finalization
+    # into the atomic staging settlement — its originating chat message only
+    # exists there, and finalizing mid-plan violates the blob lineage FK.
+    # This pins the real call site (service.py defer_finalize=True), which the
+    # custody integration tests cannot see because they fake the service.
+    assert call["custody_config"].defer_finalize is True
 
 
 def test_all_planner_surfaces_share_canonical_core_schema_and_tool_identity() -> None:
@@ -198,3 +228,46 @@ def test_all_planner_surfaces_share_canonical_core_schema_and_tool_identity() ->
     assert len({manifest.capability_core_hash for manifest in manifests}) == 1
     assert len({manifest.canonical_schema_hash for manifest in manifests}) == 1
     assert len({manifest.effective_tool_hash for manifest in manifests}) == 1
+
+
+def test_shared_candidate_finalizer_wires_named_llm_source_and_is_idempotent(
+    tmp_path: Path,
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    view, snapshot = _guardrail_profile_view(tmp_path)
+    finalize = service_module._required_controls_candidate_finalizer(
+        policy_catalog=view,
+        plugin_snapshot=snapshot,
+    )
+    candidate = {
+        "sources": {
+            "briefing": {
+                "plugin": "llm",
+                "on_success": "generated",
+                "options": {
+                    "profile": "sonnet",
+                    "prompt_template": "Write one concise audit briefing.",
+                    "response_field": "briefing",
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "generated",
+                "plugin": "json",
+                "options": {"path": "outputs/generated.json", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+
+    wired = finalize(candidate)
+
+    assert wired["sources"]["briefing"]["on_success"] == "content_safety_auto_1_in"
+    assert wired["nodes"][0]["plugin"] == "aws_bedrock_content_safety"
+    assert wired["nodes"][0]["on_success"] == "generated"
+    assert finalize(wired) is wired

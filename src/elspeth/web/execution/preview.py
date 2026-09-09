@@ -52,6 +52,117 @@ _PLAIN_TEXT_EXTENSIONS = frozenset(
 PreviewContentType = Literal["text", "csv", "jsonl", "json", "binary"]
 
 
+def _csv_record_end_offsets(text: str, *, delimiter: str) -> tuple[list[int], bool]:
+    """Return complete CSV record boundaries and whether EOF is quoted.
+
+    This is the boundary-only counterpart of the frontend's
+    ``parseCsvRows`` reader. It never materialises fields or rows: the input
+    is already byte-bounded, and the only facts this layer needs are where a
+    complete logical record ends and whether the bounded head stopped inside
+    a quoted field.
+    """
+    record_ends: list[int] = []
+    in_quotes = False
+    field_start = True
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_quotes:
+            if char == '"':
+                if index + 1 < len(text) and text[index + 1] == '"':
+                    index += 1
+                else:
+                    in_quotes = False
+            index += 1
+            continue
+        if char == '"' and field_start:
+            in_quotes = True
+        elif char == delimiter:
+            field_start = True
+        elif char == "\n":
+            record_ends.append(index + 1)
+            field_start = True
+        elif char != "\r":
+            field_start = False
+        index += 1
+
+    if not in_quotes and text and (not record_ends or record_ends[-1] < len(text)):
+        record_ends.append(len(text))
+    return record_ends, in_quotes
+
+
+def _raw_tabular_fallback(
+    head_text: str,
+    *,
+    row_cap: int,
+    truncated_by_bytes: bool,
+) -> tuple[str, None, bool]:
+    """Keep malformed tabular data inspectable without claiming a row count."""
+    lines = head_text.splitlines()
+    if len(lines) > row_cap:
+        return "\n".join(lines[:row_cap]), None, True
+    return head_text, None, truncated_by_bytes
+
+
+def _build_csv_preview(
+    head_text: str,
+    *,
+    delimiter: str,
+    row_cap: int,
+    truncated_by_bytes: bool,
+) -> tuple[str, int | None, bool]:
+    """Bound CSV/TSV by complete logical records, never physical lines."""
+    record_ends, ended_in_quotes = _csv_record_end_offsets(
+        head_text,
+        delimiter=delimiter,
+    )
+    if ended_in_quotes and not truncated_by_bytes:
+        return _raw_tabular_fallback(
+            head_text,
+            row_cap=row_cap,
+            truncated_by_bytes=False,
+        )
+
+    # A byte-bounded head that does not end at a line boundary may contain a
+    # syntactically plausible but incomplete unquoted record. Do not count or
+    # publish that fragment. The quoted equivalent is already absent because
+    # it has no record-end offset.
+    if truncated_by_bytes and head_text and not head_text.endswith(("\n", "\r")) and record_ends and record_ends[-1] == len(head_text):
+        record_ends.pop()
+
+    selected_ends = record_ends[:row_cap]
+    preview_text = head_text[: selected_ends[-1]] if selected_ends else ""
+    truncated_by_rows = len(record_ends) > row_cap
+    return preview_text, len(selected_ends), truncated_by_bytes or truncated_by_rows
+
+
+def _build_jsonl_preview(
+    head_text: str,
+    *,
+    row_cap: int,
+    truncated_by_bytes: bool,
+) -> tuple[str, int, bool]:
+    """Bound JSONL by complete, non-empty records as the renderer does."""
+    record_ends: list[int] = []
+    offset = 0
+    frames = head_text.splitlines(keepends=True)
+    for frame_index, frame in enumerate(frames):
+        offset += len(frame)
+        is_partial_tail = truncated_by_bytes and frame_index == len(frames) - 1 and not frame.endswith(("\n", "\r"))
+        if is_partial_tail:
+            continue
+        if frame.rstrip("\r\n") != "":
+            record_ends.append(offset)
+
+    selected_ends = record_ends[:row_cap]
+    truncated_by_rows = len(record_ends) > row_cap
+    if truncated_by_bytes or truncated_by_rows:
+        preview_text = head_text[: selected_ends[-1]] if selected_ends else ""
+    else:
+        preview_text = head_text
+    return preview_text, len(selected_ends), truncated_by_bytes or truncated_by_rows
+
+
 def _classify_text_or_binary(head_bytes: bytes) -> tuple[bool, str]:
     """Return ``(is_text, decoded_text)``.
 
@@ -153,24 +264,21 @@ def _build_artifact_preview_from_head(
         )
 
     content_type = _select_content_type(fs_path.suffix)
-    is_tabular = content_type in {"csv", "jsonl"}
 
-    if is_tabular:
-        # ``splitlines`` is tolerant: malformed CSV rows render as raw
-        # text rather than crashing the request. The frontend gets the
-        # first ``row_cap`` lines and decides how to render them.
-        lines = head_text.splitlines()
-        if len(lines) > row_cap:
-            preview_text = "\n".join(lines[:row_cap])
-            row_count_preview: int | None = row_cap
-            truncated = True
-        else:
-            preview_text = head_text
-            row_count_preview = len(lines)
-            # If the byte cap fired, the final line may itself be a
-            # partial row — we don't know how many full rows remain on
-            # disk, so the preview is honestly truncated.
-            truncated = truncated_by_bytes
+    if content_type == "csv":
+        delimiter = "\t" if fs_path.suffix.lower() == ".tsv" else ","
+        preview_text, row_count_preview, truncated = _build_csv_preview(
+            head_text,
+            delimiter=delimiter,
+            row_cap=row_cap,
+            truncated_by_bytes=truncated_by_bytes,
+        )
+    elif content_type == "jsonl":
+        preview_text, row_count_preview, truncated = _build_jsonl_preview(
+            head_text,
+            row_cap=row_cap,
+            truncated_by_bytes=truncated_by_bytes,
+        )
     else:
         preview_text = head_text
         row_count_preview = None

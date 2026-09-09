@@ -253,7 +253,13 @@ def test_cli_diagnose_loads_authoritative_hmac_from_env_file(
         assert _HMAC_KEY not in captured.out
         assert "UNRELATED_SECRET" not in os.environ
     finally:
-        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+        # Plain ``pop``, NOT ``monkeypatch.delenv``: the loader hoisted the key
+        # into this process's ``os.environ``, and ``delenv`` records the value
+        # it removes so teardown *re-inserts* it — turning the cleanup into a
+        # guaranteed leak that makes every later key-free surface on this xdist
+        # worker fail closed (``stage_scan``, ``tier-model-corpus``). Same shape
+        # as the ``_run_sign`` env-file tests below.
+        os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
 
 def test_standalone_diagnose_loads_authoritative_hmac_from_env_file(
@@ -279,7 +285,9 @@ def test_standalone_diagnose_loads_authoritative_hmac_from_env_file(
         assert key in captured.out
         assert _HMAC_KEY not in captured.out
     finally:
-        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+        # See the sibling test above: ``monkeypatch.delenv`` here would restore
+        # the hoisted key at teardown instead of removing it.
+        os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
 
 def test_cli_diagnose_rejects_missing_env_file(
@@ -407,7 +415,7 @@ def test_cli_sign_loads_env_removes_stale_entry_and_invokes_justify(
 
     calls: list[Any] = []
 
-    def fake_justify(args: Any) -> int:
+    def fake_justify(args: Any, **_kwargs: Any) -> int:
         calls.append(args)
         return 0
 
@@ -442,6 +450,28 @@ def test_cli_sign_restores_stale_entry_when_justify_blocks(
     root, _target = _build_source_tree(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
     key = _write_v2_entry(allowlist_dir, source_root=root, scope_fingerprint="b" * 64)
+    yaml_path = allowlist_dir / "plugins.yaml"
+    signed_entry = yaml_path.read_text(encoding="utf-8").removeprefix("allow_hits:\n")
+    yaml_path.write_text(
+        """\
+allow_hits:
+- key: plugins/first.py:R1:Widget:lookup:fp=aaa
+  owner: test-owner
+  reason: first pre-judge entry
+  safety: suppression
+  expires: '2030-01-01'
+"""
+        + signed_entry
+        + """\
+- key: plugins/last.py:R1:Widget:lookup:fp=ccc
+  owner: test-owner
+  reason: last pre-judge entry
+  safety: suppression
+  expires: '2030-01-01'
+""",
+        encoding="utf-8",
+    )
+    before = yaml_path.read_text(encoding="utf-8")
     env_file = tmp_path / "operator.env"
     env_file.write_text(f"ELSPETH_JUDGE_METADATA_HMAC_KEY={_HMAC_KEY}\n", encoding="utf-8")
     monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
@@ -452,7 +482,8 @@ def test_cli_sign_restores_stale_entry_when_justify_blocks(
 
         captured = capsys.readouterr()
         assert "restored the stale row" in captured.err
-        assert key in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
+        assert key in yaml_path.read_text(encoding="utf-8")
+        assert yaml_path.read_text(encoding="utf-8") == before
     finally:
         os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
@@ -481,7 +512,7 @@ entries:
     calls: list[Any] = []
 
     try:
-        with patch("elspeth_lints.core.cli._run_justify", side_effect=lambda args: calls.append(args) or 0):
+        with patch("elspeth_lints.core.cli._run_justify", side_effect=lambda args, **_kwargs: calls.append(args) or 0):
             assert (
                 _run_sign(
                     root,
@@ -630,7 +661,7 @@ entries:
     monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
     calls: list[Any] = []
 
-    def fake_justify(args: Any) -> int:
+    def fake_justify(args: Any, **_kwargs: Any) -> int:
         calls.append(args)
         return 1 if args.fingerprint == "blocked123" else 0
 

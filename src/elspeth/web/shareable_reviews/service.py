@@ -9,7 +9,8 @@ Responsibilities:
 * Record the audit event in ``composer_completion_events_table`` BEFORE
   writing the blob (audit-first ordering).
 * Mint a signed capability token that encodes the content-address.
-* Resolve an inbound token back to the frozen snapshot for the reviewer.
+* Resolve an inbound token to a public view derived from the authenticated
+  frozen snapshot.
 
 Audit-first ordering (load-bearing):
 
@@ -29,19 +30,23 @@ Frozen-at-mark-time discipline (load-bearing):
 * ``get_shareable_link`` may re-mint only when the current
   ``(session, state)`` already has a ``mark_ready_for_review`` audit row
   whose snapshot blob still exists. It does not create a new share decision.
-* ``resolve_token`` reads ``audit_readiness`` directly from the blob; it
+* ``resolve_token`` verifies the token and content digest, reads the frozen
+  evidence blob, then derives the current public projection in memory. It
   never re-calls ``ReadinessService.compute_snapshot``. This means:
-    - The reviewer sees exactly what the owner saw at mark-time, even if
-      the live state has drifted.
-    - The ``payload_digest`` fingerprint covers the readiness panel too —
-      content-addressing is evidentially complete.
+    - Live state drift cannot change the response. Composition, YAML, and
+      readiness are sanitized through the current public boundary, including
+      when the authenticated evidence predates that boundary.
+    - The ``payload_digest`` authenticates the immutable mark-time evidence,
+      including the readiness panel; resolve-time projection does not rewrite
+      the stored blob.
     - The reviewer-vs-owner permission question for the readiness service
       never arises at resolve time.
 
 Mark-time gate: ``mark_ready_for_review`` raises
-``CompositionNotRunnableError`` if validation fails OR if any readiness row
-has ``status == "error"``. ``status == "warning"`` (e.g. pending LLM
-interpretations) is permitted; the reviewer sees the warning.
+``CompositionNotRunnableError`` if validation fails, completion readiness is
+withheld, OR any readiness row has ``status == "error"``. ``status ==
+"warning"`` (e.g. pending LLM interpretations) is permitted; the reviewer
+sees the warning.
 
 Layer: L3 (web application).
 """
@@ -53,24 +58,34 @@ import json
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Protocol, TypedDict, cast
-from uuid import UUID, uuid4
+from typing import Any, Final, NotRequired, Protocol, TypedDict, cast
+from uuid import UUID
 
-from sqlalchemy import desc, insert, select
+from sqlalchemy import desc, select
 from sqlalchemy.engine import Engine
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.telemetry_phase8 import (
     SessionsTelemetry,
     record_session_completed,
 )
-from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.composer.yaml_generator import (
+    generate_public_composition_dict,
+    generate_public_yaml,
+)
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.repository import SessionDerivedCustodyError
+from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.shareable_reviews.models import (
+    CompositionStateResponse,
     MarkReadyForReviewResponse,
     ShareableLinkResponse,
     SharedInspectResponse,
@@ -98,15 +113,19 @@ _NOT_MARKED_READY_DETAIL = "current composition state has not been marked ready 
 class CompositionNotRunnableError(Exception):
     """Raised when the composition fails the mark-for-review gates.
 
-    Two distinct failure modes carry the same exception type because the
-    route layer maps both to HTTP 409 with the same user-facing message
-    ("the composition is not in a shareable state — fix the surfaced
-    errors and try again").
+    Every failure mode carries the same exception type; the route layer
+    maps them all to HTTP 409 and forwards ``detail`` as the user-facing
+    message, so ``detail`` is written in user register.
 
     The ``reason`` field disambiguates for logs and tests:
 
     * ``"validation_failed"`` — ``ExecutionService.validate`` returned
-      ``is_valid=False``.
+      ``is_valid=False`` for a genuine validation failure.
+    * ``"review_pending"`` — validation halted ONLY because interpretation
+      review cards are pending (the soft-halt handoff shape); there are no
+      errors to fix (elspeth-3830c620a2).
+    * ``"completion_not_ready"`` — validation succeeded, but a completion
+      gate (such as advisor sign-off) withheld ``completion_ready``.
     * ``"readiness_error_row"`` — ``ReadinessService.compute_snapshot``
       returned a row with ``status == "error"``. Sharing a known-broken
       readiness state is share-theatre; the gate refuses.
@@ -140,18 +159,32 @@ class _SessionServiceLike(Protocol):
 
 
 class _ExecutionServiceLike(Protocol):
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> Any: ...
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> Any: ...
     async def validate_state(
         self,
         state: Any,
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> Any: ...
 
 
 class _ReadinessServiceLike(Protocol):
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str) -> AuditReadinessSnapshot: ...
+    async def compute_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> AuditReadinessSnapshot: ...
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -160,10 +193,22 @@ class _ReadinessServiceLike(Protocol):
 class _BlobShape(TypedDict):
     """Wire-shape contract for the canonical-JSON snapshot blob.
 
-    The same five keys are produced by ``_build_snapshot`` and consumed by
-    ``ShareableReviewService.resolve_token``. Adding a key here is a
-    breaking change for outstanding share artifacts — bump the signer
-    payload version + ship a migration before extending.
+    ``_build_snapshot`` produces every key below; ``resolve_token``
+    consumes them. Outstanding share artifacts are immutable signed bytes
+    that we can never rewrite, so the two directions are not symmetric:
+
+    * ADDING a key is safe only when the consumer reads it as
+      ``NotRequired`` — blobs minted before the key existed resolve
+      against the same code and must not crash. The producer still emits
+      it unconditionally, which is why ``_BLOB_KEYS`` (the producer-side
+      closed set) lists it.
+    * REMOVING or retyping a key is breaking, because outstanding blobs
+      still carry the old shape. That needs a new signer payload version
+      landed side by side, not an in-place edit.
+
+    ``created_by_username`` is the worked example: it was added after
+    ``created_by_user_id`` stopped being a human-readable username and
+    became an opaque identity id, and pre-existing blobs have no such key.
     """
 
     pipeline_metadata: Any  # CompositionObject (dict[str, JsonValue])
@@ -171,6 +216,11 @@ class _BlobShape(TypedDict):
     yaml: str
     audit_readiness: Any  # AuditReadinessSnapshot.model_dump output
     created_by_user_id: str
+    # Attribution for the human reader of the shared view. ``created_by_user_id``
+    # is the opaque identity id the token signature binds; it means nothing to a
+    # recipient who has no login and no way to resolve it. Absent on blobs minted
+    # before this key existed — see the class docstring.
+    created_by_username: NotRequired[str]
 
 
 # Closed-set producer-side guard. The digest only proves bytes-on-disk
@@ -179,8 +229,9 @@ class _BlobShape(TypedDict):
 # ``_assert_blob_shape`` catches that class of drift at the producer so
 # the bug surfaces in the owner's request instead of several frames away
 # in the reviewer's Pydantic construction. Update both ``_BlobShape`` AND
-# this constant in the same commit — and bump the signer payload version
-# per the ``_BlobShape`` docstring.
+# this constant in the same commit, observing the add/remove asymmetry in
+# the ``_BlobShape`` docstring. This set is what the PRODUCER must emit,
+# so a ``NotRequired`` consumer-side key still belongs here.
 _BLOB_KEYS: Final[frozenset[str]] = frozenset(
     {
         "pipeline_metadata",
@@ -188,6 +239,7 @@ _BLOB_KEYS: Final[frozenset[str]] = frozenset(
         "yaml",
         "audit_readiness",
         "created_by_user_id",
+        "created_by_username",
     }
 )
 
@@ -214,23 +266,36 @@ def _has_error_readiness_row(snapshot: AuditReadinessSnapshot) -> bool:
     return any(row.status == "error" for row in snapshot.rows)
 
 
+def _public_audit_readiness(snapshot: AuditReadinessSnapshot) -> AuditReadinessSnapshot:
+    """Remove owner-global inventory detail from a share-scoped snapshot."""
+    rows = tuple(row.model_copy(update={"detail": None}) if row.id == "secrets" else row for row in snapshot.rows)
+    return snapshot.model_copy(update={"rows": rows})
+
+
 def _build_snapshot(
     *,
     session_id: UUID,
     state_record: Any,
     audit_readiness: AuditReadinessSnapshot,
     created_by_user_id: str,
+    created_by_username: str,
 ) -> _Snapshot:
     """Build the canonical-JSON snapshot blob and compute its content-address.
 
     The blob shape is the same one ``SharedInspectResponse`` deserialises
     on the resolve path — pipeline_metadata, composition_snapshot, yaml,
-    audit_readiness, created_by_user_id, created_at. This is the
-    contractual wire shape for the share artifact.
+    audit_readiness, created_by_user_id, created_by_username, created_at.
+    This is the contractual wire shape for the share artifact.
+
+    Both attribution fields are frozen into the blob: the identity id
+    because the token signature binds it, and the username because it is
+    the only one of the two a recipient can read. The username is a
+    point-in-time copy on purpose — a later rename must not silently
+    restate who signed this snapshot.
     """
     composition_state = state_from_record(state_record)
     yaml_text = generate_public_yaml(composition_state)
-    composition_dict = composition_state.to_dict()
+    composition_dict = generate_public_composition_dict(composition_state)
     # ``metadata`` is normalised to ``{"name", "description"}`` by
     # CompositionState.to_dict — that IS the pipeline_metadata wire shape.
     # Direct indexing per CLAUDE.md offensive programming: ``to_dict``
@@ -240,7 +305,11 @@ def _build_snapshot(
     # The blob carries ONLY content-addressed content. Mark-time and
     # mint-time live in the token envelope (and the audit row), not here,
     # so two re-mints over an unchanged composition yield the same
-    # payload_digest.
+    # payload_digest. Precisely: unchanged composition AND unchanged
+    # attribution — ``created_by_username`` is blob content, so a rename
+    # between marks legitimately produces a new digest. Nothing depends on
+    # the digest surviving a rename: ``get_shareable_link`` re-mints against
+    # the digest recorded on the audit row, not a recomputed one.
     #
     # The readiness snapshot is normalised: its ``checked_at`` is pinned
     # to the composition state's ``created_at`` rather than the live
@@ -250,7 +319,8 @@ def _build_snapshot(
     # composition. Pinning to state.created_at is semantically defensible:
     # the readiness panel describes "what readiness signal accompanied
     # the state when it was committed," not "when was this query run."
-    audit_readiness_dict = audit_readiness.model_dump(mode="json")
+    public_audit_readiness = _public_audit_readiness(audit_readiness)
+    audit_readiness_dict = public_audit_readiness.model_dump(mode="json")
     audit_readiness_dict["checked_at"] = state_record.created_at.isoformat()
     blob: _BlobShape = {
         "pipeline_metadata": pipeline_metadata,
@@ -258,6 +328,7 @@ def _build_snapshot(
         "yaml": yaml_text,
         "audit_readiness": audit_readiness_dict,
         "created_by_user_id": created_by_user_id,
+        "created_by_username": created_by_username,
     }
     # Producer-side drift guard. ``_BlobShape: TypedDict`` is a static
     # type — Python does not enforce it at runtime. Without this assert,
@@ -271,7 +342,11 @@ def _build_snapshot(
         extra = actual_keys - _BLOB_KEYS
         raise RuntimeError(
             f"shareable-review snapshot blob shape drift: missing={sorted(missing)!r} extra={sorted(extra)!r}. "
-            "Update _BlobShape and _BLOB_KEYS together, and bump the signer payload version."
+            "Update _BlobShape and _BLOB_KEYS together. Do NOT bump the signer payload version to "
+            "add a key: the version gates token acceptance (signer.py rejects any version != 1), so "
+            "bumping it invalidates every outstanding link while doing nothing about blob shape. "
+            "Blobs are content-addressed and immutable, so readers tolerate an older shape by "
+            "treating a new key as optional on read."
         )
     canonical_str = canonical_json(blob)
     canonical_bytes = canonical_str.encode("utf-8")
@@ -280,7 +355,7 @@ def _build_snapshot(
         canonical_bytes=canonical_bytes,
         payload_digest=_DIGEST_PREFIX + digest_hex,
         digest_hex=digest_hex,
-        audit_readiness=audit_readiness,
+        audit_readiness=public_audit_readiness,
         state_id=state_record.id,
         created_at=datetime.now(UTC),
     )
@@ -305,6 +380,7 @@ class ShareableReviewService:
         signer: ShareTokenSigner,
         settings: WebSettings,
         sessions_db_engine: Engine,
+        session_operation_authority: SessionOperationAuthority,
         payload_store: FilesystemPayloadStore,
         telemetry: SessionsTelemetry,
     ) -> None:
@@ -314,6 +390,7 @@ class ShareableReviewService:
         self._signer = signer
         self._settings = settings
         self._sessions_db_engine = sessions_db_engine
+        self._session_operation_authority = session_operation_authority
         self._payload_store = payload_store
         # Phase 8 Sub-task 7c — composer.session.completed_total counter.
         # Mirrors the sessions/service.py pattern at line 48/2446 (the
@@ -324,13 +401,26 @@ class ShareableReviewService:
         # exits cleanly.
         self._telemetry = telemetry
 
-    async def mark_ready_for_review(self, *, session_id: UUID, user_id: str) -> MarkReadyForReviewResponse:
+    async def mark_ready_for_review(
+        self,
+        *,
+        session_id: UUID,
+        user_id: str,
+        username: str,
+        session_operation_context: SessionOperationContext,
+    ) -> MarkReadyForReviewResponse:
         """Build a signed share artifact for ``(session_id, current state)``.
+
+        ``user_id`` is the opaque identity id — it scopes ownership, the
+        audit row's actor, and the token signature. ``username`` is the
+        same person's human-readable login name and is carried only so the
+        recipient's banner can name who shared the pipeline; nothing
+        authorises off it.
 
         Sequence (audit-first ordering):
 
-        1. Validate the composition (raises ``CompositionNotRunnableError``
-           on failure).
+        1. Validate the composition and completion gates (raises
+           ``CompositionNotRunnableError`` on failure).
         2. Compute the readiness snapshot using the OWNER's user_id and
            apply the mark-time gate (no row with status='error').
         3. Build the canonical-JSON snapshot bytes; compute payload_digest.
@@ -351,15 +441,47 @@ class ShareableReviewService:
         composition_state = state_from_record(state_record)
         # session_id scopes the sink path allowlist (blobs/<session_id>/) and
         # inline-blob metadata lookups; omitting it fails closed to outputs-only
-        # and rejects states that /validate and /execute accept.
-        validation = await self._execution_service.validate_state(composition_state, user_id=user_id, session_id=session_id)
+        # and rejects states that /validate and /execute accept. Persisted
+        # completion-gate facts (advisor sign-off, R2-F14) are threaded from the
+        # record so the share-time validation reports the same readiness the
+        # composer and /validate report.
+        validation = await self._execution_service.validate_state(
+            composition_state,
+            user_id=user_id,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            completion_gates=parse_completion_gates(state_record.composer_meta),
+        )
         if not validation.is_valid:
+            # elspeth-3830c620a2: a pending-interpretation handoff is
+            # ``is_valid=False`` by design (soft halt; authoring validated and
+            # the only blocker is a resolvable review card). Refusing it as
+            # "validation failed; fix errors" told the user to fix errors that
+            # do not exist. The share stays blocked — a reviewer of an
+            # un-reviewed composition would be attesting over unresolved
+            # cards — but the reason tells the truth. Allowing
+            # share-while-pending is a separate product decision (tracked on
+            # the ticket); this branch does not foreclose it.
+            if is_pending_interpretation_handoff(validation):
+                raise CompositionNotRunnableError(
+                    reason="review_pending",
+                    detail="interpretation review cards are waiting; resolve them before sharing",
+                )
             raise CompositionNotRunnableError(
                 reason="validation_failed",
                 detail="composition validation failed; fix errors before sharing",
             )
+        if not validation.readiness.completion_ready:
+            raise CompositionNotRunnableError(
+                reason="completion_not_ready",
+                detail="composition completion gates have not passed; resolve blockers before sharing",
+            )
 
-        audit_readiness = await self._readiness_service.compute_snapshot(session_id=session_id, user_id=user_id)
+        audit_readiness = await self._readiness_service.compute_snapshot(
+            session_id=session_id,
+            user_id=user_id,
+            session_operation_context=session_operation_context,
+        )
         if _has_error_readiness_row(audit_readiness):
             raise CompositionNotRunnableError(
                 reason="readiness_error_row",
@@ -376,6 +498,7 @@ class ShareableReviewService:
             state_record=state_record,
             audit_readiness=audit_readiness,
             created_by_user_id=user_id,
+            created_by_username=username,
         )
 
         # Stamp expiry now so the same value lands in both the audit row
@@ -384,21 +507,26 @@ class ShareableReviewService:
         lifetime = timedelta(seconds=self._settings.shareable_link_lifetime_seconds)
         expires_at = snapshot.created_at + lifetime
 
-        # AUDIT FIRST. Sync, crash-on-failure. If this raises, no blob
-        # gets written and the caller sees the error.
-        with self._sessions_db_engine.begin() as conn:
-            conn.execute(
-                insert(composer_completion_events_table).values(
-                    id=str(uuid4()),
-                    session_id=str(session_id),
-                    composition_state_id=str(snapshot.state_id),
-                    event_type="mark_ready_for_review",
+        # AUDIT FIRST under the exact COMPOSE authority already spanning
+        # validation and readiness (a completion event is a write, so the
+        # route holds writer authority). The facet re-proves that this is
+        # still the current state in the same transaction as the insert.
+        try:
+            self._session_operation_authority.mutate(
+                session_operation_context,
+                lambda transaction: transaction.composer_completion.mark_ready_for_review(
+                    composition_state_id=snapshot.state_id,
                     actor=user_id,
                     created_at=snapshot.created_at,
                     payload_digest=snapshot.payload_digest,
                     expires_at=expires_at,
-                )
+                ),
             )
+        except SessionDerivedCustodyError:
+            raise CompositionNotRunnableError(
+                reason="readiness_state_drift",
+                detail="composition changed while preparing the review snapshot; retry against the current state",
+            ) from None
 
         # Phase 8 Sub-task 7c (telemetry-backfill: phase-6).
         # Audit primacy: the helper runs AFTER the engine.begin() block
@@ -512,20 +640,38 @@ class ShareableReviewService:
         # any tampering on the filesystem path raises IntegrityError
         # before we get here.
         blob_dict = self._parse_blob(blob_bytes)
+        # A valid digest authenticates the immutable evidence blob, but legacy
+        # blobs may predate the public projection. Reconstruct the frozen state
+        # and project it in memory; never rewrite the content-addressed bytes.
+        composition_state = CompositionState.from_dict(blob_dict["composition_snapshot"])
+        public_composition = CompositionStateResponse.model_validate(generate_public_composition_dict(composition_state))
+        public_yaml = generate_public_yaml(composition_state)
         # ``model_validate_json`` (not ``model_validate``) on the
         # audit_readiness sub-tree because the strict-mode model rejects
         # ISO-string datetimes and list-as-tuple after a JSON round-trip.
         # ``model_validate_json`` activates Pydantic's JSON validators
         # which DO coerce wire-format primitives back to native types.
-        audit_readiness = AuditReadinessSnapshot.model_validate_json(json.dumps(blob_dict["audit_readiness"]))
+        audit_readiness = _public_audit_readiness(AuditReadinessSnapshot.model_validate_json(json.dumps(blob_dict["audit_readiness"])))
+        # Membership test rather than a defaulting read: the absence of this
+        # key is a declared state of the wire shape (a snapshot minted before
+        # the producer carried a username), not a value we are papering over.
+        # Those bytes are signed and content-addressed, so backfilling
+        # attribution into them is not available — re-minting would change the
+        # payload_digest the outstanding token binds.
+        created_by_username = blob_dict["created_by_username"] if "created_by_username" in blob_dict else None
         return SharedInspectResponse(
             session_id=str(payload.session_id),
             state_id=str(payload.state_id),
             pipeline_metadata=blob_dict["pipeline_metadata"],
-            composition_snapshot=blob_dict["composition_snapshot"],
-            yaml=blob_dict["yaml"],
+            composition_snapshot=public_composition,
+            yaml=public_yaml,
             audit_readiness=audit_readiness,
             created_by_user_id=blob_dict["created_by_user_id"],
+            # ``None`` here means "this snapshot predates the field"; the
+            # frontend falls back to the opaque id, which is degraded but
+            # honest, and self-limiting because every share token expires
+            # within ``shareable_link_lifetime_seconds`` of being minted.
+            created_by_username=created_by_username,
             # ``created_at`` lives in the token envelope rather than the blob —
             # the blob is content-addressed and must not carry mint-time data.
             created_at=payload.created_at,

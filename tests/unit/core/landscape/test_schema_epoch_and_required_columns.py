@@ -1,17 +1,26 @@
-"""Schema epoch + required-shape + provenance-write guards (epoch 29)."""
+"""Schema epoch + required-shape + provenance-write guards (epoch 36)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import inspect, select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.schema import CreateIndex
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from elspeth.contracts.scheduler import SchedulerEventType
-from elspeth.core.landscape.database import _REQUIRED_COLUMNS, _REQUIRED_COMPOSITE_FOREIGN_KEYS, _REQUIRED_INDEXES, LandscapeDB
+from elspeth.core.landscape.database import (
+    _REQUIRED_CHECK_CONSTRAINTS,
+    _REQUIRED_COLUMNS,
+    _REQUIRED_COMPOSITE_FOREIGN_KEYS,
+    _REQUIRED_INDEXES,
+    LandscapeDB,
+)
 from elspeth.core.landscape.schema import (
     SQLITE_SCHEMA_EPOCH,
+    aggregation_result_members_table,
+    aggregation_result_outputs_table,
+    aggregation_results_table,
     artifacts_table,
     batches_table,
     checkpoints_table,
@@ -27,8 +36,137 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_twenty_nine() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 29
+def test_epoch_is_thirty_eight() -> None:
+    # Epoch 37 (elspeth-07cd19ba73, pluggable SSO) widened the auth provider
+    # CHECKs. Epoch 38 (elspeth-2d436dd6e8, elspeth-5d66fc5ed1): scheduler_events
+    # gains an AUTOINCREMENT ``seq`` primary key that every reader orders by,
+    # and event_id becomes a non-unique content digest without recorded_at.
+    # Database time ties inside a SQLite second and inside a PostgreSQL
+    # transaction, so (recorded_at, event_id) replayed in hash order and two
+    # identical same-second transitions collided on the old primary key.
+    assert SQLITE_SCHEMA_EPOCH == 38
+
+
+def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:
+    from elspeth.core.landscape.schema import scheduler_events_table
+
+    assert [c.name for c in scheduler_events_table.primary_key.columns] == ["seq"]
+    assert ("scheduler_events", "seq") in set(_REQUIRED_COLUMNS)
+    assert ("scheduler_events", "ix_scheduler_events_run_token_seq") in set(_REQUIRED_INDEXES)
+    sqlite_ddl = str(CreateTable(scheduler_events_table).compile(dialect=sqlite.dialect()))
+    assert "seq INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT" in sqlite_ddl, sqlite_ddl
+    assert "event_id VARCHAR(64) NOT NULL" in sqlite_ddl, sqlite_ddl
+    assert "UNIQUE (event_id)" not in sqlite_ddl, sqlite_ddl
+    postgres_ddl = str(CreateTable(scheduler_events_table).compile(dialect=postgresql.dialect()))
+    assert "seq SERIAL NOT NULL" in postgres_ddl, postgres_ddl
+    assert "PRIMARY KEY (seq)" in postgres_ddl, postgres_ddl
+
+
+def test_unified_lineage_tables_exist_with_exact_keys() -> None:
+    from elspeth.core.landscape.schema import group_losses_table, group_records_table, token_lineage_frames_table
+
+    assert [c.name for c in token_lineage_frames_table.primary_key.columns] == ["token_id", "run_id", "depth"]
+    assert {c.name for c in token_lineage_frames_table.columns} == {"token_id", "run_id", "depth", "kind", "group_id", "member_key"}
+    assert [c.name for c in group_records_table.primary_key.columns] == ["run_id", "group_id"]
+    assert {c.name for c in group_records_table.columns} == {
+        "run_id",
+        "group_id",
+        "kind",
+        "opener_token_id",
+        "member_count",
+        "created_at",
+        "closes_group_id",
+    }
+    # META-38: the written release fact is nullable (real openers leave it
+    # NULL) and is a startup-verified required column at epoch 36.
+    assert group_records_table.c.closes_group_id.nullable is True
+    assert ("group_records", "closes_group_id") in set(_REQUIRED_COLUMNS)
+    assert {c.name for c in group_losses_table.columns} == {
+        "loss_id",
+        "run_id",
+        "closer_name",
+        "group_id",
+        "member_key",
+        "token_id",
+        "reason",
+        "recorded_by",
+        "recorded_at",
+        "adopted_epoch",
+    }
+    # No defaulted getattr here — the whole-tree masquerade gate pins the exact
+    # set of dynamic-attribute sites; every table index carries .name.
+    # Named unique Index (not UniqueConstraint), matching the retired
+    # coalesce_branch_losses precedent — required for _REQUIRED_INDEXES
+    # verifiability (ruling 2026-08-24).
+    natural = next(ix for ix in group_losses_table.indexes if ix.name == "uq_group_losses_natural")
+    assert natural.unique
+    assert [col.name for col in natural.columns] == ["run_id", "closer_name", "group_id", "member_key"]
+
+
+def test_epoch_33_resolves_run_scoped_per_token_outcome_reads_by_index_order() -> None:
+    """Pin the PLAN, not the index's existence (elspeth-c675c8c2d9).
+
+    ``ix_token_outcomes_run_token`` exists to make a run-scoped per-token read
+    resolvable by one index covering both equality columns. Asserting the index
+    is declared would pass even if SQLite kept choosing ``run_id`` alone, which
+    is exactly the choice that cost 618s on a 60k-token run — so this reads the
+    query plan instead. Streaming in (run_id, token_id) order also removes the
+    grouping sort, which is the absence the second assertion pins.
+    """
+    db = LandscapeDB.in_memory()
+    try:
+        with db.read_only_connection() as conn:
+            plan = "\n".join(
+                str(row)
+                for row in conn.execute(
+                    text("EXPLAIN QUERY PLAN SELECT run_id, token_id FROM token_outcomes WHERE run_id = 'run-1' GROUP BY run_id, token_id")
+                )
+            )
+        assert "ix_token_outcomes_run_token" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    finally:
+        db.close()
+
+
+def test_epoch_32_requires_normalized_aggregation_result_receipts() -> None:
+    required_columns = set(_REQUIRED_COLUMNS)
+    required_foreign_keys = set(_REQUIRED_COMPOSITE_FOREIGN_KEYS)
+    required_checks = set(_REQUIRED_CHECK_CONSTRAINTS)
+    required_indexes = set(_REQUIRED_INDEXES)
+
+    for table in (aggregation_results_table, aggregation_result_outputs_table, aggregation_result_members_table):
+        assert table.name in metadata.tables
+        for column in table.columns:
+            assert (table.name, column.name) in required_columns
+
+    assert (
+        "aggregation_results",
+        ("batch_id", "run_id"),
+        "batches",
+        ("batch_id", "run_id"),
+    ) in required_foreign_keys
+    assert (
+        "aggregation_results",
+        ("aggregation_state_id", "run_id"),
+        "node_states",
+        ("state_id", "run_id"),
+    ) in required_foreign_keys
+    assert (
+        "aggregation_result_members",
+        ("token_id", "run_id"),
+        "tokens",
+        ("token_id", "run_id"),
+    ) in required_foreign_keys
+    assert ("aggregation_results", "ck_aggregation_results_output_hash_hex") in required_checks
+    assert ("aggregation_results", "ck_aggregation_results_mode_shape_parent") in required_checks
+    assert ("aggregation_result_outputs", "ck_aggregation_result_outputs_ref_hex") in required_checks
+    assert ("aggregation_result_members", "ck_aggregation_result_members_action") in required_checks
+    assert ("aggregation_results", "ix_aggregation_results_run") in required_indexes
+
+
+def test_epoch_30_requires_row_union_name() -> None:
+    assert "row_union_name" in token_work_items_table.c
+    assert ("token_work_items", "row_union_name") in set(_REQUIRED_COLUMNS)
 
 
 def test_epoch_29_requires_node_output_contract_hash() -> None:
@@ -126,11 +264,15 @@ def test_token_work_items_has_barrier_adopted_epoch() -> None:
 
 
 def test_epoch_21_coordination_tables_are_defined() -> None:
-    """Epoch 21 (ADR-030 slice 2): the four coordination tables exist in metadata."""
+    """Epoch 21 (ADR-030 slice 2): the four coordination tables exist in metadata.
+
+    The fourth table was ``coalesce_branch_losses`` through epoch 34; WS3
+    retires it in favor of the unified ``group_losses`` ledger (spec §6.2).
+    """
     assert "run_coordination" in metadata.tables
     assert "run_workers" in metadata.tables
     assert "run_coordination_events" in metadata.tables
-    assert "coalesce_branch_losses" in metadata.tables
+    assert "group_losses" in metadata.tables
 
 
 def test_checkpoints_have_barrier_scalars_column() -> None:
@@ -188,16 +330,16 @@ def test_required_columns_include_epoch_21_coordination_substrate() -> None:
     for column in (
         "loss_id",
         "run_id",
-        "coalesce_name",
-        "row_id",
-        "branch_name",
+        "closer_name",
+        "group_id",
+        "member_key",
         "token_id",
         "reason",
         "recorded_by",
         "recorded_at",
         "adopted_epoch",
     ):
-        assert ("coalesce_branch_losses", column) in required
+        assert ("group_losses", column) in required
 
 
 def test_required_columns_include_epoch_22_routing_event_run_scope() -> None:
@@ -331,6 +473,7 @@ def test_token_work_items_barrier_blocked_at_defaults_to_none() -> None:
                 available_at=now,
                 created_at=now,
                 updated_at=now,
+                lineage_path_json="[]",
             )
         )
 

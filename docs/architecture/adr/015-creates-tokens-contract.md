@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-20
 **Status:** Accepted
-**Deciders:** Codex synthesis from the Phase 2B panel-reviewed plan
+**Deciders:** ELSPETH maintainer
 **Tags:** declaration-contract, transform, deaggregation, semantics, governance
 **Supersedes:** None
 **Depends on:** [ADR-010](010-declaration-trust-framework.md)
@@ -107,5 +107,4 @@ new ADR amendment or successor ADR.
 - [ADR-011](011-declared-output-fields-contract.md)
 - `src/elspeth/plugins/infrastructure/base.py`
 - `src/elspeth/contracts/plugin_protocols.py`
-- Historical Phase 2B declaration-trust plan: preserved in git history or
-  maintainer-local archives
+- Phase 2B implementation history: commits `85dfa6608` and `56e003a0c`

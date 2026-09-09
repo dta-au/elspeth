@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.prompts import build_context_string
+from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.yaml_generator import generate_public_yaml
@@ -26,6 +26,7 @@ from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
+from tests.helpers.tree_gate import iter_gate_sources
 
 _ROOT = Path(__file__).resolve().parents[3]
 _AWS_PROMPT = PluginId("transform", "aws_bedrock_prompt_shield")
@@ -109,6 +110,7 @@ def _guardrail_settings(**overrides: object) -> WebSettings:
                 "region_name": "us-east-1",
             }
         },
+        "default_llm_profile": "llm-default",
     }
     values.update(overrides)
     return _settings(**values)
@@ -278,7 +280,7 @@ def _guarded_state() -> CompositionState:
                 on_error="discard",
                 options={
                     "profile": "content-default",
-                    "fields": ["response"],
+                    "fields": ["llm_response"],
                     "source": "OUTPUT",
                     "schema": {"mode": "observed", "fields": None},
                 },
@@ -358,7 +360,7 @@ def test_profiled_prompt_shield_contract_uses_executable_binding_without_mutatin
                     "fingerprint_field": "page_fingerprint",
                     "format": "text",
                     "http": {
-                        "abuse_contact": "policy-test@foundryside.dev",
+                        "abuse_contact": "policy-test@example.gov.au",
                         "scraping_reason": "profile-aware contract integration test",
                     },
                     "schema": {"mode": "observed"},
@@ -445,7 +447,13 @@ def test_private_bindings_never_enter_authored_prompt_snapshot_or_policy_evidenc
     policy, profiles, snapshot = _policy_context(_guardrail_settings())
     state = _guarded_state()
     view = PolicyCatalogView(create_catalog_service(), snapshot, profiles)
-    prompt = build_context_string(state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    # Both authored context messages: the profile-alias inventory rides in the
+    # catalog message, the authored state in the session message.
+    prompt = (
+        build_catalog_context_string(view, plugin_snapshot=snapshot)
+        + "\n"
+        + build_context_string(state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    )
     evidence = _build_web_plugin_policy_evidence(snapshot=snapshot, policy=policy)
     surfaces = {
         "authored_state": json.dumps(state.to_dict(), sort_keys=True),
@@ -518,11 +526,10 @@ def test_generic_policy_modules_have_no_aws_specific_parallel_mechanism() -> Non
         assert "startup_probe" not in source
 
     duplicate_types: list[str] = []
-    for path in (_ROOT / "src/elspeth/web").rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+    for parsed in iter_gate_sources(_ROOT / "src/elspeth/web"):
+        for node in ast.walk(parsed.tree):
             if isinstance(node, ast.ClassDef) and node.name.startswith("AWS") and ("Snapshot" in node.name or "Inventory" in node.name):
-                duplicate_types.append(f"{path.relative_to(_ROOT)}:{node.lineno}:{node.name}")
+                duplicate_types.append(f"{parsed.path.relative_to(_ROOT)}:{node.lineno}:{node.name}")
     assert duplicate_types == []
 
     availability_source = inspect.getsource(build_plugin_snapshot)

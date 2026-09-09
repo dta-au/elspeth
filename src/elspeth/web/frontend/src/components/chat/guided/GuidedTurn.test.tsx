@@ -45,6 +45,7 @@ const SINGLE_SELECT_PAYLOAD: SingleSelectPayload = {
   question: "Which data source should we use?",
   options: [{ id: "csv", label: "CSV File", hint: null }],
   allow_custom: false,
+  source_blob_compatible_option_ids: ["csv"],
 };
 
 const INSPECT_AND_CONFIRM_PAYLOAD: InspectAndConfirmPayload = {
@@ -196,22 +197,21 @@ describe("GuidedTurn dispatcher — routing", () => {
     ).toBeTruthy();
   });
 
-  it("single_select + isTutorial: suppresses the pick widget entirely", () => {
-    // The chip menu is a live, submit-on-click RIVAL to the one action a passive
-    // learner has (Send). Its options don't even include the scripted source, so
-    // clicking any chip derails the tutorial into an unscripted build. In
-    // tutorial mode the pick widget is omitted; the decision collapses to its
-    // heading + "press Send" caption (rendered by ChatPanel, not here).
-    const { container } = render(
+  it("single_select + isTutorial: renders the tutorial-aware picker", () => {
+    // ChatPanel owns the contextual pre-Send suppression because only it knows
+    // whether the locked stage prompt has already been sent. Once allowed
+    // through, the dispatcher renders the tutorial-aware picker so a legal
+    // Add-created turn remains actionable.
+    render(
       <GuidedTurn
         turn={makeTurn("single_select", SINGLE_SELECT_PAYLOAD)}
         onSubmit={vi.fn()}
         isTutorial
       />,
     );
-    expect(screen.queryByText("Which data source should we use?")).toBeNull();
-    expect(screen.queryByRole("button", { name: "CSV File" })).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.getByText("Which data source should we use?")).toBeVisible();
+    expect(screen.getByRole("button", { name: "CSV File" })).toBeEnabled();
+    expect(screen.queryByText(/choosing an option continues/i)).toBeNull();
   });
 
   it("inspect_and_confirm: renders InspectAndConfirmTurn ('Looks right' button)", () => {
@@ -258,6 +258,18 @@ describe("GuidedTurn dispatcher — routing", () => {
     );
     expect(screen.getByRole("heading", { name: "Review sources" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Edit customers" })).toBeEnabled();
+  });
+
+  it("review_components: disallows an unusable tutorial source add", () => {
+    render(
+      <GuidedTurn
+        turn={makeTurn("review_components", COMPONENT_REVIEW_PAYLOAD)}
+        onSubmit={vi.fn()}
+        isTutorial
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Add source" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Finish sources" })).toBeEnabled();
   });
 
   it("propose_pipeline: renders the current durable proposal renderer", () => {
@@ -370,7 +382,7 @@ describe("GuidedTurn dispatcher — onSubmit forwarding", () => {
     );
 
     await user.type(screen.getByLabelText("What should change?"), "Change the source route.");
-    await user.click(screen.getByRole("button", { name: "Re-plan wiring" }));
+    await user.click(screen.getByRole("button", { name: "Edit component settings" }));
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith({

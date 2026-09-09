@@ -21,6 +21,10 @@ turns).
 
 from __future__ import annotations
 
+import re
+
+import pytest
+
 from elspeth.web.composer.state import (
     CompositionState,
     OutputSpec,
@@ -28,6 +32,8 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.composer.state_claim_grounding import (
+    _FIELD_PATTERNS,
+    _FIELD_READERS,
     ActionClaim,
     StateClaim,
     check_state_claim_grounding,
@@ -35,6 +41,7 @@ from elspeth.web.composer.state_claim_grounding import (
     extract_action_claims,
     extract_state_claims,
     format_grounding_correction,
+    unreadable_pattern_fields,
     verify_action_claims,
     verify_state_claims,
 )
@@ -795,3 +802,50 @@ class TestFormatCorrection:
         message = compose_grounded_message(prose="", violations=violations)
         assert message.startswith("")
         assert "[ELSPETH-SYSTEM]" in message
+
+
+class TestFieldReaderRegistry:
+    """The verifier's reach is exactly the reader registry (elspeth-cbf1f78a57).
+
+    Before this pin the lookup helpers carried arms for ``plugin`` and
+    ``on_success`` that no pattern ever produced, the docstring claimed
+    five enforced fields, and a claim for an unregistered field fell
+    through the same empty-tuple path as "no sources configured" — a
+    silent skip indistinguishable from a grounded claim.
+    """
+
+    def test_patterns_and_readers_name_the_same_two_fields(self) -> None:
+        pattern_fields = {(scope, field_name) for field_name, scope, _pattern, _group in _FIELD_PATTERNS}
+        assert pattern_fields == set(_FIELD_READERS)
+        assert pattern_fields == {("source", "on_validation_failure"), ("outputs", "on_write_failure")}
+        assert unreadable_pattern_fields(_FIELD_PATTERNS, _FIELD_READERS) == frozenset()
+
+    def test_pattern_without_reader_is_reported(self) -> None:
+        # The import-time guard is this function's non-empty result; prove
+        # it names the gap rather than the whole pattern set.
+        widened = (*_FIELD_PATTERNS, ("plugin", "source", re.compile(r"plugin"), 0))
+        assert unreadable_pattern_fields(widened, _FIELD_READERS) == frozenset({("source", "plugin")})
+
+    def test_unregistered_field_claim_raises_instead_of_skipping(self) -> None:
+        claim = StateClaim(field_name="plugin", scope="source", claimed_value="csv", span=(0, 3))
+        with pytest.raises(LookupError, match=re.escape("source.plugin")):
+            verify_state_claims((claim,), _state_with_source())
+
+    def test_registered_claim_against_empty_state_is_the_only_silent_path(self) -> None:
+        empty = _state_with_outputs()
+        source_claim = StateClaim(field_name="on_validation_failure", scope="source", claimed_value="discard", span=(0, 3))
+        output_claim = StateClaim(field_name="on_write_failure", scope="outputs", claimed_value="discard", span=(0, 3))
+        assert verify_state_claims((source_claim, output_claim), empty) == ()
+
+    def test_explanation_nouns_come_from_the_reader(self) -> None:
+        source_claim = StateClaim(field_name="on_validation_failure", scope="source", claimed_value="discard", span=(0, 3))
+        output_claim = StateClaim(field_name="on_write_failure", scope="outputs", claimed_value="discard", span=(0, 3))
+        state = _state_with_source("quarantine")
+        (source_violation,) = verify_state_claims((source_claim,), state)
+        assert source_violation.explanation == (
+            "Prose claims a source's on_validation_failure is 'discard', but configured sources use 'quarantine'."
+        )
+        (output_violation,) = verify_state_claims((output_claim,), _state_with_outputs("quarantine"))
+        assert output_violation.explanation == (
+            "Prose claims an output's on_write_failure is 'discard', but configured outputs use 'quarantine'."
+        )

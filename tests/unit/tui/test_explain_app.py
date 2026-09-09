@@ -6,10 +6,12 @@ Tests that require LandscapeDB (TestExplainAppWithData) are deferred to
 integration tier.
 """
 
+from datetime import UTC, datetime
 from typing import cast
 
 import pytest
 
+from elspeth.contracts.audit import Artifact, NodeStateCompleted, NodeStateStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.tui.lineage_view import TuiLineageItem, TuiLineageView
 from elspeth.tui.screens.explain_screen import LoadedState
@@ -418,3 +420,100 @@ class TestExplainApp:
                     "run_id": "run-empty",
                     "message": "No recorded nodes",
                 }
+
+
+class TestArtifactForLineage:
+    """Pin the evidence-precedence mechanism of ExplainScreen._artifact_for_lineage."""
+
+    @staticmethod
+    def _effect_artifact(artifact_id: str) -> Artifact:
+        return Artifact(
+            artifact_id=artifact_id,
+            run_id="run-1",
+            sink_node_id="sink-1",
+            artifact_type="csv",
+            path_or_uri=f"out/{artifact_id}.csv",
+            content_hash="hash-1",
+            size_bytes=1,
+            created_at=datetime.now(UTC),
+            sink_effect_id="effect-1",
+        )
+
+    @staticmethod
+    def _state_artifact(artifact_id: str, state_id: str) -> Artifact:
+        return Artifact(
+            artifact_id=artifact_id,
+            run_id="run-1",
+            sink_node_id="sink-1",
+            artifact_type="csv",
+            path_or_uri=f"out/{artifact_id}.csv",
+            content_hash="hash-1",
+            size_bytes=1,
+            created_at=datetime.now(UTC),
+            produced_by_state_id=state_id,
+            publication_evidence_kind="legacy_returned",
+        )
+
+    @staticmethod
+    def _completed_state(state_id: str) -> NodeStateCompleted:
+        return NodeStateCompleted(
+            state_id=state_id,
+            token_id="token-1",
+            node_id="sink-1",
+            step_index=0,
+            attempt=0,
+            status=NodeStateStatus.COMPLETED,
+            input_hash="in-hash",
+            started_at=datetime.now(UTC),
+            output_hash="out-hash",
+            completed_at=datetime.now(UTC),
+            duration_ms=1.0,
+        )
+
+    def test_effect_membership_wins_over_state_evidence(self) -> None:
+        """A token indexed by sink-effect membership returns its latest effect artifact."""
+        from elspeth.tui.screens.explain_screen import ExplainScreen
+
+        screen = ExplainScreen()
+        state = self._completed_state("state-1")
+        effect_first = self._effect_artifact("artifact-effect-1")
+        effect_latest = self._effect_artifact("artifact-effect-2")
+        state_artifact = self._state_artifact("artifact-state-1", "state-1")
+
+        result = screen._artifact_for_lineage(
+            "token-1",
+            [state],
+            {"state-1": [state_artifact]},
+            {"token-1": [effect_first, effect_latest]},
+        )
+
+        assert result is effect_latest
+
+    def test_absent_membership_falls_back_to_latest_state_evidence(self) -> None:
+        """Without effect membership, the most recent state's artifact is returned."""
+        from elspeth.tui.screens.explain_screen import ExplainScreen
+
+        screen = ExplainScreen()
+        earlier = self._completed_state("state-1")
+        later = self._completed_state("state-2")
+        earlier_artifact = self._state_artifact("artifact-state-1", "state-1")
+        later_artifact = self._state_artifact("artifact-state-2", "state-2")
+
+        result = screen._artifact_for_lineage(
+            "token-1",
+            [earlier, later],
+            {"state-1": [earlier_artifact], "state-2": [later_artifact]},
+            {},
+        )
+
+        assert result is later_artifact
+
+    def test_no_evidence_returns_none(self) -> None:
+        """A token with neither effect membership nor state evidence yields None."""
+        from elspeth.tui.screens.explain_screen import ExplainScreen
+
+        screen = ExplainScreen()
+
+        result = screen._artifact_for_lineage("token-1", [self._completed_state("state-1")], {}, {})
+
+        assert result is None

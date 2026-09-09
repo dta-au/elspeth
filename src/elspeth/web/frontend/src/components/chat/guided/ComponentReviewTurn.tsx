@@ -1,4 +1,7 @@
 import { useId } from "react";
+
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { Button } from "@/components/ui";
 import type {
   ComponentReviewPayload,
   GuidedComponentAction,
@@ -9,6 +12,7 @@ interface ComponentReviewTurnProps {
   payload: ComponentReviewPayload;
   onSubmit: (body: GuidedRespondAction) => void;
   disabled?: boolean;
+  isTutorial?: boolean;
 }
 
 function responseFor(component_action: GuidedComponentAction): GuidedRespondAction {
@@ -32,6 +36,7 @@ export function ComponentReviewTurn({
   payload,
   onSubmit,
   disabled = false,
+  isTutorial = false,
 }: ComponentReviewTurnProps) {
   const headingId = useId();
   const stableIds = payload.items.map((item) => item.stable_id);
@@ -72,17 +77,21 @@ export function ComponentReviewTurn({
             <li
               key={item.stable_id}
               className="guided-component-review-item"
-              aria-label={`${item.name}, ${item.plugin}, reviewed`}
+              // `listitem` supports naming from author, so aria-label is
+              // permitted here (unlike the role-less span ModelChip carried).
+              aria-label={`${item.name}, ${pluginDisplayName(item.plugin)}`}
             >
               <div className="guided-component-review-summary">
                 <strong>{item.name}</strong>
-                <span>{item.plugin}</span>
-                <span>{item.status}</span>
+                {/* `item.status` is closed to "reviewed" (types/guided.ts), so
+                    the word carried no information; the list heading "Review
+                    sources" already says what these rows are. */}
+                <span title={item.plugin}>{pluginDisplayName(item.plugin)}</span>
               </div>
               <div className="guided-component-review-item-actions">
                 {allowed.has("edit") && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="bare"
                     className="guided-component-review-btn"
                     onClick={() =>
                       submit({
@@ -93,11 +102,11 @@ export function ComponentReviewTurn({
                     disabled={disabled}
                   >
                     Edit {item.name}
-                  </button>
+                  </Button>
                 )}
                 {allowed.has("remove") && payload.items.length > 1 && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="bare"
                     className="guided-component-review-btn guided-component-review-btn--remove"
                     onClick={() =>
                       submit({
@@ -108,28 +117,28 @@ export function ComponentReviewTurn({
                     disabled={disabled}
                   >
                     Remove {item.name}
-                  </button>
+                  </Button>
                 )}
                 {allowed.has("reorder") && payload.items.length > 1 && (
                   <>
-                    <button
-                      type="button"
+                    <Button
+                      variant="bare"
                       className="guided-component-review-btn"
                       aria-label={`Move ${item.name} up`}
                       onClick={() => move(item.stable_id, -1)}
                       disabled={disabled || currentIndex === 0}
                     >
                       Move up
-                    </button>
-                    <button
-                      type="button"
+                    </Button>
+                    <Button
+                      variant="bare"
                       className="guided-component-review-btn"
                       aria-label={`Move ${item.name} down`}
                       onClick={() => move(item.stable_id, 1)}
                       disabled={disabled || currentIndex === stableIds.length - 1}
                     >
                       Move down
-                    </button>
+                    </Button>
                   </>
                 )}
               </div>
@@ -138,25 +147,25 @@ export function ComponentReviewTurn({
         })}
       </ol>
       <div className="guided-component-review-actions">
-        {allowed.has("add") && (
-          <button
-            type="button"
+        {allowed.has("add") && !(isTutorial && payload.component_kind === "source") && (
+          <Button
+            variant="bare"
             className="guided-component-review-btn"
             onClick={() => submit({ action: "add", component_kind: payload.component_kind })}
             disabled={disabled}
           >
             Add {payload.component_kind}
-          </button>
+          </Button>
         )}
         {allowed.has("finish") && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-component-review-btn guided-component-review-btn--finish"
             onClick={() => submit({ action: "finish", component_kind: payload.component_kind })}
             disabled={disabled}
           >
             Finish {plural}
-          </button>
+          </Button>
         )}
       </div>
     </section>

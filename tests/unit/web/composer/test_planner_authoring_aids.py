@@ -4,29 +4,40 @@ The aids exist because the 2026-07-22 pack stress test showed cold planners
 fabricating ``blob_id`` values and missing the source options contract: the
 pack had rules but no worked exemplars, and the ``no_deployment_plugin_facts``
 gate (correctly) forbids plugin literals in the static prompts. These tests
-enforce the self-verifying-teaching contract: the exact exemplar objects the
-planner prompt carries are run through ``build_set_pipeline_candidate``
-against the real catalog, so a drifting exemplar fails CI instead of teaching
-planners an invalid shape.
+enforce the self-verifying-teaching contract: the exact flat canonical
+documents nested in the prompt's provider envelopes are run through
+``build_set_pipeline_candidate`` against the real catalog, so a drifting
+exemplar fails CI instead of teaching planners an invalid shape.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from threading import Barrier
+from types import SimpleNamespace
+from typing import Any, get_args
 from uuid import uuid4
 
+import pytest
+from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginSummary
+from elspeth.web.composer import planner_authoring_aids
 from elspeth.web.composer.planner_authoring_aids import (
     PLACEHOLDER_BLOB_ID,
     build_planner_authoring_aids,
     discovery_digest,
     fork_coalesce_exemplar_args,
+    planner_expression_grammar,
+    planner_model_catalog,
     source_custody_exemplar_args,
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -49,6 +60,125 @@ def _trained_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     return PolicyCatalogView.for_trained_operator(catalog, snapshot), snapshot
 
 
+@pytest.mark.parametrize("missing_selection", [False, True])
+def test_profile_selection_distinguishes_explicit_none_from_corrupt_snapshot(tmp_path: Path, missing_selection: bool) -> None:
+    from dataclasses import replace
+
+    from elspeth.web.plugin_policy.models import PluginId
+
+    view, snapshot = _profile_view(tmp_path)
+    llm_id = PluginId("transform", "llm")
+    selections = tuple(
+        (plugin_id, None if plugin_id == llm_id else alias)
+        for plugin_id, alias in snapshot.selected_profile_aliases
+        if not (missing_selection and plugin_id == llm_id)
+    )
+    altered = replace(snapshot, selected_profile_aliases=selections)
+    altered_view = PolicyCatalogView(view._full, altered, view._profiles)
+    if missing_selection:
+        with pytest.raises(KeyError) as caught:
+            planner_authoring_aids._usable_llm_profile_alias(altered_view)
+        assert caught.value.args == (llm_id,)
+    else:
+        assert planner_authoring_aids._usable_llm_profile_alias(altered_view) == dict(snapshot.usable_profile_aliases)[llm_id][0]
+
+
+def _compiler_manager_with_llm_source() -> Any:
+    """Required-policy registry while production source discovery stays off."""
+    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.plugins.sources.llm import LLMSource
+
+    class _CompilerLLMSource(LLMSource):
+        determinism = LLMSource.determinism
+        source_file_hash = "sha256:0123456789abcdef"
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([_CompilerLLMSource], "elspeth_get_source"))
+    return manager
+
+
+def _catalog_with_llm_source() -> Any:
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    return CatalogServiceImpl(_compiler_manager_with_llm_source())
+
+
+def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lookup, eviction, and insertion are locked while cold builds remain off-lock."""
+
+    class LockCheckedMemo(dict[str, dict[str, Any]]):
+        def _assert_locked(self) -> None:
+            assert planner_authoring_aids._AIDS_MEMO_LOCK.locked()
+
+        def get(self, key: str, default: Any = None) -> Any:
+            self._assert_locked()
+            return super().get(key, default)
+
+        def __len__(self) -> int:
+            self._assert_locked()
+            return super().__len__()
+
+        def __setitem__(self, key: str, value: dict[str, Any]) -> None:
+            self._assert_locked()
+            super().__setitem__(key, value)
+
+        def __iter__(self) -> Iterator[str]:
+            self._assert_locked()
+            return super().__iter__()
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            self._assert_locked()
+            return super().pop(key, default)
+
+    memo = LockCheckedMemo({"old-snapshot": {"key": "old-value"}})
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", memo)
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO_MAX", 1)
+    monkeypatch.setattr(planner_authoring_aids, "read_openrouter_catalog_snapshot_id", lambda: ("catalog-sha", "live"))
+
+    def build(_catalog: object) -> dict[str, str]:
+        assert not planner_authoring_aids._AIDS_MEMO_LOCK.locked()
+        return {"key": "value"}
+
+    monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
+    catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="snapshot"))
+
+    first = planner_authoring_aids.build_planner_authoring_aids(catalog)
+    second = planner_authoring_aids.build_planner_authoring_aids(catalog)
+
+    assert first == second == {"key": "value"}
+    assert first is not second
+    assert dict(memo) == {"snapshot:live:catalog-sha": {"key": "value"}}
+
+
+@pytest.mark.parametrize("snapshot_hashes", [["same"] * 4, ["one", "two", "three", "four"]])
+def test_authoring_aids_concurrent_cold_builds_are_bounded_and_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_hashes: list[str],
+) -> None:
+    """Concurrent misses cannot corrupt eviction or share mutable return values."""
+    barrier = Barrier(len(snapshot_hashes))
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO", {})
+    monkeypatch.setattr(planner_authoring_aids, "_AIDS_MEMO_MAX", 2)
+
+    def build(catalog: Any) -> dict[str, str]:
+        assert not planner_authoring_aids._AIDS_MEMO_LOCK.locked()
+        barrier.wait(timeout=5)
+        return {"purpose": catalog.snapshot.snapshot_hash}
+
+    monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
+    catalogs = [SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash=value)) for value in snapshot_hashes]
+
+    with ThreadPoolExecutor(max_workers=len(catalogs)) as executor:
+        results = list(executor.map(planner_authoring_aids.build_planner_authoring_aids, catalogs))
+
+    assert [result["purpose"] for result in results] == snapshot_hashes
+    assert len(planner_authoring_aids._AIDS_MEMO) <= 2
+    assert len({id(result) for result in results}) == len(results)
+
+
 def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     """Live-deployment posture: one OpenRouter LLM operator profile.
 
@@ -56,7 +186,6 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
     the posture every failing planner surface (tutorial, guided, freeform web)
     actually runs under, where llm nodes are authored via a profile alias.
     """
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -78,10 +207,12 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="sonnet",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_compiler_manager_with_llm_source(), settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = _catalog_with_llm_source()
 
     class _ServerKeyInventory:
         def has_server_ref(self, name: str) -> bool:
@@ -101,13 +232,273 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
 
     snapshot = build_plugin_snapshot(
         policy=policy,
-        catalog=create_catalog_service(),
+        catalog=catalog,
         profiles=profiles,
         principal_scope="local:authoring-aids-profile",
         secret_inventory=_ServerKeyInventory(),
         generation_key=b"authoring-aids-key",
     )
-    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
+
+
+def _source_only_profile_view(
+    tmp_path: Path,
+    *,
+    content_safety_required: bool = False,
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Pre-discovery source profile posture with transform:llm hidden."""
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.plugins.sources.llm import LLMSource
+    from elspeth.web.catalog.service import CatalogServiceImpl
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    catalog = CatalogServiceImpl(manager)
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = WebPluginPolicy.create(
+        required=frozenset(),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=(),
+    )
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    transform_llm = PluginId("transform", "llm")
+    available = frozenset(
+        {
+            *(PluginId("source", item.name) for item in catalog.list_sources()),
+            *(PluginId("transform", item.name) for item in catalog.list_transforms()),
+            *(PluginId("sink", item.name) for item in catalog.list_sinks()),
+        }
+        - {transform_llm}
+    )
+    source_llm = PluginId("source", "llm")
+    selected = tuple(
+        (
+            capability,
+            (
+                PluginId("transform", "aws_bedrock_content_safety")
+                if capability is PluginCapability.CONTENT_SAFETY and content_safety_required
+                else source_llm
+                if capability is PluginCapability.LLM
+                else None
+            ),
+        )
+        for capability in PluginCapability
+    )
+    control_modes = ((PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED),) if content_safety_required else ()
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="source-only-policy",
+        principal_scope="local:source-only",
+        available=available,
+        unavailable=(),
+        selected=selected,
+        usable_profile_aliases=((source_llm, ("sonnet",)),),
+        selected_profile_aliases=((source_llm, "sonnet"),),
+        binding_generation_fingerprint="source-only-bindings",
+        control_modes=control_modes,
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
+
+
+def _guardrail_profile_view(
+    tmp_path: Path,
+    *,
+    control_mode: str = "required",
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Control-required posture: LLM profile plus both Bedrock Guardrail profiles.
+
+    Mirrors the AWS scenario module, which authorizes the two Bedrock controls,
+    sets both control modes to ``required``, and binds each to an operator-owned
+    Guardrail behind an opaque alias.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:aws_bedrock_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:aws_bedrock_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode(control_mode),
+            PluginCapability.CONTENT_SAFETY: ControlMode(control_mode),
+        },
+        bedrock_guardrail_profiles=(
+            BedrockGuardrailProfileSettings(
+                alias="prompt-approved",
+                plugin="aws_bedrock_prompt_shield",
+                guardrail_identifier="operatorpromptguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+            BedrockGuardrailProfileSettings(
+                alias="content-approved",
+                plugin="aws_bedrock_content_safety",
+                guardrail_identifier="operatorcontentguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+        ),
+        bedrock_guardrail_default_profiles={
+            "aws_bedrock_prompt_shield": "prompt-approved",
+            "aws_bedrock_content_safety": "content-approved",
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=_compiler_manager_with_llm_source(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = _catalog_with_llm_source()
+
+    class _ServerKeyInventory:
+        def has_server_ref(self, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name == "OPENROUTER_API_KEY" else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=catalog,
+        profiles=profiles,
+        principal_scope="local:authoring-aids-guardrail",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"authoring-aids-key",
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
+
+
+def _direct_control_view(
+    tmp_path: Path,
+    *,
+    control_mode: str = "required",
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Control posture with NO operator profile aliases for the controls.
+
+    The Azure safety plugins are USER_CONFIGURABLE_WITH_POLICY: selected and
+    available (their credential is in the inventory) but carrying zero
+    operator profile aliases — the direct-configuration deployment shape.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:azure_prompt_shield", "transform:azure_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:azure_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:azure_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode(control_mode),
+            PluginCapability.CONTENT_SAFETY: ControlMode(control_mode),
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=_compiler_manager_with_llm_source(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = _catalog_with_llm_source()
+
+    class _ServerKeyInventory:
+        _names = frozenset({"OPENROUTER_API_KEY", "AZURE_CONTENT_SAFETY_KEY"})
+
+        def has_server_ref(self, name: str) -> bool:
+            return name in self._names
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name in self._names
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name in self._names else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=catalog,
+        profiles=profiles,
+        principal_scope="local:authoring-aids-direct-control",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"authoring-aids-key",
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
 def _session_with_user_message(content: str) -> tuple[Any, str, str, str]:
@@ -296,8 +687,28 @@ def _assert_operator_ruled_topology(args: dict[str, Any]) -> None:
 
 
 class TestForkCoalesceExemplar:
+    def test_llm_exemplar_teaches_source_to_target_mapping_direction(self, tmp_path: Path) -> None:
+        """At least one rename key is an arriving LLM response field.
+
+        Identity-only mappings are direction-blind: they let an author reverse
+        ``source -> target`` without any visible difference.  The worked LLM
+        exemplar must keep a real rename whose key is produced by an LLM arm
+        and whose value is the tidied output name (elspeth-d4ae04b374).
+        """
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        llm_response_fields = {node["options"]["response_field"] for node in args["nodes"] if node.get("plugin") == "llm"}
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        renames = {source: target for source, target in cleanup["options"]["mapping"].items() if source != target}
+
+        assert renames
+        assert set(renames) <= llm_response_fields
+        assert set(renames.values()).isdisjoint(llm_response_fields)
+
     def test_fork_coalesce_exemplar_validates_under_the_live_profile_posture(self, tmp_path: Path) -> None:
-        """The exact fork -> two-llm -> coalesce exemplar bytes must build."""
+        """The exemplar builds with derived producer and authored consumer contracts."""
         (tmp_path / "outputs").mkdir(exist_ok=True)
         view, snapshot = _profile_view(tmp_path)
         args = fork_coalesce_exemplar_args(view)
@@ -309,6 +720,25 @@ class TestForkCoalesceExemplar:
 
         rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
         assert candidate.acceptable is True, f"fork/coalesce exemplar rejected: {rejection}"
+        state = candidate.result.updated_state
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        cleanup = next(node for node in state.nodes if node.plugin == "field_mapper")
+        output = state.outputs[0]
+
+        # The structural node contributes no authored producer claim. Its
+        # require-all/union guarantees are instead derived from branch plugin
+        # contracts, and validate() proves those guarantees satisfy the
+        # cleanup's declared input contract.
+        assert coalesce.options == {}
+        branch_output_fields = {node.options["response_field"] for node in state.nodes if node.plugin == "llm"}
+        assert branch_output_fields <= set(cleanup.options["schema"]["guaranteed_fields"])
+        assert state.validate().is_valid
+
+        # Exact emitted shape remains planner-authored at the consumer seam.
+        assert cleanup.options["select_only"] is True
+        assert output.options["schema"]["mode"] == "fixed"
+        sink_fields = [field.partition(":")[0] for field in output.options["schema"]["fields"]]
+        assert sink_fields == list(cleanup.options["mapping"].values())
 
     def test_fork_coalesce_exemplar_has_the_operator_ruled_topology(self, tmp_path: Path) -> None:
         """Two separate LLM transform nodes + coalesce merge — never a queries map."""
@@ -327,6 +757,256 @@ class TestForkCoalesceExemplar:
         assert len({llm["options"]["response_field"] for llm in llms}) == 2
         assert all("queries" not in llm["options"] for llm in llms)
 
+    def test_field_mapper_exemplar_teaches_source_to_target_rename_direction(self, tmp_path: Path) -> None:
+        """A real rename keeps mapping direction visible across both contracts."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        mapping = cleanup["options"]["mapping"]
+        assert mapping["sentiment"] == "ticket_sentiment"
+        assert any(source != target for source, target in mapping.items())
+
+        input_guarantees = set(cleanup["options"]["schema"]["guaranteed_fields"])
+        sink_fields = {field.partition(":")[0].strip() for field in args["outputs"][0]["options"]["schema"]["fields"]}
+        assert input_guarantees == set(mapping)
+        assert sink_fields == set(mapping.values())
+
+    def test_forked_exemplar_still_builds_with_controls_inserted(self, tmp_path: Path) -> None:
+        """Inserting the control nodes must not break the exemplar's topology.
+
+        Scope: this proves the bytes still construct a valid pipeline with two
+        extra nodes spliced into the stream chain. It does NOT prove control
+        coverage — ``build_set_pipeline_candidate`` does not run the plugin-policy
+        coverage check (an uncovered fork is accepted here and rejected later, at
+        completion validation). The dominance relationships that satisfy coverage
+        are asserted structurally in the next test.
+        """
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"control-required fork exemplar rejected: {rejection}"
+
+    def test_selected_controls_are_wired_into_the_forked_llm_exemplar(self, tmp_path: Path) -> None:
+        """A control-required deployment must not be taught two bare llm branches.
+
+        ``control_coverage_findings`` proves coverage per LLM node: the shield
+        must dominate the node's prompt inputs and content safety must dominate
+        every one of its output streams. An exemplar modelling an uncovered fork
+        would teach exactly the topology this deployment's validator rejects, so
+        the controls are wired — one shield upstream of the fork covering both
+        branches' prompt fields, one safety node downstream of the rejoin
+        covering both branches' response fields.
+        """
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        nodes = {node["id"]: node for node in args["nodes"]}
+        llms = [node for node in nodes.values() if node.get("plugin") == "llm"]
+        assert len(llms) == 2
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        coalesce = next(node for node in nodes.values() if node["node_type"] == "coalesce")
+
+        shield = next(node for node in nodes.values() if node.get("plugin") == "aws_bedrock_prompt_shield")
+        safety = next(node for node in nodes.values() if node.get("plugin") == "aws_bedrock_content_safety")
+
+        # The shield dominates the fork, so one node covers both branches, and it
+        # covers exactly the row fields the branch prompts interpolate.
+        assert shield["input"] == args["source"]["on_success"]
+        assert gate["input"] == shield["on_success"]
+        prompt_fields = {"ticket_id", "body"}
+        assert prompt_fields <= set(shield["options"]["fields"])
+
+        # Safety dominates the rejoin, covering both branches' response fields.
+        assert safety["input"] == coalesce["id"]
+        assert {llm["options"]["response_field"] for llm in llms} <= set(safety["options"]["fields"])
+        cleanup = next(node for node in nodes.values() if node.get("plugin") == "field_mapper")
+        assert cleanup["input"] == safety["on_success"]
+
+        # Operator-owned bindings stay behind the alias — never modelled inline.
+        for control in (shield, safety):
+            assert control["options"]["profile"] in {"prompt-approved", "content-approved"}
+            assert "guardrail_identifier" not in control["options"]
+            assert "guardrail_version" not in control["options"]
+
+    def test_forked_exemplar_passes_required_control_coverage_at_completion(self, tmp_path: Path) -> None:
+        """The accepted exemplar must clear the completion-validation coverage gate.
+
+        ``build_set_pipeline_candidate`` does not run required-control
+        coverage — completion validation does. The exemplar's
+        one-shield-above-the-fork placement is only teachable if that gate
+        accepts a shield dominating both branches through the fan-out gate.
+        """
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+        assert candidate.acceptable is True, (candidate.result.data or {}).get("error")
+
+        result = view.validate_authored_state(candidate.result.updated_state)
+        coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
+        assert coverage == [], [finding.message for finding in coverage]
+
+    def test_recommended_controls_remain_advisory_and_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
+
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        plugins = {node.get("plugin") for node in args["nodes"]}
+        assert "aws_bedrock_prompt_shield" not in plugins
+        assert "aws_bedrock_content_safety" not in plugins
+
+        aids = build_planner_authoring_aids(view)
+        rendered = "\n".join(aids["prompt_shield"]["rules"])
+        assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
+        assert "required, not advisory" not in rendered
+        assert "content_safety" not in aids
+
+    def test_required_controls_without_profile_aliases_are_still_wired_into_the_exemplar(self, tmp_path: Path) -> None:
+        """Zero profile aliases must not drop a REQUIRED control from the exemplar.
+
+        A selected control can be usable without operator profile aliases
+        (direct user-configurable plugins such as the Azure safety pair).
+        Omitting the control nodes taught exactly the uncovered fork this
+        deployment's required-control-coverage validator rejects. The
+        alias-less form authors the control directly: no ``profile`` option,
+        the credential wired as the supported inline ``secret_ref`` marker,
+        and the remaining required service bindings as placeholders.
+        """
+        view, _snapshot = _direct_control_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        nodes = {node["id"]: node for node in args["nodes"]}
+        shield = next(node for node in nodes.values() if node.get("plugin") == "azure_prompt_shield")
+        safety = next(node for node in nodes.values() if node.get("plugin") == "azure_content_safety")
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        coalesce = next(node for node in nodes.values() if node["node_type"] == "coalesce")
+
+        # Same dominance wiring as the profiled variant.
+        assert shield["input"] == args["source"]["on_success"]
+        assert gate["input"] == shield["on_success"]
+        assert safety["input"] == coalesce["id"]
+
+        for control in (shield, safety):
+            assert "profile" not in control["options"]
+            assert control["options"]["fields"]
+            assert control["options"]["api_key"] == {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"}
+        # Effective blocking posture — all-6 thresholds are a coverage no-op.
+        thresholds = safety["options"]["thresholds"]
+        assert any(value < 6 for value in thresholds.values())
+
+
+class TestForkRowUnionExemplar:
+    def test_exemplar_validates_and_teaches_the_row_union_contract(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"fork/row_union exemplar rejected: {rejection}"
+        nodes = {node["id"]: node for node in args["nodes"]}
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        union = next(node for node in nodes.values() if node["node_type"] == "row_union")
+        branch_nodes = [node for node in nodes.values() if node.get("input") in gate["fork_to"]]
+        assert set(union["branches"]) == set(gate["fork_to"])
+        assert set(union["branches"].values()) == {node["on_success"] for node in branch_nodes}
+        assert union["input"] == next(iter(union["branches"].values()))
+        assert union["on_success"] == "unioned_rows"
+        assert union["timeout_seconds"] > 0
+        assert "plugin" not in union
+        assert "policy" not in union
+        assert "merge" not in union
+
+    def test_exemplar_carries_a_non_discard_failure_route_to_a_declared_sink(self) -> None:
+        """elspeth-0aace271b4 I2: the aids corpus must not be a discard monoculture.
+
+        Before this exemplar, every failure edge in every worked exemplar was
+        'discard' (15/15), teaching silent row loss as the house style. This
+        pins the one retention-shaped counter-exemplar: a transform on_error
+        naming a sink that the same exemplar declares in outputs.
+        """
+        view, _snapshot = _trained_view()
+        args = planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert args is not None
+        declared_sinks = {output["sink_name"] for output in args["outputs"]}
+        non_discard_routes = {node["on_error"] for node in args["nodes"] if "on_error" in node and node["on_error"] != "discard"}
+        assert non_discard_routes, "row_union exemplar lost its non-discard failure route"
+        assert non_discard_routes <= declared_sinks
+
+    def test_authoring_aids_publish_row_union_rules_and_exemplar(self) -> None:
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+
+        assert payload["fork_row_union"]["set_pipeline_exemplar"] == {"pipeline": planner_authoring_aids.fork_row_union_exemplar_args(view)}
+        rendered = " ".join(payload["fork_row_union"]["rules"])
+        assert "require_all" in rendered
+        assert "N-to-N" in rendered
+        assert "first branch" in rendered
+
+    def test_select_only_exemplars_cover_distinct_fixed_sink_contracts(self) -> None:
+        """Every taught whitelist visibly preserves its downstream required fields."""
+        trained_view, _trained_snapshot = _trained_view()
+        fork_args = fork_coalesce_exemplar_args(trained_view)
+        union_args = planner_authoring_aids.fork_row_union_exemplar_args(trained_view)
+        assert fork_args is not None and union_args is not None
+
+        sink_contracts: list[set[str]] = []
+        for args in (fork_args, union_args):
+            cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+            sink_schema = args["outputs"][0]["options"]["schema"]
+            assert sink_schema["mode"] == "fixed"
+            required_fields = {field.partition(":")[0].strip() for field in sink_schema["fields"]}
+            assert required_fields
+            assert required_fields <= set(cleanup["options"]["mapping"].values())
+            assert set(cleanup["options"]["mapping"]) <= set(cleanup["options"]["schema"]["guaranteed_fields"])
+            sink_contracts.append(required_fields)
+
+        assert sink_contracts[0] != sink_contracts[1]
+
+    def test_alias_less_control_exemplar_validates_through_the_real_candidate_builder(self, tmp_path: Path) -> None:
+        """The exact alias-less control exemplar bytes must build."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _direct_control_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"alias-less control exemplar rejected: {rejection}"
+
+    def test_recommended_alias_less_controls_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
+        view, _snapshot = _direct_control_view(tmp_path, control_mode="recommend")
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        plugins = {node.get("plugin") for node in args["nodes"]}
+        assert "azure_prompt_shield" not in plugins
+        assert "azure_content_safety" not in plugins
+
     def test_topology_exemplar_renders_and_validates_without_a_usable_llm_profile(self, tmp_path: Path) -> None:
         """No usable llm profile -> the SAME topology with non-LLM branches.
 
@@ -335,8 +1015,10 @@ class TestForkCoalesceExemplar:
         profile alias (as the module originally did) meant a deployment with no
         visible LLM profile lost the topology teaching entirely, which is
         exactly backwards. Branch transforms are drawn deterministically from
-        the policy-visible catalog: first two alphabetically whose only
-        required option is ``schema``.
+        the policy-visible catalog: ``passthrough`` when available, otherwise
+        the first alphabetic candidate whose only required option is
+        ``schema``. The same plugin/configuration on both branches guarantees
+        the union coalesce does not mix runtime schema modes.
         """
         view, _snapshot = _trained_view()
         args = fork_coalesce_exemplar_args(view)
@@ -364,8 +1046,9 @@ class TestForkCoalesceExemplar:
             and {field.name for field in plugin.config_fields if field.required} <= {"schema"}
         )
         gate = next(node for node in nodes if node["node_type"] == "gate")
-        branch_plugins = sorted(node["plugin"] for node in nodes if node.get("input") in gate["fork_to"])
-        assert branch_plugins == renderable[:2]
+        branch_plugins = [node["plugin"] for node in nodes if node.get("input") in gate["fork_to"]]
+        expected_plugin = "passthrough" if "passthrough" in renderable else renderable[0]
+        assert branch_plugins == [expected_plugin, expected_plugin]
         # The exact bytes the prompt carries must build under this posture.
         (tmp_path / "outputs").mkdir(exist_ok=True)
         content = args["source"]["inline_blob"]["content"]
@@ -381,7 +1064,58 @@ class TestForkCoalesceExemplar:
         payload = build_planner_authoring_aids(view)
 
         section = payload["fork_coalesce"]
-        assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+        assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
+
+
+class TestSelectedControlProfile:
+    """Selection contract for the exemplar's required-control wiring."""
+
+    def test_required_with_aliases_returns_plugin_and_alias(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == (
+            "aws_bedrock_prompt_shield",
+            "prompt-approved",
+        )
+        assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == (
+            "aws_bedrock_content_safety",
+            "content-approved",
+        )
+
+    def test_required_without_aliases_returns_plugin_with_no_alias(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        view, snapshot = _direct_control_view(tmp_path)
+        # Precondition, stated as the ABSENT-PAIR fact rather than a defaulted
+        # read: build_plugin_snapshot records a usable_profile_aliases pair
+        # only for a WebConfigAuthority.OPERATOR_PROFILED plugin, and these
+        # Azure controls are USER_CONFIGURABLE_WITH_POLICY, so the pair is
+        # missing entirely. _selected_control_profile must answer the
+        # restrictive () to that absence, never credit the control with an
+        # alias the snapshot did not grant it.
+        aliases_by_plugin = dict(snapshot.usable_profile_aliases)
+        for capability in (PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY):
+            selected = dict(snapshot.selected)[capability]
+            assert selected is not None
+            assert selected not in aliases_by_plugin
+
+        assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == ("azure_prompt_shield", None)
+        assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == ("azure_content_safety", None)
+
+    def test_recommend_mode_returns_none_even_with_a_selection(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        for view, _snapshot in (
+            _guardrail_profile_view(tmp_path, control_mode="recommend"),
+            _direct_control_view(tmp_path, control_mode="recommend"),
+        ):
+            assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) is None
+            assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) is None
 
 
 class TestExemplarDomainDisjointness:
@@ -462,13 +1196,37 @@ class TestExemplarDomainDisjointness:
         payload = build_planner_authoring_aids(view)
 
         section = payload["fork_coalesce"]
-        assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+        assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
         rules = " ".join(section["rules"])
         assert "SHAPE SELECTION" in rules  # run-3 E1: selection rule, not preference
         assert "queries map (multi_query)" in rules  # run-3 E1: both shapes taught, selection by input variance
 
 
 class TestDiscoveryDigest:
+    def test_digest_carries_bounded_prohibited_plugin_facts_without_inventory_call(self) -> None:
+        view, _snapshot = _trained_view()
+        prohibited = PluginSummary(
+            name="named_but_prohibited",
+            description="Categorically unavailable on the web surface.",
+            plugin_type="source",
+            config_fields=[],
+        )
+        view.list_prohibited_sources = lambda: [prohibited]  # type: ignore[method-assign]
+
+        digest = discovery_digest(view)
+
+        assert digest["prohibited"]["sources"] == [
+            {
+                "name": "named_but_prohibited",
+                "reason": "plugin_not_allowed_on_web",
+                "explanation": (
+                    "the plugin is installed and authorized for this deployment's runtime but prohibited on the "
+                    "web authoring surface by security policy"
+                ),
+            }
+        ]
+        assert len(planner_authoring_aids.canonical_json(digest).encode("utf-8")) <= 28 * 1024
+
     def test_digest_covers_every_policy_visible_plugin(self) -> None:
         """DISCOVERY_CYCLE churn re-derives the catalog; the digest IS the catalog."""
         view, _snapshot = _trained_view()
@@ -479,7 +1237,7 @@ class TestDiscoveryDigest:
         assert {entry["name"] for entry in digest["transforms"]} == {plugin.name for plugin in view.list_transforms()}
         assert {entry["name"] for entry in digest["sinks"]} == {plugin.name for plugin in view.list_sinks()}
 
-    def test_digest_entries_carry_purpose_required_knobs_and_hints(self) -> None:
+    def test_digest_entries_carry_bounded_selection_facts_without_contract_hints(self) -> None:
         view, _snapshot = _trained_view()
 
         digest = discovery_digest(view)
@@ -487,12 +1245,229 @@ class TestDiscoveryDigest:
         csv_source = next(entry for entry in digest["sources"] if entry["name"] == "csv")
         assert csv_source["purpose"] == next(plugin.description for plugin in view.list_sources() if plugin.name == "csv")
         assert {"schema", "path", "on_validation_failure"} <= set(csv_source["required_options"])
-        # composer_hints are the designated live channel for web-policy facts
-        # (e.g. the json sink's explicit collision_policy contract) — the
-        # digest must surface them verbatim, not summarize them away.
         json_sink = next(entry for entry in digest["sinks"] if entry["name"] == "json")
-        assert json_sink["composer_hints"] == list(next(plugin.composer_hints for plugin in view.list_sinks() if plugin.name == "json"))
-        assert any("collision_policy" in hint for hint in json_sink["composer_hints"])
+        assert "composer_hints" not in json_sink
+        assert json_sink["purpose"]
+
+    def test_every_declared_prohibition_and_tag_set_reaches_the_digest_verbatim(self) -> None:
+        """The always-present tier states what a plugin must NOT be used for.
+
+        g11 (elspeth-afdf55a17c): a planner authored multiline LLM text into
+        the ``text`` sink, which diverts any value bearing CR or LF. The sink
+        had said so all along in ``usage_when_not_to_use`` — but only in a
+        ``list_sinks`` result the digest guidance tells the planner it rarely
+        needs. A selection rule carried solely by a tool the planner is
+        steered away from is a rule it will usually not read.
+        """
+        view, _snapshot = _trained_view()
+
+        digest = discovery_digest(view)
+
+        for kind, plugins in (("sources", view.list_sources()), ("transforms", view.list_transforms()), ("sinks", view.list_sinks())):
+            entries = {entry["name"]: entry for entry in digest[kind]}
+            for plugin in plugins:
+                entry = entries[plugin.name]
+                if plugin.usage_when_not_to_use is None:
+                    assert "not_for" not in entry
+                else:
+                    # Verbatim, never summarized: a shortened prohibition
+                    # reads as a narrower rule than the one declared.
+                    assert entry["not_for"] == plugin.usage_when_not_to_use
+                assert entry.get("capability_tags", []) == list(plugin.capability_tags)
+
+    def test_digest_fits_the_canonical_utf8_selection_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        view, _snapshot = _trained_view()
+
+        rendered = canonical_json(discovery_digest(view)).encode("utf-8")
+
+        assert len(rendered) <= 28 * 1024
+
+    def test_digest_bounds_synthetic_public_prose_without_losing_plugin_identities(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        view, _snapshot = _trained_view()
+        summaries: dict[str, list[PluginSummary]] = {"source": [], "transform": [], "sink": []}
+        for kind in summaries:
+            summaries[kind] = [
+                PluginSummary(
+                    name=f"synthetic_{kind}_{index:02d}",
+                    description=f"purpose-{index}-" + ("p" * 12_000),
+                    plugin_type=kind,
+                    config_fields=[],
+                    usage_when_not_to_use=f"prohibition-{index}-" + ("n" * 12_000),
+                    capability_tags=("synthetic",),
+                )
+                for index in range(12)
+            ]
+
+        digest = discovery_digest(view, summaries=summaries)
+
+        assert len(canonical_json(digest).encode("utf-8")) <= 28 * 1024
+        assert digest["budget"]["max_canonical_bytes"] == 28 * 1024
+        assert digest["budget"]["canonical_bytes_used"] <= digest["budget"]["max_canonical_bytes"]
+        assert digest["budget"]["omitted_public_text_count"] > 0
+        for kind, entries in (("source", digest["sources"]), ("transform", digest["transforms"]), ("sink", digest["sinks"])):
+            assert [entry["name"] for entry in entries] == [plugin.name for plugin in summaries[kind]]
+            for entry in entries:
+                assert entry["required_options"] == []
+                assert "purpose" not in entry
+                assert entry["purpose_omitted"]["sha256"]
+                assert entry["purpose_omitted"]["details_via"] == f"list_{kind}s"
+                assert "not_for" not in entry
+                assert entry["not_for_omitted"]["sha256"]
+                assert entry["not_for_omitted"]["details_via"] == f"list_{kind}s"
+
+    def test_digest_omission_hash_is_literal_utf8_sha256(self) -> None:
+        view, _snapshot = _trained_view()
+        purpose = "literal-purpose-" + ("p" * 2_000)
+        summaries = {
+            "source": [PluginSummary(name="hashed", description=purpose, plugin_type="source", config_fields=[])],
+            "transform": [],
+            "sink": [],
+        }
+
+        entry = discovery_digest(view, summaries=summaries)["sources"][0]
+
+        assert entry["purpose_omitted"]["sha256"] == hashlib.sha256(purpose.encode("utf-8")).hexdigest()
+
+    def test_digest_budgeting_uses_bounded_envelope_serializations(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        view, _snapshot = _trained_view()
+        summaries = {
+            "source": [
+                PluginSummary(
+                    name=f"bounded_{index:02d}",
+                    description=f"purpose-{index}-" + ("p" * 700),
+                    plugin_type="source",
+                    config_fields=[],
+                    usage_when_not_to_use=f"prohibition-{index}-" + ("n" * 700),
+                )
+                for index in range(40)
+            ],
+            "transform": [],
+            "sink": [],
+        }
+        original = planner_authoring_aids.canonical_json
+        calls = 0
+
+        def counted(value: object) -> str:
+            nonlocal calls
+            calls += 1
+            return original(value)
+
+        monkeypatch.setattr(planner_authoring_aids, "canonical_json", counted)
+
+        digest = discovery_digest(view, summaries=summaries)
+
+        assert len(original(digest).encode("utf-8")) <= 28 * 1024
+        assert calls <= 8
+
+    def test_digest_fails_closed_when_identity_facts_alone_exceed_budget(self) -> None:
+        view, _snapshot = _trained_view()
+        summaries = {
+            "source": [
+                PluginSummary(
+                    name=f"identity_{index:04d}_" + ("x" * 96),
+                    description="",
+                    plugin_type="source",
+                    config_fields=[],
+                )
+                for index in range(400)
+            ],
+            "transform": [],
+            "sink": [],
+        }
+
+        with pytest.raises(RuntimeError, match="discovery_digest_budget_invariant"):
+            discovery_digest(view, summaries=summaries)
+
+    def test_three_selected_plugin_contracts_fit_the_canonical_utf8_budget(self) -> None:
+        """The budget is read from the runtime constant, never restated here.
+
+        A hard-coded ``48 * 1024`` has teeth in both directions: raise the
+        constant to unblock the planner and this test still fails, so it reads
+        as a broken fix; lower it and this test passes while the planner
+        refuses real contracts. Importing it means this test tracks whatever
+        the planner actually enforces.
+
+        Was RED for elspeth-623c69c59f: the three contracts aggregated to
+        50,365 bytes against a 49,152-byte budget, so the planner refused the
+        third ``get_plugin_schema`` call with
+        ``schema_contract_budget_exceeded``. No single contract exceeded the
+        budget — ``llm`` alone was 39,093 bytes, 79.5% of it — so it was an
+        aggregate overflow, not one oversized contract.
+
+        Green since ``_collapse_uniform_variant_fields`` stopped the projection
+        re-emitting a discriminated union's shared knobs once per variant. The
+        constant was NOT raised — it is a ratchet, loosening it silently buys
+        room for the next option pair to overflow again, and it is the
+        developer's call, not a lane's. If this goes red again, shrink the
+        contract; do not raise the budget. The post-fix totals are deliberately
+        not restated here: this assertion does not enforce them, and the
+        pre-fix pair above already rotted by two bytes between the ticket's
+        summary and its own measurement table.
+        """
+        from elspeth.core.canonical import canonical_json
+        from elspeth.web.composer.pipeline_planner import _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
+
+        view, _snapshot = _trained_view()
+        contracts = [
+            planner_authoring_aids.planner_plugin_contract(view.get_schema("transform", name)).to_dict()
+            for name in ("web_scrape", "llm", "field_mapper")
+        ]
+
+        assert len(canonical_json(contracts).encode("utf-8")) <= _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES
+
+    def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
+        """The exact g11 regression anchor, held on the stable token only.
+
+        Phase 1 of the fix plan extends this sentence with a ``line_explode``
+        remedy, so pinning the whole string would pin prose that is expected
+        to change. What must not regress is that the digest — not only a
+        ``list_sinks`` result — tells the planner the sink refuses multiline.
+        """
+        view, _snapshot = _trained_view()
+
+        text_sink = next(entry for entry in discovery_digest(view)["sinks"] if entry["name"] == "text")
+
+        assert "multiline" in text_sink["not_for"]
+
+    def test_digest_carries_no_worked_example_and_says_so(self) -> None:
+        """``example_use`` is YAML and unvalidated; the omission is disclosed.
+
+        Every worked shape this module renders is run through the real
+        candidate builder by these tests, so a drifting exemplar fails CI.
+        ``example_use`` has no such gate and is written in YAML, while this
+        surface authors through ``set_pipeline``. Carrying it in the
+        always-present tier would teach an unverified shape in the wrong
+        language — so it is omitted, and the guidance states the omission
+        instead of leaving the planner to infer the digest is complete.
+        """
+        view, _snapshot = _trained_view()
+
+        digest = discovery_digest(view)
+
+        assert all("example_use" not in entry for kind in ("sources", "transforms", "sinks") for entry in digest[kind])
+        assert "carry no worked example" in planner_authoring_aids._DISCOVERY_DIGEST_GUIDANCE
+
+    def test_prohibition_is_absent_rather_than_null_when_a_plugin_declares_none(self) -> None:
+        """A third-party plugin may omit reference content; nulls are not carried."""
+        summary = PluginSummary(
+            name="third_party",
+            description="External plugin with no reference content.",
+            plugin_type="sink",
+            config_fields=[],
+        )
+
+        entry = planner_authoring_aids._digest_entries([summary])[0]
+
+        assert "not_for" not in entry
+        assert "capability_tags" not in entry
+        assert entry["name"] == "third_party"
 
     def test_capability_core_discovery_order_speaks_with_the_digest_voice(self) -> None:
         """The static core and the live digest guidance must agree, zero daylight.
@@ -525,8 +1500,14 @@ class TestDiscoveryDigest:
             assert phrase in core_flat, f"core lacks shared phrase: {phrase!r}"
             assert phrase in _DISCOVERY_DIGEST_GUIDANCE, f"digest guidance lacks shared phrase: {phrase!r}"
         # The narrowing must not disturb the closed provenance rules the core
-        # keeps: model ids only from list_models, secret discovery intact.
-        assert "Model identifiers come only from `list_models`" in core
+        # keeps: model ids from the request-supplied catalog or list_models
+        # and nothing else, secret discovery intact. The provenance set is
+        # closed either way — a supplied catalog is the same policy-projected
+        # fact list_models returns, so pre-supplying it removes a discovery
+        # turn without widening where an identifier may come from.
+        assert (
+            "Model identifiers come from the supplied model catalog where the request provides one, and otherwise only from `list_models`"
+        ) in core_flat
         assert "list_secret_refs" in core
 
     def test_payload_carries_digest_with_discovery_short_circuit_guidance(self) -> None:
@@ -540,21 +1521,393 @@ class TestDiscoveryDigest:
         assert "rarely need" in guidance
         assert "get_plugin_schema" in guidance
         assert "current" in guidance
+        assert "omitted_public_text_count" in guidance
+        assert "details_via" in guidance
         # The digest short-circuits catalog re-discovery only: model ids still
-        # come solely from list_models, and structured-repair tooling
-        # (get_plugin_assistance) keeps its role.
+        # come from a served catalog and nothing else, and structured-repair
+        # tooling (get_plugin_assistance) keeps its role.
         assert "list_models" in guidance
         assert "get_plugin_assistance" in guidance
 
 
+def _llmless_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot, Any]:
+    """Trained catalog with both llm surfaces closed by policy.
+
+    Returns the profile registry too: this helper can only prove the registry
+    was untouched by its OWN probe, and the build under test runs later. Each
+    consuming test re-asserts ``mock_calls == []`` AFTER
+    ``build_planner_authoring_aids``, which is where a registry touch would
+    actually put a mock repr into a digest entry.
+    """
+    from unittest.mock import MagicMock
+
+    from elspeth.web.plugin_policy.models import PluginId
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+    catalog = create_catalog_service()
+    trained = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="model-catalog-llmless",
+        principal_scope="local:model-catalog",
+        available=frozenset(plugin_id for plugin_id in trained.available if plugin_id.name != "llm"),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="model-catalog-llmless-generation",
+    )
+    assert PluginId("transform", "llm") not in snapshot.available
+    profiles = MagicMock(spec=OperatorProfileRegistry)
+    view = PolicyCatalogView(catalog, snapshot, profiles)
+    # No plugin has a usable alias here, so the projection must short-circuit
+    # before the registry: a MagicMock summary reaching the digest would render
+    # a mock repr as a plugin purpose and still leave the grammar assertions
+    # green. Prove the view is real, not merely non-crashing.
+    assert [plugin.name for plugin in view.list_transforms()] == [
+        plugin.name for plugin in catalog.list_transforms() if PluginId("transform", plugin.name) in snapshot.available
+    ]
+    assert profiles.mock_calls == []
+    return view, snapshot, profiles
+
+
+class TestModelCatalogAid:
+    """F3: every llm-node intent bought a deployment-static catalog with a turn.
+
+    ``list_models`` is two-mode — unfiltered it returns provider names and
+    counts plus a hint to call again with a provider, so an author that did not
+    already know the provider paid TWO turns for a catalog that is fixed for
+    the process. The aid restates both modes from the same accessors, so the
+    tests below are parity tests against the real tool rather than restatements
+    of its filter rule.
+    """
+
+    def test_provider_summary_matches_the_models_listing_unfiltered_mode(self) -> None:
+        view, snapshot = _trained_view()
+
+        catalog = planner_model_catalog()
+        result = _dispatch_tool("list_models", {}, _empty_state(), view, plugin_snapshot=snapshot)
+
+        assert result.success is True, result.to_dict()
+        assert catalog["provider_model_counts"] == result.data["providers"]
+        assert catalog["total_models"] == result.data["total_models"]
+
+    def test_every_carried_list_matches_the_models_listing_filtered_mode(self) -> None:
+        """The identifiers are the tool's own, in the tool's own form.
+
+        A trailing-slash provider argument is an exact segment match in the
+        tool, which is the grouping the unfiltered mode reports counts for —
+        so each carried list must equal the tool's answer for its provider,
+        OpenRouter's live-catalog substitution included.
+        """
+        view, snapshot = _trained_view()
+
+        catalog = planner_model_catalog()
+
+        assert catalog["models_by_provider"]
+        for provider, identifiers in catalog["models_by_provider"].items():
+            result = _dispatch_tool(
+                "list_models",
+                {"provider": f"{provider}/", "limit": 10_000},
+                _empty_state(),
+                view,
+                plugin_snapshot=snapshot,
+            )
+            assert result.success is True, result.to_dict()
+            assert result.data["truncated"] is False
+            # The tool result is deep-frozen on the way out; only the sequence
+            # type differs from the aid's mutable list.
+            assert identifiers == list(result.data["models"]), provider
+            assert len(identifiers) == catalog["provider_model_counts"][provider]
+
+    def test_carried_providers_are_the_live_llm_provider_vocabulary(self) -> None:
+        """The carried set is derived from the two live ``provider`` literals.
+
+        The subset direction alone is not enough. It permits an authorable
+        provider with a non-zero count to be missing from BOTH
+        ``models_by_provider`` and ``models_omitted`` while
+        ``authorable_providers`` still names it — identifiers that vanish with
+        no disclosure and no marker to follow, which is exactly the silent
+        under-supply the aid exists to prevent. The positive direction is
+        pinned below: every authorable provider the catalog knows models for is
+        either carried or explicitly deferred.
+        """
+        from elspeth.plugins.sources.llm.config import LLMSourceConfig
+        from elspeth.plugins.transforms.llm.base import LLMConfig
+
+        catalog = planner_model_catalog()
+
+        declared = {*get_args(LLMConfig.model_fields["provider"].annotation)} | {
+            *get_args(LLMSourceConfig.model_fields["provider"].annotation)
+        }
+        assert catalog["authorable_providers"] == sorted(declared)
+        assert set(catalog["models_by_provider"]) <= declared
+        for provider in catalog["authorable_providers"]:
+            if provider in catalog["provider_model_counts"] and catalog["provider_model_counts"][provider]:
+                assert provider in catalog["models_by_provider"] or any(
+                    omission["provider"] == provider for omission in catalog["models_omitted"]
+                ), provider
+
+    def test_identifiers_are_not_carried_for_providers_an_llm_node_cannot_name(self) -> None:
+        """Counts stay complete; only the unspendable identifier lists drop out."""
+        catalog = planner_model_catalog()
+
+        unauthorable = set(catalog["provider_model_counts"]) - set(catalog["authorable_providers"])
+        assert unauthorable, "the litellm catalog should know providers an llm node cannot name"
+        assert not unauthorable & set(catalog["models_by_provider"])
+        assert all(catalog["provider_model_counts"][provider] > 0 for provider in unauthorable)
+
+    def test_an_authorable_provider_the_catalog_knows_nothing_about_carries_no_key(self) -> None:
+        """An empty list would claim the deployment serves no model for it."""
+        catalog = planner_model_catalog()
+
+        for provider in catalog["authorable_providers"]:
+            if provider not in catalog["provider_model_counts"]:
+                assert provider not in catalog["models_by_provider"]
+        assert all(identifiers for identifiers in catalog["models_by_provider"].values())
+
+    def test_catalog_fits_its_canonical_utf8_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        catalog = planner_model_catalog()
+
+        rendered = canonical_json(catalog).encode("utf-8")
+        assert len(rendered) <= 32 * 1024
+        assert catalog["budget"]["canonical_bytes_used"] == len(rendered)
+        assert catalog["budget"]["max_canonical_bytes"] == 32 * 1024
+        assert catalog["models_omitted"] == []
+        assert catalog["budget"]["omitted_provider_count"] == 0
+
+    def test_over_budget_defers_whole_lists_and_keeps_the_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Whole lists or none: a sliced list reads as a complete one."""
+        from elspeth.core.canonical import canonical_json
+
+        full = planner_model_catalog()
+        monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 4 * 1024)
+
+        catalog = planner_model_catalog()
+
+        assert catalog["models_by_provider"] == {}
+        assert catalog["provider_model_counts"] == full["provider_model_counts"]
+        assert catalog["total_models"] == full["total_models"]
+        assert catalog["models_omitted"] == [
+            {"provider": provider, "model_count": len(identifiers), "details_via": "list_models"}
+            for provider, identifiers in sorted(full["models_by_provider"].items())
+        ]
+        assert catalog["budget"]["omitted_provider_count"] == len(full["models_by_provider"])
+        assert len(canonical_json(catalog).encode("utf-8")) <= 4 * 1024
+
+    def test_catalog_fails_closed_when_the_counts_alone_exceed_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The raise is the SECOND gate, reached only after deferral still failed."""
+        settled: list[dict[str, Any]] = []
+        measure = planner_authoring_aids._model_catalog_size
+
+        def spy(catalog: Any) -> int:
+            settled.append(json.loads(json.dumps(catalog)))
+            return measure(catalog)
+
+        monkeypatch.setattr(planner_authoring_aids, "_model_catalog_size", spy)
+        monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 64)
+
+        with pytest.raises(RuntimeError, match=r"model_catalog_budget_invariant"):
+            planner_model_catalog()
+
+        # A no-op deferral arm would raise here too, and this is what tells the
+        # two apart: the lists were dropped and disclosed before the raise.
+        assert settled[-1]["models_by_provider"] == {}
+        assert settled[-1]["models_omitted"]
+        assert settled[0]["models_by_provider"]
+
+    def test_payload_carries_the_catalog_only_where_an_llm_surface_is_visible(self) -> None:
+        view, _snapshot = _trained_view()
+        llmless, _llmless_snapshot, profiles = _llmless_view()
+
+        assert build_planner_authoring_aids(view)["model_catalog"]["catalog"] == planner_model_catalog()
+        assert "model_catalog" not in build_planner_authoring_aids(llmless)
+        # After the build, not only after the helper's own probe: a registry
+        # touch during the sweep is what would put a mock repr in a digest.
+        assert profiles.mock_calls == []
+
+    def test_guidance_names_the_closed_provenance_and_the_deferral_marker(self) -> None:
+        view, _snapshot = _trained_view()
+
+        guidance = build_planner_authoring_aids(view)["model_catalog"]["guidance"]
+
+        assert "no discovery call" in guidance
+        assert "authorable_providers" in guidance
+        assert "models_omitted" in guidance
+        assert "details_via" in guidance
+        assert "Never invent a slug" in guidance
+
+    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(self, tmp_path: Path) -> None:
+        """The operator's binding stays private; the public catalog stays public.
+
+        ``_source_only_profile_view`` binds ``anthropic/claude-sonnet-4.6``
+        privately through the ``sonnet`` alias, and the public profile
+        projection deliberately hides ``model``. That slug is also an ordinary
+        member of OpenRouter's public catalog, which ``list_models`` already
+        returns in full to this same planner — so carrying the catalog
+        discloses nothing about which member the operator chose. What proves it
+        is that the carried list is the public reader's whole content, never a
+        deployment-selected subset.
+        """
+        from elspeth.contracts.value_source import get_catalog_values
+        from elspeth.plugins.transforms.llm.model_catalog import MODEL_CATALOG_OPENROUTER
+
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        carried = aids["model_catalog"]["catalog"]["models_by_provider"]["openrouter"]
+
+        # The profile view's catalog is the profile-free one, key for key: a
+        # leak that landed under some OTHER provider key could never reach the
+        # prompt either, whatever it was.
+        assert aids["model_catalog"]["catalog"] == planner_model_catalog()
+        assert carried == sorted(get_catalog_values(MODEL_CATALOG_OPENROUTER))
+        assert "anthropic/claude-sonnet-4.6" in carried
+        without_public_inventory = json.loads(json.dumps(aids))
+        without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(without_public_inventory)
+        assert "OPENROUTER_API_KEY" not in json.dumps(aids)
+
+    def test_memo_keys_on_the_model_catalog_identity_not_the_snapshot_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A catalog primed after the first build must not serve the old aids.
+
+        The OpenRouter catalog is a process-global the boot lifespan primes,
+        and no plugin-policy snapshot covers it — so a memo keyed on
+        ``snapshot_hash`` alone would pin the pre-prime catalog for the
+        process lifetime. Reverting the key to the snapshot hash makes the
+        second build below return the first build's payload.
+        """
+        builds: list[str] = []
+        identity = ["bundled-sha", "bundled"]
+
+        def build(_catalog: object) -> dict[str, str]:
+            builds.append(identity[0])
+            return {"purpose": identity[0]}
+
+        monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
+        monkeypatch.setattr(
+            planner_authoring_aids,
+            "read_openrouter_catalog_snapshot_id",
+            lambda: (identity[0], identity[1]),
+        )
+        catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="one-policy-snapshot"))
+
+        first = planner_authoring_aids.build_planner_authoring_aids(catalog)
+        repeat = planner_authoring_aids.build_planner_authoring_aids(catalog)
+        identity[0], identity[1] = "live-sha", "live"
+        after_prime = planner_authoring_aids.build_planner_authoring_aids(catalog)
+
+        assert first == repeat == {"purpose": "bundled-sha"}
+        assert after_prime == {"purpose": "live-sha"}
+        assert builds == ["bundled-sha", "live-sha"]
+        assert sorted(planner_authoring_aids._AIDS_MEMO) == [
+            "one-policy-snapshot:bundled:bundled-sha",
+            "one-policy-snapshot:live:live-sha",
+        ]
+
+
+class TestExpressionGrammarAid:
+    """F5: a deployment-static public reference cost one turn per gate shape."""
+
+    def test_grammar_is_the_tools_own_reference_verbatim(self) -> None:
+        from elspeth.web.composer.tools.generation import get_expression_grammar
+
+        view, _snapshot = _trained_view()
+
+        section = build_planner_authoring_aids(view)["expression_grammar"]
+
+        assert section["grammar"] == get_expression_grammar()
+        assert "grammar_omitted" not in section
+
+    def test_grammar_is_carried_on_every_deployment(self) -> None:
+        """Gate conditions are structural, so no plugin visibility gates it."""
+        llmless, _snapshot, profiles = _llmless_view()
+
+        assert build_planner_authoring_aids(llmless)["expression_grammar"] == planner_expression_grammar()
+        # After the build: a registry touch during the sweep would put a mock
+        # repr into a digest entry and leave this assertion the only witness.
+        assert profiles.mock_calls == []
+
+    def test_grammar_fits_its_canonical_utf8_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        section = planner_expression_grammar()
+
+        rendered = canonical_json(section).encode("utf-8")
+        assert len(rendered) <= 8 * 1024
+        assert section["budget"]["canonical_bytes_used"] == len(rendered)
+        assert section["budget"]["max_canonical_bytes"] == 8 * 1024
+
+    def test_over_budget_defers_the_whole_reference_with_its_hash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.canonical import canonical_json
+        from elspeth.web.composer.tools.generation import get_expression_grammar
+
+        monkeypatch.setattr(planner_authoring_aids, "_EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES", 2 * 1024)
+
+        section = planner_expression_grammar()
+
+        assert "grammar" not in section
+        assert section["grammar_omitted"] == {
+            "sha256": hashlib.sha256(get_expression_grammar().encode("utf-8")).hexdigest(),
+            "details_via": "get_expression_grammar",
+        }
+        assert len(canonical_json(section).encode("utf-8")) <= 2 * 1024
+
+    def test_grammar_fails_closed_when_the_marker_alone_exceeds_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(planner_authoring_aids, "_EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES", 32)
+
+        with pytest.raises(RuntimeError, match=r"expression_grammar_budget_invariant"):
+            planner_expression_grammar()
+
+    def test_guidance_names_the_static_reference_and_its_deferral_marker(self) -> None:
+        view, _snapshot = _trained_view()
+
+        guidance = build_planner_authoring_aids(view)["expression_grammar"]["guidance"]
+
+        assert "no discovery call" in guidance
+        assert "grammar_omitted" in guidance
+        assert "details_via" in guidance
+
+
 class TestAuthoringAidsPayload:
+    def test_set_pipeline_exemplars_match_the_web_provider_argument_envelope(self) -> None:
+        """Prompt examples wrap flat canonical documents exactly as the web tool does."""
+        from elspeth.web.composer.service import ComposerServiceImpl
+
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+        semantic_exemplars = (
+            source_custody_exemplar_args(view),
+            fork_coalesce_exemplar_args(view),
+            planner_authoring_aids.fork_row_union_exemplar_args(view),
+        )
+        prompt_exemplars = (
+            payload["source_custody"]["set_pipeline_exemplar_inline_blob"],
+            payload["fork_coalesce"]["set_pipeline_exemplar"],
+            payload["fork_row_union"]["set_pipeline_exemplar"],
+        )
+        service = object.__new__(ComposerServiceImpl)
+        provider_tool = next(tool for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+        provider_schema = provider_tool["function"]["parameters"]
+        validator = Draft202012Validator(provider_schema)
+
+        assert all(exemplar is not None and "pipeline" not in exemplar for exemplar in semantic_exemplars)
+        assert len(prompt_exemplars) == len(semantic_exemplars) == 3
+        for prompt_args, semantic in zip(prompt_exemplars, semantic_exemplars, strict=True):
+            assert prompt_args == {"pipeline": semantic}
+            validator.validate(prompt_args)
+
     def test_payload_carries_the_custody_exemplar_and_the_closed_provenance_rule(self) -> None:
         view, _snapshot = _trained_view()
 
         payload = build_planner_authoring_aids(view)
 
         custody = payload["source_custody"]
-        assert custody["set_pipeline_exemplar_inline_blob"] == source_custody_exemplar_args(view)
+        assert custody["set_pipeline_exemplar_inline_blob"] == {"pipeline": source_custody_exemplar_args(view)}
         blob_variant = source_custody_exemplar_args(view, blob_id=PLACEHOLDER_BLOB_ID)
         assert blob_variant is not None
         assert custody["existing_blob_source_binding"] == blob_variant["source"]
@@ -594,26 +1947,18 @@ class TestPromptShieldRules:
     imported constants, so the aids can never drift from the contract.
     """
 
-    def test_trained_view_quotes_term_and_available_draft_verbatim(self) -> None:
-        from elspeth.web.interpretation_state import (
-            PROMPT_SHIELD_AVAILABLE_DRAFT,
-            PROMPT_SHIELD_USER_TERM,
-            PROMPT_SHIELD_WARNING_DRAFT,
-        )
+    def test_selected_recommended_shield_stays_an_advisory(self) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
 
         view, snapshot = _trained_view()
-        # The trained snapshot SELECTS a prompt shield — the honest draft is
-        # the shield-available wording (mirrors the warning→available upgrade
-        # the server itself applies when the shield is selected).
-        from elspeth.contracts.plugin_capabilities import PluginCapability
+        selected = dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD)
+        assert selected is not None
 
-        assert dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None
-
-        aids = build_planner_authoring_aids(view)
-        rendered = "\n".join(aids["prompt_shield"]["rules"])
-        assert PROMPT_SHIELD_USER_TERM in rendered
+        rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
+        assert selected.name in rendered
         assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
-        assert PROMPT_SHIELD_WARNING_DRAFT not in rendered
+        assert "required, not advisory" not in rendered
 
     def test_shieldless_view_quotes_the_warning_draft_verbatim(self) -> None:
         from unittest.mock import MagicMock
@@ -652,12 +1997,86 @@ class TestPromptShieldRules:
         assert PROMPT_SHIELD_AVAILABLE_DRAFT not in rendered
 
     def test_rules_name_the_untrusted_producer_and_the_llm_attachment_point(self) -> None:
+        """Both regimes name the untrusted producer and the llm attachment point.
+
+        The shielded regime attaches a wired transform between them; the
+        shieldless regime attaches the review row to the llm node's
+        ``interpretation_requirements``.
+        """
         view, _snapshot = _trained_view()
 
         rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
         assert "web_scrape" in rendered
-        assert "interpretation_requirements" in rendered
         assert "llm" in rendered
+        # Shielded deployment: the attachment point is the wiring, not a card.
+        # Producer-neutral wording applies equally to fetched, generated,
+        # retrieved, and document-extracted untrusted content.
+        assert "between that producer node and" in rendered
+
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        shieldless = "\n".join(_prompt_shield_rules(shield_plugin=None, untrusted_producers=("web_scrape",)))
+        assert "web_scrape" in shieldless
+        assert "llm" in shieldless
+        assert "interpretation_requirements" in shieldless
+
+    def test_rules_teach_every_untrusted_producer_in_the_contract_set(self) -> None:
+        """The taught producers come from the contract set, so a new one is taught automatically.
+
+        The aids intersect the contract's untrusted-producer set with the
+        policy-visible transforms, so membership is the only thing that decides
+        whether a producer is taught. Document extraction is in that set:
+        Textract returns whatever text the uploaded document carried.
+        """
+        from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        untrusted_producer_names = untrusted_content_transform_names()
+        assert "aws_textract_document_analysis" in untrusted_producer_names
+
+        rendered = "\n".join(
+            _prompt_shield_rules(
+                shield_plugin="aws_bedrock_prompt_shield",
+                untrusted_producers=tuple(sorted(untrusted_producer_names)),
+            )
+        )
+        for producer in untrusted_producer_names:
+            assert producer in rendered
+
+    def test_non_fetch_producer_rules_make_no_fetch_or_remote_provenance_claim(self) -> None:
+        """RAG content is untrusted without being an HTTP-fetch transform."""
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        rendered = "\n".join(_prompt_shield_rules(shield_plugin=None, untrusted_producers=("rag_retrieval",)))
+
+        assert "untrusted or externally controlled upstream content" in rendered
+        assert all(term not in rendered.casefold() for term in ("fetch", "internet", "remote"))
+
+    def test_textract_is_shielded_but_never_taught_web_scrape_cleanup(self) -> None:
+        """Document text is untrusted input, not raw HTML with a fingerprint field."""
+        view, _snapshot = _trained_view()
+
+        aids = build_planner_authoring_aids(view)
+        shield_rules = "\n".join(aids["prompt_shield"]["rules"])
+        cleanup_rules = "\n".join(aids["raw_html_cleanup"]["rules"])
+
+        assert "aws_textract_document_analysis" in shield_rules
+        assert "web_scrape" in cleanup_rules
+        assert "aws_textract_document_analysis" not in cleanup_rules
+
+    def test_recommend_mode_draft_names_the_selected_shield_not_azure(self) -> None:
+        """A selected non-Azure shield's audit card must not claim azure_prompt_shield.
+
+        ``PROMPT_SHIELD_AVAILABLE_DRAFT`` used to hardcode "azure_prompt_shield"
+        in its text, and the planner is told to copy that draft verbatim into
+        the authored review row — so a deployment that selected a different
+        shield implementation got a review card recording the wrong control.
+        """
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        rendered = "\n".join(_prompt_shield_rules(shield_plugin="aws_bedrock_prompt_shield", untrusted_producers=("web_scrape",)))
+        assert "azure_prompt_shield" not in rendered
+        assert "aws_bedrock_prompt_shield" in rendered
 
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
         # The failing surface is the tutorial/guided walk under the operator-
@@ -669,6 +2088,85 @@ class TestPromptShieldRules:
 
         rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
         assert PROMPT_SHIELD_USER_TERM in rendered
+
+
+class TestRequiredModeAutoWireAids:
+    """R2-F10: REQUIRED mode is auto-wired server-side — the aids teach the
+    guarantee (and drop the shield-recommendation row) instead of demanding
+    manual wiring. RECOMMEND mode keeps the advisory regime, pinned by the
+    existing advisory tests."""
+
+    def test_required_shield_rules_teach_auto_wiring_not_manual_wiring(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import (
+            PROMPT_SHIELD_USER_TERM,
+            REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+        )
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
+        assert "automatically splices" in rendered
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rendered
+        assert "aws_bedrock_prompt_shield" in rendered
+        # The manual mandate is retired; the drop-the-recommendation-row rule stays.
+        assert "WIRE a" not in rendered
+        assert f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row" in rendered
+
+    def test_required_content_safety_rules_teach_auto_wiring_and_keep_on_error_discipline(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        rendered = "\n".join(build_planner_authoring_aids(view)["content_safety"]["rules"])
+        assert "automatically splices" in rendered
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rendered
+        assert "WIRE a" not in rendered
+        # Auto-wiring cannot repair an error route — the on_error discipline stays taught.
+        assert "on_error" in rendered
+        assert "'discard'" in rendered
+        assert "operator decision" in rendered
+
+    def test_placeholder_dependent_direct_required_posture_keeps_the_manual_wiring_mandate(self, tmp_path: Path) -> None:
+        """Review finding 1 counterpart: an alias-less selection whose required
+        bindings only exist as placeholder exemplars is NOT auto-wired, so the
+        aids must keep the manual WIRE mandate and never claim the guarantee."""
+        view, _snapshot = _direct_control_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        shield_rules = "\n".join(aids["prompt_shield"]["rules"])
+        safety_rules = "\n".join(aids["content_safety"]["rules"])
+        for rendered in (shield_rules, safety_rules):
+            assert "automatically splices" not in rendered
+            assert "WIRE a" in rendered
+            assert "required, not advisory" in rendered
+
+    def test_review_registry_forbids_hand_authoring_the_auto_wire_disclosure(self) -> None:
+        """Minor 2: the disclosure row is server-staged only — a planner-authored
+        row would forge a policy_required audit entry."""
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        view, _snapshot = _trained_view()
+
+        rules = "\n".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+        assert "NEVER author a pipeline_decision row" in rules
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rules
+        assert "forges" in rules
+
+    def test_required_but_unselected_shield_keeps_the_warning_advisory(self, tmp_path: Path) -> None:
+        """REQUIRED with no selected implementation is the operator-problem
+        posture: nothing can be auto-wired, so the aids must not claim it."""
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_WARNING_DRAFT
+
+        rendered = "\n".join(
+            _prompt_shield_rules(
+                shield_plugin=None,
+                shield_required=True,
+                untrusted_producers=("web_scrape",),
+            )
+        )
+        assert "automatically splices" not in rendered
+        assert PROMPT_SHIELD_WARNING_DRAFT in rendered
 
 
 class TestModelCustody:
@@ -705,6 +2203,117 @@ class TestModelCustody:
         assert "multi_query" in rules
         assert "does NOT create row fields" in rules
 
+    def test_known_business_columns_are_declared_at_the_sink_not_left_to_row_one(self) -> None:
+        """The planner must not promise a stable output shape and author an observed sink.
+
+        ``guaranteed_fields`` is a producer-presence contract, a coalesce has
+        no authored schema option, and a sink consumes rows rather than
+        producing them.  The stable CSV header therefore belongs in the
+        sink's explicit ``fields`` declaration (with an exact projection when
+        the user asked for exactly those columns), never in copied guarantee
+        metadata on every downstream component.
+        """
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "first accepted row" in rules
+        assert "sink schema.fields" in rules
+        assert "plugin-free coalesce" in rules
+        assert "guaranteed_fields on a sink" in rules
+
+    def test_llm_usage_and_model_columns_are_named_as_operational_not_audit_fields(self) -> None:
+        """Runtime row columns must not be conflated with separate audit metadata."""
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "operational row fields" in rules
+        assert "_usage / _model audit fields" not in rules
+
+
+class TestLlmSourceGenerationAid:
+    def test_source_only_generation_uses_llm_source_without_transform_advice(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        rendered = " ".join(aids["llm_source_generation"]["rules"])
+
+        assert "source:llm" in rendered
+        assert "generation-first" in rendered
+        assert "transform:llm" not in rendered
+        assert "seed" in rendered
+        assert "exactly one" in rendered
+        assert "incoming row" in rendered
+
+    def test_source_generation_names_output_and_value_source_contract(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        rendered = " ".join(build_planner_authoring_aids(view)["llm_source_generation"]["rules"])
+
+        assert "response_field" in rendered
+        assert "_usage" in rendered
+        assert "_model" in rendered
+        assert "lookup" in rendered
+        assert "{{ row" in rendered
+        assert "sonnet" in rendered
+        assert "provider/model/credential" in rendered
+
+    def test_source_generation_marks_model_catalog_as_refreshable_session_snapshot(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        rendered = " ".join(aids["llm_source_generation"]["rules"])
+        guidance = aids["discovery_digest"]["guidance"]
+
+        assert "list_models" in rendered
+        assert "session snapshot" in rendered
+        assert "stale" in rendered
+        assert "list_models" in guidance
+        assert "session snapshot" in guidance
+        assert "stale" in guidance
+        # The operator's profile binds a concrete model privately and the
+        # public profile projection hides it. That slug is separately an
+        # ordinary member of OpenRouter's public catalog, which the served
+        # model_catalog section carries whole — so the canary blanks the public
+        # identifier lists and still holds over every other section, including
+        # that catalog's own counts, guidance and omission markers. The
+        # discrimination itself is pinned by
+        # TestModelCatalogAid.test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory.
+        without_public_inventory = json.loads(json.dumps(aids))
+        without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(without_public_inventory)
+
+    def test_source_generation_requires_discard_when_content_safety_is_required(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path, content_safety_required=True)
+
+        rendered = " ".join(build_planner_authoring_aids(view)["llm_source_generation"]["rules"])
+
+        assert "on_validation_failure" in rendered
+        assert "discard" in rendered
+        assert "REQUIRES" in rendered
+        assert "Prompt Shield" in rendered
+        assert "not applicable" in rendered
+
+    def test_source_digest_has_source_profile_alias_and_public_required_options(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        digest = discovery_digest(view)
+        source = next(entry for entry in digest["sources"] if entry["name"] == "llm")
+
+        assert source["profile_aliases"] == ["sonnet"]
+        assert set(source["required_options"]) == {
+            "profile",
+            "schema",
+            "prompt_template",
+            "on_validation_failure",
+        }
+        assert not set(source["required_options"]) & {
+            "provider",
+            "model",
+            "api_key",
+            "queries",
+            "required_input_fields",
+        }
+
 
 class TestReviewRegistry:
     """Suite run 1 G5: the closed pipeline_decision registry never surfaced at authoring time."""
@@ -731,6 +2340,41 @@ class TestReviewRegistry:
         assert "auto-stage" in rules
         assert "llm_prompt_template" in rules
         assert "llm_model_choice" in rules
+
+    def test_gate_decision_rule_scopes_its_call_half_to_the_actual_palette(self) -> None:
+        """F8: one aid payload, two surfaces, two different palettes.
+
+        These aids ride in the planner request — whose palette carries no
+        ``request_interpretation_review``, so obeying an unconditional
+        instruction to call it lands on the DISCOVERY_ONLY terminal guard — and
+        in the compose-loop catalog context, whose palette does carry it. The
+        STAGING half is unconditional on both surfaces and stays verbatim; only
+        the CALL half is scoped. The conditional clause is shared word-for-word
+        with the capability core because both texts ride in the same context,
+        and where they overlap they must not disagree.
+        """
+        from elspeth.web.composer.capability_skill import load_pipeline_capability_core
+
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+        # Word-for-word agreement is about words: collapse the markdown's hard
+        # line wrapping before comparing.
+        core_flat = " ".join(load_pipeline_capability_core().split())
+
+        # The staging half survives, and the unconditional call is gone.
+        assert "user_term gate_condition_authored ON THAT GATE NODE." in rules
+        assert "ON THAT GATE NODE and call request_interpretation_review" not in rules
+        assert "The row is valid only on a gate node" in rules
+        for phrase in (
+            "Where your palette carries",
+            (
+                "the staged requirement rides in that gate node's own options inside the terminal "
+                "proposal and its review card is surfaced from the sealed proposal"
+            ),
+        ):
+            assert phrase in rules, f"review-registry rule lacks shared phrase: {phrase!r}"
+            assert phrase in core_flat, f"capability core lacks shared phrase: {phrase!r}"
 
 
 class TestOwnershipAlignedExemplars:
@@ -766,6 +2410,15 @@ class TestCoalesceVocabulary:
 
         coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
         assert coalesce["input"] in set(coalesce["branches"].values())
+
+    def test_exemplar_does_not_put_a_noop_schema_on_the_structural_coalesce(self, tmp_path: Path) -> None:
+        """CoalesceSettings has no schema field; export drops NodeSpec options."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
+        assert coalesce["options"] == {}
 
 
 class TestNamedButMissingFile:
@@ -820,16 +2473,11 @@ class TestRun2PackEdits:
         assert RAW_HTML_CLEANUP_REVIEW_DRAFT in rendered
         assert "field_mapper" in rendered  # attachment point
 
-    def test_llm_digest_hint_scopes_the_shield_advisory_to_fetched_content(self) -> None:
-        # G3 DECIDED: the advisory covers llms consuming untrusted REMOTE
-        # (fetched) producer output — not "every unshielded llm". The old
-        # hint contradicted the skill and the aids' own prompt_shield rule.
+    def test_detailed_llm_hints_are_not_copied_into_the_selection_digest(self) -> None:
         view, _snapshot = _trained_view()
         aids = build_planner_authoring_aids(view)
         llm_entry = next(e for e in aids["discovery_digest"]["plugins"]["transforms"] if e["name"] == "llm")
-        hints = "\n".join(llm_entry["composer_hints"])
-        assert "EVERY LLM node" not in hints
-        assert "externally-fetched" in hints or "externally fetched" in hints
+        assert "composer_hints" not in llm_entry
 
     def test_skill_authoring_exemplar_carries_no_server_review_fields(self) -> None:
         # G5: an exemplar demonstrated the heavy server-side review row
@@ -894,5 +2542,214 @@ class TestRun3PackEdits:
         assert len(rows) == 1
         assert rows[0]["kind"] == "vague_term"
         assert rows[0]["user_term"] == "urgency"
+        assert set(rows[0]) == {"kind", "user_term", "draft"}
         parts = urgency["options"]["prompt_template_parts"]
-        assert any(p.get("kind") == "interpretation_ref" and p.get("requirement_id") == rows[0]["id"] for p in parts)
+        assert any(p.get("kind") == "interpretation_ref" and p.get("requirement_id") == "urgency:assess_urgency" for p in parts)
+
+
+class TestRun5PackEdits:
+    """Pack pressure-suite run-5 closures — planner-shielding review findings.
+
+    Finding A: the run-4 CLOSED per-query key set (E1) omitted
+    ``response_format``, ``max_tokens``, and list-form ``name`` — all valid
+    ``QueryDefinition`` keys (``src/elspeth/plugins/transforms/llm/
+    multi_query.py``) — so the rule steered planners to omit valid
+    configuration or author a list entry validation rejects for a missing
+    name.
+
+    Finding B: the digest advertised an active profile-bound llm node's
+    operator-private fields (``provider`` et al.) as *required* — the raw
+    catalog schema's required set, never projected through the operator
+    profile's public schema — steering profile-bound authors toward a
+    ``profile_unavailable``/``plugin_unavailable`` rejection guaranteed by
+    ``_LLMProfileResolver`` (``src/elspeth/web/plugin_policy/profiles.py``).
+    """
+
+    def test_query_definition_rule_permits_the_full_supported_key_set(self) -> None:
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        # response_format and max_tokens are real QueryDefinition fields the
+        # run-4 closed-set rule forbade by omission.
+        assert "response_format" in rendered
+        assert "max_tokens" in rendered
+
+    def test_llm_digest_required_options_are_profile_projected_under_an_active_profile(self, tmp_path: Path) -> None:
+        view, _snapshot = _profile_view(tmp_path)
+        aids = build_planner_authoring_aids(view)
+        llm_entry = next(e for e in aids["discovery_digest"]["plugins"]["transforms"] if e["name"] == "llm")
+        required = set(llm_entry["required_options"])
+        # Operator profile validation rejects these on a profile-bound node —
+        # the digest must never advertise them as required.
+        assert not required & {"provider", "model", "credential_ref", "api_key", "api_key_secret"}
+        assert "profile" in required
+
+    def test_trained_operator_llm_digest_required_options_are_unaffected(self) -> None:
+        """The trained-operator (profile-bypassed) view keeps the raw required set."""
+        view, _snapshot = _trained_view()
+        digest = discovery_digest(view)
+        llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
+        assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+
+
+class TestSession891b7b1eLiveReviewEdits:
+    """Live-review session 891b7b1e closures (epic elspeth-cce536a2ba), pinned."""
+
+    def test_llm_output_rules_teach_enum_constrained_join_keys(self) -> None:
+        """elspeth-85df4312b7: exact-match consumers get enum output_fields.
+
+        A free-text 'reply with only the category word' prompt fed
+        reference_join key_field with on_error: discard — one off-vocabulary
+        reply silently drops the row. The API-native constraint existed and
+        was untaught, as was the single-prompt field-naming fact (top-level
+        output_fields land UNPREFIXED, named exactly by suffix).
+        """
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "'enum'" in rendered
+        assert "reference_join" in rendered
+        assert "UNPREFIXED" in rendered
+        assert "no normalization" in rendered
+
+    def test_llm_output_rules_steer_any_narrowing_to_type_coerce(self) -> None:
+        """elspeth-8762d9b666: narrow at type_coerce, never widen consumers."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "type_coerce" in rendered
+        assert "never by widening" in rendered
+
+    def test_custody_rules_state_full_replacement_source_resupply(self) -> None:
+        """elspeth-6cadbff05f: source: null never means 'keep the source'."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        replacement_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
+        mutation_rule = next(rule for rule in rules if rule.startswith("ORDINARY/FREEFORM MUTATION SURFACE"))
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+
+        assert "source: null never means" in replacement_rule
+        assert "Plugin-backed sources must be preserved" in replacement_rule
+        assert "do not assume the current source is blob-bound" in replacement_rule
+        assert "source.blob_id only for an existing singular blob-bound source whose block carries one" in replacement_rule
+        assert "source.inline_blob only when intentionally supplying new literal data" in replacement_rule
+
+        assert "complete existing `source` configuration" in mutation_rule
+        assert "named `sources` map" in mutation_rule
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in mutation_rule
+        assert "round_trip_unavailable" in mutation_rule
+        assert "never fabricate or rebind source custody" in mutation_rule
+        assert "advertised narrow patch tool" in mutation_rule
+        assert "surface the named gap" in mutation_rule
+
+        assert "current-state context" in proposal_rule
+        assert "only tools advertised in this request" in proposal_rule
+        assert "never invoke an unadvertised inspection or mutation tool" in proposal_rule
+        assert "exact authorable source binding" in proposal_rule
+        assert "exact-source/round-trip gap" in proposal_rule
+        assert "stop instead of guessing" in proposal_rule
+
+    def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
+        """Shared aids must not teach proposal planners calls absent from their palette."""
+        from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
+        from elspeth.web.composer.pipeline_proposal import PlannerSurface
+        from elspeth.web.composer.tools import get_tool_definitions
+
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+        registered_names = {definition["name"] for definition in get_tool_definitions()}
+        named_tools = {name for name in registered_names if name in proposal_rule}
+
+        for surface in PlannerSurface:
+            policy = PlannerDiscoveryPolicy.initial(surface)
+            advertised_names = {definition["function"]["name"] for definition in planner_tool_definitions(policy)}
+            assert named_tools <= advertised_names
+
+        assert "get_pipeline_state" not in proposal_rule
+        assert "patch_source_options" not in proposal_rule
+
+    def test_custody_verbatim_rule_names_the_user_requested_sample_exception(self) -> None:
+        """Planner-authored samples must be an explicit, provenance-preserving exception."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        verbatim_rule = next(rule for rule in rules if rule.startswith("inline_blob.content must be"))
+        assert "verbatim source data" in verbatim_rule
+        assert "ONLY exception" in verbatim_rule
+        assert "user explicitly requested" in verbatim_rule
+        assert "planner-authored sample data" in verbatim_rule
+        assert "bind it through inline_blob" in verbatim_rule
+        assert "invented_source" in verbatim_rule
+
+    def test_custody_rules_demand_first_person_invented_source_narration(self) -> None:
+        """elspeth-47eba5cced: fabricated-at-user-request content is self-authored."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["source_custody"]["rules"])
+        assert "FIRST PERSON" in rendered
+        assert "invented_source" in rendered
+        assert "get_blob_content" in rendered
+
+    def test_review_registry_turn_end_promise_is_prompt_template_only(self) -> None:
+        """Ordinary no-tool finalization surfaces prompt review, not model choice."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["review_registry"]["rules"]
+
+        timing_rules = [rule for rule in rules if "TURN END" in rule or "finalization" in rule]
+        assert len(timing_rules) == 1
+        assert all("llm_model_choice" not in rule for rule in timing_rules)
+        timing_rule = timing_rules[0]
+        assert "ordinary no-tool finalization" in timing_rule
+        assert "llm_prompt_template" in timing_rule
+        assert "not a completion signal" in timing_rule
+
+
+class TestLlmOnErrorRuleGating:
+    """The on_error advice must match what the deployment's controls permit.
+
+    Taught unconditionally, "route on_error to a dedicated quarantine sink"
+    contradicted required_control_coverage: an llm node's on_error edge is an
+    independent output path, so a quarantine sink on it is rejected, and no
+    control transform can be interposed there (on_error may only name a sink
+    or 'discard'). Only the GATING is asserted here — which of the two module
+    constants is served — never the prose, per project convention.
+    """
+
+    def test_recommend_mode_keeps_the_quarantine_sink_advice(self, tmp_path: Path) -> None:
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules
+        assert not any(rule.startswith("This deployment REQUIRES the") for rule in rules)
+
+    def test_required_mode_serves_the_discard_only_rule(self, tmp_path: Path) -> None:
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="required")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="aws_bedrock_content_safety") in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control="aws_bedrock_content_safety") in rules
+
+    def test_recommend_mode_carries_no_operator_escalation_rule(self, tmp_path: Path) -> None:
+        """The operator escalation only makes sense when the gate is required."""
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert not any("operator decision" in rule for rule in rules)
+
+    def test_alias_less_required_control_also_gates_the_rule(self, tmp_path: Path) -> None:
+        """Gating follows the control MODE, not how the control is configured."""
+        view, _snapshot = _direct_control_view(tmp_path, control_mode="required")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="azure_content_safety") in rules
+
+    def test_deployment_without_a_selected_control_keeps_the_quarantine_advice(self) -> None:
+        view, _snapshot = _trained_view()
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules

@@ -1,4 +1,4 @@
-"""Shared fixtures for the composer capability-parity real-path matrix (Task 3).
+"""Shared fixtures for the composer capability-parity real-path matrix.
 
 This conftest builds ONE production stack that all parity surfaces share:
 
@@ -9,7 +9,7 @@ This conftest builds ONE production stack that all parity surfaces share:
   ``app.state.composer_service`` (so both freeform ``compose`` and guided-full's
   ``plan_guided_full_pipeline`` run the real planner against the same web policy),
   with ``_compute_availability`` forced available;
-* a permissive-but-real web plugin policy that admits every plugin the nine
+* a permissive-but-real web plugin policy that admits every plugin the ten
   fixtures use (``csv`` / ``json`` sources+sinks and ``llm`` are already in
   ``REQUIRED_WEB_PLUGIN_IDS``; ``passthrough`` / ``type_coerce`` / ``batch_stats``
   / ``batch_replicate`` are added to the allowlist). The guided conftest
@@ -20,7 +20,6 @@ This conftest builds ONE production stack that all parity surfaces share:
   module global ``elspeth.web.composer.service._litellm_acompletion`` so the
   real planner response parser, custody, candidate validation, and audited
   ``set_pipeline`` commit are all exercised;
-* the freeform recipe fast-path bypass (``match_freeform_recipe_intent`` → None)
   so freeform provably traverses ``plan_pipeline`` +
   ``build_planner_capability_manifest`` rather than a recipe-router graph
   (design false-green trap #2).
@@ -75,7 +74,11 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 # the deferred-intent negatives in ``test_repair_and_deferral.py`` can request it
 # (guided/'s conftest is a sibling scope and not inherited here). Importing it in
 # the test module instead would shadow the fixture parameter and trip ruff F811.
-from tests.integration.web.composer.guided.conftest import composer_test_client  # noqa: F401
+from tests.integration.web.composer.guided.conftest import (  # noqa: F401
+    _GuidedTestExecutionService,
+    composer_test_client,
+)
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Deterministic completion double (lifted from test_pipeline_planner.py)       #
@@ -134,9 +137,30 @@ class _ScriptedCompletion:
             raise response
         return response
 
+    def replace_unconsumed_response(self, *responses: _Response) -> None:
+        """Replace the sole queued response after reviewed stable IDs are known.
 
-def emit_proposal_response(pipeline: Mapping[str, Any]) -> _Response:
-    """A terminal response calling ``emit_pipeline_proposal`` with ``pipeline``."""
+        Both guided-staged arms now queue exactly one response — the single
+        planner run at the step-2 finish (goal-first, elspeth-378cfa0e18,
+        removed the tutorial arm's second run). The varargs form is kept for a
+        walk that must queue a repair turn behind the candidate; nothing
+        currently does, so the multi-response path is presently unexercised.
+        """
+        if self.requests or len(self._responses) != 1:
+            raise AssertionError("scripted completion response can only be replaced before its first call")
+        if not responses:
+            raise AssertionError("scripted completion replacement requires at least one response")
+        self._responses[:] = list(responses)
+
+
+def emit_proposal_response(pipeline: Mapping[str, Any], *, tool_call_id: str = "parity-terminal") -> _Response:
+    """A terminal response calling ``emit_pipeline_proposal`` with ``pipeline``.
+
+    ``tool_call_id`` must be distinct per staged proposal within one session:
+    composition_proposals carries uq_composition_proposals_session_tool_call,
+    exactly as real provider tool-call ids are unique per call. A walk that
+    stages more than one scripted proposal must not share the default.
+    """
     return _Response(
         choices=[
             _Choice(
@@ -144,7 +168,7 @@ def emit_proposal_response(pipeline: Mapping[str, Any]) -> _Response:
                     content=None,
                     tool_calls=[
                         _ToolCall(
-                            id="parity-terminal",
+                            id=tool_call_id,
                             function=_Function(
                                 name="emit_pipeline_proposal",
                                 arguments=json.dumps({"pipeline": pipeline}),
@@ -168,26 +192,27 @@ FIXTURES_DIR = REPO_ROOT / "evals" / "composer-parity" / "fixtures"
 
 
 def load_parity_fixtures() -> list[dict[str, Any]]:
-    """Load the nine canonical class fixtures, sorted by class for stable ids."""
+    """Load the ten canonical class fixtures, sorted by class for stable ids."""
     fixtures = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(FIXTURES_DIR.glob("*.json"))]
-    if len(fixtures) != 9:  # pragma: no cover - corpus contract
-        raise AssertionError(f"expected 9 parity fixtures, found {len(fixtures)}")
+    if len(fixtures) != 10:  # pragma: no cover - corpus contract
+        raise AssertionError(f"expected 10 parity fixtures, found {len(fixtures)}")
     return fixtures
 
 
 PARITY_FIXTURES = load_parity_fixtures()
+_REFERENCE_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 
 
-def rewrite_source_paths(args: Mapping[str, Any], data_dir: Path) -> dict[str, Any]:
-    """Rebind every source ``path`` under ``{data_dir}/blobs/`` (the S2 allowlist).
+def rewrite_source_paths(args: Mapping[str, Any], data_dir: Path, session_id: str) -> dict[str, Any]:
+    """Rebind source paths under the caller's session-owned blob subtree.
 
     The committed ``set_pipeline`` dispatch enforces that source file paths live
-    under ``{data_dir}/blobs/``; the corpus stores abstract relative names. Both
-    surfaces receive the same rewrite so their committed graphs stay identical,
-    and the isomorphism helper canonicalizes paths to basename regardless.
+    under ``{data_dir}/blobs/{session_id}/``; the corpus stores abstract relative
+    names. Both surfaces receive the same rewrite so their committed graphs stay
+    identical, and the isomorphism helper canonicalizes paths to basename regardless.
     """
     rewritten = copy.deepcopy(dict(args))
-    blobs = data_dir / "blobs"
+    blobs = data_dir / "blobs" / session_id
 
     def fix(spec: dict[str, Any]) -> None:
         options = spec.get("options")
@@ -224,7 +249,7 @@ def _empty_state() -> CompositionState:
 # a source/output to the guided default — while free node-to-node connection
 # names (``rows``, ``stats``, ``gate_in``, …) stay verbatim (the comparator
 # canonicalizes them). The committed graph is then isomorphic to the reference;
-# only the component *names* differ, which §8.1 canonicalizes away.
+# only the component *names* differ, which the comparator canonicalizes away.
 
 
 def _guided_naming(args: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
@@ -244,6 +269,7 @@ def _derive_guided_candidate(
     source_map: Mapping[str, str],
     output_map: Mapping[str, str],
     data_dir: Path,
+    session_id: str,
 ) -> dict[str, Any]:
     """Rename the canonical pipeline into the guided candidate the planner emits.
 
@@ -275,7 +301,7 @@ def _derive_guided_candidate(
         entry = copy.deepcopy(dict(spec))
         options = entry.get("options")
         if isinstance(options, dict) and isinstance(options.get("path"), str):
-            entry["options"] = {**options, "path": str(data_dir / "blobs" / Path(options["path"]).name)}
+            entry["options"] = {**options, "path": str(data_dir / "blobs" / session_id / Path(options["path"]).name)}
         if "on_success" in entry:
             entry["on_success"] = route(entry["on_success"])
         if "on_validation_failure" in entry:
@@ -332,6 +358,40 @@ def _derive_guided_candidate(
     return candidate
 
 
+def _derive_guided_initial_delta(
+    candidate: Mapping[str, Any],
+    guided_session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project a parity candidate onto the reviewed-boundary topology contract."""
+    raw_sources = candidate.get("sources")
+    if isinstance(raw_sources, dict):
+        source_specs = tuple(raw_sources.values())
+    else:
+        source = candidate.get("source")
+        if not isinstance(source, dict):
+            raise AssertionError("guided parity candidate has no source authority shell")
+        source_specs = (source,)
+    source_order = guided_session.get("source_order")
+    output_order = guided_session.get("output_order")
+    if not isinstance(source_order, list) or len(source_order) != len(source_specs):
+        raise AssertionError("guided parity source stable identities do not match the candidate")
+    outputs = candidate.get("outputs")
+    if not isinstance(outputs, list) or not isinstance(output_order, list) or len(output_order) != len(outputs):
+        raise AssertionError("guided parity output stable identities do not match the candidate")
+    delta: dict[str, Any] = {
+        "source_routes": [
+            {"stable_id": stable_id, "on_success": source_spec.get("on_success")}
+            for stable_id, source_spec in zip(source_order, source_specs, strict=True)
+        ],
+        "nodes": copy.deepcopy(candidate.get("nodes", [])),
+        "edges": copy.deepcopy(candidate.get("edges", [])),
+        "output_targets": [{"stable_id": stable_id} for stable_id in output_order],
+    }
+    if "metadata" in candidate:
+        delta["metadata"] = copy.deepcopy(candidate["metadata"])
+    return delta
+
+
 # --------------------------------------------------------------------------- #
 # Shared production stack + per-surface adapters                               #
 # --------------------------------------------------------------------------- #
@@ -341,6 +401,8 @@ _PARITY_ALLOWLIST = (
     "transform:type_coerce",
     "transform:batch_stats",
     "transform:batch_replicate",
+    "transform:value_transform",
+    "transform:batch_experiment_compare",
 )
 
 
@@ -365,9 +427,9 @@ class ParityEnv:
     def _client(self) -> AsyncClient:
         return AsyncClient(transport=ASGITransport(app=self.app), base_url="http://parity")
 
-    def _script(self, fixture: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _script(self, fixture: Mapping[str, Any], session_id: str) -> Mapping[str, Any]:
         """Patch the completion global to emit this fixture's pipeline; return it."""
-        pipeline = rewrite_source_paths(fixture["canonical_arguments"], self.data_dir)
+        pipeline = rewrite_source_paths(fixture["canonical_arguments"], self.data_dir, session_id)
         completion = _ScriptedCompletion(emit_proposal_response(pipeline))
         self.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
         return pipeline
@@ -381,7 +443,7 @@ class ParityEnv:
         alias — resolves identically). Each surface's real-path committed graph
         must be isomorphic to this, which anchors cross-surface parity.
         """
-        pipeline = rewrite_source_paths(fixture["canonical_arguments"], self.data_dir)
+        pipeline = rewrite_source_paths(fixture["canonical_arguments"], self.data_dir, _REFERENCE_SESSION_ID)
         user = UserIdentity(user_id="alice", username="alice")
         snapshot = self.app.state.plugin_snapshot_factory(user)
         policy = PolicyCatalogView(
@@ -396,6 +458,7 @@ class ParityEnv:
             policy,
             plugin_snapshot=snapshot,
             data_dir=str(self.data_dir),
+            session_id=_REFERENCE_SESSION_ID,
             session_engine=self.app.state.session_engine,
             secret_service=None,
             user_id="alice",
@@ -429,8 +492,8 @@ class ParityEnv:
         stages one pending proposal, which is then accepted over the real HTTP
         route.
         """
-        self._script(fixture)
         session = await self.sessions.create_session("alice", "Alice", "local")
+        self._script(fixture, str(session.id))
         await self.sessions.update_composer_preferences(
             session.id,
             trust_mode="explicit_approve",
@@ -458,14 +521,15 @@ class ParityEnv:
                 f"(got {len(proposals)}) — it may have fallen through to the compose loop"
             )
         proposal = proposals[0]
-        surface_value = getattr(proposal.pipeline_metadata, "surface", None) if proposal.pipeline_metadata is not None else None
-        surface_value = getattr(surface_value, "value", surface_value)
-        if surface_value != "freeform":
-            raise AssertionError(f"freeform proposal recorded surface {surface_value!r}, not 'freeform'")
+        metadata = proposal.pipeline_metadata
+        if metadata is None:
+            raise AssertionError(f"freeform proposal for {fixture['class']} carries no pipeline metadata")
+        if metadata.surface != "freeform":
+            raise AssertionError(f"freeform proposal recorded surface {metadata.surface!r}, not 'freeform'")
         async with self._client() as client:
             response = await client.post(
                 f"/api/sessions/{session.id}/proposals/{proposal.id}/accept",
-                json={"draft_hash": proposal.pipeline_metadata.draft_hash},
+                json={"draft_hash": metadata.draft_hash},
             )
         if response.status_code != 200:
             raise AssertionError(f"freeform accept failed ({response.status_code}): {response.text}")
@@ -473,12 +537,12 @@ class ParityEnv:
 
     async def drive_guided_full(self, fixture: Mapping[str, Any]) -> CompositionState:
         """Guided-full: authenticated ``POST /guided/plan`` → proposal → accept."""
-        self._script(fixture)
         async with self._client() as client:
             created = await client.post("/api/sessions", json={"title": "parity guided-full"})
             if created.status_code != 201:
                 raise AssertionError(f"session create failed ({created.status_code}): {created.text}")
             session_id = created.json()["id"]
+            self._script(fixture, session_id)
             plan = await client.post(
                 f"/api/sessions/{session_id}/guided/plan",
                 json={"operation_id": str(uuid4()), "intent": fixture["intent"]},
@@ -514,7 +578,7 @@ class ParityEnv:
             raise AssertionError(f"guided-staged respond {sorted(fields)} failed ({resp.status_code}): {resp.text}")
         return resp.json()
 
-    def _source_review_options(self, spec: Mapping[str, Any], output_map: Mapping[str, str]) -> dict[str, Any]:
+    def _source_review_options(self, spec: Mapping[str, Any], output_map: Mapping[str, str], session_id: str) -> dict[str, Any]:
         """Build the Step-1 SCHEMA_FORM options that review one source verbatim.
 
         ``on_validation_failure`` rides inside the submitted options (the
@@ -525,16 +589,16 @@ class ParityEnv:
         """
         options = copy.deepcopy(dict(spec["options"]))
         if isinstance(options.get("path"), str):
-            options["path"] = str(self.data_dir / "blobs" / Path(options["path"]).name)
+            options["path"] = str(self.data_dir / "blobs" / session_id / Path(options["path"]).name)
         failure = spec.get("on_validation_failure", "discard")
         options["on_validation_failure"] = output_map.get(failure, failure)
         return options
 
-    def _output_review_options(self, output: Mapping[str, Any], output_map: Mapping[str, str]) -> dict[str, Any]:
+    def _output_review_options(self, output: Mapping[str, Any], output_map: Mapping[str, str], session_id: str) -> dict[str, Any]:
         """Build the Step-2 SCHEMA_FORM options that review one output verbatim."""
         options = copy.deepcopy(dict(output["options"]))
         if isinstance(options.get("path"), str):
-            options["path"] = str(self.data_dir / "outputs" / Path(options["path"]).name)
+            options["path"] = str(self.data_dir / "outputs" / session_id / Path(options["path"]).name)
         failure = output.get("on_write_failure", "discard")
         options["on_write_failure"] = output_map.get(failure, failure)
         return options
@@ -544,16 +608,16 @@ class ParityEnv:
 
         ``start_profile`` (when given) explicitly opens the guided session with
         that workflow profile via ``POST /guided/start`` before the first turn is
-        fetched — the tutorial-identity negative passes ``"tutorial"`` so the sole
-        planner call runs on the ``TUTORIAL_PROFILE`` surface with its frozen
-        lesson, while the reviewed components and the committed graph stay
-        identical to the ``live`` staged run. When ``None`` the first GET
+        fetched — the tutorial-identity negative passes ``"tutorial"`` so both
+        planner calls (the pass-through entry, then the frozen-lesson revision)
+        run on the ``TUTORIAL_PROFILE`` surface, while the reviewed components
+        and the committed graph stay identical to the ``live`` staged run. When ``None`` the first GET
         implicitly opens a ``live`` session (the positive-matrix behaviour).
 
         ``/guided/start`` (implicit on first GET) → per-source review (single
         select → schema form → review) → finish sources → per-output review
         (single select → schema form → passthrough field review → review) →
-        finish outputs (the ONLY planner call: real ``plan_guided_pipeline`` →
+        finish outputs (the walk's first planner call: real ``plan_guided_pipeline`` →
         scripted completion emits the guided-named candidate → real
         ``bind_guided_reviewed_components`` + candidate validation → durable
         proposal) → review wiring → confirm wiring (the sole commit).
@@ -566,12 +630,6 @@ class ParityEnv:
         """
         args = fixture["canonical_arguments"]
         source_map, output_map = _guided_naming(args)
-        candidate = _derive_guided_candidate(args, source_map, output_map, self.data_dir)
-        (self.data_dir / "blobs").mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "outputs").mkdir(parents=True, exist_ok=True)
-
-        completion = _ScriptedCompletion(emit_proposal_response(candidate))
-        self.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
 
         source_items = list(args["sources"].items()) if isinstance(args.get("sources"), dict) else [("source", args["source"])]
         outputs = args["outputs"]
@@ -581,29 +639,28 @@ class ParityEnv:
             if created.status_code != 201:
                 raise AssertionError(f"session create failed ({created.status_code}): {created.text}")
             session_id = created.json()["id"]
+            candidate = _derive_guided_candidate(args, source_map, output_map, self.data_dir, session_id)
+            (self.data_dir / "blobs" / session_id).mkdir(parents=True, exist_ok=True)
+            (self.data_dir / "outputs" / session_id).mkdir(parents=True, exist_ok=True)
 
+            completion = _ScriptedCompletion(emit_proposal_response(candidate))
+            self.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+
+            # Goal-first (elspeth-378cfa0e18): every profile's start carries the
+            # goal, so both arms open the same way and spend the single scripted
+            # planner response on the ONE run at the step-2 finish. The tutorial
+            # arm used to start rootless and then buy the lesson graph with a
+            # second planner run through a synthetic prose revision; that was a
+            # walk no learner performs.
+            start_body: dict[str, Any] = {
+                "operation_id": str(uuid4()),
+                "intent": f"Build the {fixture['class']} pipeline from the reviewed components.",
+            }
             if start_profile is not None:
-                started = await client.post(
-                    f"/api/sessions/{session_id}/guided/start",
-                    json={"profile": start_profile, "operation_id": str(uuid4())},
-                )
-                if started.status_code != 200:
-                    raise AssertionError(f"guided-staged {start_profile} start failed ({started.status_code}): {started.text}")
-            else:
-                # A ROOT INTENT keeps the finish-outputs transition on the
-                # provider planner path: a rootless 1x1 step-3 entry now
-                # server-synthesizes the discarded starting sketch with zero
-                # planner calls, so a rootless walk could never derive a
-                # transform-ful fixture graph from its sole planner call.
-                started = await client.post(
-                    f"/api/sessions/{session_id}/guided/start",
-                    json={
-                        "operation_id": str(uuid4()),
-                        "intent": f"Build the {fixture['class']} pipeline from the reviewed components.",
-                    },
-                )
-                if started.status_code != 200:
-                    raise AssertionError(f"guided-staged intent start failed ({started.status_code}): {started.text}")
+                start_body["profile"] = start_profile
+            started = await client.post(f"/api/sessions/{session_id}/guided/start", json=start_body)
+            if started.status_code != 200:
+                raise AssertionError(f"guided-staged {start_profile or 'live'} start failed ({started.status_code}): {started.text}")
 
             # Step 1 — review every source in canonical order.
             for index, (_name, spec) in enumerate(source_items):
@@ -613,7 +670,7 @@ class ParityEnv:
                 reviewed = await self._staged_respond(
                     client,
                     session_id,
-                    edited_values={"plugin": spec["plugin"], "options": self._source_review_options(spec, output_map)},
+                    edited_values={"plugin": spec["plugin"], "options": self._source_review_options(spec, output_map, session_id)},
                 )
                 if reviewed["next_turn"]["type"] == "inspect_and_confirm":
                     columns = list(
@@ -629,6 +686,7 @@ class ParityEnv:
 
             # Step 2 — review every output in canonical order. The finish-output
             # transition is the sole planner call.
+            reviewed_output: dict[str, Any] | None = None
             for index, output in enumerate(outputs):
                 if index > 0:
                     await self._staged_respond(client, session_id, component_action={"action": "add", "component_kind": "output"})
@@ -636,9 +694,15 @@ class ParityEnv:
                 await self._staged_respond(
                     client,
                     session_id,
-                    edited_values={"plugin": output["plugin"], "options": self._output_review_options(output, output_map)},
+                    edited_values={"plugin": output["plugin"], "options": self._output_review_options(output, output_map, session_id)},
                 )
-                await self._staged_respond(client, session_id, control_signal="passthrough")
+                reviewed_output = await self._staged_respond(client, session_id, control_signal="passthrough")
+            if reviewed_output is None:
+                raise AssertionError("guided parity fixture reviewed no outputs")
+            guided_session = reviewed_output["composition_state"]["composer_meta"]["guided_session"]
+            # One planner run, both profiles: the step-2 finish plans the whole
+            # graph from the goal the start carried.
+            completion.replace_unconsumed_response(emit_proposal_response(_derive_guided_initial_delta(candidate, guided_session)))
             staged = await self._staged_respond(client, session_id, component_action={"action": "finish", "component_kind": "output"})
             if staged["next_turn"]["type"] != "propose_pipeline":
                 raise AssertionError(
@@ -648,25 +712,6 @@ class ParityEnv:
             surface_value = staged["composition_state"]["composer_meta"]["guided_session"]["active_proposal"]
             if surface_value is None:
                 raise AssertionError(f"guided-staged staged no active proposal for {fixture['class']}")
-
-            if start_profile == "tutorial":
-                # The rootless tutorial entry now stages the server-synthesized
-                # starting sketch (zero planner calls); the lesson pipeline
-                # arrives via the frozen-prompt REVISION — the real tutorial
-                # flow. The revision below is therefore the walk's sole
-                # planner call, consuming the scripted completion.
-                staged = await self._staged_respond(
-                    client,
-                    session_id,
-                    proposal_id=proposal["proposal_id"],
-                    draft_hash=proposal["draft_hash"],
-                    edited_values={"revision_instruction": f"Apply the tutorial lesson: build the {fixture['class']} pipeline."},
-                )
-                if staged["next_turn"]["type"] != "propose_pipeline":
-                    raise AssertionError(
-                        f"tutorial revision did not stage a proposal for {fixture['class']} (got {staged['next_turn']['type']!r})"
-                    )
-                proposal = staged["next_turn"]["payload"]
 
             # Step 3 → Step 4 — review wiring, then confirm (the sole commit).
             reviewed = await self._staged_respond(
@@ -706,6 +751,7 @@ def _build_settings(data_dir: Path) -> WebSettings:
                 "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             }
         },
+        default_llm_profile="task-role",
     )
 
 
@@ -714,7 +760,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     """Build the shared real production stack with the two false-green bypasses."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
-    sessions = SessionServiceImpl(
+    sessions = DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.parity"),
@@ -764,10 +810,6 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
         "_compute_availability",
         lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
-    # Freeform recipe fast-path bypass (false-green trap #2): guarantee non-match
-    # so freeform provably traverses plan_pipeline + build_planner_capability_manifest.
-    monkeypatch.setattr("elspeth.web.composer.service.match_freeform_recipe_intent", lambda _message: None)
-
     # Production wires the composer service in WEB mode — operator_profile_registry
     # plus a user-id-keyed snapshot factory (app.py create_app), NOT
     # for_trained_operator. Match that so freeform PLANNING and guided-full
@@ -804,6 +846,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.plugin_snapshot_factory = lambda user: build_snapshot(user.user_id)
     app.state.composer_recorder = BufferingRecorder()
     app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.execution_service = _GuidedTestExecutionService(app)
     app.include_router(create_session_router())
 
     try:

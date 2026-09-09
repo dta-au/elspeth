@@ -7,14 +7,14 @@ This framework explains how to interpret evidence. Follow the executable
 
 ### Full
 
-A full assessment inventories all 68 catalog legs, every required case, and all
+A full assessment inventories all 73 catalog legs, every required case, and all
 hard gates. It may change the global verdict.
 
 ### Delta
 
 A delta assessment names the changed legs/cases, establishes change impact,
 reruns their evidence and adjacent invariants, and changes only those cells. Its
-manifest still materializes all 68 legs, names the parent digest, and lists the
+manifest still materializes all 73 legs, names the parent digest, and lists the
 changed tuples. It inherits unresolved cells from the preceding full assessment
 and cannot declare the whole engine complete.
 
@@ -24,11 +24,15 @@ A historical rerun reconstructs a named baseline and executes recorded command
 vectors in a fresh worktree. It writes a new rerun directory and divergence
 report; it never overwrites the original assessment.
 
+Catalog and assessment versions are exact pairs. Historical v1 uses assessment
+schema 1; frozen v2 uses schema 2; candidate v3 uses schema 3. A validator never
+guesses a schema from record shape or silently falls back to a current catalog.
+
 ## Assessment sequence
 
 1. Fix the code baseline and capture the complete worktree identity.
 2. Verify Loomweave freshness and record structural-query limitations.
-3. Load the exact catalog version and verify all 68 legs are present.
+3. Load the exact catalog version and verify all 73 legs are present.
 4. Discover production writers, callers, read models, external-effect
    boundaries, and cross-transaction seams.
 5. Reconcile live Filigree issues without treating issue closure as proof.
@@ -49,15 +53,40 @@ Every execution record contains:
 - repository-relative working directory;
 - safe environment additions/removals and required resources;
 - start/end times, timeout, exit code, and duration;
-- collected node IDs and pass/fail/error/skip/xfail counts;
+- one machine-produced runtime profile report with its state store, deployment,
+  semantic backend version, probe kind, exact probe node, one classified pytest
+  outcome per collected node, and warning provenance;
+- positive, unique collected node IDs and exact
+  pass/fail/error/skip/xfail/xpass/warning counts;
 - stdout, stderr, JUnit, and retained artifact paths with SHA-256 when stored;
-- catalog coverage tuples: leg, dimension, and case;
+- catalog coverage tuples: leg, dimension, semantic case, profile case, and the
+  exact node IDs that establish that tuple;
 - `establishes` and `does_not_establish` statements;
 - reproducibility class: `deterministic`, `semantic_comparison`, or
   `external_observation`.
 
 Warnings, skips, xfails, missing credentials, and partial platform coverage are
 evidence facts. Do not omit them to make a run appear cleaner.
+
+The `collect-evidence` compatibility command statically revalidates retained
+artifacts; it never replays pytest or imports a recorded test module. It and
+`validate-package` share one exact command/environment schema. The recorded
+vector must load the trusted profile reporter, select explicit `tests/` nodes,
+and bind its JUnit and profile outputs to retained artifacts. The reporter gets
+backend facts from the live database connection at a trusted test boundary;
+deployment is a trusted test assertion bound to that probe node, not a manifest
+label. The closed safe-environment allowlist records only approved reproduction
+inputs.
+
+Only a successful `pytest` record with a positive pass count, no
+fail/error/skip/xfail/xpass result, matching JUnit testcase/aggregate totals,
+exact equality among JUnit properties, node index, and profile node IDs, and one
+proof subject per cited node can promote a behavioral cell. Manifest result
+counts are derived from the profile's machine outcomes and warnings; human
+stdout summaries are retained context, never count authority. XFAIL and XPASS
+remain distinct from generic skip and pass, and any XPASS blocks promotion. A
+node may cover several dimensions of that one leg/case/profile subject.
+Documentation records are support-only and cannot promote behavioral cells.
 
 ## Classification rules
 
@@ -72,6 +101,10 @@ evidence facts. Do not omit them to make a run appear cleaner.
 - Record an explicit `owner_issue` key for every active gap. `null` means
   visibly unowned; it does not make the gap disappear.
 - State an observable exit gate. “Add more tests” is not an exit gate.
+
+Hard-gate status, affected legs, and support are derived from the catalog's
+gate-to-dimension mappings and the validated cell evidence. Assessors explain
+the result; they do not independently close a gate.
 
 ## Proof boundaries
 

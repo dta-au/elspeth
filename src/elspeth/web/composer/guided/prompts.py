@@ -25,6 +25,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
 from elspeth.web.composer.guided.protocol import GuidedStep
 
@@ -39,15 +40,30 @@ _STEP_FILE_NAMES: dict[GuidedStep, str] = {
     GuidedStep.STEP_4_WIRE: "step_4_wire.md",
 }
 
-# Discoverability invariant: the per-step file map and the playbook order
-# must cover every GuidedStep member.  If GuidedStep gains a new member and
-# either map is not updated, fail loudly at import time rather than silently
-# omit the step from the composed skill.
-assert set(_STEP_FILE_NAMES.keys()) == set(GuidedStep), (
-    f"_STEP_FILE_NAMES out of sync with GuidedStep: "
-    f"missing {set(GuidedStep) - set(_STEP_FILE_NAMES)}, "
-    f"extra {set(_STEP_FILE_NAMES) - set(GuidedStep)}"
-)
+# Discoverability invariant: the per-step file map must cover every
+# GuidedStep member. If GuidedStep gains a new member and this map is not
+# updated, fail loudly at import time rather than silently omit the step
+# from the composed skill.
+#
+# RAISES rather than asserting (elspeth-37941f1731). As an ``assert`` this
+# guard made a promise it could not keep: ``python -O`` strips assertions, so
+# under optimisation it did precisely the thing the paragraph above says it
+# prevents — the new step was silently omitted from the skill handed to the
+# planner on every guided turn. Nothing else caught it either; no test
+# consumes ``_STEP_FILE_NAMES``.
+#
+# ``GuidedStep`` is the live authority and only the map is hand-written.
+# Deriving the map from the enum would make this comparison a tautology no
+# drift could fail — the point is that a human must supply a skill FILE for
+# each step, which no derivation can do for them.
+_missing_steps = set(GuidedStep) - set(_STEP_FILE_NAMES)
+_extra_steps = set(_STEP_FILE_NAMES) - set(GuidedStep)
+if _missing_steps or _extra_steps:
+    raise RuntimeError(
+        "_STEP_FILE_NAMES out of sync with GuidedStep: "
+        f"missing {sorted(step.name for step in _missing_steps)}, "
+        f"extra {sorted(step.name for step in _extra_steps)}"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -126,6 +142,17 @@ def _looks_secret_like_sample(value: str) -> bool:
     return lowered.startswith(("sk-", "pk_", "rk_", "xoxb-")) or any(marker in lowered for marker in secret_markers)
 
 
+@observation_boundary(
+    tier=3,
+    source="one uploaded sample-row value: Tier-3 operator-uploaded data of unknown type, observed only to mask it for prompt display",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a bounded '<sample:...>' type tag for every possible value — never the value itself, a key, "
+        "or a member — masking secret-like, url, and email-like strings behind category tags; unknown types "
+        "collapse to their type name and this masker never raises"
+    ),
+)
 def _summarize_sample_value(value: Any) -> str:
     if value is None:
         return "<sample:null>"
@@ -152,5 +179,44 @@ def _summarize_sample_value(value: Any) -> str:
     return f"<sample:{type(value).__name__}>"
 
 
-def _summarize_sample_row(row: Mapping[str, Any]) -> dict[str, str]:
-    return {str(key): _summarize_sample_value(value) for key, value in row.items()}
+def _summarize_sample_row(
+    row: Mapping[str, Any],
+    *,
+    field_aliases: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Summarize a sample row without promoting uploaded field labels.
+
+    Field names are Tier-3 uploaded data just like field values.  Use caller-
+    supplied aliases when several source projections must share stable names;
+    otherwise assign deterministic row-local aliases disjoint from every raw
+    row label. A label missing from a supplied registry is omitted rather than
+    exposed or assigned an inconsistent fallback alias.
+    """
+    aliases: Mapping[str, str]
+    if field_aliases is None:
+        labels = tuple(str(key) for key in row)
+        reserved_labels = set(labels)
+        local_aliases: dict[str, str] = {}
+        used_aliases: set[str] = set()
+        next_index = 1
+        for label in labels:
+            if label in local_aliases:
+                continue
+            candidate = f"field_{next_index}"
+            while candidate in reserved_labels or candidate in used_aliases:
+                next_index += 1
+                candidate = f"field_{next_index}"
+            local_aliases[label] = candidate
+            used_aliases.add(candidate)
+            next_index += 1
+        aliases = local_aliases
+    else:
+        aliases = field_aliases
+
+    projection: dict[str, str] = {}
+    for key, value in row.items():
+        label = str(key)
+        if label not in aliases:
+            continue
+        projection[aliases[label]] = _summarize_sample_value(value)
+    return projection

@@ -129,3 +129,20 @@ class TestPromoteSetSourceArgErrorRouting:
         )
         assert result.success is True
         assert result.updated_state.sources["source"].plugin == "csv"
+
+    def test_empty_on_validation_failure_canonicalizes_to_discard(self) -> None:
+        """elspeth-bcd7051143: "" names no route (sink names are non-empty),
+        so the shared canonicalizer folds it into 'discard' at this seam —
+        the same owner every other source-authoring seam routes through."""
+        result = _execute_set_source(
+            {
+                "plugin": "csv",
+                "options": {"path": "/tmp/x.csv", "schema": {"mode": "observed"}},
+                "on_success": "rows",
+                "on_validation_failure": "",
+            },
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+        assert result.success is True
+        assert result.updated_state.sources["source"].on_validation_failure == "discard"

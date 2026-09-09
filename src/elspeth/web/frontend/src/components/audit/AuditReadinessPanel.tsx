@@ -1,7 +1,7 @@
 /**
  * AuditReadinessPanel (Phase 2)
  *
- * Persistent right-rail panel showing six rows of audit-readiness state.
+ * Inspector Audit-tab panel showing six rows of audit-readiness state.
  * Auto-fetches on compositionState.version change; collapses to a single
  * "Audit ready ✓" summary when nothing actionable is present.
  *
@@ -11,26 +11,32 @@
  * default arm fails the build if a new row is added to the wire schema
  * without a UI case.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { useSessionStore } from "../../stores/sessionStore";
 import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
 import { useExecutionStore } from "../../stores/executionStore";
 import { useInlineSourceStore } from "../../stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "../../stores/interpretationEventsStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { hasCompositionContent } from "../../utils/compositionState";
 import { relativeTime } from "../../utils/time";
 import type {
-  AuditReadinessSnapshot,
   CompositionState,
   ReadinessRow,
   ReadinessRowId,
   ReadinessStatus,
-  ValidationResult,
 } from "../../types/api";
+import { Button } from "@/components/ui";
 import { ReadinessRowDetail } from "./ReadinessRowDetail";
 import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
+import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
+import { matchingAuditReadinessSnapshot } from "@/lib/auditReadinessFreshness";
+import {
+  projectMatchingSnapshotToExecution,
+  useAuditReadinessSync,
+} from "./useAuditReadinessSync";
 
 /** Glyph + accessible label for each row status. */
 function statusGlyph(status: ReadinessStatus): { glyph: string; aria: string } {
@@ -89,8 +95,9 @@ function isActionable(status: ReadinessStatus): boolean {
  *
  *   | Backend status   | Frontend summary text                                     |
  *   |------------------|-----------------------------------------------------------|
- *   | `not_applicable` | (row hidden) OR "not yet surfaced" when LLM transform     |
- *   |                  | exists but no events yet (frontend-derived F-14 state)    |
+ *   | `not_applicable` | (row hidden), the backend source-only narrative, OR       |
+ *   |                  | "not yet surfaced" when an LLM transform exists but no   |
+ *   |                  | events yet (frontend-derived F-14 state)                  |
  *   | `warning`        | "{P} pending review ({R} resolved)"                       |
  *   | `ok`             | "all {N} resolved"                                        |
  *
@@ -108,8 +115,8 @@ function isActionable(status: ReadinessStatus): boolean {
  * CLOSED switch over `ReadinessStatus`; the `never` arm prevents silent
  * fallthrough if a future backend extension adds a new status value.
  *
- * @returns null when the row should be HIDDEN (not_applicable with no
- *   LLM-context to surface). The caller must skip rendering the row
+ * @returns null when the row should be HIDDEN (not_applicable with no LLM
+ *   transform or source to surface). The caller must skip rendering the row
  *   entirely on null.
  */
 interface LlmInterpretationsRenderInputs {
@@ -118,6 +125,8 @@ interface LlmInterpretationsRenderInputs {
   resolvedCount: number;
   optedOut: boolean;
   hasLlmTransform: boolean;
+  hasLlmSource: boolean;
+  backendSummaryText: string;
 }
 
 interface LlmInterpretationsRenderOutput {
@@ -132,8 +141,15 @@ interface LlmInterpretationsRenderOutput {
 function formatLlmInterpretationsRow(
   inputs: LlmInterpretationsRenderInputs,
 ): LlmInterpretationsRenderOutput | null {
-  const { status, pendingCount, resolvedCount, optedOut, hasLlmTransform } =
-    inputs;
+  const {
+    status,
+    pendingCount,
+    resolvedCount,
+    optedOut,
+    hasLlmTransform,
+    hasLlmSource,
+    backendSummaryText,
+  } = inputs;
   const total = pendingCount + resolvedCount;
 
   // Opt-out override is unconditional — it suppresses the status mapping
@@ -148,6 +164,20 @@ function formatLlmInterpretationsRow(
       summaryText: `Opted out for this session (${total} drafted, not reviewed)`,
       glyph: "◎", // ◎ — neutral "circled dot" per spec table row
       ariaStatusLabel: "Opted out",
+    };
+  }
+
+  // A source-native LLM issues an authored prompt without consuming rows, so
+  // it has no interpretation-event lifecycle. Keep the backend's narrative
+  // authoritative: unlike transform event counts, there is nothing for the
+  // frontend to derive or re-word here. Source options are deliberately never
+  // inspected by this presentation path. The unconditional session opt-out
+  // override above remains authoritative when both contexts are present.
+  if (status === "not_applicable" && hasLlmSource && !hasLlmTransform) {
+    return {
+      summaryText: backendSummaryText,
+      glyph: "—",
+      ariaStatusLabel: "Not applicable",
     };
   }
 
@@ -177,8 +207,8 @@ function formatLlmInterpretationsRow(
           ariaStatusLabel: "Not yet surfaced",
         };
       }
-      // No LLM transform AND no events: hide the row entirely (return
-      // null). The caller skips rendering.
+      // No LLM transform or source AND no events: hide the row entirely
+      // (return null). The caller skips rendering.
       return null;
     case "error":
       // The backend never emits `error` for this row today. Render with a
@@ -206,39 +236,32 @@ function compositionHasLlmTransform(state: CompositionState | null): boolean {
   );
 }
 
-function validationResultFromSnapshot(snapshot: AuditReadinessSnapshot): ValidationResult {
-  return snapshot.validation_result;
+/** True when the composition contains at least one source-native `llm`. */
+function compositionHasLlmSource(state: CompositionState | null): boolean {
+  if (state === null) return false;
+  return Object.values(state.sources).some((source) => source.plugin === "llm");
 }
 
-function projectMatchingSnapshotToExecution(
-  sessionId: string,
-  compositionVersion: number,
-  setValidationResult: (result: ValidationResult) => void,
-): void {
-  const currentSnapshot =
-    useAuditReadinessStore.getState().snapshotsBySession[sessionId];
-  const activeSessionId = useSessionStore.getState().activeSessionId;
-  const activeVersion =
-    useSessionStore.getState().compositionState?.version ?? null;
-  if (
-    activeSessionId !== sessionId ||
-    activeVersion !== compositionVersion ||
-    currentSnapshot?.composition_version !== compositionVersion
-  ) {
-    return;
-  }
-  setValidationResult(validationResultFromSnapshot(currentSnapshot));
+interface AuditReadinessPanelProps {
+  onSelectComponent?: (componentId: string) => void;
 }
 
-export function AuditReadinessPanel() {
+export function AuditReadinessPanel({
+  onSelectComponent,
+}: AuditReadinessPanelProps = {}) {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
 
   const currentCompositionVersion = compositionState?.version ?? null;
   const snapshot = useAuditReadinessStore((s) => {
-    if (!activeSessionId || currentCompositionVersion === null) return undefined;
-    const cached = s.snapshotsBySession[activeSessionId];
-    return cached?.composition_version === currentCompositionVersion ? cached : undefined;
+    const cached = activeSessionId
+      ? s.snapshotsBySession[activeSessionId]
+      : undefined;
+    return matchingAuditReadinessSnapshot(
+      cached,
+      activeSessionId,
+      currentCompositionVersion,
+    );
   });
   const isLoading = useAuditReadinessStore((s) =>
     activeSessionId ? !!s.isLoadingBySession[activeSessionId] : false,
@@ -248,6 +271,7 @@ export function AuditReadinessPanel() {
   );
   const loadSnapshot = useAuditReadinessStore((s) => s.loadSnapshot);
   const setValidationResult = useExecutionStore((s) => s.setValidationResult);
+  const showAdvanced = useShowAdvanced();
 
   // Phase 5a Task 7: when an inline_blob source is bound to the active
   // composition, the Provenance row's summary text is replaced with an
@@ -278,33 +302,9 @@ export function AuditReadinessPanel() {
 
   const compositionHasContent = hasCompositionContent(compositionState);
 
-  useEffect(() => {
-    if (!activeSessionId || !compositionState || !compositionHasContent) return;
-    let cancelled = false;
-    // Fire and forget; store handles errors.
-    void loadSnapshot(activeSessionId, compositionState.version).then(() => {
-      if (cancelled) return;
-      projectMatchingSnapshotToExecution(
-        activeSessionId,
-        compositionState.version,
-        setValidationResult,
-      );
-    });
-    return () => {
-      cancelled = true;
-      // Unmount-during-fetch cleanup: abort the in-flight controller for this
-      // session. The store's AbortError catch arm clears
-      // isLoadingBySession[activeSessionId] and preserves cached snapshot/error.
-      const ctrl = useAuditReadinessStore.getState().abortControllers[activeSessionId];
-      if (ctrl) {
-        ctrl.abort();
-      }
-    };
-  // Intentional: `compositionState?.version` is the dep, not the compositionState reference.
-  // Using the reference would re-run the effect on every render-cycle that re-creates the object
-  // without changing the version. The linter flags `compositionState` as missing; suppress here.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, compositionState?.version, compositionHasContent, loadSnapshot, setValidationResult]);
+  // Ambient snapshot sync (shared with ArtifactWorkspaceSurface, which runs
+  // it while this panel is unmounted; see useAuditReadinessSync).
+  useAuditReadinessSync();
 
   const anyActionable = useMemo(
     () => snapshot?.rows.some((r) => isActionable(r.status)) ?? false,
@@ -319,7 +319,7 @@ export function AuditReadinessPanel() {
   // user explicitly clicked Expand).
   //
   // Stored per-session in auditReadinessStore so the preference survives
-  // right-rail remounts. Component-local useState would reset on remount.
+  // Inspector remounts. Component-local useState would reset on remount.
   const userExpanded = useAuditReadinessStore((s) =>
     activeSessionId ? (s.userExpandedBySession[activeSessionId] ?? false) : false,
   );
@@ -336,10 +336,9 @@ export function AuditReadinessPanel() {
     throw new Error("compositionState missing after audit-readiness content guard");
   }
 
-  // Visible panel name, rendered in EVERY state (elspeth-4f69b267dd): the
-  // graduation card sends users to "the Audit panel", so the destination must
-  // exist by that name even while loading, collapsed, or errored — not only in
-  // the expanded view.
+  // Visible panel name for non-ready standalone states. The collapsed ready
+  // card uses its "Audit ready" status as the compact visible label; the
+  // expanded panel renders its own heading below.
   const panelHeading = <h2 className="audit-readiness-title audit-readiness-title--standalone">Audit</h2>;
 
   if (isLoading && !snapshot) {
@@ -363,7 +362,7 @@ export function AuditReadinessPanel() {
     );
   }
 
-  if (error && !snapshot) {
+  if (error) {
     return (
       <section
         aria-label="Audit readiness"
@@ -374,9 +373,9 @@ export function AuditReadinessPanel() {
         <div role="alert" className="audit-readiness-error">
           {error}
         </div>
-        <button
+        <Button
           type="button"
-          className="btn audit-readiness-action-btn audit-readiness-action-btn--ghost"
+          className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
           onClick={() =>
             void loadSnapshot(
               activeSessionId,
@@ -394,7 +393,7 @@ export function AuditReadinessPanel() {
           aria-label="Retry audit readiness check"
         >
           Retry
-        </button>
+        </Button>
       </section>
     );
   }
@@ -413,15 +412,18 @@ export function AuditReadinessPanel() {
         className="audit-readiness audit-readiness--collapsed"
         aria-busy={isLoading ? "true" : undefined}
       >
-        {panelHeading}
-        <button
+        <Button
+          variant="bare"
           type="button"
           className="audit-readiness-summary"
           onClick={() => setUserExpandedInStore(activeSessionId, true)}
           aria-expanded={false}
           aria-label="Audit ready. Show details."
         >
-          <span aria-hidden="true">{"✓"}</span> Audit ready
+          <span className="audit-readiness-summary-status">
+            <span aria-hidden="true">{"✓"}</span>
+            Audit ready
+          </span>
           {/* No aria-label here: on a role-less span it is never exposed
               (elspeth-37293a3b7c), and the parent button's aria-label wins
               the name computation anyway. The freshness detail is the
@@ -429,7 +431,7 @@ export function AuditReadinessPanel() {
           <span className="audit-readiness-summary-meta">
             Checked {checkedText} · as of v{snapshot.composition_version}
           </span>
-        </button>
+        </Button>
       </section>
     );
   }
@@ -454,55 +456,71 @@ export function AuditReadinessPanel() {
               Checked {checkedText} · as of v{snapshot.composition_version}
             </p>
             {/* Gate legibility (elspeth-088bf83922 T-2, option (a)): a
-                one-line explanation of the per-row "Blocks Run" / "Advisory"
+                one-line explanation of the per-row "Blocks run" / "Advisory"
                 badges below — legibility only, no gating change. Reuses the
                 freshness paragraph's existing muted-text style rather than
-                introducing a new one. */}
+                introducing a new one.
+                The quoted label must match AuditReadinessRow's literal
+                verbatim, case included (elspeth-1fbb371ac3) — a reader
+                matches this sentence against the badges directly beneath
+                it. */}
             <p className="audit-readiness-freshness">
-              Rows marked "Blocks Run" must be clear before you can run this
+              Rows marked "Blocks run" must be clear before you can run this
               pipeline; the rest are advisory and do not stop a run.
             </p>
           </div>
           <div className="audit-readiness-actions">
-            <button
-              type="button"
-              className="btn audit-readiness-action-btn audit-readiness-action-btn--ghost"
-              onClick={() =>
-                void loadSnapshot(
-                  activeSessionId,
-                  compositionState.version,
-                  {
-                    force: true,
-                  },
-                ).then(() =>
-                  projectMatchingSnapshotToExecution(
+            {/* The panel refetches on every composition version (useEffect
+                above); a manual Refresh is a debugging affordance
+                (elspeth-f1394307e3). Explain and Collapse stay. */}
+            {showAdvanced && (
+              <Button
+                type="button"
+                className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
+                onClick={() =>
+                  void loadSnapshot(
                     activeSessionId,
                     compositionState.version,
-                    setValidationResult,
-                  ),
-                )
-              }
-              aria-label="Refresh audit check now"
-            >
-              Refresh
-            </button>
-            <button
+                    {
+                      force: true,
+                    },
+                  ).then(() =>
+                    projectMatchingSnapshotToExecution(
+                      activeSessionId,
+                      compositionState.version,
+                      setValidationResult,
+                    ),
+                  )
+                }
+                aria-label="Refresh audit check now"
+              >
+                Refresh
+              </Button>
+            )}
+            <Button
+              variant="primary"
               type="button"
-              className="btn btn-primary audit-readiness-action-btn"
+              className="audit-readiness-action-btn"
               onClick={() => setExplainOpen(true)}
               aria-label="Explain what this pipeline will record"
             >
-              Explain →
-            </button>
+              {/* No trailing arrow (elspeth-cc56449892): this button opens a
+                  dialog exactly like its two cluster siblings (Refresh,
+                  Collapse), so a forward glyph on this one alone promised a
+                  navigation the others do not make. If a forward affordance
+                  is ever wanted it belongs on all three and comes from the
+                  SVG Icon primitive, not a text arrow. */}
+              Explain
+            </Button>
             {!anyActionable && (
-              <button
+              <Button
                 type="button"
-                className="btn audit-readiness-action-btn audit-readiness-action-btn--ghost"
+                className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
                 onClick={() => setUserExpandedInStore(activeSessionId, false)}
                 aria-label="Collapse audit readiness"
               >
                 Collapse
-              </button>
+              </Button>
             )}
           </div>
         </header>
@@ -518,10 +536,10 @@ export function AuditReadinessPanel() {
             // frontend-stylised renderer driven by interpretationEventsStore
             // counts (pending / resolved) and the opt-out flag. The
             // formatter returns null when the row should be HIDDEN (no LLM
-            // transform + no events); we skip rendering entirely in that
-            // case so the row is removed from the list (parallel to the
-            // backend's "not_applicable" semantics but with the
-            // frontend-derived F-14 "not yet surfaced" override layered on).
+            // transform or source + no events); we skip rendering entirely in
+            // that case so the row is removed from the list (parallel to the
+            // backend's "not_applicable" semantics but with source parity and
+            // the frontend-derived F-14 "not yet surfaced" override layered on).
             if (row.id === "llm_interpretations") {
               const pendingCount = activeSessionId
                 ? Object.keys(
@@ -543,10 +561,12 @@ export function AuditReadinessPanel() {
                 resolvedCount,
                 optedOut,
                 hasLlmTransform: compositionHasLlmTransform(compositionState),
+                hasLlmSource: compositionHasLlmSource(compositionState),
+                backendSummaryText: row.summary,
               });
               if (formatted === null) {
-                // Row hidden — no LLM transform AND no events AND not
-                // opted out. Skip rendering so the row does not appear.
+                // Row hidden — no LLM transform or source AND no events AND
+                // not opted out. Skip rendering so the row does not appear.
                 return null;
               }
               const heading = row.label || rowHeading(row.id);
@@ -557,6 +577,10 @@ export function AuditReadinessPanel() {
                 summaryText: formatted.summaryText,
                 glyph: formatted.glyph,
                 ariaStatusLabel: formatted.ariaStatusLabel,
+                blocksRun: isRunGatingReadinessRow(
+                  row.id,
+                  snapshot.validation_result.readiness.execution_ready,
+                ),
                 extraClassName: "audit-readiness-row--llm-interpretations",
                 testId: "audit-readiness-row-llm-interpretations",
               };
@@ -593,6 +617,10 @@ export function AuditReadinessPanel() {
               summaryText,
               glyph,
               ariaStatusLabel: aria,
+              blocksRun: isRunGatingReadinessRow(
+                row.id,
+                snapshot.validation_result.readiness.execution_ready,
+              ),
             };
             return (
               <AuditReadinessRow
@@ -614,6 +642,7 @@ export function AuditReadinessPanel() {
           validationErrors={
             selectedRowId === "validation" ? snapshot.validation_result.errors : undefined
           }
+          onSelectComponent={onSelectComponent}
           onClose={() => setSelectedRowId(null)}
         />
       )}

@@ -12,18 +12,22 @@ while the repo is tested directly.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from _pytest.mark import ParameterSet
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql import Select, Update
 
 from elspeth.contracts import (
     BatchStatus,
     CallStatus,
     CallType,
+    FrameKind,
     FrameworkBugError,
     NodeStateCompleted,
     NodeStateFailed,
@@ -58,7 +62,7 @@ from elspeth.core.landscape.model_loaders import (
 )
 from elspeth.core.landscape.schema import node_states_table, routing_events_table
 from elspeth.core.payload_store import FilesystemPayloadStore
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -344,7 +348,7 @@ class TestCompleteNodeStateCrashPaths:
                 original_execute = conn.execute
 
                 def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    if getattr(stmt, "is_select", False):
+                    if isinstance(stmt, Select):
                         compiled = stmt.compile(dialect=conn.dialect, compile_kwargs={"render_postcompile": True})
                         statement = str(compiled)
                         if "FROM node_states" in statement and "node_states.state_id IN" in statement:
@@ -397,12 +401,15 @@ class TestCompleteNodeStateCrashPaths:
             original_execute = conn.execute
 
             def observed_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
-                if getattr(stmt, "is_select", False) and "FROM node_states" in str(stmt):
-                    if getattr(stmt, "_for_update_arg", None) is not None:
+                # Narrow on the concrete SQLAlchemy statement types this repository
+                # issues; ``Select._for_update_arg`` is None unless with_for_update()
+                # was applied, so the prelock is read directly off the narrowed type.
+                if isinstance(stmt, Select) and "FROM node_states" in str(stmt):
+                    if stmt._for_update_arg is not None:
                         events.append(("lock", None))
                     else:
                         events.append(("read", None))
-                elif getattr(stmt, "is_update", False) and stmt.table is node_states_table:
+                elif isinstance(stmt, Update) and stmt.table is node_states_table:
                     events.append(("update", None))
                 return original_execute(stmt, *args, **kwargs)
 
@@ -568,30 +575,42 @@ class TestCompleteNodeStateCrashPaths:
         assert isinstance(result_f, NodeStateFailed)
 
 
-class TestCompletedRowLookup:
-    """Exact completed-row lookup for coalesce late-arrival detection."""
+class TestReleasedTokenLookup:
+    """Released-only (status COMPLETED) token-scoped read for row_union restore.
 
-    def test_has_completed_row_for_node_scopes_by_run_node_and_row(self) -> None:
+    A FAILED closure has completed_at set too, so completion evidence alone
+    cannot discriminate — a failure-closed row_union group is not a released
+    one.
+    """
+
+    def test_find_released_node_state_token_ids_is_token_scoped(self) -> None:
+        # The residual shape: two tokens share ONE row at the union node — the
+        # released member closed COMPLETED, the late-arrival residual closed
+        # FAILED. Row-scoped release evidence sees the row as released; the
+        # token-scoped read must admit only the member.
         _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
+        fac.data_flow.create_token("row-1", token_id="tok-late")
 
-        first = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-        second = repo.begin_node_state("tok-2", "transform-1", "run-1", 1, {"name": "second"})
-        repo.complete_node_state(first.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
-        repo.complete_node_state(second.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
+        member = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
+        residual = repo.begin_node_state("tok-late", "transform-1", "run-1", 1, {"name": "test"}, attempt=1)
+        repo.complete_node_state(member.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
+        repo.complete_node_state(
+            residual.state_id,
+            NodeStateStatus.FAILED,
+            error=ExecutionError(exception="late_arrival_after_release", exception_type="RowUnionFailure"),
+            duration_ms=1.0,
+        )
 
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is True
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-missing") is False
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="sink-0", row_id="row-1") is False
-        assert repo.has_completed_row_for_node(run_id="run-missing", node_id="transform-1", row_id="row-1") is False
-
-    def test_has_completed_row_for_node_ignores_open_state(self) -> None:
-        _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-
-        assert repo.has_completed_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is False
+        reads = fac.barrier_restore
+        assert reads.find_released_node_state_token_ids(
+            "run-1",
+            node_ids=["transform-1"],
+            token_ids=["tok-1", "tok-late"],
+        ) == frozenset({"tok-1"})
+        # Scoped to the requested nodes and tokens; empty node list short-circuits.
+        assert reads.find_released_node_state_token_ids("run-1", node_ids=["sink-0"], token_ids=["tok-1", "tok-late"]) == frozenset()
+        assert reads.find_released_node_state_token_ids("run-1", node_ids=["transform-1"], token_ids=["tok-late"]) == frozenset()
+        assert reads.find_released_node_state_token_ids("run-1", node_ids=[], token_ids=["tok-1"]) == frozenset()
 
 
 class TestCompleteNodeStateForbiddenFields:
@@ -2450,6 +2469,174 @@ class TestCallRecordingWithPayloadStore:
 
 
 # ---------------------------------------------------------------------------
+# WS3 Task 6 fix round 2 (Ruling 42): resolve_group_member_token
+# ---------------------------------------------------------------------------
+
+
+class TestResolveGroupMemberToken:
+    """Direct coverage for `resolve_group_member_token` (Ruling 42): the
+    honest identity for an escalated group loss is the token whose OWN
+    lineage path terminates at the resolved frame — not a descendant that
+    also carries the same frame as an ancestor."""
+
+    def _mint(self, factory: RecorderFactory, *, run_id: str, row_id: str, token_id: str, frames: list[tuple[str, str]]) -> None:
+        from elspeth.contracts.identity import LineageFrame
+
+        factory.data_flow.create_token(
+            row_id,
+            token_id=token_id,
+            lineage_path=tuple(LineageFrame(kind=FrameKind.FORK, group_id=g, member_key=m) for g, m in frames),
+        )
+
+    def test_resolves_the_token_whose_own_path_terminates_at_the_frame(self) -> None:
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-1",
+            data={},
+        )
+        # outer_a-only token: the frame IS its own terminal frame.
+        self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a", frames=[("fg-outer", "outer_a")])
+        # A descendant that forked further: the SAME frame appears as its
+        # ancestor, but it has a deeper frame of its own — must be excluded.
+        self._mint(
+            factory,
+            run_id="run-1",
+            row_id="row-1",
+            token_id="tok-inner-a1",
+            frames=[("fg-outer", "outer_a"), ("fg-inner", "inner_a1")],
+        )
+
+        resolved = factory.execution.resolve_group_member_token(
+            run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a"
+        )
+
+        assert resolved == "tok-outer-a"
+
+    def test_raises_when_no_token_terminates_at_the_frame(self) -> None:
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+
+        with pytest.raises(AuditIntegrityError, match="expected exactly one live token"):
+            factory.execution.resolve_group_member_token(
+                run_id="run-1", kind=FrameKind.FORK, group_id="fg-nonexistent", member_key="outer_a"
+            )
+
+    def test_raises_when_only_a_descendant_carries_the_frame(self) -> None:
+        """A frame that exists ONLY as an ancestor of deeper tokens (the
+        outer_a-only token itself was never minted, e.g. audit corruption or
+        a test fixture that skipped it) must not silently resolve to a
+        descendant."""
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-1",
+            data={},
+        )
+        self._mint(
+            factory,
+            run_id="run-1",
+            row_id="row-1",
+            token_id="tok-inner-a1",
+            frames=[("fg-outer", "outer_a"), ("fg-inner", "inner_a1")],
+        )
+
+        with pytest.raises(AuditIntegrityError, match="expected exactly one live token"):
+            factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a")
+
+    def _row(self, setup) -> str:
+        setup.factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-1",
+            data={},
+        )
+        return "row-1"
+
+    def _merge(self, factory: RecorderFactory, children, row_id: str):
+        from elspeth.contracts.audit import TokenRef
+        from elspeth.contracts.schema_contract import SchemaContract
+
+        return factory.data_flow.coalesce_tokens(
+            parent_refs=[TokenRef(token_id=child.token_id, run_id="run-1") for child in children],
+            row_id=row_id,
+            merged_payload={"merged": True},
+            merged_contract=SchemaContract(mode="OBSERVED", fields=(), locked=True),
+        )
+
+    def test_successful_inner_merge_supersedes_the_consumed_branch_token(self) -> None:
+        """Final review F1: after an inner closer MERGES, both the original
+        branch token and the merged token terminate at the outer frame. The
+        merged token is a `token_parents` descendant of the branch token —
+        the closer's own record of the succession — so it is the live
+        member; the consumed branch token is superseded, never a second
+        candidate. A sequential fork→merge→fork→merge chain resolves to the
+        LATEST merged token by the same rule."""
+        from elspeth.contracts.audit import TokenRef
+
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        row_id = self._row(setup)
+        root = factory.data_flow.create_token(row_id)
+        (branch_a, branch_b), outer_group = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"), row_id=row_id, branches=["a", "b"]
+        )
+        inner_children, _ = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=branch_b.token_id, run_id="run-1"),
+            row_id=row_id,
+            branches=["b1", "b2"],
+            parent_lineage_path=branch_b.lineage_path,
+        )
+        merged_1 = self._merge(factory, inner_children, row_id)
+
+        resolve = lambda: factory.execution.resolve_group_member_token(  # noqa: E731
+            run_id="run-1", kind=FrameKind.FORK, group_id=outer_group, member_key="b"
+        )
+        assert resolve() == merged_1.token_id
+        # The untouched sibling branch still resolves to its own token.
+        assert (
+            factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id=outer_group, member_key="a")
+            == branch_a.token_id
+        )
+
+        # Sequential nesting: fork the merged token again and merge again.
+        second_children, _ = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=merged_1.token_id, run_id="run-1"),
+            row_id=row_id,
+            branches=["c1", "c2"],
+            parent_lineage_path=merged_1.lineage_path,
+        )
+        merged_2 = self._merge(factory, second_children, row_id)
+        assert resolve() == merged_2.token_id
+
+    def test_two_unrelated_tokens_at_one_frame_still_fail_closed(self) -> None:
+        """Supersession is structural, not positional: two tokens that
+        terminate at the same frame with NO `token_parents` ancestry between
+        them are genuinely ambiguous and must still raise, not pick one."""
+        setup = make_recorder_with_run(run_id="run-1")
+        factory = setup.factory
+        self._row(setup)
+        self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a", frames=[("fg-outer", "outer_a")])
+        self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a-twin", frames=[("fg-outer", "outer_a")])
+
+        with pytest.raises(AuditIntegrityError, match=r"expected exactly one live token .* found 2"):
+            factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a")
+
+
+# ---------------------------------------------------------------------------
 # M4: Delegation signature alignment test
 # ---------------------------------------------------------------------------
 
@@ -2462,45 +2649,228 @@ class TestDelegationSignatureAlignment:
     drift from the repository.
     """
 
-    # Methods expected on RecorderFactory.execution (ExecutionRepository)
-    _DELEGATED_METHODS: ClassVar[list[str]] = [
-        "begin_node_state",
-        "complete_node_state",
-        "get_node_state",
-        "record_routing_event",
-        "record_routing_events",
-        "allocate_call_index",
-        "record_call",
-        "begin_operation",
-        "complete_operation",
-        "allocate_operation_call_index",
-        "record_operation_call",
-        "get_operation",
-        "get_operation_calls",
-        "get_operations_for_run",
-        "get_all_operation_calls_for_run",
-        "find_call_by_request_hash",
-        "get_call_response_data",
-        "create_batch",
-        "add_batch_member",
-        "update_batch_status",
-        "complete_batch",
-        "get_batch",
-        "get_batches",
-        "get_incomplete_batches",
-        "get_batch_members",
-        "get_all_batch_members_for_run",
-        "retry_batch",
-        "register_artifact",
-        "get_artifacts",
-    ]
+    # Every public ExecutionRepository method, paired with an explicit accessor for
+    # the factory side and the unbound repository function. Written out (rather
+    # than resolved by name) so a factory that stopped exposing a method raises
+    # AttributeError here; the coverage assertion below keeps the table pinned to
+    # the live class, so a newly added repository method fails until it is listed.
+    _DELEGATED_METHODS: ClassVar[tuple[ParameterSet, ...]] = (
+        pytest.param(
+            "begin_node_state", lambda execution: execution.begin_node_state, ExecutionRepository.begin_node_state, id="begin_node_state"
+        ),
+        pytest.param(
+            "complete_node_state",
+            lambda execution: execution.complete_node_state,
+            ExecutionRepository.complete_node_state,
+            id="complete_node_state",
+        ),
+        pytest.param("get_node_state", lambda execution: execution.get_node_state, ExecutionRepository.get_node_state, id="get_node_state"),
+        pytest.param(
+            "record_routing_event",
+            lambda execution: execution.record_routing_event,
+            ExecutionRepository.record_routing_event,
+            id="record_routing_event",
+        ),
+        pytest.param(
+            "record_routing_events",
+            lambda execution: execution.record_routing_events,
+            ExecutionRepository.record_routing_events,
+            id="record_routing_events",
+        ),
+        pytest.param(
+            "allocate_call_index",
+            lambda execution: execution.allocate_call_index,
+            ExecutionRepository.allocate_call_index,
+            id="allocate_call_index",
+        ),
+        pytest.param("record_call", lambda execution: execution.record_call, ExecutionRepository.record_call, id="record_call"),
+        pytest.param(
+            "begin_operation", lambda execution: execution.begin_operation, ExecutionRepository.begin_operation, id="begin_operation"
+        ),
+        pytest.param(
+            "complete_operation",
+            lambda execution: execution.complete_operation,
+            ExecutionRepository.complete_operation,
+            id="complete_operation",
+        ),
+        pytest.param(
+            "allocate_operation_call_index",
+            lambda execution: execution.allocate_operation_call_index,
+            ExecutionRepository.allocate_operation_call_index,
+            id="allocate_operation_call_index",
+        ),
+        pytest.param(
+            "record_operation_call",
+            lambda execution: execution.record_operation_call,
+            ExecutionRepository.record_operation_call,
+            id="record_operation_call",
+        ),
+        pytest.param("get_operation", lambda execution: execution.get_operation, ExecutionRepository.get_operation, id="get_operation"),
+        pytest.param(
+            "get_operation_calls",
+            lambda execution: execution.get_operation_calls,
+            ExecutionRepository.get_operation_calls,
+            id="get_operation_calls",
+        ),
+        pytest.param(
+            "get_operations_for_run",
+            lambda execution: execution.get_operations_for_run,
+            ExecutionRepository.get_operations_for_run,
+            id="get_operations_for_run",
+        ),
+        pytest.param(
+            "get_all_operation_calls_for_run",
+            lambda execution: execution.get_all_operation_calls_for_run,
+            ExecutionRepository.get_all_operation_calls_for_run,
+            id="get_all_operation_calls_for_run",
+        ),
+        pytest.param(
+            "find_call_by_request_hash",
+            lambda execution: execution.find_call_by_request_hash,
+            ExecutionRepository.find_call_by_request_hash,
+            id="find_call_by_request_hash",
+        ),
+        pytest.param(
+            "get_call_response_data",
+            lambda execution: execution.get_call_response_data,
+            ExecutionRepository.get_call_response_data,
+            id="get_call_response_data",
+        ),
+        pytest.param("create_batch", lambda execution: execution.create_batch, ExecutionRepository.create_batch, id="create_batch"),
+        pytest.param(
+            "add_batch_member", lambda execution: execution.add_batch_member, ExecutionRepository.add_batch_member, id="add_batch_member"
+        ),
+        pytest.param(
+            "update_batch_status",
+            lambda execution: execution.update_batch_status,
+            ExecutionRepository.update_batch_status,
+            id="update_batch_status",
+        ),
+        pytest.param("complete_batch", lambda execution: execution.complete_batch, ExecutionRepository.complete_batch, id="complete_batch"),
+        pytest.param("get_batch", lambda execution: execution.get_batch, ExecutionRepository.get_batch, id="get_batch"),
+        pytest.param("get_batches", lambda execution: execution.get_batches, ExecutionRepository.get_batches, id="get_batches"),
+        pytest.param(
+            "get_incomplete_batches",
+            lambda execution: execution.get_incomplete_batches,
+            ExecutionRepository.get_incomplete_batches,
+            id="get_incomplete_batches",
+        ),
+        pytest.param(
+            "get_batch_members",
+            lambda execution: execution.get_batch_members,
+            ExecutionRepository.get_batch_members,
+            id="get_batch_members",
+        ),
+        pytest.param(
+            "get_all_batch_members_for_run",
+            lambda execution: execution.get_all_batch_members_for_run,
+            ExecutionRepository.get_all_batch_members_for_run,
+            id="get_all_batch_members_for_run",
+        ),
+        pytest.param("retry_batch", lambda execution: execution.retry_batch, ExecutionRepository.retry_batch, id="retry_batch"),
+        pytest.param(
+            "register_artifact",
+            lambda execution: execution.register_artifact,
+            ExecutionRepository.register_artifact,
+            id="register_artifact",
+        ),
+        pytest.param("get_artifacts", lambda execution: execution.get_artifacts, ExecutionRepository.get_artifacts, id="get_artifacts"),
+        pytest.param(
+            "begin_node_states_many",
+            lambda execution: execution.begin_node_states_many,
+            ExecutionRepository.begin_node_states_many,
+            id="begin_node_states_many",
+        ),
+        pytest.param(
+            "complete_aggregation_result",
+            lambda execution: execution.complete_aggregation_result,
+            ExecutionRepository.complete_aggregation_result,
+            id="complete_aggregation_result",
+        ),
+        pytest.param(
+            "complete_node_states_completed_many",
+            lambda execution: execution.complete_node_states_completed_many,
+            ExecutionRepository.complete_node_states_completed_many,
+            id="complete_node_states_completed_many",
+        ),
+        pytest.param(
+            "get_max_node_state_attempts",
+            lambda execution: execution.get_max_node_state_attempts,
+            ExecutionRepository.get_max_node_state_attempts,
+            id="get_max_node_state_attempts",
+        ),
+        pytest.param(
+            "get_open_node_state_ids",
+            lambda execution: execution.get_open_node_state_ids,
+            ExecutionRepository.get_open_node_state_ids,
+            id="get_open_node_state_ids",
+        ),
+        pytest.param(
+            "row_id_for_token",
+            lambda execution: execution.row_id_for_token,
+            ExecutionRepository.row_id_for_token,
+            id="row_id_for_token",
+        ),
+        pytest.param(
+            "resolve_group_member_token",
+            lambda execution: execution.resolve_group_member_token,
+            ExecutionRepository.resolve_group_member_token,
+            id="resolve_group_member_token",
+        ),
+        pytest.param(
+            "reconcile_source_completions_from_scheduler",
+            lambda execution: execution.reconcile_source_completions_from_scheduler,
+            ExecutionRepository.reconcile_source_completions_from_scheduler,
+            id="reconcile_source_completions_from_scheduler",
+        ),
+        pytest.param(
+            "record_completed_node_state",
+            lambda execution: execution.record_completed_node_state,
+            ExecutionRepository.record_completed_node_state,
+            id="record_completed_node_state",
+        ),
+        pytest.param(
+            "record_completed_node_state_on",
+            lambda execution: execution.record_completed_node_state_on,
+            ExecutionRepository.record_completed_node_state_on,
+            id="record_completed_node_state_on",
+        ),
+        pytest.param(
+            "get_group_record",
+            lambda execution: execution.get_group_record,
+            ExecutionRepository.get_group_record,
+            id="get_group_record",
+        ),
+        pytest.param(
+            "any_member_token_for_group",
+            lambda execution: execution.any_member_token_for_group,
+            ExecutionRepository.any_member_token_for_group,
+            id="any_member_token_for_group",
+        ),
+        pytest.param(
+            "member_keys_for_group",
+            lambda execution: execution.member_keys_for_group,
+            ExecutionRepository.member_keys_for_group,
+            id="member_keys_for_group",
+        ),
+    )
 
-    @pytest.mark.parametrize("method_name", _DELEGATED_METHODS)
-    def test_signature_alignment(self, method_name: str) -> None:
+    def test_delegation_table_covers_every_public_repository_method(self) -> None:
+        """The table above must name exactly ExecutionRepository's public methods."""
+        listed = {str(param.id) for param in self._DELEGATED_METHODS}
+        public = {name for name, value in vars(ExecutionRepository).items() if not name.startswith("_") and callable(value)}
+        assert listed == public, f"delegation table drifted: missing={public - listed}, extra={listed - public}"
+
+    @pytest.mark.parametrize(("method_name", "read_factory_method", "repo_method"), _DELEGATED_METHODS)
+    def test_signature_alignment(
+        self,
+        method_name: str,
+        read_factory_method: Callable[[ExecutionRepository], object],
+        repo_method: object,
+    ) -> None:
         """Method must exist on RecorderFactory.execution with correct signature."""
         factory = make_factory()
-        factory_method = getattr(factory.execution, method_name)
-        repo_method = getattr(ExecutionRepository, method_name)
+        factory_method = read_factory_method(factory.execution)
 
         factory_sig = inspect.signature(factory_method)
         repo_sig = inspect.signature(repo_method)
@@ -2608,3 +2978,83 @@ class TestResolvedPromptTemplateHashAnchor:
         )
         assert call.resolved_prompt_template_hash == "a" * 64
         assert self._calls_row_count(db) == 1
+
+
+class TestAggregationReceiptProbeOutcome:
+    """Post-failure idempotency probe: declared outcomes, integrity signal propagates.
+
+    Pins the mechanism of the elspeth-ca0a7e71b1 fix: the probe's handler
+    catches ONLY SQLAlchemyError (store unreadable → PROBE_UNAVAILABLE);
+    an AuditIntegrityError raised by receipt comparison is a detected Tier-1
+    divergence and must propagate, never be reclassified.
+    """
+
+    @staticmethod
+    def _bare_probe_self(db: object) -> ExecutionRepository:
+        probe_self = ExecutionRepository.__new__(ExecutionRepository)
+        probe_self._db = db  # type: ignore[attr-defined]
+        return probe_self
+
+    @staticmethod
+    def _stub_db(execute_result: object = None, raise_on_execute: Exception | None = None) -> object:
+        from contextlib import contextmanager
+
+        class _StubResult:
+            def one_or_none(self) -> object:
+                return execute_result
+
+        class _StubConn:
+            def execute(self, *_args: object, **_kwargs: object) -> _StubResult:
+                if raise_on_execute is not None:
+                    raise raise_on_execute
+                return _StubResult()
+
+        class _StubDB:
+            @contextmanager
+            def read_only_connection(self):  # type: ignore[no-untyped-def]
+                yield _StubConn()
+
+        return _StubDB()
+
+    def test_probe_unavailable_when_store_unreadable(self) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        from elspeth.core.landscape.execution_repository import _ReceiptProbeOutcome
+
+        repo = self._bare_probe_self(self._stub_db(raise_on_execute=OperationalError("stmt", {}, Exception("down"))))
+        outcome = repo._probe_existing_aggregation_receipt(
+            state_id="s",
+            batch_id="b",
+            receipt_is_exact=lambda *_a, **_k: True,
+        )
+        assert outcome is _ReceiptProbeOutcome.PROBE_UNAVAILABLE
+
+    def test_no_match_when_rows_absent(self) -> None:
+        from elspeth.core.landscape.execution_repository import _ReceiptProbeOutcome
+
+        repo = self._bare_probe_self(self._stub_db(execute_result=None))
+        outcome = repo._probe_existing_aggregation_receipt(
+            state_id="s",
+            batch_id="b",
+            receipt_is_exact=lambda *_a, **_k: True,
+        )
+        assert outcome is _ReceiptProbeOutcome.NO_MATCH
+
+    def test_match_when_receipt_exact(self) -> None:
+        from elspeth.core.landscape.execution_repository import _ReceiptProbeOutcome
+
+        repo = self._bare_probe_self(self._stub_db(execute_result=object()))
+        outcome = repo._probe_existing_aggregation_receipt(
+            state_id="s",
+            batch_id="b",
+            receipt_is_exact=lambda *_a, **_k: True,
+        )
+        assert outcome is _ReceiptProbeOutcome.MATCH
+
+    def test_audit_integrity_error_propagates(self) -> None:
+        def diverged(*_a: object, **_k: object) -> bool:
+            raise AuditIntegrityError("aggregation receipt diverged")
+
+        repo = self._bare_probe_self(self._stub_db(execute_result=object()))
+        with pytest.raises(AuditIntegrityError, match="diverged"):
+            repo._probe_existing_aggregation_receipt(state_id="s", batch_id="b", receipt_is_exact=diverged)

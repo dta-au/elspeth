@@ -3,131 +3,123 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
-import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from elspeth.contracts.aws_s3 import (
+    S3_MAX_KEY_BYTES,
+    S3_PRIVATE_BINDING_OPTION_NAMES,
+    S3_PROFILED_AUTHOR_OPTION_NAMES,
+    S3ProfiledAuditIdentity,
+    s3_profiled_binding_fingerprint,
+    validate_relative_s3_path,
+)
+from elspeth.contracts.aws_textract import (
+    TEXTRACT_PRIVATE_BINDING_OPTION_NAMES,
+    TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES,
+    TextractProfiledAuditIdentity,
+    textract_profiled_binding_fingerprint,
+)
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
+from elspeth.core.llm_profiles import (
+    LLM_PROFILE_PRIVATE_FIELDS,
+    CredentialScope,
+    RuntimeLLMProfile,
+    lower_llm_profile_options,
+    validate_profile_alias,
+)
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region, is_well_formed_aws_region
 
 if TYPE_CHECKING:
-    from elspeth.web.catalog.schemas import PluginSchemaInfo
+    from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
 
-CredentialScope = Literal["server", "user"]
-_ALIAS = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
-_SECRET_REF = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
+
+_S3_MAX_BUCKET_CHARS = 2048
 
 
-def validate_profile_alias(alias: str) -> str:
-    if _ALIAS.fullmatch(alias) is None:
-        raise ValueError("profile alias must be a lowercase opaque identifier")
-    return alias
-
-
-class WebLLMProfileSettings(BaseModel):
-    """Operator-owned provider binding; private fields stay out of reprs."""
+class AWSS3SourceProfileSettings(BaseModel):
+    """Operator-owned binding for one Web-authorable S3 source location."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
-    provider: str = Field(repr=False)
-    model: str = Field(min_length=1, max_length=512, repr=False)
-    credential_scope: CredentialScope | None = Field(default=None, repr=False)
-    credential_ref: str | None = Field(default=None, repr=False)
-    region_name: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", repr=False)
-    endpoint: str | None = Field(default=None, repr=False)
-    deployment_name: str | None = Field(default=None, min_length=1, max_length=256, repr=False)
-    api_version: str | None = Field(default=None, min_length=1, max_length=64, repr=False)
-    timeout_seconds: float = Field(default=60.0, gt=0, le=300, repr=False)
-    max_tokens: int | None = Field(default=None, gt=0, le=131072, repr=False)
-
-    @model_validator(mode="after")
-    def _validate_provider_binding(self) -> WebLLMProfileSettings:
-        # Plan 09 owns this registry.  Profile validation consumes it rather
-        # than maintaining a second provider allowlist.
-        from elspeth.plugins.transforms.llm.transform import LLMTransform
-
-        providers = LLMTransform.discriminated_variants()[1]
-        if self.provider not in providers:
-            raise ValueError("profile provider is not registered")
-        if self.provider != "openrouter" and "timeout_seconds" in self.model_fields_set:
-            raise ValueError(f"{self.provider} profile does not support timeout_seconds")
-        if self.provider == "azure" and self.region_name is not None:
-            raise ValueError("azure profile does not support region_name")
-        if self.provider == "bedrock":
-            if self.credential_scope is not None or self.credential_ref is not None:
-                raise ValueError("Bedrock profiles use the keyless AWS credential chain")
-            if self.endpoint is not None or self.deployment_name is not None or self.api_version is not None:
-                raise ValueError("Bedrock profile contains fields owned by another provider")
-            # Reuse Plan 09's provider model validation for model/region shape.
-            providers[self.provider](
-                provider="bedrock",
-                model=self.model,
-                region_name=self.region_name,
-                schema={"mode": "observed"},
-                prompt_template="{{ row }}",
-            )
-        else:
-            if self.credential_scope is None or self.credential_ref is None:
-                raise ValueError("credentialed profile requires explicit scope and reference")
-            if _SECRET_REF.fullmatch(self.credential_ref) is None:
-                raise ValueError("credential reference has invalid syntax")
-            if self.provider == "openrouter" and any(
-                value is not None for value in (self.region_name, self.endpoint, self.deployment_name, self.api_version)
-            ):
-                raise ValueError("OpenRouter profile contains unsupported provider fields")
-            if self.provider == "azure":
-                if self.endpoint is None or self.deployment_name is None:
-                    raise ValueError("Azure profile requires operator endpoint and deployment")
-                if self.model != self.deployment_name:
-                    raise ValueError("Azure profile model must match deployment_name")
-                from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
-
-                validate_credential_safe_https_url(self.endpoint, field_name="endpoint")
-        return self
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeWebLLMProfile:
     alias: str
-    provider: str = field(repr=False)
-    model: str = field(repr=False)
-    credential_scope: CredentialScope | None = field(default=None, repr=False)
-    credential_ref: str | None = field(default=None, repr=False)
-    provider_options: tuple[tuple[str, object], ...] = field(default=(), repr=False)
+    bucket: str = Field(repr=False)
+    prefix: str | None = Field(default=None, repr=False)
 
+    @field_validator("alias")
     @classmethod
-    def from_settings(cls, alias: str, settings: WebLLMProfileSettings) -> RuntimeWebLLMProfile:
-        validate_profile_alias(alias)
-        provider_fields = {
-            "bedrock": (("region_name", settings.region_name),),
-            "azure": (
-                ("endpoint", settings.endpoint),
-                ("deployment_name", settings.deployment_name),
-                ("api_version", settings.api_version),
-            ),
-            "openrouter": (("timeout_seconds", settings.timeout_seconds),),
-        }
-        options = tuple(
-            (name, value) for name, value in (*provider_fields[settings.provider], ("max_tokens", settings.max_tokens)) if value is not None
-        )
-        return cls(
-            alias=alias,
-            provider=settings.provider,
-            model=settings.model,
-            credential_scope=settings.credential_scope,
-            credential_ref=settings.credential_ref,
-            provider_options=options,
-        )
+    def _validate_alias(cls, value: str) -> str:
+        validate_profile_alias(value)
+        return value
+
+    @field_validator("bucket")
+    @classmethod
+    def _validate_bucket(cls, value: str) -> str:
+        if not value or value != value.strip() or len(value) > _S3_MAX_BUCKET_CHARS:
+            raise ValueError("bucket must be non-blank, canonical, and at most 2048 characters")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("bucket must not contain control characters")
+        return reject_operator_required_placeholder_value(value, field_name="bucket")
+
+    @field_validator("prefix")
+    @classmethod
+    def _validate_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        validated = validate_relative_s3_path(value, field_name="prefix")
+        if len(validated.encode("utf-8")) > S3_MAX_KEY_BYTES - 2:
+            raise ValueError("prefix must leave room for a relative S3 object key")
+        return validated
+
+
+class AWSTextractProfileSettings(BaseModel):
+    """Operator-owned binding for one Web-authorable Textract document location."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    alias: str
+    bucket: str = Field(repr=False)
+    key_prefix: str | None = Field(default=None, repr=False)
+
+    @field_validator("alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        validate_profile_alias(value)
+        return value
+
+    @field_validator("bucket")
+    @classmethod
+    def _validate_bucket(cls, value: str) -> str:
+        if not value or value != value.strip() or len(value) > _S3_MAX_BUCKET_CHARS:
+            raise ValueError("bucket must be non-blank, canonical, and at most 2048 characters")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("bucket must not contain control characters")
+        return reject_operator_required_placeholder_value(value, field_name="bucket")
+
+    @field_validator("key_prefix")
+    @classmethod
+    def _validate_key_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        validated = validate_relative_s3_path(value, field_name="key_prefix")
+        if len(validated.encode("utf-8")) > S3_MAX_KEY_BYTES - 2:
+            raise ValueError("key_prefix must leave room for a relative S3 object key")
+        return validated
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,10 +127,13 @@ class RuntimeWebPluginConfig:
     plugin_allowlist: tuple[str, ...]
     plugin_preferences: tuple[tuple[PluginCapability, tuple[str, ...]], ...]
     plugin_control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
-    llm_profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...] = field(repr=False)
-    tutorial_llm_profile: str | None
+    llm_profiles: tuple[tuple[str, RuntimeLLMProfile], ...] = field(repr=False)
+    default_llm_profile: str | None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
+    aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = field(repr=False)
+    aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = field(repr=False)
+    deployment_aws_region: str | None
 
     @property
     def operator_profiles(self) -> tuple[BedrockGuardrailProfileSettings, ...]:
@@ -155,11 +150,14 @@ class RuntimeWebPluginConfig:
             ),
             plugin_control_modes=tuple(sorted(settings.plugin_control_modes.items(), key=lambda item: item[0].value)),
             llm_profiles=tuple(
-                (alias, RuntimeWebLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
+                (alias, RuntimeLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
             ),
-            tutorial_llm_profile=settings.tutorial_llm_profile,
+            default_llm_profile=settings.default_llm_profile,
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
             bedrock_guardrail_default_profiles=tuple(sorted(settings.bedrock_guardrail_default_profiles.items())),
+            aws_s3_source_profiles=tuple(sorted(settings.aws_s3_source_profiles, key=lambda profile: profile.alias)),
+            aws_textract_profiles=tuple(sorted(settings.aws_textract_profiles, key=lambda profile: profile.alias)),
+            deployment_aws_region=settings.deployment_aws_region,
         )
 
 
@@ -187,6 +185,8 @@ class LocalRequirementResult:
 class LoweredPluginConfig:
     executable_options: Mapping[str, object] = field(repr=False)
     audit_safe_options: Mapping[str, object]
+    profiled_s3_audit_identity: S3ProfiledAuditIdentity | None = None
+    profiled_textract_audit_identity: TextractProfiledAuditIdentity | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "executable_options", "audit_safe_options")
@@ -215,69 +215,120 @@ class OperatorProfileResolver(Protocol):
 
     def check_local_requirements(self, alias: str) -> LocalRequirementResult: ...
 
-
-_LLM_PRIVATE_OPTIONS = frozenset(
-    {
-        "provider",
-        "model",
-        "api_key",
-        "api_key_secret",
-        "base_url",
-        "endpoint",
-        "deployment_name",
-        "region_name",
-        "api_version",
-        "credential_ref",
-        "credential_scope",
-        "tracing",
-        "timeout_seconds",
-        "max_tokens",
-        "pool_size",
-        "min_dispatch_delay_ms",
-        "max_dispatch_delay_ms",
-        "backoff_multiplier",
-        "recovery_step_ms",
-        "max_capacity_retry_seconds",
-        "prompt_template_source",
-        "lookup_source",
-        "system_prompt_source",
-        "resolved_prompt_template_hash",
-    }
-)
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None: ...
 
 
 class _LLMProfileResolver:
     def __init__(
         self,
-        profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...],
+        profiles: tuple[tuple[str, RuntimeLLMProfile], ...],
         *,
         preferred_alias: str | None,
     ) -> None:
         self._profiles = dict(profiles)
         aliases = tuple(self._profiles)
+        self._preferred_alias = preferred_alias if preferred_alias in self._profiles else None
         self._ordered_aliases = (
-            (preferred_alias, *(alias for alias in aliases if alias != preferred_alias)) if preferred_alias in self._profiles else aliases
+            (self._preferred_alias, *(alias for alias in aliases if alias != self._preferred_alias))
+            if self._preferred_alias is not None
+            else aliases
         )
 
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        """The operator-designated default, and only that — never a stand-in.
+
+        A missing ``default_llm_profile`` is a supported degraded state: the
+        aliases stay individually authorable, but no alias is the house
+        default, and promoting whichever one sorts first would point the
+        Composer at a provider/model the operator never designated. The same
+        holds when the designated default is not usable by this principal —
+        substituting the next usable alias swaps providers silently.
+        """
+        if self._preferred_alias is not None and self._preferred_alias in usable_aliases:
+            return self._preferred_alias
+        return None
+
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for an LLM plugin: a pydantic-discriminated-union JSON Schema whose $defs/discriminator/properties shape is generated from plugin-author-owned provider config models",
+        source_param="full_schema",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') when $defs, discriminator, discriminator['mapping'], a "
+            "mapped provider definition, its properties, or its required list deviates from the shape every variant "
+            "of THIS union declares (dict / list[str], required non-empty) — the section that decides "
+            "public-vs-LLM_PROFILE_PRIVATE_FIELDS exposure never silently narrows there. An absent 'required' counts "
+            "as a deviation on that measured ground and not on a general pydantic guarantee (pydantic v2 omits "
+            "'required' for an all-defaulted model); what holds is that every LLM provider variant reachable through "
+            "discriminator['mapping'] inherits a non-empty required set from LLMConfig. The downstream $ref-closure walk that assembles public $defs, and "
+            "the source knob-field projection, are unchanged pre-existing best-effort behaviour and are not covered "
+            "by this invariant. An ABSENT key is not a softer path into the exposure decision: a discriminator "
+            "naming a $defs entry the schema does not carry raises, and with neither $defs nor discriminator the "
+            "projection collapses to the operator-approved 'profile' alias alone — an absent key can only narrow "
+            "this public schema, never admit a provider field the union did not declare."
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_llm_public_schema_rejects_malformed_defs_shape",
+        test_fingerprint="607c1d68c9a2b0168d5172e35bb81bd5b514e0cb59ae4bcd945f5068ced0c577",
+    )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
 
         safe_properties: dict[str, Any] = {}
         definitions = full_schema.json_schema.get("$defs", {})
-        if isinstance(definitions, dict):
-            from elspeth.plugins.transforms.llm.transform import LLMTransform
-
-            provider_definition_names = {config_cls.__name__ for config_cls in LLMTransform.discriminated_variants()[1].values()}
-            for definition_name in provider_definition_names:
-                definition = definitions.get(definition_name)
-                if not isinstance(definition, dict):
+        if not isinstance(definitions, dict):
+            raise ValueError("malformed_profile_schema")
+        discriminator = full_schema.json_schema.get("discriminator", {})
+        if not isinstance(discriminator, dict):
+            raise ValueError("malformed_profile_schema")
+        mapping = discriminator.get("mapping", {})
+        if not isinstance(mapping, dict):
+            raise ValueError("malformed_profile_schema")
+        provider_definitions: list[dict[str, Any]] = []
+        for definition_ref in mapping.values():
+            if not isinstance(definition_ref, str) or not definition_ref.startswith("#/$defs/"):
+                raise ValueError("malformed_profile_schema")
+            definition = definitions.get(definition_ref.removeprefix("#/$defs/"))
+            if not isinstance(definition, dict):
+                raise ValueError("malformed_profile_schema")
+            provider_definitions.append(definition)
+            properties = definition.get("properties", {})
+            if not isinstance(properties, dict):
+                raise ValueError("malformed_profile_schema")
+            for name, property_schema in properties.items():
+                if name in LLM_PROFILE_PRIVATE_FIELDS:
                     continue
-                properties = definition.get("properties", {})
-                if not isinstance(properties, dict):
-                    continue
-                for name, property_schema in properties.items():
-                    if name not in _LLM_PRIVATE_OPTIONS and isinstance(property_schema, dict):
-                        safe_properties.setdefault(name, deepcopy(property_schema))
+                if not isinstance(property_schema, dict):
+                    raise ValueError("malformed_profile_schema")
+                # First variant wins: the union's variants share these public
+                # property names and the projection publishes one shape for each.
+                if name not in safe_properties:
+                    safe_properties[name] = deepcopy(property_schema)
+        required_by_variant: list[set[str]] = []
+        for definition in provider_definitions:
+            # An absent "required" is a shape deviation HERE, not "nothing is
+            # required" — but that rests on these variants, not on pydantic in
+            # general: pydantic v2 omits "required" entirely for a model whose
+            # fields all carry defaults (measured on 2.13.4). What holds is
+            # narrower and checkable. Measured against this tree over both
+            # unions this resolver serves, every variant reachable through
+            # ``discriminator["mapping"]`` declares a non-empty ``required``:
+            # the four ``LLMTransform`` provider configs and the four
+            # ``LLMSource`` ones each inherit ``schema`` and ``prompt_template``
+            # from ``LLMConfig`` (the source variants add
+            # ``on_validation_failure``), and ``provider`` is injected on top.
+            # Only mapping values are read, so the ``$defs`` entries that DO
+            # lack "required" (``OutputFieldType``, ``ResponseFormat``) are
+            # never reached. Should an all-defaulted provider variant ever
+            # appear, this REJECTS rather than publishing a guessed empty
+            # required set — the public-vs-private exposure decision below is
+            # not one to infer from a shape we no longer recognise.
+            # ``list``/``str`` are exact because the schema is
+            # json/pydantic-generated, never a subclass or a frozen container.
+            required_names = definition["required"] if "required" in definition else None
+            if type(required_names) is not list or any(type(name) is not str for name in required_names):
+                raise ValueError("malformed_profile_schema")
+            required_by_variant.append(set(required_names))
+        required_in_all_variants = set.intersection(*required_by_variant) if required_by_variant else set()
         safe_properties = {
             "profile": {
                 "type": "string",
@@ -286,10 +337,20 @@ class _LLMProfileResolver:
             },
             **safe_properties,
         }
+        required_properties = [name for name in safe_properties if name in required_in_all_variants]
+        if full_schema.plugin_type == "transform":
+            # Preserve the established transform projection byte-for-byte;
+            # source variants add their own required routing field below the
+            # naturally ordered common properties.
+            established_order = ("prompt_template", "schema")
+            required_properties = [
+                *(name for name in established_order if name in required_properties),
+                *(name for name in required_properties if name not in established_order),
+            ]
         public_json_schema: dict[str, Any] = {
             "type": "object",
             "properties": safe_properties,
-            "required": ["profile", "prompt_template", "schema"],
+            "required": ["profile", *required_properties],
             "additionalProperties": False,
         }
         referenced_definitions: dict[str, Any] = {}
@@ -304,16 +365,60 @@ class _LLMProfileResolver:
                 pending.update(_schema_refs(definition))
         if referenced_definitions:
             public_json_schema["$defs"] = referenced_definitions
-        fields = [
-            {
-                "name": name,
-                "type": "string" if name == "profile" else str(schema.get("type", "object")),
-                "required": name in public_json_schema["required"],
-                "description": schema.get("description"),
-                **({"choices": list(available_aliases)} if name == "profile" else {}),
-            }
-            for name, schema in safe_properties.items()
-        ]
+        canonical_tiers = _canonical_field_tiers(full_schema)
+        if full_schema.plugin_type == "source":
+            raw_fields = full_schema.knob_schema.get("fields", ())
+            first_raw_field: dict[str, dict[str, Any]] = {}
+            for field in raw_fields:
+                if isinstance(field, dict) and isinstance(field.get("name"), str) and field["name"] not in first_raw_field:
+                    first_raw_field[field["name"]] = field
+            fields: list[dict[str, Any]] = [
+                {
+                    "name": "profile",
+                    "label": "profile",
+                    "kind": "enum",
+                    "tier": _DEFAULT_COMPOSER_TIER,
+                    "required": True,
+                    "nullable": False,
+                    "enum": list(available_aliases),
+                    "description": "Operator-approved LLM profile alias",
+                }
+            ]
+            for name in safe_properties:
+                if name == "profile":
+                    continue
+                try:
+                    field = deepcopy(first_raw_field[name])
+                except KeyError as exc:
+                    raise ValueError(f"source profile field {name!r} has no canonical knob projection") from exc
+                if "visible_when" in field:
+                    del field["visible_when"]
+                if "tier" not in field:
+                    field["tier"] = _projected_tier(name, canonical_tiers)
+                fields.append(field)
+        else:
+            # Keep the established transform policy-view projection
+            # byte-compatible. Source forms use the current-schema knob wire
+            # contract because Guided Step 1 consumes them directly.
+            fields = [
+                {
+                    "name": name,
+                    "type": "string" if name == "profile" else str(schema["type"] if "type" in schema else "object"),
+                    # The canonical composer tier for this knob, so the
+                    # inspector partitions a policy view exactly as it
+                    # partitions the unprofiled catalog schema.
+                    "tier": _projected_tier(name, canonical_tiers),
+                    "required": name in public_json_schema["required"],
+                    # The composer-surface help text substitutes the CLI/YAML
+                    # description on web knobs (mirrors
+                    # web/catalog/knob_schema._composer_description); a present
+                    # but empty composer_description falls through to description.
+                    "description": (schema["composer_description"] if "composer_description" in schema else None)
+                    or (schema["description"] if "description" in schema else None),
+                    **({"choices": list(available_aliases)} if name == "profile" else {}),
+                }
+                for name, schema in safe_properties.items()
+            ]
         return PluginSchemaInfo(
             name=full_schema.name,
             plugin_type=full_schema.plugin_type,
@@ -327,23 +432,13 @@ class _LLMProfileResolver:
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
-        if set(safe_options) & _LLM_PRIVATE_OPTIONS:
+        if set(safe_options) & LLM_PROFILE_PRIVATE_FIELDS:
             raise ValueError("private_profile_option")
         try:
             profile = self._profiles[alias]
         except KeyError:
             raise ValueError("profile_unavailable") from None
-        executable = dict(safe_options)
-        executable["provider"] = profile.provider
-        if profile.provider != "azure":
-            executable["model"] = profile.model
-        executable.update(profile.provider_options)
-        if profile.credential_ref is not None:
-            assert profile.credential_scope is not None
-            executable["api_key"] = {
-                "secret_ref": profile.credential_ref,
-                "secret_scope": profile.credential_scope,
-            }
+        executable, audit_safe = lower_llm_profile_options(alias, profile, safe_options, private_fields=LLM_PROFILE_PRIVATE_FIELDS)
         # Web-authored multi-query LLM nodes cannot set the sequential retry
         # budget themselves — ``pool_size`` and ``max_capacity_retry_seconds``
         # are private profile options rejected by the node's public schema — yet
@@ -352,11 +447,15 @@ class _LLMProfileResolver:
         # lowered config's one-hour default would monopolise a worker. The
         # operator-profile layer supplies the web-safe default so typed
         # multi-query nodes stay both committable and run-safe.
-        if executable.get("queries") is not None and "pool_size" not in executable and "max_capacity_retry_seconds" not in executable:
+        if (
+            "queries" in executable
+            and executable["queries"] is not None
+            and "pool_size" not in executable
+            and "max_capacity_retry_seconds" not in executable
+        ):
             from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
 
             executable["max_capacity_retry_seconds"] = WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
-        audit_safe = {"profile": alias, **safe_options}
         return LoweredPluginConfig(
             executable_options=MappingProxyType(executable),
             audit_safe_options=MappingProxyType(audit_safe),
@@ -399,7 +498,7 @@ class _LLMProfileResolver:
         return tuple(result)
 
     @staticmethod
-    def _binding_generation(profile: RuntimeWebLLMProfile, *, credential_generation: str | None) -> str:
+    def _binding_generation(profile: RuntimeLLMProfile, *, credential_generation: str | None) -> str:
         return hashlib.sha256(
             json.dumps(
                 {
@@ -445,11 +544,27 @@ class _BedrockGuardrailProfileResolver:
             (default_alias, *(alias for alias in aliases if alias != default_alias)) if default_alias in self._profiles else aliases
         )
 
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for a Bedrock Guardrail plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a mapping, "
+            "or if the always-required 'fields'/'schema' properties are present but not mappings — never emits a "
+            "'required' list naming a property absent from 'properties', which would be an unsatisfiable schema. "
+            "An ABSENT 'properties' reaches that same rejection, because 'fields'/'schema' are always required"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_bedrock_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="629473a1e9f8d1697fa7861f5ca3f2e71a679a85875e2e4be6d1dde2f2b1033b",
+    )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
 
         safe_names = ("fields", "schema") if full_schema.name == "aws_bedrock_prompt_shield" else ("fields", "schema", "source")
         full_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(full_properties, dict):
+            raise ValueError("malformed_profile_schema")
         safe_properties: dict[str, Any] = {
             "profile": {
                 "type": "string",
@@ -457,12 +572,16 @@ class _BedrockGuardrailProfileResolver:
                 "description": "Operator-approved Bedrock Guardrail profile alias",
             }
         }
-        if isinstance(full_properties, dict):
-            for name in safe_names:
-                value = full_properties.get(name)
-                if isinstance(value, dict):
-                    safe_properties[name] = deepcopy(value)
         required = ["profile", "fields", "schema"]
+        for name in safe_names:
+            value = full_properties.get(name)
+            if value is None:
+                if name in required:
+                    raise ValueError("malformed_profile_schema")
+                continue
+            if not isinstance(value, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(value)
         public_json_schema: dict[str, Any] = {
             "type": "object",
             "properties": safe_properties,
@@ -482,12 +601,20 @@ class _BedrockGuardrailProfileResolver:
                 pending.update(_schema_refs(definition))
         if referenced_definitions:
             public_json_schema["$defs"] = referenced_definitions
+        canonical_tiers = _canonical_field_tiers(full_schema)
         fields = [
             {
                 "name": name,
-                "type": "string" if name == "profile" else str(schema.get("type", "object")),
+                "type": "string" if name == "profile" else str(schema["type"] if "type" in schema else "object"),
+                # As in the LLM projection above: carry the canonical composer
+                # tier so the policy view partitions like the catalog schema.
+                "tier": _projected_tier(name, canonical_tiers),
                 "required": name in required,
-                "description": schema.get("description"),
+                # Mirrors the LLM profile lowering above: composer-surface help
+                # text substitutes the CLI/YAML description on web knobs, and a
+                # present but empty composer_description falls through.
+                "description": (schema["composer_description"] if "composer_description" in schema else None)
+                or (schema["description"] if "description" in schema else None),
                 **({"choices": list(available_aliases)} if name == "profile" else {}),
             }
             for name, schema in safe_properties.items()
@@ -560,10 +687,15 @@ class _BedrockGuardrailProfileResolver:
         return tuple(result)
 
     def check_local_requirements(self, alias: str) -> LocalRequirementResult:
-        profile = self._profiles.get(alias)
-        if profile is None or not profile.check_local_requirements().available:
+        if alias not in self._profiles or not self._profiles[alias].check_local_requirements().available:
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
         return LocalRequirementResult(available=True)
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        # Config validation guarantees an explicit default whenever more than
+        # one profile exists, and ``_ordered_aliases`` puts it first — so the
+        # first usable alias IS the designated (or sole) profile.
+        return usable_aliases[0] if usable_aliases else None
 
     def approved_profile(self, alias: str) -> BedrockGuardrailProfileSettings:
         """Return one exact frozen operator binding for an already-authorized plugin."""
@@ -574,6 +706,438 @@ class _BedrockGuardrailProfileResolver:
             raise ValueError("profile_unavailable") from None
 
 
+class _S3SourceProfileResolver:
+    def __init__(self, profiles: tuple[AWSS3SourceProfileSettings, ...], *, region: str) -> None:
+        if not profiles or not is_well_formed_aws_region(region):
+            raise ValueError("profile_unavailable")
+        self._profiles = {profile.alias: profile for profile in profiles}
+        self._region = region
+
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for the aws_s3 source plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
+            "mapping or if any S3_PROFILED_AUTHOR_OPTION_NAMES entry is present but not a mapping; never silently "
+            "narrows the profiled-author-visible option set. An ABSENT key is not a softer path into that set: "
+            "'properties' absent reaches the same rejection because every profiled-author option is read by name, "
+            "an absent knob 'fields' list reaches it through the canonical-projection lookup, an absent 'required' "
+            "carries JSON Schema's own 'nothing is required', and an absent '$defs' is reachable only for a schema "
+            "carrying no $ref, since the declared pydantic-generated source never emits one without the other"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_s3_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="5d4be073e45335f7ec4883ab4c3e6d0ead594be3879bde781f6428b97760a761",
+    )
+    def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
+        from elspeth.web.catalog.schemas import PluginSchemaInfo
+
+        raw_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(raw_properties, dict):
+            raise ValueError("malformed_profile_schema")
+        safe_properties: dict[str, Any] = {
+            "profile": {
+                "type": "string",
+                "enum": list(available_aliases),
+                "description": "Operator-approved S3 source profile alias",
+            }
+        }
+        for name in S3_PROFILED_AUTHOR_OPTION_NAMES:
+            raw_schema = raw_properties.get(name)
+            if not isinstance(raw_schema, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(raw_schema)
+        safe_properties["key"].update(
+            {
+                "description": "Relative object key within the operator-approved S3 source prefix",
+                "pattern": (
+                    r"^(?!/)(?![A-Za-z][A-Za-z0-9+.-]*:)(?!.*\\)"
+                    r"(?!.*(?:^|/)(?:\.|\.\.)(?:/|$))(?!.*//)(?!.*\/$).+$"
+                ),
+            }
+        )
+        raw_required = full_schema.json_schema.get("required", ())
+        required = [
+            "profile",
+            *(name for name in raw_required if isinstance(name, str) and name in S3_PROFILED_AUTHOR_OPTION_NAMES),
+        ]
+        public_json_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": safe_properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+        definitions = full_schema.json_schema.get("$defs", {})
+        referenced_definitions: dict[str, Any] = {}
+        pending = _schema_refs(public_json_schema)
+        while pending:
+            definition_name = pending.pop()
+            if definition_name in referenced_definitions:
+                continue
+            definition = definitions.get(definition_name) if isinstance(definitions, dict) else None
+            if isinstance(definition, dict):
+                referenced_definitions[definition_name] = deepcopy(definition)
+                pending.update(_schema_refs(definition))
+        if referenced_definitions:
+            public_json_schema["$defs"] = referenced_definitions
+
+        raw_fields = full_schema.knob_schema.get("fields", ())
+        canonical_fields = {
+            raw_field["name"]: raw_field
+            for raw_field in raw_fields
+            if isinstance(raw_field, dict) and isinstance(raw_field.get("name"), str)
+        }
+        fields: list[dict[str, Any]] = [
+            {
+                "name": "profile",
+                "label": "Profile",
+                "kind": "enum",
+                "tier": _DEFAULT_COMPOSER_TIER,
+                "required": True,
+                "nullable": False,
+                "enum": list(available_aliases),
+                "description": "Operator-approved S3 source profile alias",
+            }
+        ]
+        for name in S3_PROFILED_AUTHOR_OPTION_NAMES:
+            try:
+                field_projection = deepcopy(canonical_fields[name])
+            except KeyError as exc:
+                raise ValueError("malformed_profile_schema") from exc
+            field_projection["required"] = name in required
+            if "tier" not in field_projection:
+                field_projection["tier"] = _DEFAULT_COMPOSER_TIER
+            if name == "key":
+                field_projection["label"] = "Relative Object Key"
+                field_projection["description"] = "Relative object key within the operator-approved S3 source prefix"
+            fields.append(field_projection)
+        return PluginSchemaInfo(
+            name=full_schema.name,
+            plugin_type=full_schema.plugin_type,
+            description=full_schema.description,
+            json_schema=public_json_schema,
+            knob_schema={"fields": fields},
+            composer_hints=(
+                "Select an operator-approved S3 source profile and provide only a relative object key.",
+                "The server supplies the profile's private runtime binding.",
+                "Choose the parser, schema, and validation-failure routing for the selected object.",
+            ),
+            secret_requirements=(),
+            web_config_authority=full_schema.web_config_authority,
+            policy_capabilities=full_schema.policy_capabilities,
+        )
+
+    def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        try:
+            profile = self._profiles[alias]
+        except KeyError:
+            raise ValueError("profile_unavailable") from None
+        if set(safe_options) & S3_PRIVATE_BINDING_OPTION_NAMES:
+            raise ValueError("private_profile_option")
+        if set(safe_options) - set(S3_PROFILED_AUTHOR_OPTION_NAMES):
+            raise ValueError("private_profile_option")
+        relative_key = safe_options["key"] if "key" in safe_options else None
+        if type(relative_key) is not str:
+            raise ValueError("unsafe_s3_object_key")
+        try:
+            relative_key = validate_relative_s3_path(relative_key, field_name="key")
+        except ValueError:
+            raise ValueError("unsafe_s3_object_key") from None
+        executable_key = f"{profile.prefix}/{relative_key}" if profile.prefix is not None else relative_key
+        if len(executable_key.encode("utf-8")) > S3_MAX_KEY_BYTES:
+            raise ValueError("unsafe_s3_object_key")
+        executable = {
+            **safe_options,
+            "bucket": profile.bucket,
+            "key": executable_key,
+            "region_name": self._region,
+        }
+        return LoweredPluginConfig(
+            executable_options=MappingProxyType(executable),
+            audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+            profiled_s3_audit_identity=S3ProfiledAuditIdentity(
+                profile_alias=alias,
+                relative_key=relative_key,
+                binding_fingerprint=s3_profiled_binding_fingerprint(
+                    bucket=profile.bucket,
+                    executable_key=executable_key,
+                    region_name=self._region,
+                    endpoint_url=None,
+                ),
+            ),
+        )
+
+    def profile_availability(
+        self,
+        principal: str,
+        inventory: ProfileCredentialInventory,
+    ) -> tuple[ProfileAvailability, ...]:
+        del principal, inventory
+        return tuple(
+            ProfileAvailability(
+                alias=alias,
+                credential_scope=None,
+                usable=True,
+                generation=hashlib.sha256(
+                    json.dumps(
+                        {
+                            "bucket": profile.bucket,
+                            "prefix": profile.prefix,
+                            "region_name": self._region,
+                            "auth_mode": "default_chain",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            )
+            for alias, profile in self._profiles.items()
+        )
+
+    def check_local_requirements(self, alias: str) -> LocalRequirementResult:
+        return LocalRequirementResult(available=alias in self._profiles)
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        return usable_aliases[0] if len(usable_aliases) == 1 else None
+
+
+class _TextractProfileResolver:
+    def __init__(self, profiles: tuple[AWSTextractProfileSettings, ...], *, region: str) -> None:
+        if not profiles or not is_supported_textract_region(region):
+            raise ValueError("profile_unavailable")
+        self._profiles = {profile.alias: profile for profile in profiles}
+        self._region = region
+
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for the aws_textract_document_analysis transform plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
+            "mapping or if any TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES entry is present but not a mapping; never "
+            "silently narrows the profiled-author-visible option set. An ABSENT key is not a softer path into that "
+            "set: 'properties' absent reaches the same rejection because every profiled-author option is read by "
+            "name, an absent knob 'fields' list reaches it through the canonical-projection lookup, an absent "
+            "'required' carries JSON Schema's own 'nothing is required', and an absent '$defs' is reachable only "
+            "for a schema carrying no $ref, since the declared pydantic-generated source never emits one without "
+            "the other"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_textract_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="9f2da2dcb0d7727bcaa893abb5aba4663bfd75f5e4661d1b60756bddfa050b94",
+    )
+    def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
+        from elspeth.web.catalog.schemas import PluginSchemaInfo
+
+        raw_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(raw_properties, dict):
+            raise ValueError("malformed_profile_schema")
+        safe_properties: dict[str, Any] = {
+            "profile": {
+                "type": "string",
+                "enum": list(available_aliases),
+                "description": "Operator-approved Textract document profile alias",
+            }
+        }
+        for name in TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES:
+            raw_schema = raw_properties.get(name)
+            if not isinstance(raw_schema, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(raw_schema)
+        safe_properties["key_field"].update(
+            {
+                "description": ("Input row field containing the relative S3 object key within the operator-approved document location"),
+            }
+        )
+        raw_required = full_schema.json_schema.get("required", ())
+        required = [
+            "profile",
+            *(name for name in raw_required if isinstance(name, str) and name in TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES),
+        ]
+        public_json_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": safe_properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+        definitions = full_schema.json_schema.get("$defs", {})
+        referenced_definitions: dict[str, Any] = {}
+        pending = _schema_refs(public_json_schema)
+        while pending:
+            definition_name = pending.pop()
+            if definition_name in referenced_definitions:
+                continue
+            definition = definitions.get(definition_name) if isinstance(definitions, dict) else None
+            if isinstance(definition, dict):
+                referenced_definitions[definition_name] = deepcopy(definition)
+                pending.update(_schema_refs(definition))
+        if referenced_definitions:
+            public_json_schema["$defs"] = referenced_definitions
+
+        raw_fields = full_schema.knob_schema.get("fields", ())
+        canonical_fields = {
+            raw_field["name"]: raw_field
+            for raw_field in raw_fields
+            if isinstance(raw_field, dict) and isinstance(raw_field.get("name"), str)
+        }
+        fields: list[dict[str, Any]] = [
+            {
+                "name": "profile",
+                "type": "string",
+                "tier": _DEFAULT_COMPOSER_TIER,
+                "required": True,
+                "description": "Operator-approved Textract document profile alias",
+                "choices": list(available_aliases),
+            }
+        ]
+        for name in TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES:
+            try:
+                field_projection = deepcopy(canonical_fields[name])
+            except KeyError as exc:
+                raise ValueError("malformed_profile_schema") from exc
+            field_projection["required"] = name in required
+            if "tier" not in field_projection:
+                field_projection["tier"] = _DEFAULT_COMPOSER_TIER
+            if name == "key_field":
+                field_projection["description"] = (
+                    "Input row field containing the relative S3 object key within the operator-approved document location"
+                )
+            fields.append(field_projection)
+        return PluginSchemaInfo(
+            name=full_schema.name,
+            plugin_type=full_schema.plugin_type,
+            description=full_schema.description,
+            json_schema=public_json_schema,
+            knob_schema={"fields": fields},
+            composer_hints=(
+                "Select an operator-approved Textract document profile; the server supplies the private storage binding.",
+                "Rows carry relative object keys in key_field — never bucket names or document locations.",
+                "Choose feature_types and map at least one output field.",
+            ),
+            secret_requirements=(),
+            web_config_authority=full_schema.web_config_authority,
+            policy_capabilities=full_schema.policy_capabilities,
+        )
+
+    def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        try:
+            profile = self._profiles[alias]
+        except KeyError:
+            raise ValueError("profile_unavailable") from None
+        if set(safe_options) & TEXTRACT_PRIVATE_BINDING_OPTION_NAMES:
+            raise ValueError("private_profile_option")
+        if set(safe_options) - set(TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES):
+            raise ValueError("private_profile_option")
+        executable: dict[str, object] = {
+            **safe_options,
+            "bucket": profile.bucket,
+            "region": self._region,
+            "auth_mode": "default_chain",
+        }
+        if profile.key_prefix is not None:
+            executable["key_prefix"] = profile.key_prefix
+        return LoweredPluginConfig(
+            executable_options=MappingProxyType(executable),
+            audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+            profiled_textract_audit_identity=TextractProfiledAuditIdentity(
+                profile_alias=alias,
+                binding_fingerprint=textract_profiled_binding_fingerprint(
+                    bucket=profile.bucket,
+                    region=self._region,
+                    key_prefix=profile.key_prefix,
+                ),
+            ),
+        )
+
+    def profile_availability(
+        self,
+        principal: str,
+        inventory: ProfileCredentialInventory,
+    ) -> tuple[ProfileAvailability, ...]:
+        del principal, inventory
+        return tuple(
+            ProfileAvailability(
+                alias=alias,
+                credential_scope=None,
+                usable=True,
+                generation=hashlib.sha256(
+                    json.dumps(
+                        {
+                            "bucket": profile.bucket,
+                            "key_prefix": profile.key_prefix,
+                            "region": self._region,
+                            "auth_mode": "default_chain",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            )
+            for alias, profile in self._profiles.items()
+        )
+
+    def check_local_requirements(self, alias: str) -> LocalRequirementResult:
+        return LocalRequirementResult(available=alias in self._profiles)
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        return usable_aliases[0] if len(usable_aliases) == 1 else None
+
+
+# Every field the catalog lowers carries a composer tier
+# (``web/catalog/knob_schema._attach_tier``: "Every wire field carries a tier
+# so the form never has to guess"), and its own default when a plugin declares
+# no ``composer_tier`` is "common". The hand-built policy-view projections
+# below must carry that fact forward: a projected field with no tier reaches
+# the inspector as a field the catalog KNOWS but does not rank, and the live
+# ``transform:llm`` policy view shipped all fourteen of its knobs that way —
+# emptying the visible partition and burying the prompt under the advanced
+# disclosure (elspeth-a6ea581e8a).
+_DEFAULT_COMPOSER_TIER = "common"
+
+
+def _canonical_field_tiers(full_schema: PluginSchemaInfo) -> dict[str, str]:
+    """Map each canonical knob field name to the composer tier it was lowered with.
+
+    First occurrence wins, matching the ``first_raw_field`` projection below:
+    a flattened discriminated union repeats a field name once per variant, and
+    the projections take the first copy.
+
+    ``knob_schema`` is ELSPETH's own catalog lowering output, not a foreign
+    boundary, so this reads it nominally (ADR-032): membership then index, no
+    ``.get`` defaults and no ``isinstance`` re-derivation of a shape the
+    lowering already guarantees. A field the lowering left untiered simply
+    does not appear here, and ``_projected_tier`` supplies the default.
+    """
+    knob_schema = full_schema.knob_schema
+    raw_fields = knob_schema["fields"] if "fields" in knob_schema else ()
+    tiers: dict[str, str] = {}
+    for raw_field in raw_fields:
+        name = raw_field["name"]
+        if "tier" in raw_field and name not in tiers:
+            tiers[name] = raw_field["tier"]
+    return tiers
+
+
+def _projected_tier(name: str, canonical_tiers: Mapping[str, str]) -> str:
+    """The tier one projected field carries: the canonical one, else "common".
+
+    A synthesized field (the operator ``profile`` selector) has no canonical
+    counterpart and is never advanced — it is the first thing the author picks.
+    """
+    return canonical_tiers[name] if name in canonical_tiers else _DEFAULT_COMPOSER_TIER
+
+
+@observation_boundary(
+    tier=3,
+    source="a node of a plugin-author-owned JSON Schema (PluginSchemaInfo.json_schema) being walked for $defs references",
+    source_param="value",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns only the '#/$defs/<name>' references it can prove present; any non-mapping, non-list, or "
+        "non-string $ref contributes nothing and is never coerced. Never raises on a malformed schema node"
+    ),
+)
 def _schema_refs(value: object) -> set[str]:
     refs: set[str] = set()
     if isinstance(value, dict):
@@ -595,11 +1159,16 @@ class OperatorProfileRegistry:
         from elspeth.web.plugin_policy.models import PluginId
 
         self._policy = policy
+        llm_transform_resolver = _LLMProfileResolver(
+            settings.llm_profiles,
+            preferred_alias=settings.default_llm_profile,
+        )
         self._resolvers: dict[PluginId, OperatorProfileResolver] = {
-            PluginId("transform", "llm"): _LLMProfileResolver(
+            PluginId("source", "llm"): _LLMProfileResolver(
                 settings.llm_profiles,
-                preferred_alias=settings.tutorial_llm_profile,
-            )
+                preferred_alias=settings.default_llm_profile,
+            ),
+            PluginId("transform", "llm"): llm_transform_resolver,
         }
         defaults = dict(settings.bedrock_guardrail_default_profiles)
         for plugin_name in ("aws_bedrock_prompt_shield", "aws_bedrock_content_safety"):
@@ -607,8 +1176,29 @@ class OperatorProfileRegistry:
             if plugin_profiles:
                 self._resolvers[PluginId("transform", plugin_name)] = _BedrockGuardrailProfileResolver(
                     plugin_profiles,
-                    default_alias=defaults.get(plugin_name),
+                    default_alias=defaults[plugin_name] if plugin_name in defaults else None,
                 )
+        if (
+            settings.aws_s3_source_profiles
+            and type(settings.deployment_aws_region) is str
+            and is_well_formed_aws_region(settings.deployment_aws_region)
+            and importlib.util.find_spec("boto3") is not None
+        ):
+            assert settings.deployment_aws_region is not None
+            self._resolvers[PluginId("source", "aws_s3")] = _S3SourceProfileResolver(
+                settings.aws_s3_source_profiles,
+                region=settings.deployment_aws_region,
+            )
+        if (
+            settings.aws_textract_profiles
+            and is_supported_textract_region(settings.deployment_aws_region)
+            and importlib.util.find_spec("boto3") is not None
+        ):
+            assert settings.deployment_aws_region is not None
+            self._resolvers[PluginId("transform", "aws_textract_document_analysis")] = _TextractProfileResolver(
+                settings.aws_textract_profiles,
+                region=settings.deployment_aws_region,
+            )
 
     def public_schema(
         self,
@@ -617,10 +1207,116 @@ class OperatorProfileRegistry:
         *,
         available_aliases: tuple[str, ...],
     ) -> PluginSchemaInfo:
-        resolver = self._resolvers.get(plugin_id)
-        if resolver is None:
+        if plugin_id not in self._resolvers:
             return full_schema
-        return resolver.public_schema(full_schema, available_aliases)
+        return self._resolvers[plugin_id].public_schema(full_schema, available_aliases)
+
+    def public_summary(
+        self,
+        plugin_id: PluginId,
+        full_summary: PluginSummary,
+        full_schema: PluginSchemaInfo,
+        *,
+        available_aliases: tuple[str, ...],
+    ) -> PluginSummary:
+        """Project list discovery through the same profile contract as schema discovery."""
+        from elspeth.web.catalog.schema_parse import SchemaObject
+        from elspeth.web.catalog.schemas import ConfigFieldSummary
+
+        if plugin_id not in self._resolvers:
+            return full_summary
+        resolver = self._resolvers[plugin_id]
+        public_schema = resolver.public_schema(full_schema, available_aliases)
+        parsed = SchemaObject.model_validate(public_schema.json_schema)
+        required = set(parsed.required)
+        config_fields: list[ConfigFieldSummary] = []
+        for name, field_schema in parsed.properties.items():
+            json_type = field_schema.type or "object"
+            if field_schema.any_of and field_schema.type is None:
+                json_type = next((branch.type or "object" for branch in field_schema.any_of if branch.type != "null"), "object")
+            config_fields.append(
+                ConfigFieldSummary(
+                    name=name,
+                    type=json_type,
+                    required=name in required,
+                    description=field_schema.description,
+                    default=field_schema.default,
+                )
+            )
+        updates: dict[str, object] = {
+            "config_fields": config_fields,
+            "composer_hints": public_schema.composer_hints,
+            "secret_requirements": public_schema.secret_requirements,
+        }
+        # Exact-type dispatch over the three module-private resolver classes:
+        # each arm publishes the guidance for ONE operator-profile contract, so a
+        # future subclass must declare its own arm rather than silently inherit.
+        if type(resolver) is _S3SourceProfileResolver:
+            example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
+            updates["usage_when_to_use"] = (
+                "Use in Web Composer when an operator-approved S3 source profile is available and the workflow "
+                "needs one bounded CSV, JSON-array, or JSONL object selected by relative object key."
+            )
+            updates["usage_when_not_to_use"] = (
+                "Do not use when no matching operator-approved profile is available, the object is outside the "
+                "approved prefix, or the workflow needs to enumerate or stream multiple objects."
+            )
+            updates["example_use"] = (
+                "sources:\n"
+                "  s3_input:\n"
+                "    plugin: aws_s3\n"
+                "    on_success: output\n"
+                "    options:\n"
+                f"      profile: {example_alias}\n"
+                "      key: records/input.csv\n"
+                "      format: csv\n"
+                "      schema: {mode: observed}\n"
+                "      on_validation_failure: discard"
+            )
+        elif type(resolver) is _TextractProfileResolver:
+            example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
+            updates["example_use"] = (
+                "transform:\n"
+                "  plugin: aws_textract_document_analysis\n"
+                "  options:\n"
+                f"    profile: {example_alias}\n"
+                "    key_field: document_key\n"
+                "    feature_types: [TABLES, FORMS]\n"
+                "    text_field: textract_text\n"
+                "    schema: {mode: observed}"
+            )
+        return full_summary.model_copy(update=updates)
+
+    def public_assistance(
+        self,
+        plugin_id: PluginId,
+        full_assistance: PluginAssistance,
+    ) -> PluginAssistance:
+        """Project plugin guidance through the same operator-profile authority."""
+        resolver = self._resolvers[plugin_id] if plugin_id in self._resolvers else None
+        if type(resolver) is _S3SourceProfileResolver:
+            return PluginAssistance(
+                plugin_name=full_assistance.plugin_name,
+                issue_code=full_assistance.issue_code,
+                summary="Read bounded CSV, JSON-array, or JSONL rows through an operator-approved S3 source profile.",
+                composer_hints=(
+                    "Select an available profile and provide a canonical relative object key.",
+                    "Choose the parser, schema, and validation-failure routing for the selected object.",
+                    "Use a different approved profile when the object belongs to a different operator-managed location.",
+                ),
+            )
+        if type(resolver) is _TextractProfileResolver:
+            return PluginAssistance(
+                plugin_name=full_assistance.plugin_name,
+                issue_code=full_assistance.issue_code,
+                summary="Analyze S3-backed documents asynchronously through an operator-approved Textract document profile.",
+                composer_hints=(
+                    "Select an available profile; the server supplies the private document storage binding.",
+                    "Rows carry relative object keys in key_field; choose feature_types and map at least one output field.",
+                    "The bound document location is verified against the deployment before analysis starts.",
+                ),
+            )
+        return full_assistance
 
     def lower_options(
         self,
@@ -629,11 +1325,9 @@ class OperatorProfileRegistry:
         alias: str,
         safe_options: dict[str, object],
     ) -> LoweredPluginConfig:
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
-            raise ValueError("plugin_has_no_operator_profile") from None
-        return resolver.lower_options(alias, safe_options)
+        if plugin_id not in self._resolvers:
+            raise ValueError("plugin_has_no_operator_profile")
+        return self._resolvers[plugin_id].lower_options(alias, safe_options)
 
     def profile_availability(
         self,
@@ -642,18 +1336,20 @@ class OperatorProfileRegistry:
         principal: str,
         inventory: ProfileCredentialInventory,
     ) -> tuple[ProfileAvailability, ...]:
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
+        if plugin_id not in self._resolvers:
             return ()
-        return resolver.profile_availability(principal, inventory)
+        return self._resolvers[plugin_id].profile_availability(principal, inventory)
 
     def check_local_requirements(self, plugin_id: PluginId, alias: str) -> LocalRequirementResult:
-        try:
-            resolver = self._resolvers[plugin_id]
-        except KeyError:
+        if plugin_id not in self._resolvers:
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
-        return resolver.check_local_requirements(alias)
+        return self._resolvers[plugin_id].check_local_requirements(alias)
+
+    def selected_profile_alias(self, plugin_id: PluginId, *, usable_aliases: tuple[str, ...]) -> str | None:
+        """The designated default among ``usable_aliases``, or None if none is."""
+        if plugin_id not in self._resolvers:
+            return None
+        return self._resolvers[plugin_id].selected_alias(usable_aliases)
 
     def approved_bedrock_guardrail_profile(
         self,
@@ -665,7 +1361,7 @@ class OperatorProfileRegistry:
 
         if plugin_id not in self._policy.authorized:
             raise ValueError("profile_unavailable")
-        resolver = self._resolvers.get(plugin_id)
-        if not isinstance(resolver, _BedrockGuardrailProfileResolver):
+        resolver = self._resolvers[plugin_id] if plugin_id in self._resolvers else None
+        if type(resolver) is not _BedrockGuardrailProfileResolver:
             raise ValueError("profile_unavailable")
         return resolver.approved_profile(alias)

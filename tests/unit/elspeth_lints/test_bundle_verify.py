@@ -13,6 +13,9 @@ Fixtures are replicated locally (rather than imported from
 
 from __future__ import annotations
 
+import os
+import subprocess
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +26,7 @@ from elspeth_lints.core.allowlist import JudgeVerdict, compute_judge_metadata_si
 from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
+from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 _HMAC_KEY = "x" * 32
@@ -146,15 +150,31 @@ def _write_pre_judge_entry(allowlist_dir: Path, yaml_name: str, *, key: str) -> 
 
 
 def _bundle(root: Path, allowlist_dir: Path, actions: tuple[BundleAction, ...]) -> ReviewBundle:
+    repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    if (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    ):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "bundle-verify@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Bundle Verify Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
     return ReviewBundle(
         bundle_id="verify-bundle",
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root=str(root),
         allowlist_dir=str(allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=binding.source_rev,
+        source_dirty=binding.source_dirty,
+        source_snapshot_sha256=binding.source_snapshot_sha256,
         actions=actions,
     )
 
@@ -199,6 +219,73 @@ def test_verify_passes_when_claims_match_tree(tmp_path: Path) -> None:
     assert report.rotation_plan is None  # no rotation action
 
 
+def test_verify_rejects_harmless_relevant_byte_drift_with_same_action_inventory(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle = _bundle(root, allowlist_dir, ())
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless comment\n", encoding="utf-8")
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("source snapshot" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_rejects_head_advance_with_identical_relevant_bytes(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle = _bundle(root, allowlist_dir, ())
+    (tmp_path / "irrelevant.txt").write_text("advance HEAD only\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "irrelevant.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "advance"], check=True)
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("source_rev" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_accepts_unchanged_tracked_dirty_snapshot(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    _bundle(root, allowlist_dir, ())
+    source.write_text(source.read_text(encoding="utf-8") + "# tracked dirty\n", encoding="utf-8")
+    dirty_bundle = _bundle(root, allowlist_dir, ())
+
+    report = verify_bundle_against_tree(dirty_bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert dirty_bundle.source_dirty is True
+    assert report.ok is True
+
+
+def test_verify_rechecks_source_binding_after_action_derivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth_lints.core import bundle_verify as verify_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle = _bundle(root, allowlist_dir, ())
+    original = verify_module.diagnose_judge_signatures
+
+    def changing_diagnosis(*args: Any, **kwargs: Any) -> Any:
+        report = original(*args, **kwargs)
+        source.write_text(source.read_text(encoding="utf-8") + "# changed during verify\n", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(verify_module, "diagnose_judge_signatures", changing_diagnosis)
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("changed while verifying" in mismatch for mismatch in report.mismatches)
+
+
 def test_verify_passes_with_cli_style_relative_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The documented sign-bundle defaults are relative to the repository root."""
     root = _build_root(tmp_path)
@@ -218,9 +305,219 @@ def test_verify_passes_with_cli_style_relative_paths(tmp_path: Path, monkeypatch
     assert report.mismatches == ()
 
 
+def test_verify_rejects_empty_bundle_when_empty_allowlist_census_finds_target(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("target census" in mismatch and "missing justify action" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_rejects_bundle_omitting_live_rotation(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = identity_prefix(_canonical_key(finding)) + ":fp=deadbeefdeadbeef"
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("target census" in mismatch and "missing rotation action" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_rejects_ambiguous_same_prefix_target_group(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    assert len({identity_prefix(_canonical_key(finding)) for finding in findings}) == 1
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=_canonical_key(findings[0]))
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("ambiguous non-judge target group" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_accepts_mixed_signed_and_prejudge_exact_same_prefix_group(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+    _write_pre_judge_entry(allowlist_dir, "prejudge.yaml", key=_canonical_key(findings[1]))
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is True
+    assert report.mismatches == ()
+
+
+def test_verify_signed_exact_entry_does_not_cover_second_same_prefix_finding(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert report.target_census.exact_covered_count == 1
+    assert report.target_census.uncovered_count == 1
+    assert any(_canonical_key(findings[1]) in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_accepts_judgment_for_second_same_prefix_finding(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+    bundle = _bundle(root, allowlist_dir, (_new_judgment_action(findings[1], "plugins/gadget.py"),))
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is True
+    assert report.mismatches == ()
+
+
+def test_verify_rejects_relative_paths_recorded_in_bundle(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    relative_bundle = replace(_bundle(root, allowlist_dir, ()), root="src_root", allowlist_dir="allowlist")
+
+    report = verify_bundle_against_tree(relative_bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("bundle root must be absolute" in mismatch for mismatch in report.mismatches)
+    assert any("bundle allowlist_dir must be absolute" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_rejects_bundle_omitting_live_drift_repair(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding, scope_fingerprint="b" * 64)
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any(
+        "target census" in mismatch and "missing drift_repair action" in mismatch and key in mismatch for mismatch in report.mismatches
+    )
+
+
+def test_verify_rejects_bundle_omitting_stale_delete(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any(
+        "target census" in mismatch and "missing stale_delete action" in mismatch and key in mismatch for mismatch in report.mismatches
+    )
+
+
+def test_verify_fails_closed_when_source_tree_contains_syntax_error(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    (root / "plugins" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"tier-model scan failed.*plugins/broken\.py.*syntax"):
+        verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+
+def test_verify_rejects_stale_delete_when_bound_source_is_unscannable(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    target.write_text("def broken(:\n", encoding="utf-8")
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=key, source_file="widget.yaml"),),
+    )
+
+    with pytest.raises(ValueError, match=r"tier-model scan failed.*plugins/widget\.py.*syntax"):
+        verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+
+def test_verify_rejects_substituted_scan_scope_before_signing(tmp_path: Path) -> None:
+    staged_root = _build_root(tmp_path / "staged")
+    staged_allowlist = _build_allowlist_dir(tmp_path / "staged")
+    substituted_root = _build_root(tmp_path / "substituted")
+    substituted_allowlist = _build_allowlist_dir(tmp_path / "substituted")
+    bundle = _bundle(staged_root, staged_allowlist, ())
+    _bundle(substituted_root, substituted_allowlist, ())
+
+    report = verify_bundle_against_tree(
+        bundle,
+        root=substituted_root,
+        allowlist_dir=substituted_allowlist,
+    )
+
+    assert report.ok is False
+    assert any("bundle root" in mismatch for mismatch in report.mismatches)
+    assert any("bundle allowlist_dir" in mismatch for mismatch in report.mismatches)
+
+
 def test_verify_scans_each_new_judgment_file_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Large bundles commonly carry hundreds of findings from one source file."""
-    from elspeth_lints.core import bundle_verify
+    from elspeth_lints.core import tier_model_scan
     from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
 
     root = _build_root(tmp_path)
@@ -242,7 +539,7 @@ def test_verify_scans_each_new_judgment_file_once(tmp_path: Path, monkeypatch: p
         tuple(_new_judgment_action(finding, "plugins/gadget.py") for finding in findings),
     )
 
-    real_scan = bundle_verify.scan_single_file_findings
+    real_scan = tier_model_scan.scan_single_file_findings
     scan_calls = 0
 
     def counted_scan(*, target_file: Path, root: Path) -> list[Any]:
@@ -250,7 +547,7 @@ def test_verify_scans_each_new_judgment_file_once(tmp_path: Path, monkeypatch: p
         scan_calls += 1
         return real_scan(target_file=target_file, root=root)
 
-    monkeypatch.setattr(bundle_verify, "scan_single_file_findings", counted_scan)
+    monkeypatch.setattr(tier_model_scan, "scan_single_file_findings", counted_scan)
     report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
 
     assert report.ok is True
@@ -293,19 +590,46 @@ def test_verify_aborts_on_vanished_new_judgment_finding(tmp_path: Path) -> None:
     assert any(action.key in m for m in report.mismatches)
 
 
-def test_verify_passes_when_new_judgment_finding_became_covered(tmp_path: Path) -> None:
+def test_verify_aborts_when_new_judgment_finding_became_exactly_covered(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
     _write_source(root, "plugins/gadget.py", "gadget")
     finding = _live_finding(root, "plugins/gadget.py")
     action = _new_judgment_action(finding, "plugins/gadget.py")
-    # An allowlist entry has since come to cover the same key (covered between
-    # stage and fire). Verify keys off finding existence, not the coverage delta.
+    # An exact allowlist entry has since come to cover the same key.
     _write_signed_v2_entry(allowlist_dir, "gadget.yaml", finding=finding)
 
     bundle = _bundle(root, allowlist_dir, (action,))
     report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
-    assert report.ok is True
+    assert report.ok is False
+    assert any("already covered" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_aborts_when_new_judgment_finding_is_covered_by_per_file_rule(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    action = _new_judgment_action(finding, "plugins/gadget.py")
+    (allowlist_dir / "gadget.yaml").write_text(
+        "\n".join(
+            [
+                "per_file_rules:",
+                "- pattern: plugins/gadget.py",
+                "  rules: [R1]",
+                "  reason: existing production suppression",
+                "  expires: '2030-01-01'",
+                "  max_hits: 1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bundle = _bundle(root, allowlist_dir, (action,))
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+    assert report.ok is False
+    assert any("already covered" in mismatch for mismatch in report.mismatches)
 
 
 def test_verify_aborts_on_reappeared_stale_delete_finding(tmp_path: Path) -> None:
@@ -325,6 +649,25 @@ def test_verify_aborts_on_reappeared_stale_delete_finding(tmp_path: Path) -> Non
     report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
     assert report.ok is False
     assert any(key in m for m in report.mismatches)
+
+
+def test_verify_rejects_stale_delete_wrong_owning_yaml(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=key, source_file="other.yaml"),),
+    )
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("owning YAML" in mismatch for mismatch in report.mismatches)
 
 
 def test_verify_aborts_on_rotation_no_longer_applicable(tmp_path: Path) -> None:
@@ -353,8 +696,8 @@ def test_verify_does_not_crash_on_judge_gated_fp_shift_in_scanned_dir(tmp_path: 
 
     Places a judge-gated, fp-SHIFTED entry (the AST-position cascade: a real
     statement prepended so the leading ``ast_path`` index and ``:fp=`` shift
-    while the enclosing scope stays byte-identical) as a NON-action in the
-    scanned dir, coexisting with a normal non-judge-gated ``rotation`` action.
+    while the enclosing scope stays byte-identical) in the scanned dir,
+    coexisting with a normal non-judge-gated ``rotation`` action.
     Against the pre-fix unfiltered whole-dir scan this would ``RuntimeError`` at
     ``plan_rotations`` regardless of bundle membership; the fixed
     ``exclude_judge_gated=True`` scan filters it out first, so verify must NOT
@@ -363,10 +706,10 @@ def test_verify_does_not_crash_on_judge_gated_fp_shift_in_scanned_dir(tmp_path: 
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
 
-    # (1) Judge-gated fp-shifted NON-action entry.
+    # (1) Judge-gated fp-shifted drift-repair action.
     widget = _write_source(root, "plugins/widget.py", "widget")
     widget_finding = _live_finding(root, "plugins/widget.py")
-    _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
+    widget_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=widget_finding)
     widget.write_text("_SHIM = 1\n\n\n" + _src("widget"), encoding="utf-8")  # shift -> fp drift
 
     # (2) Non-judge-gated rotation ACTION (positional drift via stale fp).
@@ -378,7 +721,15 @@ def test_verify_does_not_crash_on_judge_gated_fp_shift_in_scanned_dir(tmp_path: 
     bundle = _bundle(
         root,
         allowlist_dir,
-        (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),),
+        (
+            BundleAction(
+                lane="resign",
+                kind="drift_repair",
+                key=widget_key,
+                diagnosis_status="AST_PATH_BINDING_DRIFT",
+            ),
+            BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="gadget.yaml"),
+        ),
     )
 
     # The unfiltered whole-dir scan would raise here; the filtered scan does not.

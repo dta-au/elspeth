@@ -1,0 +1,36 @@
+{
+ "case_id": "write-once",
+ "expansions": [],
+ "rows": [
+  1,
+  1,
+  0
+ ],
+ "scenario_id": "sink-write-pending-redrive",
+ "sink_outputs": [
+  {
+   "rows": [
+    "{\"id\":1,\"value\":10}"
+   ],
+   "sink_name": "output"
+  }
+ ],
+ "status": "completed",
+ "terminal_dispositions": [
+  {
+   "key": "primary:0#0",
+   "outcome": "success",
+   "path": "default_flow",
+   "sink_name": "output",
+   "token_key": "primary:0#0"
+  }
+ ],
+ "tokens": [
+  {
+   "branch_name": null,
+   "key": "primary:0#0",
+   "parents": [],
+   "row_key": "primary:0"
+  }
+ ]
+}

@@ -27,8 +27,8 @@ import hashlib
 import json
 import sys
 from calendar import monthrange
-from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -45,7 +45,16 @@ from elspeth_lints.core.allowlist import (
     verify_entry_binding_against_finding,
 )
 from elspeth_lints.core.allowlist import PerFileRule as PerFileRule
-from elspeth_lints.core.ast_walker import iter_own_scope
+from elspeth_lints.core.ast_walker import iter_own_scope, iter_python_files
+from elspeth_lints.core.boundary_aliases import (
+    argument_names,
+    evaluate_alias_flow,
+    evaluate_finally_entry_aliases,
+    function_local_binding_names,
+    identical_alias_join,
+    import_alias_effect,
+    match_pattern_binding_names,
+)
 from elspeth_lints.core.protocols import (
     Finding as LintFinding,
 )
@@ -164,6 +173,7 @@ class CheckResult:
     layer_warnings: list[Finding]
     exceeded_file_rules: list[PerFileRule]
     budget_violations: list[AllowlistBudgetViolation]
+    stale_named_boundary_contexts: list[NamedBoundaryContextResolution] = field(default_factory=list)
 
     @property
     def has_errors(self) -> bool:
@@ -176,7 +186,88 @@ class CheckResult:
             or self.unused_file_rules
             or self.exceeded_file_rules
             or self.budget_violations
+            or self.stale_named_boundary_contexts
         )
+
+
+@dataclass(frozen=True)
+class NamedBoundaryContextResolution:
+    """One ``_R5_NAMED_BOUNDARY_CONTEXTS`` entry resolved against a source tree."""
+
+    file_path: str
+    qualified_name: str
+    definition_count: int
+    file_exists: bool
+
+    @property
+    def key(self) -> str:
+        return f"{self.file_path}::{self.qualified_name}"
+
+    @property
+    def status(self) -> str:
+        if not self.file_exists:
+            return "missing_file"
+        if self.definition_count == 0:
+            return "missing_definition"
+        if self.definition_count > 1:
+            return "ambiguous_definition"
+        return "ok"
+
+    @property
+    def is_stale(self) -> bool:
+        """A stale entry grants nothing, or grants more than one body."""
+        return self.status != "ok"
+
+
+def _qualified_definition_paths(tree: ast.Module) -> list[str]:
+    """Return every function definition in ``tree`` as its ``symbol_stack`` path."""
+    paths: list[str] = []
+
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                inner = [*stack, child.name]
+                if not isinstance(child, ast.ClassDef):
+                    paths.append(".".join(inner))
+                walk(child, inner)
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return paths
+
+
+def resolve_named_boundary_contexts(root: Path) -> list[NamedBoundaryContextResolution]:
+    """Resolve every judge-free R5 exemption map entry against the tree under ``root``.
+
+    ``root`` is the scan root the map's file keys are relative to (``src/elspeth``).
+    The same resolution backs the unit-test pin and the whole-tree staleness
+    diagnostic so the two can never disagree about what "live" means.
+    """
+    resolutions: list[NamedBoundaryContextResolution] = []
+    for file_path, qualified_names in sorted(TierModelVisitor._R5_NAMED_BOUNDARY_CONTEXTS.items()):
+        source_path = root / file_path
+        counts: dict[str, int] = {}
+        file_exists = source_path.is_file()
+        if file_exists:
+            tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+            for path in _qualified_definition_paths(tree):
+                counts[path] = counts.get(path, 0) + 1
+        for qualified_name in sorted(qualified_names):
+            resolutions.append(
+                NamedBoundaryContextResolution(
+                    file_path=file_path,
+                    qualified_name=qualified_name,
+                    definition_count=counts.get(qualified_name, 0),
+                    file_exists=file_exists,
+                )
+            )
+    return resolutions
+
+
+def _named_boundary_map_applies(root: Path) -> bool:
+    """The map is keyed relative to ``src/elspeth``; elsewhere it grants nothing to check."""
+    return root.name == "elspeth" and root.parent.name == "src"
 
 
 # =============================================================================
@@ -190,8 +281,8 @@ RULES: dict[str, dict[str, Any]] = {
         "remediation": "Access dict keys directly (dict[key]) and fix the schema/contract if KeyError occurs",
     },
     "R2": {
-        "name": "getattr",
-        "description": "getattr() with default can hide missing attribute bugs",
+        "name": "attribute-default",
+        "description": "getattr() or inspect.getattr_static() with a default can hide missing attribute bugs",
         "remediation": "Access attributes directly (obj.attr) and fix the type/contract if AttributeError occurs",
     },
     "R3": {
@@ -404,26 +495,23 @@ class TierModelVisitor(ast.NodeVisitor):
     )
     # CLOSED LIST: audited R5b boundary-normalization helpers from
     # docs/audit/2026-05-19-cicd-allowlist-audit.md and findings/fp-analyst.md.
-    # Do not replace this with a broad ``web/**`` or ``plugins/**`` glob; new
-    # contexts need their own audit evidence and regression tests.
+    # Keys are scan-root-relative file paths; values are QUALIFIED definition
+    # paths (``Class.method`` / ``outer.inner``, exactly ``symbol_stack``), so
+    # a same-named method on another class or a future function reusing a
+    # retired name cannot inherit the exemption. Every entry must resolve to
+    # exactly one live definition: ``resolve_named_boundary_contexts`` is
+    # pinned by tests/unit/elspeth_lints/test_tier_model_named_boundary_map.py
+    # and re-checked on every whole-tree run, where a stale entry is an
+    # ERROR like a stale allowlist entry. Functions that MOVE to another file
+    # are not successor-included: their findings surface and go through the
+    # allowlist like any other site. Do not replace this with a broad
+    # ``web/**`` or ``plugins/**`` glob; new contexts need their own audit
+    # evidence and regression tests.
     _R5_NAMED_BOUNDARY_CONTEXTS: ClassVar[dict[str, frozenset[str]]] = {
         "engine/dependency_resolver.py": frozenset({"_load_depends_on"}),
-        "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"_parse_response"}),
-        "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"_parse_and_build_chunks"}),
-        "plugins/transforms/azure/prompt_shield.py": frozenset({"_analyze_prompt"}),
-        "web/app.py": frozenset({"_settings_from_env"}),
-        "web/auth/local.py": frozenset({"_required_visible_string_claim"}),
-        "web/auth/oidc.py": frozenset(
-            {
-                "_get_jwk_algorithm",
-                "_get_token_algorithm",
-                "_validate_discovery_document",
-                "_validate_jwks_document",
-                "get_user_info",
-                "optional_profile_claim",
-            }
-        ),
-        "web/composer/_semantic_validator.py": frozenset({"_is_config_probe_exception"}),
+        "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"AzureSearchProvider._parse_response"}),
+        "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"ChromaSearchProvider._parse_and_build_chunks"}),
+        "plugins/transforms/azure/prompt_shield.py": frozenset({"AzurePromptShield._analyze_prompt"}),
         "web/composer/audit.py": frozenset(
             {
                 "_normalize_audit_payload",
@@ -459,24 +547,27 @@ class TierModelVisitor(ast.NodeVisitor):
                 "token_usage_from_response",
             }
         ),
-        "web/composer/recipes.py": frozenset({"_coerce_slot"}),
+        # The bare names ``provider`` and ``_apply`` were nested closures; the
+        # qualified keys name the two ``provider`` closures the bare key
+        # covered (measured 2026-08-29, elspeth-0bd4fb6042).
         "web/composer/redaction.py": frozenset(
             {
-                "_apply",
+                "_build_substitute_provider.provider",
+                "_build_value_provider.provider",
                 "_count_sensitive",
                 "_has_sensitive",
                 "_is_descendable",
                 "_redact_via_policy",
                 "_redact_via_schema",
+                "_redact_via_schema._apply",
                 "_walk_type",
-                "provider",
                 "walk_model_schema",
             }
         ),
         "web/composer/service.py": frozenset(
             {
-                "_cached_runtime_preflight",
-                "_compose_loop",
+                "ComposerServiceImpl._cached_runtime_preflight",
+                "ComposerServiceImpl._compose_loop",
                 # _dispatch_tool_batch was extracted from _compose_loop on
                 # 2026-05-23 (compose-loop-decomp refactor). The Tier-3
                 # boundary that validates the LLM's tool_call.function.arguments
@@ -484,25 +575,28 @@ class TierModelVisitor(ast.NodeVisitor):
                 # decoded_arguments, dict):` — moved with the code. Same
                 # semantics, same boundary, new method name: this is a
                 # 1:1 successor inclusion, not a list extension.
-                "_dispatch_tool_batch",
-                "_litellm_completion_supports_param",
-                "_matching_interpretation_placeholder_count",
-                "_optional_ancestor_present",
-                "_try_apply_freeform_recipe_intent",
-                "_validate_advisor_arguments",
+                "ComposerServiceImpl._dispatch_tool_batch",
+                "ComposerServiceImpl._validate_advisor_arguments",
             }
         ),
         "web/composer/source_inspection.py": frozenset({"_facts_from_objects", "_inspect_json", "_inspect_jsonl"}),
+        # The bare key ``from_dict`` covered six same-named classmethods; the
+        # qualified keys name each one the bare key granted (measured
+        # 2026-08-29, elspeth-0bd4fb6042). Narrowing needs per-site evidence.
         "web/composer/state.py": frozenset(
             {
+                "CompositionState.from_dict",
+                "EdgeSpec.from_dict",
+                "NodeSpec.from_dict",
+                "OutputSpec.from_dict",
+                "PipelineMetadata.from_dict",
+                "SourceSpec.from_dict",
                 "_coalesce_branch_connections",
                 "_coalesce_branch_names",
                 "_declared_input_fields_option",
                 "_is_config_probe_exception",
-                "_is_static_contract_probe_exception",
                 "_serialize_branches",
                 "_validate_web_scrape_abuse_contact_not_reserved",
-                "from_dict",
             }
         ),
         "web/execution/fanout_guard.py": frozenset(
@@ -518,27 +612,16 @@ class TierModelVisitor(ast.NodeVisitor):
         ),
         "web/execution/preflight.py": frozenset({"resolve_runtime_yaml_paths"}),
         "web/execution/routes.py": frozenset({"_run_integrity_http"}),
-        "web/execution/schemas.py": frozenset({"_enforce_data_type"}),
-        "web/execution/service.py": frozenset({"_on_pipeline_done", "_run_pipeline", "_sanitize_error_for_client"}),
-        "web/execution/validation.py": frozenset(
+        "web/execution/schemas.py": frozenset({"RunEvent._enforce_data_type"}),
+        "web/execution/service.py": frozenset(
             {
-                "_collect_secret_refs",
-                "_find_identity_node_advisories",
-                "_infer_component_type_from_plugin_error",
-                "_mask_pending_interpretation_placeholders_for_authoring_preflight",
-                "validate_pipeline",
+                "ExecutionServiceImpl._on_pipeline_done",
+                "ExecutionServiceImpl._run_pipeline",
+                "_sanitize_error_for_client",
             }
         ),
         "web/sessions/_auto_title.py": frozenset({"_auto_title_exception_class", "maybe_auto_title_session"}),
-        "web/sessions/routes.py": frozenset(
-            {
-                "_composer_persisted_validation",
-                "_dispatch_guided_respond",
-                "_extract_runtime_model_snapshot",
-                "_state_data_from_composer_state",
-            }
-        ),
-        "web/sessions/service.py": frozenset({"_patch_llm_transform_prompt", "_unwrap_envelope"}),
+        "web/sessions/service.py": frozenset({"SessionServiceImpl._unwrap_envelope"}),
         "web/sessions/telemetry.py": frozenset({"observed_value"}),
     }
 
@@ -553,14 +636,82 @@ class TierModelVisitor(ast.NodeVisitor):
         self.function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self.path_stack: list[str] = []
         self.node_stack: list[ast.AST] = []
+        # Definition nodes stay on ``node_stack`` while their decorators,
+        # defaults, annotations, bases, and type parameters are evaluated.
+        # Those expressions execute in the enclosing scope, so scope binding
+        # must temporarily ignore the not-yet-entered definition node.
+        self._definition_header_stack: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda] = []
         self._decorator_lines: set[int] = set()  # Track lines that are decorators
-        self._import_aliases: dict[str, str] = {}
+        self._import_alias_stack: list[tuple[str, dict[str, str]]] = [("module", {})]
+        self._import_alias_mutation_stack: list[tuple[dict[str, str], set[str]]] = []
         # Stack of (metadata, derived-name state) pairs — one entry per nested
         # function. ``None`` means the function has no ``@trust_boundary``
         # decorator. We push on entry to every function so popping is symmetric
         # and we can look at "the innermost enclosing decorated function" via
         # a reverse walk of the stack.
         self._boundary_stack: list[tuple[BoundaryMetadata, DerivedNameState] | None] = []
+
+    @property
+    def _import_aliases(self) -> dict[str, str]:
+        """Aliases visible in the current Python lexical scope."""
+        return self._import_alias_stack[-1][1]
+
+    def _push_import_scope(self, kind: str, *, local_bindings: Iterable[str] = ()) -> None:
+        """Enter a function/class alias scope without leaking mutations outward.
+
+        Class namespaces are not closure scopes for nested functions or
+        classes. Start each new lexical body from the nearest non-class frame;
+        the enclosing class aliases remain visible while its decorators are
+        parsed, before this method is called. Function locals are determined
+        for the whole body at compile time, so names bound anywhere in that
+        function must hide inherited imports even before the binding statement
+        is visited.
+        """
+        for frame_kind, aliases in reversed(self._import_alias_stack):
+            if frame_kind != "class":
+                scoped_aliases = dict(aliases)
+                for name in local_bindings:
+                    scoped_aliases.pop(name, None)
+                self._import_alias_stack.append((kind, scoped_aliases))
+                return
+        raise AssertionError("module import-alias scope is always present")
+
+    def _pop_import_scope(self) -> None:
+        if len(self._import_alias_stack) == 1:
+            raise AssertionError("cannot pop module import-alias scope")
+        self._import_alias_stack.pop()
+
+    def _invalidate_import_aliases(self, names: Iterable[str]) -> None:
+        """Forget imported meanings replaced by ordinary Python bindings."""
+        bound_names = set(names)
+        self._record_import_alias_mutations(bound_names)
+        for name in bound_names:
+            self._import_aliases.pop(name, None)
+
+    def _record_import_alias_mutations(self, names: Iterable[str]) -> None:
+        """Record bindings against active match cases in this exact frame."""
+        bound_names = set(names)
+        current_aliases = self._import_aliases
+        for case_aliases, mutations in self._import_alias_mutation_stack:
+            if case_aliases is current_aliases:
+                mutations.update(bound_names)
+
+    def _apply_import_alias_effect(self, node: ast.Import | ast.ImportFrom) -> None:
+        effect = import_alias_effect(node)
+        if effect.clears_all:
+            self._record_import_alias_mutations(self._import_aliases)
+            self._import_aliases.clear()
+        self._invalidate_import_aliases(effect.invalidated)
+        for bound_name, target in effect.proven:
+            self._record_import_alias_mutations((bound_name,))
+            self._import_aliases[bound_name] = target
+
+    def _restore_import_aliases(self, snapshot: Mapping[str, str]) -> None:
+        self._import_aliases.clear()
+        self._import_aliases.update(snapshot)
+
+    def _join_import_alias_paths(self, paths: Sequence[Mapping[str, str]]) -> None:
+        self._restore_import_aliases(identical_alias_join(paths))
 
     def visit(self, node: ast.AST) -> Any:
         """Visit a node while retaining ancestor context for receiver-shape checks."""
@@ -585,7 +736,9 @@ class TierModelVisitor(ast.NodeVisitor):
         enclosing def/class the module root (``node_stack[0]``) is the
         fallback target.
         """
-        ancestors = list(reversed(self.node_stack))
+        ancestors = [
+            node for node in reversed(self.node_stack) if not any(node is definition for definition in self._definition_header_stack)
+        ]
         scope = enclosing_scope_node(ancestors)
         if scope is not None:
             return compute_scope_fingerprint(scope)
@@ -608,7 +761,9 @@ class TierModelVisitor(ast.NodeVisitor):
         for them: any module-body edit (e.g. adding an import) changes the
         module's scope_fingerprint, so the scope-fingerprint-equality check fails.
         """
-        scope = enclosing_scope_node(list(reversed(self.node_stack)))
+        scope = enclosing_scope_node(
+            [node for node in reversed(self.node_stack) if not any(node is definition for definition in self._definition_header_stack)]
+        )
         if scope is None:
             return 0
         for index, node in enumerate(self.node_stack):
@@ -792,40 +947,41 @@ class TierModelVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         """Track import aliases used by receiver-type heuristics."""
-        for alias in node.names:
-            root_name = alias.name.split(".", 1)[0]
-            self._import_aliases[alias.asname or root_name] = alias.name
+        self._apply_import_alias_effect(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         """Track from-import aliases used by receiver-type heuristics."""
-        if node.module is None:
-            return
-        for alias in node.names:
-            if alias.name == "*":
-                continue
-            self._import_aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        self._apply_import_alias_effect(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Track class context."""
+        self._visit_definition_header(node)
         outer_state = self._current_derived_state()
-        if outer_state is not None:
-            outer_state.assign_target_names((node.name,), is_derived=False)
         self.symbol_stack.append(node.name)
         self.class_stack.append(node)
         self._boundary_stack.append(None)
+        self._push_import_scope("class")
         try:
-            self.generic_visit(node)
+            for index, statement in enumerate(node.body):
+                self._visit_ast_list_item("body", index, statement)
         finally:
+            self._pop_import_scope()
             self._boundary_stack.pop()
             self.class_stack.pop()
             self.symbol_stack.pop()
+        if outer_state is not None:
+            outer_state.assign_target_names((node.name,), is_derived=False)
+        self._invalidate_import_aliases((node.name,))
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         """Visit lambda bodies without inheriting enclosing boundary suppression."""
+        self._visit_definition_header(node)
         self._boundary_stack.append(None)
+        self._push_import_scope("function", local_bindings=argument_names(node.args))
         try:
-            self.generic_visit(node)
+            self._visit_ast_child("body", node.body)
         finally:
+            self._pop_import_scope()
             self._boundary_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -833,36 +989,74 @@ class TierModelVisitor(ast.NodeVisitor):
         # Collect decorator lines — .get() calls here are not dict access
         for decorator in node.decorator_list:
             self._decorator_lines.add(decorator.lineno)
+        self._visit_definition_header(node)
         outer_state = self._current_derived_state()
-        if outer_state is not None:
-            outer_state.assign_target_names((node.name,), is_derived=False)
         self.symbol_stack.append(node.name)
         self.function_stack.append(node)
         self._enter_boundary_context(node)
+        self._push_import_scope("function", local_bindings=function_local_binding_names(node))
         try:
-            self.generic_visit(node)
+            for index, statement in enumerate(node.body):
+                self._visit_ast_list_item("body", index, statement)
         finally:
+            self._pop_import_scope()
             self._boundary_stack.pop()
             self.function_stack.pop()
             self.symbol_stack.pop()
+        if outer_state is not None:
+            outer_state.assign_target_names((node.name,), is_derived=False)
+        self._invalidate_import_aliases((node.name,))
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Track async function context."""
         # Collect decorator lines — .get() calls here are not dict access
         for decorator in node.decorator_list:
             self._decorator_lines.add(decorator.lineno)
+        self._visit_definition_header(node)
         outer_state = self._current_derived_state()
-        if outer_state is not None:
-            outer_state.assign_target_names((node.name,), is_derived=False)
         self.symbol_stack.append(node.name)
         self.function_stack.append(node)
         self._enter_boundary_context(node)
+        self._push_import_scope("function", local_bindings=function_local_binding_names(node))
         try:
-            self.generic_visit(node)
+            for index, statement in enumerate(node.body):
+                self._visit_ast_list_item("body", index, statement)
         finally:
+            self._pop_import_scope()
             self._boundary_stack.pop()
             self.function_stack.pop()
             self.symbol_stack.pop()
+        if outer_state is not None:
+            outer_state.assign_target_names((node.name,), is_derived=False)
+        self._invalidate_import_aliases((node.name,))
+
+    def _visit_definition_header(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda,
+    ) -> None:
+        """Visit definition-time expressions in their enclosing scope."""
+        self._definition_header_stack.append(node)
+        try:
+            if isinstance(node, ast.ClassDef):
+                for index, decorator in enumerate(node.decorator_list):
+                    self._visit_ast_list_item("decorator_list", index, decorator)
+                for index, base in enumerate(node.bases):
+                    self._visit_ast_list_item("bases", index, base)
+                for index, keyword in enumerate(node.keywords):
+                    self._visit_ast_list_item("keywords", index, keyword)
+            else:
+                if not isinstance(node, ast.Lambda):
+                    for index, decorator in enumerate(node.decorator_list):
+                        self._visit_ast_list_item("decorator_list", index, decorator)
+                self._visit_ast_child("args", node.args)
+                if not isinstance(node, ast.Lambda):
+                    self._visit_ast_child("returns", node.returns)
+            type_params = () if isinstance(node, ast.Lambda) else node.type_params
+            for index, type_param in enumerate(type_params):
+                self._visit_ast_list_item("type_params", index, type_param)
+        finally:
+            popped = self._definition_header_stack.pop()
+            assert popped is node
 
     def _enter_boundary_context(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         """Parse ``@trust_boundary`` (if present) and push the suppression context.
@@ -968,14 +1162,88 @@ class TierModelVisitor(ast.NodeVisitor):
                     return True
         return False
 
+    _ERROR_ENTRY_KEYWORD = "error_code"
+    _VALIDATOR_ACCUMULATOR_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {"errors", "warnings", "diagnostics", "entries", "failures", "issues", "problems"}
+    )
+    _RECORD_BUILTIN_CALLS: ClassVar[frozenset[str]] = frozenset({"str", "repr", "format", "dict", "list", "tuple"})
+
+    @classmethod
+    def _is_error_entry_call(cls, node: ast.AST) -> bool:
+        """True for a constructor call carrying an ``error_code=`` keyword."""
+        return isinstance(node, ast.Call) and any(keyword.arg == cls._ERROR_ENTRY_KEYWORD for keyword in node.keywords)
+
+    @classmethod
+    def _is_constructed_record(cls, node: ast.AST | None) -> bool:
+        """True for a direct non-builtin call that builds a record."""
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in cls._RECORD_BUILTIN_CALLS
+
+    @classmethod
+    def _is_explicit_error_record(cls, node: ast.AST | None) -> bool:
+        """True when syntax proves an explicit record rather than a scalar."""
+        return node is not None and (cls._is_error_entry_call(node) or cls._is_constructed_record(node))
+
+    @classmethod
+    def _is_validator_accumulator(cls, receiver: ast.expr) -> bool:
+        """``errors`` / ``self._diagnostics`` — a validator's result accumulator by name."""
+        if isinstance(receiver, ast.Name):
+            name = receiver.id
+        elif isinstance(receiver, ast.Attribute):
+            name = receiver.attr
+        else:
+            return False
+        return name.lstrip("_") in cls._VALIDATOR_ACCUMULATOR_NAMES
+
+    def _records_error_entry_in_accumulator(self, nodes: list[ast.AST]) -> bool:
+        """True when a handler records a constructed error entry (elspeth-8d46db34ff D4).
+
+        ``errors.append(_err(component, str(exc), "high", code))`` and
+        ``diagnostics.append(_blocking_diagnostic(code=..., ...))`` report the
+        failure into the enclosing validator's result the same way a
+        ``TransformResult.error`` routed to completion does. Two closed
+        vocabularies bound it: the receiver must be a validator accumulator by
+        name, and the recorded value must be an explicit record (directly or
+        via a local bound in the handler) — ``errors.append(str(exc))`` and
+        ``seen.append(_normalise(exc))`` are still swallows. A call carrying an
+        ``error_code=`` keyword is accepted on any receiver.
+        """
+        record_names: set[str] = set()
+        for child in nodes:
+            if isinstance(child, ast.Assign) and self._is_explicit_error_record(child.value):
+                record_names.update(target.id for target in child.targets if isinstance(target, ast.Name))
+            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name) and self._is_explicit_error_record(child.value):
+                record_names.add(child.target.id)
+        for child in nodes:
+            if not (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in {"append", "add"}):
+                continue
+            if not child.args:
+                continue
+            recorded = child.args[0]
+            if self._is_error_entry_call(recorded):
+                return True
+            if not self._is_validator_accumulator(child.func.value):
+                continue
+            if self._is_explicit_error_record(recorded):
+                return True
+            if isinstance(recorded, ast.Name) and recorded.id in record_names:
+                return True
+        return False
+
     def _handler_is_silent(self, node: ast.ExceptHandler) -> bool:
-        """Return True if the except handler swallows errors without re-raise or explicit return."""
+        """Return True if the handler swallows errors without an explicit outcome."""
         own_scope_nodes = [child for statement in node.body for child in iter_own_scope(statement)]
         has_raise = any(isinstance(child, ast.Raise) for child in own_scope_nodes)
         if has_raise:
             return False
 
         if self._routes_transform_error_to_completion(own_scope_nodes):
+            return False
+
+        if self._records_error_entry_in_accumulator(own_scope_nodes):
+            return False
+
+        yields = [child for child in own_scope_nodes if isinstance(child, (ast.Yield, ast.YieldFrom))]
+        if any(not self._is_default_return_value(item.value) for item in yields):
             return False
 
         returns: list[ast.Return] = [child for child in own_scope_nodes if isinstance(child, ast.Return)]
@@ -1066,7 +1334,9 @@ class TierModelVisitor(ast.NodeVisitor):
     def _receiver_assigned_known_type_before(self, scope: ast.AST, receiver: ast.expr, lineno: int) -> bool:
         known: bool | None = None
         for child in self._walk_scope_nodes(scope):
-            if getattr(child, "lineno", lineno) >= lineno:
+            if not isinstance(child, (ast.Assign, ast.AnnAssign, ast.With, ast.AsyncWith)):
+                continue
+            if child.lineno >= lineno:
                 continue
             if isinstance(child, ast.Assign):
                 value_is_known = isinstance(child.value, ast.Call) and self._call_constructs_known_non_dict_get_receiver(child.value)
@@ -1148,9 +1418,30 @@ class TierModelVisitor(ast.NodeVisitor):
         if current_function is None or current_function.name != "__post_init__":
             return set()
         aliases: set[str] = set()
-        for stmt in current_function.body:
+
+        def is_self_field_or_alias(value: ast.expr | None) -> bool:
+            if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id == "self":
+                return True
+            return isinstance(value, ast.Name) and value.id in aliases
+
+        def is_private_validator_over_self_field(value: ast.expr | None) -> bool:
+            # elspeth-8d46db34ff D2(b): ``_freeze(self.row, "row")`` returns the
+            # field's own (normalised) value. Only module-private callees are
+            # trusted for this — a public helper may return anything.
+            return (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id.startswith("_")
+                and any(is_self_field_or_alias(arg) for arg in value.args)
+            )
+
+        statements = sorted(
+            (child for stmt in current_function.body for child in iter_own_scope(stmt) if isinstance(child, ast.stmt)),
+            key=lambda child: child.lineno,
+        )
+        for stmt in statements:
             if stmt.lineno >= lineno:
-                continue
+                break
             target: ast.expr | None = None
             value: ast.expr | None = None
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -1159,14 +1450,15 @@ class TierModelVisitor(ast.NodeVisitor):
             elif isinstance(stmt, ast.AnnAssign):
                 target = stmt.target
                 value = stmt.value
-            if not (
-                isinstance(target, ast.Name)
-                and isinstance(value, ast.Attribute)
-                and isinstance(value.value, ast.Name)
-                and value.value.id == "self"
-            ):
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                # elspeth-8d46db34ff D2(a): ``for part in self.content`` — the
+                # loop variable IS an element of the field.
+                target = stmt.target
+                value = stmt.iter
+            if not isinstance(target, ast.Name):
                 continue
-            aliases.add(target.id)
+            if is_self_field_or_alias(value) or is_private_validator_over_self_field(value):
+                aliases.add(target.id)
         return aliases
 
     def _is_self_field_isinstance(self, node: ast.Call) -> bool:
@@ -1209,10 +1501,91 @@ class TierModelVisitor(ast.NodeVisitor):
         current_function = self._current_function()
         if current_function is None:
             return False
-        return current_function.name in self._R5_NAMED_BOUNDARY_CONTEXTS.get(self.file_path, frozenset())
+        return ".".join(self.symbol_stack) in self._R5_NAMED_BOUNDARY_CONTEXTS.get(self.file_path, frozenset())
+
+    def _containing_direct_assert_test(self, node: ast.Call) -> ast.Assert | None:
+        """Return the assert whose direct test conjunct contains ``node``."""
+        child: ast.AST = node
+        depth = 1
+        while True:
+            parent = self._ancestor_node(depth)
+            if isinstance(parent, ast.Assert):
+                return parent if parent.test is child else None
+            if not isinstance(parent, ast.BoolOp) or not isinstance(parent.op, ast.And):
+                return None
+            if not parent.values or parent.values[0] is not child:
+                return None
+            child = parent
+            depth += 1
+
+    @staticmethod
+    def _is_matching_isinstance_call(candidate: ast.AST, node: ast.Call) -> bool:
+        """Match calls whose subject and type are stable name lookups."""
+        return (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Name)
+            and candidate.func.id == "isinstance"
+            and len(candidate.args) == 2
+            and not candidate.keywords
+            and len(node.args) == 2
+            and not node.keywords
+            and isinstance(candidate.args[0], ast.Name)
+            and isinstance(candidate.args[1], ast.Name)
+            and isinstance(node.args[0], ast.Name)
+            and isinstance(node.args[1], ast.Name)
+            and candidate.args[0].id == node.args[0].id
+            and candidate.args[1].id == node.args[1].id
+        )
+
+    def _guard_rejects_isinstance_mismatch(self, test: ast.AST, node: ast.Call) -> bool:
+        """Return True when ``test`` identifies the inverse of ``node``."""
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return self._is_matching_isinstance_call(test.operand, node)
+        return False
+
+    @staticmethod
+    def _statement_sequence_terminates(statements: Sequence[ast.stmt]) -> bool:
+        """Return True for a suite with an unconditional surviving exit."""
+        if not statements:
+            return False
+        final = statements[-1]
+        if isinstance(final, (ast.Raise, ast.Return, ast.Break, ast.Continue)):
+            return True
+        if isinstance(final, ast.If):
+            return TierModelVisitor._statement_sequence_terminates(final.body) and TierModelVisitor._statement_sequence_terminates(
+                final.orelse
+            )
+        return False
+
+    def _is_matching_runtime_guard(self, statement: ast.stmt, node: ast.Call) -> bool:
+        """Return True for ``if not isinstance(...): <surviving exit>``."""
+        return (
+            isinstance(statement, ast.If)
+            and not statement.orelse
+            and self._guard_rejects_isinstance_mismatch(statement.test, node)
+            and self._statement_sequence_terminates(statement.body)
+        )
+
+    def _is_runtime_guarded_assert_test_isinstance(self, node: ast.Call) -> bool:
+        """Return True when the immediately preceding statement is a stable guard."""
+        assertion = self._containing_direct_assert_test(node)
+        if assertion is None:
+            return False
+
+        assertion_index = self.node_stack.index(assertion)
+        container = self.node_stack[assertion_index - 1]
+        for _field_name, value in ast.iter_fields(container):
+            if not isinstance(value, list):
+                continue
+            for index, item in enumerate(value):
+                if item is assertion:
+                    return index > 0 and isinstance(value[index - 1], ast.stmt) and self._is_matching_runtime_guard(value[index - 1], node)
+        return False
 
     def _is_allowed_r5_context(self, node: ast.Call) -> bool:
         """Return True for R5a/R5b contexts where isinstance is the desired guard."""
+        if any(isinstance(ancestor, ast.Assert) for ancestor in self.node_stack[:-1]):
+            return self._is_runtime_guarded_assert_test_isinstance(node)
         return (
             self._is_tier1_frozen_dataclass_post_init_guard(node)
             or self._is_pydantic_before_validator()
@@ -1279,6 +1652,24 @@ class TierModelVisitor(ast.NodeVisitor):
         state = self._current_derived_state()
         return frozenset() if state is None else state.snapshot()
 
+    def _visit_tracked_statement_sequence(
+        self,
+        field_name: str,
+        statements: Sequence[ast.stmt],
+        snapshot: frozenset[str],
+    ) -> tuple[frozenset[str], dict[str, str], set[str]]:
+        """Visit one flow path and capture mutations in its lexical frame."""
+        aliases = self._import_aliases
+        mutations: set[str] = set()
+        self._import_alias_mutation_stack.append((aliases, mutations))
+        try:
+            state_end = self._visit_statement_sequence_from_snapshot(field_name, statements, snapshot)
+        finally:
+            popped_aliases, popped_mutations = self._import_alias_mutation_stack.pop()
+            if popped_aliases is not aliases or popped_mutations is not mutations:
+                raise AssertionError("flow alias mutation stack is unbalanced")
+        return state_end, dict(aliases), mutations
+
     @staticmethod
     def _intersect_snapshots(snapshots: Sequence[frozenset[str]]) -> frozenset[str]:
         if not snapshots:
@@ -1288,15 +1679,25 @@ class TierModelVisitor(ast.NodeVisitor):
             joined.intersection_update(snapshot)
         return frozenset(joined)
 
+    def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
+        """A PEP 695 type alias binds its name in the containing scope."""
+        self.generic_visit(node)
+        self._invalidate_import_aliases(assignment_target_names(node.name))
+
     def visit_Assign(self, node: ast.Assign) -> None:
         state = self._current_derived_state()
         snapshot = frozenset() if state is None else state.snapshot()
+        assigned_import = self._qualified_import_name(node.value)
 
         self._visit_ast_child("value", node.value)
         for index, target in enumerate(node.targets):
             self._visit_ast_list_item("targets", index, target)
 
         self._assign_targets_from_value(node.targets, node.value, snapshot)
+        for target in node.targets:
+            self._invalidate_import_aliases(assignment_target_names(target))
+            if isinstance(target, ast.Name) and assigned_import == "inspect.getattr_static":
+                self._import_aliases[target.id] = assigned_import
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         state = self._current_derived_state()
@@ -1309,6 +1710,7 @@ class TierModelVisitor(ast.NodeVisitor):
 
         if node.value is not None:
             self._assign_targets_from_value((node.target,), node.value, snapshot)
+            self._invalidate_import_aliases(assignment_target_names(node.target))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         state = self._current_derived_state()
@@ -1320,6 +1722,7 @@ class TierModelVisitor(ast.NodeVisitor):
 
         if state is not None:
             state.assign_target(node.target, is_derived=is_derived)
+        self._invalidate_import_aliases(assignment_target_names(node.target))
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         state = self._current_derived_state()
@@ -1331,44 +1734,151 @@ class TierModelVisitor(ast.NodeVisitor):
 
         if state is not None:
             state.assign_target(node.target, is_derived=is_derived)
+        self._invalidate_import_aliases(assignment_target_names(node.target))
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        """A deleted name no longer carries its previous imported meaning."""
+        for index, target in enumerate(node.targets):
+            self._visit_ast_list_item("targets", index, target)
+            self._invalidate_import_aliases(assignment_target_names(target))
+
+    @staticmethod
+    def _loop_normal_exit_aliases(
+        entry_aliases: Mapping[str, str],
+        body: Sequence[ast.stmt],
+        *,
+        target: ast.expr | None = None,
+    ) -> tuple[dict[str, str], list[dict[str, str]]]:
+        flow_entry = dict(entry_aliases)
+        if target is not None:
+            for name in assignment_target_names(target):
+                flow_entry.pop(name, None)
+        flow_paths = evaluate_alias_flow(body, flow_entry)
+        normal_paths = [path.aliases for path in flow_paths if path.transfer in {None, "continue"}]
+        break_paths = [dict(path.aliases) for path in flow_paths if path.transfer == "break"]
+        return identical_alias_join((entry_aliases, *normal_paths)), break_paths
+
+    def _finish_loop_alias_flow(
+        self,
+        *,
+        normal_exit: Mapping[str, str],
+        break_paths: Sequence[Mapping[str, str]],
+        orelse: Sequence[ast.stmt],
+    ) -> None:
+        orelse_paths = evaluate_alias_flow(orelse, normal_exit)
+        post_loop_paths = [path.aliases for path in orelse_paths if path.transfer is None]
+        self._join_import_alias_paths((*post_loop_paths, *break_paths))
+
+    def visit_Match(self, node: ast.Match) -> None:
+        """Isolate mutually exclusive cases and conservatively join aliases."""
+        self._visit_ast_child("subject", node.subject)
+        aliases = self._import_aliases
+        pre_match_aliases = dict(aliases)
+        match_mutations: set[str] = set()
+        for index, case in enumerate(node.cases):
+            aliases.clear()
+            aliases.update(pre_match_aliases)
+            case_mutations: set[str] = set()
+            self._import_alias_mutation_stack.append((aliases, case_mutations))
+            try:
+                self._visit_ast_list_item("cases", index, case)
+            finally:
+                popped_aliases, popped_mutations = self._import_alias_mutation_stack.pop()
+                if popped_aliases is not aliases or popped_mutations is not case_mutations:
+                    raise AssertionError("match-case alias mutation stack is unbalanced")
+            match_mutations.update(case_mutations)
+
+        # A case body can rebind an alias only on that mutually exclusive path,
+        # while no case may match at all. Retain exactly the pre-match aliases
+        # that no case captured or rebound; never promote a case-local import
+        # into unconditional post-match trust.
+        aliases.clear()
+        aliases.update({name: target for name, target in pre_match_aliases.items() if name not in match_mutations})
+
+    def visit_match_case(self, node: ast.match_case) -> None:
+        """Invalidate captures before visiting the guard and selected body."""
+        self._visit_ast_child("pattern", node.pattern)
+        self._invalidate_import_aliases(match_pattern_binding_names(node.pattern))
+        if node.guard is not None:
+            self._visit_ast_child("guard", node.guard)
+        for index, statement in enumerate(node.body):
+            self._visit_ast_list_item("body", index, statement)
 
     def visit_If(self, node: ast.If) -> None:
         state = self._current_derived_state()
-        if state is None:
-            self.generic_visit(node)
-            return
-
         self._visit_ast_child("test", node.test)
-        branch_start = state.snapshot()
+        branch_start = frozenset() if state is None else state.snapshot()
+        alias_start = dict(self._import_aliases)
+
+        self._restore_import_aliases(alias_start)
         body_end = self._visit_statement_sequence_from_snapshot("body", node.body, branch_start)
-        orelse_end = self._visit_statement_sequence_from_snapshot("orelse", node.orelse, branch_start) if node.orelse else branch_start
-        self._set_current_derived_names(self._intersect_snapshots((body_end, orelse_end)))
+        body_aliases = dict(self._import_aliases)
+
+        self._restore_import_aliases(alias_start)
+        if node.orelse:
+            orelse_end = self._visit_statement_sequence_from_snapshot("orelse", node.orelse, branch_start)
+            orelse_aliases = dict(self._import_aliases)
+        else:
+            orelse_end = branch_start
+            orelse_aliases = alias_start
+
+        self._join_import_alias_paths((body_aliases, orelse_aliases))
+        if state is not None:
+            # elspeth-8d46db34ff D6: a branch that cannot fall through takes no
+            # part in the join (same rule as the ``try`` join) — ``else: return``
+            # must not erase names bound on the surviving branches.
+            surviving: list[frozenset[str]] = []
+            if not self._statement_sequence_terminates(node.body):
+                surviving.append(body_end)
+            if not node.orelse or not self._statement_sequence_terminates(node.orelse):
+                surviving.append(orelse_end)
+            self._set_current_derived_names(self._intersect_snapshots(tuple(surviving)))
 
     def _visit_try_like(self, node: ast.Try | ast.TryStar) -> None:
         state = self._current_derived_state()
-        if state is None or not node.handlers:
-            self.generic_visit(node)
-            return
+        branch_start = frozenset() if state is None else state.snapshot()
+        alias_start = dict(self._import_aliases)
+        finally_entry_aliases = evaluate_finally_entry_aliases(node, alias_start) if node.finalbody else None
 
-        branch_start = state.snapshot()
-        body_end = self._visit_statement_sequence_from_snapshot("body", node.body, branch_start)
+        self._restore_import_aliases(alias_start)
+        body_end, body_aliases, body_mutations = self._visit_tracked_statement_sequence("body", node.body, branch_start)
         if node.orelse:
+            self._restore_import_aliases(body_aliases)
             body_end = self._visit_statement_sequence_from_snapshot("orelse", node.orelse, body_end)
-        branch_ends = [body_end]
+            body_aliases = dict(self._import_aliases)
+        # elspeth-8d46db34ff D1: only paths that can reach the statement after
+        # the ``try`` take part in the derived-name join. A handler (or body)
+        # ending in an unconditional raise/return/break/continue contributes
+        # nothing, so a name bound only in the body survives when every handler
+        # re-raises.
+        body_falls_through = not self._statement_sequence_terminates(node.orelse or node.body)
+        branch_ends = [body_end] if body_falls_through else []
+        alias_ends = [body_aliases]
 
+        handler_start_aliases = {name: target for name, target in alias_start.items() if name not in body_mutations}
         for index, handler in enumerate(node.handlers):
+            self._restore_import_aliases(handler_start_aliases)
             self.path_stack.append(f"handlers[{index}]")
             self.node_stack.append(handler)
             try:
                 self._check_exception_handler(handler)
                 if handler.type is not None:
                     self._visit_ast_child("type", handler.type)
-                branch_ends.append(self._visit_statement_sequence_from_snapshot("body", handler.body, branch_start))
+                if handler.name is not None:
+                    self._invalidate_import_aliases((handler.name,))
+                handler_end = self._visit_statement_sequence_from_snapshot("body", handler.body, branch_start)
+                if not self._statement_sequence_terminates(handler.body):
+                    branch_ends.append(handler_end)
+                alias_ends.append(dict(self._import_aliases))
             finally:
                 self.node_stack.pop()
                 self.path_stack.pop()
 
-        self._set_current_derived_names(self._intersect_snapshots(tuple(branch_ends)))
+        self._join_import_alias_paths(tuple(alias_ends))
+        if state is not None:
+            self._set_current_derived_names(self._intersect_snapshots(tuple(branch_ends)))
+        if finally_entry_aliases is not None:
+            self._restore_import_aliases(finally_entry_aliases)
         for index, statement in enumerate(node.finalbody):
             self._visit_ast_list_item("finalbody", index, statement)
 
@@ -1380,32 +1890,56 @@ class TierModelVisitor(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While) -> None:
         state = self._current_derived_state()
-        if state is None:
-            self.generic_visit(node)
-            return
-
         self._visit_ast_child("test", node.test)
-        loop_entry = state.snapshot()
+        loop_entry = frozenset() if state is None else state.snapshot()
+        entry_aliases = dict(self._import_aliases)
+        normal_exit, break_paths = self._loop_normal_exit_aliases(entry_aliases, node.body)
+        self._restore_import_aliases(entry_aliases)
         body_end = self._visit_statement_sequence_from_snapshot("body", node.body, loop_entry)
+
         joined = self._intersect_snapshots((loop_entry, body_end))
+        self._restore_import_aliases(normal_exit)
         if node.orelse:
             orelse_end = self._visit_statement_sequence_from_snapshot("orelse", node.orelse, joined)
             joined = self._intersect_snapshots((joined, orelse_end))
+        self._finish_loop_alias_flow(
+            normal_exit=normal_exit,
+            break_paths=break_paths,
+            orelse=node.orelse,
+        )
         self._set_current_derived_names(joined)
 
     def _visit_for_like(self, node: ast.For | ast.AsyncFor) -> None:
         state = self._current_derived_state()
         snapshot = frozenset() if state is None else state.snapshot()
-        target_is_derived = subject_is_rooted(node.iter, snapshot)
+        # A loop target is an assignment from the iterable, so it derives by
+        # the assignment rule (elspeth-8d46db34ff): ``for e in _require_sequence(payload)``
+        # binds ``e`` exactly as ``e = _require_sequence(payload)[0]`` would.
+        target_is_derived = self._value_depends_on_boundary(node.iter, snapshot)
 
         self._visit_ast_child("iter", node.iter)
+        entry_aliases = dict(self._import_aliases)
+        normal_exit, break_paths = self._loop_normal_exit_aliases(
+            entry_aliases,
+            node.body,
+            target=node.target,
+        )
+        self._restore_import_aliases(entry_aliases)
         if state is not None:
             state.assign_target(node.target, is_derived=target_is_derived)
         self._visit_ast_child("target", node.target)
+        self._invalidate_import_aliases(assignment_target_names(node.target))
         for index, statement in enumerate(node.body):
             self._visit_ast_list_item("body", index, statement)
+
+        self._restore_import_aliases(normal_exit)
         for index, statement in enumerate(node.orelse):
             self._visit_ast_list_item("orelse", index, statement)
+        self._finish_loop_alias_flow(
+            normal_exit=normal_exit,
+            break_paths=break_paths,
+            orelse=node.orelse,
+        )
 
     def visit_For(self, node: ast.For) -> None:
         self._visit_for_like(node)
@@ -1419,18 +1953,20 @@ class TierModelVisitor(ast.NodeVisitor):
             self.path_stack.append(f"items[{index}]")
             try:
                 snapshot = frozenset() if state is None else state.snapshot()
-                optional_vars_is_derived = subject_is_rooted(item.context_expr, snapshot)
+                optional_vars_is_derived = self._value_depends_on_boundary(item.context_expr, snapshot)
                 self._visit_ast_child("context_expr", item.context_expr)
                 if item.optional_vars is not None:
                     if state is not None:
                         state.assign_target(item.optional_vars, is_derived=optional_vars_is_derived)
                     self._visit_ast_child("optional_vars", item.optional_vars)
+                    self._invalidate_import_aliases(assignment_target_names(item.optional_vars))
             finally:
                 self.path_stack.pop()
         for index, statement in enumerate(node.body):
             self._visit_ast_list_item("body", index, statement)
 
-    def _restore_comprehension_targets(self, original_names: set[str], target_names: set[str]) -> None:
+    def _restore_comprehension_scope(self, original_names: set[str], target_names: set[str]) -> None:
+        self._pop_import_scope()
         state = self._current_derived_state()
         if state is None:
             return
@@ -1441,23 +1977,36 @@ class TierModelVisitor(ast.NodeVisitor):
                 state.names.discard(name)
 
     def _visit_comprehension_generators(self, generators: list[ast.comprehension]) -> tuple[set[str], set[str]]:
+        if not generators:
+            raise AssertionError("comprehensions always contain at least one generator")
         state = self._current_derived_state()
         original_names = set() if state is None else set(state.names)
         target_names: set[str] = set()
-        for index, generator in enumerate(generators):
-            self.path_stack.append(f"generators[{index}]")
-            try:
-                snapshot = frozenset() if state is None else state.snapshot()
-                target_is_derived = subject_is_rooted(generator.iter, snapshot)
-                self._visit_ast_child("iter", generator.iter)
-                if state is not None:
-                    state.assign_target(generator.target, is_derived=target_is_derived)
-                target_names.update(assignment_target_names(generator.target))
-                self._visit_ast_child("target", generator.target)
-                for if_index, if_node in enumerate(generator.ifs):
-                    self._visit_ast_list_item("ifs", if_index, if_node)
-            finally:
-                self.path_stack.pop()
+        alias_scope_pushed = False
+        try:
+            for index, generator in enumerate(generators):
+                self.path_stack.append(f"generators[{index}]")
+                try:
+                    snapshot = frozenset() if state is None else state.snapshot()
+                    target_is_derived = self._value_depends_on_boundary(generator.iter, snapshot)
+                    self._visit_ast_child("iter", generator.iter)
+                    if not alias_scope_pushed:
+                        self._push_import_scope("comprehension")
+                        alias_scope_pushed = True
+                    if state is not None:
+                        state.assign_target(generator.target, is_derived=target_is_derived)
+                    bound_names = assignment_target_names(generator.target)
+                    target_names.update(bound_names)
+                    self._visit_ast_child("target", generator.target)
+                    self._invalidate_import_aliases(bound_names)
+                    for if_index, if_node in enumerate(generator.ifs):
+                        self._visit_ast_list_item("ifs", if_index, if_node)
+                finally:
+                    self.path_stack.pop()
+        except BaseException:
+            if alias_scope_pushed:
+                self._pop_import_scope()
+            raise
         return original_names, target_names
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
@@ -1465,14 +2014,14 @@ class TierModelVisitor(ast.NodeVisitor):
         try:
             self._visit_ast_child("elt", node.elt)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
         original_names, target_names = self._visit_comprehension_generators(node.generators)
         try:
             self._visit_ast_child("elt", node.elt)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:
         original_names, target_names = self._visit_comprehension_generators(node.generators)
@@ -1480,17 +2029,17 @@ class TierModelVisitor(ast.NodeVisitor):
             self._visit_ast_child("key", node.key)
             self._visit_ast_child("value", node.value)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
         original_names, target_names = self._visit_comprehension_generators(node.generators)
         try:
             self._visit_ast_child("elt", node.elt)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Detect R1 (dict.get), R2 (getattr), R3 (hasattr), R5 (isinstance), R8/R9 defaults."""
+        """Detect R1, R2 attribute defaults, R3, R5, and R8/R9 mapping defaults."""
         # R1: dict.get() - Call(func=Attribute(attr="get"))
         if isinstance(node.func, ast.Attribute) and node.func.attr == "get" and not self._is_likely_non_dict_get(node):
             self._add_finding(
@@ -1519,13 +2068,18 @@ class TierModelVisitor(ast.NodeVisitor):
                 f"dict.pop() with default hides missing keys: {self._get_code_snippet(node.lineno)}",
             )
 
-        # R2: getattr() - Call(func=Name("getattr"))
-        # Only flag if there's a default argument (3 args)
-        if isinstance(node.func, ast.Name) and node.func.id == "getattr" and (len(node.args) >= 3 or node.keywords):
+        # R2: builtin getattr() or import-resolved inspect.getattr_static().
+        # Only flag calls that supply the fallback default.
+        lookup_name: str | None = None
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            lookup_name = "getattr"
+        elif self._qualified_import_name(node.func) == "inspect.getattr_static":
+            lookup_name = "inspect.getattr_static"
+        if lookup_name is not None and (len(node.args) >= 3 or any(keyword.arg == "default" for keyword in node.keywords)):
             self._add_finding(
                 "R2",
                 node,
-                f"getattr() with default hides AttributeError: {self._get_code_snippet(node.lineno)}",
+                f"{lookup_name}() with default hides AttributeError: {self._get_code_snippet(node.lineno)}",
             )
 
         # R3: hasattr() - Call(func=Name("hasattr"))
@@ -1596,23 +2150,14 @@ class TierModelVisitor(ast.NodeVisitor):
                     is_broad = True
                     break
 
-        if is_broad:
-            # Check if the handler re-raises
-            has_reraise = False
-            for statement in node.body:
-                for child in iter_own_scope(statement):
-                    if isinstance(child, ast.Raise):
-                        has_reraise = True
-                        break
-                if has_reraise:
-                    break
-
-            if not has_reraise:
-                self._add_finding(
-                    "R4",
-                    node,
-                    f"Broad exception caught without re-raise: {self._get_code_snippet(node.lineno)}",
-                )
+        if is_broad and self._handler_is_silent(node):
+            # R4 and R6 share one notion of "explicit outcome" (elspeth-8d46db34ff D3):
+            # a re-raise, a non-default return/yield, or a recorded error result.
+            self._add_finding(
+                "R4",
+                node,
+                f"Broad exception caught without re-raise: {self._get_code_snippet(node.lineno)}",
+            )
 
         # R6: specific exception swallowed without re-raise or explicit return
         if not is_broad and self._handler_is_silent(node):
@@ -1625,7 +2170,12 @@ class TierModelVisitor(ast.NodeVisitor):
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         """Detect R4/R6 exception handling findings."""
         self._check_exception_handler(node)
-        self.generic_visit(node)
+        if node.type is not None:
+            self._visit_ast_child("type", node.type)
+        if node.name is not None:
+            self._invalidate_import_aliases((node.name,))
+        for index, statement in enumerate(node.body):
+            self._visit_ast_list_item("body", index, statement)
 
     def generic_visit(self, node: ast.AST) -> None:
         """Visit a node, tracking AST path for stable fingerprints."""
@@ -1686,29 +2236,29 @@ def scan_directory(
     return findings
 
 
+def iter_scannable_python_files(
+    root: Path,
+    exclude_patterns: list[str] | None = None,
+) -> Iterator[Path]:
+    """Yield exactly the Python paths consumed by the directory scanners."""
+    if exclude_patterns is None:
+        exclude_patterns = []
+    for py_file in iter_python_files(root):
+        relative = py_file.relative_to(root)
+        if any(relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")) for pattern in exclude_patterns):
+            continue
+        yield py_file
+
+
 def scan_directory_with_observations(
     root: Path,
     exclude_patterns: list[str] | None = None,
 ) -> tuple[list[Finding], list[Finding]]:
     """Scan all Python files and return violations plus suppression observations."""
-    exclude_patterns = exclude_patterns or []
     findings: list[Finding] = []
     suppressed_findings: list[Finding] = []
 
-    for py_file in root.rglob("*.py"):
-        relative = py_file.relative_to(root)
-        # Skip vendored/third-party directories
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
-        # Check user-specified exclusions
-        skip = False
-        for pattern in exclude_patterns:
-            if relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")):
-                skip = True
-                break
-        if skip:
-            continue
-
+    for py_file in iter_scannable_python_files(root, exclude_patterns):
         file_findings, file_suppressed_findings = scan_file_with_observations(py_file, root)
         findings.extend(file_findings)
         suppressed_findings.extend(file_suppressed_findings)
@@ -1852,24 +2402,10 @@ def scan_layer_imports_directory(
     exclude_patterns: list[str] | None = None,
 ) -> tuple[list[Finding], list[Finding]]:
     """Scan all Python files for upward layer imports."""
-    exclude_patterns = exclude_patterns or []
     all_violations: list[Finding] = []
     all_tc_findings: list[Finding] = []
 
-    for py_file in root.rglob("*.py"):
-        relative = py_file.relative_to(root)
-        # Skip vendored/third-party directories
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
-        # Check user-specified exclusions
-        skip = False
-        for pattern in exclude_patterns:
-            if relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")):
-                skip = True
-                break
-        if skip:
-            continue
-
+    for py_file in iter_scannable_python_files(root, exclude_patterns):
         violations, tc_findings = scan_layer_imports_file(py_file, root)
         all_violations.extend(violations)
         all_tc_findings.extend(tc_findings)
@@ -2044,25 +2580,13 @@ def scan_dump_edges(
 
     Returns (nodes, edges, sccs).  All collections are sorted deterministically.
     """
-    exclude_patterns = exclude_patterns or []
-
     file_count: dict[str, int] = {}
     file_loc: dict[str, int] = {}
     node_layer: dict[str, int] = {}
     raw_edges: list[tuple[str, str, _ImportSite]] = []
 
-    for py_file in sorted(root.rglob("*.py")):
+    for py_file in iter_scannable_python_files(root, exclude_patterns):
         relative = py_file.relative_to(root)
-        if any(part in _ALWAYS_EXCLUDED_DIRS for part in relative.parts):
-            continue
-        skip = False
-        for pattern in exclude_patterns:
-            if relative.match(pattern) or str(relative).startswith(pattern.rstrip("*/")):
-                skip = True
-                break
-        if skip:
-            continue
-
         rel_str = str(relative)
         try:
             source = py_file.read_text(encoding="utf-8")
@@ -2424,10 +2948,6 @@ _ALLOWLIST_PATTERN_TAGS = frozenset(
     }
 )
 
-# Directories that are always excluded from scanning — vendored/third-party code
-# that happens to contain .py files but is not part of the ELSPETH codebase.
-_ALWAYS_EXCLUDED_DIRS = ("node_modules",)
-
 
 def _validate_allowlist_governance(allowlist: Allowlist) -> None:
     """Apply tier_model's domain-specific governance to a loaded ``Allowlist``.
@@ -2497,7 +3017,12 @@ def _match_per_file_rule(rules: list[PerFileRule], finding_key: FindingKey) -> P
     return None
 
 
-def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | PerFileRule | None:
+def _match_finding(
+    allowlist: Allowlist,
+    finding: Finding,
+    *,
+    binding_failure_is_no_match: bool = False,
+) -> AllowlistEntry | PerFileRule | None:
     """Match a tier_model ``Finding`` against ``allowlist``.
 
     Preserves tier_model's historical match order: per-file rules are checked
@@ -2507,6 +3032,10 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
     diagnostics) for findings covered by both an exact entry and a per-file
     rule. We keep the historical order to preserve the production
     ``contracts.yaml`` semantics across this consolidation.
+
+    Direct callers retain binding-verifier ``ValueError`` diagnostics. Collection
+    passes ``binding_failure_is_no_match=True`` so a stale signed binding remains
+    an ordinary unsuppressed finding while unrelated matcher errors still escape.
     """
     finding_key = _finding_key_for(finding)
     matched_rule = _match_per_file_rule(allowlist.per_file_rules, finding_key)
@@ -2523,12 +3052,17 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
             # persisted ast_path is the AST-level address the judge
             # actually inspected; it must equal the live finding's
             # ast_path. Mismatch ⇒ tampering or unannounced refactor.
-            verify_entry_binding_against_finding(
-                entry,
-                file_path=finding.file_path,
-                ast_path=finding.ast_path,
-                scope_fingerprint=finding.scope_fingerprint,
-            )
+            try:
+                verify_entry_binding_against_finding(
+                    entry,
+                    file_path=finding.file_path,
+                    ast_path=finding.ast_path,
+                    scope_fingerprint=finding.scope_fingerprint,
+                )
+            except ValueError:
+                if binding_failure_is_no_match:
+                    return None
+                raise
             entry.matched = True
             return entry
     # Exact key missed. A judge-gated v2 entry whose module-rooted ast_path
@@ -2550,6 +3084,11 @@ def _match_finding(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | P
         fallback.matched = True
         return fallback
     return None
+
+
+def _match_finding_for_collection(allowlist: Allowlist, finding: Finding) -> AllowlistEntry | PerFileRule | None:
+    """Fail closed on stale judge bindings while preserving direct diagnostics."""
+    return _match_finding(allowlist, finding, binding_failure_is_no_match=True)
 
 
 def _load_tier_model_allowlist(path: Path, *, source_root: Path | None = None) -> Allowlist:
@@ -2621,6 +3160,11 @@ def format_stale_entry_text(entry: AllowlistEntry) -> str:
     return base
 
 
+def format_stale_named_boundary_context_text(resolution: NamedBoundaryContextResolution) -> str:
+    """Format a stale ``_R5_NAMED_BOUNDARY_CONTEXTS`` entry for text output."""
+    return f"\n  Key: {resolution.key}\n  Status: {resolution.status}\n  Definitions: {resolution.definition_count}"
+
+
 def format_expired_entry_text(entry: AllowlistEntry) -> str:
     """Format an expired allowlist entry for text output."""
     return f"\n  Key: {entry.key}\n  Owner: {entry.owner}\n  Expired: {entry.expires}"
@@ -2636,6 +3180,7 @@ def report_json(
     layer_warnings: list[Finding] | None = None,
     exceeded_file_rules: list[PerFileRule] | None = None,
     budget_violations: list[AllowlistBudgetViolation] | None = None,
+    stale_named_boundary_contexts: list[NamedBoundaryContextResolution] | None = None,
 ) -> str:
     """Generate JSON report."""
     result: dict[str, Any] = {
@@ -2656,6 +3201,11 @@ def report_json(
         "stale_allowlist_entries": [{"key": e.key, "owner": e.owner, "reason": e.reason} for e in stale_entries],
         "expired_allowlist_entries": [{"key": e.key, "owner": e.owner, "expires": str(e.expires)} for e in expired_entries],
     }
+    if stale_named_boundary_contexts:
+        result["stale_named_boundary_contexts"] = [
+            {"key": resolution.key, "status": resolution.status, "definitions": resolution.definition_count}
+            for resolution in stale_named_boundary_contexts
+        ]
     if expired_file_rules:
         result["expired_file_rules"] = [
             {"pattern": r.pattern, "rules": r.rules, "reason": r.reason, "expires": str(r.expires)} for r in expired_file_rules
@@ -2741,12 +3291,12 @@ def collect_check_result(
 
     violations: list[Finding] = []
     for finding in all_findings:
-        if finding.rule_id in _BANNED_RULES or _match_finding(allowlist, finding) is None:
+        if finding.rule_id in _BANNED_RULES or _match_finding_for_collection(allowlist, finding) is None:
             violations.append(finding)
 
     layer_warnings: list[Finding] = []
     for tc_finding in all_tc_findings:
-        if _match_finding(allowlist, tc_finding) is None:
+        if _match_finding_for_collection(allowlist, tc_finding) is None:
             layer_warnings.append(tc_finding)
 
     if files:
@@ -2762,6 +3312,10 @@ def collect_check_result(
         unused_file_rules = allowlist.get_unused_rules() if allowlist.fail_on_stale else []
         exceeded_file_rules = allowlist.get_exceeded_rules()
 
+    stale_named_boundary_contexts: list[NamedBoundaryContextResolution] = []
+    if not files and _named_boundary_map_applies(resolved_root):
+        stale_named_boundary_contexts = [resolution for resolution in resolve_named_boundary_contexts(resolved_root) if resolution.is_stale]
+
     return CheckResult(
         allowlist_path=resolved_allowlist_path,
         violations=violations,
@@ -2773,6 +3327,7 @@ def collect_check_result(
         layer_warnings=layer_warnings,
         exceeded_file_rules=exceeded_file_rules,
         budget_violations=allowlist.get_budget_violations(),
+        stale_named_boundary_contexts=stale_named_boundary_contexts,
     )
 
 
@@ -2822,6 +3377,11 @@ def _legacy_finding_to_lint(finding: Finding) -> LintFinding:
         fingerprint=finding.fingerprint,
         severity=Severity.NOTE if finding.rule_id == "R_TB_SUPPRESSED" else RULE_METADATA.severity,
         suggestion=rule.get("remediation"),
+        symbol_context=finding.symbol_context,
+        ast_path=finding.ast_path,
+        scope_fingerprint=finding.scope_fingerprint,
+        file_fingerprint=finding.file_fingerprint,
+        scope_depth=finding.scope_depth,
     )
 
 
@@ -2834,6 +3394,15 @@ def _allowlist_diagnostics_to_lints(result: CheckResult) -> list[LintFinding]:
                 entry.source_file,
                 message=f"Stale tier-model allowlist entry: {entry.key}",
                 fingerprint_payload=f"stale:{entry.key}",
+            )
+        )
+    for resolution in result.stale_named_boundary_contexts:
+        findings.append(
+            _diagnostic_finding(
+                Path(__file__),
+                "",
+                message=f"Stale tier-model named-boundary map entry ({resolution.status}): {resolution.key}",
+                fingerprint_payload=f"stale-named-boundary:{resolution.key}",
             )
         )
     for entry in result.expired_entries:
@@ -3153,6 +3722,7 @@ def run_check(args: argparse.Namespace) -> int:
                 result.layer_warnings,
                 result.exceeded_file_rules,
                 result.budget_violations,
+                result.stale_named_boundary_contexts,
             )
         )
     else:
@@ -3190,6 +3760,14 @@ def run_check(args: argparse.Namespace) -> int:
             print("=" * 60)
             for e in result.stale_entries:
                 print(format_stale_entry_text(e))
+
+        if result.stale_named_boundary_contexts:
+            print(f"\n{'=' * 60}")
+            print(f"STALE NAMED-BOUNDARY MAP ENTRIES: {len(result.stale_named_boundary_contexts)}")
+            print("(_R5_NAMED_BOUNDARY_CONTEXTS entries that resolve to no single live definition - remove them)")
+            print("=" * 60)
+            for resolution in result.stale_named_boundary_contexts:
+                print(format_stale_named_boundary_context_text(resolution))
 
         if result.expired_entries:
             print(f"\n{'=' * 60}")

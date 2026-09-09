@@ -73,6 +73,7 @@ def _context(
                     "region_name": "us-east-1",
                 }
             },
+            "default_llm_profile": "llm-default",
         }
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)

@@ -35,6 +35,7 @@ from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from pydantic import SecretBytes
+from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
@@ -147,6 +148,7 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+        operator_metrics_bearer_token="operator-metrics-token-for-tests-0001",
     )
 
     app = create_app(settings)
@@ -172,10 +174,28 @@ def test_metrics_endpoint_returns_prometheus_format(tmp_path: Path) -> None:
     # AnyIO portal and, when used as a context manager, run lifespan startup;
     # neither is part of this route-level meter -> exposition contract.
     metrics_route = next(
-        route for route in app.routes if getattr(route, "path", None) == "/metrics" and "GET" in getattr(route, "methods", set())
+        route
+        for route in app.routes
+        if isinstance(route, Route) and route.path == "/metrics" and route.methods is not None and "GET" in route.methods
     )
-    assert isinstance(metrics_route, Route)
-    response = metrics_route.endpoint()
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/metrics",
+            "raw_path": b"/metrics",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer operator-metrics-token-for-tests-0001")],
+            "client": ("test", 123),
+            "server": ("test", 80),
+            "root_path": "",
+            "app": app,
+        }
+    )
+    response = metrics_route.endpoint(request)
     assert isinstance(response, Response)
 
     assert response.status_code == 200, (

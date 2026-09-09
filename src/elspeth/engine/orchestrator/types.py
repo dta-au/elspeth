@@ -105,6 +105,10 @@ class PipelineConfig:
     coalesce_settings: Sequence[CoalesceSettings] = field(default_factory=list)
     sink_effect_modes: Mapping[str, str] = field(default_factory=dict, repr=False)
     sink_effect_admission: object | None = field(default=None, repr=False, compare=False)
+    # Derived at graph build from the actual bound-region depth (+ margin);
+    # never a bare constant (barrier-scopes spec §6.3). leader_drain iterates
+    # the EOF barrier-flush fixpoint to exactly this bound.
+    escalation_fixpoint_bound: int = 1_000
 
     def __post_init__(self) -> None:
         from elspeth.contracts.errors import OrchestrationInvariantError

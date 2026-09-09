@@ -15,12 +15,19 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Set
-from typing import Any, cast
+from typing import Any, Final, cast
 from urllib.parse import parse_qs, urlparse
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
-_REDACTED = "<redacted-secret>"
+# Public so consumers that must NOT treat two scrubbed strings as the same
+# fact (failure-attribution correlation) can recognise the constant instead of
+# re-spelling it. Whole-string replacement means every secret-bearing message
+# collapses to this one value; equality of two scrubbed strings is therefore
+# not evidence they came from the same failure.
+REDACTED_SECRET_TEXT: Final[str] = "<redacted-secret>"
+_REDACTED = REDACTED_SECRET_TEXT
 
 # Heuristic patterns. Order matters — longer / more specific first.
 #
@@ -141,11 +148,26 @@ def scrub_text_for_audit(text: str) -> str:
     return cast(str, _scrub_value(text, parent_key=None))
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "an audit payload value being scrubbed before persistence — provider responses, exception "
+        "payloads, and other heterogeneous external content ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a redacted deep copy for recognized str/Mapping/list/tuple/Set shapes and passes every "
+        "other value through unchanged; a non-str mapping key cannot name a secret and is walked with no "
+        "parent-key match; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _scrub_value(value: Any, *, parent_key: str | None) -> Any:
     if parent_key is not None and _is_secret_key_name(parent_key):
         return _REDACTED
     if isinstance(value, Mapping):
-        return {k: _scrub_value(v, parent_key=k) for k, v in value.items()}
+        return {k: _scrub_value(v, parent_key=k if isinstance(k, str) else None) for k, v in value.items()}
     if isinstance(value, str):
         if _contains_sensitive_http_url(value):
             return _REDACTED

@@ -15,11 +15,70 @@ import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
+from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
-from elspeth.web.composer._compose_loop_carriers import _PersistOutcome, _ToolOutcome
-from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.tool_error_payloads import INVALID_TOOL_ARGUMENTS_REDACTION_STATUS
-from elspeth.web.sessions._persist_payload import RedactedToolRow
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedAssistantMessage,
+    _AdmittedToolCall,
+    _PersistOutcome,
+    _ToolOutcome,
+)
+from elspeth.web.composer.bounded_json import bounded_json_loads
+from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.tool_error_payloads import (
+    INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+    unknown_tool_arguments_redaction,
+)
+from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.sessions._persist_payload import RedactedToolRow, RejectionRecord
+
+
+def build_rejection_records(tool_outcomes: tuple[_ToolOutcome, ...]) -> tuple[RejectionRecord, ...]:
+    """Extract one durable rejection record per refused mutation
+    (elspeth-3e28029d2f).
+
+    The chat ``tool`` row persists REDACTED; this record carries the exact
+    payload the planner saw — the text and the reasoning — for the session
+    store (operator ruling 2026-09-02: session data, not Landscape data).
+
+    Three outcome shapes (see ``_ToolOutcome``): failure envelopes with
+    ``error_class`` set (argument errors, plugin crashes); ``ToolResult``
+    with ``success=False`` (validation rejections); everything else —
+    successes and advisor mapping envelopes — records nothing.
+    """
+    records: list[RejectionRecord] = []
+    for outcome in tool_outcomes:
+        tool_name = outcome.call.function.name
+        if outcome.error_class is not None:
+            records.append(
+                RejectionRecord(
+                    tool_call_id=outcome.call.id,
+                    tool_name=tool_name,
+                    error_code=outcome.error_class,
+                    message=outcome.error_message or "",
+                    planner_payload=json.dumps(
+                        {
+                            "error_class": outcome.error_class,
+                            "error_message": outcome.error_message,
+                        }
+                    ),
+                )
+            )
+        elif isinstance(outcome.response, ToolResult) and not outcome.response.success:
+            errors = outcome.response.validation.errors
+            primary = next((entry for entry in errors if entry.error_code), errors[0] if errors else None)
+            records.append(
+                RejectionRecord(
+                    tool_call_id=outcome.call.id,
+                    tool_name=tool_name,
+                    error_code=primary.error_code if primary is not None else None,
+                    message=primary.message if primary is not None else "",
+                    planner_payload=serialize_tool_result(outcome.response),
+                )
+            )
+    return tuple(records)
+
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
@@ -30,14 +89,17 @@ async def persist_turn_audit(
     *,
     tool_outcomes: tuple[_ToolOutcome, ...],
     decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
-    assistant_message: Any,
+    assistant_message: _AdmittedAssistantMessage,
     raw_assistant_content: str | None,
-    assistant_tool_calls: tuple[Any, ...],
-    plugin_crash: ComposerPluginCrashError | None,
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...],
+    crash_pending: bool,
     session_id: str | None,
+    session_operation_context: SessionOperationContext | None,
     current_state_id: str | None,
     persisted_tool_call_turn: bool,
     persisted_assistant_message_id: str | None,
+    persisted_assistant_content: str | None,
+    assistant_row_uses_current_dispatch: bool,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -56,11 +118,14 @@ async def persist_turn_audit(
        Unwind-audit invariants are checked after the persist returns;
        failures raise additional AuditIntegrityError(s).
 
-    Plugin-crash propagation (the post-persist re-raise of a
-    ``ComposerPluginCrashError`` captured in P3) is intentionally
-    *not* in this helper: the driver decides whether to raise based
-    on ``dispatch.plugin_crash is not None`` so the carrier never
-    carries a "post-crash" disposition.
+    Crash propagation is intentionally *not* in this helper. P3 supplies a
+    discriminated carrier (plugin crash or first-party advisor failure), and
+    the driver raises it only after this phase publishes the closed row.
+
+    ``assistant_row_uses_current_dispatch`` is the caller-owned P4
+    disposition for whether ``assistant_message`` still contains the current
+    dispatch's model prose. It is required because the caller performs the
+    advisor-repair substitution; row presence cannot recover that fact.
     """
     from pydantic import ValidationError as PydanticValidationError
 
@@ -69,14 +134,20 @@ async def persist_turn_audit(
         inline_custody_audit_projection,
         inline_custody_manifest_redaction_input,
     )
-    from elspeth.web.composer.redaction import MANIFEST, redact_tool_call_arguments
+    from elspeth.web.composer.redaction import (
+        MANIFEST,
+        redact_arg_error_response,
+        redact_failure_response,
+        redact_tool_call_arguments,
+    )
 
     phase3_self = cast(Any, service)
     redaction_telemetry = phase3_self._redaction_telemetry
     redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...] = ()
-    for tool_outcome in tool_outcomes:
+    for index, tool_outcome in enumerate(tool_outcomes):
         tc = tool_outcome.call
         decoded_args: dict[str, Any]
+        persisted_arguments: Mapping[str, Any]
         if tc.id in decoded_args_by_call_id:
             # deep_thaw restores plain dict/list types from any
             # MappingProxyType / tuple introduced by the carrier's
@@ -86,13 +157,43 @@ async def persist_turn_audit(
             # _DispatchOutcome carries frozen args.
             decoded_args = deep_thaw(decoded_args_by_call_id[tc.id])
         elif tool_outcome.error_class is not None:
-            decoded_args = {
-                "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                "error_class": tool_outcome.error_class,
-            }
+            try:
+                decoded_json = bounded_json_loads(
+                    tc.function.arguments,
+                    label="composer tool-call arguments",
+                )
+            except (TypeError, ValueError):
+                decoded_args = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": tool_outcome.error_class,
+                }
+            else:
+                decoded_args = (
+                    # bounded_json_loads forwards to json.loads with no
+                    # object_hook and no object_pairs_hook at this call site,
+                    # so a decoded object is always an exact dict, never a
+                    # subclass.
+                    {"_decoded_non_object": decoded_json}
+                    if type(decoded_json) is not dict
+                    else {
+                        "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                        "error_class": tool_outcome.error_class,
+                    }
+                )
         else:
             decoded_args = {"_raw_arguments": tc.function.arguments}
-        if tc.function.name in MANIFEST:
+        is_arg_error = tool_outcome.error_class is not None and not (crash_pending and index == len(tool_outcomes) - 1)
+        if is_arg_error:
+            arg_error_projection = redact_arg_error_response(
+                error_class=tool_outcome.error_class,
+                error_message=None,
+            )
+            persisted_arguments = {
+                "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                "error_class": arg_error_projection["error_class"],
+                "field_count": len(decoded_args),
+            }
+        elif tc.function.name in MANIFEST:
             try:
                 redaction_input = (
                     inline_custody_manifest_redaction_input(decoded_args) if tc.function.name == "set_pipeline" else decoded_args
@@ -110,16 +211,18 @@ async def persist_turn_audit(
             except PydanticValidationError:
                 if tool_outcome.error_class is None:
                     raise
+                failure_projection = redact_failure_response(
+                    status=ComposerToolStatus.PLUGIN_CRASH.value,
+                    error_class=tool_outcome.error_class,
+                    error_message=tool_outcome.error_message,
+                )
                 persisted_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                    "error_class": tool_outcome.error_class,
+                    "error_class": failure_projection["error_class"],
+                    "field_count": len(decoded_args),
                 }
         else:
-            # Unknown tool names are Tier-3 LLM hallucinations handled
-            # by execute_tool as a semantic failure ToolResult. The
-            # manifest is intentionally closed, so do not call the
-            # walker for names it cannot know about.
-            persisted_arguments = decoded_args
+            persisted_arguments = unknown_tool_arguments_redaction(telemetry=redaction_telemetry)
         redacted_assistant_tool_calls = (
             *redacted_assistant_tool_calls,
             {
@@ -134,19 +237,34 @@ async def persist_turn_audit(
     redacted_tool_rows = tuple(
         RedactedToolRow(
             tool_call_id=tool_outcome.call.id,
-            content=phase3_self._serialize_response_via_walker(tool_outcome, telemetry=redaction_telemetry),
+            content=phase3_self._serialize_response_via_walker(
+                tool_outcome,
+                telemetry=redaction_telemetry,
+                failure_status=(
+                    None
+                    if tool_outcome.error_class is None
+                    else (
+                        ComposerToolStatus.PLUGIN_CRASH
+                        if crash_pending and index == len(tool_outcomes) - 1
+                        else ComposerToolStatus.ARG_ERROR
+                    )
+                ),
+            ),
             composition_state_payload=(
-                phase3_self._state_payload_for_compose_turn_for_test(tool_outcome.response)
+                phase3_self._state_payload_for_compose_turn(tool_outcome.response)
                 if tool_outcome.post_version > tool_outcome.pre_version
                 else None
             ),
         )
-        for tool_outcome in tool_outcomes
+        for index, tool_outcome in enumerate(tool_outcomes)
     )
     service._phase3_last_redacted_assistant_tool_calls = redacted_assistant_tool_calls
     service._phase3_last_redacted_tool_rows = redacted_tool_rows
     failed_turn: FailedTurnMetadata | None = None
+    unwind_audit_failed = False
     if session_id is not None:
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
         sessions_service = service._require_sessions_service()
         try:
             audit_outcome = await sessions_service.persist_compose_turn_async(
@@ -155,10 +273,12 @@ async def persist_turn_audit(
                 raw_content=raw_assistant_content,
                 redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                 redacted_tool_rows=redacted_tool_rows,
+                rejection_records=build_rejection_records(tool_outcomes),
                 parent_composition_state_id=current_state_id,
                 expected_current_state_id=current_state_id,
                 writer_principal="compose_loop",
-                plugin_crash_pending=plugin_crash is not None,
+                plugin_crash_pending=crash_pending,
+                session_operation_context=session_operation_context,
             )
         except AuditIntegrityError as exc:
             exc.failed_turn = FailedTurnMetadata(
@@ -168,12 +288,14 @@ async def persist_turn_audit(
             )
             raise
         service._phase3_last_audit_outcome = audit_outcome
+        unwind_audit_failed = audit_outcome.unwind_audit_failed
         current_state_id = audit_outcome.current_state_id
         failed_turn = FailedTurnMetadata(
             assistant_message_id=audit_outcome.assistant_id,
             tool_calls_attempted=len(assistant_tool_calls),
+            tool_responses_persisted=0 if audit_outcome.assistant_id is None else len(redacted_tool_rows),
         )
-        if audit_outcome.assistant_id is None and plugin_crash is None:
+        if audit_outcome.assistant_id is None and not crash_pending:
             raise AuditIntegrityError(
                 "persist_compose_turn_async returned unwind_audit_failed without an in-flight plugin crash",
                 failed_turn=failed_turn,
@@ -184,10 +306,25 @@ async def persist_turn_audit(
                 failed_turn=failed_turn,
             )
         persisted_assistant_message_id = audit_outcome.assistant_id
-        persisted_tool_call_turn = True
+        # Derived here rather than by the caller because this is the only
+        # frame that knows what reached the row: the persist call above sends
+        # ``assistant_message.content or ""``, and ``assistant_message`` is
+        # already the substituted message on the advisor-repair branch. A
+        # caller reconstructing it from the turn prose would record the wrong
+        # bytes for that branch (elspeth-d581b3da7f). Rolled back (no
+        # assistant id) means no row holds anything — the pair goes to None
+        # together.
+        persisted_assistant_content = None if audit_outcome.assistant_id is None else (assistant_message.content or "")
+        # The unwind-failure outcome means the transaction rolled back: no
+        # assistant or tool row survived, so the driver must retain the
+        # in-flight invocation evidence on the propagated plugin crash.
+        persisted_tool_call_turn = audit_outcome.assistant_id is not None
     return _PersistOutcome(
         current_state_id=current_state_id,
         persisted_assistant_message_id=persisted_assistant_message_id,
+        persisted_assistant_content=persisted_assistant_content,
         persisted_tool_call_turn=persisted_tool_call_turn,
+        persisted_assistant_matches_current_dispatch=(persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch),
+        unwind_audit_failed=unwind_audit_failed,
         failed_turn=failed_turn,
     )

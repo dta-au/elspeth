@@ -1,16 +1,38 @@
 # ELSPETH Examples
 
-This directory contains runnable pipeline examples demonstrating ELSPETH's features. Most examples have a `settings.yaml` entry point; some use named pipeline files instead (see notes below).
+This directory contains runnable pipeline examples demonstrating ELSPETH's
+features. Most examples have a `settings.yaml` entry point; launchers and named
+pipeline entry points are listed below and in each example's README.
 
 ## Quick Start
 
 ```bash
-# Run any example from the repository root
+# Standard case: run from the repository root
 elspeth run --settings examples/<name>/settings.yaml --execute
 
-# Explore the audit trail after a run
+# Explore the audit trail using the URL configured by that example
 elspeth explain --run latest --database examples/<name>/runs/audit.db
 ```
+
+Some examples need setup or use multiple configurations:
+
+| Example | Canonical entry point |
+|---------|-----------------------|
+| `database_sink` | `./examples/database_sink/run.sh` |
+| `blob_transforms` (offline) | `./examples/blob_transforms/run.sh` |
+| `pdf_rasterize` | `./examples/pdf_rasterize/run.sh` |
+| `blob_transforms` (hosted fetch) | `./examples/blob_transforms/run_hosted_fetch.sh` |
+| `chroma_rag` | `./examples/chroma_rag/run.sh` |
+| `chroma_rag_qa` (OpenRouter) | `./examples/chroma_rag_qa/run.sh` |
+| `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
+| `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
+| `join_refused` | `./examples/join_refused/run.sh` |
+| `multi_worker` | `./examples/multi_worker/run.sh` |
+| `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
+| `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
+
+Landscape database names vary between variants. Read the selected YAML or the
+individual README before using `elspeth explain`.
 
 ## Example Index
 
@@ -26,22 +48,34 @@ These examples run locally with no credentials or external services.
 | [`error_routing`](error_routing/) | `on_error` diversion to quarantine sinks |
 | [`deep_routing`](deep_routing/) | 5 chained gates, 3 transforms, 7 sinks — complex decision tree |
 | [`fork_coalesce`](fork_coalesce/) | Fork/join DAG pattern — parallel paths merged with configurable policy (includes ARCH-15 per-branch transforms variant) |
+| [`row_union_ab_experiment`](row_union_ab_experiment/) | Fork-based A/B experiment — `row_union` releases both variant branches as one correlated group in long format; variants cover pooled and paired statistics, screening with reject routing, and list-form branches |
+| [`ab_llm_experiment`](ab_llm_experiment/) | The same A/B barrier with real LLM calls in the arms — one case study forked to two assessments, `row_union` releasing the pair. `settings.yaml` varies the prompt, `settings_models.yaml` varies the model, and `settings_arm_loss.yaml` shows what a lost arm costs: the whole row, including a completed sibling assessment |
+| [`document_review_panel`](document_review_panel/) | The combined example — a two-reviewer LLM fork nested inside an EXPAND group of pages, closed by a collector, summarised by a run-level aggregation. Shows one lost token unrolling into a lost page, a refused document verdict, and a short corpus number — and how encapsulating the run as one row makes the whole thing fail closed |
 | [`batch_aggregation`](batch_aggregation/) | Count-triggered aggregation with group-by statistics |
 | [`report_assemble`](report_assemble/) | Assemble text rows into paginated markdown reports with flush metadata |
 | [`statistical_batch_plugins`](statistical_batch_plugins/) | Statistical batch QA: distributions, experiments, classifier metrics, paired preferences, drift, outliers, data quality, top-k, thresholds, and effect sizes |
 | [`deaggregation`](deaggregation/) | 1-to-N row expansion via `batch_replicate` |
 | [`json_explode`](json_explode/) | Expand nested JSON arrays into individual rows |
-| [`database_sink`](database_sink/) | Write pipeline output to a SQLite database |
+| [`scope_collector`](scope_collector/) | `scopes:` + `collectors:` — the barrier that closes an EXPAND group. `require_all` vs `best_effort` on a document with one lost page: no statistic at all, or a mean over the survivors |
+| [`transform_pipeline`](transform_pipeline/) | Normalize CSV field types, then compute derived values with `type_coerce` and `value_transform` |
+| [`reference_join`](reference_join/) | Enrich a row from a keyed reference table bound as configuration; three configs — flat CSV, nested JSON with a sparse entry, and the default `on_miss: fail` quarantining an unknown key (exit 1 by design) |
+| [`database_sink`](database_sink/) | Write pipeline output to SQLite via `./examples/database_sink/run.sh`, which provisions the operator-owned target and effect ledger |
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
 | [`retention_purge`](retention_purge/) | Payload retention lifecycle and `elspeth purge` |
-| [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: offline CSV blob row expansion plus an opt-in hosted tutorial HTML fetch |
+| [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: offline CSV expansion via `run.sh`, plus opt-in hosted tutorial HTML fetch via `run_hosted_fetch.sh` |
+| [`pdf_rasterize`](pdf_rasterize/) | Multipage PDF to PNG page rows via `run.sh`, with a malformed-document quarantine |
 | [`audit_export`](audit_export/) | Export the Landscape audit trail to JSON |
 | [`landscape_journal`](landscape_journal/) | Event journaling for real-time audit monitoring |
 | [`multi_flow`](multi_flow/) | Two independent named source flows in one run |
 | [`multi_source_queue`](multi_source_queue/) | Multiple named sources fan into a durable pass-through queue |
 | [`schema_contracts_demo`](schema_contracts_demo/) | DAG-time schema validation (`guaranteed_fields` / `required_input_fields`) |
 | [`large_scale_test`](large_scale_test/) | Performance testing with large datasets |
-| [`threshold_gate_container`](threshold_gate_container/) | Docker-packaged pipeline deployment |
+
+### Container Deployment
+
+| Example | What It Demonstrates |
+|---------|---------------------|
+| [`threshold_gate_container`](threshold_gate_container/) | The threshold-gate pipeline packaged with `/app/pipeline/` paths for Docker |
 
 ### RAG / ChromaDB (requires `chromadb` — no API keys for retrieval-only)
 
@@ -49,8 +83,8 @@ These examples demonstrate Retrieval-Augmented Generation using ChromaDB as a ve
 
 | Example | What It Demonstrates |
 |---------|---------------------|
-| [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — query a pre-populated ChromaDB collection |
-| [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM — retrieve context then generate answers via OpenRouter (requires `OPENROUTER_API_KEY`) |
+| [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — `./examples/chroma_rag/run.sh` seeds the collection, then runs retrieval |
+| [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM via `./examples/chroma_rag_qa/run.sh` (requires `OPENROUTER_API_KEY`) |
 | [`chroma_rag_indexed`](chroma_rag_indexed/) | **Pipeline dependencies** — `depends_on` runs an indexing pipeline first, commencement gate verifies the collection, then query pipeline retrieves context. Entry point: `query_pipeline.yaml` |
 
 ### 0.6.0 — Multi-Worker & Concurrent Scheduling
@@ -62,7 +96,8 @@ New in 0.6.0: examples that demonstrate concurrent in-process token scheduling
 |---------|---------------------|
 | [`concurrent_scheduler`](concurrent_scheduler/) | Count-6 two-source rendezvous — proves the scheduler holds multiple token lifecycles open at once (pure-data, self-verifying) |
 | [`multi_worker`](multi_worker/) | `elspeth join` — leader + follower(s) share one RUNNING run; asserts ≥2 workers shared the rows (ChaosLLM, self-verifying) |
-| [`multi_worker_showcase`](multi_worker_showcase/) | 4-worker swarm spectacle with live stats card — demonstrative only, no assertion (ChaosLLM) |
+| [`join_refused`](join_refused/) | The same admission path **refusing** — a follower whose settings differ from the leader's by one scalar is rejected with `JoinRefusedError` and registers nothing, while a matching follower keeps working (ChaosLLM, self-verifying) |
+| [`multi_worker_showcase`](multi_worker_showcase/) | 4-worker swarm with live stats and a shared-work assertion (ChaosLLM, self-verifying) |
 
 ### OpenRouter LLM (real API — requires `OPENROUTER_API_KEY`)
 
@@ -74,6 +109,7 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 
 | Example | What It Demonstrates |
 |---------|---------------------|
+| [`llm_source`](llm_source/) | One authored prompt becomes one generated row through the source-native `llm` plugin |
 | [`openrouter_sentiment`](openrouter_sentiment/) | Single-query sentiment analysis (sequential and pooled modes) |
 | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) | Multi-query matrix (case studies x criteria) with stress/overflow variants |
 | [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) | LLM pipeline with DAG-time schema contract validation |
@@ -88,17 +124,48 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 | [`azure_keyvault_secrets`](azure_keyvault_secrets/) | Secret resolution from Azure Key Vault |
 | [`multi_query_assessment`](multi_query_assessment/) | Azure-backed multi-query assessment matrix |
 
-### ChaosLLM / ChaosWeb (local fault injection — no API keys needed)
+### AWS (requires AWS credentials)
 
-These examples use ELSPETH's built-in fault injection servers to test pipeline resilience without real API credentials.
+| Example | What It Demonstrates |
+|---------|---------------------|
+| [`textract_inline`](textract_inline/) | Synchronous Amazon Textract analysis of local documents: stage JPEG/PNG/single-page PDF blobs, `blob_rows` custody rows, one billable audited `AnalyzeDocument` per row |
+
+### ChaosLLM / ChaosWeb (local fault injection — no provider API keys needed)
+
+These examples use local fault injection servers to test pipeline resilience
+without real API credentials or OpenRouter traffic. The ChaosLLM settings still
+contain a fake `api_key` field required by the OpenAI-compatible client.
+Convenience launchers generate a process-scoped `ELSPETH_FINGERPRINT_KEY` so
+ELSPETH can safely fingerprint that field; manual commands must set one as
+shown in the individual READMEs.
 
 | Example | What It Demonstrates |
 |---------|---------------------|
 | [`chaosllm_sentiment`](chaosllm_sentiment/) | Sentiment analysis against ChaosLLM (mirrors `openrouter_sentiment`) |
+| [`ab_llm_experiment`](ab_llm_experiment/) | Two-arm A/B over ChaosLLM; `run.sh` starts its own server, runs all three configs and self-verifies each |
+| [`reference_join_fork_llm`](reference_join_fork_llm/) | Enrich once with `reference_join`, then fork into two LLM branches on separate endpoints and merge with a `require_all` / `merge: nested` coalesce; `run.sh` starts both ChaosLLM servers with zero fault injection |
+| [`document_review_panel`](document_review_panel/) | Two-reviewer panel per page over ChaosLLM; `run.sh` runs the clean, cascade and run-as-one-row configs and self-verifies each |
 | [`chaosllm_endurance`](chaosllm_endurance/) | Multi-query endurance test with fault injection |
 | [`rate_limited_llm`](rate_limited_llm/) | LLM pipeline with rate limiting (30 req/min cap) |
 | [`chaosweb`](chaosweb/) | Web scraping resilience with ChaosWeb fault injection |
 | [`chaosllm`](chaosllm/) | Response data used by ChaosLLM server (not a runnable pipeline) |
+
+### Expected Non-Complete Demonstrations
+
+Some examples deliberately exercise failure accounting:
+
+| Example or variant | Expected result |
+|--------------------|-----------------|
+| `deep_routing`, `error_routing` | `PARTIAL`, exit 1; packaged blocked-content rows reach quarantine |
+| `pdf_rasterize` | `PARTIAL`, exit 1; 1 malformed PDF is quarantined by design (3 page rows still succeed) |
+| `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
+| `row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1; screened pairs fail closed and remain audited |
+| `scope_collector/settings.yaml` | `PARTIAL`, exit 1; one page is malformed by construction and `require_all` withholds that document's statistics |
+| `scope_collector/settings_best_effort.yaml` | `PARTIAL`, exit 1; the same lost page, but `best_effort` still reports over the survivors |
+| `ab_llm_experiment/settings_arm_loss.yaml` | `PARTIAL`, exit 1; 3 of 24 cases lose one arm and each surviving sibling is invalidated with it |
+| `document_review_panel/settings_incomplete.yaml` | `PARTIAL`, exit 1; one page loses a reviewer, so the page and then the document verdict fail closed |
+| `document_review_panel/settings_run_as_row.yaml` | `PARTIAL`, exit 1; the same loss with the run as a single row — nothing is published, and the empty sink is the pass |
+| ChaosLLM / ChaosWeb realistic fault profiles | Stochastic `COMPLETED`, `PARTIAL`, or preflight failure depending on injected faults; verify every ingested row reached a result or error sink |
 
 ## Resetting examples
 
@@ -125,10 +192,19 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Simple routing** | [`threshold_gate`](threshold_gate/) or [`boolean_routing`](boolean_routing/) |
 | **Complex decision trees** | [`deep_routing`](deep_routing/) — 5 gates, 7 sinks, 8-node-deep DAG |
 | **Fork/join patterns** | [`fork_coalesce`](fork_coalesce/) — parallel paths with merge policies |
+| **Fork/union patterns (A/B)** | [`row_union_ab_experiment`](row_union_ab_experiment/) — both branches kept as separate correlated rows for cross-variant statistics |
+| **A/B testing two prompts or two models** | [`ab_llm_experiment`](ab_llm_experiment/) — each arm is a real LLM call; one config varies the prompt, the other the model |
+| **What a lost fork branch costs** | [`ab_llm_experiment`](ab_llm_experiment/) `settings_arm_loss.yaml` — a lost arm invalidates its sibling, so the row contributes nothing |
+| **Fork nested inside a batch group** | [`document_review_panel`](document_review_panel/) — two LLM reviewers per page, pages closed by a collector, documents summarised at run level |
+| **Making an entire run fail closed** | [`document_review_panel`](document_review_panel/) `settings_run_as_row.yaml` — encapsulate the run as one row so a scope's `require_all` spans the whole corpus |
+| **Closing an expand group (completeness)** | [`scope_collector`](scope_collector/) — a collector barrier, and the `require_all` / `best_effort` policy that decides what an incomplete group means |
 | **Error handling / quarantine** | [`error_routing`](error_routing/) — `on_error` diversion pattern |
 | **Aggregation (N to 1)** | [`batch_aggregation`](batch_aggregation/) — count triggers, group-by stats; [`report_assemble`](report_assemble/) — paginated markdown reports |
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
+| **PDF to page images** | [`pdf_rasterize`](pdf_rasterize/) — one PNG page row per page, with malformed-document quarantine |
+| **Type normalization and derived fields** | [`transform_pipeline`](transform_pipeline/) — coerce CSV strings to typed values, then compute dependent fields |
+| **LLM as a source (no input rows)** | [`llm_source`](llm_source/) — one static authored prompt produces one generated row |
 | **LLM integration (quick start)** | [`openrouter_sentiment`](openrouter_sentiment/) — simplest real LLM pipeline |
 | **LLM without API keys** | [`chaosllm_sentiment`](chaosllm_sentiment/) — same pipeline, local ChaosLLM server |
 | **Multi-query LLM matrices** | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) — case studies x criteria |
@@ -137,7 +213,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Schema contracts** | [`schema_contracts_demo`](schema_contracts_demo/) (pure data) or [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) (with LLM) |
 | **Jinja2 templates** | [`template_lookups`](template_lookups/) — field extraction and template-driven prompts |
 | **Web scraping** | [`chaosweb`](chaosweb/) — fault-injected scraping with content gates |
-| **Database output** | [`database_sink`](database_sink/) — write to SQLite (or PostgreSQL/MySQL) |
+| **Database output** | [`database_sink`](database_sink/) — write to SQLite or PostgreSQL |
 | **Crash recovery / resume** | [`checkpoint_resume`](checkpoint_resume/) — checkpoint + Ctrl-C + `elspeth resume` |
 | **Graceful shutdown** | [`checkpoint_resume`](checkpoint_resume/) — covers Ctrl-C shutdown behaviour |
 | **Payload retention / blob refs** | [`retention_purge`](retention_purge/) — payload lifecycle and `elspeth purge`; [`blob_transforms`](blob_transforms/) — fetch/store blobs and expand CSV blobs |

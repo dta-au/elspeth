@@ -5,7 +5,8 @@
 // dropped singular `state.source` and threw
 //   TypeError: Cannot read properties of undefined (reading 'options')
 // inside ChatPanel (readSourceBlobRef / compositionHasSource), tripping the
-// <ErrorBoundary label="Chat panel"> (Layout.tsx) and blanking the composer on
+// <ErrorBoundary label="Authoring pane"> (ComposerWorkspace.tsx) and blanking
+// the authoring surface on
 // guided source-select AND on reloading any composed session. The deployed
 // dist predated the fix; nothing caught it.
 //
@@ -32,6 +33,7 @@ import {
   tokenFromStorageState,
   uploadBlob,
 } from "./helpers/api";
+import { switchToGuidedWithGoal } from "./helpers/guided-entry";
 import { ComposerPage } from "./page-objects/composer-page";
 
 const BLOB_FILENAME = "release-smoke-orders.csv";
@@ -62,7 +64,12 @@ test.describe("release smoke — built bundle renders against real backend", () 
       // this re-renders ChatPanel against plural-`sources` backend state, reads
       // the dropped singular `state.source`, and throws — so the source review
       // card below never appears and the ErrorBoundary fallback shows instead.
-      await page.getByRole("button", { name: "Switch to guided" }).click();
+      // Goal-first (elspeth-378cfa0e18): the switch card collects the goal the
+      // wizard is rooted on before the guided surface mounts.
+      await switchToGuidedWithGoal(
+        page,
+        "Save the uploaded CSV rows to a JSON file.",
+      );
       await expect(page.getByLabel(/guided composer/i)).toBeVisible();
 
       await page.getByRole("button", { name: "CSV", exact: true }).click();

@@ -1,0 +1,112 @@
+# Row Union Variant — Paired Preference (within-ticket comparison)
+#
+# Same fork/union topology as settings.yaml, but the statistics plugin is
+# `batch_paired_preference`, which compares the two variants WITHIN each
+# ticket rather than across pooled means.
+#
+#   source ─> [variant_fork] ─┬─ control_branch ───> tag_control ──────┐
+#                              └─ treatment_branch ─> tag_treatment ────┤
+#                                                                       ├─ [variant_union]
+#                                    ─(experiment_in)─> [paired_preference] ─> output
+#
+# This variant is the sharpest demonstration of what row_union guarantees.
+# Paired preference is only meaningful if both of a ticket's variants land in
+# the SAME batch: it joins on `pair_field: id`, so a ticket whose control and
+# treatment rows were split across batch boundaries would silently contribute
+# nothing to the win/loss tally. The row_union releases the pair as one
+# indivisible group, so that split cannot occur.
+#
+# The input carries an explicit per-ticket `treatment_delta` so the outcome is
+# mixed (6 wins, 2 losses) rather than uniform — a uniform sweep would not
+# distinguish a working pairing from a broken one.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/row_union_ab_experiment/paired_input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'ticket: str'
+        - 'baseline_quality: int'
+        - 'treatment_delta: int'
+      on_validation_failure: discard
+
+gates:
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+    - control_branch
+    - treatment_branch
+
+transforms:
+- name: tag_control
+  plugin: value_transform
+  input: control_branch
+  on_success: control_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'control'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.0"
+
+- name: tag_treatment
+  plugin: value_transform
+  input: treatment_branch
+  on_success: treatment_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'treatment'"
+    - target: score
+      expression: "row['baseline_quality'] + row['treatment_delta']"
+
+row_unions:
+- name: variant_union
+  branches:
+    control_branch: control_scored
+    treatment_branch: treatment_scored
+  on_success: experiment_in
+
+aggregations:
+- name: paired_preference
+  plugin: batch_paired_preference
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    pair_field: id
+    variant_field: prompt_variant
+    score_field: score
+    baseline_variant: control
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/row_union_ab_experiment/output/paired_preference.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/row_union_ab_experiment/runs/paired_preference.db

@@ -5,23 +5,238 @@ These types answer: "How do we refer to things?"
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.freeze import require_int
 from elspeth.contracts.schema_contract import PipelineRow
+
+
+@dataclass(frozen=True, slots=True)
+class LineageFrame:
+    """One (kind, group_id, member_key) lineage-path entry (spec §4.1).
+
+    Frames are minted only by the opening primitives inside TokenManager /
+    DataFlowTokenRepository — never asserted by failing code — which is what
+    makes the §6.2 loss guard self-authenticating.
+    """
+
+    kind: FrameKind
+    group_id: str
+    member_key: str
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not FrameKind:
+            raise TypeError(f"LineageFrame.kind must be FrameKind, got {type(self.kind).__name__}: {self.kind!r}")
+        for field_name, value in (("group_id", self.group_id), ("member_key", self.member_key)):
+            if type(value) is not str:
+                raise TypeError(f"LineageFrame.{field_name} must be str, got {type(value).__name__}: {value!r}")
+            if not value:
+                raise ValueError(f"LineageFrame.{field_name} must not be empty")
+
+
+def lineage_path_to_json(path: tuple[LineageFrame, ...]) -> str:
+    """Serialize a lineage path (outermost first) for the scheduler journal."""
+    return json.dumps([[frame.kind.value, frame.group_id, frame.member_key] for frame in path], allow_nan=False)
+
+
+def lineage_path_from_json(raw: str) -> tuple[LineageFrame, ...]:
+    """Inverse of lineage_path_to_json. Raises ValueError on corrupt input."""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Corrupt lineage_path JSON: {exc}") from exc
+    if type(payload) is not list:
+        raise ValueError(f"Corrupt lineage_path JSON: expected array, got {type(payload).__name__}")
+    frames: list[LineageFrame] = []
+    for entry in payload:
+        if type(entry) is not list or len(entry) != 3:
+            raise ValueError(f"Corrupt lineage_path frame: expected [kind, group_id, member_key], got {entry!r}")
+        kind_raw, group_id, member_key = entry
+        try:
+            kind = FrameKind(kind_raw)
+        except ValueError as exc:
+            raise ValueError(f"Corrupt lineage_path frame kind: {kind_raw!r}") from exc
+        frames.append(LineageFrame(kind=kind, group_id=group_id, member_key=member_key))
+    return tuple(frames)
+
+
+def innermost_fork_frame(path: tuple[LineageFrame, ...]) -> LineageFrame | None:
+    """The innermost FORK frame — WS1b's branch_name/fork_group_id accessor source."""
+    for frame in reversed(path):
+        if frame.kind is FrameKind.FORK:
+            return frame
+    return None
+
+
+def innermost_expand_frame(path: tuple[LineageFrame, ...]) -> LineageFrame | None:
+    """The innermost EXPAND frame — WS1b's expand_group_id accessor source."""
+    for frame in reversed(path):
+        if frame.kind is FrameKind.EXPAND:
+            return frame
+    return None
+
+
+def path_branch_name(path: tuple[LineageFrame, ...]) -> str | None:
+    """Derived branch_name (§4.1a): the innermost FORK frame's member_key.
+
+    WS1b re-exposes TokenInfo.branch_name as a property over exactly this
+    function; WS3's loss attribution and WS4's wire fields import it too.
+    """
+    frame = innermost_fork_frame(path)
+    return None if frame is None else frame.member_key
+
+
+def path_fork_group_id(path: tuple[LineageFrame, ...]) -> str | None:
+    """Derived fork_group_id (§4.1a): the innermost FORK frame's group_id."""
+    frame = innermost_fork_frame(path)
+    return None if frame is None else frame.group_id
+
+
+def path_expand_group_id(path: tuple[LineageFrame, ...]) -> str | None:
+    """Derived expand_group_id (§4.1a): the innermost EXPAND frame's group_id."""
+    frame = innermost_expand_frame(path)
+    return None if frame is None else frame.group_id
+
+
+def truncate_at_closer_frame(
+    path: tuple[LineageFrame, ...],
+    *,
+    kind: FrameKind,
+    group_id: str,
+    is_release_group: Callable[[str], bool],
+) -> tuple[LineageFrame, ...]:
+    """Guarded truncation at the closer's own frame (spec rulings 24/28 as amended by META-38).
+
+    A MERGING closer (coalesce, collector) consumes its members and mints a
+    successor whose lineage is the path BELOW the closer's frame. The closer
+    names the frame it is entitled to close (kind + group_id); this scans
+    innermost → outward for it and returns ``path[:index]``. Whenever that
+    frame IS innermost the result is byte-identical to the old strict pop.
+
+    Frames strictly ABOVE the match are allowed only if EVERY one is a
+    collector RELEASE group — ``is_release_group(frame.group_id)`` must
+    answer True for each. A release group is pure provenance: it has no
+    closer of its own, so its frame stays innermost on the release token
+    for the rest of that token's life and the enclosing closer legitimately
+    truncates through it (a release inside a fork reaching the coalesce; a
+    collector-in-collector release reaching the outer collector). ANY other
+    frame above the match — a real fork or expand scope that has not closed
+    — is an orchestration invariant violation (SESE nesting, spec §7 rule 5)
+    and raises; it is never skippable. The predicate is the caller's: the
+    engine memoises ``TokenManager.is_release_group``, the durable twin
+    reads the written ``group_records.closes_group_id`` fact in its own
+    transaction — this Tier-1 identity code holds no config and derives
+    nothing.
+
+    An absent frame — an empty path, no frame of that kind, a different
+    group — is lineage corruption, never a recoverable state (the old
+    refusal, unchanged). Every closer routes through this one function so
+    the refusal semantics cannot drift; ``pop_fork_frame`` (a pass-through
+    closer's pop) is deliberately separate.
+    """
+    if path and path[-1].kind is kind and path[-1].group_id == group_id:
+        # The closer's own frame is innermost: the old strict pop, verbatim,
+        # with no predicate read — a closer's group is a declared scope or
+        # fork group and is never a release group.
+        return path[:-1]
+    own = innermost_own_frame(path, is_release_group=is_release_group)
+    if own is not None:
+        index, frame = own
+        if frame.kind is kind and frame.group_id == group_id:
+            return path[:index]
+        if any(deeper.kind is kind and deeper.group_id == group_id for deeper in path[:index]):
+            raise OrchestrationInvariantError(
+                f"truncate_at_closer_frame: {frame.kind.name} frame for group {frame.group_id!r} sits above the "
+                f"{kind.name} frame for group {group_id!r} and is not a collector release group — an unclosed "
+                f"scope inside a closing region is not skippable (spec §7 rule 5; path={path!r})"
+            )
+    innermost = path[-1] if path else None
+    raise OrchestrationInvariantError(
+        f"truncate_at_closer_frame: path has no matching innermost {kind.name} frame for group {group_id!r} "
+        f"(innermost={innermost!r}, searched below collector release-group frames); a closer closes exactly "
+        "its own frame (spec rulings 24/28)"
+    )
+
+
+def innermost_own_frame(
+    path: tuple[LineageFrame, ...],
+    *,
+    is_release_group: Callable[[str], bool],
+) -> tuple[int, LineageFrame] | None:
+    """THE guarded walk (META-38): a token's OWN group frame and its index.
+
+    Innermost → outward, skipping ONLY frames the caller's predicate
+    verifies as collector release groups (the written
+    ``group_records.closes_group_id`` fact), to the first frame that is not
+    one — the frame of the group the token is currently a member of. A
+    collector release carries its release-group frame(s) innermost, and a
+    release of a release carries a run of them (expand-of-a-release →
+    close → two consecutive release frames); every one is skipped, nothing
+    else is. ``None`` when the path is empty or every frame is a release
+    frame (a release whose own scope has fully closed — an ordinary
+    consumer or a sink awaits it).
+
+    The single derivation behind every "this token's group" question: the
+    merging closers' truncation (:func:`truncate_at_closer_frame`), the
+    collector arrival keying (barrier key, member key, roster lookup — on
+    the traversal, the intake adoption, the executor's ``accept`` and the
+    journal restore), and the coalesce anchor. Never index ``[-1]``, never
+    ``innermost_fork_frame`` for an anchor — the latter skips EVERY EXPAND
+    frame, including an unreleased scope's, which is exactly the shape the
+    guard must reject.
+    """
+    for index in range(len(path) - 1, -1, -1):
+        frame = path[index]
+        if is_release_group(frame.group_id):
+            continue
+        return index, frame
+    return None
+
+
+def pop_fork_frame(path: tuple[LineageFrame, ...], *, group_id: str) -> tuple[LineageFrame, ...]:
+    """Remove the FORK frame identified by group_id, wherever it sits (ruling 27).
+
+    The PASS-THROUGH closer's pop, as distinct from the MERGING closers'
+    :func:`truncate_at_closer_frame`: a row_union releases the ORIGINAL
+    tokens, so every frame other than the union's own FORK frame is
+    preserved in place (a surviving EXPAND frame, a collector release-group
+    frame); a merging closer mints a successor and truncates to the path
+    below its frame, passing through release-group frames only. Unlike the
+    strict-innermost pop (rulings 24/28, where a merging closer's own frame
+    IS the innermost frame by construction — coalesce and fork are strictly
+    LIFO-nested), a row_union release closes only the
+    branch-selection scope. A row-multiplying transform inside the branch
+    (e.g. an expand) may have stacked an EXPAND frame on top of the branch's
+    FORK frame before the token reached the union — elspeth-a5b86149d4,
+    tests/integration/pipeline/test_row_union_branch_cardinality.py. FORK and
+    EXPAND scopes do not close in LIFO order with respect to each other: the
+    row_union closes the branch scope here, the expand's own multiplicity
+    scope closes elsewhere (or never explicitly closes). So this removes the
+    named FORK frame from wherever it sits in the path and preserves every
+    other frame in order — discarding a surviving EXPAND frame on release
+    would fabricate lineage, since the expand genuinely happened.
+    """
+    for index in range(len(path) - 1, -1, -1):
+        frame = path[index]
+        if frame.kind is FrameKind.FORK and frame.group_id == group_id:
+            return path[:index] + path[index + 1 :]
+    raise OrchestrationInvariantError(f"pop_fork_frame: no FORK frame for group {group_id!r} in path {path!r} (ruling 27 pop)")
 
 
 @dataclass(frozen=True, slots=True)
 class TokenInfo:
     """Identity and data for a token flowing through the DAG.
 
-    Tokens track row instances through forks/joins:
-    - row_id: Stable source row identity
-    - token_id: Instance of row in a specific DAG path
-    - branch_name: Which fork path this token is on (if forked)
-    - fork_group_id: Groups all children from a fork operation
-    - join_group_id: Groups all tokens merged in a coalesce operation
-    - expand_group_id: Groups all children from an expand operation
+    Lineage is ONE field — the lineage path (spec §4.1): a stack of typed frames,
+    outermost first. branch_name / fork_group_id / expand_group_id are DERIVED
+    accessors over the path (ruling 21: the only read path for the legacy names;
+    any stored-field resurrection is a defect). join_group_id is a merge EVENT,
+    not a membership — it left TokenInfo (ruling 20) and rides RowResult /
+    PendingOutcome / TokenWorkItem carriers.
 
     Resume state (resume_attempt_offset, resume_checkpoint_id): carried on the token —
     not WorkItem — because SinkExecutor buffers TokenInfos across WorkItem boundaries,
@@ -33,10 +248,7 @@ class TokenInfo:
     row_id: str
     token_id: str
     row_data: PipelineRow  # CHANGED from dict[str, Any]
-    branch_name: str | None = None
-    fork_group_id: str | None = None
-    join_group_id: str | None = None
-    expand_group_id: str | None = None
+    lineage_path: tuple[LineageFrame, ...] = ()  # Outermost first (spec §4.1).
     resume_attempt_offset: int = 0  # Added to every node_states.attempt written while
     # re-driving THIS token on resume, so its records coexist with the append-only run-1
     # records under UniqueConstraint(token_id, node_id, attempt). Value is the prior run's
@@ -63,13 +275,13 @@ class TokenInfo:
             raise TypeError(f"TokenInfo.token_id must be str, got {type(self.token_id).__name__}: {self.token_id!r}")
         if not self.token_id:
             raise ValueError("TokenInfo.token_id must not be empty")
-        for _field_name in ("branch_name", "fork_group_id", "join_group_id", "expand_group_id"):
-            _value = getattr(self, _field_name)
-            if _value is not None:
-                if not isinstance(_value, str):
-                    raise TypeError(f"TokenInfo.{_field_name} must be str or None, got {type(_value).__name__}: {_value!r}")
-                if not _value:
-                    raise ValueError(f"TokenInfo.{_field_name} must be None or non-empty string, got {_value!r}")
+        if type(self.lineage_path) is not tuple:
+            raise TypeError(
+                f"TokenInfo.lineage_path must be tuple[LineageFrame, ...], got {type(self.lineage_path).__name__}: {self.lineage_path!r}"
+            )
+        for frame in self.lineage_path:
+            if type(frame) is not LineageFrame:
+                raise TypeError(f"TokenInfo.lineage_path entries must be LineageFrame, got {type(frame).__name__}: {frame!r}")
         # One-way resume invariant: a positive resume_attempt_offset only ever originates
         # from a resume re-drive (processor.resume_incomplete_token), which always stamps
         # the checkpoint id. The implication is one-directional — offset 0 is ambiguous
@@ -81,12 +293,24 @@ class TokenInfo:
                 f"resume_checkpoint_id (a positive offset only arises from a resume re-drive), got None"
             )
 
+    @property
+    def branch_name(self) -> str | None:
+        return path_branch_name(self.lineage_path)
+
+    @property
+    def fork_group_id(self) -> str | None:
+        return path_fork_group_id(self.lineage_path)
+
+    @property
+    def expand_group_id(self) -> str | None:
+        return path_expand_group_id(self.lineage_path)
+
     def with_updated_data(self, new_data: PipelineRow) -> TokenInfo:
-        """Return a new TokenInfo with updated row_data, preserving all lineage fields.
+        """Return a new TokenInfo with updated row_data, preserving lineage_path.
 
         This method ensures that when row_data is updated after a transform,
-        all identity and lineage metadata (branch_name, fork_group_id,
-        join_group_id, expand_group_id) are preserved.
+        all identity and lineage metadata (lineage_path, and the derived
+        branch_name/fork_group_id/expand_group_id accessors over it) are preserved.
 
         Critically, resume_attempt_offset and resume_checkpoint_id are also
         preserved via dataclasses.replace — this is the propagation mechanism that

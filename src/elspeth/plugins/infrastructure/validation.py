@@ -18,6 +18,7 @@ Usage:
     source = CSVSource(config)  # Assumes config is valid
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,8 +69,16 @@ def validate_source_config(
     Returns:
         List of validation errors (empty if valid)
     """
-    # Get config model for source type
-    config_model = get_source_config_model(source_type)
+    # Get config model for source type (config needed for provider dispatch).
+    try:
+        config_model = get_source_config_model(source_type, config)
+    except UnknownPluginTypeError:
+        raise
+    except ValueError as exc:
+        # Same contract as validate_transform_config: dispatch rejection is a
+        # config error, reported rather than raised. The value is absent when
+        # the missing key IS the error.
+        return [ValidationError(field="provider", message=str(exc), value=config["provider"] if "provider" in config else None)]
 
     # Handle special case: null_source has no config class
     if config_model is None:
@@ -85,11 +94,19 @@ def validate_source_config(
         return _extract_wrapped_plugin_config_error(e, config)
 
 
-def get_source_config_model(source_type: str) -> type[PluginConfigProtocol] | None:
+def get_source_config_model(
+    source_type: str,
+    config: Mapping[str, Any] | None = None,
+) -> type[PluginConfigProtocol] | None:
     """Get Pydantic config model for source type.
 
     Resolves the plugin class via pluggy discovery (PluginManager), then
-    calls get_config_model() on it.
+    calls get_config_model(config) on it. The config parameter enables
+    provider dispatch for source plugins with discriminated variants.
+
+    Args:
+        source_type: Plugin type name
+        config: Plugin configuration dict (needed for provider dispatch)
 
     Returns:
         Config model class, or None for sources with no config (e.g., null_source)
@@ -103,7 +120,7 @@ def get_source_config_model(source_type: str) -> type[PluginConfigProtocol] | No
         plugin_cls = get_shared_plugin_manager().get_source_by_name(source_type)
     except PluginNotFoundError as exc:
         raise UnknownPluginTypeError(f"Unknown source type: {source_type}") from exc
-    return plugin_cls.get_config_model()
+    return plugin_cls.get_config_model(dict(config) if config is not None else None)
 
 
 def validate_transform_config(
@@ -120,7 +137,19 @@ def validate_transform_config(
         List of validation errors (empty if valid)
     """
     # Get config model for transform type (config needed for provider dispatch)
-    config_model = get_transform_config_model(transform_type, config)
+    try:
+        config_model = get_transform_config_model(transform_type, config)
+    except UnknownPluginTypeError:
+        raise
+    except ValueError as exc:
+        # Provider dispatch rejected the config (unknown or non-string
+        # ``provider``). That is a CONFIG error from authored input, not an
+        # engine fault: report it through the same channel as a Pydantic
+        # rejection so ``PluginManager`` raises the standard prefixed
+        # ValueError and every composer probe abstains instead of crashing
+        # ``CompositionState.validate()`` (elspeth-2ed41f0a4a census). The
+        # value is absent when the missing key IS the error.
+        return [ValidationError(field="provider", message=str(exc), value=config["provider"] if "provider" in config else None)]
 
     if config_model is None:
         return []  # No validation needed

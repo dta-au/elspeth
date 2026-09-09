@@ -10,12 +10,19 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, Field
 
+from elspeth.contracts.enums import Determinism
+from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth_lints.rules.plugin_contract.options_metadata import RULE
 from elspeth_lints.rules.plugin_contract.options_metadata.rule import (
     OptionsMetadataRule,
     collect_metadata_findings,
+    iter_metadata_models,
     load_options_metadata_allowlist,
 )
+
+
+class _MissingTitleOptions(BaseModel):
+    value: str = Field(description="Missing title")
 
 
 def test_options_metadata_rule_reports_missing_title() -> None:
@@ -37,6 +44,50 @@ def test_options_metadata_rule_checks_discriminated_variants() -> None:
     findings = collect_metadata_findings(plugin_manager=_fake_manager_with_broken_variant(), allowlist=set(), root=None)
 
     assert [finding.message for finding in findings] == ["transform/metadata_variant[alpha]:variant_field: missing title"]
+
+
+def test_options_metadata_rule_checks_inherited_discriminated_variants() -> None:
+    class _Parent(BaseTransform):
+        name = "parent_variant"
+        determinism = Determinism.DETERMINISTIC
+        config_model = None
+
+        @classmethod
+        def discriminated_variants(cls) -> tuple[str, dict[str, type[BaseModel]]]:
+            return "provider", {"alpha": _MissingTitleOptions}
+
+    class _Child(_Parent):
+        name = "child_variant"
+        determinism = Determinism.DETERMINISTIC
+
+    models = tuple(iter_metadata_models("transform", _Child))
+
+    assert models == (("transform/child_variant[alpha]", _MissingTitleOptions),)
+
+
+def test_options_metadata_rule_checks_mixin_discriminated_variants() -> None:
+    class _VariantMixin:
+        @classmethod
+        def discriminated_variants(cls) -> tuple[str, dict[str, type[BaseModel]]]:
+            return "provider", {"alpha": _MissingTitleOptions}
+
+    class _Transform(_VariantMixin, BaseTransform):
+        name = "mixin_variant"
+        determinism = Determinism.DETERMINISTIC
+        config_model = None
+
+    models = tuple(iter_metadata_models("transform", _Transform))
+
+    assert models == (("transform/mixin_variant[alpha]", _MissingTitleOptions),)
+
+
+def test_options_metadata_rule_rejects_plugin_category_impostor() -> None:
+    class _SinkMasqueradingAsSource(BaseSink):
+        name = "wrong_category"
+        determinism = Determinism.IO_WRITE
+
+    with pytest.raises(TypeError, match=r"source plugin.*must inherit BaseSource"):
+        tuple(iter_metadata_models("source", _SinkMasqueradingAsSource))
 
 
 def test_options_metadata_rule_uses_legacy_identifier_allowlist() -> None:
@@ -87,6 +138,39 @@ def test_options_metadata_cli_json_mode_succeeds_on_current_plugins() -> None:
     assert json.loads(result.stdout) == []
 
 
+def test_options_metadata_cli_resolves_allowlist_from_the_canonical_scan_root() -> None:
+    """The rule must run under ``--root src/elspeth``, the documented gate invocation.
+
+    Allowlist governance lives at ``<repo>/config/cicd`` while the canonical scan
+    root is ``<repo>/src/elspeth``, so joining the relative allowlist path onto the
+    scan root points at a path that cannot exist.
+    """
+    project_root = Path(__file__).resolve().parents[3]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "elspeth_lints.core.cli",
+            "check",
+            "--rules",
+            "plugin_contract.options_metadata",
+            "--root",
+            "src/elspeth",
+            "--format",
+            "json",
+        ],
+        cwd=project_root,
+        env={"PYTHONPATH": str(project_root / "elspeth-lints" / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "FileNotFoundError" not in result.stderr, result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_registered_rule_is_production_rule() -> None:
     assert isinstance(RULE, OptionsMetadataRule)
     assert RULE.id == "plugin_contract.options_metadata"
@@ -96,8 +180,9 @@ def _fake_manager_with_missing_title() -> object:
     class _Options(BaseModel):
         missing_title: str = Field(description="Has description but no title")
 
-    class _Source:
+    class _Source(BaseSource):
         name = "metadata_gap"
+        determinism = Determinism.IO_READ
         config_model = _Options
 
     return _FakePluginManager(sources=[_Source])
@@ -107,8 +192,9 @@ def _fake_manager_with_missing_description() -> object:
     class _Options(BaseModel):
         missing_description: str = Field(title="Missing description")
 
-    class _Sink:
+    class _Sink(BaseSink):
         name = "metadata_gap"
+        determinism = Determinism.IO_WRITE
         config_model = _Options
 
     return _FakePluginManager(sinks=[_Sink])
@@ -118,8 +204,9 @@ def _fake_manager_with_broken_variant() -> object:
     class _AlphaOptions(BaseModel):
         variant_field: str = Field(description="Has description but no title")
 
-    class _Transform:
+    class _Transform(BaseTransform):
         name = "metadata_variant"
+        determinism = Determinism.DETERMINISTIC
         config_model = None
 
         @classmethod

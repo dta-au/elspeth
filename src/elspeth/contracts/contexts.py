@@ -22,12 +22,13 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.node_state_context import AggregationBatchContext
     from elspeth.contracts.payload_store import PayloadStore
@@ -35,7 +36,6 @@ if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import SchemaContract
 
 
-@runtime_checkable
 class LimiterProtocol(Protocol):
     """Behavior-level limiter surface shared by concrete and no-op limiters."""
 
@@ -65,7 +65,6 @@ class LimiterProtocol(Protocol):
         ...
 
 
-@runtime_checkable
 class RateLimitRegistryProtocol(Protocol):
     """Minimal rate-limit registry surface exposed to plugins."""
 
@@ -74,7 +73,6 @@ class RateLimitRegistryProtocol(Protocol):
         ...
 
 
-@runtime_checkable
 class SourceContext(Protocol):
     """What source plugins need during load().
 
@@ -100,6 +98,9 @@ class SourceContext(Protocol):
     @property
     def telemetry_emit(self) -> Callable[[Any], None]: ...
 
+    @property
+    def shutdown_event(self) -> threading.Event | None: ...
+
     def record_validation_error(
         self,
         row: Any,
@@ -123,7 +124,6 @@ class SourceContext(Protocol):
     ) -> Call | None: ...
 
 
-@runtime_checkable
 class TransformContext(Protocol):
     """What transform plugins need during process()/accept().
 
@@ -171,7 +171,6 @@ class TransformContext(Protocol):
     ) -> Call | None: ...
 
 
-@runtime_checkable
 class SinkContext(Protocol):
     """What sink plugins need during write().
 
@@ -207,7 +206,6 @@ class SinkContext(Protocol):
     ) -> Call | None: ...
 
 
-@runtime_checkable
 class LifecycleContext(Protocol):
     """What plugins need during on_start()/on_complete().
 
@@ -231,6 +229,19 @@ class LifecycleContext(Protocol):
 
     @property
     def landscape(self) -> PluginAuditWriter | None: ...
+
+    @property
+    def coordination_token(self) -> CoordinationToken | None: ...
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+    ) -> None: ...
 
     @property
     def payload_store(self) -> PayloadStore | None: ...

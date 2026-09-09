@@ -4,15 +4,32 @@ from __future__ import annotations
 
 import pytest
 
-from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
+from elspeth.contracts.secrets import ResolvedSecret, ScopedSecretResolverContract, SecretInventoryItem, SecretScope
 from elspeth.core.secrets import (
     SECRET_REF_VALIDATION_PLACEHOLDER,
     SecretResolutionError,
+    collect_credential_field_violations,
+    collect_disallowed_secret_ref_markers,
+    is_secret_field,
     redact_secret_refs_for_validation,
     resolve_secret_refs,
 )
 
 _VALID_FINGERPRINT = "a" * 64
+
+
+def test_aws_access_key_id_is_a_credential_field() -> None:
+    assert is_secret_field("aws_access_key_id") is True
+
+
+def test_literal_aws_access_key_id_is_rejected_as_credential() -> None:
+    options = {"aws_access_key_id": "literal-access-key-id"}
+    assert collect_credential_field_violations(options) == ["aws_access_key_id"]
+
+
+def test_secret_ref_is_allowed_in_aws_access_key_id() -> None:
+    options = {"aws_access_key_id": {"secret_ref": "AWS_ACCESS_KEY_ID"}}
+    assert collect_disallowed_secret_ref_markers(options) == []
 
 
 class FakeResolver:
@@ -29,6 +46,38 @@ class FakeResolver:
         if name not in self._secrets:
             return None
         return ResolvedSecret(name=name, value=self._secrets[name], scope="user", fingerprint=_VALID_FINGERPRINT)
+
+
+class _StructuralScopedImpostor(FakeResolver):
+    """Duck-typed lookalike: has resolve_scoped but does NOT inherit the contract."""
+
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None:
+        del scope
+        return self.resolve(user_id, name)
+
+
+class _NominalScopedResolver(FakeResolver, ScopedSecretResolverContract):
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None:
+        del scope
+        return self.resolve(user_id, name)
+
+
+def test_scoped_marker_rejects_structural_impostor() -> None:
+    """ADR-032: scoped-marker admission is nominal (the owned ABC), never the
+    runtime_checkable Protocol — a duck-typed lookalike must not be handed a
+    scope-pinned credential resolution."""
+    resolver = _StructuralScopedImpostor({"PINNED": "sk-1"})
+    config = {"api_key": {"secret_ref": "PINNED", "secret_scope": "server"}}
+    with pytest.raises(TypeError, match="ScopedSecretResolverContract"):
+        resolve_secret_refs(config, resolver, "user1")
+
+
+def test_scoped_marker_admits_nominal_inheritor() -> None:
+    resolver = _NominalScopedResolver({"PINNED": "sk-1"})
+    config = {"api_key": {"secret_ref": "PINNED", "secret_scope": "server"}}
+    result, resolutions = resolve_secret_refs(config, resolver, "user1")
+    assert result == {"api_key": "sk-1"}
+    assert len(resolutions) == 1
 
 
 def test_replaces_secret_ref_in_flat_dict() -> None:

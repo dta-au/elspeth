@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elspeth.dev/schemas/state-engine/catalog-v3.json",
+  "title": "ELSPETH state-engine proof catalog v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "catalog_id",
+    "criteria_ref",
+    "architecture_ref",
+    "dimensions",
+    "vocabularies",
+    "execution_profiles",
+    "family_dimension_acceptance",
+    "evidence_contract",
+    "hard_gates",
+    "required_leg_ids",
+    "legs"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "catalog_id": {"const": "elspeth-state-engine-v3"},
+    "criteria_ref": {"type": "string", "minLength": 1},
+    "architecture_ref": {"type": "string", "minLength": 1},
+    "dimensions": {"$ref": "#/$defs/dimension_ids"},
+    "vocabularies": {"type": "object"},
+    "execution_profiles": {"type": "object"},
+    "family_dimension_acceptance": {"type": "object"},
+    "evidence_contract": {"type": "object"},
+    "hard_gates": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "required_leg_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^(TS|AUX|RC|PB|RM|F)-[0-9]{2}$"}
+    },
+    "legs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/leg"}
+    }
+  },
+  "$defs": {
+    "dimension_ids": {
+      "const": [
+        "production_entry",
+        "precondition_image",
+        "success_effects",
+        "guard_refusal",
+        "zero_mutation_rollback",
+        "concurrency",
+        "crash_restart",
+        "boundary_composition",
+        "read_model_truth_table",
+        "maintenance"
+      ]
+    },
+    "cell": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {"status": {"const": "required"}, "reason": {"type": "null"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"const": "not_applicable"},
+            "reason": {"type": "string", "minLength": 1, "pattern": "\\S"}
+          }
+        }
+      ]
+    },
+    "dimension_cells": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "production_entry",
+        "precondition_image",
+        "success_effects",
+        "guard_refusal",
+        "zero_mutation_rollback",
+        "concurrency",
+        "crash_restart",
+        "boundary_composition",
+        "read_model_truth_table",
+        "maintenance"
+      ],
+      "properties": {
+        "production_entry": {"$ref": "#/$defs/cell"},
+        "precondition_image": {"$ref": "#/$defs/cell"},
+        "success_effects": {"$ref": "#/$defs/cell"},
+        "guard_refusal": {"$ref": "#/$defs/cell"},
+        "zero_mutation_rollback": {"$ref": "#/$defs/cell"},
+        "concurrency": {"$ref": "#/$defs/cell"},
+        "crash_restart": {"$ref": "#/$defs/cell"},
+        "boundary_composition": {"$ref": "#/$defs/cell"},
+        "read_model_truth_table": {"$ref": "#/$defs/cell"},
+        "maintenance": {"$ref": "#/$defs/cell"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "plugin_key", "variant_id", "cell_applicability"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "plugin_key": {"type": ["string", "null"], "minLength": 1, "pattern": "\\S"},
+        "variant_id": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+        "cell_applicability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sqlite-wal-single-process-leader",
+            "sqlite-wal-same-host-leader-plus-claim-only-followers",
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers",
+            "postgresql-16-aws-single-leader-landscape"
+          ],
+          "properties": {
+            "sqlite-wal-single-process-leader": {"$ref": "#/$defs/dimension_cells"},
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {"$ref": "#/$defs/dimension_cells"},
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {"$ref": "#/$defs/dimension_cells"},
+            "postgresql-16-aws-single-leader-landscape": {"$ref": "#/$defs/dimension_cells"}
+          }
+        }
+      }
+    },
+    "leg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "family", "title", "contract", "required_cases"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^(TS|AUX|RC|PB|RM|F)-[0-9]{2}$"},
+        "family": {"enum": ["transition", "auxiliary", "run_coordination", "production_boundary", "read_model", "forbidden"]},
+        "title": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "contract": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "required_cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}}
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["id"],
+            "properties": {"id": {"not": {"const": "PB-09"}}}
+          },
+          "then": {
+            "properties": {
+              "required_cases": {
+                "items": {
+                  "properties": {"variant_id": {"const": "default"}}
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

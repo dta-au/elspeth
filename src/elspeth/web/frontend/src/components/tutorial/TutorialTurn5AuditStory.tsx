@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getRunAuditSummary } from "@/api/client";
+import { Button } from "@/components/ui";
 import type { RunAuditStoryResponse } from "@/types/api";
 import { TUTORIAL_ASSUMPTION_CALLOUT, TURN_5_PRIMARY_BUTTON } from "./copy";
 
@@ -104,18 +105,18 @@ export function TutorialTurn5AuditStory({
             details, source hash, and plugin versions tied together.
           </p>
           <div className="tutorial-actions">
-            <button type="button" className="btn btn-primary" onClick={onContinue}>
+            <Button variant="primary" onClick={onContinue}>
               {TURN_5_PRIMARY_BUTTON}
-            </button>
+            </Button>
             {onBack !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="tutorial-link-button"
                 onClick={onBack}
                 aria-label="Back to your pipeline run"
               >
                 Back
-              </button>
+              </Button>
             )}
           </div>
         </>
@@ -179,14 +180,17 @@ function HashWithCopy({
   return (
     <div className="tutorial-hash">
       <code className="tutorial-hash-value">{hash}</code>
-      <button
-        type="button"
+      {/* Composes .btn-compact (elspeth-e7dd7ae371): geometry, radius,
+          transition and hover come from the primitive; .tutorial-hash-copy
+          carries only the deliberate divergences (tutorial.css:618). */}
+      <Button
+        compact
         className="tutorial-hash-copy"
         onClick={() => void onCopy()}
         aria-label={`Copy full ${label}`}
       >
         {copied ? "Copied" : "Copy"}
-      </button>
+      </Button>
       <span role="status" className="sr-only">
         {copied ? `Full ${label} copied to clipboard.` : ""}
       </span>

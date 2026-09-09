@@ -1,0 +1,205 @@
+column,code,value,rows
+source_head,-,a1451bf6363a0c748419f8ce2c9cd11ad0cbb168,5302
+topic,T01,Retained repository scope,4553
+topic,T02,Browser application,517
+topic,T03,Design system and UI prototypes,68
+topic,T04,Separate public website remit,21
+topic,T05,API and event contracts,12
+topic,T06,build_hosting_and_integration,9
+topic,T07,domain_projection,9
+topic,T08,joint_product_acceptance,9
+topic,T09,wire_contracts,9
+topic,T10,Backend projections and browser behavior,7
+topic,T11,Public website prototypes,7
+topic,T12,retry_and_lifecycle,7
+topic,T13,Cross-team contract and integration tests / Cross-language contract checks,6
+topic,T14,Retained service and backend tooling,6
+topic,T15,tutorial_product_contract,6
+topic,T16,Combined frontend/backend release artifact,5
+topic,T17,Public tutorial fixtures,5
+topic,T18,User guides and training,5
+topic,T19,producer_consumer_fixtures,5
+topic,T20,Shared Node tooling,4
+topic,T21,Cross-team contract and integration tests,3
+topic,T22,End-to-end author-and-run acceptance,3
+topic,T23,identity_and_capabilities,3
+topic,T24,Compiler proposal reconciliation,2
+topic,T25,Cross-team contract and integration tests / Producer-generated consumer fixtures,2
+topic,T26,Duplicated presentation labels,2
+topic,T27,Shared CI and dependency updates,2
+topic,T28,UX design instructions,2
+topic,T29,Authentication browser contract,1
+topic,T30,Browser delivery and API integration,1
+topic,T31,Browser deployment configuration,1
+topic,T32,Compose request cancellation and retry,1
+topic,T33,Contributor workflow,1
+topic,T34,Cross-language contract checks,1
+topic,T35,Cross-team contract and integration tests / Tutorial corpus and published URLs,1
+topic,T36,Duplicated graph semantics,1
+topic,T37,Public site hosting,1
+topic,T38,Run command and event lifecycle,1
+topic,T39,Shared fixture producer / Producer-generated consumer fixtures,1
+topic,T40,Shared vocabulary subset,1
+topic,T41,Tutorial persistence contract,1
+basis,B01,retained-default; not individually reviewed,4553
+basis,B02,frontend-directory rule,517
+basis,B03,targeted source review; preliminary,131
+basis,B04,directory-remit review; representative files inspected,101
+reason,R01,"Not proposed for transfer in this workload split; retained provisionally, not certified uncoupled.",4553
+reason,R02,Browser implementation and local tests proposed for web-team ownership.,517
+reason,R03,"Design assets, component examples, tokens and prototypes derived from the product frontend; directory-level assignment, not individual semantic review.",68
+reason,R04,Standalone public website; transfer of application UX does not establish ownership of public product content and hosting. Directory-level assignment.,21
+reason,R05,Prototype kit for the separate public website; application UX transfer does not establish this remit.,7
+reason,R06,"Service deployment, Python package configuration, or Composer authoring/parity evaluation stays with engine/Composer ownership; web wording does not imply interface ownership.",6
+reason,R07,Current image builds the SPA and embeds dist in the installed Python package; associated build and ignore gates encode this arrangement.,5
+reason,R08,"Material combines visible Composer workflows with backend execution, audit, custody, or deployment guarantees.",5
+reason,R09,Published synthetic input corpus used by tutorial and collector scenarios; Python tests enforce no frontend/public duplicate.,5
+reason,R10,"Root dependencies include backend Azurite tooling and Playwright; Node/npm pins and tests span local, CI, Docker and frontend environments.",4
+reason,R100,Runtime decoder for authoritative readiness snapshots; meanings and shape belong to backend.,1
+reason,R101,Runtime exact-key validation mirrors backend proposal/state semantics; additive fields can break older clients.,1
+reason,R102,Secret inventory and mutation response/request shapes without secret authority transfer.,1
+reason,R103,Selects authoritative server-projected reviewed state; do not reintroduce browser-derived settlement.,1
+reason,R104,Server-generated form fields and visibility predicates consumed by guided form renderers.,1
+reason,R105,"Session, composition state, guided turns and interpretation request/response shapes.",1
+reason,R106,Share-link and public inspection response shapes.,1
+reason,R107,Single-use SSO fragment handoff parsing and scrub-before-network rules; Python parity gate reads failure categories.,1
+reason,R108,Streams run progress and reconnect snapshots to browser clients.,1
+reason,R109,Strict shared-review decoder distinguishes authenticated identity from link capability and preserves session on capability failures.,1
+reason,R11,Operator scenarios exercise chat authoring followed by pipeline execution and output verification; assignment derived from battery README.,3
+reason,R110,Submits fixed scenario prompts through the normal guided authoring workflow.,1
+reason,R111,Tool classification as read-only or mutating is checked against backend tool registry semantics.,1
+reason,R112,Tutorial lifecycle wire models.,1
+reason,R113,Upload/download metadata and blob response shapes.,1
+reason,R114,Uses shared deployment identity and setup assumptions for staging browser acceptance.,1
+reason,R115,"Validation results, run events, acknowledgement requests and WebSocket ticket shapes.",1
+reason,R116,YAML preview section vocabulary is directly pinned against the backend importer by a Python test.,1
+reason,R12,Design-system usage or desktop workspace interaction specification supports specialist web ownership.,2
+reason,R13,One file covers Python/backend plus frontend checks or dependency updates; CI aggregates frontend unit and browser checks into release admission.,2
+reason,R14,The two proposals differ on portable graph artifacts versus settings-based verification and graph rebuild.,2
+reason,R15,Admits readiness only for matching session and composition version; protects display of authoritative state.,1
+reason,R16,Asset retention must agree with deployment cache and old-tab lazy-loading behavior.,1
+reason,R17,Attributes provider/audit evidence to individual authoring transitions; protects the no-provider-bypass invariant.,1
+reason,R18,Audit characteristic vocabulary is directly pinned against backend declarations.,1
+reason,R19,Audit-story response projections consumed by the audit UI.,1
+reason,R20,AuditCharacteristic values are read by Python-to-TypeScript catalog vocabulary parity tests.,1
+reason,R21,Backend retry route binds browser abort/disconnect to Composer cancellation and durable turn settlement.,1
+reason,R22,Binds explicit Run/cancel gestures and results to backend tutorial execution lifecycle.,1
+reason,R23,Browser bearer-token persistence and logout clear dependent user-scoped state.,1
+reason,R24,Build/type generation/test commands integrate with root CI and release packaging; generation currently targets localhost OpenAPI.,1
+reason,R25,"Builds guided picker, form and wiring payloads including human presentation content.",1
+reason,R26,Builds guided proposal projections that frontend exact-key decoders consume.,1
+reason,R27,Builds progress snapshots and user-visible phase descriptions.,1
+reason,R28,Builds source component identities shared by graph and state consumers.,1
+reason,R29,"CORS origins, public base URL and tutorial sample origin connect backend policy to browser deployment.",1
+reason,R30,Central request/error/auth envelope and operation-identity implementation; edits can alter API semantics and same-origin assumptions.,1
+reason,R31,Checks redacted tool-argument fixture shared with frontend proposal summary tests. / Backend production functions regenerate or verify checked-in JSON consumed by frontend tests.,1
+reason,R32,Client abort budget derives from server timeout; changing pacing can abort healthy provider work.,1
+reason,R33,Closed Composer progress vocabulary mirrored in TypeScript.,1
+reason,R34,Compares browser asset identity with backend /api/system/status frontend_build field.,1
+reason,R35,Compares live Python proposal projection with frontend gateProposalProjection.json fixture. / Backend production functions regenerate or verify checked-in JSON consumed by frontend tests.,1
+reason,R36,Connects user cancellation/timeouts to HTTP abort and session-store lifecycle.,1
+reason,R37,Consumer half of backend-generated gate proposal fixture conformance.,1
+reason,R38,"Contains scenario prompts, persisted stage vocabulary and tutorial progression state.",1
+reason,R39,Contributor instructions cover both Python and separately locked frontend workflows plus shared gates.,1
+reason,R40,"Coordinates guided/freeform submission, proposal review, state publication, retries and authoritative reconciliation.",1
+reason,R41,"Coordinates tutorial persistence, resume/abandon and named session lifecycle.",1
+reason,R42,"Coordinates validation invalidation, execution guards, terminal states and event/REST lifecycle.",1
+reason,R43,Creates browser acceptance authentication/data against the managed backend.,1
+reason,R44,"Cross-store invalidation connects composition changes with validation, execution and review state.",1
+reason,R45,Curated plugin labels are hand-mirrored in backend guided display labels.,1
+reason,R46,Defines agent-driven Composer evaluation prompts and scoring expectations.,1
+reason,R47,"Defines and validates guided turn payloads, proposal variants and wiring projections.",1
+reason,R48,Defines backend recovery-error discrimination and failed-turn/transcript shapes.,1
+reason,R49,Defines live OIDC test origin/TLS expectations and evidence-safe execution configuration.,1
+reason,R50,Defines live deployment test entrypoint and staging environment/auth assumptions.,1
+reason,R51,"Defines one-use ticket, close-code, reconnect and terminal/REST fallback contract; derives host from browser origin.",1
+reason,R52,Development /api and /ws proxies plus retained build assets implement assumptions shared with backend serving.,1
+reason,R53,Exact-key preference decoder is inspected directly by a Python parity gate.,1
+reason,R54,"Execute returns run identity, owns ticket/progress lifecycle and applies acknowledgement/error semantics used by browser.",1
+reason,R55,Exercises live deployment authentication acceptance across browser and backend.,1
+reason,R56,Explicitly hand-mirrors frontend catalog pluginDisplayName.ts curated labels.,1
+reason,R57,Generated by backend redaction fixture script and checked by Python; frontend diff consumers rely on its exact grammar.,1
+reason,R58,Generates backend redaction contract fixture under the frontend tree. / Backend production functions regenerate or verify checked-in JSON consumed by frontend tests.,1
+reason,R59,"Handwritten shared API/domain/event models; Python gates directly inspect provider, progress and semantic-edge declarations.",1
+reason,R60,Handwritten/re-exported API models; generated OpenAPI types are explicitly deferred.,1
+reason,R61,Holds browser transition responses until durable backend audit rows are reread for attribution.,1
+reason,R62,Implicit self-publishing node kinds are mirrored by frontend graphTopology.ts.,1
+reason,R63,Includes frontend provider union parity check against types/index.ts. / Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R64,Includes parity checks against frontend types/index.ts progress vocabulary. / Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R65,Includes prompt-hash fixture content directly pinned by a Python Composer test.,1
+reason,R66,Interprets text emitted by backend validation producers; message grammar changes can alter the displayed meaning.,1
+reason,R67,Launches Python backend and frontend from repository-relative paths; pins backend settings and credentials for browser tests.,1
+reason,R68,Live tutorial acceptance; backend tutorial-content test inspects this collector spec.,1
+reason,R69,Loaded directly by backend plugin-policy integration tests as well as frontend policy tests.,1
+reason,R70,"Login, refresh and SSO redirect/origin behavior are implemented beside authoritative identity handling.",1
+reason,R71,"Mirrors Python guided protocol, state-machine discriminators and request/response schemas.",1
+reason,R72,Mirrors the interpretation review wire shapes and closed vocabulary.,1
+reason,R73,Orphan cleanup matches the pending tutorial session title also authored in browser copy.,1
+reason,R74,"Owns SPA dist mount, browser headers, API configuration and frontend build identity alongside backend service wiring.",1
+reason,R75,"Parses OIDC/handoff evidence, including backend token issuer and evidence bounds.",1
+reason,R76,Parses backend redaction summary grammar; unknown projection must not be presented as no change.,1
+reason,R77,"Pending-session title is matched verbatim by backend orphan cleanup, alongside ordinary display copy.",1
+reason,R78,Persists operation identities/fingerprints and reconciles orphan descriptors across reloads.,1
+reason,R79,Pins allowed placement of planner calls within the tutorial journey.,1
+reason,R80,"Plugin catalog, schema and principal availability response shapes.",1
+reason,R81,Preferences exact-record response keys and update request semantics.,1
+reason,R82,Presents backend-produced audit story and result meanings in the teaching journey.,1
+reason,R83,Projects reviewed output fields for consumer-visible review surfaces.,1
+reason,R84,Protects live identity credentials and protocol material in browser test reports.,1
+reason,R85,Publishes website tree including tutorial synthetic fixtures to GitHub Pages.,1
+reason,R86,Python gate compares this fixture with actual guided proposal projection; frontend decoder test consumes it.,1
+reason,R87,Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R88,"Readiness rows, component jump targets and diagnostic response shapes.",1
+reason,R89,Reads backend authoring/audit evidence and implements efficiency/completeness acceptance.,1
+reason,R90,Reads frontend auditCharacteristics.ts and compares Python AuditCharacteristic vocabulary. / Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R91,Reads frontend graphTopology.ts mirrors of Python topology rules. / Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R92,Reads frontend index.html and checks browser delivery and frontend build identity.,1
+reason,R93,Reads frontend playwright.config.ts backend settings used by browser harness.,1
+reason,R94,Reads frontend pluginPolicyMatrix.json and checks live backend policy projections.,1
+reason,R95,Reads frontend preferencesDecoder.ts exact response keys. / Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R96,Reads frontend types/index.ts semantic edge interface and outcome vocabulary. / Python test reads frontend TypeScript source to pin an API vocabulary or domain mirror; some files also contain ordinary backend assertions.,1
+reason,R97,Reads published website/tutorial-site fixtures and staging browser scenario references; verifies fixture semantics and URLs and explicitly rejects frontend public copies.,1
+reason,R98,Redacted tool arguments feed client proposal summaries; representation changes affect frontend readers.,1
+reason,R99,Restates backend implicit producer and fan-in rules; Python parity tests directly read this file.,1
+resolution,X01,Retain with your team unless subsequent scope review identifies a handoff or shared contract.,4553
+resolution,X02,Coordinate contract-sensitive changes identified separately; ordinary UI work belongs to web team.,517
+resolution,X03,Web team maintains visual system; backend team reviews statements of engine capability and canonical domain vocabulary when they change.,68
+resolution,X04,Confirm whether public site belongs to web team; if so transfer site maintenance and coordinate product claims and token copies.,21
+resolution,X05,"Backend remains contract authority; coordinate schema/vocabulary changes with TypeScript decoders, renderers and shared contract fixtures.",12
+resolution,X06,"Web team owns browser automation implementation; backend/product owner owns provider-authoring and audit acceptance meaning. Coordinate scenario/rubric/evidence changes, preserving per-transition provider scrutiny and credential-safe diagnostics.",9
+resolution,X07,"Web team owns frontend tooling; coordinate service origin, asset identity/retention, Python harness dependencies and required release checks with backend/release owner. Separate ownership can retain current combined deployment.",9
+resolution,X08,"Web team owns implementation; coordinate field, enum, error and protocol changes with backend schema owner. Publish generated schemas and conformance fixtures; retain current parity gates until equivalent checks exist.",9
+resolution,X09,Web team owns rendering; coordinate semantic vocabulary changes. Prefer backend-projected facts or published conformance cases rather than another authoritative domain implementation. Pure presentation edits remain autonomous.,9
+resolution,X10,Confirm public website ownership before assigning this kit; shared visual design system can transfer independently.,7
+resolution,X11,Keep producer and correctness rules with backend; agree payload and presentation changes with consuming web components and their fixtures.,7
+resolution,X12,"Web team owns browser implementation; backend owns durable outcomes. Agree operation identity, timeout, cancellation, conflict, reconciliation and terminal-state contracts; preserve interrupted-response and reload acceptance cases.",7
+resolution,X13,Keep Python test owner mine; keep frontend counterpart/fixture edits coordinated and preserve the test input path or replace it with a versioned shared contract artifact before repository extraction. / Backend retains test/contract authority; web team coordinates consumer changes. Extract cross-language checks into contract verification when useful; do not transfer all backend tests.,6
+resolution,X14,Retain backend owner; consult web team only for actual artifact/API dependencies.,6
+resolution,X15,"Web team owns tutorial UI/content implementation; coordinate scenario prompts, persistence/cleanup markers and execution/audit meaning with backend/product owner. Layout and ordinary wording remain theirs; preserve the common Composer backend path.",6
+resolution,X16,Keep backend/release owner accountable for combined artifact; web team supplies verified SPA build. Separate artifacts only if separately approved.,5
+resolution,X17,Retain backend responsibility for fixture meaning and stable scenario URLs; agree hosting ownership separately.,5
+resolution,X18,Web team owns consumer use and file maintenance; backend owns producer truth. Update fixtures from backend production paths and run producer/consumer parity checks together; publish fixtures before any repository separation.,5
+resolution,X19,Web team owns interface instructions and screenshots; backend team owns behavior/security claims and operator sections. Assign document editor or separate sections.,5
+resolution,X20,Backend owns Azurite; web team owns browser tooling. Agree shared runtime pin and package manifest ownership or move dependency consumers into scoped packages.,4
+resolution,X21,"Backend owns expected engine/Composer outcomes and input corpus; web team owns browser journey checks, with one integrated acceptance owner.",3
+resolution,X22,Keep Python test owner mine; keep frontend counterpart/fixture edits coordinated and preserve the test input path or replace it with a versioned shared contract artifact before repository extraction.,3
+resolution,X23,"Web team owns browser code; backend owns authentication, authorization and capability policy. Coordinate storage, logout, callback/origin and capability-error semantics, with auth journey checks.",3
+resolution,X24,Keep Python test owner mine; keep frontend counterpart/fixture edits coordinated and preserve the test input path or replace it with a versioned shared contract artifact before repository extraction. / Backend owns fixture generation and schema meaning; web team owns consuming tests; publish/recheck fixtures with contract changes.,2
+resolution,X25,"Name owner by job/ecosystem, retaining one integration gate owner and coordinated required-check changes.",2
+resolution,X26,Transfer maintenance; retain backend review when statements affect service/domain invariants.,2
+resolution,X27,Your team reconciles compiler scope separately; this is not a prerequisite for UX ownership transfer.,2
+resolution,X28,Backend retains test/contract authority; web team coordinates consumer changes. Extract cross-language checks into contract verification when useful; do not transfer all backend tests.,1
+resolution,X29,"Coordinate curated label changes with backend guided/_display.py, or publish one authoritative label source.",1
+resolution,X30,Decide public-site remit; preserve fixture availability and URLs independently of app UX ownership.,1
+resolution,X31,Keep Python generator owner mine; jointly review generated frontend fixture and consumer tests when the wire projection changes. / Backend owns fixture generation and schema meaning; web team owns consuming tests; publish/recheck fixtures with contract changes.,1
+resolution,X32,Keep Python owner mine initially; nominate one shared label authority or synchronize the two implementations until the presentation contract is extracted.,1
+resolution,X33,Keep Python test owner mine; keep frontend counterpart/fixture edits coordinated and preserve the test input path or replace it with a versioned shared contract artifact before repository extraction. / Backend owns semantic corpus assertions; web team maintains browser scenario references; public-site owner preserves hosting.,1
+resolution,X34,"Keep backend owner; coordinate command, cancellation, ticket/reconnect and conflict-envelope behavior, without treating internal execution work as shared.",1
+resolution,X35,Keep backend owner; jointly specify retry/abort/settlement semantics so browser request changes do not create duplicated or abandoned work.,1
+resolution,X36,"Keep backend ownership; agree browser login/refresh/logout and callback/error behavior, without delegating authorization policy.",1
+resolution,X37,Keep backend ownership; coordinate only browser-facing settings and origin changes with web team.,1
+resolution,X38,"Keep backend ownership; coordinate title/identity changes with frontend tutorial copy, or replace text matching with explicit identity.",1
+resolution,X39,"Keep backend ownership; jointly agree static hosting, origins, public config and build identity before deployment changes.",1
+resolution,X40,Keep backend semantics authoritative; coordinate new node kinds and topology changes with frontend graph projection/parity tests.,1
+resolution,X41,Keep repository guide ownership with your team; web team owns accuracy of frontend setup/check instructions.,1
+resolution,X42,Only changes to UI-exposed enum values need coordination; retain all engine enum ownership with backend.,1

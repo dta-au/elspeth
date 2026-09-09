@@ -755,6 +755,91 @@ def test_unbound_method_call_does_not_count_receiver_as_source_param(tmp_path: P
     assert [finding.rule_id for finding in findings] == ["R_TB_TESTS_IRRELEVANT_INPUT"]
 
 
+def test_classmethod_boundary_call_binds_cls_implicitly(tmp_path: Path) -> None:
+    """``Cls.restore(envelope)`` supplies ``envelope``; ``cls`` is bound implicitly.
+
+    Regression: ``_is_unbound_method_call`` keys off the receiver *name*, so a
+    classmethod's canonical ``Cls.method(payload)`` receiver was read as an
+    unbound ``Cls.method(self, payload)`` call. The declared ``source_param``
+    index was then off by one and this honest test was reported as
+    R_TB_TESTS_IRRELEVANT_INPUT.
+    """
+    test_ref = "tests/test_classmethod.py::test_rejects_bad_input"
+    _write_test_file(
+        tmp_path,
+        "tests/test_classmethod.py",
+        """
+        import pytest
+
+        class Binding:
+            pass
+
+        def test_rejects_bad_input():
+            with pytest.raises(ValueError):
+                Binding.restore({"bad": object()})
+        """,
+    )
+    fingerprint = _test_fingerprint(tmp_path, test_ref)
+    findings = _analyze_at(
+        f"""
+        class Binding:
+            @classmethod
+            @trust_boundary(
+                tier=3,
+                source="x",
+                source_param="envelope",
+                suppresses=("R1",),
+                invariant="raises ValueError on malformed envelope",
+                test_ref="{test_ref}",
+                test_fingerprint="{fingerprint}",
+            )
+            def restore(cls, envelope):
+                return envelope["x"]
+        """,
+        repo_root=tmp_path,
+    )
+    assert findings == []
+
+
+def test_classmethod_boundary_called_without_source_param_still_fires(tmp_path: Path) -> None:
+    """The classmethod adjustment must not blanket-accept: no argument, no proof."""
+    test_ref = "tests/test_classmethod_bare.py::test_rejects_bad_input"
+    _write_test_file(
+        tmp_path,
+        "tests/test_classmethod_bare.py",
+        """
+        import pytest
+
+        class Binding:
+            pass
+
+        def test_rejects_bad_input():
+            with pytest.raises(ValueError):
+                Binding.restore()
+        """,
+    )
+    fingerprint = _test_fingerprint(tmp_path, test_ref)
+    findings = _analyze_at(
+        f"""
+        class Binding:
+            @classmethod
+            @trust_boundary(
+                tier=3,
+                source="x",
+                source_param="envelope",
+                suppresses=("R1",),
+                invariant="raises ValueError on malformed envelope",
+                test_ref="{test_ref}",
+                test_fingerprint="{fingerprint}",
+            )
+            def restore(cls, envelope):
+                return envelope["x"]
+        """,
+        repo_root=tmp_path,
+    )
+    assert [finding.rule_id for finding in findings] == ["R_TB_TESTS_IRRELEVANT_INPUT"]
+
+
 def test_repurposed_test_that_calls_different_subject_fires_irrelevant_input(tmp_path: Path) -> None:
     test_ref = "tests/test_repurposed.py::test_rejects_bad_input"
     _write_test_file(
@@ -1108,6 +1193,31 @@ def test_nonraising_clean_returns_no_findings(tmp_path: Path) -> None:
     assert findings == [], f"Clean non_raising boundary must pass; got: {[(f.rule_id, f.message[:80]) for f in findings]}"
 
 
+def test_observation_boundary_alias_uses_nonraising_honesty_check(tmp_path: Path) -> None:
+    """The distinct marker implies non-raising semantics even when imported under an alias."""
+    findings = _analyze_at(
+        """
+        from elspeth.contracts.trust_boundary import observation_boundary as observes
+
+        @observes(
+            tier=3,
+            source="LLM tool-call arguments",
+            source_param="arguments",
+            suppresses=("R5",),
+            invariant="returns None on malformed input",
+        )
+        def extract(arguments):
+            source = arguments["source"] if "source" in arguments else None
+            if source is None:
+                return None
+            return source
+        """,
+        repo_root=tmp_path,
+    )
+
+    assert findings == []
+
+
 def test_nonraising_raise_on_source_param_guard_is_flagged(tmp_path: Path) -> None:
     """A raise gated by a source_param-derived check contradicts the non_raising claim."""
     findings = _analyze_at(
@@ -1130,6 +1240,29 @@ def test_nonraising_raise_on_source_param_guard_is_flagged(tmp_path: Path) -> No
         """,
         repo_root=tmp_path,
     )
+    assert [f.rule_id for f in findings] == [RULE_NONRAISING_RAISES]
+
+
+def test_observation_boundary_raise_on_source_param_guard_is_flagged(tmp_path: Path) -> None:
+    findings = _analyze_at(
+        """
+        from elspeth.contracts.trust_boundary import observation_boundary
+
+        @observation_boundary(
+            tier=3,
+            source="LLM tool-call arguments",
+            source_param="arguments",
+            suppresses=("R5",),
+            invariant="returns None on malformed input",
+        )
+        def extract(arguments):
+            if arguments.get("source") is None:
+                raise ValueError("missing source")
+            return arguments["source"]
+        """,
+        repo_root=tmp_path,
+    )
+
     assert [f.rule_id for f in findings] == [RULE_NONRAISING_RAISES]
 
 

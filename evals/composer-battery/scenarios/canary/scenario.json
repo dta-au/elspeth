@@ -1,0 +1,95 @@
+{
+  "case": "canary",
+  "example": null,
+  "variant": null,
+  "corpus_version": 0,
+  "surface": {
+    "required": "compose_loop",
+    "classifier_decision": "AMBIGUOUS"
+  },
+  "canonical_arguments": {
+    "source": {
+      "plugin": "json",
+      "on_success": "out",
+      "options": {
+        "path": "colours.json",
+        "schema": {
+          "mode": "observed"
+        }
+      },
+      "on_validation_failure": "discard"
+    },
+    "nodes": [],
+    "edges": [],
+    "outputs": [
+      {
+        "sink_name": "out",
+        "plugin": "json",
+        "options": {
+          "path": "outputs/colours.json",
+          "format": "json",
+          "schema": {
+            "mode": "observed"
+          },
+          "mode": "write",
+          "collision_policy": "auto_increment"
+        },
+        "on_write_failure": "discard"
+      }
+    ],
+    "metadata": {}
+  },
+  "expected_topology": {
+    "nodes": [
+      {
+        "kind": "source",
+        "plugin": "json",
+        "extras": {}
+      },
+      {
+        "kind": "output",
+        "plugin": "json",
+        "extras": {}
+      }
+    ],
+    "edges": [
+      [
+        0,
+        1,
+        "on_success"
+      ]
+    ]
+  },
+  "option_assertions": [],
+  "floor": {
+    "tool_bearing_calls": 2,
+    "components": {
+      "discovery": 1,
+      "dependent_listing": 0,
+      "mutation": 1
+    },
+    "repairs": 0,
+    "backtracks": 0,
+    "derivation": [
+      "discovery: 0 \u2014 json in, json out; observed 2026-08-17, the composer authors these directly and the green criterion must_discover_schema_before_first_mutation is false for this case (see calibration/README.md)",
+      "data: the invented rows travel with the mutation \u2014 0 extra (this substrate resolves them via a blob and one interpretation-review round, which is the second tool-bearing turn)",
+      "dependent_listing: none",
+      "mutation: single set_pipeline authors the source and the sink"
+    ],
+    "pre_calibration": 2,
+    "post_calibration": null
+  },
+  "red_criteria": {
+    "passivity_phrases": "rgr_default",
+    "build_failure_sentinels": [
+      "I cannot mark this pipeline complete",
+      "runtime preflight failed"
+    ]
+  },
+  "green_criteria": {
+    "topology_matches_expected": true,
+    "option_assertions_hold": true,
+    "must_discover_schema_before_first_mutation": false,
+    "is_valid": true
+  }
+}

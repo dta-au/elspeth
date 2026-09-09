@@ -4,11 +4,32 @@ import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+# Observed mode forbids explicit field definitions, so declared output field
+# metadata reaches the emitted contract only under fixed/flexible mode.
+DECLARED_SCHEMA = {"mode": "fixed", "fields": ["dish: str", "cuisine: str"]}
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="field_mapper-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
 
 
 class TestFieldMapper:
@@ -90,8 +111,9 @@ class TestFieldMapper:
         assert result.row is not None
         assert result.row.to_dict() == {"price": 12.5}
 
-    def test_rename_over_existing_field_updates_output_contract(self, ctx: PluginContext) -> None:
-        """An overwrite rename must not keep the overwritten field's stale type."""
+    def test_rename_over_existing_field_is_rejected_before_mutation(self, ctx: PluginContext) -> None:
+        """Direct process calls enforce the same no-overwrite contract as the executor."""
+        from elspeth.contracts.errors import PluginContractViolation
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -110,15 +132,8 @@ class TestFieldMapper:
         )
         row = PipelineRow({"name": "Alice", "age": 40}, contract)
 
-        result = transform.process(row, ctx)
-
-        assert result.status == "success"
-        assert result.row is not None
-        assert result.row.to_dict() == {"age": "Alice"}
-        age_field = result.row.contract.get_field("age")
-        assert age_field.original_name == "Name"
-        assert age_field.python_type is str
-        assert result.row.contract.validate(result.row.to_dict()) == []
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(row, ctx)
 
     def test_select_fields_only(self, ctx: PluginContext) -> None:
         """Only include specified fields (drop others)."""
@@ -622,9 +637,18 @@ class TestOutputSchemaConfig:
         assert transform._output_schema_config is not None
         assert frozenset(transform._output_schema_config.guaranteed_fields) == frozenset({"new_name", "target"})
 
-    def test_non_strict_optional_mapping_does_not_declare_or_guarantee_target(self) -> None:
-        """A skipped non-strict mapping target is not present on every successful row."""
+    def test_non_strict_mapping_assertion_declares_and_guarantees_target(self) -> None:
+        """The mapping itself now requires its source, so every successful row has its target.
+
+        ``declared_input_fields`` is enforced before ``process()`` by the
+        executor.  A row missing ``maybe_field`` therefore cannot become a
+        successful partial output, even though the transform's legacy direct
+        ``process()`` branch still skips a normalization-stable source when
+        called outside the executor.
+        """
+        from elspeth.contracts.errors import DeclaredRequiredInputFieldsViolation
         from elspeth.engine.executors.declared_output_fields import verify_declared_output_fields
+        from elspeth.engine.executors.declared_required_fields import verify_declared_required_fields
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -634,15 +658,27 @@ class TestOutputSchemaConfig:
                 "strict": False,
             }
         )
-        assert transform.declared_output_fields == frozenset()
+        assert transform.declared_input_fields == frozenset({"maybe_field"})
+        assert transform.declared_output_fields == frozenset({"output"})
         assert transform._output_schema_config is not None
-        assert transform._output_schema_config.guaranteed_fields is None
+        assert transform._output_schema_config.guaranteed_fields == ("output",)
 
-        result = transform.process(make_pipeline_row({"other_field": "value"}), make_context())
+        with pytest.raises(DeclaredRequiredInputFieldsViolation, match="maybe_field"):
+            verify_declared_required_fields(
+                declared_input_fields=transform.declared_input_fields,
+                effective_input_fields=frozenset({"other_field"}),
+                plugin_name=transform.name,
+                node_id="node",
+                run_id="run",
+                row_id="row",
+                token_id="token",
+            )
+
+        result = transform.process(make_pipeline_row({"maybe_field": "value"}), make_context())
 
         assert result.status == "success"
         assert result.row is not None
-        assert result.row.to_dict() == {"other_field": "value"}
+        assert result.row.to_dict() == {"output": "value"}
         verify_declared_output_fields(
             declared_output_fields=transform.declared_output_fields,
             emitted_rows=(result.row,),
@@ -669,6 +705,273 @@ class TestOutputSchemaConfig:
         assert transform._output_schema_config is not None
         assert transform._output_schema_config.guaranteed_fields is not None
         assert frozenset(transform._output_schema_config.guaranteed_fields) == frozenset({"target", "kept"})
+
+    def test_select_only_output_schema_does_not_declare_renamed_away_source(self) -> None:
+        """A renamed source is CONSUMED, not emitted, so it is not an output field.
+
+        Regression: elspeth-a2bf676e6f. ``_build_field_mapper_output_schema_config``
+        carried the AUTHORED INPUT ``fields`` straight onto the output config, so a
+        source the mapper renames away stayed declared as a required OUTPUT field it
+        provably never emits. ``get_effective_guaranteed_fields()`` then demanded it
+        and the composer's transform-contract rule rejected a correct pipeline.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"id": "id", "rating_text": "rating"},
+                "select_only": True,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        output_config = transform._output_schema_config
+        assert output_config is not None
+        declared = {field.name for field in output_config.fields or ()}
+        assert "rating_text" not in declared
+        assert frozenset(output_config.get_effective_guaranteed_fields()) == frozenset({"id", "rating"})
+
+    def test_select_only_renamed_target_keeps_the_source_declared_type(self) -> None:
+        """The rename moves a value, so the target carries the source's authored type.
+
+        Regression: elspeth-a2bf676e6f. Dropping the source declaration must not
+        downgrade the target to ``any`` — the mapper copies the value unchanged,
+        so its declared type is known.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"id": "id", "rating_text": "rating"},
+                "select_only": True,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        output_config = transform._output_schema_config
+        assert output_config is not None
+        by_name = {field.name: field for field in output_config.fields or ()}
+        assert by_name["rating"].field_type == "str"
+
+    def test_select_only_emitted_row_satisfies_its_own_output_contract(self) -> None:
+        """The ADR-014 post-emission check passes on the row the mapper actually emits.
+
+        Regression: elspeth-a2bf676e6f. This is the end-to-end statement of the
+        defect — the transform's own output contract must accept its own row.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"id": "id", "rating_text": "rating"},
+                "select_only": True,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        result = transform.process(make_pipeline_row({"id": 1, "rating_text": "4"}), make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"id": 1, "rating": "4"}
+        _run_post_emission_check(transform, result.row)
+
+    def test_passthrough_output_schema_does_not_declare_renamed_away_source(self) -> None:
+        """Without select_only, process() still renames the source away.
+
+        Regression: elspeth-a2bf676e6f. The deep-copy branch keeps UNMAPPED
+        fields but a renamed source is deleted from the row, so its authored
+        declaration must not survive onto the output contract either.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"rating_text": "rating"},
+                "select_only": False,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["id: int", "rating_text: str"],
+                    "guaranteed_fields": ["id", "rating_text"],
+                },
+            }
+        )
+
+        result = transform.process(make_pipeline_row({"id": 1, "rating_text": "4"}), make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"id": 1, "rating": "4"}
+        _run_post_emission_check(transform, result.row)
+
+    def test_identity_mapped_original_header_abstains_passthrough_guarantees(self) -> None:
+        """An identity-mapped original header renames a normalized field away.
+
+        ``{"Amount USD": "Amount USD"}`` deletes the normalized ``amount_usd``
+        key at runtime and writes the literal ``"Amount USD"`` key, so the
+        constructor cannot name the removed field. Claiming the upstream
+        guarantees as pass-through would promise ``amount_usd`` on rows that
+        no longer carry it — the abstain arm must cover identity mappings,
+        not only renames to a different target.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"Amount USD": "Amount USD"},
+                "schema": {"mode": "observed", "guaranteed_fields": ["amount_usd", "kept"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        guarantees = frozenset(transform._output_schema_config.guaranteed_fields or ())
+        assert "amount_usd" not in guarantees
+        assert "kept" not in guarantees
+
+    def test_unresolved_original_header_abstains_from_passthrough_declarations(self) -> None:
+        """The unnameable removal costs the whole passthrough declaration set.
+
+        Regression: elspeth-a2bf676e6f. ``{"Amount USD": "amount_usd"}``
+        deletes a normalized key only ``contract.resolve_name`` can name at
+        runtime, so the constructor cannot say WHICH other forwarded column
+        stopped being emitted. The rename target itself remains a known output.
+
+        Dropping the declarations is NOT the safe direction, and an earlier
+        revision of this fix did exactly that. ``fields`` feeds two OPPOSED
+        limbs: declared-REQUIRED names union into
+        ``get_effective_guaranteed_fields`` (over-declaring promises rows that
+        may not arrive), while the declared NAMES are the fixed-mode extras
+        allow-list in ``verify_schema_config_mode`` (under-declaring rejects
+        rows that do). Declaring the forwarded columns OPTIONAL satisfies both.
+        Pinned under ``mode: fixed`` on purpose — under ``flexible`` the extras
+        limb never runs, which is how the regression hid.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"Amount USD": "amount_usd"},
+                "select_only": False,
+                "schema": {"mode": "fixed", "fields": ["amount_usd: float", "kept: str"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert set(by_name) == {"amount_usd", "kept"}
+        assert by_name["amount_usd"].required is True
+        assert by_name["kept"].required is False
+        assert transform._output_schema_config.get_effective_guaranteed_fields() == frozenset({"amount_usd"})
+
+        # Model the original-header lineage the test claims to exercise.  A
+        # generic make_pipeline_row gives ``amount_usd`` the same original and
+        # normalized name; under that fixture ``Amount USD`` is genuinely
+        # absent and the historical non-strict skip merely hid the mismatch.
+        row = PipelineRow(
+            {"amount_usd": 1.5, "kept": "x"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("amount_usd", float, original_name="Amount USD", required=True),
+                    make_field("kept", str, required=True),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        _run_post_emission_check(transform, result.row)
+
+    def test_rename_target_declared_without_its_source_keeps_that_declaration(self) -> None:
+        """An author may declare the EMITTED name instead of the consumed one.
+
+        Regression: elspeth-a2bf676e6f. The projection prefers the source's
+        declaration because a rename moves that value, but an author who
+        declared only the target still declared the emitted column — so the
+        target's own declaration is the fallback, not a discard. That fallback
+        limb had no coverage: deleting it left 10,213 tests green, while the
+        comment above it asserts the shape is supported.
+
+        Distinct from ``test_rename_collision_is_described_by_the_source_that_lands_there``,
+        where BOTH sides are declared and the source must win.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "b"},
+                "select_only": True,
+                "schema": {"mode": "flexible", "fields": ["b: str"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert by_name["b"].field_type == "str", "the target's authored declaration must survive when the source carries none"
+
+    def test_rename_collision_is_described_by_the_source_that_lands_there(self) -> None:
+        """Projection describes the attempted value even though runtime rejects it.
+
+        Regression: elspeth-a2bf676e6f. If ``{"a": "b"}`` could emit, ``a``'s
+        declaration would describe the value landing in ``b``.
+        Preferring the target's authored declaration silently re-typed the
+        attempted write. The independent collision contract then rejects the
+        occupied target before mutation.
+        """
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "b"},
+                "select_only": False,
+                "schema": {"mode": "fixed", "fields": ["a: int", "b: str"], "guaranteed_fields": ["a", "b"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert by_name["b"].field_type == "int"
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(make_pipeline_row({"a": 1, "b": "orig"}), make_context())
+
+    def test_passthrough_keeps_unmapped_declarations_when_every_source_is_nameable(self) -> None:
+        """The abstention above is scoped to unnameable removals, not to renames.
+
+        Regression: elspeth-a2bf676e6f. With only statically-nameable sources the
+        constructor knows exactly which field is renamed away, so the surviving
+        columns keep their authored declarations.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"rating_text": "rating"},
+                "select_only": False,
+                "schema": {"mode": "flexible", "fields": ["kept: str", "rating_text: str"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        by_name = {field.name: field for field in transform._output_schema_config.fields or ()}
+        assert set(by_name) == {"kept", "rating"}
+        assert by_name["rating"].field_type == "str"
 
     def test_guaranteed_fields_empty_mapping(self):
         from elspeth.plugins.transforms.field_mapper import FieldMapper
@@ -748,8 +1051,8 @@ class TestOutputSchemaConfig:
         # "score" → "score" is identity (excluded), "name" → "display_name" is a rename (included)
         assert transform.declared_output_fields == frozenset({"display_name"})
 
-    def test_original_header_rename_does_not_retain_unresolved_source_guarantee(self) -> None:
-        """Original-header sources are not treated as normalized guarantee keys."""
+    def test_original_header_rename_guarantees_target_not_unresolved_source(self) -> None:
+        """Runtime lineage resolves the source; successful output names only the target."""
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -759,12 +1062,12 @@ class TestOutputSchemaConfig:
             }
         )
 
-        assert transform.declared_output_fields == frozenset()
+        assert transform.declared_output_fields == frozenset({"price"})
         assert transform._output_schema_config is not None
-        assert transform._output_schema_config.guaranteed_fields == ()
+        assert transform._output_schema_config.guaranteed_fields == ("price",)
 
-    def test_original_header_identity_mapping_does_not_declare_target_as_new_field(self) -> None:
-        """Original-name identity mappings must not trigger false collision checks."""
+    def test_original_header_to_normalized_name_guarantees_the_emitted_target(self) -> None:
+        """Different config literals still describe one guaranteed emitted key."""
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
@@ -774,7 +1077,7 @@ class TestOutputSchemaConfig:
             }
         )
 
-        assert transform.declared_output_fields == frozenset()
+        assert transform.declared_output_fields == frozenset({"amount_usd"})
 
 
 class TestFieldMapperOutputSchemaContract:
@@ -835,3 +1138,1132 @@ class TestFieldMapperOutputSchemaContract:
         guaranteed = frozenset(transform._output_schema_config.guaranteed_fields)
         assert "id" in guaranteed
         assert "name" in guaranteed
+
+
+class TestFieldMapperDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-ed2c2315d7).
+
+    Contract propagation infers a field created by an upstream transform as
+    ``required=False, source="inferred"``. When the author also declares that
+    field in ``schema.fields``, FieldMapper copies the declaration into its
+    output schema config, so ADR-014's post-emission check compares declared
+    ``required``/``nullable``/``python_type`` against the inferred metadata and
+    fails the run unless FieldMapper restamps the declaration on emission.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    def test_select_only_restamps_declared_metadata_over_inferred_upstream_field(self, ctx: PluginContext) -> None:
+        """A declared field created upstream emits with its declared metadata."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"dish": "dish", "cuisine": "cuisine"},
+                "select_only": True,
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa", "cuisine": "Malaysian"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("dish", str, required=True, source="declared"),
+                    # An upstream LLM transform created 'cuisine', so contract
+                    # propagation inferred it as optional.
+                    make_field("cuisine", str, required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        _run_post_emission_check(transform, result.row)
+        emitted = result.row.contract.get_field("cuisine")
+        assert emitted.required is True
+        assert emitted.nullable is False
+        assert emitted.python_type is str
+
+    def test_rename_without_select_only_restamps_declared_metadata(self, ctx: PluginContext) -> None:
+        """Renames carry source metadata forward, so they need the same restamp."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                # `raw_cuisine` is DECLARED, unlike DECLARED_SCHEMA: a mapping
+                # source is a configured READ, and a mode: fixed schema is
+                # extra='forbid', so a row carrying an undeclared source dies at
+                # input validation and the rename could never fire. Construction
+                # rejects that as incoherent (elspeth-d3958d90f5). The restamp
+                # under test is unaffected — only the config is made coherent.
+                "schema": {"mode": "fixed", "fields": ["dish: str", "cuisine: str", "raw_cuisine: str"]},
+                "mapping": {"raw_cuisine": "cuisine"},
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa", "raw_cuisine": "Malaysian"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("dish", str, required=True, source="declared"),
+                    make_field("raw_cuisine", str, required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("cuisine").required is True
+
+    def test_restamp_does_not_mask_a_declared_field_missing_from_the_row(self, ctx: PluginContext) -> None:
+        """Restamping declared metadata must not invent an absent declared field.
+
+        ``cuisine`` is a MAPPING TARGET here, so it is genuinely declared on the
+        output contract; the upstream row simply never carried it. Before
+        elspeth-a2bf676e6f this scenario was written with ``cuisine`` merely
+        declared in the authored INPUT ``schema.fields`` and whitelisted away by
+        the mapping — which the output contract no longer claims, so it could no
+        longer exercise the restamp. The guard being pinned is the restamp, not
+        the declaration copying, so it moves onto a field the output really does
+        promise.
+        """
+        from elspeth.contracts.errors import SchemaConfigModeViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"dish": "dish", "cuisine": "cuisine"},
+                "select_only": True,
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(make_field("dish", str, required=True, source="declared"),),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert "cuisine" not in result.row.to_dict()
+
+        with pytest.raises(SchemaConfigModeViolation) as exc_info:
+            _run_post_emission_check(transform, result.row)
+
+        assert tuple(exc_info.value.payload["missing_required_fields"]) == ("cuisine",)
+        # Absence is reported as a missing guarantee, not as metadata drift:
+        # the mismatch collector only inspects fields the row actually carries.
+        assert "field_metadata_mismatches" not in exc_info.value.payload
+
+    def test_select_only_whitelist_drops_a_non_selected_field_from_the_output_contract(self, ctx: PluginContext) -> None:
+        """Cleanup is the documented purpose of select_only, so it must validate.
+
+        Regression: elspeth-a2bf676e6f. ``schema.fields`` is the INPUT contract,
+        so declaring a field there and omitting it from the whitelist is the
+        ordinary "save only these fields" gesture — not a contradiction. The
+        output contract must stop promising the dropped field, and the emitted
+        row must satisfy its own contract.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"dish": "dish"},
+                "select_only": True,
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa", "cuisine": "Malaysian"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("dish", str, required=True, source="declared"),
+                    make_field("cuisine", str, required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row.to_dict() == {"dish": "laksa"}
+        assert transform._output_schema_config is not None
+        assert {field.name for field in transform._output_schema_config.fields or ()} == {"dish"}
+        _run_post_emission_check(transform, result.row)
+
+
+def test_select_only_assistance_requires_every_downstream_field() -> None:
+    """Discovery guidance names the contract obligation behind a whitelist."""
+    from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+    assistance = FieldMapper.get_agent_assistance()
+    assert assistance is not None
+    rendered = " ".join(assistance.composer_hints)
+
+    assert "every field required by the downstream sink" in rendered
+
+
+class TestFieldMapperOriginalHeaderClassification:
+    """Which mapping sources name a row key, and which only resolve at runtime.
+
+    Regression: elspeth-f262a8c678. ``_is_unresolved_original_source`` used
+    ``not source.isidentifier()`` as its proxy for "an original header resolved
+    only at runtime". ``normalize_field_name`` LOWERCASES and keyword-suffixes,
+    so every case-variant header ('B', 'Name', 'userID', 'class') is an
+    identifier that a normalized header never yields — the proxy caught only
+    the visibly messy 'First Name' class. Four declarations consume the
+    predicate, and each one then described a field the transform does not emit.
+
+    The parametrize column reads ``names_a_row_key`` for symmetry with the
+    helper, but what it pins is "is a normalization fixed point". A row CAN be
+    keyed 'B' — headerless ``columns`` and a source's ``field_mapping`` values
+    are identifier-checked but never lowercased — so False here means "may not
+    name a row key", which is what makes abstention the only safe answer, not
+    "no row is keyed by this" (elspeth-bb470636d1).
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    @pytest.mark.parametrize(
+        ("source", "names_a_row_key"),
+        [
+            ("name", True),
+            ("first_name", True),
+            ("field2", True),
+            ("café", True),
+            ("B", False),
+            ("Name", False),
+            ("userID", False),
+            ("ID", False),
+            ("class", False),
+            ("Ünicode", False),
+            ("First Name", False),
+            ("2fast", False),
+            ("!!!", False),
+            ("", False),
+        ],
+        ids=repr,
+    )
+    def test_only_normalization_fixed_points_name_a_row_key(self, source: str, names_a_row_key: bool) -> None:
+        """The guard tests normalization's fixed points, not Python's identifier alphabet."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        assert FieldMapper._is_static_normalized_source(source) is names_a_row_key
+        assert FieldMapper._is_unresolved_original_source(source) is not names_a_row_key
+
+    @pytest.mark.parametrize("source", ["meta.name", "meta.Name", "Meta.name", "a.b.c"])
+    def test_dotted_sources_are_neither_row_key_nor_original_header(self, source: str) -> None:
+        """A dotted source is a nested read, so neither predicate claims it."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        assert FieldMapper._is_static_normalized_source(source) is False
+        assert FieldMapper._is_unresolved_original_source(source) is False
+
+    @pytest.mark.parametrize(
+        "header",
+        ["name", "first_name", "field2", "B", "Name", "userID", "ID", "class", "First Name", "2fast"],
+        ids=repr,
+    )
+    def test_static_classification_agrees_with_the_runtime_resolver(self, header: str) -> None:
+        """The predicate answers the question ``process`` actually asks of a row.
+
+        ``process`` deletes ``row.contract.resolve_name(source)``, so a source
+        is statically nameable exactly when the resolver returns the literal
+        unchanged. Cross-checking against the resolver — rather than against
+        ``normalize_field_name`` again — keeps this from restating the
+        implementation.
+        """
+        from elspeth.plugins.sources.field_normalization import normalize_field_name
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        contract = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(make_field(normalize_field_name(header), str, original_name=header, required=True, source="declared"),),
+            locked=True,
+        )
+
+        assert FieldMapper._is_static_normalized_source(header) is (contract.resolve_name(header) == header)
+
+    def test_case_variant_source_does_not_promise_the_name_it_deletes(self, ctx: PluginContext) -> None:
+        """A case-variant rename abstains instead of guaranteeing a deleted column.
+
+        At HEAD the guard called 'Name' statically nameable, so the output
+        config kept 'name' as a passthrough guarantee while ``process``
+        deleted it — the transform's own post-emission check then rejected its
+        own row.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": {"mode": "flexible", "fields": ["name: str", "keep: str"], "guaranteed_fields": ["name", "keep"]},
+                "mapping": {"Name": "full_name"},
+                "select_only": False,
+                "strict": True,
+            }
+        )
+        row = PipelineRow(
+            {"name": "Ada", "keep": "kept"},
+            SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    make_field("name", str, original_name="Name", required=True, source="declared"),
+                    make_field("keep", str, original_name="keep", required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        assert transform._output_schema_config is not None
+        assert "name" not in (transform._output_schema_config.guaranteed_fields or ())
+        assert transform.forwards_input_fields is False
+        assert transform.removed_input_fields == frozenset()
+        assert transform.declared_output_fields == frozenset({"full_name"})
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row.to_dict() == {"full_name": "Ada", "keep": "kept"}
+        _run_post_emission_check(transform, result.row)
+
+    @pytest.mark.parametrize("case_variant_source", ["Name", "userID", "ID", "class"], ids=repr)
+    def test_case_variant_sources_declare_exactly_like_the_messy_header_class(self, case_variant_source: str) -> None:
+        """The fix makes the two halves of "original header" agree.
+
+        'First Name' already abstained at HEAD. A case variant resolves through
+        the same ``contract.resolve_name`` path, so every declaration it drives
+        must match — that equivalence is the whole content of the fix.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        def declarations(source: str) -> tuple[object, ...]:
+            transform = FieldMapper(
+                {
+                    "schema": {"mode": "flexible", "fields": ["name: str", "keep: str"], "guaranteed_fields": ["name", "keep"]},
+                    "mapping": {source: "mapped"},
+                    "select_only": False,
+                    "strict": True,
+                }
+            )
+            assert transform._output_schema_config is not None
+            return (
+                transform.forwards_input_fields,
+                transform.removed_input_fields,
+                transform.declared_output_fields,
+                transform._output_schema_config.guaranteed_fields,
+            )
+
+        assert declarations(case_variant_source) == declarations("First Name")
+
+    @pytest.mark.parametrize("source", ["", "!!!", "   "], ids=repr)
+    def test_an_empty_normalizing_mapping_key_still_constructs(self, source: str) -> None:
+        """``normalize_field_name`` raising must not change the construction contract.
+
+        It raises ``ExternalHeaderError`` for a key that normalizes to nothing.
+        The guard answers it the way ``value_transform._row_key_aliases`` does —
+        such a literal names no field, so it is an unresolved original header —
+        rather than letting a new exception class escape ``__init__``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": {"mode": "observed"}, "mapping": {source: "mapped"}})
+
+        assert FieldMapper._is_unresolved_original_source(source) is True
+        assert transform.forwards_input_fields is False
+
+
+class TestFieldMapperOverlapNormalization:
+    """The overlap rule reads the row key ``process`` deletes (elspeth-bb470636d1).
+
+    ``_reject_overlapping_rename_graphs`` compared LITERAL config strings while
+    ``process`` deletes a renamed source by a key it picks at runtime, so a
+    case-variant source slipped a rename chain past construction and then lost
+    data exactly like the literal chain that is rejected.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    @pytest.mark.parametrize(
+        ("literal_chain", "aliased_chain"),
+        [
+            ({"a": "b", "b": "c"}, {"a": "b", "B": "c"}),
+            ({"a": "b", "b": "c"}, {"A": "b", "b": "c"}),
+            ({"b": "c", "a": "b"}, {"b": "c", "a": "B"}),
+            ({"a": "b", "b": "a"}, {"a": "b", "B": "a"}),
+            ({"a": "class_", "class_": "c"}, {"a": "class_", "class": "c"}),
+            ({"a": "first_name", "first_name": "c"}, {"a": "first_name", "First Name": "c"}),
+        ],
+        ids=repr,
+    )
+    def test_an_aliased_chain_is_rejected_like_its_literal_twin(
+        self,
+        literal_chain: dict[str, str],
+        aliased_chain: dict[str, str],
+    ) -> None:
+        """Two chains that behave identically at runtime must be judged identically.
+
+        The aliased half is the defect: it reached ``process`` and deleted the
+        normalized key another entry had just written.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        for mapping in (literal_chain, aliased_chain):
+            with pytest.raises(PluginConfigError, match="overlapping rename"):
+                FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {"A": "a"},
+            {"Name": "name"},
+            {"First Name": "first_name"},
+            {"class": "class_"},
+            {"A": "a", "b": "c"},
+        ],
+        ids=repr,
+    )
+    def test_a_canonical_identity_mapping_is_not_an_overlap(self, mapping: dict[str, str]) -> None:
+        """An original header mapped onto its own row key is a no-op, not a chain.
+
+        ``process`` deletes the normalized key and writes the same value back
+        under the same name. Judging identity on the LITERAL strings would call
+        every one of these a rename onto a live source and reject a working
+        config at construction.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+        assert transform._mapping == mapping
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {"meta.source": "a", "meta_source": "b"},
+            {"meta.source": "x", "y": "meta_source"},
+            {"a.b": "x", "y": "a_b"},
+        ],
+        ids=repr,
+    )
+    def test_a_dotted_source_is_not_normalized_into_a_false_overlap(self, mapping: dict[str, str]) -> None:
+        """A dotted source is a nested read, so it is keyed by its literal text.
+
+        ``normalize_field_name('meta.source')`` is ``'meta_source'``, so
+        canonicalising a dotted name would make the nested read answer to a
+        sibling's plain field name and reject a config ``process`` runs
+        correctly — the second case is the one that discriminates, since it puts
+        that invented key on the TARGET side where membership is tested.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+        assert transform._mapping == mapping
+
+    def test_a_dotted_source_still_overlaps_on_its_literal_target(self) -> None:
+        """The nested read writes a key a later entry then deletes — still a chain."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        with pytest.raises(PluginConfigError, match="overlapping rename"):
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"meta.name": "x", "x": "y"}})
+
+    @pytest.mark.parametrize(
+        "mapping",
+        [
+            {"": "mapped", "kept": "moved"},
+            {"!!!": "mapped", "kept": "moved"},
+            {"   ": "mapped", "kept": "moved"},
+            {"!!!": "mapped", "a": "???"},
+            {"": "mapped", "a": "   "},
+        ],
+        ids=repr,
+    )
+    def test_a_key_that_normalizes_to_nothing_is_its_own_overlap_key(self, mapping: dict[str, str]) -> None:
+        """Such a literal names no field, so it can alias nothing and constructs.
+
+        It must also keep its OWN identity rather than collapsing onto a shared
+        empty key: the last two cases put an unnormalizable literal on the target
+        side, where a collapsed key would match an unrelated source and reject a
+        config that names no common field at all.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+        assert transform._mapping == mapping
+
+    @pytest.mark.parametrize(
+        "header",
+        ["name", "first_name", "field2", "B", "Name", "userID", "ID", "class", "First Name", "2fast"],
+        ids=repr,
+    )
+    def test_the_overlap_key_agrees_with_the_runtime_resolver(self, header: str) -> None:
+        """The key the rule compares is the key ``process`` asks the row for.
+
+        Cross-checked against ``SchemaContract.resolve_name`` rather than against
+        ``normalize_field_name`` again, so the assertion cannot restate the
+        implementation.
+        """
+        from elspeth.plugins.sources.field_normalization import normalize_field_name
+        from elspeth.plugins.transforms.field_mapper import _canonical_row_key
+
+        contract = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(make_field(normalize_field_name(header), str, original_name=header, required=True, source="declared"),),
+            locked=True,
+        )
+
+        assert _canonical_row_key(header) == contract.resolve_name(header)
+
+    def test_a_non_canonical_target_colliding_with_a_source_is_rejected(self) -> None:
+        """A target is canonicalised too, and the over-rejection is deliberate.
+
+        ``{'a': 'B', 'b': 'c'}`` is measurably lossless — two keys in, two keys
+        out, in either order. It is rejected anyway because no contract exists at
+        construction to say whether the row keys that field under ``'B'`` or
+        under ``'b'``, and the ``'b'`` reading is ``{'a': 'B', 'B': 'c'}``, which
+        destroys a value through ``process``'s literal ``source in output``
+        branch. Fail closed.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        with pytest.raises(PluginConfigError, match="overlapping rename"):
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"a": "B", "b": "c"}})
+
+    @pytest.mark.parametrize("mapping", [{"B": "b", "b": "y"}, {"b": "B", "B": "y"}], ids=repr)
+    def test_a_literal_source_that_is_itself_a_row_key_still_overlaps(self, mapping: dict[str, str]) -> None:
+        """A row can carry ``'B'`` and ``'b'`` as two DISTINCT keys, so this is a real chain.
+
+        A source's ``field_mapping`` values bypass ``normalize_field_name``
+        (``resolve_field_names`` validates them with ``isidentifier()`` alone)
+        and headerless ``columns`` are taken as already-clean identifiers, so
+        neither is ever lowercased. Judging ``{'B': 'b'}`` a canonical no-op
+        therefore waves through a two-field rename chain that destroys one value
+        — measured: ``{'B': '1', 'b': '2'}`` emits ``{'y': '2'}``, and the
+        reversed spelling emits ``{'y': '1'}`` from the same input. The LITERAL
+        comparison is what catches it, which is why canonicalising cannot
+        replace it.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        with pytest.raises(PluginConfigError, match="overlapping rename"):
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": mapping})
+
+    def test_an_accepted_canonical_identity_is_safe_at_runtime(self, ctx: PluginContext) -> None:
+        """The relief this rule grants must be exercised, not merely constructed.
+
+        ``{'A': 'a'}`` is accepted because ``process`` deletes the normalized key
+        and writes the same value straight back. Asserting only that the config
+        constructs would pin the EXISTENCE of the relief and say nothing about
+        its safety, so run the row through and check arity and values.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"A": "a"}})
+        row = PipelineRow(
+            {"a": "charlie", "z": "delta"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("a", str, original_name="A", required=False, source="inferred"),
+                    make_field("z", str, original_name="z", required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row.to_dict() == {"a": "charlie", "z": "delta"}
+
+
+class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
+    """The raw and effective output guarantees must describe one behavior.
+
+    d4ae04b374 made ``mapping`` the required-read authority. Its targets are
+    therefore guaranteed independently of duplicate schema spellings, while
+    the open branch continues to use its forwarding channel for unknown
+    passthrough fields.
+    """
+
+    @staticmethod
+    def _built(mapping: dict[str, str], fields: list[str], *, select_only: bool = True) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper(
+            {
+                "select_only": select_only,
+                "mapping": mapping,
+                "schema": {"mode": "fixed", "fields": fields},
+            }
+        )
+
+    @staticmethod
+    def _halves(transform: "object") -> tuple[frozenset[str], frozenset[str]]:
+        config = transform._output_schema_config
+        raw = frozenset(config.guaranteed_fields or ())
+        return raw, frozenset(config.get_effective_guaranteed_fields())
+
+    @pytest.mark.parametrize(
+        ("mapping", "fields"),
+        [
+            ({"a": "z"}, ["a: str"]),
+            ({"a": "a"}, ["a: str"]),
+            ({"a": "z", "b": "y"}, ["a: str", "b: str"]),
+        ],
+    )
+    def test_a_closed_emit_set_does_not_disown_what_the_input_guarantees(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+    ) -> None:
+        """Each of these had the raw half abstaining while the effective half claimed."""
+        transform = self._built(mapping, fields)
+
+        raw, effective = self._halves(transform)
+
+        assert raw == effective, f"raw={sorted(raw)} contradicts effective={sorted(effective)}"
+
+    @pytest.mark.parametrize(
+        ("mapping", "fields", "expected_targets"),
+        [
+            ({"a": "z"}, ["a: str", "b: str"], ("z",)),
+            ({}, ["a: str"], None),
+        ],
+    )
+    def test_an_open_emit_set_declares_only_its_known_target_lower_bound(
+        self,
+        mapping: dict[str, str],
+        fields: list[str],
+        expected_targets: tuple[str, ...] | None,
+    ) -> None:
+        """The open branch promises targets without claiming the full emit set.
+
+        Passthrough membership remains unknown and travels through
+        ``forwards_input_fields``. Mapping targets are a sound lower bound
+        because d4ae04b374 prevents a successful partial mapping.
+        """
+        transform = self._built(mapping, fields, select_only=False)
+
+        assert transform._output_schema_config.guaranteed_fields == expected_targets
+
+    def test_a_guaranteed_target_is_now_derived_from_a_fixed_input_schema(self) -> None:
+        """The concrete consequence: a declared, required source guarantees its target.
+
+        Both channels agree since the collision consumers became
+        capability-keyed (elspeth-6ea3619737 / elspeth-0d1da6dc44):
+        ``declared_output_fields`` claims the target too, honestly, and the
+        gate's safety lives at the consumer — see
+        ``TestSelectOnlyCannotTripTheCollisionGate``.
+        """
+        transform = self._built({"a": "z"}, ["a: str"])
+
+        assert transform._output_schema_config.guaranteed_fields == ("z",)
+        assert transform.declared_output_fields == frozenset({"z"})
+
+    def test_an_unresolved_original_source_guarantees_its_target_on_success(self) -> None:
+        """Runtime lineage owns the source key; routing owns the output promise.
+
+        Construction cannot say whether ``Name`` resolves to ``name`` or an
+        explicit source mapping, so the input declaration still abstains.  It
+        need not know that key to promise ``nm`` on every *successful* row:
+        d4ae04b374 routes an unresolved source even when ``strict`` is false.
+        """
+        transform = self._built({"Name": "nm"}, ["Name: str"])
+
+        assert transform._output_schema_config.guaranteed_fields == ("nm",)
+        assert transform.declared_output_fields == frozenset({"nm"})
+
+    def test_an_observed_input_schema_still_guarantees_mapping_targets(self) -> None:
+        """Input-schema abstention does not erase the mapping's output promise."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper({"select_only": True, "mapping": {"a": "z"}, "schema": DYNAMIC_SCHEMA})
+
+        raw, effective = self._halves(transform)
+        assert raw == effective == frozenset({"z"})
+
+
+class TestSelectOnlyCannotTripTheCollisionGate:
+    """``select_only`` cannot overwrite an input field, and the CONSUMER knows it.
+
+    ``declared_output_fields`` is an honest guarantee claim — "this target is on
+    every successful output row". The field-collision consumers
+    (``TransformExecutor._run_preflight``, the build-time twin, composer Rule D)
+    are capability-keyed on ``can_overwrite_input_fields``: they arm only when
+    the write path preserves the input row. Under ``select_only`` ``process``
+    starts from a fresh ``{}`` — it cannot overwrite anything, and a mapping
+    that renames onto a name the input also carries DROPS that input, which is
+    what ``select_only`` MEANS — so both presence channels are False and the
+    gate stays asleep however much this node declares.
+
+    History: elspeth-892161b2d5 armed the gate by widening the declaration
+    (100% row loss at runtime); the interim cure narrowed the declaration back,
+    which left the strict and explicit-``guaranteed_fields`` families still
+    armed (elspeth-6ea3619737) and starved the open branch's gate
+    (elspeth-0d1da6dc44). The capability key at the consumers fixes both
+    polarities and lets the declaration stay honest.
+    """
+
+    @staticmethod
+    def _built(mapping: dict[str, str], fields: list[str], mode: str, required: list[str], **extra: object) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper(
+            {
+                "select_only": True,
+                "mapping": mapping,
+                "schema": {"mode": mode, "fields": fields, "required_fields": required},
+                **extra,
+            }
+        )
+
+    @pytest.mark.parametrize("mode", ["fixed", "flexible"])
+    @pytest.mark.parametrize("required", [["a", "b"], ["a"]])
+    @pytest.mark.parametrize("target", ["b", "fresh"])
+    def test_select_only_declares_its_guaranteed_targets(self, mode: str, required: list[str], target: str) -> None:
+        """The declaration is honest: a target with an effectively guaranteed source is claimed.
+
+        Every one of these shapes used to pin ``frozenset()`` — a narrowing
+        that existed only to keep the declaration-keyed collision gate asleep.
+        With the consumers capability-keyed, the guarantee walk gets the truth.
+        """
+        fields = ["a: str", "b: str"] if target == "b" else ["a: str", "b: str", "fresh: str"]
+        transform = self._built({"a": target}, fields, mode, required)
+
+        assert transform.declared_output_fields == frozenset({target})
+
+    def test_select_only_disarms_both_capability_channels(self) -> None:
+        """The mechanism that keeps the declaring node alive: no presence promise.
+
+        ``can_overwrite_input_fields`` is the consumers' arming predicate; a
+        select_only mapper answers False on both of its inputs, so declaring a
+        colliding target cannot trip any collision gate.
+        """
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
+
+        transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
+
+        assert transform.passes_through_input is False
+        assert transform.forwards_input_fields is False
+        assert (
+            can_overwrite_input_fields(
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            )
+            is False
+        )
+
+    def test_strict_select_only_declares_without_any_schema_promise(self) -> None:
+        """The elspeth-6ea3619737 family-1 shape guarantees every target.
+
+        No ``guaranteed_fields`` and no declared fields are needed: engine
+        dispatch requires every configured mapping source before ``process``,
+        so each successful row contains every target. ``strict: true`` remains
+        in this regression shape but is no longer the authority. This is the
+        config that lost 100% of rows under the declaration-keyed gate; its
+        safety now lives in the capability key, pinned end-to-end in
+        ``tests/unit/engine/test_executors.py::TestTransformExecutor::
+        test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "select_only": True,
+                "strict": True,
+                "mapping": {"a": "b"},
+                "schema": {"mode": "observed"},
+            }
+        )
+
+        assert transform.declared_output_fields == frozenset({"b"})
+        assert transform.forwards_input_fields is False
+
+    def test_select_only_still_emits_the_renamed_target(self) -> None:
+        """Behaviour, unchanged through every declaration revision.
+
+        The rename still happens and the input field it lands on is dropped,
+        not overwritten.
+        """
+        from elspeth.testing import make_pipeline_row
+        from tests.fixtures.factories import make_context
+
+        transform = self._built({"a": "b"}, ["a: str", "b: str"], "fixed", ["a", "b"])
+        transform.on_start(make_context())
+
+        result = transform.process(make_pipeline_row({"a": "1", "b": "2"}), make_context())
+
+        assert result.status == "success"
+        assert result.row.to_dict() == {"b": "1"}
+
+
+class TestOpenBranchDeclarationChannelStability:
+    """One promise, two spellings, ONE verdict (elspeth-0d1da6dc44).
+
+    Under ``select_only: false`` a rename onto a field the input guarantees is
+    a REAL overwrite: ``process`` deep-copies the row and then writes the
+    target. The input guarantee can be spelled ``guaranteed_fields: [a, c]`` or
+    ``mode: fixed`` with required declared fields — ``SchemaConfig`` documents
+    both as guarantees (``get_effective_guaranteed_fields``). Reading the raw
+    tuple collapsed the fixed-schema ABSTAIN into explicit-zero, so the second
+    spelling disarmed all three collision gates while the first was rejected:
+    opposite verdicts on identical runtime behaviour, keyed on spelling.
+    """
+
+    @staticmethod
+    def _mapper(schema: dict[str, object]) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        return FieldMapper({"mapping": {"a": "c"}, "schema": schema})
+
+    def test_fixed_schema_and_guaranteed_fields_declare_identically(self) -> None:
+        """The cure, pinned as an equality so the channels cannot drift apart."""
+        via_fixed = self._mapper({"mode": "fixed", "fields": ["a: str", "c: str"]})
+        via_guaranteed = self._mapper({"mode": "observed", "guaranteed_fields": ["a", "c"]})
+
+        assert via_fixed.declared_output_fields == via_guaranteed.declared_output_fields == frozenset({"c"})
+
+    def test_required_fields_is_the_third_spelling_of_the_same_promise(self) -> None:
+        """``schema.required_fields`` declares like the other two channels.
+
+        Found by the adversarial review of a7c783423: the first cure equalized
+        ``guaranteed_fields`` and fixed-mode required fields but left
+        ``required_fields`` disarmed. It is the same per-row promise —
+        ``get_raw_node_required_fields`` feeds the build-time edge contract,
+        which rejects EVERY graph whose upstream does not guarantee the field
+        (measured: an abstaining bare-observed upstream is rejected, no
+        abstention skip), so on any runnable graph every row carries it and
+        the rename target is written on every row.
+        """
+        via_required = self._mapper({"mode": "observed", "required_fields": ["a", "c"]})
+        via_guaranteed = self._mapper({"mode": "observed", "guaranteed_fields": ["a", "c"]})
+
+        assert via_required.declared_output_fields == via_guaranteed.declared_output_fields == frozenset({"c"})
+
+    def test_select_only_emit_guarantees_cover_every_declared_target(self) -> None:
+        """Closed-branch subset invariant: declared ⊆ emit guarantees, all channels.
+
+        Both declarations derive from the mapping authority. Repeating a
+        source through required, guaranteed, or fixed-schema channels must not
+        change the target guarantee.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        for schema in (
+            {"mode": "observed", "required_fields": ["a"]},
+            {"mode": "observed", "guaranteed_fields": ["a"]},
+            {"mode": "fixed", "fields": ["a: str", "b: str"]},
+        ):
+            transform = FieldMapper({"mapping": {"a": "b"}, "select_only": True, "schema": schema})
+            emitted = frozenset(transform._output_schema_config.get_effective_guaranteed_fields())
+            assert transform.declared_output_fields <= emitted, (schema, sorted(transform.declared_output_fields), sorted(emitted))
+
+    def test_open_branch_keeps_the_forwarding_promise_that_arms_the_gate(self) -> None:
+        """The consumer half of the FN cure: the open branch answers True.
+
+        A declared target is only rejected when the row survives onto the
+        output — which is exactly what the open branch promises through
+        ``forwards_input_fields``.
+        """
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
+
+        transform = self._mapper({"mode": "fixed", "fields": ["a: str", "c: str"]})
+
+        assert transform.forwards_input_fields is True
+        assert (
+            can_overwrite_input_fields(
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            )
+            is True
+        )
+
+    def test_optional_fixed_field_cannot_override_the_mapping_assertion(self) -> None:
+        """The mapping requires ``a`` even when its duplicate schema spelling is optional."""
+        transform = self._mapper({"mode": "fixed", "fields": ["a: str?", "c: str"]})
+
+        assert transform.declared_output_fields == frozenset({"c"})
+
+    def test_bare_observed_schema_does_not_override_the_mapping_assertion(self) -> None:
+        """The mapping is the declaration channel even when ``schema`` abstains."""
+        transform = self._mapper({"mode": "observed"})
+
+        assert transform.declared_output_fields == frozenset({"c"})
+
+    def test_open_branch_runtime_resolves_original_header_collisions(self) -> None:
+        """Lineage makes the uncertain collision decision at row time.
+
+        Static collision gates cannot know whether ``Name`` resolves to the
+        target itself (a runtime identity) or to another row key (a destructive
+        overwrite). The mapper must reject only the latter before mutation.
+        """
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        destructive = FieldMapper({"mapping": {"Name": "full_name"}, "schema": {"mode": "observed"}})
+        dynamic_identity = FieldMapper({"mapping": {"Name": "name"}, "schema": {"mode": "observed"}})
+        destructive_row = PipelineRow(
+            {"name": "Ada", "full_name": "Existing"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("name", str, original_name="Name", required=False, source="inferred"),
+                    make_field("full_name", str, original_name="full_name", required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+        identity_row = PipelineRow(
+            {"name": "Ada"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(make_field("name", str, original_name="Name", required=False, source="inferred"),),
+                locked=True,
+            ),
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            destructive.process(destructive_row, make_context())
+
+        result = dynamic_identity.process(identity_row, make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"name": "Ada"}
+
+    def test_runtime_lineage_cannot_hide_an_overlapping_rename_graph(self) -> None:
+        """A resolved source key may reveal the overlap config could not see."""
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "b", "Weird Header": "c"},
+                "schema": {"mode": "observed"},
+            }
+        )
+        row = PipelineRow(
+            {"a": "first", "b": "second"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    make_field("a", str, original_name="a", required=False, source="inferred"),
+                    make_field("b", str, original_name="Weird Header", required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(row, make_context())
+
+
+class TestFieldMapperDerivedInputRequirement:
+    """``mapping`` sources become ``declared_input_fields`` (elspeth-d4ae04b374).
+
+    John's ruling: "the field mapper should assert a required field when it's
+    configured." Configuring ``mapping: {source: target}`` IS that assertion,
+    so the requirement is DERIVED from the mapping rather than restated by hand
+    in ``required_input_fields`` — a guard must derive from the authority it
+    enforces.
+
+    ``declared_input_fields`` is the right channel rather than the explicit
+    option because its build-time enforcement gates on the producer's
+    ``EffectiveGuaranteeVote.participated``; the explicit option routes through
+    ``validate_edge_schemas`` Phase 1, a bare set subtraction that also rejects
+    an OBSERVED upstream — which promises nothing because nothing was declared,
+    not because the field is absent.
+    """
+
+    @staticmethod
+    def _config(**overrides: object) -> "object":
+        from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+        options: dict[str, object] = {"schema": DYNAMIC_SCHEMA, "mapping": {"colour": "colour"}}
+        options.update(overrides)
+        return FieldMapperConfig.from_dict(options, plugin_name="field_mapper")
+
+    def test_identity_and_rename_sources_are_both_required(self) -> None:
+        """An identity mapping asserts its source just as a rename does."""
+        config = self._config(mapping={"colour": "colour", "complementary_colour": "recommended_pairing"})
+
+        assert config.declared_input_fields == frozenset({"colour", "complementary_colour"})
+
+    def test_rename_targets_are_not_required(self) -> None:
+        """Targets are CREATED here; requiring them on input is elspeth-d6eeb3a71d."""
+        config = self._config(mapping={"colour": "colour", "complementary_colour": "recommended_pairing"})
+
+        assert "recommended_pairing" not in config.declared_input_fields
+
+    def test_dotted_sources_require_their_top_level_container(self) -> None:
+        """A flat contract can assert the root needed by a nested read.
+
+        The contract cannot promise the nested leaf, but ``meta.origin`` can
+        never resolve unless the top-level ``meta`` field arrives.  Omitting
+        that root left the executor's pre-emission guard blind and allowed the
+        default non-strict path to drop the configured output silently.
+        """
+        config = self._config(mapping={"meta.origin": "origin", "colour": "colour"})
+
+        assert config.declared_input_fields == frozenset({"colour", "meta"})
+
+    def test_fixed_schema_with_dotted_root_guarantees_target_without_strict(self) -> None:
+        """The root makes the input contract coherent; missing leaves route.
+
+        ``strict`` is no longer the output-guarantee authority for a dotted
+        read.  Once d4ae04b374 made a missing leaf an error in non-strict mode,
+        every successful row necessarily contains ``origin``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": {"mode": "fixed", "fields": ["meta: any"]},
+                "mapping": {"meta.origin": "origin"},
+                "select_only": True,
+                "strict": False,
+            }
+        )
+
+        assert transform.declared_input_fields == frozenset({"meta"})
+        assert transform.declared_output_fields == frozenset({"origin"})
+        assert transform._output_schema_config is not None
+        assert transform._output_schema_config.guaranteed_fields == ("origin",)
+
+        present = transform.process(make_pipeline_row({"meta": {"origin": "api"}}), make_context())
+        missing_leaf = transform.process(make_pipeline_row({"meta": {}}), make_context())
+
+        assert present.status == "success"
+        assert present.row is not None
+        assert present.row.to_dict() == {"origin": "api"}
+        assert missing_leaf.status == "error"
+        assert missing_leaf.reason is not None
+        assert missing_leaf.reason["reason"] == "missing_field"
+
+    def test_dotted_source_with_unresolved_original_root_still_abstains(self) -> None:
+        """An original-header root has no safe normalized config-time name."""
+        config = self._config(mapping={"Meta.origin": "origin"})
+
+        assert config.declared_input_fields == frozenset()
+
+    @pytest.mark.parametrize("source", ["First Name", "B", "Name", "userID", "class"])
+    def test_non_fixed_point_sources_abstain(self, source: str) -> None:
+        """Config time cannot say which row key these name (elspeth-f262a8c678).
+
+        ``normalize_field_name`` lowercases and keyword-suffixes, so each of
+        these reaches ``process`` through ``contract.resolve_name``. Claiming
+        them as required would reject pipelines that run.
+        """
+        config = self._config(mapping={source: "target"})
+
+        assert config.declared_input_fields == frozenset()
+
+    def test_explicit_required_input_fields_are_unioned_not_replaced(self) -> None:
+        """An author may still declare extra requirements the mapping never names."""
+        config = self._config(mapping={"colour": "colour"}, required_input_fields=["audit_id"])
+
+        assert config.declared_input_fields == frozenset({"colour", "audit_id"})
+
+    def test_empty_mapping_declares_nothing(self) -> None:
+        """A field_mapper with no mapping asserts no input contract."""
+        config = self._config(mapping={})
+
+        assert config.declared_input_fields == frozenset()
+
+    def test_transform_instance_carries_the_derivation(self) -> None:
+        """The declaration must survive construction, not just live on the config."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {"colour": "colour", "complementary_colour": "recommended_pairing"},
+            }
+        )
+
+        assert transform.declared_input_fields == frozenset({"colour", "complementary_colour"})
+
+    @pytest.mark.parametrize("source", ["meta.origin", "Name"])
+    def test_unrepresentable_missing_source_routes_even_when_non_strict(self, source: str) -> None:
+        """Every configured source is asserted even when flat metadata cannot name it.
+
+        Dotted leaves and original-header aliases cannot be represented fully
+        in ``declared_input_fields``.  Their runtime fallback must therefore
+        route a missing value instead of preserving the historical silent-skip
+        behaviour behind ``strict: false``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {source: "target"},
+                "strict": False,
+            }
+        )
+
+        result = transform.process(make_pipeline_row({"other": "value"}), make_context())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_field"
+        assert result.reason["field"] == source
+
+    def test_original_header_source_still_resolves_when_present(self) -> None:
+        """Runtime lineage resolution, not guessed normalization, owns aliases."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "mapping": {"Name": "display_name"},
+                "strict": False,
+            }
+        )
+        row = PipelineRow(
+            {"name": "Ada"},
+            SchemaContract(
+                mode="OBSERVED",
+                fields=(make_field("name", str, original_name="Name", required=True),),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, make_context())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict() == {"display_name": "Ada"}

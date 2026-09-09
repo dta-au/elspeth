@@ -21,29 +21,77 @@ These run immediately with no setup:
 |---------|------|-------|
 | `audit_export` | 8 | Demonstrates audit data export |
 | `batch_aggregation` | 15 | Batch accumulation and trigger |
+| `report_assemble` | 5 (3 reports) | Paginated report aggregation with count and end-of-source flushes |
 | `statistical_batch_plugins` | 8 each | Statistical batch plugin examples; run one `settings_*.yaml` file at a time |
 | `boolean_routing` | 10 | True/false gate routing |
 | `checkpoint_resume` | 20 | Checkpoint/resume on interruption |
 | `database_sink` | 8 (4 to DB) | SQLite database output — durable exactly-once sink; run via `./examples/database_sink/run.sh` (seeds the operator-owned target + `_elspeth_*` effect ledger first; a bare `elspeth run` fails preflight by design) |
 | `deaggregation` | 6 | Expanding aggregated rows (6→11 output) |
-| `deep_routing` | 20 | Multi-level cascading gates |
-| `error_routing` | 17 | Error-triggered routing paths |
+| `deep_routing` | 20 | Multi-level cascading gates; fixture ends PARTIAL/exit 1 with 2 blocked rows quarantined by design |
+| `error_routing` | 17 | Error-triggered routing; fixture ends PARTIAL/exit 1 with 4 blocked rows quarantined by design |
 | `explicit_routing` | 10 | Named route destinations |
-| `fork_coalesce` | 5 | Parallel path fork/join DAG pattern |
+| `fork_coalesce` | 5 each | Parallel path fork/join DAG; ships five `settings*.yaml` files, run one at a time. `settings.yaml` coalesces both branches; `settings_per_branch.yaml` runs a different transform chain per branch (ARCH-15); the three union variants exercise the field-collision policies — `settings_union_last_wins.yaml` and `settings_union_first_wins.yaml` resolve the same collision to opposite branches (`path_b` / `path_a`), and `settings_union_fail.yaml` raises `CoalesceCollisionError` and exits non-zero **by design** |
+| `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
+| `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
+| `reference_join` | 5 / 5 / 3 | Keyed enrichment from a config-bound reference table; ships three `settings*.yaml` files, run one at a time. `settings.yaml` joins a flat CSV table, `settings_nested.yaml` a nested JSON table with one deliberately sparse entry (`on_miss: default` fills the one missing value per field), and `settings_missing_product.yaml` ends PARTIAL/exit 1 **by design** — one order names a product the table does not list and the default `on_miss: fail` quarantines it. `reference_file` resolves relative to the SETTINGS directory, not the repo root, which is why `products.csv` sits beside `settings.yaml` |
 | `landscape_journal` | 2 | JSON source, audit journal |
 | `multi_flow` | 4 | Two independent named source flows in one run |
 | `multi_source_queue` | 3 | Multiple named sources fan into a queue |
-| `large_scale_test` | 10,000 | Performance test — committed `input.csv` is 10k rows (~1.5 min); regenerate larger via `generate_data.py` (default 50k) |
+| `large_scale_test` | 10,000 | Performance test — committed `input.csv` is 10k rows (observed ~4 min locally); regenerate larger via `generate_data.py` (default 50k) |
 | `retention_purge` | 5 | Payload retention policy demo |
-| `blob_transforms` | 200 offline expansion rows | Blob refs, payload-store CSV expansion; optional hosted tutorial HTML fetch |
+| `blob_transforms` | 200 + 3 + 5 + 5 + 3 offline expansion rows | FIVE offline configs, all COMPLETED/exit 0 — the point is the two ARMS, not just the three formats. Blob arm (bytes from the payload store via `blob_ref`): `settings_expand_csv_blobs.yaml` (2 -> 200), `settings_expand_json_blobs.yaml` (2 -> 3, format INFERRED from `blob_content_type`), `settings_expand_text_blobs.yaml` (2 -> 5, `skip_blank_lines: true` so `line_index` reads 0,2,3 and shows the index is a position in the BLOB, not a row counter). Inline arm (`source: field`, text already on the row, **no `payload_store:` block at all**): `settings_expand_inline_csv.yaml` (2 -> 5), `settings_expand_inline_json.yaml` (2 -> 3, `format` REQUIRED — a row field carries no content type to infer from). Run all five with `./examples/blob_transforms/run.sh`, which stages fixtures and checks each config against its own expected exit code. One at a time: run `scripts/prepare_csv_blob_manifest.py` and `scripts/prepare_expander_blobs.py` first for the three BLOB configs; the two inline configs need no staging. The hosted HTML fetch is opt-in via `./examples/blob_transforms/run_hosted_fetch.sh`. |
+| `pdf_rasterize` | 2 (1 fails) | Run `./examples/pdf_rasterize/run.sh`; it stages two committed mock PDFs into the payload store before executing. Fixture ends PARTIAL/exit 1 with 1 malformed document quarantined by design (3 page rows still succeed) |
 | `schema_contracts_demo` | 5 | Schema validation contracts |
+| `scope_collector` | 3 docs (8 pages) | `scopes:` + `collectors:` — an EXPAND group closed by a barrier; run one `settings*.yaml` at a time. Both variants end PARTIAL/exit 1 **by design** (one page is malformed by construction); the exit code does NOT distinguish them — the OUTPUT ROWS do. `settings.yaml` (`require_all`) writes 2 rows, withholding any statistic for the incomplete document; `settings_best_effort.yaml` writes 3, reporting that document's mean over a denominator of 2 |
 | `threshold_gate` | 8 | Numeric threshold routing |
 
 Run pattern:
 ```bash
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
+
+### Exit 0 is not the corpus gate
+
+Thirteen shipped configs end non-zero **by design**. A runner that treats any
+non-zero exit as failure will report phantom defects; encode the expected exit
+per config, not a blanket `-eq 0`:
+
+| Config | Exit | Why |
+|--------|------|-----|
+| `deep_routing/settings.yaml` | 1 | 2 blocked rows quarantined |
+| `error_routing/settings.yaml` | 1 | 4 blocked rows quarantined |
+| `pdf_rasterize/settings.yaml` | 1 | 1 malformed document quarantined |
+| `row_union_ab_experiment/settings_screened_at_settlement.yaml` | 1 | 3 tickets discarded mid-branch, orphaned treatment siblings fail closed |
+| `fork_coalesce/settings_union_fail.yaml` | non-zero | raising `CoalesceCollisionError` is the point of the variant |
+| `scope_collector/settings.yaml` | 1 | 1 malformed page lost; `require_all` withholds that group's statistics |
+| `scope_collector/settings_best_effort.yaml` | 1 | the same lost page; `best_effort` still reports over survivors |
+| `ab_llm_experiment/settings_arm_loss.yaml` | 1 | 3 of 24 cases lose an arm; each surviving sibling is invalidated with it |
+| `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
+| `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
+| `reference_join/settings_missing_product.yaml` | 1 | 1 order names a product absent from the reference table; `on_miss: fail` quarantines it |
+| `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
+| `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
+
+The first eleven are deterministic fixtures with fixed counts. The last two
+depend on randomly injected faults, so they may also exit 0 — for those the
+acceptance criterion is **conservation**, not the exit code: every source row
+reaches either the result sink or the error sink, with the failure reason
+retained in Landscape. The sink file carries only the original input fields;
+the reason lives in the audit trail (`transform_errors.error_details_json`).
+
+Checking the exit code alone is weak in both directions — an example that
+silently processed zero rows also exits 0. Compare each run's summary line
+against the row counts in the tables above.
+
+Do not run examples in a checkout while `pytest tests/` is running there.
+Example runs write working state into the checkout's `.elspeth/` by design
+(`audit_export` writes its export spool and content store there — the
+validator pins those roots), and the test suite's pollution guard
+(`tests/conftest.py::_refuse_in_repo_elspeth_writes`) fingerprints that
+directory for the whole session: a concurrent example run fails every
+pytest-xdist worker at teardown with "Contents under .../.elspeth changed".
+Run examples before or after the suite, or from a separate worktree.
 
 ### Container-only
 
@@ -56,6 +104,12 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 These need a ChaosLLM server running. Start it BEFORE the pipeline:
 
 ```bash
+# Local configs contain a fake api_key, which ELSPETH still fingerprints before
+# writing the audit-safe config. This is not a provider credential.
+export ELSPETH_FINGERPRINT_KEY="$(
+  .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+)"
+
 # Start server (must use --workers=1 due to errorworks bug with multi-worker presets)
 chaosllm serve --port 8199 --preset=realistic --workers=1 &
 sleep 3
@@ -84,7 +138,11 @@ category.
 |---------|------|-------|
 | `chaosllm_sentiment` | 10 | Basic sentiment with fault injection |
 | `rate_limited_llm` | 8 | Rate limiter with ChaosLLM |
-| `chaosllm_endurance` | 10,000 | Long-running endurance test |
+| `join_refused` | 80 | The admission fence returning a NEGATIVE: one follower admitted on the leader's own `settings.yaml` shares work while a second, launched with `settings_mismatched.yaml` (one scalar different), is refused with `JoinRefusedError`/exit 1. Run `./examples/join_refused/run.sh`; starts its OWN ChaosLLM on 8199 and self-verifies. Ends SUCCESS/exit 0 — the exit-1 arm is INTERNAL and asserted by the launcher. The assertion is on the refusal REASON, not the code: all four admission refusal arms exit 1, so an exit-only check passes for a run that merely finished first |
+| `chaosllm_endurance` | 10,000 | Long-running endurance test; may end PARTIAL/exit 1 with rows in `quarantined.json` — see "Exit 0 is not the corpus gate" |
+| `reference_join_fork_llm` | 5 | ONE lookup, TWO consumers: `reference_join` enriches each ticket BEFORE a fork, then two `llm` branches (separate endpoints, ports 8201/8202) consume the enriched row alongside the original message, and a `require_all` / `merge: nested` coalesce writes only fully-answered tickets. Run `./examples/reference_join_fork_llm/run.sh` — it starts BOTH ChaosLLM servers with ZERO fault injection and tears them down; ends SUCCESS/exit 0. Shows the config-time payoff of the join declaring its output fields: the downstream `llm` nodes name them in `required_input_fields` and a misspelling refuses the run |
+| `ab_llm_experiment` | 8 + 8 + 24 cases x 2 arms | Fork one case study to TWO LLM arms, `row_union` the pair, compare. Run `./examples/ab_llm_experiment/run.sh` — it starts its OWN ChaosLLM on 8199 (never alongside a shared one), runs all THREE configs and self-verifies each against its own expected exit code. `settings.yaml` varies the PROMPT and `settings_models.yaml` varies the MODEL (8 cases, COMPLETED/exit 0 — a non-zero exit there is a real defect); `settings_arm_loss.yaml` is 24 cases of which 3 lose one arm, and ends PARTIAL/exit 1 **by design** with 21 whole pairs from 45 llm calls |
+| `document_review_panel` | 4 docs / 12 pages | THE COMBINED EXAMPLE: a fork (two LLM reviewers per page) nested inside an EXPAND group (pages closed by a collector), plus a run-level aggregation. Run `./examples/document_review_panel/run.sh` — it starts its OWN ChaosLLM on 8199 and self-verifies all three configs. `settings.yaml` is clean (COMPLETED/exit 0); `settings_incomplete.yaml` omits ONE field from ONE page and ends PARTIAL/exit 1 **by design**, publishing a summary over 3 of 4 documents; `settings_run_as_row.yaml` takes the same loss with the run encapsulated as a single row and ends PARTIAL/exit 1 publishing NOTHING — an empty/absent sink is the PASS there |
 
 ### ChaosWeb (mock web server required)
 
@@ -98,7 +156,7 @@ elspeth run --settings examples/chaosweb/settings.yaml --execute
 
 | Example | Rows | Notes |
 |---------|------|-------|
-| `chaosweb` | 10 | Web scraping with fault injection |
+| `chaosweb` | 10 | Web scraping with fault injection; may end PARTIAL/exit 1 with rows in `scrape_failures.csv` — see "Exit 0 is not the corpus gate" |
 
 ### Chroma RAG (embedded, no external server)
 
@@ -106,8 +164,9 @@ ChromaDB runs embedded — no server setup needed, but requires `chromadb` packa
 
 | Example | Rows | Notes |
 |---------|------|-------|
-| `chroma_rag` | 8 | Vector retrieval only (~1s) |
-| `chroma_rag_qa` | 8 | RAG + OpenRouter LLM QA (~19s, uses API credits) |
+| `chroma_rag` | 8 | Vector retrieval only; run `./examples/chroma_rag/run.sh` to seed and query |
+| `chroma_rag_indexed` | 10 index + 5 query | Dependency-managed indexing and retrieval; run `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
+| `chroma_rag_qa` | 8 | RAG + OpenRouter LLM QA; run `./examples/chroma_rag_qa/run.sh` (~19s, uses API credits) |
 
 ### OpenRouter (real API, costs money)
 
@@ -120,6 +179,7 @@ timeout 20 elspeth run --settings examples/openrouter_sentiment/settings.yaml --
 
 | Example | Rows | Typical time | Notes |
 |---------|------|-------------|-------|
+| `llm_source` | 1 | one request | One static authored prompt emitted as one generated row |
 | `openrouter_sentiment` | 5 | ~6s | GPT-4o-mini sentiment |
 | `template_lookups` | 5 | ~8s | Claude Haiku with templates |
 | `openrouter_multi_query_assessment` | 3 | ~18s | Claude Sonnet multi-query |
@@ -135,6 +195,12 @@ If a pipeline is interrupted, resume with the command shown in the output.
 | `azure_keyvault_secrets` | Azure Key Vault secrets |
 | `azure_openai_sentiment` | Azure OpenAI endpoint |
 | `multi_query_assessment` | Azure OpenAI multi-query (settings say `provider: azure`) |
+
+### AWS (skip unless AWS credentials configured — billable)
+
+| Example | Notes |
+|---------|-------|
+| `textract_inline` | Copy JPEG/PNG/single-page PDF files into `input/`, run `python examples/textract_inline/scripts/prepare_document_blobs.py` (stages blobs, writes `settings.generated.yaml`), then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute`. Each row is one billable `AnalyzeDocument` call. A multipage PDF is not accepted by the prepare script — rasterize it into per-page PNGs with `pdf_rasterize` first. |
 
 ### Not a runnable pipeline
 
@@ -154,14 +220,17 @@ If a pipeline is interrupted, resume with the command shown in the output.
 
 `concurrent_scheduler` is pure-data (no server). `multi_worker` and
 `multi_worker_showcase` start their own ChaosLLM server inside `run.sh` (with
-`--workers 1`) and orchestrate a leader + `elspeth join` follower(s); run them
-via their `run.sh`, not a bare `elspeth run`. (`elspeth join` takes no
-`--execute` flag — only `elspeth run` does.)
+`--workers 1`), establish a process-scoped fingerprint key when needed, and
+orchestrate a leader + `elspeth join` follower(s); run them via their `run.sh`,
+not a bare `elspeth run`. Their default ChaosLLM profiles add latency without
+terminal faults so the self-verifying launchers have a deterministic clean-run
+contract; each README documents a separate opt-in fault profile. (`elspeth
+join` takes no `--execute` flag — only `elspeth run` does.)
 
 ```bash
 .venv/bin/elspeth run --settings examples/concurrent_scheduler/settings.yaml --execute
 ./examples/multi_worker/run.sh                      # leader + 1 follower (self-verifying)
-WORKERS=3 ./examples/multi_worker_showcase/run.sh   # 1 leader + 3 followers = 4-way (demo only)
+WORKERS=3 ./examples/multi_worker_showcase/run.sh   # 4-way, asserts shared work
 ```
 
 Do not gate dogfood completion on `multi_worker_showcase` (~200 rows × 4
@@ -171,5 +240,5 @@ workers — the heaviest of the three). For a bounded smoke, run `multi_worker`
 | Example | Rows / Work units | Notes |
 |---------|-------------------|-------|
 | `concurrent_scheduler` | 6 (2×3 CSV rows) | Count-6 rendezvous; proves concurrent scheduling; `elspeth run` only |
-| `multi_worker` | ~600 (1 JSONL row → 600 exploded items) | `elspeth join` leader+follower; asserts ≥2 workers shared rows; `WORKERS` env |
-| `multi_worker_showcase` | ~200 (2×100 CSV rows) | 4-worker swarm + stats card; demonstrative only; NOT for dogfood gate |
+| `multi_worker` | 120 (1 JSONL row → 120 exploded items) | `elspeth join` leader+follower; asserts ≥2 workers shared rows; `WORKERS` env |
+| `multi_worker_showcase` | 200 (10×20 exploded items) | 4-worker swarm + stats card; asserts ≥2 workers shared outcomes; NOT for dogfood gate |

@@ -9,7 +9,11 @@ from __future__ import annotations
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from typing import Literal
+from uuid import UUID
 
+import structlog
+
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_commit import (
@@ -19,12 +23,16 @@ from elspeth.web.composer.pipeline_commit import (
     prepare_pipeline_proposal_commit,
 )
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
+from elspeth.web.composer.protocol import PipelineCommitIntent
 from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.sessions.protocol import (
     AuthoritativePipelineProposal,
+    ComposerTrustMode,
     CompositionProposalRecord,
     PipelineProposalRejectionReason,
     PipelineProposalSettlementResult,
+    TransitionAssistantDraft,
+    TrustModeAutoCommitRevokedError,
 )
 
 from .._helpers import (
@@ -41,6 +49,8 @@ from .._helpers import (
 
 _GUIDED_ATOMIC_SETTLEMENT_COMPLETED = "_elspeth_guided_atomic_settlement_completed"
 _GUIDED_ATOMIC_SETTLEMENT_FAILURE = "_elspeth_guided_atomic_settlement_failure"
+
+slog = structlog.get_logger()
 
 
 @dataclass(slots=True)
@@ -147,8 +157,21 @@ async def settle_pipeline_proposal_under_compose_lock(
     draft_hash: str,
     composer_meta: Mapping[str, object] | None = None,
     telemetry_source: Literal["compose", "recompose"] = "compose",
+    transition_assistant: TransitionAssistantDraft | None = None,
+    required_trust_mode: ComposerTrustMode | None = None,
+    require_transition_consumed: bool = True,
+    session_operation_context: SessionOperationContext,
 ) -> PipelineRouteSettlement:
-    """Settle one exact canonical proposal while the caller holds the lock."""
+    """Settle one exact canonical proposal while the caller holds the lock.
+
+    ``required_trust_mode`` threads the commit-boundary trust check into the
+    settlement write transaction (elspeth-01d4c6e683): auto-commit callers
+    pass ``"auto_commit"`` and receive ``TrustModeAutoCommitRevokedError``
+    when a durable preference downgrade beat the settlement — the proposal
+    stays pending (with its durable dispatch audit recoverable by a later
+    manual approval, the same crash-between-dispatch-and-settlement state
+    the recovery path already supports). Manual approval passes ``None``.
+    """
     service: SessionServiceProtocol = request.app.state.session_service
     proposal = authority.row
     if draft_hash != authority.proposal.draft_hash:
@@ -161,6 +184,19 @@ async def settle_pipeline_proposal_under_compose_lock(
         if proposal.committed_state_id is None:
             raise RuntimeError("committed pipeline proposal has no committed state id")
         state = await service.get_state(proposal.committed_state_id)
+        # The exact-committed replay still owes the post-commit surfacing pass
+        # below. The first attempt can die between the settling commit and that
+        # pass, which leaves the committed state carrying pending
+        # interpretation requirements with no event row — /execute then fails
+        # closed on interpretation_placeholder_unresolved with nothing the user
+        # can resolve. The pass is idempotent, so re-running it here is a no-op
+        # when the first attempt already completed it.
+        await request.app.state.composer_service.surface_pending_interpretation_reviews(
+            _state_from_record(state),
+            session_id=str(proposal.session_id),
+            current_state_id=str(state.id),
+            session_operation_context=session_operation_context,
+        )
         return PipelineRouteSettlement(
             settlement=PipelineProposalSettlementResult(proposal=proposal, state=state),
             validation=None,
@@ -219,6 +255,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                         captured,
                         None,
                         plugin_crash_pending=True,
+                        session_operation_context=session_operation_context,
+                        session_operation_kind=session_operation_context.operation_kind,
                     ),
                     state=cancellation_state,
                 )
@@ -231,8 +269,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                 "VALIDATION_FAILED": "validation_failed",
                 "BASE_CONFLICT": "base_conflict",
             }
-            reason = reason_by_code.get(exc.code)
-            if reason is not None:
+            if exc.code in reason_by_code:
+                reason = reason_by_code[exc.code]
                 await _await_with_deferred_cancellation(
                     service.reject_pipeline_composition_proposal(
                         session_id=proposal.session_id,
@@ -242,6 +280,7 @@ async def settle_pipeline_proposal_under_compose_lock(
                         reason=reason,
                         dispatch=persisted_dispatch,
                         actor=f"system:pipeline_commit:user:{user.user_id}",
+                        session_operation_context=session_operation_context,
                     ),
                     state=cancellation_state,
                 )
@@ -263,6 +302,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                     captured,
                     None,
                     plugin_crash_pending=True,
+                    session_operation_context=session_operation_context,
+                    session_operation_kind=session_operation_context.operation_kind,
                 ),
                 state=cancellation_state,
             )
@@ -281,6 +322,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                     (prepared.invocation,),
                     None,
                     plugin_crash_pending=False,
+                    session_operation_context=session_operation_context,
+                    session_operation_kind=session_operation_context.operation_kind,
                 ),
                 state=cancellation_state,
             )
@@ -316,6 +359,10 @@ async def settle_pipeline_proposal_under_compose_lock(
                 final_composer_metadata=state_data.composer_meta,
                 dispatch=bindings[0],
                 actor=f"user:{user.user_id}",
+                transition_assistant=transition_assistant,
+                required_trust_mode=required_trust_mode,
+                require_transition_consumed=require_transition_consumed,
+                session_operation_context=session_operation_context,
             ),
             state=cancellation_state,
         )
@@ -339,5 +386,74 @@ async def settle_pipeline_proposal_under_compose_lock(
         prepared.result.updated_state,
         session_id=str(proposal.session_id),
         current_state_id=str(settled.state.id),
+        session_operation_context=session_operation_context,
     )
     return PipelineRouteSettlement(settlement=settled, validation=validation)
+
+
+@dataclass(frozen=True, slots=True)
+class AutoCommitRevoked:
+    """Auto-commit authority was durably revoked at the settlement boundary.
+
+    Carries the trust facts from ``TrustModeAutoCommitRevokedError`` so the
+    route can act on the revocation as an explicit outcome: the proposal
+    remains pending and the turn becomes an ordinary review-path response.
+    By the time a caller holds this value the revocation is already durable:
+    the locked settlement transaction writes the ``auto_commit.revoked``
+    proposal event before raising the outcome translated here.
+    """
+
+    required: str
+    current: str
+
+
+async def settle_auto_commit_intent(
+    *,
+    request: Request,
+    user: UserIdentity,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    intent: PipelineCommitIntent,
+    composer_meta: Mapping[str, object] | None,
+    telemetry_source: Literal["compose", "recompose"],
+    transition_assistant: TransitionAssistantDraft | None,
+    session_operation_context: SessionOperationContext,
+) -> PipelineRouteSettlement | AutoCommitRevoked:
+    """Settle a planner-minted auto-commit intent, or report revocation.
+
+    Shared by the send-message and recompose routes. ``AutoCommitRevoked``
+    means the session's trust mode was durably downgraded before the
+    settlement transaction could commit (elspeth-01d4c6e683): the proposal
+    remains pending and the caller must fall back to the review-path
+    response.
+    """
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=intent.proposal_id,
+        reviewed_facts={},
+    )
+    try:
+        return await settle_pipeline_proposal_under_compose_lock(
+            request=request,
+            user=user,
+            authority=authority,
+            draft_hash=intent.draft_hash,
+            composer_meta=composer_meta,
+            telemetry_source=telemetry_source,
+            transition_assistant=transition_assistant,
+            required_trust_mode="auto_commit",
+            session_operation_context=session_operation_context,
+        )
+    except TrustModeAutoCommitRevokedError as exc:
+        # The locked settlement transaction committed this revocation before
+        # raising, so cancellation or process failure cannot leave the
+        # successful dispatch unexplained while the proposal stays pending.
+        slog.info(
+            "composer.auto_commit.revoked",
+            session_id=str(session_id),
+            proposal_id=str(intent.proposal_id),
+            required_trust_mode=exc.required,
+            current_trust_mode=exc.current,
+            telemetry_source=telemetry_source,
+        )
+        return AutoCommitRevoked(required=exc.required, current=exc.current)

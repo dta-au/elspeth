@@ -18,7 +18,15 @@
 // the `test.skip` call.
 
 import { expect, test } from "@playwright/test";
-import { authedContext, createSession, deleteSession, tokenFromStorageState } from "./helpers/api";
+import {
+  authedContext,
+  createSession,
+  deleteSession,
+  getDefaultMode,
+  setDefaultMode,
+  setShowAdvanced,
+  tokenFromStorageState,
+} from "./helpers/api";
 import { ComposerPage } from "./page-objects/composer-page";
 
 // State-seed gap flag — flip to `true` once the add-node-without-LLM
@@ -35,7 +43,18 @@ test.describe("llm-provider-schema — catalog must enforce the operator-profile
     const token = tokenFromStorageState(await page.context().storageState());
     const ctx = await authedContext(token);
     const session = await createSession(ctx, "llm-provider-schema-test-1");
+    // A fresh session opens in the account's default_mode, and a guided build
+    // hides the plugin catalog (catalogAvailable = !guidedBuildActive), so the
+    // Ctrl+Shift+P shortcut is a no-op there. An earlier live spec's
+    // "Switch to guided" leaves the shared E2E account on guided; state the
+    // freeform precondition here and restore whatever was there afterwards.
+    const priorMode = await getDefaultMode(ctx);
     try {
+      await setDefaultMode(ctx, "freeform");
+      // Since a0d256676 the catalog's Schema view renders only with the
+      // show_advanced preference on; seed it before the drawer mounts and
+      // reset it in the finally so sibling specs inherit the default.
+      await setShowAdvanced(ctx, true);
       const composer = new ComposerPage(page);
       await composer.goto(session.id);
       await composer.waitForChatReady();
@@ -69,6 +88,8 @@ test.describe("llm-provider-schema — catalog must enforce the operator-profile
         await expect(catalog.getByText(privateField, { exact: true })).toHaveCount(0);
       }
     } finally {
+      await setShowAdvanced(ctx, false);
+      await setDefaultMode(ctx, priorMode);
       await deleteSession(ctx, session.id);
       await ctx.dispose();
     }

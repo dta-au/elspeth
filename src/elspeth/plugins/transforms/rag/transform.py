@@ -21,6 +21,7 @@ from elspeth.contracts import Determinism, TransformResult, propagate_contract
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError, TransformErrorReason
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
@@ -55,11 +56,38 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f79530b7533b8958"
+    source_file_hash: str | None = "sha256:0996eb17570dff7a"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     _provider: RetrievalProvider | None
+    capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
+
+    usage_when_to_use = (
+        "Use to retrieve ranked, provenance-bearing context from an existing Chroma collection or "
+        "Azure Search index. Retrieved text is untrusted before LLM consumption even when it comes "
+        "from an approved index."
+    )
+    usage_when_not_to_use = (
+        "Not for corpus indexing or answer generation: populate the collection with chroma_sink or "
+        "an operator-managed indexer, and add an llm transform separately when an answer is required."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: rag_retrieval\n"
+        "  options:\n"
+        "    output_prefix: policy\n"
+        "    query_field: question\n"
+        "    provider: azure_search\n"
+        "    provider_config:\n"
+        "      endpoint: https://catalogue-reference.search.windows.net\n"
+        "      index: approved-documents\n"
+        "      api_key: {secret_ref: AZURE_SEARCH_API_KEY}\n"
+        "      search_mode: hybrid\n"
+        "    top_k: 5\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -158,6 +186,7 @@ class RAGRetrievalTransform(BaseTransform):
                 self._field_sources,
             ]
         )
+        self._reject_input_options_naming_created_fields({"query_field": self._rag_config.query_field})
 
         # Schemas — RAG adds fields, so output uses observed mode
         self.input_schema, self.output_schema = self._create_schemas(
@@ -201,7 +230,7 @@ class RAGRetrievalTransform(BaseTransform):
         provider_name = self._rag_config.provider
         config_cls, factory = PROVIDERS[provider_name]
         provider_config = config_cls(**self._rag_config.provider_config)
-        collection_name = self._configured_collection_name(provider_config)
+        collection_name = self._configured_collection_name(provider_name, provider_config)
 
         try:
             self._provider = factory(
@@ -333,6 +362,7 @@ class RAGRetrievalTransform(BaseTransform):
                 output_row=output,
                 transform_adds_fields=True,
             )
+            output_contract = self._apply_declared_output_field_contracts(output_contract)
             output_contract = self._align_output_contract(output_contract)
             no_results_success_metadata: dict[str, Any] = {"chunk_count": 0, "no_results": True}
             if skipped_count > 0:
@@ -384,6 +414,7 @@ class RAGRetrievalTransform(BaseTransform):
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 
         success_metadata: dict[str, Any] = {
@@ -404,16 +435,27 @@ class RAGRetrievalTransform(BaseTransform):
             },
         )
 
-    def _configured_collection_name(self, provider_config: Any) -> str:
-        """Extract the configured collection/index name for readiness audit records."""
-        for field_name in ("collection", "index"):
-            value = getattr(provider_config, field_name, None)
-            if isinstance(value, str) and value:
-                return value
-        raise FrameworkBugError(
-            f"{self.__class__.__name__} provider config {type(provider_config).__name__} "
-            "must expose a non-empty 'collection' or 'index' for readiness auditing."
-        )
+    def _configured_collection_name(self, provider_name: str, provider_config: Any) -> str:
+        """Read readiness identity from the nominal config for a known provider."""
+        if provider_name == "chroma":
+            from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
+
+            if not isinstance(provider_config, ChromaSearchProviderConfig):
+                raise FrameworkBugError(
+                    f"{self.__class__.__name__} provider chroma requires ChromaSearchProviderConfig; "
+                    f"received {type(provider_config).__name__}."
+                )
+            return provider_config.collection
+        if provider_name == "azure_search":
+            from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
+
+            if not isinstance(provider_config, AzureSearchProviderConfig):
+                raise FrameworkBugError(
+                    f"{self.__class__.__name__} provider azure_search requires AzureSearchProviderConfig; "
+                    f"received {type(provider_config).__name__}."
+                )
+            return provider_config.index
+        raise FrameworkBugError(f"{self.__class__.__name__} has no readiness identity contract for provider {provider_name!r}.")
 
     def _record_readiness_check(
         self,
@@ -424,10 +466,15 @@ class RAGRetrievalTransform(BaseTransform):
         count: int | None,
         message: str,
     ) -> None:
-        """Persist retrieval readiness facts when the audit writer is available."""
-        if ctx.landscape is not None:
-            ctx.landscape.record_readiness_check(
-                run_id=ctx.run_id,
+        """Persist retrieval readiness facts when the context can write them.
+
+        The write goes through the context, which forwards the run's leader
+        token by value (ADR-048 §3); a plugin never holds a token itself. A
+        context with no audit writer or no token (a follower, a probe) records
+        nothing — the same skip the writer-less arm has always taken.
+        """
+        if ctx.landscape is not None and ctx.coordination_token is not None:
+            ctx.record_readiness_check(
                 name=self.name,
                 collection=collection,
                 reachable=reachable,
@@ -480,9 +527,9 @@ class RAGRetrievalTransform(BaseTransform):
                 issue_code=None,
                 summary="Vector retrieval against a configured backend (Chroma, etc). Builds a query from row fields, returns ranked chunks for downstream LLM grounding.",
                 composer_hints=(
-                    "Collection naming is per-provider — check provider config for the canonical pattern before pinning collection_name.",
+                    "Name the Chroma collection in provider_config.collection or the Azure Search index in provider_config.index.",
                     "Query template uses row-field interpolation; document what fields are read so downstream consumers can wire them.",
-                    "top_k and score_threshold interact — high threshold + low top_k may return zero chunks. Configure on_zero_results to handle the empty-result case.",
+                    "top_k and min_score interact — high min_score plus low top_k may return zero chunks. Configure on_no_results to handle the empty-result case.",
                     "The transform emits running mean/variance telemetry for retrieval scores — watch these to catch retrieval-quality regressions.",
                 ),
             )

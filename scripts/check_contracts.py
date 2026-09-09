@@ -8,9 +8,52 @@ Scans the codebase for:
 
 Also validates that all whitelist entries are still valid (not stale).
 
+SCOPE OF CHECK 2 — read this before treating a green run as "no soft types".
+This scan is syntactic and deliberately narrow. It reports a site only when ALL
+of the following hold, and a green result says nothing about anything else:
+
+  * the annotation spells ``dict[str, Any]`` / ``Dict[str, Any]`` — directly,
+    unioned with ``None``, wrapped in ``list[...]``, or through a module-level
+    alias resolved by :class:`DictAliasIndex`;
+  * the value type is ``Any`` — ``dict[str, object]`` and ``Mapping[str,
+    object]`` are out of scope by design, because ``object`` already forces
+    narrowing at every use site;
+  * the container is ``dict`` — ``Mapping``, ``MutableMapping`` and every other
+    mapping ABC are NOT scanned, even with an ``Any`` value type;
+  * the annotation sits on a function PARAMETER (positional-or-keyword or
+    keyword-only) or a RETURN. Positional-only parameters, ``*args`` and
+    ``**kwargs`` are not scanned, and neither is any variable or class-attribute
+    annotation (``ast.AnnAssign``);
+  * the file lives under ``src/elspeth`` and outside ``src/elspeth/contracts``.
+
+Measured at 2026-09-04 against ``src/elspeth``: 2,162 soft-mapping annotations
+exist in total, of which 1,601 are ``Any``-valued. This check can reach roughly a
+third of them. Widening it to the remaining forms is tracked work, not an
+oversight — see the ``[str, Any]`` burn-down epic — and the point of stating the
+scope here is that the gap stays visible while that work is outstanding.
+
+``tests/unit/scripts/test_check_contracts.py`` pins this scope: each exclusion
+above has a test that asserts the scanner does NOT report it, so widening the
+scanner without updating the record fails loudly.
+
+CHECK 4 — SOFT-MAPPING CENSUS (elspeth-10d605be55). Check 2's whitelist is a
+ratchet over the third it can see, and "whitelist rows retired" credits a
+``dict[str, Any]`` -> ``Mapping[str, Any]`` rewrite exactly like an owned-type
+conversion. The census is the second measure: it counts EVERY soft mapping
+form (``dict``/``Mapping``/``MutableMapping`` with a ``str`` key and an ``Any``
+or ``object`` value) in EVERY annotation position, all of ``src/elspeth``, and
+pins the per-file, per-form counts in ``config/cicd/soft-mapping-census.yaml``.
+Any drift from the pin fails; a rewrite between forms is a swap the re-pin diff
+shows, and only the ``soft`` total falling is progress. A parameter parsed at a
+``@trust_boundary`` (its ``source_param``) scores as a boundary conversion, i.e.
+a removal. The exact counting rule is :data:`CENSUS_METHOD`, emitted verbatim
+into the pin file. Re-pin with ``--write-census`` in the same commit that
+changes a soft site.
+
 Usage:
     python scripts/check_contracts.py
     python scripts/check_contracts.py --no-fail-on-stale  # Skip stale check
+    python scripts/check_contracts.py --write-census      # Re-pin the soft-mapping census
 
 Exit codes:
     0: All contracts properly centralized
@@ -25,6 +68,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from typing import Final
 
 import yaml
 
@@ -209,8 +253,105 @@ def find_type_definitions(file_path: Path) -> list[tuple[str, int, str]]:
     return definitions
 
 
-def _is_dict_str_any(annotation: ast.expr | None) -> bool:
-    """Check if annotation is dict[str, Any] or Dict[str, Any]."""
+@dataclass
+class DictAliasIndex:
+    """Module-level ``X = dict[str, Any]`` aliases, resolved per importing module.
+
+    The dict-pattern matcher below is syntactic: it recognises the *spelling*
+    ``dict[str, Any]``. A name bound to that type at module scope therefore
+    launders it — ``def get_run(...) -> RunDetail | None`` and
+    ``def get_run(...) -> dict[str, Any] | None`` are the same type, and without
+    this index only the second is ever scanned.
+
+    Resolution is by import, not by name: an alias counts for a file only if that
+    file defines it or imports it from the module that does. Two modules may bind
+    the same name to different types without one poisoning the other.
+
+    SCOPE, stated so callers do not over-trust it. Resolved: module-level
+    ``X = dict[str, Any]`` and ``X: TypeAlias = dict[str, Any]``, reached through
+    ``from <module> import <name>`` (absolute or relative). NOT resolved: aliases
+    bound inside a function or class body, aliases reached as an attribute
+    (``import types_mod`` then ``types_mod.RunDetail``), aliases re-exported
+    through an intermediate module, aliases renamed on import (``as``), and
+    annotations written as string forward references. Each is a known hole, not
+    an oversight; widen this only with a test that witnesses the new form.
+    """
+
+    # Dotted module name -> the alias names it defines
+    _by_module: dict[str, frozenset[str]] = field(default_factory=dict)
+
+    @staticmethod
+    def _module_name(py_file: Path, src_dir: Path) -> str:
+        """Return the dotted module name for ``py_file`` (``src/elspeth/mcp/types.py`` -> ``elspeth.mcp.types``)."""
+        relative = py_file.relative_to(src_dir.parent).with_suffix("")
+        parts = list(relative.parts)
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    @classmethod
+    def build(cls, src_dir: Path) -> DictAliasIndex:
+        """Parse every file once and record its module-level dict[str, Any] aliases."""
+        index = cls()
+        for py_file in src_dir.rglob("*.py"):
+            try:
+                tree = ast.parse(py_file.read_text())
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            names: set[str] = set()
+            # Module scope only: tree.body, never ast.walk. An alias bound inside a
+            # function is not importable, so resolving it would report a name the
+            # annotation cannot actually refer to.
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and _is_dict_str_any(node.value):
+                    names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+                elif (
+                    isinstance(node, ast.AnnAssign)
+                    and node.value is not None
+                    and _is_dict_str_any(node.value)
+                    and isinstance(node.target, ast.Name)
+                ):
+                    names.add(node.target.id)
+            if names:
+                index._by_module[cls._module_name(py_file, src_dir)] = frozenset(names)
+        return index
+
+    def names_in_scope(self, py_file: Path, src_dir: Path) -> frozenset[str]:
+        """Return the alias names ``py_file`` can refer to: its own plus those it imports."""
+        module = self._module_name(py_file, src_dir)
+        in_scope = set(self._by_module.get(module, frozenset()))
+        try:
+            tree = ast.parse(py_file.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            return frozenset(in_scope)
+        package = module.rsplit(".", 1)[0] if "." in module else module
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level:
+                # from .types import X / from ..mcp.types import X
+                base = package.split(".")
+                trimmed = base[: len(base) - (node.level - 1)] if node.level > 1 else base
+                source = ".".join([*trimmed, node.module]) if node.module else ".".join(trimmed)
+            else:
+                source = node.module or ""
+            defined = self._by_module.get(source)
+            if not defined:
+                continue
+            # asname is deliberately not followed: the renamed name is a different
+            # binding and resolving it would need scope tracking this index lacks.
+            in_scope.update(alias.name for alias in node.names if alias.asname is None and alias.name in defined)
+        return frozenset(in_scope)
+
+
+def _is_dict_str_any(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation is dict[str, Any], Dict[str, Any], or an alias of one.
+
+    ``aliases`` carries the module-level ``X = dict[str, Any]`` names in scope for
+    the file being scanned (see :class:`DictAliasIndex`). Without it this matcher
+    is purely syntactic, so ``-> RunDetail`` and ``-> dict[str, Any]`` — the same
+    type — are treated differently and only the second is ever reported.
+    """
     if annotation is None:
         return False
 
@@ -221,6 +362,11 @@ def _is_dict_str_any(annotation: ast.expr | None) -> bool:
         if isinstance(expr, ast.Name) and expr.id == "Any":
             return True
         return isinstance(expr, ast.Attribute) and expr.attr == "Any" and isinstance(expr.value, ast.Name) and expr.value.id == "typing"
+
+    # A bare name bound to dict[str, Any] at module scope, e.g. mcp/types.py's
+    # RunDetail. Resolved from the alias index, never from the name's spelling.
+    if isinstance(annotation, ast.Name) and annotation.id in aliases:
+        return True
 
     # dict[str, Any] - modern syntax
     if (
@@ -236,55 +382,60 @@ def _is_dict_str_any(annotation: ast.expr | None) -> bool:
     return False
 
 
-def _is_list_of_dict_str_any(annotation: ast.expr | None) -> bool:
-    """Check if annotation is list[dict[str, Any]]."""
+def _is_list_of_dict_str_any(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation is list[dict[str, Any]] (or list of an alias of one)."""
     if annotation is None:
         return False
 
     if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name) and annotation.value.id in ("list", "List"):
-        return _is_dict_str_any(annotation.slice)
+        return _is_dict_str_any(annotation.slice, aliases)
     return False
 
 
-def _is_optional_dict(annotation: ast.expr | None) -> bool:
-    """Check if annotation is dict[str, Any] | None."""
+def _is_optional_dict(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation is dict[str, Any] | None (or an alias of one)."""
     if annotation is None:
         return False
 
     # dict[str, Any] | None
     if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-        left_is_dict = _is_dict_str_any(annotation.left)
+        left_is_dict = _is_dict_str_any(annotation.left, aliases)
         right_is_none = isinstance(annotation.right, ast.Constant) and annotation.right.value is None
         if left_is_dict and right_is_none:
             return True
         # None | dict[str, Any]
         left_is_none = isinstance(annotation.left, ast.Constant) and annotation.left.value is None
-        right_is_dict = _is_dict_str_any(annotation.right)
+        right_is_dict = _is_dict_str_any(annotation.right, aliases)
         if left_is_none and right_is_dict:
             return True
     return False
 
 
-def _is_union_with_dict(annotation: ast.expr | None) -> bool:
-    """Check if annotation contains dict[str, Any] in a union."""
+def _is_union_with_dict(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation contains dict[str, Any] (or an alias) in a union."""
     if annotation is None:
         return False
 
     # Check direct dict
-    if _is_dict_str_any(annotation):
+    if _is_dict_str_any(annotation, aliases):
         return True
 
     # Check union types (X | Y | Z)
     if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-        return _is_union_with_dict(annotation.left) or _is_union_with_dict(annotation.right)
+        return _is_union_with_dict(annotation.left, aliases) or _is_union_with_dict(annotation.right, aliases)
 
     return False
 
 
-def find_dict_patterns_in_file(file_path: Path) -> list[str]:
+def find_dict_patterns_in_file(file_path: Path, aliases: frozenset[str] = frozenset()) -> list[str]:
     """Find all dict[str, Any] patterns in a file.
 
     Returns list of qualified names like "path:Class.method:param"
+
+    ``aliases`` must match what :func:`find_dict_violations` was given for the same
+    file. The stale-entry check compares whitelist rows against this function's
+    output, so a narrower view here reports a legitimately whitelisted alias site
+    as stale and fails the gate closed on a row that is doing its job.
     """
     try:
         source = file_path.read_text()
@@ -316,23 +467,42 @@ def find_dict_patterns_in_file(file_path: Path) -> list[str]:
                 param_name = arg.arg
                 annotation = arg.annotation
 
-                if _is_dict_str_any(annotation) or _is_optional_dict(annotation) or _is_union_with_dict(annotation):
+                if (
+                    _is_dict_str_any(annotation, aliases)
+                    or _is_optional_dict(annotation, aliases)
+                    or _is_union_with_dict(annotation, aliases)
+                ):
                     patterns.append(f"{relative_path}:{context}:{param_name}")
-                elif _is_list_of_dict_str_any(annotation):
+                elif _is_list_of_dict_str_any(annotation, aliases):
                     patterns.append(f"{relative_path}:{context}:{param_name} (list)")
 
             # Check return type
             if node.returns:
-                if _is_dict_str_any(node.returns) or _is_optional_dict(node.returns) or _is_union_with_dict(node.returns):
+                if (
+                    _is_dict_str_any(node.returns, aliases)
+                    or _is_optional_dict(node.returns, aliases)
+                    or _is_union_with_dict(node.returns, aliases)
+                ):
                     patterns.append(f"{relative_path}:{context}:return")
-                elif _is_list_of_dict_str_any(node.returns):
+                elif _is_list_of_dict_str_any(node.returns, aliases):
                     patterns.append(f"{relative_path}:{context}:return (list)")
 
     return patterns
 
 
-def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: dict[str, bool]) -> list[DictViolation]:
-    """Find dict[str, Any] type hints that should be typed contracts."""
+def find_dict_violations(
+    file_path: Path,
+    whitelist: set[str],
+    matched_entries: dict[str, bool],
+    aliases: frozenset[str] = frozenset(),
+) -> list[DictViolation]:
+    """Find dict[str, Any] type hints that should be typed contracts.
+
+    Scans function PARAMETERS and RETURN annotations only. Variable and
+    class-attribute annotations (``ast.AnnAssign``) are not scanned, and neither
+    are positional-only parameters, ``*args`` or ``**kwargs`` — see this module's
+    docstring for the full scope statement.
+    """
     try:
         source = file_path.read_text()
         tree = ast.parse(source)
@@ -369,7 +539,11 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                 param_name = arg.arg
                 annotation = arg.annotation
 
-                if _is_dict_str_any(annotation) or _is_optional_dict(annotation) or _is_union_with_dict(annotation):
+                if (
+                    _is_dict_str_any(annotation, aliases)
+                    or _is_optional_dict(annotation, aliases)
+                    or _is_union_with_dict(annotation, aliases)
+                ):
                     # Build qualified name for whitelist check
                     qualified = f"{relative_path}:{context}:{param_name}"
                     if qualified in whitelist:
@@ -378,12 +552,12 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                         violations.append(
                             DictViolation(
                                 file=relative_path,
-                                line=arg.lineno if hasattr(arg, "lineno") else node.lineno,
+                                line=arg.lineno,
                                 context=context,
                                 param_name=param_name,
                             )
                         )
-                elif _is_list_of_dict_str_any(annotation):
+                elif _is_list_of_dict_str_any(annotation, aliases):
                     # List types have "(list)" suffix in whitelist
                     qualified = f"{relative_path}:{context}:{param_name} (list)"
                     if qualified in whitelist:
@@ -392,7 +566,7 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                         violations.append(
                             DictViolation(
                                 file=relative_path,
-                                line=arg.lineno if hasattr(arg, "lineno") else node.lineno,
+                                line=arg.lineno,
                                 context=context,
                                 param_name=f"{param_name} (list)",
                             )
@@ -400,7 +574,11 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
 
             # Check return type
             if node.returns:
-                if _is_dict_str_any(node.returns) or _is_optional_dict(node.returns) or _is_union_with_dict(node.returns):
+                if (
+                    _is_dict_str_any(node.returns, aliases)
+                    or _is_optional_dict(node.returns, aliases)
+                    or _is_union_with_dict(node.returns, aliases)
+                ):
                     qualified = f"{relative_path}:{context}:return"
                     if qualified in whitelist:
                         matched_entries[qualified] = True
@@ -413,7 +591,7 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                                 param_name="return",
                             )
                         )
-                elif _is_list_of_dict_str_any(node.returns):
+                elif _is_list_of_dict_str_any(node.returns, aliases):
                     # List types have "(list)" suffix in whitelist
                     qualified = f"{relative_path}:{context}:return (list)"
                     if qualified in whitelist:
@@ -629,7 +807,7 @@ def validate_type_entry(entry: str, src_dir: Path) -> str | None:
     return None
 
 
-def validate_dict_pattern_entry(entry: str, src_dir: Path) -> str | None:
+def validate_dict_pattern_entry(entry: str, src_dir: Path, alias_index: DictAliasIndex | None = None) -> str | None:
     """Validate that an allowed_dict_patterns entry exists.
 
     Entry format: "src/elspeth/path/file.py:Class.method:param"
@@ -651,7 +829,8 @@ def validate_dict_pattern_entry(entry: str, src_dir: Path) -> str | None:
         return f"File not found: {file_path}"
 
     # Find all dict patterns in the file
-    patterns = find_dict_patterns_in_file(file_path)
+    aliases = alias_index.names_in_scope(file_path, src_dir) if alias_index is not None else frozenset()
+    patterns = find_dict_patterns_in_file(file_path, aliases)
 
     # Check if this entry matches any pattern
     if entry in patterns:
@@ -677,6 +856,7 @@ def find_stale_entries(
     matched_dict_patterns: dict[str, bool],
     matched_type_patterns: set[str],
     src_dir: Path,
+    alias_index: DictAliasIndex | None = None,
 ) -> list[StaleEntry]:
     """Find whitelist entries that don't match any code."""
     stale = []
@@ -695,7 +875,7 @@ def find_stale_entries(
             if matched_dict_patterns.get(entry.value, False):
                 continue
             # Validate the entry
-            error = validate_dict_pattern_entry(entry.value, src_dir)
+            error = validate_dict_pattern_entry(entry.value, src_dir, alias_index)
             if error:
                 stale.append(StaleEntry(entry=entry.value, category="dict_pattern", reason=error))
 
@@ -1254,6 +1434,368 @@ def check_settings_alignment(config_path: Path) -> list[SettingsViolation]:
     return violations
 
 
+# ---------------------------------------------------------------------------
+# Soft-mapping census (elspeth-10d605be55)
+#
+# Check 2 above counts one SPELLING (``dict[str, Any]``) in two positions and
+# credits every retired whitelist row identically — a ``dict[str, Any]`` ->
+# ``Mapping[str, Any]`` rewrite and a genuine owned-type conversion both retire
+# exactly one row, and the 2026-08-31 campaign that replaced ``Any`` with
+# ``object`` wholesale went green on it while retiring no risk. The census is
+# the second measure: it counts every soft mapping form in every annotation
+# position, pins the counts per file, and refuses ANY drift from the pin. A
+# rewrite between forms therefore shows up as a swap in the re-pin diff (one
+# column down, another up in the same file) instead of scoring; only a site
+# that leaves the soft family altogether lowers the soft total, and that total
+# is the burn-down score.
+# ---------------------------------------------------------------------------
+
+SOFT_MAPPING_FORMS: Final[tuple[str, ...]] = (
+    "dict[str, Any]",
+    "Mapping[str, Any]",
+    "MutableMapping[str, Any]",
+    "dict[str, object]",
+    "Mapping[str, object]",
+)
+"""The five soft mapping forms, keyed on container and value type.
+
+``object``-valued forms are soft here even though check 2 excludes them: they
+force narrowing at every use site instead of at a boundary, which is the shape
+the failed ``Any`` -> ``object`` sweep produced. Counting them is what stops
+that sweep from ever scoring again.
+"""
+
+BOUNDARY_COLUMN: Final = "boundary"
+
+CENSUS_METHOD: Final = (
+    "Every dict/Dict/Mapping/MutableMapping[str, Any|object] subscript occurring anywhere inside an "
+    "annotation (unions, Optional and container wrappers included, each occurrence counted) on any "
+    "function parameter (positional-only, ordinary, *args, keyword-only, **kwargs), any return, and any "
+    "AnnAssign at module, class or function scope, in every parseable .py file under src/elspeth "
+    "including contracts/; module-level dict[str, Any] aliases resolved by import through DictAliasIndex. "
+    "A parameter named as source_param by a @trust_boundary decorator on the same function counts in the "
+    "'boundary' column (a boundary conversion scores as a removal), not in its form column. Measured "
+    "2,739 soft + 63 boundary occurrences across 386 files at release/0.8.0@e8998f20a, six of them "
+    "reached only through alias resolution; the 2,162 quoted by the 2026-09-04 scope statement used a "
+    "narrower rule that could not be recovered and is NOT this census."
+)
+
+_SOFT_CONTAINERS: Final[dict[str, str]] = {
+    "dict": "dict",
+    "Dict": "dict",
+    "Mapping": "Mapping",
+    "MutableMapping": "MutableMapping",
+}
+
+
+@dataclass(frozen=True)
+class CensusSite:
+    """One soft-mapping occurrence: where it is, which form, and whether it is a boundary parse."""
+
+    file: str
+    line: int
+    context: str
+    position: str
+    form: str
+    boundary: bool
+
+
+@dataclass(frozen=True)
+class CensusDrift:
+    """One per-file, per-form disagreement between the pinned census and the live tree."""
+
+    file: str
+    form: str
+    pinned: int
+    live: int
+
+
+@dataclass(frozen=True)
+class CensusReport:
+    """Outcome of :func:`check_soft_mapping_census`: pass/fail, printable lines, and the score."""
+
+    ok: bool
+    lines: tuple[str, ...]
+    totals: dict[str, int]
+    drifts: tuple[CensusDrift, ...]
+
+
+def _annotation_name(expr: ast.expr) -> str | None:
+    """Return the bare or attribute name an annotation node spells, else ``None``."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        return expr.attr
+    return None
+
+
+def soft_mapping_form(node: ast.AST, aliases: frozenset[str] = frozenset()) -> str | None:
+    """Classify ONE annotation node as a soft mapping form, or ``None``.
+
+    ``typing.Mapping`` / ``collections.abc.Mapping`` / bare ``Mapping`` all read
+    as the same container; ``typing.Any`` and ``Any`` as the same value. A name
+    in ``aliases`` is a module-level ``dict[str, Any]`` alias resolved by import.
+    """
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return "dict[str, Any]"
+    if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2):
+        return None
+    container = _SOFT_CONTAINERS.get(_annotation_name(node.value) or "")
+    key_type, value_type = node.slice.elts
+    value = _annotation_name(value_type)
+    if container is None or _annotation_name(key_type) != "str" or value not in ("Any", "object"):
+        return None
+    return f"{container}[str, {value}]"
+
+
+def iter_soft_mapping_forms(annotation: ast.expr, aliases: frozenset[str] = frozenset()) -> list[str]:
+    """Every soft form occurring anywhere inside ``annotation``, in source order.
+
+    Walks the whole expression so a union carrying two soft forms yields two
+    and a wrapper such as ``list[dict[str, Any]]`` yields one — per-occurrence
+    counting is what turns a form-to-form rewrite into a visible swap.
+    """
+    forms: list[str] = []
+    for node in ast.walk(annotation):
+        form = soft_mapping_form(node, aliases)
+        if form is not None:
+            forms.append(form)
+    return forms
+
+
+def _trust_boundary_source_param(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The ``source_param`` a ``@trust_boundary(...)`` decorator on ``func`` names, else ``None``."""
+    for decorator in func.decorator_list:
+        if not isinstance(decorator, ast.Call) or _annotation_name(decorator.func) != "trust_boundary":
+            continue
+        for keyword in decorator.keywords:
+            if keyword.arg == "source_param" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                return keyword.value.value
+    return None
+
+
+def _annassign_target(node: ast.AnnAssign) -> str:
+    dotted = _dotted_name(node.target)
+    return dotted if dotted is not None else ast.unparse(node.target)
+
+
+def census_file(file_path: Path, aliases: frozenset[str] = frozenset()) -> list[CensusSite]:
+    """Every soft-mapping occurrence in one file, in source order (see :data:`CENSUS_METHOD`)."""
+    try:
+        tree = ast.parse(file_path.read_text())
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    parent_map: dict[int, ast.AST] = {}
+    for parent_node in ast.walk(tree):
+        for child_node in ast.iter_child_nodes(parent_node):
+            parent_map[id(child_node)] = parent_node
+
+    def context_of(node: ast.AST) -> str:
+        """Dotted enclosing class/function names, ``<module>`` at module scope."""
+        names: list[str] = []
+        ancestor = parent_map.get(id(node))
+        while ancestor is not None:
+            if isinstance(ancestor, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                names.append(ancestor.name)
+            ancestor = parent_map.get(id(ancestor))
+        return ".".join(reversed(names)) if names else "<module>"
+
+    sites: list[CensusSite] = []
+    relative_path = str(file_path)
+
+    def record(line: int, context: str, position: str, annotation: ast.expr, *, boundary: bool) -> None:
+        for form in iter_soft_mapping_forms(annotation, aliases):
+            sites.append(CensusSite(relative_path, line, context, position, form, boundary))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            own_context = context_of(node)
+            context = f"{own_context}.{node.name}" if own_context != "<module>" else node.name
+            source_param = _trust_boundary_source_param(node)
+            args = node.args
+            labelled: list[tuple[str, ast.arg]] = [(arg.arg, arg) for arg in args.posonlyargs + args.args]
+            if args.vararg is not None:
+                labelled.append((f"*{args.vararg.arg}", args.vararg))
+            labelled.extend((arg.arg, arg) for arg in args.kwonlyargs)
+            if args.kwarg is not None:
+                labelled.append((f"**{args.kwarg.arg}", args.kwarg))
+            for label, arg in labelled:
+                if arg.annotation is not None:
+                    record(arg.lineno, context, f"param:{label}", arg.annotation, boundary=arg.arg == source_param)
+            if node.returns is not None:
+                record(node.lineno, context, "return", node.returns, boundary=False)
+        elif isinstance(node, ast.AnnAssign):
+            record(node.lineno, context_of(node), f"annassign:{_annassign_target(node)}", node.annotation, boundary=False)
+    return sites
+
+
+def build_census(src_dir: Path, alias_index: DictAliasIndex | None = None) -> list[CensusSite]:
+    """Every soft-mapping occurrence under ``src_dir`` (contracts/ included), file order sorted."""
+    sites: list[CensusSite] = []
+    for py_file in sorted(src_dir.rglob("*.py")):
+        aliases = alias_index.names_in_scope(py_file, src_dir) if alias_index is not None else frozenset()
+        sites.extend(census_file(py_file, aliases))
+    return sites
+
+
+def tabulate_census(sites: list[CensusSite]) -> dict[str, dict[str, int]]:
+    """Per-file counts: ``{file: {form: n, ..., "boundary": n}}`` with zero columns omitted."""
+    table: dict[str, dict[str, int]] = {}
+    for site in sites:
+        column = BOUNDARY_COLUMN if site.boundary else site.form
+        row = table.setdefault(site.file, {})
+        row[column] = row.get(column, 0) + 1
+    return table
+
+
+def census_totals(table: dict[str, dict[str, int]]) -> dict[str, int]:
+    """The score: ``soft`` (every form column summed), ``boundary``, and one entry per form."""
+    totals = dict.fromkeys(SOFT_MAPPING_FORMS, 0)
+    totals[BOUNDARY_COLUMN] = 0
+    for row in table.values():
+        for column, count in row.items():
+            totals[column] = totals.get(column, 0) + count
+    return {
+        "soft": sum(totals[form] for form in SOFT_MAPPING_FORMS),
+        BOUNDARY_COLUMN: totals[BOUNDARY_COLUMN],
+        **{form: totals[form] for form in SOFT_MAPPING_FORMS},
+    }
+
+
+def compare_census(
+    pinned: dict[str, dict[str, int]],
+    stored_totals: dict[str, int],
+    live: dict[str, dict[str, int]],
+) -> list[CensusDrift]:
+    """Every per-file, per-form disagreement, either direction, plus a forged-totals check.
+
+    Decreases are drifts too: a stale-high pin is slack a later addition could
+    hide in, so the pin must move with every change and the re-pin diff is the
+    record of what moved.
+    """
+    drifts: list[CensusDrift] = []
+    for file in sorted(set(pinned) | set(live)):
+        pinned_row = pinned.get(file, {})
+        live_row = live.get(file, {})
+        for column in sorted(set(pinned_row) | set(live_row)):
+            before, after = pinned_row.get(column, 0), live_row.get(column, 0)
+            if before != after:
+                drifts.append(CensusDrift(file=file, form=column, pinned=before, live=after))
+    recomputed = census_totals(pinned)
+    for column in sorted(set(stored_totals) | set(recomputed)):
+        if stored_totals.get(column, 0) != recomputed.get(column, 0):
+            drifts.append(CensusDrift(file="<totals>", form=column, pinned=stored_totals.get(column, 0), live=recomputed.get(column, 0)))
+    return drifts
+
+
+def write_census(path: Path, table: dict[str, dict[str, int]]) -> None:
+    """Pin ``table`` to ``path`` with the counting rule in the header, keys sorted for stable diffs."""
+    document = {
+        "totals": census_totals(table),
+        "files": {file: dict(sorted(row.items())) for file, row in sorted(table.items())},
+    }
+    header = (
+        "# Soft-mapping census — GENERATED by `python scripts/check_contracts.py --write-census`.\n"
+        "# Do not hand-edit: every per-file, per-form count is compared against the live tree and\n"
+        "# any drift fails the contracts gate. Re-pin in the same commit that changes a soft site;\n"
+        "# the diff of this file is the record of what moved (a dict -> Mapping rewrite is a swap,\n"
+        "# not a retirement — only the `soft` total falling is progress).\n"
+        "# Counting rule: `method` below, verbatim from CENSUS_METHOD in scripts/check_contracts.py.\n"
+    )
+    # The method is emitted as a literal block scalar (``|-``) by hand so it lands
+    # verbatim on one line — safe_dump would fold it at the line width and the
+    # stated rule would no longer be greppable as written.
+    method_block = f"method: |-\n  {CENSUS_METHOD}\n"
+    path.write_text(
+        header + method_block + yaml.safe_dump(document, sort_keys=True, default_flow_style=False, allow_unicode=True, width=120)
+    )
+
+
+def load_census(path: Path) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """Read a pin written by :func:`write_census`: ``(files table, stored totals)``.
+
+    The file is repository-owned config, but its shape is still asserted rather
+    than trusted, so a hand-edit that breaks it fails here instead of reading
+    as "no soft sites".
+    """
+    loaded = yaml.safe_load(path.read_text())
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("files"), dict) or not isinstance(loaded.get("totals"), dict):
+        raise ValueError(f"{path}: expected a mapping with 'files' and 'totals' blocks")
+    table: dict[str, dict[str, int]] = {}
+    for file, row in loaded["files"].items():
+        if not isinstance(file, str) or not isinstance(row, dict):
+            raise ValueError(f"{path}: malformed files row {file!r}")
+        counts: dict[str, int] = {}
+        for column, count in row.items():
+            if column not in SOFT_MAPPING_FORMS and column != BOUNDARY_COLUMN:
+                raise ValueError(f"{path}: {file}: unknown census column {column!r}")
+            if type(count) is not int or count < 0:
+                raise ValueError(f"{path}: {file}: {column} count must be a non-negative int, got {count!r}")
+            counts[column] = count
+        table[file] = counts
+    totals: dict[str, int] = {}
+    for column, count in loaded["totals"].items():
+        if not isinstance(column, str) or type(count) is not int:
+            raise ValueError(f"{path}: malformed totals entry {column!r}")
+        totals[column] = count
+    return table, totals
+
+
+def check_soft_mapping_census(
+    src_dir: Path,
+    census_path: Path,
+    alias_index: DictAliasIndex | None,
+    *,
+    write: bool,
+) -> CensusReport:
+    """Build the live census, pin it when asked, otherwise compare it against the pin."""
+    sites = build_census(src_dir, alias_index)
+    live = tabulate_census(sites)
+    totals = census_totals(live)
+    score = f"{totals['soft']} soft occurrences across {len(live)} files, {totals[BOUNDARY_COLUMN]} boundary-parsed"
+
+    if write:
+        write_census(census_path, live)
+        return CensusReport(True, (f"✅ Soft-mapping census pinned to {census_path}: {score}",), totals, ())
+
+    if not census_path.exists():
+        return CensusReport(
+            False,
+            (
+                f"❌ Soft-mapping census pin missing: {census_path}",
+                f"   Live tree: {score}",
+                "   Fix: python scripts/check_contracts.py --write-census, and commit the file",
+            ),
+            totals,
+            (),
+        )
+
+    pinned, stored_totals = load_census(census_path)
+    drifts = compare_census(pinned, stored_totals, live)
+    if not drifts:
+        return CensusReport(True, (f"✅ Soft-mapping census matches {census_path}: {score}",), totals, ())
+
+    pinned_soft = stored_totals.get("soft", 0)
+    lines = [
+        "❌ Soft-mapping census drift (the live tree disagrees with the pin):\n",
+        f"  soft total pinned {pinned_soft} -> live {totals['soft']} "
+        f"({'progress' if totals['soft'] < pinned_soft else 'REGRESSION' if totals['soft'] > pinned_soft else 'no change — a swap between forms is not a retirement'})\n",
+    ]
+    by_key: dict[tuple[str, str], list[CensusSite]] = {}
+    for site in sites:
+        by_key.setdefault((site.file, BOUNDARY_COLUMN if site.boundary else site.form), []).append(site)
+    for drift in drifts:
+        lines.append(f"  {drift.file}: {drift.form} pinned {drift.pinned} -> live {drift.live}")
+        for site in by_key.get((drift.file, drift.form), [])[:20]:
+            lines.append(f"    line {site.line}: {site.context} {site.position}")
+    lines.append("")
+    lines.append("    Fix: convert the site to an owned type (or parse it at a @trust_boundary), then")
+    lines.append("    re-pin with `python scripts/check_contracts.py --write-census` in the same commit.")
+    lines.append("    Rewriting one soft form as another does not retire it and will not pass.\n")
+    return CensusReport(False, tuple(lines), totals, tuple(drifts))
+
+
 def main() -> int:
     """Run the contracts enforcement check."""
     parser = argparse.ArgumentParser(description="Check that cross-boundary types are in contracts/ and whitelist entries are valid")
@@ -1262,11 +1804,17 @@ def main() -> int:
         action="store_true",
         help="Don't fail on stale whitelist entries (just warn)",
     )
+    parser.add_argument(
+        "--write-census",
+        action="store_true",
+        help="Re-pin config/cicd/soft-mapping-census.yaml from the live tree instead of comparing against it",
+    )
     args = parser.parse_args()
 
     src_dir = Path("src/elspeth")
     contracts_dir = src_dir / "contracts"
     whitelist_path = Path("config/cicd/contracts-whitelist.yaml")
+    census_path = Path("config/cicd/soft-mapping-census.yaml")
 
     whitelist, all_entries = load_whitelist(whitelist_path)
     violations: list[Violation] = []
@@ -1276,6 +1824,9 @@ def main() -> int:
 
     # Build import index once (O(files) instead of O(files x types))
     import_index = ImportIndex.build(src_dir)
+    # Module-level `X = dict[str, Any]` aliases, so a name bound to the pattern is
+    # scanned like the pattern itself rather than walked past.
+    alias_index = DictAliasIndex.build(src_dir)
 
     # Scan all Python files outside contracts/
     for py_file in src_dir.rglob("*.py"):
@@ -1305,10 +1856,12 @@ def main() -> int:
                 )
 
         # Check for dict[str, Any] patterns
-        dict_violations.extend(find_dict_violations(py_file, whitelist["dicts"], matched_dict_patterns))
+        dict_violations.extend(
+            find_dict_violations(py_file, whitelist["dicts"], matched_dict_patterns, alias_index.names_in_scope(py_file, src_dir))
+        )
 
     # Find stale whitelist entries
-    stale_entries = find_stale_entries(all_entries, matched_dict_patterns, matched_type_patterns, src_dir)
+    stale_entries = find_stale_entries(all_entries, matched_dict_patterns, matched_type_patterns, src_dir, alias_index)
 
     # Check Settings → Runtime alignment
     config_path = src_dir / "core" / "config.py"
@@ -1323,6 +1876,9 @@ def main() -> int:
 
     # Check hardcoded literals in from_settings() are documented in INTERNAL_DEFAULTS
     hardcode_violations = check_hardcode_documentation(runtime_path)
+
+    # Soft-mapping census: every form, every position, pinned per file
+    census = check_soft_mapping_census(src_dir, census_path, alias_index, write=args.write_census)
 
     has_violations = False
     has_stale = False
@@ -1389,6 +1945,11 @@ def main() -> int:
             print(f"  [{se.category}] {se.entry}")
             print(f"    Reason: {se.reason}\n")
 
+    if not census.ok:
+        has_violations = True
+        for line in census.lines:
+            print(line)
+
     if has_violations:
         return 1
 
@@ -1407,6 +1968,8 @@ def main() -> int:
     print("✅ All Settings fields are accessed in from_settings() methods")
     print("✅ All field name mappings match FIELD_MAPPINGS")
     print("✅ All hardcoded values are documented in INTERNAL_DEFAULTS")
+    for line in census.lines:
+        print(line)
     return 0
 
 

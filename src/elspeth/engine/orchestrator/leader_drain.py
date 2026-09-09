@@ -39,7 +39,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.engine.orchestrator.aggregation import flush_remaining_aggregation_buffers
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.leader_follower_drain import LeaderFollowerDrain
-from elspeth.engine.orchestrator.outcomes import accumulate_row_outcomes, flush_coalesce_pending
+from elspeth.engine.orchestrator.outcomes import accumulate_row_outcomes, flush_coalesce_pending, flush_row_union_pending
 from elspeth.engine.orchestrator.run_state import LoopContext, LoopResult, _RunFailedWithPartialResultError
 from elspeth.engine.orchestrator.runtime_preflight import run_transform_runtime_preflights
 from elspeth.engine.orchestrator.types import (
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     )
 
     RegisterGraphNodesAndEdges = Callable[
-        [RecorderFactory, str, PipelineConfig, ExecutionGraph],
+        [RecorderFactory, str, PipelineConfig, ExecutionGraph, CoordinationToken],
         GraphArtifacts,
     ]
 
@@ -108,7 +108,7 @@ class LeaderDrainCoordinator:
         *,
         payload_store: PayloadStore,
         shutdown_event: threading.Event | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
         register_graph_nodes_and_edges: RegisterGraphNodesAndEdges,
     ) -> RunResult:
@@ -142,10 +142,10 @@ class LeaderDrainCoordinator:
         # The resume path does NOT write this — it rebases onto the
         # persisted sequence (ResumeCoordinator.resume -> rebase_sequence).
         # Failures propagate: no baseline means the run cannot checkpoint.
-        self._checkpoints.checkpoint_run_start(run_id)
+        self._checkpoints.checkpoint_run_start(coordination_token=coordination_token)
 
         # 1. Register graph nodes and edges
-        artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph)
+        artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
 
         # 2. Initialize context + processor
         run_ctx = self._context_factory.initialize_run_context(
@@ -169,8 +169,8 @@ class LeaderDrainCoordinator:
                 retry_manager=preflight_retry_manager,
                 shutdown_event=shutdown_event,
             )
-        except BaseException:
-            cleanup_plugins(config, run_ctx.ctx, include_source=True)
+        except BaseException as pending_exc:
+            cleanup_plugins(config, run_ctx.ctx, include_source=True, pending_exc=pending_exc)
             raise
 
         loop_ctx = LoopContext(
@@ -184,6 +184,7 @@ class LeaderDrainCoordinator:
             coalesce_node_map=run_ctx.coalesce_node_map,
         )
 
+        cleanup_pending_exc: BaseException | None = None
         try:
             # 3. Source + Process phase. This is sequential multi-source ingest:
             # each declared source is iterated in turn with the active
@@ -219,6 +220,7 @@ class LeaderDrainCoordinator:
                     shutdown_event=shutdown_event,
                     flush_end_of_input=source_ordinal == len(source_items) - 1,
                     check_coordination_latch=check_coordination_latch,
+                    coordination_token=coordination_token,
                 )
                 if loop_result.interrupted:
                     break
@@ -284,8 +286,13 @@ class LeaderDrainCoordinator:
                     f"Active scheduler work: {active_work}."
                 )
 
-            # 4. Sink writes — outside source_load track_operation context.
-            # Each sink write has its own track_operation (sink_write) in SinkExecutor.
+            # 4. Sink writes — outside the source_load track_operation context.
+            # Each sink write still gets its own sink_write operation, but it is
+            # owned by the sink-effect reservation (SinkEffectReservation
+            # ._insert_or_compare_operation), keyed on the effect identity — not
+            # by a track_operation call in SinkExecutor. A boundary violation
+            # that raises before the effect is reserved records its own failed
+            # sink_write operation instead (elspeth-207c9fbb0b).
             self._sink_flush.flush_and_write_sinks(
                 factory,
                 run_id,
@@ -293,8 +300,12 @@ class LeaderDrainCoordinator:
                 artifacts.sink_id_map,
                 artifacts.edge_map,
                 loop_result.interrupted,
-                on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
+                on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
+                    run_ctx.processor, coordination_token=coordination_token
+                ),
                 scheduler_terminalizer=run_ctx.processor,
+                check_coordination_latch=check_coordination_latch,
+                coordination_token=coordination_token,
             )
 
             # 4b. ADR-030 multi-worker: after the leader's own sink writes are done
@@ -333,8 +344,12 @@ class LeaderDrainCoordinator:
                         artifacts.sink_id_map,
                         artifacts.edge_map,
                         interrupted_by_shutdown=False,
-                        on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
+                        on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
+                            run_ctx.processor, coordination_token=coordination_token
+                        ),
                         scheduler_terminalizer=run_ctx.processor,
+                        check_coordination_latch=check_coordination_latch,
+                        coordination_token=coordination_token,
                     )
                     return True
 
@@ -382,16 +397,22 @@ class LeaderDrainCoordinator:
                 )
 
             self._events.emit(PhaseCompleted(phase=PipelinePhase.PROCESS, duration_seconds=current_time - loop_result.phase_start))
-        except GracefulShutdownError:
+        except GracefulShutdownError as exc:
+            cleanup_pending_exc = exc
             raise
         except Exception as exc:
-            raise _RunFailedWithPartialResultError(
+            outgoing_exc = _RunFailedWithPartialResultError(
                 original_error=exc,
                 partial_result=loop_ctx.counters.to_run_result(run_id, status=RunStatus.FAILED),
-            ) from exc
+            )
+            cleanup_pending_exc = outgoing_exc
+            raise outgoing_exc from exc
+        except BaseException as exc:
+            cleanup_pending_exc = exc
+            raise
 
         finally:
-            cleanup_plugins(config, run_ctx.ctx, include_source=True)
+            cleanup_plugins(config, run_ctx.ctx, include_source=True, pending_exc=cleanup_pending_exc)
             self._checkpoints.set_active_graph(None)
 
         return loop_ctx.counters.to_run_result(run_id, status=RunStatus.RUNNING)
@@ -399,8 +420,13 @@ class LeaderDrainCoordinator:
 
 # §D step-3 convergence valve: each iteration adopts every intake-pending
 # barrier row and force-resolves every flushable barrier, so legal pipelines
-# converge in a handful of rounds (one per barrier "layer" in the DAG).
-MAX_END_OF_INPUT_FLUSH_ITERATIONS = 1_000
+# converge in a handful of rounds (one per barrier "layer" in the DAG). The
+# bound used at runtime is PipelineConfig.escalation_fixpoint_bound, derived
+# per build from the real bound-region nesting depth by
+# elspeth.core.dag.bound_regions.derive_escalation_fixpoint_bound (spec
+# §6.3; that docstring also carries the superseded-constant history) — no
+# bare constant lives here, since one would collide with an override-deep
+# unwind.
 
 
 def run_end_of_input_barrier_flush(
@@ -433,7 +459,9 @@ def run_end_of_input_barrier_flush(
     INSIDE the loop by the intake's §E.3a arm. Terminates because step 2
     guarantees nothing outside the loop can newly ``mark_blocked``.
     """
-    if not config.aggregation_settings and coalesce_executor is None:
+    row_union_executor = processor.row_union_executor
+    collector_executor = processor.collector_executor
+    if not config.aggregation_settings and coalesce_executor is None and row_union_executor is None and collector_executor is None:
         return
 
     unquiesced = processor.count_unquiesced_scheduler_work()
@@ -446,7 +474,8 @@ def run_end_of_input_barrier_flush(
             f"unquiesced work: {summary}."
         )
 
-    for _ in range(MAX_END_OF_INPUT_FLUSH_ITERATIONS):
+    flush_iteration_bound = config.escalation_fixpoint_bound
+    for _ in range(flush_iteration_bound):
         # §E.2 intake: adopt anything deposited by the final drains (and, on
         # the takeover path, inherited intake-pending rows), release late
         # arrivals (§E.3a), replay durable branch losses (§E.5) — all before
@@ -485,11 +514,28 @@ def run_end_of_input_barrier_flush(
                 pending_tokens=pending_tokens,
             )
 
+        if row_union_executor is not None:
+            flush_row_union_pending(
+                row_union_executor=row_union_executor,
+                processor=processor,
+                ctx=ctx,
+                counters=counters,
+            )
+
+        # No collector flush arm, by design (spec §5): a collector closes on
+        # end_of_group only — it has no timeout and nothing to force at EOF.
+        # Every buffered member holds a BLOCKED row, so an unsettled group
+        # keeps has_blocked_barrier_work() true and the loop alive until its
+        # roster settles through intake (arrival or loss replay); a group
+        # that never settles is the non-convergence below, named as such.
         if not processor.has_blocked_barrier_work():
             return
 
+    collector_detail = ""
+    if collector_executor is not None:
+        collector_detail = f" Collector members still buffered in memory: {collector_executor.buffered_member_count()}."
     raise OrchestrationInvariantError(
         f"End-of-input barrier flush for run '{processor.run_id}' did not converge within "
-        f"{MAX_END_OF_INPUT_FLUSH_ITERATIONS} intake/flush rounds; durable BLOCKED barrier holds remain. "
-        "Possible barrier cycle or a flush that re-deposits its own inputs."
+        f"{flush_iteration_bound} intake/flush rounds; durable BLOCKED barrier holds remain. "
+        f"Possible barrier cycle or a flush that re-deposits its own inputs.{collector_detail}"
     )

@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+from tests.fixtures.landscape import leader_coordination_token
+
 _KEYVAULT_URL = os.environ.get("TEST_KEYVAULT_URL")
 
 pytestmark = pytest.mark.e2e
@@ -99,7 +101,9 @@ class TestKeyVault:
         run = system_landscape_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         resolutions = load_secrets_from_config(_fingerprint_key_config())
 
-        system_landscape_factory.run_lifecycle.record_secret_resolutions(run.run_id, resolutions)
+        system_landscape_factory.run_lifecycle.record_secret_resolutions(
+            resolutions, coordination_token=leader_coordination_token(system_landscape_factory, run.run_id)
+        )
         stored = system_landscape_factory.run_lifecycle.get_secret_resolutions_for_run(run.run_id)
 
         assert len(stored) == 1

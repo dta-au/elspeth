@@ -241,6 +241,37 @@ class TestToolListOrderIsCacheKeyContract:
         # by the filter).
         assert set(tool_names).issubset(set(defn_names))
 
+    def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
+        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.web.composer.tools import get_tool_definitions
+        from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
+
+        definitions = get_tool_definitions()
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        tools = service._get_litellm_tools()
+
+        assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in definitions]
+        for definition, tool in zip(definitions, tools, strict=True):
+            parameters = tool["function"]["parameters"]
+            if definition["name"] == "set_pipeline":
+                assert parameters == {
+                    "type": "object",
+                    "properties": {"pipeline": definition["parameters"]},
+                    "required": ["pipeline"],
+                    "additionalProperties": False,
+                }
+            else:
+                assert parameters == definition["parameters"]
+
+        _, marked_tools = apply_anthropic_cache_markers([], tools)
+        assert marked_tools is not None
+        marked_names = [tool["function"]["name"] for tool in marked_tools]
+        assert marked_names == [definition["name"] for definition in definitions]
+        assert ["cache_control" in tool for tool in marked_tools] == [False] * (len(marked_tools) - 1) + [True]
+        assert marked_tools[-1]["cache_control"] == {"type": "ephemeral"}
+        set_pipeline_index = marked_names.index("set_pipeline")
+        assert marked_tools[set_pipeline_index]["function"] == tools[set_pipeline_index]["function"]
+
     def test_trailing_tool_name_is_locked(self) -> None:
         """Lock the trailing tool's NAME so a reorder of ``get_tool_definitions()``
         breaks this test rather than silently invalidating Anthropic's prompt cache.
@@ -319,13 +350,23 @@ class TestCacheMarkersWiredAtCallSite:
         system_messages = [m for m in sent_messages if m.get("role") == "system"]
         assert len(system_messages) == 1
         stable_system_msg = system_messages[0]
-        dynamic_context_msg = sent_messages[1]
+        catalog_context_msg = sent_messages[1]
+        state_context_msg = sent_messages[-2]
         assert stable_system_msg["cache_control"] == {"type": "ephemeral"}
         assert "Current pipeline state" not in stable_system_msg["content"]
-        assert dynamic_context_msg["role"] == "user"
-        assert dynamic_context_msg["content"].startswith("Current pipeline state and available plugins")
-        assert "UNTRUSTED DATA" in dynamic_context_msg["content"]
-        assert "cache_control" not in dynamic_context_msg
+        # Cache-layout contract (elspeth-a79f1b2e6b): the deployment-constant
+        # catalog message is breakpointed; the session-varying state message
+        # rides after history, unmarked; the last message carries the sliding
+        # tail marker for the append-only tool loop.
+        assert catalog_context_msg["role"] == "user"
+        assert catalog_context_msg["content"].startswith("Deployment plugin catalog and authoring aids")
+        assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
+        assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
+        assert state_context_msg["role"] == "user"
+        assert state_context_msg["content"].startswith("Current pipeline state and session progress")
+        assert "UNTRUSTED DATA" in state_context_msg["content"]
+        assert "cache_control" not in state_context_msg
+        assert sent_messages[-1]["cache_control"] == {"type": "ephemeral"}
 
         # The trailing tool MUST carry cache_control after the transform.
         sent_tools = captured["tools"]
@@ -393,11 +434,12 @@ class TestCacheMarkersWiredAtCallSite:
         sent_messages = captured["messages"]
         system_messages = [m for m in sent_messages if m.get("role") == "system"]
         assert len(system_messages) == 1
-        for system_msg in system_messages:
-            assert "cache_control" not in system_msg
+        for message in sent_messages:
+            assert "cache_control" not in message
         assert sent_messages[1]["role"] == "user"
-        assert sent_messages[1]["content"].startswith("Current pipeline state and available plugins")
-        assert "UNTRUSTED DATA" in sent_messages[1]["content"]
+        assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
+        assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
+        assert sent_messages[-2]["content"].startswith("Current pipeline state and session progress")
         assert "cache_control" not in sent_messages[1]
 
         sent_tools = captured["tools"]

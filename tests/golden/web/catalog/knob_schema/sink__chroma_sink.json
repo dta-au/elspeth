@@ -2,12 +2,14 @@
   "knob_schema": {
     "fields": [
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
         "nullable": false,
-        "required": true
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "ChromaDB collection name",
@@ -15,7 +17,8 @@
         "label": "Collection",
         "name": "collection",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "description": "Connection mode",
@@ -27,7 +30,8 @@
         "label": "Mode",
         "name": "mode",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -36,7 +40,8 @@
         "label": "Persist Directory",
         "name": "persist_directory",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -45,7 +50,8 @@
         "label": "Host",
         "name": "host",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 8000,
@@ -54,7 +60,8 @@
         "label": "Port",
         "name": "port",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -63,7 +70,8 @@
         "label": "SSL",
         "name": "ssl",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "cosine",
@@ -77,7 +85,8 @@
         "label": "Distance Function",
         "name": "distance_function",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "description": "Maps row fields to ChromaDB document/id/metadata",
@@ -85,7 +94,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": false,
-        "required": true
+        "required": true,
+        "tier": "common"
       },
       {
         "default": "overwrite",
@@ -99,7 +109,8 @@
         "label": "On Duplicate",
         "name": "on_duplicate",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

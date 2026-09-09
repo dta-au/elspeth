@@ -1,4 +1,4 @@
-import { AlertBanner } from "../ui";
+import { AlertBanner, Button } from "../ui";
 import {
   TURN_1_PRIMARY_BUTTON,
   TURN_1_SKIP_BUTTON,
@@ -44,21 +44,16 @@ export function TutorialTurn1Welcome({
         </AlertBanner>
       )}
       <div className="tutorial-actions">
-        <button
-          type="button"
-          className="btn btn-primary"
-          onClick={onStart}
-          disabled={startDisabled}
-        >
+        <Button variant="primary" onClick={onStart} disabled={startDisabled}>
           {TURN_1_PRIMARY_BUTTON}
-        </button>
-        <button
-          type="button"
+        </Button>
+        <Button
+          variant="bare"
           className="tutorial-link-button"
           onClick={onSkip}
         >
           {TURN_1_SKIP_BUTTON}
-        </button>
+        </Button>
       </div>
     </section>
   );

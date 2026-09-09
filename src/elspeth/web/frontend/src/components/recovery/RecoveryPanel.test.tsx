@@ -1,10 +1,13 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RecoveryPanel } from "./RecoveryPanel";
 import type { CompositionState, ComposerRecoveryError } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { usePreferencesStore } from "@/stores/preferencesStore";
+import { resetStore } from "@/test/store-helpers";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 
 vi.mock("./RecoveryTranscript", () => ({
   RecoveryTranscript: () => <div>Tool transcript</div>,
@@ -89,7 +92,10 @@ function Harness({
 }
 
 describe("RecoveryPanel", () => {
+  beforeEach(() => resetStore(usePreferencesStore));
+
   it("renders headline reason evidence diff transcript and controls", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
     renderPanel();
 
     expect(
@@ -111,6 +117,16 @@ describe("RecoveryPanel", () => {
     expect(screen.getByRole("button", { name: "Apply partial draft" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Discard recovery" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View raw transcript controls" })).toBeInTheDocument();
+  });
+
+  it("omits the raw transcript and its controls with the flag off; keeps the diff and both actions (elspeth-f1394307e3)", () => {
+    const { container } = renderPanel();
+    expect(screen.getByText("Pipeline changes")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply partial draft" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Discard recovery" })).toBeInTheDocument();
+    expect(screen.queryByText("Tool transcript")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View raw transcript controls" })).not.toBeInTheDocument();
+    expectNoIdentifiersInDefaultDom(container);
   });
 
   it("does not auto-apply when Enter is pressed on the dialog", async () => {

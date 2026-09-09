@@ -15,10 +15,12 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import RuntimePreflightFailedError
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -27,8 +29,14 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult, UnrecognizedFinishReason
-from elspeth.testing import make_pipeline_row
+from elspeth.plugins.transforms.llm.provider import (
+    FinishReason,
+    LLMAuditParent,
+    LLMProvider,
+    LLMQueryResult,
+    UnrecognizedFinishReason,
+)
+from elspeth.testing import make_field, make_pipeline_row
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,6 +44,10 @@ from elspeth.testing import make_pipeline_row
 
 # Common observed schema config
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+# Observed mode forbids explicit field definitions, so declared output field
+# metadata reaches the emitted contract only under fixed/flexible mode.
+DECLARED_SCHEMA = {"mode": "fixed", "fields": ["text: str", "cuisine: str"]}
 
 
 class _CallRecorder:
@@ -93,6 +105,7 @@ def _make_ctx() -> SimpleNamespace:
         run_id="run-123",
         token=SimpleNamespace(token_id="token-1"),
         shutdown_event=None,
+        payload_store=None,
     )
 
 
@@ -104,6 +117,37 @@ def _identity_contract(contract: SchemaContract) -> SchemaContract:
 def _identity_row(row: PipelineRow) -> PipelineRow:
     """Mirror the transform's no-op row alignment in focused strategy tests."""
     return row
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="llm-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
+
+
+def _declared_input_row() -> PipelineRow:
+    """Input row whose declared 'cuisine' field arrived inferred from an upstream node."""
+    return PipelineRow(
+        {"text": "hello", "cuisine": "Malaysian"},
+        SchemaContract(
+            mode="FIXED",
+            fields=(
+                make_field("text", str, required=True, source="declared"),
+                make_field("cuisine", str, required=False, source="inferred"),
+            ),
+            locked=True,
+        ),
+    )
 
 
 def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:
@@ -134,6 +178,12 @@ def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]
 def _make_multi_query_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:
     """Build LLMTransform config with multi-query specs."""
     config = _make_config(provider=provider, **overrides)
+    # Queries bind the template variable ``text_content`` (→ row column
+    # ``text``), and queries without an override render the node-level
+    # template — so it must interpolate ``row.text_content``, not ``row.text``
+    # (the single-query default from _make_config).
+    if "prompt_template" not in overrides:
+        config["prompt_template"] = "Process this: {{ row.text_content }}"
     config["queries"] = {
         "quality": {
             "input_fields": {"text_content": "text"},
@@ -567,7 +617,7 @@ class TestTruncationDetection:
 
         call_count = [0]
 
-        def mock_execute_query(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute_query(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 return LLMQueryResult(
@@ -743,7 +793,7 @@ class TestTemplateTierPolicy:
 
         # Verify the custom per-query template was used, not the default
         call_messages = mock_provider.execute_query.call_args.args[0]
-        assert call_messages == [{"role": "user", "content": "Custom: hello"}]
+        assert call_messages == [ChatMessage(role="user", content="Custom: hello")]
 
     def test_render_undefined_variable_is_row_error_not_structural(self) -> None:
         """A render-time UndefinedError must produce TransformResult.error,
@@ -781,7 +831,7 @@ class TestMultiQueryPartialFailure:
         # Mock provider: queries 1,2 succeed, query 3 fails, query 4 would succeed
         call_count = [0]
 
-        def mock_execute_query(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute_query(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 3:
                 raise LLMClientError("Bad response for query 3", retryable=False)
@@ -825,7 +875,7 @@ class TestMultiQueryPartialFailure:
 
         call_count = [0]
 
-        def mock_execute_query(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute_query(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 return LLMQueryResult(
@@ -892,7 +942,7 @@ class TestMultiQueryJSONExtraction:
         assert result.row is not None
         assert result.row["q1_llm_response"] == "override result"
         call_messages = mock_provider.execute_query.call_args.args[0]
-        assert call_messages == [{"role": "user", "content": "Override OVERRIDE: hello"}]
+        assert call_messages == [ChatMessage(role="user", content="Override OVERRIDE: hello")]
 
     def test_per_query_template_override_preserves_lookup_audit_metadata(self) -> None:
         """Per-query template overrides should keep lookup provenance fields."""
@@ -1103,7 +1153,7 @@ class TestMultiQueryContextLength:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 raise ContextLengthError("Context too long for q2")
@@ -1632,6 +1682,7 @@ class TestResponseFormatPassthrough:
 
         config = _make_config(
             prompt_template="Evaluate: {{ row.text_content }}",
+            system_prompt="",
             queries={
                 "q1": {
                     "input_fields": {"text_content": "text"},
@@ -1655,9 +1706,165 @@ class TestResponseFormatPassthrough:
         transform._process_row(_make_row(), _make_ctx())
 
         # Verify response_format was passed to provider
+        call_messages = mock_provider.execute_query.call_args.args[0]
         call_kwargs = mock_provider.execute_query.call_args.kwargs
-        assert "response_format" in call_kwargs
-        assert call_kwargs["response_format"]["type"] == "json_schema"
+        assert call_messages == [ChatMessage(role="user", content="Evaluate: hello")]
+        assert call_kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "q1_output",
+                "schema": {
+                    "type": "object",
+                    "properties": {"score": {"type": "integer"}},
+                    "required": ["score"],
+                },
+            },
+        }
+
+    @pytest.mark.parametrize("pool_size", [1, 4])
+    @pytest.mark.parametrize("system_prompt", [None, "", "Follow the authored rubric exactly."])
+    def test_standard_response_format_sends_declared_contract_and_traces_exact_messages(
+        self,
+        pool_size: int,
+        system_prompt: str | None,
+    ) -> None:
+        """Standard JSON must send every required field/type/enum in both execution modes."""
+        from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            queries={
+                "quality": {
+                    "input_fields": {"text_content": "text"},
+                    "response_format": "standard",
+                    "output_fields": [
+                        {"suffix": "score", "type": "integer"},
+                        {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+                    ],
+                },
+            },
+            pool_size=pool_size,
+            **({"system_prompt": system_prompt} if system_prompt is not None else {}),
+        )
+        transform = LLMTransform(config)
+        mock_provider = Mock(spec=LLMProvider)
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        mock_tracer = Mock(spec=LangfuseTracer)
+        transform._provider = mock_provider
+        transform._tracer = mock_tracer
+
+        try:
+            result = transform._process_row(_make_row(), _make_ctx())
+        finally:
+            if transform._query_executor is not None:
+                transform._query_executor.shutdown(wait=True)
+
+        contract_json = (
+            '{"properties":{"label":{"enum":["pass","fail"],"type":"string"},'
+            '"score":{"type":"integer"}},"required":["score","label"],"type":"object"}'
+        )
+        augmented_prompt = (
+            f"Evaluate: hello\n\nReturn exactly one JSON object matching this required output contract (JSON Schema):\n{contract_json}"
+        )
+        expected_messages = []
+        if system_prompt:
+            expected_messages.append(ChatMessage(role="system", content=system_prompt))
+        expected_messages.append(ChatMessage(role="user", content=augmented_prompt))
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["quality_score"] == 42
+        assert result.row["quality_label"] == "pass"
+        assert mock_provider.execute_query.call_args.args[0] == expected_messages
+        assert mock_provider.execute_query.call_args.kwargs["response_format"] == {"type": "json_object"}
+
+        trace_kwargs = mock_tracer.record_success.call_args.kwargs
+        traced_messages = []
+        if trace_kwargs["system_prompt"] is not None:
+            traced_messages.append(ChatMessage(role="system", content=trace_kwargs["system_prompt"]))
+        traced_messages.append(ChatMessage(role="user", content=trace_kwargs["prompt"]))
+        assert traced_messages == expected_messages
+
+    @pytest.mark.parametrize("system_prompt", ["", "Follow the authored rubric exactly."])
+    @pytest.mark.parametrize(
+        ("provider_outcome", "expected_reason"),
+        [
+            pytest.param(
+                ContextLengthError("request exceeds provider context"),
+                "context_length_exceeded",
+                id="context-length-error",
+            ),
+            pytest.param(
+                ContentPolicyError("provider rejected the request"),
+                "multi_query_failed",
+                id="llm-client-error",
+            ),
+            pytest.param(
+                LLMQueryResult(
+                    content="partial response",
+                    usage=TokenUsage.known(10, 5),
+                    model="gpt-4o",
+                    finish_reason=FinishReason.LENGTH,
+                ),
+                "response_truncated",
+                id="finish-reason-error",
+            ),
+        ],
+    )
+    def test_standard_response_format_error_trace_uses_augmented_prompt_without_leaking_it_to_result(
+        self,
+        system_prompt: str,
+        provider_outcome: LLMQueryResult | Exception,
+        expected_reason: str,
+    ) -> None:
+        """Provider failures trace the outbound contract, while row errors stay bounded."""
+        from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            system_prompt=system_prompt,
+            queries={
+                "quality": {
+                    "input_fields": {"text_content": "text"},
+                    "response_format": "standard",
+                    "output_fields": [
+                        {"suffix": "score", "type": "integer"},
+                        {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+                    ],
+                },
+            },
+        )
+        transform = LLMTransform(config)
+        mock_provider = Mock(spec=LLMProvider)
+        if isinstance(provider_outcome, Exception):
+            mock_provider.execute_query.side_effect = provider_outcome
+        else:
+            mock_provider.execute_query.return_value = provider_outcome
+        mock_tracer = Mock(spec=LangfuseTracer)
+        transform._provider = mock_provider
+        transform._tracer = mock_tracer
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        provider_messages = mock_provider.execute_query.call_args.args[0]
+        trace_kwargs = mock_tracer.record_error.call_args.kwargs
+        traced_messages = []
+        if trace_kwargs["system_prompt"] is not None:
+            traced_messages.append(ChatMessage(role="system", content=trace_kwargs["system_prompt"]))
+        traced_messages.append(ChatMessage(role="user", content=trace_kwargs["prompt"]))
+        assert traced_messages == provider_messages
+        assert "required output contract" in trace_kwargs["prompt"]
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == expected_reason
+        assert "required output contract" not in str(result.reason)
 
     def test_standard_response_format_passes_json_object(self) -> None:
         """When response_format=standard with output_fields, use json_object mode."""
@@ -1697,6 +1904,7 @@ class TestResponseFormatPassthrough:
 
         config = _make_config(
             prompt_template="Classify: {{ row.text_content }}",
+            system_prompt="",
             queries={
                 "q1": {"input_fields": {"text_content": "text"}},
             },
@@ -1713,7 +1921,9 @@ class TestResponseFormatPassthrough:
 
         transform._process_row(_make_row(), _make_ctx())
 
+        call_messages = mock_provider.execute_query.call_args.args[0]
         call_kwargs = mock_provider.execute_query.call_args.kwargs
+        assert call_messages == [ChatMessage(role="user", content="Classify: hello")]
         # No response_format constraint when output_fields is None
         assert call_kwargs.get("response_format") is None
 
@@ -1892,7 +2102,7 @@ class TestMultiQueryFieldTypeValidation:
         mock_provider = Mock(spec=LLMProvider)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return LLMQueryResult(
@@ -2002,7 +2212,7 @@ class TestMultiQuerySequentialRetryBehavior:
         # Record (query order) of calls: q1 then q2 then q2-retry.
         q2_attempts = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             # Fail q2's first attempt only (call #2); its retry (call #3) succeeds.
             if call_count[0] == 2:
@@ -2089,7 +2299,7 @@ class TestMultiQuerySequentialReasonImmutability:
 
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return LLMQueryResult(
@@ -2194,7 +2404,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 raise ContentPolicyError("Content blocked for q2")
@@ -2243,7 +2453,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return LLMQueryResult(
@@ -2291,7 +2501,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             # q2 (2nd call) fails non-retryable; q1 and q3 succeed
             if call_count[0] == 2:
@@ -2341,7 +2551,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             # q1 succeeds, q2 and q3 both fail
             if call_count[0] == 1:
@@ -2411,6 +2621,17 @@ class TestConfigureAzureMonitor:
         yield
         _reset_azure_monitor_state()
 
+    @staticmethod
+    def _fake_inference_tracing_module() -> Any:
+        """Stand-in azure.ai.inference.tracing module for the instrumentor import."""
+        from types import SimpleNamespace
+
+        class _Instrumentor:
+            def instrument(self, *, enable_content_recording: bool) -> None:
+                del enable_content_recording
+
+        return SimpleNamespace(AIInferenceInstrumentor=_Instrumentor)
+
     def test_raises_import_error_when_sdk_is_none(self) -> None:
         """_configure_azure_monitor raises ImportError when SDK is None (not installed)."""
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
@@ -2463,13 +2684,18 @@ class TestConfigureAzureMonitor:
 
     def test_idempotency_second_call_returns_true_without_reconfiguring(self) -> None:
         """Second call to _configure_azure_monitor returns True without calling SDK again."""
+        import sys
+
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
 
         config = AzureAITracingConfig(connection_string="InstrumentationKey=test")
-        with patch(
-            "elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor",
-        ) as mock_sdk:
+        with (
+            patch(
+                "elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor",
+            ) as mock_sdk,
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
+        ):
             # First call — configures
             result1 = _configure_azure_monitor(config)
             assert result1 is True
@@ -2482,6 +2708,8 @@ class TestConfigureAzureMonitor:
 
     def test_idempotency_logs_warning_on_second_call(self) -> None:
         """Second call logs a warning about duplicate initialization."""
+        import sys
+
         from elspeth.plugins.transforms.llm.providers.azure import _configure_azure_monitor
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
 
@@ -2489,9 +2717,10 @@ class TestConfigureAzureMonitor:
         with (
             patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor"),
             patch("elspeth.plugins.transforms.llm.providers.azure.logger") as mock_logger,
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
         ):
             _configure_azure_monitor(config)
-            mock_logger.reset_mock()  # Clear warnings from first call (env-var fallback)
+            mock_logger.reset_mock()  # Isolate the second call's warning
 
             _configure_azure_monitor(config)
             # Assert warning was emitted — don't match exact message prose
@@ -2517,7 +2746,12 @@ class TestConfigureAzureMonitor:
             _configure_azure_monitor(config)
 
         # Second call with working SDK — should succeed (not blocked by idempotency)
-        with patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor") as mock_sdk:
+        import sys
+
+        with (
+            patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor") as mock_sdk,
+            patch.dict(sys.modules, {"azure.ai.inference.tracing": self._fake_inference_tracing_module()}),
+        ):
             result2 = _configure_azure_monitor(config)
             assert result2 is True
             mock_sdk.assert_called_once()
@@ -2603,11 +2837,7 @@ class TestAzureAITracingOnStart:
     """Tests for _configure_azure_monitor() wiring in on_start()."""
 
     def test_on_start_calls_configure_azure_monitor(self) -> None:
-        """on_start() calls _configure_azure_monitor for AzureAITracingConfig.
-
-        Also verifies success-path logging: logger.info is called with
-        "Azure AI tracing initialized" and the content_recording value.
-        """
+        """on_start configures Azure tracing without duplicate lifecycle logging."""
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 
@@ -2636,12 +2866,7 @@ class TestAzureAITracingOnStart:
             assert isinstance(call_arg, AzureAITracingConfig)
             assert call_arg.connection_string == "InstrumentationKey=test"
 
-            # Verify success-path logging includes content_recording value
-            mock_logger.info.assert_any_call(
-                "Azure AI tracing initialized",
-                provider="azure_ai",
-                content_recording=True,
-            )
+            mock_logger.info.assert_not_called()
 
     def test_on_start_propagates_import_error_from_configure(self) -> None:
         """on_start() lets ImportError propagate when _configure_azure_monitor fails."""
@@ -2785,6 +3010,7 @@ class TestParallelErrorReasonNotFabricated:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=mock_executor,
         )
 
@@ -2868,6 +3094,7 @@ class TestParallelAuditMetadataThreadSafety:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=mock_executor,
         )
 
@@ -2949,6 +3176,7 @@ class TestParallelAuditMetadataThreadSafety:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=mock_executor,
         )
 
@@ -3036,6 +3264,7 @@ class TestMultiQueryFinishReasonAudit:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=None,  # Sequential mode
         )
 
@@ -3082,6 +3311,7 @@ class TestMultiQueryFinishReasonAudit:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=None,
         )
 
@@ -3133,6 +3363,7 @@ class TestSequentialErrorReasonNotFabricated:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=None,  # Sequential mode
         )
 
@@ -3269,3 +3500,376 @@ class TestComposerInterpolationGuidance:
         assert any("{{ row.content }}" in t for t in templates), (
             "no published example prompt_template interpolates the per-row fetched content field"
         )
+
+
+class TestLLMDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-d1f20e8385).
+
+    ``_build_llm_output_schema_config`` passes the authored ``schema.fields``
+    straight into the transform's output declaration, but every emit path builds
+    its contract with ``propagate_contract``, which preserves whatever metadata
+    an upstream node attached. A declared field that arrived inferred therefore
+    reaches ADR-014's post-emission check as ``required=False`` against a
+    declared ``required=True``, failing the run unless the declaration is
+    restamped on emission.
+
+    There is no output-side backstop: ``output_schema`` is built with
+    ``adds_fields=True``, so it carries no model fields and ``extra="allow"``.
+    These tests are the only guard.
+    """
+
+    def test_single_query_restamps_declared_metadata_over_inferred_upstream_field(self) -> None:
+        """SingleQueryStrategy emits declared fields with their declared metadata."""
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_config(schema=DECLARED_SCHEMA),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content="a response",
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_declared_input_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("cuisine").required is True
+
+    def test_multi_query_sequential_restamps_declared_metadata(self) -> None:
+        """The sequential multi-query emit path restamps the declaration too."""
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_multi_query_config(schema=DECLARED_SCHEMA, pool_size=1),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 1}',
+            usage=TokenUsage.known(1, 1),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        assert transform._query_executor is None
+
+        result = transform._process_row(_declared_input_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("cuisine").required is True
+
+    def test_multi_query_parallel_restamps_declared_metadata(self) -> None:
+        """The parallel multi-query emit path restamps the declaration too."""
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_multi_query_config(schema=DECLARED_SCHEMA, pool_size=4),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 1}',
+            usage=TokenUsage.known(1, 1),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        assert transform._query_executor is not None
+
+        try:
+            result = transform._process_row(_declared_input_row(), _make_ctx())
+
+            assert result.status == "success"
+            assert result.row is not None
+            _run_post_emission_check(transform, result.row)
+            assert result.row.contract.get_field("cuisine").required is True
+        finally:
+            transform._query_executor.shutdown(wait=True)
+
+    def test_provenance_side_fields_are_restamped_as_declared(self) -> None:
+        """Auto-appended usage/model side fields carry DECLARED contracts.
+
+        The output schema config declares every field it guarantees — a
+        guaranteed-but-undeclared field is the invalid SchemaConfig state
+        that made the output contract forbid the transform's own outputs
+        (elspeth-97487736ca). The side fields are declared as required
+        any-typed fields, so the restamp reaches them: declared source,
+        required, object-typed. Before that fix they stayed inferred and
+        optional, understating what the plugin has always guaranteed.
+        """
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_config(schema=DECLARED_SCHEMA),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content="a response",
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_declared_input_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert transform._output_schema_config is not None
+        declared_by_name = {field.name: field for field in transform._output_schema_config.fields}
+        for side_field in ("llm_response", "llm_response_usage", "llm_response_model"):
+            assert side_field in declared_by_name
+            assert declared_by_name[side_field].field_type == "any"
+            emitted = result.row.contract.get_field(side_field)
+            assert emitted.source == "declared"
+            assert emitted.required is True
+        # Guarantees continue to admit them, and the declaration now matches.
+        assert {"llm_response", "llm_response_usage", "llm_response_model"} <= set(transform._output_schema_config.guaranteed_fields)
+
+
+# ---------------------------------------------------------------------------
+# Single-query structured output (top-level output_fields / response_format)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleQueryStructuredOutputConfig:
+    """Config-time rules for top-level ``output_fields`` / ``response_format``.
+
+    Single-prompt mode lifts the per-query structured-output surface to the
+    config top level. The same Tier-3 parsing/validation applies; fields are
+    written UNPREFIXED (no query name exists to prefix with).
+    """
+
+    def test_structured_config_accepted_in_single_mode(self) -> None:
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            response_format="structured",
+            output_fields=[{"suffix": "score", "type": "integer"}],
+        )
+        transform = LLMTransform(config)
+        assert transform is not None
+
+    def test_output_fields_rejected_alongside_queries(self) -> None:
+        """Multi-query mode owns per-query output_fields; top-level is ambiguous."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_multi_query_config(
+            output_fields=[{"suffix": "score", "type": "integer"}],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="output_fields"):
+            LLMTransform(config)
+
+    def test_structured_response_format_rejected_alongside_queries(self) -> None:
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_multi_query_config(response_format="structured")
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="response_format"):
+            LLMTransform(config)
+
+    def test_structured_without_output_fields_rejected(self) -> None:
+        """structured mode with nothing to enforce is an authoring mistake."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(response_format="structured")
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="output_fields"):
+            LLMTransform(config)
+
+    def test_duplicate_suffixes_rejected(self) -> None:
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            output_fields=[
+                {"suffix": "score", "type": "integer"},
+                {"suffix": "score", "type": "string"},
+            ],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="score"):
+            LLMTransform(config)
+
+    def test_suffix_colliding_with_response_field_rejected(self) -> None:
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            output_fields=[{"suffix": "llm_response", "type": "string"}],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="llm_response"):
+            LLMTransform(config)
+
+    def test_suffix_colliding_with_operational_field_rejected(self) -> None:
+        """usage/model side fields are written by the transform — not claimable."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            output_fields=[{"suffix": "llm_response_usage", "type": "string"}],
+        )
+        with pytest.raises((PluginConfigError, PydanticValidationError), match="llm_response_usage"):
+            LLMTransform(config)
+
+
+class TestSingleQueryStructuredOutputExecution:
+    """Provider wire shape and Tier-3 extraction for single-mode output_fields."""
+
+    def _make_structured_transform(self, **config_overrides: Any) -> tuple[Any, Mock]:
+        base: dict[str, Any] = {
+            "response_format": "structured",
+            "output_fields": [
+                {"suffix": "score", "type": "integer"},
+                {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+            ],
+        }
+        base.update(config_overrides)
+        return _make_transform_with_mock_provider(_make_config(**base))
+
+    def test_structured_sends_json_schema_response_format(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "success"
+        call_kwargs = mock_provider.execute_query.call_args.kwargs
+        assert call_kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "single_output",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "score": {"type": "integer"},
+                        "label": {"type": "string", "enum": ["pass", "fail"]},
+                    },
+                    "required": ["score", "label"],
+                },
+            },
+        }
+        # The prompt is NOT suffixed in structured mode — the API enforces the schema
+        call_messages = mock_provider.execute_query.call_args.args[0]
+        assert call_messages == [ChatMessage(role="user", content="Classify: hello")]
+
+    def test_standard_mode_sends_json_object_and_contract_suffix(self) -> None:
+        transform, mock_provider = self._make_structured_transform(response_format="standard")
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "success"
+        call_kwargs = mock_provider.execute_query.call_args.kwargs
+        assert call_kwargs["response_format"] == {"type": "json_object"}
+        call_messages = mock_provider.execute_query.call_args.args[0]
+        prompt = call_messages[-1].content
+        assert prompt.startswith("Classify: hello\n\nReturn exactly one JSON object")
+        assert '"score":{"type":"integer"}' in prompt
+
+    def test_structured_fields_extracted_unprefixed_with_raw_content(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["score"] == 42
+        assert result.row["label"] == "pass"
+        # Raw content retained for audit traceability
+        assert result.row["llm_response"] == '{"score": 42, "label": "pass"}'
+        assert result.row["llm_response_model"] == "gpt-4o"
+
+    def test_missing_output_field_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_output_field"
+        assert result.reason["field"] == "label"
+
+    def test_field_type_mismatch_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": "not-a-number", "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "field_type_mismatch"
+        assert result.reason["field"] == "score"
+
+    def test_json_parse_failure_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content="not json at all",
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "json_parse_failed"
+
+    def test_json_array_returns_error(self) -> None:
+        transform, mock_provider = self._make_structured_transform()
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='[{"score": 42}]',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_json_type"
+        assert result.reason["expected"] == "object"
+
+    def test_declared_output_fields_include_structured_suffixes(self) -> None:
+        transform, _ = self._make_structured_transform()
+        assert {"score", "label"} <= transform.declared_output_fields
+
+    def test_output_schema_carries_typed_structured_fields(self) -> None:
+        transform, _ = self._make_structured_transform(
+            schema={"mode": "fixed", "fields": ["text: str"]},
+        )
+        model_fields = transform.output_schema.model_fields
+        assert "score" in model_fields
+        assert "label" in model_fields

@@ -9,18 +9,33 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Literal
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from elspeth.core.security.web import NetworkError, SSRFBlockedError, validate_url_for_ssrf
+from elspeth.core.security.web import (
+    NetworkError,
+    SSRFBlockedError,
+    SSRFSafeRequest,
+    validate_url_for_ssrf,
+)
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode_enabled
+
+ChromaConnectionMode = Literal["persistent", "client"]
+ChromaSearchMode = Literal["ephemeral", "persistent", "client"]
 
 _LOOPBACK_HOSTS = {"localhost"}
 _LOOPBACK_ALLOWED_RANGES = (
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("::1/128"),
 )
+
+
+class _ChromaHTTPClientArgs(TypedDict):
+    host: str
+    port: int
+    ssl: bool
+    headers: dict[str, str]
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -46,19 +61,48 @@ def _host_url(host: str, port: int, *, ssl: bool) -> str:
     return f"{scheme}://{url_host}:{port}/"
 
 
-def _validate_chroma_http_target(host: str, port: int, *, ssl: bool) -> None:
-    """Apply the project SSRF policy before handing the target to Chroma SDK.
+def _validate_chroma_http_target(host: str, port: int, *, ssl: bool) -> SSRFSafeRequest:
+    """Validate and resolve a Chroma target for a pinned-IP SDK connection.
 
-    The SDK owns the actual HTTP transport, so we cannot use
-    AuditedHTTPClient's pinned-IP request path here. This preflight still
-    enforces the same host/IP blocklist for user-authored Chroma targets and
-    keeps loopback-only local development explicitly bounded.
+    Callers must pass ``resolved_ip`` to the Chroma SDK. Merely validating and
+    then passing ``host`` would let the SDK resolve the hostname again, which
+    reopens the DNS-rebinding window that ``SSRFSafeRequest`` closes.
     """
     allowed_ranges = _LOOPBACK_ALLOWED_RANGES if _is_loopback_host(host) else ()
     try:
-        validate_url_for_ssrf(_host_url(host, port, ssl=ssl), allowed_ranges=allowed_ranges)
+        safe_target = validate_url_for_ssrf(_host_url(host, port, ssl=ssl), allowed_ranges=allowed_ranges)
     except (SSRFBlockedError, NetworkError) as exc:
         raise ValueError(f"ChromaDB host {host!r} is blocked by the SSRF policy: {exc}") from exc
+    if _is_loopback_host(host) and not ipaddress.ip_address(safe_target.resolved_ip).is_loopback:
+        raise ValueError(f"ChromaDB loopback host {host!r} resolved outside the loopback ranges")
+    return safe_target
+
+
+def _validated_chroma_http_client_args(host: str, port: int, *, ssl: bool) -> _ChromaHTTPClientArgs:
+    """Build Chroma SDK arguments that cannot re-resolve an operator hostname.
+
+    Chroma 1.5.5 does not expose an HTTP transport hook that can connect to a
+    validated IP while setting a distinct TLS SNI hostname. DNS-named HTTPS
+    targets therefore fail closed; literal-IP TLS remains available when the
+    server certificate has a matching IP subject alternative name.
+    """
+    safe_target = _validate_chroma_http_target(host, port, ssl=ssl)
+    if ssl:
+        try:
+            ipaddress.ip_address(safe_target.sni_hostname)
+        except ValueError as exc:
+            raise ValueError(
+                "ChromaDB TLS hostname targets are blocked because chromadb.HttpClient "
+                "cannot use a validated IP while preserving TLS SNI; configure a literal IP "
+                "with a matching certificate IP SAN, or use persistent mode"
+            ) from exc
+    sdk_host = f"[{safe_target.resolved_ip}]" if ":" in safe_target.resolved_ip else safe_target.resolved_ip
+    return {
+        "host": sdk_host,
+        "port": port,
+        "ssl": ssl,
+        "headers": {"Host": safe_target.host_header},
+    }
 
 
 class ChromaConnectionConfig(BaseModel):
@@ -80,7 +124,7 @@ class ChromaConnectionConfig(BaseModel):
             )
         return v
 
-    mode: Literal["persistent", "client"] = Field(description="Connection mode: persistent (local disk) or client (remote HTTP)")
+    mode: ChromaConnectionMode = Field(description="Connection mode: persistent (local disk) or client (remote HTTP)")
     persist_directory: str | None = Field(
         default=None,
         description="Path to ChromaDB data directory (persistent mode only)",

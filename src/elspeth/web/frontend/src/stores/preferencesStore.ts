@@ -41,6 +41,7 @@ import type {
   ApiError,
   ComposerMode,
   PersistedTutorialStage,
+  UserComposerPreferencesPayload,
 } from "@/types/api";
 
 // localStorage key for cross-tab banner-dismiss broadcasts. Versioned
@@ -74,6 +75,9 @@ interface PreferencesState {
   tutorialSessionId: string | null;
   tutorialRunId: string | null;
   tutorialSourceDataHash: string | null;
+  // Detail level (elspeth-9c11df65f8). false = standard view. Read it ONLY
+  // through useShowAdvanced()/selectShowAdvanced so consumers cannot drift.
+  showAdvanced: boolean;
   loaded: boolean;
   writing: boolean;
   // Most-recent error from a setDefaultMode or dismiss call. Components
@@ -88,6 +92,7 @@ interface PreferencesState {
   saveTutorialProgress: (progress: TutorialProgress) => Promise<void>;
   resolveDefaultMode: () => Promise<ComposerMode>;
   setDefaultMode: (mode: ComposerMode, activeSessionId?: string | null) => Promise<void>;
+  setShowAdvanced: (value: boolean) => Promise<void>;
   saveTutorialMode: (mode: ComposerMode) => Promise<void>;
   markTutorialGraduated: (options?: {
     publishLocally?: boolean;
@@ -109,6 +114,31 @@ function tutorialCompletedFrom(value: string | null): boolean {
   return value !== null;
 }
 
+// Rate-limited ApiError guard (same per-module pattern as
+// RunOutputsPanel.tsx / shareableReviewStore.ts): a thrown ApiError is a
+// plain object, never `instanceof Error`, so discriminate on `status`.
+function isRateLimitedApiError(
+  err: unknown,
+): err is { status: number; detail: string; retry_after?: number } {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { status?: unknown }).status === 429
+  );
+}
+
+// Longest the graduation retry will sleep on a server-supplied retry_after.
+// This MUST stay below markTutorialGraduated's own 5000ms wait-loop bound:
+// `writing` is held across the sleep, and the whole store assumes that flag
+// covers about one round-trip — the wait loop's double-stamp guard and five
+// sibling actions that `return` while it is true (resetTutorial, the
+// mid-tutorial wedged-resume escape hatch, most of all) both break if a
+// retry can hold it for tens of seconds. A retry_after ABOVE this cap is
+// therefore not slept out: the save fails fast and surfaces the envelope's
+// actionable "try again in N seconds" copy, which beats freezing the
+// tutorial's own escape hatch for half a minute.
+const MAX_RETRY_AFTER_WAIT_MS = 3_000;
+
 const INITIAL_STATE = {
   defaultMode: null as ComposerMode | null,
   bannerDismissedAt: null as string | null,
@@ -119,6 +149,7 @@ const INITIAL_STATE = {
   tutorialSessionId: null as string | null,
   tutorialRunId: null as string | null,
   tutorialSourceDataHash: null as string | null,
+  showAdvanced: false,
   loaded: false,
   writing: false,
   writeError: null as string | null,
@@ -156,6 +187,7 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialSessionId: payload.tutorial_session_id,
         tutorialRunId: payload.tutorial_run_id,
         tutorialSourceDataHash: payload.tutorial_source_data_hash,
+        showAdvanced: payload.show_advanced,
         loaded: true,
       });
     } catch (err) {
@@ -285,6 +317,26 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     }
   },
 
+  setShowAdvanced: async (value) => {
+    if (get().writing) return;
+    const previous = get().showAdvanced;
+    set({ showAdvanced: value, writing: true, writeError: null });
+    try {
+      const payload = await updateUserComposerPreferences({ show_advanced: value });
+      set({ showAdvanced: payload.show_advanced, writing: false });
+    } catch (err) {
+      set({
+        showAdvanced: previous,
+        writing: false,
+        writeError:
+          err instanceof Error
+            ? `Couldn't save your preference: ${err.message}`
+            : "Couldn't save your preference.",
+      });
+      throw err;
+    }
+  },
+
   saveTutorialMode: async (mode) => {
     if (get().writing) return;
     const previous = {
@@ -354,13 +406,34 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       writing: true,
       writeError: null,
     });
+    const patchBody = {
+      tutorial_completed_at: stamp,
+      ...(options.via !== undefined
+        ? { tutorial_completed_via: options.via }
+        : {}),
+    };
     try {
-      const payload = await updateUserComposerPreferences({
-        tutorial_completed_at: stamp,
-        ...(options.via !== undefined
-          ? { tutorial_completed_via: options.via }
-          : {}),
-      });
+      let payload: UserComposerPreferencesPayload;
+      try {
+        payload = await updateUserComposerPreferences(patchBody);
+      } catch (err) {
+        // One delayed retry for a rate-limited save: the tutorial's own
+        // stage-persist burst can transiently exhaust the write bucket,
+        // and completion is the one write that must not be dropped (it
+        // gates whether the tutorial re-shows on next load). `writing`
+        // stays true across the wait so the graduation card's busy state
+        // ("Saving tutorial completion") stays honest.
+        if (!isRateLimitedApiError(err) || err.retry_after === undefined) {
+          throw err;
+        }
+        const waitMs = err.retry_after * 1000;
+        if (waitMs > MAX_RETRY_AFTER_WAIT_MS) {
+          // Too long to hold `writing` — fail fast instead of sleeping.
+          throw err;
+        }
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        payload = await updateUserComposerPreferences(patchBody);
+      }
       set({
         ...(publishLocally
           ? {
@@ -386,10 +459,15 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialCompletedAt: previous.tutorialCompletedAt,
         tutorialCompleted: previous.tutorialCompleted,
         writing: false,
+        // Surface the ApiError envelope detail too: a thrown ApiError is a
+        // plain object, not `instanceof Error`, and the bare fallback hid
+        // the actionable "try again in N seconds" message.
         writeError:
           err instanceof Error
             ? `Couldn't save tutorial completion: ${err.message}`
-            : "Couldn't save tutorial completion.",
+            : typeof err === "object" && err !== null && typeof (err as { detail?: unknown }).detail === "string"
+              ? `Couldn't save tutorial completion: ${(err as { detail: string }).detail}`
+              : "Couldn't save tutorial completion.",
       });
       throw err;
     }
@@ -587,4 +665,13 @@ initCrossTabSync();
 
 export function selectTutorialCompleted(state: PreferencesState): boolean {
   return state.tutorialCompleted;
+}
+
+export function selectShowAdvanced(state: PreferencesState): boolean {
+  return state.showAdvanced;
+}
+
+/** The single consumer entry point for the detail-level flag. */
+export function useShowAdvanced(): boolean {
+  return usePreferencesStore(selectShowAdvanced);
 }

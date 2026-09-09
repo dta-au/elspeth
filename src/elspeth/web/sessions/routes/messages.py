@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import sys
+from dataclasses import replace as _replace_dataclass
+
+from elspeth.contracts.errors import GuidedCustodyIntegrityError
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -9,6 +16,7 @@ from ._helpers import (
     Any,
     APIRouter,
     AuditIntegrityError,
+    ChatMessageRecord,
     ChatMessageResponse,
     ComposerConvergenceError,
     ComposerPluginCrashError,
@@ -20,6 +28,7 @@ from ._helpers import (
     CompositionStateData,
     CompositionStateResponse,
     Depends,
+    FailedTurnMetadata,
     GuidedSession,
     HTTPException,
     InvariantError,
@@ -39,6 +48,7 @@ from ._helpers import (
     _composer_conversation_tool_or_llm_audit_messages,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
+    _failed_turn_response_body,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _handle_convergence_error,
@@ -52,7 +62,7 @@ from ._helpers import (
     _message_response,
     _pending_proposal_responses,
     _persist_llm_calls,
-    _persist_tool_invocations,
+    _persist_turn_audit_cohort,
     _publish_progress,
     _record_composer_request_terminal,
     _record_composer_runtime_preflight_telemetry,
@@ -61,12 +71,14 @@ from ._helpers import (
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
+    _tool_call_outcomes_by_call_id,
     _track_compose_inflight,
     _verify_session_ownership,
     asyncio,
     client_cancelled_progress_event,
-    contextlib,
+    composer_turn_end_assistant_row,
     convergence_progress_event,
+    freeform_planner_progress_reason,
     get_current_user,
     get_rate_limiter,
     maybe_auto_title_session,
@@ -74,7 +86,8 @@ from ._helpers import (
     slog,
     validation_errors_for_composer_surface,
 )
-from .composer.pipeline_settlement import settle_pipeline_proposal_under_compose_lock
+from .composer.pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
+from .guided_operations import _join_shielded_task_after_cancellation
 
 
 def _requests_audit_grade_messages_view(
@@ -120,7 +133,16 @@ def register_message_routes(router: APIRouter) -> None:
         service: SessionServiceProtocol = request.app.state.session_service
         settings = request.app.state.settings
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-        async with compose_lock:
+        async with (
+            compose_lock,
+            await SessionOperationLease.acquire(
+                service.session_operation_authority,
+                session_id=session.id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            ) as compose_operation_lease,
+        ):
             # 1. Load or create CompositionState — needed before user message
             #    for pre-send provenance (AD-7: user msg records what user saw).
             state_record = await service.get_current_state(session.id)
@@ -190,16 +212,22 @@ def register_message_routes(router: APIRouter) -> None:
                 _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
             )
 
-            # 2. Persist user message with pre-send provenance.
-            # Keep the inserted row so the subsequent snapshot can prove
-            # it is composing against the transcript that actually ends
-            # at this request's user turn.
-            user_msg = await service.add_message(
+            # 2. Persist user message with pre-send provenance AND take the
+            # transcript snapshot in the SAME write-locked transaction.
+            # A separate get_messages call here read on a different pooled
+            # connection; behind a read/write-splitting proxy or a pinned
+            # snapshot that stale read did not yet contain the committed
+            # insert and the Tier-1 snapshot guard below fired as a false
+            # 500 on every send. The combined method returns a transcript
+            # that ends at the inserted row BY CONSTRUCTION — never
+            # re-call get_messages for this snapshot.
+            user_msg, records = await service.add_message_with_transcript(
                 session.id,
                 "user",
                 body.content,
                 composition_state_id=pre_send_state_id,
                 writer_principal="route_user_message",
+                session_operation_context=compose_operation_lease.context,
             )
             progress_registry = _get_composer_progress_registry(request)
             progress_sink = _composer_progress_sink(
@@ -209,10 +237,7 @@ def register_message_routes(router: APIRouter) -> None:
                 user_id=str(user.user_id),
             )
             await _publish_progress(
-                progress_registry,
-                session_id=str(session.id),
-                request_id=str(user_msg.id),
-                user_id=str(user.user_id),
+                progress_sink,
                 event=ComposerProgressEvent(
                     phase="starting",
                     headline="I'm reading your request and current pipeline.",
@@ -228,22 +253,38 @@ def register_message_routes(router: APIRouter) -> None:
             # reached. Assigned below only when first-message conditions
             # hold.
             auto_title_task: asyncio.Task[None] | None = None
+            # Set once the compose loop returns; the audit-integrity arm below
+            # needs it to describe the turn whose persistence was refused.
+            _compose_result: ComposerResult | None = None
             try:
-                # 3. Pre-fetch chat history as plain dicts (seam contract B)
-                # Pass limit=None to fetch the full conversation — the default
-                # limit=100 would silently drop recent context once a session
-                # exceeds 100 turns, causing the LLM to lose conversation state.
-                # Exclude the just-persisted user message — the composer receives
-                # it separately via body.content and appends it in _build_messages.
-                records = await service.get_messages(session.id, limit=None)
-                if not records or records[-1].id != user_msg.id:
+                # 3. Transcript snapshot guard + chat history.
+                # ``records`` is the same-transaction transcript returned by
+                # add_message_with_transcript above — full conversation, no
+                # limit (the old default limit=100 silently dropped recent
+                # context past 100 turns).
+                #
+                # The guard compares against CONVERSATION rows only (parity
+                # with /recompose): audit sidecar rows share the
+                # chat_messages sequence range, so a trailing audit row is
+                # not interleaved conversation history and must not trip a
+                # Tier-1 refusal. The guard stays INSIDE this try so a
+                # failure is still covered by the "starting" progress event,
+                # the in-flight counter, and terminal-status accounting.
+                conversation_records = _composer_conversation_messages(records)
+                if not conversation_records or conversation_records[-1].id != user_msg.id:
                     raise AuditIntegrityError(
                         "Tier 1 audit anomaly: send_message transcript snapshot "
                         f"for session {session.id} does not end at inserted user "
                         f"message {user_msg.id}. Refusing to compose against "
                         "interleaved session history."
                     )
-                chat_messages = _composer_chat_history(records[:-1])
+                # Exclude the just-persisted user message — the composer
+                # receives it separately via body.content and appends it in
+                # _build_messages. _composer_chat_history takes the FULL
+                # transcript (not the conversation-scoped list) because it
+                # decodes role="audit" provider-control rows back into
+                # prompt history itself.
+                chat_messages = _composer_chat_history([record for record in records if record.id != user_msg.id])
 
                 # 3b. First-message auto-titling.
                 #
@@ -262,7 +303,7 @@ def register_message_routes(router: APIRouter) -> None:
                 # gets re-titled. Tighten to a separate auto_titled_at
                 # column if this becomes annoying.
                 if len(records) == 1 and is_default_session_title(session.title):
-                    auto_title_task = asyncio.create_task(
+                    auto_title_task = compose_operation_lease.create_task(
                         maybe_auto_title_session(
                             service=service,
                             session_id=session.id,
@@ -270,6 +311,16 @@ def register_message_routes(router: APIRouter) -> None:
                             model=settings.composer_model,
                             temperature=settings.composer_temperature,
                             seed=settings.composer_seed,
+                            session_operation_context=compose_operation_lease.context,
+                            # Auto-title uses the PRIMARY composer role only
+                            # (Phase 3 Task 2 endpoint affordance) — never
+                            # the advisor's endpoint.
+                            api_base=settings.composer_endpoint_base_url,
+                            api_key=(
+                                settings.composer_endpoint_api_key.get_secret_value()
+                                if settings.composer_endpoint_api_key is not None
+                                else None
+                            ),
                         )
                     )
 
@@ -297,6 +348,7 @@ def register_message_routes(router: APIRouter) -> None:
                             user_id=str(user.user_id),
                             progress=progress_sink,
                             guided_terminal=_guided_terminal_for_compose,
+                            session_operation_context=compose_operation_lease.context,
                             # Bind the freshly persisted user message id so any
                             # inline_blob created by
                             # this turn's tool calls can record provenance
@@ -315,10 +367,7 @@ def register_message_routes(router: APIRouter) -> None:
                     # dispatch the three failure modes would collapse into a single
                     # generic event — the original bug filed as elspeth-5030f7373d.
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=convergence_progress_event(budget_exhausted=exc.budget_exhausted),
                     )
                     response_body = await _handle_convergence_error(
@@ -333,6 +382,7 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=422, detail=response_body) from exc
                 except LiteLLMAuthError as exc:
@@ -357,10 +407,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exc_class=type(exc).__name__,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer model is not available.",
@@ -371,7 +418,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=_litellm_error_detail(
@@ -392,10 +446,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exc_class=type(exc).__name__,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer model is temporarily unavailable.",
@@ -406,7 +457,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=_litellm_error_detail(
@@ -422,10 +480,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exc_class=type(exc).__name__,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer model rejected this request.",
@@ -436,7 +491,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=_litellm_error_detail(
@@ -485,12 +547,10 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not safely finish this request.",
@@ -532,10 +592,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exception_class=rpf_exc.exc_class,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not safely finish this request.",
@@ -556,6 +613,7 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_snapshot=plugin_snapshot,
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 except PipelinePlannerError as exc:
@@ -571,16 +629,16 @@ def register_message_routes(router: APIRouter) -> None:
                     # (llm_calls_durable), so _handle_planner_failure MUST NOT — and
                     # does not — persist it again.
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not build a pipeline for this request.",
                             evidence=("The composer model did not return a usable pipeline plan.",),
                             likely_next="Retry the request; if it keeps failing, simplify it or check the composer provider.",
-                            reason="provider_unavailable",
+                            # Attribute the failure to its actual actor rather than blaming the
+                            # provider for every planner code — the guided mirror already does
+                            # (guided_plan.py), and the closed vocabulary carries the codes.
+                            reason=freeform_planner_progress_reason(exc.code),
                         ),
                     )
                     status_code, planner_response_body = await _handle_planner_failure(
@@ -588,14 +646,12 @@ def register_message_routes(router: APIRouter) -> None:
                         service,
                         session.id,
                         compose_base_state_id,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
                 except ComposerServiceError as exc:
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not finish this request.",
@@ -606,11 +662,42 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail={"error_type": "composer_error", "detail": str(exc)},
                     ) from exc
+                finally:
+                    # Unknown/first-party composer faults are intentionally
+                    # not caught here: their exact type must keep unwinding.
+                    # P4 already owns the request_advisor_hint tool row; this
+                    # finalizer publishes only attached inner LLM sidecars.
+                    # Typed handlers above translate their fault before this
+                    # runs, so sys.exception() is then the new HTTPException
+                    # and cannot duplicate the rows those handlers persisted.
+                    current_exc = sys.exception()
+                    llm_calls = (
+                        ()
+                        if current_exc is None or isinstance(current_exc, asyncio.CancelledError)
+                        else _llm_calls_from_exception(current_exc)
+                    )
+                    if llm_calls:
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
+                _compose_result = result
 
                 # 5. Save state if version changed — post-compose provenance.
                 #
@@ -665,31 +752,49 @@ def register_message_routes(router: APIRouter) -> None:
 
                 state_response: CompositionStateResponse | None = None
                 post_compose_state_id: UUID | None = compose_base_state_id
+                assistant_msg: ChatMessageRecord | None = None
+                route_settlement: PipelineRouteSettlement | None = None
                 if result.pipeline_commit_intent is not None:
-                    authority = await service.get_authoritative_pipeline_proposal(
-                        session_id=session.id,
-                        proposal_id=result.pipeline_commit_intent.proposal_id,
-                        reviewed_facts={},
-                    )
-                    route_settlement = await settle_pipeline_proposal_under_compose_lock(
+                    settlement_outcome = await settle_auto_commit_intent(
                         request=request,
+                        session_operation_context=compose_operation_lease.context,
                         user=user,
-                        authority=authority,
-                        draft_hash=result.pipeline_commit_intent.draft_hash,
+                        service=service,
+                        session_id=session.id,
+                        intent=result.pipeline_commit_intent,
                         composer_meta=_post_compose_meta,
                         telemetry_source="compose",
+                        transition_assistant=composer_turn_end_assistant_row(result) if _guided_terminal_for_compose is not None else None,
                     )
+                    if type(settlement_outcome) is PipelineRouteSettlement:
+                        route_settlement = settlement_outcome
+                    else:
+                        # Auto-commit authority was durably revoked before the
+                        # settlement transaction (elspeth-01d4c6e683): the
+                        # proposal stays pending, so this turn becomes an
+                        # ordinary review-path response.
+                        result = _replace_dataclass(
+                            result,
+                            message=PIPELINE_STAGED_REVIEW_MESSAGE,
+                            pipeline_commit_intent=None,
+                        )
+                # Computed HERE, below the auto-commit-revoked branch above: that
+                # branch rebinds ``result`` with the staged-review message, so a
+                # pair hoisted to the top of the handler would be stale. Every
+                # writer below shares this one — the turn-end row must not re-carry
+                # prose the compose loop already committed mid-turn
+                # (elspeth-d581b3da7f).
+                _turn_end = composer_turn_end_assistant_row(result)
+                if route_settlement is not None:
                     state_response = _state_response(
                         route_settlement.settlement.state,
                         live_validation=route_settlement.validation,
                     )
                     post_compose_state_id = route_settlement.settlement.state.id
+                    assistant_msg = route_settlement.settlement.transition_message
                 elif result.state.version != state.version:
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="validating",
                             headline="The composer has updated the pipeline and is validating the result.",
@@ -725,10 +830,7 @@ def register_message_routes(router: APIRouter) -> None:
                         # a validation/persistence-stage failure rather than
                         # a compose-stage failure.
                         await _publish_progress(
-                            progress_registry,
-                            session_id=str(session.id),
-                            request_id=str(user_msg.id),
-                            user_id=str(user.user_id),
+                            progress_sink,
                             event=ComposerProgressEvent(
                                 phase="failed",
                                 headline="The composer could not safely validate the pipeline update.",
@@ -749,13 +851,11 @@ def register_message_routes(router: APIRouter) -> None:
                             plugin_snapshot=plugin_snapshot,
                             profile_registry=profile_registry,
                             catalog=request.app.state.catalog_service,
+                            session_operation_context=compose_operation_lease.context,
                         )
                         raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="saving",
                             headline="ELSPETH is saving the pipeline update.",
@@ -763,13 +863,26 @@ def register_message_routes(router: APIRouter) -> None:
                             likely_next="The assistant response will appear after the save completes.",
                         ),
                     )
-                    new_state_record = await service.save_composition_state(
-                        session.id,
-                        state_data,
-                        # Successful send-message state advance after the LLM
-                        # composer returns a newer state version.
-                        provenance="post_compose",
-                    )
+                    if _guided_terminal_for_compose is not None:
+                        transition_settlement = await service.commit_transition_response(
+                            session_id=session.id,
+                            expected_current_state_id=compose_base_state_id,
+                            state=state_data,
+                            assistant_content=_turn_end.content,
+                            raw_content=_turn_end.raw_content,
+                            session_operation_context=compose_operation_lease.context,
+                        )
+                        new_state_record = transition_settlement.state
+                        assistant_msg = transition_settlement.message
+                    else:
+                        new_state_record = await service.save_composition_state(
+                            session.id,
+                            state_data,
+                            # Successful send-message state advance after the LLM
+                            # composer returns a newer state version.
+                            provenance="post_compose",
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     state_response = _state_response(new_state_record, live_validation=validation)
                     post_compose_state_id = new_state_record.id
                 elif _guided_terminal_for_compose is not None and _post_compose_guided is not None:
@@ -792,53 +905,50 @@ def register_message_routes(router: APIRouter) -> None:
                         ),
                         composer_meta=_post_compose_meta,
                     )
-                    _transition_record = await service.save_composition_state(
-                        session.id,
-                        _transition_state_data,
-                        # Metadata-only post-compose advance: the LLM result
-                        # did not change graph version, but the guided-session
-                        # transition was consumed and must be audited separately
-                        # from session seeding.
-                        provenance="post_compose",
+                    transition_settlement = await service.commit_transition_response(
+                        session_id=session.id,
+                        expected_current_state_id=compose_base_state_id,
+                        state=_transition_state_data,
+                        assistant_content=_turn_end.content,
+                        raw_content=_turn_end.raw_content,
+                        session_operation_context=compose_operation_lease.context,
                     )
+                    _transition_record = transition_settlement.state
+                    assistant_msg = transition_settlement.message
                     post_compose_state_id = _transition_record.id
                     state_response = _state_response(_transition_record)
 
                 # 6. Persist assistant message with post-compose provenance
-                assistant_msg = await service.add_message(
-                    session.id,
-                    "assistant",
-                    result.message,
-                    composition_state_id=post_compose_state_id,
-                    raw_content=result.raw_assistant_content,
-                    writer_principal="compose_loop",
-                )
+                if assistant_msg is None:
+                    assistant_msg = await service.add_message(
+                        session.id,
+                        "assistant",
+                        _turn_end.content,
+                        composition_state_id=post_compose_state_id,
+                        raw_content=_turn_end.raw_content,
+                        writer_principal="compose_loop",
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 # 6b. Persist per-tool-call audit trail. Each ComposerToolInvocation
                 # lands as one role=tool chat message linked to the post-compose
                 # state id (when version advanced) so the audit trail records
-                # which tool calls produced this state.
-                if result.tool_invocations and not result.persisted_tool_call_turn:
-                    await _persist_tool_invocations(
-                        service,
-                        session.id,
-                        result.tool_invocations,
-                        post_compose_state_id,
-                        parent_assistant_id=assistant_msg.id,
-                        plugin_crash_pending=False,
-                    )
-                if result.llm_calls:
-                    await _persist_llm_calls(
-                        service,
-                        session.id,
-                        result.llm_calls,
-                        compose_base_state_id,
-                        plugin_crash_pending=False,
-                    )
+                # which tool calls produced this state. Tool rows and LLM
+                # sidecars are ONE turn cohort and settle in a single
+                # transaction (elspeth-90231248dc) even though they bind to
+                # different state ids.
+                await _persist_turn_audit_cohort(
+                    service,
+                    session.id,
+                    result.tool_invocations if not result.persisted_tool_call_turn else (),
+                    result.llm_calls,
+                    tool_composition_state_id=post_compose_state_id,
+                    llm_composition_state_id=compose_base_state_id,
+                    parent_assistant_id=assistant_msg.id,
+                    plugin_crash_pending=False,
+                    session_operation_context=compose_operation_lease.context,
+                )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=str(user_msg.id),
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="complete",
                         headline="The composer has updated the pipeline."
@@ -867,6 +977,38 @@ def register_message_routes(router: APIRouter) -> None:
                 )
                 terminal_status = "completed"
                 return response
+            except GuidedCustodyIntegrityError as exc:
+                # The pre-persist custody gate refused the post-compose tip
+                # (elspeth-4c442aaaa8): the user row is committed and the tip
+                # did not advance, so this is a failed turn — describe it from
+                # the compose result rather than let the app-level handler emit
+                # the no-metadata 500. Custody-only by design: every gate raise
+                # is Guided*, and any other AuditIntegrityError keeps the
+                # app-level handler surface with its own diagnostics.
+                if exc.failed_turn is None and _compose_result is not None:
+                    exc.failed_turn = FailedTurnMetadata(
+                        assistant_message_id=_compose_result.persisted_assistant_message_id,
+                        tool_calls_attempted=len(_compose_result.tool_invocations),
+                        tool_responses_persisted=None if _compose_result.persisted_tool_call_turn else 0,
+                    )
+                if exc.failed_turn is None or _compose_result is None:
+                    raise
+                slog.error(
+                    "http_audit_integrity_error",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    exc_class=type(exc).__name__,
+                    message=str(exc),
+                    site="send_message",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error_type": "audit_integrity_error",
+                        "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                        "failed_turn": await _failed_turn_response_body(service, session.id, exc.failed_turn),
+                    },
+                ) from exc
             except InvariantError as exc:
                 # Same B1-sanitization rationale as the /guided/respond
                 # transition and settlement handlers: server-invariant
@@ -886,45 +1028,46 @@ def register_message_routes(router: APIRouter) -> None:
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail="Server invariant violated. See application audit log for diagnostic detail.",
+                    detail={
+                        "error_type": "server_invariant_violated",
+                        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                    },
                 ) from exc
             except asyncio.CancelledError as exc:
                 # Client-disconnect or operator cancel during the
-                # composer-engaged window. Publish a discriminated
-                # ``cancelled`` snapshot under ``asyncio.shield`` so the
-                # registry update reaches /_active and per-session pollers
-                # even though the outer task is being torn down. The
-                # nested except absorbs the CancelledError that ``await
-                # asyncio.shield`` re-raises on the cancelling task — the
-                # shielded coroutine itself runs to completion in the
-                # background.
+                # composer-engaged window. The route task is already
+                # cancelling, so a plain await of either write below would
+                # re-raise CancelledError before the write is durable. Each
+                # runs as its own task joined through the shielded-join
+                # helper: the audit sidecar row lands and the discriminated
+                # ``cancelled`` snapshot reaches /_active and per-session
+                # pollers, repeated cancellation of this task is absorbed
+                # while they finish, and the cancel chain is restored by the
+                # handler's terminal ``raise`` (or HTTP 499) below.
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.shield(
+                    await _join_shielded_task_after_cancellation(
+                        asyncio.create_task(
                             _persist_llm_calls(
                                 service,
                                 session.id,
                                 llm_calls,
                                 compose_base_state_id,
                                 plugin_crash_pending=True,
-                            )
-                        )
-                with contextlib.suppress(asyncio.CancelledError):
-                    # The shielded publish runs to completion in the
-                    # background; the outer await re-raises CancelledError
-                    # on the cancelling task, which we deliberately swallow
-                    # because we already know we're being cancelled and
-                    # ``raise`` two lines below restores the cancel chain.
-                    await asyncio.shield(
-                        _publish_progress(
-                            progress_registry,
-                            session_id=str(session.id),
-                            request_id=str(user_msg.id),
-                            user_id=str(user.user_id),
-                            event=client_cancelled_progress_event(),
+                                session_operation_context=compose_operation_lease.context,
+                            ),
+                            name="send-message-cancelled-llm-call-persist",
                         )
                     )
+                await _join_shielded_task_after_cancellation(
+                    asyncio.create_task(
+                        _publish_progress(
+                            progress_sink,
+                            event=client_cancelled_progress_event(),
+                        ),
+                        name="send-message-cancelled-progress-publish",
+                    )
+                )
                 terminal_status = "cancelled"
                 if _is_client_disconnect_cancel(exc):
                     # Disconnect-initiated cancellation (our
@@ -978,7 +1121,10 @@ def register_message_routes(router: APIRouter) -> None:
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
-        include_llm_audit: bool = Query(False),
+        include_llm_audit: bool = Query(
+            False,
+            description="Include value-free LLM-call rows and their paired semantic planner-attempt rows.",
+        ),
         include_raw_content: bool = Query(False),
         include_tool_rows: bool = Query(False),
     ) -> list[ChatMessageResponse]:
@@ -999,9 +1145,13 @@ def register_message_routes(router: APIRouter) -> None:
             include_raw_content=include_raw_content,
         ):
             audit_query_args = {key: value for key, value in request.query_params.items() if key in AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST}
+            # The authority re-proves (session, principal, provider) against the
+            # live row before writing, so the provider is the session's own —
+            # ownership above already proved it equals the deployment's.
             await service.record_audit_grade_view_async(
                 session_id=str(session.id),
                 requesting_principal=user.user_id,
+                auth_provider_type=session.auth_provider_type,
                 request_path=request.url.path,
                 query_args=audit_query_args,
                 ip_address=request.client.host if request.client else None,
@@ -1009,8 +1159,10 @@ def register_message_routes(router: APIRouter) -> None:
         # Fetch before slicing so hidden audit rows cannot skew normal-chat
         # pagination. The service remains the durable audit store; this route
         # is the user-facing conversation channel. The eval harness can opt in
-        # to LLM-call sidecars, which contain model/usage/cost metadata but not
-        # raw prompts, provider reasoning artifacts, tool arguments, or tool results.
+        # to paired LLM-call/planner-attempt sidecars. They contain bounded
+        # model/usage/cost metadata and closed decision classifications, but
+        # not raw prompts, provider reasoning artifacts, tool arguments,
+        # candidate values, or tool results.
         messages = await service.get_messages(session.id, limit=None)
         if include_tool_rows and include_llm_audit:
             conversation_messages = _composer_conversation_tool_or_llm_audit_messages(messages)
@@ -1021,4 +1173,19 @@ def register_message_routes(router: APIRouter) -> None:
         else:
             conversation_messages = _composer_conversation_messages(messages)
         paged_messages = conversation_messages[offset : offset + limit]
-        return [_message_response(m, include_raw_content=include_raw_content) for m in paged_messages]
+        # Per-call outcome stamping (elspeth-f5e6723133): project the Tier-1
+        # role="tool" rows onto the assistant envelopes so the SPA can label
+        # executed mutations as applied (with the resulting state version)
+        # instead of describing every call as a lookup. Derived server-side
+        # from durable rows — never from tool names. The version map is a
+        # lean id/version projection, fetched only when tool rows exist.
+        has_tool_rows = any(m.role == "tool" and m.tool_call_id is not None for m in messages)
+        tool_outcomes = (
+            _tool_call_outcomes_by_call_id(
+                messages,
+                state_versions_by_id=await service.get_state_version_numbers(session.id),
+            )
+            if has_tool_rows
+            else None
+        )
+        return [_message_response(m, include_raw_content=include_raw_content, tool_outcomes=tool_outcomes) for m in paged_messages]

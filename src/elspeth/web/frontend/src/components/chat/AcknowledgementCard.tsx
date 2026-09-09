@@ -6,9 +6,9 @@
 // InlineMessage presentation.  The behaviour — resolve / amend / error
 // mapping / 8 KB cap — is reused VERBATIM via `useInterpretationResolver`;
 // this component owns only the compact card rendering, the per-kind copy, the
-// value rendering (shared CodeBlock for JSON; monospace prompt template
-// behind the two-stage View→Approve primary button), ARIA wiring, and focus
-// on amend toggle.
+// value rendering (shared CodeBlock for JSON; monospace prompt template behind
+// a "View prompt" disclosure that gates a separate Approve), ARIA wiring, and
+// focus on amend toggle.
 //
 // Acknowledge == today's accept (`accepted_as_drafted`).  The card NEVER
 // auto-steals focus on mount (the stack is persistent and must not yank focus
@@ -25,21 +25,25 @@ import {
 } from "react";
 import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { Button } from "@/components/ui";
 import { CodeBlock } from "./CodeBlock";
+import { resolvePromptDisplaySegments } from "./promptTemplateDisplay";
+import {
+  ACKNOWLEDGEMENT_ACCEPT_LABEL,
+  ACKNOWLEDGEMENT_AMEND_LABEL,
+  ACKNOWLEDGEMENT_APPROVE_LABEL,
+  ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+} from "./acknowledgementLabels";
 import {
   INTERPRETATION_AMENDMENT_MAX_BYTES,
   useInterpretationResolver,
 } from "@/hooks/useInterpretationResolver";
+import { preferredScrollBehavior } from "@/utils/motion";
 
 const PROMPT_TEMPLATE_STYLE: CSSProperties = {
   maxHeight: "16rem",
   overflow: "auto",
 };
-
-/** Kinds the operator can amend inline (vague_term / legacy null). */
-export function supportsAmendment(kind: InterpretationEvent["kind"]): boolean {
-  return kind === null || kind === "vague_term";
-}
 
 /**
  * Stable DOM id for a card's labelled <section>. The wire-stage named-blocker
@@ -58,12 +62,115 @@ export function acknowledgementCardDomId(eventId: string): string {
 export function focusAcknowledgementCard(eventId: string): void {
   const element = document.getElementById(acknowledgementCardDomId(eventId));
   if (element === null) return;
-  element.scrollIntoView({ behavior: "smooth", block: "center" });
+  element.scrollIntoView({ behavior: preferredScrollBehavior(), block: "center" });
   element.focus({ preventScroll: true });
 }
 
 function assertNever(value: never): never {
   throw new Error(`Unhandled interpretation kind: ${String(value)}`);
+}
+
+/**
+ * Parsed shape of the server-computed source_data_contract draft JSON
+ * (src/elspeth/web/composer/source_demand.py::build_source_data_contract_draft).
+ * The draft carries the FACTS — demanded fields, illustrative sample header,
+ * per-field sample misses — and this card carries the prose.
+ */
+interface DataContractDraft {
+  demandedFields: string[];
+  sampleHeader: string[] | null;
+  missingFromSample: string[];
+}
+
+const DATA_CONTRACT_DRAFT_VERSION = 2;
+const DATA_CONTRACT_DRAFT_KEYS = [
+  "contract_version",
+  "kind",
+  "demanded_fields",
+  "sample_header",
+  "missing_from_sample",
+] as const;
+
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (char) => char.codePointAt(0) ?? 0);
+  const rightPoints = Array.from(right, (char) => char.codePointAt(0) ?? 0);
+  const sharedLength = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = leftPoints[index] - rightPoints[index];
+    if (difference !== 0) return difference;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+export function parseDataContractDraft(draft: string): DataContractDraft | null {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(draft);
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const record = payload as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (
+    keys.length !== DATA_CONTRACT_DRAFT_KEYS.length ||
+    !DATA_CONTRACT_DRAFT_KEYS.every((key) => keys.includes(key)) ||
+    record["contract_version"] !== DATA_CONTRACT_DRAFT_VERSION ||
+    record["kind"] !== "source_data_contract"
+  ) {
+    return null;
+  }
+  const demanded = record["demanded_fields"];
+  if (
+    !Array.isArray(demanded) ||
+    !demanded.every((field) => typeof field === "string")
+  ) {
+    return null;
+  }
+  const demandedFields = demanded as string[];
+  const canonicalDemanded = [...new Set(demandedFields)].sort(
+    compareUnicodeCodePoints,
+  );
+  if (
+    demandedFields.length === 0 ||
+    !stringArraysEqual(demandedFields, canonicalDemanded)
+  ) {
+    return null;
+  }
+  const sample = record["sample_header"];
+  if (
+    sample !== null &&
+    (!Array.isArray(sample) ||
+      !sample.every((cell) => typeof cell === "string"))
+  ) {
+    return null;
+  }
+  const missing = record["missing_from_sample"];
+  if (
+    !Array.isArray(missing) ||
+    !missing.every((field) => typeof field === "string")
+  ) {
+    return null;
+  }
+  const missingFromSample = missing as string[];
+  const sampleHeader = sample as string[] | null;
+  const expectedMissing =
+    sampleHeader === null
+      ? []
+      : demandedFields.filter((field) => !sampleHeader.includes(field));
+  if (!stringArraysEqual(missingFromSample, expectedMissing)) return null;
+  return {
+    demandedFields,
+    sampleHeader,
+    missingFromSample,
+  };
 }
 
 interface CardPresentation {
@@ -75,16 +182,44 @@ interface CardPresentation {
   acceptAriaLabel: string;
 }
 
+/**
+ * Strip a trailing `[user_term: ...]` annotation from a pipeline_decision
+ * draft body. The annotation is registry plumbing that older backend draft
+ * constants embedded verbatim (removed at the source by elspeth-9665dcca32,
+ * but events persisted before that fix still carry it), and the card is a
+ * user surface — internal registry keys never render.
+ */
+function stripUserTermAnnotation(draft: string): string {
+  return draft.replace(/\s*\[user_term:[^\]]*\]\s*$/, "");
+}
+
+/**
+ * The card-title fragment for a caller that holds only a step LABEL. Keeps
+ * the pre-elspeth-... wording exactly; production callers pass a resolved
+ * `stepTitle` (humaniseStepTitle), which additionally disambiguates a removed
+ * step by its ghost id.
+ */
+function defaultStepTitle(stepLabel: string): string {
+  return `${stepLabel} step`;
+}
+
+/**
+ * `stepLabel` names the step MID-SENTENCE ("…columns from Summarise"), while
+ * `stepTitle` is the card-title fragment ("Summarise step", "Removed step
+ * (was Extract Invoice)"). Two registers of one name: the title slot has room
+ * to disambiguate a deleted step, the prose slot reads worse if it tries.
+ */
 function getCardPresentation(
   event: InterpretationEvent,
   stepLabel: string,
+  stepTitle: string,
 ): CardPresentation {
   const userTerm = event.user_term ?? "this term";
   const llmDraft = event.llm_draft ?? "";
   switch (event.kind) {
     case "llm_prompt_template":
       return {
-        title: `${stepLabel} step · prompt`,
+        title: `${stepTitle} · prompt`,
         line: "The LLM wrote the instruction for this step.",
         // Prompt cards use the two-stage View→Approve button, so the accept
         // action is named "Approve" (visible label and accessible name must
@@ -93,17 +228,17 @@ function getCardPresentation(
       };
     case "pipeline_decision":
       return {
-        title: `${stepLabel} step · decision`,
+        title: `${stepTitle} · decision`,
         line: (
           <span className="ack-card-decision">
-            {llmDraft || "(no decision recorded)"}
+            {stripUserTermAnnotation(llmDraft) || "(no decision recorded)"}
           </span>
         ),
         acceptAriaLabel: "Acknowledge the pipeline decision",
       };
     case "llm_model_choice":
       return {
-        title: `${stepLabel} step · model`,
+        title: `${stepTitle} · model`,
         line: (
           <>
             The LLM picked{" "}
@@ -118,6 +253,19 @@ function getCardPresentation(
         title: "Source data",
         line: "The LLM invented this source data — review before fetching.",
         acceptAriaLabel: "Acknowledge the invented source data",
+      };
+    case "source_data_contract":
+      return {
+        title: "Data contract",
+        line: (
+          <>
+            This pipeline relies on certain columns from{" "}
+            {stepLabel ? <em>{stepLabel}</em> : "this source"}. Acknowledging
+            promises that <strong>whatever you feed this pipeline</strong> will
+            carry these columns — not just the file you uploaded.
+          </>
+        ),
+        acceptAriaLabel: "Acknowledge the source data contract",
       };
     case "vague_term":
     case null:
@@ -147,8 +295,9 @@ function getCardPresentation(
 export function acknowledgementCardTitle(
   event: InterpretationEvent,
   stepLabel: string,
+  stepTitle: string = defaultStepTitle(stepLabel),
 ): string {
-  return getCardPresentation(event, stepLabel).title;
+  return getCardPresentation(event, stepLabel, stepTitle).title;
 }
 
 export interface AcknowledgementCardProps {
@@ -156,8 +305,25 @@ export interface AcknowledgementCardProps {
   event: InterpretationEvent;
   /** Owning session id; round-tripped to the store actions. */
   sessionId: string;
-  /** Humanised step label resolved from the composition (e.g. "Summarise"). */
+  /** Humanised step label resolved from the composition (e.g. "Summarise"),
+   *  used where the step is named mid-sentence. */
   stepLabel: string;
+  /** The card-title fragment resolved from the composition
+   *  (`humaniseStepTitle`, e.g. "Summarise step" or "Removed step (was
+   *  Extract Invoice)"). Optional: a caller holding only a label gets
+   *  `${stepLabel} step`, which is what every caller rendered before a
+   *  removed step needed disambiguating. */
+  stepTitle?: string;
+  /**
+   * The session's live composition state (threaded from the stack's existing
+   * store subscription — the card itself stays store-free and testable).
+   * Prompt-template cards use it to render the prompt with accepted
+   * interpretation values substituted (elspeth-990f5ea562); the event's
+   * `llm_draft` is frozen at staging time with every slot masked as
+   * "pending interpretation".  Optional: without it the card falls back to
+   * the frozen draft.
+   */
+  compositionState?: CompositionState | null;
   /** Render the inline amend affordance (vague_term only; off in tutorial). */
   showAmend?: boolean;
   /**
@@ -185,6 +351,8 @@ export function AcknowledgementCard({
   event,
   sessionId,
   stepLabel,
+  stepTitle,
+  compositionState = null,
   showAmend = false,
   onResolved,
   acceptButtonRef,
@@ -228,25 +396,21 @@ export function AcknowledgementCard({
   const hasInlineValue = event.kind === "invented_source" && !valueIsLong;
 
   const [expanded, setExpanded] = useState(false);
-  // Two-stage primary button for prompt cards (operator ask 2026-07-03): the
-  // big green button does double duty — click 1 reveals the prompt ("View
-  // prompt"), the label flips to "Approve", click 2 accepts. Replaces the
-  // old scroll-to-end gate, whose disabled-Acknowledge-beside-a-small-View
-  // arrangement read as a dead end. Once viewed, always viewed — collapsing
-  // the prompt afterwards does not demote the button back to stage 1.
+  // Two-control design for prompt cards (elspeth-3a4a65530f, audit
+  // ux-review-2026-08-13): the small "View prompt" disclosure toggle is the
+  // ONLY reveal, and the primary button is always "Approve" — disabled until
+  // the prompt has been viewed.  This deliberately REVERSES the 2026-07-03
+  // operator ask (one morphing button: click 1 reveals, click 2 approves),
+  // because a control whose meaning changes under the pointer commits an
+  // approval a double-clicking user never intended.  The old rationale —
+  // a disabled Approve beside a View button "read as a dead end" — is
+  // mitigated by the visible gate note naming the unlock condition.  Once
+  // viewed, always viewed — collapsing the prompt afterwards does not
+  // re-disable Approve.
   const [promptViewed, setPromptViewed] = useState(!requiresPromptView);
 
   const acceptDisabled = primaryButtonsDisabled;
-
-  function handlePrimaryAction(): void {
-    if (acceptDisabled) return;
-    if (!promptViewed) {
-      setExpanded(true);
-      setPromptViewed(true);
-      return;
-    }
-    void handleUseMine();
-  }
+  const approveGated = requiresPromptView && !promptViewed;
 
   // Focus on amend-mode toggle ONLY (never on mount — see file header).  Skip
   // the first run so mounting the card does not move focus.
@@ -265,8 +429,103 @@ export function AcknowledgementCard({
     }
   }, [mode]);
 
-  const presentation = getCardPresentation(event, stepLabel);
+  const presentation = getCardPresentation(
+    event,
+    stepLabel,
+    stepTitle ?? defaultStepTitle(stepLabel),
+  );
   const chooseMode = mode === "choose" || !showAmend;
+
+  // Data-contract body: the demanded columns with per-field sample warnings,
+  // the illustrative sample note, and the honest consequence of acknowledging
+  // (a valid source row that breaks the producer guarantee stops the run).
+  // Source-validation quarantine is a separate, earlier path. Falls back
+  // to the raw draft when the payload cannot be parsed — an attestation
+  // surface must never silently render a degraded summary as the real one.
+  const dataContract =
+    event.kind === "source_data_contract"
+      ? parseDataContractDraft(llmDraft)
+      : null;
+  const dataContractBody =
+    event.kind === "source_data_contract" ? (
+      dataContract !== null ? (
+        <div className="ack-card-data-contract">
+          <ul className="ack-card-data-contract-fields">
+            {dataContract.demandedFields.map((field) => {
+              const missingFromSample =
+                dataContract.missingFromSample.includes(field);
+              return (
+                <li key={field}>
+                  <code>{field}</code>
+                  {missingFromSample && (
+                    <span
+                      className="ack-card-data-contract-warning"
+                      role="alert"
+                    >
+                      {" "}
+                      — your data doesn't appear to have this. Fix the data or
+                      change the pipeline.
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          <p className="ack-card-data-contract-note">
+            {dataContract.sampleHeader !== null ? (
+              <>
+                Sample columns seen in your file:{" "}
+                {dataContract.sampleHeader.join(", ")} (illustrative only — the
+                promise covers every row you feed this pipeline, not this
+                sample).
+              </>
+            ) : (
+              <>
+                No sample of this source's data was available; the promise
+                covers every row you feed this pipeline.
+              </>
+            )}
+          </p>
+          <p className="ack-card-data-contract-note">
+            Each valid row must carry the column in both its data and emitted
+            schema contract; the value may be empty. If either omits one of
+            these columns, the run stops and records a source data-contract
+            failure. Rows quarantined during source validation are handled
+            separately and never reach this check.
+          </p>
+        </div>
+      ) : (
+        <div className="ack-card-data-contract">
+          <p className="ack-card-data-contract-note">
+            The data-contract details could not be parsed; showing the stored
+            card payload as-is.
+          </p>
+          <CodeBlock code={llmDraft} prettyJson ariaLabel="Data contract" />
+        </div>
+      )
+    ) : null;
+
+  // Resolved-prompt rendering (elspeth-990f5ea562): re-render the prompt
+  // from the live composition state so accepted interpretation values appear
+  // in place of the staging-time "pending interpretation" masks.  The frozen
+  // event.llm_draft is demoted to a secondary "View original template"
+  // disclosure, shown only when it differs from the resolved render.
+  const promptDisplay = requiresPromptView
+    ? resolvePromptDisplaySegments(compositionState, event)
+    : null;
+  const promptDisplayText =
+    promptDisplay === null
+      ? ""
+      : promptDisplay.segments.map((segment) => segment.text).join("");
+  const promptHasPendingSlot =
+    promptDisplay !== null &&
+    promptDisplay.segments.some((segment) => segment.kind === "pending");
+  const showOriginalTemplate =
+    promptDisplay !== null && llmDraft !== "" && promptDisplayText !== llmDraft;
+
+  const promptHasResolvedSlot =
+    promptDisplay !== null &&
+    promptDisplay.segments.some((segment) => segment.kind === "resolved");
 
   const spinner = (
     <>
@@ -274,6 +533,156 @@ export function AcknowledgementCard({
       Saving…
     </>
   );
+
+  const valueDisclosure = hasViewExpander ? (
+    <div className="ack-card-value">
+      {/* Sole disclosure control (elspeth-3a4a65530f): always rendered.
+          For prompt cards the first open latches promptViewed so Approve
+          unlocks; collapsing afterwards never re-locks it (once viewed,
+          always viewed).  Exactly one control carries the name "View
+          prompt" in every state — the duplicate-name trap the old
+          morphing-primary design worked around is gone structurally. */}
+      <Button
+        variant="bare"
+        // While Approve is gated, this disclosure IS the card's next action —
+        // and it was the only control on the card NOT drawn as one (xs quiet
+        // outline beside a big primary-styled-but-inert Approve, next to
+        // sibling cards' filled active Acknowledge buttons). The --next
+        // modifier gives it the filled active treatment until the first view
+        // latches promptViewed; after that it recedes to the quiet toggle and
+        // the unlocked Approve takes the emphasis back — one filled control
+        // per card at a time (operator report 2026-08-16).
+        className={
+          approveGated
+            ? "ack-card-view-toggle ack-card-view-toggle--next"
+            : "ack-card-view-toggle"
+        }
+        aria-expanded={expanded}
+        aria-controls={valueRegionId}
+        onClick={() => {
+          if (!expanded) setPromptViewed(true);
+          setExpanded((prev) => !prev);
+        }}
+      >
+        {requiresPromptView
+          ? expanded
+            ? "Hide prompt"
+            : ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL
+          : expanded
+            ? "Hide"
+            : "View"}
+      </Button>
+      {expanded &&
+        (requiresPromptView && promptDisplay !== null ? (
+          <div
+            id={valueRegionId}
+            role="region"
+            aria-label="Prompt template review"
+            tabIndex={0}
+            className="ack-card-prompt-template"
+            style={PROMPT_TEMPLATE_STYLE}
+          >
+            {/* Visible key for the two slot tints (ux-review 2026-08-13).
+                Both resolved and pending slots render as <mark> and differ
+                only by CSS, so a sighted operator on an ATTESTATION surface
+                had no way to tell an already-attested value from a sibling
+                review's draft — while the sr-only per-slot prefixes below
+                DID disambiguate, leaving AT users better served than sighted
+                ones.  The distinction is carried by the TEXT, not the
+                swatch: under forced-colors the swatch backgrounds are
+                stripped and two identical squares would key nothing.  Each
+                item renders only when a slot of that kind is present — the
+                same one-way invariant as "never name a control the card does
+                not render", applied to tints. */}
+            {(promptHasResolvedSlot || promptHasPendingSlot) && (
+              <ul className="ack-card-prompt-legend">
+                {promptHasResolvedSlot && (
+                  <li>
+                    <span
+                      className="ack-card-prompt-legend-swatch ack-card-prompt-slot--resolved"
+                      aria-hidden="true"
+                    />
+                    Accepted value
+                  </li>
+                )}
+                {promptHasPendingSlot && (
+                  <li>
+                    <span
+                      className="ack-card-prompt-legend-swatch ack-card-prompt-slot--pending"
+                      aria-hidden="true"
+                    />
+                    Pending value — awaiting its own review
+                  </li>
+                )}
+              </ul>
+            )}
+            <pre className="ack-card-prompt-pre">
+              {promptDisplay.segments.map((segment, index) =>
+                segment.kind === "text" ? (
+                  <span key={index}>{segment.text}</span>
+                ) : (
+                  <mark
+                    key={index}
+                    className={`ack-card-prompt-slot ack-card-prompt-slot--${segment.kind}`}
+                  >
+                    {/* The resolved/pending distinction is otherwise
+                        CSS-only (background/border on <mark>), which is
+                        invisible non-visually, so an SR user needs a
+                        per-slot cue to audit which parts are still drafts
+                        (WCAG 1.3.1).  Same two words the visible legend
+                        uses, so the encodings agree. */}
+                    <span className="visually-hidden">
+                      {segment.kind === "pending"
+                        ? "pending value: "
+                        : "accepted value: "}
+                    </span>
+                    {segment.text}
+                  </mark>
+                ),
+              )}
+            </pre>
+            {promptHasPendingSlot && (
+              <p className="ack-card-prompt-pending-note">
+                {/* Scoped to the PENDING tint only.  The previous wording
+                    ("Highlighted values await their own interpretation
+                    reviews") was false for every resolved slot, because
+                    resolved slots are highlighted too — on a mixed prompt
+                    it told the operator a value they had already attested
+                    was still a draft. */}
+                Pending values are drafts from their own reviews; the prompt
+                runs with whatever you accept there.
+              </p>
+            )}
+            {promptDisplay.usedFallback && (
+              <p className="ack-card-prompt-pending-note">
+                {/* Audit honesty (code-review 2026-08-13): the structured
+                    parts could not be rendered, so this is the node's stored
+                    template verbatim with no slots broken out.  A card whose
+                    entire purpose is showing what actually runs must say so
+                    rather than let the degraded render pass as the resolved
+                    one. */}
+                Showing the stored prompt template as-is — the interpretation
+                slots could not be broken out for this card.
+              </p>
+            )}
+            {showOriginalTemplate && (
+              <details className="ack-card-original-template">
+                <summary>View original template</summary>
+                <pre className="ack-card-prompt-pre">{llmDraft}</pre>
+              </details>
+            )}
+          </div>
+        ) : (
+          <div id={valueRegionId}>
+            <CodeBlock
+              code={llmDraft}
+              prettyJson
+              ariaLabel="Invented source data"
+            />
+          </div>
+        ))}
+    </div>
+  ) : null;
 
   return (
     <section
@@ -283,6 +692,7 @@ export function AcknowledgementCard({
       className="ack-card"
       aria-labelledby={titleId}
       data-testid="acknowledgement-card"
+      data-affected-node-id={event.affected_node_id ?? undefined}
     >
       <h3 id={titleId} className="ack-card-title">
         {presentation.title}
@@ -290,52 +700,69 @@ export function AcknowledgementCard({
 
       <div className="ack-card-main">
         <p className="ack-card-line">{presentation.line}</p>
-        {/* Two-stage note: names what the first click does so the primary
-            button is never a mystery (successor of the old scroll-gate note,
-            elspeth-3b35abf148 variant 2). */}
-        {chooseMode && requiresPromptView && !promptViewed && (
+        {dataContractBody}
+        {/* Gate note: says WHY Approve is disabled and names the unlock
+            condition, so the gated primary is never an unexplained dead
+            control (successor of the old scroll-gate note, elspeth-3b35abf148
+            variant 2; kept visible and prominent as the mitigation for the
+            pre-2026-07 "dead end" reading — see the promptViewed comment). */}
+        {chooseMode && approveGated && (
           <p id={promptGateId} className="ack-card-gate-note">
-            <strong>View prompt</strong> shows the LLM's instruction; the same
-            button then approves it.
+            <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the
+            LLM's instruction; {ACKNOWLEDGEMENT_APPROVE_LABEL} unlocks once
+            you have viewed it.
           </p>
         )}
+        {/* The disclosure precedes the gated primary in DOM AND tab order
+            (ux-review 2026-08-13): "View prompt" is Approve's prerequisite,
+            so reaching it second — and, in a 360px pane, finding it below the
+            fold under a greyed-out primary — inverted the sequence.  Lives
+            inside .ack-card-main on its own full-width flex row. */}
+        {valueDisclosure}
         {chooseMode && (
           <div className="ack-card-actions">
-            <button
+            <Button
               ref={acceptButtonRef}
-              type="button"
-              className="btn btn-primary ack-card-accept-btn"
-              // Stage 1 is a disclosure (visible label is its own accessible
-              // name + expander semantics); stage 2 carries the decision-
-              // naming accept label.
-              aria-label={promptViewed ? presentation.acceptAriaLabel : undefined}
-              aria-expanded={!promptViewed ? expanded : undefined}
-              aria-controls={!promptViewed ? valueRegionId : undefined}
-              aria-describedby={
-                requiresPromptView && !promptViewed ? promptGateId : undefined
-              }
-              onClick={handlePrimaryAction}
+              variant="primary"
+              className="ack-card-accept-btn"
+              // Single-meaning control (elspeth-3a4a65530f): always the
+              // decision-naming accept label; the disclosure semantics live
+              // on the separate small View-prompt toggle.
+              aria-label={presentation.acceptAriaLabel}
+              aria-describedby={approveGated ? promptGateId : undefined}
+              onClick={() => {
+                // The VIEW GATE uses aria-disabled + a no-op click, the house
+                // idiom for a gated primary carrying an attached reason
+                // (ExecuteButton.tsx, elspeth-94c32de486): a natively
+                // disabled button is skipped by SR navigation, which makes
+                // the aria-describedby gate note — the whole mitigation for
+                // the "dead end" reading — unreachable.  shared.css styles
+                // .btn[aria-disabled="true"] identically to .btn:disabled,
+                // so there is no visual change.  An in-flight resolve keeps
+                // NATIVE disabled: that one must hard-block a double submit
+                // and carries no explanatory note.
+                if (approveGated) return;
+                void handleUseMine();
+              }}
               disabled={acceptDisabled}
+              aria-disabled={approveGated ? true : undefined}
             >
-              {!promptViewed
-                ? "View prompt"
-                : resolveInFlight
-                  ? spinner
-                  : requiresPromptView
-                    ? "Approve"
-                    : "Acknowledge"}
-            </button>
+              {resolveInFlight
+                ? spinner
+                : requiresPromptView
+                  ? ACKNOWLEDGEMENT_APPROVE_LABEL
+                  : ACKNOWLEDGEMENT_ACCEPT_LABEL}
+            </Button>
             {showAmend && (
-              <button
+              <Button
                 ref={changeButtonRef}
-                type="button"
-                className="btn ack-card-amend-btn"
-                aria-label={`Edit the interpretation of ${userTerm}`}
+                className="ack-card-amend-btn"
+                aria-label={`Change the interpretation of ${userTerm}`}
                 onClick={handleOpenAmend}
                 disabled={primaryButtonsDisabled}
               >
-                Change…
-              </button>
+                {ACKNOWLEDGEMENT_AMEND_LABEL}
+              </Button>
             )}
           </div>
         )}
@@ -347,54 +774,6 @@ export function AcknowledgementCard({
           prettyJson
           ariaLabel="Invented source data"
         />
-      )}
-
-      {hasViewExpander && (
-        <div className="ack-card-value">
-          {/* Prompt cards: the PRIMARY button owns the first reveal (two-stage
-              View→Approve), so this small toggle only appears once viewed —
-              two side-by-side "View prompt" buttons would be a duplicate-name
-              trap. It then offers collapse/re-open without demoting the
-              primary back to stage 1. */}
-          {(!requiresPromptView || promptViewed) && (
-            <button
-              type="button"
-              className="ack-card-view-toggle"
-              aria-expanded={expanded}
-              aria-controls={valueRegionId}
-              onClick={() => setExpanded((prev) => !prev)}
-            >
-              {requiresPromptView
-                ? expanded
-                  ? "Hide prompt"
-                  : "View prompt"
-                : expanded
-                  ? "Hide"
-                  : "View"}
-            </button>
-          )}
-          {expanded &&
-            (requiresPromptView ? (
-              <div
-                id={valueRegionId}
-                role="region"
-                aria-label="Prompt template review"
-                tabIndex={0}
-                className="ack-card-prompt-template"
-                style={PROMPT_TEMPLATE_STYLE}
-              >
-                <pre className="ack-card-prompt-pre">{llmDraft}</pre>
-              </div>
-            ) : (
-              <div id={valueRegionId}>
-                <CodeBlock
-                  code={llmDraft}
-                  prettyJson
-                  ariaLabel="Invented source data"
-                />
-              </div>
-            ))}
-        </div>
       )}
 
       {displayedError !== null && (
@@ -421,28 +800,42 @@ export function AcknowledgementCard({
             disabled={resolveInFlight}
           />
           {amendIsTooLong && (
+            // Characters, not bytes, in the sentence the writer reads. The
+            // byte overage is an UPPER bound on the characters to remove
+            // (multibyte text shortens faster), so "about" is honest.
+            //
+            // The exact figures go in an .sr-only span, NOT in `title` alone.
+            // This <p> is not focusable, so a keyboard user gets no hover and
+            // no focus tooltip; and `title` on a role="status" element is a
+            // naming fallback, not part of the live-region announcement, so a
+            // screen-reader user would hear only the approximate count. The
+            // .sr-only span is inside the live region and is announced with it.
             <p className="ack-card-amend-cap-warning" role="status">
-              Amendment is {amendByteLength} bytes; the maximum is{" "}
-              {INTERPRETATION_AMENDMENT_MAX_BYTES} bytes.
+              Shorten this by about{" "}
+              {amendByteLength - INTERPRETATION_AMENDMENT_MAX_BYTES} characters
+              to fit the {INTERPRETATION_AMENDMENT_MAX_BYTES / 1024} KB limit.
+              <span className="sr-only">
+                {" "}({amendByteLength} bytes; the maximum is{" "}
+                {INTERPRETATION_AMENDMENT_MAX_BYTES} bytes.)
+              </span>
             </p>
           )}
           <div className="ack-card-amend-actions">
-            <button
-              type="button"
-              className="btn ack-card-cancel-btn"
+            <Button
+              className="ack-card-cancel-btn"
               onClick={handleCancelAmend}
               disabled={resolveInFlight}
             >
               Cancel
-            </button>
-            <button
-              type="button"
-              className="btn btn-primary ack-card-submit-btn"
+            </Button>
+            <Button
+              variant="primary"
+              className="ack-card-submit-btn"
               onClick={() => void handleSubmitAmend()}
               disabled={submitDisabled}
             >
               {resolveInFlight ? spinner : "Submit"}
-            </button>
+            </Button>
           </div>
         </div>
       )}

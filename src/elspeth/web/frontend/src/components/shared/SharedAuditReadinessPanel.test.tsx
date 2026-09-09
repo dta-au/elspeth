@@ -166,17 +166,17 @@ describe("SharedAuditReadinessPanel", () => {
   // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ───────────────────
   //
   // The shared read-only view renders through the same AuditReadinessRow
-  // primitive as the live panel, so it inherits the identical "Blocks Run" /
-  // "Advisory" classification (validation + llm_interpretations gate;
-  // plugin_trust/provenance/retention/secrets are advisory). It also gets a
+  // primitive as the live panel, so it inherits the identical "Blocks run" /
+  // "Advisory" classification (validation follows snapshot execution
+  // readiness; llm_interpretations gates; the other rows are advisory). It also gets a
   // standalone explanatory line in the header, since a reviewer here has no
   // ExecuteButton in view to infer the distinction from.
 
-  it("labels validation and llm_interpretations rows 'Blocks Run' and the other four 'Advisory'", () => {
+  it("labels execution-ready validation and the four informational rows Advisory while llm_interpretations Blocks run", () => {
     render(<SharedAuditReadinessPanel snapshot={_snapshot} />);
     expect(
       screen.getByTestId("shared-inspect-readiness-row-validation"),
-    ).toHaveAttribute("data-gate", "blocks");
+    ).toHaveAttribute("data-gate", "advisory");
     expect(
       screen.getByTestId("shared-inspect-readiness-row-llm_interpretations"),
     ).toHaveAttribute("data-gate", "blocks");
@@ -187,10 +187,69 @@ describe("SharedAuditReadinessPanel", () => {
     }
   });
 
-  it("explains the 'Blocks Run' classification in the frozen-snapshot header", () => {
+  it("labels an execution-ready advisor-pending validation row Advisory in the read-only snapshot", () => {
+    const advisorPending: AuditReadinessSnapshot = {
+      ..._snapshot,
+      rows: _snapshot.rows.map((row) =>
+        row.id === "validation"
+          ? {
+              ...row,
+              status: "warning" as const,
+              summary: "Advisor sign-off pending",
+            }
+          : row,
+      ),
+      validation_result: {
+        ..._snapshot.validation_result,
+        checks: [
+          {
+            name: "advisor_signoff",
+            passed: false,
+            detail: "Advisor sign-off pending.",
+            affected_nodes: [],
+            outcome_code: null,
+          },
+        ],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: false,
+          blockers: [],
+        },
+      },
+    };
+
+    render(<SharedAuditReadinessPanel snapshot={advisorPending} />);
+
+    const validation = screen.getByTestId("shared-inspect-readiness-row-validation");
+    expect(validation).toHaveAttribute("data-gate", "advisory");
+    expect(validation).toHaveTextContent("Advisory");
+    expect(screen.queryByRole("button", { name: /validation/i })).not.toBeInTheDocument();
+  });
+
+  it("quotes the gate badge in the frozen-snapshot header using the badge's own literal, case included", () => {
+    // The live panel has this guard (AuditReadinessPanel.test.tsx); this panel
+    // did not, and that gap is how a real case drift shipped: the badge in the
+    // shared AuditReadinessRow primitive moved to "Blocks run" while this
+    // header still read "Blocks Run". The assertion that was here could not
+    // see it, because its regex carried the /i flag — a case-insensitive
+    // check on a case defect passes by construction.
+    //
+    // So do not pin the literal on both sides. Read the quoted label OUT of
+    // the rendered sentence and require a badge rendering that exact text on
+    // the same screen; then either side drifting fails.
     render(<SharedAuditReadinessPanel snapshot={_snapshot} />);
-    expect(
-      screen.getByText(/Rows marked "Blocks Run" had to be clear/i),
-    ).toBeInTheDocument();
+
+    const explanation = screen.getByText(/^Rows marked "/);
+    const quoted = /"([^"]+)"/.exec(explanation.textContent ?? "")?.[1];
+    expect(quoted, "the header must quote a gate label").toBeDefined();
+    expect(screen.getAllByText(quoted!).length).toBeGreaterThan(0);
+
+    // One case register across the binary pair, matching the live panel.
+    for (const label of [quoted!, "Advisory"]) {
+      expect(label.slice(1), `${label} must be sentence case, not Title Case`).toBe(
+        label.slice(1).toLowerCase(),
+      );
+    }
   });
 });

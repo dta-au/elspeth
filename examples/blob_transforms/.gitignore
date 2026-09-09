@@ -1,4 +1,6 @@
 input/csv_blob_manifest.csv
+input/json_blob_manifest.csv
+input/text_blob_manifest.csv
 output/*
 !output/.gitkeep
 runs/*

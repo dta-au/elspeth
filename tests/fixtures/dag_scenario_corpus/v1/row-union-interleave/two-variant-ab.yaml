@@ -1,0 +1,66 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "baseline_score: int"]}
+gates:
+  - name: variant_fork
+    input: routed
+    condition: "True"
+    routes: {"true": fork, "false": discard}
+    fork_to: [control_branch, treatment_branch]
+transforms:
+  - name: tag_control
+    plugin: value_transform
+    input: control_branch
+    on_success: control_scored
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations:
+        - target: prompt_variant
+          expression: "'control'"
+        - target: score
+          expression: "row['baseline_score'] * 1.0"
+  - name: tag_treatment
+    plugin: value_transform
+    input: treatment_branch
+    on_success: treatment_scored
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations:
+        - target: prompt_variant
+          expression: "'treatment'"
+        - target: score
+          expression: "row['baseline_score'] * 1.5"
+row_unions:
+  - name: variant_union
+    branches:
+      control_branch: control_scored
+      treatment_branch: treatment_scored
+    on_success: experiment_in
+aggregations:
+  - name: prompt_experiment
+    plugin: batch_experiment_compare
+    input: experiment_in
+    on_success: output
+    on_error: discard
+    trigger: {}
+    output_mode: transform
+    options:
+      schema: {mode: observed}
+      variant_field: prompt_variant
+      score_field: score
+      baseline_variant: control
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_output}
+      format: jsonl
+      schema: {mode: observed}

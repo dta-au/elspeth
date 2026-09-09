@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -181,7 +182,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(RateLimitError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert exc_info.value.retryable is True
@@ -207,7 +208,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(LLMClientError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert type(exc_info.value) is LLMClientError
@@ -239,7 +240,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(ServerError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert exc_info.value.retryable is True
@@ -265,7 +266,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(NetworkError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert exc_info.value.retryable is True
@@ -291,7 +292,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(ContentPolicyError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert exc_info.value.retryable is False
@@ -317,7 +318,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(ContextLengthError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert exc_info.value.retryable is False
@@ -343,7 +344,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(LLMClientError) as exc_info:
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         assert exc_info.value.retryable is False
@@ -370,7 +371,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(ServerError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         # Verify recorder was called with retryable=True
@@ -386,7 +387,7 @@ class TestLLMClientExceptionTypes:
         with pytest.raises(LLMClientError):
             client.chat_completion(
                 model="gpt-4",
-                messages=[{"role": "user", "content": "test"}],
+                messages=[ChatMessage(role="user", content="test")],
             )
 
         # Verify recorder was called with retryable=False

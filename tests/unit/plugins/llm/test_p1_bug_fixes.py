@@ -18,6 +18,8 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.plugins.transforms.llm import (
     _build_augmented_output_schema,
@@ -274,14 +276,17 @@ class TestEnableContentRecording:
         finally:
             _reset_azure_monitor_state()
 
-    def test_content_recording_falls_back_to_env_var(self) -> None:
-        """When AIInferenceInstrumentor is not available, falls back to env var.
+    def test_missing_instrumentor_fails_closed_without_env_var_policy(self) -> None:
+        """Absent azure-ai-inference raises instead of asserting an unverifiable policy.
 
-        Since azure.ai.inference is not installed in the test environment,
-        the ImportError path is the natural path. We just need to mock
-        configure_azure_monitor and verify the env var is set.
+        enable_content_recording is policy-bearing: the removed fallback wrote an
+        environment variable no verifiable control reads when the instrumentor is
+        missing. The configure step now fails closed with a remediation message,
+        leaves the environment untouched, and does NOT latch the idempotency
+        guard — installing azure-ai-inference and retrying succeeds.
         """
         import os
+        import sys
 
         from elspeth.plugins.transforms.llm.providers.azure import (
             _configure_azure_monitor,
@@ -297,109 +302,31 @@ class TestEnableContentRecording:
             enable_live_metrics=False,
         )
 
-        # Remove any injected mock from previous tests to ensure ImportError path
         env_key = "AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED"
         old_value = os.environ.pop(env_key, None)
         azure_monitor = RecordingAzureMonitorConfigurator()
         try:
-            with patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor", new=azure_monitor):
+            # azure-ai-inference is not installed in the test environment, so
+            # the ImportError path is the natural one.
+            with (
+                patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor", new=azure_monitor),
+                pytest.raises(ImportError, match="azure-ai-inference is not installed"),
+            ):
                 _configure_azure_monitor(config)
 
-            assert azure_monitor.calls == [
-                {
-                    "connection_string": "InstrumentationKey=test-key",
-                    "enable_live_metrics": False,
-                }
-            ]
-            assert os.environ.get(env_key) == "true"
-        finally:
-            # Clean up
-            _reset_azure_monitor_state()
-            os.environ.pop(env_key, None)
-            if old_value is not None:
-                os.environ[env_key] = old_value
+            assert env_key not in os.environ
 
-    def test_enable_live_metrics_forwarded_when_true(self) -> None:
-        """enable_live_metrics=True is forwarded to configure_azure_monitor SDK call.
-
-        All existing tests use enable_live_metrics=False. This test catches
-        a hardcoded False that would pass all other tests but silently ignore
-        the user's configuration.
-        """
-        import sys
-
-        from elspeth.plugins.transforms.llm.providers.azure import (
-            _configure_azure_monitor,
-            _reset_azure_monitor_state,
-        )
-        from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
-
-        _reset_azure_monitor_state()
-
-        config = AzureAITracingConfig(
-            connection_string="InstrumentationKey=test-key",
-            enable_content_recording=False,
-            enable_live_metrics=True,
-        )
-
-        azure_monitor = RecordingAzureMonitorConfigurator()
-        instrumentor_factory = RecordingAIInferenceInstrumentorFactory()
-
-        tracing_module = _tracing_module_with(instrumentor_factory)
-
-        try:
+            # The guard is not latched: a retry with the instrumentor present succeeds.
+            instrumentor_factory = RecordingAIInferenceInstrumentorFactory()
+            tracing_module = _tracing_module_with(instrumentor_factory)
             with (
                 patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor", new=azure_monitor),
                 patch.dict(sys.modules, {"azure.ai.inference.tracing": tracing_module}),
             ):
-                result = _configure_azure_monitor(config)
-
-            assert result is True
-            assert azure_monitor.calls == [
-                {
-                    "connection_string": "InstrumentationKey=test-key",
-                    "enable_live_metrics": True,
-                }
-            ]
+                assert _configure_azure_monitor(config) is True
             instrumentor = _only_instrumentor(instrumentor_factory)
-            assert instrumentor.instrument_calls == [{"enable_content_recording": False}]
+            assert instrumentor.instrument_calls == [{"enable_content_recording": True}]
         finally:
-            _reset_azure_monitor_state()
-
-    def test_content_recording_false_env_var(self) -> None:
-        """enable_content_recording=False sets env var to 'false'."""
-        import os
-
-        from elspeth.plugins.transforms.llm.providers.azure import (
-            _configure_azure_monitor,
-            _reset_azure_monitor_state,
-        )
-        from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
-
-        _reset_azure_monitor_state()
-
-        config = AzureAITracingConfig(
-            connection_string="InstrumentationKey=test-key",
-            enable_content_recording=False,
-            enable_live_metrics=False,
-        )
-
-        env_key = "AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED"
-        old_value = os.environ.pop(env_key, None)
-        azure_monitor = RecordingAzureMonitorConfigurator()
-        try:
-            with patch("elspeth.plugins.transforms.llm.providers.azure.configure_azure_monitor", new=azure_monitor):
-                _configure_azure_monitor(config)
-
-            assert azure_monitor.calls == [
-                {
-                    "connection_string": "InstrumentationKey=test-key",
-                    "enable_live_metrics": False,
-                }
-            ]
-            assert os.environ.get(env_key) == "false"
-        finally:
-            # Clean up
             _reset_azure_monitor_state()
             os.environ.pop(env_key, None)
             if old_value is not None:

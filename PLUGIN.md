@@ -32,7 +32,7 @@ Create custom sources, transforms, and sinks for ELSPETH pipelines.
 - **ELSPETH concepts** - Read [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the Three-Tier Trust Model
 
 ```bash
-git clone https://github.com/johnm-dta/elspeth.git && cd elspeth
+git clone https://github.com/dta-au/elspeth.git && cd elspeth
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
@@ -47,6 +47,9 @@ The fastest path to a working plugin:
 # src/elspeth/plugins/transforms/double_value.py
 from typing import Any
 
+from pydantic import Field
+
+from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -56,13 +59,14 @@ from elspeth.plugins.infrastructure.results import TransformResult
 
 class DoubleValueConfig(TransformDataConfig):
     """Config with custom field."""
-    field: str = "value"
+    field: str = Field(default="value", description="Numeric field to double.")
 
 
 class DoubleValueTransform(BaseTransform):
     """Double a numeric field value."""
 
     name = "double_value"
+    determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
     source_file_hash: str | None = "sha256:0000000000000000"
     config_model = DoubleValueConfig
@@ -93,7 +97,7 @@ class DoubleValueTransform(BaseTransform):
         output[self._field] = result
         return TransformResult.success(
             PipelineRow(output, self._align_output_contract(row.contract)),
-            success_reason={"action": "doubled_value", "fields_modified": [self._field]},
+            success_reason={"action": "transformed", "fields_modified": [self._field]},
         )
 
     def close(self) -> None:
@@ -115,6 +119,7 @@ transforms:
   plugin: double_value
   input: validated           # Explicit input connection
   on_success: doubled        # Named output connection
+  on_error: discard          # Sink name for failed rows, or 'discard'
   options:
     schema:
       mode: observed
@@ -180,6 +185,9 @@ Transforms process rows one at a time (or in batches for aggregation).
 ```python
 from typing import Any
 
+from pydantic import Field
+
+from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -189,14 +197,15 @@ from elspeth.plugins.infrastructure.results import TransformResult
 
 class MyTransformConfig(TransformDataConfig):
     """Config with your custom fields."""
-    multiplier: int = 2
-    target_field: str = "value"
+    multiplier: int = Field(default=2, description="Factor to multiply the target field by.")
+    target_field: str = Field(default="value", description="Numeric field to multiply.")
 
 
 class MyTransform(BaseTransform):
     """Multiply a field by a configured factor."""
 
     name = "my_transform"
+    determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
     source_file_hash: str | None = "sha256:0000000000000000"
     config_model = MyTransformConfig
@@ -236,7 +245,7 @@ class MyTransform(BaseTransform):
         return TransformResult.success(
             PipelineRow(output, self._align_output_contract(row.contract)),
             success_reason={
-                "action": "multiplied_field",
+                "action": "transformed",
                 "fields_modified": [self._target_field],
             },
         )
@@ -258,16 +267,27 @@ class MyTransform(BaseTransform):
 | `_output_schema_config` | `SchemaConfig \| None` | Static output guarantee surface for DAG validation |
 | `on_error` | `str \| None` | Sink name for error routing; injected by runtime settings |
 | `on_success` | `str \| None` | Output connection name; injected by runtime settings |
-| `determinism` | `Determinism` | Reproducibility level (default: `DETERMINISTIC`) |
+| `determinism` | `Determinism` | Reproducibility level; every plugin MUST declare one in its own class body — there is no default, and an undeclared value raises `TypeError` at class creation |
 | `plugin_version` | `str` | Plugin version for audit trail (default: `"0.0.0"`) |
 | `source_file_hash` | `str \| None` | Entry-point file hash for audit identity; CI enforces concrete plugin values |
+| `usage_when_to_use` | `str \| None` | Persona-facing prose naming a concrete input or workflow and the useful outcome |
+| `usage_when_not_to_use` | `str \| None` | Persona-facing prose naming a hard limitation and a concrete alternative |
+| `example_use` | `str \| None` | One bounded, parseable YAML component fragment using real option names |
+| `capability_tags` | `tuple[str, ...]` | 2-6 unique lowercase kebab-case discovery terms, each at most 32 characters, at least one plugin-specific |
+
+The last four are the catalogue reference content contract. The base defaults
+stay optional so third-party and legacy plugins keep loading, but repository
+tests require every registered built-in to provide all four. See
+[Plugin catalogue reference content](docs/contracts/plugin-catalogue-reference-content.md).
 
 **Determinism levels:**
 
 - `DETERMINISTIC` - Same input always produces same output
-- `EXTERNAL_CALL` - Calls external service (LLM, API)
+- `SEEDED` - Capture the seed, replay with the same seed
 - `IO_READ` - Reads from external source
 - `IO_WRITE` - Writes to external sink
+- `EXTERNAL_CALL` - Calls external service (LLM, API)
+- `NON_DETERMINISTIC` - Must record output, cannot reproduce
 
 ### TransformResult Options
 
@@ -279,12 +299,12 @@ TransformResult.success(
 )
 
 # Error - row failed processing (routes to on_error sink)
-TransformResult.error({"reason": "division_by_zero"})
+TransformResult.error({"reason": "invalid_input"})
 
 # Multiple outputs (requires creates_tokens=True)
 TransformResult.success_multi(
     [PipelineRow(row1, output_contract), PipelineRow(row2, output_contract)],
-    success_reason={"action": "expanded"},
+    success_reason={"action": "split"},
 )
 
 # Intentional zero emission for filters
@@ -307,6 +327,7 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 
 class BatchStatsTransform(BaseTransform):
     name = "batch_stats"
+    determinism = Determinism.DETERMINISTIC
     is_batch_aware = True  # Receives list[PipelineRow] instead of PipelineRow
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -331,7 +352,7 @@ class BatchStatsTransform(BaseTransform):
                 {"count": len(rows), "sum": total, "mean": total / len(rows)},
                 self._aggregate_output_contract,
             ),
-            success_reason={"action": "batch_stats_computed"},
+            success_reason={"action": "aggregated"},
         )
 ```
 
@@ -346,7 +367,8 @@ aggregations:
   on_error: discard          # Sink name for batch errors, or 'discard'
   trigger:
     count: 100  # Process every 100 rows
-  output_mode: single  # N inputs → 1 output
+  output_mode: transform     # Emit the aggregate row the plugin builds (default)
+  expected_output_count: 1   # Assert N inputs → 1 output
 ```
 
 </details>
@@ -362,6 +384,7 @@ from elspeth.contracts.contract_propagation import propagate_contract
 
 class ExpandItemsTransform(BaseTransform):
     name = "expand_items"
+    determinism = Determinism.DETERMINISTIC
     creates_tokens = True  # Engine creates new tokens for each output
     declared_output_fields = frozenset({"item", "item_index"})
 
@@ -380,7 +403,7 @@ class ExpandItemsTransform(BaseTransform):
             output_contract = self._align_output_contract(output_contract)
             output_rows.append(PipelineRow(output, output_contract))
 
-        return TransformResult.success_multi(output_rows, success_reason={"action": "expanded_items"})
+        return TransformResult.success_multi(output_rows, success_reason={"action": "split"})
 ```
 
 For production deaggregation code, use `line_explode` as the reference pattern:
@@ -404,9 +427,9 @@ ingestion boundary.**
 ```python
 from collections.abc import Iterator
 from typing import Any
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
-from elspeth.contracts import PluginSchema, SourceRow
+from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
@@ -417,13 +440,14 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 
 class MySourceConfig(SourceDataConfig):
     """Inherits path, schema, and on_validation_failure."""
-    skip_header: bool = True
+    skip_header: bool = Field(default=True, description="Skip the first line of the file.")
 
 
 class MySource(BaseSource):
     """Load data from a custom format."""
 
     name = "my_source"
+    determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
     source_file_hash: str | None = "sha256:0000000000000000"
     config_model = MySourceConfig
@@ -463,7 +487,7 @@ class MySource(BaseSource):
         if self._skip_header and lines:
             lines = lines[1:]
 
-        for line in lines:
+        for index, line in enumerate(lines):
             row = self._parse_line(line)
 
             try:
@@ -492,10 +516,11 @@ class MySource(BaseSource):
                                 row=validated_row,
                                 error=error_msg,
                                 destination=self._on_validation_failure,
+                                source_row_index=index,
                             )
                         continue
 
-                yield SourceRow.valid(validated_row, contract=contract)
+                yield SourceRow.valid(validated_row, contract=contract, source_row_index=index)
 
             except ValidationError as e:
                 ctx.record_validation_error(
@@ -509,6 +534,7 @@ class MySource(BaseSource):
                         row=row,
                         error=str(e),
                         destination=self._on_validation_failure,
+                        source_row_index=index,
                     )
 
     def _parse_line(self, line: str) -> dict[str, Any]:
@@ -523,15 +549,24 @@ class MySource(BaseSource):
 
 ```python
 # Valid row - proceed to processing
-SourceRow.valid({"id": 1, "value": 100}, contract=source_contract)
+SourceRow.valid({"id": 1, "value": 100}, contract=source_contract, source_row_index=0)
 
 # Quarantined - route to on_validation_failure sink
-SourceRow.quarantined(row=raw_row, error="Invalid type", destination="quarantine_sink")
+SourceRow.quarantined(
+    row=raw_row,
+    error="Invalid type",
+    destination="quarantine_sink",
+    source_row_index=0,
+)
 ```
 
 Valid source rows must carry a `SchemaContract`. Create the contract from the
 effective source schema, update it through `ContractBuilder` for observed or
 flexible first-row inference, then pass it to `SourceRow.valid(..., contract=...)`.
+
+Both constructors also require a keyword-only `source_row_index`: the
+source-authored row position within its emission stream. It has no default, so
+omitting it raises `TypeError`.
 
 ---
 
@@ -544,22 +579,25 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from elspeth.contracts import ArtifactDescriptor
+from pydantic import Field
+
+from elspeth.contracts import ArtifactDescriptor, Determinism
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import PathConfig
+from elspeth.plugins.infrastructure.config_base import SinkPathConfig
 from elspeth.contracts.contexts import LifecycleContext, SinkContext
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 
 
-class MySinkConfig(PathConfig):
-    append: bool = False
+class MySinkConfig(SinkPathConfig):
+    append: bool = Field(default=False, description="Append to an existing file instead of overwriting it.")
 
 
 class MySink(BaseSink):
     """Write data to a custom format."""
 
     name = "my_sink"
+    determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
     source_file_hash: str | None = "sha256:0000000000000000"
     config_model = MySinkConfig
@@ -829,17 +867,20 @@ class MyTransform(BaseTransform):
 ## Checklist for New Plugins
 
 - [ ] Has `name` class attribute
+- [ ] Has `determinism` declared in the plugin's own class body (no default; undeclared raises `TypeError`)
 - [ ] Has `plugin_version`, `source_file_hash`, and `config_model` class attributes
+- [ ] Has catalogue reference content (`usage_when_to_use`, `usage_when_not_to_use`, `example_use`, `capability_tags`)
 - [ ] Has required schema attributes (`input_schema`, `output_schema`)
-- [ ] Config extends the correct data config base (`TransformDataConfig`, `SourceDataConfig`, `PathConfig`, or a narrower sink/source config)
+- [ ] Config extends the correct data config base (`TransformDataConfig`, `SourceDataConfig`, `SinkPathConfig`, or a narrower sink/source config)
+- [ ] Every config field declares a pydantic `description`
 - [ ] Schema created with correct `allow_coercion`
-- [ ] Source valid rows call `SourceRow.valid(row, contract=contract)`
+- [ ] Source valid rows call `SourceRow.valid(row, contract=contract, source_row_index=index)`
 - [ ] Transform successes return `PipelineRow` values, never raw dicts
 - [ ] Sink `write()` returns `SinkWriteResult(artifact=ArtifactDescriptor, diversions=...)`
 - [ ] Transform field declarations are set (`declared_input_fields`, `declared_output_fields`, `_output_schema_config`) when the plugin requires or adds fields
 - [ ] Sink required fields are set with `declared_required_fields`
 - [ ] Plugin file lives in a scanned discovery directory, or `PLUGIN_SCAN_CONFIG` was updated
-- [ ] `elspeth-lints check --rules plugin_contract.plugin_hashes --root src/elspeth` passes (`source_file_hash` is current)
+- [ ] `elspeth-lints check --rules plugin_contract.plugin_hashes,plugin_contract.options_metadata,plugin_contract.component_type --root src/elspeth` passes
 - [ ] Contract tests pass
 - [ ] `close()` is idempotent
 

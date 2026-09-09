@@ -27,6 +27,9 @@ from elspeth.mcp.types import (
     FailureContextReport,
     FieldExplanation,
     FieldNotFoundError,
+    GroupLossEntry,
+    GroupRecordEntry,
+    LineageFrameEntry,
     LLMUsageReport,
     NodeDetail,
     NodeStateRecord,
@@ -61,7 +64,7 @@ class LandscapeAnalyzer:
         """Initialize analyzer with database connection.
 
         Args:
-            database_url: SQLAlchemy connection URL (e.g., sqlite:////home/john/elspeth/data/runs/audit.db)
+            database_url: SQLAlchemy connection URL (e.g., sqlite:////srv/elspeth/data/runs/audit.db)
             passphrase: SQLCipher encryption passphrase (if database is encrypted)
         """
         self._db = LandscapeDB.from_url(database_url, passphrase=passphrase, create_tables=False, read_only=True)
@@ -88,6 +91,15 @@ class LandscapeAnalyzer:
 
     def get_token_children(self, parent_token_id: str) -> list[TokenChildRecord]:
         return queries.get_token_children(self._db, self._factory, parent_token_id)
+
+    def list_group_records(self, run_id: str, kind: str | None = None) -> list[GroupRecordEntry]:
+        return queries.list_group_records(self._db, self._factory, run_id, kind=kind)
+
+    def list_group_losses(self, run_id: str, group_id: str | None = None) -> list[GroupLossEntry]:
+        return queries.list_group_losses(self._db, self._factory, run_id, group_id=group_id)
+
+    def get_token_lineage(self, run_id: str, token_id: str) -> list[LineageFrameEntry]:
+        return queries.get_token_lineage(self._db, self._factory, run_id, token_id)
 
     def list_operations(
         self,

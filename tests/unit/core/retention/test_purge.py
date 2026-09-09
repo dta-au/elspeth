@@ -22,6 +22,9 @@ from elspeth.contracts import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
+    aggregation_result_outputs_table,
+    aggregation_results_table,
+    batches_table,
     calls_table,
     edges_table,
     node_states_table,
@@ -768,6 +771,66 @@ class TestFindExpiredPayloadRefs:
             _create_token(conn, "run-token-ref", "row-token-ref", "tok-token-ref", token_data_ref="ref-token-data")
 
         assert manager._find_affected_run_ids(["ref-token-data"]) == {"run-token-ref"}
+
+    def test_aggregation_result_refs_participate_in_expiry_and_affected_run_lookup(self, db: LandscapeDB) -> None:
+        now = datetime(2026, 3, 10, tzinfo=UTC)
+        receipt_ref = "b" * 64
+        with db.write_connection() as conn:
+            _create_run(conn, "run-aggregation-ref", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "run-aggregation-ref", "source-aggregation-ref")
+            _create_node(conn, "run-aggregation-ref", "agg-aggregation-ref")
+            _create_row(
+                conn,
+                "run-aggregation-ref",
+                "source-aggregation-ref",
+                "row-aggregation-ref",
+                row_index=0,
+                source_data_ref=None,
+            )
+            _create_token(conn, "run-aggregation-ref", "row-aggregation-ref", "tok-aggregation-ref")
+            _create_node_state(
+                conn,
+                state_id="state-aggregation-ref",
+                token_id="tok-aggregation-ref",
+                run_id="run-aggregation-ref",
+                node_id="agg-aggregation-ref",
+            )
+            conn.execute(
+                batches_table.insert().values(
+                    batch_id="batch-aggregation-ref",
+                    run_id="run-aggregation-ref",
+                    aggregation_node_id="agg-aggregation-ref",
+                    attempt=0,
+                    status="completed",
+                    created_at=now,
+                    completed_at=now,
+                    aggregation_state_id="state-aggregation-ref",
+                )
+            )
+            conn.execute(
+                aggregation_results_table.insert().values(
+                    batch_id="batch-aggregation-ref",
+                    run_id="run-aggregation-ref",
+                    aggregation_state_id="state-aggregation-ref",
+                    output_mode="transform",
+                    output_shape="single",
+                    output_hash="a" * 64,
+                    expansion_parent_token_id="tok-aggregation-ref",
+                    created_at=now,
+                )
+            )
+            conn.execute(
+                aggregation_result_outputs_table.insert().values(
+                    batch_id="batch-aggregation-ref",
+                    run_id="run-aggregation-ref",
+                    ordinal=0,
+                    token_data_ref=receipt_ref,
+                )
+            )
+
+        manager = PurgeManager(db, MockPayloadStore())
+        assert receipt_ref in manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        assert manager._find_affected_run_ids([receipt_ref]) == {"run-aggregation-ref"}
 
 
 class TestPurgePayloads:

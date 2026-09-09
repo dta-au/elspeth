@@ -23,11 +23,13 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileKind,
 )
+from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.engine.orchestrator.preflight import (
     SinkEffectCapabilityError,
     validate_sink_effect_capability,
     validate_sink_effect_type_capability,
 )
+from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks.chroma_sink import ChromaSink
 from tests.fixtures.base_classes import inject_write_failure
 from tests.fixtures.factories import make_context, make_operation_context
@@ -165,11 +167,7 @@ class TestChromaSinkOnStart:
 
             sink.on_start(ctx)
 
-            mock_chromadb.HttpClient.assert_called_once_with(
-                host="localhost",
-                port=8000,
-                ssl=False,
-            )
+            mock_chromadb.HttpClient.assert_called_once()
             mock_client.heartbeat.assert_called_once()
 
     def test_on_start_failure_raises(self) -> None:
@@ -181,6 +179,107 @@ class TestChromaSinkOnStart:
 
             with pytest.raises(RuntimeError, match="Connection refused"):
                 sink.on_start(ctx)
+
+    def test_client_passes_validated_ip_not_original_hostname_to_sdk(self) -> None:
+        config = _make_config(
+            mode="client",
+            persist_directory=None,
+            host="localhost",
+            port=8000,
+            ssl=False,
+        )
+        with plugin_preflight_mode(True):
+            sink = inject_write_failure(ChromaSink(config))
+        ctx = _make_lifecycle_ctx()
+        safe_target = SSRFSafeRequest(
+            original_url="http://localhost:8000/",
+            resolved_ip="127.0.0.1",
+            host_header="localhost:8000",
+            port=8000,
+            path="/",
+            scheme="http",
+            bare_hostname="localhost",
+        )
+
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=safe_target,
+            ),
+            patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb,
+        ):
+            mock_client = _make_chroma_client_double()
+            mock_chromadb.HttpClient.return_value = mock_client
+            mock_client.get_or_create_collection.return_value = _make_chroma_collection_double()
+
+            sink.on_start(ctx)
+
+            mock_chromadb.HttpClient.assert_called_once_with(
+                host="127.0.0.1",
+                port=8000,
+                ssl=False,
+                headers={"Host": "localhost:8000"},
+            )
+
+    def test_client_fails_closed_when_tls_hostname_sni_cannot_be_preserved(self) -> None:
+        config = _make_config(
+            mode="client",
+            persist_directory=None,
+            host="chroma.example.com",
+            port=443,
+            ssl=True,
+        )
+        with plugin_preflight_mode(True):
+            sink = inject_write_failure(ChromaSink(config))
+        ctx = _make_lifecycle_ctx()
+        safe_target = SSRFSafeRequest(
+            original_url="https://chroma.example.com/",
+            resolved_ip="203.0.113.10",
+            host_header="chroma.example.com",
+            port=443,
+            path="/",
+            scheme="https",
+            bare_hostname="chroma.example.com",
+        )
+
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
+                return_value=safe_target,
+            ),
+            patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb,
+        ):
+            with pytest.raises(ValueError, match=r"TLS SNI.*literal IP"):
+                sink.on_start(ctx)
+
+            mock_chromadb.HttpClient.assert_not_called()
+
+    def test_client_on_start_revalidates_ssrf_target_after_preflight_construction(self) -> None:
+        config = {
+            "collection": "test-collection",
+            "mode": "client",
+            "host": "169.254.169.254",
+            "port": 8000,
+            "ssl": True,
+            "field_mapping": {
+                "document_field": "text",
+                "id_field": "doc_id",
+                "metadata_fields": [],
+            },
+            "schema": {
+                "mode": "fixed",
+                "fields": ["doc_id: str", "text: str"],
+            },
+        }
+        with plugin_preflight_mode(True):
+            sink = inject_write_failure(ChromaSink(config))
+        ctx = _make_lifecycle_ctx()
+
+        with patch("elspeth.plugins.sinks.chroma_sink.chromadb") as mock_chromadb:
+            with pytest.raises(ValueError, match=r"(?i)ssrf"):
+                sink.on_start(ctx)
+
+            mock_chromadb.HttpClient.assert_not_called()
 
 
 class TestChromaSinkFlush:
@@ -197,14 +296,22 @@ class TestChromaSinkClose:
     def test_close_releases_resources(self) -> None:
         mock_collection = _make_chroma_collection_double()
         sink = _make_sink_with_collection(mock_collection)
-        mock_client = _make_chroma_client_double()
-        sink._client = mock_client
+
+        class OwnedClient:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        client = OwnedClient()
+        sink._client = client  # type: ignore[assignment]
 
         sink.close()
 
         assert sink._client is None
         assert sink._collection is None  # type: ignore[unreachable]
-        mock_client.clear_system_cache.assert_called_once()
+        assert client.close_count == 1
 
 
 def _chroma_effect_member(ordinal: int, row: dict[str, object]) -> SinkEffectMember:
@@ -300,7 +407,7 @@ class TestChromaMemberEffects:
                 )
             )
         )
-        effect_input = SinkEffectPipelineMembersInput(members, members)
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -330,7 +437,7 @@ class TestChromaMemberEffects:
             {"doc_id": "d2", "text": "two", "topic": "beta"},
         )
         members = tuple(_chroma_effect_member(index, row) for index, row in enumerate(rows))
-        effect_input = SinkEffectPipelineMembersInput(members, members)
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -392,7 +499,7 @@ class TestChromaMemberEffects:
         )
         sink._collection = collection  # type: ignore[assignment]
         member = _chroma_effect_member(0, row)
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -407,11 +514,65 @@ class TestChromaMemberEffects:
         sink = ChromaSink(_make_config())
         sink._collection = collection  # type: ignore[assignment]
         member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
         collection.documents["d1"] = ("tampered", {"topic": "alpha"})
+
+        result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+
+        assert result.kind is SinkEffectReconcileKind.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "provider_result",
+        [
+            [],
+            {"ids": [], "documents": ["unexpected"], "metadatas": []},
+            {"ids": [], "documents": [], "metadatas": "not-a-list"},
+            {"ids": ["d1"], "documents": ["one"], "metadatas": [0]},
+            {"ids": [1], "documents": ["one"], "metadatas": [{"topic": "alpha"}]},
+        ],
+    )
+    def test_reconcile_malformed_provider_shapes_are_unknown(self, provider_result: object) -> None:
+        class ResultCollection:
+            def get(self, *, ids: list[str], include: list[str]) -> object:
+                del ids, include
+                return provider_result
+
+        sink = ChromaSink(_make_config())
+        sink._collection = ResultCollection()  # type: ignore[assignment]
+        member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
+        ctx = _chroma_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+        result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+
+        assert result.kind is SinkEffectReconcileKind.UNKNOWN
+
+    def test_reconcile_ids_object_cannot_masquerade_as_empty_list(self) -> None:
+        class PretendEmptyIds:
+            def __eq__(self, _other: object) -> bool:
+                return True
+
+        class ResultCollection:
+            def get(self, *, ids: list[str], include: list[str]) -> dict[str, object]:
+                del ids, include
+                return {
+                    "ids": PretendEmptyIds(),
+                    "documents": [],
+                    "metadatas": [],
+                }
+
+        sink = ChromaSink(_make_config())
+        sink._collection = ResultCollection()  # type: ignore[assignment]
+        member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
+        ctx = _chroma_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
 
         result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
 
@@ -422,4 +583,19 @@ class TestChromaMemberEffects:
             _make_config(on_duplicate="overwrite"),
             purpose=SinkEffectExecutionPurpose.FRESH,
         )
+        assert resolved is not None and resolved.value == "overwrite"
+
+    def test_effect_mode_resolver_uses_explicit_default_branch(self) -> None:
+        class DirectOnlyConfig(dict[str, object]):
+            def get(self, _key: str, _default: object = None) -> object:
+                raise AssertionError("raw config get(default) is forbidden")
+
+        config = DirectOnlyConfig(_make_config())
+        del config["on_duplicate"]
+
+        resolved = ChromaSink._resolve_sink_effect_mode(
+            config,
+            purpose=SinkEffectExecutionPurpose.FRESH,
+        )
+
         assert resolved is not None and resolved.value == "overwrite"

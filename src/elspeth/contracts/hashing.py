@@ -15,14 +15,23 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TypeGuard
 
 import rfc8785
+
+from elspeth.contracts.trust_boundary import trust_boundary
 
 # Version string stored with every run for hash verification.
 # Single source of truth — core/canonical.py imports this constant.
 CANONICAL_VERSION = "sha256-rfc8785-v1"
+_LOWER_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def is_lower_sha256_hex(value: object) -> TypeGuard[str]:
+    """Return whether ``value`` is exactly one lowercase SHA-256 hex digest."""
+    return isinstance(value, str) and _LOWER_SHA256_HEX_RE.fullmatch(value) is not None
 
 
 def _normalize_frozen_and_reject_non_finite(obj: Any) -> Any:
@@ -93,6 +102,20 @@ def stable_hash(obj: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "already-malformed external data on the repr_hash quarantine fallback path — arbitrary Python "
+        "values that failed canonical_json (NaN, Infinity, non-serializable types)"
+    ),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "returns a deterministic repr string for every input — unordered containers are sorted, anything "
+        "unrecognized falls through to repr(obj); never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _stable_repr(obj: Any) -> str:
     """Produce a deterministic repr by sorting unordered containers.
 

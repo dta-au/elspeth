@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from inspect import cleandoc
 from typing import Any, cast
 
 from pydantic import BaseModel
@@ -286,7 +287,7 @@ class CatalogServiceImpl:
         validate_knob_schema(knob_schema, plugin_kind=plugin_type, plugin_name=name)
 
         # Full docstring for schema view (not just first line)
-        description = (plugin_cls.__doc__ or "").strip()
+        description = cleandoc(plugin_cls.__doc__ or "")
         if not description:
             description = get_plugin_description(plugin_cls)
 

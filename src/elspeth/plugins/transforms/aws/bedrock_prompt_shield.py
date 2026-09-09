@@ -31,11 +31,28 @@ class AWSBedrockPromptShield(BedrockGuardrailTransformBase):
         }
     )
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1aaf47d6ca39af81"
+    source_file_hash: str | None = "sha256:99c73100f803b8f0"
     config_model = AWSBedrockPromptShieldConfig
     _required_filters = PROMPT_ATTACK_FILTERS
     _detected_reason = "prompt_injection_detected"
     _probe_field = "bedrock_prompt_shield_probe_text"
+    capability_tags: tuple[str, ...] = ("aws", "bedrock", "prompt-shield")
+
+    usage_when_to_use = (
+        "Use as a pre-LLM prompt attack control for untrusted prompt fields. Web-authored nodes select "
+        "an opaque operator profile; the operator binding uses the default AWS credential chain."
+    )
+    usage_when_not_to_use = (
+        "Not for post-LLM harmful content moderation. Use aws_bedrock_content_safety with source: OUTPUT for that output-control role."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: aws_bedrock_prompt_shield\n"
+        "  options:\n"
+        "    profile: approved-input-guardrail\n"
+        "    fields: [prompt]\n"
+        "    schema: {mode: observed}"
+    )
 
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = AWSBedrockPromptShieldConfig.from_dict(config, plugin_name=self.name)

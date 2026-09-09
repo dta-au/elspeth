@@ -6,19 +6,24 @@ import asyncio
 import inspect
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import event as sqlalchemy_event
+from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web.composer.guided.emitters import build_step_4_wire_turn
 from elspeth.web.composer.guided.planning import (
     build_guided_proposal_projection,
+    guided_candidate_state,
     guided_private_reviewed_facts,
 )
 from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
@@ -34,9 +39,16 @@ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.config import WebSettings
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.models import (
+    chat_messages_table,
     composition_proposals_table,
     composition_states_table,
     guided_operations_table,
@@ -46,6 +58,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     GuidedOperationClaimed,
     GuidedOperationSettlementConflictError,
+    GuidedPipelineProposalRejectCommand,
     GuidedPipelineProposalStageCommand,
     GuidedReplayTurn,
     GuidedResponseDescriptor,
@@ -54,6 +67,8 @@ from elspeth.web.sessions.routes._helpers import _initial_composition_state_with
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 SOURCE_ID = "00000000-0000-4000-8000-000000000201"
 OUTPUT_ID = "00000000-0000-4000-8000-000000000202"
@@ -74,7 +89,11 @@ def service() -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.guided.proposal"))
+    return DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.guided.proposal"),
+    )
 
 
 def _guided() -> GuidedSession:
@@ -192,7 +211,12 @@ async def _command(
             )
             deferred_intents.append(replace(deferred, originating_message_id=str(message.id)))
         guided = replace(guided, deferred_intents=tuple(deferred_intents))
-    predecessor = await service.save_composition_state(session.id, _state_data(guided), provenance="session_seed")
+    predecessor = await _save_composition_state_with_compose_authority(
+        service,
+        session.id,
+        _state_data(guided),
+        provenance="session_seed",
+    )
     predecessor_state = _state_from_record(predecessor)
     checkpoint_id = uuid4()
     proposal_id = uuid4()
@@ -255,7 +279,14 @@ async def _command(
     )
     assert isinstance(outcome, GuidedOperationClaimed)
     if drift:
-        await service.save_composition_state(session.id, _state_data(guided), provenance="convergence_persist")
+        assert isinstance(service, DualFencedSessionServiceHarness)
+        context = await service._guided_test_context(session.id, "guided")
+        await service.save_composition_state(
+            session.id,
+            _state_data(guided),
+            provenance="convergence_persist",
+            session_operation_context=context,
+        )
     redacted = redact_tool_call_arguments("set_pipeline", _pipeline(), telemetry=NoopRedactionTelemetry())
     return (
         GuidedPipelineProposalStageCommand(
@@ -467,9 +498,20 @@ def test_stage_writes_checkpoint_reference_private_row_event_and_operation_atomi
 def test_predecessor_drift_rolls_back_every_stage_row(service: SessionServiceImpl, tmp_path: Path) -> None:
     payload_store = FilesystemPayloadStore(tmp_path / "payloads")
     command, session_id = asyncio.run(_command(service, payload_store, drift=True))
+    assert isinstance(service, DualFencedSessionServiceHarness)
+    context = asyncio.run(service._guided_test_context(session_id, "guided"))
 
-    with pytest.raises(GuidedOperationSettlementConflictError):
-        asyncio.run(service.stage_guided_pipeline_proposal(command, payload_store=payload_store))
+    try:
+        with pytest.raises(GuidedOperationSettlementConflictError):
+            asyncio.run(
+                service.stage_guided_pipeline_proposal(
+                    command,
+                    payload_store=payload_store,
+                    session_operation_context=context,
+                )
+            )
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, context))
 
     with service._engine.connect() as conn:
         assert (
@@ -685,6 +727,14 @@ def test_revision_old_status_drift_rolls_back_successor_cohort(
 ) -> None:
     payload_store = FilesystemPayloadStore(tmp_path / "revision-status-drift")
     predecessor, successor, session_id = asyncio.run(_successor_command(service, payload_store))
+    # The successor's guided reservation holds the session's live COMPOSE
+    # authority, so nothing else can mint a PROPOSAL lease on this session
+    # until it is released (the multi-replica session fence refuses it). The
+    # drift is therefore modelled the way the platform allows it to happen:
+    # the predecessor is rejected under that same live authority, which the
+    # pipeline rejection writer accepts alongside PROPOSAL.
+    assert isinstance(service, DualFencedSessionServiceHarness)
+    guided_context = asyncio.run(service._guided_test_context(session_id, "guided"))
     asyncio.run(
         service.reject_pipeline_composition_proposal(
             session_id=session_id,
@@ -694,6 +744,7 @@ def test_revision_old_status_drift_rolls_back_successor_cohort(
             reason="operator_rejected",
             dispatch=None,
             actor="concurrent-operator",
+            session_operation_context=guided_context,
         )
     )
 
@@ -732,15 +783,214 @@ def test_revision_old_status_drift_rolls_back_successor_cohort(
     assert predecessor_events[-1].payload["reason_code"] == "operator_rejected"
 
 
+async def _staged_reject_command(
+    service: SessionServiceImpl,
+    payload_store: FilesystemPayloadStore,
+) -> tuple[GuidedPipelineProposalRejectCommand, UUID]:
+    command, session_id = await _command(service, payload_store)
+    staged = await service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
+    operation_id = str(uuid4())
+    outcome = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id=operation_id,
+        kind="guided_respond",
+        request_hash=stable_hash({"operation_id": operation_id}),
+        actor="test",
+        lease_seconds=300,
+    )
+    assert isinstance(outcome, GuidedOperationClaimed)
+    return (
+        GuidedPipelineProposalRejectCommand(
+            fence=outcome.fence,
+            expected_current_state_id=staged.result_state.id,
+            expected_current_state_version=staged.result_state.version,
+            proposal_id=command.proposal_id,
+            draft_hash=command.plan.proposal.draft_hash,
+            reviewed_facts=guided_private_reviewed_facts(_guided()),
+            actor="composer_route",
+            response=GuidedResponseDescriptor(
+                kind="guided_respond",
+                next_turn=None,
+                assistant_turn_seq=None,
+            ),
+        ),
+        session_id,
+    )
+
+
+def test_dual_fenced_rejection_allocates_exactly_next_version_without_consuming_message_sequence(
+    service: SessionServiceImpl,
+    tmp_path: Path,
+) -> None:
+    payload_store = FilesystemPayloadStore(tmp_path / "valid-rejection")
+    command, session_id = asyncio.run(_staged_reject_command(service, payload_store))
+    with service._engine.connect() as conn:
+        before_count = conn.scalar(
+            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+        )
+        before_sequence = conn.scalar(
+            select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(chat_messages_table.c.session_id == str(session_id))
+        )
+
+    rejected = asyncio.run(service.reject_guided_pipeline_proposal(command))
+
+    assert before_count is not None
+    assert rejected.result_state.version == command.expected_current_state_version + 1
+    with service._engine.connect() as conn:
+        after_count = conn.scalar(
+            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+        )
+        after_sequence = conn.scalar(
+            select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(chat_messages_table.c.session_id == str(session_id))
+        )
+    assert after_count == before_count + 1
+    assert after_sequence == before_sequence
+    guided = _state_from_record(rejected.result_state).guided_session
+    assert guided is not None
+    assert guided.active_proposal is None
+    assert guided.active_edit_target is None
+    assert not guided.history
+
+
+@pytest.mark.parametrize("drift", ("stale_command_current_db", "current_command_stale_db"))
+def test_dual_fenced_rejection_state_mismatch_changes_nothing_and_consumes_no_sequence(
+    service: SessionServiceImpl,
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    payload_store = FilesystemPayloadStore(tmp_path / drift)
+    command, session_id = asyncio.run(_staged_reject_command(service, payload_store))
+    assert isinstance(service, DualFencedSessionServiceHarness)
+    context = asyncio.run(service._guided_test_context(session_id, "guided"))
+    try:
+        if drift == "stale_command_current_db":
+            prior = asyncio.run(service.get_state(command.expected_current_state_id))
+            assert prior.derived_from_state_id is not None
+            command = replace(
+                command,
+                expected_current_state_id=prior.derived_from_state_id,
+                expected_current_state_version=command.expected_current_state_version - 1,
+            )
+        else:
+            current = asyncio.run(service.get_current_state(session_id))
+            assert current is not None
+            current_guided = _state_from_record(current).guided_session
+            assert current_guided is not None
+            asyncio.run(
+                service.save_composition_state(
+                    session_id,
+                    _state_data(current_guided),
+                    provenance="convergence_persist",
+                    session_operation_context=context,
+                )
+            )
+
+        with service._engine.connect() as conn:
+            before_count = conn.scalar(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+            )
+            before_max_version = conn.scalar(
+                select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == str(session_id))
+            )
+            before_sequence = conn.scalar(
+                select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(
+                    chat_messages_table.c.session_id == str(session_id)
+                )
+            )
+
+        with pytest.raises((AuditIntegrityError, GuidedOperationSettlementConflictError)):
+            asyncio.run(
+                service.reject_guided_pipeline_proposal(
+                    command,
+                    session_operation_context=context,
+                )
+            )
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, context))
+
+    with service._engine.connect() as conn:
+        assert (
+            conn.scalar(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+            )
+            == before_count
+        )
+        assert (
+            conn.scalar(
+                select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == str(session_id))
+            )
+            == before_max_version
+        )
+        assert (
+            conn.scalar(
+                select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(
+                    chat_messages_table.c.session_id == str(session_id)
+                )
+            )
+            == before_sequence
+        )
+        proposal_status = conn.scalar(
+            select(composition_proposals_table.c.status).where(composition_proposals_table.c.id == str(command.proposal_id))
+        )
+    assert proposal_status == "pending"
+
+
+def test_rejected_proposal_authority_reads_are_zero_dml_and_leave_checkpoint_unchanged(
+    service: SessionServiceImpl,
+    tmp_path: Path,
+) -> None:
+    payload_store = FilesystemPayloadStore(tmp_path / "rejected-read")
+    stage_command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
+    staged = asyncio.run(service.get_current_state(session_id))
+    assert staged is not None
+    statements: list[str] = []
+
+    def observe_dml(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if statement.lstrip().partition(" ")[0].upper() in {"INSERT", "UPDATE", "DELETE"}:
+            statements.append(statement)
+
+    sqlalchemy_event.listen(service._engine, "before_cursor_execute", observe_dml)
+    try:
+        current = asyncio.run(service.get_current_state(session_id))
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=session_id,
+                proposal_id=stage_command.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(_guided()),
+            )
+        )
+    finally:
+        sqlalchemy_event.remove(service._engine, "before_cursor_execute", observe_dml)
+
+    assert current is not None and current.id == staged.id
+    assert authority.row.status == "rejected"
+    assert statements == []
+
+
 async def _stage_and_reject(
     service: SessionServiceImpl,
     payload_store: FilesystemPayloadStore,
     *,
     reason: str,
 ) -> tuple[GuidedPipelineProposalStageCommand, UUID]:
-    command, session_id = await _command(service, payload_store)
-    await service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
-    await service.reject_pipeline_composition_proposal(
+    """Fabricate a terminal row behind an active guided reference.
+
+    The generic pipeline rejection is fenced on this branch, so this test
+    helper supplies the same exact COMPOSE authority that staged the guided
+    checkpoint. The intentionally mismatched lifecycle remains useful to pin
+    GET's fail-closed, zero-DML behavior (elspeth-4dc78b3897).
+    """
+    authority_service = service
+    if not isinstance(authority_service, DualFencedSessionServiceHarness):
+        authority_service = DualFencedSessionServiceHarness(
+            service._engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.guided.proposal.release-integration"),
+        )
+    command, session_id = await _command(authority_service, payload_store)
+    await authority_service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
+    context = await authority_service._guided_test_context(session_id, "guided")
+    await authority_service.reject_pipeline_composition_proposal(
         session_id=session_id,
         proposal_id=command.proposal_id,
         draft_hash=command.plan.proposal.draft_hash,
@@ -748,113 +998,287 @@ async def _stage_and_reject(
         reason=reason,  # type: ignore[arg-type]
         dispatch=None,
         actor="test",
+        session_operation_context=context,
     )
     return command, session_id
 
 
-@pytest.mark.parametrize("reason", ("operator_rejected", "superseded"))
-def test_reconcile_exact_explicit_rejection_clears_reference_and_occurrence(
-    service: SessionServiceImpl,
-    tmp_path: Path,
-    reason: str,
-) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / reason)
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason=reason))
+# ---------------------------------------------------------------------------
+# CONFIRM_WIRING settlement parity (inv-f6 F6): staging asserts; settlement
+# verifies — and the independent re-derivation must lower operator-profile
+# options through the session principal's snapshot exactly like the route.
+# ---------------------------------------------------------------------------
 
-    reconciled = asyncio.run(
-        service.reconcile_rejected_guided_pipeline_proposal(
-            session_id=session_id,
-            expected_current_state_id=command.checkpoint_state_id,
-            proposal_id=command.proposal_id,
-            draft_hash=command.plan.proposal.draft_hash,
-            reviewed_facts=guided_private_reviewed_facts(_guided()),
+_PROFILE_CATALOG_IDS = {
+    "source": frozenset({"csv"}),
+    "transform": frozenset({"llm"}),
+    "sink": frozenset({"json"}),
+}
+
+
+@pytest.fixture
+def profile_service(tmp_path: Path) -> SimpleNamespace:
+    """A profile-aware session service mirroring production create_app wiring."""
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    initialize_session_schema(engine)
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "task-role": {
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            }
+        },
+        default_llm_profile="task-role",
+    )
+    catalog = create_catalog_service()
+    runtime_policy = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_policy)
+    profile_registry = OperatorProfileRegistry(policy=policy, settings=runtime_policy)
+
+    class _EmptyInventory:
+        def has_server_ref(self, name: str) -> bool:
+            return False
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def server_generation(self, name: str) -> str | None:
+            return None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    def snapshot_for(user_id: str):
+        return build_plugin_snapshot(
+            policy=policy,
+            catalog=catalog,
+            profiles=profile_registry,
+            principal_scope=f"local:{user_id}",
+            secret_inventory=_EmptyInventory(),
+            generation_key=b"guided-proposal-settlement-key",
         )
+
+    return SimpleNamespace(
+        service=DualFencedSessionServiceHarness(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.guided.proposal.profile"),
+            plugin_snapshot_factory=snapshot_for,
+            operator_profile_registry=profile_registry,
+            catalog=catalog,
+        ),
+        snapshot_for=snapshot_for,
+        profile_registry=profile_registry,
+        catalog=catalog,
     )
 
-    guided = _state_from_record(reconciled).guided_session
-    assert guided is not None
-    assert guided.active_proposal is None
-    assert guided.active_edit_target is None
-    assert not guided.history
-    assert reconciled.derived_from_state_id == command.checkpoint_state_id
+
+def _profile_bound_pipeline() -> dict[str, object]:
+    return {
+        "sources": {
+            "primary": {
+                "plugin": "csv",
+                "on_success": "summarize_rows",
+                "options": {"schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "summarize_rows",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "summarize_rows",
+                "on_success": "rows",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "profile": "task-role",
+                    "prompt_template": "Summarise this row in one short sentence.",
+                    "response_field": "summary",
+                },
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "rows",
+                "plugin": "json",
+                "options": {"schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            }
+        ],
+    }
 
 
-@pytest.mark.parametrize("tamper", ("missing", "cross_session", "draft", "duplicate_event", "committed"))
-def test_reconcile_missing_cross_session_or_altered_authority_is_a_hard_conflict(
-    service: SessionServiceImpl,
+async def _confirm_wiring_command(
+    harness: SimpleNamespace,
+    payload_store: FilesystemPayloadStore,
+) -> tuple[GuidedPipelineProposalStageCommand, UUID]:
+    """Stage command whose durable turn is a route-built CONFIRM_WIRING review."""
+    service = harness.service
+    session = await service.create_session("alice", "Guided wire proposal", "local")
+    base_guided = _guided()
+    predecessor = await _save_composition_state_with_compose_authority(
+        service,
+        session.id,
+        _state_data(base_guided),
+        provenance="session_seed",
+    )
+    predecessor_state = _state_from_record(predecessor)
+    checkpoint_id = uuid4()
+    proposal_id = uuid4()
+    plan = PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=_profile_bound_pipeline(),
+            base=PresentBase(
+                state_id=checkpoint_id,
+                composition_content_hash=composition_content_hash(predecessor_state),
+            ),
+            reviewed_facts=guided_private_reviewed_facts(base_guided),
+            surface=PlannerSurface.GUIDED_STAGED,
+            repair_count=0,
+            skill_hash=stable_hash("guided skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="guided-planner-wire-terminal",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+    projection = build_guided_proposal_projection(
+        proposal_id=proposal_id,
+        proposal=plan.proposal,
+        guided=base_guided,
+        catalog_plugin_ids=_PROFILE_CATALOG_IDS,
+    )
+    # Route-built wire review: the authored candidate validated once through
+    # the principal's policy boundary, with the lowered executable view
+    # feeding the projection (guided.py review-advance/correction parity).
+    candidate = guided_candidate_state(plan.proposal)
+    policy_result = validate_authored_composition_state(
+        candidate,
+        snapshot=harness.snapshot_for("alice"),
+        profile_registry=harness.profile_registry,
+        catalog=harness.catalog,
+    )
+    assert not policy_result.validation.errors, policy_result.validation.errors
+    assert policy_result.executable_state is not candidate
+    wire_turn = build_step_4_wire_turn(
+        candidate,
+        proposal_projection=projection,
+        guided=base_guided,
+        catalog=None,
+        validation_state=policy_result.executable_state,
+        validation_summary=policy_result.validation,
+    )
+    prepared_wire = prepare_guided_json_payload(payload_store, purpose="turn", payload=wire_turn["payload"])
+    active = GuidedProposalRef(
+        proposal_id=proposal_id,
+        draft_hash=plan.proposal.draft_hash,
+        base=plan.proposal.base,
+        reviewed_anchor_hash=plan.proposal.reviewed_anchor_hash,
+        covered_deferred_intent_ids=(),
+        creation_event_schema="pipeline_proposal_created.v1",
+    )
+    checkpoint_guided = replace(
+        base_guided,
+        step=GuidedStep.STEP_4_WIRE,
+        active_proposal=active,
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_4_WIRE,
+                turn_type=TurnType.CONFIRM_WIRING,
+                payload_hash=prepared_wire.payload_id,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+    )
+    operation_id = str(uuid4())
+    outcome = await service.reserve_guided_operation(
+        session_id=session.id,
+        operation_id=operation_id,
+        kind="guided_respond",
+        request_hash=stable_hash({"operation_id": operation_id}),
+        actor="test",
+        lease_seconds=300,
+    )
+    assert isinstance(outcome, GuidedOperationClaimed)
+    return (
+        GuidedPipelineProposalStageCommand(
+            fence=outcome.fence,
+            expected_current_state_id=predecessor.id,
+            expected_current_state_version=predecessor.version,
+            expected_current_content_hash=composition_content_hash(predecessor_state),
+            checkpoint_state_id=checkpoint_id,
+            proposal_id=proposal_id,
+            state=_state_data(checkpoint_guided),
+            plan=plan,
+            summary="pipeline_proposal.summary.v1",
+            rationale="pipeline_proposal.rationale.v1",
+            affects=("pipeline",),
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline",
+                _profile_bound_pipeline(),
+                telemetry=NoopRedactionTelemetry(),
+            ),
+            catalog_plugin_ids=_PROFILE_CATALOG_IDS,
+            proposal_projection=projection,
+            actor="composer_route",
+            user_message_id=None,
+            user_message_content_hash=None,
+            originating_message=None,
+            supersedes_proposal_id=None,
+            response=GuidedResponseDescriptor(
+                kind="guided_respond",
+                next_turn=GuidedReplayTurn(
+                    turn_type=TurnType.CONFIRM_WIRING,
+                    step_index=3,
+                    payload_id=prepared_wire.payload_id,
+                ),
+                assistant_turn_seq=None,
+            ),
+            payloads=(prepared_wire,),
+        ),
+        session.id,
+    )
+
+
+def test_stage_confirm_wiring_re_verifies_through_profile_lowering(
+    profile_service: SimpleNamespace,
     tmp_path: Path,
-    tamper: str,
 ) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / tamper)
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
-    reconcile_session_id = session_id
-    expected_state_id = command.checkpoint_state_id
-    proposal_id = command.proposal_id
-    draft_hash = command.plan.proposal.draft_hash
+    """Settlement's 7-key comparison must hold against the route-built payload.
 
-    if tamper == "missing":
-        proposal_id = uuid4()
-    elif tamper == "cross_session":
-        other = asyncio.run(service.create_session("alice", "other", "local"))
-        other_state = asyncio.run(service.save_composition_state(other.id, _state_data(_guided()), provenance="session_seed"))
-        reconcile_session_id = other.id
-        expected_state_id = other_state.id
-    elif tamper == "draft":
-        draft_hash = "f" * 64
-    elif tamper == "duplicate_event":
-        event = asyncio.run(service.list_proposal_events(session_id))[0]
-        with service._engine.begin() as conn:
-            conn.execute(
-                insert(proposal_events_table).values(
-                    id=str(uuid4()),
-                    session_id=str(session_id),
-                    proposal_id=str(command.proposal_id),
-                    event_type="proposal.created",
-                    actor="tamper",
-                    payload=deep_thaw(event.payload),
-                    created_at=event.created_at,
-                )
-            )
-    else:
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(composition_proposals_table)
-                .where(composition_proposals_table.c.id == str(command.proposal_id))
-                .values(status="committed", committed_state_id=str(command.checkpoint_state_id))
-            )
+    inv-f6 F6 parity regression: the settlement rebuilt the wire review from
+    the AUTHORED candidate — the un-lowered profile options crashed the
+    row-cardinality probe, and even a tolerant probe would have diffed
+    authored-vs-lowered projections into a false AuditIntegrityError.
+    """
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads-profile-wire")
+    command, session_id = asyncio.run(_confirm_wiring_command(profile_service, payload_store))
 
-    with pytest.raises((AuditIntegrityError, KeyError)):
-        asyncio.run(
-            service.reconcile_rejected_guided_pipeline_proposal(
-                session_id=reconcile_session_id,
-                expected_current_state_id=expected_state_id,
-                proposal_id=proposal_id,
-                draft_hash=draft_hash,
-                reviewed_facts=guided_private_reviewed_facts(_guided()),
-            )
-        )
+    settlement = asyncio.run(profile_service.service.stage_guided_pipeline_proposal(command, payload_store=payload_store))
 
-
-def test_reconcile_checkpoint_fault_keeps_active_reference(service: SessionServiceImpl, tmp_path: Path, monkeypatch) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / "fault")
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
-
-    def fail_insert(*_args, **_kwargs):
-        raise RuntimeError("synthetic checkpoint failure")
-
-    monkeypatch.setattr(service, "_insert_composition_state", fail_insert)
-    with pytest.raises(RuntimeError, match="synthetic checkpoint failure"):
-        asyncio.run(
-            service.reconcile_rejected_guided_pipeline_proposal(
-                session_id=session_id,
-                expected_current_state_id=command.checkpoint_state_id,
-                proposal_id=command.proposal_id,
-                draft_hash=command.plan.proposal.draft_hash,
-                reviewed_facts=guided_private_reviewed_facts(_guided()),
-            )
-        )
-
-    current = asyncio.run(service.get_current_state(session_id))
+    assert settlement.result_state.id == command.checkpoint_state_id
+    assert settlement.proposal.id == command.proposal_id
+    current = asyncio.run(profile_service.service.get_current_state(session_id))
     assert current is not None and current.id == command.checkpoint_state_id
     guided = _state_from_record(current).guided_session
     assert guided is not None and guided.active_proposal is not None

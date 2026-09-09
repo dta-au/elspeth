@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -11,10 +13,12 @@ from sqlalchemy import insert, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BlobPendingProposalError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
-from elspeth.web.blobs.protocol import BlobNotFoundError, BlobPendingProposalError
+from elspeth.web.blobs.protocol import BlobNotFoundError, BlobRecord
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
@@ -24,12 +28,14 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composition_proposals_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -45,7 +51,7 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -53,6 +59,7 @@ def service(engine):
 
 
 def _insert_session(conn, session_id: str) -> None:
+    created_at = datetime.now(UTC)
     conn.execute(
         insert(sessions_table).values(
             id=session_id,
@@ -61,15 +68,102 @@ def _insert_session(conn, session_id: str) -> None:
             title="Composer UX",
             trust_mode="explicit_approve",
             density_default="high",
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=f"create-{session_id}",
+            lease_token=f"create-token-{session_id}",
+            operation_kind=SessionOperationKind.CREATE.value,
+            owner_instance_id="test-owner",
+            operation_epoch=1,
+            lease_expires_at=created_at,
+            released_at=created_at,
         )
     )
 
 
-def _pipeline_plan_result(*, tool_call_id: str = "call_pipeline") -> PipelinePlanResult:
+@asynccontextmanager
+async def _session_operation_context(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    operation_kind: SessionOperationKind,
+) -> AsyncIterator[SessionOperationContext]:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _create_test_blob(
+    service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    *,
+    filename: str,
+    content: bytes,
+) -> BlobRecord:
+    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE) as context:
+        return await blob_service.create_blob(
+            session_id=session_id,
+            filename=filename,
+            content=content,
+            mime_type="text/csv",
+            created_by="assistant",
+            session_operation_context=context,
+        )
+
+
+async def _create_pending_test_blob(
+    service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+) -> BlobRecord:
+    """Seed the pending row ``create_blob``'s reservation phase leaves, through the blob-service test seeder."""
+    from tests.unit.web.blobs.test_service import _seed_pending_blob
+
+    del service
+    return _seed_pending_blob(blob_service._engine, blob_service, session_id, "proposal.csv")
+
+
+async def _delete_test_blob(
+    service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    blob_id: UUID,
+) -> None:
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        await blob_service.delete_blob(blob_id, session_operation_context=context)
+
+
+async def _get_test_blob(
+    service: SessionServiceImpl,
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    blob_id: UUID,
+) -> BlobRecord:
+    async with _session_operation_context(service, session_id, SessionOperationKind.BLOB_READ) as context:
+        return await blob_service.get_blob(blob_id, session_operation_context=context)
+
+
+def _pipeline_plan_result(
+    *,
+    tool_call_id: str = "call_pipeline",
+    pipeline: dict[str, object] | None = None,
+) -> PipelinePlanResult:
     proposal = PipelineProposal.create(
-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
+        pipeline=pipeline if pipeline is not None else {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
         reviewed_facts={},
         surface=PlannerSurface.FREEFORM,
@@ -94,6 +188,32 @@ def _pipeline_public_arguments() -> dict[str, object]:
         {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         telemetry=NoopRedactionTelemetry(),
     )
+
+
+def _row_union_pipeline(branch_order: tuple[str, ...]) -> dict[str, object]:
+    connections = {
+        "a": "a_in",
+        "b": "b_in",
+        "c": "c_in",
+    }
+    return {
+        "sources": {},
+        "nodes": [
+            {
+                "id": "union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "a_in",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": {alias: connections[alias] for alias in branch_order},
+                "timeout_seconds": 30.0,
+            }
+        ],
+        "edges": [],
+        "outputs": [],
+    }
 
 
 def test_session_preferences_columns_exist(engine) -> None:
@@ -267,18 +387,20 @@ async def test_create_composition_proposal_writes_created_event(service) -> None
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    proposal = await service.create_composition_proposal(
-        session_id=session_id,
-        tool_call_id="call_set_pipeline",
-        tool_name="set_pipeline",
-        summary="Replace the pipeline with one source and one sink.",
-        rationale="Requested by the user.",
-        affects=("graph", "validation"),
-        arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        base_state_id=None,
-        actor="composer-web:user-alice",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline with one source and one sink.",
+            rationale="Requested by the user.",
+            affects=("graph", "validation"),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
 
     assert proposal.status == "pending"
     assert proposal.affects == ("graph", "validation")
@@ -298,18 +420,20 @@ async def test_three_field_proposal_created_event_is_rejected_not_compatibly_rea
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    proposal = await service.create_composition_proposal(
-        session_id=session_id,
-        tool_call_id="call_current",
-        tool_name="set_pipeline",
-        summary="Current tool proposal.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        base_state_id=None,
-        actor="test",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_current",
+            tool_name="set_pipeline",
+            summary="Current tool proposal.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="test",
+            session_operation_context=context,
+        )
     with service._engine.begin() as conn:
         conn.execute(
             update(proposal_events_table)
@@ -333,18 +457,20 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
     plan = _pipeline_plan_result()
     public_arguments = _pipeline_public_arguments()
 
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_redacted_json=public_arguments,
-        actor="composer-web:user-alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=public_arguments,
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
 
     assert row.tool_call_id == plan.tool_call_id
     assert row.arguments_json == plan.proposal.pipeline
@@ -388,6 +514,47 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
 
 
 @pytest.mark.asyncio
+async def test_authoritative_pipeline_restore_rejects_non_first_row_union_order_tampering(service) -> None:
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    original = _row_union_pipeline(("a", "b", "c"))
+    tampered = _row_union_pipeline(("a", "c", "b"))
+    plan = _pipeline_plan_result(pipeline=original)
+    public_arguments = redact_tool_call_arguments(
+        "set_pipeline",
+        original,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=public_arguments,
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
+
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(arguments_json=tampered)
+        )
+
+    with pytest.raises(AuditIntegrityError, match="private arguments binding mismatch"):
+        await service.get_authoritative_pipeline_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            reviewed_facts={},
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("target", "replacement"),
     [
@@ -415,18 +582,20 @@ async def test_authoritative_pipeline_restore_rejects_every_tampered_binding(ser
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=_pipeline_plan_result(),
-        summary="Replace the pipeline.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_redacted_json=_pipeline_public_arguments(),
-        actor="composer-web:user-alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=_pipeline_plan_result(),
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=_pipeline_public_arguments(),
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
 
     with service._engine.begin() as conn:
         if target == "row_private":
@@ -494,18 +663,20 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
         _insert_session(conn, str(other_session_id))
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=_pipeline_plan_result(),
-        summary="Replace the pipeline.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_redacted_json=_pipeline_public_arguments(),
-        actor="composer-web:user-alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=_pipeline_plan_result(),
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=_pipeline_public_arguments(),
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
     with service._engine.begin() as conn:
         conn.execute(
             update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(audit_event_id=str(uuid4()))
@@ -559,76 +730,80 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", ["missing", "cross_session", "pending"])
 async def test_create_composition_proposal_rejects_unusable_blob_reference(engine, service, tmp_path, failure_kind) -> None:
-    session_id = uuid4()
-    other_session_id = uuid4()
-    with engine.begin() as conn:
-        _insert_session(conn, str(session_id))
-        _insert_session(conn, str(other_session_id))
+    session_id = (await service.create_session("alice", "Composer UX", "local")).id
+    other_session_id = (await service.create_session("alice", "Other composer UX", "local")).id
 
     blob_id = uuid4()
     if failure_kind != "missing":
         owner = other_session_id if failure_kind == "cross_session" else session_id
-        blob_service = BlobServiceImpl(engine, tmp_path)
+        blob_service = BlobServiceImpl(
+            engine,
+            tmp_path,
+        )
         if failure_kind == "pending":
-            record = await blob_service.create_pending_blob(
-                session_id=owner,
-                filename="proposal.csv",
-                mime_type="text/csv",
-                created_by="assistant",
+            record = await _create_pending_test_blob(
+                service,
+                blob_service,
+                owner,
             )
         else:
-            record = await blob_service.create_blob(
-                session_id=owner,
+            record = await _create_test_blob(
+                service,
+                blob_service,
+                owner,
                 filename="proposal.csv",
                 content=b"value\n1\n",
-                mime_type="text/csv",
-                created_by="assistant",
             )
         blob_id = record.id
 
     with pytest.raises(ValueError, match="blob"):
-        await service.create_composition_proposal(
-            session_id=session_id,
-            tool_call_id=f"call_{failure_kind}",
-            tool_name="set_source_from_blob",
-            summary="Use the blob as source.",
-            rationale="Requested by the user.",
-            affects=("source",),
-            arguments_json={"blob_id": str(blob_id)},
-            arguments_redacted_json={"blob_id": str(blob_id)},
-            base_state_id=None,
-            actor="composer-web:user-alice",
-        )
+        async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+            await service.create_composition_proposal(
+                session_id=session_id,
+                tool_call_id=f"call_{failure_kind}",
+                tool_name="set_source_from_blob",
+                summary="Use the blob as source.",
+                rationale="Requested by the user.",
+                affects=("source",),
+                arguments_json={"blob_id": str(blob_id)},
+                arguments_redacted_json={"blob_id": str(blob_id)},
+                base_state_id=None,
+                actor="composer-web:user-alice",
+                session_operation_context=context,
+            )
 
     assert await service.list_composition_proposals(session_id) == []
 
 
 @pytest.mark.asyncio
 async def test_create_composition_proposal_accepts_owned_ready_blob(engine, service, tmp_path) -> None:
-    session_id = uuid4()
-    with engine.begin() as conn:
-        _insert_session(conn, str(session_id))
-    blob_service = BlobServiceImpl(engine, tmp_path)
-    record = await blob_service.create_blob(
-        session_id=session_id,
+    session_id = (await service.create_session("alice", "Composer UX", "local")).id
+    blob_service = BlobServiceImpl(
+        engine,
+        tmp_path,
+    )
+    record = await _create_test_blob(
+        service,
+        blob_service,
+        session_id,
         filename="proposal.csv",
         content=b"value\n1\n",
-        mime_type="text/csv",
-        created_by="assistant",
     )
 
-    proposal = await service.create_composition_proposal(
-        session_id=session_id,
-        tool_call_id="call_ready_blob",
-        tool_name="set_source_from_blob",
-        summary="Use the blob as source.",
-        rationale="Requested by the user.",
-        affects=("source",),
-        arguments_json={"blob_id": str(record.id)},
-        arguments_redacted_json={"blob_id": str(record.id)},
-        base_state_id=None,
-        actor="composer-web:user-alice",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_ready_blob",
+            tool_name="set_source_from_blob",
+            summary="Use the blob as source.",
+            rationale="Requested by the user.",
+            affects=("source",),
+            arguments_json={"blob_id": str(record.id)},
+            arguments_redacted_json={"blob_id": str(record.id)},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
 
     assert proposal.status == "pending"
 
@@ -648,106 +823,191 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
     session_id = uuid4()
     with engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    blob = await blob_service.create_blob(
-        session_id=session_id,
-        filename="race.csv",
-        content=b"value\n1\n",
-        mime_type="text/csv",
-        created_by="assistant",
-    )
+    async with _session_operation_context(session_service, session_id, SessionOperationKind.CREATE) as create_context:
+        blob = await blob_service.create_blob(
+            session_id=session_id,
+            filename="race.csv",
+            content=b"value\n1\n",
+            mime_type="text/csv",
+            created_by="assistant",
+            session_operation_context=create_context,
+        )
 
     entered = threading.Event()
     release = threading.Event()
 
-    async def create_proposal():
-        return await session_service.create_composition_proposal(
-            session_id=session_id,
-            tool_call_id=f"call_{winner}",
-            tool_name="set_source_from_blob",
-            summary="Use the blob as source.",
-            rationale="Requested by the user.",
-            affects=("source",),
-            arguments_json={"blob_id": str(blob.id)},
-            arguments_redacted_json={"blob_id": str(blob.id)},
-            base_state_id=None,
-            actor="composer-web:user-alice",
-        )
+    # A session holds one live operation, so both effects run under the same
+    # COMPOSE context — one composer turn proposing a blob-backed source while
+    # deleting the blob. The context does not order the effects; the custody
+    # lock under test does.
+    async with _session_operation_context(session_service, session_id, SessionOperationKind.COMPOSE) as context:
 
-    if winner == "proposal":
-        from elspeth.web.sessions import service as service_module
+        async def create_proposal():
+            return await session_service.create_composition_proposal(
+                session_operation_context=context,
+                session_id=session_id,
+                tool_call_id=f"call_{winner}",
+                tool_name="set_source_from_blob",
+                summary="Use the blob as source.",
+                rationale="Requested by the user.",
+                affects=("source",),
+                arguments_json={"blob_id": str(blob.id)},
+                arguments_redacted_json={"blob_id": str(blob.id)},
+                base_state_id=None,
+                actor="composer-web:user-alice",
+            )
 
-        original_validate = service_module.validate_proposal_blob_references
+        if winner == "proposal":
+            from elspeth.web.sessions import service as service_module
 
-        def blocked_validate(*args, **kwargs):
+            original_validate = service_module.validate_proposal_blob_references
+
+            def blocked_validate(*args, **kwargs):
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("proposal race barrier timed out")
+                return original_validate(*args, **kwargs)
+
+            monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
+            proposal_task = asyncio.create_task(create_proposal())
+            assert await asyncio.to_thread(entered.wait, 5)
+            delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
+            await asyncio.sleep(0)
+            release.set()
+
+            proposal = await proposal_task
+            with pytest.raises(BlobPendingProposalError):
+                await delete_task
+            assert proposal.status == "pending"
+            assert await blob_service.get_blob(blob.id, session_operation_context=context) == blob
+            return
+
+        from elspeth.web.blobs import service as blob_service_module
+
+        original_pending = blob_service_module.pending_proposal_reference_id
+
+        def blocked_pending(*args, **kwargs):
             entered.set()
             if not release.wait(timeout=5):
-                raise AssertionError("proposal race barrier timed out")
-            return original_validate(*args, **kwargs)
+                raise AssertionError("delete race barrier timed out")
+            return original_pending(*args, **kwargs)
 
-        monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
-        proposal_task = asyncio.create_task(create_proposal())
+        monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
+        delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
         assert await asyncio.to_thread(entered.wait, 5)
-        delete_task = asyncio.create_task(blob_service.delete_blob(blob.id))
+        proposal_task = asyncio.create_task(create_proposal())
         await asyncio.sleep(0)
         release.set()
 
-        proposal = await proposal_task
-        with pytest.raises(BlobPendingProposalError):
-            await delete_task
-        assert proposal.status == "pending"
-        assert await blob_service.get_blob(blob.id) == blob
-        return
+        await delete_task
+        with pytest.raises(ValueError, match="does not exist"):
+            await proposal_task
+        with pytest.raises(BlobNotFoundError):
+            await blob_service.get_blob(blob.id, session_operation_context=context)
+        assert await session_service.list_composition_proposals(session_id) == []
 
-    from elspeth.web.blobs import service as blob_service_module
 
-    original_pending = blob_service_module.pending_proposal_reference_id
+@pytest.mark.asyncio
+async def test_reject_composition_proposal_raises_conflict_only_for_a_terminal_row(service) -> None:
+    """Pin the raise contract the route-level auto-reject sentinel depends on.
 
-    def blocked_pending(*args, **kwargs):
-        entered.set()
-        if not release.wait(timeout=5):
-            raise AssertionError("delete race barrier timed out")
-        return original_pending(*args, **kwargs)
+    A missing row is ``KeyError`` (corruption of our own data, never
+    swallowed); a row that exists but is no longer pending is
+    ``ProposalStateConflictError``, the benign status race the accept route
+    suppresses before surfacing the validation failure as 422.
+    """
+    session_id = (await service.create_session("alice", "Reject contract", "local")).id
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
 
-    monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
-    delete_task = asyncio.create_task(blob_service.delete_blob(blob.id))
-    assert await asyncio.to_thread(entered.wait, 5)
-    proposal_task = asyncio.create_task(create_proposal())
-    await asyncio.sleep(0)
-    release.set()
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        with pytest.raises(KeyError):
+            await service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=uuid4(),
+                actor="user:alice",
+                session_operation_context=context,
+            )
+        rejected = await service.reject_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+        assert rejected.status == "rejected"
+        with pytest.raises(ProposalStateConflictError, match="must be pending to reject; got 'rejected'"):
+            await service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal.id,
+                actor="user:alice",
+                session_operation_context=context,
+            )
 
-    await delete_task
-    with pytest.raises(ValueError, match="does not exist"):
-        await proposal_task
-    with pytest.raises(BlobNotFoundError):
-        await blob_service.get_blob(blob.id)
-    assert await session_service.list_composition_proposals(session_id) == []
+    events = await service.list_proposal_events(session_id)
+    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
 
 
 @pytest.mark.asyncio
 async def test_reject_composition_proposal_is_forward_only(service) -> None:
-    session_id = uuid4()
-    with service._engine.begin() as conn:
-        _insert_session(conn, str(session_id))
-    proposal = await service.create_composition_proposal(
-        session_id=session_id,
-        tool_call_id="call_set_pipeline",
-        tool_name="set_pipeline",
-        summary="Replace the pipeline.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        base_state_id=None,
-        actor="composer-web:user-alice",
-    )
+    session_id = (await service.create_session("alice", "Reject composition proposal", "local")).id
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
 
-    rejected = await service.reject_composition_proposal(
-        session_id=session_id,
-        proposal_id=proposal.id,
-        actor="user:alice",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        rejected = await service.reject_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     assert rejected.status == "rejected"
+    tied_at = datetime(2025, 1, 1, tzinfo=UTC)
+    created_event_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+    rejected_event_id = "00000000-0000-4000-8000-000000000001"
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(proposal_events_table)
+            .where(proposal_events_table.c.proposal_id == str(proposal.id))
+            .where(proposal_events_table.c.event_type == "proposal.created")
+            .values(id=created_event_id, created_at=tied_at)
+        )
+        conn.execute(
+            update(proposal_events_table)
+            .where(proposal_events_table.c.proposal_id == str(proposal.id))
+            .where(proposal_events_table.c.event_type == "proposal.rejected")
+            .values(id=rejected_event_id, created_at=tied_at)
+        )
+        conn.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.id == str(proposal.id))
+            .values(audit_event_id=rejected_event_id, updated_at=tied_at)
+        )
+
     events = await service.list_proposal_events(session_id)
     assert [event.event_type for event in events] == [
         "proposal.created",
@@ -757,71 +1017,96 @@ async def test_reject_composition_proposal_is_forward_only(service) -> None:
 
 @pytest.mark.asyncio
 async def test_accept_composition_proposal_requires_pending_status(service) -> None:
-    session_id = uuid4()
-    with service._engine.begin() as conn:
-        _insert_session(conn, str(session_id))
-    proposal = await service.create_composition_proposal(
-        session_id=session_id,
-        tool_call_id="call_set_pipeline",
-        tool_name="set_pipeline",
-        summary="Replace the pipeline.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        base_state_id=None,
-        actor="composer-web:user-alice",
-    )
-    await service.reject_composition_proposal(
-        session_id=session_id,
-        proposal_id=proposal.id,
-        actor="user:alice",
-    )
-
-    with pytest.raises(ValueError, match="pending"):
-        await service.mark_composition_proposal_committed(
+    session_id = (await service.create_session("alice", "Reject before commit", "local")).id
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        await service.reject_composition_proposal(
             session_id=session_id,
             proposal_id=proposal.id,
-            committed_state_id=uuid4(),
             actor="user:alice",
+            session_operation_context=context,
         )
+
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        with pytest.raises(ValueError, match="pending"):
+            await service.accept_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal.id,
+                expected_current_state_id=None,
+                state=CompositionStateData(is_valid=True),
+                actor="user:alice",
+                session_operation_context=context,
+            )
 
 
 @pytest.mark.asyncio
-async def test_mark_composition_proposal_committed_writes_forward_event(service) -> None:
-    session_id = uuid4()
-    with service._engine.begin() as conn:
-        _insert_session(conn, str(session_id))
-    state_record = await service.save_composition_state(
-        session_id,
-        CompositionStateData(is_valid=True),
-        provenance="tool_call",
-    )
-    proposal = await service.create_composition_proposal(
-        session_id=session_id,
-        tool_call_id="call_set_pipeline",
-        tool_name="set_pipeline",
-        summary="Replace the pipeline.",
-        rationale="Requested by the user.",
-        affects=("graph",),
-        arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
-        base_state_id=None,
-        actor="composer-web:user-alice",
-    )
+async def test_accept_composition_proposal_writes_forward_event(service) -> None:
+    session_id = (await service.create_session("alice", "Commit composition proposal", "local")).id
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
 
-    committed = await service.mark_composition_proposal_committed(
-        session_id=session_id,
-        proposal_id=proposal.id,
-        committed_state_id=state_record.id,
-        actor="user:alice",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        committed = await service.accept_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            expected_current_state_id=None,
+            state=CompositionStateData(is_valid=True),
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     assert committed.status == "committed"
-    assert committed.committed_state_id == state_record.id
+    assert committed.committed_state_id is not None
+    tied_at = datetime(2025, 1, 1, tzinfo=UTC)
+    created_event_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+    accepted_event_id = "00000000-0000-4000-8000-000000000001"
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(proposal_events_table)
+            .where(proposal_events_table.c.proposal_id == str(proposal.id))
+            .where(proposal_events_table.c.event_type == "proposal.created")
+            .values(id=created_event_id, created_at=tied_at)
+        )
+        conn.execute(
+            update(proposal_events_table)
+            .where(proposal_events_table.c.proposal_id == str(proposal.id))
+            .where(proposal_events_table.c.event_type == "proposal.accepted")
+            .values(id=accepted_event_id, created_at=tied_at)
+        )
+        conn.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.id == str(proposal.id))
+            .values(audit_event_id=accepted_event_id, updated_at=tied_at)
+        )
+
     events = await service.list_proposal_events(session_id)
     assert [event.event_type for event in events] == [
         "proposal.created",
         "proposal.accepted",
     ]
-    assert events[-1].payload == {"committed_state_id": str(state_record.id)}
+    assert events[-1].payload == {"committed_state_id": str(committed.committed_state_id)}

@@ -51,7 +51,7 @@ class TestPluginAssistanceSecretHygiene:
         [
             ("summary", "Fetch https://example.test/private.csv before configuring the plugin.", "raw URL"),
             ("suggested_fixes", ("Set Authorization: Bearer sk-testsecret1234567890.",), "credential"),
-            ("composer_hints", ("Read /home/john/private/input.csv and copy the headers.",), "file path"),
+            ("composer_hints", ("Read /home/alice/private/input.csv and copy the headers.",), "file path"),
             ("summary", "Provider failed with BadRequestError: API key abc123 was rejected.", "exception string"),
         ],
     )

@@ -67,6 +67,11 @@ hardcodes the fix; the plugin owns it.
 
 ## Installation
 
+The Web Scrape transform's HTTP and HTML dependencies are part of the base
+project dependencies; there is no separate `web` extra. From a source
+checkout, install the locked environment with:
+
 ```bash
-uv pip install -e ".[web]"
+uv sync --frozen
+source .venv/bin/activate
 ```

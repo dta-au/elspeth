@@ -175,6 +175,44 @@ class TestBaselineRedSignals:
 
         assert result["verdict"] == "GREEN", result["red_reasons"]
 
+    def test_red_when_relaxed_validity_cannot_read_codes_off_a_stringified_state(self) -> None:
+        """The allowance is undecidable on the HTTP state shape, and the reason must say so.
+
+        ``CompositionStateResponse.validation_errors`` is ``list[str] | None``
+        (``src/elspeth/web/sessions/schemas.py``), so a state that came through
+        the HTTP boundary carries bare messages and
+        ``_extract_error_codes_from_entries`` ignores them BY DESIGN. That is the
+        branch this pins, and it had no test before: both sibling relaxation
+        tests supply dict entries, which only the mocked-LLM harness produces.
+
+        Failing closed is correct — an unreadable state must not buy a GREEN.
+        What would be wrong is the WORDING: reporting "no codes were present"
+        states a fact about the pipeline that the scorer cannot know, when the
+        run may well have raised coded errors that the boundary stringified.
+        The reason must attribute the blindness to the observation.
+        """
+        result = score(
+            scenario=_scenario(
+                red={
+                    "must_be_valid": False,
+                    "allow_is_valid_false_when_error_codes": ["interpretation_review_pending"],
+                },
+                green={"must_be_valid": False},
+            ),
+            messages=[_msg("assistant", "Reviews are surfaced for operator resolution.")],
+            state=_state_valid(
+                is_valid=False,
+                validation_errors=["LLM model choice review is pending"],
+            ),
+        )
+
+        assert result["verdict"] == "RED"
+        reason = next(r for r in result["red_reasons"] if "is_valid=false" in r and "allowed" in r)
+        assert "structurally readable" in reason
+        assert "what the state made observable" in reason
+        # The scorer must NOT assert the pipeline raised nothing.
+        assert "no structured validation error codes were present" not in reason
+
     def test_red_when_relaxed_validity_has_disallowed_error_code(self) -> None:
         result = score(
             scenario=_scenario(
@@ -1047,7 +1085,7 @@ class TestDiscoverBeforeMutation:
 
     def test_mutation_recognises_full_mutating_set(self) -> None:
         # Any of the mutating tool names triggers the check.
-        for mutating in ("set_source", "upsert_node", "set_output", "set_source_from_blob", "apply_pipeline_recipe", "patch_node_options"):
+        for mutating in ("set_source", "upsert_node", "set_output", "set_source_from_blob", "patch_node_options"):
             messages = [
                 _assistant_with_calls(_tool_call("c1", mutating)),
                 _tool_row("c1", success=True),
@@ -1081,3 +1119,50 @@ class TestPersistedToolCallCountStat:
         messages = [_msg("user", "hi"), _msg("assistant", "what do you want?")]
         result = score(scenario=_scenario(), messages=messages, state=_state_valid())
         assert result["stats"]["persisted_tool_call_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# fork shape token — a fork is a gate node with fork_to; there is no fork node_type
+# --------------------------------------------------------------------------
+
+
+class TestForkTokenAlias:
+    def _fork_state(self) -> dict[str, Any]:
+        return _state_valid(
+            nodes=[
+                {"id": "fork_gate", "node_type": "gate", "plugin": None, "routes": {"true": "fork"}, "fork_to": ["path_a", "path_b"]},
+                {"id": "merge_results", "node_type": "coalesce", "plugin": None},
+            ],
+        )
+
+    def test_fork_chain_token_matches_a_real_gate_node(self) -> None:
+        """Scenario generation emits ``fork`` for fork gates; the composer authors a ``gate`` node."""
+        result = score(
+            scenario=_scenario(green={"must_have_node_chain_in_order": ["csv", "fork", "coalesce"]}),
+            messages=[_msg("assistant", "ok")],
+            state=self._fork_state(),
+        )
+        assert result["verdict"] == "GREEN", result["amber_reasons"]
+
+    def test_fork_kind_token_matches_a_real_gate_node(self) -> None:
+        result = score(
+            scenario=_scenario(green={"must_have_node_kinds_substring_any_of": [["fork", "coalesce"]]}),
+            messages=[_msg("assistant", "ok")],
+            state=self._fork_state(),
+        )
+        assert result["verdict"] == "GREEN", result["amber_reasons"]
+
+    def test_fork_chain_still_fails_without_a_gate(self) -> None:
+        """Control: the alias must not make ``fork`` match arbitrary nodes."""
+        result = score(
+            scenario=_scenario(green={"must_have_node_chain_in_order": ["csv", "fork", "coalesce"]}),
+            messages=[_msg("assistant", "ok")],
+            state=_state_valid(
+                nodes=[
+                    {"id": "n0", "node_type": "transform", "plugin": "passthrough"},
+                    {"id": "n1", "node_type": "coalesce", "plugin": None},
+                ]
+            ),
+        )
+        assert result["verdict"] == "AMBER"
+        assert any("'fork'" in r for r in result["amber_reasons"])

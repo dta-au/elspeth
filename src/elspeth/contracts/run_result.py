@@ -26,7 +26,7 @@ class RunResult:
     rows_succeeded: int
     rows_failed: int
     rows_routed_success: int  # MOVE: gate route_to_sink (intentional success-side routing)
-    rows_routed_failure: int  # DIVERT: transform on_error reroute to failure sink
+    rows_routed_failure: int  # DIVERT: transform/config-gate on_error reroute to failure sink
     rows_quarantined: int = 0
     rows_forked: int = 0
     rows_coalesced: int = 0

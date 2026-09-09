@@ -23,6 +23,8 @@ from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMet
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import _initial_composition_state_with_guided_session
+from tests.helpers.session_fences import get_blob_under_fence
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 _CURRENT_TOKEN = object()
@@ -98,7 +100,8 @@ def _persist_state(
     existing_meta["guided_session"] = guided.to_dict()
     data = state.to_dict()
     asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session_id),
             CompositionStateData(
                 sources=data["sources"],
@@ -135,7 +138,14 @@ def _seed_completed_pipeline(client: TestClient, session_id: str) -> None:
         json={"filename": "rows.csv", "content": "price\n1.99\n", "mime_type": "text/csv"},
     )
     assert upload.status_code == 201, upload.json()
-    blob = asyncio.run(client.app.state.blob_service.get_blob(UUID(upload.json()["id"])))
+    blob = asyncio.run(
+        get_blob_under_fence(
+            client.app.state.session_service,
+            client.app.state.blob_service,
+            UUID(session_id),
+            UUID(upload.json()["id"]),
+        )
+    )
     output_dir = Path(client.app.state.settings.data_dir) / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     record = TurnRecord(
@@ -321,7 +331,10 @@ def test_completed_exit_reentry_fails_closed_on_corrupt_marker(
     response = _reenter_raw(composer_test_client, session_id)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     after_record, _state = _current_state(composer_test_client, session_id)
     after_meta = dict(deep_thaw(after_record.composer_meta))
     assert after_meta["guided_completed_terminal_before_user_exit"] == corrupt_marker

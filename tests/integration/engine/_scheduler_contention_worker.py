@@ -1,7 +1,7 @@
 # tests/integration/engine/_scheduler_contention_worker.py
 """Child-process entry point for the slice-1 two-process contention test.
 
-Option-c design (notes/option-c-multi-worker-coordination-design-2026-06-11.md
+Option-c design (docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md
 §H "Contention (slice 1)", landing plan slice 1): two real OS processes hammer
 ``claim_ready`` / ``recover_expired_leases`` against one WAL SQLite file via
 the real ``TokenSchedulerRepository`` write-intent path, while a third process
@@ -17,7 +17,8 @@ Roles
 -----
 hammer
     Single-threaded loop: ``claim_ready`` every iteration with
-    ``--lease-seconds`` (default 0, so every lease is instantly expired and
+    ``--lease-seconds`` (default 0: every lease is aged into the database
+    clock's past right after the claim, so it is instantly expired, and
     the PEER's sweep genuinely reaps it — the hammer is self-feeding);
     ``recover_expired_leases`` every ``--sweep-every`` iterations (the
     self-steal guard means only the peer's leases are reaped — the exact
@@ -66,16 +67,18 @@ import os
 import sys
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import event, update
 from sqlalchemy.engine import Connection
 
+from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.landscape.database import LandscapeDB, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
-from elspeth.core.landscape.schema import runs_table
+from elspeth.core.landscape.schema import runs_table, token_work_items_table
 
 ROLE_HAMMER = "hammer"
 ROLE_READER = "reader"
@@ -104,6 +107,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--sweep-every", type=int, default=8)
     parser.add_argument("--lease-seconds", type=int, default=0)
     parser.add_argument("--beat-interval-ms", type=int, default=250)
+    # The cross-owner reap the parent asserts per hammer (A9). The measurement
+    # window is a floor: a hammer keeps going past it until it has reaped this
+    # many peer leases, because that needs the peer to have claimed before this
+    # hammer's last sweep, and a lock-starved peer's first claim can land after
+    # any fixed window. The parent's join timeout bounds the wait.
+    parser.add_argument("--min-recovered", type=int, default=1)
     return parser.parse_args(argv)
 
 
@@ -201,7 +210,7 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         deadline = start + args.duration_seconds
         next_beat = start  # first beat fires immediately
         iteration = 0
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline or recovered_total < args.min_recovered:
             iteration += 1
             try:
                 item = timed(
@@ -210,7 +219,6 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                         run_id=args.run_id,
                         lease_owner=args.owner,
                         lease_seconds=args.lease_seconds,
-                        now=datetime.now(UTC),
                     ),
                 )
                 if item is None:
@@ -218,6 +226,19 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     claims += 1
                     claimed_work_item_ids.append(item.work_item_id)
+                    if args.lease_seconds <= 0:
+                        # A zero-length lease is live for the rest of its whole
+                        # SQLite database second (expiry is strict, ADR-047), so
+                        # "instantly expired" is written explicitly: the lease is
+                        # aged one second into the database clock's past, and a
+                        # peer's next sweep finds it lapsed.
+                        with begin_write(engine) as conn:
+                            conn.execute(
+                                update(token_work_items_table)
+                                .where(token_work_items_table.c.work_item_id == item.work_item_id)
+                                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                                .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
+                            )
             except Exception as exc:
                 errors.append({"where": VERB_CLAIM, "type": type(exc).__name__, "msg": str(exc)})
 
@@ -227,7 +248,6 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                         VERB_RECOVER,
                         lambda: repo.recover_expired_leases_legacy_unfenced(
                             run_id=args.run_id,
-                            now=datetime.now(UTC),
                             caller_owner=args.owner,
                         ),
                     )
@@ -249,6 +269,7 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
             "owner": args.owner,
             "pragmas": pragmas,
             "errors": errors,
+            "elapsed_seconds": time.monotonic() - start,
             "claims": claims,
             "claim_none": claim_none,
             "sweeps": sweeps,

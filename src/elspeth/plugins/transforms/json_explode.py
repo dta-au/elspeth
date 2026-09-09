@@ -29,11 +29,14 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.errors import PluginContractViolation
+from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sources.field_normalization import is_normalized_field_name
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -60,7 +63,90 @@ def _build_json_explode_input_requirements(
                 requirement_code="json_explode.array_field.list",
                 accepted_value_types=frozenset({SemanticValueType.LIST}),
                 severity="high",
-                unknown_policy=UnknownSemanticPolicy.FAIL,
+                # WARN, not FAIL. No plugin declares SemanticValueType.LIST as
+                # a fact — it appears only here, as a requirement — so FAIL made
+                # json_explode unwireable from EVERY producer, including the
+                # ones that declare nothing about this field at all (a json or
+                # csv source), which are precisely the producers that DO put a
+                # real list in the row. That was elspeth-7a2c9a24c3: the gate
+                # rejected this transform's actual use case.
+                #
+                # That gap follows from the row model and no declaration can
+                # close it. ELSPETH's atomic unit is one row and a row field
+                # holds a DISCRETE value. Neither type vocabulary has a list:
+                # the schema DSL is str/int/float/bool/any (schema.py:39) and
+                # the runtime contract is int/str/float/bool/NoneType/datetime/
+                # object (type_normalization.py:25), closed because a field type
+                # must be checkpoint-serializable. A list is never a resting
+                # field value — it rides in an ``any`` field only for as long as
+                # it takes deaggregation to explode it into rows, and an
+                # ``any``/``object`` field SKIPS type validation outright
+                # (schema_contract.py:270-272).
+                #
+                # So LIST is coherent as a REQUIREMENT (this transform really
+                # does need a real list at the instant it explodes) yet
+                # structurally undeclarable as a FACT: nothing in the type
+                # system can assert it. Declaring LIST for an ``any`` field to
+                # satisfy the requirement would trade a fail-closed
+                # false-reject for a false-accept and misstate the row contract.
+                #
+                # ADR-008 §Alternative 3 and ADR-014 §Tier classification draw
+                # the line this sits on: a DECLARATION LIE is Tier 1 and must
+                # crash, but a wrong VALUE is not that. A non-list here is one
+                # row's value with no plugin having lied — nothing can declare
+                # the property in the first place. ADR-003 §Validation Semantics
+                # already skips static validation when a schema is dynamic; WARN
+                # keeps that posture but discloses the gap rather than staying
+                # silent.
+                #
+                # Note the module docstring's trust model: this transform
+                # deliberately does not soften a wrong type, because the SOURCE
+                # is supposed to have validated it. For a list-shaped field the
+                # source cannot — the DSL types it ``any``, which validates
+                # nothing. So all three candidate checkpoints (source schema,
+                # this static gate, plugin-level on_error) are blind to it by
+                # construction, and the only real one is process(), which
+                # detects a non-list at the row boundary and raises with an
+                # explicit diagnostic. Holding the static gate at FAIL rejected
+                # every valid pipeline to pre-empt a case that surfaces loudly
+                # and legibly when it does occur.
+                #
+                # WARN softens exactly that case and nothing else: it grades
+                # UNKNOWN — an ABSTAINING producer — as an advisory, and never
+                # touches CONFLICT.
+                #
+                # A CONFLICT remains a hard error, and that is not a gap in the
+                # above — it is the other half of it. Every producer that
+                # DECLARES a type for a field it writes declares STR: the llm
+                # source and transform (``llm.response_field.string``) and
+                # web_scrape (``web_scrape.content.*``, which provably encodes
+                # a str). Pointing array_field at one of those fields is a
+                # pipeline that raises TypeError on row 1 in ``process`` below,
+                # so refusing it at authoring time is correct rather than a
+                # false reject.
+                #
+                # This does NOT make json_explode unwireable, and the
+                # distinction is load-bearing: ``_find_producer_facts`` matches
+                # facts to requirements by EXACT FIELD NAME, so the refusal
+                # binds only when array_field IS the declared string field. A
+                # list-bearing field alongside it carries no facts, compares
+                # UNKNOWN, and stays authorable under the WARN above. The
+                # blocked wiring and the supported one are different edges, not
+                # different verdicts on the same edge.
+                # Pinned by TestWebScrapeValueTypeDeclarationSideEffect and
+                # test_llm_response_field_cannot_feed_json_explode_array_field.
+                #
+                # Restore FAIL if a producer ever declares LIST honestly.
+                #
+                # SCOPE WARNING: unknown_policy applies to the whole
+                # requirement, not per dimension. This one constrains ONLY
+                # accepted_value_types (content_kinds and text_framings are
+                # empty above), so WARN covers exactly the undeclarable case
+                # argued here. If you add a content-kind or text-framing
+                # constraint to this requirement it silently inherits WARN and
+                # none of the reasoning above applies to it — split it into a
+                # second FieldSemanticRequirement with its own policy instead.
+                unknown_policy=UnknownSemanticPolicy.WARN,
                 configured_by=("array_field",),
             ),
         ),
@@ -113,6 +199,12 @@ class JSONExplodeConfig(DataPluginConfig):
     def _reject_field_collision(self) -> JSONExplodeConfig:
         if self.output_field == self.array_field:
             raise ValueError(f"output_field and array_field must differ, both are '{self.output_field}'")
+        if self.include_index and self.array_field == "item_index":
+            raise ValueError(
+                "array_field='item_index' conflicts with the auto-generated index field "
+                "when include_index=True — the generated index would overwrite the very "
+                "column being exploded. Rename the source column or set include_index=False."
+            )
         if self.include_index and self.output_field == "item_index":
             raise ValueError(
                 "output_field='item_index' conflicts with the auto-generated index field "
@@ -174,12 +266,33 @@ class JSONExplode(BaseTransform):
         to surface the upstream bug. This is intentional - see module docstring.
     """
 
+    # array_field is the INPUT column being exploded; output_field is emitted.
+    output_naming_config_keys = frozenset({"output_field"})
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6b8ffd45b12ab18f"
+    source_file_hash: str | None = "sha256:36c7c718e2cee382"
     config_model = JSONExplodeConfig
+    usage_when_to_use: str = (
+        "Use when one JSON array field in each row must become multiple rows, with the surrounding "
+        "row context copied to every emitted array item."
+    )
+    usage_when_not_to_use: str = (
+        "Not for object flattening or batch aggregation: map object fields explicitly with "
+        "field_mapper, or choose an aggregation plugin when many input rows must become one result."
+    )
+    example_use: str = """transform:
+  plugin: json_explode
+  options:
+    array_field: items
+    output_field: item
+    include_index: true
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("json", "array", "fan-out", "deaggregation")
     creates_tokens = True  # CRITICAL: enables new token creation for deaggregation
+    preserves_input_values = True
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -211,6 +324,15 @@ class JSONExplode(BaseTransform):
         self._output_field = cfg.output_field
         self._include_index = cfg.include_index
 
+        # Sibling fields are duplicated onto every emitted element row (the
+        # plugin's own assistance text says so); only the consumed array field
+        # is dropped. Same extras-firewall gap line_explode carried
+        # (elspeth-15c72686f2). An original-header spelling cannot name the
+        # normalized key removed at runtime, so the static declaration
+        # abstains while process() resolves that key from row lineage.
+        self.forwards_input_fields = is_normalized_field_name(cfg.array_field)
+        self.removed_input_fields = frozenset({cfg.array_field}) if self.forwards_input_fields else frozenset()
+
         # Declare output fields for centralized collision detection in TransformExecutor.
         fields = [cfg.output_field]
         if cfg.include_index:
@@ -229,6 +351,10 @@ class JSONExplode(BaseTransform):
     def input_semantic_requirements(self) -> InputSemanticRequirements:
         return _build_json_explode_input_requirements(array_field=self._array_field)
 
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject one valid item so the value-preservation harness reaches emission."""
+        return [self._augment_invariant_probe_row(probe, field_name=self._array_field, value=["probe-item"])]
+
     @classmethod
     def get_agent_assistance(
         cls,
@@ -243,8 +369,10 @@ class JSONExplode(BaseTransform):
                 issue_code=None,
                 summary="Deaggregate a list-valued field — emits one row per array element, preserving sibling fields and optionally adding an item_index.",
                 composer_hints=(
-                    "array_field MUST hold a real list (value_type=list). A JSON-looking string does NOT count — insert a parser first.",
-                    "Single-query LLM responses are strings. Do not wire response_field directly to json_explode; explode after parsing.",
+                    "Feed array_field from a source that natively parses structured data — a json source reading nested arrays puts a real list in the row.",
+                    "Type that field 'any' in the source schema and give json_explode schema {mode: observed}. ELSPETH rows hold discrete values, so the schema DSL has no list type; 'any' is how a list rides to the explode. See examples/json_explode.",
+                    "A JSON-looking STRING is not an array_field, and there is no transform that parses one into a list — the value must arrive list-shaped from the source.",
+                    "Single-query LLM responses are strings, so do not wire response_field directly to json_explode.",
                     "Sibling fields are duplicated onto every emitted row — that's by design for fan-out lineage.",
                 ),
             )
@@ -259,8 +387,8 @@ class JSONExplode(BaseTransform):
                 "contains JSON-looking text."
             ),
             suggested_fixes=(
-                "Point array_field at a source or transform output that declares value_type=list.",
-                "If the upstream value is JSON text, insert an explicit parser/validator transform that emits a real list before json_explode.",
+                "Read the data with a source that parses structure natively — a json source over nested arrays delivers a real list. Type the field 'any' in the source schema and give json_explode schema {mode: observed}; examples/json_explode is the working shape.",
+                "Do not look for a parser transform to convert JSON text into a list — none exists, and type_coerce only targets int/float/bool/str. Change where the data enters the pipeline instead.",
                 "For single-query llm output, do not wire response_field directly to json_explode; the response_field is a string.",
             ),
         )
@@ -343,7 +471,6 @@ class JSONExplode(BaseTransform):
 
         Raises:
             KeyError: If array_field is missing (upstream bug)
-            TypeError: If array_field is not a list (upstream bug)
         """
         # Direct access - TRUST that source validated field exists
         # KeyError here = upstream bug (source didn't validate field exists)
@@ -353,9 +480,24 @@ class JSONExplode(BaseTransform):
         # PipelineRow deep-freezes data (list→tuple), so both are valid.
         # Strings/dicts are iterable but would produce garbage - fail explicitly.
         if not isinstance(array_value, (list, tuple)):
-            raise TypeError(
-                f"Field '{self._array_field}' must be a list, got {type(array_value).__name__}. "
-                f"This indicates an upstream validation bug - check source schema or prior transforms."
+            # A wrong-typed value is a ROW-level failure, not a run-level one:
+            # it is a fact about this row's data, identical in kind to the
+            # empty-array rejection below, so it takes the same routable exit.
+            # Raising here instead would abort the whole run — ADR-008
+            # §"TIER_1 registration is load-bearing" (Correction 2026-08-21,
+            # elspeth-181db83da7): only a RETURNED error reaches the
+            # `result.status == "error"` branch that honours `on_error`; a
+            # raised exception escapes every catch site. Not coerced: a str or
+            # dict is not a list, and iterating one would fabricate rows
+            # (one per character, or per key) that the operator never supplied.
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": self._array_field,
+                    "error_type": "wrong_type",
+                    "error": f"must be a list, got {type(array_value).__name__}",
+                },
+                retryable=False,
             )
 
         row_data = row.to_dict()
@@ -364,6 +506,12 @@ class JSONExplode(BaseTransform):
         else:
             # row[self._array_field] above already validated resolvability.
             normalized_array_field = row.contract.resolve_name(self._array_field)
+        collisions = detect_field_collisions(set(row_data) - {normalized_array_field}, self.declared_output_fields)
+        if collisions:
+            raise PluginContractViolation(
+                f"Transform '{self.name}' would overwrite existing input fields {collisions}. "
+                "This is a pipeline configuration error — the transform's output fields collide with fields already present in the row."
+            )
         base = {k: v for k, v in row_data.items() if k != normalized_array_field}
 
         # Empty array: nothing to deaggregate — quarantine with clear audit trail
@@ -448,6 +596,7 @@ class JSONExplode(BaseTransform):
                 fields=patched_fields,
                 locked=True,
             )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 
         return TransformResult.success_multi(

@@ -35,6 +35,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import RowResult
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.engine.processor import SCHEDULER_MAINTENANCE_INTERVAL
 from elspeth.engine.scheduler_drain import ProcessorMode
@@ -148,6 +149,119 @@ def test_follower_mode_without_explicit_lease_owner_refuses_construction() -> No
     """A follower's registered worker identity IS its lease owner (§A.1)."""
     with pytest.raises(OrchestrationInvariantError, match="requires an explicit scheduler_lease_owner"):
         _build(lease_owner=None, register_leader=None, mode=ProcessorMode.FOLLOWER)
+
+
+def _construct(setup: Any, clock: Any, **overrides: Any) -> None:
+    """Construct a RowProcessor directly, so one wiring field can be made wrong.
+
+    ``_build`` always supplies a CORRECT ``member_token`` for a follower, so the
+    ADR-030 D4 type-split guards below cannot be driven through it. Every field
+    here is the valid follower shape except the one each test overrides — the
+    member-token guards fire AFTER the coordination_token, run_coordination and
+    lease-owner checks, so a negative arm that got those wrong would red on the
+    wrong message and prove nothing.
+    """
+    from elspeth.contracts.types import NodeID
+    from elspeth.engine.processor import DAGTraversalContext, RowProcessor
+    from elspeth.engine.spans import SpanFactory
+
+    kwargs: dict[str, Any] = {
+        "execution": setup.execution,
+        "data_flow": setup.data_flow,
+        "span_factory": SpanFactory(),
+        "run_id": setup.run_id,
+        "source_node_id": NodeID(setup.source_node_id),
+        "source_on_success": "default",
+        "traversal": DAGTraversalContext(
+            node_step_map={NodeID(setup.source_node_id): 0},
+            node_to_plugin={},
+            node_to_next={},
+            coalesce_node_map={},
+        ),
+        "scheduler": setup.factory.scheduler,
+        "scheduler_lease_owner": FOLLOWER_OWNER,
+        "coordination_token": None,
+        "member_token": WorkerMembershipToken(run_id=setup.run_id, worker_id=FOLLOWER_OWNER),
+        "run_coordination": None,
+        "clock": clock,
+        "mode": ProcessorMode.FOLLOWER,
+    }
+    kwargs.update(overrides)
+    RowProcessor(**kwargs)
+
+
+def test_follower_mode_without_member_token_refuses_construction() -> None:
+    """A follower's authority IS its WorkerMembershipToken (ADR-030 D4, second fence).
+
+    The absence of a leader token is not the same as the presence of the right
+    one: a follower with neither can present membership to no fenced verb.
+    """
+    _follower, _spy, setup, clock = _build(lease_owner=FOLLOWER_OWNER, mode=ProcessorMode.FOLLOWER)
+
+    with pytest.raises(OrchestrationInvariantError, match="requires a member_token"):
+        _construct(setup, clock, member_token=None)
+
+
+def test_follower_mode_with_foreign_member_token_refuses_construction() -> None:
+    """The token must name THIS processor's run and ITS lease owner (§A.1).
+
+    A member token for another worker would let a follower present someone
+    else's membership to the fence — which the fence itself would accept,
+    because that row really is active.
+    """
+    _follower, _spy, setup, clock = _build(lease_owner=FOLLOWER_OWNER, mode=ProcessorMode.FOLLOWER)
+
+    with pytest.raises(OrchestrationInvariantError, match="member_token to name this processor's run"):
+        _construct(setup, clock, member_token=WorkerMembershipToken(run_id=setup.run_id, worker_id="someone-else"))
+
+    with pytest.raises(OrchestrationInvariantError, match="member_token to name this processor's run"):
+        _construct(setup, clock, member_token=WorkerMembershipToken(run_id="another-run", worker_id=FOLLOWER_OWNER))
+
+
+def test_follower_mode_rejects_leader_authority_in_member_parameter() -> None:
+    """Matching identities cannot turn a leader token into membership authority."""
+    _follower, _spy, setup, clock = _build(lease_owner=FOLLOWER_OWNER, mode=ProcessorMode.FOLLOWER)
+
+    with pytest.raises(OrchestrationInvariantError, match="requires a WorkerMembershipToken"):
+        _construct(
+            setup,
+            clock,
+            member_token=CoordinationToken(run_id=setup.run_id, worker_id=FOLLOWER_OWNER, leader_epoch=1),
+        )
+
+
+def test_leader_mode_with_member_token_refuses_construction() -> None:
+    """The other half of the type split: a leader derives membership, never carries it.
+
+    A leader holding a follower's authority type is the wrong-mode bug this
+    guard exists to catch, and it is the direction that would otherwise go
+    unnoticed — a leader carrying BOTH types would satisfy every fence it met.
+    """
+    _leader, _spy, setup, clock = _build(lease_owner=LEADER_OWNER, mode=ProcessorMode.LEADER)
+
+    with pytest.raises(OrchestrationInvariantError, match="LEADER forbids a member_token"):
+        _construct(
+            setup,
+            clock,
+            mode=ProcessorMode.LEADER,
+            scheduler_lease_owner=LEADER_OWNER,
+            member_token=WorkerMembershipToken(run_id=setup.run_id, worker_id=LEADER_OWNER),
+        )
+
+
+def test_leader_mode_rejects_membership_in_coordination_parameter() -> None:
+    """Membership cannot authorize the leader's maintenance and recovery verbs."""
+    _leader, _spy, setup, clock = _build(lease_owner=LEADER_OWNER, mode=ProcessorMode.LEADER)
+
+    with pytest.raises(OrchestrationInvariantError, match="requires a CoordinationToken"):
+        _construct(
+            setup,
+            clock,
+            mode=ProcessorMode.LEADER,
+            scheduler_lease_owner=LEADER_OWNER,
+            member_token=None,
+            coordination_token=WorkerMembershipToken(run_id=setup.run_id, worker_id=LEADER_OWNER),
+        )
 
 
 # ---------------------------------------------------------------------------

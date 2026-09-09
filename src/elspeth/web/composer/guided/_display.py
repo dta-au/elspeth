@@ -38,6 +38,7 @@ _ACRONYMS: Final[frozenset[str]] = frozenset(
         "io",
         "json",
         "llm",
+        "pdf",
         "rag",
         "sql",
         "url",

@@ -2,11 +2,12 @@
 
 **Date:** 2026-04-19
 **Status:** Accepted (amended 2026-04-20 — see Amendment A3 below for H2 cluster)
-**Deciders:** John Morrissey (author); five-reviewer panel (solution-architect, systems-thinker, python-engineer, quality-engineer, security-architect) per session `/home/john/.claude/plans/elspeth-track-2-phase-2a-declaration-framework.review.json`
+**Deciders:** ELSPETH maintainer
+**Review evidence:** Advisory solution-architecture, systems-thinking, Python-engineering, quality, and security review
 **Supersedes:** (partial, clause-level) — see "Supersession map" below
 **Tags:** framework, declaration-contract, audit-evidence, tier-1, registry, audit-integrity
 **Review date:** 2026-10-19 (six months from acceptance; ADR-010 §Consequences must be re-evaluated against observed 2B/2C experience by that date)
-**Filigree epic:** `elspeth-a3ac5d88c6` (Track 2 — Declaration-trust framework Phase 2B/2C; hard SLA 2026-07-18)
+**Filigree epic:** `elspeth-300abf520d` (Track 2 — Declaration-trust framework Phase 2B/2C). Re-filed 2026-08-06 from the pre-Jun-30 archived store, where it is `elspeth-a3ac5d88c6`; the "hard SLA 2026-07-18" carried by the original has lapsed and is not a live commitment.
 
 ---
 
@@ -151,7 +152,7 @@ A YAML schema enumerates declarations; a code-generator produces stubs. Rejected
 
 ### Alternative 3: `AuditEvidence` as a structural `@runtime_checkable` Protocol
 
-Rejected. The five-reviewer panel's security review identified this as a Critical Spoofing (STRIDE S) finding: any class exposing `to_audit_dict()` would satisfy the structural protocol, including accidental matches from third-party libraries, test helpers, or unrelated plugin code. Nominal `AuditEvidenceBase` requires explicit author declaration and closes the spoofing vector.
+Rejected. Any class exposing `to_audit_dict()` would satisfy the structural protocol, including accidental matches from third-party libraries, test helpers, or unrelated plugin code. Nominal `AuditEvidenceBase` requires explicit author declaration and closes the spoofing vector.
 
 ### Alternative 4: defer the entire `DeclarationContract` protocol to Phase 2B
 
@@ -159,14 +160,13 @@ Considered seriously in review. Rejected because: (a) the nominal `AuditEvidence
 
 ## References
 
-- Plan: `/home/john/.claude/plans/elspeth-track-2-phase-2a-declaration-framework.md`
-- Reviewer verdicts: `.review.json` alongside the plan file (5-reviewer panel, 2026-04-19)
+- Decision record: commit `187e1fcee`
 - Predecessor ADRs: 007 (pass-through propagation), 008 (runtime cross-check), 009 (pathway fusion)
 - Successor ADRs (Phase 2B/2C): each declaration gets its own ADR per §Supersession map ADR-008 reference
 - CLAUDE.md §Three-Tier Trust Model, §Plugin Ownership, §Frozen Dataclass Immutability, §Defensive Programming Forbidden
 - Track 2 filigree epic: `elspeth-a3ac5d88c6`; ADR-009 §Clause 3 SLA hard trigger 2026-07-18
 - H2 cluster landing (2026-04-20): `elspeth-425047a599` (H2), `elspeth-10dc0b747f` (N1), `elspeth-60890a7388` (N3), `elspeth-f52d7c5a47` (F2), `elspeth-5fc876138d` (F3), `elspeth-b513c01cff` (F4), `elspeth-121b268aec` (F5), `elspeth-5dae105959` (H1 amendment)
-- H2 design sketch: preserved in git history or maintainer-local archives
+- H2 implementation and amendment record: commit `009b6009c`
 - H2 decision anchor: comment #417 on `elspeth-425047a599` — ADR-010 §Semantics audit-complete decision record
 
 ---
@@ -339,3 +339,80 @@ contracts fire produces `exception_type =
 `violations` list. Queries filtering on a specific contract's exception
 type must be updated to also match inside the aggregate's `violations`
 list when they want all occurrences.
+
+## §Terminology — the runtime declaration cross-check, colloquially "val" (Amendment A4)
+
+> **Amendment A4 — 2026-09-10.**
+> The term appears 83 times — in ADR-008, in this ADR, in
+> `contracts/runtime_val_manifest.py`, on the orchestrator's resume path, in the
+> Landscape schema, and throughout the invariant suite — and is defined in none
+> of them. This section is the definition of record. It documents vocabulary
+> already in use: no behaviour changes, no symbol is renamed, nothing is
+> superseded.
+
+### The term
+
+The mechanism is the **runtime declaration cross-check**. Everywhere it is
+actually spoken about it is a **val** — capitalised `VAL` in compounds
+(`runtime-VAL manifest`, `declaration-VAL gate`), lowercase in prose.
+
+It is not an initialism, and it is not short for "validation". The name is an
+accident of origin: a value named `val`, in the problem discussion that grew
+into this framework, lent its name to the idea that discussion produced, and the
+shorthand outlived the variable. Nothing is gained by back-forming an expansion
+for it, and something is lost — "validation" suggests ordinary input checking,
+which is precisely what a val is not.
+
+### What a val is
+
+A val is the runtime check that holds a plugin to its own word.
+
+A plugin *declares* something about its behaviour — `passes_through_input`,
+`sink_required_fields`. Static analysis of the DAG *trusts* that declaration and
+plans around it. The val is what stands behind the trust: at runtime it measures
+observed behaviour against the declaration and fails closed when the two
+disagree. In code it is a `DeclarationContract`'s `runtime_check`; there is no
+`static_check` in the 2A protocol (§Decision 3, Amendment A1), so for now the
+val carries the whole of the enforcement.
+
+The failure is deliberately loud. Each registered contract's `violation_class`
+carries `@tier_1_error`, so a contradicted declaration aborts the run rather
+than letting it finish and produce evidence nobody can trust. Measured
+2026-09-10: `passes_through_input` → `PassThroughContractViolation` and
+`sink_required_fields` → `SinkRequiredFieldsViolation` are both in
+`TIER_1_ERRORS`, as is `AggregateDeclarationContractViolation`. The generic base
+`DeclarationContractViolation` is not, and should not be — registration belongs
+on the concrete subclasses.
+
+A val is a countable noun: each declaration contract has exactly one. It can
+also be present without being alive. A contract whose `runtime_check` does not
+raise on its own `negative_example` has a **dormant** val — the declaration is
+still trusted, but nothing is holding it to account. That is the failure
+`tests/invariants/test_contract_negative_examples_fire.py` exists to catch, and
+the reason the orchestrator asserts per-site registry equality at bootstrap
+(§Decision 3) rather than merely asserting the registry is non-empty.
+
+### Established compounds
+
+These are the forms in use. None of them changes.
+
+| Form | Meaning |
+| ---- | ------- |
+| runtime val, runtime-VAL | The check itself — 73 of the 83 occurrences. |
+| runtime-VAL manifest | The record, written into the Landscape run header, of which vals and which dispatch sites were in force for a given run. Its drift check is a resume precondition (`orchestrator/resume.py`). |
+| declaration val | A val on a transform (Phase 2B). |
+| boundary val | A val sited at a trust boundary rather than on a transform (Phase 2C). |
+
+### Provenance
+
+ADR-008 built the pattern for a single declaration and named its parts:
+"annotation + static trust + runtime VAL + TIER_1 escalation + invariant
+framework". This ADR generalised those parts into the `DeclarationContract`
+protocol; the name came along unchanged.
+
+### Writing rule
+
+In reader-facing prose — README, runbooks, composer copy — keep the bare term
+and gloss it once, at first use: *"runtime VAL manifests (a val being the
+runtime check that backs a static plugin declaration)"*. Do not expand it, and
+do not write "(VAL)" after an invented phrase.

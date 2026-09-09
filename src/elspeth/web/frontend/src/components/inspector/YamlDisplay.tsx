@@ -24,6 +24,7 @@
 import { useState, useCallback } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 
+import { Button } from "@/components/ui";
 import { useTheme } from "@/hooks/useTheme";
 
 interface YamlDisplayProps {
@@ -76,21 +77,21 @@ export function YamlDisplay({
   return (
     <div className="yaml-view-display" data-testid="yaml-display">
       <div className="yaml-view-toolbar">
-        <button
+        <Button
           onClick={handleCopy}
           aria-label={copied ? "Copied to clipboard" : "Copy YAML to clipboard"}
-          className="btn yaml-toolbar-btn"
+          className="yaml-toolbar-btn"
           data-copied={copied ? "true" : "false"}
         >
           {copied ? "Copied!" : "Copy"}
-        </button>
-        <button
+        </Button>
+        <Button
           onClick={handleDownload}
           aria-label="Download YAML file"
-          className="btn yaml-toolbar-btn"
+          className="yaml-toolbar-btn"
         >
           Download
-        </button>
+        </Button>
       </div>
 
       <div className="yaml-view-content">

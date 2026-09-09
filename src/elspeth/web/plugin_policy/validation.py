@@ -8,15 +8,23 @@ from typing import Literal
 
 from jsonschema import Draft202012Validator
 
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditIdentity
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, TextractProfiledAuditIdentity
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
-from elspeth.web.plugin_policy.coverage import control_coverage_findings
+from elspeth.web.plugin_policy.coverage import (
+    ControlCoverageFinding,
+    _source_component_id,
+    _stable_source_items,
+    control_coverage_findings,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
+from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 
 PolicyValidationStage = Literal[
     "plugin_enablement",
@@ -27,6 +35,14 @@ PolicyValidationStage = Literal[
 
 _PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"resolved_prompt_template_hash"}
 
+# Profiled plugins whose operator binding is a STORAGE location rather than an
+# LLM-family provider/model/credential set — their rejection prose must speak
+# storage-binding repair language or the planner repair loop cannot converge.
+_STORAGE_PROFILED_COMPONENT_KINDS: dict[PluginId, str] = {
+    PluginId("source", "aws_s3"): "source",
+    PluginId("transform", "aws_textract_document_analysis"): "node",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PluginPolicyFinding:
@@ -35,12 +51,19 @@ class PluginPolicyFinding:
     component_type: str | None
     error_code: str
     message: str
+    # Per-finding remediation, set when the producer can diagnose the repair
+    # more precisely than the stage-level default (control-coverage diagnoses
+    # and the endpoint-specific S3 profile denial). ``None`` falls back to the
+    # consumer's stage default suggestion.
+    suggestion: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class PluginPolicyValidationResult:
     executable_state: CompositionState = field(repr=False)
     findings: tuple[PluginPolicyFinding, ...]
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
 
     def findings_for(self, stage: PolicyValidationStage) -> tuple[PluginPolicyFinding, ...]:
         return tuple(finding for finding in self.findings if finding.stage == stage)
@@ -52,9 +75,57 @@ class _Component:
     component_type: Literal["source", "transform", "sink"]
     plugin_id: PluginId | None
     options: Mapping[str, object]
+    source_on_validation_failure: str | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "options")
+
+
+def _s3_source_endpoint_override_finding(component: _Component) -> PluginPolicyFinding | None:
+    """Keep the endpoint-specific denial ahead of operator-profile lowering."""
+    if component.component_type != "source" or component.plugin_id != PluginId("source", "aws_s3"):
+        return None
+    message = web_aws_s3_endpoint_url_policy_error("aws_s3", component.options)
+    if message is None:
+        return None
+    return PluginPolicyFinding(
+        stage="operator_profile_options",
+        component_id=component.component_id,
+        component_type=component.component_type,
+        error_code="aws_s3_endpoint_url_not_allowed",
+        message=message,
+        suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
+    )
+
+
+def _textract_alias_as_bucket_finding(component: _Component, alias_inventory: frozenset[str]) -> PluginPolicyFinding | None:
+    """Name the alias-as-bucket confusion before the generic schema rejection.
+
+    Battery evidence (elspeth-cd0f6a6cd9, run e41d0e6b): a planner asked to use
+    an operator profile authored its alias as a literal bucket value. The
+    generic "option not authorable" rejection never names the confusion, so
+    the repair loop reattempts bucket shapes instead of selecting the profile.
+    Aliases are public enum values, so echoing one is value-safe.
+    """
+    if component.plugin_id != PluginId("transform", "aws_textract_document_analysis") or not alias_inventory:
+        return None
+    for option_name in ("bucket", "bucket_field"):
+        if option_name not in component.options:
+            continue
+        value = component.options[option_name]
+        if type(value) is str and value in alias_inventory:
+            return PluginPolicyFinding(
+                stage="operator_profile_options",
+                component_id=component.component_id,
+                component_type=component.component_type,
+                error_code="profile_alias_used_as_bucket",
+                message=(
+                    f"Option '{option_name}' carries the operator profile alias '{value}' as a literal "
+                    "document-location value. Profile aliases are not bucket names or row columns."
+                ),
+                suggestion="Select the alias with the 'profile' option; rows carry relative object keys in key_field.",
+            )
+    return None
 
 
 def validate_plugin_policy(
@@ -87,7 +158,9 @@ def validate_plugin_policy(
             continue
         if component.plugin_id in snapshot.available:
             continue
-        reason = unavailable.get(component.plugin_id, PluginUnavailableReason.NOT_AUTHORIZED)
+        # An authorized-but-unavailable plugin carries its recorded reason; a
+        # plugin the snapshot never declined at all was simply never authorized.
+        reason = unavailable[component.plugin_id] if component.plugin_id in unavailable else PluginUnavailableReason.NOT_AUTHORIZED
         findings.append(
             PluginPolicyFinding(
                 stage="plugin_enablement",
@@ -98,9 +171,18 @@ def validate_plugin_policy(
             )
         )
 
+    if not snapshot.is_trained_operator:
+        findings.extend(finding for component in components if (finding := _s3_source_endpoint_override_finding(component)) is not None)
+        alias_inventory = frozenset(alias for _plugin_id, aliases in snapshot.usable_profile_aliases for alias in aliases)
+        findings.extend(
+            finding for component in components if (finding := _textract_alias_as_bucket_finding(component, alias_inventory)) is not None
+        )
+
     executable_state = state
-    if not findings and snapshot.principal_scope != "local:trained-operator":
-        executable_state, profile_findings = _lower_profiled_components(
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
+    if not findings and not snapshot.is_trained_operator:
+        executable_state, profile_findings, profiled_s3_audit_identities, profiled_textract_audit_identities = _lower_profiled_components(
             state,
             snapshot=snapshot,
             profile_registry=profile_registry,
@@ -111,7 +193,7 @@ def validate_plugin_policy(
     selected = dict(snapshot.selected)
     required = tuple(capability for capability, mode in snapshot.control_modes if mode is ControlMode.REQUIRED)
     for capability in required:
-        selected_plugin = selected.get(capability)
+        selected_plugin = selected[capability] if capability in selected else None
         if selected_plugin is not None and selected_plugin in snapshot.available:
             continue
         findings.append(
@@ -126,39 +208,191 @@ def validate_plugin_policy(
 
     for capability in required:
         for coverage in control_coverage_findings(state, capability):
-            findings.append(
-                PluginPolicyFinding(
-                    stage="required_control_coverage",
-                    component_id=coverage.component_id,
-                    component_type="transform",
-                    error_code="required_control_coverage",
-                    message=(
-                        f"Node '{coverage.component_id}' is not covered by the required "
-                        f"'{coverage.capability.value}' {coverage.role.value} control."
-                    ),
-                )
+            findings.append(_control_coverage_finding(coverage))
+
+    return PluginPolicyValidationResult(
+        executable_state=executable_state,
+        findings=tuple(findings),
+        profiled_s3_audit_identities=profiled_s3_audit_identities,
+        profiled_textract_audit_identities=profiled_textract_audit_identities,
+    )
+
+
+# Per-diagnosis remediation for coverage findings, keyed on the finding's
+# ``reason`` — never on the stage. The diagnoses have distinct repairs, and a
+# stage-level string cannot be right for all of them: telling
+# an input-domination (prompt_shield) author to "set on_error to 'discard'"
+# names a repair that cannot address the finding, while the error-route
+# conflict has exactly that one authorable repair. Total over
+# ``ControlCoverageFinding.reason`` (pinned by test); a KeyError here means a
+# new reason was added without deciding its remediation.
+_CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
+    "input_not_dominated": (
+        "Interpose the required control transform upstream of the named node so every "
+        "path carrying data into it passes the control first: route the producer (or "
+        "source) through the control, then connect the control's output to this node. "
+        "Then validate again. If that layout is not possible, ask the operator to relax "
+        "the control mode to 'recommend' — it is not an authoring change."
+    ),
+    "input_fields_unprovable": (
+        "Do not auto-wire a field-scoped control from the known field subset. Place a "
+        "blocking control after any downstream rewrites and set fields: 'all', or rewrite "
+        "the node's prompt template so every row access is static ('{{ row.field }}', "
+        "never '{{ row[key] }}') and then protect those exact fields. Validate again."
+    ),
+    "output_not_post_dominated": (
+        "Wire the required control transform so it sits on every path that carries the "
+        "named node's output before any sink, then validate again. If a conforming "
+        "layout is not possible, ask the operator to relax the control mode to "
+        "'recommend' — it is not an authoring change."
+    ),
+    "output_error_route_not_post_dominated": (
+        "Set the named node's on_error to 'discard' — an on_error route is a separate "
+        "write path and no control can sit on it (on_error may only name a sink or "
+        "'discard'). Then validate again. If failed rows must be kept in a quarantine "
+        "sink, ask the operator to relax the control mode to 'recommend' — it is not an "
+        "authoring change."
+    ),
+    "output_validation_failure_route_not_post_dominated": (
+        "Set the named source's on_validation_failure to 'discard'. The current graph "
+        "cannot interpose a required output control on a source validation-failure "
+        "route. Then validate again. If failed rows must be kept in a quarantine sink, "
+        "ask the operator to relax the control mode to 'recommend' — it is not an "
+        "authoring change."
+    ),
+}
+
+
+def _field_set(fields: tuple[str, ...]) -> str:
+    """Render a coverage field set for an author-facing message."""
+    return f"[{', '.join(fields)}]" if fields else "none provable"
+
+
+def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyFinding:
+    """Name unrepairable alternate routes and their one authorable repair.
+
+    The bare "not covered" message told authors nothing about WHY an
+    otherwise-correct pipeline was rejected, and the on_error case is the one
+    that reads as a contradiction: the planner is taught to route failures to a
+    quarantine sink, then a required output control rejects the pipeline for
+    doing exactly that. The conflict is real and the rejection is correct — an
+    on_error edge writes rows to a sink without passing the control, so it is
+    an independent output path.
+
+    There is exactly ONE authoring repair. A transform's ``on_error`` may only
+    name a sink or the literal ``discard`` (``core/dag/builder.py:1108``,
+    mirrored at ``web/composer/state.py:1060``), and ``on_error`` is mandatory
+    (``transform_missing_on_error``) — so no control transform can sit on an
+    error branch. Do NOT offer interposing the control on the error branch: the
+    graph rejects that edge (``transform_on_error_unknown_sink`` at the composer
+    surface, ``No producer for connection`` when built), so a planner that
+    followed the advice would ping-pong between two rejections.
+
+    The source-side ``on_validation_failure`` route has the same topology
+    constraint: it may write directly to a sink, but the current graph cannot
+    interpose a control on that route. Preserving failed rows is a real need
+    with an operator-owned answer; the only authoring repair under REQUIRED is
+    ``discard``. Naming that escape hatch keeps the author from concluding the
+    requirement is a bug. See ``docs/reference/configuration.md`` — "Required
+    controls and error routing".
+    """
+    if coverage.reason == "output_error_route_not_post_dominated" and coverage.uncovered_stream is not None:
+        message = (
+            f"Node '{coverage.component_id}' routes its on_error rows to the "
+            f"'{coverage.uncovered_stream}' sink, which is an independent output path: those rows "
+            f"are written without passing the required '{coverage.capability.value}' "
+            f"{coverage.role.value} control, so this node is not covered. A transform's on_error "
+            "may only name a sink or 'discard', so no control can be interposed on an error "
+            "branch — set this node's on_error to 'discard'. That drops the failed row's content "
+            "(nothing reaches a sink to inspect later) while the audit trail still records its "
+            "terminal outcome and content hash. Preserving failed rows in a quarantine sink is an "
+            f"operator decision, not an authoring workaround: it needs the "
+            f"'{coverage.capability.value}' control mode relaxed to 'recommend', or the pipeline "
+            "run under the CLI/batch runtime where web plugin policy does not apply."
+        )
+    elif coverage.reason == "output_validation_failure_route_not_post_dominated" and coverage.uncovered_stream is not None:
+        message = (
+            f"Source '{coverage.component_id}' routes rows that fail schema validation to the "
+            f"'{coverage.uncovered_stream}' sink through on_validation_failure. The current "
+            "graph cannot interpose a required output control on that independent write path, "
+            f"so the source is not covered by the required '{coverage.capability.value}' "
+            "output control. Set on_validation_failure to 'discard'. That drops the failed "
+            "row's content while the audit trail still records its terminal outcome and "
+            "content hash. Preserving failed rows in a quarantine sink is an operator "
+            "decision: it requires the control mode relaxed to 'recommend', or the pipeline "
+            "run under the CLI/batch runtime where web plugin policy does not apply."
+        )
+    elif coverage.reason == "input_fields_unprovable":
+        if coverage.scanned_fields:
+            message = (
+                f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+                f"{coverage.role.value} control upstream, but its own protected field set could not "
+                "be proven from its prompt template, so a control scoped to specific fields cannot be "
+                f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
+                f"{_field_set(coverage.scanned_fields)}. A dynamic access such as row[key] can read "
+                "outside the statically known set, so only fields: 'all' covers it."
             )
-
-    return PluginPolicyValidationResult(executable_state=executable_state, findings=tuple(findings))
-
-
-def _plugin_id(kind: Literal["source", "transform", "sink"], name: str) -> PluginId | None:
-    try:
-        return PluginId(kind, name)
-    except ValueError:
-        return None
+        else:
+            message = (
+                f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+                f"{coverage.role.value} control, but its complete protected field set could not be "
+                f"proven from its prompt template (known fields: {_field_set(coverage.protected_fields)}). "
+                "A dynamic access such as row[key] can read outside that set, so Composer cannot safely "
+                "auto-wire a field-scoped control. Place a blocking control after any downstream rewrites "
+                "with fields: 'all', or rewrite the prompt to use only static row fields."
+            )
+    else:
+        component_label = "Source" if coverage.component_type == "source" else "Node"
+        message = (
+            f"{component_label} '{coverage.component_id}' is not covered by the required "
+            f"'{coverage.capability.value}' {coverage.role.value} control."
+        )
+        if coverage.protected_fields and coverage.scanned_fields:
+            message += (
+                f" It reads row fields {_field_set(coverage.protected_fields)}, while the nearest "
+                f"upstream control scans {_field_set(coverage.scanned_fields)}."
+            )
+    suggestion = _CONTROL_COVERAGE_SUGGESTIONS[coverage.reason]
+    if coverage.reason == "input_not_dominated" and coverage.protected_fields and coverage.scanned_fields:
+        # Both field sets are populated only when a control provably dominates
+        # the input (coverage.py decides that with the credit walk itself), so
+        # this rejection is a SCOPE mismatch on correct wiring. The keyed
+        # suggestion would send the author to interpose a control that is
+        # already interposed — a repair that re-emits the same topology and
+        # draws the same rejection.
+        suggestion = (
+            f"The control already covers every path into this node, so do not move it: it scans "
+            f"{_field_set(coverage.scanned_fields)} while the node reads row fields "
+            f"{_field_set(coverage.protected_fields)}. Extend the control's 'fields' to include every "
+            "field the node reads (or set it to 'all'), or change the node so it only reads fields the "
+            "control already scans. Then validate again. If neither is possible, ask the operator to "
+            "relax the control mode to 'recommend' — it is not an authoring change."
+        )
+    return PluginPolicyFinding(
+        stage="required_control_coverage",
+        component_id=coverage.component_id,
+        component_type=coverage.component_type,
+        error_code="required_control_coverage",
+        message=message,
+        suggestion=suggestion,
+    )
 
 
 def _components(state: CompositionState) -> tuple[_Component, ...]:
     result: list[_Component] = []
-    for source_name, source in sorted(state.sources.items()):
-        component_id = "source" if source_name == "source" else f"source:{source_name}"
+    for source_name, source in _stable_source_items(state):
+        component_id = _source_component_id(source_name)
         result.append(
             _Component(
                 component_id=component_id,
                 component_type="source",
-                plugin_id=_plugin_id("source", source.plugin),
+                plugin_id=PluginId.for_name("source", source.plugin),
+                # SourceSpec.options is a Tier-1/2 owned Mapping (frozen at
+                # construction); a corrupted shape must crash in deep_thaw,
+                # not be silently replaced with {} — which would erase the
+                # authored options and disable every downstream policy check.
                 options=deep_thaw(source.options),
+                source_on_validation_failure=source.on_validation_failure,
             )
         )
     for node in state.nodes:
@@ -168,8 +402,9 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
             _Component(
                 component_id=node.id,
                 component_type="transform",
-                plugin_id=_plugin_id("transform", node.plugin),
+                plugin_id=PluginId.for_name("transform", node.plugin),
                 options=deep_thaw(node.options),
+                source_on_validation_failure=None,
             )
         )
     for output in state.outputs:
@@ -177,8 +412,9 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
             _Component(
                 component_id=output.name,
                 component_type="sink",
-                plugin_id=_plugin_id("sink", output.plugin),
+                plugin_id=PluginId.for_name("sink", output.plugin),
                 options=deep_thaw(output.options),
+                source_on_validation_failure=None,
             )
         )
     return tuple(result)
@@ -190,10 +426,12 @@ def _lower_profiled_components(
     snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry | None,
     catalog: CatalogService,
-) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...]]:
+) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...], S3ProfiledAuditIdentities, TextractProfiledAuditIdentities]:
     aliases_by_plugin = dict(snapshot.usable_profile_aliases)
     components = _components(state)
     lowered_options: dict[tuple[str, str], dict[str, object]] = {}
+    s3_audit_identities_by_component: dict[str, S3ProfiledAuditIdentity] = {}
+    textract_audit_identities_by_component: dict[str, TextractProfiledAuditIdentity] = {}
     findings: list[PluginPolicyFinding] = []
     lowering_registry = profile_registry
     lowering_catalog = catalog
@@ -208,14 +446,29 @@ def _lower_profiled_components(
         if profile_context is None:
             continue
         plugin_id, aliases, resolved_public_schema = profile_context
-        authored_options = {
-            name: deep_thaw(value) for name, value in component.options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS
-        }
-        authoring_metadata = {
-            name: deep_thaw(value) for name, value in component.options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS
-        }
-        alias = authored_options.pop("profile", None)
-        if not isinstance(alias, str) or alias not in aliases:
+        component_options = {name: deep_thaw(value) for name, value in component.options.items()}
+        if component.component_type == "source":
+            route = component.source_on_validation_failure
+            duplicate_route = component_options["on_validation_failure"] if "on_validation_failure" in component_options else route
+            if type(route) is not str or type(duplicate_route) is not str or duplicate_route != route:
+                findings.append(
+                    PluginPolicyFinding(
+                        stage="operator_profile_options",
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        error_code="profile_unavailable",
+                        message=(
+                            f"Plugin '{plugin_id}' source routing disagrees with its profile-bound "
+                            "on_validation_failure option. Keep one exact source routing value."
+                        ),
+                    )
+                )
+                continue
+            component_options["on_validation_failure"] = route
+        authored_options = {name: value for name, value in component_options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
+        authoring_metadata = {name: value for name, value in component_options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
+        alias = authored_options.pop("profile") if "profile" in authored_options else None
+        if type(alias) is not str or alias not in aliases:
             findings.append(_profile_unavailable_finding(component, plugin_id, available_aliases=tuple(aliases)))
             continue
         public_schema = resolved_public_schema.json_schema
@@ -231,13 +484,20 @@ def _lower_profiled_components(
             # option (e.g. max_capacity_retry_seconds) read as "profile gone"
             # and no planner could repair it. Unexpected option NAMES are
             # author-authored keys; offending VALUES are never echoed.
-            allowed_properties = set(public_schema.get("properties") or ())
+            allowed_properties = set(public_schema["properties"] or ()) if "properties" in public_schema else set()
             unexpected = sorted(set(public_options) - allowed_properties)
             if unexpected:
-                detail = (
-                    f"option(s) not authorable on a profile-bound node: {unexpected}. "
-                    "The operator profile supplies provider/model/credential/pacing settings — remove them."
-                )
+                if plugin_id in _STORAGE_PROFILED_COMPONENT_KINDS:
+                    storage_component_kind = _STORAGE_PROFILED_COMPONENT_KINDS[plugin_id]
+                    detail = (
+                        f"option(s) not authorable on a profile-bound {storage_component_kind}: {unexpected}. "
+                        "Remove them; the operator profile supplies the private storage binding."
+                    )
+                else:
+                    detail = (
+                        f"option(s) not authorable on a profile-bound node: {unexpected}. "
+                        "The operator profile supplies provider/model/credential/pacing settings — remove them."
+                    )
             else:
                 failing = sorted({"/".join(str(part) for part in error.absolute_path) or "<options>" for error in schema_errors})
                 detail = f"option(s) failing the public profile schema: {failing}."
@@ -266,10 +526,21 @@ def _lower_profiled_components(
             # real defect was an operator-private option in their node — a
             # message no planner can repair from.
             if str(exc) == "private_profile_option":
+                if plugin_id in _STORAGE_PROFILED_COMPONENT_KINDS:
+                    message = (
+                        f"Plugin '{plugin_id}' profile-bound options include operator-private storage settings. "
+                        "Remove them; the operator profile supplies the private binding."
+                    )
+                else:
+                    message = (
+                        f"Plugin '{plugin_id}' profile-bound options include operator-private option(s) "
+                        "(provider/model/credential/pacing settings such as pool_size or "
+                        "max_capacity_retry_seconds). Remove them — the operator profile supplies these."
+                    )
+            elif str(exc) == "unsafe_s3_object_key":
                 message = (
-                    f"Plugin '{plugin_id}' profile-bound options include operator-private option(s) "
-                    "(provider/model/credential/pacing settings such as pool_size or "
-                    "max_capacity_retry_seconds). Remove them — the operator profile supplies these."
+                    f"Plugin '{plugin_id}' requires a canonical relative object key within the selected operator profile. "
+                    "Remove absolute, traversal, empty-segment, trailing-separator, or overlong key forms."
                 )
             else:
                 message = f"Plugin '{plugin_id}' operator profile is no longer available."
@@ -283,30 +554,63 @@ def _lower_profiled_components(
                 )
             )
             continue
+        executable_options = deep_thaw(lowered.executable_options)
+        if component.component_type == "source":
+            lowered_route = executable_options.pop("on_validation_failure") if "on_validation_failure" in executable_options else None
+            if type(lowered_route) is not str or lowered_route != component.source_on_validation_failure:
+                findings.append(
+                    PluginPolicyFinding(
+                        stage="operator_profile_options",
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        error_code="profile_unavailable",
+                        message=f"Plugin '{plugin_id}' profile lowering changed source on_validation_failure routing.",
+                    )
+                )
+                continue
+        if lowered.profiled_s3_audit_identity is not None:
+            if component.component_type != "source" or plugin_id != PluginId("source", "aws_s3"):
+                raise TypeError("profile resolver returned an S3 audit identity for a non-S3 source")
+            s3_audit_identities_by_component[component.component_id] = lowered.profiled_s3_audit_identity
+        if lowered.profiled_textract_audit_identity is not None:
+            if component.component_type != "transform" or plugin_id != PluginId("transform", "aws_textract_document_analysis"):
+                raise TypeError("profile resolver returned a Textract audit identity for a non-Textract component")
+            textract_audit_identities_by_component[component.component_id] = lowered.profiled_textract_audit_identity
         lowered_options[(component.component_type, component.component_id)] = {
-            **deep_thaw(lowered.executable_options),
+            **executable_options,
             **authoring_metadata,
         }
 
     if findings:
-        return state, _normalized_profile_findings(findings)
+        return state, _normalized_profile_findings(findings), (), ()
 
     sources: dict[str, SourceSpec] = {}
     for source_name, source in state.sources.items():
-        component_id = "source" if source_name == "source" else f"source:{source_name}"
-        options = lowered_options.get(("source", component_id))
-        sources[source_name] = source if options is None else replace(source, options=options)
+        source_key = ("source", _source_component_id(source_name))
+        sources[source_name] = replace(source, options=lowered_options[source_key]) if source_key in lowered_options else source
     nodes: list[NodeSpec] = []
     for node in state.nodes:
-        options = lowered_options.get(("transform", node.id))
-        nodes.append(node if options is None else replace(node, options=options))
+        node_key = ("transform", node.id)
+        nodes.append(replace(node, options=lowered_options[node_key]) if node_key in lowered_options else node)
     outputs: list[OutputSpec] = []
     for output in state.outputs:
-        options = lowered_options.get(("sink", output.name))
-        outputs.append(output if options is None else replace(output, options=options))
+        output_key = ("sink", output.name)
+        outputs.append(replace(output, options=lowered_options[output_key]) if output_key in lowered_options else output)
+    profiled_s3_audit_identities = tuple(
+        (source_name, s3_audit_identities_by_component[component_id])
+        for source_name in sources
+        if (component_id := _source_component_id(source_name)) in s3_audit_identities_by_component
+    )
+    profiled_textract_audit_identities = tuple(
+        (node.id, textract_audit_identities_by_component[node.id])
+        for node in state.nodes
+        if node.id in textract_audit_identities_by_component
+    )
     return (
         replace(state, sources=sources, nodes=tuple(nodes), outputs=tuple(outputs)),
         (),
+        profiled_s3_audit_identities,
+        profiled_textract_audit_identities,
     )
 
 
@@ -362,7 +666,7 @@ def validate_authored_composition_state(
     catalog: CatalogService,
 ) -> ProfileAwareValidationResult:
     """Validate authored state once through the principal's policy boundary."""
-    if snapshot.principal_scope == "local:trained-operator":
+    if snapshot.is_trained_operator:
         return ProfileAwareValidationResult(
             authored_state=state,
             executable_state=state,

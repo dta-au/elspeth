@@ -30,13 +30,66 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import * as api from "@/api/shareableReviews";
+import type { ValidationReadiness, ValidationResult } from "@/types/index";
 
-function _validValidation() {
+const READY_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} satisfies ValidationReadiness;
+
+const BLOCKED_READINESS = {
+  authoring_valid: false,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "validation_error",
+      component_id: "n",
+      component_type: "transform",
+      detail: "The transform did not pass validation.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+const COMPLETION_BLOCKED_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "advisor_signoff_required",
+      component_id: null,
+      component_type: null,
+      detail: "Advisor sign-off is required before sharing for review.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+function _validValidation(): ValidationResult {
   return {
     is_valid: true,
     checks: [],
     errors: [],
-  } as never;
+    readiness: READY_READINESS,
+  };
+}
+
+function _invalidValidation(): ValidationResult {
+  return {
+    is_valid: false,
+    checks: [],
+    errors: [
+      {
+        component_id: "n",
+        component_type: "transform",
+        message: "x",
+        suggestion: null,
+      },
+    ],
+    readiness: BLOCKED_READINESS,
+  };
 }
 
 function _withOrigin(origin: string, fn: () => void) {
@@ -150,7 +203,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
 
   it("clicking Save for review is a no-op when validation is invalid", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: false, checks: [], errors: [{ component_id: "n", component_type: "transform", message: "x", suggestion: null }] } as never,
+      validationResult: _invalidValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
@@ -168,6 +221,34 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
     const btn = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     fireEvent.click(btn);
+    expect(apiSpy).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
+  });
+
+  it("does not call the review API or open the dialog when completion readiness is blocked", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        ..._validValidation(),
+        readiness: COMPLETION_BLOCKED_READINESS,
+      },
+      isExecuting: false,
+      progress: null,
+      execute: vi.fn(),
+    } as never);
+    const apiSpy = vi.spyOn(api, "markReadyForReview");
+
+    render(
+      <>
+        <CompletionBar />
+        <SaveForReviewDialog />
+      </>,
+    );
+
+    const button = screen.getByTestId(
+      "completion-bar-save-for-review",
+    ) as HTMLButtonElement;
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
     expect(apiSpy).not.toHaveBeenCalled();
     expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
   });

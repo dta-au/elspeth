@@ -28,6 +28,7 @@ from elspeth.contracts.errors import ContractViolation, TransformErrorReason
 from elspeth.contracts.schema_contract import SchemaContract
 
 if TYPE_CHECKING:
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.schema_contract import PipelineRow
 
 
@@ -196,11 +197,11 @@ class PluginAuditWriter(Protocol):
 
     def record_readiness_check(
         self,
-        run_id: str,
         *,
         name: str,
         collection: str,
         reachable: bool,
         count: int | None,
         message: str,
+        coordination_token: CoordinationToken,
     ) -> None: ...

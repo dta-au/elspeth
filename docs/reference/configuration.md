@@ -9,11 +9,13 @@ Complete reference for ELSPETH pipeline configuration.
 - [Configuration File Format](#configuration-file-format)
 - [Top-Level Settings](#top-level-settings)
 - [Web Plugin Policy](#web-plugin-policy)
+- [Identity and Single Sign-On](#identity-and-single-sign-on)
 - [Secrets Settings](#secrets-settings)
 - [Source Settings](#source-settings)
 - [Queue Settings](#queue-settings)
 - [Sink Settings](#sink-settings)
 - [Transform Settings](#transform-settings)
+  - [LLM transform (`llm`)](#llm-transform-llm)
 - [Gate Settings](#gate-settings)
 - [Aggregation Settings](#aggregation-settings)
 - [Coalesce Settings](#coalesce-settings)
@@ -61,11 +63,18 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 | `sources` | object | **Yes** | - | Named source plugin configurations (one or more per run; map of source name → source config) |
 | `sinks` | object | **Yes** | - | Named sink configurations (at least one required) |
 | `queues` | object | No | `{}` | Named pass-through queue nodes for explicit fan-in (required when multiple producers feed one processing node) |
+| `llm_profiles` | object | No | `{}` | Operator-owned LLM provider profiles keyed by opaque alias; an `llm` transform can select a profile instead of carrying raw provider config |
+| `default_llm_profile` | string | No | - | Preferred profile alias; must name a configured `llm_profiles` entry |
 | `run_mode` | string | No | `"live"` | Execution mode: `live`, `replay`, `verify` |
 | `replay_from` | string | No | - | Run ID to replay/verify against (required for replay/verify modes) |
 | `transforms` | list | No | `[]` | Ordered transforms to apply |
 | `gates` | list | No | `[]` | Config-driven routing gates |
 | `coalesce` | list | No | `[]` | Fork path merge configurations |
+| `row_unions` | list | No | `[]` | `row_union` barriers — wait for every declared fork branch of a row, then release those branch tokens as one indivisible group in declared branch order. Payloads pass through untouched; unlike `coalesce` it merges no fields |
+| `collectors` | list | No | `[]` | Collectors — the closer of an expand group. Buffers every member of one group and flushes on end of group only, using the same batch-transform plugin contract as `aggregations` |
+| `scopes` | list | No | `[]` | Scope bindings pairing a multi-row transform opener with its collector closer; `policy` is required with no default |
+| `max_bound_region_depth` | int | No | `5` | Maximum supported bound-region nesting depth; the builder rejects deeper nesting. The ceiling is 64 |
+| `max_expand_group_width` | int | No | `100000` | Maximum members one expansion may mint; the engine refuses a wider expansion at the opener and routes the row through the transform error channel. The ceiling is 10000000 |
 | `aggregations` | list | No | `[]` | Batch processing configurations |
 | `depends_on` | list | No | `[]` | Pipeline dependencies — run these before the main pipeline |
 | `commencement_gates` | list | No | `[]` | Go/no-go conditions evaluated after dependencies complete |
@@ -108,18 +117,52 @@ Authorize every optional web plugin with its kind-qualified ID in
 available to CLI and batch runs but is hidden from every web discovery,
 authoring, import, validation, and execution surface.
 
+The allowlist *authorizes*; it does not *guarantee availability*. A small
+number of plugins are banned from the web authoring surface categorically —
+independent of `plugin_allowlist` — because their web-authored form would let
+an author redirect a server-held credential (see the
+[AWS S3 sink](#aws-s3-sink)'s source ban for a worked example). Allowlisting
+one of these does not enable it on the web: the entry still authorizes the
+plugin for CLI/batch runtime, but the web availability snapshot carries it
+as a *declined authorization* (`PluginUnavailableReason.WEB_SURFACE_PROHIBITED`),
+never as an offer. Deleting the allowlist entry to "clear" that decline
+only narrows the CLI/batch runtime authorization — it does not change web
+availability, which the categorical ban already controls.
+
+The required authorization set above is always authorized regardless of
+`plugin_allowlist`; the allowlist only adds optional plugins on top of it,
+and repeating a required ID is harmless. An empty or unset allowlist
+therefore authorizes exactly the required core — it does not mean "allow
+every installed plugin". Startup fails when an allowlisted plugin is not
+installed.
+
+The Composer's own chat and advisor models are configured separately from
+the plugin policy (`ELSPETH_WEB__COMPOSER_MODEL`,
+`ELSPETH_WEB__COMPOSER_ADVISOR_MODEL`). See
+[Web LLM Configuration](environment-variables.md#web-llm-configuration) for
+how every web LLM surface — Composer models, operator LLM profiles, the
+tutorial profile, and the allowlist — fits together.
+
 ### Environment configuration
 
 Collection and mapping values use JSON. This example enables the AWS Bedrock
 prompt and output controls, requires both controls, and selects a keyless
 Bedrock profile for the tutorial:
 
+> **This is the plain-environment-file form** — systemd, Docker Compose, or any
+> deployment where you set these variables yourself. It is **not** the AWS ECS
+> form. There, the Terraform scenario module creates both Guardrails and renders
+> their identifiers for you, so the hand-written `guardrail_identifier` and
+> `guardrail_version` values below would name Guardrails nothing owns. Configure
+> that deployment through the module's variables instead — see
+> [Where each deployment sets these](environment-variables.md#where-each-deployment-sets-these).
+
 ```bash
 ELSPETH_WEB__PLUGIN_ALLOWLIST='["transform:aws_bedrock_prompt_shield","transform:aws_bedrock_content_safety"]'
 ELSPETH_WEB__PLUGIN_PREFERENCES='{"prompt_shield":["transform:aws_bedrock_prompt_shield"],"content_safety":["transform:aws_bedrock_content_safety"]}'
 ELSPETH_WEB__PLUGIN_CONTROL_MODES='{"prompt_shield":"required","content_safety":"required"}'
-ELSPETH_WEB__LLM_PROFILES='{"tutorial":{"provider":"bedrock","model":"bedrock/anthropic.claude-3-haiku-20240307-v1:0","region_name":"ap-southeast-2"}}'
-ELSPETH_WEB__TUTORIAL_LLM_PROFILE='tutorial'
+ELSPETH_WEB__LLM_PROFILES='{"standard":{"provider":"bedrock","model":"bedrock/anthropic.claude-3-haiku-20240307-v1:0","region_name":"ap-southeast-2"}}'
+ELSPETH_WEB__DEFAULT_LLM_PROFILE='standard'
 ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES='[{"alias":"prompt-default","plugin":"aws_bedrock_prompt_shield","guardrail_identifier":"operatorpromptguardrail","guardrail_version":"7","region":"ap-southeast-2"},{"alias":"content-default","plugin":"aws_bedrock_content_safety","guardrail_identifier":"operatorcontentguardrail","guardrail_version":"4","region":"ap-southeast-2"}]'
 ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES='{"aws_bedrock_prompt_shield":"prompt-default","aws_bedrock_content_safety":"content-default"}'
 ```
@@ -143,6 +186,25 @@ operator-owned `credential_ref`. A server-scoped profile resolves only through
 the server store; a user-scoped profile resolves only through that principal's
 store. Web-authored pipeline state stores the opaque profile alias, not the
 provider, model, endpoint, or credential binding.
+
+`ELSPETH_WEB__DEFAULT_LLM_PROFILE` must name a configured profile or the
+service refuses to start — so renaming or removing a profile this still points
+at will break a previously healthy deployment on its next restart; change both
+together. The tutorial needs *a* profile, not a dedicated one: point it at an
+ordinary general-purpose alias rather than inventing a `tutorial` alias, which
+would otherwise appear in every unrelated pipeline's audit trail. It is also the
+alias listed first for authors and used by the Composer's worked examples, so it
+should name a general-purpose tier. Setting it enables the first-run tutorial, whose
+launch contract needs more than the profile alone: the tutorial pipeline is
+exactly one `csv`/`json` source, the `web_scrape`, `llm`, and `field_mapper`
+transforms, and one `json` sink, and every one of those plugins must be
+installed and available (with required-control coverage satisfied when
+prompt-shield/content-safety modes are `required`). The three tutorial
+transforms are part of the required core, but keep them listed explicitly in
+deployment allowlist templates so the tutorial's dependency set stays
+visible, and verify the tutorial rows in `GET /api/system/status` after any
+policy change. See
+[Web LLM Configuration](environment-variables.md#web-llm-configuration).
 
 Bedrock Guardrail profiles follow the same separation. Web authors select only
 an opaque `profile`, row `fields`, `schema`, and, for content safety, `source`.
@@ -204,6 +266,283 @@ audit data retain the authored alias form. CLI and batch configuration remain
 explicit and unrestricted by web policy: `instantiate_plugins_from_config()`
 and `make_sink_factory()` consume normal pipeline settings without `WebSettings`
 or a web availability snapshot.
+
+---
+
+## Identity and Single Sign-On
+
+The web service authenticates browsers against either its own local user store
+or exactly one external identity provider. `auth_provider` selects which, and
+every other setting in this section is that choice's configuration for this
+container. The build carries no credentials and the profile carries no
+deployment facts, so registering a client with an identity provider is a
+deployment-time action taken by whoever runs ELSPETH, against their own tenant
+or user pool. Moving a container from one provider to another is a
+configuration change and a restart, never a rebuild.
+
+The backend is a **confidential client**: it redeems the authorization code
+server-side. The browser never holds `sso_client_secret` and never performs the
+token exchange, so the implicit flow must not be enabled on the client you
+register.
+
+These are web-service settings, set as `ELSPETH_WEB__*` environment variables
+(`ELSPETH_WEB__AUTH_PROVIDER`, `ELSPETH_WEB__SSO_CLIENT_ID`, and so on), not in
+the pipeline `settings.yaml`. Collection values are JSON arrays, as elsewhere in
+[Environment configuration](#environment-configuration). An unrecognized
+`ELSPETH_WEB__` name is refused at startup rather than ignored, so a deployment
+still exporting a setting that has since been removed — the retired `oidc_*`
+browser-client settings, for instance — does not boot.
+
+[Identity Providers](../guides/identity-providers.md) walks through registering
+a client with each provider and pointing a container at it. This section is the
+per-setting reference.
+
+### A partial identity configuration does not start
+
+Every rule below is enforced when `WebSettings` is constructed, which happens
+before the application is assembled. A deployment that omits a required setting,
+or carries one belonging to a different provider, raises a configuration error
+and the process exits.
+
+This is not a degraded mode. There is no container to probe, no
+`/api/system/status` to read, and nothing for
+[readiness](#readiness-and-audit-evidence) to report, because readiness never
+runs. An orchestrator sees a task that fails to start, not an unhealthy task.
+Read the startup error, not the health check.
+
+### Providers
+
+`auth_provider` names one profile. Each profile declares what it additionally
+requires, what it additionally accepts, and — by subtraction — what it refuses.
+
+| `auth_provider` | Identity source | Additionally required | Additionally optional | Refused |
+|-----------------|-----------------|-----------------------|-----------------------|---------|
+| `local` | ELSPETH's own user store; no external provider | - | - | `entra_tenant_id` |
+| `entra` | Microsoft Entra ID; issuer derived from the tenant | `entra_tenant_id` | - | `google_hosted_domain`, `sso_endpoint_origins`, `sso_issuer` |
+| `google` | Google Workspace; issuer fixed at `https://accounts.google.com` | `google_hosted_domain` | - | `entra_tenant_id`, `sso_endpoint_origins`, `sso_issuer` |
+| `oidc` | Generic OIDC provider, including AWS Cognito | `sso_issuer` | `sso_endpoint_origins` | `entra_tenant_id`, `google_hosted_domain` |
+| `vanguard` | VANguard; issuer supplied by the operator | `sso_issuer` | - | `entra_tenant_id`, `google_hosted_domain`, `sso_endpoint_origins` |
+
+Any value outside this list is rejected by the schema before any of these rules
+run: `auth_provider: Input should be 'local', 'oidc', 'entra', 'vanguard' or
+'google'`.
+
+Three properties of this table are worth stating explicitly, because each one
+surprises operators:
+
+**Required means required for the provider you selected.** Every non-`local`
+provider also requires the common confidential-client set — `sso_client_id`,
+`sso_client_secret`, `sso_transaction_secret`, `public_base_url`,
+`compartment_id`, `quota_default_tokens_per_day` and
+`quota_default_storage_bytes` — on top of the profile-specific column above. A
+missing member of either set is named individually:
+
+```
+auth_provider='oidc' requires: sso_issuer
+```
+
+**A setting belonging to another provider is refused by name, not ignored.**
+Configuring `entra_tenant_id` under `oidc` is a startup failure, not a
+harmlessly unused variable:
+
+```
+auth_provider='oidc' does not use: entra_tenant_id, google_hosted_domain
+(configuring a setting for a different IdP is silently ignored otherwise)
+```
+
+The refused column is *derived* — each profile subtracts the settings it uses
+from the set of all provider-specific settings — so it cannot drift out of step
+with the profiles the way a hand-maintained list would. This is also why
+`sso_endpoint_origins` is refused everywhere except `oidc`: only the generic
+profile declares it.
+
+**Under `auth_provider=local` the refusal is narrow.** Only `entra_tenant_id`
+is checked (`Local auth does not use entra_tenant_id`). A leftover
+`ELSPETH_WEB__SSO_CLIENT_ID` or `ELSPETH_WEB__SSO_ISSUER` in a local deployment
+is accepted and does nothing. Do not read a clean local startup as evidence
+that an SSO configuration is correct — it is only evidence that it was never
+consulted.
+
+### Provider selection and local authentication
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `auth_provider` | string | No | `"local"` | `local`, `entra`, `google`, `oidc`, or `vanguard`. Selects the profile that decides every other rule in this section |
+| `registration_mode` | string | No | `"open"` | `open`, `email_verified`, or `closed`. Governs **local** self-registration only. Under any identity provider it is accepted and inert: an SSO first login is always pending an administrator regardless of this value |
+| `dev_admin_user` | string | `local` only | - | Names the one local-auth user granted the in-app user-management surface (`/api/auth/admin/users`). Unset removes that surface entirely. Setting it under any identity provider refuses at load: `dev_admin_user requires auth_provider=local; IdP deployments must not carry it`. A blank value is refused too |
+
+`registration_mode: email_verified` on a non-local host (anything other than
+`127.0.0.1`, `localhost` or `::1`) additionally requires a publicly reachable
+`public_base_url`, so that verification links are never derived from a request
+`Host` header.
+
+### Confidential client (required by every identity provider)
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_client_id` | string | Yes (every IdP) | - | The client identifier issued when you registered ELSPETH with your provider |
+| `sso_client_secret` | secret | Yes (every IdP) | - | The client secret for that registration. Held server-side only; never sent to the browser. Supply by reference from a secret store, never as an environment literal |
+| `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` and place the value in a secret store; supply by reference, never as an environment literal |
+| `public_base_url` | string | Yes (every IdP) | - | This deployment's externally visible origin. Must be a bare origin — scheme, host, and optional port, with no path, query, or fragment — and must be public HTTPS unless it is an HTTP loopback address for local development. A trailing slash is stripped |
+| `compartment_id` | string | Yes (every IdP) | - | Operator-declared marking for this container's identities and artifacts. Validated non-blank; no runtime path reads it in this release |
+| `quota_default_tokens_per_day` | int | Yes (every IdP) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
+| `quota_default_storage_bytes` | int | Yes (every IdP) | - | Blob storage allowance written into the same row. Must be greater than 0 |
+
+The two quota defaults are required rather than defaulted because an activated
+identity spends the container's shared LLM credential: without a policy row
+there is no ceiling to enforce. An administrator may override either number per
+identity afterwards.
+
+A blank value is never treated as a value. `sso_client_id`, `sso_issuer`,
+`entra_tenant_id`, `google_hosted_domain`, `compartment_id` and the four
+endpoint overrides are rejected outright with `must not be blank (omit the
+field or set to a non-empty value)`. A blank secret is reported as the missing
+required setting it is, and a blank `public_base_url` as `public_base_url must
+not be empty`. This matters more than it
+looks: an empty environment variable in a task definition
+(`ELSPETH_WEB__SSO_ISSUER=`) would otherwise satisfy every "is it set?" check
+on the way to a deployment that cannot complete a login.
+
+### Provider-specific settings
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_issuer` | string | Yes (`oidc`, `vanguard`) | - | The issuer URL tokens must claim to come from, and the origin discovery runs against. Refused under `entra` (derived from the tenant) and `google` (fixed) so two sources of truth cannot disagree |
+| `entra_tenant_id` | string | Yes (`entra`) | - | The Entra tenant this deployment accepts. The profile derives the issuer from it and checks the tenant claim on every token |
+| `google_hosted_domain` | string | Yes (`google`) | - | The Workspace domain this deployment accepts. Required rather than defaulted: without it, any Google account in the world would be a valid login |
+| `sso_endpoint_origins` | JSON array of strings | No (`oidc` only) | `[]` | HTTPS origins the discovered endpoints may use **in addition to** the issuer origin. Exists for AWS Cognito, whose hosted login domain is a different origin from the user-pool issuer, so a same-origin rule would refuse a correct deployment. Each entry must be a bare origin with no path, query, or fragment |
+
+`sso_endpoint_origins` entries are parsed where they are used, not where they
+are declared. A malformed entry fails with `expected origin failed HTTPS check`,
+`failed bare-origin check`, or `failed nonblank check` — at settings load if the
+break-glass overrides below are also configured, and otherwise at startup when
+discovery runs. Either way the process does not serve traffic, but only the
+first of those two is a settings-load failure.
+
+### The redirect URI
+
+The redirect URI ELSPETH presents is `public_base_url` plus the fixed callback
+path `/api/auth/sso/callback`. It is not configurable. For
+`public_base_url: https://elspeth.example.org` the value to register with the
+provider is:
+
+```
+https://elspeth.example.org/api/auth/sso/callback
+```
+
+Providers match redirect URIs exactly, so a mismatched scheme, host, port, or
+trailing slash is rejected by the provider at login time rather than by ELSPETH
+at startup. Every profile requests the scopes `openid profile email` and pins
+`RS256` for ID token signatures; the validator never reads the algorithm from
+the token header.
+
+### Break-glass endpoint overrides
+
+Normal operation is discovery: ELSPETH fetches the provider's discovery
+document and validates the endpoints it names against the profile's origin
+policy. The four overrides below exist for the case where that document is
+wrong or unreachable. They skip **discovery**, and with it two things that
+only discovery does — see below — but not endpoint validation: whatever you
+supply is still held to the same origin policy, and an endpoint outside it is
+refused with `authorization_endpoint failed expected-origin check`.
+
+Discovery is a hard dependency at startup. When it is not overridden and the
+provider cannot be reached, the process exits with `FATAL: SSO discovery
+failed`.
+
+**What skipping discovery costs, and why these are not for permanent use.**
+The exact-issuer check lives inside the discovery path: it is the comparison
+that produces `discovery document failed the exact issuer check`. With the
+trio configured, the provider's document is never fetched, so that check never
+runs, and the origin policy is the only remaining tie between the configured
+issuer and the endpoints in use. Second, `sso_jwks_uri` becomes a fixed
+address rather than one the provider publishes, so a provider that relocates
+its JWKS endpoint breaks every login until the setting is edited by hand. ID
+token validation is unaffected — issuer, audience, expiry and nonce are
+checked on every token regardless.
+
+Set them to survive a broken or unreachable document, then remove them. A
+deployment that carries them permanently has traded a startup dependency it
+can observe for two guarantees it no longer has, which is a worse trade than
+the boot failure it avoids.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_authorization_endpoint` | string | No, all-or-none | - | Authorization endpoint, bypassing discovery |
+| `sso_token_endpoint` | string | No, all-or-none | - | Token endpoint |
+| `sso_jwks_uri` | string | No, all-or-none | - | JWKS URI |
+| `sso_userinfo_endpoint` | string | No | - | Userinfo endpoint. Optional on top of the other three; only the `vanguard` profile calls userinfo during login |
+
+The first three are all-or-none. A partial override would silently mix
+operator-supplied and discovered endpoints, leaving which policy applied to
+which URL dependent on which variables happened to be set, so the mixture is
+refused:
+
+```
+sso endpoint overrides are all-or-none; missing: sso_jwks_uri, sso_token_endpoint
+```
+
+`sso_userinfo_endpoint` is not part of that trio, but it is not an override on
+its own either — with no endpoints to pair it with there is nothing for it to
+bypass discovery *for*:
+
+```
+sso_userinfo_endpoint requires the other sso endpoint overrides:
+sso_authorization_endpoint, sso_token_endpoint, sso_jwks_uri
+```
+
+The overrides apply to every profile. Each is validated against the origin
+policy of the profile in use — the issuer's origin for `oidc` and `vanguard`,
+`https://login.microsoftonline.com` for `entra`, and Google's four published
+origins for `google` — so a profile that derives its issuer rather than
+stating it can still break the glass.
+
+### Bootstrap, quotas, and identity lifecycle
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_admin_subjects` | JSON array of strings | No | `[]` | Provider `sub` claims that may seed the first `admin` role at first login, and **only** while the container has zero active human admins. The gate is a live count re-evaluated at every login, not a record that a bootstrap has happened, so the list **re-arms** if the container ever returns to zero active human admins. Delete it once the first administrator is activated. Entries are matched exactly and are not validated at load |
+| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `identity_dormancy_days` | int | No | `90` | Intended dormancy window for an activated identity. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
+
+An SSO first login lands **pending** and is activated by an administrator. The
+provider verified who the person is; it did not decide whether this container
+admits them. `sso_admin_subjects` is the one exception, and only for the first
+administrator — a later listed subject logging into a container that already
+has an active human admin follows the ordinary pending path.
+
+That exception is scoped to the count, not to time: should the container fall
+back to zero active human admins, a listed subject seeds themselves again on
+their next login. Remove the setting once the first administrator exists.
+
+`elspeth composer users bootstrap-admin` does the same job from the operator's
+side and leaves no standing entry in the configuration, which makes it the
+better of the two. It is not, however, a general recovery path: it calls the
+same guarded method, so it is refused under the identical condition, and it
+recovers only the zero-admin case — the same case in which the seed re-arms. A
+deployment whose administrator row is active but whose administrator can no
+longer authenticate is recoverable by neither, and needs direct work against
+the sessions store. Keep more than one administrator activated.
+
+### JWKS cache tuning
+
+Applies to every identity provider. Defaults match the provider defaults and
+most deployments should leave them alone.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `jwks_cache_ttl_seconds` | int | No | `3600` | How long a successfully fetched key set is served before refresh. Minimum 1 |
+| `jwks_failure_retry_seconds` | int | No | `300` | How long a failed fetch is throttled before the next attempt. Minimum 10 |
+| `jwks_max_stale_seconds` | int | No | `86400` | Absolute authority of a cached key set, measured from the last successful, fully validated fetch. Failure retries never renew it. Minimum 1 |
+
+Raising `jwks_failure_retry_seconds` lengthens the window in which stale keys
+are served, which is safer during a brief provider outage. Lowering it shrinks
+the blast radius of a sustained one. Its floor is 10 rather than 1 because the
+throttle exists so that during an outage the first caller absorbs the HTTP
+timeout and the rest short-circuit; a one-second window would let concurrent
+logins re-hit the dead provider almost immediately.
 
 ---
 
@@ -293,9 +632,19 @@ Per-source fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `azure_blob`, `dataverse`, `null` |
+| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `aws_s3`, `azure_blob`, `dataverse`, `null` |
 | `on_success` | string | **Yes** | Connection name for source output (transforms reference this via `input`) |
 | `options` | object | No | Plugin-specific configuration |
+
+**`options.path` on the web surface.** For file sources (`csv`, `json`, `text`)
+`path` is an ordinary filesystem path when the pipeline runs under the CLI. A
+web-authored source instead references a file uploaded to the session:
+`path: blob:<uuid>`, where the UUID identifies that session's uploaded blob.
+Filesystem paths are not free-form on the web surface — a source may only read
+from the session's own subtree of the deployment blob directory, and a request
+without a session identity gets no readable local path at all — so referencing
+the upload by its `blob:<uuid>` sentinel is the practical way to author a file
+source there.
 
 Source names are durable, audit-visible identifiers: they become DAG node IDs
 and appear in audit records (`run_sources`, `source_node_id`). Names must be
@@ -314,6 +663,7 @@ directing the operator to rewrite it as `sources: { <name>: { ... } }`.
 | `csv` | Load from CSV file |
 | `json` | Load from JSON file or JSONL |
 | `text` | Load one output row per text line into a configured column |
+| `aws_s3` | Load bounded CSV, JSON-array, or JSONL rows from one immutable S3 object (CLI and batch only — see [AWS S3 sink](#aws-s3-sink)) |
 | `azure_blob` | Load from Azure Blob Storage |
 | `dataverse` | Load from Microsoft Dataverse via OData v4 REST API |
 | `null` | Empty source (for testing) |
@@ -478,7 +828,7 @@ sinks:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `database`, `azure_blob`, `dataverse`, `chroma_sink` |
+| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `document`, `aws_s3`, `database`, `azure_blob`, `dataverse`, `chroma_sink` |
 | `on_write_failure` | string | **Yes** | Per-row write failure handling: `discard` to drop with audit record, or a sink name to divert to a failsink |
 | `options` | object | No | Plugin-specific configuration |
 
@@ -497,6 +847,7 @@ For local file sinks (`csv`, `json`, `text`), `options.collision_policy` can mak
 | `csv` | Write to CSV file |
 | `json` | Write to JSON file |
 | `text` | Write one configured string field per row as canonical LF-delimited text |
+| `aws_s3` | Write one bounded cumulative CSV, JSON, or JSONL object to AWS S3 |
 | `database` | Write to SQL database |
 | `azure_blob` | Write to Azure Blob Storage |
 | `dataverse` | Write to Microsoft Dataverse via OData v4 REST API |
@@ -517,6 +868,70 @@ boundary. The text sink is not eligible as a generic failure sink because it
 writes only one selected field and therefore cannot preserve an arbitrary
 rejected row losslessly.
 
+### AWS S3 sink
+
+`aws_s3` writes one bounded S3 object per run — the accumulated rows serialized
+as CSV, JSON, or JSONL. It has **no credential options**: the client is built
+from the ordinary AWS default credential chain, so on ECS you grant the task
+role access to the target prefix rather than configuring keys. The sink calls
+`HeadObject` before `PutObject` — to reconcile an existing object against the
+run's write plan — so the identity needs `s3:GetObject` as well as
+`s3:PutObject` on the key it writes.
+
+```yaml
+sinks:
+  results:
+    plugin: aws_s3
+    on_write_failure: discard
+    options:
+      bucket: my-results-bucket
+      key: "exports/{{ run_id }}/results.csv"
+      format: csv
+      overwrite: false
+      region_name: ap-southeast-2
+      schema:
+        mode: observed
+```
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `bucket` | string | **Yes** | — | Bucket name or access-point identifier, at most 2048 characters |
+| `key` | string | **Yes** | — | Object-key template, rendered once per run |
+| `format` | `csv` \| `json` \| `jsonl` | No | `csv` | Serialization of the written object |
+| `overwrite` | bool | No | `true` | Allow replacing an existing object at the rendered key |
+| `csv_options.delimiter` | string | No | `,` | Single-character field delimiter (`format: csv`) |
+| `csv_options.encoding` | string | No | `utf-8` | Output encoding (`format: csv`) |
+| `csv_options.include_header` | bool | No | `true` | Write the CSV header record (`format: csv`) |
+| `headers` | string or mapping | No | (normalized) | Output header names: normalized (default), `original`, or an explicit mapping |
+| `region_name` | string | No | (AWS default resolution) | Signing-region override |
+| `endpoint_url` | string | No | (AWS default) | S3-compatible HTTP endpoint. **CLI and batch runs only** — see below |
+| `max_object_bytes` | int | No | `268435456` (256 MiB) | Cap on the serialized object; the ceiling is 1 GiB |
+| `max_record_chars` | int | No | `1000000` | Cap on characters in one serialized record; the ceiling is 8000000 |
+
+The `key` template is deliberately tiny: literal text plus `{{ run_id }}` and
+`{{ timestamp }}`, and nothing else. Any other variable, expression, or
+control-flow tag fails configuration with `key template may contain only literal
+text and approved variables`. The template may be up to 4096 UTF-8 bytes and the
+*rendered* key up to 1024. There is no per-row key — one run writes one object,
+so `key` cannot depend on row data.
+
+**Web policy.** Three rules apply to web-authored pipelines, and only the first
+is a mere allowlist question:
+
+- The **sink** is authorable from the Web Composer once the operator adds
+  `sink:aws_s3` to `plugin_allowlist` — it is not in the required core
+  authorization set (see [Web Plugin Policy](#web-plugin-policy)), so an
+  unallowlisted deployment simply does not offer it.
+- The **source** is prohibited outright and no allowlist entry enables it. An
+  `aws_s3` source reads with the server's AWS credential chain while `bucket`
+  and `key` are author-controlled, which would let an author read any object the
+  server can reach. Use an operator-controlled connector, an allowlisted
+  ingestion job, or the batch/CLI runtime for S3 reads.
+- `endpoint_url` is forbidden in web-authored options for **both** the source
+  and the sink, because a custom storage endpoint redirects server-side requests
+  to an author-chosen destination. Omit it and use operator-controlled AWS
+  configuration.
+
 ---
 
 ## Transform Settings
@@ -525,20 +940,43 @@ Ordered list of transforms applied to each row. Each transform declares its posi
 
 ```yaml
 transforms:
+  # field_mapper renames, selects, and drops fields. It computes nothing.
   - name: enricher
     plugin: field_mapper
     input: source_out
+    on_success: naming_in
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      mapping:
+        given_name: first_name
+        family_name: last_name
+      required_input_fields: [given_name, family_name]  # Validated at DAG construction
+
+  # value_transform computes new or replacement values from expressions.
+  - name: compose_full_name
+    plugin: value_transform
+    input: naming_in
     on_success: output
     on_error: quarantine
     options:
       schema:
         mode: observed
-      mappings:
-        old_field: new_field
-      computed:
-        full_name: "row['first_name'] + ' ' + row['last_name']"
-      required_input_fields: [first_name, last_name]  # Validated at DAG construction
+      operations:
+        - target: full_name
+          expression: "row['first_name'] + ' ' + row['last_name']"
 ```
+
+The split is not stylistic. `field_mapper` accepts `mapping` (singular),
+`select_only`, and `strict` — there is no `computed` key, and because plugin
+options are validated with `extra: forbid`, an unknown key is a hard
+configuration failure rather than an ignored one. Computing a value is
+`value_transform`'s job: an ordered list of `operations`, each with a `target`
+field and an `expression` in the
+[restricted expression language](#expression-syntax). Operations are applied in
+order on a working copy of the row, so a later operation sees the results of the
+earlier ones.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -572,6 +1010,189 @@ fields = extract_jinja2_fields(template)  # frozenset({'customer_id', 'message_t
 # Add these to required_input_fields in your config
 ```
 
+### LLM transform (`llm`)
+
+One plugin, `llm`, covers every provider. `provider` selects the variant and
+therefore which additional options are legal. Options are validated with
+`extra: forbid`, so an option belonging to a different provider is rejected
+rather than ignored.
+
+Every variant also takes the ordinary transform options `schema` (**required**)
+and `required_input_fields`. `required_input_fields` is not optional in
+practice for this plugin: when `prompt_template` — or any query's
+`input_fields`/`template` — references a row field that
+`required_input_fields` does not declare, configuration fails with
+`LLM prompt_template references row fields [...] but options.required_input_fields is not declared`.
+
+Options common to all providers:
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `provider` | `azure` \| `openrouter` \| `bedrock` | **Yes** | — | Provider variant |
+| `prompt_template` | string | **Yes** | — | Jinja2 prompt template |
+| `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
+| `system_prompt` | string | No | (none) | Optional system message |
+| `temperature` | float | No | `0.0` | Sampling temperature, `0.0`–`2.0`; the default is the deterministic setting |
+| `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0 |
+| `response_field` | string | No | `llm_response` | Row field for the model response; must be a valid Python identifier |
+| `queries` | list or mapping | No | (none) | Multi-query specs; omit for single-query mode |
+| `lookup` | mapping | No | (none) | Lookup data made available to the template |
+| `prompt_template_source` | string | No | (none) | Prompt-template file path recorded for audit; `null` when the template is inline |
+| `system_prompt_source` | string | No | (none) | System-prompt file path recorded for audit |
+| `lookup_source` | string | No | (none) | Lookup-data file path recorded for audit |
+| `pool_size` | int | No | `1` | Concurrent in-flight requests; `1` is sequential and disables pooling |
+| `min_dispatch_delay_ms` | int | No | `0` | Floor for the delay between dispatches |
+| `max_dispatch_delay_ms` | int | No | `5000` | Ceiling for the delay between dispatches |
+| `backoff_multiplier` | float | No | `2.0` | Delay multiplier applied on a capacity error; must be > 1 |
+| `recovery_step_ms` | int | No | `50` | Delay reduction applied after a success |
+| `max_capacity_retry_seconds` | int | No | `3600` | Per-row ceiling on retrying capacity errors |
+
+`provider: azure` adds:
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `deployment_name` | string | **Yes** | — | Azure OpenAI deployment name; also the default `model` |
+| `endpoint` | string | **Yes** | — | Azure OpenAI endpoint URL |
+| `api_key` | string | **Yes** | — | Azure OpenAI API key |
+| `api_version` | string | No | `2024-10-21` | Azure API version |
+| `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` or `azure_ai`) |
+
+`provider: bedrock` adds:
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `model` | string | **Yes** | — | LiteLLM Bedrock identifier in `bedrock/<model-id>` form |
+| `region_name` | string | No | (AWS default resolution) | AWS signing-region override |
+| `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` only) |
+
+Bedrock has no credential options at all — it uses the ordinary AWS default
+credential chain. See [AWS Bedrock LLM](#aws-bedrock-llm).
+
+`provider: openrouter` adds:
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `model` | string | **Yes** | — | Model identifier such as `anthropic/claude-sonnet-4.6`; must appear in the OpenRouter catalog while `base_url` is the canonical endpoint |
+| `api_key` | string | **Yes** | — | OpenRouter API key |
+| `base_url` | string | No | `https://openrouter.ai/api/v1` | API base URL; HTTPS is required except for loopback hosts |
+| `timeout_seconds` | float | No | `60.0` | Per-request timeout; must be > 0 |
+| `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` only; `azure_ai` is not supported for OpenRouter) |
+
+```yaml
+transforms:
+  - name: classify_sentiment
+    plugin: llm
+    input: classify_in
+    on_success: output
+    on_error: quarantine
+    options:
+      provider: openrouter
+      model: anthropic/claude-sonnet-4.6
+      api_key: ${OPENROUTER_API_KEY}
+      prompt_template: "Classify the sentiment of: {{ row.review_text }}"
+      response_field: sentiment
+      temperature: 0.0
+      max_tokens: 200
+      required_input_fields: [review_text]
+      schema:
+        mode: observed
+```
+
+Single-query mode writes three row fields: the response itself
+(`<response_field>`), plus `<response_field>_usage` (token counts) and
+`<response_field>_model` (the model that actually answered).
+
+#### Multi-query (`queries`)
+
+Supplying `queries` runs several questions per row against the one provider
+binding. Two authoring forms are accepted: a **mapping** keyed by query name, or
+a **list** in which each entry carries its own `name`.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | List form: **Yes**. Mapping form: no — the key supplies it | — | Query identifier; prefixes this query's output fields |
+| `input_fields` | mapping | **Yes** | — | Template variable name → row column name |
+| `response_format` | `standard` \| `structured` | No | `standard` | `structured` enforces a JSON schema built from `output_fields` |
+| `output_fields` | list | No | (none) | Typed structured-output definitions; omit for an unstructured response |
+| `template` | string | No | (the node's `prompt_template`) | Per-query Jinja2 template override |
+| `max_tokens` | int | No | (the node's `max_tokens`) | Per-query override |
+
+Each `output_fields` entry:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `suffix` | string | **Yes** | Column suffix; the output column is `<query_name>_<suffix>` |
+| `type` | `string` \| `integer` \| `number` \| `boolean` \| `enum` | **Yes** | Declared type, enforced against the response |
+| `values` | list of strings | For `enum` only | Allowed values; required for `enum` and rejected for every other type |
+
+A per-query `template` may not contain `{{interpretation:...}}` tokens —
+interpretation review rewrites only the node-level `prompt_template`, so a token
+here would survive to the run and fail as a Jinja error. Put reviewed slots in
+the node-level template.
+
+Multi-query mode emits **suffixed fields only** — there is no unprefixed base
+field. Each query contributes `<query_name>_<response_field>` plus
+`<query_name>_<response_field>_usage` and `<query_name>_<response_field>_model`,
+and each structured output field lands at `<query_name>_<suffix>`. Suffixes may
+not collide across queries, and `usage`, `model`, and `error` are reserved.
+
+```yaml
+transforms:
+  - name: assess_review
+    plugin: llm
+    input: assess_in
+    on_success: output
+    on_error: quarantine
+    options:
+      provider: openrouter
+      model: anthropic/claude-sonnet-4.6
+      api_key: ${OPENROUTER_API_KEY}
+      prompt_template: "Assess this review: {{ review }}"
+      max_capacity_retry_seconds: 30
+      required_input_fields: [review_text]
+      schema:
+        mode: observed
+      queries:
+        - name: quality
+          input_fields:
+            review: review_text
+          response_format: structured
+          output_fields:
+            - suffix: score
+              type: integer
+            - suffix: band
+              type: enum
+              values: [low, medium, high]
+            - suffix: rationale
+              type: string
+        - name: topic
+          input_fields:
+            review: review_text
+          template: "Name the single main topic of: {{ review }}"
+          max_tokens: 40
+```
+
+That node writes `quality_score`, `quality_band`, `quality_rationale`, and
+`quality_llm_response` for the first query and `topic_llm_response` for the
+second, plus the per-query metadata pair for each —
+`quality_llm_response_usage`, `quality_llm_response_model`,
+`topic_llm_response_usage`, and `topic_llm_response_model`.
+
+#### Web-authored LLM nodes
+
+Three of these options are constrained further on the Web Composer surface,
+beyond whatever the plugin itself accepts:
+
+| Option | Web policy |
+|--------|------------|
+| `base_url` | **Forbidden.** The `api_key` is resolved server-side, so an author-chosen base URL would direct a server-held bearer token to a destination the author picked — a credential-egress/SSRF path. Omit it to use the canonical OpenRouter endpoint; a private OpenAI-compatible gateway is an operator-controlled runtime concern. |
+| `tracing` | **Forbidden.** Tracing can send server-held credentials and pipeline inputs or outputs to a configured destination. |
+| `max_capacity_retry_seconds` | Must be set explicitly to 30 or less for a **sequential** (`pool_size: 1`) multi-query node. The plugin default of one hour can monopolize the web execution worker; use `pool_size` greater than 1 for pooled retry handling instead. |
+
+The plugin itself tolerates an HTTP loopback `base_url` so the shipped local-dev
+examples run under the CLI. That single-machine threat model does not hold for a
+hosted server, which is why the web boundary pins `base_url` separately.
+
 ### Available Transform Plugins
 
 | Plugin | Purpose |
@@ -580,7 +1201,8 @@ fields = extract_jinja2_fields(template)  # frozenset({'customer_id', 'message_t
 | `blob_fetch` | Fetch an operator-authorised remote document into the run payload store |
 | `blob_csv_expand` | Expand a payload-store CSV blob into output rows |
 | `passthrough` | Pass rows unchanged |
-| `field_mapper` | Rename, compute, drop fields |
+| `field_mapper` | Rename, select, and drop fields (renaming only — it computes nothing) |
+| `value_transform` | Compute new or replacement field values from expressions |
 | `truncate` | Limit string field lengths |
 | `keyword_filter` | Filter rows by regex patterns |
 | `json_explode` | Expand list-valued fields to multiple rows |
@@ -594,7 +1216,11 @@ fields = extract_jinja2_fields(template)  # frozenset({'customer_id', 'message_t
 | `azure_prompt_shield` | Detect prompt injection via Azure AI |
 | `aws_bedrock_content_safety` | Detect configured harmful-content categories through Bedrock Guardrails |
 | `aws_bedrock_prompt_shield` | Detect prompt attacks through Bedrock Guardrails |
+| `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
+| `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
+| `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
+| `reference_join` | Add named fields to a row by matching one of its values against a key in a reference table bound as configuration (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
 
 ### AWS Bedrock LLM
 
@@ -618,6 +1244,90 @@ transforms:
       schema:
         mode: observed
 ```
+
+### Custom OpenAI-compatible endpoints
+
+The `llm` transform's OpenRouter provider is a plain OpenAI Chat Completions
+client. Overriding its `base_url` points it at any other endpoint that speaks the
+same shape — a self-hosted proxy, an agency translation layer, an ELSPETH LLM
+compatibility gateway, or a local development server. No gateway-specific
+option is involved.
+
+```yaml
+transforms:
+  - name: classify
+    plugin: llm
+    input: classify_in
+    on_success: output
+    on_error: discard
+    options:
+      provider: openrouter
+      base_url: https://gateway.internal.example.gov.au/v1
+      api_key: ${LLM_GATEWAY_BEARER}
+      model: openai/gpt-4o
+      prompt_template: "Classify: {{ row.text }}"
+      required_input_fields: [text]
+      schema:
+        mode: observed
+```
+
+`base_url` must be HTTPS, carry no embedded user information, and default to
+`https://openrouter.ai/api/v1` when omitted. HTTP is permitted only for a
+loopback host, so the shipped local ChaosLLM example
+(`http://127.0.0.1:8199/v1`) validates; the bearer never leaves the machine
+in that case.
+
+The `model` value is interpreted by whichever endpoint you configured. When
+`base_url` is left at the OpenRouter default, `model` is checked against the
+OpenRouter catalogue; when you override `base_url`, that check is dropped,
+because the endpoint — not OpenRouter — owns the model identifiers.
+
+### The `gateway` provider
+
+`provider: gateway` targets the ELSPETH LLM compatibility gateway
+specifically. It adds startup capability preflight and exact envelope error
+codes on top of what `base_url` pointing gives you.
+
+```yaml
+transforms:
+  - name: classify
+    plugin: llm
+    input: classify_in
+    on_success: output
+    on_error: discard
+    options:
+      provider: gateway
+      endpoint: https://gateway.internal.example.gov.au/v1
+      api_key: ${LLM_GATEWAY_BEARER}
+      model: standard
+      contract_major: 1
+      required_capabilities: [text, json_schema, usage]
+      prompt_template: "Classify: {{ row.text }}"
+      required_input_fields: [text]
+      schema:
+        mode: observed
+```
+
+| Option | Notes |
+|--------|-------|
+| `endpoint` | Gateway base URL; must end with `/v1`. HTTPS, or HTTP against the literal `127.0.0.1` loopback host only. No query string or fragment. |
+| `api_key` | Static inbound bearer the gateway expects. |
+| `model` | A **logical alias** the gateway resolves server-side, not a raw upstream model id. There is no local catalogue to check it against; the gateway's readiness document is the authority. |
+| `contract_major` | Wire contract major version this configuration expects. Only `1` is supported. |
+| `required_capabilities` | Closed set: `text`, `tools`, `json_object`, `json_schema`, `seed`, `usage`. Checked at startup against what the gateway declares. |
+
+At startup the provider reads `/readyz` and verifies the contract major, the
+adapter identity, the model alias, and every required capability, then runs
+one bounded real completion — a readiness document alone is not accepted as
+health. A gateway whose adapter cannot do JSON Schema therefore fails the run
+at boot rather than per row. Gateway error codes (`invalid_request`,
+`contract_mismatch`, `model_not_allowed`, `capability_unsupported`,
+`upstream_unauthorized`, and the rest) map to definite retryable or
+non-retryable outcomes instead of being inferred from an HTTP status.
+
+Before pointing a pipeline at any endpoint you do not operate, read
+[Custom LLM Endpoints](environment-variables.md#custom-llm-endpoints) — it
+sets out what ELSPETH can and cannot tell you about the endpoint you chose.
 
 ### AWS Bedrock Guardrail shields
 
@@ -666,6 +1376,329 @@ The harmful-content categories required by this AWS plugin do not include
 Azure Content Safety's `self_harm` category. A deployment must not claim Azure
 coverage parity unless an additional approved control covers that category.
 
+When a control mode is `required`, these shields must cover every stream an
+`llm` node emits — including its `on_error` path. See
+[Required controls and error routing](#required-controls-and-error-routing) for
+the two conforming shapes and what each does to a failed row.
+
+### AWS Textract document analysis
+
+`aws_textract_document_analysis` runs Amazon Textract's asynchronous
+document-analysis job over a document already stored in S3, and adds the
+extracted text, tables, forms, and layout to the row.
+
+Documents are located in one of two mutually exclusive modes:
+
+- **Static bucket mode**: `bucket` names the S3 bucket directly and rows carry
+  only relative object keys in `key_field`. An optional `key_prefix` (a
+  canonical relative path) is joined ahead of every row key, and row keys are
+  rejected if they are absolute, contain traversal segments, or overflow the
+  joined 1024-byte S3 key bound. This is the mode the Web Composer's operator
+  document profiles lower into: rows carry keys, never locations.
+- **Row-data mode**: `bucket_field` and `key_field` name the input fields
+  holding the bucket and key, so one manifest row supplies both halves of the
+  document location.
+
+In both modes `version_field` is optional and pins a specific S3 object
+version.
+
+Because those references come from row data, the manifest source must
+**guarantee** `doc_bucket`/`doc_key` as required declared fields.
+`required_input_fields` is a graph-validated contract, and either `mode:
+fixed` or `mode: flexible` satisfies it as long as the two fields are declared
+required — fields marked optional with `?` are not guaranteed, since a
+producer is allowed to omit them. Only a fully-dynamic `mode: observed`
+producer fails: the graph fails to build with `Schema contract violation …
+Producer (csv) guarantees: (none - dynamic schema)`. This complete example
+runs as written:
+
+```yaml
+sources:
+  manifest:
+    plugin: csv
+    on_success: extract_in
+    options:
+      path: /app/input/manifest.csv
+      on_validation_failure: discard   # required on the csv source
+      schema:
+        mode: fixed                    # fixed or flexible both work here; proves doc_bucket/doc_key exist
+        fields:
+          - "doc_id: str"
+          - "doc_bucket: str"
+          - "doc_key: str"
+
+sinks:
+  extracted:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: /app/output/extracted.json
+      schema:
+        mode: observed
+
+transforms:
+  - name: extract_invoice
+    plugin: aws_textract_document_analysis
+    input: extract_in
+    on_success: extracted
+    on_error: discard
+    options:
+      region: ap-southeast-2
+      bucket_field: doc_bucket
+      key_field: doc_key
+      feature_types: [TABLES, FORMS]
+      text_field: document_text
+      page_count_field: page_count
+      required_input_fields: [doc_bucket, doc_key]
+      schema:
+        mode: observed
+```
+
+with a manifest of the shape:
+
+```csv
+doc_id,doc_bucket,doc_key
+1,my-documents-bucket,invoices/2026-07/invoice-001.pdf
+```
+
+`feature_types` is a unique selection from `TABLES`, `FORMS`, `QUERIES`,
+`SIGNATURES`, and `LAYOUT`.
+
+**`QUERIES` and `queries` are bound together in both directions.** The
+constraint is not one-way: `QUERIES` in `feature_types` without a `queries`
+array is rejected, and a `queries` array without `QUERIES` in `feature_types`
+is rejected too — both with `queries and the QUERIES feature must be configured
+together`. Add or remove the pair as a unit.
+
+Each `queries` element is a question put to every document:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `text` | string | **Yes** | The question, 1–200 characters |
+| `alias` | string | No | Short label for the answer, 1–200 characters |
+| `pages` | list of strings | No | Page selectors; empty (the default) means Textract's own default page selection |
+
+`text` and `alias` are restricted to the character set Amazon Textract accepts
+for query text (ASCII letters, digits, whitespace, and common punctuation); a
+value outside it is rejected at configuration time, not at call time.
+
+Each `pages` selector is 1–9 characters matching `^[0-9*-]+$` and is one of a
+single positive page number (`"3"`), a closed range (`"1-3"`, ordered, both
+endpoints positive), an open-ended range (`"2-*"`), or `"*"` for every page.
+`"*"` must be the only selector, and duplicate selectors are rejected.
+
+```yaml
+      feature_types: [TABLES, FORMS, QUERIES]
+      queries:
+        - text: What is the invoice total?
+          alias: invoice_total
+          pages: ["1"]
+        - text: What is the payment due date?
+          alias: due_date
+          pages: ["1-3"]
+        - text: Who is the vendor?          # pages omitted
+```
+
+Query answers arrive as the normalized `queries` facet. Land them on a row field
+with `extract: {queries: <field_name>}`, or read them out of the bounded
+aggregate in `result_field`.
+
+Choose at least one output field or the extraction has nowhere to land:
+`text_field` (page-ordered `LINE` text), `page_count_field`,
+`metadata_field` (bounded job metadata), `result_field` (the bounded
+provider-shaped aggregate), or `extract` (mappings from normalized document
+facets to row fields).
+
+**Credentials.** `auth_mode` defaults to `default_chain`, which uses the
+ordinary AWS credential chain — on ECS, the task role. `secret_refs` mode
+exists for CLI and batch pipelines that resolve credentials from ELSPETH secret
+references; web-authored pipelines must not carry access keys.
+
+**IAM.** The calling identity needs `textract:StartDocumentAnalysis` and
+`textract:GetDocumentAnalysis`. Neither action names an ARN, so `"*"` is the
+only expressible resource — the effective scope is the S3 object grant, because
+Textract reads `DocumentLocation.S3Object` under the caller's own credentials
+and can therefore only analyse documents the identity could already read. The
+AWS ECS scenario module grants both actions to the task role and carries the
+same statement in the permissions boundary.
+
+**The S3 object must fall inside the caller's own object grant, and a document
+outside it fails misleadingly.** The effective read scope is whatever
+`s3:GetObject` grant the pipeline identity holds. When `version_field` is
+configured, the identity also needs `s3:GetObjectVersion` on that same object
+scope; `s3:GetObject` alone does not authorize the version-pinned read. In the
+reference AWS ECS deployment both actions are granted on
+`<bucket>/<namespace>/<run_id>/*`, so documents must live under that prefix — a
+document elsewhere in the *same* bucket is unreadable. Textract reports that as
+`{"code": "InvalidS3ObjectException", "error_type": "service_error", "reason":
+"submit_failed"}`; the provider does not distinguish an authorization miss from
+a missing or corrupt file. ELSPETH therefore classifies this code with
+`cause: s3_object_unreadable` and an `error` hint in the audit reason: check
+the role's `s3:GetObject` scope and, for a version-pinned row,
+`s3:GetObjectVersion` (then object existence and region) before suspecting the
+document itself. Read the granted prefix from the task-role policy rather than
+guessing:
+
+```sh
+aws iam get-role-policy --role-name <task-role> --policy-name <task-policy> \
+  --query 'PolicyDocument.Statement[?Sid==`UseAcceptanceObjects`].Resource' --output json
+```
+
+To tell an authorization problem from a bad document, submit the identical
+object with a principal you know can read it
+(`aws textract start-document-analysis --document-location ...`). If that
+succeeds, the file is fine and the pipeline identity's object grant is the
+problem.
+
+**Bounds and polling.** Each document is capped by `max_result_pages`,
+`max_blocks`, and `max_result_bytes`, and the job poll is governed by
+`poll_interval_seconds`, `poll_backoff_multiplier`, `poll_max_interval_seconds`,
+`poll_timeout_seconds`, and `batch_wait_timeout_seconds`. The defaults suit
+ordinary business documents; raise the caps deliberately, because they bound
+how much provider-shaped data can enter one row.
+
+**Extracted text is untrusted third-party content.** A document supplied by an
+outside party can carry text crafted to steer a downstream model, exactly like
+a scraped web page. Put a prompt shield between this transform and any `llm`
+node that consumes its output. When `ELSPETH_WEB__PLUGIN_CONTROL_MODES` sets
+`prompt_shield` to `required`, web-authored pipelines cannot omit that shield;
+under `recommend` it is the author's responsibility.
+
+### AWS Textract inline analysis
+
+`aws_textract_inline_analysis` is the synchronous sibling: each row names a
+payload-store content hash (`blob_ref_field`, default `blob_ref` — the field
+the `blob_rows` source emits), and the transform retrieves the bytes with
+integrity checking, verifies the byte signature of the **required, explicit**
+`document_format` (`jpeg`, `png`, or `pdf` — no `jpg` alias, runtime never
+infers), and sends them as inline bytes to one audited `AnalyzeDocument` call.
+Output projections (`text_field`, `page_count_field`, `metadata_field`,
+`extract`, `result_field`) match the asynchronous plugin, so downstream nodes
+can switch between S3 and blob ingestion unchanged.
+
+```yaml
+transforms:
+  - name: analyze
+    plugin: aws_textract_inline_analysis
+    input: documents
+    on_success: results
+    on_error: failures
+    options:
+      region: ap-southeast-2
+      auth_mode: default_chain
+      document_format: png
+      feature_types: [TABLES, FORMS]
+      text_field: textract_text
+      schema: {mode: observed}
+```
+
+**Bounds.** Documents are capped at 5 MiB (`max_document_bytes` may lower but
+never raise that provider bound), PDF support is single-page only, and a
+response proving any page count other than one fails the row. Queries are
+limited to Textract's synchronous ceiling of 15, with page selectors
+restricted to `["1"]` or `["*"]`. Larger, multipage, or already-S3 documents
+belong in `aws_textract_document_analysis`.
+
+**Billing.** Synchronous `AnalyzeDocument` has no idempotency token: botocore's
+standard retries and any engine-level row retry each place another billable
+call. The per-row success metadata records the SDK attempt count as evidence.
+
+**IAM.** The calling identity needs `textract:AnalyzeDocument` (no ARN-scoped
+resource exists). No S3 access is involved — the document bytes travel in the
+request, and the call audit records their SHA-256 hash and length, never the
+bytes.
+
+The untrusted-content guidance above applies identically: inline-extracted
+text taints downstream `llm` nodes, and the web surface counts this plugin
+among untrusted-content producers.
+
+### Required controls and error routing
+
+When a control mode is `required`, the web surface checks that the control
+*dominates* (for `prompt_shield`) or *post-dominates* (for `content_safety`)
+every `llm` node. The check treats **each stream a node emits as an independent
+path**: `on_success`, `on_error`, every gate route, and every fork branch.
+There is one exemption — the virtual `discard` target, which produces no
+stream.
+
+**With `content_safety: required`, an `llm` node's `on_error` must be
+`discard`.** Two independent rules combine to leave exactly one option:
+
+- A transform's `on_error` is a **sink name or `discard`** — never a connection
+  name. Naming a stream there fails graph construction with
+  `No producer for connection '<name>'`, because only `on_success` publishes a
+  connection. So no transform, including a control, can be interposed on an
+  error path.
+- Any sink target on that path fails the coverage check with
+  `output_error_route_not_post_dominated`, because the row reaches a sink
+  without passing the control.
+
+`discard` is therefore the only conforming value, and it is what the check
+accepts:
+
+```yaml
+transforms:
+  - name: summarize_document
+    plugin: llm
+    input: summarize_in
+    on_success: screen_summary_in
+    on_error: discard                 # the only value that satisfies the check
+    options:
+      provider: bedrock
+      model: bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0
+      region_name: ap-southeast-2
+      prompt_template: "Summarise: {{ row.document_text }}"
+      required_input_fields: [document_text]
+      response_field: summary
+      schema:
+        mode: observed
+
+  - name: screen_summary
+    plugin: aws_bedrock_content_safety
+    input: screen_summary_in
+    on_success: output
+    on_error: quarantine
+    options:
+      guardrail_identifier: operatorcontentguardrail
+      guardrail_version: "4"
+      region: ap-southeast-2
+      fields: [summary]               # must cover the llm response_field
+      source: OUTPUT
+      schema:
+        mode: observed
+```
+
+Note that the success-path control must scan the `llm` node's `response_field`:
+coverage requires the control's `fields` to include every protected field, so
+`response_field: summary` pairs with `fields: [summary]`.
+
+What `discard` costs you is the row's **content**, not the record of it. The
+failed row reaches no sink, so there is nothing to inspect or re-drive later; the
+audit trail still records the terminal outcome for that row and its content hash,
+so the failure remains explainable, attributable to the node, and countable in
+run accounting.
+
+If a deployment genuinely needs failed LLM rows preserved in a quarantine sink,
+that is an operator decision rather than an authoring workaround. `on_error:
+<quarantine sink>` builds and runs perfectly well; it is only the *required*
+control mode that rejects it. Either the operator sets `content_safety` to
+`recommend` in `ELSPETH_WEB__PLUGIN_CONTROL_MODES` — making the control the
+author's responsibility, as it is by default — or the pipeline runs under the
+CLI/batch runtime, where the web plugin policy does not apply.
+
+On the success path, intermediate transforms between the `llm` node and the
+control are allowed — the check keeps walking downstream until it finds one —
+but every stream that intermediate node emits must itself reach a control or
+`discard`, and a `field_mapper` that renames a protected field is followed
+through while one that drops it (`select_only: true` without that field) fails
+the check.
+
+The input side has the mirror-image trap: a node between the prompt shield and
+the `llm` node that writes a shielded field replaces scanned content with
+unscanned content, so the shield no longer covers it. Coverage fails closed
+there on any node whose write set it cannot prove — only `passthrough`,
+`value_transform`, and `field_mapper` have provable write sets.
+
 ---
 
 ## Gate Settings
@@ -680,6 +1713,7 @@ gates:
     routes:
       "true": next_step_in   # Connection name for downstream node
       "false": discard       # Virtual terminal discard; records gate_discarded
+    on_error: discard         # Optional row-scoped expression-error policy
 
   - name: amount_threshold
     input: validated
@@ -695,6 +1729,7 @@ gates:
 | `input` | string | **Yes** | Connection name to receive data from |
 | `condition` | string | **Yes** | Expression to evaluate (see [Expression Syntax](#expression-syntax)) |
 | `routes` | object | **Yes** | Maps evaluation results to destinations |
+| `on_error` | string | No | Sink name for row-scoped expression-evaluation failures, or `discard`; omission preserves fail-fast execution |
 | `fork_to` | list | No | Branch paths for fork operations |
 
 ### Route Destinations
@@ -708,6 +1743,26 @@ gates:
 
 All route destinations must be explicit connection names, sink names, `fork`, or the virtual `discard` target. There is no implicit "forward to next step" — every routing decision must name its destination.
 
+### Expression Evaluation Failures
+
+Gate `on_error` applies only after a valid condition reaches row-scoped runtime
+evaluation. Invalid syntax and forbidden expression constructs fail config
+validation before any rows are processed.
+
+- A named sink records the gate node state as failed, records an audited
+  `DIVERT` routing event, and terminates the row as
+  `(failure, on_error_routed)` with `sink_name` and `error_hash`.
+- `on_error: discard` records the failed gate state and terminates the row as
+  `(failure, gate_error_discarded)` with `error_hash`. The row reaches no sink,
+  so no routing event is fabricated.
+- If `on_error` is omitted, the evaluation error propagates and the run fails
+  fast.
+
+Configured policies are per-row: unaffected source rows continue. Do not
+confuse a route destination of `discard`, which is an intentional successful
+decision recorded as `(success, gate_discarded)`, with `on_error: discard`,
+which records a failed evaluation.
+
 ### Boolean Conditions
 
 Boolean expressions (comparisons, `and`/`or`) must use `"true"`/`"false"` as route labels:
@@ -720,6 +1775,7 @@ gates:
     routes:
       "true": high_values
       "false": output
+    on_error: discard
 
 # WRONG - boolean condition with non-boolean labels
 gates:
@@ -901,14 +1957,19 @@ When `merge: union` is used and two or more branches emit the same field name, `
 |-------|----------|
 | `last_wins` *(default)* | The last branch in declaration order wins. Matches the historical behavior of union merges. |
 | `first_wins` | The first branch in declaration order wins. |
-| `fail` | Raise `CoalesceCollisionError` the moment any field collides. No merged row is produced. The full collision record (origin of every field plus each contributing `(branch, value)` pair) is still written to the audit trail on the failed node state. |
+| `fail` | Raise `CoalesceCollisionError` the moment any field collides. No merged row is produced. Field origins and contributing branch names are still written to the failed node state. |
 
 > **Note on `fail`:** Collision detection is **name-based**, not value-based. Two branches that both emit a field called `id` with the *same* value still trigger `fail` — the executor does not compare values to decide whether the overlap is "real." If your branches share trivially-identical fields (like an `id` carried unchanged through both transforms), use `last_wins` or `first_wins` instead, or rename the shared fields out of one branch.
 
 Regardless of the chosen value, every union merge records:
 
 - `union_field_origins` — a mapping from every merged field to the branch that produced the winning value. Always populated so auditors can reconstruct field-level provenance even when no collision occurred.
-- `union_field_collision_values` — a mapping from each colliding field to the ordered list of `(branch, value)` pairs. Populated only when at least one field collided.
+- `union_field_collisions` — a mapping from each colliding field to the ordered list of contributing branches. Populated only when at least one field collided.
+
+Collision audit metadata deliberately does not contain raw values, value hashes, or
+Python value types. This prevents low-entropy branch values from being recovered by
+offline enumeration while preserving the branch, field, and winner provenance needed
+to explain first-wins, last-wins, and failed merges.
 
 `union_collision_policy` is **orthogonal to `policy`**: `policy` governs branch-level arrival (what to do when some branches never arrive), while `union_collision_policy` governs field-level conflict within an already-assembled merge. They are independent axes and can be combined freely.
 
@@ -952,15 +2013,33 @@ Go/no-go conditions evaluated after dependencies complete but before the main pi
 ```yaml
 commencement_gates:
   - name: collection_ready
-    condition: "probes['products'].document_count > 0"
+    condition: "collections['products']['count'] > 0"
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | **Yes** | Unique label for this gate |
-| `condition` | string | **Yes** | Expression evaluated against pre-flight context (including probe results) |
+| `condition` | string | **Yes** | Expression evaluated against pre-flight context (see the bound names below) |
 
-Gate failures raise `CommencementGateFailedError` and abort the pipeline. Gate passes are recorded in the audit trail.
+Conditions use the same restricted grammar as gates and aggregation triggers
+(see [Expression Syntax](#expression-syntax)), but they run before any row
+exists, so `row` is **not** bound. Exactly three names are available:
+
+| Name | Shape | Description |
+|------|-------|-------------|
+| `collections` | `{<collection>: {reachable, count}}` | One entry per [collection probe](#collection-probes) |
+| `dependency_runs` | `{<name>: {run_id, settings_hash, duration_ms, indexed_at}}` | One entry per completed [pipeline dependency](#pipeline-dependencies) |
+| `env` | `{<key>: <value>}` | Explicitly supplied non-secret gate environment values |
+
+Because attribute access is forbidden by the grammar, every lookup is a
+subscript or a single-argument `.get()`:
+`collections['products']['count']`, not `collections['products'].count`.
+Nested values are read the same way — `dependency_runs['indexing']['run_id']`.
+
+Gate failures raise `CommencementGateFailedError` and abort the pipeline. Gate
+passes are recorded in the audit trail; the audited context snapshot includes
+`collections` and `dependency_runs` in full but records only the *key names*
+from `env`, never its values.
 
 ---
 
@@ -982,7 +2061,18 @@ collection_probes:
 | `provider` | string | **Yes** | Provider type (e.g., `chroma`) |
 | `provider_config` | object | No | Provider-specific connection configuration |
 
-Probe results (document count, metadata) are available to commencement gate expressions via `probes['<collection_name>']`.
+Probe results are available to commencement-gate expressions as
+`collections['<collection_name>']`, a mapping with two keys:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `reachable` | bool | Whether the probe reached the provider |
+| `count` | int | Documents the probe observed in the collection |
+
+A collection that was never probed is absent from `collections`, and
+subscripting it fails the gate with `Field '<name>' not found in dict` rather
+than reading as zero. Use `collections.get('<name>') is not None` when the probe
+itself is conditional.
 
 ---
 
@@ -1018,9 +2108,12 @@ landscape:
       durability: replicated
   # Optional: JSONL change journal for emergency backup
   dump_to_jsonl: false
-  dump_to_jsonl_path: ./runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
   dump_to_jsonl_include_payloads: false
 ```
+
+For SQLite, ELSPETH resolves a relative journal path against the directory
+containing `landscape.url`. Here, both files live under `./runs/`.
 
 Committed journal batches are bound to the canonical sidecar path that
 created them. Startup recovery only drains that path's backlog; changing a
@@ -1036,12 +2129,12 @@ Concurrent drains for one path are serialized across processes.
 | `url` | string | `sqlite:///./state/audit.db` | SQLAlchemy database URL |
 | `export` | object | (disabled) | Post-run audit export configuration |
 | `dump_to_jsonl` | bool | `false` | Write append-only JSONL change journal |
-| `dump_to_jsonl_path` | string | (derived from url) | Path for JSONL journal file |
+| `dump_to_jsonl_path` | string | (derived from url) | Path for JSONL journal file; SQLite resolves relative paths against the database directory |
 | `dump_to_jsonl_fail_on_error` | bool | `false` | Fail database startup if a committed outbox batch cannot be published during recovery |
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 29
+### Landscape schema epoch 38
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -1053,16 +2146,51 @@ validation-error links, canonical node output-contract hashes, durable batch
 expansion claims, and a transaction-owned sidecar-journal outbox. Each outbox
 batch records its
 canonical sidecar owner so another worker or path cannot publish or acknowledge
-it. See the
+it. Epoch 30 adds `token_work_items.row_union_name` so a recovered scheduler can
+attribute a blocked work item to its declared row_union barrier. Epoch 31
+closes `token_work_items.status` over the public scheduler status enum so a
+removed state such as `waiting` cannot be reintroduced through direct SQL.
+Epoch 32 adds normalized, content-addressed aggregation result receipts. For
+every successful transform or passthrough flush, node completion, batch
+completion, the exact ordered outputs, and every member action commit in one
+transaction. Resume can create a pending transform expansion, continue
+passthrough rows with their original token identities, or finish an empty
+result without invoking the aggregation plugin again. Empty-result member
+outcomes commit with the scheduler barrier transition rather than in a separate
+write. Epoch 33 gives token outcomes a composite (run_id, token_id) access
+path so a run-scoped per-token read resolves through one index instead of
+choosing between two single-column candidates. Epoch 34 adds the
+unified-lineage groundwork tables (`token_lineage_frames`, `group_records`,
+`group_losses`) and `token_work_items.lineage_path_json`. Epoch 35 flips
+lineage onto that groundwork: the tri-column `fork_group_id`/`expand_group_id`/
+`branch_name` discriminators are retired from `tokens`, `token_outcomes`, and
+`token_work_items` (plus `token_outcomes.expected_branches_json`), and
+`token_lineage_frames`/`lineage_path_json` become the sole lineage truth.
+`join_group_id` stays — it is a merge-event identity, not a lineage-path
+field. Epoch 36 binds every coalesce effect to its required non-null lineage
+group so aggregation recovery cannot lose group identity. Epoch 37 widens the
+auth provider discriminator on `auth_events` and `run_attributions` from three
+values to five, admitting `vanguard` and `google` alongside `local`, `oidc`
+and `entra`; the constraint only widens, but Landscape compares declared CHECK
+text against the reflected constraint structurally, so it is a schema change
+like any other and is cut over in the same service-stop window as sessions
+epoch 50. Epoch 38 gives `scheduler_events` an auto-incrementing `seq` primary
+key that is the authoritative replay order, and every reader orders by it;
+`event_id` becomes a non-unique content digest of the transition that no
+longer covers `recorded_at`. Events are stamped from database time, which is
+whole-second on SQLite and one shared transaction timestamp on PostgreSQL, so
+`(recorded_at, event_id)` tied and replayed in hash order, and two identical
+transitions of one work item inside one second collided on the old primary
+key. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-29, either automatically at startup or through an operator migration command.
+38, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-29 database.
+an older epoch must not be rolled back over an epoch-38 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.
@@ -1196,7 +2324,7 @@ landscape:
 
   # Enable the change journal
   dump_to_jsonl: true
-  dump_to_jsonl_path: ./runs/audit.journal.jsonl
+  dump_to_jsonl_path: audit.journal.jsonl
 
   # Include LLM/HTTP request and response bodies
   dump_to_jsonl_include_payloads: true
@@ -1733,7 +2861,14 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 
 ## Expression Syntax
 
-Gate conditions and aggregation triggers use a restricted expression language.
+Gate conditions, aggregation triggers, commencement-gate conditions, and
+`value_transform` operations use a restricted expression language.
+
+Row-scoped expressions (gates, aggregation triggers, `value_transform`
+operations) bind a single name, `row`. Commencement-gate conditions run before
+any row exists and bind a different set of names —
+[Commencement Gates](#commencement-gates) documents them — but they are parsed
+by the same grammar, so everything below applies to them too.
 
 ### Allowed Constructs
 
@@ -1831,13 +2966,25 @@ transforms:
   - name: enricher
     plugin: field_mapper
     input: raw_data
+    on_success: flagging_in
+    on_error: quarantine
+    options:
+      schema:
+        mode: observed
+      mapping:
+        customer_id: account_id
+
+  - name: flag_large_orders
+    plugin: value_transform
+    input: flagging_in
     on_success: enriched
     on_error: quarantine
     options:
       schema:
         mode: observed
-      computed:
-        processed_at: "row.get('timestamp', 'unknown')"
+      operations:
+        - target: is_large_order
+          expression: "row['amount'] >= 1000"
 
 # Gates - routing decisions
 gates:
@@ -1847,6 +2994,7 @@ gates:
     routes:
       "true": high_values
       "false": output
+    on_error: discard
 
 # Audit trail
 landscape:

@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from dataclasses import replace as replace_dc
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.service import ExecutionServiceImpl
@@ -23,11 +23,12 @@ from elspeth.web.interpretation_state import (
     SOURCE_AUTHORING_KEY,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -50,25 +51,11 @@ def _session_service() -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return SessionServiceImpl(
+    return DualFencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.preflight_per_class"),
     )
-
-
-def _insert_session(service: SessionServiceImpl, session_id: UUID) -> None:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="interpretation preflight",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
 
 
 class _UnusedYamlGenerator:
@@ -142,9 +129,14 @@ async def _seed_and_execute(
     state_data: CompositionStateData,
 ) -> UnresolvedInterpretationPlaceholderError:
     session_service = _session_service()
-    session_id = uuid4()
-    _insert_session(session_service, session_id)
-    await session_service.save_composition_state(
+    session = await session_service.create_session(
+        user_id="alice",
+        title="interpretation preflight",
+        auth_provider_type="local",
+    )
+    session_id = session.id
+    await _save_composition_state_with_compose_authority(
+        session_service,
         session_id,
         state_data,
         provenance="session_seed",
@@ -155,8 +147,20 @@ async def _seed_and_execute(
         session_service=session_service,
     )
     try:
-        with pytest.raises(UnresolvedInterpretationPlaceholderError) as exc_info:
-            await execution_service.execute(session_id, user_id="alice")
+        lease = await SessionOperationLease.acquire(
+            session_service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        async with lease:
+            with pytest.raises(UnresolvedInterpretationPlaceholderError) as exc_info:
+                await execution_service.execute(
+                    session_id,
+                    session_operation_lease=lease,
+                    user_id="alice",
+                )
     finally:
         await execution_service.shutdown()
     return exc_info.value
@@ -259,3 +263,27 @@ async def test_execute_rejects_unreviewed_llm_prompt_template(tmp_path: Path) ->
         InterpretationKind.LLM_MODEL_CHOICE,
     }
     assert "llm_prompt_template" in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_execute_gate_ignores_persisted_is_valid_true(tmp_path: Path) -> None:
+    """FENCE (elspeth-67c6fa691d): /execute must re-derive the strict predicate
+    unconditionally — ``materialize_state_for_execution`` runs regardless of
+    what ``composition_states.is_valid`` says.
+
+    The persisted row here asserts ``is_valid=True`` (the permissive shape a
+    mid-turn authoring-lane writer could produce) while the state still
+    carries a pending interpretation review. A future "skip preflight when
+    the persisted row is valid" fast path would admit this run and turn the
+    two-writers legibility defect into a genuine safety hole; this test must
+    fail on any such change.
+    """
+    state_data = _llm_state_with_options(
+        {
+            "prompt_template": "Rate how {{ interpretation: primary colour }} this page is.",
+            "model": "stub-model",
+        }
+    )
+    exc = await _seed_and_execute(tmp_path, replace_dc(state_data, is_valid=True, validation_errors=None))
+
+    assert ("rate", InterpretationKind.VAGUE_TERM) in [(site.component_id, site.kind) for site in exc.sites]

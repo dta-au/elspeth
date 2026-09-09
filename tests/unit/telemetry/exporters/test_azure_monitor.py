@@ -14,7 +14,7 @@ import inside configure() to allow running without installing the package.
 """
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import ModuleType
 from typing import Any
 from unittest.mock import patch
@@ -24,6 +24,12 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 
 from elspeth.contracts.enums import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.events import (
+    EngineSpanCompleted,
+    EngineSpanName,
+    EngineSpanStatus,
+    PhaseAction,
+    PhaseChanged,
+    PipelinePhase,
     RunFinished,
     RunStarted,
 )
@@ -31,6 +37,7 @@ from elspeth.telemetry.errors import TelemetryExporterError
 
 # Import the exporter class - it doesn't import Azure SDK at module level
 from elspeth.telemetry.exporters.azure_monitor import AzureMonitorExporter
+from elspeth.telemetry.serialization import derive_trace_id
 
 
 @dataclass
@@ -293,6 +300,264 @@ class TestAzureMonitorExporterSpanConversion:
         span = spans[0]
         assert span.attributes.get("cloud.provider") == "azure"
         assert span.attributes.get("elspeth.exporter") == "azure_monitor"
+
+    def test_engine_span_preserves_duration_identity_parent_and_canonical_trace_start(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        started_at = datetime(2026, 7, 24, 1, 2, 4, 123456, tzinfo=UTC)
+        completed_at = datetime(2026, 7, 24, 1, 2, 5, 654321, tzinfo=UTC)
+        event = EngineSpanCompleted(
+            timestamp=completed_at,
+            run_id="run-engine-span",
+            name=EngineSpanName.AGGREGATION,
+            started_at=started_at,
+            trace_started_at=trace_started_at,
+            span_id="1234567890abcdef",
+            parent_span_id="fedcba0987654321",
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"plugin.name": "row_union"},
+        )
+
+        configured_exporter.export(event)
+        configured_exporter.flush()
+
+        span = azure_monitor_trace_exporter.instance.export_calls[0][0]
+        assert span.name == "aggregation"
+        assert span.start_time == int(started_at.timestamp() * 1_000_000_000)
+        assert span.end_time == int(completed_at.timestamp() * 1_000_000_000)
+        assert span.context.trace_id == derive_trace_id("run-engine-span", started_at=trace_started_at)
+        assert span.context.span_id == int("1234567890abcdef", 16)
+        assert span.parent is not None
+        assert span.parent.span_id == int("fedcba0987654321", 16)
+        assert span.attributes["plugin.name"] == "row_union"
+        assert span.attributes["cloud.provider"] == "azure"
+
+    def test_lifecycle_and_engine_spans_share_the_durable_trace_identity(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        configured_exporter.export(
+            RunStarted(
+                timestamp=trace_started_at,
+                run_id="run-engine-span",
+                config_hash="abc123",
+                source_plugin="csv",
+            )
+        )
+        configured_exporter.export(
+            EngineSpanCompleted(
+                timestamp=trace_started_at + timedelta(seconds=2),
+                run_id="run-engine-span",
+                name=EngineSpanName.SOURCE,
+                started_at=trace_started_at + timedelta(seconds=1),
+                trace_started_at=trace_started_at,
+                span_id="1234567890abcdef",
+                parent_span_id=None,
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"plugin.name": "csv", "plugin.type": "source"},
+            )
+        )
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len(exported) == 2
+        assert exported[0].context.trace_id == exported[1].context.trace_id
+
+    def test_joined_run_engine_span_binds_following_lifecycle_identity_without_run_started(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        configured_exporter.export(
+            EngineSpanCompleted(
+                timestamp=trace_started_at + timedelta(seconds=2),
+                run_id="joined-run",
+                name=EngineSpanName.ROW,
+                started_at=trace_started_at + timedelta(seconds=1),
+                trace_started_at=trace_started_at,
+                span_id="1234567890abcdef",
+                parent_span_id=None,
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"row.id": "row-1", "token.id": "token-1"},
+            )
+        )
+        configured_exporter.export(
+            RunFinished(
+                timestamp=trace_started_at + timedelta(seconds=3),
+                run_id="joined-run",
+                status=RunStatus.COMPLETED,
+                row_count=1,
+                duration_ms=3000.0,
+            )
+        )
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len(exported) == 2
+        assert exported[0].context.trace_id == exported[1].context.trace_id
+        assert "joined-run" not in configured_exporter._trace_started_at
+        assert "joined-run" not in configured_exporter._fresh_run_ids
+
+    def test_run_finished_without_run_span_retains_origin_until_close(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        configured_exporter.export(RunStarted(timestamp=started_at, run_id="run-no-span", config_hash="abc", source_plugin="csv"))
+        configured_exporter.export(
+            RunFinished(
+                timestamp=started_at + timedelta(seconds=3),
+                run_id="run-no-span",
+                status=RunStatus.COMPLETED,
+                row_count=1,
+                duration_ms=3000.0,
+            )
+        )
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert exported[0].context.trace_id == exported[1].context.trace_id
+        assert "run-no-span" in configured_exporter._trace_started_at
+        assert "run-no-span" in configured_exporter._fresh_run_ids
+        assert "run-no-span" in configured_exporter._fresh_run_finished_ids
+
+        configured_exporter.close()
+
+        assert "run-no-span" not in configured_exporter._trace_started_at
+        assert "run-no-span" not in configured_exporter._fresh_run_ids
+        assert "run-no-span" not in configured_exporter._fresh_run_finished_ids
+
+    @pytest.mark.parametrize("terminal_order", ["finish-first", "run-span-first"])
+    def test_fresh_run_terminal_pair_keeps_one_trace_then_releases_registry(
+        self,
+        terminal_order: str,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        """RunFinished and the enclosing run span may arrive in either order."""
+        run_id = f"run-terminal-{terminal_order}"
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        run_finished = RunFinished(
+            timestamp=trace_started_at + timedelta(seconds=3),
+            run_id=run_id,
+            status=RunStatus.COMPLETED,
+            row_count=1,
+            duration_ms=3000.0,
+        )
+        run_span = EngineSpanCompleted(
+            timestamp=trace_started_at + timedelta(seconds=4),
+            run_id=run_id,
+            name=EngineSpanName.RUN,
+            started_at=trace_started_at,
+            trace_started_at=trace_started_at,
+            span_id="1234567890abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"run.id": run_id},
+        )
+
+        configured_exporter.export(RunStarted(timestamp=trace_started_at, run_id=run_id, config_hash="abc", source_plugin="csv"))
+        if terminal_order == "finish-first":
+            configured_exporter.export(run_finished)
+            configured_exporter.export(run_span)
+        else:
+            configured_exporter.export(run_span)
+            configured_exporter.export(run_finished)
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len({span.context.trace_id for span in exported}) == 1
+        assert run_id not in configured_exporter._trace_started_at
+        assert run_id not in configured_exporter._fresh_run_ids
+        assert run_id not in configured_exporter._fresh_run_finished_ids
+        assert run_id not in configured_exporter._fresh_run_span_completed_ids
+
+    def test_export_phase_between_run_finished_and_run_span_keeps_durable_trace_origin(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        run_id = "run-terminal-export-phase"
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+
+        configured_exporter.export(RunStarted(timestamp=trace_started_at, run_id=run_id, config_hash="abc", source_plugin="csv"))
+        configured_exporter.export(
+            RunFinished(
+                timestamp=trace_started_at + timedelta(seconds=3),
+                run_id=run_id,
+                status=RunStatus.COMPLETED,
+                row_count=1,
+                duration_ms=3000.0,
+            )
+        )
+        configured_exporter.export(
+            PhaseChanged(
+                timestamp=trace_started_at + timedelta(seconds=4),
+                run_id=run_id,
+                phase=PipelinePhase.EXPORT,
+                action=PhaseAction.EXPORTING,
+            )
+        )
+        configured_exporter.export(
+            EngineSpanCompleted(
+                timestamp=trace_started_at + timedelta(seconds=5),
+                run_id=run_id,
+                name=EngineSpanName.RUN,
+                started_at=trace_started_at,
+                trace_started_at=trace_started_at,
+                span_id="1234567890abcdef",
+                parent_span_id=None,
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"run.id": run_id},
+            )
+        )
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len(exported) == 4
+        assert len({span.context.trace_id for span in exported}) == 1
+        assert run_id not in configured_exporter._trace_started_at
+        assert run_id not in configured_exporter._fresh_run_ids
+
+    def test_failed_engine_span_sets_error_status_with_safe_exception_type_only(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        timestamp = datetime(2026, 7, 24, 1, 2, 5, tzinfo=UTC)
+        event = EngineSpanCompleted(
+            timestamp=timestamp,
+            run_id="run-engine-span",
+            name=EngineSpanName.SOURCE,
+            started_at=timestamp,
+            trace_started_at=timestamp,
+            span_id="1234567890abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.ERROR,
+            exception_type="RuntimeError",
+            attributes={},
+        )
+
+        configured_exporter.export(event)
+        configured_exporter.flush()
+
+        span = azure_monitor_trace_exporter.instance.export_calls[0][0]
+        assert span.status.status_code.name == "ERROR"
+        assert span.status.description is None
+        assert span.attributes["exception_type"] == "RuntimeError"
+        assert not any("message" in key or "stack" in key for key in span.attributes)
 
     def test_datetime_serialized_as_iso8601(
         self,

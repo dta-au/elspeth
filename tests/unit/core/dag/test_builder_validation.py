@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from elspeth.contracts import RouteDestination
+from elspeth.contracts import RouteDestination, RoutingMode
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings, GateSettings, SourceSettings, TransformSettings
@@ -24,6 +24,17 @@ from elspeth.core.dag.wiring import WiredTransform
 class _BuilderValidationMockSource:
     name = "mock_source"
     output_schema = None
+    config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
+    _on_validation_failure = "discard"
+    on_success = "source_out"
+    _output_schema_config: SchemaConfig | None = None
+    observed_value_type: str | None = None
+
+
+class _BuilderValidationSourceImpostor:
+    name = "source_impostor"
+    output_schema = None
+    observed_value_type: str | None = None
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "source_out"
@@ -45,13 +56,109 @@ class _BuilderValidationTransform:
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
+    creates_tokens = False
     declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
+    preserves_input_values = False
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
         self.config = {"schema": {"mode": "observed"}}
         self._output_schema_config = output_schema_config
+
+
+class TestBuilderTopLevelAdmission:
+    """Top-level plugin collections fail before partial graph construction."""
+
+    def test_empty_source_map_is_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match="at least one source"):
+            ExecutionGraph.from_plugin_instances(
+                sources={},
+                source_settings_map={},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_missing_sink_map_is_rejected(self) -> None:
+        source = _BuilderValidationMockSource()
+
+        with pytest.raises(GraphValidationError, match="at least one sink"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks=None,
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_empty_sink_map_is_rejected(self) -> None:
+        source = _BuilderValidationMockSource()
+
+        with pytest.raises(GraphValidationError, match="at least one sink"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="discard", options={})},
+                transforms=[],
+                sinks={},
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_source_plugin_and_settings_names_must_match(self) -> None:
+        source = _BuilderValidationMockSource()
+
+        with pytest.raises(GraphValidationError, match="names must match"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"plugin_name": source},  # type: ignore[arg-type]
+                source_settings_map={"settings_name": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_invalid_raw_source_schema_is_wrapped_as_graph_validation_error(self) -> None:
+        class InvalidSchemaSource(_BuilderValidationMockSource):
+            config: ClassVar[dict[str, Any]] = {"schema": "invalid"}
+
+        source = InvalidSchemaSource()
+
+        with pytest.raises(GraphValidationError, match="Invalid schema config"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_generated_node_id_length_is_bounded(self) -> None:
+        source = _BuilderValidationMockSource()
+        source_name = "s" * 300
+
+        with pytest.raises(GraphValidationError, match="Generated node_id exceeds"):
+            ExecutionGraph.from_plugin_instances(
+                sources={source_name: source},  # type: ignore[arg-type]
+                source_settings_map={source_name: SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
 
 
 class TestCoalesceBranchPlanning:
@@ -86,6 +193,20 @@ class TestCoalesceBranchPlanning:
             graph.set_sink_id_map({})
         with pytest.raises(GraphValidationError, match="build metadata is frozen"):
             graph.add_route_resolution_entry(NodeID("gate"), "true", RouteDestination.discard())
+
+    def test_source_missing_owned_schema_contract_fails_loudly(self) -> None:
+        source = _BuilderValidationSourceImpostor()
+
+        with pytest.raises(AttributeError, match="_output_schema_config"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
 
     def test_branch_info_carries_identity_and_transform_branch_plan(self) -> None:
         source = _BuilderValidationMockSource()
@@ -569,3 +690,586 @@ class TestCoalesceOnSuccessRejectsConnection:
                 gates=list(settings.gates),
                 coalesce_settings=settings.coalesce,
             )
+
+
+class TestTransformOutputFieldCollisionRejectedAtBuild:
+    """The ticket's g05 shape must not build (elspeth-cfcd333f83).
+
+    A composer-authored "title-case the headline" pipeline reused the existing
+    field name as the llm transform's ``response_field``. That passed
+    validation and then crashed on the first row in
+    ``TransformExecutor._run_preflight`` with "would overwrite existing input
+    fields ... This is a pipeline configuration error". Configuration errors
+    belong on the build-time surface: ``build_execution_graph`` runs
+    ``validate_edge_compatibility()``, which both ``elspeth run`` and the web
+    ``POST /validate`` reach, so the rejection surfaces from
+    ``from_plugin_instances`` itself.
+    """
+
+    @staticmethod
+    def _build(tmp_path: Any, *, response_field: str) -> ExecutionGraph:
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import ElspethSettings, SinkSettings
+
+        text_path = tmp_path / "in.txt"
+        text_path.write_text("hello world\n", encoding="utf-8")
+
+        settings = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="text",
+                    on_success="title_case",
+                    options={
+                        "path": str(text_path),
+                        "column": "headline",
+                        "schema": {"mode": "observed"},
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="title_case",
+                    plugin="llm",
+                    input="title_case",
+                    on_success="main",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4.1-nano",
+                        "api_key": "env:OPENROUTER_API_KEY",
+                        "prompt_template": "Title-case: {{ row.headline }}",
+                        "response_field": response_field,
+                        "schema": {"mode": "observed"},
+                        "required_input_fields": ["headline"],
+                    },
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="text",
+                    on_write_failure="discard",
+                    options={
+                        "path": str(tmp_path / "out.txt"),
+                        "field": "headline",
+                        "schema": {"mode": "observed"},
+                    },
+                )
+            },
+        )
+        plugins = instantiate_plugins_from_config(settings)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=None,
+        )
+
+    def test_response_field_reusing_source_column_is_rejected(self, tmp_path: Any) -> None:
+        """The `text` source guarantees `headline` from its `column:` option."""
+        with pytest.raises(GraphValidationError, match="headline") as exc_info:
+            self._build(tmp_path, response_field="headline")
+
+        message = str(exc_info.value)
+        assert exc_info.value.component_type == "transform"
+        # Actionable for an LLM author: names the fix, not just the fault.
+        assert "response_field" in message
+
+    def test_fresh_response_field_still_builds(self, tmp_path: Any) -> None:
+        """Negative control: renaming the output field makes the pipeline valid."""
+        graph = self._build(tmp_path, response_field="title_cased")
+
+        graph.validate_edge_compatibility()
+
+
+def _build_gate_fork_graph(
+    *,
+    fork_to: list[str],
+    coalesce: CoalesceSettings | list[CoalesceSettings] | None,
+    extra_sinks: dict[str, Any] | None = None,
+) -> ExecutionGraph:
+    """Minimal source + one fork gate + optional coalesce(s) + sinks graph."""
+    source = _BuilderValidationMockSource()
+    sinks: dict[str, Any] = {"out": _BuilderValidationMockSink()}
+    if extra_sinks:
+        sinks.update(extra_sinks)
+    coalesce_settings: list[CoalesceSettings] = []
+    if coalesce is not None:
+        coalesce_settings = coalesce if isinstance(coalesce, list) else [coalesce]
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[],
+        sinks=sinks,  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="splitter",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=fork_to,
+            )
+        ],
+        coalesce_settings=coalesce_settings,
+    )
+
+
+class TestWholeRosterForkClosure:
+    """Spec §7 rule 2 (ruling 23): a fork closes entirely at ONE closer or not at all."""
+
+    def test_mixed_fork_closure_rejected(self) -> None:
+        # fork_to [failing, survivor]: 'failing' declared by a coalesce,
+        # 'survivor' matches a sink name — buildable today, rejected now.
+        with pytest.raises(GraphValidationError, match="mixed closure"):
+            _build_gate_fork_graph(
+                fork_to=["failing", "survivor"],
+                coalesce=CoalesceSettings(name="merge", branches={"failing": "failing", "second": "second"}, on_success="out"),
+                extra_sinks={"survivor": _BuilderValidationMockSink()},
+            )
+
+    def test_pure_fan_out_fork_stays_legal(self) -> None:
+        # BOTH branches direct to sinks, no closer anywhere: "fully unbound
+        # (pure fan-out)" — LEGAL under rule 2 as written (plan pinned decision 2).
+        graph = _build_gate_fork_graph(
+            fork_to=["left", "right"],
+            coalesce=None,
+            extra_sinks={"left": _BuilderValidationMockSink(), "right": _BuilderValidationMockSink()},
+        )
+        assert graph is not None
+
+    def test_fork_split_across_two_closers_rejected(self) -> None:
+        # The parallel-coalesces shape: ONE fork closing at TWO sibling coalesces.
+        with pytest.raises(GraphValidationError, match="closes at multiple barriers"):
+            _build_gate_fork_graph(
+                fork_to=["left_a", "left_b", "right_a", "right_b"],
+                coalesce=[
+                    CoalesceSettings(name="merge_left", branches={"left_a": "left_a", "left_b": "left_b"}, on_success="out"),
+                    CoalesceSettings(name="merge_right", branches={"right_a": "right_a", "right_b": "right_b"}, on_success="out"),
+                ],
+            )
+
+    def test_closer_roster_must_equal_fork_roster(self) -> None:
+        # Closer declares a strict SUPERSET of the fork's branches → mismatch.
+        with pytest.raises(GraphValidationError, match="roster mismatch"):
+            _build_gate_fork_graph(
+                fork_to=["path_a", "path_b"],
+                coalesce=CoalesceSettings(
+                    name="merge",
+                    branches={"path_a": "path_a", "path_b": "path_b", "path_c": "path_c"},
+                    on_success="out",
+                ),
+            )
+
+
+class TestUnboundConsumerFedForkBranch:
+    """E2: a fork branch consumed by exactly one downstream transform/gate is
+    a legal unbound (pure-fan-out) destination — spec §7 rule 2's "closer or
+    sink" trichotomy gains a fourth path: an ordinary downstream consumer,
+    with no barrier claiming the branch at all (task-8a nested-expand-in-fork;
+    protocols RC-3's ratified B topology)."""
+
+    def test_branch_feeding_a_transform_with_no_barrier_or_sink_match_is_accepted(self) -> None:
+        # task-8a's exact shape: fork_to=[explode_path, control]; "control"
+        # matches a sink directly (rule 3, already legal); "explode_path"
+        # matches NEITHER a coalesce/row_union alias NOR a sink name — it is
+        # consumed only by transform "consumer"'s `input`.
+        source = _BuilderValidationMockSource()
+        consumer = _BuilderValidationTransform(name="consumer", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": source},  # type: ignore[arg-type]
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+            transforms=[
+                WiredTransform(
+                    plugin=consumer,  # type: ignore[arg-type]
+                    settings=TransformSettings(
+                        name="consumer",
+                        plugin=consumer.name,
+                        input="explode_path",
+                        on_success="exploded",
+                        on_error="discard",
+                        options={},
+                    ),
+                )
+            ],
+            sinks={"exploded": _BuilderValidationMockSink(), "control": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+            aggregations={},
+            gates=[
+                GateSettings(
+                    name="splitter",
+                    input="source_out",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["explode_path", "control"],
+                )
+            ],
+            coalesce_settings=[],
+        )
+        assert graph is not None
+
+    def test_branch_feeding_a_nested_gate_with_no_barrier_is_accepted(self) -> None:
+        # RC-3's ratified B topology, one region: outer branch "left" feeds an
+        # INNER fork gate directly (input="left"), no barrier claims "left"
+        # itself, and the inner fork closes whole-roster at its own coalesce.
+        source = _BuilderValidationMockSource()
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": source},  # type: ignore[arg-type]
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+            transforms=[],
+            sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+            aggregations={},
+            gates=[
+                GateSettings(
+                    name="outer",
+                    input="source_out",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["left"],
+                ),
+                GateSettings(
+                    name="inner",
+                    input="left",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["left_a", "left_b"],
+                ),
+            ],
+            coalesce_settings=[
+                CoalesceSettings(name="merge_left", branches={"left_a": "left_a", "left_b": "left_b"}, on_success="out"),
+            ],
+        )
+        assert graph is not None
+
+    def test_branch_with_two_downstream_consumers_is_rejected(self) -> None:
+        # Ambiguous: two different nodes both declare input="shared" — a fork
+        # branch may feed at most one consumer (use a gate for fan-out).
+        source = _BuilderValidationMockSource()
+        t1 = _BuilderValidationTransform(name="t1", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        t2 = _BuilderValidationTransform(name="t2", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        with pytest.raises(GraphValidationError, match="downstream consumers"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+                transforms=[
+                    WiredTransform(
+                        plugin=t1,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="t1", plugin=t1.name, input="shared", on_success="out", on_error="discard", options={}
+                        ),
+                    ),
+                    WiredTransform(
+                        plugin=t2,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="t2", plugin=t2.name, input="shared", on_success="out", on_error="discard", options={}
+                        ),
+                    ),
+                ],
+                sinks={"out": _BuilderValidationMockSink(), "other": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[
+                    GateSettings(
+                        name="splitter",
+                        input="source_out",
+                        condition="True",
+                        routes={"true": "fork", "false": "fork"},
+                        fork_to=["shared", "other"],
+                    )
+                ],
+                coalesce_settings=[],
+            )
+
+    def test_unclaimed_branch_still_rejected_with_the_updated_exhaustive_message(self) -> None:
+        # No coalesce/row_union alias, no sink match, no downstream consumer:
+        # still a build error, and the message must name all four legal shapes.
+        with pytest.raises(GraphValidationError, match=r"no destination") as exc_info:
+            _build_gate_fork_graph(fork_to=["orphan", "control"], coalesce=None, extra_sinks={"control": _BuilderValidationMockSink()})
+        assert "exactly one downstream transform/gate" in str(exc_info.value)
+
+    def test_mixed_bound_and_consumer_fed_stays_mixed_closure_rejected(self) -> None:
+        # rule 2 interplay: a consumer-fed (unbound) branch mixed with a
+        # closer-bound branch on the SAME gate is still mixed closure.
+        source = _BuilderValidationMockSource()
+        consumer = _BuilderValidationTransform(name="consumer", output_schema_config=SchemaConfig(mode="observed", fields=None))
+        with pytest.raises(GraphValidationError, match="mixed closure"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+                transforms=[
+                    WiredTransform(
+                        plugin=consumer,  # type: ignore[arg-type]
+                        settings=TransformSettings(
+                            name="consumer", plugin=consumer.name, input="free_path", on_success="out", on_error="discard", options={}
+                        ),
+                    )
+                ],
+                sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[
+                    GateSettings(
+                        name="splitter",
+                        input="source_out",
+                        condition="True",
+                        routes={"true": "fork", "false": "fork"},
+                        fork_to=["free_path", "bound_path"],
+                    )
+                ],
+                coalesce_settings=[
+                    CoalesceSettings(name="merge", branches={"bound_path": "bound_path", "second": "second"}, on_success="out"),
+                ],
+            )
+
+
+def _build_fork_coalesce_with_branch_on_error_to_closer() -> ExecutionGraph:
+    """A transform strictly INSIDE a fork->coalesce region names that same
+    coalesce as its on_error target — legal under rule 9 (spec §7): the
+    closer is the transform's own enclosing region's closer.
+    """
+    source = _BuilderValidationMockSource()
+    branch_a_transform = _BuilderValidationTransform(
+        name="branch_a_transform", output_schema_config=SchemaConfig(mode="observed", fields=None)
+    )
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=branch_a_transform,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="branch_a_transform",
+                    plugin=branch_a_transform.name,
+                    input="branch_a",
+                    on_success="a_out",
+                    on_error="merge",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="splitter",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["branch_a", "branch_b"],
+            )
+        ],
+        coalesce_settings=[
+            CoalesceSettings(name="merge", branches={"branch_a": "a_out", "branch_b": "branch_b"}, on_success="out"),
+        ],
+    )
+
+
+def _build_out_of_region_on_error_to_closer() -> ExecutionGraph:
+    """Two SEQUENTIAL (not nested) fork->coalesce regions: a transform
+    inside the FIRST region's branch names the SECOND region's closer as
+    its on_error target — a real closer name, but not the one enclosing
+    this transform. Rejected under rule 9 (spec §7).
+    """
+    source = _BuilderValidationMockSource()
+    a1_transform = _BuilderValidationTransform(name="a1_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=a1_transform,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="a1_transform",
+                    plugin=a1_transform.name,
+                    input="a1",
+                    on_success="a1_out",
+                    on_error="merge_b",  # WRONG closer: not merge_a's own region
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="gate_a",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["a1", "a2"],
+            ),
+            GateSettings(
+                name="gate_b",
+                input="merge_a",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["b1", "b2"],
+            ),
+        ],
+        coalesce_settings=[
+            # merge_a is NON-TERMINAL (on_success omitted): it publishes its
+            # own name as the connection gate_b consumes, same pattern as
+            # every other non-terminal coalesce in this test suite.
+            CoalesceSettings(name="merge_a", branches={"a1": "a1_out", "a2": "a2"}),
+            CoalesceSettings(name="merge_b", branches={"b1": "b1", "b2": "b2"}, on_success="out"),
+        ],
+    )
+
+
+def _build_transform_with_bogus_on_error() -> ExecutionGraph:
+    """A transform's on_error names neither a sink nor any closer — the
+    pre-existing unknown-sink rejection must keep firing byte-identically.
+    """
+    source = _BuilderValidationMockSource()
+    transform = _BuilderValidationTransform(name="lone_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=transform,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="lone_transform",
+                    plugin=transform.name,
+                    input="source_out",
+                    on_success="out",
+                    on_error="nonexistent_thing",
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[],
+    )
+
+
+def _build_nested_regions_with_inner_transform_on_error_to_outer_closer() -> ExecutionGraph:
+    """An inner fork->coalesce region nested inside one branch of an outer
+    fork->coalesce region; a transform strictly inside the INNER region names
+    the OUTER closer as its on_error target. Legal under rule 9 (spec §7,
+    interpretation 4): any ENCLOSING region's closer qualifies, not only the
+    innermost — reach-based membership makes the outer region transitively
+    contain the inner region's nodes.
+    """
+    source = _BuilderValidationMockSource()
+    deep_transform = _BuilderValidationTransform(name="deep_transform", output_schema_config=SchemaConfig(mode="observed", fields=None))
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[
+            WiredTransform(
+                plugin=deep_transform,  # type: ignore[arg-type]
+                settings=TransformSettings(
+                    name="deep_transform",
+                    plugin=deep_transform.name,
+                    input="inner_a",
+                    on_success="ia_out",
+                    on_error="merge_outer",  # the OUTER closer, skipping merge_inner
+                    options={},
+                ),
+            ),
+        ],
+        sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="outer_gate",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["outer_a", "outer_b"],
+            ),
+            GateSettings(
+                name="inner_gate",
+                input="outer_a",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["inner_a", "inner_b"],
+            ),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(name="merge_inner", branches={"inner_a": "ia_out", "inner_b": "inner_b"}),
+            CoalesceSettings(name="merge_outer", branches={"outer_a": "merge_inner", "outer_b": "outer_b"}, on_success="out"),
+        ],
+    )
+
+
+def _build_fork_coalesce_with_gate_on_error_to_closer() -> ExecutionGraph:
+    """Same shape as the transform case, but the deferred on_error is a
+    plain routing GATE's row-level on_error — symmetric coverage for the
+    gate error-edge block's identical deferral/resolution treatment.
+    """
+    source = _BuilderValidationMockSource()
+    return ExecutionGraph.from_plugin_instances(
+        sources={"primary": source},  # type: ignore[arg-type]
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="source_out", options={})},
+        transforms=[],
+        sinks={"out": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+        aggregations={},
+        gates=[
+            GateSettings(
+                name="splitter",
+                input="source_out",
+                condition="'all'",
+                routes={"all": "fork"},
+                fork_to=["branch_a", "branch_b"],
+            ),
+            GateSettings(
+                name="inner_gate",
+                input="branch_a",
+                condition="'all'",
+                routes={"all": "a_out"},
+                on_error="merge",
+            ),
+        ],
+        coalesce_settings=[
+            CoalesceSettings(name="merge", branches={"branch_a": "a_out", "branch_b": "branch_b"}, on_success="out"),
+        ],
+    )
+
+
+class TestOnErrorCloserTargets:
+    """Spec §7 rule 9: on_error may target the ENCLOSING bound region's
+    closer, not only a sink.
+    """
+
+    def test_in_region_transform_may_name_its_closer(self) -> None:
+        graph = _build_fork_coalesce_with_branch_on_error_to_closer()
+        closer_id = graph.get_coalesce_id_map()[CoalesceName("merge")]
+        divert_labels = {e.label for e in graph.get_incoming_edges(closer_id) if e.mode is RoutingMode.DIVERT}
+        assert any("branch_a_transform" in label for label in divert_labels)
+
+    def test_in_region_gate_may_name_its_closer(self) -> None:
+        graph = _build_fork_coalesce_with_gate_on_error_to_closer()
+        closer_id = graph.get_coalesce_id_map()[CoalesceName("merge")]
+        divert_labels = {e.label for e in graph.get_incoming_edges(closer_id) if e.mode is RoutingMode.DIVERT}
+        assert any("inner_gate" in label for label in divert_labels)
+
+    def test_out_of_region_transform_naming_closer_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match="not inside that closer's bound region"):
+            _build_out_of_region_on_error_to_closer()
+
+    def test_unknown_on_error_sink_message_unchanged(self) -> None:
+        with pytest.raises(GraphValidationError, match="references unknown sink"):
+            _build_transform_with_bogus_on_error()
+
+    def test_nested_inner_transform_may_name_the_outer_closer(self) -> None:
+        # Interpretation 4: ANY enclosing closer, not only the innermost.
+        # Pins reach-based membership — a representation change that narrowed
+        # rule 9 to innermost-only would redden this before shipping.
+        graph = _build_nested_regions_with_inner_transform_on_error_to_outer_closer()
+        outer_closer_id = graph.get_coalesce_id_map()[CoalesceName("merge_outer")]
+        divert_labels = {e.label for e in graph.get_incoming_edges(outer_closer_id) if e.mode is RoutingMode.DIVERT}
+        assert any("deep_transform" in label for label in divert_labels)
+        inner_closer_id = graph.get_coalesce_id_map()[CoalesceName("merge_inner")]
+        assert not any(e.mode is RoutingMode.DIVERT for e in graph.get_incoming_edges(inner_closer_id))
+
+    def test_rule_9_divert_edges_do_not_trigger_the_divert_coalesce_warning(self) -> None:
+        # The divert-coalesce warning pass runs BEFORE rule-9 resolution, so
+        # rule-9 edges are exempt from its "rows will never reach the
+        # coalesce" text (which would be false for an edge INTO the closer).
+        # Pins the ordering: moving the warning pass after region computation
+        # would start emitting a factually wrong warning here.
+        graph = _build_fork_coalesce_with_branch_on_error_to_closer()
+        assert not any(w.code.startswith("DIVERT_COALESCE_") for w in graph.validation_warnings)

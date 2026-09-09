@@ -34,7 +34,6 @@ from elspeth.core.config import (
     SinkSettings,
     SourceSettings,
     TransformSettings,
-    load_settings,
 )
 from elspeth.core.dag import (
     ExecutionGraph,
@@ -103,6 +102,5 @@ __all__ = [
     "canonical_json",
     "configure_logging",
     "get_logger",
-    "load_settings",
     "stable_hash",
 ]

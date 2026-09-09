@@ -17,6 +17,7 @@ from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame, lineage_path_from_json, lineage_path_to_json
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.schema import nodes_table, rows_table, token_work_items_table, tokens_table
@@ -28,6 +29,24 @@ def work_item_id(run_id: str, token_id: str, node_id: str | None, attempt: int) 
     node_key = "<terminal>" if node_id is None else node_id
     raw = f"{run_id}:{token_id}:{node_key}:{attempt}".encode()
     return hashlib.sha256(raw).hexdigest()
+
+
+def collector_barrier_key(collector_name: str, group_id: str) -> str:
+    """The compound barrier_key address for a collector-bound work item (spec §4.3).
+
+    "collector:<collector_name>:<group_id>" — unlike coalesce/row_union's
+    bare-name barrier_key (one closer per node), a single collector name
+    spans many concurrent EXPAND groups, so the group_id must be part of
+    the address (WS4 Task 6 / META-14.2, ruled a constant convention). THE
+    single construction site: every caller that needs a collector's
+    barrier_key string calls this rather than re-deriving the format
+    inline — including test_collector_barrier_key_interlock.py's
+    no-production-writer canary, which is retargeted (I-2, fix round) to
+    scan for CALLS to this symbol rather than pattern-matching bare
+    literals/f-strings, so a helper call, string concat, or .format() can
+    no longer evade it the way a naive scan could.
+    """
+    return f"collector:{collector_name}:{group_id}"
 
 
 def work_item_identity(values: dict[str, object]) -> str:
@@ -52,6 +71,10 @@ def item_from_mapping(row: RowMapping) -> TokenWorkItem:
         value = data[key]
         if type(value) is datetime and value.tzinfo is None:
             data[key] = value.replace(tzinfo=UTC)
+    try:
+        lineage_path = lineage_path_from_json(data["lineage_path_json"])
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Corrupt token_work_items.lineage_path_json for work_item_id={data['work_item_id']!r}: {exc}") from exc
     return TokenWorkItem(
         work_item_id=data["work_item_id"],
         run_id=data["run_id"],
@@ -70,12 +93,12 @@ def item_from_mapping(row: RowMapping) -> TokenWorkItem:
         pending_path=data["pending_path"],
         pending_error_hash=data["pending_error_hash"],
         pending_error_message=data["pending_error_message"],
-        branch_name=data["branch_name"],
-        fork_group_id=data["fork_group_id"],
         join_group_id=data["join_group_id"],
-        expand_group_id=data["expand_group_id"],
+        lineage_path=lineage_path,
         coalesce_node_id=data["coalesce_node_id"],
         coalesce_name=data["coalesce_name"],
+        row_union_name=data["row_union_name"],
+        collector_name=data["collector_name"],
         attempt=data["attempt"],
         lease_owner=data["lease_owner"],
         lease_expires_at=data["lease_expires_at"],
@@ -101,12 +124,12 @@ def ready_work_item_values(
     queue_key: str | None,
     barrier_key: str | None,
     on_success_sink: str | None,
-    branch_name: str | None,
-    fork_group_id: str | None,
     join_group_id: str | None,
-    expand_group_id: str | None,
+    lineage_path: tuple[LineageFrame, ...],
     coalesce_node_id: str | None,
     coalesce_name: str | None,
+    row_union_name: str | None = None,
+    collector_name: str | None = None,
 ) -> dict[str, object]:
     return {
         "work_item_id": work_item_id(run_id, token_id, node_id, attempt),
@@ -126,12 +149,12 @@ def ready_work_item_values(
         "pending_path": None,
         "pending_error_hash": None,
         "pending_error_message": None,
-        "branch_name": branch_name,
-        "fork_group_id": fork_group_id,
         "join_group_id": join_group_id,
-        "expand_group_id": expand_group_id,
+        "lineage_path_json": lineage_path_to_json(lineage_path),
         "coalesce_node_id": coalesce_node_id,
         "coalesce_name": coalesce_name,
+        "row_union_name": row_union_name,
+        "collector_name": collector_name,
         "attempt": attempt,
         "lease_owner": None,
         "lease_expires_at": None,
@@ -262,12 +285,12 @@ def insert_work_item_idempotent(conn: Connection, *, values: dict[str, object], 
         "pending_path",
         "pending_error_hash",
         "pending_error_message",
-        "branch_name",
-        "fork_group_id",
         "join_group_id",
-        "expand_group_id",
+        "lineage_path_json",
         "coalesce_node_id",
         "coalesce_name",
+        "row_union_name",
+        "collector_name",
         "attempt",
     )
     mismatches = {

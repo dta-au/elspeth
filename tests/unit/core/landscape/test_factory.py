@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.engine import Connection, Engine
@@ -18,6 +19,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import (
     DataFlowReadRepository,
     ExecutionReadRepository,
+    PayloadStoreReadRepository,
     RecorderFactory,
     RunLifecycleReadRepository,
 )
@@ -117,6 +119,39 @@ class TestPayloadStore:
     def test_payload_store_defaults_to_none(self, factory: RecorderFactory) -> None:
         assert factory.payload_store is None
 
+    @pytest.mark.parametrize("build", ["read_only", "read_repositories"])
+    def test_read_repositories_expose_only_read_payload_operations(self, build: str) -> None:
+        db = LandscapeDB.in_memory()
+        payload_store = MockPayloadStore()
+        payload_ref = payload_store.store(b"audit evidence")
+
+        if build == "read_only":
+            read_payloads = RecorderFactory.read_only(db, payload_store=payload_store).payload_store
+        else:
+            read_payloads = RecorderFactory(db, payload_store=payload_store).read_repositories().payload_store
+
+        assert isinstance(read_payloads, PayloadStoreReadRepository)
+        assert read_payloads.exists(payload_ref)
+        assert read_payloads.retrieve(payload_ref) == b"audit evidence"
+        with pytest.raises(AttributeError):
+            read_payloads.store  # noqa: B018 — capability must be absent
+        with pytest.raises(AttributeError):
+            read_payloads.delete  # noqa: B018 — capability must be absent
+
+    def test_read_repositories_payload_store_none_stays_none(self) -> None:
+        db = LandscapeDB.in_memory()
+        assert RecorderFactory.read_only(db).payload_store is None
+        assert RecorderFactory(db).read_repositories().payload_store is None
+
+    def test_write_repositories_retain_mutable_payload_store(self) -> None:
+        db = LandscapeDB.in_memory()
+        payload_store = MockPayloadStore()
+
+        write_repositories = RecorderFactory(db, payload_store=payload_store).write_repositories()
+
+        assert write_repositories.payload_store is payload_store
+        assert isinstance(write_repositories.read.payload_store, PayloadStoreReadRepository)
+
 
 class TestPluginAuditWriter:
     """Verify plugin_audit_writer() returns the adapter."""
@@ -130,18 +165,31 @@ class TestPluginAuditWriter:
         assert "PluginAuditWriterAdapter" not in vars(factory_module)
 
 
-class _RecordingRepo:
-    """Duck-typed repository stub: records every call, returns a per-method sentinel."""
+def _recording_repo_stub(
+    repo_cls: type,
+    method_names: list[str],
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]],
+) -> Mock:
+    """A spec-bound stand-in for ``repo_cls`` that records every delegated call.
 
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ``spec=repo_cls`` is what makes this an explicit contract rather than a
+    masquerade: the stub answers only names the real repository actually
+    defines, so a facade delegating to a method that does not exist on the
+    repository raises ``AttributeError`` here instead of being quietly absorbed
+    by a catch-all ``__getattr__``. Each recorded method returns a per-method
+    sentinel so the facade's return value can be checked for pass-through.
+    """
 
-    def __getattr__(self, name: str) -> Any:
-        def _method(*args: object, **kwargs: object) -> tuple[str, str]:
-            self.calls.append((name, args, dict(kwargs)))
+    def make_side_effect(name: str) -> Callable[..., tuple[str, str]]:
+        def side_effect(*args: object, **kwargs: object) -> tuple[str, str]:
+            calls.append((name, args, dict(kwargs)))
             return ("delegated", name)
 
-        return _method
+        return side_effect
+
+    stub = Mock(spec=repo_cls)
+    stub.configure_mock(**{f"{name}.side_effect": make_side_effect(name) for name in method_names})
+    return stub
 
 
 class TestReadPortDelegation:
@@ -155,14 +203,20 @@ class TestReadPortDelegation:
     """
 
     @pytest.mark.parametrize(
-        "facade_cls",
-        [RunLifecycleReadRepository, DataFlowReadRepository, ExecutionReadRepository],
+        ("facade_cls", "repo_cls"),
+        [
+            pytest.param(RunLifecycleReadRepository, RunLifecycleRepository, id="run-lifecycle"),
+            pytest.param(DataFlowReadRepository, DataFlowRepository, id="data-flow"),
+            pytest.param(ExecutionReadRepository, ExecutionRepository, id="execution"),
+            pytest.param(PayloadStoreReadRepository, MockPayloadStore, id="payload-store"),
+        ],
     )
-    def test_every_public_method_delegates_to_same_named_repo_method(self, facade_cls: type) -> None:
-        stub = _RecordingRepo()
-        facade = facade_cls(cast(Any, stub))
+    def test_every_public_method_delegates_to_same_named_repo_method(self, facade_cls: type, repo_cls: type) -> None:
         methods = [(name, func) for name, func in inspect.getmembers(facade_cls, inspect.isfunction) if not name.startswith("_")]
         assert methods, f"{facade_cls.__name__} exposes no public methods"
+        calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        stub = _recording_repo_stub(repo_cls, [name for name, _func in methods], calls)
+        facade = facade_cls(cast(Any, stub))
         for name, func in methods:
             args: list[object] = []
             kwargs: dict[str, object] = {}
@@ -176,9 +230,11 @@ class TestReadPortDelegation:
                     args.extend((f"var-{param.name}-0", f"var-{param.name}-1"))
                 else:  # VAR_KEYWORD
                     kwargs[f"extra_{param.name}"] = f"kw-{param.name}"
-            result = getattr(facade, name)(*args, **kwargs)
+            # ``func`` is the facade's own unbound function from the walk above,
+            # so it is invoked directly rather than re-resolved by name.
+            result = func(facade, *args, **kwargs)
             assert result == ("delegated", name), f"{facade_cls.__name__}.{name} did not return the repository result"
-            recorded_name, recorded_args, recorded_kwargs = stub.calls[-1]
+            recorded_name, recorded_args, recorded_kwargs = calls[-1]
             assert recorded_name == name, f"{facade_cls.__name__}.{name} delegated to {recorded_name!r}"
             assert recorded_args == tuple(args), f"{facade_cls.__name__}.{name} altered positional arguments"
             assert recorded_kwargs == kwargs, f"{facade_cls.__name__}.{name} altered keyword arguments"

@@ -1,0 +1,33 @@
+# Source-native LLM example: one authored prompt produces one generated row.
+
+sources:
+  generated_briefing:
+    plugin: llm
+    on_success: result
+    options:
+      provider: openrouter
+      api_key: ${OPENROUTER_API_KEY}
+      model: openai/gpt-4.1-mini
+      timeout_seconds: 20
+      prompt_template: >-
+        Explain in one concise sentence why an auditable data pipeline matters.
+      temperature: 0.0
+      max_tokens: 80
+      response_field: briefing
+      schema:
+        mode: observed
+      on_validation_failure: discard
+
+sinks:
+  result:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/llm_source/output/briefing.jsonl
+      format: jsonl
+      collision_policy: auto_increment
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/llm_source/runs/audit.db

@@ -38,7 +38,7 @@ def test_finalize_audit_corruption_escapes_best_effort_ceremony() -> None:
         pytest.raises(AuditIntegrityError, match="Run not found after UPDATE"),
         best_effort("Generic failure ceremony on run failure", run_id="run-1"),
     ):
-        ceremony.emit_failed_ceremony("run-1", factory, 0.0, token=MagicMock(spec=CoordinationToken))
+        ceremony.emit_failed_ceremony("run-1", factory, 0.0, coordination_token=MagicMock(spec=CoordinationToken))
 
 
 def test_deposed_leader_finalize_refusal_stays_suppressed() -> None:
@@ -48,4 +48,4 @@ def test_deposed_leader_finalize_refusal_stays_suppressed() -> None:
     factory = _raising_factory(RunLeadershipLostError(run_id="run-1", worker_id="w-1", leader_epoch=3, verb="finalize_run"))
 
     with best_effort("Generic failure ceremony on run failure", run_id="run-1"):
-        ceremony.emit_failed_ceremony("run-1", factory, 0.0, token=MagicMock(spec=CoordinationToken))
+        ceremony.emit_failed_ceremony("run-1", factory, 0.0, coordination_token=MagicMock(spec=CoordinationToken))

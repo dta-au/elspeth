@@ -13,6 +13,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetad
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_USER_TERM,
+    PROMPT_SHIELD_WARNING_DRAFT,
     PROMPT_TEMPLATE_PARTS_KEY,
     RAW_HTML_CLEANUP_USER_TERM,
     SOURCE_AUTHORING_KEY,
@@ -85,7 +86,7 @@ def _state_with_cleanup_node(options: dict[str, object]) -> CompositionState:
 
 def _state_with_web_scrape_identity_node(
     *,
-    abuse_contact: str = "abuse-contact-unset@elspeth.foundryside.dev",
+    abuse_contact: str = "abuse-contact-unset@elspeth.example.gov.au",
     scraping_reason: str = "User-requested public web fetch for rules download",
     allowed_hosts: object | None = "public_only",
 ) -> CompositionState:
@@ -453,6 +454,61 @@ def test_pending_invented_source_requirement_blocks_execution() -> None:
     assert result.sites[0].component_type == "source"
 
 
+def test_every_named_llm_authored_source_has_an_independent_review_site() -> None:
+    def _source(*, content_hash: str, accepted_hash: str | None) -> SourceSpec:
+        status = "resolved" if accepted_hash is not None else "pending"
+        event_id = "event-1" if accepted_hash is not None else None
+        return SourceSpec(
+            plugin="json",
+            on_success="rows",
+            on_validation_failure="fail",
+            options={
+                SOURCE_AUTHORING_KEY: {
+                    "modality": "llm_generated",
+                    "content_hash": content_hash,
+                    "review_event_id": event_id,
+                    "resolved_kind": "invented_source" if event_id is not None else None,
+                },
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "id": "source-review",
+                        "kind": "invented_source",
+                        "user_term": "inline_source_data",
+                        "status": status,
+                        "draft": "generated rows",
+                        "event_id": event_id,
+                        "accepted_value": "accepted" if event_id is not None else None,
+                        "accepted_artifact_hash": accepted_hash,
+                        "resolved_prompt_template_hash": None,
+                    }
+                ],
+            },
+        )
+
+    state = CompositionState(
+        sources={
+            "source": _source(content_hash="a" * 64, accepted_hash="a" * 64),
+            "orders": _source(content_hash="b" * 64, accepted_hash=None),
+            "refunds": _source(content_hash="c" * 64, accepted_hash="d" * 64),
+        },
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    sites = interpretation_sites(state)
+
+    assert [(site.component_id, site.user_term) for site in sites] == [
+        ("source:orders", "inline_source_data"),
+        ("source:refunds", "inline_source_data"),
+    ]
+    result = materialize_state_for_execution(state)
+    assert isinstance(result, InterpretationReviewPending)
+    assert result.sites == sites
+
+
 def test_pending_llm_prompt_template_requirement_blocks_execution() -> None:
     state = _state_with_llm(
         {
@@ -600,6 +656,110 @@ def test_gate_routed_web_scrape_into_llm_warns_without_prompt_shield() -> None:
     assert all(site.user_term != PROMPT_SHIELD_USER_TERM for site in result.sites)
 
 
+def test_web_scrape_fed_llm_keeps_untrusted_content_drafts_verbatim() -> None:
+    """The untrusted-producer branch is a genuine security advisory: its wording
+    must stay byte-identical in both availability states — the local-content
+    split must never soften a real scrape graph's card."""
+    from elspeth.web.interpretation_state import (
+        PROMPT_SHIELD_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_WARNING_DRAFT,
+    )
+
+    state = _state_with_web_scrape_gate_to_llm()
+
+    pairs_c = prompt_shield_recommendation_warning_pairs(state, shield_available=False)
+    assert any(PROMPT_SHIELD_WARNING_DRAFT in message for _component, message in pairs_c)
+
+    pairs_b = prompt_shield_recommendation_warning_pairs(state, shield_available=True)
+    assert any(PROMPT_SHIELD_AVAILABLE_DRAFT in message for _component, message in pairs_b)
+
+
+@pytest.mark.parametrize(
+    ("producer_plugin", "intermediate_plugin"),
+    [
+        ("blob_fetch", "blob_text_expand"),
+        ("azure_document_intelligence", None),
+        ("rag_retrieval", None),
+        ("llm", None),
+    ],
+)
+def test_untrusted_producers_use_provenance_neutral_content_draft(
+    producer_plugin: str,
+    intermediate_plugin: str | None,
+) -> None:
+    producer = NodeSpec(
+        id="remote_producer",
+        node_type="transform",
+        plugin=producer_plugin,
+        input="source_rows",
+        on_success="remote_result",
+        on_error="stop",
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    nodes = [producer]
+    llm_input = "remote_result"
+    if intermediate_plugin is not None:
+        nodes.append(
+            NodeSpec(
+                id="remote_expander",
+                node_type="transform",
+                plugin=intermediate_plugin,
+                input="remote_result",
+                on_success="remote_content",
+                on_error="stop",
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        llm_input = "remote_content"
+    nodes.append(_llm(input_stream=llm_input))
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(_state(tuple(nodes)))
+
+    assert any(PROMPT_SHIELD_WARNING_DRAFT in message for _component, message in warning_pairs)
+    message = next(message for component, message in warning_pairs if component == "node:classify")
+    assert "untrusted or externally controlled upstream content" in message
+    assert f"produced by {producer_plugin}" in message
+    if producer_plugin in {"azure_document_intelligence", "rag_retrieval", "llm"}:
+        assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
+
+
+def test_refiner_upgrades_local_content_draft_variant() -> None:
+    """C->B upgrade must stay variant-aligned: a local-content warning upgrades
+    to the local-content B draft, never to producer-specific wording."""
+    from elspeth.web.interpretation_state import (
+        PROMPT_SHIELD_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
+        refine_prompt_shield_warnings_for_availability,
+    )
+
+    refined = refine_prompt_shield_warnings_for_availability(
+        [
+            {
+                "component": "node:rate_node",
+                "message": f"lead {PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT}",
+                "severity": "medium",
+            }
+        ],
+        shield_available=True,
+    )
+    assert PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT in refined[0]["message"]
+    assert PROMPT_SHIELD_AVAILABLE_DRAFT not in refined[0]["message"]
+    assert PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT not in refined[0]["message"]
+
+
 def test_gate_routed_web_scrape_through_prompt_shield_emits_no_warning() -> None:
     state = _state_with_web_scrape_gate_shield_to_llm()
 
@@ -635,6 +795,28 @@ def _queue(queue_id: str = "inbound") -> NodeSpec:
     )
 
 
+def _row_union(
+    *,
+    branches: dict[str, str],
+    on_success: str = "inbound",
+) -> NodeSpec:
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input=next(iter(branches.values())),
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy=None,
+        merge=None,
+    )
+
+
 def _web_scrape(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
     return NodeSpec(
         id=node_id,
@@ -644,6 +826,24 @@ def _web_scrape(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec
         on_success=on_success,
         on_error="stop",
         options={"url_field": "url", "content_field": "content"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _textract(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input=input_stream,
+        on_success=on_success,
+        on_error="stop",
+        options={"bucket_field": "bucket", "key_field": "key", "feature_types": ["TABLES"], "text_field": "content"},
         condition=None,
         routes=None,
         fork_to=None,
@@ -732,7 +932,8 @@ def test_prompt_shield_before_web_scrape_does_not_bless_downstream_llm() -> None
 
     assert warning_pairs
     message = next(message for component, message in warning_pairs if component == "node:classify")
-    assert "web_scrape upstream without an authorized prompt-injection shield between them" in message
+    assert "produced by web_scrape" in message
+    assert "without an authorized prompt-injection shield between them" in message
 
 
 def test_queue_fan_in_untrusted_on_any_predecessor_marks_downstream_untrusted() -> None:
@@ -752,7 +953,102 @@ def test_queue_fan_in_untrusted_on_any_predecessor_marks_downstream_untrusted() 
 
     assert warning_pairs
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
-    assert "consumes externally-fetched content from a web_scrape upstream" in message
+    assert "consumes untrusted or externally controlled upstream content produced by web_scrape" in message
+
+
+# ── Document-extraction producers are untrusted too ──────────────────────
+# Text extracted from an uploaded document is attacker-controlled in exactly
+# the way scraped web content is: the author does not write it, and it lands
+# in an LLM prompt. Classifying it as trusted let a
+# source -> textract -> llm pipeline claim it consumed no untrusted content.
+
+
+def test_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content() -> None:
+    """Document-extracted text is externally controlled, so it taints a downstream LLM."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(state)
+
+    assert warning_pairs
+    message = next(msg for component, msg in warning_pairs if component == "node:classify")
+    assert "consumes untrusted or externally controlled upstream content produced by aws_textract_document_analysis" in message
+    assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
+
+
+def test_inline_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content() -> None:
+    """The synchronous Textract sibling extracts the same attacker-controlled text."""
+    inline = NodeSpec(
+        id="extract",
+        node_type="transform",
+        plugin="aws_textract_inline_analysis",
+        input="rows",
+        on_success="inbound",
+        on_error="stop",
+        options={"document_format": "png", "feature_types": ["TABLES"], "text_field": "content"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    state = _state((inline, _llm()))
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(state)
+
+    assert warning_pairs
+    message = next(msg for component, msg in warning_pairs if component == "node:classify")
+    assert "consumes untrusted or externally controlled upstream content produced by aws_textract_inline_analysis" in message
+    assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
+
+
+def test_untrusted_producer_lead_names_the_actual_producer_not_web_scrape() -> None:
+    """The advisory must name the producer it found — never assert a web_scrape that is absent."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
+
+    assert "web_scrape" not in message
+
+
+def test_web_scrape_untrusted_lead_uses_shared_provenance_neutral_wording() -> None:
+    """All untrusted producers share one provenance-neutral operator record."""
+    state = _state(
+        (
+            _web_scrape("scrape", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
+
+    assert (
+        "consumes untrusted or externally controlled upstream content produced by web_scrape without an authorized "
+        "prompt-injection shield between them. " in message
+    )
+
+
+def test_shield_between_textract_and_llm_is_silent() -> None:
+    """An authorized shield downstream of the extraction sanitizes it (State A)."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="extracted"),
+            _shield("shield", input_stream="extracted", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    assert prompt_shield_recommendation_warning_pairs(state) == ()
 
 
 def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() -> None:
@@ -773,7 +1069,7 @@ def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() ->
 
     assert warning_pairs, "an unshielded predecessor path must still surface the shield advisory"
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
-    assert "consumes externally-fetched content from a web_scrape upstream" in message
+    assert "consumes untrusted or externally controlled upstream content produced by web_scrape" in message
 
     # When EVERY predecessor path is shielded, State A is silent.
     fully_shielded = _state(
@@ -788,6 +1084,66 @@ def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() ->
     )
 
     assert prompt_shield_recommendation_warning_pairs(fully_shielded) == ()
+
+
+def test_row_union_requires_every_branch_to_be_prompt_shielded() -> None:
+    branches = {"control": "control_done", "treatment": "treatment_done"}
+    partially_shielded = _state(
+        (
+            _web_scrape("control_scrape", input_stream="control_url", on_success="control_raw"),
+            _shield("control_shield", input_stream="control_raw", on_success="control_done"),
+            _web_scrape("treatment_scrape", input_stream="treatment_url", on_success="treatment_done"),
+            _row_union(branches=branches),
+            _llm(),
+        )
+    )
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(partially_shielded)
+
+    assert warning_pairs
+    message = next(message for component, message in warning_pairs if component == "node:classify")
+    assert "produced by web_scrape" in message
+    assert "without an authorized prompt-injection shield between them" in message
+
+    fully_shielded = _state(
+        (
+            _web_scrape("control_scrape", input_stream="control_url", on_success="control_raw"),
+            _shield("control_shield", input_stream="control_raw", on_success="control_done"),
+            _web_scrape("treatment_scrape", input_stream="treatment_url", on_success="treatment_raw"),
+            _shield("treatment_shield", input_stream="treatment_raw", on_success="treatment_done"),
+            _row_union(branches=branches),
+            _llm(),
+        )
+    )
+
+    assert prompt_shield_recommendation_warning_pairs(fully_shielded) == ()
+
+
+def test_row_union_artifact_hash_covers_every_branch_path() -> None:
+    def build(treatment_id: str) -> CompositionState:
+        return _state(
+            (
+                _web_scrape("control_scrape", input_stream="control_url", on_success="control_done"),
+                _web_scrape(treatment_id, input_stream="treatment_url", on_success="treatment_done"),
+                _row_union(branches={"control": "control_done", "treatment": "treatment_done"}),
+                _llm(),
+            )
+        )
+
+    baseline = build("treatment_scrape")
+    changed = build("treatment_scrape_changed")
+    baseline_llm = next(node for node in baseline.nodes if node.plugin == "llm")
+    changed_llm = next(node for node in changed.nodes if node.plugin == "llm")
+
+    assert pipeline_decision_artifact_hash(
+        baseline_llm,
+        baseline.nodes,
+        user_term=PROMPT_SHIELD_USER_TERM,
+    ) != pipeline_decision_artifact_hash(
+        changed_llm,
+        changed.nodes,
+        user_term=PROMPT_SHIELD_USER_TERM,
+    )
 
 
 def test_queue_fan_in_one_unknown_predecessor_emits_conservative_warning() -> None:
@@ -902,16 +1258,29 @@ def test_plain_unshielded_llm_warns_always_on() -> None:
 
 
 def test_prompt_shield_warning_uses_available_draft_in_state_b() -> None:
-    from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
+    """A fetch-less graph gets the LOCAL-CONTENT drafts in both states.
+
+    The producer-specific constants assert a declared untrusted-content
+    producer; on this graph (plain llm over operator-supplied rows, no upstream
+    producer) that claim is false, and the staged review
+    card carries the draft alone — so the draft itself must tell the truth
+    (build-review finding L2, session 94bdae4f).
+    """
+    from elspeth.web.interpretation_state import (
+        PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT,
+        PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
+    )
 
     state = _state_with_plain_llm_only()
     pairs_b = prompt_shield_recommendation_warning_pairs(state, shield_available=True)
     assert pairs_b
-    assert any(PROMPT_SHIELD_AVAILABLE_DRAFT in message for _component, message in pairs_b)
+    assert any(PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT in message for _component, message in pairs_b)
+    assert all("external-content fetch step and this LLM" not in message for _component, message in pairs_b)
 
     pairs_c = prompt_shield_recommendation_warning_pairs(state, shield_available=False)
     assert pairs_c
-    assert any("continuing without it is allowed" in message for _component, message in pairs_c)
+    assert any(PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT in message for _component, message in pairs_c)
+    assert any("continuing without a shield is allowed" in message for _component, message in pairs_c)
 
 
 def test_field_mapper_projection_without_web_scrape_raw_fields_does_not_create_cleanup_review_site() -> None:
@@ -1592,7 +1961,7 @@ def test_web_scrape_http_identity_hash_binds_wire_visible_defaults() -> None:
         {
             "review_kind": "web_scrape_http_identity",
             "node_id": "fetch_pages",
-            "abuse_contact": "abuse-contact-unset@elspeth.foundryside.dev",
+            "abuse_contact": "abuse-contact-unset@elspeth.example.gov.au",
             "scraping_reason": "User-requested public web fetch for rules download",
             "allowed_hosts": "public_only",
         }
@@ -1647,7 +2016,11 @@ def test_prompt_shield_warning_is_advisory_not_blocking() -> None:
     validation = state.validate()
     warning_text = " ".join(w.message for w in validation.warnings)
 
-    assert "prompt_injection_shield_recommendation" in warning_text
+    # The warning identifies its subject in user register — the raw registry
+    # key (`prompt_injection_shield_recommendation`) rides the requirement's
+    # structured user_term field, never the message body (elspeth-9665dcca32).
+    assert "prompt-injection" in warning_text
+    assert "prompt_injection_shield_recommendation" not in warning_text
     assert "continuing without it is allowed" in warning_text
 
     materialized = materialize_state_for_execution(state)
@@ -1863,9 +2236,582 @@ def test_pipeline_decision_semantics_rejects_unregistered_user_term() -> None:
         validate_pipeline_decision_semantics(
             node_id="reconcile",
             plugin="field_mapper",
+            node_type="transform",
             options={},
+            condition=None,
+            routes=None,
             user_term="ab_reconciliation_retention",
             draft="Retain both variants in the reconciled row.",
             context="test",
             web_scrape_raw_fields=frozenset(),
         )
+
+
+# --------------------------------------------------------------------------- #
+# gate_condition_authored — the planner-authored gate-semantics review.
+#
+# The composer prompt doctrine instructs the planner to escalate a gate
+# threshold, category literal, or route direction it CHOSE ITSELF (rather than
+# carrying the user's stated value verbatim) as a pipeline_decision review. That
+# instruction was inert until this term was registered: an unregistered term is
+# rejected at validate_pipeline_decision_semantics and again at
+# pipeline_decision_artifact_hash, so the doctrine routed the planner into an
+# unresolvable card (elspeth-c2c35e52ae).
+#
+# A gate is a NODE TYPE, not a plugin (NodeSpec.plugin is None for gates), so
+# this arm binds on node_type — the mechanism differs from web_scrape_http_identity,
+# which binds on plugin.
+# --------------------------------------------------------------------------- #
+
+
+_DEFAULT_GATE_ROUTES: dict[str, str] = {"true": "accepted", "false": "rejected"}
+
+
+def _gate(
+    *,
+    node_id: str = "score_gate",
+    condition: str = "row.score >= 80",
+    # Sentinel-free explicit default: ``routes=None`` is a REAL case under test
+    # (a gate whose route mapping is absent), so it must not collapse into the
+    # convenience default.
+    routes: dict[str, str] | None = _DEFAULT_GATE_ROUTES,
+    fork_to: tuple[str, ...] | None = None,
+    options: dict[str, Any] | None = None,
+) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="gate",
+        plugin=None,
+        input="inbound",
+        on_success=None,
+        on_error=None,
+        options=options if options is not None else {},
+        condition=condition,
+        routes=routes,
+        fork_to=fork_to,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _gate_state(gate: NodeSpec) -> CompositionState:
+    return CompositionState(
+        source=None,
+        nodes=(gate,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_gate_condition_authored_is_registered() -> None:
+    """The escalation path the prompt doctrine names must be resolvable.
+
+    Both the authoring-time validator and the resolve-time hash registry are
+    closed sets keyed on this constant; membership is what makes an authored
+    gate escalation stageable at all.
+    """
+
+    from elspeth.web.interpretation_state import (
+        COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS,
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        REGISTERED_PIPELINE_DECISION_USER_TERMS,
+    )
+
+    assert GATE_CONDITION_AUTHORED_USER_TERM in REGISTERED_PIPELINE_DECISION_USER_TERMS
+    # The planner authors this row itself — it is not a server-staged disclosure.
+    assert GATE_CONDITION_AUTHORED_USER_TERM in COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS
+
+
+def test_registered_pipeline_decision_user_terms_is_the_exact_closed_set() -> None:
+    """Pin the closed registry membership itself.
+
+    Every member must have BOTH a validation arm and an artifact-hash helper.
+    Adding a term without them mints review cards that can never be resolved,
+    so growth of this set is a deliberate, reviewed act — not a side effect.
+    """
+
+    from elspeth.web.interpretation_state import REGISTERED_PIPELINE_DECISION_USER_TERMS
+
+    assert (
+        frozenset(
+            {
+                "drop_raw_html_fields",
+                "gate_condition_authored",
+                "prompt_injection_shield_recommendation",
+                "required_control_auto_wired",
+                "web_scrape_http_identity",
+            }
+        )
+        == REGISTERED_PIPELINE_DECISION_USER_TERMS
+    )
+
+
+def test_gate_condition_authored_passes_semantics_on_a_gate_node() -> None:
+    from elspeth.web.interpretation_state import (
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        validate_pipeline_decision_node_semantics,
+    )
+
+    gate = _gate()
+    validate_pipeline_decision_node_semantics(
+        node=gate,
+        all_nodes=(gate,),
+        user_term=GATE_CONDITION_AUTHORED_USER_TERM,
+        draft="I chose the 80 cutoff; you did not state one.",
+        context="test",
+    )
+
+
+def test_gate_condition_authored_rejects_a_non_gate_node() -> None:
+    """A registered term with no binding validates on ANY node.
+
+    Without this arm the planner could stage the gate escalation on an llm or
+    field_mapper node, pass set_pipeline, mint the card, and only then have
+    pipeline_decision_artifact_hash raise at resolve time — displacing the
+    wedge downstream instead of preventing it.
+    """
+
+    from elspeth.web.interpretation_state import (
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        validate_pipeline_decision_node_semantics,
+    )
+
+    not_a_gate = NodeSpec(
+        id="scorer",
+        node_type="transform",
+        plugin="llm",
+        input="inbound",
+        on_success="scored",
+        on_error="errors",
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+    with pytest.raises(ValueError, match="gate node"):
+        validate_pipeline_decision_node_semantics(
+            node=not_a_gate,
+            all_nodes=(not_a_gate,),
+            user_term=GATE_CONDITION_AUTHORED_USER_TERM,
+            draft="I chose the 80 cutoff.",
+            context="test",
+        )
+
+
+@pytest.mark.parametrize(
+    ("condition", "routes"),
+    [
+        pytest.param("", {"true": "a", "false": "b"}, id="blank-condition"),
+        pytest.param("   ", {"true": "a", "false": "b"}, id="whitespace-condition"),
+        pytest.param("row.score >= 80", None, id="absent-routes"),
+    ],
+)
+def test_gate_condition_authored_requires_reviewable_gate_semantics(condition: str, routes: dict[str, str] | None) -> None:
+    """There must be something to review.
+
+    A blank condition or absent route mapping pins nothing — the card would
+    adjudicate an empty artifact.
+    """
+
+    from elspeth.web.interpretation_state import (
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        validate_pipeline_decision_node_semantics,
+    )
+
+    gate = _gate(condition=condition, routes=routes)
+    with pytest.raises(ValueError, match="gate"):
+        validate_pipeline_decision_node_semantics(
+            node=gate,
+            all_nodes=(gate,),
+            user_term=GATE_CONDITION_AUTHORED_USER_TERM,
+            draft="I chose the cutoff.",
+            context="test",
+        )
+
+
+def test_gate_condition_authored_artifact_hash_is_deterministic() -> None:
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    gate = _gate()
+    twin = _gate()
+    assert pipeline_decision_artifact_hash(gate, (gate,), user_term=GATE_CONDITION_AUTHORED_USER_TERM) == pipeline_decision_artifact_hash(
+        twin, (twin,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    )
+
+
+def test_gate_condition_authored_artifact_hash_is_route_order_insensitive() -> None:
+    """Route insertion order is not an adjudicated fact — the mapping is."""
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    forward = _gate(routes={"true": "accepted", "false": "rejected"})
+    reversed_order = _gate(routes={"false": "rejected", "true": "accepted"})
+    assert pipeline_decision_artifact_hash(
+        forward, (forward,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    ) == pipeline_decision_artifact_hash(reversed_order, (reversed_order,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+
+def test_gate_condition_authored_artifact_hash_tracks_the_condition() -> None:
+    """Fabrication axis 1+2: threshold value and category literal.
+
+    Silently re-cutting 80 to 70 after review must drift the accepted hash.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    at_80 = _gate(condition="row.score >= 80")
+    at_70 = _gate(condition="row.score >= 70")
+    assert pipeline_decision_artifact_hash(at_80, (at_80,), user_term=GATE_CONDITION_AUTHORED_USER_TERM) != pipeline_decision_artifact_hash(
+        at_70, (at_70,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    )
+
+
+@pytest.mark.parametrize(
+    "mutated_routes",
+    [
+        pytest.param({"true": "rejected", "false": "accepted"}, id="routes-inverted"),
+        pytest.param({"true": "quarantine", "false": "rejected"}, id="true-destination-changed"),
+        pytest.param({"true": "accepted", "false": "quarantine"}, id="false-destination-changed"),
+    ],
+)
+def test_gate_condition_authored_artifact_hash_tracks_each_route_destination(mutated_routes: dict[str, str]) -> None:
+    """Fabrication axis 3: route direction.
+
+    EACH destination is material — an inversion is the exact failure the
+    doctrine's "never invert stated routes" rule guards, so it must drift the
+    hash, not just a change to the mapping's size.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    baseline = _gate(routes={"true": "accepted", "false": "rejected"})
+    mutated = _gate(routes=mutated_routes)
+    assert pipeline_decision_artifact_hash(
+        baseline, (baseline,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    ) != pipeline_decision_artifact_hash(mutated, (mutated,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+
+def test_gate_condition_authored_artifact_hash_tracks_fork_destinations() -> None:
+    """A fork gate's route direction lives in fork_to, not routes."""
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    forked = _gate(fork_to=("fast_path", "slow_path"))
+    reforked = _gate(fork_to=("fast_path", "manual_path"))
+    assert pipeline_decision_artifact_hash(
+        forked, (forked,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    ) != pipeline_decision_artifact_hash(reforked, (reforked,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+
+def test_gate_condition_authored_artifact_hash_ignores_unrelated_option_edits() -> None:
+    """Minimum-projection doctrine: unrelated edits must not re-stage the card."""
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    plain = _gate(options={})
+    annotated = _gate(options={"description": "score cutoff gate"})
+    assert pipeline_decision_artifact_hash(plain, (plain,), user_term=GATE_CONDITION_AUTHORED_USER_TERM) == pipeline_decision_artifact_hash(
+        annotated, (annotated,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    )
+
+
+def test_staged_gate_pipeline_decision_survives_the_non_llm_kind_filter() -> None:
+    """The whole point of the escalation: the card must actually surface.
+
+    ``_pending_node_sites`` drops every pending kind except PIPELINE_DECISION on
+    a non-llm node. A gate is non-llm, so this is the one kind that reaches the
+    review surface there — and the review requirement must appear in
+    ``interpretation_sites`` for /validate and /execute to block on it.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    gate = _gate(
+        options={
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": "score_gate:gate_condition_authored",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": GATE_CONDITION_AUTHORED_USER_TERM,
+                    "status": "pending",
+                    "draft": "I chose the 80 cutoff; you did not state one.",
+                    "event_id": None,
+                    "accepted_value": None,
+                    "accepted_artifact_hash": None,
+                    "resolved_prompt_template_hash": None,
+                }
+            ]
+        }
+    )
+
+    sites = interpretation_sites(_gate_state(gate))
+
+    assert len(sites) == 1
+    assert sites[0].component_id == "score_gate"
+    assert sites[0].component_type == "transform"
+    assert sites[0].user_term == GATE_CONDITION_AUTHORED_USER_TERM
+    assert sites[0].kind is InterpretationKind.PIPELINE_DECISION
+
+
+def test_resolved_gate_pipeline_decision_round_trips_through_materialization() -> None:
+    """A resolved gate review must survive the execution drift guard.
+
+    ``_validate_pipeline_decision_review`` re-runs BOTH the semantics arm and
+    the hash arm on the resolved row, so a resolved gate escalation exercises
+    the full write-then-read path the session service uses.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    bare = _gate()
+    accepted_hash = pipeline_decision_artifact_hash(bare, (bare,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+    resolved = _gate(
+        options={
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": "score_gate:gate_condition_authored",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": GATE_CONDITION_AUTHORED_USER_TERM,
+                    "status": "resolved",
+                    "draft": "I chose the 80 cutoff; you did not state one.",
+                    "event_id": "evt-1",
+                    "accepted_value": "Approved: 80 is the right cutoff.",
+                    "accepted_artifact_hash": accepted_hash,
+                    "resolved_prompt_template_hash": None,
+                }
+            ]
+        }
+    )
+
+    assert interpretation_sites(_gate_state(resolved)) == ()
+    # Materialization must not report the gate as blocking. Authoring options are
+    # stripped later by ``strip_authoring_options`` at config lowering, not here,
+    # so this asserts only that the resolved review clears the execution gate.
+    assert not isinstance(materialize_state_for_execution(_gate_state(resolved)), InterpretationReviewPending)
+
+    # Re-cutting the threshold after acceptance must NOT silently execute.
+    drifted = _gate_state(replace(resolved, condition="row.score >= 70"))
+    with pytest.raises(ValueError, match="drifted"):
+        materialize_state_for_execution(drifted)
+
+
+def test_gate_condition_authored_artifact_hash_survives_the_persistence_bridge() -> None:
+    """The write side and the read side must agree across serialization.
+
+    ``gate_condition_authored`` is the FIRST registered term whose projection
+    reads NodeSpec fields OUTSIDE ``options`` (condition / routes / fork_to).
+    The session service recomputes this hash from a persisted state record via
+    ``NodeSpec.from_dict``, so any of those fields dropped or re-typed by the
+    to_dict/from_dict round trip would make an accepted review read as drifted
+    on reload — a wedge that only appears after a session is saved and
+    reopened, never in an in-memory test.
+
+    ``fork_to`` is the sharp edge: it is a tuple in memory and a list on the
+    wire, so the projection must normalise it.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    gate = _gate(routes={"true": "accepted", "false": "rejected"}, fork_to=("fast_path", "slow_path"))
+    in_memory = pipeline_decision_artifact_hash(gate, (gate,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+    # Exactly the bridge sessions/service uses: state.to_dict() -> NodeSpec.from_dict.
+    round_tripped = NodeSpec.from_dict(dict(_gate_state(gate).to_dict()["nodes"][0]))
+    reloaded = pipeline_decision_artifact_hash(round_tripped, (round_tripped,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+    assert reloaded == in_memory
+
+
+# --- Direct trust-boundary characterization tests --------------------------
+#
+# These call a @trust_boundary-decorated function directly through its
+# declared source_param and assert the exact raise its invariant promises.
+# They exist to satisfy the elspeth-lints `trust_boundary.tests` honesty gate
+# (TBE1-4): every raising boundary must carry a test_ref to a pytest node
+# whose own body contains a raising assertion invoking the decorated symbol
+# through source_param — a test that only exercises the boundary indirectly
+# (e.g. through interpretation_sites()) does not satisfy it.
+
+
+def test_source_authoring_metadata_rejects_non_string_modality() -> None:
+    from elspeth.web.interpretation_state import _source_authoring_metadata
+
+    options = {SOURCE_AUTHORING_KEY: {"modality": 123, "content_hash": "abc"}}
+    with pytest.raises(TypeError, match=r"source_authoring\.modality must be a non-empty string"):
+        _source_authoring_metadata(options=options)
+
+
+def test_prompt_parts_rejects_non_list_value() -> None:
+    from elspeth.web.interpretation_state import _prompt_parts
+
+    options = {PROMPT_TEMPLATE_PARTS_KEY: "not-a-list"}
+    with pytest.raises(TypeError, match="prompt_template_parts must be a list"):
+        _prompt_parts(options=options)
+
+
+def test_requirements_rejects_non_list_value() -> None:
+    from elspeth.web.interpretation_state import _requirements
+
+    options = {INTERPRETATION_REQUIREMENTS_KEY: "not-a-list"}
+    with pytest.raises(TypeError, match="interpretation_requirements must be a list"):
+        _requirements(options=options)
+
+
+def test_coerce_requirement_rejects_non_string_id() -> None:
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="interpretation requirement id must be a non-empty string"):
+        _coerce_requirement(value={"id": 123, "user_term": "x", "status": "pending"})
+
+
+def test_coerce_requirement_rejects_non_string_draft() -> None:
+    """Regression: draft previously passed through _coerce_requirement unchecked.
+
+    InterpretationRequirement.draft is typed str | None, but the constructor
+    read it straight from the input mapping with no validation — unlike every
+    other field on the TypedDict. A non-string draft silently violated the
+    declared type with no error anywhere. Closed alongside event_id below.
+    """
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="interpretation requirement draft must be a string or None"):
+        _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "pending", "draft": 123})
+
+
+def test_coerce_requirement_rejects_non_string_event_id() -> None:
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="interpretation requirement event_id must be a string or None"):
+        _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "pending", "event_id": 123})
+
+
+def test_coerce_requirement_rejects_resolved_without_string_accepted_value() -> None:
+    """The control that lets _render_prompt_parts read accepted_value nominally.
+
+    `_render_prompt_parts` reaches `requirement["accepted_value"]` only on the
+    non-pending arm, and `InterpretationRequirement.accepted_value` is typed
+    `str | None`. This boundary is what guarantees the resolved case carries a
+    real string, so the renderer needs no runtime type interrogation of its own.
+    """
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="resolved interpretation requirement must carry accepted_value"):
+        _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "resolved", "accepted_value": 123})
+
+
+def test_render_prompt_parts_substitutes_resolved_accepted_value() -> None:
+    """A resolved interpretation_ref renders its accepted text into the prompt.
+
+    Pins the resolved-ref arm of `_render_prompt_parts`, which previously
+    re-checked `isinstance(accepted, str)` even though every requirement
+    reaching it is built by `_coerce_requirement` (see the test above). The
+    guard is now `accepted is None`, exactly equivalent over the declared
+    `str | None`, and this asserts the substitution itself still happens.
+    """
+    from elspeth.web.interpretation_state import (
+        _prompt_parts,
+        _render_prompt_parts,
+        _requirements_by_id,
+    )
+
+    options: dict[str, object] = {
+        PROMPT_TEMPLATE_PARTS_KEY: [
+            {"kind": "text", "text": "Rate "},
+            {"kind": "interpretation_ref", "requirement_id": "coolness"},
+            {"kind": "text", "text": ": {{ row.text }}"},
+        ],
+        INTERPRETATION_REQUIREMENTS_KEY: [
+            {
+                "id": "coolness",
+                "kind": "vague_term",
+                "user_term": "coolness",
+                "status": "resolved",
+                "draft": "well-designed and useful",
+                "event_id": "event-1",
+                "accepted_value": "well-designed and useful",
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": None,
+            }
+        ],
+    }
+
+    parts = _prompt_parts(options)
+    assert parts is not None
+    rendered = _render_prompt_parts(parts, _requirements_by_id(options), unresolved_text=None)
+
+    assert rendered == "Rate well-designed and useful: {{ row.text }}"
+
+
+def test_validate_pipeline_decision_semantics_rejects_malformed_http_mapping() -> None:
+    from elspeth.web.interpretation_state import (
+        WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+        validate_pipeline_decision_semantics,
+    )
+
+    with pytest.raises(ValueError, match=r"requires options\.http"):
+        validate_pipeline_decision_semantics(
+            node_id="scrape",
+            plugin="web_scrape",
+            node_type="transform",
+            options={"http": "not-a-mapping"},
+            condition=None,
+            routes=None,
+            user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+            draft=None,
+            context="test",
+            web_scrape_raw_fields=frozenset(),
+        )
+
+
+def test_web_scrape_http_identity_artifact_hash_rejects_malformed_http_mapping() -> None:
+    from elspeth.web.interpretation_state import _web_scrape_http_identity_artifact_hash
+
+    node = _web_scrape("scrape", input_stream="rows", on_success="inbound")
+    node = replace(node, options={"http": "not-a-mapping"})
+
+    with pytest.raises(ValueError, match=r"requires options\.http"):
+        _web_scrape_http_identity_artifact_hash(node=node)
+
+
+def test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape() -> None:
+    """Regression: a present-but-malformed field_mapper.mapping used to be
+    silently coerced to {} instead of raising, unlike the identically-shaped
+    check in validate_pipeline_decision_semantics and the sibling
+    _web_scrape_http_identity_artifact_hash boundary."""
+    from elspeth.web.interpretation_state import _raw_html_cleanup_artifact_hash
+
+    node = NodeSpec(
+        id="cleanup",
+        node_type="transform",
+        plugin="field_mapper",
+        input="scraped",
+        on_success="output",
+        on_error="stop",
+        options={"mapping": "not-a-mapping", "select_only": True},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+    with pytest.raises(ValueError, match=r"requires field_mapper\.mapping to be a mapping"):
+        _raw_html_cleanup_artifact_hash(node, ())
+
+
+@pytest.mark.parametrize("bad_field", [123, None, b"content", ["content"], {"content": 1}])
+def test_validated_mapping_field_rejects_non_string_mapping_sides(bad_field: object) -> None:
+    """Tier-3 boundary honesty: a non-string side of an authored
+    field_mapper mapping raises ValueError, never coerces or stringifies."""
+    from elspeth.web.interpretation_state import _validated_mapping_field
+
+    with pytest.raises(ValueError, match="must map string field names"):
+        _validated_mapping_field(bad_field, context="raw-html cleanup review contract", node_id="drop-raw")

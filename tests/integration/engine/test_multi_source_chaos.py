@@ -45,26 +45,23 @@ from __future__ import annotations
 
 import inspect
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from sqlalchemy import and_, literal_column, select
+from sqlalchemy import and_, select, update
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import Determinism, PluginSchema, RunStatus
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
-from elspeth.core.config import (
-    ElspethSettings,
-    QueueSettings,
-    SourceSettings,
-    TransformSettings,
-    load_settings_from_yaml_string,
-)
+from elspeth.core.config import ElspethSettings, QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     node_states_table,
@@ -256,10 +253,21 @@ class _LeaseBusterTransform(BaseTransform):
             # fortiori the shorter heartbeat interval — the RowProcessor
             # constructor enforces heartbeat < lease) without sleeping.
             self._clock.advance(_LEASE_EXPIRY_ADVANCE)
+            # Lease expiry is decided on the Landscape database clock
+            # (ADR-047), which the process MockClock cannot move: age the
+            # in-flight lease — the only LEASED row at this point — into that
+            # clock's past so the peer sweep finds it lapsed.
+            with self._db.engine.begin() as conn:
+                aged = conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.run_id == ctx.run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
+                )
+                assert aged.rowcount == 1, f"expected exactly the in-flight lease to be LEASED, matched {aged.rowcount}"
             peer_repo = TokenSchedulerRepository(self._db.engine)
             self.peer_recovered_count = peer_repo.recover_expired_leases_legacy_unfenced(
                 run_id=ctx.run_id,
-                now=self._clock.now_utc(),
                 caller_owner=self._peer_owner,
             )
         return TransformResult.success(row, success_reason={"action": "lease_buster"})
@@ -439,7 +447,7 @@ def _scheduler_events(db: LandscapeDB, run_id: str) -> list[dict[str, Any]]:
             dict(row)
             for row in conn.execute(
                 select(
-                    literal_column("scheduler_events.rowid").label("seq"),
+                    scheduler_events_table.c.seq,
                     scheduler_events_table.c.token_id,
                     scheduler_events_table.c.event_type,
                     scheduler_events_table.c.from_status,
@@ -452,7 +460,7 @@ def _scheduler_events(db: LandscapeDB, run_id: str) -> list[dict[str, Any]]:
                     scheduler_events_table.c.context_json,
                 )
                 .where(scheduler_events_table.c.run_id == run_id)
-                .order_by(literal_column("scheduler_events.rowid"))
+                .order_by(scheduler_events_table.c.seq)
             ).mappings()
         ]
 
@@ -727,7 +735,11 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
     # No token reached a terminal outcome: the fence abandoned the in-flight
     # result without fabricating completion, and the parked PENDING_SINK
     # tokens were refused sink delivery when the run failed its invariant.
-    assert _outcomes_by_source(db, run_id) == []
+    # Under ADR-038 that abandonment is now an explicit audit record: the
+    # FAILED finalize on this non-resumable run marks every undecided token
+    # (NULL, ABANDONED) — non-terminal, no lifecycle answer fabricated.
+    outcomes = _outcomes_by_source(db, run_id)
+    assert sorted(outcomes) == sorted([("orders", None, "abandoned", None)] * 2 + [("refunds", None, "abandoned", None)] * 2)
 
 
 # ---------------------------------------------------------------------------

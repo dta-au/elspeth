@@ -166,6 +166,13 @@ class TestTriggerEvaluatorRestoreValidation:
         config = TriggerConfig(count=5)
         return TriggerEvaluator(config)
 
+    def _make_condition_evaluator(self) -> TriggerEvaluator:
+        from elspeth.core.config import TriggerConfig
+        from elspeth.engine.triggers import TriggerEvaluator
+
+        config = TriggerConfig(condition="row['batch_count'] >= 1")
+        return TriggerEvaluator(config)
+
     def test_rejects_negative_batch_count(self) -> None:
         evaluator = self._make_evaluator()
         with pytest.raises(ValueError, match="batch_count must be non-negative"):
@@ -209,12 +216,95 @@ class TestTriggerEvaluatorRestoreValidation:
                 batch_count=0, elapsed_age_seconds=0.0, count_fire_offset=None, condition_fire_offset=float("inf")
             )
 
+    def test_rejects_elapsed_age_for_empty_batch(self) -> None:
+        evaluator = self._make_evaluator()
+        with pytest.raises(ValueError, match="empty batch checkpoint"):
+            evaluator.restore_from_checkpoint(
+                batch_count=0,
+                elapsed_age_seconds=1.0,
+                count_fire_offset=None,
+                condition_fire_offset=None,
+            )
+
+    def test_rejects_count_fire_offset_for_empty_batch(self) -> None:
+        evaluator = self._make_evaluator()
+        with pytest.raises(ValueError, match="empty batch checkpoint"):
+            evaluator.restore_from_checkpoint(
+                batch_count=0,
+                elapsed_age_seconds=0.0,
+                count_fire_offset=0.0,
+                condition_fire_offset=None,
+            )
+
+    def test_rejects_condition_fire_offset_for_empty_batch(self) -> None:
+        evaluator = self._make_condition_evaluator()
+        with pytest.raises(ValueError, match="empty batch checkpoint"):
+            evaluator.restore_from_checkpoint(
+                batch_count=0,
+                elapsed_age_seconds=0.0,
+                count_fire_offset=None,
+                condition_fire_offset=0.0,
+            )
+
+    def test_rejects_count_fire_offset_after_checkpoint_age(self) -> None:
+        evaluator = self._make_evaluator()
+        with pytest.raises(ValueError, match="count_fire_offset cannot exceed elapsed_age_seconds"):
+            evaluator.restore_from_checkpoint(
+                batch_count=5,
+                elapsed_age_seconds=1.0,
+                count_fire_offset=1.5,
+                condition_fire_offset=None,
+            )
+
+    def test_rejects_condition_fire_offset_after_checkpoint_age(self) -> None:
+        evaluator = self._make_condition_evaluator()
+        with pytest.raises(ValueError, match="condition_fire_offset cannot exceed elapsed_age_seconds"):
+            evaluator.restore_from_checkpoint(
+                batch_count=1,
+                elapsed_age_seconds=1.0,
+                count_fire_offset=None,
+                condition_fire_offset=1.5,
+            )
+
+    def test_rejects_count_fire_offset_without_count_trigger(self) -> None:
+        from elspeth.core.config import TriggerConfig
+        from elspeth.engine.triggers import TriggerEvaluator
+
+        evaluator = TriggerEvaluator(TriggerConfig(timeout_seconds=10.0))
+        with pytest.raises(ValueError, match="count_fire_offset requires a configured count trigger"):
+            evaluator.restore_from_checkpoint(
+                batch_count=1,
+                elapsed_age_seconds=1.0,
+                count_fire_offset=1.0,
+                condition_fire_offset=None,
+            )
+
+    def test_rejects_count_fire_offset_before_count_threshold(self) -> None:
+        evaluator = self._make_evaluator()
+        with pytest.raises(ValueError, match="count_fire_offset requires batch_count to satisfy configured count"):
+            evaluator.restore_from_checkpoint(
+                batch_count=4,
+                elapsed_age_seconds=1.0,
+                count_fire_offset=1.0,
+                condition_fire_offset=None,
+            )
+
+    def test_rejects_condition_fire_offset_without_condition_trigger(self) -> None:
+        evaluator = self._make_evaluator()
+        with pytest.raises(ValueError, match="condition_fire_offset requires a configured condition trigger"):
+            evaluator.restore_from_checkpoint(
+                batch_count=1,
+                elapsed_age_seconds=1.0,
+                count_fire_offset=None,
+                condition_fire_offset=1.0,
+            )
+
     def test_accepts_valid(self) -> None:
         evaluator = self._make_evaluator()
-        evaluator.restore_from_checkpoint(batch_count=3, elapsed_age_seconds=5.0, count_fire_offset=2.0, condition_fire_offset=None)
-        assert evaluator._batch_count == 3
+        evaluator.restore_from_checkpoint(batch_count=5, elapsed_age_seconds=5.0, count_fire_offset=2.0, condition_fire_offset=None)
+        assert evaluator._batch_count == 5
 
     def test_accepts_valid_with_condition_fire_offset(self) -> None:
-        evaluator = self._make_evaluator()
-        evaluator.restore_from_checkpoint(batch_count=0, elapsed_age_seconds=0.0, count_fire_offset=None, condition_fire_offset=1.5)
+        evaluator = self._make_condition_evaluator()
+        evaluator.restore_from_checkpoint(batch_count=1, elapsed_age_seconds=2.0, count_fire_offset=None, condition_fire_offset=1.5)
         assert evaluator.get_condition_fire_offset() == 1.5

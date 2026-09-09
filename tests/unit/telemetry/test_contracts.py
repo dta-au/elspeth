@@ -195,18 +195,35 @@ def _serialize_for_json(obj: Any) -> Any:
 def test_exporter_implements_protocol(exporter_class: type) -> None:
     """All exporters must implement ExporterProtocol correctly.
 
-    This test verifies:
-    1. The class is recognized as implementing ExporterProtocol via isinstance()
-    2. All protocol methods and properties are present
-    3. Methods can be called (not just defined)
+    Conformance is checked by RESOLVING each protocol member, not by
+    ``isinstance`` against the Protocol: ADR-032 rule 3 forbids a
+    ``runtime_checkable`` Protocol as a gate, and ``ExporterProtocol`` is no
+    longer decorated. Direct access is also the stronger check here — it
+    goes through ``__getattr__``, so a wrapper exporter that forwards its
+    members passes, exactly as it does at runtime, and a missing member
+    fails with an ``AttributeError`` naming it.
     """
-    # Create an instance
     exporter = exporter_class()
 
-    # Verify protocol compliance via isinstance (runtime_checkable)
-    assert isinstance(exporter, ExporterProtocol), (
-        f"{exporter_class.__name__} does not satisfy ExporterProtocol. Check that all required methods/properties are implemented."
-    )
+    assert isinstance(exporter.name, str), f"{exporter_class.__name__}.name must be a str property"
+    assert callable(exporter.configure), f"{exporter_class.__name__}.configure must be callable"
+    assert callable(exporter.export), f"{exporter_class.__name__}.export must be callable"
+    assert callable(exporter.flush), f"{exporter_class.__name__}.flush must be callable"
+    assert callable(exporter.close), f"{exporter_class.__name__}.close must be callable"
+
+
+def test_exporter_protocol_is_not_an_isinstance_gate() -> None:
+    """ADR-032 rule 3: the exporter Protocol must not be usable as a guard.
+
+    Mirrors ``test_delivery_metrics_protocol_is_not_an_isinstance_gate`` for
+    the sibling capability Protocol. Exporters arrive from third-party pluggy
+    plugins, so a structural gate here would admit an impostor and reject an
+    honest dynamic-attribute exporter.
+    """
+    exporter = ALL_EXPORTERS[0]()
+
+    with pytest.raises(TypeError):
+        isinstance(exporter, ExporterProtocol)  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("exporter_class", ALL_EXPORTERS)

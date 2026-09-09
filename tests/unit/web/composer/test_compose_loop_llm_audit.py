@@ -229,6 +229,164 @@ def test_token_usage_reads_real_litellm_pydantic_extra_fields() -> None:
     assert record.provider_cost == 0.0123
 
 
+def _record_with_reasoning_artifact(artifact: object) -> ComposerLLMCall:
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(reasoning_details=artifact, thinking_blocks=None))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+    return build_llm_call_record(
+        model_requested="provider/model",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        status=ComposerLLMCallStatus.SUCCESS,
+        started_at=datetime.now(UTC),
+        started_ns=time.monotonic_ns(),
+        temperature=None,
+        seed=None,
+        response=response,
+    )
+
+
+def test_provider_reasoning_cycle_degrades_to_fixed_sentinel() -> None:
+    artifact: dict[str, object] = {}
+    artifact["self"] = artifact
+
+    record = _record_with_reasoning_artifact(artifact)
+
+    assert record.reasoning_details == "<provider-artifact-unavailable>"
+
+
+def _nested_json_lists(depth: int) -> object:
+    value: object = 0
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        pytest.param({"deep": _nested_json_lists(65)}, id="deep"),
+        pytest.param({"wide": [None] * 10_001}, id="wide"),
+        pytest.param({"oversized": ["x" * 65_500] * 17}, id="oversized"),
+    ],
+)
+def test_provider_reasoning_artifact_budgets_degrade_to_fixed_sentinel(artifact: object) -> None:
+    record = _record_with_reasoning_artifact(artifact)
+
+    assert record.reasoning_details == "<provider-artifact-unavailable>"
+
+
+def test_provider_reasoning_does_not_invoke_serializer_methods() -> None:
+    calls: list[str] = []
+
+    class _ThrowingSerializer:
+        __slots__ = ()
+
+        def model_dump(self, **_kwargs: object) -> object:
+            calls.append("model_dump")
+            raise RuntimeError("provider-controlled serializer ran")
+
+    record = _record_with_reasoning_artifact(_ThrowingSerializer())
+
+    assert record.reasoning_details == "<provider-artifact-unavailable>"
+    assert calls == []
+
+
+def test_provider_reasoning_does_not_invoke_provider_descriptors() -> None:
+    calls: list[str] = []
+
+    class _ThrowingDescriptor:
+        def __init__(self) -> None:
+            self.safe = "value"
+
+        @property
+        def __pydantic_extra__(self) -> object:
+            calls.append("descriptor")
+            raise RuntimeError("provider-controlled descriptor ran")
+
+    record = _record_with_reasoning_artifact(_ThrowingDescriptor())
+
+    assert record.reasoning_details == {"safe": "value"}
+    assert calls == []
+
+
+def test_provider_artifact_admits_real_litellm_tool_call() -> None:
+    """A real LiteLLM tool call must audit as an artifact, not as the sentinel.
+
+    ``litellm.types.utils.ChatCompletionMessageToolCall`` declares no pydantic
+    model fields: ``id``/``type``/``function`` live in ``__pydantic_extra__``
+    and its ``__dict__`` is empty. Reading ``__dict__`` alone yields no
+    data-only representation, so the whole artifact silently degrades to
+    ``PROVIDER_ARTIFACT_UNAVAILABLE`` in the durable audit record
+    (ADR-032; same defect class as elspeth-9ea866438b).
+    """
+    from litellm.types.utils import ChatCompletionMessageToolCall, Function
+
+    tool_call = ChatCompletionMessageToolCall(
+        id="call_1",
+        type="function",
+        function=Function(name="do_thing", arguments='{"a": 1}'),
+    )
+    assert object.__getattribute__(tool_call, "__dict__") == {}  # the storage split this test pins
+
+    record = _record_with_reasoning_artifact(tool_call)
+
+    assert record.reasoning_details == {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "do_thing", "arguments": '{"a": 1}'},
+    }
+
+
+def test_provider_artifact_admits_pydantic_extra_allow_model() -> None:
+    """Undeclared fields on an ``extra="allow"`` model must reach the audit record."""
+    import pydantic
+
+    class _ProviderArtifact(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(extra="allow")
+
+        declared: str
+
+    artifact = _ProviderArtifact(declared="visible", undeclared="also visible")
+
+    record = _record_with_reasoning_artifact(artifact)
+
+    assert record.reasoning_details == {"declared": "visible", "undeclared": "also visible"}
+
+
+def test_provider_artifact_without_data_fields_still_degrades_to_sentinel() -> None:
+    """The sentinel fallback is preserved, not removed, by the extras merge."""
+
+    class _Opaque:
+        __slots__ = ()
+
+    record = _record_with_reasoning_artifact(_Opaque())
+
+    assert record.reasoning_details == "<provider-artifact-unavailable>"
+
+
+def test_provider_reasoning_content_degrades_when_oversized() -> None:
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(reasoning="x" * 65_537))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    record = build_llm_call_record(
+        model_requested="provider/model",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        status=ComposerLLMCallStatus.SUCCESS,
+        started_at=datetime.now(UTC),
+        started_ns=time.monotonic_ns(),
+        temperature=None,
+        seed=None,
+        response=response,
+    )
+
+    assert record.reasoning_content == "<provider-artifact-unavailable>"
+
+
 def test_llm_call_record_redacts_raw_provider_error_detail() -> None:
     openai_key = "sk-" + ("A" * 48)
     bearer_token = "Bearer " + ("x" * 32)
@@ -504,6 +662,63 @@ async def test_empty_choices_records_malformed_response() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "choice"),
+    [
+        ("missing-message", SimpleNamespace()),
+        ("non-string-content", SimpleNamespace(message=SimpleNamespace(content=["part-a", "part-b"], tool_calls=None))),
+        ("dict-content", SimpleNamespace(message=SimpleNamespace(content={"text": "hi"}, tool_calls=None))),
+        ("int-content", SimpleNamespace(message=SimpleNamespace(content=7, tool_calls=None))),
+        ("missing-content-attr", SimpleNamespace(message=SimpleNamespace(tool_calls=None))),
+        ("non-sequence-tool-calls", SimpleNamespace(message=SimpleNamespace(content=None, tool_calls={"id": "x"}))),
+        ("missing-tool-calls-attr", SimpleNamespace(message=SimpleNamespace(content="hi"))),
+        (
+            "tool-call-missing-id",
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(function=SimpleNamespace(name="set_metadata", arguments="{}"))],
+                )
+            ),
+        ),
+        (
+            "tool-call-non-string-function-metadata",
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(id="tc_1", function=SimpleNamespace(name=42, arguments="{}"))],
+                )
+            ),
+        ),
+    ],
+)
+async def test_malformed_nonempty_response_records_malformed_not_success(case: str, choice: Any) -> None:
+    """Regression for elspeth-b6be9e991f: a nonempty-but-malformed provider
+    response must classify as MALFORMED_RESPONSE before the audit wrapper
+    records SUCCESS — previously only choices cardinality was validated, so
+    the caller crashed dereferencing message/content/tool_calls after durable
+    audit evidence had already recorded the call as successful.
+    """
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    malformed = _FakeLLMResponse(
+        choices=[choice],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3),
+    )
+
+    with (
+        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=malformed),
+        pytest.raises(ComposerServiceError) as exc_info,
+    ):
+        await service.compose("Hello", [], _empty_state())
+
+    llm_calls = _captured_llm_calls(exc_info.value)
+    assert len(llm_calls) == 1
+    call = llm_calls[0]
+    assert call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE, case
+    assert call.error_message == "malformed_response"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_model_call_records_cancelled_status() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     cancelled = asyncio.CancelledError()
@@ -517,3 +732,15 @@ async def test_cancelled_model_call_records_cancelled_status() -> None:
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
     assert llm_calls[0].status is ComposerLLMCallStatus.CANCELLED
+
+
+def test_pydantic_extra_unset_slot_reads_as_no_extras_without_raising() -> None:
+    """A declared-but-unset ``__pydantic_extra__`` slot is third-party state a
+    partially constructed provider object can legitimately carry: the boundary
+    answers None ("no extras"), it never propagates the AttributeError."""
+    from elspeth.web.composer.llm_response_parsing import _pydantic_extra_fields
+
+    class _UnsetSlot:
+        __slots__ = ("__pydantic_extra__",)
+
+    assert _pydantic_extra_fields(_UnsetSlot()) is None

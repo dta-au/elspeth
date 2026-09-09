@@ -112,6 +112,8 @@ class _BatchContractExemplarTransform(BaseTransform, BatchTransformMixin):
     source_file_hash: str | None = "sha256:test-batch-contract"
     declared_output_fields = frozenset({"processed"})
     passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)

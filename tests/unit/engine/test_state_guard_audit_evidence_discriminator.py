@@ -83,6 +83,7 @@ def _make_guard(execution: _ExecutionFake) -> NodeStateGuard:
         step_index=0,
         input_data={},
         attempt=0,
+        auto_fail_phase="transform_execution",
     )
 
 

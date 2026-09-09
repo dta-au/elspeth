@@ -4,9 +4,11 @@
 
 import { request, type APIRequestContext } from "@playwright/test";
 
+import type { CompositionState } from "@/types";
+
 // Overridable by Playwright configs so the same specs can run against either
 // the local-spawned webServer or an already-deployed environment (e.g.
-// elspeth.foundryside.dev).
+// elspeth.example.gov.au).
 const BACKEND_PORT = process.env.PLAYWRIGHT_BACKEND_PORT ?? "8451";
 const BACKEND_BASE_URL =
   process.env.PLAYWRIGHT_BACKEND_BASE_URL ?? `http://127.0.0.1:${BACKEND_PORT}`;
@@ -16,7 +18,14 @@ export interface SessionSummary {
   title: string;
 }
 
-export type CompositionStateSeed = Record<string, unknown>;
+export type CompositionStateSeed = Pick<
+  CompositionState,
+  "version" | "metadata" | "sources" | "nodes" | "edges" | "outputs"
+>;
+
+export interface SeedCompositionStateOptions {
+  timeout?: number;
+}
 
 export async function authedContext(token: string): Promise<APIRequestContext> {
   return request.newContext({
@@ -51,33 +60,104 @@ export async function createSession(
   return (await resp.json()) as SessionSummary;
 }
 
+/** Detail level (elspeth-aa39cffb16): Import YAML renders only when the
+ *  show_advanced preference is on; specs that measure the three-verb bar
+ *  seed it, and reset it, through this helper. */
+export async function setShowAdvanced(
+  ctx: APIRequestContext,
+  value: boolean,
+): Promise<void> {
+  const resp = await ctx.patch("/api/composer-preferences", {
+    data: { show_advanced: value },
+  });
+  if (!resp.ok()) {
+    throw new Error(
+      `PATCH /api/composer-preferences failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+    );
+  }
+}
+
+/** The account's persisted composer mode. A fresh session opens in the
+ *  account's default_mode, and a guided build hides the plugin catalog
+ *  (App.tsx catalogAvailable = !guidedBuildActive), so specs that drive the
+ *  catalog on a real session state their mode instead of inheriting whatever
+ *  an earlier live spec left on the shared E2E account. */
+export async function getDefaultMode(
+  ctx: APIRequestContext,
+): Promise<"guided" | "freeform"> {
+  const resp = await ctx.get("/api/composer-preferences");
+  if (!resp.ok()) {
+    throw new Error(
+      `GET /api/composer-preferences failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+    );
+  }
+  const body = (await resp.json()) as { default_mode: "guided" | "freeform" };
+  return body.default_mode;
+}
+
+export async function setDefaultMode(
+  ctx: APIRequestContext,
+  mode: "guided" | "freeform",
+): Promise<void> {
+  const resp = await ctx.patch("/api/composer-preferences", {
+    data: { default_mode: mode },
+  });
+  if (!resp.ok()) {
+    throw new Error(
+      `PATCH /api/composer-preferences failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+    );
+  }
+}
+
+const DELETE_SESSION_CONFLICT_RETRIES = 20;
+const DELETE_SESSION_CONFLICT_BACKOFF_MS = 250;
+
 export async function deleteSession(
   ctx: APIRequestContext,
   sessionId: string,
 ): Promise<void> {
-  const resp = await ctx.delete(`/api/sessions/${sessionId}`);
-  // 404 is acceptable — session may have been deleted by the test itself.
-  if (!resp.ok() && resp.status() !== 404) {
-    throw new Error(
-      `DELETE /api/sessions/${sessionId} failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
-    );
+  // Teardown quiescence: the archive takes the session operation fence, and
+  // a page the test has not closed yet may still hold a short read lease on
+  // it (validate / audit-readiness / blob read), which the backend answers
+  // with 409 "Session operation is already active". That contention is a
+  // product concern tracked in elspeth-bf52d495a2; teardown only waits for
+  // the in-flight read to release and tries again, bounded, then fails loud.
+  let lastConflictBody = "";
+  for (let attempt = 0; attempt <= DELETE_SESSION_CONFLICT_RETRIES; attempt += 1) {
+    const resp = await ctx.delete(`/api/sessions/${sessionId}`);
+    // 404 is acceptable — session may have been deleted by the test itself.
+    if (resp.ok() || resp.status() === 404) {
+      return;
+    }
+    if (resp.status() !== 409) {
+      throw new Error(
+        `DELETE /api/sessions/${sessionId} failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+      );
+    }
+    lastConflictBody = (await resp.text()).slice(0, 500);
+    await new Promise((resolve) => setTimeout(resolve, DELETE_SESSION_CONFLICT_BACKOFF_MS));
   }
+  throw new Error(
+    `DELETE /api/sessions/${sessionId} still 409 after ${DELETE_SESSION_CONFLICT_RETRIES} retries: ${lastConflictBody}`,
+  );
 }
 
 export async function seedCompositionState(
   ctx: APIRequestContext,
   sessionId: string,
   state: CompositionStateSeed,
-): Promise<Record<string, unknown>> {
+  options: SeedCompositionStateOptions = {},
+): Promise<CompositionState> {
   const resp = await ctx.post(`/api/sessions/${sessionId}/state/e2e-seed`, {
     data: { state },
+    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
   });
   if (!resp.ok()) {
     throw new Error(
       `POST /api/sessions/${sessionId}/state/e2e-seed failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
     );
   }
-  return (await resp.json()) as Record<string, unknown>;
+  return (await resp.json()) as CompositionState;
 }
 
 // Minimal blob metadata fields used by tests.  The backend returns more fields

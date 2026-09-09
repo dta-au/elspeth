@@ -8,7 +8,7 @@ and pool configuration (flat fields assembled into PoolConfig).
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from jinja2 import TemplateSyntaxError
 from pydantic import Field, field_validator, model_validator
@@ -16,9 +16,49 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
-from elspeth.plugins.infrastructure.templates import TemplateError
-from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
+from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
+from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
+from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, QueryDefinition, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
+
+# The names PromptTemplate.render actually supplies (templates.py builds the
+# context as exactly {"row": ..., "lookup": ...} in both single- and
+# multi-query mode) plus the Jinja2 environment globals (range, namespace,
+# ...) that resolve at render time. Any other top-level template name hits
+# StrictUndefined and raises TemplateError live. Mirrors the composer-side
+# constants in web/composer/state.py.
+_PROMPT_CONTEXT_NAMES: frozenset[str] = frozenset({"row", "lookup"})
+_PROMPT_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().globals)
+
+# The one name build_template_context injects beside the query's own
+# input_fields variables (multi_query.py): the full source row, reachable as
+# row.source_row.<column> inside a query template.
+_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
+
+
+# Single-owned by the plugin layer and imported by the composer rule, so the
+# tool-call surface and the planner's repair turn cannot serve different
+# remedies for one error code (elspeth-920bd88299).
+#
+# Rewrite-the-reference leads DELIBERATELY. Declaring the read name is correct
+# only when the producer guarantees that exact spelling, and config time cannot
+# tell: ``SchemaContract.find_name`` matches a field's ``normalized_name`` OR
+# its ``original_name``, so ``{{ row.Name }}`` may resolve against a header
+# ``Name`` while the row key is ``name`` — and ``verify_declared_required_fields``
+# is a plain set difference over row keys with NO dual-name limb. Measured:
+# declaring the read name there is ACCEPTED at config time and then raises
+# DeclaredRequiredInputFieldsViolation on EVERY row. Leading with it would hand
+# the planner a repair that clears this error and breaks the run.
+_UNDECLARED_ROW_FIELDS_REMEDY: Final[str] = (
+    "Rewrite each reference to a field the node already declares — that always applies, and a "
+    "spelling the declaration does not carry works at best by accident of the producer's original "
+    "header. Add a name to options.required_input_fields ONLY if the upstream producer guarantees "
+    "that exact name (declare the parenthesised form where one is shown; the bracket literal itself "
+    "is not a legal declaration entry). Declaring a name the producer does not guarantee is accepted "
+    "here and then fails every row at run time. Do not empty required_input_fields to silence this: "
+    "[] withdraws the contract for every field the node reads, including the unconditional ones."
+)
 
 
 class LLMConfig(TransformDataConfig):
@@ -46,7 +86,7 @@ class LLMConfig(TransformDataConfig):
     only declare the fields that are TRULY required (always accessed).
 
     LLM-specific fields:
-    - provider: LLM provider ("azure", "openrouter", or "bedrock")
+    - provider: LLM provider ("azure", "openrouter", "bedrock", or "gateway")
     - model: Model identifier (optional — Azure uses deployment_name instead)
     - prompt_template: Jinja2 prompt template (required)
     - system_prompt: Optional system message
@@ -64,19 +104,90 @@ class LLMConfig(TransformDataConfig):
     - max_capacity_retry_seconds: Max time to retry capacity errors per row
     """
 
-    provider: Literal["azure", "openrouter", "bedrock"] = Field(..., description="LLM provider")
+    provider: Literal["azure", "openrouter", "bedrock", "gateway"] = Field(..., description="LLM provider")
     model: str | None = Field(None, description="Model identifier (optional — Azure uses deployment_name)")
     queries: list[QueryDefinition] | dict[str, QueryDefinition] | None = Field(
         None, description="Multi-query specs (None = single-query mode)"
     )
     prompt_template: str = Field(..., description="Jinja2 prompt template")
     system_prompt: str | None = Field(None, description="Optional system prompt")
-    temperature: float = Field(0.0, ge=0.0, le=2.0, description="Sampling temperature")
-    max_tokens: int | None = Field(None, gt=0, description="Maximum tokens in response")
+    temperature: float = Field(
+        0.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_tokens: int | None = Field(
+        None,
+        gt=0,
+        description="Maximum tokens in response",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
     response_field: str = Field("llm_response", description="Field name for LLM response in output")
 
+    # Single-prompt structured output. These are the top-level lift of the
+    # per-query structured-output surface (QueryDefinition.response_format /
+    # QueryDefinition.output_fields): single-prompt mode has no query entry to
+    # carry them, so they live on the config itself and are rejected when
+    # ``queries`` is set (each query owns its own pair there). Semantics are
+    # identical to the multi-query surface — structured mode lowers
+    # output_fields into an API-native json_schema response_format; standard
+    # mode appends the field contract to the prompt and requests json_object —
+    # except the extracted fields land UNPREFIXED (no query name exists).
+    response_format: ResponseFormat = Field(
+        ResponseFormat.STANDARD,
+        description=(
+            "Single-prompt response format mode (standard JSON object vs. enforced json_schema). "
+            "Multi-query mode declares response_format per query instead."
+        ),
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    output_fields: list[OutputFieldConfig] | None = Field(
+        None,
+        min_length=1,
+        description=(
+            "Typed structured-output field definitions for single-prompt mode (None = unstructured "
+            "response). Multi-query mode declares output_fields per query instead."
+        ),
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
+    # Image inputs (docs/specs/2026-08-25-llm-image-input-design.md §4):
+    # absent (None) is exactly today's text-only behavior. Each entry names a
+    # row column holding a payload-store blob ref (str or list[str]); its image
+    # format comes from a literal or a per-row mime column, resolved at message
+    # assembly time (image_inputs.resolve_image_parts), never here.
+    # min_length=1: spec §4 requires entries "non-empty and distinct" — an
+    # authored `image_inputs: []` is a mistake to catch at config-build time,
+    # not a silent no-op alias for omitting the key entirely (fail-fast, per
+    # AWSTextractInlineAnalysisConfig's "at least one output target" precedent).
+    image_inputs: list[ImageInputConfig] | None = Field(
+        None,
+        min_length=1,
+        description="Row columns to resolve as image message parts (absent = text-only)",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_image_bytes: int = Field(
+        5_242_880,
+        gt=0,
+        le=20_971_520,
+        description="Per-image byte cap (hard upper bound 20 MiB)",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_images_per_call: int = Field(
+        20,
+        gt=0,
+        description="Maximum resolved images per LLM call",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
     # File-based content with source paths for audit trail
-    lookup: dict[str, Any] | None = Field(None, description="Lookup data loaded from YAML file")
+    lookup: dict[str, Any] | None = Field(
+        None,
+        description="Lookup data loaded from YAML file",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
     prompt_template_source: str | None = Field(None, description="Prompt template file path for audit (None if inline)")
     lookup_source: str | None = Field(None, description="Lookup file path for audit (None if no lookup)")
     system_prompt_source: str | None = Field(None, description="System prompt file path for audit (None if inline)")
@@ -99,12 +210,42 @@ class LLMConfig(TransformDataConfig):
     )
 
     # Pool configuration fields (flat - assembled into PoolConfig by pool_config property)
-    pool_size: int = Field(1, ge=1, description="Number of concurrent requests (1 = sequential)")
-    min_dispatch_delay_ms: int = Field(0, ge=0, description="Minimum dispatch delay in milliseconds")
-    max_dispatch_delay_ms: int = Field(5000, ge=0, description="Maximum dispatch delay in milliseconds")
-    backoff_multiplier: float = Field(2.0, gt=1.0, description="Backoff multiplier on capacity error")
-    recovery_step_ms: int = Field(50, ge=0, description="Recovery step in milliseconds")
-    max_capacity_retry_seconds: int = Field(3600, gt=0, description="Max seconds to retry capacity errors")
+    pool_size: int = Field(
+        1,
+        ge=1,
+        description="Number of concurrent requests (1 = sequential)",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    min_dispatch_delay_ms: int = Field(
+        0,
+        ge=0,
+        description="Minimum dispatch delay in milliseconds",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_dispatch_delay_ms: int = Field(
+        5000,
+        ge=0,
+        description="Maximum dispatch delay in milliseconds",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    backoff_multiplier: float = Field(
+        2.0,
+        gt=1.0,
+        description="Backoff multiplier on capacity error",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    recovery_step_ms: int = Field(
+        50,
+        ge=0,
+        description="Recovery step in milliseconds",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+    max_capacity_retry_seconds: int = Field(
+        3600,
+        gt=0,
+        description="Max seconds to retry capacity errors",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     @property
     def pool_config(self) -> PoolConfig | None:
@@ -213,18 +354,70 @@ class LLMConfig(TransformDataConfig):
         resolve_queries(self.queries)
         return self
 
+    @model_validator(mode="after")
+    def _validate_single_mode_structured_output(self) -> LLMConfig:
+        """Enforce the top-level structured-output rules (single-prompt mode only).
+
+        Multi-query mode declares ``response_format``/``output_fields`` per
+        query (``QueryDefinition``); the top-level pair is single-prompt-only,
+        so combining either with ``queries`` is rejected rather than silently
+        ignored. In single mode: structured with nothing to enforce is an
+        authoring mistake (the json_schema is built FROM output_fields), and a
+        suffix that collides with the response/operational fields the
+        transform itself writes would be destroyed on emission.
+        """
+        if self.queries is not None:
+            if self.output_fields is not None:
+                raise ValueError(
+                    "output_fields at the config top level is a single-prompt option; "
+                    "multi-query mode declares output_fields on each queries entry"
+                )
+            if self.response_format is not ResponseFormat.STANDARD:
+                raise ValueError(
+                    "response_format at the config top level is a single-prompt option; "
+                    "multi-query mode declares response_format on each queries entry"
+                )
+            return self
+        if self.response_format is ResponseFormat.STRUCTURED and self.output_fields is None:
+            raise ValueError("response_format='structured' requires output_fields: the enforced json_schema is built from them")
+        if self.output_fields is not None:
+            reserved = {f"{self.response_field}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES}
+            seen: set[str] = set()
+            for field in self.output_fields:
+                if field.suffix in seen:
+                    raise ValueError(f"Duplicate output field suffix '{field.suffix}'. Each output field must be unique")
+                seen.add(field.suffix)
+                if field.suffix in reserved:
+                    raise ValueError(
+                        f"Output field suffix '{field.suffix}' collides with the transform's own "
+                        f"response/operational fields {sorted(reserved)}; choose another suffix "
+                        "or rename response_field"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_image_inputs_field_names_unique(self) -> LLMConfig:
+        """Reject image_inputs entries that name the same row column twice.
+
+        Each entry's ``field`` selects a distinct blob-ref column; a duplicate
+        would resolve the same column twice into the assembled message with no
+        defined ordering between the two resolutions.
+        """
+        if self.image_inputs is None:
+            return self
+        names = [spec.field for spec in self.image_inputs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate image_inputs field names: {duplicates}. Each entry's field must be unique")
+        return self
+
     def _field_extraction_templates(self) -> tuple[tuple[str, str], ...]:
         """Return (label, template) for every LLM Jinja2 template that can interpolate row data."""
         templates = [("prompt_template", self.prompt_template)]
-        if isinstance(self.queries, dict):
-            for name, defn in self.queries.items():
-                if defn.template:
-                    templates.append((f"query {name!r} template", defn.template))
-        elif isinstance(self.queries, list):
-            for index, item in enumerate(self.queries):
-                if item.template:
-                    label = item.name if item.name is not None else index
-                    templates.append((f"query {label!r} template", item.template))
+        if self.queries is not None:
+            for spec in resolve_queries(self.queries):
+                if spec.template:
+                    templates.append((f"query {spec.name!r} template", spec.template))
         return tuple(templates)
 
     @model_validator(mode="after")
@@ -257,7 +450,7 @@ class LLMConfig(TransformDataConfig):
             "map(attribute)": "map(attribute=expr)",
             "row-api": "row API",
         }
-        access_examples = ", ".join(access_examples_by_kind.get(kind, kind) for kind in access_kinds)
+        access_examples = ", ".join(access_examples_by_kind[kind] for kind in access_kinds)
         raise ValueError(
             "LLM prompt_template uses dynamic row field access "
             f"({', '.join(access_kinds)} via {access_examples}). "
@@ -297,15 +490,10 @@ class LLMConfig(TransformDataConfig):
                 # any row.* references in the top-level and per-query templates.
                 extracted: set[str] = set()
                 # Collect row column names from input_fields mappings
-                query_defs: list[QueryDefinition]
-                if isinstance(self.queries, dict):
-                    query_defs = list(self.queries.values())
-                else:
-                    query_defs = list(self.queries)
-                for defn in query_defs:
-                    extracted.update(defn.input_fields.values())
-                    if defn.template:
-                        extracted.update(extract_jinja2_fields(defn.template))
+                for spec in resolve_queries(self.queries):
+                    extracted.update(spec.input_fields.values())
+                    if spec.template:
+                        extracted.update(extract_jinja2_fields(spec.template))
                 # Also check the top-level template for row references
                 extracted.update(extract_jinja2_fields(self.prompt_template))
             else:
@@ -314,7 +502,21 @@ class LLMConfig(TransformDataConfig):
 
             if extracted:
                 required_fields = sorted(extracted)
-                required_fields_json = json.dumps(required_fields)
+                # The suggested value must be one ``validate_field_names`` will
+                # accept. A bracket read returns its literal verbatim, so
+                # ``{{ row["Original Header"] }}`` extracts a name no
+                # declaration can carry; suggesting it hands the planner a
+                # repair that is rejected on application. Offer the canonical
+                # row key such a literal resolves to at render
+                # (``SchemaContract.resolve_name`` accepts either spelling),
+                # and drop a name with no declarable form at all
+                # (elspeth-a9ba80cb0b).
+                from elspeth.plugins.sources.field_normalization import declarable_field_name
+
+                suggested_fields = sorted(
+                    {entry for entry in (declarable_field_name(name) for name in required_fields) if entry is not None}
+                )
+                required_fields_json = json.dumps(suggested_fields)
                 raise ValueError(
                     f"LLM prompt_template references row fields {required_fields} but "
                     f"options.required_input_fields is not declared.\n\n"
@@ -378,3 +580,162 @@ class LLMConfig(TransformDataConfig):
             f'{{"prompt_template": "<...includes {example_interpolations}...>"}}}})\n\n'
             f"Declared fields: {declared_json}. Template row.* references: []."
         )
+
+    @model_validator(mode="after")
+    def _validate_template_variable_bindings(self) -> LLMConfig:
+        """Reject templates whose names may be unbound on a render path.
+
+        ``PromptTemplate.render`` supplies exactly ``{row, lookup}`` under
+        StrictUndefined in BOTH modes — multi-query rendering wraps the
+        query's synthetic context (its ``input_fields`` variables plus
+        ``source_row``) under ``row`` (``_execute_one_query`` →
+        ``render_with_metadata``). Two config-time-provable defects:
+
+        * a top-level name outside ``{row, lookup}`` + environment globals that
+          is not definitely assigned locally before every load (covers the
+          legacy positional ``{{ input_N }}`` idiom, which is a bare name);
+        * in multi-query mode, a ``row.<name>`` reference outside that
+          query's ``input_fields`` keys + ``{source_row}`` raises
+          ``Undefined variable`` when that query renders;
+        * in single-prompt mode, a ``row.<name>`` reference outside
+          ``required_input_fields`` (elspeth-a9ba80cb0b). This limb is a
+          CONTRACT check, not a proof of failure, and its wording must not
+          borrow the multi-query branch's. A query renders a synthetic context,
+          so an unbound name provably raises; single-prompt binds ``row`` to
+          the WHOLE row, so an undeclared reference raises only when that
+          column happens to be absent — which is exactly what the declaration
+          exists to rule out. ``required_input_fields`` is the audited set the
+          DAG checks against upstream guarantees and
+          ``verify_declared_required_fields`` re-checks per row, so a reference
+          outside it escapes both. Skipped when the declaration is ``None``
+          (the sibling validator above already rejects that with row
+          references present) and when it is ``[]``, the documented opt-out.
+          ``undeclared_row_fields`` owns the comparison; it drops undeclarable
+          bracket literals and matches case variants, so the only remedy this
+          limb ever names — declare the name, or rewrite the reference — always
+          clears it. A genuinely OPTIONAL read guarded by ``is defined`` /
+          ``| default()`` is the one shape with no honest repair here; none
+          exists in the tree, and guard analysis is deliberately not attempted
+          (``{% if row.x %}`` raises where ``{% if row.x is defined %}`` does
+          not, one token apart).
+
+        Each query's effective template is its ``template`` override when
+        present, else the node-level ``prompt_template``; a node-level
+        template no query falls back to never renders and is not checked
+        (the shipped multi-query examples carry exactly that dead slot).
+        YAML-authoring twin of the composer guards emitting
+        ``prompt_template_unbound_variables`` /
+        ``query_template_unbound_row_fields`` — the wording here mirrors
+        those messages so the planner's repair patterns match both layers.
+
+        Defined LAST deliberately: the dynamic-access and required-fields
+        validators above carry their own opt-out guidance and must keep
+        primacy over a plain binding error (after-validators run in
+        definition order).
+        """
+        from elspeth.core.templates import extract_jinja2_field_usage
+        from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
+
+        env = create_sandboxed_environment()
+
+        def unbound_top_level(template: str) -> list[str]:
+            # Field validators already compile-checked both template slots,
+            # so parse cannot fail here; no TemplateSyntaxError handling.
+            names = find_runtime_unbound_variables(env.parse(template))
+            return sorted(names - _PROMPT_CONTEXT_NAMES - _PROMPT_GLOBAL_NAMES)
+
+        if self.queries is None:
+            unbound = unbound_top_level(self.prompt_template)
+            if unbound:
+                names = ", ".join(f"'{name}'" for name in unbound)
+                raise ValueError(
+                    f"LLM prompt_template references {names}, which the prompt render context does not "
+                    "define — row data is only available as 'row.<field>' and lookup data as "
+                    "'lookup.<key>', so rendering fails with 'Undefined variable' at runtime and none of "
+                    "the row's data reaches the model. Rewrite each name as '{{ row.<field> }}' or "
+                    "'{{ lookup.<key> }}', or remove the reference."
+                )
+            if self.required_input_fields:
+                undeclared = undeclared_row_fields(
+                    extract_jinja2_field_usage(self.prompt_template).fields,
+                    self.required_input_fields,
+                )
+                if undeclared:
+                    fields = describe_undeclared_row_fields(undeclared)
+                    declared_names = ", ".join(f"'{name}'" for name in sorted(self.required_input_fields))
+                    raise ValueError(
+                        f"LLM prompt_template reads {fields} under 'row', which "
+                        f"options.required_input_fields does not declare — it declares {declared_names}. "
+                        "required_input_fields IS this node's input contract: it is what the DAG checks "
+                        "against the upstream producer's guarantees and what the engine verifies on every "
+                        "row. A reference outside it is required by nothing, so no producer is obliged to "
+                        "supply it, and a row that arrives without it fails the whole node at render with "
+                        "'Undefined variable' — an unattributed template error rather than a named contract "
+                        f"violation. {_UNDECLARED_ROW_FIELDS_REMEDY}"
+                    )
+            return self
+
+        node_template_specs: list[str] = []
+        for spec in resolve_queries(self.queries):
+            if spec.template is not None:
+                template = spec.template
+                source_desc = f"query '{spec.name}' template"
+                unbound = unbound_top_level(template)
+                if unbound:
+                    names = ", ".join(f"'{name}'" for name in unbound)
+                    raise ValueError(
+                        f"Query '{spec.name}' template references {names}, which the multi-query render "
+                        "context does not define — a query template sees only 'row' (this query's "
+                        "input_fields variables plus 'row.source_row') and 'lookup', so rendering fails "
+                        "with 'Undefined variable' at runtime. Rewrite each name as '{{ row.<variable> }}' "
+                        "where <variable> is one of this query's input_fields keys, or bind it in "
+                        "input_fields first."
+                    )
+            else:
+                template = self.prompt_template
+                source_desc = "the node-level prompt_template"
+                node_template_specs.append(spec.name)
+
+            bound = frozenset(spec.input_fields)
+            unbound_fields = sorted(extract_jinja2_field_usage(template).fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+            if unbound_fields:
+                fields = ", ".join(f"'{name}'" for name in unbound_fields)
+                bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
+                raise ValueError(
+                    f"Query '{spec.name}' renders {source_desc}, which references {fields} under 'row', "
+                    f"but this query's input_fields binds only {bound_names} (plus 'source_row'). At "
+                    "render the query context contains exactly its input_fields variables, so each "
+                    "unbound reference fails with 'Undefined variable' and the query errors for every "
+                    "row. Add the missing variables to input_fields (template variable → row column), "
+                    "rename the reference to a bound variable, or use 'row.source_row.<column>' for "
+                    "direct row access."
+                )
+
+        if node_template_specs:
+            unbound = unbound_top_level(self.prompt_template)
+            if unbound:
+                names = ", ".join(f"'{name}'" for name in unbound)
+                users = ", ".join(f"'{name}'" for name in node_template_specs)
+                raise ValueError(
+                    f"prompt_template references {names}, which the multi-query render context does not "
+                    f"define — queries without a template override ({users}) render it with 'row' bound "
+                    "to their input_fields variables (plus 'row.source_row') and 'lookup', so rendering "
+                    "fails with 'Undefined variable' at runtime. Rewrite each name as "
+                    "'{{ row.<variable> }}' with <variable> an input_fields key of every query that uses "
+                    "this template, or give those queries template overrides."
+                )
+        return self
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """``required_input_fields`` plus every ``image_inputs`` field/format_field.
+
+        Mirrors ``AWSTextractInlineAnalysisConfig.declared_input_fields``: an
+        image input column is consumed the same as any other authored input
+        column, so the DAG must see it in the requiredness contract even
+        though nothing in ``prompt_template`` interpolates it.
+        """
+        if self.image_inputs is None:
+            return super().declared_input_fields
+        image_field_names = {name for spec in self.image_inputs for name in (spec.field, spec.format_field) if name is not None}
+        return super().declared_input_fields | frozenset(image_field_names)

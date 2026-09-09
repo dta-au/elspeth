@@ -7,6 +7,21 @@ export const TURN_1_PRIMARY_BUTTON = "Let's go";
 // so skip exits the whole tutorial straight to graduation rather than naming a
 // removed step.
 export const TURN_1_SKIP_BUTTON = "Skip the tutorial";
+/**
+ * The explicit Run gesture on the run turn (I-1). The pipeline never executes
+ * on mount: the learner clicks this, exactly as the composer's own Run button
+ * asks in normal use. The graduation lesson "before clicking Run" names this
+ * button.
+ */
+export const TURN_4_RUN_BUTTON = "Run";
+/**
+ * Pre-run framing on the run turn. States two checkable facts: the pipeline
+ * pane shows the graph the learner just confirmed (the workspace frame stays
+ * mounted around the run card), and nothing executes until Run is clicked.
+ */
+export const TURN_4_READY_BODY =
+  "The pipeline pane shows the graph you just confirmed. Look it over — " +
+  "nothing runs until you click Run.";
 export const TURN_4_PRIMARY_BUTTON = "Continue";
 export const TURN_5_PRIMARY_BUTTON = "Continue";
 export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";
@@ -65,7 +80,7 @@ export const TURN_7_LEARNING_BULLETS_SKIPPED = [
   {
     title: "What the composer builds is AI-generated.",
     body:
-      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The prompt it writes for itself and cleanup choices it makes are kept in the audit trail with your approval against them. You can revisit that record any time in the Audit panel beside each pipeline.",
+      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The prompt it writes for itself and cleanup choices it makes are kept in the audit trail with your approval against them. You can revisit that record any time in each pipeline's Checks tab.",
   },
   {
     title: "Read before you run.",
@@ -78,7 +93,7 @@ export const TURN_7_LEARNING_BULLETS = [
   {
     title: "What you built is AI-generated.",
     body:
-      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The prompt it wrote for itself and cleanup choices such as dropping raw HTML are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time in the Audit panel beside your pipeline.",
+      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The prompt it wrote for itself and cleanup choices such as dropping raw HTML are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time in your pipeline's Checks tab.",
   },
   {
     title: "Read before you run.",
@@ -86,15 +101,15 @@ export const TURN_7_LEARNING_BULLETS = [
       "From this point on, when the composer drafts a pipeline for you in normal use, glance at the graph and the YAML before clicking Run. If anything looks wrong, amend or reject — the same gestures you just practised.",
   },
   {
-    title: "Ask Elspeth.",
-    // Trails into the freeform-for-complex note (operator 2026-07-23),
-    // folded into this existing chat-panel guidance rather than a new item:
-    // both halves are conversational escalations — ask when confused, and
-    // switch modes when the guided wizard isn't enough. "Switch to" is
-    // deliberate (freeform is a distinct mode reached via the mode switch,
-    // not the same surface). Shared verbatim with the skip path.
+    // Wordmark, not a name: the tutorial says "Welcome to ELSPETH." two turns
+    // earlier, and this was the only mixed-case rendering of it in the tree
+    // (elspeth-cc67815217). The trailing full stop is part of the literal, as
+    // it is on every sibling bullet title.
+    title: "Ask ELSPETH.",
+    // Guided/freeform parity guidance is folded into this existing chat-panel
+    // item and shared verbatim with the skip path.
     body:
-      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. And for particularly complex pipelines you will need to switch to freeform mode and build the pipeline up step by step rather than through the guided wizard.",
+      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. Guided and freeform can build the same pipelines: choose guided for structured prompts or freeform for a conversational, step-by-step exchange. That is an interaction preference, not a capability limit.",
   },
   {
     title: "LLMs are confident even when they're wrong.",
@@ -129,6 +144,22 @@ export const TUTORIAL_SHIELD_OVERRIDE_CAVEAT =
   "Running an LLM over fetched content without a shield is always a high-risk " +
   "decision, not a default. Against real or untrusted web content you would " +
   "wire the shield.";
+
+/**
+ * The same teaching moment for a deployment that HAS an authorized prompt
+ * shield. The override caveat above states a fact about the pipeline — "we are
+ * proceeding without a prompt shield" — which became false once the planner
+ * started wiring an available shield rather than recommending it. Stating it
+ * over a shielded pipeline teaches the reader to distrust the interface, so
+ * this deployment gets the true version of the same lesson: the shield is the
+ * rule, and it is here because the content is fetched from outside.
+ */
+export const TUTORIAL_SHIELD_WIRED_NOTE =
+  "Your pipeline runs the fetched page content through a prompt shield before " +
+  "the model sees it. That is the rule, not an optional extra: anything " +
+  "fetched from outside is untrusted, and text on a page can be written to " +
+  "steer a model. This deployment requires the shield, so the composer wired " +
+  "one for you.";
 
 /**
  * Teaching moment (spec §"Teaching moments"): the source's on_validation_failure

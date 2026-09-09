@@ -17,8 +17,10 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TransformProtocol
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.types import CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine.dag_navigator import DAGNavigator
 from elspeth.engine.processor import DAGTraversalContext
@@ -28,6 +30,14 @@ from elspeth.testing import make_token_info
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+def _forked_token_info(*, data: dict[str, object], branch_name: str, fork_group_id: str = "fg-dag-navigator-test"):
+    """make_token_info() for a token that landed inside a fork branch (WS1b flip)."""
+    return make_token_info(
+        data=data,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),),
+    )
 
 
 def _make_mock_transform(
@@ -54,6 +64,9 @@ def _make_nav(
     coalesce_on_success_map: dict[CoalesceName, str] | None = None,
     sink_names: frozenset[str] | None = None,
     branch_first_node: dict[str, NodeID] | None = None,
+    row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
+    collector_node_ids: dict[CollectorName, NodeID] | None = None,
+    collector_on_success_map: dict[CollectorName, str] | None = None,
 ) -> DAGNavigator:
     """Create a DAGNavigator with sensible defaults."""
     _node_to_plugin = node_to_plugin or {}
@@ -73,6 +86,9 @@ def _make_nav(
         coalesce_on_success_map=coalesce_on_success_map or {},
         sink_names=sink_names or frozenset(),
         branch_first_node=branch_first_node or {},
+        row_union_node_ids=row_union_node_ids or {},
+        collector_node_ids=collector_node_ids or {},
+        collector_on_success_map=collector_on_success_map or {},
     )
 
 
@@ -210,6 +226,57 @@ class TestResolveCoalesceSink:
             nav.resolve_coalesce_sink(CoalesceName("unknown"), context="test")
 
 
+class TestResolveBarrierIdentity:
+    """Barrier lookup maps fail closed in both directions."""
+
+    def test_resolves_coalesce_node(self) -> None:
+        node_id = NodeID("coalesce::merge")
+        nav = _make_nav(coalesce_node_ids={CoalesceName("merge"): node_id})
+
+        assert nav.resolve_coalesce_node(CoalesceName("merge")) == node_id
+
+    def test_unknown_coalesce_name_raises(self) -> None:
+        nav = _make_nav(coalesce_node_ids={CoalesceName("merge"): NodeID("coalesce::merge")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown coalesce name 'missing'"):
+            nav.resolve_coalesce_node(CoalesceName("missing"))
+
+    def test_resolves_row_union_node(self) -> None:
+        node_id = NodeID("row_union::merge")
+        nav = _make_nav(row_union_node_ids={RowUnionName("merge"): node_id})
+
+        assert nav.resolve_row_union_node(RowUnionName("merge")) == node_id
+
+    def test_unknown_row_union_name_raises(self) -> None:
+        nav = _make_nav(row_union_node_ids={RowUnionName("merge"): NodeID("row_union::merge")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown row_union name 'missing'"):
+            nav.resolve_row_union_node(RowUnionName("missing"))
+
+    def test_resolves_coalesce_name(self) -> None:
+        node_id = NodeID("coalesce::merge")
+        nav = _make_nav(coalesce_name_by_node_id={node_id: CoalesceName("merge")})
+
+        assert nav.resolve_coalesce_name(node_id) == CoalesceName("merge")
+
+    def test_unknown_coalesce_node_id_raises(self) -> None:
+        nav = _make_nav(coalesce_name_by_node_id={NodeID("coalesce::merge"): CoalesceName("merge")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown coalesce node id 'coalesce::missing'"):
+            nav.resolve_coalesce_name(NodeID("coalesce::missing"))
+
+    def test_resolves_branch_first_node(self) -> None:
+        nav = _make_nav(branch_first_node={"left": NodeID("transform-left")})
+
+        assert nav.resolve_branch_first_node("left") == NodeID("transform-left")
+
+    def test_unknown_branch_name_raises(self) -> None:
+        nav = _make_nav(branch_first_node={"left": NodeID("transform-left")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown branch name 'right'"):
+            nav.resolve_branch_first_node("right")
+
+
 # =============================================================================
 # resolve_jump_target_sink
 # =============================================================================
@@ -234,6 +301,29 @@ class TestResolveJumpTargetSink:
         )
         assert nav.resolve_jump_target_sink(NodeID("branch-t1")) == "branch_sink"
 
+    def test_resolves_through_non_conforming_transform_on_success(self) -> None:
+        """A transform-shaped plugin missing a protocol member still resolves its sink.
+
+        elspeth-8783933d99 mechanism pin: the walk keys nominally on
+        GateSettings (negative form) over the closed node_to_plugin container.
+        Re-measuring TransformProtocol conformance here silently SKIPPED any
+        non-conforming transform and mis-resolved the jump-target sink — pin
+        the VALUE so the silent-skip mutation is caught.
+        """
+        from tests.fixtures.nonconforming_transform import NonConformingTransform
+
+        transform = NonConformingTransform(node_id="branch-t1", on_success="branch_sink")
+        assert not isinstance(transform, TransformProtocol)  # precondition, not the pin
+        nav = _make_nav(
+            node_to_plugin={NodeID("branch-t1"): transform},
+            node_to_next={
+                NodeID("source-0"): NodeID("branch-t1"),
+                NodeID("branch-t1"): None,
+            },
+            sink_names=frozenset({"branch_sink"}),
+        )
+        assert nav.resolve_jump_target_sink(NodeID("branch-t1")) == "branch_sink"
+
     def test_returns_none_for_gate_path(self) -> None:
         """Paths containing a gate return None (gate self-routes)."""
         gate = GateSettings(name="gate1", input="in_conn", condition="True", routes={"true": "out", "false": "err"})
@@ -244,6 +334,21 @@ class TestResolveJumpTargetSink:
                 NodeID("gate-1"): None,
             },
         )
+        assert nav.resolve_jump_target_sink(NodeID("gate-1")) is None
+
+    def test_gate_path_does_not_pre_resolve_its_transform_destination_sink(self) -> None:
+        """A gate owns routing even when its selected transform is sink-bound."""
+        transform = _make_mock_transform(node_id="branch-t1", on_success="branch_sink")
+        gate = GateSettings(name="gate1", input="in_conn", condition="True", routes={"true": "out", "false": "err"})
+        nav = _make_nav(
+            node_to_plugin={NodeID("branch-t1"): transform, NodeID("gate-1"): gate},
+            node_to_next={
+                NodeID("gate-1"): NodeID("branch-t1"),
+                NodeID("branch-t1"): None,
+            },
+            sink_names=frozenset({"branch_sink"}),
+        )
+
         assert nav.resolve_jump_target_sink(NodeID("gate-1")) is None
 
     def test_raises_when_no_sink_and_no_gate(self) -> None:
@@ -276,6 +381,70 @@ class TestResolveJumpTargetSink:
             coalesce_on_success_map={CoalesceName("merge"): "merged_sink"},
         )
         assert nav.resolve_jump_target_sink(coalesce_node) == "merged_sink"
+
+    def test_resolves_terminal_collector_on_success(self) -> None:
+        """Walk resolves sink from a terminal collector's on_success map.
+
+        Regression for elspeth-b6a0a85a15: the terminal arm recognised
+        coalesce only, so a jump landing at (or upstream of) a terminal
+        collector raised the no-sink invariant on a builder-accepted graph.
+        """
+        collector_node = NodeID("collector::stitch")
+        nav = _make_nav(
+            node_to_next={
+                NodeID("source-0"): collector_node,
+                collector_node: None,
+            },
+            structural_node_ids=frozenset({collector_node}),
+            collector_node_ids={CollectorName("stitch"): collector_node},
+            collector_on_success_map={CollectorName("stitch"): "stitched_sink"},
+            sink_names=frozenset({"stitched_sink"}),
+        )
+        assert nav.resolve_jump_target_sink(collector_node) == "stitched_sink"
+
+    def test_resolves_through_transform_into_terminal_collector(self) -> None:
+        """The ticket's repro shape: jump target is a transform whose chain ends
+        at a terminal collector barrier — the walk must read the collector's
+        sink, not raise."""
+        collector_node = NodeID("collector::stitch")
+        transform = _make_mock_transform(node_id="mid-t", on_success="pages")
+        nav = _make_nav(
+            node_to_plugin={NodeID("mid-t"): transform},
+            node_to_next={
+                NodeID("mid-t"): collector_node,
+                collector_node: None,
+            },
+            structural_node_ids=frozenset({collector_node}),
+            collector_node_ids={CollectorName("stitch"): collector_node},
+            collector_on_success_map={CollectorName("stitch"): "stitched_sink"},
+            sink_names=frozenset({"stitched_sink"}),
+        )
+        assert nav.resolve_jump_target_sink(NodeID("mid-t")) == "stitched_sink"
+
+    def test_terminal_collector_missing_from_on_success_map_raises(self) -> None:
+        """A terminal collector absent from the on_success map is an invariant
+        violation named for the collector, not the generic no-sink raise."""
+        collector_node = NodeID("collector::stitch")
+        nav = _make_nav(
+            node_to_next={collector_node: None},
+            structural_node_ids=frozenset({collector_node}),
+            collector_node_ids={CollectorName("stitch"): collector_node},
+        )
+        with pytest.raises(OrchestrationInvariantError, match="Collector 'stitch' not in on_success map"):
+            nav.resolve_jump_target_sink(collector_node)
+
+    def test_terminal_row_union_raises_named_invariant(self) -> None:
+        """A row_union can never be terminal (builder forces its on_success to a
+        processing connection); a walk ending there names the broken invariant
+        instead of the generic no-sink raise."""
+        union_node = NodeID("row_union::stitch")
+        nav = _make_nav(
+            node_to_next={union_node: None},
+            structural_node_ids=frozenset({union_node}),
+            row_union_node_ids={RowUnionName("stitch"): union_node},
+        )
+        with pytest.raises(OrchestrationInvariantError, match=r"row_union 'stitch'.*cannot be terminal"):
+            nav.resolve_jump_target_sink(union_node)
 
 
 # =============================================================================
@@ -345,7 +514,7 @@ class TestCreateContinuationWorkItem:
         """With coalesce name from a gate node, routes to branch first node."""
         gate = GateSettings(name="fork_gate", input="in", condition="True", routes={"true": "out", "false": "err"})
         gate_node = NodeID("gate-1")
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         coalesce_node = NodeID("coalesce::merge")
         nav = _make_nav(
             node_to_plugin={gate_node: gate},
@@ -489,6 +658,43 @@ class TestFromTraversalContext:
         )
         assert nav.resolve_coalesce_sink(CoalesceName("merge"), context="test") == "out"
 
+    def test_derives_collector_arm_from_context(self) -> None:
+        """collector_node_map + collector_on_success_map reach the walk's
+        terminal arm through the factory (elspeth-b6a0a85a15)."""
+        collector_node = NodeID("collector::stitch")
+        traversal = DAGTraversalContext(
+            node_step_map={NodeID("source-0"): 0, collector_node: 1},
+            node_to_plugin={},
+            node_to_next={NodeID("source-0"): collector_node, collector_node: None},
+            coalesce_node_map={},
+            collector_node_map={CollectorName("stitch"): collector_node},
+        )
+
+        nav = DAGNavigator.from_traversal_context(
+            traversal,
+            collector_on_success_map={CollectorName("stitch"): "out"},
+            sink_names=frozenset({"out"}),
+        )
+        assert nav.resolve_jump_target_sink(collector_node) == "out"
+
+    def test_collector_nodes_are_structural_even_when_snapshot_omits_them(self) -> None:
+        """The factory's own structural union covers collectors — the belt for
+        snapshot implementations that do not union barrier ids themselves
+        (DAGTraversalContext does; the Protocol does not promise it)."""
+
+        class _BareSnapshot:
+            def __init__(self) -> None:
+                self.coalesce_node_map: dict[CoalesceName, NodeID] = {}
+                self.row_union_node_map: dict[RowUnionName, NodeID] = {}
+                self.collector_node_map = {CollectorName("stitch"): NodeID("collector::stitch")}
+                self.node_to_plugin: dict[NodeID, object] = {}
+                self.node_to_next: dict[NodeID, NodeID | None] = {NodeID("collector::stitch"): None}
+                self.branch_first_node: dict[str, NodeID] = {}
+                self.structural_node_ids: frozenset[NodeID] = frozenset()
+
+        nav = DAGNavigator.from_traversal_context(_BareSnapshot())
+        assert nav.resolve_plugin_for_node(NodeID("collector::stitch")) is None
+
 
 # =============================================================================
 # ARCH-15: Per-branch transform routing
@@ -527,7 +733,7 @@ class TestBranchTransformRouting:
             branch_first_node={"path_a": branch_t1},  # Transform branch
         )
 
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=token,
             current_node_id=gate_node,
@@ -560,7 +766,7 @@ class TestBranchTransformRouting:
             branch_first_node={"path_a": coalesce_node},  # Identity branch
         )
 
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=token,
             current_node_id=gate_node,
@@ -597,7 +803,7 @@ class TestBranchTransformRouting:
             branch_first_node={"path_a": branch_t1},
         )
 
-        token = make_token_info(data={"v": 1}, branch_name="path_a")
+        token = _forked_token_info(data={"v": 1}, branch_name="path_a")
 
         # First: fork creates work item at branch start
         item1 = WorkItemFactory(nav).create_continuation(
@@ -665,7 +871,7 @@ class TestContinuationCoalesceNonForkRegression:
         )
 
         # Expanded child token inherits branch_name from parent
-        child_token = make_token_info(data={"v": 1}, branch_name="path_a")
+        child_token = _forked_token_info(data={"v": 1}, branch_name="path_a")
 
         # Deaggregation continuation: current_node_id is the deagg transform (NOT the gate)
         item = WorkItemFactory(nav).create_continuation(
@@ -708,7 +914,7 @@ class TestContinuationCoalesceNonForkRegression:
         )
 
         # Token from aggregation flush (passthrough or transform mode)
-        flush_token = make_token_info(data={"v": 1}, branch_name="path_a")
+        flush_token = _forked_token_info(data={"v": 1}, branch_name="path_a")
 
         # Aggregation flush continuation: current_node_id is the agg transform
         item = WorkItemFactory(nav).create_continuation(
@@ -746,7 +952,7 @@ class TestContinuationCoalesceNonForkRegression:
             branch_first_node={"path_a": NodeID("branch-t1")},
         )
 
-        fork_child = make_token_info(data={"v": 1}, branch_name="path_a")
+        fork_child = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=fork_child,
             current_node_id=gate_node,
@@ -769,7 +975,7 @@ class TestContinuationCoalesceNonForkRegression:
 
         with pytest.raises(OrchestrationInvariantError, match="structural"):
             WorkItemFactory(nav).create_continuation(
-                token=make_token_info(data={"v": 1}, branch_name="path_a"),
+                token=_forked_token_info(data={"v": 1}, branch_name="path_a"),
                 current_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
             )
@@ -786,7 +992,7 @@ class TestContinuationCoalesceNonForkRegression:
 
         with pytest.raises(OrchestrationInvariantError, match="ghost"):
             WorkItemFactory(nav).create_continuation(
-                token=make_token_info(data={"v": 1}, branch_name="path_a"),
+                token=_forked_token_info(data={"v": 1}, branch_name="path_a"),
                 current_node_id=NodeID("ghost"),
                 coalesce_name=CoalesceName("merge"),
             )
@@ -815,7 +1021,7 @@ class TestContinuationCoalesceNonForkRegression:
             branch_first_node={"path_a": branch_t1},
         )
 
-        child_token = make_token_info(data={"v": 1}, branch_name="path_a")
+        child_token = _forked_token_info(data={"v": 1}, branch_name="path_a")
         item = WorkItemFactory(nav).create_continuation(
             token=child_token,
             current_node_id=branch_t1,

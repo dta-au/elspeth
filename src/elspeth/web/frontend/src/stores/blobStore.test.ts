@@ -56,6 +56,98 @@ describe("blobStore", () => {
     vi.restoreAllMocks();
   });
 
+  it("publishes a monotonic activation epoch for exact session fences", () => {
+    const initialEpoch = useBlobStore.getState().activationEpoch;
+
+    useBlobStore.getState().activateSession("session-a");
+    expect(useBlobStore.getState().activeSessionId).toBe("session-a");
+    expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 1);
+
+    useBlobStore.getState().activateSession("session-a");
+    expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 1);
+
+    useBlobStore.getState().activateSession("session-b");
+    expect(useBlobStore.getState().activeSessionId).toBe("session-b");
+    expect(useBlobStore.getState().activationEpoch).toBe(initialEpoch + 2);
+  });
+
+  describe("invalidateBlobForEpoch", () => {
+    it("removes only the exact UUID under matching session ownership", () => {
+      const rejected = makeBlob({ id: "blob-rejected" });
+      const retained = makeBlob({ id: "blob-retained" });
+      useBlobStore.getState().activateSession("session-1");
+      useBlobStore.setState({ blobs: [rejected, retained] });
+      const epoch = useBlobStore.getState().activationEpoch;
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-1", epoch, rejected.id),
+      ).toBe(true);
+      expect(useBlobStore.getState().blobs).toEqual([retained]);
+    });
+
+    it("prevents an older overlapping list from restoring the rejected UUID", async () => {
+      const olderList = deferred<BlobMetadata[]>();
+      const rejected = makeBlob({ id: "blob-rejected" });
+      const { listBlobs } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(olderList.promise);
+      useBlobStore.getState().activateSession("session-1");
+      useBlobStore.setState({ blobs: [rejected] });
+      const epoch = useBlobStore.getState().activationEpoch;
+      const load = useBlobStore.getState().loadBlobs("session-1");
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-1", epoch, rejected.id),
+      ).toBe(true);
+      olderList.resolve([rejected]);
+      await load;
+
+      expect(useBlobStore.getState().blobs).toEqual([]);
+      expect(useBlobStore.getState().isLoading).toBe(false);
+    });
+
+    it("does not remove a same-UUID row after an A-to-B-to-A activation cycle", () => {
+      const fresh = makeBlob({
+        id: "blob-same-uuid",
+        session_id: "session-a",
+      });
+      useBlobStore.getState().activateSession("session-a");
+      const oldEpoch = useBlobStore.getState().activationEpoch;
+      useBlobStore.getState().activateSession("session-b");
+      useBlobStore.getState().activateSession("session-a");
+      useBlobStore.setState({ blobs: [fresh] });
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-a", oldEpoch, fresh.id),
+      ).toBe(false);
+      expect(useBlobStore.getState().blobs).toEqual([fresh]);
+    });
+
+    it("allows a current authoritative refresh to restore a ready UUID", async () => {
+      const rejected = makeBlob({ id: "blob-rejected" });
+      const { listBlobs } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockResolvedValue([rejected]);
+      useBlobStore.getState().activateSession("session-1");
+      useBlobStore.setState({ blobs: [rejected] });
+      const epoch = useBlobStore.getState().activationEpoch;
+
+      expect(
+        useBlobStore
+          .getState()
+          .invalidateBlobForEpoch("session-1", epoch, rejected.id),
+      ).toBe(true);
+      expect(useBlobStore.getState().blobs).toEqual([]);
+      await useBlobStore.getState().loadBlobs("session-1");
+
+      expect(useBlobStore.getState().blobs).toEqual([rejected]);
+    });
+  });
+
   describe("loadBlobs", () => {
     it("fetches blobs and sets them in state", async () => {
       const blobs = [makeBlob(), makeBlob({ id: "blob-2", filename: "other.json" })];
@@ -124,6 +216,27 @@ describe("blobStore", () => {
       expect(useBlobStore.getState().blobs).toEqual([blobB]);
       expect(useBlobStore.getState().error).toBeNull();
     });
+
+    it("does not display the previous session while a new session load is pending", async () => {
+      const sessionB = deferred<BlobMetadata[]>();
+      const blobA = makeBlob({ id: "blob-a", session_id: "session-a" });
+      const blobB = makeBlob({ id: "blob-b", session_id: "session-b" });
+      const { listBlobs } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockImplementation(
+        (sessionId: string) =>
+          sessionId === "session-a" ? Promise.resolve([blobA]) : sessionB.promise,
+      );
+
+      await useBlobStore.getState().loadBlobs("session-a");
+      const loadB = useBlobStore.getState().loadBlobs("session-b");
+
+      expect(useBlobStore.getState().blobs).toEqual([]);
+      expect(useBlobStore.getState().isLoading).toBe(true);
+
+      sessionB.resolve([blobB]);
+      await loadB;
+      expect(useBlobStore.getState().blobs).toEqual([blobB]);
+    });
   });
 
   describe("uploadBlob", () => {
@@ -142,6 +255,121 @@ describe("blobStore", () => {
       const state = useBlobStore.getState();
       expect(state.blobs[0]).toEqual(newBlob);
       expect(state.blobs[1]).toEqual(existing);
+      expect(state.error).toBeNull();
+    });
+
+    it("deduplicates an upload UUID already returned by an overlapping list", async () => {
+      const listResult = deferred<BlobMetadata[]>();
+      const uploadResult = deferred<BlobMetadata>();
+      const uploadedBlob = makeBlob({
+        id: "blob-shared",
+        filename: "shared.csv",
+      });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(listResult.promise);
+      (uploadBlob as ReturnType<typeof vi.fn>).mockReturnValue(uploadResult.promise);
+
+      const load = useBlobStore.getState().loadBlobs("session-1");
+      const upload = useBlobStore
+        .getState()
+        .uploadBlob("session-1", new File(["content"], "shared.csv"));
+
+      listResult.resolve([uploadedBlob]);
+      await load;
+      expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
+
+      uploadResult.resolve(uploadedBlob);
+      await upload;
+
+      expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
+    });
+
+    it("preserves a completed upload when an older list request resolves last", async () => {
+      const staleList = deferred<BlobMetadata[]>();
+      const staleBlob = makeBlob({ id: "blob-stale", filename: "stale.csv" });
+      const uploadedBlob = makeBlob({
+        id: "blob-uploaded",
+        filename: "uploaded.csv",
+      });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(staleList.promise);
+      (uploadBlob as ReturnType<typeof vi.fn>).mockResolvedValue(uploadedBlob);
+
+      const load = useBlobStore.getState().loadBlobs("session-1");
+      const file = new File(["content"], "uploaded.csv", { type: "text/csv" });
+      await useBlobStore.getState().uploadBlob("session-1", file);
+
+      expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
+
+      staleList.resolve([staleBlob]);
+      await load;
+
+      const state = useBlobStore.getState();
+      expect(state.blobs).toEqual([uploadedBlob]);
+      expect(state.isLoading).toBe(false);
+      expect(state.error).toBeNull();
+    });
+
+    it("lets a new session load win over an older session upload success", async () => {
+      const sessionBList = deferred<BlobMetadata[]>();
+      const uploadAResult = deferred<BlobMetadata>();
+      const blobA = makeBlob({ id: "blob-a", session_id: "session-a" });
+      const uploadedA = makeBlob({
+        id: "blob-uploaded-a",
+        session_id: "session-a",
+      });
+      const blobB = makeBlob({ id: "blob-b", session_id: "session-b" });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockImplementation(
+        (sessionId: string) =>
+          sessionId === "session-a" ? Promise.resolve([blobA]) : sessionBList.promise,
+      );
+      (uploadBlob as ReturnType<typeof vi.fn>).mockReturnValue(uploadAResult.promise);
+
+      await useBlobStore.getState().loadBlobs("session-a");
+      const uploadA = useBlobStore
+        .getState()
+        .uploadBlob("session-a", new File(["a"], "a.csv"));
+      const loadB = useBlobStore.getState().loadBlobs("session-b");
+
+      uploadAResult.resolve(uploadedA);
+      await expect(uploadA).resolves.toEqual(uploadedA);
+      sessionBList.resolve([blobB]);
+      await loadB;
+
+      const state = useBlobStore.getState();
+      expect(state.blobs).toEqual([blobB]);
+      expect(state.isLoading).toBe(false);
+      expect(state.error).toBeNull();
+    });
+
+    it("does not publish an older session upload failure into the loaded session", async () => {
+      const sessionBList = deferred<BlobMetadata[]>();
+      const uploadAResult = deferred<BlobMetadata>();
+      const blobA = makeBlob({ id: "blob-a", session_id: "session-a" });
+      const blobB = makeBlob({ id: "blob-b", session_id: "session-b" });
+      const uploadError = { status: 500 };
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockImplementation(
+        (sessionId: string) =>
+          sessionId === "session-a" ? Promise.resolve([blobA]) : sessionBList.promise,
+      );
+      (uploadBlob as ReturnType<typeof vi.fn>).mockReturnValue(uploadAResult.promise);
+
+      await useBlobStore.getState().loadBlobs("session-a");
+      const uploadA = useBlobStore
+        .getState()
+        .uploadBlob("session-a", new File(["a"], "a.csv"));
+      const loadB = useBlobStore.getState().loadBlobs("session-b");
+      sessionBList.resolve([blobB]);
+      await loadB;
+
+      uploadAResult.reject(uploadError);
+      await expect(uploadA).rejects.toEqual(uploadError);
+
+      const state = useBlobStore.getState();
+      expect(state.blobs).toEqual([blobB]);
+      expect(state.isLoading).toBe(false);
       expect(state.error).toBeNull();
     });
 
@@ -172,6 +400,44 @@ describe("blobStore", () => {
         "Unsupported file type. Please use CSV, JSON, JSONL, or plain text.",
       );
     });
+
+    it("does not publish an upload error rejected by the request owner fence", async () => {
+      const uploadError = { status: 413 };
+      const shouldPublishError = vi.fn().mockReturnValue(false);
+      const { uploadBlob } = await import("@/api/client");
+      (uploadBlob as ReturnType<typeof vi.fn>).mockRejectedValue(uploadError);
+
+      const file = new File(["x"], "stale.csv", { type: "text/csv" });
+      await expect(
+        useBlobStore.getState().uploadBlob("session-1", file, {
+          shouldPublishError,
+        }),
+      ).rejects.toEqual(uploadError);
+
+      expect(shouldPublishError).toHaveBeenCalledWith(uploadError);
+      expect(useBlobStore.getState().error).toBeNull();
+    });
+
+    it("publishes a mapped upload error accepted by the request owner fence", async () => {
+      const uploadError = { status: 415 };
+      const shouldPublishError = vi.fn().mockReturnValue(true);
+      const { uploadBlob } = await import("@/api/client");
+      (uploadBlob as ReturnType<typeof vi.fn>).mockRejectedValue(uploadError);
+
+      const file = new File(["x"], "current.exe", {
+        type: "application/octet-stream",
+      });
+      await expect(
+        useBlobStore.getState().uploadBlob("session-1", file, {
+          shouldPublishError,
+        }),
+      ).rejects.toEqual(uploadError);
+
+      expect(shouldPublishError).toHaveBeenCalledWith(uploadError);
+      expect(useBlobStore.getState().error).toBe(
+        "Unsupported file type. Please use CSV, JSON, JSONL, or plain text.",
+      );
+    });
   });
 
   describe("deleteBlob", () => {
@@ -188,6 +454,82 @@ describe("blobStore", () => {
       const state = useBlobStore.getState();
       expect(state.blobs).toHaveLength(1);
       expect(state.blobs[0].id).toBe("blob-2");
+    });
+
+    it("preserves a completed deletion when an older list request resolves last", async () => {
+      const staleList = deferred<BlobMetadata[]>();
+      const deletedBlob = makeBlob({ id: "blob-deleted" });
+      useBlobStore.setState({ blobs: [deletedBlob] });
+      const { listBlobs, deleteBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(staleList.promise);
+      (deleteBlob as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      const load = useBlobStore.getState().loadBlobs("session-1");
+      await useBlobStore.getState().deleteBlob("session-1", deletedBlob.id);
+
+      expect(useBlobStore.getState().blobs).toEqual([]);
+
+      staleList.resolve([deletedBlob]);
+      await load;
+
+      const state = useBlobStore.getState();
+      expect(state.blobs).toEqual([]);
+      expect(state.isLoading).toBe(false);
+      expect(state.error).toBeNull();
+    });
+
+    it("lets a new session load win over an older session deletion success", async () => {
+      const sessionBList = deferred<BlobMetadata[]>();
+      const deleteAResult = deferred<void>();
+      const blobA = makeBlob({ id: "blob-a", session_id: "session-a" });
+      const blobB = makeBlob({ id: "blob-b", session_id: "session-b" });
+      const { listBlobs, deleteBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockImplementation(
+        (sessionId: string) =>
+          sessionId === "session-a" ? Promise.resolve([blobA]) : sessionBList.promise,
+      );
+      (deleteBlob as ReturnType<typeof vi.fn>).mockReturnValue(deleteAResult.promise);
+
+      await useBlobStore.getState().loadBlobs("session-a");
+      const deleteA = useBlobStore.getState().deleteBlob("session-a", blobA.id);
+      const loadB = useBlobStore.getState().loadBlobs("session-b");
+
+      deleteAResult.resolve(undefined);
+      await deleteA;
+      sessionBList.resolve([blobB]);
+      await loadB;
+
+      const state = useBlobStore.getState();
+      expect(state.blobs).toEqual([blobB]);
+      expect(state.isLoading).toBe(false);
+      expect(state.error).toBeNull();
+    });
+
+    it("does not publish an older session deletion failure into the loaded session", async () => {
+      const sessionBList = deferred<BlobMetadata[]>();
+      const deleteAResult = deferred<void>();
+      const blobA = makeBlob({ id: "blob-a", session_id: "session-a" });
+      const blobB = makeBlob({ id: "blob-b", session_id: "session-b" });
+      const { listBlobs, deleteBlob } = await import("@/api/client");
+      (listBlobs as ReturnType<typeof vi.fn>).mockImplementation(
+        (sessionId: string) =>
+          sessionId === "session-a" ? Promise.resolve([blobA]) : sessionBList.promise,
+      );
+      (deleteBlob as ReturnType<typeof vi.fn>).mockReturnValue(deleteAResult.promise);
+
+      await useBlobStore.getState().loadBlobs("session-a");
+      const deleteA = useBlobStore.getState().deleteBlob("session-a", blobA.id);
+      const loadB = useBlobStore.getState().loadBlobs("session-b");
+      sessionBList.resolve([blobB]);
+      await loadB;
+
+      deleteAResult.reject({ status: 409 });
+      await deleteA;
+
+      const state = useBlobStore.getState();
+      expect(state.blobs).toEqual([blobB]);
+      expect(state.isLoading).toBe(false);
+      expect(state.error).toBeNull();
     });
 
     it("sets active-run message for 409 error", async () => {

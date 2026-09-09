@@ -1,0 +1,38 @@
+<!-- @dsCard group="Composer" viewport="1200x760" name="Web Composer" subtitle="Login → conversational pipeline build → validate → run" -->
+<!-- @startingPoint section="Web Composer" subtitle="Full ELSPETH composer — header, chat, side rail, catalog" viewport="1200x760" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ELSPETH — Web Composer</title>
+<link rel="stylesheet" href="../../styles.css" />
+<style>
+  html, body { height: 100%; margin: 0; overflow: hidden; background: var(--color-bg); }
+  #root { height: 100%; }
+  .textarea { font-family: var(--font-sans); }
+  .chat-input-icon-btn { padding: 8px 10px; background: transparent; border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); cursor: pointer; color: var(--color-text); display: flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; }
+  .chat-input-send-btn { padding: 8px 16px; background: var(--color-surface-elevated); color: var(--color-text-muted); border: none; border-radius: var(--radius-md); cursor: not-allowed; min-width: 44px; min-height: 44px; }
+  .chat-input-send-btn:not(:disabled) { background: var(--color-accent); color: var(--color-text-inverse); cursor: pointer; }
+  .composing-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--color-text-muted); animation: cb 1.2s ease-in-out infinite; }
+  .composing-dot:nth-child(2) { animation-delay: .15s; }
+  .composing-dot:nth-child(3) { animation-delay: .3s; }
+  @keyframes cb { 0%,60%,100% { transform: translateY(0); opacity: .4; } 30% { transform: translateY(-5px); opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .composing-dot { animation: none; opacity: .7; } }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<script src="../../_ds_bundle.js"></script>
+<script src="data.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" src="PipelineGraph.jsx"></script>
+<script type="text/babel" src="CatalogDrawer.jsx"></script>
+<script type="text/babel" src="LoginScreen.jsx"></script>
+<script type="text/babel" src="ComposerShell.jsx"></script>
+<script type="text/babel" src="app.jsx"></script>
+</body>
+</html>

@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, insert, select
 
 from elspeth.contracts.coordination import (
@@ -36,6 +37,7 @@ from elspeth.contracts.coordination import (
     CoordinationToken,
 )
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -49,6 +51,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import landscape_database_now
 
 RUN_ID = "run-evict-housekeeping"
 NOW = datetime(2026, 6, 13, 10, 0, 0, tzinfo=UTC)
@@ -64,11 +67,11 @@ def _make_engine() -> Tier1Engine:
     return Tier1Engine(engine)
 
 
-def _seed_run(engine: Tier1Engine) -> None:
+def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID) -> None:
     with engine.begin() as conn:
         conn.execute(
             insert(runs_table).values(
-                run_id=RUN_ID,
+                run_id=run_id,
                 started_at=NOW,
                 config_hash="config",
                 settings_json="{}",
@@ -84,7 +87,7 @@ def _seed_run(engine: Tier1Engine) -> None:
         ):
             conn.execute(
                 insert(nodes_table).values(
-                    run_id=RUN_ID,
+                    run_id=run_id,
                     node_id=node_id,
                     plugin_name=plugin,
                     node_type=node_type,
@@ -128,16 +131,38 @@ def _seed_follower(
     worker_id: str,
     now: datetime = NOW,
     heartbeat_expires_at: datetime,
+    run_id: str = RUN_ID,
 ) -> None:
     """Seed an active follower row."""
     with engine.begin() as conn:
         conn.execute(
             insert(run_workers_table).values(
                 worker_id=worker_id,
-                run_id=RUN_ID,
+                run_id=run_id,
                 role="follower",
                 status="active",
                 registered_at=now,
+                heartbeat_expires_at=heartbeat_expires_at,
+            )
+        )
+
+
+def _seed_leader_role_worker(
+    engine: Tier1Engine,
+    *,
+    worker_id: str,
+    registered_at: datetime,
+    heartbeat_expires_at: datetime,
+) -> None:
+    """Seed an active leader-role row that does not own the current seat."""
+    with engine.begin() as conn:
+        conn.execute(
+            insert(run_workers_table).values(
+                worker_id=worker_id,
+                run_id=RUN_ID,
+                role="leader",
+                status="active",
+                registered_at=registered_at,
                 heartbeat_expires_at=heartbeat_expires_at,
             )
         )
@@ -209,9 +234,8 @@ def _seed_leased_item(
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload,
-        available_at=now,
     )
-    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds, now=now)
+    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds)
     assert item is not None
     return item.work_item_id
 
@@ -228,11 +252,11 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         coord = RunCoordinationRepository(engine)
         _seed_run(engine)
 
-        sweep_at = NOW + timedelta(seconds=200)  # well past grace threshold
         leader_id = "leader-w"
         token = _seed_leader(engine, leader_id=leader_id, now=NOW)
 
-        # Two followers with expired heartbeats.
+        # Two followers with expired heartbeats (the sweep judges them against
+        # the Landscape database clock, ADR-047; NOW is months in its past).
         follower_a, follower_b = "follower-a", "follower-b"
         expired_hb = NOW - timedelta(seconds=GRACE + 10)
         _seed_follower(engine, worker_id=follower_a, now=NOW, heartbeat_expires_at=expired_hb)
@@ -241,7 +265,6 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         dead = coord.dead_non_leader_workers(
             run_id=RUN_ID,
             leader_worker_id=leader_id,
-            now=sweep_at,
             grace_seconds=GRACE,
         )
         assert set(dead) == {follower_a, follower_b}
@@ -250,14 +273,12 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         evicted_a = coord.evict_worker(
             token=token,
             target_worker_id=follower_a,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
         evicted_b = coord.evict_worker(
             token=token,
             target_worker_id=follower_b,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -287,17 +308,98 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         # One live follower, one dead follower.
         live_follower = "follower-live"
         dead_follower = "follower-dead"
-        _seed_follower(engine, worker_id=live_follower, now=NOW, heartbeat_expires_at=NOW + timedelta(hours=1))
+        _seed_follower(engine, worker_id=live_follower, now=NOW, heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1))
         _seed_follower(engine, worker_id=dead_follower, now=NOW, heartbeat_expires_at=NOW - timedelta(seconds=GRACE + 10))
 
-        sweep_at = NOW + timedelta(seconds=200)
         dead = coord.dead_non_leader_workers(
             run_id=RUN_ID,
             leader_worker_id=leader_id,
-            now=sweep_at,
             grace_seconds=GRACE,
         )
         assert dead == (dead_follower,)  # tuple, deterministic by registered_at
+
+    def test_dead_non_leader_workers_excludes_non_current_leader_role(self) -> None:
+        engine = _make_engine()
+        coord = RunCoordinationRepository(engine)
+        _seed_run(engine)
+
+        leader_id = "leader-current"
+        _seed_leader(engine, leader_id=leader_id, now=NOW)
+        expired = NOW - timedelta(seconds=GRACE + 10)
+        _seed_leader_role_worker(
+            engine,
+            worker_id="leader-role-stale",
+            registered_at=NOW + timedelta(seconds=1),
+            heartbeat_expires_at=expired,
+        )
+        _seed_follower(
+            engine,
+            worker_id="follower-stale",
+            now=NOW + timedelta(seconds=2),
+            heartbeat_expires_at=expired,
+        )
+
+        dead = coord.dead_non_leader_workers(
+            run_id=RUN_ID,
+            leader_worker_id=leader_id,
+            grace_seconds=GRACE,
+        )
+
+        assert dead == ("follower-stale",)
+
+    @pytest.mark.parametrize("target_is_current", [True, False], ids=["current-leader", "other-leader-role"])
+    def test_evict_worker_refuses_leader_role_target(self, *, target_is_current: bool) -> None:
+        engine = _make_engine()
+        coord = RunCoordinationRepository(engine)
+        _seed_run(engine)
+
+        token = _seed_leader(engine, leader_id="leader-current", now=NOW)
+        target = token.worker_id if target_is_current else "leader-role-stale"
+        if not target_is_current:
+            _seed_leader_role_worker(
+                engine,
+                worker_id=target,
+                registered_at=NOW + timedelta(seconds=1),
+                heartbeat_expires_at=NOW - timedelta(seconds=GRACE + 10),
+            )
+
+        result = coord.evict_worker(
+            token=token,
+            target_worker_id=target,
+            grace_seconds=GRACE,
+            window_seconds=WINDOW,
+        )
+
+        assert result is False
+        assert _worker_status(engine, target) == "active"
+        assert _coordination_events(engine, "worker_evict") == []
+
+    def test_evict_worker_refuses_foreign_run_target(self) -> None:
+        engine = _make_engine()
+        coord = RunCoordinationRepository(engine)
+        _seed_run(engine)
+
+        token = _seed_leader(engine, leader_id="leader-current", now=NOW)
+        foreign_run_id = "run-foreign"
+        target = "foreign-follower-stale"
+        _seed_run(engine, run_id=foreign_run_id)
+        _seed_follower(
+            engine,
+            worker_id=target,
+            heartbeat_expires_at=NOW - timedelta(seconds=GRACE + 10),
+            run_id=foreign_run_id,
+        )
+
+        result = coord.evict_worker(
+            token=token,
+            target_worker_id=target,
+            grace_seconds=GRACE,
+            window_seconds=WINDOW,
+        )
+
+        assert result is False
+        assert _worker_status(engine, target) == "active"
+        assert _coordination_events(engine, "worker_evict") == []
 
     def test_evict_worker_cas_miss_on_fresh_heartbeat_returns_false(self) -> None:
         """If the target worker heartbeated between the dead-list scan and the
@@ -312,13 +414,11 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
 
         # Follower has a FRESH heartbeat — the grace CAS will miss.
         fresh_follower = "follower-fresh"
-        _seed_follower(engine, worker_id=fresh_follower, now=NOW, heartbeat_expires_at=NOW + timedelta(hours=1))
+        _seed_follower(engine, worker_id=fresh_follower, now=NOW, heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1))
 
-        sweep_at = NOW + timedelta(seconds=200)
         result = coord.evict_worker(
             token=token,
             target_worker_id=fresh_follower,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -338,16 +438,15 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         token = _seed_leader(engine, leader_id=leader_id, now=NOW)
 
         target = "worker-with-lease"
-        # Expired heartbeat but holds an UNEXPIRED item lease.
+        # Expired heartbeat but holds an UNEXPIRED item lease (the lease is
+        # judged against the Landscape database clock, so it is minted from it).
         expired_hb = NOW - timedelta(seconds=GRACE + 10)
         _seed_follower(engine, worker_id=target, now=NOW, heartbeat_expires_at=expired_hb)
-        _seed_leased_item(engine, token_id="token-held", lease_owner=target, now=NOW, lease_seconds=600)
+        _seed_leased_item(engine, token_id="token-held", lease_owner=target, now=landscape_database_now(engine), lease_seconds=600)
 
-        sweep_at = NOW + timedelta(seconds=200)
         result = coord.evict_worker(
             token=token,
             target_worker_id=target,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -384,21 +483,19 @@ class TestEvictionBeforeReapOrdering:
         from sqlalchemy import update
 
         _seed_leased_item(engine, token_id="token-dead-owned", lease_owner=dead_member, now=NOW, lease_seconds=10)
-        # Force-expire the lease.
-        sweep_at = NOW + timedelta(seconds=200)
+        # Force-expire the lease one second into the database's past (ADR-047).
         with engine.begin() as conn:
             conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.run_id == RUN_ID)
                 .where(token_work_items_table.c.lease_owner == dead_member)
-                .values(lease_expires_at=NOW - timedelta(seconds=1))
+                .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
             )
 
         # Step 1: evict before reap.
         evicted = coord.evict_worker(
             token=token,
             target_worker_id=dead_member,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -407,7 +504,6 @@ class TestEvictionBeforeReapOrdering:
 
         # Step 2: reap. The owner is now status='evicted' → owner_registry_dead (arm b).
         reaped = scheduler.recover_expired_leases(
-            now=sweep_at,
             coordination_token=token,
             grace_seconds=GRACE,
             stall_budget_seconds=1.0,  # very short budget to force reap regardless

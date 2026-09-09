@@ -191,15 +191,13 @@ def _create_explicit_schema(
 def _get_python_type(field_def: FieldDefinition) -> Any:
     """Convert field definition to Python type annotation.
 
-    For optional fields, returns a Union type (base_type | None).
-    For required fields, returns the base type directly.
+    Nullable or optional fields return a Union type (base_type | None).
+    Required non-nullable fields return the base type directly.
 
     Returns Any to satisfy mypy - the actual return is a type or UnionType.
     """
     base_type = TYPE_MAP[field_def.field_type]
 
-    if field_def.required:
-        return base_type
-    else:
-        # Optional: allow None
+    if field_def.nullable or not field_def.required:
         return base_type | None
+    return base_type

@@ -18,7 +18,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Final
+from typing import IO, Final, cast
 from urllib.parse import unquote, urlsplit
 
 from elspeth.contracts.hashing import stable_hash
@@ -120,35 +120,35 @@ class LocalFileEffectPlanEvidence:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> LocalFileEffectPlanEvidence:
-        if value.get("schema") != _EVIDENCE_SCHEMA:
+        if value["schema"] != _EVIDENCE_SCHEMA:
             raise LocalFilePreconditionError("local-file plan evidence schema is missing or divergent")
-        accepted = _exact_ordinals(value.get("accepted_ordinals"), "accepted_ordinals")
-        diverted = _exact_ordinals(value.get("diverted_ordinals"), "diverted_ordinals")
+        accepted = _exact_ordinals(value["accepted_ordinals"], "accepted_ordinals")
+        diverted = _exact_ordinals(value["diverted_ordinals"], "diverted_ordinals")
         if set(accepted) & set(diverted):
             raise LocalFilePreconditionError("accepted and diverted ordinals overlap")
         try:
             diversion_attribution = parse_diversion_attribution(
-                value.get("diversion_attribution"),
+                value["diversion_attribution"],
                 diverted_ordinals=diverted,
             )
         except ValueError as exc:
             raise LocalFilePreconditionError(str(exc)) from exc
         return cls(
-            target_path=_exact_string(value.get("target_path"), "target_path"),
-            staging_path=_exact_string(value.get("staging_path"), "staging_path"),
-            lock_path=_exact_string(value.get("lock_path"), "lock_path"),
-            predecessor_exists=_exact_bool(value.get("predecessor_exists"), "predecessor_exists"),
-            predecessor_hash=_optional_string(value.get("predecessor_hash"), "predecessor_hash"),
-            predecessor_size=_optional_int(value.get("predecessor_size"), "predecessor_size"),
-            predecessor_file_id=_optional_string(value.get("predecessor_file_id"), "predecessor_file_id"),
-            predecessor_declared=_exact_bool(value.get("predecessor_declared"), "predecessor_declared"),
-            staged_hash=_exact_string(value.get("staged_hash"), "staged_hash"),
-            staged_size=_exact_int(value.get("staged_size"), "staged_size"),
-            staged_file_id=_exact_string(value.get("staged_file_id"), "staged_file_id"),
-            encoding=_exact_string(value.get("encoding"), "encoding"),
-            format_name=_exact_string(value.get("format_name"), "format_name"),
-            stream_sequence=_exact_int(value.get("stream_sequence"), "stream_sequence"),
-            publication_kind=_exact_string(value.get("publication_kind"), "publication_kind"),
+            target_path=_exact_string(value["target_path"], "target_path"),
+            staging_path=_exact_string(value["staging_path"], "staging_path"),
+            lock_path=_exact_string(value["lock_path"], "lock_path"),
+            predecessor_exists=_exact_bool(value["predecessor_exists"], "predecessor_exists"),
+            predecessor_hash=_optional_string(value["predecessor_hash"], "predecessor_hash"),
+            predecessor_size=_optional_int(value["predecessor_size"], "predecessor_size"),
+            predecessor_file_id=_optional_string(value["predecessor_file_id"], "predecessor_file_id"),
+            predecessor_declared=_exact_bool(value["predecessor_declared"], "predecessor_declared"),
+            staged_hash=_exact_string(value["staged_hash"], "staged_hash"),
+            staged_size=_exact_int(value["staged_size"], "staged_size"),
+            staged_file_id=_exact_string(value["staged_file_id"], "staged_file_id"),
+            encoding=_exact_string(value["encoding"], "encoding"),
+            format_name=_exact_string(value["format_name"], "format_name"),
+            stream_sequence=_exact_int(value["stream_sequence"], "stream_sequence"),
+            publication_kind=_exact_string(value["publication_kind"], "publication_kind"),
             accepted_ordinals=accepted,
             diverted_ordinals=diverted,
             diversion_attribution=diversion_attribution,
@@ -186,9 +186,10 @@ def _optional_int(value: object, field_name: str) -> int | None:
 
 
 def _exact_ordinals(value: object, field_name: str) -> tuple[int, ...]:
-    if not isinstance(value, (list, tuple)):
+    if type(value) not in {list, tuple}:
         raise LocalFilePreconditionError(f"{field_name} must be an ordered sequence")
-    result = tuple(_exact_int(item, field_name) for item in value)
+    sequence = cast("list[object] | tuple[object, ...]", value)
+    result = tuple(_exact_int(item, field_name) for item in sequence)
     if len(result) != len(set(result)) or result != tuple(sorted(result)):
         raise LocalFilePreconditionError(f"{field_name} must contain unique ascending ordinals")
     return result
@@ -286,26 +287,24 @@ def predecessor_local_path(request: SinkEffectInspectionRequest) -> Path | None:
 
 def _inspection_snapshot(inspection: SinkEffectInspection, *, effect_id: str) -> tuple[Path, _FileSnapshot, bool]:
     evidence = inspection.evidence
-    if evidence.get("schema") != "local-file-effect-inspection-v1":
+    if evidence["schema"] != "local-file-effect-inspection-v1":
         raise LocalFilePreconditionError("inspection evidence schema is missing or divergent")
-    if evidence.get("effect_id") != effect_id:
+    if evidence["effect_id"] != effect_id:
         raise LocalFilePreconditionError("inspection evidence is bound to a different effect")
-    target = _normalize_path(Path(_exact_string(evidence.get("target_path"), "target_path")))
-    observed = evidence.get("observed")
-    if not isinstance(observed, Mapping):
-        raise LocalFilePreconditionError("inspection observed evidence must be a mapping")
-    exists = _exact_bool(observed.get("exists"), "observed.exists")
+    target = _normalize_path(Path(_exact_string(evidence["target_path"], "target_path")))
+    observed = cast("Mapping[str, object]", evidence["observed"])
+    exists = _exact_bool(observed["exists"], "observed.exists")
     snapshot = _FileSnapshot(
         exists=exists,
-        content_hash=_optional_string(observed.get("hash"), "observed.hash"),
-        size_bytes=_optional_int(observed.get("size"), "observed.size"),
-        file_id=_optional_string(observed.get("file_id"), "observed.file_id"),
+        content_hash=_optional_string(observed["hash"], "observed.hash"),
+        size_bytes=_optional_int(observed["size"], "observed.size"),
+        file_id=_optional_string(observed["file_id"], "observed.file_id"),
     )
     if exists and None in (snapshot.content_hash, snapshot.size_bytes, snapshot.file_id):
         raise LocalFilePreconditionError("existing inspection snapshot is incomplete")
     if not exists and any(item is not None for item in (snapshot.content_hash, snapshot.size_bytes, snapshot.file_id)):
         raise LocalFilePreconditionError("absent inspection snapshot carries file identity")
-    return target, snapshot, _exact_bool(evidence.get("predecessor_declared"), "predecessor_declared")
+    return target, snapshot, _exact_bool(evidence["predecessor_declared"], "predecessor_declared")
 
 
 def _staging_path(target: Path, effect_id: str) -> Path:
@@ -346,14 +345,15 @@ def cleanup_stale_local_effect_building_files(
             break
         try:
             result = path.lstat()
-        except OSError:
+        except FileNotFoundError:
+            # A concurrent sweep already removed this entry — its goal is met.
+            # Every other OSError (permission, I/O) on a code-owned building
+            # name is an anomaly and propagates instead of reading as a clean
+            # sweep that found nothing.
             continue
         if not stat.S_ISREG(result.st_mode) or current_time - result.st_mtime < older_than_seconds:
             continue
-        try:
-            path.unlink()
-        except OSError:
-            continue
+        path.unlink(missing_ok=True)
         removed += 1
     return removed
 
@@ -383,14 +383,19 @@ def _plan_hash(
 
 
 def _remove_exact_staging(path: Path, snapshot: _FileSnapshot) -> None:
-    """Best-effort cleanup for a prepare that cannot produce a durable plan."""
-    try:
-        current = _snapshot(path)
-        if current == snapshot:
-            path.unlink()
-            _fsync_directory(path.parent)
-    except (LocalFileEffectError, OSError):
+    """Remove the staged body left by a failed prepare while it is still ours.
+
+    A staged path that is already gone needs nothing, and one whose snapshot
+    no longer matches is not ours to unlink. Every other failure — permission,
+    I/O, a non-regular file standing where our regular staging body stood —
+    is an anomaly in the code-owned staging namespace and propagates, chaining
+    over the primary prepare error instead of being silently discarded.
+    """
+    current = _snapshot(path)
+    if not current.exists or current != snapshot:
         return
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
 
 
 def prepare_local_effect(
@@ -489,7 +494,7 @@ def prepare_local_effect(
     descriptor_size = staged.size_bytes
     if input_kind is SinkEffectInputKind.PIPELINE_MEMBERS and not accepted:
         descriptor_mode = SinkEffectDescriptorMode.NO_PUBLICATION
-        if predecessor.exists:
+        if predecessor.exists and predecessor_declared:
             if predecessor.content_hash is None or predecessor.size_bytes is None:
                 _remove_exact_staging(staging, staged)
                 raise LocalFilePreconditionError("existing no-publication predecessor has incomplete descriptor evidence")

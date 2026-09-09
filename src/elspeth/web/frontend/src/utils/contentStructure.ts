@@ -69,21 +69,28 @@ function detectStructuralFormat(mimeType: string): BlobStructuralFormat {
 
 /**
  * Minimal CSV tokenizer: splits text into rows of fields, honouring
- * double-quoted fields (with `""` as an escaped quote) so a comma or
- * newline inside a quoted field doesn't get mistaken for a delimiter —
+ * double-quoted fields (with `""` as an escaped quote) so a delimiter or
+ * newline inside a quoted field doesn't get mistaken for a separator —
  * which would otherwise produce false "ragged row" verdicts.
+ *
+ * Exported because it is the tree's only correct delimited-text reader and
+ * the run-output preview needs exactly this (elspeth-7f1e148ed6): that panel
+ * hand-rolled `line.split(delimiter)`, so any comma inside a quoted value
+ * shredded the row and left the header padded with blank columns. One reader,
+ * one set of quoting rules.
  */
-interface CsvParseResult {
+export interface CsvParseResult {
   rows: string[][];
   /** True when the text ended while still inside a quoted field — a hard sign of malformed or cut-off CSV. */
   endedInQuotes: boolean;
 }
 
-function parseCsvRows(text: string): CsvParseResult {
+export function parseCsvRows(text: string, delimiter = ","): CsvParseResult {
   const rows: string[][] = [];
   let row: string[] = [];
   let field = "";
   let inQuotes = false;
+  let recordStarted = false;
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -102,11 +109,13 @@ function parseCsvRows(text: string): CsvParseResult {
     }
     if (ch === '"' && field === "") {
       inQuotes = true;
+      recordStarted = true;
       continue;
     }
-    if (ch === ",") {
+    if (ch === delimiter) {
       row.push(field);
       field = "";
+      recordStarted = true;
       continue;
     }
     if (ch === "\r") {
@@ -117,12 +126,14 @@ function parseCsvRows(text: string): CsvParseResult {
       rows.push(row);
       row = [];
       field = "";
+      recordStarted = false;
       continue;
     }
     field += ch;
+    recordStarted = true;
   }
 
-  if (field !== "" || row.length > 0) {
+  if (recordStarted || row.length > 0) {
     row.push(field);
     rows.push(row);
   }

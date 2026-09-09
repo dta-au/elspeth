@@ -29,6 +29,7 @@ from __future__ import annotations
 import uuid
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 
 from elspeth.web.composer.state import (
@@ -40,6 +41,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 def test_snapshot_returns_six_canonical_rows(
@@ -182,11 +184,10 @@ def test_provenance_row_component_ids_populated_via_real_validate_pipeline(
 ) -> None:
     """C1 guard: affected_nodes wired in execution/validation.py must propagate to component_ids.
 
-    If the _CHECK_IDENTITY_NODE_ADVISORY site in execution/validation.py
-    (grep for ``name=_CHECK_IDENTITY_NODE_ADVISORY``) does not pass
-    ``affected_nodes``, this assertion will fail even if the unit test
-    passes (because the unit test supplies affected_nodes manually). The
-    fixture's passthrough node triggers the advisory.
+    If the runtime validation advisory does not pass ``affected_nodes``, this
+    assertion will fail even if the unit test passes (because the unit test
+    supplies affected_nodes manually). The fixture's passthrough node triggers
+    the advisory.
     """
     client, session_id = audit_readiness_client_with_state
     response = client.get(f"/api/sessions/{session_id}/audit-readiness")
@@ -235,12 +236,14 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
             title="audit-readiness disallowed secret-ref fixture",
             auth_provider_type=settings.auth_provider,
         )
+        (settings.data_dir / "blobs" / str(record.id)).mkdir(parents=True, exist_ok=True)
+        (settings.data_dir / "outputs" / str(record.id)).mkdir(parents=True, exist_ok=True)
         state = CompositionState(
             source=SourceSpec(
                 plugin="csv",
                 on_success="src_out",
                 options={
-                    "path": str(settings.data_dir / "blobs" / "audit_readiness_fixture.csv"),
+                    "path": str(settings.data_dir / "blobs" / str(record.id) / "audit_readiness_fixture.csv"),
                     "schema": {"mode": "observed"},
                 },
                 on_validation_failure="discard",
@@ -279,7 +282,7 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
                     name="out",
                     plugin="csv",
                     options={
-                        "path": str(settings.data_dir / "outputs" / "audit_readiness_fixture_out.csv"),
+                        "path": str(settings.data_dir / "outputs" / str(record.id) / "audit_readiness_fixture_out.csv"),
                         "schema": {"mode": "observed"},
                     },
                     on_write_failure="discard",
@@ -292,7 +295,8 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
             version=1,
         )
         state_d = state.to_dict()
-        await session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            session_service,
             record.id,
             CompositionStateData(
                 sources=state_d["sources"],
@@ -319,9 +323,22 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
     assert "scrape" in rows["secrets"]["component_ids"]
 
 
-def test_audit_readiness_routes_are_rate_limited(
+def test_audit_readiness_reads_do_not_consume_the_composer_rate_limit(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
+    """Reads are unguarded — the shared per-user bucket is for writes.
+
+    These GETs previously shared the composer message bucket (added in
+    d1fbdf3fc as a phase-2 review blocker, mirroring sibling routes).
+    In deployment that bucket is sized for LLM-backed compose calls
+    (10/min), and the tutorial's endgame polls audit-readiness enough
+    to starve the tutorial-completion PATCH into a 429. Policy per
+    preferences/routes.py: "Read GET is intentionally unguarded —
+    idempotent, safe to spam, no write amplification."
+
+    limit=1 makes the assertion sharp: if either route consumed or
+    checked the bucket, the second request would 429.
+    """
     client, session_id = audit_readiness_client_with_state
 
     for suffix in ("", "/explain"):
@@ -329,4 +346,97 @@ def test_audit_readiness_routes_are_rate_limited(
         first_response = client.get(f"/api/sessions/{session_id}/audit-readiness{suffix}")
         assert first_response.status_code == 200
         response = client.get(f"/api/sessions/{session_id}/audit-readiness{suffix}")
-        assert response.status_code == 429
+        assert response.status_code == 200
+
+
+# --- P4-A-3 (elspeth-bf52d495a2): a page load's two reads share the session ---
+
+
+def test_validate_and_audit_readiness_in_flight_together_both_succeed(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """The workspace fires validate and audit-readiness concurrently on load.
+
+    Both take a BLOB_READ admission; before the read admission was shareable
+    the loser answered 409 "Session operation is already active" and the
+    Checks tab settled on "Check failed". Two threads against the real app
+    reproduce the load; both must be 200 on every interleaving.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    client, session_id = audit_readiness_client_with_state
+    state_id = str(asyncio.run(client.app.state.session_service.get_current_state(session_id)).id)
+
+    def validate() -> int:
+        return client.post(f"/api/sessions/{session_id}/validate", params={"state_id": state_id}).status_code
+
+    def readiness() -> int:
+        return client.get(f"/api/sessions/{session_id}/audit-readiness").status_code
+
+    for _ in range(5):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            validate_future = pool.submit(validate)
+            readiness_future = pool.submit(readiness)
+            assert (validate_future.result(), readiness_future.result()) == (200, 200)
+
+
+def test_delete_succeeds_while_a_page_read_admission_is_open(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """E2E teardown: DELETE while a read lease is open is 204, and the reader then loses custody.
+
+    The loss reason is MISSING when the archive deleted the session row and
+    OWNER_INACTIVE when it only marked it archived; either way the reader
+    cannot act again, and the session is gone.
+    """
+    from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+    client, session_id = audit_readiness_client_with_state
+    service = client.app.state.session_service
+    reader = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    assert client.delete(f"/api/sessions/{session_id}").status_code == 204
+    assert client.get(f"/api/sessions/{session_id}/audit-readiness").status_code == 404
+    with pytest.raises(SessionOperationFenceLost) as lost:
+        service.session_operation_authority.compare_and_swap(reader)
+    assert lost.value.reason in {FenceLossReason.MISSING, FenceLossReason.OWNER_INACTIVE}
+
+
+def test_mark_ready_for_review_is_409_while_another_compose_is_live(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """Marking ready writes a completion event, so it holds COMPOSE authority and
+    contends with a live compose (elspeth-bf52d495a2 option A). A page read
+    admission never contends with it."""
+    from elspeth.contracts.session_operation import SessionOperationKind
+
+    client, session_id = audit_readiness_client_with_state
+    service = client.app.state.session_service
+    writer = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    try:
+        response = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Session operation is already active"
+    finally:
+        service.session_operation_authority.release(writer)
+    reader = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    try:
+        assert client.post(f"/api/sessions/{session_id}/mark-ready-for-review").status_code != 409
+    finally:
+        service.session_operation_authority.release(reader)

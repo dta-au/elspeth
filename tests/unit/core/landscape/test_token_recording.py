@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts import AggregationParentDisposition, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.identity import LineageFrame, path_branch_name, path_expand_group_id, path_fork_group_id
+from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import node_states_table, token_outcomes_table, token_parents_table, tokens_table
+from elspeth.core.landscape.schema import (
+    batches_table,
+    group_records_table,
+    node_states_table,
+    token_lineage_frames_table,
+    token_outcomes_table,
+    token_parents_table,
+    token_work_items_table,
+    tokens_table,
+)
 from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -256,6 +269,22 @@ class TestCreateToken:
         token = factory.data_flow.create_token(row.row_id, token_id="custom-token-id")
         assert token.token_id == "custom-token-id"
 
+    def test_rejects_empty_string_join_group_id(self):
+        """join_group_id must be None or a non-empty string (ruling 20: a merge-event
+        carrier, not a lineage-path frame — so it has no LineageFrame constructor to
+        catch an empty value on its behalf; create_token is the only write path)."""
+        _db, factory = _setup()
+        row = factory.data_flow.create_row(
+            run_id="run-1",
+            source_node_id="source-0",
+            row_index=0,
+            data={"col": "val"},
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        with pytest.raises(AuditIntegrityError, match="join_group_id must be None or non-empty"):
+            factory.data_flow.create_token(row.row_id, join_group_id="")
+
     def test_creates_token_with_branch_name(self):
         _db, factory = _setup()
         row = factory.data_flow.create_row(
@@ -266,9 +295,11 @@ class TestCreateToken:
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, branch_name="path-a", fork_group_id="fg-1")
-        assert token.branch_name == "path-a"
-        assert token.fork_group_id == "fg-1"
+        token = factory.data_flow.create_token(
+            row.row_id, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path-a"),)
+        )
+        assert path_branch_name(token.lineage_path) == "path-a"
+        assert path_fork_group_id(token.lineage_path) == "fg-1"
 
     def test_creates_token_with_fork_group_id(self):
         _db, factory = _setup()
@@ -280,8 +311,10 @@ class TestCreateToken:
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, fork_group_id="fg-1")
-        assert token.fork_group_id == "fg-1"
+        token = factory.data_flow.create_token(
+            row.row_id, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="b"),)
+        )
+        assert path_fork_group_id(token.lineage_path) == "fg-1"
 
     def test_creates_token_with_join_group_id(self):
         _db, factory = _setup()
@@ -337,7 +370,7 @@ class TestForkToken:
             branches=["path-a", "path-b", "path-c"],
         )
         assert len(children) == 3
-        branch_names = [c.branch_name for c in children]
+        branch_names = [path_branch_name(c.lineage_path) for c in children]
         assert "path-a" in branch_names
         assert "path-b" in branch_names
         assert "path-c" in branch_names
@@ -351,7 +384,7 @@ class TestForkToken:
             branches=["path-a", "path-b"],
         )
         assert fork_group_id is not None
-        assert all(c.fork_group_id == fork_group_id for c in children)
+        assert all(path_fork_group_id(c.lineage_path) == fork_group_id for c in children)
 
     def test_children_linked_to_same_row(self):
         _db, factory = _setup()
@@ -376,7 +409,11 @@ class TestForkToken:
         assert outcome.outcome == TerminalOutcome.TRANSIENT
         assert outcome.path == TerminalPath.FORK_PARENT
         assert outcome.completed is True
-        assert outcome.fork_group_id == fork_group_id
+        # fork_group_id retired from token_outcomes (D2): the roster of record
+        # is the children's persisted FORK frames, asserted via fork_group_id
+        # itself (the second fork_token return value) plus the exact-replay
+        # frame-equality tests in TestForkToken.
+        assert fork_group_id is not None
 
     def test_empty_branches_raises_value_error(self):
         _db, factory = _setup()
@@ -429,10 +466,15 @@ class TestForkToken:
 
         assert replayed_group == first_group
         assert [child.token_id for child in replayed_children] == [child.token_id for child in first_children]
+
+        parent_path = factory.data_flow.load_lineage_paths("run-1", [token.token_id])[token.token_id]
+        child_paths = factory.data_flow.load_lineage_paths("run-1", [child.token_id for child in first_children])
+        for child, branch in zip(first_children, ["path-a", "path-b"], strict=True):
+            assert child_paths[child.token_id] == (
+                *parent_path,
+                LineageFrame(kind=FrameKind.FORK, group_id=first_group, member_key=branch),
+            )
         with db.connection() as conn:
-            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.fork_group_id == first_group)).all() == [
-                (child.token_id,) for child in first_children
-            ]
             assert len(conn.execute(select(token_parents_table).where(token_parents_table.c.parent_token_id == token.token_id)).all()) == 2
             assert len(conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.token_id == token.token_id)).all()) == 1
 
@@ -454,11 +496,30 @@ class TestForkToken:
                 step_in_pipeline=3,
             )
 
+        parent_path = factory.data_flow.load_lineage_paths("run-1", [token.token_id])[token.token_id]
+        child_paths = factory.data_flow.load_lineage_paths("run-1", [child.token_id for child in first_children])
+        for child, branch in zip(first_children, ["path-a", "path-b"], strict=True):
+            assert child_paths[child.token_id] == (
+                *parent_path,
+                LineageFrame(kind=FrameKind.FORK, group_id=first_group, member_key=branch),
+            )
         with db.connection() as conn:
-            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.fork_group_id == first_group)).all() == [
-                (child.token_id,) for child in first_children
-            ]
             assert len(conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.token_id == token.token_id)).all()) == 1
+
+
+def _make_coalesce_parents(factory: RecorderFactory, row_id: str, branches: list[str], *, run_id: str = "run-1"):
+    """Sibling parents sharing one FORK lineage frame, minted by the REAL
+    fork_token writer — coalesce_tokens' durable strict truncation requires
+    a shared FORK frame to close (spec rulings 24/28) AND reads the written
+    release fact for every frame it walks (META-38: a crafted frame with no
+    group_records row fails closed); never weaken the closer to accommodate
+    a fixture that models something a real fork never produces.
+    """
+    parent = factory.data_flow.create_token(row_id)
+    children, _fork_group_id = factory.data_flow.fork_token(
+        parent_ref=TokenRef(token_id=parent.token_id, run_id=run_id), row_id=row_id, branches=branches
+    )
+    return children
 
 
 class TestCoalesceTokens:
@@ -466,8 +527,8 @@ class TestCoalesceTokens:
 
     def test_creates_merged_token(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -479,8 +540,8 @@ class TestCoalesceTokens:
 
     def test_merged_token_has_join_group_id(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -491,9 +552,8 @@ class TestCoalesceTokens:
 
     def test_coalesce_three_tokens(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
-        token_c = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b, token_c = _make_coalesce_parents(factory, row.row_id, ["a", "b", "c"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[
                 TokenRef(token_id=token_a.token_id, run_id="run-1"),
@@ -509,8 +569,8 @@ class TestCoalesceTokens:
 
     def test_coalesce_with_step_in_pipeline(self):
         _db, factory = _setup()
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -545,7 +605,7 @@ class TestExpandToken:
             child_payloads=[{"item": i} for i in range(3)],
             output_contract=_MINIMAL_CONTRACT,
         )
-        assert all(c.expand_group_id == expand_group_id for c in children)
+        assert all(path_expand_group_id(c.lineage_path) == expand_group_id for c in children)
 
     def test_children_linked_to_same_row(self):
         _db, factory = _setup()
@@ -572,7 +632,9 @@ class TestExpandToken:
         assert outcome.outcome == TerminalOutcome.TRANSIENT
         assert outcome.path == TerminalPath.EXPAND_PARENT
         assert outcome.completed is True
-        assert outcome.expand_group_id == expand_group_id
+        # expand_group_id retired from token_outcomes (D2): the roster of
+        # record is the children's persisted EXPAND frames plus group_records.
+        assert expand_group_id is not None
 
     def test_count_less_than_one_raises_value_error(self):
         _db, factory = _setup()
@@ -628,7 +690,11 @@ class TestExpandToken:
 
         with _db.connection() as conn:
             persisted_children = conn.execute(
-                select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id == expand_group_id)
+                select(token_lineage_frames_table.c.token_id).where(
+                    (token_lineage_frames_table.c.run_id == "run-1")
+                    & (token_lineage_frames_table.c.kind == FrameKind.EXPAND.value)
+                    & (token_lineage_frames_table.c.group_id == expand_group_id)
+                )
             ).all()
         assert len(children) == 2
         assert len(persisted_children) == 2
@@ -651,7 +717,12 @@ class TestExpandToken:
             parent_batch_id=batch_id,
         )
 
-        with pytest.raises(AuditIntegrityError, match="already claimed an expansion"):
+        first_outcome = factory.data_flow.get_token_outcome(first_parent.token_id)
+        second_outcome = factory.data_flow.get_token_outcome(second_parent.token_id)
+        assert first_outcome is not None and first_outcome.path == TerminalPath.BATCH_CONSUMED
+        assert second_outcome is not None and second_outcome.path == TerminalPath.BATCH_CONSUMED
+
+        with pytest.raises(AuditIntegrityError, match="divergent expansion replay"):
             factory.data_flow.expand_token(
                 parent_ref=TokenRef(token_id=second_parent.token_id, run_id="run-1"),
                 row_id=second_row.row_id,
@@ -663,10 +734,67 @@ class TestExpandToken:
 
         with _db.connection() as conn:
             persisted_children = conn.execute(
-                select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id == expand_group_id)
+                select(token_lineage_frames_table.c.token_id).where(
+                    (token_lineage_frames_table.c.run_id == "run-1")
+                    & (token_lineage_frames_table.c.kind == FrameKind.EXPAND.value)
+                    & (token_lineage_frames_table.c.group_id == expand_group_id)
+                )
             ).all()
         assert len(children) == 2
         assert len(persisted_children) == 2
+
+    def test_batch_expansion_rolls_back_children_and_all_parent_dispositions_together(self, monkeypatch: pytest.MonkeyPatch):
+        """A failure on a later mixed disposition cannot strand a partial receipt."""
+        db, factory = _setup()
+        batch_id = _make_batch(factory, batch_id="batch-expand-rollback")
+        first_row, first_parent = _make_row(factory, row_index=0)
+        _second_row, second_parent = _make_row(factory, row_index=1)
+        factory.execution.add_batch_member(batch_id, first_parent.token_id, 0)
+        factory.execution.add_batch_member(batch_id, second_parent.token_id, 1)
+        dispositions = (
+            AggregationParentDisposition(
+                parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
+                outcome=TerminalOutcome.TRANSIENT,
+                path=TerminalPath.BATCH_CONSUMED,
+            ),
+            AggregationParentDisposition(
+                parent_ref=TokenRef(token_id=second_parent.token_id, run_id="run-1"),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="quarantined-test-hash",
+            ),
+        )
+        original_record = factory.data_flow.outcomes.record_token_outcome
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise LandscapeRecordError("injected second disposition failure")
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(factory.data_flow.outcomes, "record_token_outcome", fail_second)
+        with pytest.raises(LandscapeRecordError, match="injected second disposition failure"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
+                row_id=first_row.row_id,
+                child_payloads=[{"item": 1}],
+                output_contract=_MINIMAL_CONTRACT,
+                parent_path=TerminalPath.BATCH_CONSUMED,
+                parent_batch_id=batch_id,
+                aggregation_parent_dispositions=dispositions,
+            )
+
+        with db.connection() as conn:
+            assert (
+                conn.execute(
+                    select(token_lineage_frames_table.c.token_id).where(token_lineage_frames_table.c.kind == FrameKind.EXPAND.value)
+                ).all()
+                == []
+            )
+            assert conn.execute(select(token_outcomes_table.c.outcome_id).where(token_outcomes_table.c.completed == 1)).all() == []
+            assert conn.execute(select(batches_table.c.expansion_group_id).where(batches_table.c.batch_id == batch_id)).scalar_one() is None
 
     def test_batch_expansion_rejects_parent_outside_batch(self):
         """BATCH_CONSUMED expansion must be claimed by an actual batch member."""
@@ -730,10 +858,21 @@ class TestExpandToken:
 
         assert replayed_group == first_group
         assert [child.token_id for child in replayed_children] == [child.token_id for child in first_children]
+
+        parent_path = factory.data_flow.load_lineage_paths("run-1", [token.token_id])[token.token_id]
+        child_paths = factory.data_flow.load_lineage_paths("run-1", [child.token_id for child in first_children])
+        for child in first_children:
+            assert child_paths[child.token_id] == (
+                *parent_path,
+                LineageFrame(kind=FrameKind.EXPAND, group_id=first_group, member_key=child.token_id),
+            )
         with db.connection() as conn:
-            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id == first_group)).all() == [
-                (child.token_id,) for child in first_children
-            ]
+            group_row = conn.execute(
+                select(group_records_table.c.member_count).where(
+                    (group_records_table.c.run_id == "run-1") & (group_records_table.c.group_id == first_group)
+                )
+            ).one()
+            assert group_row.member_count == len(first_children)
             assert len(conn.execute(select(token_parents_table).where(token_parents_table.c.parent_token_id == token.token_id)).all()) == 2
             assert len(conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.token_id == token.token_id)).all()) == 1
 
@@ -757,11 +896,40 @@ class TestExpandToken:
                 step_in_pipeline=7,
             )
 
+        parent_path = factory.data_flow.load_lineage_paths("run-1", [token.token_id])[token.token_id]
+        child_paths = factory.data_flow.load_lineage_paths("run-1", [child.token_id for child in first_children])
+        for child in first_children:
+            assert child_paths[child.token_id] == (
+                *parent_path,
+                LineageFrame(kind=FrameKind.EXPAND, group_id=first_group, member_key=child.token_id),
+            )
         with db.connection() as conn:
-            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id == first_group)).all() == [
-                (child.token_id,) for child in first_children
-            ]
             assert len(conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.token_id == token.token_id)).all()) == 1
+
+    def test_expand_replay_group_record_count_mismatch_refuses(self):
+        """A hand-corrupted group_records.member_count refuses replay (D2:
+        the roster of record is group_records, not a stored tokens column)."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 1}, {"item": 2}],
+            output_contract=_MINIMAL_CONTRACT,
+            step_in_pipeline=7,
+        )
+
+        with db.write_connection() as conn:
+            conn.execute(update(group_records_table).where(group_records_table.c.run_id == "run-1").values(member_count=999))
+
+        with pytest.raises(AuditIntegrityError, match="divergent expansion replay"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+                row_id=row.row_id,
+                child_payloads=[{"item": 1}, {"item": 2}],
+                output_contract=_MINIMAL_CONTRACT,
+                step_in_pipeline=7,
+            )
 
     def test_expand_count_one(self):
         _db, factory = _setup()
@@ -774,6 +942,331 @@ class TestExpandToken:
         )
         assert len(children) == 1
         assert expand_group_id is not None
+
+
+class TestCollectTokens:
+    """Tests for DataFlowRepository.collect_tokens (WS4 Task 3, spec §4.2/§4.4).
+
+    The strict-pop N->M release mint's durable Tier-1 twin: closes a bound
+    EXPAND group (here, an expand_token roster stands in for a collector's
+    arrived members) and mints a fresh EXPAND release group over the popped
+    base path.
+
+    NOTE for Task 4's review (I-1/B-2 amendment): collect_tokens deliberately
+    does NOT write the representative member's terminal disposition — that
+    write rides the WS3 settlement seam by design (CloserKind.COLLECTOR
+    dispatch, wired by the WS4 integration item). uq_group_records_opener's
+    uniqueness for a collect release is therefore only EVENTUALLY-sustained
+    until that seam is wired; Task 4's review must verify the seam actually
+    closes the gap once CloserKind.COLLECTOR lands, not assume this test
+    file already covers it — it deliberately does not.
+    """
+
+    def test_collect_mints_release_children_over_the_popped_base_path(self):
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        committed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+        assert len(committed.children) == 1
+        assert committed.release_group_id != group_id
+
+        child_id = committed.children[0].token_id
+        child_path = factory.data_flow.load_lineage_paths("run-1", [child_id])[child_id]
+        assert child_path[-1] == LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child_id)
+        assert child_path[:-1] == ()  # the expand roster's own base path (no enclosing frames here)
+
+        record = _group_record(_db, committed.release_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", members[0].token_id, 1)
+
+    def test_collect_replay_returns_existing_children_without_reminting(self):
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        first = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+        replayed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+        assert replayed.release_group_id == first.release_group_id
+        assert [c.token_id for c in replayed.children] == [c.token_id for c in first.children]
+
+        with db.connection() as conn:
+            token_count = len(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == "run-1")).all())
+        # initial token + 2 expand members + 1 release child; the replay minted nothing new.
+        assert token_count == 4
+
+    def test_collect_replay_with_divergent_outputs_refuses_without_mutation(self):
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        first = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+        )
+
+        with pytest.raises(AuditIntegrityError, match="divergent collect replay"):
+            factory.data_flow.collect_tokens(
+                member_refs=member_refs,
+                group_id=group_id,
+                collector_node_id="collector-1",
+                output_payloads=[{"combined": False}],
+                output_contracts=[_MINIMAL_CONTRACT],
+            )
+
+        with db.connection() as conn:
+            token_ids = {
+                row["token_id"] for row in conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == "run-1")).mappings()
+            }
+            record_ids = {
+                row["group_id"]
+                for row in conn.execute(select(group_records_table.c.group_id).where(group_records_table.c.run_id == "run-1")).mappings()
+            }
+        # Unchanged: initial + 2 expand members + 1 release child (the divergent replay wrote nothing).
+        assert token_ids == {token.token_id, *[m.token_id for m in members], first.children[0].token_id}
+        assert record_ids == {group_id, first.release_group_id}
+
+    def test_collect_mints_multiple_children_in_ordinal_order(self):
+        """I-4: N->M has only ever been exercised as N->1; pin M=3, including
+        ordinal-ordered token_parents and the children<->output_rows pairing
+        that a divergent-replay check (or an integration caller) depends on."""
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}, {"item": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        committed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"row": 0}, {"row": 1}, {"row": 2}],
+            output_contracts=[_MINIMAL_CONTRACT, _MINIMAL_CONTRACT, _MINIMAL_CONTRACT],
+        )
+        assert len(committed.children) == 3
+        assert len({c.token_id for c in committed.children}) == 3  # every child token_id distinct
+
+        replayed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"row": 0}, {"row": 1}, {"row": 2}],
+            output_contracts=[_MINIMAL_CONTRACT, _MINIMAL_CONTRACT, _MINIMAL_CONTRACT],
+        )
+        # Replay reconciliation zips (children, output_data_refs) in the SAME
+        # order they were minted — an ordinal-ordering bug here would surface
+        # as a spurious "divergent collect replay" on a healthy re-drive.
+        assert [c.token_id for c in replayed.children] == [c.token_id for c in committed.children]
+
+        record = _group_record(_db, committed.release_group_id)
+        assert record is not None
+        assert record.member_count == 3
+
+    def test_collect_pops_only_the_closer_frame_leaving_a_nonempty_base_path(self):
+        """I-5: every prior durable test released over an EMPTY base_path
+        (the expand roster had no enclosing frames). Pin the nested case: a
+        fork branch that itself gets expanded carries mint frames
+        (FORK, EXPAND) — the closer pops only the innermost EXPAND frame,
+        leaving the FORK frame in the release children's persisted path. This
+        also exercises _reconcile_collect_replay's frame-equality check
+        (C-2) against a non-trivial base_path."""
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        (branch,), fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        (member,), expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=branch.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        # member's mint frames are (FORK, EXPAND) — non-empty remaining path
+        # once the collector pops its own EXPAND closer frame.
+        expected_base_path = (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key="path-a"),)
+
+        committed = factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=member.token_id, run_id="run-1")],
+            group_id=expand_group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+            member_lineage_paths={
+                member.token_id: (
+                    LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key="path-a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member.token_id),
+                )
+            },
+        )
+        child_id = committed.children[0].token_id
+        child_path = factory.data_flow.load_lineage_paths("run-1", [child_id])[child_id]
+        assert child_path == (
+            *expected_base_path,
+            LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child_id),
+        )
+
+        # Replay must re-derive the SAME non-empty base_path and pass the C-2
+        # frame-equality check rather than short-circuiting on member_count alone.
+        replayed = factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=member.token_id, run_id="run-1")],
+            group_id=expand_group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+            member_lineage_paths={
+                member.token_id: (
+                    LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key="path-a"),
+                    LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member.token_id),
+                )
+            },
+        )
+        assert replayed.children[0].token_id == child_id
+
+    def test_collect_uses_supplied_member_path_not_mint_frames_for_row_union_released_members(self):
+        """C-1: the reachable failure shape the review names —
+        expand -> member -> fork -> row_union release -> collector. A member
+        released across a row_union pops its FORK frame (ruling 27); its
+        CURRENT path then ends in the collector's own EXPAND closer frame
+        even though its MINT frames end in FORK. Re-deriving the pop from
+        mint frames alone (the pre-fix behaviour) refuses this healthy
+        release outright — pinned here as the first call. member_lineage_paths
+        must be threaded through and cross-checked (_assert_parent_lineage)
+        for the second call to succeed."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        members, expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member = members[0]
+        member_expand_frame = LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member.token_id)
+        (branch,), _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=member.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+            parent_lineage_path=(member_expand_frame,),
+        )
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=branch.token_id)
+        released_path = (member_expand_frame,)  # mint (EXPAND, FORK) minus the popped FORK frame
+
+        # Without member_lineage_paths, the durable half re-derives from MINT
+        # frames (EXPAND, FORK): path[-1] is FORK, not this collector's own
+        # EXPAND(expand_group_id) closer frame -> strict pop refuses.
+        with pytest.raises(AuditIntegrityError, match="durable strict pop refused"):
+            factory.data_flow.collect_tokens(
+                member_refs=[TokenRef(token_id=branch.token_id, run_id="run-1")],
+                group_id=expand_group_id,
+                collector_node_id="collector-1",
+                output_payloads=[{"combined": True}],
+                output_contracts=[_MINIMAL_CONTRACT],
+            )
+
+        committed = factory.data_flow.collect_tokens(
+            member_refs=[TokenRef(token_id=branch.token_id, run_id="run-1")],
+            group_id=expand_group_id,
+            collector_node_id="collector-1",
+            output_payloads=[{"combined": True}],
+            output_contracts=[_MINIMAL_CONTRACT],
+            member_lineage_paths={branch.token_id: released_path},
+        )
+        assert len(committed.children) == 1
+        child_id = committed.children[0].token_id
+        child_path = factory.data_flow.load_lineage_paths("run-1", [child_id])[child_id]
+        assert child_path == (LineageFrame(kind=FrameKind.EXPAND, group_id=committed.release_group_id, member_key=child_id),)
+
+    def test_collect_empty_output_mints_an_empty_release_group_durably(self):
+        """Ruling 1 (fix-round): M=0 is a legal close, not "mint nothing" —
+        it must leave the SAME durable footprint an M>0 close does, mirroring
+        record_empty_expansion's already-opened-group guard shape. Also pins
+        the idempotent replay: a second M=0 drive returns the SAME empty
+        release rather than re-minting or raising."""
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        members, group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"item": 0}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
+
+        committed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[],
+            output_contracts=[],
+        )
+        assert committed.children == ()
+        record = _group_record(_db, committed.release_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", members[0].token_id, 0)
+
+        replayed = factory.data_flow.collect_tokens(
+            member_refs=member_refs,
+            group_id=group_id,
+            collector_node_id="collector-1",
+            output_payloads=[],
+            output_contracts=[],
+        )
+        assert replayed.release_group_id == committed.release_group_id
+        assert replayed.children == ()
+
+        with pytest.raises(AuditIntegrityError, match="divergent collect replay"):
+            factory.data_flow.collect_tokens(
+                member_refs=member_refs,
+                group_id=group_id,
+                collector_node_id="collector-1",
+                output_payloads=[{"combined": True}],
+                output_contracts=[_MINIMAL_CONTRACT],
+            )
 
 
 class TestValidateOutcomeFields:
@@ -827,24 +1320,16 @@ class TestValidateOutcomeFields:
         )
         assert outcome_id is not None
 
-    def test_forked_requires_fork_group_id(self):
-        _db, factory = _setup()
-        _row, token = _make_row(factory)
-        with pytest.raises(ValueError, match="fork_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id="run-1"),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.FORK_PARENT,
-            )
-
-    def test_forked_accepts_fork_group_id(self):
+    def test_forked_accepts_no_discriminators(self):
+        """fork_group_id retired from token_outcomes (D2): FORK_PARENT now
+        forbids every discriminator field — the roster of record moved to the
+        children's persisted FORK frames (see TestForkToken's replay tests)."""
         _db, factory = _setup()
         _row, token = _make_row(factory)
         outcome_id = factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
-            fork_group_id="fg-1",
         )
         assert outcome_id is not None
 
@@ -924,18 +1409,10 @@ class TestValidateOutcomeFields:
         )
         assert outcome_id is not None
 
-    def test_coalesced_requires_join_group_id(self):
-        _db, factory = _setup()
-        _row, token = _make_row(factory)
-        with pytest.raises(ValueError, match="join_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id="run-1"),
-                outcome=TerminalOutcome.SUCCESS,
-                path=TerminalPath.COALESCED,
-                sink_name="output",
-            )
-
-    def test_coalesced_accepts_join_group_id(self):
+    def test_coalesced_accepts_sink_name(self):
+        """join_group_id retired from token_outcomes (D2): COALESCED requires
+        nothing — the merge-event identity lives solely on the result token's
+        tokens.join_group_id column (kept)."""
         _db, factory = _setup()
         _row, token = _make_row(factory)
         outcome_id = factory.data_flow.record_token_outcome(
@@ -943,39 +1420,29 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="output",
-            join_group_id="jg-1",
         )
         assert outcome_id is not None
 
-    def test_coalesced_accepts_join_group_id_without_sink_name(self):
+    def test_coalesced_accepts_no_discriminators(self):
         _db, factory = _setup()
         _row, token = _make_row(factory)
         outcome_id = factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
-            join_group_id="jg-1",
         )
         assert outcome_id is not None
 
-    def test_expanded_requires_expand_group_id(self):
-        _db, factory = _setup()
-        _row, token = _make_row(factory)
-        with pytest.raises(ValueError, match="expand_group_id"):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id="run-1"),
-                outcome=TerminalOutcome.TRANSIENT,
-                path=TerminalPath.EXPAND_PARENT,
-            )
-
-    def test_expanded_accepts_expand_group_id(self):
+    def test_expanded_accepts_no_discriminators(self):
+        """expand_group_id retired from token_outcomes (D2): EXPAND_PARENT now
+        forbids every discriminator field — the roster of record moved to the
+        children's persisted EXPAND frames plus group_records."""
         _db, factory = _setup()
         _row, token = _make_row(factory)
         outcome_id = factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.EXPAND_PARENT,
-            expand_group_id="eg-1",
         )
         assert outcome_id is not None
 
@@ -2009,8 +2476,7 @@ class TestCrossRunContaminationPrevention:
             source_row_index=0,
             ingest_sequence=0,
         )
-        token_a = factory.data_flow.create_token(row_a.row_id)
-        token_b = factory.data_flow.create_token(row_a.row_id)
+        token_a, token_b = _make_coalesce_parents(factory, row_a.row_id, ["a", "b"], run_id="run-A")
 
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-A"), TokenRef(token_id=token_b.token_id, run_id="run-A")],
@@ -2075,8 +2541,8 @@ class TestTokenRunIdConsistency:
     def test_coalesced_token_has_run_id(self):
         """Coalesced token must inherit run_id from parents."""
         _db, factory = _setup(run_id="run-1")
-        row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        row, _root = _make_row(factory, row_index=0)
+        token_a, token_b = _make_coalesce_parents(factory, row.row_id, ["a", "b"])
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=token_a.token_id, run_id="run-1"), TokenRef(token_id=token_b.token_id, run_id="run-1")],
             row_id=row.row_id,
@@ -2229,3 +2695,300 @@ class TestTokenRunIdConsistency:
                     started_at=now(),
                 )
             )
+
+
+def _frames_for(db: LandscapeDB, token_id: str, run_id: str = "run-1") -> list[tuple[int, str, str, str]]:
+    with db.engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                token_lineage_frames_table.c.depth,
+                token_lineage_frames_table.c.kind,
+                token_lineage_frames_table.c.group_id,
+                token_lineage_frames_table.c.member_key,
+            )
+            .where(token_lineage_frames_table.c.token_id == token_id)
+            .where(token_lineage_frames_table.c.run_id == run_id)
+            .order_by(token_lineage_frames_table.c.depth)
+        ).fetchall()
+    return [(int(r.depth), str(r.kind), str(r.group_id), str(r.member_key)) for r in rows]
+
+
+def _group_record(db: LandscapeDB, group_id: str, run_id: str = "run-1"):
+    with db.engine.connect() as conn:
+        return conn.execute(
+            select(group_records_table).where(group_records_table.c.run_id == run_id).where(group_records_table.c.group_id == group_id)
+        ).one_or_none()
+
+
+class TestUnifiedLineageWriters:
+    def test_fork_writes_child_frames_and_group_record(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        children, fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=parent.token_id, run_id="run-1"),
+            row_id=parent.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+        )
+        for child, branch in zip(children, ["a", "b"], strict=True):
+            assert _frames_for(db, child.token_id) == [(0, "fork", fork_group_id, branch)]
+        record = _group_record(db, fork_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("fork", parent.token_id, 2)
+
+    def test_expand_child_frames_stack_on_parent_frames(self) -> None:
+        db, factory = _setup()
+        _row, root = _make_row(factory)
+        (branch_child, _other), fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"),
+            row_id=root.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+        )
+        children, expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=branch_child.token_id, run_id="run-1"),
+            row_id=root.row_id,
+            child_payloads=[{"v": 1}, {"v": 2}],
+            output_contract=_MINIMAL_CONTRACT,
+            step_in_pipeline=2,
+        )
+        for child in children:
+            assert _frames_for(db, child.token_id) == [
+                (0, "fork", fork_group_id, "a"),
+                (1, "expand", expand_group_id, child.token_id),
+            ]
+        record = _group_record(db, expand_group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", branch_child.token_id, 2)
+
+    def test_fork_replay_does_not_double_mint(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        ref = TokenRef(token_id=parent.token_id, run_id="run-1")
+        _children, fork_group_id = factory.data_flow.fork_token(
+            parent_ref=ref, row_id=parent.row_id, branches=["a", "b"], step_in_pipeline=1
+        )
+        replayed, replay_group = factory.data_flow.fork_token(parent_ref=ref, row_id=parent.row_id, branches=["a", "b"], step_in_pipeline=1)
+        assert replay_group == fork_group_id
+        with db.engine.connect() as conn:
+            count = conn.execute(select(func.count()).select_from(group_records_table)).scalar()
+        assert count == 1
+        assert _frames_for(db, replayed[0].token_id) == [(0, "fork", fork_group_id, "a")]
+
+    def test_coalesce_pops_the_shared_fork_frame(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        children, _fork_group_id = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=parent.token_id, run_id="run-1"),
+            row_id=parent.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+        )
+        merged = factory.data_flow.coalesce_tokens(
+            parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
+            row_id=parent.row_id,
+            merged_payload={"v": 1},
+            merged_contract=_MINIMAL_CONTRACT,
+            coalesce_node_id="agg-0",
+            step_in_pipeline=2,
+        )
+        assert _frames_for(db, merged.token_id) == []  # depth-1 fork popped to empty path
+
+    def test_coalesce_refuses_parents_without_fork_frames(self) -> None:
+        _db, factory = _setup()
+        row_a, tok_a = _make_row(factory, row_index=0)
+        tok_b = factory.data_flow.create_token(row_a.row_id)
+        with pytest.raises(AuditIntegrityError, match="innermost FORK"):
+            factory.data_flow.coalesce_tokens(
+                parent_refs=[TokenRef(token_id=tok_a.token_id, run_id="run-1"), TokenRef(token_id=tok_b.token_id, run_id="run-1")],
+                row_id=row_a.row_id,
+                merged_payload={"v": 1},
+                merged_contract=_MINIMAL_CONTRACT,
+                coalesce_node_id="agg-0",
+                step_in_pipeline=2,
+            )
+
+    def test_create_token_lineage_frames_seam_for_crafted_tokens(self) -> None:
+        db, factory = _setup()
+        row, _tok = _make_row(factory)
+        crafted = factory.data_flow.create_token(
+            row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-crafted", member_key="a"),),
+        )
+        assert _frames_for(db, crafted.token_id) == [(0, "fork", "fg-crafted", "a")]
+
+    def test_record_empty_expansion_mints_zero_member_group_idempotently(self) -> None:
+        db, factory = _setup()
+        _row, parent = _make_row(factory)
+        ref = TokenRef(token_id=parent.token_id, run_id="run-1")
+        group_id = factory.data_flow.record_empty_expansion(ref)
+        assert factory.data_flow.record_empty_expansion(ref) == group_id  # re-driven claim
+        record = _group_record(db, group_id)
+        assert record is not None
+        assert (record.kind, record.opener_token_id, record.member_count) == ("expand", parent.token_id, 0)
+
+    def test_record_empty_expansion_refuses_divergent_replay(self) -> None:
+        _db, factory = _setup()
+        _row, parent = _make_row(factory)
+        ref = TokenRef(token_id=parent.token_id, run_id="run-1")
+        factory.data_flow.expand_token(
+            parent_ref=ref,
+            row_id=parent.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+            step_in_pipeline=1,
+        )
+        with pytest.raises(AuditIntegrityError, match="divergent empty-expansion"):
+            factory.data_flow.record_empty_expansion(ref)
+
+
+def _craft_row_union_release_witness(db: LandscapeDB, *, run_id: str, row_id: str, token_id: str) -> None:
+    """Write a token_work_items row with row_union_name set and a non-BLOCKED
+    status — the durable witness _row_union_release_witness checks for
+    (ruling 27's sanctioned relief in _assert_parent_lineage). A crafted row,
+    not a real row_union run: only the witness predicate's own columns are
+    populated with real ownership (run_id/token_id/row_id); the rest are
+    inert filler satisfying NOT NULL/FK constraints."""
+    now = datetime.now(UTC)
+    with db.write_connection() as conn:
+        conn.execute(
+            token_work_items_table.insert().values(
+                work_item_id=f"wi-{token_id}",
+                run_id=run_id,
+                token_id=token_id,
+                row_id=row_id,
+                step_index=0,
+                ingest_sequence=0,
+                row_payload_json="{}",
+                status=TokenWorkStatus.TERMINAL.value,
+                lineage_path_json="[]",
+                row_union_name="merge",
+                attempt=0,
+                available_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+class TestAssertParentLineageRuling27Relief:
+    """D8 (task-10-brief.md step 5): _assert_parent_lineage's ONE sanctioned
+    divergence from exact equality is a row_union release popping the
+    parent's FORK frame — from wherever it sits, symmetric with
+    contracts.identity.pop_fork_frame, not just when it's the innermost/last
+    frame. Fix-round-1 BLOCKING finding: the original relief only recognized
+    `mint[-1].kind is FORK` (literal last frame), which false-positives an
+    AuditIntegrityError on a healthy run for exactly the shape ruling 27
+    itself makes reachable — a fork-branch token whose branch contained a
+    mid-branch expand, released with lineage_path (FORK, EXPAND) -> (EXPAND,).
+    """
+
+    def test_refuses_popped_parent_path_without_witness(self) -> None:
+        """(a) fork children minted, path popped by hand, no union journal
+        row for the parent -> AuditIntegrityError."""
+        _db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        with pytest.raises(AuditIntegrityError, match="parent lineage divergence"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+                row_id=row.row_id,
+                child_payloads=[{"v": 1}],
+                output_contract=_MINIMAL_CONTRACT,
+                parent_lineage_path=(),
+            )
+
+    def test_accepts_popped_parent_path_with_row_union_witness(self) -> None:
+        """(b) same, but with a crafted completed row_union work-item row for
+        the parent -> accepted; child frames = popped path + EXPAND frame."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=child.token_id)
+
+        (grandchild,), expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+            parent_lineage_path=(),
+        )
+        grandchild_paths = factory.data_flow.load_lineage_paths("run-1", [grandchild.token_id])
+        assert grandchild_paths[grandchild.token_id] == (
+            LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),
+        )
+
+    def test_refuses_two_frames_short_even_with_witness(self) -> None:
+        """(c) supplied shorter by TWO frames with the witness present ->
+        still refused — the weakening admits exactly one popped FORK frame,
+        never a prefix walk."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        (grandchild,), _eg = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        # grandchild's mint frames are now (FORK, EXPAND) — 2 frames.
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=grandchild.token_id)
+
+        with pytest.raises(AuditIntegrityError, match="parent lineage divergence"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=grandchild.token_id, run_id="run-1"),
+                row_id=row.row_id,
+                child_payloads=[{"v": 2}],
+                output_contract=_MINIMAL_CONTRACT,
+                parent_lineage_path=(),
+            )
+
+    def test_accepts_popped_parent_path_with_buried_fork_frame(self) -> None:
+        """The motivating shape (fix-round-2 residual): a fork branch
+        containing a mid-branch expand has mint (FORK, EXPAND) — the FORK
+        frame is NOT innermost. Released with the FORK frame popped, supplied
+        is (EXPAND,), which differs from (b)'s single-(FORK,)-frame mint
+        (structurally indistinguishable from pre-fix behaviour, since
+        removing the ONLY frame is also removing the LAST frame). This pins
+        that the relief finds and pops the FORK frame from wherever it sits,
+        not just when it's already innermost."""
+        db, factory = _setup()
+        row, token = _make_row(factory)
+        (child,), _fg = factory.data_flow.fork_token(
+            parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            branches=["path-a"],
+        )
+        (grandchild,), expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 1}],
+            output_contract=_MINIMAL_CONTRACT,
+        )
+        # grandchild's mint frames are (FORK, EXPAND) — FORK is buried, not innermost.
+        _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=grandchild.token_id)
+
+        (great_grandchild,), inner_expand_group_id = factory.data_flow.expand_token(
+            parent_ref=TokenRef(token_id=grandchild.token_id, run_id="run-1"),
+            row_id=row.row_id,
+            child_payloads=[{"v": 2}],
+            output_contract=_MINIMAL_CONTRACT,
+            parent_lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),),
+        )
+        great_grandchild_paths = factory.data_flow.load_lineage_paths("run-1", [great_grandchild.token_id])
+        assert great_grandchild_paths[great_grandchild.token_id] == (
+            LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),
+            LineageFrame(kind=FrameKind.EXPAND, group_id=inner_expand_group_id, member_key=great_grandchild.token_id),
+        )

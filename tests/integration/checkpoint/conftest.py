@@ -36,6 +36,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for
 from tests.helpers.checkpoint import checkpoint_draft
 
 
@@ -121,6 +122,9 @@ def run_with_checkpoint_and_payloads(
                 openrouter_catalog_source="bundled",
             )
         )
+        # A run written by raw SQL has no seat; leave the lapsed seat its
+        # crashed leader would have left so checkpoint writes can read it back.
+        insert_crashed_leader_seat(conn, run_id=run_id)
 
         # Create source node
         conn.execute(
@@ -201,14 +205,16 @@ def run_with_checkpoint_and_payloads(
 
         conn.commit()
 
-    # Create checkpoint at row 2 (rows 3-4 are unprocessed)
+    # Create checkpoint at row 2 (rows 3-4 are unprocessed), under the seat
+    # the crashed leader left (ADR-048 §5 read-back).
     graph = _create_test_graph()
     checkpoint_manager.create_checkpoint(
         draft=checkpoint_draft(
             run_id=run_id,
             sequence_number=2,
             graph=graph,
-        )
+        ),
+        coordination_token=leader_token_for(db, run_id),
     )
 
     return run_id

@@ -99,15 +99,21 @@ row and confirm every live token reached an expected terminal path.
 
 ## Docker Resume
 
-When running in Docker:
+When running in Docker, select an exact tag that you have confirmed exists in
+the registry. Use the same immutable image identity that created the
+checkpoint unless a reviewed compatibility decision approves a newer image:
 
 ```bash
+: "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
+docker buildx imagetools inspect \
+  "ghcr.io/dta-au/elspeth:${IMAGE_TAG}" >/dev/null
+
 docker run --rm \
   -v $(pwd)/config:/app/config:ro \
   -v $(pwd)/input:/app/input:ro \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/state:/app/state \
-  ghcr.io/johnm-dta/elspeth:latest \
+  ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
   resume <RUN_ID> --execute
 ```
 
@@ -159,6 +165,26 @@ The checkpoint was corrupted or source data changed. Options:
 1. Start a fresh run.
 2. Preserve the failed run's audit database and checkpoint files if they are
    needed for incident evidence.
+
+### "source lifecycle is incomplete" on a run that is still `running`
+
+The run's leader died (crash, SIGKILL, evicted replica) before its source was
+recorded `exhausted`, and the run is stuck `running` with an expired seat.
+Resume refuses because it replays only persisted rows and cannot prove that
+no unread source rows exist. No resume can recover such a run; finalize it
+honestly instead:
+
+```bash
+# Dry run: shows the dead seat, source states, and the undecided work
+elspeth abandon <RUN_ID> --settings pipeline.yaml --database ./runs/audit.db
+
+# Take the dead seat and finalize the run as interrupted
+elspeth abandon <RUN_ID> --settings pipeline.yaml --database ./runs/audit.db --execute
+```
+
+Undecided tokens are recorded as `abandoned` (ADR-038), followers are
+departed, and the seat is vacated. Reprocess the source with a fresh run. If
+the dry run reports `Resumable: yes`, use `elspeth resume` instead.
 
 ---
 

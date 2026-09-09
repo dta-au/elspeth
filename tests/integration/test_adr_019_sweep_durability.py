@@ -75,7 +75,6 @@ def _plant_orphan_fork_parent(
         ref=TokenRef(token_id=token.token_id, run_id=run_id),
         outcome=TerminalOutcome.TRANSIENT,
         path=TerminalPath.FORK_PARENT,
-        fork_group_id=f"fg_durability_{row_index}",
     )
     if complete_row_for_resume:
         sibling = factory.data_flow.create_token(row_id=row.row_id)
@@ -524,6 +523,7 @@ def test_realtime_invariant_crash_finalizes_failed_and_preserves_witnesses(
         shutdown_event=None,
         flush_end_of_input=True,
         check_coordination_latch=None,
+        coordination_token=None,
     ):
         captured["run_id"] = run_id
         sink = factory.data_flow.register_node(
@@ -616,7 +616,15 @@ def test_realtime_invariant_crash_finalizes_failed_and_preserves_witnesses(
     run_row = factory.run_lifecycle.get_run(captured["run_id"])
     assert run_row is not None
     assert run_row.status == RunStatus.FAILED
-    assert factory.data_flow.get_token_outcome(captured["token_id"]) is None
+    # The refused (corrupt) write must leave NO decided outcome. The token
+    # is not record-free anymore: the crash finalized a non-resumable run,
+    # so the ADR-038 sweep honestly marked it (NULL, ABANDONED) — a
+    # non-terminal marker, not a lifecycle answer.
+    surviving = factory.data_flow.get_token_outcome(captured["token_id"])
+    assert surviving is not None
+    assert surviving.completed is False
+    assert surviving.outcome is None
+    assert surviving.path is TerminalPath.ABANDONED
     if kind == "I1c":
         artifacts = factory.execution.get_artifacts(captured["run_id"])
         assert any(artifact.artifact_id == captured["artifact_id"] for artifact in artifacts)

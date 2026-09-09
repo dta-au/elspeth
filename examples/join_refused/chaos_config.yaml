@@ -1,0 +1,46 @@
+# ChaosLLM config for the join_refused example.
+# Zero terminal fault injection: this example demonstrates the ADMISSION
+# fence, so the pipeline itself must be deterministic. The latency is what
+# keeps the run live long enough for both join attempts.
+
+server:
+  host: "127.0.0.1"
+  port: 8199
+  workers: 1
+
+metrics:
+  database: "file:chaosllm-metrics?mode=memory&cache=shared"
+
+response:
+  mode: preset
+  preset:
+    file: examples/join_refused/responses.jsonl
+    selection: sequential
+
+latency:
+  # Deliberately slower than the multi_worker profile. This example must stay
+  # RUNNING through TWO sequential join attempts, and its 80 items otherwise
+  # drain in ~4s, which leaves no window. Pacing lives here rather than in a
+  # bigger input so the fixture stays small and the window stays explicit.
+  base_ms: 400
+  jitter_ms: 100
+
+error_injection:
+  rate_limit_pct: 0.0
+  capacity_529_pct: 0.0
+  service_unavailable_pct: 0.0
+  internal_error_pct: 0.0
+  bad_gateway_pct: 0.0
+  gateway_timeout_pct: 0.0
+  retry_after_sec: [1, 2]
+  timeout_pct: 0.0
+  timeout_sec: [2, 4]
+  connection_reset_pct: 0.0
+  slow_response_pct: 0.0
+  slow_response_sec: [1, 3]
+  invalid_json_pct: 0.0
+  truncated_pct: 0.0
+  empty_body_pct: 0.0
+  missing_fields_pct: 0.0
+  burst:
+    enabled: false

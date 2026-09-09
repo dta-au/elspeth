@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
 
-from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool
+from elspeth.composer_mcp.server import _build_stdio_server, _build_tool_defs, _dispatch_tool, create_server
+from elspeth.composer_mcp.session import SessionCheckout, SessionManager
+from elspeth.contracts.composer_audit import ComposerToolRecorder
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer.state import (
@@ -19,6 +23,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
 
 def _empty_state() -> CompositionState:
@@ -38,7 +43,7 @@ def _invalid_contract_state() -> CompositionState:
             plugin="csv",
             on_success="t1",
             options={"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         ),
         nodes=(
             NodeSpec(
@@ -81,7 +86,7 @@ def _valid_state_with_no_edge_contracts() -> CompositionState:
             plugin="csv",
             on_success="main",
             options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         ),
         nodes=(),
         edges=(),
@@ -104,7 +109,7 @@ def _connection_valid_field_mapper_state_without_edges() -> CompositionState:
             plugin="text",
             on_success="mapper_in",
             options={"path": "/data/in.txt", "column": "text", "schema": {"mode": "observed"}},
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         ),
         nodes=(
             NodeSpec(
@@ -158,6 +163,38 @@ def _mock_catalog() -> CatalogService:
         PluginSummary(name="json", description="JSON sink", plugin_type="sink", config_fields=[]),
     ]
     return catalog
+
+
+def _call_handler(handlers: dict[object, object], name: str, arguments: dict[str, object]) -> object:
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    request = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name=name, arguments=arguments),
+    )
+    return handlers[CallToolRequest](request)  # type: ignore[index,operator]
+
+
+def _session_authority(scratch_dir: Path) -> tuple[SessionManager, list[SessionCheckout | None]]:
+    return SessionManager(scratch_dir), [None]
+
+
+def _dispatch_session_once(
+    tool_name: str,
+    arguments: dict[str, Any],
+    state: CompositionState,
+    scratch_dir: Path,
+) -> dict[str, Any]:
+    session_manager, session_checkout_ref = _session_authority(scratch_dir)
+    return _dispatch_tool(
+        tool_name,
+        arguments,
+        state,
+        _mock_catalog(),
+        scratch_dir,
+        session_manager=session_manager,
+        session_checkout_ref=session_checkout_ref,
+    )
 
 
 class TestBuildToolDefs:
@@ -215,6 +252,173 @@ class TestBuildToolDefs:
 
 
 class TestDispatchTool:
+    @pytest.mark.asyncio
+    async def test_live_session_manager_token_authorizes_save_after_mutation(self, scratch_dir: Path) -> None:
+        recorder = MagicMock(spec_set=ComposerToolRecorder)
+        server = create_server(
+            _mock_catalog(), scratch_dir, recorder=recorder, runtime_preflight=None, runtime_preflight_settings_hash=None
+        )
+        created = await _call_handler(server.request_handlers, "new_session", {"name": "CAS"})  # type: ignore[misc]
+        created_payload = json.loads(created.root.content[0].text)
+        session_id = created_payload["data"]["session_id"]
+        assert "token" not in created_payload["data"]
+
+        mutated = await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_metadata",
+            {
+                "patch": {"name": "CAS updated"},
+            },
+        )
+        assert json.loads(mutated.root.content[0].text)["success"] is True
+
+        saved = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+        saved_payload = json.loads(saved.root.content[0].text)
+        assert saved_payload["success"] is True
+        assert "token" not in saved_payload["data"]
+
+        mutated_again = await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_metadata",
+            {
+                "patch": {"description": "second mutation"},
+            },
+        )
+        assert json.loads(mutated_again.root.content[0].text)["success"] is True
+
+        saved_again = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+        saved_again_payload = json.loads(saved_again.root.content[0].text)
+        assert saved_again_payload["success"] is True
+        assert "token" not in saved_again_payload["data"]
+
+        for call in recorder.record.call_args_list:
+            invocation = call.args[0]
+            if invocation.result_canonical is not None:
+                assert "token" not in json.loads(invocation.result_canonical).get("data", {})
+
+        durable = SessionManager(scratch_dir).load(session_id)
+        assert durable.metadata.name == "CAS updated"
+        assert durable.metadata.description == "second mutation"
+        assert durable.version == 3
+
+    @pytest.mark.asyncio
+    async def test_live_save_to_non_active_session_conflicts_and_preserves_sessions(self, scratch_dir: Path) -> None:
+        server = create_server(_mock_catalog(), scratch_dir, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        created_a = await _call_handler(server.request_handlers, "new_session", {"name": "A"})  # type: ignore[misc]
+        session_a = json.loads(created_a.root.content[0].text)["data"]["session_id"]
+        created_b = await _call_handler(server.request_handlers, "new_session", {"name": "B"})  # type: ignore[misc]
+        session_b = json.loads(created_b.root.content[0].text)["data"]["session_id"]
+        path_a = scratch_dir / f"{session_a}.json"
+        path_b = scratch_dir / f"{session_b}.json"
+        original_a = path_a.read_bytes()
+        original_b = path_b.read_bytes()
+
+        await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+
+        rejected = await _call_handler(server.request_handlers, "save_session", {"session_id": session_a})  # type: ignore[misc]
+
+        assert rejected.root.isError is True
+        assert path_a.read_bytes() == original_a
+        assert path_b.read_bytes() == original_b
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_active_checkout_authority(self, scratch_dir: Path) -> None:
+        server = create_server(_mock_catalog(), scratch_dir, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        created = await _call_handler(server.request_handlers, "new_session", {"name": "deleted"})  # type: ignore[misc]
+        created_payload = json.loads(created.root.content[0].text)
+        session_id = created_payload["data"]["session_id"]
+        original = CompositionState.from_dict(created_payload["state"])
+
+        deleted = await _call_handler(server.request_handlers, "delete_session", {"session_id": session_id})  # type: ignore[misc]
+        assert json.loads(deleted.root.content[0].text)["success"] is True
+
+        # Recreate the same durable bytes externally. A retained pre-delete
+        # checkout token would now compare equal and incorrectly regain write
+        # authority; the live server must have cleared it after the tombstone.
+        path = SessionManager(scratch_dir).save(session_id, original)
+        recreated = path.read_bytes()
+
+        await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+        rejected = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+
+        assert rejected.root.isError is True
+        assert path.read_bytes() == recreated
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_active_authority_when_tombstone_recording_raises(
+        self,
+        scratch_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.composer_mcp.audit import JsonlEventRecorder, events_sidecar_path
+        from elspeth.contracts.composer_audit import ComposerToolInvocation
+
+        original_record = JsonlEventRecorder.record
+        delete_attempts = 0
+
+        def record_then_fail_delete(
+            recorder: JsonlEventRecorder,
+            invocation: ComposerToolInvocation,
+        ) -> None:
+            nonlocal delete_attempts
+            original_record(recorder, invocation)
+            if invocation.tool_name == "delete_session":
+                delete_attempts += 1
+                raise RuntimeError("delete tombstone recorder failure")
+
+        monkeypatch.setattr(JsonlEventRecorder, "record", record_then_fail_delete)
+        server = create_server(_mock_catalog(), scratch_dir, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        created = await _call_handler(server.request_handlers, "new_session", {"name": "deleted"})  # type: ignore[misc]
+        created_payload = json.loads(created.root.content[0].text)
+        session_id = created_payload["data"]["session_id"]
+        path = scratch_dir / f"{session_id}.json"
+        original_bytes = path.read_bytes()
+        sidecar = events_sidecar_path(scratch_dir, session_id)
+
+        delete_error = await _call_handler(server.request_handlers, "delete_session", {"session_id": session_id})  # type: ignore[misc]
+
+        assert delete_error.root.isError is True
+        assert delete_attempts == 1
+        assert not path.exists()
+        tombstone_audit = sidecar.read_bytes()
+
+        # Recreate the deleted session with byte-identical durable state. The
+        # failed audit must not retain either its scope or its old CAS evidence.
+        path.write_bytes(original_bytes)
+        await _call_handler(  # type: ignore[misc]
+            server.request_handlers,
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "source_out",
+                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+        )
+        save_error = await _call_handler(server.request_handlers, "save_session", {"session_id": session_id})  # type: ignore[misc]
+
+        assert save_error.root.isError is True
+        assert path.read_bytes() == original_bytes
+        assert sidecar.read_bytes() == tombstone_audit
+
     def test_dispatch_constructs_explicit_trained_operator_policy(self, scratch_dir: Path) -> None:
         from elspeth.web.catalog.policy_view import PolicyCatalogView
         from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -254,7 +458,7 @@ class TestDispatchTool:
         )
         assert result["success"] is True
 
-    def test_set_source_mutates_state(self, scratch_dir: Path) -> None:
+    def test_set_source_path_without_session_identity_fails_closed(self, scratch_dir: Path) -> None:
         # set_source is promoted to a type-driven manifest entry
         # (SetSourceArgumentsModel) with extra="forbid" — the LLM-supplied
         # argument set MUST include all four required fields.  Prior to
@@ -272,8 +476,9 @@ class TestDispatchTool:
             _mock_catalog(),
             scratch_dir,
         )
-        assert result["success"] is True
-        assert result["state"]["sources"]["source"]["plugin"] == "csv"
+        assert result["success"] is False
+        assert "Path violation (S2)" in result["data"]["error"]
+        assert "data_dir" in result["data"]["error"]
 
     def test_set_output_requires_explicit_collision_policy(self, scratch_dir: Path) -> None:
         result = _dispatch_tool(
@@ -380,17 +585,21 @@ class TestDispatchTool:
         assert "collision_policy" in result["error"]
 
     def test_new_session_returns_session_id(self, scratch_dir: Path) -> None:
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
         result = _dispatch_tool(
             "new_session",
             {},
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         assert result["success"] is True
         assert "session_id" in result["data"]
 
     def test_save_and_load_round_trip(self, scratch_dir: Path) -> None:
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
         # Create a session first
         new_result = _dispatch_tool(
             "new_session",
@@ -398,19 +607,16 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         session_id = new_result["data"]["session_id"]
 
-        # Modify state via set_source.  All four required fields per
-        # SetSourceArgumentsModel (extra="forbid").
+        # Modify state with a path-free composer tool. Raw local source paths
+        # are intentionally unavailable to this unscoped direct dispatcher.
         modified = _dispatch_tool(
-            "set_source",
-            {
-                "plugin": "csv",
-                "on_success": "node_1",
-                "options": {"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
-                "on_validation_failure": "discard",
-            },
+            "set_metadata",
+            {"patch": {"name": "Round Trip"}},
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
@@ -424,6 +630,8 @@ class TestDispatchTool:
             modified_state,
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         assert save_result["success"] is True
 
@@ -434,13 +642,16 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
         assert load_result["success"] is True
-        assert load_result["state"]["sources"]["source"]["plugin"] == "csv"
+        assert load_result["state"]["metadata"]["name"] == "Round Trip"
 
     def test_delete_missing_session_before_scratch_exists_returns_not_found(self, tmp_path: Path) -> None:
         scratch_dir = tmp_path / "scratch"
         session_id = "0" * 12
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
 
         result = _dispatch_tool(
             "delete_session",
@@ -448,6 +659,8 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            session_manager=session_manager,
+            session_checkout_ref=session_checkout_ref,
         )
 
         assert result["success"] is False
@@ -455,11 +668,10 @@ class TestDispatchTool:
         assert result["state"] == _empty_state().to_dict()
 
     def test_generate_yaml_returns_string_for_valid_state(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _valid_state_with_no_edge_contracts(),
-            _mock_catalog(),
             scratch_dir,
         )
         assert result["success"] is True
@@ -515,7 +727,7 @@ class TestDispatchTool:
             version=1,
         )
 
-        result = _dispatch_tool("generate_yaml", {}, state, _mock_catalog(), scratch_dir)
+        result = _dispatch_session_once("generate_yaml", {}, state, scratch_dir)
 
         assert result["success"] is True
         assert yaml.safe_load(result["data"])["transforms"][0]["options"]["profile"] == "operator-owned-alias"
@@ -532,7 +744,7 @@ class TestDispatchTool:
                     "mode": "bind_source",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             ),
             nodes=(),
             edges=(),
@@ -553,11 +765,10 @@ class TestDispatchTool:
             version=1,
         )
 
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             state,
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -568,6 +779,151 @@ class TestDispatchTool:
         assert "blob_ref" not in options
         assert "mode" not in options
         assert options["schema"] == {"mode": "observed"}
+
+    def test_generate_yaml_projects_adjacent_state_through_public_boundary(self, scratch_dir: Path) -> None:
+        """The MCP result's adjacent state must be as public as its YAML data."""
+        private_values = {
+            "/private/blob-backed.csv",
+            "/private/explicit-null.csv",
+            "/private/path-only.csv",
+            "/private/nested.csv",
+            "/private/source-index",
+            "/private/vector-index",
+            "/private/node-input.csv",
+            "/private/blob-output.csv",
+            "/private/null-output.csv",
+            "/private/output.csv",
+            "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+            "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+            "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+        }
+        state = CompositionState(
+            sources={
+                "blob_backed": SourceSpec(
+                    plugin="csv",
+                    on_success="blob_out",
+                    options={
+                        "path": "/private/blob-backed.csv",
+                        "blob_ref": "98b1357d-5aab-4fb3-85b4-5ad643912e84",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "explicit_null": SourceSpec(
+                    plugin="csv",
+                    on_success="null_out",
+                    options={
+                        "path": "/private/explicit-null.csv",
+                        "blob_ref": None,
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "path_only": SourceSpec(
+                    plugin="csv",
+                    on_success="pass_in",
+                    options={
+                        "file": "/private/path-only.csv",
+                        SOURCE_AUTHORING_KEY: {
+                            "path": "/private/nested.csv",
+                            "blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "custody": {
+                            "persist_directory": "/private/source-index",
+                            "blob_id": "30b944e3-fd46-434f-b9a2-4fb508db30f0",
+                        },
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+            },
+            nodes=(
+                NodeSpec(
+                    id="pass",
+                    node_type="transform",
+                    plugin="llm",
+                    input="pass_in",
+                    on_success="main",
+                    on_error="discard",
+                    options={
+                        "profile": "operator-owned-alias",
+                        "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
+                        "lookup": {
+                            "path": "north",
+                            "file": "case.txt",
+                            "mode": "bind_source",
+                            "safe": "kept",
+                        },
+                        "provider_config": {
+                            "persist_directory": "/private/vector-index",
+                            "nested": {"path": "/private/node-input.csv"},
+                        },
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="blob_out",
+                    plugin="csv",
+                    options={
+                        "path": "/private/blob-output.csv",
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="null_out",
+                    plugin="csv",
+                    options={
+                        "path": "/private/null-output.csv",
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="main",
+                    plugin="csv",
+                    options={
+                        "path": "/private/output.csv",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = _dispatch_session_once("generate_yaml", {}, state, scratch_dir)
+        serialized = yaml.safe_dump(result)
+
+        assert result["success"] is True, result
+        assert all(value not in serialized for value in private_values)
+        assert "blob_ref" not in serialized
+        assert "blob_id" not in serialized
+        assert SOURCE_AUTHORING_KEY not in serialized
+        assert set(result["state"]["sources"]) == {"blob_backed", "explicit_null", "path_only"}
+        assert all(source["plugin"] == "csv" for source in result["state"]["sources"].values())
+        expected_lookup = {
+            "path": "north",
+            "file": "case.txt",
+            "mode": "bind_source",
+            "safe": "kept",
+        }
+        assert result["state"]["nodes"][0]["options"]["lookup"] == expected_lookup
+        assert yaml.safe_load(result["data"])["transforms"][0]["options"]["lookup"] == expected_lookup
 
     def test_generate_yaml_rejects_state_missing_file_sink_collision_policy(self, scratch_dir: Path) -> None:
         state = CompositionState(
@@ -591,11 +947,10 @@ class TestDispatchTool:
             version=1,
         )
 
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             state,
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -603,11 +958,10 @@ class TestDispatchTool:
         assert "collision_policy" in result["error"]
 
     def test_generate_yaml_rejects_invalid_contract_state(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _invalid_contract_state(),
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -627,11 +981,10 @@ class TestDispatchTool:
         ]
 
     def test_generate_yaml_allows_valid_state_with_no_edge_contracts(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _valid_state_with_no_edge_contracts(),
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -639,11 +992,10 @@ class TestDispatchTool:
         assert isinstance(result["data"], str)
 
     def test_generate_yaml_allows_connection_valid_state_without_ui_edges(self, scratch_dir: Path) -> None:
-        result = _dispatch_tool(
+        result = _dispatch_session_once(
             "generate_yaml",
             {},
             _connection_valid_field_mapper_state_without_edges(),
-            _mock_catalog(),
             scratch_dir,
         )
 
@@ -824,3 +1176,182 @@ class TestQueueExposure:
         )
         assert result["success"] is False
         assert result["state"] == state.to_dict()
+
+
+class TestRowUnionExposure:
+    def test_tools_list_uses_generic_upsert_for_row_union(self) -> None:
+        definitions = _build_tool_defs()
+        assert all(tool["name"] != "upsert_row_union" for tool in definitions)
+        upsert = next(tool for tool in definitions if tool["name"] == "upsert_node")
+        assert "row_union" in upsert["parameters"]["properties"]["node_type"]["enum"]
+        assert upsert["parameters"]["properties"]["timeout_seconds"]["exclusiveMinimum"] == 0
+
+
+_STDIO_SOURCE_ARGS = {
+    "plugin": "null",
+    "on_success": "main",
+    "options": {"schema": {"mode": "observed"}},
+    "on_validation_failure": "discard",
+}
+
+
+def _stdio_output_args(path: str) -> dict[str, Any]:
+    return {
+        "sink_name": "main",
+        "plugin": "csv",
+        "options": {
+            "path": path,
+            "schema": {"mode": "observed"},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        },
+        "on_write_failure": "discard",
+    }
+
+
+class TestStdioServerConstruction:
+    """The construction ``run_server`` actually uses must run stage 2.
+
+    These drive ``_build_stdio_server`` rather than a parallel test-only
+    wiring: if the runtime preflight is ever dropped from the stdio
+    construction again, ``runtime_preflight`` comes back null here.
+    """
+
+    @pytest.fixture()
+    def data_dir(self, tmp_path: Path) -> Path:
+        d = tmp_path / "data"
+        d.mkdir()
+        return d
+
+    async def _preview_with_sink_path(self, tmp_path: Path, data_dir: Path, label: str, path: str) -> dict[str, Any]:
+        from elspeth.web.dependencies import create_catalog_service
+
+        scratch = tmp_path / f"scratch-{label}"
+        scratch.mkdir()
+        server = _build_stdio_server(create_catalog_service(), scratch, data_dir)
+        handlers = server.request_handlers
+        for tool, arguments in (("set_source", _STDIO_SOURCE_ARGS), ("set_output", _stdio_output_args(path))):
+            mutated = await _call_handler(handlers, tool, arguments)  # type: ignore[misc]
+            assert json.loads(mutated.root.content[0].text)["success"] is True, f"{tool} failed"
+        preview = await _call_handler(handlers, "preview_pipeline", {})  # type: ignore[misc]
+        payload = json.loads(preview.root.content[0].text)
+        assert payload["success"] is True
+        # The whole envelope: ``runtime_preflight`` is an envelope field, not
+        # a key under ``data`` (elspeth-e405ad7cd2, F9).
+        assert "runtime_preflight" not in payload["data"]
+        return payload
+
+    @pytest.mark.asyncio
+    async def test_stdio_construction_publishes_valid_pipeline_with_runtime_preflight(
+        self,
+        tmp_path: Path,
+        data_dir: Path,
+    ) -> None:
+        """Green control: the stdio data_dir wiring must not reject legitimate pipelines."""
+        envelope = await self._preview_with_sink_path(tmp_path, data_dir, "green", "outputs/out.csv")
+
+        preflight = envelope.get("runtime_preflight")
+        assert preflight is not None, "stage 2 never ran — the stdio construction dropped the preflight"
+        assert preflight["is_valid"] is True
+        assert envelope["data"]["preview_is_valid"] is True
+        # The costly checks are asserted present-and-passed rather than
+        # inferred from an absence of failures: a stub preflight returning an
+        # empty check list would otherwise satisfy every assertion above.
+        passed = {check["name"] for check in preflight["checks"] if check["passed"]}
+        assert {"path_allowlist", "plugin_instantiation", "graph_structure", "schema_compatibility"} <= passed
+
+    @pytest.mark.asyncio
+    async def test_stdio_runtime_preflight_uses_bounded_worker_pool(
+        self,
+        tmp_path: Path,
+        data_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Stdio preflight must not bypass the bounded sync-worker bridge."""
+        from elspeth.composer_mcp import server as server_module
+
+        calls: list[Any] = []
+
+        async def recording_worker(func: Any, *args: object, **kwargs: object) -> Any:
+            calls.append(func)
+            return func(*args, **kwargs)
+
+        async def reject_default_executor(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("stdio runtime preflight bypassed run_sync_in_worker")
+
+        monkeypatch.setattr(server_module, "run_sync_in_worker", recording_worker)
+        monkeypatch.setattr(asyncio, "to_thread", reject_default_executor)
+
+        envelope = await self._preview_with_sink_path(tmp_path, data_dir, "bounded-worker", "outputs/out.csv")
+
+        assert calls == [server_module.validate_pipeline]
+        assert envelope["runtime_preflight"]["is_valid"] is True
+
+    @pytest.mark.parametrize(
+        ("label", "sink_path"),
+        [("traversal", "outputs/../../evil.csv"), ("absolute", "/etc/elspeth-evil.csv")],
+    )
+    @pytest.mark.asyncio
+    async def test_stdio_construction_publishes_runtime_rejection(
+        self,
+        tmp_path: Path,
+        data_dir: Path,
+        label: str,
+        sink_path: str,
+    ) -> None:
+        """Escaping data_dir must flip the published verdict — the security-not-weakened pin.
+
+        The synthetic session id scopes paths; it must not admit them. Both
+        escape forms have to stay rejected under it.
+        """
+        # Stage 1 accepts these paths; only the runtime allowlist rejects them.
+        envelope = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
+
+        assert envelope["validation"]["is_valid"] is True
+        preflight = envelope.get("runtime_preflight")
+        assert preflight is not None
+        assert preflight["is_valid"] is False
+        # Named, because a sink path resolving outside data_dir is not
+        # automatically a rejection — ``resolve_sink_data_path`` adopts a
+        # non-UUID second segment under the caller's own outputs directory,
+        # so ``outputs/deadbeef1234/x.csv`` validates TRUE. A verdict-only
+        # assertion here would pass for the wrong reason.
+        assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
+        assert envelope["data"]["preview_is_valid"] is False
+
+    def test_create_server_requires_an_explicit_runtime_preflight(self, tmp_path: Path) -> None:
+        """Re-adding the silent default is itself the mutation being caught."""
+        import elspeth.composer_mcp as composer_mcp_package
+
+        with pytest.raises(TypeError):
+            create_server(_mock_catalog(), tmp_path)  # type: ignore[call-arg]
+        # The package re-export forwards *args/**kwargs; the guard must not be
+        # laundered by the passthrough.
+        with pytest.raises(TypeError):
+            composer_mcp_package.create_server(_mock_catalog(), tmp_path)
+
+    def _main_run_server_args(self, monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[tuple[Path, Path]]:
+        from elspeth.composer_mcp import server as server_module
+
+        received: list[tuple[Path, Path]] = []
+
+        async def capture_run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> None:
+            received.append((scratch_dir, data_dir))
+
+        monkeypatch.setattr(server_module, "run_server", capture_run_server)
+        monkeypatch.setattr(server_module, "_install_parent_death_signal_workaround", lambda: None)
+        monkeypatch.setattr("elspeth.web.dependencies.create_catalog_service", _mock_catalog)
+        monkeypatch.setattr("sys.argv", ["elspeth-composer", *argv])
+        server_module.main()
+        return received
+
+    def test_main_threads_data_dir_into_run_server(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--data-dir must reach the preflight, not merely be parsed."""
+        received = self._main_run_server_args(monkeypatch, ["--scratch-dir", str(tmp_path / "s"), "--data-dir", str(tmp_path / "d")])
+
+        assert received == [(tmp_path / "s", tmp_path / "d")]
+
+    def test_main_defaults_data_dir_to_web_parity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        received = self._main_run_server_args(monkeypatch, [])
+
+        assert [data_dir for _scratch, data_dir in received] == [Path("data")]

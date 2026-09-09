@@ -22,17 +22,39 @@ from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.node_state_context import AggregationBatchContext
+from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+    from elspeth.contracts.token_usage import TokenUsage
 
 logger = logging.getLogger(__name__)
+
+
+@observation_boundary(
+    tier=3,
+    source="optional usage metadata in the external LLM response supplied by a plugin, before audit read-back",
+    source_param="response_data",
+    suppresses=("R1",),
+    invariant=(
+        "Missing or malformed usage is observed as unknown by TokenUsage.from_dict; "
+        "returns None when no valid usage field exists, preserving partial known counts without inventing zero counts. "
+        "The caller records the original response independently; this helper only projects telemetry metadata."
+    ),
+)
+def _observed_response_token_usage(response_data: Mapping[str, object]) -> TokenUsage | None:
+    """Project optional provider usage independently of audit recording."""
+    from elspeth.contracts.token_usage import TokenUsage
+
+    usage = TokenUsage.from_dict(response_data.get("usage"))
+    return usage if usage.has_data else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +108,10 @@ class PluginContext:
 
     # === Audit & Infrastructure ===
     landscape: PluginAuditWriter | None = None
+    # The run's current leader token, carried BY VALUE from the executor that
+    # built this context (ADR-048 §3). A plugin never constructs one; a
+    # context without one cannot write to the Landscape.
+    coordination_token: CoordinationToken | None = None
     payload_store: PayloadStore | None = None
     rate_limit_registry: RateLimitRegistryProtocol | None = None
     concurrency_config: RuntimeConcurrencyConfig | None = None
@@ -159,6 +185,7 @@ class PluginContext:
         state_id: str | None = None,
         operation_id: str | None = None,
         telemetry_emit: Callable[[Any], None] | None = None,
+        coordination_token: CoordinationToken | None = None,
         _pending_quarantine_validation_errors: list[tuple[str, str]] | None = None,
         _config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -175,6 +202,7 @@ class PluginContext:
         # config must be immutable for audit integrity.
         self._config = deep_freeze(raw_config)
         self.landscape = landscape
+        self.coordination_token = coordination_token
         self.payload_store = payload_store
         self.rate_limit_registry = rate_limit_registry
         self.concurrency_config = concurrency_config
@@ -214,7 +242,42 @@ class PluginContext:
             state_id=self.state_id,
             operation_id=self.operation_id,
             telemetry_emit=self.telemetry_emit,
+            coordination_token=self.coordination_token,
             _pending_quarantine_validation_errors=self._pending_quarantine_validation_errors,
+        )
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+    ) -> None:
+        """Record a provider readiness check under the run's leader token (ADR-048 §3).
+
+        The token is forwarded by value from the executor that built this
+        context; a context without one cannot write, and that is the intended
+        failure mode — never a silently skipped audit row.
+        """
+        from elspeth.contracts import FrameworkBugError
+
+        if self.landscape is None or self.coordination_token is None:
+            raise FrameworkBugError(
+                f"record_readiness_check() called without landscape or leader token. "
+                f"Context state: run_id={self.run_id}, node_id={self.node_id}, "
+                f"landscape={'set' if self.landscape is not None else 'None'}, "
+                f"coordination_token={'set' if self.coordination_token is not None else 'None'}. "
+                f"This is a framework bug — the executor must inject both before plugin on_start()."
+            )
+        self.landscape.record_readiness_check(
+            name=name,
+            collection=collection,
+            reachable=reachable,
+            count=count,
+            message=message,
+            coordination_token=self.coordination_token,
         )
 
     @staticmethod
@@ -374,16 +437,11 @@ class PluginContext:
             response_snapshot = response_data
 
             # Extract token usage for LLM calls if available.
-            # raw_usage is external (Tier 3) optional metadata; TokenUsage.from_dict
-            # is the boundary validator — it accepts Any, returns unknown() (has_data
-            # False) for non-Mapping / missing input, so no pre-guard is needed here.
+            # Keep external metadata observation separate from the audit-writing
+            # method: the response remains untrusted even after recording it.
             token_usage = None
             if call_type == CallTypeEnum.LLM and response_snapshot is not None:
-                from elspeth.contracts.token_usage import TokenUsage
-
-                raw_usage = response_snapshot.get("usage")
-                tu = TokenUsage.from_dict(raw_usage)
-                token_usage = tu if tu.has_data else None
+                token_usage = _observed_response_token_usage(response_snapshot)
 
             # Wrap data in RawCallPayload for typed telemetry payload.
             # RawCallPayload.__init__ calls deep_freeze(), creating an independent
@@ -429,6 +487,31 @@ class PluginContext:
 
         return recorded_call
 
+    @observation_boundary(
+        tier=3,
+        source=(
+            "the row that failed source validation — external file/API content ELSPETH does not own, "
+            "explicitly not required to be a dict (a JSON array of primitives quarantines its "
+            "elements here) and not required to be canonically serializable"
+        ),
+        source_param="row",
+        suppresses=("R5",),
+        invariant=(
+            "never raises on the row: a Mapping carrying 'id' yields that id, anything else is "
+            "identified by its canonical hash, and a row that canonical_json rejects (NaN, Infinity, "
+            "a non-serializable object) falls back to a repr() hash so the quarantine still gets an "
+            "audit row. Recording what was actually seen outranks recording it canonically — the "
+            "only failures this method raises on are missing node_id/landscape, which are framework "
+            "bugs in the caller, not properties of the row. The landscape writer this delegates to "
+            "is non-raising on the same input class by construction: "
+            "core/landscape/data_flow/errors.py::record_validation_error routes row_data through "
+            "canonical_or_recorded_hash / canonical_or_recorded_json, which return an explicit "
+            "repr/NonCanonicalMetadata fallback rather than propagating. Pinned end-to-end against a "
+            "real recorder by tests/unit/contracts/test_plugin_context_recording.py::"
+            "TestRecordValidationErrorHappyPath::"
+            "test_non_canonical_row_does_not_leak_row_content_to_logger"
+        ),
+    )
     def record_validation_error(
         self,
         row: Any,
@@ -594,25 +677,43 @@ def plugin_context_scope(
     scoped so state/token/contract attribution cannot leak into the next plugin
     call on the same context.
     """
-    updates = {
-        "node_id": node_id,
-        "token": token,
-        "batch_token_ids": batch_token_ids,
-        "aggregation_batch": aggregation_batch,
-        "contract": contract,
-        "state_id": state_id,
-        "operation_id": operation_id,
-    }
-    previous: dict[str, object] = {}
+    previous_node_id = ctx.node_id
+    previous_token = ctx.token
+    previous_batch_token_ids = ctx.batch_token_ids
+    previous_aggregation_batch = ctx.aggregation_batch
+    previous_contract = ctx.contract
+    previous_state_id = ctx.state_id
+    previous_operation_id = ctx.operation_id
 
-    for name, value in updates.items():
-        if value is _CONTEXT_SCOPE_UNSET:
-            continue
-        previous[name] = getattr(ctx, name)
-        setattr(ctx, name, value)
+    if not isinstance(node_id, _ContextScopeUnset):
+        ctx.node_id = node_id
+    if not isinstance(token, _ContextScopeUnset):
+        ctx.token = token
+    if not isinstance(batch_token_ids, _ContextScopeUnset):
+        ctx.batch_token_ids = batch_token_ids
+    if not isinstance(aggregation_batch, _ContextScopeUnset):
+        ctx.aggregation_batch = aggregation_batch
+    if not isinstance(contract, _ContextScopeUnset):
+        ctx.contract = contract
+    if not isinstance(state_id, _ContextScopeUnset):
+        ctx.state_id = state_id
+    if not isinstance(operation_id, _ContextScopeUnset):
+        ctx.operation_id = operation_id
 
     try:
         yield ctx
     finally:
-        for name, previous_value in previous.items():
-            setattr(ctx, name, previous_value)
+        if not isinstance(node_id, _ContextScopeUnset):
+            ctx.node_id = previous_node_id
+        if not isinstance(token, _ContextScopeUnset):
+            ctx.token = previous_token
+        if not isinstance(batch_token_ids, _ContextScopeUnset):
+            ctx.batch_token_ids = previous_batch_token_ids
+        if not isinstance(aggregation_batch, _ContextScopeUnset):
+            ctx.aggregation_batch = previous_aggregation_batch
+        if not isinstance(contract, _ContextScopeUnset):
+            ctx.contract = previous_contract
+        if not isinstance(state_id, _ContextScopeUnset):
+            ctx.state_id = previous_state_id
+        if not isinstance(operation_id, _ContextScopeUnset):
+            ctx.operation_id = previous_operation_id

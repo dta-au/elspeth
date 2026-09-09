@@ -1,11 +1,11 @@
 # What ELSPETH Guarantees
 
 > **LAYERED ASSURANCE APPENDIX — RC-3 contract language with RC-5.2, RC-6, and AWS ECS context.**
-> §1 through §6 preserve the RC-3 guarantees as originally drafted (3 March 2026) because downstream engineering and audit references cite that wording. §7 has been amended to reflect that the **no-multi-user / no-access-control** disclaimer is no longer true as of RC-4 and RC-5. §11 through §14 document RC-5.2 guarantees for authentication, secret references, multi-user sessions, and composer authoring. §15 documents RC-6 guarantees for multi-source execution and durable token scheduling; §7.1's "single-threaded in RC-3" statement is amended to scope it to RC-3 history. §16 adds the 0.7.1 AWS ECS operator-telemetry authority and outage boundary. Read this as a versioned assurance appendix, not as marketing copy.
+> §1 through §6 preserve the RC-3 guarantees as originally drafted (3 March 2026) because downstream engineering and audit references cite that wording. §7 has been amended to reflect that the **no-multi-user / no-access-control** disclaimer is no longer true as of RC-4 and RC-5. §11 through §14 document RC-5.2 guarantees for authentication, secret references, multi-user sessions, and composer authoring. §15 documents RC-6 guarantees for multi-source execution and durable token scheduling; §7.1's "single-threaded in RC-3" statement is amended to scope it to RC-3 history. §16 adds the 0.7.1 AWS ECS operator-telemetry authority and outage boundary. §1.2, §11 and §13 carry 0.8.0 amendments covering the two-axis terminal model, the five-provider identity surface, and the session principal key. Read this as a versioned assurance appendix, not as marketing copy.
 
-**Versions:** RC-3 (§1–§10) + RC-5.2 additions (§11–§14) + RC-6 additions (§15) + AWS ECS operator telemetry (§16) + 0.7.0 context
+**Versions:** RC-3 (§1–§10) + RC-5.2 additions (§11–§14) + RC-6 additions (§15) + AWS ECS operator telemetry (§16) + 0.7.0 context + 0.8.0 amendments (§1.2, §11, §13)
 **Original date:** 3 March 2026 (§1–§10)
-**Refreshed:** 19 May 2026 (§7 amendment; §11–§14 additions); 10 June 2026 (§7.1 amendment; §15 addition); 8 July 2026 (0.7.0 context refresh); 13 July 2026 (§16 addition)
+**Refreshed:** 19 May 2026 (§7 amendment; §11–§14 additions); 10 June 2026 (§7.1 amendment; §15 addition); 8 July 2026 (0.7.0 context refresh); 13 July 2026 (§16 addition); 7 September 2026 (§11 amendment); 8 September 2026 (§1.2 amendment; §13.1, §10 and §4.2 corrections)
 **Audience:** Users, integrators, auditors, and assurance staff evaluating contractual claims
 **Register:** Technical / contractual
 
@@ -16,7 +16,7 @@ This document defines the promises ELSPETH makes to its users and to anyone eval
 This document is **not** a roadmap, a feature list, or a marketing surface. For
 the inventory of what has shipped, see the root [`CHANGELOG.md`](../../CHANGELOG.md).
 For the high-level capability and assurance posture, see
-[`executive-summary.md`](executive-summary.md).
+the [project overview](../../README.md).
 
 ---
 
@@ -68,6 +68,28 @@ This is not optional. This is not best-effort. This is the reason ELSPETH exists
 | EXPANDED | Parent token for deaggregation (1→N expansion) |
 
 **What this means:** You will never ask "what happened to row 42?" and get silence. The system recorded what happened.
+
+> **§1.2 amendment (0.8.0, 8 September 2026):** the outcome names above remain
+> accurate as a description of the RC-3 outcome vocabulary. As of ADR-019
+> (accepted 4 May 2026) the recorded outcome is a two-axis value, and
+> `explain()` returns it as a `TokenOutcome` rather than a string. The
+> **lifecycle** axis `TerminalOutcome` has three values — `success`, `failure`
+> and `transient`. The **provenance** axis `TerminalPath` has sixteen —
+> `default_flow`, `gate_routed`, `gate_discarded`, `gate_error_discarded`,
+> `on_error_routed`, `filter_dropped`, `coalesced`, `unrouted`,
+> `quarantined_at_source`, `sink_fallback_to_failsink`, `sink_discarded`,
+> `fork_parent`, `expand_parent`, `batch_consumed`, `buffered` and `abandoned`
+> (`src/elspeth/contracts/enums.py`). A row's outcome is the legal
+> `(outcome, path)` pair; `buffered` and `abandoned` are the two non-terminal
+> paths and pair with `outcome IS NULL` and `completed=False`.
+>
+> That last distinction is what this promise turns on. `buffered` means the row
+> has not decided yet and still may; `abandoned` (ADR-038, accepted 6 August
+> 2026 and shipped in 0.8.0) means the row never decided and never will,
+> because its run terminated in a state no resume can recover. An abandoned row
+> is still a recorded outcome, written by run finalization — so the promise
+> above holds, and a reader can tell an abandoned row from a still-buffered one
+> rather than finding silence at both.
 
 ### 1.3 Hash Integrity
 
@@ -189,7 +211,7 @@ When a row forks to parallel paths:
 **Promise:** Rate limits are respected (when configured).
 
 LLM plugins include built-in rate limiting:
-- Configurable requests per second
+- Configurable requests per minute (`rate_limit.default_requests_per_minute`, with per-service overrides under `rate_limit.services`)
 - Automatic backoff on 429 responses
 - No silent failures from rate exhaustion
 
@@ -278,10 +300,12 @@ ELSPETH records what external systems return, but cannot guarantee:
 
 Aggregation timeout triggers are polled while source iteration waits, so buffered
 aggregation batches can flush during complete source idle periods without
-requiring heartbeat rows. The same idle-polling pass also checks coalesce
-timeouts in mixed aggregation/coalesce pipelines. Coalesce-only streaming
-pipelines still depend on token arrival, source completion, or heartbeat rows;
-coalesce timeouts are not general background timers.
+requiring heartbeat rows. The same idle-polling pass checks coalesce timeouts,
+and a configured coalesce timeout alone enables source-idle polling. A
+coalesce-only streaming pipeline can therefore resolve pending groups while
+waiting for the next source row without heartbeat rows or source completion.
+These checks run while source iteration is waiting rather than as an always-on
+background timer.
 
 ---
 
@@ -306,6 +330,7 @@ This contract is versioned with the software.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 0.8.0 (§1.2, §11, §13 amendments) | September 2026 | §1.2 amended — the RC-3 outcome vocabulary is superseded by the ADR-019 two-axis terminal model (three `TerminalOutcome` values, sixteen `TerminalPath` values); ADR-038 adds the non-terminal `abandoned` path in this release. §11 amended — five authentication providers, not three; the bearer access-token path is deleted in favour of ID-token verification against the discovered issuer and JWKS; identity administration is gated on an active deployment-wide `admin` role and token issuance on an `active` access state. §13.1 amended — the principal identifier is an `identities.identity_id` and the no-local-users-table justification for declaring no foreign key is retired. §10 and §4.2 corrected to the shipped interfaces. |
 | 0.7.1 (§16 addition) | July 2026 | AWS ECS operator telemetry keeps Landscape authoritative, fixes web OTLP routing to the task-local collector, restricts dimensions, and makes collector loss observable but best effort. |
 | RC-6 (§15 addition) | June 2026 | §15 Multi-source execution and token scheduling guarantees. §7.1 amended — "single-threaded in RC-3" scoped to RC-3 history; current concurrency posture (single leader plus claim-only follower workers per ADR-030, overlapping token lifecycles, sequential cross-source ingest) stated explicitly. |
 | RC-5.2 (§11–§14 additions) | May 2026 | §11 Authentication and identity guarantees; §12 Secret-reference handling; §13 Multi-user session; §14 Composer authoring. §7.2 amended — "ELSPETH is not multi-user" disclaimer no longer accurate; replaced with organisational-policy boundary statement. |
@@ -324,12 +349,14 @@ Future versions may:
 The ultimate test of ELSPETH's contract:
 
 ```python
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape import explain
 from elspeth.core.landscape.factory import RecorderFactory
 
 def test_attributability(factory: RecorderFactory, run_id: str, token_id: str):
     """Given any output, prove complete lineage to source."""
     lineage = explain(factory.query, factory.data_flow, run_id, token_id=token_id)
+    assert lineage is not None
 
     # Source exists
     assert lineage.source_row is not None
@@ -342,13 +369,18 @@ def test_attributability(factory: RecorderFactory, run_id: str, token_id: str):
         if state.status == "completed":
             assert state.output_hash is not None
 
-    # Terminal state recorded
+    # Terminal state recorded, on both axes of the ADR-019 terminal model
     assert lineage.outcome is not None
-    assert lineage.outcome in [
-        "COMPLETED", "ROUTED", "FORKED",
-        "CONSUMED_IN_BATCH", "COALESCED",
-        "QUARANTINED", "FAILED", "EXPANDED"
-    ]
+    if lineage.outcome.completed:
+        assert lineage.outcome.outcome in (
+            TerminalOutcome.SUCCESS,
+            TerminalOutcome.FAILURE,
+            TerminalOutcome.TRANSIENT,
+        )
+    else:
+        # The two non-terminal paths pair with a NULL outcome.
+        assert lineage.outcome.outcome is None
+        assert lineage.outcome.path in (TerminalPath.BUFFERED, TerminalPath.ABANDONED)
 
     # Call linkage valid
     for call in lineage.calls:
@@ -361,15 +393,53 @@ If this test fails for any output that ELSPETH produced, the contract is broken.
 
 ## 11. AUTHENTICATION AND IDENTITY (RC-5.2)
 
+> **§11 amendment (0.8.0, 7 September 2026):** the RC-5.2 statements below
+> remain accurate as a description of the RC-5.2 identity surface. Three things
+> changed in 0.8.0 and govern instead.
+>
+> **§11.1 — five providers, not three.** `local`, `oidc`, `entra`, `vanguard`
+> and `google` (`src/elspeth/contracts/auth.py:10`). The two added profiles
+> validate on the same surface as `oidc` with their own issuer derivation.
+>
+> **§11.1 — the bearer access-token path is deleted.** The legacy browser path
+> that consumed an IdP access token as a credential was removed in the identity
+> sprint. ELSPETH now verifies the **ID token** against the discovered issuer
+> and JWKS; the access token is used once to call userinfo and is then dropped,
+> never validated as a credential and never stored. The `token_use=access`
+> binding and the Entra optional group-claim assertion described below no
+> longer exist — `IdTokenClaims` carries a closed field set and deliberately
+> does not read IdP group or role claims
+> (`src/elspeth/web/auth/claims.py:65-107`).
+>
+> **§11.4 — one authorisation decision is now enforced.** The boundary below
+> still holds for organisational policy, with one exception: identity
+> administration requires the caller to hold an active deployment-wide `admin`
+> role, checked against the store per request and re-proved inside every
+> mutation's transaction (`src/elspeth/web/auth/identity_admin_routes.py:318-330`).
+> Separately, token issuance is gated on access state: `active` is the only
+> state a token is issued to, `pending` and `disabled` are refused, and an
+> unrecognised state is a refusal rather than a pass
+> (`src/elspeth/web/auth/sso.py:1136-1150`). The remaining `IdentityRole`
+> values (`approver`, `reviewer`, `user`, `curator`, and the rest of the
+> seven-value vocabulary) are **recorded, not enforced** — no code path gates
+> on them. ELSPETH still does not enforce general organisational authorisation
+> policy.
+
 ### 11.1 Provider Coverage
 
-**Promise:** Three authentication providers are supported, each with its declared validation surface.
+**Promise:** Five authentication providers are supported, each with its declared validation surface.
 
 | Provider | Use case | Validation surface |
 |----------|----------|--------------------|
 | Local username/password | Development; air-gapped deployments | Per-deployment user database; bcrypt-hashed credentials |
-| OpenID Connect | Federated identity against a generic OIDC IdP or Cognito user pool | Exact issuer and JWKS verification; bearer access-token signature and required expiry; configured `aud` or Cognito `client_id`/`token_use=access` binding; authorization-code S256 PKCE and single-use state callback |
-| Microsoft Entra ID | Enterprise federation against Azure AD / Entra | All OIDC checks plus tenant ID validation; optional group-claim assertion |
+| OpenID Connect | Federated identity against a generic OIDC IdP or Cognito user pool | Exact issuer and JWKS verification; ID-token signature and required `exp`/`iat`/`iss`/`sub`/`aud` envelope; authorization-code S256 PKCE and single-use state callback |
+| Microsoft Entra ID | Enterprise federation against Azure AD / Entra | All OIDC checks plus tenant ID validation |
+| Vanguard | Federated identity against a Vanguard IdP profile | The `oidc` surface with its own issuer derivation |
+| Google | Federated identity against Google as IdP | The `oidc` surface with its own issuer derivation |
+
+The closed discriminator is `AuthProviderType` (`src/elspeth/contracts/auth.py:10`).
+Per the §11 amendment above, the bearer access-token path and the Entra
+optional group-claim assertion no longer exist.
 
 ### 11.2 Principal Recording
 
@@ -435,7 +505,7 @@ The HMAC fingerprint allows an auditor to verify that the same value was used ac
 
 - A session created by principal A is not visible to principal B
 - Preference state is keyed on the principal ID
-- The session database enforces the principal-key boundary at the schema level: `user_id` is `NOT NULL` and indexed on every session-scoped table. The principal identifier is treated as opaque (it originates from an external auth provider — Local, OIDC, or Entra) and is therefore not a foreign key into a local users table; the contract is integrity-by-not-null-plus-index, not by referential constraint to an internal users table.
+- The session database enforces the principal-key boundary at the schema level: `user_id` is `NOT NULL` and indexed on every session-scoped table. The principal identifier originates from an external auth provider (`local`, `oidc`, `entra`, `vanguard` or `google`) and is carried as an `identities.identity_id`. No foreign key is declared, but the reason is cost, not impossibility: as of 0.8.0 the session store creates the `identities` table on the same metadata, so an FK is available and is deferred because adding one is a table-shape change that must ride an epoch window already being paid for (`elspeth-2371269e07`). The contract today is integrity-by-not-null-plus-index, not by referential constraint.
 
 ### 13.2 Session State Is Persisted
 

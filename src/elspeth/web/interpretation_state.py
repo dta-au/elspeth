@@ -13,26 +13,51 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from difflib import get_close_matches
 from typing import Any, Final, Literal, NotRequired, TypedDict
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
-from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
+from elspeth.web.composer.source_demand import (
+    SOURCE_DATA_CONTRACT_USER_TERM,
+    backtraced_source_demand,
+    parse_source_data_contract_accepted_fields,
+    source_data_contract_artifact_hash,
+    source_data_contract_fields_for_demand_recompute,
+)
+
+# ``SOURCE_AUTHORING_KEY`` is re-exported in the explicit ``X as X`` form on
+# purpose. Six composer modules (service, pipeline_proposal,
+# reviewed_source_authority, tools/_common, tools/sources, tools/sessions)
+# source this key from the interpretation-state facade rather than from
+# composer.state; this module declares no ``__all__``, so under mypy's
+# no_implicit_reexport the plain import form makes every one of those imports
+# an attr-defined error (introduced by 3dc67fb1d).
+from elspeth.web.composer.state import (
+    SOURCE_AUTHORING_KEY as SOURCE_AUTHORING_KEY,
+)
+from elspeth.web.composer.state import (
+    CompositionState,
+    NodeSpec,
+    SourceSpec,
+    _coalesce_branch_connections,
+)
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
 )
 from elspeth.web.plugin_policy.coverage import (
     build_output_stream_graph as _output_stream_graph,
 )
-from elspeth.web.plugin_policy.coverage import node_has_blocking_control
+from elspeth.web.plugin_policy.coverage import node_has_blocking_control, node_has_capability
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 INTERPRETATION_REQUIREMENTS_KEY = "interpretation_requirements"
 PROMPT_TEMPLATE_PARTS_KEY = "prompt_template_parts"
-SOURCE_AUTHORING_KEY = "source_authoring"
 SOURCE_COMPONENT_ID = "source"
 INTERPRETATION_REVIEW_PENDING_CODE = "interpretation_review_pending"
 PENDING_INTERPRETATION_AUTHORING_TEXT = "pending interpretation"
@@ -46,6 +71,8 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
         "drop_raw_html_fields",
         "web_scrape_http_identity",
         "prompt_injection_shield_recommendation",
+        "required_control_auto_wired",
+        "gate_condition_authored",
     }
 )
 # Sink-neutral wording (pack pressure-suite run 2, G6): the old "JSON output"
@@ -54,20 +81,95 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
 RAW_HTML_CLEANUP_REVIEW_DRAFT: Final[str] = "Drop the scraped raw HTML and fingerprint fields before saving the output."
 WEB_SCRAPE_HTTP_IDENTITY_USER_TERM: Final[str] = "web_scrape_http_identity"
 PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
+# Acknowledgeable disclosure for a control node the server spliced into the
+# graph because deployment policy makes that control REQUIRED (R2-F10,
+# elspeth-f99655f540). The row rides on the INSERTED node, staged pending by
+# ``web.composer.required_controls.wire_required_controls``.
+REQUIRED_CONTROL_AUTO_WIRED_USER_TERM: Final[str] = "required_control_auto_wired"
+# Planner-authored gate semantics (elspeth-c2c35e52ae). The composer prompt
+# doctrine tells the planner to escalate a gate threshold, category literal, or
+# route direction it CHOSE ITSELF rather than carrying the user's stated value
+# verbatim. That instruction was inert until this term existed: an unregistered
+# term is rejected at ``validate_pipeline_decision_semantics`` and again at
+# ``pipeline_decision_artifact_hash``, so the doctrine routed the planner into a
+# card that could never be minted.
+#
+# Unlike the two plugin-bound terms above, a gate is a NODE TYPE and carries no
+# plugin at all (``NodeSpec.plugin`` is None for structural nodes), so this term
+# binds on ``node_type == "gate"``.
+GATE_CONDITION_AUTHORED_USER_TERM: Final[str] = "gate_condition_authored"
+
+# The public composer may author only these pipeline-decision rows.  The full
+# registry above also contains server-staged disclosures, so teaching that set
+# to the model would invite it to forge server authority.
+COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = REGISTERED_PIPELINE_DECISION_USER_TERMS - {
+    REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+}
+
+
+class ServerStagedRequiredControlUserTerm(str):
+    """Nominal in-process authority for a server-staged auto-wire disclosure.
+
+    Public composer payloads can carry only the ordinary string value. The
+    required-control finalizer uses this owned subtype while the candidate is
+    admitted; persisted canonical rows intentionally return to plain JSON
+    strings and use the existing internal-revalidation path thereafter.
+    """
+
+
+def composer_pipeline_decision_user_term_error(*, user_term: str, context: str) -> str | None:
+    """Return bounded repair guidance for a model-authored decision term.
+
+    The rejected value is Tier-3 text and is deliberately not reflected.  A
+    closest match is selected only from the closed public vocabulary, so the
+    repair remains actionable without leaking or teaching server-only terms.
+    """
+
+    normalized = user_term.strip()
+    if normalized in COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS:
+        return None
+    allowed = sorted(COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS)
+    closest = get_close_matches(normalized, allowed, n=1, cutoff=0.5)
+    closest_guidance = f"; closest registered term: {closest[0]!r}" if closest else ""
+    return (
+        f"{context}: pipeline_decision user_term is not registered for composer authoring. "
+        f"Available registered terms: {allowed}{closest_guidance}. Use one exactly, or remove the "
+        "pipeline_decision requirement and record a novel rationale in metadata.description."
+    )
+
+
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
-    "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
-    "between the external-content fetch step and this LLM. The current draft routes "
-    "internet-controlled text directly into the LLM without that shield, which is a prompt-injection "
-    "exposure on untrusted remote content, but continuing without it is allowed. "
-    "[user_term: prompt_injection_shield_recommendation]"
+    "Recommend inserting a prompt-injection shield transform "
+    "between the untrusted-content producer and this LLM. The current draft routes "
+    "untrusted or externally controlled upstream content directly into the LLM without that shield, "
+    "which is a prompt-injection exposure, but continuing without it is allowed. "
 )
 PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
-    "An authorized prompt-injection shield (azure_prompt_shield) IS available in "
-    "this deployment. Wire it between the external-content fetch step and this LLM: "
-    "untrusted remote text routed straight into the LLM is a prompt-injection "
-    "exposure, and the shield is configured and ready to use. Wiring it in is "
-    "strongly recommended, but you may proceed without it. "
-    "[user_term: prompt_injection_shield_recommendation]"
+    "An authorized prompt-injection shield IS available in this deployment. Wire "
+    "it between the untrusted-content producer and this LLM: untrusted or externally "
+    "controlled upstream content routed straight into the LLM is a prompt-injection exposure, and the "
+    "shield is configured and ready to use. Wiring it in is strongly recommended, "
+    "but you may proceed without it. "
+)
+# Provenance-honest siblings for an LLM with no declared untrusted-content
+# producer upstream. The constants above describe a declared producer; staged
+# verbatim onto an operator-supplied-data pipeline that claim would be false
+# for the graph. Every draft-choosing site therefore selects by the closed
+# ContentTrust declaration: untrusted producers present -> the constants
+# above; none -> these.
+PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT: Final[str] = (
+    "Recommend inserting a prompt-injection shield transform "
+    "in front of this LLM if its input data may carry adversarial text. This pipeline has no "
+    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
+    "exposure is limited to adversarial text already present in that data, and continuing "
+    "without a shield is allowed. "
+)
+PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
+    "An authorized prompt-injection shield IS available in this deployment. This pipeline has no "
+    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
+    "exposure is limited to adversarial text already present in that data. Wiring the shield in "
+    "front of this LLM is recommended if that data may carry adversarial text, and you may "
+    "proceed without it. "
 )
 
 _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerprint")
@@ -80,10 +182,23 @@ _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerpr
 # 18b4cee7, 2026-07-22).
 RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX: Final[str] = "Raw-html cleanup review draft is malformed"
 
-# Transform plugins whose output is externally-controlled remote content for
-# prompt-injection-defence purposes. web_scrape returns whatever the fetched
-# page served, which is by definition untrusted.
-_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape"})
+# A pending vague_term requirement with no resolvable prompt wiring stages a
+# review the operator can approve but never resolve: the resolver dead-ends
+# (or silent-drops) and the execution gate counts the requirement as pending
+# forever, blocking Run with no card offered. The review-staging tool rejects
+# this shape at its own boundary; ``set_pipeline`` and the other node-authoring
+# tools are second doors into the same state and enforce it via
+# :func:`composition_review_contract_error` (session 4c42a794, 2026-09-01).
+VAGUE_TERM_UNWIRED_PREFIX: Final[str] = "Pending vague_term review is not wired for resolution"
+
+# Honest-provenance sentinel prefix for interpretation event rows written by a
+# BACKEND surfacer (finalization PT auto-surface, kind-general settlement
+# surfacer, YAML-import surfacer) rather than an LLM tool call. Consumers use
+# it to tell server obligations apart from LLM surfacing invocations — e.g.
+# the interpretation rate-cap counters exclude backend-stamped rows because
+# the caps throttle LLM churn, never server-staged obligations
+# (elspeth-558fa5a321).
+BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX: Final[str] = "backend_auto_surface:"
 
 AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
     {
@@ -92,6 +207,41 @@ AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
         SOURCE_AUTHORING_KEY,
     }
 )
+
+# The requirement fields the per-turn planner context keeps when it reduces a
+# canonical row (elspeth-c67fbbbd83): enough to keep resolved/pending review
+# state legible without echoing resolver-owned linkage (event ids, accepted
+# values, artifact hashes) back to the provider. The echo-tolerant write gates
+# match a supplied row against this projection as well as against the full
+# stored row, so the two surfaces must share one field list.
+PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS: Final[tuple[str, ...]] = (
+    "id",
+    "kind",
+    "user_term",
+    "draft",
+    "status",
+)
+
+
+def project_planner_context_interpretation_requirement(requirement: Mapping[str, Any]) -> dict[str, Any]:
+    """Reduce one requirement row to its planner-context projection."""
+    return {field: deep_thaw(requirement[field]) for field in PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement}
+
+
+def source_component_id(source_name: str) -> str:
+    """Return the audit-visible component id for one composition source key."""
+    return SOURCE_COMPONENT_ID if source_name == SOURCE_COMPONENT_ID else f"{SOURCE_COMPONENT_ID}:{source_name}"
+
+
+def source_name_from_component_id(component_id: str) -> str | None:
+    """Resolve an audit-visible source component id back to its map key."""
+    if component_id == SOURCE_COMPONENT_ID:
+        return SOURCE_COMPONENT_ID
+    prefix = f"{SOURCE_COMPONENT_ID}:"
+    if component_id.startswith(prefix):
+        source_name = component_id.removeprefix(prefix)
+        return source_name or None
+    return None
 
 
 class InterpretationRequirement(TypedDict):
@@ -104,6 +254,47 @@ class InterpretationRequirement(TypedDict):
     accepted_value: str | None
     accepted_artifact_hash: str | None
     resolved_prompt_template_hash: str | None
+
+
+ResolvedReviewEvidenceField = Literal[
+    "accepted_artifact_hash",
+    "resolved_prompt_template_hash",
+]
+
+_ARTIFACT_BOUND_INTERPRETATION_KINDS: Final[frozenset[InterpretationKind]] = frozenset(
+    {
+        InterpretationKind.INVENTED_SOURCE,
+        InterpretationKind.PIPELINE_DECISION,
+        InterpretationKind.SOURCE_DATA_CONTRACT,
+    }
+)
+
+
+def resolved_review_evidence_field(kind: InterpretationKind) -> ResolvedReviewEvidenceField:
+    """Return the one hash field a resolved review kind must carry."""
+    if kind in _ARTIFACT_BOUND_INTERPRETATION_KINDS:
+        return "accepted_artifact_hash"
+    return "resolved_prompt_template_hash"
+
+
+def resolved_review_evidence_is_coherent(
+    requirement: InterpretationRequirement,
+    kind: InterpretationKind,
+) -> bool:
+    """Whether one resolved row carries the complete evidence for ``kind``."""
+    if requirement["status"] != "resolved":
+        return False
+    event_id = requirement["event_id"]
+    if type(event_id) is not str or not event_id.strip():
+        return False
+    if type(requirement["accepted_value"]) is not str:
+        return False
+    evidence_field = resolved_review_evidence_field(kind)
+    other_evidence_field: ResolvedReviewEvidenceField = (
+        "resolved_prompt_template_hash" if evidence_field == "accepted_artifact_hash" else "accepted_artifact_hash"
+    )
+    evidence = requirement[evidence_field]
+    return type(evidence) is str and bool(evidence.strip()) and requirement[other_evidence_field] is None
 
 
 class PromptTextPart(TypedDict):
@@ -153,17 +344,43 @@ def strip_authoring_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in options.items() if key not in AUTHORING_METADATA_OPTION_KEYS}
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options, an untyped Mapping[str, Any] persisted on the composer node and "
+    "round-tripped through sessions.db storage, a composer LLM tool call, or YAML import; condition/"
+    "routes are typed NodeSpec fields handled nominally, not through this boundary — see the docstring "
+    "note above the gate-condition arm",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises ValueError on every malformed field read from options across the web_scrape http "
+    "identity and raw-html-cleanup mapping arms; never substitutes a default for a present-but-malformed "
+    "field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_validate_pipeline_decision_semantics_rejects_malformed_http_mapping",
+    test_fingerprint="2a5d50996e14068729a406e3abc8872a5afc35ff8cff068a81a2e7cfca3e74ff",
+)
 def validate_pipeline_decision_semantics(
     *,
     node_id: str,
     plugin: str | None,
+    node_type: str,
     options: Mapping[str, Any],
+    condition: str | None,
+    routes: Mapping[str, str] | None,
     user_term: str,
     draft: str | None,
     context: str,
     web_scrape_raw_fields: frozenset[str],
 ) -> None:
-    """Validate that reviewed pipeline-shaping decisions match node behavior."""
+    """Validate that reviewed pipeline-shaping decisions match node behavior.
+
+    Every registered term needs a binding arm here. A registered term that
+    falls through validates on ANY node, which lets a misplaced row pass
+    ``set_pipeline`` and mint a card that only fails later at
+    ``pipeline_decision_artifact_hash`` — displacing the unresolvable-card wedge
+    downstream instead of preventing it. ``node_type``/``condition``/``routes``
+    are required rather than defaulted for the same reason: a caller that omits
+    the gate facts would silently skip the gate arm.
+    """
 
     normalized_term = user_term.strip()
     if normalized_term not in REGISTERED_PIPELINE_DECISION_USER_TERMS:
@@ -176,17 +393,40 @@ def validate_pipeline_decision_semantics(
             "be reviewed or resolved — drop the requirement and record the rationale in "
             "metadata.description, or use an llm_prompt_template review for prompt-shaped decisions."
         )
+    if _is_gate_condition_authored_decision(user_term=user_term):
+        if node_type != "gate":
+            raise ValueError(
+                f"{context}: authored gate-condition decision must be implemented by a gate node; "
+                f"node {node_id!r} has node_type {node_type!r}"
+            )
+        # There must be something to adjudicate. Composer Stage 1 already
+        # requires BOTH fields on every gate (``gate_missing_condition`` /
+        # ``gate_missing_routes``), so requiring them here cannot reject a gate
+        # the composer would otherwise accept — this arm is never stricter than
+        # the legality rules, it only refuses to pin an empty artifact.
+        #
+        # These are NOMINAL checks, not structural ones: ``condition`` and
+        # ``routes`` are typed fields of the owned ``NodeSpec`` dataclass, so
+        # ADR-032 says type them nominally. The sibling arms below reach for
+        # ``isinstance`` only because they parse ``options``, an untyped
+        # Tier-3 ``Mapping[str, Any]`` blob — a different trust domain.
+        if condition is None or not condition.strip():
+            raise ValueError(f"{context}: authored gate-condition decision requires a non-empty condition on gate {node_id!r}")
+        if routes is None:
+            raise ValueError(f"{context}: authored gate-condition decision requires a routes mapping on gate {node_id!r}")
+        return
+
     if _is_web_scrape_http_identity_decision(user_term=user_term):
         if plugin != "web_scrape":
             raise ValueError(
                 f"{context}: web-scrape HTTP identity decision must be implemented by a web_scrape node; "
                 f"node {node_id!r} has plugin {plugin!r}"
             )
-        http = options.get("http")
+        http = options["http"] if "http" in options else None
         if not isinstance(http, Mapping):
             raise ValueError(f"{context}: web-scrape HTTP identity decision requires options.http on node {node_id!r}")
         for field_name in ("abuse_contact", "scraping_reason"):
-            value = http.get(field_name)
+            value = http[field_name] if field_name in http else None
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{context}: web-scrape HTTP identity decision requires non-empty http.{field_name} on node {node_id!r}")
         return
@@ -197,9 +437,9 @@ def validate_pipeline_decision_semantics(
         raise ValueError(
             f"{context}: raw-html cleanup decision must be implemented by a field_mapper node; node {node_id!r} has plugin {plugin!r}"
         )
-    if options.get("select_only") is not True:
+    if "select_only" not in options or options["select_only"] is not True:
         raise ValueError(f"{context}: raw-html cleanup decision requires field_mapper.select_only=true on node {node_id!r}")
-    mapping = options.get("mapping")
+    mapping = options["mapping"] if "mapping" in options else None
     if not isinstance(mapping, Mapping) or not mapping:
         raise ValueError(f"{context}: raw-html cleanup decision requires a non-empty field_mapper.mapping on node {node_id!r}")
     preserved_raw_fields = sorted(
@@ -230,7 +470,10 @@ def validate_pipeline_decision_node_semantics(
     validate_pipeline_decision_semantics(
         node_id=node.id,
         plugin=node.plugin,
+        node_type=node.node_type,
         options=node.options,
+        condition=node.condition,
+        routes=node.routes,
         user_term=user_term,
         draft=draft,
         context=context,
@@ -238,6 +481,24 @@ def validate_pipeline_decision_node_semantics(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="CompositionState.nodes[].options['mapping'] / ['select_only'], untyped Mapping[str, Any] "
+    "entries persisted on composer nodes and round-tripped through sessions.db storage, a composer LLM "
+    "tool call, or YAML import; the state's own typed fields are nominal ELSPETH-owned data and are not "
+    "part of this boundary",
+    source_param="state",
+    suppresses=("R5",),
+    invariant="a node whose options['mapping'] is present but not a Mapping, or is empty, is skipped as "
+    "un-analysable rather than coerced to {} — so it can never be credited here with dropping a web-scrape "
+    "raw field. Non-raising, and deliberately NOT the review gate: this function only reports a "
+    "composer-facing CONTRADICTION, and it returns None for a node it could not analyse. The requirement "
+    "that such a node still carry a cleanup review is enforced independently by "
+    "_missing_raw_html_cleanup_review_sites (reached via interpretation_sites), which is fail-safe in the "
+    "same direction — a malformed mapping yields a smaller preserved-field set there and so still emits the "
+    "review site.",
+    non_raising=True,
+)
 def raw_html_cleanup_review_contract_error(state: CompositionState) -> str | None:
     """Return a composer-facing error for unreviewed or contradictory raw cleanup."""
     web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
@@ -248,9 +509,9 @@ def raw_html_cleanup_review_contract_error(state: CompositionState) -> str | Non
         if requirement_error is not None:
             return requirement_error
     for node in state.nodes:
-        if node.plugin != "field_mapper" or node.options.get("select_only") is not True:
+        if node.plugin != "field_mapper" or "select_only" not in node.options or node.options["select_only"] is not True:
             continue
-        mapping = node.options.get("mapping")
+        mapping = node.options["mapping"] if "mapping" in node.options else None
         if not isinstance(mapping, Mapping) or not mapping:
             continue
         preserved_fields = _preserved_mapping_fields(mapping)
@@ -285,11 +546,74 @@ def composition_review_contract_error(state: CompositionState) -> str | None:
     recommendation is advisory, not blocking (see
     :func:`prompt_shield_recommendation_warning_pairs`): an unshielded
     LLM-over-untrusted-content composition surfaces a warning rather than
-    failing the contract. Composition is therefore gated solely on the
-    raw-HTML-cleanup review contract here.
+    failing the contract. Composition is therefore gated on the
+    raw-HTML-cleanup review contract and on every staged pending
+    ``vague_term`` review being resolvable.
     """
 
-    return raw_html_cleanup_review_contract_error(state)
+    error = raw_html_cleanup_review_contract_error(state)
+    if error is not None:
+        return error
+    return unwired_vague_term_error(state)
+
+
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] rows, untyped Mapping[str, Any] entries "
+    "persisted on composer state and round-tripped through sessions.db storage",
+    source_param="state",
+    suppresses=("R5",),
+    invariant="a malformed row is skipped (unconditional invariant B rejects it downstream) rather than "
+    "raised on; the only outputs are None or an error string naming a well-formed unwired row, so the "
+    "lenient reads can only under-report, never admit an unresolvable requirement",
+    non_raising=True,
+)
+def unwired_vague_term_error(state: CompositionState) -> str | None:
+    """Return the first pending ``vague_term`` review that nothing can resolve.
+
+    ``vague_term_wiring_count`` is the single resolvability contract: a
+    pending requirement is resolvable only when exactly one wiring exists for
+    its ``user_term`` (a ``prompt_template_parts`` ``interpretation_ref``
+    naming its id, or — with no requirement rows staged — exactly one legacy
+    placeholder). The review-staging tool already refuses to stage an unwired
+    requirement; this enforces the same invariant at the node-authoring doors
+    (``set_pipeline`` / ``upsert_node`` / ``splice_transform`` /
+    ``patch_node_options``), which session 4c42a794 (2026-09-01) proved could
+    commit the unresolvable shape directly: the requirement stayed pending
+    forever, the execution gate blocked Run on it, and no resolver card
+    existed. Reads are lenient (Tier-3 staging idiom, mirroring
+    ``vague_term_wiring_count``): a malformed row is invariant B's to reject,
+    not this contract's.
+    """
+
+    for node in state.nodes:
+        if INTERPRETATION_REQUIREMENTS_KEY not in node.options:
+            continue
+        requirements = node.options[INTERPRETATION_REQUIREMENTS_KEY]
+        if not isinstance(requirements, (list, tuple)):
+            continue
+        for requirement in requirements:
+            if not isinstance(requirement, Mapping):
+                continue
+            if "kind" not in requirement or requirement["kind"] != InterpretationKind.VAGUE_TERM.value:
+                continue
+            if "status" not in requirement or requirement["status"] != "pending":
+                continue
+            if "user_term" not in requirement or not isinstance(requirement["user_term"], str):
+                continue
+            user_term = requirement["user_term"]
+            if vague_term_wiring_count(node.options, user_term=user_term) == 1:
+                continue
+            requirement_id = requirement["id"] if "id" in requirement and isinstance(requirement["id"], str) else user_term
+            return (
+                f"{VAGUE_TERM_UNWIRED_PREFIX} on node {node.id!r}: requirement {requirement_id!r} "
+                f"(user term {user_term!r}) has no resolvable prompt wiring. Wire exactly one "
+                f'prompt_template_parts entry {{"kind": "interpretation_ref", "requirement_id": '
+                f"{requirement_id!r}}} into the node's prompt, or drop the requirement row. An "
+                "unwired requirement stages a review the operator can approve but never resolve, "
+                "and the execution gate blocks Run on it forever."
+            )
+    return None
 
 
 def prompt_shield_recommendation_warning_pairs(
@@ -300,7 +624,7 @@ def prompt_shield_recommendation_warning_pairs(
     """Return always-on advisory warnings for unshielded LLM nodes.
 
     The review is now ALWAYS-ON per LLM node, decoupled from whether an
-    untrusted remote producer (web_scrape) is upstream:
+    untrusted-content producer is upstream:
 
     - **State A** (an authorized shield is reachable upstream) — silent, no warning.
     - **State B** (``shield_available is True``) — an authorized shield IS
@@ -318,47 +642,61 @@ def prompt_shield_recommendation_warning_pairs(
     graph = _output_stream_graph(state.nodes)
     warnings: list[tuple[str, str]] = []
     for node in state.nodes:
-        if node.plugin != "llm":
+        if not node_has_capability(node, PluginCapability.LLM):
             continue
         if _llm_has_authorized_shield_upstream(node, graph):
             continue  # State A — already shielded, silent
         if _llm_has_shield_recommendation(node):
             continue  # review already staged on this node
-        draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
-        consumes_untrusted = _llm_consumes_untrusted_remote_content(node, graph)
-        lead = (
-            f"LLM node {node.id!r} consumes externally-fetched content from a web_scrape upstream "
-            "without an authorized prompt-injection shield between them. "
-            if consumes_untrusted
-            else f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
-        )
+        untrusted_producers = _llm_untrusted_content_producers(node, graph)
+        if untrusted_producers:
+            # Name the producer actually found. Hardcoding "web_scrape" made the
+            # sentence assert a plugin that need not be in the pipeline at all.
+            named = " and ".join(sorted(untrusted_producers))
+            lead = (
+                f"LLM node {node.id!r} consumes untrusted or externally controlled upstream content "
+                f"produced by {named} without an authorized prompt-injection shield between them. "
+            )
+            draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
+        else:
+            # Provenance-honest draft: no declared untrusted producer exists in
+            # this graph, so the producer-specific constants would be false —
+            # and the staged review card carries the DRAFT alone, discarding
+            # this computed lead, so the draft itself must tell the truth.
+            lead = f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
+            draft = PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT
         warnings.append((f"node:{node.id}", f"{lead}{draft}"))
     return tuple(warnings)
 
 
-def _llm_consumes_untrusted_remote_content(
+def _llm_untrusted_content_producers(
     node: NodeSpec,
     graph: _OutputStreamGraph,
-) -> bool:
-    """Return True iff ANY predecessor path reaches an untrusted producer without a shield.
+) -> frozenset[str]:
+    """Return the untrusted producer plugins any predecessor path reaches unshielded.
 
-    The asymmetry is deliberate and security-critical: a single tainted
-    predecessor of a queue fan-in taints the downstream LLM. A missing producer
-    ends that path without reaching an untrusted producer.
+    Empty means no such path exists, so the set is truthy exactly where the
+    former boolean was True. The asymmetry is deliberate and security-critical:
+    a single tainted predecessor of a queue fan-in taints the downstream LLM. A
+    missing producer ends that path without reaching an untrusted producer.
+
+    Returning the plugin NAMES rather than a bool keeps the advisory honest: it
+    must name the producer it actually found, never assert a web_scrape that is
+    not in the pipeline.
     """
 
-    if node.plugin != "llm":
-        return False
+    if not node_has_capability(node, PluginCapability.LLM):
+        return frozenset()
     return _stream_reaches_untrusted(node.input, graph, frozenset())
 
 
-def _stream_reaches_untrusted(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> bool:
-    if not isinstance(stream, str) or not stream:
-        return False
-    producers = graph.producers_by_stream.get(stream)
-    if not producers:
-        return False
-    return any(_producer_reaches_untrusted(producer, graph, visited) for producer in producers)
+def _stream_reaches_untrusted(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> frozenset[str]:
+    if not stream:
+        return frozenset()
+    reached: set[str] = set()
+    for producer in graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ():
+        reached |= _producer_reaches_untrusted(producer, graph, visited)
+    return frozenset(reached)
 
 
 def _is_effective_prompt_shield(node: NodeSpec) -> bool:
@@ -366,20 +704,27 @@ def _is_effective_prompt_shield(node: NodeSpec) -> bool:
     return node_has_blocking_control(node, PluginCapability.PROMPT_SHIELD, ControlRole.INPUT)
 
 
-def _producer_reaches_untrusted(producer: NodeSpec, graph: _OutputStreamGraph, visited: frozenset[str]) -> bool:
+def _producer_reaches_untrusted(producer: NodeSpec, graph: _OutputStreamGraph, visited: frozenset[str]) -> frozenset[str]:
     if producer.id in visited:
-        return False
+        return frozenset()
     # Path-LOCAL visited (passed by value), keyed on stable node id: a diamond
     # that reconverges on a shared upstream must not truncate a sibling path.
     visited = visited | {producer.id}
     if _is_effective_prompt_shield(producer):
-        return False
-    if producer.plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
-        return True
+        return frozenset()
+    plugin = producer.plugin
+    if plugin is not None and plugin in untrusted_content_transform_names():
+        return frozenset({plugin})
     if producer.node_type == "queue":
-        return any(
-            _producer_reaches_untrusted(predecessor, graph, visited) for predecessor in graph.queue_predecessors.get(producer.id, ())
-        )
+        reached: set[str] = set()
+        for predecessor in graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ():
+            reached |= _producer_reaches_untrusted(predecessor, graph, visited)
+        return frozenset(reached)
+    if producer.node_type == "row_union":
+        reached = set()
+        for branch in _coalesce_branch_connections(producer.branches):
+            reached |= set(_stream_reaches_untrusted(branch, graph, visited))
+        return frozenset(reached)
     return _stream_reaches_untrusted(producer.input, graph, visited)
 
 
@@ -395,15 +740,15 @@ def _llm_has_authorized_shield_upstream(
     predecessor path is fail-safe (NOT proven safe), so the advisory still fires.
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return False
     return _stream_proves_shield(node.input, graph, frozenset())
 
 
 def _stream_proves_shield(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> bool:
-    if not isinstance(stream, str) or not stream:
+    if not stream:
         return False  # chain ended without a shield → not proven
-    producers = graph.producers_by_stream.get(stream)
+    producers = graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ()
     if not producers:
         return False  # missing producer → unknown → fail-safe
     return all(_producer_proves_shield(producer, graph, visited) for producer in producers)
@@ -415,13 +760,16 @@ def _producer_proves_shield(producer: NodeSpec, graph: _OutputStreamGraph, visit
     visited = visited | {producer.id}
     if _is_effective_prompt_shield(producer):
         return True
-    if producer.plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+    if producer.plugin in untrusted_content_transform_names():
         return False
     if producer.node_type == "queue":
-        predecessors = graph.queue_predecessors.get(producer.id, ())
+        predecessors = graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ()
         if not predecessors:
             return False  # queue with no known predecessor → unknown → fail-safe
         return all(_producer_proves_shield(predecessor, graph, visited) for predecessor in predecessors)
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        return bool(branches) and all(_stream_proves_shield(branch, graph, visited) for branch in branches)
     return _stream_proves_shield(producer.input, graph, visited)
 
 
@@ -444,7 +792,7 @@ def prompt_shield_state_for_node(
     ``False`` (State C, fail-safe).
     """
 
-    if node.plugin != "llm":
+    if not node_has_capability(node, PluginCapability.LLM):
         return "A"
     graph = _output_stream_graph(all_nodes)
     if _llm_has_authorized_shield_upstream(node, graph):
@@ -452,6 +800,16 @@ def prompt_shield_state_for_node(
     return "B" if shield_available else "C"
 
 
+@trust_boundary(
+    tier=3,
+    source="warnings, a Sequence[Mapping[str, Any]] of already-serialised confirm_wiring wire-turn "
+    "payload entries authored by the composer LLM tool call",
+    source_param="warnings",
+    suppresses=("R5",),
+    invariant="a non-string 'message' entry passes through unmodified rather than raising; this is a "
+    "cosmetic wording-refinement pass, not a security gate, so a malformed entry is inert",
+    non_raising=True,
+)
 def refine_prompt_shield_warnings_for_availability(
     warnings: Sequence[Mapping[str, Any]],
     *,
@@ -476,10 +834,21 @@ def refine_prompt_shield_warnings_for_availability(
     result: list[dict[str, Any]] = [dict(entry) for entry in warnings]
     if not shield_available:
         return result
+    # C->B upgrades per provenance variant; the replace pairs must stay
+    # variant-aligned so a local-content warning never acquires the
+    # producer-specific untrusted-content claim.
+    upgrades = (
+        (PROMPT_SHIELD_WARNING_DRAFT, PROMPT_SHIELD_AVAILABLE_DRAFT),
+        (PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT, PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT),
+    )
     for entry in result:
-        message = entry.get("message")
-        if isinstance(message, str) and PROMPT_SHIELD_WARNING_DRAFT in message:
-            entry["message"] = message.replace(PROMPT_SHIELD_WARNING_DRAFT, PROMPT_SHIELD_AVAILABLE_DRAFT)
+        message = entry["message"] if "message" in entry else None
+        if not isinstance(message, str):
+            continue
+        for c_draft, b_draft in upgrades:
+            if c_draft in message:
+                entry["message"] = message.replace(c_draft, b_draft)
+                break
     return result
 
 
@@ -522,7 +891,10 @@ def _raw_html_cleanup_requirement_contract_error(
             validate_pipeline_decision_semantics(
                 node_id=node.id,
                 plugin=node.plugin,
+                node_type=node.node_type,
                 options=node.options,
+                condition=node.condition,
+                routes=node.routes,
                 user_term=requirement["user_term"],
                 draft=requirement["draft"],
                 context="raw-html cleanup review contract",
@@ -537,7 +909,7 @@ def _is_raw_html_cleanup_decision(*, user_term: str, draft: str | None) -> bool:
     normalized_term = user_term.strip()
     if normalized_term != RAW_HTML_CLEANUP_USER_TERM:
         return False
-    if not isinstance(draft, str):
+    if draft is None:
         return False
     normalized_draft = draft.lower()
     return all(marker in normalized_draft for marker in _RAW_HTML_CLEANUP_DRAFT_MARKERS)
@@ -547,10 +919,33 @@ def _is_web_scrape_http_identity_decision(*, user_term: str) -> bool:
     return user_term.strip() == WEB_SCRAPE_HTTP_IDENTITY_USER_TERM
 
 
-def _validated_mapping_pair(source_field: object, target_field: object, *, context: str, node_id: str) -> tuple[str, str]:
-    if not isinstance(source_field, str) or not isinstance(target_field, str):
+def _is_gate_condition_authored_decision(*, user_term: str) -> bool:
+    return user_term.strip() == GATE_CONDITION_AUTHORED_USER_TERM
+
+
+@trust_boundary(
+    tier=3,
+    source="one side of a node.options['mapping'] item on a field_mapper composer node — an "
+    "untyped authored value persisted through sessions.db storage, a composer LLM tool call, or "
+    "YAML import",
+    source_param="field",
+    suppresses=("R5",),
+    invariant="raises ValueError whenever the mapping side is not a str; never coerces, "
+    "stringifies, or substitutes a default for a malformed side",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_validated_mapping_field_rejects_non_string_mapping_sides",
+    test_fingerprint="dbd1cadb64e0020d540e8430f2ff1412f2bb097afe9d6b6754b21b8196746ac8",
+)
+def _validated_mapping_field(field: object, *, context: str, node_id: str) -> str:
+    if not isinstance(field, str):
         raise ValueError(f"{context}: field_mapper.mapping on node {node_id!r} must map string field names to string field names")
-    return (source_field, target_field)
+    return field
+
+
+def _validated_mapping_pair(source_field: object, target_field: object, *, context: str, node_id: str) -> tuple[str, str]:
+    return (
+        _validated_mapping_field(source_field, context=context, node_id=node_id),
+        _validated_mapping_field(target_field, context=context, node_id=node_id),
+    )
 
 
 def _looks_like_raw_html_field(field_name: str) -> bool:
@@ -563,6 +958,24 @@ def _looks_like_cleanup_node_id(node_id: str) -> bool:
     return "drop" in normalized or "cleanup" in normalized or "clean" in normalized or "raw" in normalized or "html" in normalized
 
 
+@trust_boundary(
+    tier=3,
+    source="the items of node.options['mapping'], an untyped Mapping[str, Any] persisted on a "
+    "field_mapper composer node and round-tripped through sessions.db storage, a composer LLM tool call, "
+    "or YAML import",
+    source_param="mapping",
+    suppresses=("R5",),
+    invariant="collects only entries that are genuinely str; a non-string key or value contributes "
+    "nothing rather than being coerced or stringified, so the returned frozenset never names a field the "
+    "authored mapping does not carry. Non-raising: its one caller, "
+    "raw_html_cleanup_review_contract_error, reads a smaller set as 'this raw field is NOT preserved', "
+    "which falls through to that function's review-requirement check rather than emitting a "
+    "preserves-raw-fields contradiction. The sibling enumerator "
+    "_missing_raw_html_cleanup_review_sites deliberately does NOT call this helper: it needs the STRICTER "
+    "both-sides-str pair filter, and widening it to this helper's per-side collection would grow its "
+    "preserved set and suppress review sites.",
+    non_raising=True,
+)
 def _preserved_mapping_fields(mapping: Mapping[str, Any]) -> frozenset[str]:
     fields: set[str] = set()
     for source_field, target_field in mapping.items():
@@ -571,6 +984,33 @@ def _preserved_mapping_fields(mapping: Mapping[str, Any]) -> frozenset[str]:
         if isinstance(target_field, str):
             fields.add(target_field.strip())
     return frozenset(fields)
+
+
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options[key], an untyped Mapping[str, Any] persisted on the composer node and "
+    "round-tripped through sessions.db storage, a composer LLM tool call, or YAML import; key names one "
+    "of the scalar string-valued options (model, prompt_template, profile, content_field, "
+    "fingerprint_field) — the node's other, typed fields are nominal ELSPETH-owned data and are not part "
+    "of this boundary",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="returns the value only when the key is present AND holds a str, and None in every other "
+    "case; a present-but-non-string value is reported as absent rather than coerced or stringified, so no "
+    "caller can observe a non-str. Non-raising by contract: every caller reads None as 'this node has no "
+    "authored value for key' and takes the same branch an absent key already took, which in each case is "
+    "the conservative one (no materialization, no review site suppressed, no field credited as preserved).",
+    non_raising=True,
+)
+def _node_str_option(node: NodeSpec, key: str) -> str | None:
+    """Read one string-valued option off a composer node's Tier-3 options map.
+
+    The single parse point for the scalar string options this module reads.
+    Callers consume the owned ``str | None`` and never re-interrogate the
+    option's runtime type.
+    """
+    value = node.options[key] if key in node.options else None
+    return value if isinstance(value, str) else None
 
 
 def _raw_html_cleanup_requirement(requirements: Sequence[InterpretationRequirement] | None) -> InterpretationRequirement | None:
@@ -598,15 +1038,9 @@ def interpretation_sites(
     """
 
     sites: list[InterpretationReviewSite] = []
-    # Source-level interpretation review is keyed to the default source
-    # component (SOURCE_COMPONENT_ID). _pending_source_sites and the
-    # resolution path (resolve_interpretation_event / invented_source) both
-    # hardcode that component id, so only the default named source carries a
-    # resolvable review site; named non-default sources are not reviewable
-    # through this subsystem.
-    default_source = state.sources[SOURCE_COMPONENT_ID] if SOURCE_COMPONENT_ID in state.sources else None
-    if default_source is not None:
-        sites.extend(_pending_source_sites(default_source))
+    for source_name, source in state.sources.items():
+        sites.extend(_pending_source_sites(source, component_id=source_component_id(source_name)))
+    sites.extend(_pending_source_data_contract_sites(state))
     web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
     for node in state.nodes:
         node_sites = [*_pending_node_sites(node), *_legacy_placeholder_sites(node)]
@@ -654,6 +1088,33 @@ def materialize_state_for_authoring(state: CompositionState) -> CompositionState
     return replace(state, nodes=tuple(materialized_nodes))
 
 
+def _profile_resolved_model_node_ids(state: CompositionState) -> frozenset[str]:
+    """LLM nodes whose concrete model came from an operator-owned profile alias."""
+    return frozenset(node.id for node in state.nodes if node.plugin == "llm" and _node_str_option(node, "profile") is not None)
+
+
+def pending_execution_interpretation_sites(
+    state: CompositionState,
+    *,
+    operator_resolved_model_node_ids: frozenset[str] = frozenset(),
+) -> tuple[InterpretationReviewSite, ...]:
+    """Pending interpretation-review sites as the execution gate counts them.
+
+    Single authority for "which unresolved reviews block execution": derives
+    the operator-profile model exemption from the state itself (unioned with
+    any caller-supplied ids) and delegates to :func:`interpretation_sites`.
+    :func:`materialize_state_for_execution` and the composer's mid-turn
+    composition-state persistence (``_state_payload_for_compose_turn``) share
+    this predicate so a state the mid-turn writer persists as valid can never
+    carry a review the execution gate would block on — the two answers agree
+    by construction (elspeth-67c6fa691d).
+    """
+    return interpretation_sites(
+        state,
+        operator_resolved_model_node_ids=operator_resolved_model_node_ids | _profile_resolved_model_node_ids(state),
+    )
+
+
 def materialize_state_for_execution(
     state: CompositionState,
     *,
@@ -673,12 +1134,9 @@ def materialize_state_for_execution(
     construction. Mirrors ``execution.validation``'s ``profile``-is-str test.
     """
 
-    profile_resolved_model_node_ids = frozenset(
-        node.id for node in state.nodes if node.plugin == "llm" and isinstance(node.options.get("profile"), str)
-    )
-    operator_resolved_model_node_ids = operator_resolved_model_node_ids | profile_resolved_model_node_ids
+    operator_resolved_model_node_ids = operator_resolved_model_node_ids | _profile_resolved_model_node_ids(state)
 
-    pending_sites = interpretation_sites(
+    pending_sites = pending_execution_interpretation_sites(
         state,
         operator_resolved_model_node_ids=operator_resolved_model_node_ids,
     )
@@ -686,15 +1144,11 @@ def materialize_state_for_execution(
         return InterpretationReviewPending(sites=pending_sites)
 
     changed = False
-    # Mirror interpretation_sites' scope: only the default source component
-    # carries reviewable composer-authored metadata, so materialization (which
-    # enforces the reviewed-content-hash drift check) operates on it alone.
     materialized_sources = dict(state.sources)
-    default_source = materialized_sources[SOURCE_COMPONENT_ID] if SOURCE_COMPONENT_ID in materialized_sources else None
-    if default_source is not None:
-        materialized_default = _materialize_source_for_execution(default_source)
-        if materialized_default is not default_source:
-            materialized_sources[SOURCE_COMPONENT_ID] = materialized_default
+    for source_name, source in state.sources.items():
+        materialized_source = _materialize_source_for_execution(source)
+        if materialized_source is not source:
+            materialized_sources[source_name] = materialized_source
             changed = True
     materialized_nodes: list[NodeSpec] = []
     for node in state.nodes:
@@ -722,8 +1176,8 @@ def _materialize_node_for_authoring(node: NodeSpec) -> NodeSpec:
     if "resolved_prompt_template_hash" in options:
         return node
 
-    prompt_template = options.get("prompt_template")
-    if not isinstance(prompt_template, str):
+    prompt_template = _node_str_option(node, "prompt_template")
+    if prompt_template is None:
         return node
     masked = INTERPRETATION_PLACEHOLDER_RE.sub(PENDING_INTERPRETATION_AUTHORING_TEXT, prompt_template)
     return _replace_prompt_if_changed(node, masked, include_hash=False)
@@ -738,13 +1192,13 @@ def _materialize_node_for_execution(
     _validate_pipeline_decision_review(node, all_nodes)
     if node.plugin != "llm":
         return node
-    model = node.options.get("model")
-    if isinstance(model, str) and model and not operator_resolved_model:
+    model = _node_str_option(node, "model")
+    if model and not operator_resolved_model:
         _validate_model_choice_review(node, model)
     parts = _prompt_parts(node.options)
     if parts is None:
-        prompt_template = node.options.get("prompt_template")
-        if isinstance(prompt_template, str) and prompt_template:
+        prompt_template = _node_str_option(node, "prompt_template")
+        if prompt_template:
             requirement = _prompt_template_review_requirement(node.options)
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)
@@ -770,8 +1224,8 @@ def _materialize_source_for_execution(source: SourceSpec) -> SourceSpec:
 
 
 def _replace_prompt_if_changed(node: NodeSpec, prompt: str, *, include_hash: bool) -> NodeSpec:
-    current = node.options.get("prompt_template")
-    current_hash = node.options.get("resolved_prompt_template_hash")
+    current = node.options["prompt_template"] if "prompt_template" in node.options else None
+    current_hash = node.options["resolved_prompt_template_hash"] if "resolved_prompt_template_hash" in node.options else None
     next_hash = stable_hash(prompt) if include_hash else current_hash
     if current == prompt and current_hash == next_hash:
         return node
@@ -783,13 +1237,13 @@ def _replace_prompt_if_changed(node: NodeSpec, prompt: str, *, include_hash: boo
 
 
 def _ensure_prompt_template_hash(node: NodeSpec) -> NodeSpec:
-    prompt_template = node.options.get("prompt_template")
-    if not isinstance(prompt_template, str) or not prompt_template:
+    prompt_template = _node_str_option(node, "prompt_template")
+    if not prompt_template:
         return node
     return _replace_prompt_if_changed(node, prompt_template, include_hash=True)
 
 
-def _pending_source_sites(source: SourceSpec) -> tuple[InterpretationReviewSite, ...]:
+def _pending_source_sites(source: SourceSpec, *, component_id: str) -> tuple[InterpretationReviewSite, ...]:
     metadata = _source_authoring_metadata(source.options)
     if metadata is None or not _is_llm_authored_modality(metadata["modality"]):
         return ()
@@ -798,7 +1252,7 @@ def _pending_source_sites(source: SourceSpec) -> tuple[InterpretationReviewSite,
     if requirement is None:
         return (
             InterpretationReviewSite(
-                component_id=SOURCE_COMPONENT_ID,
+                component_id=component_id,
                 component_type="source",
                 user_term="llm_generated_source",
                 kind=InterpretationKind.INVENTED_SOURCE,
@@ -815,12 +1269,157 @@ def _pending_source_sites(source: SourceSpec) -> tuple[InterpretationReviewSite,
         return ()
     return (
         InterpretationReviewSite(
-            component_id=SOURCE_COMPONENT_ID,
+            component_id=component_id,
             component_type="source",
             user_term=requirement["user_term"].strip(),
             kind=InterpretationKind.INVENTED_SOURCE,
         ),
     )
+
+
+def _source_data_contract_requirement(options: Mapping[str, Any]) -> InterpretationRequirement | None:
+    return _requirement_for_kind(_requirements(options), InterpretationKind.SOURCE_DATA_CONTRACT)
+
+
+def resolved_source_data_contract_fields(requirement: InterpretationRequirement) -> tuple[str, ...] | None:
+    """Return the field set bound by coherent resolved contract evidence."""
+    if not resolved_review_evidence_is_coherent(requirement, InterpretationKind.SOURCE_DATA_CONTRACT):
+        return None
+    accepted_value = requirement["accepted_value"]
+    if accepted_value is None:
+        return None
+    fields = parse_source_data_contract_accepted_fields(accepted_value)
+    if requirement["accepted_artifact_hash"] != source_data_contract_artifact_hash(fields):
+        return None
+    return fields
+
+
+@observation_boundary(
+    tier=3,
+    source="a source options schema mapping persisted in composer state, whose guaranteed_fields value "
+    "may have been authored by the planner or stamped by source_data_contract resolution",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns a frozen string set only for an observed schema with an explicit list/tuple of "
+    "string guaranteed_fields; every absent, malformed, or non-observed shape returns None and never raises",
+)
+def _observed_source_guaranteed_fields(options: Mapping[str, Any]) -> frozenset[str] | None:
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else None)
+    if schema_key is None:
+        return None
+    raw_schema = options[schema_key]
+    if not isinstance(raw_schema, Mapping):
+        return None
+    mode = raw_schema["mode"] if "mode" in raw_schema else None
+    if mode != "observed" or "guaranteed_fields" not in raw_schema:
+        return None
+    raw_fields = raw_schema["guaranteed_fields"]
+    if not isinstance(raw_fields, (list, tuple)) or not all(isinstance(field, str) for field in raw_fields):
+        return None
+    return frozenset(raw_fields)
+
+
+def _source_data_contract_evidence_is_current(
+    source: SourceSpec,
+    requirement: InterpretationRequirement,
+) -> bool:
+    acknowledged_fields = resolved_source_data_contract_fields(requirement)
+    guaranteed_fields = _observed_source_guaranteed_fields(source.options)
+    return acknowledged_fields is not None and guaranteed_fields is not None and frozenset(acknowledged_fields) <= guaranteed_fields
+
+
+def current_source_data_contract_demand(state: CompositionState, source_name: str) -> tuple[str, ...]:
+    """Requirement-aware demand backtrace for one source.
+
+    The single derivation shared by the pending-site enumerator, the
+    event-writer boundary, and the resolve arm (``sessions/service.py``), so
+    the card, its dedup identity, and the resolution stamp cannot diverge on
+    what the pipeline demands. Strips a previously ACKNOWLEDGED field set
+    (parsed from the resolved requirement's ``accepted_value``) before
+    recomputing, so a demand-set change after acknowledgement is measured
+    against the graph rather than against the stamp the previous answer
+    produced. Returns ``()`` for ineligible sources: an LLM-authored bound
+    blob (``source_authoring`` present — its content IS the run's data and
+    the invented_source/auto-declare flow owns it), a missing source, or a
+    source that cannot carry a guarantee stamp.
+    """
+    source = state.sources[source_name] if source_name in state.sources else None
+    if source is None or SOURCE_AUTHORING_KEY in source.options:
+        return ()
+    requirement = _source_data_contract_requirement(source.options)
+    disregard: frozenset[str] = frozenset()
+    if (
+        requirement is not None
+        and requirement["status"] == "resolved"
+        and resolved_review_evidence_is_coherent(requirement, InterpretationKind.SOURCE_DATA_CONTRACT)
+        and requirement["accepted_value"] is not None
+    ):
+        acknowledged = source_data_contract_fields_for_demand_recompute(
+            requirement["accepted_value"],
+            requirement["accepted_artifact_hash"],
+        )
+        disregard = frozenset(acknowledged)
+    return backtraced_source_demand(state, source_name, disregard_fields=disregard)
+
+
+def _pending_source_data_contract_sites(state: CompositionState) -> tuple[InterpretationReviewSite, ...]:
+    """Enumerate unacknowledged (or drifted) data-contract sites per source.
+
+    Derived, not staged (elspeth-da68332faf work item 2): the site exists
+    exactly while the graph demands fields from a not-preflight-checkable
+    source that no current acknowledgement covers — whether the demand
+    existed at bind time or arose later from a node mutation. Mirrors the
+    ``_pending_source_sites`` drift posture for invented_source: a resolved
+    requirement is clean ONLY while its accepted artifact (here the
+    acknowledged contract version, consequence, and FIELD SET, bound by
+    ``source_data_contract_artifact_hash``)
+    still matches the current demand; a demand-set change falls through to a
+    pending site, re-opening the card. A demand that shrinks to EMPTY closes
+    the site without re-asking: there is nothing left to acknowledge, and
+    the standing stamp remains the user's own recorded promise. Independently,
+    a resolved row whose evidence is incoherent or whose source no longer
+    carries the acknowledged guarantee always emits a blocking integrity site,
+    even when the current graph has no remaining demand. With no live demand,
+    that site is fail-closed state-integrity evidence rather than a new user-
+    resolvable acknowledgement card.
+    """
+    sites: list[InterpretationReviewSite] = []
+    for source_name, source in state.sources.items():
+        if SOURCE_AUTHORING_KEY in source.options:
+            continue
+        requirement = _source_data_contract_requirement(source.options)
+        if (
+            requirement is not None
+            and requirement["status"] == "resolved"
+            and not _source_data_contract_evidence_is_current(source, requirement)
+        ):
+            sites.append(
+                InterpretationReviewSite(
+                    component_id=source_component_id(source_name),
+                    component_type="source",
+                    user_term=requirement["user_term"].strip(),
+                    kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+                )
+            )
+            continue
+        demand = current_source_data_contract_demand(state, source_name)
+        if not demand:
+            continue
+        if (
+            requirement is not None
+            and requirement["status"] == "resolved"
+            and requirement["accepted_artifact_hash"] == source_data_contract_artifact_hash(demand)
+        ):
+            continue
+        sites.append(
+            InterpretationReviewSite(
+                component_id=source_component_id(source_name),
+                component_type="source",
+                user_term=(requirement["user_term"].strip() if requirement is not None else SOURCE_DATA_CONTRACT_USER_TERM),
+                kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+            )
+        )
+    return tuple(sites)
 
 
 def _pending_node_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
@@ -833,6 +1432,11 @@ def _pending_node_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
         if status == "pending":
             kind = InterpretationKind(requirement["kind"])
             if node.plugin != "llm" and kind is not InterpretationKind.PIPELINE_DECISION:
+                continue
+            if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                # Source-only kind: its sites derive from the graph demand in
+                # _pending_source_data_contract_sites. A rogue node-staged row
+                # must not mint a transform site no resolver arm can settle.
                 continue
             sites.append(
                 InterpretationReviewSite(
@@ -850,15 +1454,29 @@ def _web_scrape_raw_fields(nodes: Sequence[NodeSpec]) -> frozenset[str]:
     for node in nodes:
         if node.plugin != "web_scrape":
             continue
-        content_field = node.options.get("content_field")
-        fingerprint_field = node.options.get("fingerprint_field")
-        if isinstance(content_field, str) and content_field.strip():
+        content_field = _node_str_option(node, "content_field")
+        fingerprint_field = _node_str_option(node, "fingerprint_field")
+        if content_field and content_field.strip():
             fields.add(content_field.strip())
-        if isinstance(fingerprint_field, str) and fingerprint_field.strip():
+        if fingerprint_field and fingerprint_field.strip():
             fields.add(fingerprint_field.strip())
     return frozenset(fields)
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['mapping'] / ['select_only'], untyped Mapping[str, Any] entries persisted "
+    "on a field_mapper composer node and round-tripped through sessions.db storage, a composer LLM tool "
+    "call, or YAML import",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="options['mapping'] must be a present, non-empty Mapping and each preserved field must be "
+    "a genuine str->str pair; anything else contributes no preserved field. Non-raising and fail-safe in "
+    "the review direction: a malformed mapping yields a SMALLER preserved-field set, which means the "
+    "web-scrape raw fields read as NOT preserved and the cleanup review site is still emitted. Malformed "
+    "options can therefore only ADD a required review, never suppress one.",
+    non_raising=True,
+)
 def _missing_raw_html_cleanup_review_sites(
     node: NodeSpec,
     *,
@@ -872,9 +1490,9 @@ def _missing_raw_html_cleanup_review_sites(
     requirements = _requirements(node.options)
     if _raw_html_cleanup_requirement(requirements) is not None:
         return ()
-    if node.options.get("select_only") is not True:
+    if "select_only" not in node.options or node.options["select_only"] is not True:
         return ()
-    mapping = node.options.get("mapping")
+    mapping = node.options["mapping"] if "mapping" in node.options else None
     if not isinstance(mapping, Mapping) or not mapping:
         return ()
     preserved_fields = {
@@ -898,8 +1516,8 @@ def _missing_raw_html_cleanup_review_sites(
 def _legacy_placeholder_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
     if node.plugin != "llm":
         return ()
-    prompt_template = node.options.get("prompt_template")
-    if not isinstance(prompt_template, str):
+    prompt_template = _node_str_option(node, "prompt_template")
+    if prompt_template is None:
         return ()
     return tuple(
         InterpretationReviewSite(
@@ -915,8 +1533,8 @@ def _legacy_placeholder_sites(node: NodeSpec) -> tuple[InterpretationReviewSite,
 def _missing_prompt_template_review_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
     if node.plugin != "llm":
         return ()
-    prompt_template = node.options.get("prompt_template")
-    if not isinstance(prompt_template, str) or not prompt_template:
+    prompt_template = _node_str_option(node, "prompt_template")
+    if not prompt_template:
         return ()
     requirement = _prompt_template_review_requirement(node.options)
     if requirement is None:
@@ -954,8 +1572,8 @@ def _missing_model_choice_review_sites(node: NodeSpec) -> tuple[InterpretationRe
     """
     if node.plugin != "llm":
         return ()
-    model = node.options.get("model")
-    if not isinstance(model, str) or not model:
+    model = _node_str_option(node, "model")
+    if not model:
         return ()
     requirement = _model_choice_review_requirement(node.options)
     if requirement is None:
@@ -998,6 +1616,18 @@ def _requirements_by_id(options: Mapping[str, Any]) -> dict[str, InterpretationR
     return by_id
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] / SourceSpec.options['interpretation_requirements'], "
+    "an untyped Mapping[str, Any] entry persisted on composer state and round-tripped through sessions.db "
+    "storage, a composer LLM tool call, or YAML import",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises TypeError on a non-list value or a non-mapping list item; delegates per-item field "
+    "validation to _coerce_requirement, itself a separately-declared boundary",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_requirements_rejects_non_list_value",
+    test_fingerprint="c545bfa9b28f31378cf25bc76e022cd8d17239dedbf922fb4b36892b1e60a4c7",
+)
 def _requirements(options: Mapping[str, Any]) -> tuple[InterpretationRequirement, ...] | None:
     value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     if value is None:
@@ -1027,6 +1657,20 @@ def parse_interpretation_requirements(options: Mapping[str, Any]) -> tuple[Inter
     return _requirements(options)
 
 
+@trust_boundary(
+    tier=3,
+    source="one interpretation_requirements list item: an untyped Mapping[str, Any] item extracted by "
+    "_requirements from composer state (NodeSpec.options / SourceSpec.options) round-tripped through "
+    "sessions.db storage, a composer LLM tool call, or YAML import",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises TypeError/ValueError on any malformed field (id, user_term, status, kind, "
+    "accepted_value, accepted_artifact_hash, resolved_prompt_template_hash, draft, event_id) and "
+    "constructs the owned InterpretationRequirement TypedDict only from validated fields; never "
+    "substitutes a default for a present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_coerce_requirement_rejects_non_string_id",
+    test_fingerprint="b1707a07d542960abbfdee200a95198c176e4132cd9e14fe0800bddb4298ae2b",
+)
 def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     requirement_id = value["id"]
     user_term = value["user_term"]
@@ -1053,19 +1697,37 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     resolved_prompt_template_hash = value["resolved_prompt_template_hash"] if "resolved_prompt_template_hash" in value else None
     if resolved_prompt_template_hash is not None and not isinstance(resolved_prompt_template_hash, str):
         raise TypeError("interpretation requirement resolved_prompt_template_hash must be a string or None")
+    draft = value["draft"] if "draft" in value else None
+    if draft is not None and not isinstance(draft, str):
+        raise TypeError("interpretation requirement draft must be a string or None")
+    event_id = value["event_id"] if "event_id" in value else None
+    if event_id is not None and not isinstance(event_id, str):
+        raise TypeError("interpretation requirement event_id must be a string or None")
     return InterpretationRequirement(
         id=requirement_id,
         kind=kind.value,
         user_term=user_term,
         status=status,
-        draft=value["draft"] if "draft" in value else None,
-        event_id=value["event_id"] if "event_id" in value else None,
+        draft=draft,
+        event_id=event_id,
         accepted_value=accepted_value,
         accepted_artifact_hash=accepted_artifact_hash,
         resolved_prompt_template_hash=resolved_prompt_template_hash,
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="SourceSpec.options['source_authoring'], an untyped Mapping[str, Any] persisted on the "
+    "composer state and round-tripped through sessions.db storage or YAML import",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises TypeError on any malformed field (modality/content_hash/review_event_id/"
+    "resolved_kind shape) and ValueError on an unknown resolved_kind enum value; never substitutes "
+    "a default for a present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_source_authoring_metadata_rejects_non_string_modality",
+    test_fingerprint="9c397610a6013437a0ba59a8e4f6fc8a53dfd24925a29b3f84e4f9b99b1b0f4e",
+)
 def _source_authoring_metadata(options: Mapping[str, Any]) -> SourceAuthoringMetadata | None:
     value = options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None
     if value is None:
@@ -1203,20 +1865,98 @@ def pipeline_decision_artifact_hash(
         return _raw_html_cleanup_artifact_hash(node, all_nodes)
     if normalized == WEB_SCRAPE_HTTP_IDENTITY_USER_TERM:
         return _web_scrape_http_identity_artifact_hash(node)
+    if normalized == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
+        return _required_control_auto_wired_artifact_hash(node)
+    if normalized == GATE_CONDITION_AUTHORED_USER_TERM:
+        return _gate_condition_authored_artifact_hash(node)
     raise ValueError(f"pipeline_decision_artifact_hash: unknown pipeline_decision user_term {user_term!r}")
 
 
+def _gate_condition_authored_artifact_hash(node: NodeSpec) -> str:
+    """Material-scoped hash for the planner-authored gate-semantics review.
+
+    The review accepts a gate criterion the PLANNER chose rather than one the
+    user stated verbatim. The hash binds to exactly the three fabrication axes
+    the doctrine names:
+
+    - the ``condition`` expression, which carries both the threshold VALUE and
+      any category LITERAL compared against;
+    - the ``routes`` mapping, whose every destination is material — an inverted
+      route is the precise failure the "never invert stated routes" rule guards,
+      and it changes no other field;
+    - ``fork_to``, because a fork gate's route direction lives there rather than
+      in ``routes``; omitting it would leave that axis unpinned for fork gates.
+
+    ``options`` and ``on_error`` are deliberately excluded: neither changes the
+    criterion the reviewer adjudicated, so editing them should leave an accepted
+    review intact (the minimum-projection doctrine on this function).
+
+    Route insertion order is NOT material — ``stable_hash`` canonicalises the
+    mapping by key, so re-ordering the routes cannot drift an accepted review.
+    """
+
+    if node.node_type != "gate":
+        raise ValueError(f"pipeline_decision_artifact_hash: gate_condition_authored requires a gate node, got {node.node_type!r}")
+    return stable_hash(
+        {
+            "review_kind": "gate_condition_authored",
+            "gate_node_id": node.id,
+            "condition": node.condition,
+            "routes": dict(node.routes) if node.routes is not None else None,
+            "fork_to": list(node.fork_to) if node.fork_to is not None else None,
+        }
+    )
+
+
+def _required_control_auto_wired_artifact_hash(node: NodeSpec) -> str:
+    """Material-scoped hash for the auto-wired required-control disclosure.
+
+    The review acknowledges that the server spliced this control node onto a
+    specific edge because deployment policy requires the control. The hash
+    binds to exactly that adjudication — the inserted node's identity, its
+    plugin, and the edge it occupies (input and on_success). Re-pointing the
+    node to a different edge or swapping the control implementation drifts the
+    acknowledgement; unrelated option edits (thresholds, schema mode) do not
+    change what was inserted where, so they leave the review intact.
+    """
+
+    if node.plugin is None:
+        raise ValueError("pipeline_decision_artifact_hash: required_control_auto_wired requires a plugin-bearing node")
+    return stable_hash(
+        {
+            "review_kind": "required_control_auto_wired",
+            "node_id": node.id,
+            "plugin": node.plugin,
+            "input": node.input,
+            "on_success": node.on_success,
+        }
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="node.options, an untyped Mapping[str, Any] persisted on the composer node and round-tripped "
+    "through sessions.db storage; only options.http is parsed here — node's other, typed fields are "
+    "nominal ELSPETH-owned data, not part of this boundary",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="raises ValueError when options.http is present but not a Mapping, or when its "
+    "abuse_contact/scraping_reason fields are missing or non-string; never substitutes a default for a "
+    "present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_web_scrape_http_identity_artifact_hash_rejects_malformed_http_mapping",
+    test_fingerprint="57fc3b74a14f0820f42cc7735a67a824da839a868c12c6ae960772b83678d154",
+)
 def _web_scrape_http_identity_artifact_hash(node: NodeSpec) -> str:
     """Material-scoped hash for the web_scrape HTTP identity review."""
 
     if node.plugin != "web_scrape":
         raise ValueError(f"pipeline_decision_artifact_hash: web_scrape_http_identity requires a web_scrape node, got {node.plugin!r}")
-    http = node.options.get("http")
+    http = node.options["http"] if "http" in node.options else None
     if not isinstance(http, Mapping):
         raise ValueError("pipeline_decision_artifact_hash: web_scrape_http_identity requires options.http")
-    abuse_contact = http.get("abuse_contact")
-    scraping_reason = http.get("scraping_reason")
-    allowed_hosts = http.get("allowed_hosts", "public_only")
+    abuse_contact = http["abuse_contact"] if "abuse_contact" in http else None
+    scraping_reason = http["scraping_reason"] if "scraping_reason" in http else None
+    allowed_hosts = http["allowed_hosts"] if "allowed_hosts" in http else "public_only"
     if not isinstance(abuse_contact, str) or not abuse_contact.strip():
         raise ValueError("pipeline_decision_artifact_hash: web_scrape_http_identity requires http.abuse_contact")
     if not isinstance(scraping_reason, str) or not scraping_reason.strip():
@@ -1236,8 +1976,7 @@ def _prompt_shield_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec]) 
     """Material-scoped hash for the prompt-shield recommendation review.
 
     The review accepts the recommendation that an authorized prompt-injection
-    shield (currently azure_prompt_shield) be inserted between an
-    untrusted-remote-content producer (currently web_scrape) and this LLM.
+    shield be inserted between an untrusted-content producer and this LLM.
     The hash binds to exactly that adjudication:
 
     - this LLM's node id (the review attaches to a specific node)
@@ -1270,9 +2009,9 @@ _ShieldPath = tuple[tuple[str, str | None], ...]
 
 def _prompt_shield_upstream_paths(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> list[_ShieldPath]:
     """Enumerate every upstream producer path from ``stream`` toward a shield/untrusted/end."""
-    if not isinstance(stream, str) or not stream:
+    if not stream:
         return [()]
-    producers = graph.producers_by_stream.get(stream)
+    producers = graph.producers_by_stream[stream] if stream in graph.producers_by_stream else ()
     if not producers:
         return [()]
     paths: list[_ShieldPath] = []
@@ -1286,16 +2025,33 @@ def _prompt_shield_producer_paths(producer: NodeSpec, graph: _OutputStreamGraph,
     if producer.id in visited:
         return [(head,)]  # cycle — stop, still record this producer
     visited = visited | {producer.id}
-    if _is_effective_prompt_shield(producer) or producer.plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+    if _is_effective_prompt_shield(producer) or producer.plugin in untrusted_content_transform_names():
         return [(head,)]  # adjudication boundary reached
     if producer.node_type == "queue":
-        predecessors = graph.queue_predecessors.get(producer.id, ())
+        predecessors = graph.queue_predecessors[producer.id] if producer.id in graph.queue_predecessors else ()
         if not predecessors:
             return [(head,)]
         return [(head, *sub) for predecessor in predecessors for sub in _prompt_shield_producer_paths(predecessor, graph, visited)]
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        if not branches:
+            return [(head,)]
+        return [(head, *sub) for branch in branches for sub in _prompt_shield_upstream_paths(branch, graph, visited)]
     return [(head, *sub) for sub in _prompt_shield_upstream_paths(producer.input, graph, visited)]
 
 
+@trust_boundary(
+    tier=3,
+    source="node.options['mapping'], an untyped Mapping[str, Any] persisted on the composer node and "
+    "round-tripped through sessions.db storage",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="raises ValueError when options['mapping'] is present but not a Mapping; an absent key "
+    "defaults to {} (matching field_mapper's own FieldMapperConfig.mapping default_factory=dict), so "
+    "only genuine absence — never a present-but-malformed shape — is treated as empty",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape",
+    test_fingerprint="92b3cd5feff4db8445cc652f50da44578206ac25d813b479c601ad314d9fb908",
+)
 def _raw_html_cleanup_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec]) -> str:
     """Material-scoped hash for the raw-html cleanup review.
 
@@ -1314,7 +2070,12 @@ def _raw_html_cleanup_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec
 
     upstream_raw_fields = sorted(_web_scrape_raw_fields(all_nodes))
     raw_mapping = node.options["mapping"] if "mapping" in node.options else None
-    mapping: dict[str, Any] = dict(raw_mapping) if isinstance(raw_mapping, Mapping) else {}
+    if raw_mapping is not None and not isinstance(raw_mapping, Mapping):
+        raise ValueError(
+            f"pipeline_decision_artifact_hash: raw_html_cleanup requires field_mapper.mapping to be a "
+            f"mapping on node {node.id!r}, got {type(raw_mapping).__name__}"
+        )
+    mapping: dict[str, Any] = dict(raw_mapping) if raw_mapping is not None else {}
     select_only = "select_only" in node.options and node.options["select_only"] is True
     return stable_hash(
         {
@@ -1344,6 +2105,18 @@ def _validate_pipeline_decision_review(node: NodeSpec, all_nodes: Sequence[NodeS
         raise ValueError(f"node {node.id!r} pipeline-decision review hash drifted")
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['prompt_template_parts'], an untyped Mapping[str, Any] entry persisted on "
+    "the composer node and round-tripped through sessions.db storage or a composer LLM tool call",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises TypeError/ValueError on any malformed part shape (non-list value, non-mapping "
+    "item, unknown/missing kind, non-string text or requirement_id); never substitutes a default for a "
+    "present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_prompt_parts_rejects_non_list_value",
+    test_fingerprint="f336e86a56c756420ac391c350cbf8c1e9a768284669286d103a4575dcefcb2f",
+)
 def _prompt_parts(options: Mapping[str, Any]) -> tuple[PromptPart, ...] | None:
     value = options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in options else None
     if value is None:
@@ -1432,7 +2205,7 @@ def _render_prompt_parts(
             rendered.append(unresolved_text)
             continue
         accepted = requirement["accepted_value"]
-        if not isinstance(accepted, str):
+        if accepted is None:
             raise TypeError(f"resolved interpretation requirement {requirement_id!r} has no accepted value")
         rendered.append(accepted)
     return "".join(rendered)
@@ -1442,6 +2215,18 @@ def _legacy_terms(prompt_template: str) -> tuple[str, ...]:
     return tuple(match.group(1).strip() for match in INTERPRETATION_PLACEHOLDER_RE.finditer(prompt_template))
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] / ['prompt_template_parts'] / "
+    "['prompt_template'], untyped Mapping[str, Any] entries persisted on composer state and "
+    "round-tripped through sessions.db storage",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns 0 for any malformed sub-shape rather than raising (the Tier-3 staging idiom "
+    "documented in this function's own docstring); every caller treats a result != 1 as unresolvable "
+    "and rejects/blocks the mutation rather than accepting it, so the sentinel is fail-closed",
+    non_raising=True,
+)
 def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> int:
     """Count the resolvable ``vague_term`` wirings for ``user_term`` in a node's options.
 
@@ -1470,28 +2255,38 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
     """
     normalized_user_term = user_term.strip()
     requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-    matching_ids: list[Any] = []
+    matching_ids: list[str] = []
     if isinstance(requirements, (list, tuple)):
-        matching_ids = [
-            requirement["id"]
-            for requirement in requirements
-            if isinstance(requirement, Mapping)
-            and requirement.get("status") == "pending"
-            and isinstance(requirement.get("user_term"), str)
-            and requirement["user_term"].strip() == normalized_user_term
-            and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-        ]
+        for requirement in requirements:
+            if not isinstance(requirement, Mapping):
+                continue
+            if "status" not in requirement or requirement["status"] != "pending":
+                continue
+            if "user_term" not in requirement or not isinstance(requirement["user_term"], str):
+                continue
+            if requirement["user_term"].strip() != normalized_user_term:
+                continue
+            if (
+                requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value
+            ) != InterpretationKind.VAGUE_TERM.value:
+                continue
+            if "id" not in requirement:
+                continue
+            requirement_id = requirement["id"]
+            if not isinstance(requirement_id, str) or not requirement_id:
+                continue
+            matching_ids.append(requirement_id)
     if len(matching_ids) == 1:
         requirement_id = matching_ids[0]
-        if not isinstance(requirement_id, str) or not requirement_id:
-            return 0
         parts = options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in options else None
         if not isinstance(parts, (list, tuple)):
             return 0
         ref_count = sum(
             1
             for part in parts
-            if isinstance(part, Mapping) and part.get("kind") == "interpretation_ref" and part.get("requirement_id") == requirement_id
+            if isinstance(part, Mapping)
+            and ("kind" in part and part["kind"] == "interpretation_ref")
+            and ("requirement_id" in part and part["requirement_id"] == requirement_id)
         )
         return 1 if ref_count >= 1 else 0
     if len(matching_ids) > 1:
@@ -1589,10 +2384,14 @@ def _validated_review_index(options: Mapping[str, Any]) -> dict[tuple[str, Inter
 def _require_resolved_review_coherence(requirement: InterpretationRequirement) -> None:
     if requirement["status"] != "resolved":
         return
-    if type(requirement["event_id"]) is not str or not requirement["event_id"]:
+    event_id = requirement["event_id"]
+    if type(event_id) is not str or not event_id.strip():
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no event_id")
     if type(requirement["accepted_value"]) is not str:
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no accepted_value")
+    kind = InterpretationKind(requirement["kind"])
+    if not resolved_review_evidence_is_coherent(requirement, kind):
+        raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has incoherent evidence")
 
 
 def _node_review_artifact(
@@ -1628,12 +2427,8 @@ def _node_review_artifact(
 
 
 def _resolved_review_hash(requirement: InterpretationRequirement, kind: InterpretationKind) -> str:
-    if kind in (InterpretationKind.PIPELINE_DECISION, InterpretationKind.INVENTED_SOURCE):
-        field = "accepted_artifact_hash"
-        value = requirement["accepted_artifact_hash"]
-    else:
-        field = "resolved_prompt_template_hash"
-        value = requirement["resolved_prompt_template_hash"]
+    field = resolved_review_evidence_field(kind)
+    value = requirement[field]
     if type(value) is not str or not value:
         raise ValueError(f"resolved interpretation requirement {requirement['id']!r} has no {field}")
     return value
@@ -1696,7 +2491,7 @@ def _reconcile_node_options(
         if (
             kind is InterpretationKind.PIPELINE_DECISION
             and user_term == PROMPT_SHIELD_USER_TERM
-            and proposed.plugin == "llm"
+            and node_has_capability(proposed, PluginCapability.LLM)
             and _llm_has_authorized_shield_upstream(proposed, proposed_graph)
         ):
             continue
@@ -1740,8 +2535,11 @@ def _reconcile_node_options(
             unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT,
         )
         options["prompt_template"] = rendered
-        if carried_prompt_review:
-            options["resolved_prompt_template_hash"] = stable_hash(rendered)
+    if carried_prompt_review:
+        prompt_template = options["prompt_template"] if "prompt_template" in options else None
+        if type(prompt_template) is not str:
+            raise ValueError("carried prompt review has no rendered prompt_template")
+        options["resolved_prompt_template_hash"] = stable_hash(prompt_template)
     return options
 
 
@@ -1759,6 +2557,28 @@ def _reconcile_source_options(
         requirement_id, kind, _user_term = identity
         shell = _pending_authoring_shell(proposed_requirement)
         previous_requirement = previous_index[identity] if identity in previous_index else None
+        if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+            # The acknowledged artifact binds the contract semantics and
+            # demand FIELD SET, which are facts about the whole graph rather
+            # than about this source's own options, so this per-source
+            # reconciliation cannot judge graph drift. It can and must
+            # validate the accepted-value/hash pair and require the proposed
+            # source to retain the resolver-stamped guarantee before
+            # preserving current authority. The pending-site enumerator
+            # recomputes live graph demand on every read.
+            if previous is None or previous_requirement is None or previous_requirement["status"] != "resolved":
+                reconciled.append(shell)
+                continue
+            _require_resolved_review_coherence(previous_requirement)
+            acknowledged_fields = resolved_source_data_contract_fields(previous_requirement)
+            if acknowledged_fields is None:
+                raise ValueError(f"resolved interpretation requirement {requirement_id!r} evidence drifted")
+            proposed_guaranteed_fields = _observed_source_guaranteed_fields(proposed.options)
+            if proposed_guaranteed_fields is None or not frozenset(acknowledged_fields) <= proposed_guaranteed_fields:
+                reconciled.append(shell)
+                continue
+            reconciled.append(dict(previous_requirement))
+            continue
         if kind is not InterpretationKind.INVENTED_SOURCE:
             if previous_requirement is not None and previous_requirement["status"] == "resolved":
                 raise ValueError(f"review kind {kind.value!r} cannot target source {component_id!r}")
@@ -1801,7 +2621,7 @@ def reconcile_authoritative_reviews(
             options=_reconcile_source_options(
                 previous_sources[source_name] if source_name in previous_sources else None,
                 source,
-                component_id=source_name,
+                component_id=source_component_id(source_name),
             ),
         )
         for source_name, source in proposed.sources.items()

@@ -27,7 +27,9 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.audit import Call
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
@@ -40,6 +42,7 @@ from elspeth.core.security.web import (
     validate_url_for_ssrf,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -180,7 +183,10 @@ class WebScrapeConfig(TransformDataConfig):
         default="markdown",
         description="Content extraction format to emit: markdown, plain text, or raw HTML.",
     )
-    text_separator: str = Field(
+    text_separator: Annotated[
+        str,
+        EmittedToOutput("web_scrape joins DOM text nodes with this separator, so the value becomes part of the scraped row data"),
+    ] = Field(
         default=" ",
         min_length=1,
         max_length=16,
@@ -344,20 +350,42 @@ def _build_web_scrape_output_semantics(
         ContentKind,
         FieldSemanticFacts,
         OutputSemanticDeclaration,
+        SemanticValueType,
         TextFraming,
     )
 
+    # ``value_type`` is STR for every recognized format, and that is a fact this
+    # transform genuinely knows: ``process`` calls ``content.encode()`` before
+    # assigning ``output[content_field]``, so a non-str value could not reach
+    # the row. Leaving it UNKNOWN was an under-declaration, and an abstaining
+    # dimension downgrades an otherwise-SATISFIED edge to advisory UNKNOWN for
+    # any consumer that constrains it (ADR-039: abstention cannot be graded by
+    # the facts).
+    value_type = SemanticValueType.STR
     if format == "markdown":
         kind = ContentKind.MARKDOWN
         framing = TextFraming.LINE_COMPATIBLE
         fact_code = "web_scrape.content.markdown"
     elif format == "raw":
         kind = ContentKind.HTML_RAW
-        framing = TextFraming.NOT_TEXT
+        # UNCONSTRAINED, not NOT_TEXT: the raw value is the fetched page
+        # verbatim — a str whose framing is whatever the server sent, which no
+        # configuration settles. That is the UNCONSTRAINED claim by definition.
+        # NOT_TEXT positively claims the value is not text at all, which was
+        # false of a str of HTML and made ``raw -> document`` (archive this
+        # page to a file) a false authoring CONFLICT (elspeth-24c04df25f).
+        # HTML_RAW on the kind axis already says what the text IS.
+        framing = TextFraming.UNCONSTRAINED
         fact_code = "web_scrape.content.raw_html"
     elif format == "text":
         kind = ContentKind.PLAIN_TEXT
-        if "\n" in text_separator:
+        # CR as well as LF: ``sink:text`` diverts on either ("Text values cannot
+        # contain CR or LF record separators", text_sink.py), so a separator
+        # carrying only CR would otherwise declare COMPACT and still divert.
+        # ``extract_content`` normalises intra-node CR/LF away on exactly this
+        # condition, which is what makes the COMPACT claim true rather than
+        # merely intended.
+        if "\n" in text_separator or "\r" in text_separator:
             framing = TextFraming.NEWLINE_FRAMED
             fact_code = "web_scrape.content.newline_framed_text"
         else:
@@ -365,9 +393,12 @@ def _build_web_scrape_output_semantics(
             fact_code = "web_scrape.content.compact_text"
     else:
         # Unknown format value — let the schema layer handle it.
-        # Returning UNKNOWN here is honest: we don't know.
+        # Returning UNKNOWN here is honest: we don't know. ``format`` is a
+        # Literal, so this branch is defensive; abstaining on every dimension
+        # keeps it from asserting anything about a shape it did not produce.
         kind = ContentKind.UNKNOWN
         framing = TextFraming.UNKNOWN
+        value_type = SemanticValueType.UNKNOWN
         fact_code = "web_scrape.content.unknown_format"
 
     return OutputSemanticDeclaration(
@@ -376,6 +407,7 @@ def _build_web_scrape_output_semantics(
                 field_name=content_field,
                 content_kind=kind,
                 text_framing=framing,
+                value_type=value_type,
                 fact_code=fact_code,
                 configured_by=("format", "text_separator"),
             ),
@@ -450,12 +482,42 @@ class WebScrapeTransform(BaseTransform):
                 scraping_reason: Regulatory monitoring
     """
 
+    # url_field is an INPUT column (the row field holding the URL to fetch);
+    # these two choose where the fetched content is WRITTEN.
+    output_naming_config_keys = frozenset({"content_field", "fingerprint_field"})
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:33db98243c1da728"
+    source_file_hash: str | None = "sha256:3f7fcb93381553cf"
     config_model = WebScrapeConfig
     passes_through_input = True
+    fetches_http = True
+    content_trust = ContentTrust.UNTRUSTED
+    capability_tags: tuple[str, ...] = ("http", "network", "scraping")
+
+    usage_when_to_use = (
+        "Use when each row contains a public HTTP(S) page URL and you need an audited fetch, "
+        "Markdown or plain text extraction, and a change fingerprint. Returned remote content is "
+        "untrusted before LLM consumption, so apply the appropriate prompt-injection control first."
+    )
+    usage_when_not_to_use = (
+        "Not for authenticated APIs or binary documents. Use a purpose-built authenticated API "
+        "integration for APIs, or blob_fetch when the workflow must preserve original document bytes."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: web_scrape\n"
+        "  options:\n"
+        "    url_field: page_url\n"
+        "    content_field: page_markdown\n"
+        "    fingerprint_field: page_fingerprint\n"
+        "    format: markdown\n"
+        "    http:\n"
+        "      abuse_contact: catalogue-ops@example.org\n"
+        "      scraping_reason: Audited public policy monitoring\n"
+        "      allowed_hosts: public_only\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -494,6 +556,7 @@ class WebScrapeTransform(BaseTransform):
                 "fetch_url_final_ip",
             ]
         )
+        self._reject_input_options_naming_created_fields({"url_field": cfg.url_field})
 
         # Format and fingerprint mode
         self._format = cfg.format
@@ -571,7 +634,8 @@ class WebScrapeTransform(BaseTransform):
                     "URLs MUST include explicit scheme (http:// or https://). Bare hostnames are rejected by the SSRF guard at fetch time.",
                     "schema is required; use schema: {mode: observed} unless you need fixed/flexible field contracts. For raw HTML, set format to raw, not html.",
                     "web_scrape passes through upstream row fields that the input schema guarantees, and also guarantees content_field, fingerprint_field, fetch_status, fetch_url_final, and fetch_url_final_ip.",
-                    "Do not make downstream LLM templates require a URL field unless the upstream source schema or web_scrape schema guarantees that field. If the final fetched URL is acceptable, use fetch_url_final; if the original URL is required, preserve and guarantee that source field upstream.",
+                    "Do not make downstream LLM templates require a URL field unless the upstream source schema or web_scrape schema guarantees that field; if the original URL is required, preserve and guarantee that source field upstream.",
+                    "fetch_url_final is a persistence-safe rendering of the final URL (userinfo/fragment stripped, known-sensitive query values fingerprinted, query re-encoded) — use it to identify the fetched resource, not to re-fetch it.",
                     "If validation says a downstream URL field is missing, do not patch web_scrape guaranteed_fields by guess; repair the producer schema, add an explicit mapper, or narrow the downstream template requirements.",
                     "http.abuse_contact and http.scraping_reason are mandatory and recorded in the audit trail — operator must declare them, not the model.",
                     "If the user-facing output should exclude raw scraped content, route the final path through field_mapper with select_only: true before the sink; a sink name or output name is not cleanup.",
@@ -742,11 +806,14 @@ class WebScrapeTransform(BaseTransform):
             response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
             final_resolved_ip = _final_response_ip(response)
         except BodyTooLargeError as e:
+            # Rebuild the message from structured fields — str(e) carries the
+            # underlying HTTP-layer text, which embeds the raw hop URL.
+            safe_url = fingerprint_url(safe_request.original_url)
             return TransformResult.error(
                 {
                     "reason": "body_too_large",
-                    "error": str(e),
-                    "url": safe_request.original_url,
+                    "error": f"response body {e.body_size} bytes exceeds max_body_bytes {e.max_body_bytes} for {safe_url}",
+                    "url": safe_url,
                     "body_size": e.body_size,
                     "max_body_bytes": e.max_body_bytes,
                 }
@@ -770,16 +837,21 @@ class WebScrapeTransform(BaseTransform):
         # produce mojibake fingerprints and corrupt change-detection. Only text/*
         # and application/xhtml+xml are accepted; an absent Content-Type header is
         # treated as unknown and rejected conservatively.
-        content_type_raw = response.headers.get("content-type", "")
-        content_type_lower = content_type_raw.split(";", 1)[0].strip().lower()
+        # Persistence-safe URL for every error dict below (eager fingerprint,
+        # elspeth-600360c72e): the executor scrubber cannot recognise arbitrary
+        # secret-bearing query values, so redaction happens at construction.
+        safe_url = fingerprint_url(safe_request.original_url)
+
+        content_type_raw = response.headers.get("content-type")
+        content_type_lower = None if content_type_raw is None else content_type_raw.split(";", 1)[0].strip().lower()
         _TEXT_CONTENT_TYPES = ("text/", "application/xhtml+xml")
-        if not any(content_type_lower.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES):
+        if content_type_lower is None or not any(content_type_lower.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES):
             return TransformResult.error(
                 {
                     "reason": "non_text_content_type",
-                    "error": f"non-text content-type {content_type_raw!r} returned by {safe_request.original_url}; expected text/*",
+                    "error": f"non-text content-type {content_type_raw!r} returned by {safe_url}; expected text/*",
                     "content_type": content_type_raw,
-                    "url": safe_request.original_url,
+                    "url": safe_url,
                 }
             )
 
@@ -791,12 +863,10 @@ class WebScrapeTransform(BaseTransform):
             return TransformResult.error(
                 {
                     "reason": "body_too_large",
-                    "error": (
-                        f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes} for {safe_request.original_url}"
-                    ),
+                    "error": (f"response body {body_size} bytes exceeds max_body_bytes {self._max_body_bytes} for {safe_url}"),
                     "body_size": body_size,
                     "max_body_bytes": self._max_body_bytes,
-                    "url": safe_request.original_url,
+                    "url": safe_url,
                 }
             )
 
@@ -814,7 +884,7 @@ class WebScrapeTransform(BaseTransform):
                     "reason": "content_extraction_failed",
                     "error": str(e),
                     "error_type": type(e).__name__,
-                    "url": safe_request.original_url,
+                    "url": safe_url,
                 }
             )
 
@@ -844,7 +914,12 @@ class WebScrapeTransform(BaseTransform):
         output[self._content_field] = content
         output[self._fingerprint_field] = fingerprint
         output["fetch_status"] = response.status_code
-        output["fetch_url_final"] = final_hostname_url
+        # Redirects are attacker-influenced and this value is PERSISTED — onto the
+        # row and through it into the audit trail — so userinfo and the fragment
+        # are stripped and known-sensitive query values fingerprinted first.
+        # Matches blob_fetch (7e8840bad); a query-free URL passes through
+        # unchanged, but a query string is parse/re-encode normalised.
+        output["fetch_url_final"] = fingerprint_url(final_hostname_url)
         output["fetch_url_final_ip"] = final_resolved_ip
 
         # Propagate contract so FIXED schemas can access fields added during enrichment
@@ -887,6 +962,11 @@ class WebScrapeTransform(BaseTransform):
         # Infrastructure captured in on_start()
         if ctx.state_id is None:
             raise FrameworkBugError("ctx.state_id not set by executor — executor must set state_id before calling process().")
+        # Persistence-safe URL, computed eagerly (elspeth-600360c72e): every
+        # message raised below can be persisted via TransformResult.error()
+        # or the retry path, and the underlying httpx/SSRF exception text can
+        # embed raw hop URLs — so neither the raw URL nor str(e) may appear.
+        safe_url = fingerprint_url(safe_request.original_url)
         limiter = self._limiter.get_limiter("web_scrape")
 
         # Create audited client (records to Landscape)
@@ -916,20 +996,19 @@ class WebScrapeTransform(BaseTransform):
             )
 
             # Check status code and raise appropriate errors
-            url = safe_request.original_url
             if response.status_code == 404:
-                raise NotFoundError(f"HTTP 404: {url}")
+                raise NotFoundError(f"HTTP 404: {safe_url}")
             elif response.status_code == 403:
-                raise ForbiddenError(f"HTTP 403: {url}")
+                raise ForbiddenError(f"HTTP 403: {safe_url}")
             elif response.status_code == 401:
-                raise UnauthorizedError(f"HTTP 401: {url}")
+                raise UnauthorizedError(f"HTTP 401: {safe_url}")
             elif response.status_code == 429:
-                raise RateLimitError(f"HTTP 429: {url}")
+                raise RateLimitError(f"HTTP 429: {safe_url}")
             elif 500 <= response.status_code < 600:
-                raise ServerError(f"HTTP {response.status_code}: {url}")
+                raise ServerError(f"HTTP {response.status_code}: {safe_url}")
             elif 300 <= response.status_code < 400:
                 # Unresolved redirect (e.g. 3xx without Location header) -- treat as error
-                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code}: {url} (missing or empty Location header)")
+                raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code}: {safe_url} (missing or empty Location header)")
             elif 400 <= response.status_code < 500:
                 # Catch-all for unenumerated 4xx codes (400, 402, 405, 406, 408,
                 # 410, 418, 451, ...). Without this arm the response would be
@@ -938,28 +1017,33 @@ class WebScrapeTransform(BaseTransform):
                 # 408 Request Timeout is retryable (transient server overload);
                 # all other unenumerated 4xx codes are non-retryable client errors.
                 retryable = response.status_code == 408
-                raise ClientError(f"HTTP {response.status_code}: {url}", retryable=retryable)
+                raise ClientError(f"HTTP {response.status_code}: {safe_url}", retryable=retryable)
 
             return response, final_hostname_url, call
 
         except httpx.TimeoutException as e:
-            raise NetworkError(f"Timeout fetching {safe_request.original_url}: {e}") from e
+            raise NetworkError(f"Timeout fetching {safe_url}") from e
         except httpx.ConnectError as e:
-            raise NetworkError(f"Connection error fetching {safe_request.original_url}: {e}") from e
+            raise NetworkError(f"Connection error fetching {safe_url}") from e
         except HTTPResponseBodyTooLargeError as e:
-            raise BodyTooLargeError(str(e), body_size=e.body_size, max_body_bytes=e.max_body_bytes) from e
+            # str(e) embeds the raw hop URL — rebuild from structured fields.
+            raise BodyTooLargeError(
+                f"response body {e.body_size} bytes exceeds max_body_bytes {e.max_body_bytes} for {safe_url}",
+                body_size=e.body_size,
+                max_body_bytes=e.max_body_bytes,
+            ) from e
         except SSRFBlockedError as e:
             # Redirect hop resolved to a blocked IP — non-retryable security violation
             from elspeth.plugins.transforms.web_scrape_errors import SSRFBlockedError as WSSRFBlockedError
 
-            raise WSSRFBlockedError(f"SSRF blocked during redirect: {safe_request.original_url}: {e}") from e
+            raise WSSRFBlockedError(f"SSRF blocked during redirect while fetching {safe_url}") from e
         except SSRFNetworkError as e:
             # DNS resolution failed during redirect hop
-            raise NetworkError(f"DNS resolution failed during redirect: {safe_request.original_url}: {e}") from e
+            raise NetworkError(f"DNS resolution failed during redirect while fetching {safe_url}") from e
         except httpx.TooManyRedirects as e:
-            raise InvalidURLError(f"Too many redirects: {safe_request.original_url}: {e}") from e
+            raise InvalidURLError(f"Too many redirects while fetching {safe_url}") from e
         except httpx.RequestError as e:
-            raise NetworkError(f"HTTP request error fetching {safe_request.original_url}: {e}") from e
+            raise NetworkError(f"HTTP request error fetching {safe_url} ({type(e).__name__})") from e
         finally:
             client.close()
 

@@ -34,7 +34,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.compiler import SQLCompiler
 
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.types import NODE_ID_MAX_LENGTH
 from elspeth.core.schema_identity import create_schema_identity_table
@@ -149,6 +149,28 @@ def _compile_sqlite_optional_lower_hex(element: _OptionalLowerHex64Check, _compi
 def _compile_postgres_optional_lower_hex(element: _OptionalLowerHex64Check, _compiler: SQLCompiler, **_kw: object) -> str:
     name = element.column_name
     return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{64}}$'"
+
+
+class _OptionalLowerHex16Check(ColumnElement[bool]):
+    """Dialect-exact optional 16-character audit error fingerprint."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex16Check, "sqlite")
+def _compile_sqlite_optional_lower_hex16(element: _OptionalLowerHex16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=16 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex16Check, "postgresql")
+def _compile_postgres_optional_lower_hex16(element: _OptionalLowerHex16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{16}}$'"
 
 
 def _sql_string_literal(value: str) -> str:
@@ -273,7 +295,87 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        batch expansion has one durable effect claim per batch; committed
 #        sidecar-journal batches use a transaction-owned outbox bound to their
 #        canonical sidecar destination.
-SQLITE_SCHEMA_EPOCH = 29
+#   30 → row_union barrier durability: token_work_items.row_union_name records
+#        which declared row_union barrier a blocked work item belongs to, so a
+#        recovered scheduler can reconcile fork-branch groups without in-memory
+#        state. This is a pre-1.0 delete-and-recreate boundary; a Landscape
+#        store written at epoch 29 lacks the column and is not migrated.
+#   31 → token_work_items.status is mechanically closed over TokenWorkStatus.
+#        Removed states such as WAITING can no longer be reintroduced through
+#        direct SQL. This is a pre-1.0 delete-and-recreate boundary.
+#   32 → Every successful aggregation completion records an ordered,
+#        self-contained result receipt. A replacement process can materialize
+#        transform outputs, continue passthrough rows with their original
+#        token identities, or finish empty members without replaying the
+#        plugin after node/batch completion.
+#   33 → token_outcomes carries a composite (run_id, token_id) access path.
+#        Run-scoped per-token reads previously had to choose between two
+#        single-column indexes with no statistics to separate them, and the
+#        accounting census picked the wrong one. This is a pre-1.0
+#        delete-and-recreate boundary: the index is physical schema, so a store
+#        written at epoch 32 lacks it and is not migrated.
+#   34 → Unified lineage groundwork (WS1a, barrier-scopes spec rev 3.2):
+#        token_lineage_frames (typed lineage-frame stack per token, written in
+#        the token-INSERT transaction), group_records (roster record for every
+#        opening operation, empty expansions included), group_losses (the
+#        unified loss ledger — written from WS3), and
+#        token_work_items.lineage_path_json (journal-riding lineage path).
+#        Pre-1.0 delete-and-recreate boundary; no migration.
+#   35 → Unified lineage flip (WS1b Phase B): tri-column lineage retirement —
+#        tokens.{fork_group_id,expand_group_id,branch_name},
+#        token_outcomes.{fork_group_id,join_group_id,expand_group_id}, and
+#        token_work_items.{branch_name,fork_group_id,expand_group_id} are
+#        deleted; token_outcomes.expected_branches_json is deleted (D2);
+#        lineage_path_json (token_work_items) and token_lineage_frames are the
+#        sole lineage truth. join_group_id stays on tokens/token_work_items
+#        (merge-event identity, D1). Pre-1.0 delete-and-recreate boundary; no
+#        migration.
+#   36 → coalesce_effects.group_id (elspeth-8655045f98, WS4 Task 12 part 2,
+#        arch-M1 site #4): two sibling fork groups sharing one row_id can
+#        each complete their own merge at the same coalesce node, and the
+#        restore-recovery reader (get_committed_coalesce_residual) had no
+#        column to tell them apart, raising a false AuditIntegrityError on
+#        the legitimate second residual. Unlike epoch 35's collector_name
+#        addition (nullable, no table-shape change, landed within-epoch),
+#        this column is nullable=False with no defaulting branch — a
+#        genuine table-shape change, not a same-shape widening — so it gets
+#        its own epoch rather than folding into 35. uq_coalesce_effects_scope
+#        is unchanged (row_id kept, argument on that decision at the
+#        constraint's own definition). Pre-1.0 delete-and-recreate boundary;
+#        no migration.
+#   37 → pluggable SSO (elspeth-07cd19ba73, spec
+#        docs/specs/2026-09-02-pluggable-sso-design.md): auth_events gains a
+#        nullable indexed identity_id and its event_type CHECK widens from
+#        three values to twenty-three, covering admission, authority, the org
+#        tree and workflow governance. That CHECK is CLOSED, so a value
+#        missing from it is a self-inflicted outage — R4 refuses the mutation
+#        whose audit write failed — which is why the whole vocabulary lands
+#        now rather than arriving with the features that use it. The auth
+#        provider discriminator also widens from three values to five —
+#        ck_run_attributions_auth_provider_type and ck_auth_events_provider
+#        both admit 'vanguard' and 'google'. Landscape compares declared
+#        CHECK text against the reflected constraint structurally, so a
+#        widened constraint trips the schema validator against an existing
+#        database exactly as the 2026-08-14 index change did; it is a schema
+#        change even though every value the old constraint admitted is still
+#        admitted. Cut over in the SAME service-stop window as sessions
+#        epoch 52 (one window, two stores). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+#   38 → scheduler_events replay order (elspeth-2d436dd6e8,
+#        elspeth-5d66fc5ed1): scheduler_events gains an AUTOINCREMENT ``seq``
+#        primary key in the run_coordination_events shape and every reader
+#        orders by it; event_id is demoted to a non-unique content digest of
+#        the transition that no longer covers recorded_at. Under ADR-047
+#        database time (whole-second on SQLite, one shared transaction
+#        timestamp on PostgreSQL) events tie on recorded_at and replayed in
+#        hash order — a caller-stamped mark_terminal at S.4 sorted AFTER the
+#        database-stamped claim at S.0 that followed it — and two identical
+#        transitions of one work item inside one second collided on the
+#        event_id primary key. The two supporting indexes follow the key
+#        (ix_scheduler_events_run_token_time is replaced by
+#        ix_scheduler_events_run_token_seq). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+SQLITE_SCHEMA_EPOCH = 38
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -306,6 +408,20 @@ class RunSourceLifecycleState(StrEnum):
     EXHAUSTED = "exhausted"
     LOADED = "loaded"
     INTERRUPTED = "interrupted"
+
+
+# ADR-038: the source lifecycle states from which a resume can rebuild source
+# evidence. Shared by the resume gate (``IncompleteSourceResumeError``,
+# engine/orchestrator/resume.py) and the run-finalization abandonment sweep
+# (run_lifecycle_repository) — the sweep abandons exactly when the gate would
+# refuse, and drift between the two predicates is the bug class this shared
+# constant prevents.
+SOURCE_COMPLETE_LIFECYCLE_STATES: frozenset[str] = frozenset(
+    {
+        RunSourceLifecycleState.EXHAUSTED.value,
+        RunSourceLifecycleState.LOADED.value,
+    }
+)
 
 
 # === Runs and Configuration ===
@@ -378,7 +494,10 @@ run_attributions_table = Table(
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     Column("initiated_by_user_id", String(255), nullable=False),
     Column("auth_provider_type", String(32), nullable=False),
-    CheckConstraint("auth_provider_type IN ('local', 'oidc', 'entra')", name="ck_run_attributions_auth_provider_type"),
+    CheckConstraint(
+        "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
+        name="ck_run_attributions_auth_provider_type",
+    ),
 )
 Index("ix_run_attributions_user", run_attributions_table.c.initiated_by_user_id, run_attributions_table.c.auth_provider_type)
 
@@ -553,10 +672,7 @@ tokens_table = Table(
     Column("token_id", String(64), primary_key=True),
     Column("row_id", String(64), ForeignKey("rows.row_id"), nullable=False),
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),  # Run ownership for cross-run contamination prevention
-    Column("fork_group_id", String(64)),
-    Column("join_group_id", String(64)),
-    Column("expand_group_id", String(32), nullable=True, index=True),  # For deaggregation
-    Column("branch_name", String(64)),
+    Column("join_group_id", String(64)),  # merge event — anchors the coalesce_effects composite FK
     Column("step_in_pipeline", Integer),  # Step where this token was created (fork/coalesce/expand)
     # Payload-store ref for a token whose row_data differs from its source row:
     # expand/deaggregation children (independently-transformed data) AND post-coalesce
@@ -605,14 +721,9 @@ token_outcomes_table = Table(
     # Outcome-specific fields (nullable based on (outcome, path) pair)
     Column("sink_name", String(128)),
     Column("batch_id", String(64)),
-    Column("fork_group_id", String(64)),
-    Column("join_group_id", String(64)),
-    Column("expand_group_id", String(64)),
     Column("error_hash", String(64)),
     # Optional extended context
     Column("context_json", Text),
-    # Branch contract for FORKED/EXPANDED outcomes (enables recovery validation)
-    Column("expected_branches_json", Text),
     # Composite FK: batch outcomes must point at a batch from the same run.
     ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
 )
@@ -625,6 +736,26 @@ Index(
     unique=True,
     sqlite_where=(token_outcomes_table.c.completed == 1),
     postgresql_where=(token_outcomes_table.c.completed == 1),
+)
+
+# Run-scoped per-token access path (epoch 33, elspeth-c675c8c2d9). run_id and
+# token_id are each indexed above, and that was precisely the trap: a
+# (run_id, token_id) equality pair offered two single-column candidates, and an
+# audit database carries no ANALYZE statistics, so SQLite's fixed selectivity
+# guess could not tell that run_id matches an entire run's outcomes while
+# token_id matches at most a handful. It chose run_id, and the accounting
+# census degraded to a nested scan — 618s to project one 60k-token run.
+#
+# The census no longer joins per token, so this index is not what rescues that
+# endpoint; the read model's own shape is. What it buys is ordering: the census
+# groups by (run_id, token_id), and with this index those rows arrive in group
+# order, so the grouping streams instead of sorting every outcome row through a
+# temp B-tree. It also removes the two-candidate ambiguity for any future
+# run-scoped per-token read, which is the defect class that produced the hang.
+Index(
+    "ix_token_outcomes_run_token",
+    token_outcomes_table.c.run_id,
+    token_outcomes_table.c.token_id,
 )
 
 token_work_items_table = Table(
@@ -647,12 +778,19 @@ token_work_items_table = Table(
     Column("pending_path", String(64)),
     Column("pending_error_hash", String(64)),
     Column("pending_error_message", Text),
-    Column("branch_name", String(128)),
-    Column("fork_group_id", String(128)),
     Column("join_group_id", String(128)),
-    Column("expand_group_id", String(128)),
+    # Epoch 35: the token's typed lineage path (outermost first), serialized by
+    # contracts.identity.lineage_path_to_json. The journal is authoritative for
+    # resume — this is the sole lineage write path.
+    Column("lineage_path_json", Text, nullable=False),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
     Column("coalesce_name", String(128)),
+    Column("row_union_name", String(128)),
+    # WS4 Task 6: the collector's barrier BINDING address (spec §4.3), mirroring
+    # row_union_name's epoch-30 shape one column over. Lands within the current
+    # epoch 35 (pre-1.0, no migration) rather than its own bump — no table-shape
+    # change is entangled with it, unlike epoch 30's original addition.
+    Column("collector_name", String(128)),
     Column("attempt", Integer, nullable=False),
     Column("lease_owner", String(128)),
     Column("lease_expires_at", DateTime(timezone=True)),
@@ -682,6 +820,7 @@ token_work_items_table = Table(
         f"AND lease_owner IS NOT NULL AND length(lease_owner) > 0) OR status != {_sql_string_literal(TokenWorkStatus.LEASED.value)}",
         name="ck_token_work_items_lease_owner_required_when_leased",
     ),
+    CheckConstraint(_enum_in_check("status", TokenWorkStatus), name="ck_token_work_items_status"),
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
@@ -804,7 +943,22 @@ def blocked_barrier_hold_clause() -> ColumnElement[bool]:
 scheduler_events_table = Table(
     "scheduler_events",
     metadata,
-    Column("event_id", String(64), primary_key=True),
+    # Authoritative replay order and row identity (epoch 38). AUTOINCREMENT
+    # (not bare rowid) so seq values are never reused after deletion and are
+    # strictly monotonic for the life of the ledger. recorded_at is database
+    # time (ADR-047): whole-second on SQLite and one shared transaction
+    # timestamp on PostgreSQL, so it ties inside a second and inside a
+    # transaction and cannot order; seq can. Same shape as
+    # run_coordination_events.seq.
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    # sha256(canonical_json(transition content)) — the identity of WHAT
+    # happened (run, token, work item, from/to status, owners, attempts,
+    # deadlines, caller, context), deliberately NOT of when: recorded_at is
+    # excluded, and two content-identical transitions inside one database
+    # second are two rows that share an event_id and differ by seq. Not
+    # unique by design (elspeth-5d66fc5ed1) — the tickets forbid a nonce or
+    # process-clock microseconds in the hash, and seq is the occurrence.
+    Column("event_id", String(64), nullable=False),
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
     Column("token_id", String(64), nullable=False),
     # ``work_item_id`` is a forensic scheduler identity, not a foreign key:
@@ -841,19 +995,21 @@ scheduler_events_table = Table(
     CheckConstraint("to_attempt >= 0", name="ck_scheduler_events_to_attempt_non_negative"),
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    # Mandatory for the AUTOINCREMENT DDL on SQLite (see run_coordination_events);
+    # inert on PostgreSQL, where the Integer PK becomes IDENTITY.
+    sqlite_autoincrement=True,
 )
 Index(
-    "ix_scheduler_events_run_token_time",
+    "ix_scheduler_events_run_token_seq",
     scheduler_events_table.c.run_id,
     scheduler_events_table.c.token_id,
-    scheduler_events_table.c.recorded_at,
-    scheduler_events_table.c.event_id,
+    scheduler_events_table.c.seq,
 )
 Index(
     "ix_scheduler_events_work_item",
     scheduler_events_table.c.run_id,
     scheduler_events_table.c.work_item_id,
-    scheduler_events_table.c.recorded_at,
+    scheduler_events_table.c.seq,
 )
 
 # === Multi-worker run coordination (epoch 21, ADR-030) ===
@@ -957,32 +1113,109 @@ Index(
     run_coordination_events_table.c.seq,
 )
 
-coalesce_branch_losses_table = Table(
-    "coalesce_branch_losses",
+# === Unified lineage (epoch 34, barrier-scopes spec rev 3.2 §4.3) ===
+
+token_lineage_frames_table = Table(
+    "token_lineage_frames",
     metadata,
-    # §E.5: durable cross-worker branch-loss hand-off. Table only at epoch 21;
-    # record/replay verbs land in slice 3.
+    Column("token_id", String(64), primary_key=True),
+    Column("run_id", String(64), primary_key=True),
+    Column("depth", Integer, primary_key=True),  # 0 = outermost
+    Column("kind", String(16), nullable=False),
+    Column("group_id", String(64), nullable=False),
+    Column("member_key", String(128), nullable=False),  # FORK: branch name; EXPAND: member token_id
+    CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_token_lineage_frames_kind"),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+Index(
+    "ix_token_lineage_frames_group",
+    token_lineage_frames_table.c.run_id,
+    token_lineage_frames_table.c.group_id,
+    token_lineage_frames_table.c.member_key,
+)
+
+group_records_table = Table(
+    "group_records",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("group_id", String(64), primary_key=True),
+    Column("kind", String(16), nullable=False),
+    Column("opener_token_id", String(64), nullable=False),
+    # member_count=0 is legal and REQUIRED for empty expansions (§4.3): it is
+    # the durable referent the require_all empty-group failure needs.
+    Column("member_count", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    # META-38: the WRITTEN release fact. A collector RELEASE group (minted by
+    # collect_tokens when a bound EXPAND group closes) records the id of the
+    # group it closed; a real fork/expand opener leaves it NULL. This is the
+    # ONE discriminator `is_release_group` reads — no derivation from
+    # lineage shape, terminal-path vocabulary, or binding config, none of
+    # which survive nesting or a durable-twin reader with no config in hand.
+    Column("closes_group_id", String(64), nullable=True),
+    CheckConstraint("member_count >= 0", name="ck_group_records_member_count_nonneg"),
+    CheckConstraint(_enum_in_check("kind", FrameKind), name="ck_group_records_kind"),
+    ForeignKeyConstraint(["opener_token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+# One token opens at most one group. For fork/expand openers: a non-empty
+# opener records its terminal parent disposition (FORK_PARENT /
+# EXPAND_PARENT / BATCH_CONSUMED) in the same claim as its group_records
+# row; an EMPTY expansion is the measured exception (META-38 amendment 2):
+# record_empty_expansion writes only the member_count=0 row, and the
+# opener's FILTER_DROPPED terminal lands later from the traversal
+# (token_traversal.py) — that transactional gap is ticketed separately. A
+# second open is unreachable either way — this uniqueness is what makes the empty-expansion mint
+# idempotent under re-driven claims.
+#
+# For a COLLECT release's opener (a group MEMBER token, not an "opener" in
+# the fork/expand sense): collect_tokens writes no terminal disposition for
+# the representative member in the same claim (WS4 fix-round ruling + B-2
+# amendment — collector member terminals ride the WS3 settlement seam by
+# design, the same "closers stop writing token terminals" split fork/expand
+# openers already follow). The uniqueness invariant for this case is
+# EVENTUALLY-sustained via that settlement seam once the WS4 integration item
+# wires CloserKind.COLLECTOR dispatch into it; before that lands there is a
+# crash window in which a representative could theoretically be claimed a
+# second time without its terminal write having landed, and any takeover
+# replay across that window must tolerate it via collect_tokens' idempotent
+# replay skip (the existing group_records row short-circuits the re-drive
+# rather than re-minting).
+Index(
+    "uq_group_records_opener",
+    group_records_table.c.run_id,
+    group_records_table.c.opener_token_id,
+    unique=True,
+)
+
+group_losses_table = Table(
+    "group_losses",
+    metadata,
     Column("loss_id", String(64), primary_key=True),
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
-    Column("coalesce_name", String(128), nullable=False),
-    Column("row_id", String(64), nullable=False),
-    Column("branch_name", String(128), nullable=False),
+    Column("closer_name", String(128), nullable=False),
+    Column("group_id", String(64), nullable=False),
+    Column("member_key", String(128), nullable=False),
     Column("token_id", String(64), nullable=False),
-    Column("reason", String(64), nullable=False),  # failed / quarantined / error_routed / ...
-    Column("recorded_by", String(128), nullable=False),  # worker_id
+    # Categorical vocabulary only (2026-08-08 convention; String(64) per the
+    # battery-round-7 Postgres lesson pinned in
+    # test_coalesce_branch_loss_reason_postgres.py — WS3 owes the same
+    # three-proof treatment on this column).
+    Column("reason", String(64), nullable=False),
+    Column("recorded_by", String(128), nullable=False),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
-    Column("adopted_epoch", Integer),  # NULL = not yet replayed into leader memory
+    Column("adopted_epoch", Integer),  # NULL = not yet replayed into leader memory (§E.5 cursor)
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
 )
-# Natural-key idempotency (design §G: record_coalesce_branch_loss is
-# "idempotent on the natural key"). Named unique Index rather than a
-# UniqueConstraint for _REQUIRED_INDEXES verifiability; doubles as the hot
-# lookup index (replay scans by run_id + coalesce_name prefix).
+# Natural-key idempotency (record_group_loss is idempotent on the natural
+# key). Named unique Index rather than a UniqueConstraint for
+# _REQUIRED_INDEXES verifiability — matches the retired
+# coalesce_branch_losses precedent; doubles as the hot lookup index (replay
+# scans by run_id + closer_name prefix).
 Index(
-    "uq_coalesce_branch_losses_natural",
-    coalesce_branch_losses_table.c.run_id,
-    coalesce_branch_losses_table.c.coalesce_name,
-    coalesce_branch_losses_table.c.row_id,
-    coalesce_branch_losses_table.c.branch_name,
+    "uq_group_losses_natural",
+    group_losses_table.c.run_id,
+    group_losses_table.c.closer_name,
+    group_losses_table.c.group_id,
+    group_losses_table.c.member_key,
     unique=True,
 )
 
@@ -1120,6 +1353,17 @@ coalesce_effects_table = Table(
     Column("run_id", String(64), nullable=False),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
     Column("row_id", String(64), nullable=False),
+    # Epoch 36 (elspeth-8655045f98, arch-M1 site #4): the closing FORK
+    # group's id, captured pre-pop at the writer (coalesce_tokens'
+    # shared_group_id, NOT re-derived from the merged token's own path,
+    # which no longer carries the frame once the closer pops it). Sibling
+    # fork groups share row_id but never share group_id, so this is the
+    # collision-free key the restore reader needs — row_id alone let two
+    # independently-completed sibling merges look like corruption
+    # (get_committed_coalesce_residual raised on >1 row). nullable=False,
+    # no defaulting branch: the writer's own guard already requires the
+    # anchor to carry an innermost FORK frame before it gets this far.
+    Column("group_id", String(64), nullable=False),
     Column("parent_set_hash", String(64), nullable=False),
     Column("effect_hash", String(64), nullable=False),
     Column("expected_token_data_ref", String(64), nullable=False),
@@ -1130,6 +1374,23 @@ coalesce_effects_table = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True)),
     UniqueConstraint("effect_id", "run_id", name="uq_coalesce_effects_run_identity"),
+    # uq_coalesce_effects_scope deliberately KEEPS row_id, not group_id
+    # (elspeth-8655045f98 review disposition): group_id structurally
+    # determines row_id (a fork group belongs to exactly one row) and
+    # parent_set_hash already discriminates sibling groups today — they
+    # never share a parent token set — so (row_id, parent_set_hash) and
+    # (group_id, parent_set_hash) give equivalent idempotency protection
+    # here. Swapping in group_id would buy nothing against arch-M1 while
+    # opening a real gap: the idempotency SELECT immediately below (which
+    # this constraint backstops) cannot cheaply gain group_id — the
+    # closing FORK group isn't known until the parent lineage paths load
+    # inside write_connection(), after this scope is built — so a
+    # constraint keyed on group_id while the SELECT stays row_id-keyed
+    # would let a legitimate idempotent retry miss the SELECT and hit the
+    # constraint as a hard IntegrityError instead of an idempotent return
+    # (the surrounding code's own contract: a natural-key IntegrityError
+    # here means a violated lock invariant, not idempotency, and must
+    # surface unchanged). The existing tuple remains correct as-is.
     UniqueConstraint(
         "run_id",
         "coalesce_node_id",
@@ -1976,6 +2237,74 @@ batch_members_table = Table(
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
 )
 
+aggregation_results_table = Table(
+    "aggregation_results",
+    metadata,
+    Column("batch_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("aggregation_state_id", String(64), nullable=False),
+    Column("output_mode", String(16), nullable=False),
+    Column("output_shape", String(16), nullable=False),
+    Column("output_hash", String(64), nullable=False),
+    Column("expansion_parent_token_id", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("batch_id", "run_id"),
+    UniqueConstraint("aggregation_state_id", "run_id"),
+    CheckConstraint("output_mode IN ('transform', 'passthrough')", name="ck_aggregation_results_output_mode"),
+    CheckConstraint("output_shape IN ('empty', 'single', 'multi')", name="ck_aggregation_results_output_shape"),
+    CheckConstraint(
+        "(output_mode = 'transform' AND output_shape IN ('single', 'multi') AND expansion_parent_token_id IS NOT NULL) OR "
+        "(output_mode = 'transform' AND output_shape = 'empty' AND expansion_parent_token_id IS NULL) OR "
+        "(output_mode = 'passthrough' AND output_shape IN ('empty', 'multi') AND expansion_parent_token_id IS NULL)",
+        name="ck_aggregation_results_mode_shape_parent",
+    ),
+    CheckConstraint(_LowerHex64Check("output_hash"), name="ck_aggregation_results_output_hash_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
+    ForeignKeyConstraint(
+        ["aggregation_state_id", "run_id"],
+        ["node_states.state_id", "node_states.run_id"],
+    ),
+    ForeignKeyConstraint(
+        ["expansion_parent_token_id", "run_id"],
+        ["tokens.token_id", "tokens.run_id"],
+    ),
+)
+
+aggregation_result_outputs_table = Table(
+    "aggregation_result_outputs",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("token_data_ref", String(64), nullable=False),
+    PrimaryKeyConstraint("batch_id", "ordinal"),
+    CheckConstraint("ordinal >= 0", name="ck_aggregation_result_outputs_ordinal"),
+    CheckConstraint(_LowerHex64Check("token_data_ref"), name="ck_aggregation_result_outputs_ref_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),
+)
+
+aggregation_result_members_table = Table(
+    "aggregation_result_members",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("token_id", String(64), nullable=False),
+    Column("action", String(32), nullable=False),
+    Column("error_hash", String(64)),
+    PrimaryKeyConstraint("batch_id", "ordinal"),
+    UniqueConstraint("batch_id", "token_id"),
+    CheckConstraint("ordinal >= 0", name="ck_aggregation_result_members_ordinal"),
+    CheckConstraint(
+        "(action IN ('consume_batch', 'drop_filtered', 'continue_passthrough') AND error_hash IS NULL) OR "
+        "(action = 'quarantine' AND error_hash IS NOT NULL)",
+        name="ck_aggregation_result_members_action",
+    ),
+    CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_aggregation_result_members_error_hash_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+
 batch_outputs_table = Table(
     "batch_outputs",
     metadata,
@@ -1993,6 +2322,8 @@ Index("ix_routing_events_run_state", routing_events_table.c.run_id, routing_even
 Index("ix_routing_events_group", routing_events_table.c.routing_group_id)
 Index("ix_batches_run_status", batches_table.c.run_id, batches_table.c.status)
 Index("ix_batch_members_batch", batch_members_table.c.batch_id)
+Index("ix_aggregation_results_run", aggregation_results_table.c.run_id)
+Index("ix_aggregation_result_outputs_ref", aggregation_result_outputs_table.c.token_data_ref)
 Index("ix_batch_outputs_batch", batch_outputs_table.c.batch_id)
 
 # Indexes for existing Phase 1 tables
@@ -2178,8 +2509,26 @@ auth_events_table = Table(
     Column("client_host", String(128)),
     Column("user_agent", Text),
     Column("metadata_json", Text, nullable=False),
+    # Nullable and indexed: rows written before the identity substrate
+    # existed have none, and a login that fails before an identity is
+    # resolved never will. ``user_id`` stays for the audit reader.
+    Column("identity_id", String(64)),
+    # Hand-written and pinned against ``AuthAuditEventType`` by
+    # ``tests/unit/web/auth/test_provider_type_contract.py``. Deriving the SQL
+    # from the Literal would let a contract edit change what the database
+    # admits with no epoch bump; pinning it means the drift is caught instead.
     CheckConstraint(
-        "event_type IN ('login', 'token_issued', 'auth_failure')",
+        "event_type IN ("
+        "'login', 'token_issued', 'auth_failure', 'logout', "
+        "'identity_activated', 'identity_disabled', 'identity_enabled', "
+        "'role_granted', 'role_revoked', "
+        "'relationship_asserted', 'relationship_revoked', "
+        "'approval_requested', 'approval_decided', "
+        "'review_requested', 'review_request_cancelled', 'review_attested', "
+        "'library_published', 'library_accepted', 'library_rejected', "
+        "'library_deprecated', 'library_recalled', "
+        "'quota_set', 'quota_exceeded'"
+        ")",
         name="ck_auth_events_event_type",
     ),
     CheckConstraint(
@@ -2187,7 +2536,7 @@ auth_events_table = Table(
         name="ck_auth_events_outcome",
     ),
     CheckConstraint(
-        "provider IN ('local', 'oidc', 'entra')",
+        "provider IN ('local', 'oidc', 'entra', 'vanguard', 'google')",
         name="ck_auth_events_provider",
     ),
 )
@@ -2195,6 +2544,7 @@ auth_events_table = Table(
 Index("ix_auth_events_occurred_at", auth_events_table.c.occurred_at)
 Index("ix_auth_events_type_outcome", auth_events_table.c.event_type, auth_events_table.c.outcome)
 Index("ix_auth_events_user", auth_events_table.c.user_id)
+Index("ix_auth_events_identity", auth_events_table.c.identity_id)
 
 # === Pre-flight Results (Pipeline Dependencies & Commencement Gates) ===
 

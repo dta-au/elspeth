@@ -1,0 +1,1010 @@
+[
+ {
+  "id": "C01",
+  "wave": 1,
+  "model": "opus",
+  "loc": 1921,
+  "findings": 142,
+  "files": [
+   {
+    "file": "core/templates.py",
+    "loc": 1921,
+    "findings": 142,
+    "rules": {
+     "R5": 142
+    }
+   }
+  ]
+ },
+ {
+  "id": "C02",
+  "wave": 1,
+  "model": "opus",
+  "loc": 1980,
+  "findings": 107,
+  "files": [
+   {
+    "file": "core/expression_parser.py",
+    "loc": 1038,
+    "findings": 54,
+    "rules": {
+     "R5": 54
+    }
+   },
+   {
+    "file": "core/canonical.py",
+    "loc": 322,
+    "findings": 23,
+    "rules": {
+     "R5": 23
+    }
+   },
+   {
+    "file": "core/checkpoint/serialization.py",
+    "loc": 477,
+    "findings": 20,
+    "rules": {
+     "R5": 20
+    }
+   },
+   {
+    "file": "contracts/hashing.py",
+    "loc": 143,
+    "findings": 10,
+    "rules": {
+     "R5": 10
+    }
+   }
+  ]
+ },
+ {
+  "id": "C03",
+  "wave": 1,
+  "model": "fable",
+  "loc": 4412,
+  "findings": 86,
+  "files": [
+   {
+    "file": "core/config.py",
+    "loc": 3415,
+    "findings": 67,
+    "rules": {
+     "R1": 13,
+     "R5": 52,
+     "R6": 2
+    }
+   },
+   {
+    "file": "core/secrets.py",
+    "loc": 396,
+    "findings": 16,
+    "rules": {
+     "R5": 16
+    }
+   },
+   {
+    "file": "core/security/config_secrets.py",
+    "loc": 281,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "core/security/secret_loader.py",
+    "loc": 320,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "C04",
+  "wave": 1,
+  "model": "opus",
+  "loc": 3434,
+  "findings": 111,
+  "files": [
+   {
+    "file": "contracts/runtime_val_manifest.py",
+    "loc": 1566,
+    "findings": 57,
+    "rules": {
+     "R5": 53,
+     "R6": 4
+    }
+   },
+   {
+    "file": "contracts/freeze.py",
+    "loc": 204,
+    "findings": 15,
+    "rules": {
+     "R5": 15
+    }
+   },
+   {
+    "file": "contracts/type_normalization.py",
+    "loc": 207,
+    "findings": 14,
+    "rules": {
+     "R5": 14
+    }
+   },
+   {
+    "file": "contracts/contract_records.py",
+    "loc": 370,
+    "findings": 12,
+    "rules": {
+     "R5": 12
+    }
+   },
+   {
+    "file": "contracts/call_data.py",
+    "loc": 395,
+    "findings": 9,
+    "rules": {
+     "R5": 9
+    }
+   },
+   {
+    "file": "contracts/events.py",
+    "loc": 692,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   }
+  ]
+ },
+ {
+  "id": "C05",
+  "wave": 1,
+  "model": "opus",
+  "loc": 3509,
+  "findings": 72,
+  "files": [
+   {
+    "file": "contracts/schema.py",
+    "loc": 1009,
+    "findings": 26,
+    "rules": {
+     "R1": 9,
+     "R5": 17
+    }
+   },
+   {
+    "file": "contracts/config/runtime.py",
+    "loc": 724,
+    "findings": 14,
+    "rules": {
+     "R5": 14
+    }
+   },
+   {
+    "file": "contracts/plugin_context.py",
+    "loc": 636,
+    "findings": 15,
+    "rules": {
+     "R5": 15
+    }
+   },
+   {
+    "file": "contracts/token_usage.py",
+    "loc": 278,
+    "findings": 11,
+    "rules": {
+     "R5": 11
+    }
+   },
+   {
+    "file": "contracts/results.py",
+    "loc": 862,
+    "findings": 6,
+    "rules": {
+     "R5": 6
+    }
+   }
+  ]
+ },
+ {
+  "id": "C06",
+  "wave": 1,
+  "model": "opus",
+  "loc": 4500,
+  "findings": 35,
+  "files": [
+   {
+    "file": "contracts/audit.py",
+    "loc": 1830,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "contracts/secret_scrub.py",
+    "loc": 212,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "contracts/header_modes.py",
+    "loc": 128,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "contracts/diversion.py",
+    "loc": 86,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "tui/screens/explain_screen.py",
+    "loc": 670,
+    "findings": 11,
+    "rules": {
+     "R5": 11
+    }
+   },
+   {
+    "file": "tui/widgets/node_detail.py",
+    "loc": 391,
+    "findings": 5,
+    "rules": {
+     "R5": 5
+    }
+   },
+   {
+    "file": "tui/widgets/lineage_tree.py",
+    "loc": 317,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "testing/__init__.py",
+    "loc": 866,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   }
+  ]
+ },
+ {
+  "id": "E01",
+  "wave": 1,
+  "model": "opus",
+  "loc": 5505,
+  "findings": 7,
+  "files": [
+   {
+    "file": "engine/processor.py",
+    "loc": 5505,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   }
+  ]
+ },
+ {
+  "id": "E02",
+  "wave": 1,
+  "model": "opus",
+  "loc": 4771,
+  "findings": 17,
+  "files": [
+   {
+    "file": "engine/token_traversal.py",
+    "loc": 1261,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "engine/triggers.py",
+    "loc": 448,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "engine/scheduler_drain.py",
+    "loc": 1218,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "engine/executors/gate.py",
+    "loc": 511,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "engine/executors/transform.py",
+    "loc": 969,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "engine/dag_navigator.py",
+    "loc": 364,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   }
+  ]
+ },
+ {
+  "id": "E03",
+  "wave": 1,
+  "model": "opus",
+  "loc": 3769,
+  "findings": 5,
+  "files": [
+   {
+    "file": "engine/barrier_coordination.py",
+    "loc": 2684,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "engine/tokens.py",
+    "loc": 682,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "engine/batch_adapter.py",
+    "loc": 328,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "core/landscape/formatters.py",
+    "loc": 75,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   }
+  ]
+ },
+ {
+  "id": "L01",
+  "wave": 1,
+  "model": "opus",
+  "loc": 3117,
+  "findings": 13,
+  "files": [
+   {
+    "file": "core/landscape/database.py",
+    "loc": 2056,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   },
+   {
+    "file": "core/landscape/journal.py",
+    "loc": 843,
+    "findings": 5,
+    "rules": {
+     "R5": 5
+    }
+   },
+   {
+    "file": "core/operations.py",
+    "loc": 218,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "L02",
+  "wave": 1,
+  "model": "opus",
+  "loc": 3488,
+  "findings": 7,
+  "files": [
+   {
+    "file": "core/landscape/run_lifecycle_repository.py",
+    "loc": 1857,
+    "findings": 5,
+    "rules": {
+     "R5": 5
+    }
+   },
+   {
+    "file": "core/dag/graph.py",
+    "loc": 1631,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   }
+  ]
+ },
+ {
+  "id": "P01",
+  "wave": 2,
+  "model": "opus",
+  "loc": 4209,
+  "findings": 34,
+  "files": [
+   {
+    "file": "cli.py",
+    "loc": 4050,
+    "findings": 33,
+    "rules": {
+     "R1": 11,
+     "R4": 8,
+     "R5": 8,
+     "R6": 6
+    }
+   },
+   {
+    "file": "cli_helpers.py",
+    "loc": 159,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "P02",
+  "wave": 2,
+  "model": "opus",
+  "loc": 3530,
+  "findings": 34,
+  "files": [
+   {
+    "file": "mcp/server.py",
+    "loc": 993,
+    "findings": 23,
+    "rules": {
+     "R1": 9,
+     "R5": 14
+    }
+   },
+   {
+    "file": "mcp/analyzers/queries.py",
+    "loc": 1295,
+    "findings": 7,
+    "rules": {
+     "R1": 7
+    }
+   },
+   {
+    "file": "mcp/analyzers/diagnostics.py",
+    "loc": 479,
+    "findings": 3,
+    "rules": {
+     "R1": 3
+    }
+   },
+   {
+    "file": "mcp/analyzers/reports.py",
+    "loc": 763,
+    "findings": 1,
+    "rules": {
+     "R1": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "P03",
+  "wave": 2,
+  "model": "opus",
+  "loc": 3420,
+  "findings": 34,
+  "files": [
+   {
+    "file": "composer_mcp/server.py",
+    "loc": 1147,
+    "findings": 14,
+    "rules": {
+     "R5": 14
+    }
+   },
+   {
+    "file": "plugins/infrastructure/config_base.py",
+    "loc": 784,
+    "findings": 7,
+    "rules": {
+     "R5": 7
+    }
+   },
+   {
+    "file": "plugins/infrastructure/schema_factory.py",
+    "loc": 205,
+    "findings": 5,
+    "rules": {
+     "R5": 5
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/json_utils.py",
+    "loc": 99,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/llm.py",
+    "loc": 819,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/replayer.py",
+    "loc": 305,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/infrastructure/utils.py",
+    "loc": 61,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "P04",
+  "wave": 2,
+  "model": "fable",
+  "loc": 4371,
+  "findings": 48,
+  "files": [
+   {
+    "file": "plugins/transforms/llm/transform.py",
+    "loc": 2019,
+    "findings": 19,
+    "rules": {
+     "R5": 19
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/validation.py",
+    "loc": 276,
+    "findings": 12,
+    "rules": {
+     "R5": 12
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/providers/bedrock.py",
+    "loc": 247,
+    "findings": 6,
+    "rules": {
+     "R5": 6
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/multi_query.py",
+    "loc": 370,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/image_inputs.py",
+    "loc": 187,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/templates.py",
+    "loc": 280,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/providers/azure.py",
+    "loc": 353,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/provider.py",
+    "loc": 345,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/llm/langfuse.py",
+    "loc": 294,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "P05",
+  "wave": 2,
+  "model": "fable",
+  "loc": 1904,
+  "findings": 33,
+  "files": [
+   {
+    "file": "plugins/transforms/azure/document_intelligence.py",
+    "loc": 840,
+    "findings": 20,
+    "rules": {
+     "R1": 6,
+     "R5": 11,
+     "R6": 1,
+     "R9": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/azure/document_intelligence_result.py",
+    "loc": 79,
+    "findings": 5,
+    "rules": {
+     "R1": 2,
+     "R5": 2,
+     "R6": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/azure/content_safety.py",
+    "loc": 412,
+    "findings": 4,
+    "rules": {
+     "R1": 3,
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/azure/base.py",
+    "loc": 573,
+    "findings": 4,
+    "rules": {
+     "R5": 2,
+     "R9": 2
+    }
+   }
+  ]
+ },
+ {
+  "id": "P06",
+  "wave": 2,
+  "model": "opus",
+  "loc": 2297,
+  "findings": 71,
+  "files": [
+   {
+    "file": "telemetry/exporters/otlp.py",
+    "loc": 620,
+    "findings": 20,
+    "rules": {
+     "R1": 10,
+     "R5": 9,
+     "R6": 1
+    }
+   },
+   {
+    "file": "telemetry/exporters/datadog.py",
+    "loc": 430,
+    "findings": 18,
+    "rules": {
+     "R1": 4,
+     "R5": 12,
+     "R9": 2
+    }
+   },
+   {
+    "file": "telemetry/exporters/azure_monitor.py",
+    "loc": 505,
+    "findings": 12,
+    "rules": {
+     "R1": 3,
+     "R5": 9
+    }
+   },
+   {
+    "file": "telemetry/exporters/console.py",
+    "loc": 252,
+    "findings": 11,
+    "rules": {
+     "R1": 2,
+     "R5": 9
+    }
+   },
+   {
+    "file": "telemetry/serialization.py",
+    "loc": 248,
+    "findings": 9,
+    "rules": {
+     "R5": 8,
+     "R6": 1
+    }
+   },
+   {
+    "file": "telemetry/factory.py",
+    "loc": 242,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "P07",
+  "wave": 2,
+  "model": "fable",
+  "loc": 3441,
+  "findings": 18,
+  "files": [
+   {
+    "file": "plugins/sources/aws_s3_source.py",
+    "loc": 1474,
+    "findings": 14,
+    "rules": {
+     "R5": 14
+    }
+   },
+   {
+    "file": "plugins/sources/azure_blob_source.py",
+    "loc": 1252,
+    "findings": 3,
+    "rules": {
+     "R5": 3
+    }
+   },
+   {
+    "file": "plugins/sources/csv_source.py",
+    "loc": 715,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "P08",
+  "wave": 2,
+  "model": "fable",
+  "loc": 4443,
+  "findings": 48,
+  "files": [
+   {
+    "file": "plugins/sources/llm/source.py",
+    "loc": 689,
+    "findings": 14,
+    "rules": {
+     "R5": 14
+    }
+   },
+   {
+    "file": "plugins/sources/json_source.py",
+    "loc": 753,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "plugins/sources/dataverse.py",
+    "loc": 1021,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "plugins/sinks/dataverse.py",
+    "loc": 720,
+    "findings": 6,
+    "rules": {
+     "R5": 6
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/dataverse.py",
+    "loc": 934,
+    "findings": 13,
+    "rules": {
+     "R1": 5,
+     "R5": 7,
+     "R6": 1
+    }
+   },
+   {
+    "file": "plugins/infrastructure/clients/fingerprinting.py",
+    "loc": 326,
+    "findings": 7,
+    "rules": {
+     "R1": 3,
+     "R6": 4
+    }
+   }
+  ]
+ },
+ {
+  "id": "P09",
+  "wave": 2,
+  "model": "opus",
+  "loc": 3514,
+  "findings": 13,
+  "files": [
+   {
+    "file": "plugins/sinks/json_sink.py",
+    "loc": 629,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   },
+   {
+    "file": "plugins/sinks/chroma_sink.py",
+    "loc": 723,
+    "findings": 1,
+    "rules": {
+     "R4": 1
+    }
+   },
+   {
+    "file": "plugins/transforms/safety_utils.py",
+    "loc": 45,
+    "findings": 4,
+    "rules": {
+     "R5": 4
+    }
+   },
+   {
+    "file": "plugins/transforms/type_coerce.py",
+    "loc": 550,
+    "findings": 2,
+    "rules": {
+     "R1": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/keyword_filter.py",
+    "loc": 373,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/batch_stats.py",
+    "loc": 597,
+    "findings": 2,
+    "rules": {
+     "R5": 2
+    }
+   },
+   {
+    "file": "plugins/transforms/json_explode.py",
+    "loc": 597,
+    "findings": 1,
+    "rules": {
+     "R5": 1
+    }
+   }
+  ]
+ },
+ {
+  "id": "W01",
+  "wave": 3,
+  "model": "opus",
+  "loc": 4078,
+  "findings": 13,
+  "files": [
+   {
+    "file": "web/composer/guided/chat_solver.py",
+    "loc": 4078,
+    "findings": 13,
+    "rules": {
+     "R5": 13
+    }
+   }
+  ]
+ },
+ {
+  "id": "W02",
+  "wave": 3,
+  "model": "opus",
+  "loc": 3975,
+  "findings": 16,
+  "files": [
+   {
+    "file": "web/composer/tools/_common.py",
+    "loc": 3615,
+    "findings": 6,
+    "rules": {
+     "R5": 6
+    }
+   },
+   {
+    "file": "web/composer/telemetry_phase8.py",
+    "loc": 360,
+    "findings": 10,
+    "rules": {
+     "R4": 10
+    }
+   }
+  ]
+ },
+ {
+  "id": "W03",
+  "wave": 3,
+  "model": "opus",
+  "loc": 11894,
+  "findings": 10,
+  "files": [
+   {
+    "file": "web/composer/tool_batch.py",
+    "loc": 2354,
+    "findings": 5,
+    "rules": {
+     "R6": 5
+    }
+   },
+   {
+    "file": "web/composer/service.py",
+    "loc": 9540,
+    "findings": 5,
+    "rules": {
+     "R6": 5
+    }
+   }
+  ]
+ }
+]

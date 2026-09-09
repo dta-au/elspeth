@@ -50,8 +50,7 @@ scoring):
   must_discover_schema_before_first_mutation (green_criteria)
       Boolean. AMBER if no get_plugin_schema invocation precedes the
       first state-mutating tool call (set_source, set_output,
-      upsert_node, set_pipeline, set_source_from_blob,
-      apply_pipeline_recipe). A get_plugin_schema call that fires
+      upsert_node, set_pipeline, set_source_from_blob). A get_plugin_schema call that fires
       ONLY after a rejection still earns an AMBER — the discover-first
       signal requires the schema lookup before the first mutation.
 
@@ -128,6 +127,11 @@ def _normalise_plugin_token(value: Any) -> str:
 _SHAPE_TOKEN_ALIASES: dict[str, frozenset[str]] = {
     "batch": frozenset({"stats"}),
     "content_safety": frozenset({"moderation"}),
+    # A fork is a ``gate`` node with ``fork_to`` — there is no "fork" node_type
+    # (web/composer/pipeline_planner.py). Scenario generation emits ``fork`` as
+    # the shape token for such gates; without this alias no real state could
+    # ever satisfy a fork chain/kind criterion (verified 2026-08-16).
+    "fork": frozenset({"gate"}),
     "json": frozenset({"jsonl"}),
     "rag": frozenset({"chroma"}),
 }
@@ -480,7 +484,6 @@ _MUTATING_TOOL_NAMES: frozenset[str] = frozenset(
         "patch_source_options",
         "patch_node_options",
         "patch_output_options",
-        "apply_pipeline_recipe",
         "set_metadata",
     }
 )
@@ -672,7 +675,28 @@ def _extract_error_codes_from_entries(entries: Any) -> list[str]:
 
 
 def _validation_error_codes(state: Any) -> list[str]:
-    """Extract structured runtime validation error codes from scorer state."""
+    """Extract structured runtime validation error codes from scorer state.
+
+    TWO PRODUCERS FEED THIS AND THEY DISAGREE, which decides whether the
+    allowance in ``_relaxed_invalid_state_reason`` is decidable at all:
+
+    - The mocked-LLM harness (``tests/unit/evals/
+      test_convergence_scenarios_mocked_llm.py::_state_dict_for_scoring``)
+      builds ``validation_errors`` as dicts carrying ``error_code``, precisely
+      so scoring can read codes. Codes are readable.
+    - The HTTP / persisted shape does not. ``CompositionStateResponse
+      .validation_errors`` is ``list[str] | None`` (``web/sessions/schemas.py``)
+      and the protocol records agree, so every entry is a bare message and
+      ``_extract_error_codes_from_entries`` ignores it by design. Codes are
+      NOT readable, and no amount of reading harder here recovers them —
+      the structure is discarded upstream (elspeth-8fe09316ab).
+
+    ``errors`` and ``runtime_preflight`` are read for the harness's benefit;
+    neither is a field of ``CompositionStateResponse``.
+
+    An empty return therefore means "this state made no codes observable",
+    never "the run raised no coded error". The caller must not conflate them.
+    """
     if not isinstance(state, dict):
         return []
     codes: list[str] = []
@@ -693,8 +717,15 @@ def _relaxed_invalid_state_reason(red: dict[str, Any], state: Any) -> str | None
 
     observed = _validation_error_codes(state)
     if not observed:
+        # Say what the SCORER could see, not what the pipeline did. A state whose
+        # validation_errors are message strings — the CompositionStateResponse
+        # shape — reaches this branch even when the run raised coded errors, so
+        # "no codes were present" would be a claim about the pipeline that the
+        # scorer has no standing to make.
         return (
-            f"final composition state has is_valid=false but no structured validation error codes were present (allowed: {sorted(allowed)})"
+            f"final composition state has is_valid=false and carried no structurally readable validation error "
+            f"codes, so the declared allowance could not be checked (allowed: {sorted(allowed)}) — this reports "
+            f"what the state made observable, not that the run raised no coded error"
         )
 
     disallowed = sorted({code for code in observed if code not in allowed})

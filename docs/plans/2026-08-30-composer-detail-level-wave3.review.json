@@ -1,0 +1,338 @@
+{
+  "verdict": "APPROVED_WITH_WARNINGS",
+  "summary": "Ten-lens review of the Composer Detail Level Wave 3 plan across three fix rounds. 120 original findings (9 BLOCKER / 37 MAJOR / 64 MINOR, plus 2 a11y non-severity rows and 8 leverage recommendations) were all dispositioned; the sign-off round returned 112 ACCEPT / 3 ACCEPT-PARK / 5 REJECT / 13 NEW across the ten reviewers, and every REJECT and NEW was applied in Rounds 2 and 3. Zero findings remain open. The final residual (Task 5 Step 6 had a commit message but no `git add`) was applied by the hub after architecture's Round-3 sign-off and is verified present in the reviewed artefact. Remaining items are three deliberate ACCEPT-PARK rulings, a set of execution cautions the reviewers recorded as non-defects, and two Roadmap tickets the leverage analyst asks be filed rather than built into this wave. One condition is load-bearing: leverage's N3 endorsement flips to REJECT if the producer cross-check pin is dropped or its no-dispatch sentence softened.",
+  "plan_file": "docs/plans/2026-08-30-composer-detail-level-wave3.md",
+  "reviewed_at": "2026-08-30T16:02:35+10:00",
+  "plan_identity": {
+    "lines": 4073,
+    "md5": "b1601688c8804bb708e0c55f38ce30ef",
+    "state": "uncommitted on branch feature/unified-lineage"
+  },
+  "baseline": {
+    "branch": "feature/unified-lineage",
+    "citations_verified_at": "c601c957b",
+    "review_and_signoffs_run_at": "7d0fdf534",
+    "report_written_at": "28030f28c",
+    "note": "Three distinct commits, deliberately not collapsed. The plan's own Global Constraint (reality-A MAJOR-5) forbids writing any single sha as 'current': citations were verified at c601c957b; the fix rounds and all ten sign-offs ran at 7d0fdf534 (docs-only delta from c601c957b); this report was written at 28030f28c after a large tier-model burndown merge landed. See warning W13 for the one citation class that drifted."
+  },
+  "priority_scale": {
+    "formula": "severity x likelihood x reversibility",
+    "severity": "1 cosmetic, 2 minor, 3 moderate, 4 major, 5 blocking",
+    "likelihood": "1 unlikely to bite in execution, 2 plausible, 3 near-certain if unaddressed",
+    "reversibility": "1 trivially reversible in-flight, 2 costs a re-run or a re-review, 3 lands in git history or a shipped artefact",
+    "range": "1-45",
+    "applicability": "blocking_issues is empty, so scores below apply to warnings and recommendations only"
+  },
+  "finding_counts": {
+    "original_findings": 120,
+    "by_severity": {
+      "BLOCKER": 9,
+      "MAJOR": 37,
+      "MINOR": 64,
+      "non_severity_rows": 2,
+      "leverage_recommendations": 8
+    },
+    "by_severity_note": "9 + 37 + 64 = 110 severity-rated rows, plus a11y's disposition note and cleared item (2) and leverage's 8 non-severity rows = 120. Severity is taken from the ten original reports, not from the sign-off tables (a11y's sign-off table has 15 rows because one NEW was raised at sign-off, not in the report).",
+    "rounds": 3,
+    "signoff_round_1_verdicts": {
+      "ACCEPT": 112,
+      "ACCEPT_PARK": 3,
+      "REJECT": 5,
+      "NEW": 13,
+      "note": "Per-lens sums from the ten *-signoff.md files. The fix ledger reports 106 / 3 / 4 / 12 for the same round because it counts DISPOSITIONS, not verdicts: systems' MAJOR 2 and MAJOR 3 REJECTs share one remedy (5 -> 4), and reality-A NEW-1 and systems NEW-1 were explicitly treated as one fix (13 -> 12). Both figures are correct for what they count."
+    },
+    "round_2_dispositions": {
+      "items": 16,
+      "APPLIED": 16,
+      "PARKED": 0,
+      "REJECTED": 0
+    },
+    "round_3_dispositions": {
+      "items": 5,
+      "APPLIED": 5,
+      "plus": "1 self-correction found while applying (the :1245 hoist start, which corrected the round-3 brief AND two reviewers' round-2 sign-offs) and 4 cosmetics recorded by reviewers"
+    },
+    "rejected_sub_claims": 6,
+    "rejected_sub_claims_note": "All six were re-measured by the reviewers who raised them; every rejection was upheld by its own author (reality-B x2, tests x2, reality-C's :177->:178, systems' :96->:97).",
+    "open_after_signoff": 0
+  },
+  "blocking_issues": [],
+  "warnings": [
+    {
+      "id": "W1",
+      "source": "quality",
+      "type": "ACCEPT-PARK",
+      "issue": "MAJOR-3: the ExplainDialog fidelity test does not exercise a mermaid code fence, so a future producer that emits one would render unvalidated markdown.",
+      "ruling": "PARKED with an explicit `**Ruling —**` line. Accepted because `grep -c '```' src/elspeth/web/audit_readiness/explain.py` returns 0 (the producer emits no fence at all), and a fence-stripping wrapper would put a second markdown policy in the tree. The future-producer condition and the cost are stated in the plan.",
+      "signoff": "quality re-verified the measurement independently and signed ACCEPT-PARK.",
+      "priority_score": 6,
+      "resolution": "Operator's call. Revisit only if `build_narrative` ever gains a code fence; the plan states the trigger condition."
+    },
+    {
+      "id": "W2",
+      "source": "a11y",
+      "type": "ACCEPT-PARK",
+      "issue": "B1 second half: `ConfirmDialog`'s `aria-describedby={messageId}` does not span its children, so detail rendered as a child is not part of the dialog's description.",
+      "ruling": "PARKED with a ruling — `ConfirmDialog` is a shared primitive with consumers outside this wave, so widening it here would change behaviour for surfaces nobody reviewed. Task 11 Step 5b files the ticket.",
+      "signoff": "a11y signed ACCEPT-PARK; the wave's own egress lines are fixed by the `.sr-only` + `aria-describedby` route, so the park does not leave this wave's content unreachable.",
+      "priority_score": 8,
+      "resolution": "Confirm Step 5b actually files the ticket; do not widen `ConfirmDialog` inside this wave."
+    },
+    {
+      "id": "W3",
+      "source": "prior-art",
+      "type": "ACCEPT-PARK",
+      "issue": "MAJOR 3: the decoder-primitive extraction is parked, and the parked work spans four copies (`api/auditReadiness.ts:39,:46` and `api/shareableReviews.ts:32,:50`), not the one the plan originally scoped.",
+      "ruling": "PARKED as a Roadmap row, scope corrected from 'second instance' to fourth, and the parked ticket is REQUIRED to decide `ApiError` vs `Error` — an error-contract question the park would otherwise leave undecided.",
+      "signoff": "prior-art signed ACCEPT-PARK.",
+      "priority_score": 6,
+      "resolution": "Ensure Step 5b files it with the `ApiError` vs `Error` decision named as part of the ticket, not deferred again."
+    },
+    {
+      "id": "W4",
+      "source": "architecture, quality, tests",
+      "type": "execution caution",
+      "issue": "Task 11 Step 1a's e2e typecheck will ALWAYS emit exactly one error: `tests/e2e/harness/staging-tutorial-driver.test.ts(8,8): error TS7016`. This was confirmed by running `npx tsc --noEmit -p tsconfig.e2e.json`, not reasoned about.",
+      "priority_score": 12,
+      "resolution": "The `&&` chain is split into separate invocations. App and test configs must be clean; the e2e config must show that one TS7016 and NOTHING else. A second e2e error is a finding, not noise — do not widen the acceptance to 'e2e is expected to be red'."
+    },
+    {
+      "id": "W5",
+      "source": "quality, tests",
+      "type": "execution caution",
+      "issue": "Task 2's new `defaultDomPins.test.ts` has five mutation cases, but vitest transpiles with esbuild and does not typecheck, so only cases 1 and 4a go red at runtime before the helper change. Cases 2, 3 and 4b pass by construction.",
+      "priority_score": 12,
+      "resolution": "`npx tsc --noEmit -p tsconfig.test.json` is the red-phase evidence for the unknown option properties; the plan runs both and says which is which. Do not read cases 2/3/4b passing green as proof the new options work."
+    },
+    {
+      "id": "W6",
+      "source": "architecture, systems",
+      "type": "execution caution",
+      "issue": "Task 3 renames `test_graph_view_self_publishing_parity.py` to `test_graph_topology_parity.py`. The rename's blast radius was measured tree-wide (`git grep` excluding the plan returns nothing) at review time, but the tree has moved since.",
+      "priority_score": 12,
+      "resolution": "Re-run `git grep -n 'test_graph_view_self_publishing_parity'` at dispatch and DROP the rename if it now returns a hit outside the plan. The re-anchor to `lib/graphTopology.ts` is the load-bearing half; the rename is cosmetic."
+    },
+    {
+      "id": "W7",
+      "source": "architecture, systems",
+      "type": "execution caution",
+      "issue": "`git mv` stages the rename immediately carrying the OLD content, and Task 3 Step 3 (pytest) runs BEFORE Step 4 (commit). The pre-fix sequence would have committed a renamed file still anchored at `GraphView.tsx` — green at the gate, then a commit missing the file that made it green.",
+      "priority_score": 18,
+      "resolution": "Task 3 now stages six enumerated pathspecs with a `git status --short` leftover check after. Do not shortcut to a broad `git add`."
+    },
+    {
+      "id": "W8",
+      "source": "tests",
+      "type": "known pre-existing gap",
+      "issue": "`SecretsPanel.test.tsx` mutates a store with no `resetStore`. It is the sole gap of its kind, it is pre-existing, and adding a reset would fight its own `setState` seeding.",
+      "priority_score": 4,
+      "resolution": "Recorded in Task 5 Step 2 as pre-existing and not worsened. The Global Constraint was widened to cover any file this wave adds a store-mutating test to; do not read this file's absence from that set as an oversight."
+    },
+    {
+      "id": "W9",
+      "source": "quality, a11y",
+      "type": "stated coverage gap",
+      "issue": "Task 7 has three assertions with NO negative control, and never asserts a visible focus indicator even though the CSS comment claims it does.",
+      "priority_score": 8,
+      "resolution": "Both are stated in the plan as gaps with the instruments named, and the closeout wording is prescribed. Both negative controls stay in the file as `test.skip` siblings so they are re-runnable. Do not let the closeout claim focus-indicator coverage."
+    },
+    {
+      "id": "W10",
+      "source": "a11y",
+      "type": "scope ruling",
+      "issue": "N7: the roving-tabindex item is parked, and could be mis-argued as a WCAG failure in a later ticket.",
+      "priority_score": 4,
+      "resolution": "The Roadmap row states it is an APG/usability enhancement and why it is neither a 2.4.1 nor a 2.1.1 failure. Keep that framing when the ticket is filed."
+    },
+    {
+      "id": "W11",
+      "source": "reality-C",
+      "type": "reviewer aside, live",
+      "issue": "Task 8's second new test flips `usePreferencesStore.setState({ showAdvanced: true })` AFTER `render`, outside `act()`. The test is sound (Zustand re-renders the subscriber and the async `findByTestId` observes it), but React 18 may emit an `act()` warning on that line.",
+      "priority_score": 4,
+      "resolution": "If the suite treats warnings as failures, wrap that one call in `act(...)`; `act` is imported from `\"react\"` (not RTL) in the sibling `AuditReadinessPanel.test.tsx`. Not a defect."
+    },
+    {
+      "id": "W12",
+      "source": "quality, tests",
+      "type": "applied in Round 3, not re-signed by its author",
+      "issue": "quality's NEW-3 (the `<span className=\"egress-provider\">` remedy for an underscore-bearing provider path) and tests' NEW-3 (three stale 'three' numerals now that there are five mutation cases) were applied in Round 3 and never re-verified by the reviewers who raised them — only reality-A, reality-C and architecture filed Round-3 sections. The Round-3 fix also added a consequence no reviewer saw: a new class still needs a real stylesheet rule or a `classNames.test.ts` allowlist entry with a stated reason.",
+      "priority_score": 12,
+      "resolution": "Non-blocking — both remedies are concrete and the gate consequence is stated correctly. But the `classNames.test.ts` limb touches a whole-tree gate and carries no reviewer sign-off; treat it as unreviewed if the underscore case actually arises."
+    },
+    {
+      "id": "W13",
+      "source": "synthesis (post-signoff drift check)",
+      "type": "citation drift since sign-off",
+      "issue": "A tier-model blanket-burndown merge landed between the sign-off HEAD (`7d0fdf534`) and this report (`28030f28c`), touching `src/elspeth/core/config.py`. Re-measured at current HEAD: `class CoalesceSettings` is now at `:945` (plan cites `:944`), the `policy` Literal at `:1008` (plan cites `:1007`), the `merge` Literal at `:1012` (plan cites `:1011`) — each one line later. Measured: NO file under `src/elspeth/web/**` or `tests/unit/web/**` changed, which covers the plan's frontend, composer, `audit_readiness/explain.py` and `composer/skills/__init__.py` citations. Citations outside those two pathspecs (ADRs, tracker state) were not enumerated.",
+      "priority_score": 8,
+      "resolution": "Cosmetic for execution: the Task 3 Step 2b parity assertion reads `CoalesceSettings.model_fields[...]` and does not depend on line numbers, and the four policy / three merge members are unchanged. Correct the three prose cites at dispatch, or accept them as one line stale. Separately, `config/cicd/enforce_tier_model` also changed, so Task 11's lint-corpus baseline MUST be re-measured into `$W3_CORPUS_DIR` at dispatch — the plan already forbids substituting the stale figure 2354."
+    },
+    {
+      "id": "W14",
+      "source": "reality-B, tests, reality-C, systems, reality-A",
+      "type": "reviewer claims withdrawn or superseded",
+      "issue": "Six sub-claims were rejected with evidence and every rejection was upheld by its own author, and two ACCEPTs were later superseded. Recorded so the executor does not resurrect a withdrawn claim from an original report: (a) reality-B's `llmSourceBindingLabel` docblock `:99-107` — actually `:100-108`; (b) reality-B's `load_skill_with_hash` at `:38-60` — actually `:40`, decorated definition `:39-62`; (c) tests' audit-characteristic vocabulary list (all seven names invented — the real members are in `auditCharacteristics.ts:54-67`); (d) tests' `io_read` remedy, which would have been vacuous because `DEFAULT_VISIBLE_AUDIT_FLAGS` filters it out at the default level; (e) reality-C's `ComposerPreferencesPanel.tsx:177` — actually `:178`; (f) systems' `guided/prompts.py:96` — actually `:97`.",
+      "priority_score": 6,
+      "resolution": "The ten original reports are NOT the authority — the plan as it stands is. Two further supersessions: tests withdrew its own Round-1 ACCEPT of M2 (a tag qualifier on `closest()` never narrows the exemption's reach, which a11y caught), and reality-A withdrew its Round-2 endorsement of `:1246` as the hoist start (`:1245` is the comment block's heading line)."
+    },
+    {
+      "id": "W15",
+      "source": "a11y",
+      "type": "reviewer aside, RESOLVED",
+      "issue": "The `RunEgressLine.identifiers` docblock snippet lost two spaces of indent on its last three continuation lines, and it is pasted verbatim into `ExecuteButton.tsx`.",
+      "priority_score": 2,
+      "resolution": "Already applied as Round-3 cosmetic (c) — the continuation lines regain their two spaces, matching the sibling above. Listed for completeness; no action."
+    }
+  ],
+  "recommendations": [
+    {
+      "id": "R1",
+      "source": "leverage",
+      "type": "load-bearing execution condition",
+      "recommendation": "The producer cross-check pin must survive execution intact. Task 3's ruling says 'without it this task should not be dispatched' — that sentence must not be softened, and the pin must not be dropped if it proves fiddly to write.",
+      "rationale": "The wave ends with two implementations of 'which fields publish a connection' either way it is planned (GraphView's `registerProducer` plus `graphTopology`'s `buildConnectionProducers`); `nodeTargets` never existed in the tree, so the improvement is not a reduced count but a change of character — from undiscoverable-and-untested to discoverable, unit-tested, and bound to the first by an agreement pin on one shared fan-in/fork fixture. Drop the pin and what remains is two rival topology implementations with nothing comparing them, which is the exact defect Task 3 exists to close, relocated rather than removed.",
+      "priority_score": 30,
+      "consequence_if_ignored": "leverage's N3 endorsement flips from ACCEPT to REJECT."
+    },
+    {
+      "id": "R2",
+      "source": "architecture",
+      "type": "execution condition",
+      "recommendation": "Honour the per-task `git add` discipline. Every task's `git add` must enumerate every path in its Files block; the standing rule at the top of Sequencing is now true of every task in the wave, including Task 5's nine per-step commits.",
+      "rationale": "Three separate staging gaps (Tasks 3, 9 and 10) came from `Commit.` with no pathspecs, and the class recurred once more at Task 5 Step 6 — the largest step in the task, whose commit MESSAGE got close scrutiny while its staging got none. Task 5 also holds the `AcknowledgementCard.tsx` collision with Task 1, so it is the wave's highest staging-risk surface.",
+      "priority_score": 24,
+      "consequence_if_ignored": "A commit that looks done and fails its own gate, or a broad `git add` that sweeps a sibling lane's work."
+    },
+    {
+      "id": "R3",
+      "source": "systems, architecture",
+      "type": "execution condition",
+      "recommendation": "Task 3 Step 3 must run pytest, including `tests/unit/web/composer/test_producer_resolver.py`, before Step 4 commits.",
+      "rationale": "Task 3's relocation breaks three Python tests that hard-anchor `_GRAPH_VIEW_PATH`; the original evidence line claimed it could not. The frontend-only gate would have gone green on a change that reds the Python suite, and the parity module's own import is module-level, so a wrong symbol name fails at COLLECTION and errors all five tests at once.",
+      "priority_score": 24,
+      "consequence_if_ignored": "A green frontend gate certifying a red backend suite."
+    },
+    {
+      "id": "R4",
+      "source": "leverage",
+      "type": "Roadmap ticket (NOT Wave 3 scope)",
+      "recommendation": "File the default-DOM pin coverage ticket: 110 frontend test files, 88 that mount, 7 that pin, 9 pins total, 0 doc mentions. Frame it as a RATCHET, not a big-bang sweep, using the `classNames.test.ts` precedent.",
+      "rationale": "The wave's own gate is an opt-in helper with no mechanism that makes new tests use it. The cheap 80% is already taken inside Task 2 — the helper's header now states the usage convention ('Every component test that renders user-facing prose calls this helper'), which is the line that reaches someone who has never seen the file.",
+      "priority_score": 12,
+      "filed_by": "Task 11 Step 5b item 7, which runs BEFORE the epic-close decision"
+    },
+    {
+      "id": "R5",
+      "source": "leverage",
+      "type": "Roadmap ticket (NOT Wave 3 scope)",
+      "recommendation": "File the doctrine-home ticket: three waves of `show_advanced` doctrine exist only in the three plan files, which is the class of document the project's delivery posture commits to deleting. The genuine choice is `frontend/AGENTS.md` versus an ADR. Fold in the completion criterion (P3) as the required gated/deliberately-not inventory table, and the placement convention (P4): a rule mirrored from a backend authority lives in `src/lib/` with a header naming the authority by path.",
+      "rationale": "Deliberately NOT made an epic-close gate. Instead Task 11 Step 5's closing comment must link the doc or record that the doctrine was deliberately not preserved — the proportionate form the analyst argues for. The ticket must also carry the explicit 'do NOT build a wrapper component / HOC' instruction with its three-way reason (RecoveryDiff; the blob preview; a refetch CADENCE, which is not visible content at all).",
+      "priority_score": 12,
+      "filed_by": "Task 11 Step 5b item 7"
+    },
+    {
+      "id": "R6",
+      "source": "architecture",
+      "type": "execution condition",
+      "recommendation": "Task 11 Step 5b must create all seven child tickets before the epic-close decision, and the epic-close sentence depends on it.",
+      "rationale": "Five Roadmap rows said 'file a ticket', no step filed any, and the epic closed anyway — deferred work would have evaporated at closeout. The `filigree create` invocation was also verified live and corrected (TITLE is positional, `-d/--description`; there is no `--title` and no `--body`), so the first draft of the command would not have run.",
+      "priority_score": 12
+    }
+  ],
+  "reviewer_summaries": {
+    "reality-A": {
+      "scope": "plan lines 1-691",
+      "status": "RESOLVED",
+      "original": {"BLOCKER": 1, "MAJOR": 5, "MINOR": 5},
+      "signoff_r1": {"ACCEPT": 11, "ACCEPT_PARK": 0, "REJECT": 0, "NEW": 1},
+      "signoff_r2": {"ACCEPT": 2, "REJECT": 0, "NEW": 0},
+      "signoff_r3": {"ACCEPT": 1},
+      "blocking": 0,
+      "summary": "The Spec's citation of a gitignored, unrecoverable report and the superseded figure 83 is re-pointed to the live Wave 1 epic comment and re-scoped to 40 (12/23/5) at all three sites, with the 37 reader-data items marked explicitly out of scope. Cut ranges corrected against the tree. Its one NEW (the producer-registry hoist stated three different ways) converged with systems NEW-1 and was fixed as one per-line ruling. In Round 3 it withdrew its own Round-2 endorsement of `:1246` as the hoist start: `:1245` is the comment block's heading line, and cutting from `:1246` would leave it captioning the very declarations the ruling forbids moving."
+    },
+    "reality-B": {
+      "scope": "plan lines 692-1848",
+      "status": "RESOLVED",
+      "original": {"BLOCKER": 1, "MAJOR": 4, "MINOR": 6},
+      "signoff_r1": {"ACCEPT": 11, "ACCEPT_PARK": 0, "REJECT": 0, "NEW": 2},
+      "signoff_r2": {"ACCEPT": 2, "REJECT": 0, "NEW": 0},
+      "blocking": 0,
+      "summary": "A collector test pinned `\"Explode Pages\"` where the fixture renders `\"Removed\"`; the fix repairs the fixture, keeps the pin, and adds a complementary test so both arms of `scope_opener` are covered against the same field. Re-measured both sub-claims the ledger rejected and upheld both rejections against its own report."
+    },
+    "reality-C": {
+      "scope": "plan lines 1849-2432",
+      "status": "RESOLVED",
+      "original": {"BLOCKER": 0, "MAJOR": 4, "MINOR": 15},
+      "signoff_r1": {"ACCEPT": 17, "ACCEPT_PARK": 0, "REJECT": 2, "NEW": 1},
+      "signoff_r2": {"ACCEPT": 3, "REJECT": 0, "NEW": 1},
+      "signoff_r3": {"ACCEPT": 1},
+      "blocking": 0,
+      "summary": "Caught that Task 11's typecheck gate can never pass (confirmed by running it: exactly one TS7016) and that Task 10's stated symptom does not occur and would have been committed as a decoder header comment and a tracker `root_cause` field. Its Round-1 NEW found the BlobRow caveat ruling resting on a false premise; its Round-2 NEW then found the corrective fixture had made the counts half of the same test unfailable, which Round 3 fixed by splitting it into two tests against different `contentStructure.ts` branches."
+    },
+    "architecture": {
+      "status": "RESOLVED",
+      "original": {"BLOCKER": 1, "MAJOR": 4, "MINOR": 7},
+      "signoff_r1": {"ACCEPT": 12, "ACCEPT_PARK": 0, "REJECT": 0, "NEW": 1},
+      "signoff_r2": {"ACCEPT": 1, "REJECT": 0, "NEW": 1},
+      "signoff_r3": {"status": "PARTIAL at sign-off; residual applied by the hub and verified in the reviewed artefact"},
+      "blocking": 0,
+      "summary": "Its BLOCKER (Task 3 breaks `test_graph_view_self_publishing_parity.py`, and the blast-radius claim was false) drove the largest structural change in the wave: a new Step 2b, a re-anchor, a rename with tree-wide blast-radius measurement, a pytest gate in Step 3, and a Task 11 must-be-green entry. Its Round-1 NEW (Task 3's `git add` omitted files the fix round had added) generalised into a standing staging rule that caught two more gaps; its Round-2 NEW then found that rule overclaiming coverage on Task 5. Round 3 closed eight of nine Task 5 steps, and the hub applied the ninth (Step 6's two pathspecs), which this synthesis verified present."
+    },
+    "quality": {
+      "status": "RESOLVED (1 park)",
+      "original": {"BLOCKER": 2, "MAJOR": 5, "MINOR": 7},
+      "signoff_r1": {"ACCEPT": 13, "ACCEPT_PARK": 1, "REJECT": 0, "NEW": 2},
+      "signoff_r2": {"ACCEPT": 3, "REJECT": 0, "NEW": 1},
+      "blocking": 0,
+      "summary": "Found that `modelDisplayName` strips the PROVIDER from run-confirm egress lines. It framed this as needing an operator ruling; the fix applied it rather than parking, because the plan's own Global Constraint already commits the wave. Its second BLOCKER — the shared gate helper extended with no self-test — produced Task 2's new `defaultDomPins.test.ts`. Its Round-1 NEW caught seven fixtures that would fail the plan's own `tsc` gate. Its Round-2 NEW found the prescribed `allowSelectors` remedy had no narrow implementation (the option removes whole elements, not substrings), fixed in Round 3 by an `egress-provider` product span. One ACCEPT-PARK: the mermaid hazard, bounded by measurement."
+    },
+    "systems": {
+      "status": "RESOLVED",
+      "original": {"BLOCKER": 1, "MAJOR": 5, "MINOR": 5},
+      "signoff_r1": {"ACCEPT": 9, "ACCEPT_PARK": 0, "REJECT": 2, "NEW": 1},
+      "signoff_r2": {"ACCEPT": 3, "REJECT": 0, "NEW": 0},
+      "blocking": 0,
+      "summary": "Converged with architecture on the Task 3 BLOCKER, and separately found Task 11 non-re-runnable with its lint baseline in `/tmp`. Its two REJECTs shared one cause and were the sharpest catch of the sign-off round: the new parity assertion imported `CoalesceSpec`, which does not exist (`core/config.py` declares `CoalesceSettings`) — and because the import is module-level, the wrong name fails at collection and errors all five tests, reddening Task 3's own gate for a reason unrelated to the relocation. Its NEW converged with reality-A on the hoist range."
+    },
+    "prior-art": {
+      "status": "RESOLVED (1 park)",
+      "original": {"BLOCKER": 1, "MAJOR": 3, "MINOR": 3},
+      "signoff_r1": {"ACCEPT": 6, "ACCEPT_PARK": 1, "REJECT": 0, "NEW": 0},
+      "signoff_r2": {"note": "no REJECT or NEW rows filed, so no re-sign-off round was required"},
+      "blocking": 0,
+      "summary": "Its BLOCKER — `buildConnectionIndex`'s producers half re-derives GraphView's registry — is the finding that reshaped Task 3. The full lift it asked for was unavailable (`ProducerInfo` carries `edgeType`/`label` per registration, which a `Map<string, string[]>` cannot reconstruct), so the report's attached condition was met instead: the divergence is stated and both indexes are pinned against one shared coalesce fixture, with GraphView's `:1245-1351` registry hoisted into an exported `buildProducerRegistry(state)` to make it reachable. Task 4's private `nodeTargets` helper is deleted. Signed ACCEPT on the direct question: single authority for the rule Task 4 consumes."
+    },
+    "tests": {
+      "status": "RESOLVED",
+      "original": {"BLOCKER": 1, "MAJOR": 3, "MINOR": 9},
+      "signoff_r1": {"ACCEPT": 13, "ACCEPT_PARK": 0, "REJECT": 0, "NEW": 2},
+      "signoff_r2": {"ACCEPT": 3, "REJECT": 0, "NEW": 1},
+      "blocking": 0,
+      "summary": "Converged with quality on the untested gate helper and supplied the three-case structure. Its M1 (Task 9's pin passes vacuously) was applied while both of its specifics were rejected with evidence — it re-measured and upheld both rejections, recording that it had inferred flag names from tooltip prose instead of grepping the `flag:` keys, and that its own proposed remedy would have been vacuous. Its Round-1 NEW found a tautology in the guard test it had asked for. In Round 2 it withdrew its own earlier ACCEPT of M2's fix and confirmed the fourth mutation case is real."
+    },
+    "a11y": {
+      "status": "RESOLVED (1 park)",
+      "original": {"BLOCKER": 1, "MAJOR": 4, "MINOR": 7, "non_severity_rows": 2},
+      "signoff_r1": {"ACCEPT": 12, "ACCEPT_PARK": "1 sub-half", "REJECT": 0, "NEW": 3},
+      "signoff_r2": {"ACCEPT": 4, "REJECT": 0, "NEW": 0},
+      "blocking": 0,
+      "summary": "Its BLOCKER routed egress consent detail into `title` on a non-interactive `<li>`, unreachable by keyboard and by most screen readers; the fix uses `.sr-only` + `aria-describedby` per line, the pattern the file's own comment prescribes. Its most consequential NEW corrected an error three other parties had accepted: `closest()` checks the element itself and then walks up, so a tag qualifier narrows which elements MATCH a selector, never which elements an exemption REACHES — the whole Spec tab was still exempt and the plan's 'two exact elements' claim was false. The remedy adds a second option matched with `el.matches()` plus a fourth mutation case. Its ConfirmDialog sub-half is the one park."
+    },
+    "leverage": {
+      "status": "RESOLVED — CONDITIONAL ACCEPT",
+      "original": {"recommendations": 2, "fold_in": 1, "endorsement": 1, "negatives": 4},
+      "signoff_r1": {"ACCEPT": 8, "ACCEPT_PARK": 0, "REJECT": "1 narrow", "NEW": 0},
+      "signoff_r2": {"ACCEPT": 1, "REJECT": 0, "NEW": 0},
+      "blocking": 0,
+      "summary": "Two recommendations became Roadmap tickets rather than Wave 3 scope (R4, R5), and its four negatives — findings whose recommendation is 'change nothing' — were recorded as such rather than silently dropped. Its narrow REJECT caught a Roadmap row banking a mitigation Task 2 did not deliver; the fix made the claim true by adding the usage convention to the helper's header. IMPORTANT: its N3 endorsement is CONDITIONAL. The producer cross-check pin is the entire thing holding the two-implementation outcome together; if the pin is dropped or the 'without it this task should not be dispatched' sentence softened, N3 flips to REJECT. See recommendation R1."
+    }
+  },
+  "process_notes": [
+    "Ten independent lenses, three fix rounds, and a per-finding sign-off round in which each reviewer re-verified only its OWN findings by content (line numbers shifted every round) rather than re-reviewing the plan.",
+    "The fix pass ran read-only against the tree throughout: no git write commands, and only the one permitted file was edited.",
+    "Five claims were settled by EXECUTION rather than reasoning: the e2e TS7016 (confirmed by running tsc), the mermaid fence count (grep -c returns 0), the parity mechanism's feasibility against Pydantic `model_fields`, the two producer divergences, and the leaf-module import contract. The `filigree create` CLI flags were also re-verified live, catching a command in the plan that would not have run.",
+    "Round 3 was re-signed by only three of the ten lenses (reality-A, reality-C, architecture) — the other two Round-3 items were applied without re-verification by their authors. See warning W12.",
+    "The verdict is APPROVED_WITH_WARNINGS rather than APPROVED because three ACCEPT-PARK rulings and a set of execution cautions remain live, not because any finding is unresolved."
+  ]
+}

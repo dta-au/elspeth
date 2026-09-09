@@ -22,12 +22,14 @@ sequence continues.
 
 from __future__ import annotations
 
+import builtins
 from collections.abc import Iterator
 from typing import Any
 
 import httpx
 import pytest
 
+from elspeth.plugins.llm import model_catalog as neutral_model_catalog
 from elspeth.plugins.transforms.llm import model_catalog
 
 
@@ -57,6 +59,26 @@ def _make_response(payload: Any, *, status_code: int = 200) -> httpx.Response:
         json=payload,
         request=httpx.Request("GET", "https://openrouter.ai/api/v1/models"),
     )
+
+
+def test_transform_model_catalog_preserves_public_api_as_identity_reexports() -> None:
+    """The historical transform path remains an exact compatibility surface."""
+    expected_public_api = {
+        "MODEL_CATALOG_OPENROUTER",
+        "OPENROUTER_LITELLM_PREFIX",
+        "OPENROUTER_MODELS_URL",
+        "prime_openrouter_catalog_from_live",
+        "read_litellm_model_list",
+        "read_openrouter_catalog_snapshot_id",
+        "reset_live_openrouter_catalog",
+    }
+
+    assert set(model_catalog.__all__) == expected_public_api
+    assert set(neutral_model_catalog.__all__) == expected_public_api
+    transform_exports = vars(model_catalog)
+    neutral_exports = vars(neutral_model_catalog)
+    for name in expected_public_api:
+        assert transform_exports[name] is neutral_exports[name]
 
 
 async def _prime_live_catalog(ids: list[str]) -> None:
@@ -423,3 +445,134 @@ async def test_catalog_snapshot_source_reflects_prime_state() -> None:
     sha_live, source_live = model_catalog.read_openrouter_catalog_snapshot_id()
     assert source_live == "live"
     assert sha_live != sha_bundled
+
+
+def test_module_import_forces_litellm_local_cost_map() -> None:
+    """Importing the catalog module pins LiteLLM to its bundled cost map.
+
+    LiteLLM fetches its model-cost map from raw.githubusercontent.com at
+    ``import litellm`` time unless ``LITELLM_LOCAL_MODEL_COST_MAP`` is set
+    (elspeth-c67ba40e4a: no deployment may silently egress to third
+    parties). The guard lives at module level in ``model_catalog`` — the
+    single point of truth for litellm access — so a fresh interpreter that
+    imports it before litellm never fetches the remote map. Run in a
+    subprocess: in-process the module is already imported, so the
+    import-time effect cannot be observed directly.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import os\n"
+        "assert 'LITELLM_LOCAL_MODEL_COST_MAP' not in os.environ, 'test requires a clean env'\n"
+        "import elspeth.plugins.transforms.llm.model_catalog  # noqa: F401\n"
+        "assert os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] == 'True'\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "LITELLM_LOCAL_MODEL_COST_MAP"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+def test_operator_override_of_litellm_cost_map_is_preserved() -> None:
+    """``setdefault`` semantics: an explicit operator value is never clobbered.
+
+    An operator who deliberately re-enables LiteLLM's remote cost-map
+    fetch (or spells the opt-in differently) keeps their value; ELSPETH
+    only supplies the safe default when the variable is unset.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import os\n"
+        "import elspeth.plugins.transforms.llm.model_catalog  # noqa: F401\n"
+        "assert os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] == 'False'\n"
+    )
+    env = dict(os.environ)
+    env["LITELLM_LOCAL_MODEL_COST_MAP"] = "False"
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# litellm import failures: an absent extra is not a broken install
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _uncached_litellm_read() -> Iterator[None]:
+    """Clear the reader's ``lru_cache`` around a test that patches the import.
+
+    ``read_litellm_model_list`` caches the real litellm answer for the
+    process, so a test that substitutes the import must start from an empty
+    cache and must not leave its substituted answer behind for the next one.
+    """
+    model_catalog.read_litellm_model_list.cache_clear()
+    yield
+    model_catalog.read_litellm_model_list.cache_clear()
+
+
+def _patch_litellm_import(monkeypatch: pytest.MonkeyPatch, failure: ModuleNotFoundError) -> None:
+    """Make ``import litellm`` raise ``failure``, leaving other imports alone."""
+    real_import = builtins.__import__
+
+    def _fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "litellm":
+            raise failure
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+
+@pytest.mark.usefixtures("_uncached_litellm_read")
+def test_absent_litellm_reads_as_an_empty_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """litellm genuinely missing is the documented empty-catalog path.
+
+    The LLM extra is optional, so the reader tolerates the module being
+    absent and returns an empty tuple; the walker turns that into the
+    structured "install ``elspeth[llm]``" remediation hint.
+    """
+    _patch_litellm_import(monkeypatch, ModuleNotFoundError("No module named 'litellm'", name="litellm"))
+
+    assert model_catalog.read_litellm_model_list() == ()
+
+
+@pytest.mark.usefixtures("_uncached_litellm_read")
+def test_broken_litellm_install_propagates_rather_than_reading_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A litellm that fails its own import must not be reported as absent.
+
+    ``import litellm`` also raises ``ModuleNotFoundError`` when litellm IS
+    installed but one of its transitive dependencies is not. Swallowing
+    that hands the operator the wrong remediation — the empty-catalog hint
+    says "install ``elspeth[llm]``" for a package already on disk — and
+    silently empties the validate-time model catalog. Only the absence of
+    ``litellm`` itself is tolerated; anything else propagates.
+    """
+    _patch_litellm_import(monkeypatch, ModuleNotFoundError("No module named 'tokenizers'", name="tokenizers"))
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        model_catalog.read_litellm_model_list()
+
+    assert excinfo.value.name == "tokenizers"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param({"gpt-4": {}}, id="dict-not-list"),
+        pytest.param("gpt-4", id="str-not-list"),
+        pytest.param(None, id="none-not-list"),
+        pytest.param(["gpt-4", 7], id="non-str-entry"),
+        pytest.param([b"gpt-4"], id="bytes-entry"),
+    ],
+)
+def test_parse_litellm_model_list_rejects_malformed_shapes(raw: Any) -> None:
+    """A model_list that is not a list of str raises instead of narrowing the catalog."""
+    with pytest.raises(TypeError):
+        neutral_model_catalog._parse_litellm_model_list(raw)
+
+
+def test_parse_litellm_model_list_sorts_valid_entries() -> None:
+    assert neutral_model_catalog._parse_litellm_model_list(["b", "a"]) == ("a", "b")

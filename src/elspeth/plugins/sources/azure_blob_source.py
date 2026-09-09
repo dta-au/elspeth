@@ -15,6 +15,7 @@ import itertools
 import json
 import time
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 import structlog
@@ -23,20 +24,25 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
-from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig
+from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    NormalizedColumnsOption,
+    NormalizedFieldMappingOption,
+    declared_source_schema_field_names,
+)
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
     FieldResolution,
+    check_declared_fields_reachable,
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
@@ -51,6 +57,18 @@ if TYPE_CHECKING:
     from azure.storage.blob import BlobClient
 
 logger = structlog.get_logger(__name__)
+
+
+def _azure_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Declared Azure SDK and transport failures at the external seam."""
+    from azure.core.exceptions import AzureError
+
+    return (AzureError, ConnectionError, TimeoutError)
+
+
+@dataclass(frozen=True, slots=True)
+class _AzureBlobDownloadFailure:
+    provider_error_type: str
 
 
 # Sentinel distinguishing "iterator exhausted" from a real CSV row when peeking
@@ -157,6 +175,11 @@ class AzureBlobSourceConfig(DataPluginConfig):
 
     _plugin_component_type: ClassVar[str | None] = "source"
 
+    auth_mode: AzureAuthMethod | None = Field(
+        default=None,
+        description="Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+    )
+
     # Auth Option 1: Connection string
     connection_string: str | None = Field(
         default=None,
@@ -214,11 +237,11 @@ class AzureBlobSourceConfig(DataPluginConfig):
         default_factory=JSONOptions,
         description="JSON parsing options (encoding, data_key)",
     )
-    columns: list[str] | None = Field(
+    columns: NormalizedColumnsOption = Field(
         default=None,
         description="Explicit column names for headerless CSV blobs",
     )
-    field_mapping: dict[str, str] | None = Field(
+    field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
         description="Override specific normalized field names",
     )
@@ -236,7 +259,8 @@ class AzureBlobSourceConfig(DataPluginConfig):
         """
         # Create AzureAuthConfig to validate auth fields
         # This will raise ValueError with descriptive messages if invalid
-        AzureAuthConfig(
+        auth = AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -245,6 +269,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
             client_id=self.client_id,
             client_secret=self.client_secret,
         )
+        object.__setattr__(self, "auth_mode", auth.auth_method)
         return self
 
     @model_validator(mode="after")
@@ -281,6 +306,30 @@ class AzureBlobSourceConfig(DataPluginConfig):
         if self.field_mapping is not None and self.field_mapping:
             validate_field_names(list(self.field_mapping.values()), "field_mapping values")
 
+        # Reject declared schema names the resolution can never produce
+        # (elspeth-3664e213c4). Headered CSV and JSON object keys are
+        # normalized to lowercase identifiers; headerless CSV resolves the
+        # explicit columns — or, absent columns, the declared schema names
+        # themselves (guaranteed non-empty by the B4.4 check above) — verbatim.
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            if self.format == "csv" and not self.csv_options.has_header:
+                schema_fields = self.schema_config.fields
+                effective_columns = self.columns if self.columns is not None else [fd.name for fd in schema_fields or ()]
+                check_declared_fields_reachable(
+                    declared,
+                    columns=effective_columns,
+                    field_mapping=self.field_mapping,
+                    header_kind="CSV headers",
+                )
+            else:
+                check_declared_fields_reachable(
+                    declared,
+                    columns=None,
+                    field_mapping=self.field_mapping,
+                    header_kind="CSV headers" if self.format == "csv" else "JSON object keys",
+                )
+
         return self
 
     def get_auth_config(self) -> AzureAuthConfig:
@@ -290,6 +339,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
             AzureAuthConfig instance with the auth fields from this config.
         """
         return AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -362,8 +412,32 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:83094aed497ad823"
+    source_file_hash: str | None = "sha256:bd862175b264fc46"
     config_model = AzureBlobSourceConfig
+
+    usage_when_to_use: str = (
+        "Use for one real, operator-approved Azure blob containing CSV, JSON-array, or JSONL data with an approved "
+        "authentication method. The source preserves container and blob audit identity while normalizing and validating rows."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for Composer uploads, prefix or whole-container reads, event streams, or workloads requiring unbounded "
+        "whole-object materialization."
+    )
+    example_use: str = """sources:
+  azure_input:
+    plugin: azure_blob
+    on_success: output
+    options:
+      use_managed_identity: true
+      account_url: https://records.blob.core.windows.net
+      container: inbound
+      blob_path: data/customers.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("azure", "blob-storage", "object-storage", "batch")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -458,6 +532,15 @@ class AzureBlobSource(BaseSource):
 
         return self._blob_client
 
+    def _download_blob_payload(self) -> object | _AzureBlobDownloadFailure:
+        """Return the provider payload or a sanitized, explicit failure."""
+        try:
+            return self._get_blob_client().download_blob().readall()
+        except ImportError:
+            raise
+        except _azure_provider_exception_types() as error:
+            return _AzureBlobDownloadFailure(provider_error_type=type(error).__name__)
+
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load rows from Azure Blob Storage.
 
@@ -481,42 +564,9 @@ class AzureBlobSource(BaseSource):
         # EXTERNAL SYSTEM: Azure Blob SDK calls - wrap with try/except
         # Record call for audit trail (ctx.operation_id is set by orchestrator)
         start_time = time.perf_counter()
-        try:
-            blob_client = self._get_blob_client()
-            blob_data = blob_client.download_blob().readall()
-            latency_ms = (time.perf_counter() - start_time) * 1000
-
-            # Record successful blob download in audit trail.
-            try:
-                ctx.record_call(
-                    call_type=CallType.HTTP,
-                    status=CallStatus.SUCCESS,
-                    request_data={
-                        "operation": "download_blob",
-                        "container": self._container,
-                        "blob_path": self._blob_path,
-                    },
-                    response_data={"size_bytes": len(blob_data)},
-                    latency_ms=latency_ms,
-                    provider="azure_blob_storage",
-                )
-            except Exception as exc:
-                raise AuditIntegrityError(
-                    f"Failed to record successful blob download to audit trail "
-                    f"(container={self._container!r}, blob_path={self._blob_path!r}). "
-                    f"Download completed but audit record is missing."
-                ) from exc
-        except AuditIntegrityError:
-            raise  # Audit failure — do not misattribute as download error
-        except ImportError:
-            # Re-raise ImportError as-is for clear dependency messaging
-            raise
-        except (TypeError, AttributeError, KeyError, NameError, ValueError):
-            raise  # Programming errors in our auth/client code — crash to surface the bug
-        except Exception as e:
-            latency_ms = (time.perf_counter() - start_time) * 1000
-
-            # Record failed blob download in audit trail
+        download_result = self._download_blob_payload()
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        if isinstance(download_result, _AzureBlobDownloadFailure):
             ctx.record_call(
                 call_type=CallType.HTTP,
                 status=CallStatus.ERROR,
@@ -525,14 +575,28 @@ class AzureBlobSource(BaseSource):
                     "container": self._container,
                     "blob_path": self._blob_path,
                 },
-                error={"type": type(e).__name__, "message": str(e)},
+                error={"type": download_result.provider_error_type},
                 latency_ms=latency_ms,
                 provider="azure_blob_storage",
             )
+            raise RuntimeError(f"Failed to download blob {self._blob_path!r} from container {self._container!r}.") from None
 
-            # Azure SDK errors (ResourceNotFoundError, ClientAuthenticationError, etc.)
-            # are external system errors - propagate with context
-            raise RuntimeError(f"Failed to download blob '{self._blob_path}' from container '{self._container}': {e}") from e
+        blob_data = download_result
+        if type(blob_data) is not bytes:
+            raise TypeError("Azure BlobClient.download_blob().readall() must return exact bytes")
+
+        ctx.record_call(
+            call_type=CallType.HTTP,
+            status=CallStatus.SUCCESS,
+            request_data={
+                "operation": "download_blob",
+                "container": self._container,
+                "blob_path": self._blob_path,
+            },
+            response_data={"size_bytes": len(blob_data)},
+            latency_ms=latency_ms,
+            provider="azure_blob_storage",
+        )
 
         # Parse blob content based on format
         if self._format == "csv":
@@ -1176,8 +1240,11 @@ class AzureBlobSource(BaseSource):
                 )
 
     def close(self) -> None:
-        """Release resources (no-op for Azure Blob source)."""
+        """Release the owned Azure blob client exactly once."""
+        blob_client = self._blob_client
         self._blob_client = None
+        if blob_client is not None:
+            blob_client.close()
 
     def get_field_resolution(self) -> tuple[Mapping[str, str], str | None] | None:
         """Return field resolution mapping for audit trail."""

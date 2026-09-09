@@ -94,7 +94,7 @@ test.describe("composer freeform live — the colour test (staging)", () => {
       await runButton.click();
 
       // Credential-egress confirmation dialog (same surface as guided).
-      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(runDialog).toBeVisible();
       await runDialog.getByRole("button", { name: "Run pipeline" }).click();
 

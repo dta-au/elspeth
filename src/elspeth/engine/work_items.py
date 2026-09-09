@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 
 
 class WorkItemNavigation(Protocol):
@@ -15,6 +16,7 @@ class WorkItemNavigation(Protocol):
 
     def resolve_coalesce_node(self, coalesce_name: CoalesceName) -> NodeID: ...
     def resolve_coalesce_name(self, coalesce_node_id: NodeID) -> CoalesceName: ...
+    def resolve_row_union_node(self, row_union_name: RowUnionName) -> NodeID: ...
     def resolve_plugin_for_node(self, node_id: NodeID) -> object | None: ...
     def resolve_next_node(self, node_id: NodeID) -> NodeID | None: ...
     def resolve_branch_first_node(self, branch_name: str) -> NodeID: ...
@@ -23,13 +25,56 @@ class WorkItemNavigation(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class WorkItem:
-    """Item in the work queue for DAG processing."""
+    """Item in the work queue for DAG processing.
+
+    TRAP — do not express group/scope bindings as WorkItem fields. The
+    coalesce_*/row_union_*/collector_* pairs below are the CURSOR ADDRESS of
+    the barrier this item is currently travelling to, not a lineage
+    membership: group membership rides TokenInfo (fork/expand lineage), and
+    the group→closer binding is a build-time property of the graph (the
+    barrier-scopes spec's binding registry, spec §3). The mutual-exclusion
+    check in __post_init__ therefore constrains only the cursor — one item
+    cannot be blocked at two barriers — it does NOT mean a token belongs to
+    at most one group: a token can be a fork branch AND an expand child at
+    once. A new barrier kind gets a cursor pair here only if work items
+    actually block at it; its binding lives in the builder registry, never
+    on this dataclass.
+
+    WS4 Task 6 / META-19: collector_name's cursor pair landed here because a
+    collector member IS such a case — an EXPAND member released from an
+    enclosing barrier still carries a bound collector destination forward
+    through BarrierEmission the same way a released fork branch carries a
+    bound coalesce/row_union destination (dispositions.py's
+    _insert_ready_emission_on projects BarrierEmission.collector_name onto
+    the durable row exactly like row_union_name; the codec's ready_fields/
+    ready_emission/work_item_from_scheduler round-trip it in full, no dropped
+    field anywhere in the mapping). The trap's rule stays intact: this is the
+    BLOCKED/READY-continuation cursor address, not a binding — the
+    group→collector binding still lives in the builder registry, never here.
+    Unlike coalesce/row_union, collector carries NO node-id companion and no
+    WorkItemNavigation resolver: adding one would extend the
+    WorkItemNavigation Protocol, and its sole production implementer
+    (processor.py's DAGNavigator, WS3-owned, outside this task's lane) does
+    not yet provide it — confirmed by a whole-tree mypy run before landing
+    this shape. barrier_key's compound "collector:<name>:<group_id>" address
+    is name-based, not node-id-based, so the bare name is sufficient; the
+    processor resolves it through ``RowProcessor._collector_node_for_cursor``.
+    The producers are the opener's expansion (token_traversal) and the
+    release cursor derivations (integration item 1/C5); the durable
+    barrier_key producer is ``RowProcessor._barrier_key_for_blocked_item``,
+    and test_collector_barrier_key_interlock.py pins the exact set of
+    ``collector_barrier_key`` call sites.
+    """
 
     token: TokenInfo
     current_node_id: NodeID | None
     coalesce_node_id: NodeID | None = None
     coalesce_name: CoalesceName | None = None
+    row_union_node_id: NodeID | None = None
+    row_union_name: RowUnionName | None = None
+    collector_name: CollectorName | None = None
     on_success_sink: str | None = None
+    join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         has_id = self.coalesce_node_id is not None
@@ -39,6 +84,85 @@ class WorkItem:
                 f"WorkItem coalesce fields must be both set or both None: "
                 f"coalesce_node_id={self.coalesce_node_id}, coalesce_name={self.coalesce_name}"
             )
+        has_union_id = self.row_union_node_id is not None
+        has_union_name = self.row_union_name is not None
+        if has_union_id != has_union_name:
+            raise OrchestrationInvariantError(
+                f"WorkItem row_union fields must be both set or both None: "
+                f"row_union_node_id={self.row_union_node_id}, row_union_name={self.row_union_name}"
+            )
+        has_collector_name = self.collector_name is not None
+        bound_barrier_count = sum((has_name, has_union_name, has_collector_name))
+        if bound_barrier_count > 1:
+            raise OrchestrationInvariantError(
+                f"WorkItem cannot target more than one barrier kind at once: "
+                f"coalesce_name={self.coalesce_name}, row_union_name={self.row_union_name}, "
+                f"collector_name={self.collector_name}"
+            )
+
+
+def resolve_merged_branch_barrier(
+    merged_branch_name: str | None,
+    *,
+    completed_coalesce_name: CoalesceName,
+    branch_to_coalesce: Mapping[BranchName, CoalesceName],
+    branch_to_row_union: Mapping[BranchName, RowUnionName],
+) -> tuple[CoalesceName | None, RowUnionName | None]:
+    """Barrier context for a coalesce-completion's released continuation.
+
+    A merge's released token has just had its OWN closer's frame closed
+    (``coalesce_tokens``/``truncate_at_closer_frame``). Two shapes:
+
+    - ``merged_branch_name`` is None (spec §7's flat/unnested case — no
+      ENCLOSING fork frame remains): the continuation carries no branch
+      identity of its own, so ``completed_coalesce_name`` is returned
+      UNCHANGED, preserving the pre-nesting contract at every call site
+      (``_fire_coalesce_merge``, ``complete_coalesce_merge``,
+      ``_notify_coalesce_closer_of_loss``). This value is load-bearing at
+      the first two: ``process_single_token``'s ``coalesce_node_id_for_name
+      == current_node_id and resolve_next_node(...) is None`` check (the
+      TERMINAL-coalesce on_success-sink resolution) depends on it staying
+      set to the just-completed barrier. At ``_notify_coalesce_closer_of_loss``
+      it is NOT load-bearing for correctness — that call site only reaches
+      this helper from its already-non-terminal branch (its own earlier
+      ``resolve_next_node(coalesce_node_id) is None`` check routes the
+      terminal case elsewhere before this point), and
+      ``_maybe_coalesce_token``'s arrival guard keys on the released
+      TOKEN's ``branch_name`` (already ``None`` here), never this field —
+      measured control-vs-patched byte-identical (elspeth-0bd2cde19a round-2
+      F1's p8 control-vs-patched measurement — see
+      ``.superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/task-e1-review.md``).
+      Kept identical to the other two call sites: one simple contract, not
+      a per-site special case.
+    - ``merged_branch_name`` is set (a nested coalesce/row_union closing
+      inside another bound region, spec §7 rules 2/5): an ENCLOSING fork
+      frame remains, so the released token is that outer branch's member,
+      freshly ARRIVING at ITS OWN barrier (if bound to one) — never the
+      barrier it was just released FROM, and never
+      ``completed_coalesce_name``. Reusing the just-completed barrier here
+      makes
+      ``_maybe_coalesce_token``'s "arrived at coalesce_node_id" guard
+      re-hold the release at the SAME barrier (elspeth-0bd2cde19a / E1b);
+      this mirrors the ``classify_resume_start`` FORK_CHILD arm's precedent
+      (``processor.py`` — ``branch = spec.lineage_path[-1].member_key`` then
+      resolve fresh from ``_branch_to_coalesce``/``_branch_to_row_union``)
+      applied to the live coalesce-completion path. Resolves to
+      ``(None, None)`` when that outer branch is bound to neither map (fork
+      directly to a sink, or an ordinary consumer — spec §7 E2): the
+      continuation carries no barrier context. This arm is reachable today
+      (E2 made consumer-fed outer branches authorable) — see
+      ``TestResolveMergedBranchBarrier.test_nested_branch_bound_to_neither_map_returns_none_none``
+      (``tests/unit/engine/test_work_items.py``) and the end-to-end witness
+      in ``tests/integration/core/dag/test_nested_fork_coalesce.py``.
+    """
+    if merged_branch_name is None:
+        return completed_coalesce_name, None
+    branch_key = BranchName(merged_branch_name)
+    if branch_key in branch_to_coalesce:
+        return branch_to_coalesce[branch_key], None
+    if branch_key in branch_to_row_union:
+        return None, branch_to_row_union[branch_key]
+    return None, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +178,24 @@ class WorkItemFactory:
         current_node_id: NodeID | None,
         coalesce_name: CoalesceName | None = None,
         coalesce_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
         on_success_sink: str | None = None,
+        join_group_id: str | None = None,
     ) -> WorkItem:
-        """Create a WorkItem, resolving one missing coalesce half when possible."""
+        """Create a cursor with validated coalesce or resolved row-union metadata.
+
+        A single supplied coalesce identity is resolved in the other direction;
+        when both are supplied, they must describe the same barrier. Row-union
+        names are always resolved to their structural node ids. M-1 (fix
+        round): collector names are NOT — see the WorkItem class docstring's
+        WS4 Task 6 note for why (no WorkItemNavigation.resolve_collector_node
+        exists; adding one broke mypy against processor.py's DAGNavigator).
+        This corrects the previous version of this docstring, which claimed
+        row-union AND collector names were both always resolved — false for
+        collector, and contradicting that same class docstring three
+        paragraphs up.
+        """
         resolved_coalesce_node_id = coalesce_node_id
         resolved_coalesce_name = coalesce_name
 
@@ -64,13 +203,27 @@ class WorkItemFactory:
             resolved_coalesce_node_id = self.navigation.resolve_coalesce_node(resolved_coalesce_name)
         elif resolved_coalesce_node_id is not None and resolved_coalesce_name is None:
             resolved_coalesce_name = self.navigation.resolve_coalesce_name(resolved_coalesce_node_id)
+        elif resolved_coalesce_node_id is not None and resolved_coalesce_name is not None:
+            expected_node_id = self.navigation.resolve_coalesce_node(resolved_coalesce_name)
+            if resolved_coalesce_node_id != expected_node_id:
+                raise OrchestrationInvariantError(
+                    f"WorkItem coalesce metadata mismatch: coalesce_name={resolved_coalesce_name!r} "
+                    f"resolves to node_id={expected_node_id!r}, not supplied "
+                    f"coalesce_node_id={resolved_coalesce_node_id!r}"
+                )
+
+        row_union_node_id = self.navigation.resolve_row_union_node(row_union_name) if row_union_name is not None else None
 
         return WorkItem(
             token=token,
             current_node_id=current_node_id,
             coalesce_node_id=resolved_coalesce_node_id,
             coalesce_name=resolved_coalesce_name,
+            row_union_node_id=row_union_node_id,
+            row_union_name=row_union_name,
+            collector_name=collector_name,
             on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
         )
 
     def create_continuation(
@@ -79,39 +232,50 @@ class WorkItemFactory:
         token: TokenInfo,
         current_node_id: NodeID,
         coalesce_name: CoalesceName | None = None,
+        row_union_name: RowUnionName | None = None,
+        collector_name: CollectorName | None = None,
         on_success_sink: str | None = None,
+        join_group_id: str | None = None,
     ) -> WorkItem:
-        """Create a child item that continues after current node or resumes at coalesce."""
-        if coalesce_name is not None:
-            coalesce_node_id = self.navigation.resolve_coalesce_node(coalesce_name)
+        """Create a child item that continues after current node or resumes at a barrier.
 
+        ``collector_name`` is a plain cursor pass-through: an EXPAND member
+        always advances to the node after its opener (never a fork gate), so
+        the fork-child branch-first-node arm below does not apply to it.
+        """
+        if coalesce_name is not None or row_union_name is not None:
             # Fork children route to the first processing node in their branch.
             # Non-fork continuations are already mid-branch and advance normally.
             if self.navigation.is_fork_gate_node(current_node_id):
                 branch_name = token.branch_name
                 if branch_name is None:
                     raise OrchestrationInvariantError(
-                        f"Token '{token.token_id}' has coalesce_name='{coalesce_name}' but branch_name is None. "
-                        "Fork children must have branch_name set."
+                        f"Token '{token.token_id}' targets barrier "
+                        f"'{coalesce_name or row_union_name}' but branch_name is None. "
+                        "Fork children must carry an innermost FORK frame."
                     )
                 return self.create(
                     token=token,
                     current_node_id=self.navigation.resolve_branch_first_node(branch_name),
                     coalesce_name=coalesce_name,
-                    coalesce_node_id=coalesce_node_id,
+                    row_union_name=row_union_name,
                     on_success_sink=on_success_sink,
+                    join_group_id=join_group_id,
                 )
 
             return self.create(
                 token=token,
                 current_node_id=self.navigation.resolve_next_node(current_node_id),
                 coalesce_name=coalesce_name,
-                coalesce_node_id=coalesce_node_id,
+                row_union_name=row_union_name,
                 on_success_sink=on_success_sink,
+                join_group_id=join_group_id,
             )
 
         return self.create(
             token=token,
             current_node_id=self.navigation.resolve_next_node(current_node_id),
+            collector_name=collector_name,
             on_success_sink=on_success_sink,
+            join_group_id=join_group_id,
         )

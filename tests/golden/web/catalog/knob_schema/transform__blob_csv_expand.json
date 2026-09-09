@@ -2,12 +2,14 @@
   "knob_schema": {
     "fields": [
       {
-        "description": "Schema configuration for data validation. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "kind": "json-value",
         "label": "Schema",
         "name": "schema",
         "nullable": false,
-        "required": true
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
       },
       {
         "default": null,
@@ -17,16 +19,42 @@
         "label": "Required Input Fields",
         "name": "required_input_fields",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
-        "default": "blob_ref",
-        "description": "Input field containing a payload-store content hash.",
+        "default": null,
+        "description": "Input field containing a payload-store content hash. Defaults to 'blob_ref'.",
         "kind": "text",
         "label": "Blob Ref Field",
         "name": "blob_ref_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "blob",
+        "description": "Where the CSV text comes from: 'blob' retrieves bytes from the payload store using blob_ref_field; 'field' reads CSV text already present on the row in text_field.",
+        "enum": [
+          "blob",
+          "field"
+        ],
+        "kind": "enum",
+        "label": "Source",
+        "name": "source",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Input row field holding the text to parse, when source is 'field'. Defaults to 'content'.",
+        "kind": "text",
+        "label": "Text Field",
+        "name": "text_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
       },
       {
         "default": ",",
@@ -35,16 +63,18 @@
         "label": "Delimiter",
         "name": "delimiter",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "utf-8",
-        "description": "Encoding used to decode the CSV blob.",
+        "description": "Encoding used to decode the CSV blob. Applies to source: blob only.",
         "kind": "text",
         "label": "Encoding",
         "name": "encoding",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 0,
@@ -53,7 +83,8 @@
         "label": "Skip Rows",
         "name": "skip_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -63,7 +94,8 @@
         "label": "Columns",
         "name": "columns",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": null,
@@ -72,7 +104,8 @@
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": true,
@@ -81,7 +114,8 @@
         "label": "Include Row Index",
         "name": "include_row_index",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": "csv_row_index",
@@ -90,7 +124,8 @@
         "label": "Row Index Field",
         "name": "row_index_field",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 100000,
@@ -99,16 +134,18 @@
         "label": "Max Output Rows",
         "name": "max_output_rows",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       },
       {
         "default": 104857600,
-        "description": "Maximum payload size accepted from the blob store.",
+        "description": "Maximum payload size accepted from the blob store. Applies to source: blob only.",
         "kind": "number-int",
         "label": "Max Blob Bytes",
         "name": "max_blob_bytes",
         "nullable": false,
-        "required": false
+        "required": false,
+        "tier": "common"
       }
     ]
   },

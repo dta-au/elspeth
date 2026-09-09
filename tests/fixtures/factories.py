@@ -391,7 +391,12 @@ def wire_transforms(
         input_connection = source_connection if index == 0 else f"conn_{index - 1}_{index}"
         on_success = final_sink if index == total - 1 else f"conn_{index}_{index + 1}"
         node_name = names[index] if names is not None else f"{transform.name}_{index}"
-        on_error = getattr(transform, "on_error", None) or "discard"
+        # ``TransformProtocol`` declares ``on_error: str | None`` and
+        # ``BaseTransform`` defaults it to ``None``; production injects the
+        # real value from ``TransformSettings.on_error``. Read it directly so a
+        # transform double that does not model the declared surface fails here
+        # instead of being silently wired to the "discard" default.
+        on_error = transform.on_error or "discard"
 
         settings = TransformSettings(
             name=node_name,

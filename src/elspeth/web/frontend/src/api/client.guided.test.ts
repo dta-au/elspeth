@@ -34,6 +34,7 @@ function makeGetGuidedResponse(): GetGuidedResponse {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: null,
@@ -75,6 +76,7 @@ function makeRespondResponse(): GuidedRespondResponse {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     },
     next_turn: {
@@ -171,6 +173,7 @@ function makeProposalResponse(): GetGuidedResponse {
             node_type: "transform",
             plugin: { kind: "transform", id: "schema_guard" },
             behavior: { kind: "transform" },
+            node_options_summary: [],
           },
         ],
         outputs: [
@@ -342,6 +345,7 @@ describe("api/client guided functions", () => {
         ts_iso: "2026-07-19T00:00:00Z",
         assistant_message_kind: null,
         synthetic_failure_reason: null,
+        turn_token: null,
       }];
       body.guided_session.chat_turn_seq = 1;
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
@@ -372,6 +376,7 @@ describe("api/client guided functions", () => {
             ts_iso: "2026-07-19T00:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           }];
           (body.guided_session.chat_history[0] as unknown as Record<string, unknown>).canary = true;
         }
@@ -470,7 +475,14 @@ describe("api/client guided functions", () => {
             label: "node-1",
             node_type: "gate",
             plugin: null,
-            behavior: { kind: "gate", route_aliases: ["Bearer-credential"], fork_branches: [] },
+            behavior: {
+              kind: "gate",
+              condition: "row['ok']",
+              route_aliases: ["Bearer-credential"],
+              routes: [{ alias: "Bearer-credential", key: "true" }],
+              fork_branches: [],
+            },
+            node_options_summary: [],
           };
           body.next_turn.payload.graph.edges[2].flow = {
             kind: "gate_route",
@@ -651,6 +663,69 @@ describe("api/client guided functions", () => {
       await expect(getGuided("sess-invalid-state")).rejects.toThrow(/invalid guided response/i);
     });
 
+    // Regression: the guided planner authors optional per-step `description`
+    // prose (80fa17fed). The strict state decoder initially enumerated only
+    // the pre-existing keys, so the first tutorial re-plan after deploy made
+    // every /guided response undecodable client-side ("received but could not
+    // be read") while the server kept returning 200.
+    it("accepts composer-authored step descriptions on sources, nodes, and outputs", async () => {
+      const state: Record<string, unknown> = {
+        id: "state-1",
+        session_id: "sess-1",
+        version: 1,
+        sources: {
+          source: {
+            plugin: "csv",
+            options: {},
+            on_success: "records",
+            on_validation_failure: "discard",
+            description: "Read the ticket rows.",
+          },
+        },
+        nodes: [{
+          id: "validate",
+          node_type: "transform",
+          plugin: "schema_guard",
+          input: "records",
+          on_success: "valid",
+          on_error: "discard",
+          options: {},
+          description: "Reject rows missing required columns.",
+        }],
+        edges: [{
+          id: "edge-1",
+          from_node: "source",
+          to_node: "validate",
+          edge_type: "on_success",
+          label: null,
+        }],
+        outputs: [{
+          name: "result",
+          plugin: "json",
+          options: {},
+          on_write_failure: "discard",
+          description: "Write validated rows to JSON.",
+        }],
+        metadata: { name: null, description: null },
+        is_valid: true,
+        validation_errors: [],
+        validation_warnings: [],
+        validation_suggestions: [],
+        derived_from_state_id: null,
+        created_at: "2026-07-19T00:00:00Z",
+        composer_meta: null,
+        plugin_policy_findings: [],
+      };
+      const body = makeGetGuidedResponse() as unknown as Record<string, unknown>;
+      body.composition_state = state;
+      fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
+
+      const decoded = await getGuided("sess-described-state");
+      expect(decoded.composition_state?.sources.source.description).toBe("Read the ticket rows.");
+      expect(decoded.composition_state?.nodes[0].description).toBe("Reject rows missing required columns.");
+      expect(decoded.composition_state?.outputs[0].description).toBe("Write validated rows to JSON.");
+    });
+
     it("propagates AbortSignal to fetch", async () => {
       const controller = new AbortController();
       // Mock fetch to throw an AbortError when called — this simulates the
@@ -777,7 +852,7 @@ describe("api/client guided functions", () => {
         edit_target: null,
         control_signal: "reject",
       }],
-      ["target-only revise", {
+      ["target-only form revise", {
         operation_id: "00000000-0000-4000-8000-000000000614",
         turn_token: "b".repeat(64),
         chosen: null,
@@ -786,7 +861,7 @@ describe("api/client guided functions", () => {
         proposal_id: "00000000-0000-4000-8000-000000000612",
         draft_hash: "c".repeat(64),
         edit_target: {
-          kind: "edge",
+          kind: "source",
           stable_id: "00000000-0000-4000-8000-000000000615",
         },
         control_signal: null,
@@ -872,7 +947,7 @@ describe("api/client guided functions", () => {
   });
 
   describe("startGuidedSession", () => {
-    it("POSTs the profile discriminator to the full guided-start route", async () => {
+    it("POSTs the profile discriminator AND the intent for a tutorial start", async () => {
       const body = makeGetGuidedResponse();
       body.guided_session.profile = {
         coaching: true,
@@ -888,6 +963,7 @@ describe("api/client guided functions", () => {
         "sess-1",
         {
           profile: "tutorial",
+          intent: "Summarise each page and save the results as JSON.",
           operationId: "00000000-0000-4000-8000-000000000001",
         },
       );
@@ -899,8 +975,14 @@ describe("api/client guided functions", () => {
       expect((init.headers as Record<string, string>)["Content-Type"]).toBe(
         "application/json",
       );
+      // Goal-first (elspeth-378cfa0e18): the client used to STRIP intent for
+      // every non-live profile, which made a tutorial start intent-less on the
+      // wire no matter what the caller passed. The server now requires an
+      // intent for every profile, so that conditional 400s the whole tutorial;
+      // the body must carry the intent verbatim.
       expect(JSON.parse(init.body as string)).toEqual({
         profile: "tutorial",
+        intent: "Summarise each page and save the results as JSON.",
         operation_id: "00000000-0000-4000-8000-000000000001",
       });
       expect(result.guided_session.profile?.bookends).toBe(true);
@@ -977,6 +1059,11 @@ describe("api/client guided functions", () => {
     it.each([
       [{ status: "in_progress" }],
       [{ status: "failed", failure_code: "request_cancelled" }],
+      // F13-D: the permanent policy failure code is in the closed vocabulary.
+      [{ status: "failed", failure_code: "policy_blocked" }],
+      // elspeth-5904b1683a: honest planner-exhaustion code is in the closed
+      // vocabulary (transient — retry affordances stay enabled).
+      [{ status: "failed", failure_code: "planner_repair_exhausted" }],
       [{ status: "completed", composition_state_id: "00000000-0000-4000-8000-000000000321" }],
     ])("POSTs without request content and decodes the exact closed result %#", async (body) => {
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
@@ -1067,16 +1154,26 @@ describe("api/client guided functions", () => {
         forkFromMessage("sess-1", "00000000-0000-4000-8000-000000000008", "message-1", "edited"),
       ).rejects.toBeInstanceOf(ForkCommittedResponseError);
     });
-    it("sends the store-owned operation id for guided conversion", async () => {
+    it("sends the store-owned operation id AND the goal for guided conversion", async () => {
       const body = makeGetGuidedResponse();
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
 
-      await convertToGuided("sess-1", "00000000-0000-4000-8000-000000000003");
+      await convertToGuided(
+        "sess-1",
+        "Turn each row into a one-line summary saved as JSON.",
+        "00000000-0000-4000-8000-000000000003",
+      );
 
       const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
       expect(url).toBe("/api/sessions/sess-1/guided/convert");
+      // Goal-first (elspeth-378cfa0e18): a conversion roots the fresh wizard on
+      // the goal the user stated in the mode-switch card. An intent-less
+      // convert is what the store used to send on EVERY guided-default session
+      // creation, and it is what persisted a rootless, planner-reachable
+      // wizard; the server now refuses it.
       expect(JSON.parse(init.body as string)).toEqual({
         operation_id: "00000000-0000-4000-8000-000000000003",
+        intent: "Turn each row into a one-line summary saved as JSON.",
       });
     });
     it("sends the store-owned operation id for guided re-entry", async () => {

@@ -18,29 +18,35 @@ import contextlib
 import hashlib
 import json
 import threading
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from elspeth.contracts import CallType
+from elspeth.contracts import CallType, NodeStateStatus, NodeType
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import CreationModality, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.run_result import RunResult
+from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
+    SinkEffectContract,
     SinkEffectExecutionPurpose,
     SinkEffectInputKind,
 )
@@ -52,25 +58,43 @@ from elspeth.core.config import (
 )
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.schema import run_attributions_table, runs_table
+from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.schema import run_attributions_table, runs_table, tokens_table
 from elspeth.telemetry.manager import TelemetryManager
-from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobRecord, BlobServiceProtocol
+from elspeth.web.blobs.protocol import (
+    BlobFinalizationResult,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobRecord,
+    BlobServiceProtocol,
+    BlobStateError,
+)
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.execution.errors import PipelineValidationError
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
+from elspeth.web.execution.errors import (
+    BlobRowsSourceAdmissionError,
+    CompletionGateIntegrityError,
+    ExecutionReadinessError,
+    PipelineValidationError,
+)
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.schemas import (
+    CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     RunAccounting,
     RunAccountingIntegrity,
     RunAccountingRouting,
     RunAccountingSource,
     RunAccountingTokens,
+    ValidationCheck,
     ValidationError,
     ValidationReadiness,
     ValidationReadinessBlocker,
     ValidationResult,
 )
-from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.execution.secret_guard import ExecutionSecretApprovalRequired
+from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, ExecutionServiceImpl, _discover_blob_rows_sources
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import (
@@ -89,6 +113,12 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.helpers.session_fences import (
+    RecordingSessionOperationAuthority,
+    adopt_execute_lease,
+    close_adopted_lease,
+    make_blob_read_context,
+)
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -101,10 +131,17 @@ class _WebSettingsStub:
 
     def __init__(self) -> None:
         self.deployment_target = "default"
+        self.deployment_state_mode = "sqlite-single"
         self.landscape_url = "sqlite:///test_audit.db"
         self.payload_store_path = Path("/tmp/test_payloads")
         self.landscape_passphrase = None
         self.data_dir: str | Path = "/tmp/data"
+        # Secret wiring is deny-by-default (elspeth-f3c1aafd25); tests that
+        # exercise wired secrets construct their own authorizing policy.
+        self.secret_wiring_allowlist: tuple[Any, ...] = ()
+
+    def get_session_db_url(self) -> str:
+        return f"sqlite:///{Path(self.data_dir) / 'sessions.db'}"
 
     def get_landscape_url(self) -> str:
         return self.landscape_url
@@ -176,6 +213,7 @@ def _blob_record_stub(
     content_hash: str | None = None,
     storage_path: str = "/tmp/data/blobs/blob.txt",
     status: str = "ready",
+    creation_modality: CreationModality = CreationModality.VERBATIM,
 ) -> BlobRecord:
     return BlobRecord(
         id=blob_id or uuid4(),
@@ -189,7 +227,7 @@ def _blob_record_stub(
         created_by="user",
         source_description=None,
         status=cast(Any, status),
-        creation_modality=CreationModality.VERBATIM,
+        creation_modality=creation_modality,
         created_from_message_id=None,
         creating_model_identifier=None,
         creating_model_version=None,
@@ -199,13 +237,14 @@ def _blob_record_stub(
     )
 
 
-class _EffectCapableSinkStub:
+class _EffectCapableSinkStub(SinkEffectContract):
     effect_call_type = CallType.FILESYSTEM
     name = "effect-capable"
     _on_write_failure = "discard"
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+    effect_mode_remediation: str | None = None
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -216,6 +255,14 @@ class _EffectCapableSinkStub:
     ) -> ResolvedSinkEffectMode:
         del cls, config, purpose
         return ResolvedSinkEffectMode("write")
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        del mode, required_input_kind
 
     def inspect_effect(self, _request: object, _ctx: object) -> None: ...
 
@@ -249,6 +296,7 @@ def _plugin_bundle_stub() -> SimpleNamespace:
         transforms=(),
         sinks={"primary": sink},
         aggregations={},
+        collectors={},
         sink_effect_bindings={
             "primary": SinkEffectRuntimeBinding(
                 sink_name="primary",
@@ -263,11 +311,38 @@ def _plugin_bundle_stub() -> SimpleNamespace:
 
 
 def _blob_service_stub() -> Any:
-    return create_autospec(BlobServiceProtocol, instance=True, spec_set=True)
+    blob_service = create_autospec(BlobServiceProtocol, instance=True, spec_set=True)
+    content = b"amount\n"
+    blob_service.read_blob_content_prefix_verified.return_value = (
+        content,
+        hashlib.sha256(content).hexdigest(),
+        len(content),
+    )
+    return blob_service
+
+
+def _ready_csv_blob_for_execution(*, blob_ref: str, session_id: UUID, storage_path: str) -> BlobRecord:
+    content = b"amount\n"
+    return _blob_record_stub(
+        blob_id=UUID(blob_ref),
+        session_id=session_id,
+        filename=Path(storage_path).name,
+        mime_type="text/csv",
+        size_bytes=len(content),
+        content_hash=hashlib.sha256(content).hexdigest(),
+        storage_path=storage_path,
+        status="ready",
+    )
 
 
 def _execution_graph_stub() -> Any:
-    return create_autospec(ExecutionGraph, instance=True)
+    graph = create_autospec(ExecutionGraph, instance=True)
+    # Model the real contract for a collector-free graph: an EMPTY id map.
+    # autospec's default (a truthy MagicMock) would trip the preflight's WS4
+    # collector-runnability refusal on every mocked run — fix the fake, never
+    # the production check.
+    graph.get_collector_id_map.return_value = {}
+    return graph
 
 
 def _orchestrator_stub(result: RunResult | None = None) -> MagicMock:
@@ -351,9 +426,13 @@ def _mock_pipeline_settings() -> SimpleNamespace:
         sources={},
         transforms=[],
         aggregations=[],
+        collectors=[],
         sinks={"primary": SimpleNamespace(plugin="json", options={})},
         gates=[],
         coalesce=[],
+        row_unions=[],
+        scopes=[],
+        max_bound_region_depth=5,
         queues={},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
         rate_limit=RateLimitSettings(enabled=False),
@@ -366,21 +445,21 @@ def _mock_pipeline_settings() -> SimpleNamespace:
 def _run_accounting_for_status(status: RunStatus) -> RunAccounting:
     if status == RunStatus.EMPTY:
         return RunAccounting(
-            source=RunAccountingSource(rows_processed=0),
-            tokens=RunAccountingTokens(emitted=0, terminal=0, succeeded=0, failed=0, structural=0, pending=0),
+            source=RunAccountingSource(rows_processed=0, rows_rejected=0, rows_read=0),
+            tokens=RunAccountingTokens(emitted=0, terminal=0, succeeded=0, failed=0, structural=0, pending=0, abandoned=0),
             routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
             integrity=RunAccountingIntegrity(closure="closed", missing_terminal_outcomes=0, duplicate_terminal_outcomes=0),
         )
     if status == RunStatus.COMPLETED_WITH_FAILURES:
         return RunAccounting(
-            source=RunAccountingSource(rows_processed=10),
-            tokens=RunAccountingTokens(emitted=10, terminal=10, succeeded=8, failed=2, structural=0, pending=0),
+            source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
+            tokens=RunAccountingTokens(emitted=10, terminal=10, succeeded=8, failed=2, structural=0, pending=0, abandoned=0),
             routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
             integrity=RunAccountingIntegrity(closure="closed", missing_terminal_outcomes=0, duplicate_terminal_outcomes=0),
         )
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=10),
-        tokens=RunAccountingTokens(emitted=10, terminal=10, succeeded=10, failed=0, structural=0, pending=0),
+        source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
+        tokens=RunAccountingTokens(emitted=10, terminal=10, succeeded=10, failed=0, structural=0, pending=0, abandoned=0),
         routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
         integrity=RunAccountingIntegrity(closure="closed", missing_terminal_outcomes=0, duplicate_terminal_outcomes=0),
     )
@@ -433,6 +512,14 @@ def _composition_state_record(
     nodes: list[dict[str, Any]],
     sources: dict[str, dict[str, Any]] | None = None,
 ) -> CompositionStateRecord:
+    if source_path.parent.name == "blobs":
+        scoped_source_path = source_path.parent / str(session_id) / source_path.name
+        scoped_source_path.parent.mkdir(parents=True, exist_ok=True)
+        if source_path.exists():
+            scoped_source_path.write_bytes(source_path.read_bytes())
+        source_path = scoped_source_path
+    if output_path.parent.name == "outputs":
+        output_path = output_path.parent / str(session_id) / output_path.name
     source = {
         "plugin": "text",
         "on_success": "source_rows",
@@ -471,6 +558,177 @@ def _composition_state_record(
         derived_from_state_id=None,
         composer_meta=None,
     )
+
+
+def _successful_core_validation_result() -> ValidationResult:
+    """The real validator's successful 24-check prefix, without advisories."""
+    from elspeth.web.execution._validation_ledger import CORE_VALIDATION_CHECK_NAMES
+
+    return ValidationResult(
+        is_valid=True,
+        checks=[
+            ValidationCheck(
+                name=name,
+                passed=True,
+                detail=f"{name} passed",
+                affected_nodes=(),
+                outcome_code=CHECK_OUTCOME_SECRET_REFS_NO_REFS if name == "secret_refs" else None,
+            )
+            for name in CORE_VALIDATION_CHECK_NAMES
+        ],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=True,
+            blockers=[],
+        ),
+    )
+
+
+def _proof_gate_state(
+    *,
+    source_path: Path | None,
+    blob_id: UUID | None,
+    schema_mode: str = "observed",
+    condition: str = "row['amount'] > 500",
+) -> Any:
+    """Direct CSV -> gate state exercising the observed-row proof."""
+    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+
+    source_options: dict[str, Any] = {"schema": {"mode": schema_mode}}
+    if schema_mode in {"fixed", "flexible"}:
+        source_options["schema"]["fields"] = ["amount: float"]
+    if source_path is not None:
+        source_options["path"] = str(source_path)
+    if blob_id is not None:
+        source_options["blob_ref"] = str(blob_id)
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options=source_options,
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="amount_gate",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=condition,
+                routes={"true": "high_value", "false": "standard"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(name="high_value", plugin="json", options={}, on_write_failure="discard"),
+            OutputSpec(name="standard", plugin="json", options={}, on_write_failure="discard"),
+        ),
+        metadata=PipelineMetadata(name="Proof gate"),
+        version=1,
+    )
+
+
+def _guided_sentinel_proof_gate_state(*, source_path: Path, blob_id: UUID) -> Any:
+    """Observed CSV numeric gate whose reviewed source claims blob custody."""
+    from dataclasses import replace
+
+    from elspeth.web.composer.guided.resolved import SourceResolved
+    from elspeth.web.composer.guided.state_machine import GuidedSession
+
+    live_state = _proof_gate_state(source_path=source_path, blob_id=None)
+    stable_id = str(uuid4())
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={
+                    "path": f"blob:{blob_id}",
+                    "schema": {"mode": "observed"},
+                },
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+    return replace(live_state, guided_session=guided)
+
+
+def _install_ready_proof_blob(
+    service: ExecutionServiceImpl,
+    *,
+    session_id: UUID,
+    blob_id: UUID,
+    source_path: Path,
+) -> MagicMock:
+    """Install the session-owned ready blob record the proof resolver must use."""
+    content = source_path.read_bytes()
+    content_digest = hashlib.sha256(content).hexdigest()
+    blob_service = create_autospec(BlobServiceProtocol, instance=True)
+    blob_service.get_blob.return_value = _blob_record_stub(
+        blob_id=blob_id,
+        session_id=session_id,
+        filename=source_path.name,
+        mime_type="text/csv",
+        size_bytes=source_path.stat().st_size,
+        content_hash=content_digest,
+        storage_path=str(source_path),
+        status="ready",
+    )
+    blob_service.read_blob_content_prefix_verified.return_value = (
+        content[: 8 * 1024],
+        content_digest,
+        len(content),
+    )
+    service._blob_service = blob_service
+    return blob_service
+
+
+def _install_ready_proof_blobs(
+    service: ExecutionServiceImpl,
+    *,
+    session_id: UUID,
+    bindings: dict[UUID, Path],
+) -> MagicMock:
+    """Install multiple session-owned ready blobs for multi-source proof."""
+    records: dict[UUID, BlobRecord] = {}
+    verified: dict[UUID, tuple[bytes, str, int]] = {}
+    for blob_id, source_path in bindings.items():
+        content = source_path.read_bytes()
+        content_digest = hashlib.sha256(content).hexdigest()
+        records[blob_id] = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=session_id,
+            filename=source_path.name,
+            mime_type="text/csv",
+            size_bytes=len(content),
+            content_hash=content_digest,
+            storage_path=str(source_path),
+            status="ready",
+        )
+        verified[blob_id] = (content[: 8 * 1024], content_digest, len(content))
+
+    blob_service = create_autospec(BlobServiceProtocol, instance=True)
+    blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: records[blob_id]
+    blob_service.read_blob_content_prefix_verified.side_effect = lambda blob_id, *, prefix_bytes, session_operation_context: verified[
+        blob_id
+    ]
+    service._blob_service = blob_service
+    return blob_service
 
 
 @pytest.fixture
@@ -531,11 +789,89 @@ def isolate_raw_sink_effect_eligibility_gate(request: pytest.FixtureRequest) -> 
 
 
 @pytest.fixture
+def real_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    """A test-owned loop for the service's ``_call_async`` bridge and the worker lease."""
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        loop.close()
+
+
+_worker_lease: SessionOperationLease | None = None
+
+
+def _execute_lease() -> SessionOperationLease:
+    """The live EXECUTE lease a direct call to a lease-fenced internal passes.
+
+    ``_run_pipeline``, ``_finalize_output_blobs``, ``_on_pipeline_done`` and
+    ``_broadcast_progress_event`` take the exact ``SessionOperationLease`` the
+    worker was handed at submission and reprove it through
+    ``guard_external_effect`` before every external effect. Tests that drive
+    them from the test thread pass this one; it is a real lifecycle lease
+    adopted onto ``real_loop`` over a recording authority, so the guards run.
+    """
+    if _worker_lease is None:
+        raise RuntimeError("live EXECUTE lease fixture is not active")
+    return _worker_lease
+
+
+@pytest.fixture(autouse=True)
+def _live_execute_lease(real_loop: asyncio.AbstractEventLoop) -> Iterator[None]:
+    """Adopt one real EXECUTE lease onto ``real_loop`` for the test's duration.
+
+    Closed at teardown on the same loop unless the code under test already
+    closed it (``_on_pipeline_done`` does, when the service's loop is real).
+    """
+    global _worker_lease
+    lease = adopt_execute_lease(real_loop, uuid4())
+    _worker_lease = lease
+    try:
+        yield
+    finally:
+        _worker_lease = None
+        if not lease.closed:
+            close_adopted_lease(real_loop, lease)
+
+
+async def _execute(
+    service: ExecutionServiceImpl,
+    *,
+    session_id: UUID,
+    authority: RecordingSessionOperationAuthority | None = None,
+    **kwargs: Any,
+) -> UUID:
+    """Call ``execute()`` the way the route does: under a fresh EXECUTE lease for ``session_id``.
+
+    ``execute`` requires an exact ``SessionOperationLease`` carrying EXECUTE
+    authority for this session (service.py, the head of ``execute``). Mirrors
+    ``routes.py``'s transfer contract: on success the lease belongs to the
+    worker, which closes it after terminal cleanup via ``_on_pipeline_done``;
+    when ``execute`` fails before transfer the caller closes it. Pass
+    ``authority`` to recover the exact context the lease carries
+    (``authority.calls[0]`` is ``("acquire", context)``).
+    """
+    lease = await SessionOperationLease.acquire(
+        authority if authority is not None else RecordingSessionOperationAuthority(),
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="execution-service-test",
+        lease_seconds=30,
+    )
+    try:
+        return await service.execute(session_id, session_operation_lease=lease, **kwargs)
+    except BaseException:
+        await lease.close()
+        raise
+
+
+@pytest.fixture
 def service(
     mock_loop: MagicMock,
     broadcaster: ProgressBroadcaster,
     mock_settings: MagicMock,
     mock_session_service: MagicMock,
+    real_loop: asyncio.AbstractEventLoop,
 ) -> Iterator[ExecutionServiceImpl]:
     # AC #17: All Run CRUD goes through SessionService — no direct DB access.
     yaml_generator = _YamlGeneratorStub()
@@ -550,13 +886,13 @@ def service(
     # Patch _call_async for tests that call _run_pipeline directly (sync).
     # The real _call_async uses asyncio.run_coroutine_threadsafe which needs
     # a running event loop. In unit tests, we bridge by running the coroutine
-    # synchronously via asyncio.get_event_loop().run_until_complete().
+    # synchronously on the test-owned ``real_loop`` (the loop the worker
+    # lease from ``_execute_lease()`` is adopted onto).
     # TestB8AsyncBridging tests _call_async itself with its own mocking.
-    _real_loop = asyncio.new_event_loop()
 
     def _mock_call_async(coro: Coroutine[Any, Any, Any]) -> Any:
         try:
-            return _real_loop.run_until_complete(coro)
+            return real_loop.run_until_complete(coro)
         except RuntimeError:
             # If no event loop is available, just close the coroutine
             coro.close()
@@ -582,7 +918,6 @@ def service(
     )
     with patch("elspeth.web.execution.validation.validate_pipeline", return_value=_gate_valid):
         yield svc
-    _real_loop.close()
 
 
 # ── Basic Lifecycle ────────────────────────────────────────────────────
@@ -619,7 +954,7 @@ class TestExecutionFlow:
     async def test_execute_returns_run_id_immediately(self, service: ExecutionServiceImpl) -> None:
         """execute() returns a UUID without blocking on pipeline completion."""
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -628,7 +963,7 @@ class TestExecutionFlow:
         cast(_YamlGeneratorStub, service._yaml_generator).result = object()
 
         with pytest.raises(TypeError, match="must return str"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_execute_creates_run_via_session_service(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
@@ -636,8 +971,11 @@ class TestExecutionFlow:
         with R6 expanded params (session_id, state_id, pipeline_yaml)."""
         session_id = uuid4()
         state_record = mock_session_service.get_current_state.return_value
+        authority = RecordingSessionOperationAuthority()
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id, authority=authority)
+        acquired = [context for name, context in authority.calls if name == "acquire"]
+        assert len(acquired) == 1
         mock_session_service.create_run.assert_awaited_once()
         create_call = mock_session_service.create_run.await_args
         assert create_call.args == ()
@@ -645,6 +983,8 @@ class TestExecutionFlow:
             "session_id": session_id,
             "state_id": state_record.id,
             "pipeline_yaml": _RESOLVED_TEST_PIPELINE_YAML,
+            # The exact context of the EXECUTE lease execute() was handed.
+            "session_operation_context": acquired[0],
         }
 
     @pytest.mark.asyncio
@@ -675,14 +1015,14 @@ class TestExecutionFlow:
         completed.set_result(None)
 
         with patch.object(service._executor, "submit", return_value=completed) as submit:
-            await service.execute(session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice")
 
         submitted_args = submit.call_args.args
         assert submitted_args[4].plugin_snapshot is snapshot
         assert submitted_args[4].executable_config is not submitted_args[4].audit_safe_config
 
     @pytest.mark.asyncio
-    async def test_execute_lowers_profile_only_into_frozen_executable_config(
+    async def test_execute_lowers_profile_into_fanout_guard_and_frozen_executable_config(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
@@ -692,8 +1032,11 @@ class TestExecutionFlow:
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
         from elspeth.web.composer import yaml_generator
         from elspeth.web.config import WebSettings
+        from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired, evaluate_execution_fanout_guard
+        from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
         from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
         from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+        from elspeth.web.plugin_policy.validation import validate_plugin_policy
 
         private_model = "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
         private_region = "ap-southeast-2"
@@ -711,6 +1054,7 @@ class TestExecutionFlow:
                     "region_name": private_region,
                 }
             },
+            default_llm_profile="tutorial",
         )
         runtime_policy = RuntimeWebPluginConfig.from_settings(web_settings)
         policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_policy)
@@ -730,9 +1074,9 @@ class TestExecutionFlow:
         (tmp_path / "blobs").mkdir()
         (tmp_path / "outputs").mkdir()
         source_path = tmp_path / "blobs" / "input.txt"
-        source_path.write_text("Ada\n", encoding="utf-8")
+        source_path.write_text("Ada\n" * 34, encoding="utf-8")
         mock_settings.data_dir = tmp_path
-        mock_session_service.get_current_state.return_value = _composition_state_record(
+        state_record = _composition_state_record(
             session_id=session_id,
             source_path=source_path,
             output_path=tmp_path / "outputs" / "output.jsonl",
@@ -749,6 +1093,11 @@ class TestExecutionFlow:
                         "prompt_template": "Summarise {{ row }}",
                         "schema": {"mode": "observed", "fields": None},
                         "required_input_fields": [],
+                        "queries": [
+                            {"name": "summary", "input_fields": {"text": "body"}},
+                            {"name": "sentiment", "input_fields": {"text": "body"}},
+                            {"name": "topics", "input_fields": {"text": "body"}},
+                        ],
                         INTERPRETATION_REQUIREMENTS_KEY: [
                             {
                                 "id": "prompt_template_review:summarise",
@@ -766,6 +1115,7 @@ class TestExecutionFlow:
                 }
             ],
         )
+        mock_session_service.get_current_state.return_value = state_record
         service._yaml_generator = yaml_generator
         service._plugin_snapshot_factory = lambda _user_id: snapshot
         service._operator_profile_registry = profiles
@@ -773,7 +1123,34 @@ class TestExecutionFlow:
         completed.set_result(None)
 
         with patch.object(service._executor, "submit", return_value=completed) as submit:
-            await service.execute(session_id=session_id, user_id="alice")
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await _execute(service, session_id=session_id, user_id="alice")
+
+            risk = raised.value.guard.risks[0]
+            assert risk.provider == "bedrock"
+            assert risk.model == private_model
+            assert risk.provider_calls_per_row == 3
+            assert risk.estimated_provider_calls == 102
+            materialized_state = materialize_state_for_execution(state_from_record(state_record))
+            assert not isinstance(materialized_state, InterpretationReviewPending)
+            executable_state = validate_plugin_policy(
+                materialized_state,
+                snapshot=snapshot,
+                profile_registry=profiles,
+                catalog=create_catalog_service(),
+            ).executable_state
+            expected_guard = evaluate_execution_fanout_guard(executable_state, data_dir=tmp_path)
+            assert expected_guard is not None
+            assert raised.value.guard.ack_token == expected_guard.ack_token
+            assert private_region in json.dumps(executable_state.to_dict(), default=dict)
+            assert private_region not in json.dumps(raised.value.guard.to_dict())
+
+            await _execute(
+                service,
+                session_id=session_id,
+                user_id="alice",
+                fanout_ack_token=raised.value.guard.ack_token,
+            )
 
         frozen = submit.call_args.args[4]
         executable = json.dumps(frozen.executable_config, default=dict)
@@ -824,13 +1201,74 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=invalid),
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         # No opaque failed-run: the gate refuses BEFORE create_run.
         assert mock_session_service.create_run.await_count == 0
         # Carries the structured errors for the route to surface as a 422.
         assert exc_info.value.errors
         assert exc_info.value.errors[0].component_id == "rate"
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_backend_execution_readiness_before_run_creation(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Execution admission follows readiness even when validation is green."""
+        blocker = ValidationReadinessBlocker(
+            code="runtime_admission",
+            component_id="pipeline",
+            component_type="pipeline",
+            detail="The selected runtime policy does not admit this pipeline.",
+        )
+        not_execution_ready = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[blocker],
+            ),
+        )
+
+        with (
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
+            pytest.raises(ExecutionReadinessError) as exc_info,
+        ):
+            await _execute(service, session_id=uuid4())
+
+        assert exc_info.value.blockers == (blocker,)
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_backend_execution_readiness_without_blockers(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        not_execution_ready = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[],
+            ),
+        )
+
+        with (
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
+            pytest.raises(ExecutionReadinessError) as exc_info,
+        ):
+            await _execute(service, session_id=uuid4())
+
+        assert exc_info.value.blockers == ()
+        mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_execute_rejects_saved_now_disabled_plugin_before_run_or_constructor(
@@ -872,7 +1310,7 @@ class TestExecutionFlow:
             patch.object(service._executor, "submit") as submit,
             pytest.raises(PipelineValidationError),
         ):
-            await service.execute(session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice")
 
         mock_session_service.create_run.assert_not_awaited()
         instantiate.assert_not_called()
@@ -903,6 +1341,18 @@ class TestExecutionFlow:
                 "on_write_failure": "discard",
             }
         ]
+        unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash="runtime-policy",
+            principal_scope="test:alice",
+            available=unrestricted.available,
+            unavailable=(),
+            selected=unrestricted.selected,
+            usable_profile_aliases=(),
+            selected_profile_aliases=(),
+            binding_generation_fingerprint="runtime-policy-generation",
+        )
+        service._plugin_snapshot_factory = lambda _user_id: snapshot
 
         with (
             patch("elspeth.web.execution.validation.validate_pipeline", side_effect=_real_validate_pipeline),
@@ -911,7 +1361,7 @@ class TestExecutionFlow:
             patch.object(service._executor, "submit") as mock_submit,
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await service.execute(session_id=state_record.session_id)
+            await _execute(service, session_id=state_record.session_id)
 
         assert mock_session_service.create_run.await_count == 0
         mock_load.assert_not_called()
@@ -941,9 +1391,109 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=valid),
             patch.object(service, "_run_pipeline"),
         ):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
         mock_session_service.create_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_merges_selected_state_fact_against_authored_state(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Completion facts bind to the persisted graph, not runtime materialization."""
+        from elspeth.web.composer.state import SourceSpec
+        from elspeth.web.execution.completion_gates import (
+            AdvisorSignoffGateFact,
+            CompletionGateFacts,
+            completion_gate_fingerprint,
+        )
+        from elspeth.web.execution.completion_gates import (
+            merge_completion_gates as real_merge_completion_gates,
+        )
+
+        selected_record = mock_session_service.get_state.return_value
+        session_id = selected_record.session_id
+        authored_state = state_from_record(selected_record)
+        fact = AdvisorSignoffGateFact(
+            detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+            for_graph=completion_gate_fingerprint(authored_state),
+        )
+        selected_record.composer_meta = {
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": fact.detail,
+                    "for_graph": fact.for_graph,
+                }
+            }
+        }
+        runtime_state = authored_state.with_named_source(
+            "runtime_materialized",
+            SourceSpec(
+                plugin="text",
+                on_success="runtime_rows",
+                options={},
+                on_validation_failure="discard",
+            ),
+        )
+        valid = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=True,
+                completion_ready=True,
+                blockers=[],
+            ),
+        )
+
+        with (
+            patch("elspeth.web.execution.service.materialize_state_for_execution", return_value=runtime_state),
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=valid),
+            patch(
+                "elspeth.web.execution.service.merge_completion_gates",
+                wraps=real_merge_completion_gates,
+            ) as merge,
+            patch.object(service, "_run_pipeline"),
+        ):
+            run_id = await _execute(service, session_id=session_id, state_id=selected_record.id)
+
+        assert isinstance(run_id, UUID)
+        merge.assert_called_once()
+        proof_result, merged_facts, fingerprint_state = merge.call_args.args
+        assert proof_result.checks[-1].name == "proof_diagnostics"
+        assert proof_result.checks[-1].passed is True
+        assert merged_facts == CompletionGateFacts(advisor_signoff=fact)
+        assert fingerprint_state == authored_state
+        mock_session_service.get_current_state.assert_not_awaited()
+        mock_session_service.create_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_corrupt_completion_gate_before_run_creation(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        selected_record = mock_session_service.get_current_state.return_value
+        private_persisted_detail = "private-persisted-advisor-detail"
+        selected_record.composer_meta = {
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": private_persisted_detail,
+                    # Required for_graph intentionally absent: Tier-1 corruption.
+                }
+            }
+        }
+
+        with pytest.raises(CompletionGateIntegrityError) as exc_info:
+            await _execute(service, session_id=selected_record.session_id)
+
+        assert private_persisted_detail not in str(exc_info.value)
+        assert private_persisted_detail not in repr(exc_info.value)
+        mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_validate_returns_structured_failure_when_no_current_state(
@@ -955,7 +1505,7 @@ class TestExecutionFlow:
         session_id = uuid4()
         mock_session_service.get_current_state.return_value = None
 
-        result = await service.validate(session_id, user_id="alice")
+        result = await service.validate(session_id, session_operation_context=make_blob_read_context(session_id), user_id="alice")
 
         assert result.is_valid is False
         assert result.checks[0].name == "state_exists"
@@ -987,15 +1537,18 @@ class TestExecutionFlow:
         validate_state = AsyncMock(spec=service.validate_state, return_value=expected)
         service.validate_state = validate_state  # type: ignore[method-assign]
 
-        result = await service.validate(session_id, user_id="alice")
+        context = make_blob_read_context(session_id)
+        result = await service.validate(session_id, session_operation_context=context, user_id="alice")
 
         assert result is expected
         validate_state.assert_awaited_once()
         delegated_state = validate_state.await_args.args[0]
         assert delegated_state.version == mock_session_service.get_current_state.return_value.version
         assert validate_state.await_args.kwargs == {
+            "session_operation_context": context,
             "user_id": "alice",
             "session_id": session_id,
+            "completion_gates": None,
         }
 
     @pytest.mark.asyncio
@@ -1005,8 +1558,6 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
     ) -> None:
         """validate_state() keeps sync validation off the event loop."""
-        from elspeth.web.execution.validation import validate_pipeline
-
         state = state_from_record(mock_session_service.get_current_state.return_value)
         expected = ValidationResult(
             is_valid=True,
@@ -1022,22 +1573,115 @@ class TestExecutionFlow:
 
         with patch("elspeth.web.execution.service.run_sync_in_worker", new_callable=AsyncMock) as run_worker:
             run_worker.return_value = expected
-            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+            session_id = uuid4()
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result is expected
         run_worker.assert_awaited_once()
-        worker_call = run_worker.await_args.args[0]
-        assert isinstance(worker_call, partial)
-        assert worker_call.func is validate_pipeline
-        assert worker_call.args == (
-            state,
-            service._settings,
-            service._yaml_generator,
+        assert run_worker.await_args.kwargs == {}
+        (worker_call,) = run_worker.await_args.args
+        # The handoff is a local function whose body is a direct call the
+        # session-operation-lease gate can follow (elspeth-01e919e13e), not a
+        # ``partial`` that hides the callee and its context from the walk.
+        assert not isinstance(worker_call, partial)
+        assert worker_call.__qualname__ == "ExecutionServiceImpl._authoritative_state_preflight.<locals>._preflight"
+        with patch.object(service, "_authoritative_state_preflight_sync", autospec=True, return_value=expected) as preflight_sync:
+            assert worker_call() is expected
+        preflight_sync.assert_called_once()
+        assert preflight_sync.call_args.args == (state,)
+        forwarded = preflight_sync.call_args.kwargs
+        assert set(forwarded) == {"plugin_snapshot", "user_id", "session_id", "session_operation_context"}
+        assert forwarded["user_id"] == "alice"
+        assert forwarded["session_id"] == session_id
+        assert forwarded["session_operation_context"] is context
+        assert forwarded["plugin_snapshot"] is not None
+
+    @pytest.mark.asyncio
+    async def test_validate_state_merges_persisted_completion_gate(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """A persisted advisor sign-off blocker survives the fresh recompute."""
+        from elspeth.web.execution.completion_gates import (
+            AdvisorSignoffGateFact,
+            CompletionGateFacts,
+            completion_gate_fingerprint,
         )
-        assert worker_call.keywords is not None
-        assert worker_call.keywords["secret_service"] is service._secret_service
-        assert worker_call.keywords["user_id"] == "alice"
-        assert callable(worker_call.keywords["blob_get_metadata"])
+        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
+
+        state = state_from_record(mock_session_service.get_current_state.return_value)
+        facts = CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph=completion_gate_fingerprint(state),
+            )
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            session_id = uuid4()
+            result = await service.validate_state(
+                state,
+                session_operation_context=make_blob_read_context(session_id),
+                user_id="alice",
+                session_id=session_id,
+                completion_gates=facts,
+            )
+
+        assert result.is_valid is True
+        assert result.readiness.authoring_valid is True
+        assert result.readiness.execution_ready is True
+        assert result.readiness.completion_ready is False
+        assert [blocker.code for blocker in result.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
+        assert len(result.checks) == 26
+        assert [check.name for check in result.checks[24:]] == ["advisor_signoff", "proof_diagnostics"]
+
+    @pytest.mark.asyncio
+    async def test_validate_passes_record_completion_gates_to_validate_state(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """validate() parses the record's composer_meta and threads the facts through."""
+        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
+        session_id = uuid4()
+        mock_session_service.get_current_state.return_value.composer_meta = {
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                    "for_graph": "0" * 64,
+                }
+            }
+        }
+        expected = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=True,
+                completion_ready=True,
+                blockers=[],
+            ),
+        )
+        validate_state = AsyncMock(spec=service.validate_state, return_value=expected)
+        service.validate_state = validate_state  # type: ignore[method-assign]
+
+        await service.validate(session_id, session_operation_context=make_blob_read_context(session_id), user_id="alice")
+
+        validate_state.assert_awaited_once()
+        assert validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph="0" * 64,
+            )
+        )
 
     @pytest.mark.asyncio
     async def test_get_status_returns_run_status(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
@@ -1059,6 +1703,824 @@ class TestExecutionFlow:
         status = await service.get_status(run_id)
         assert status.status == "running"
         assert status.accounting is None
+
+
+class TestAuthoritativeProofDiagnostics:
+    @pytest.mark.asyncio
+    async def test_guided_sentinel_with_valid_custody_reads_once_and_rejects_numeric_gate(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "guided-sentinel-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+            session_operation_context=context,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("terminal_kind", ["live", "completed", "exited_to_freeform"])
+    async def test_guided_terminal_kind_never_removes_the_authoritative_source_proof(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+        terminal_kind: str,
+    ) -> None:
+        """elspeth-3b45cdb41e: the three-terminal table must reject identically.
+
+        Varying ONLY the guided terminal on an otherwise identical state, the
+        admission proof must resolve custody and reject the numeric gate the
+        same way. EXITED_TO_FREEFORM previously hit the export-family identity
+        return, ran zero resolver calls, and recorded a fabricated passing
+        proof check.
+        """
+        from dataclasses import replace
+
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / f"terminal-{terminal_kind}-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        if terminal_kind == "completed":
+            terminal = TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}")
+        elif terminal_kind == "exited_to_freeform":
+            terminal = TerminalState(
+                kind=TerminalKind.EXITED_TO_FREEFORM,
+                reason=TerminalReason.USER_PRESSED_EXIT,
+                pipeline_yaml=None,
+            )
+        else:
+            terminal = None
+        if terminal is not None:
+            assert state.guided_session is not None
+            state = replace(state, guided_session=replace(state.guided_session, terminal=terminal))
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+            session_operation_context=context,
+        )
+
+    @pytest.mark.asyncio
+    async def test_exited_history_that_cannot_bind_fails_closed_without_reading(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        """A diverged exited session blocks with a FAILED proof check, never a pass."""
+        from dataclasses import replace
+
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "exited-renamed-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        base = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        assert base.guided_session is not None
+        state = replace(
+            base,
+            sources={"renamed": base.sources["source"]},
+            guided_session=replace(
+                base.guided_session,
+                terminal=TerminalState(
+                    kind=TerminalKind.EXITED_TO_FREEFORM,
+                    reason=TerminalReason.USER_PRESSED_EXIT,
+                    pipeline_yaml=None,
+                ),
+            ),
+        )
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert "unavailable" in result.checks[24].detail
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        assert result.readiness.execution_ready is False
+        blob_service.get_blob.assert_not_awaited()
+        blob_service.read_blob_content_prefix_verified.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "custody_failure",
+        ["wrong_session", "wrong_path", "not_ready", "not_found"],
+    )
+    async def test_guided_sentinel_with_failed_custody_is_invalid_without_reading(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+        custody_failure: str,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / f"guided-sentinel-{custody_failure}.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        if custody_failure == "not_found":
+            blob_service.get_blob.side_effect = BlobNotFoundError(str(blob_id))
+        else:
+            blob_service.get_blob.return_value = _blob_record_stub(
+                blob_id=blob_id,
+                session_id=uuid4() if custody_failure == "wrong_session" else session_id,
+                filename=source_path.name,
+                mime_type="text/csv",
+                size_bytes=source_path.stat().st_size,
+                content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                storage_path=(str(tmp_path / "different-custody-path.csv") if custody_failure == "wrong_path" else str(source_path)),
+                status="pending" if custody_failure == "not_ready" else "ready",
+            )
+        service._blob_service = blob_service
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
+        blob_service.read_blob_content_prefix_verified.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_observed_csv_numeric_gate_after_declared_queue_is_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import SourceSpec
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "queued-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        direct_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        state = replace(
+            direct_state,
+            sources={
+                "source": replace(
+                    direct_state.sources["source"],
+                    on_success="inbound",
+                ),
+                "other": SourceSpec(
+                    plugin="csv",
+                    on_success="inbound",
+                    options={
+                        "path": str(tmp_path / "other.csv"),
+                        "schema": {"mode": "fixed", "fields": ["amount: float"]},
+                    },
+                    on_validation_failure="discard",
+                ),
+            },
+            nodes=(
+                _queue_node("inbound"),
+                replace(direct_state.nodes[0], input="inbound"),
+            ),
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+
+    @pytest.mark.asyncio
+    async def test_more_than_256_blob_sources_blocks_instead_of_partially_passing(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import SourceSpec
+
+        base = _proof_gate_state(source_path=tmp_path / "source-0.csv", blob_id=uuid4())
+        sources = {
+            f"source_{index}": SourceSpec(
+                plugin="csv",
+                on_success=f"rows_{index}",
+                options={
+                    "path": str(tmp_path / f"source-{index}.csv"),
+                    "blob_ref": str(uuid4()),
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            )
+            for index in range(257)
+        }
+        state = replace(base, sources=sources, nodes=())
+        service._blob_service = None
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            session_id = uuid4()
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+
+    @pytest.mark.asyncio
+    async def test_observed_csv_numeric_gate_after_passthrough_is_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import NodeSpec
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "passthrough-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        direct_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        gate = direct_state.nodes[0]
+        passthrough = NodeSpec(
+            id="retain_fields",
+            node_type="transform",
+            plugin="passthrough",
+            input="rows",
+            on_success="preserved_rows",
+            on_error=None,
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = replace(
+            direct_state,
+            nodes=(passthrough, replace(gate, input="preserved_rows")),
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+
+    @pytest.mark.asyncio
+    async def test_second_observed_csv_source_feeding_numeric_gate_is_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import SourceSpec
+
+        session_id = uuid4()
+        safe_blob_id = uuid4()
+        risky_blob_id = uuid4()
+        safe_path = tmp_path / "first-safe.csv"
+        risky_path = tmp_path / "second-risky.csv"
+        safe_path.write_text("label\nready\n", encoding="utf-8")
+        risky_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        risky_state = _proof_gate_state(source_path=risky_path, blob_id=risky_blob_id)
+        risky_source = replace(risky_state.sources["source"], on_success="risky_rows")
+        state = replace(
+            risky_state,
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="safe_rows",
+                    options={
+                        "path": str(safe_path),
+                        "blob_ref": str(safe_blob_id),
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "risky": risky_source,
+            },
+            nodes=(replace(risky_state.nodes[0], input="risky_rows"),),
+        )
+        blob_service = _install_ready_proof_blobs(
+            service,
+            session_id=session_id,
+            bindings={safe_blob_id: safe_path, risky_blob_id: risky_path},
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        assert blob_service.read_blob_content_prefix_verified.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sources_sharing_blob_evaluate_both_topologies_with_one_verified_read(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "shared-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        base = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        base_source = base.sources["source"]
+        base_gate = base.nodes[0]
+        state = replace(
+            base,
+            sources={
+                "orders": replace(base_source, on_success="order_rows"),
+                "refunds": replace(base_source, on_success="refund_rows"),
+            },
+            nodes=(
+                replace(base_gate, id="order_gate", input="order_rows"),
+                replace(base_gate, id="refund_gate", input="refund_rows"),
+            ),
+        )
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.component_id for error in result.errors] == ["order_gate", "refund_gate"]
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+            session_operation_context=context,
+        )
+
+    @pytest.mark.asyncio
+    async def test_validate_state_rejects_observed_csv_numeric_gate_after_canonical_core(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert [check.name for check in result.checks[:24]] == [check.name for check in _successful_core_validation_result().checks]
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        assert result.is_valid is False
+        assert result.readiness.authoring_valid is False
+        assert result.readiness.execution_ready is False
+        assert result.readiness.completion_ready is False
+
+    @pytest.mark.asyncio
+    async def test_authoritative_proof_uses_verified_prefix_without_direct_path_read(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "verified-prefix.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with (
+            patch(
+                "elspeth.web.execution.validation.validate_pipeline",
+                return_value=_successful_core_validation_result(),
+            ),
+            patch.object(Path, "read_bytes", side_effect=AssertionError("proof must use verified prefix API")),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+            session_operation_context=context,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_observed_csv_numeric_gate_before_create_run(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        mock_settings: _WebSettingsStub,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_dir = tmp_path / "blobs" / str(session_id)
+        source_dir.mkdir(parents=True)
+        source_path = source_dir / "amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        state_dict = state.to_dict()
+        state_record = mock_session_service.get_current_state.return_value
+        state_record.session_id = session_id
+        state_record.source = state_dict["sources"]["source"]
+        state_record.sources = state_dict["sources"]
+        state_record.nodes = state_dict["nodes"]
+        state_record.edges = state_dict["edges"]
+        state_record.outputs = state_dict["outputs"]
+        mock_settings.data_dir = tmp_path
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+        snapshot_calls = 0
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+        def _snapshot_for_user(_user_id: str) -> PluginAvailabilitySnapshot:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return snapshot
+
+        service._plugin_snapshot_factory = _snapshot_for_user
+
+        with (
+            patch(
+                "elspeth.web.execution.validation.validate_pipeline",
+                return_value=_successful_core_validation_result(),
+            ),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
+            pytest.raises(PipelineValidationError) as exc_info,
+        ):
+            await _execute(service, session_id=session_id, user_id="alice")
+
+        assert exc_info.value.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
+        assert snapshot_calls == 1
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_guided_reviewed_source_binding_is_inspected_without_live_blob_ref(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.guided.resolved import SourceResolved
+        from elspeth.web.composer.guided.state_machine import GuidedSession
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "guided-amounts.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        live_state = _proof_gate_state(source_path=source_path, blob_id=None)
+        stable_id = str(uuid4())
+        guided = replace(
+            GuidedSession.initial(),
+            source_order=(stable_id,),
+            reviewed_sources={
+                stable_id: SourceResolved(
+                    name="source",
+                    plugin="csv",
+                    options={
+                        "path": str(source_path),
+                        "blob_ref": str(blob_id),
+                        "schema": {"mode": "observed"},
+                    },
+                    observed_columns=("amount",),
+                    sample_rows=(),
+                    on_validation_failure="discard",
+                )
+            },
+        )
+        state = replace(live_state, guided_session=guided)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("schema_mode", ["fixed", "flexible"])
+    async def test_explicit_numeric_source_schema_passes_proof(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+        schema_mode: str,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / f"{schema_mode}-amounts.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        state = _proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+            schema_mode=schema_mode,
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+        assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_observed_string_comparison_passes_proof(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "regions.csv"
+        source_path.write_text("region\nNSW\nVIC\n", encoding="utf-8")
+        state = _proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+            condition="row['region'] == 'NSW'",
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+
+    @pytest.mark.asyncio
+    async def test_uninspectable_blob_source_abstains_with_passing_proof_check(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        blob_id = uuid4()
+        source_path = tmp_path / "not-authoritatively-resolved.csv"
+        state = _proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+        )
+        service._blob_service = None
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            session_id = uuid4()
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+        assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_uninspectable_blob_source_with_exited_guided_claim_fails_closed(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        """elspeth-3b45cdb41e: exited review custody that cannot resolve must block.
+
+        Before the fix the exited sentinel claim was excluded from the
+        resolver's custody census (39c7fc635's parity with the export-family
+        skip), so an unresolvable claimed source abstained into a passing
+        proof check. Admission now keeps exited claims in the census and the
+        unresolvable claim surfaces as the blocking custody diagnostic.
+        """
+        from dataclasses import replace
+
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+
+        blob_id = uuid4()
+        source_path = tmp_path / "not-authoritatively-resolved.csv"
+        state = _proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+        )
+        historical_guided = _guided_sentinel_proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+        ).guided_session
+        assert historical_guided is not None
+        state = replace(
+            state,
+            guided_session=replace(
+                historical_guided,
+                terminal=TerminalState(
+                    kind=TerminalKind.EXITED_TO_FREEFORM,
+                    reason=TerminalReason.USER_PRESSED_EXIT,
+                    pipeline_yaml=None,
+                ),
+            ),
+        )
+        service._blob_service = None
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            session_id = uuid4()
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_blob_path_binding_abstains_without_reading_bytes(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "canonical.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        base = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        source = base.sources["source"]
+        state = replace(
+            base,
+            sources={
+                "source": replace(
+                    source,
+                    options={
+                        **source.options,
+                        "file": str(tmp_path / "conflicting.csv"),
+                    },
+                )
+            },
+        )
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+        blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
 
 def _text_source(path: Path, on_success: str) -> Any:
@@ -1119,6 +2581,77 @@ def _fanout_llm_node(input_label: str, node_id: str = "classify") -> Any:
     )
 
 
+def _coalesce_node(
+    *,
+    node_id: str,
+    on_success: str,
+    branches: dict[str, str],
+) -> Any:
+    """Coalesce node whose branch identities may differ from connections."""
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id=node_id,
+        node_type="coalesce",
+        plugin=None,
+        input=f"{node_id}_compatibility_input",
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy="all",
+        merge="row_union",
+    )
+
+
+def _row_union_node(
+    *,
+    branches: dict[str, str],
+    on_success: str = "unioned_rows",
+) -> Any:
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input=next(iter(branches.values())),
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy=None,
+        merge=None,
+    )
+
+
+def _fork_gate_node(*, node_id: str, input_label: str, fork_to: tuple[str, ...]) -> Any:
+    """Fork gate duplicating each row into every ``fork_to`` branch."""
+    from elspeth.web.composer.state import NodeSpec
+
+    return NodeSpec(
+        id=node_id,
+        node_type="gate",
+        plugin=None,
+        input=input_label,
+        on_success=None,
+        on_error=None,
+        options={},
+        condition="True",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=list(fork_to),
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
 def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...] = ()) -> Any:
     """CompositionState: ``sources`` fan into queue ``inbound`` feeding an LLM."""
     from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -1133,7 +2666,200 @@ def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...]
     )
 
 
+class TestFanoutGuardProducerIndexDerivesPublication:
+    """The producer index must ask the helper, not test ``on_success`` by hand.
+
+    ``_build_producer_index`` read ``node.on_success`` directly and installed
+    only queues under their own id. A non-terminal coalesce and an aggregation
+    that omits ``on_success`` publish under their own ids too, so neither was
+    ever registered — and ``walk_label`` does a ``.get()`` that returns
+    silently on a miss, so the upstream trace simply stopped.
+
+    Consequence (elspeth-8190d4e4cf): a ``batch_replicate`` aggregation over
+    500 rows feeding an ``llm`` node returned no guard at all. No 428, no ack
+    token, and ``annotate_pipeline_yaml_with_fanout_guard`` never ran, so the
+    launch YAML lost its audit comment as well. Unacknowledged LLM spend with
+    no record a guard was ever owed. FALSE ACCEPT.
+    """
+
+    @staticmethod
+    def _state_with(node: Any, *, llm_input: str, data_path: Path) -> Any:
+        from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="src_out",
+                options={"path": str(data_path.name), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(node, _fanout_llm_node(llm_input)),
+            edges=(),
+            outputs=(
+                OutputSpec(name="out", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+                OutputSpec(name="errors", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    @staticmethod
+    def _replicating_aggregation(*, on_success: str | None) -> Any:
+        from elspeth.web.composer.state import NodeSpec
+
+        return NodeSpec(
+            id="agg",
+            node_type="aggregation",
+            plugin="batch_replicate",
+            input="src_out",
+            on_success=on_success,
+            on_error="errors",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={"count": 10},
+            output_mode="transform",
+        )
+
+    def _csv(self, tmp_path: Path) -> Path:
+        path = tmp_path / "in.csv"
+        path.write_text("a,b\n" + "".join(f"{i},{i}\n" for i in range(500)), encoding="utf-8")
+        return path
+
+    def test_implicit_aggregation_upstream_of_llm_still_raises_the_guard(self, tmp_path: Path) -> None:
+        """The reproduction: two runtime-identical graphs, only the guard differed."""
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        data_path = self._csv(tmp_path)
+        implicit = self._state_with(self._replicating_aggregation(on_success=None), llm_input="agg", data_path=data_path)
+        explicit = self._state_with(self._replicating_aggregation(on_success="agg_out"), llm_input="agg_out", data_path=data_path)
+
+        implicit_guard = evaluate_execution_fanout_guard(implicit, data_dir=tmp_path)
+        explicit_guard = evaluate_execution_fanout_guard(explicit, data_dir=tmp_path)
+
+        assert implicit_guard is not None, (
+            "A transform-mode batch_replicate aggregation feeding an LLM raised NO guard when it omitted "
+            "on_success — unacknowledged LLM spend, and no audit comment on the launch YAML either."
+        )
+        assert explicit_guard is not None
+        assert implicit_guard.risk_level == explicit_guard.risk_level, (
+            "The two graphs are runtime-identical; omitting on_success must not change the risk level."
+        )
+        assert [risk.node_id for risk in implicit_guard.risks] == [risk.node_id for risk in explicit_guard.risks]
+
+    def test_every_implicit_self_publisher_registers_as_a_producer_of_its_own_id(self, tmp_path: Path) -> None:
+        """The pin, ENUMERATED FROM the helper's own set — not restated here.
+
+        A fourth node kind added to ``_IMPLICIT_SELF_PUBLISHING_NODE_TYPES``
+        cannot skip this site: it joins the loop automatically and fails here
+        if the producer index does not register it.
+        """
+        from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES, published_success_connection
+        from elspeth.web.composer.state import NodeSpec
+        from elspeth.web.execution.fanout_guard import _build_producer_index
+
+        data_path = self._csv(tmp_path)
+        for kind in sorted(_IMPLICIT_SELF_PUBLISHING_NODE_TYPES):
+            node = NodeSpec(
+                id="publisher",
+                node_type=kind,
+                plugin=None,
+                # A queue's input IS its own id; the others consume upstream.
+                input="publisher" if kind == "queue" else "src_out",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"only": "src_out"} if kind == "coalesce" else None,
+                policy="all" if kind == "coalesce" else None,
+                merge="row_union" if kind == "coalesce" else None,
+                **({"trigger": {"count": 10}} if kind == "aggregation" else {}),
+            )
+            assert published_success_connection(node) == "publisher", kind
+            index = _build_producer_index(self._state_with(node, llm_input="publisher", data_path=data_path))
+            assert "publisher" in index.by_connection, (
+                f"A '{kind}' publishing under its own id is not registered in the fanout guard's producer "
+                "index, so walk_label() returns silently on it and the upstream trace stops — the LLM "
+                "fanout guard is disabled for every pipeline routing through one. Register "
+                "published_success_connection(node); do not restate the set here."
+            )
+
+    def test_a_queue_owns_its_own_id_regardless_of_node_order(self, tmp_path: Path) -> None:
+        """Deleting the separate queue install must not depend on declaration order.
+
+        The removed block re-installed each queue as the canonical producer of
+        its id AFTER the main loop. Deriving the channel makes the queue
+        self-register inside the loop instead, and ``register``'s divert only
+        routes away producers whose key is not ``node:<queue id>`` — so the
+        queue wins either way. Measured here rather than reasoned.
+        """
+        from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import _build_producer_index
+
+        data_path = self._csv(tmp_path)
+        queue = _queue_node("q")
+        feeders = (_fanout_llm_node("src_out", node_id="a"), _fanout_llm_node("src_out", node_id="b"))
+        feeders = tuple(replace(node, on_success="q") for node in feeders)
+
+        for label, nodes in (
+            ("feeders first", (*feeders, queue)),
+            ("queue first", (queue, *feeders)),
+        ):
+            state = CompositionState(
+                source=SourceSpec(
+                    plugin="csv",
+                    on_success="src_out",
+                    options={"path": str(data_path.name), "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                ),
+                nodes=nodes,
+                edges=(),
+                outputs=(
+                    OutputSpec(name="out", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+                    OutputSpec(name="errors", plugin="json", options={"schema": {"mode": "observed"}}, on_write_failure="discard"),
+                ),
+                metadata=PipelineMetadata(),
+                version=1,
+            )
+            index = _build_producer_index(state)
+            owner = index.by_connection.get("q")
+            assert owner is not None and owner.node is not None and owner.node.id == "q", label
+            assert sorted(p.node.id for p in index.queue_predecessors.get("q", ()) if p.node) == ["a", "b"], label
+
+
 class TestExecutionFanoutGuard:
+    def test_source_native_llm_bounds_downstream_llm_transform_to_one_row(self, tmp_path: Path) -> None:
+        """A source:llm may emit zero or one row, never unknown fanout."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                on_success="generated",
+                options={
+                    "provider": "openrouter",
+                    "model": "openai/gpt-4o-mini",
+                    "prompt_template": "Write one briefing.",
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(_fanout_llm_node("generated", node_id="refine"),),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        assert evaluate_execution_fanout_guard(state, data_dir=tmp_path) is None
+
     @pytest.mark.asyncio
     async def test_line_explode_to_llm_requires_ack_before_run_creation(
         self,
@@ -1146,13 +2872,13 @@ class TestExecutionFanoutGuard:
         from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
 
         data_dir = tmp_path
-        blob_dir = data_dir / "blobs"
-        output_dir = data_dir / "outputs"
-        blob_dir.mkdir()
-        output_dir.mkdir()
+        session_id = uuid4()
+        blob_dir = data_dir / "blobs" / str(session_id)
+        output_dir = data_dir / "outputs" / str(session_id)
+        blob_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
         source_path = blob_dir / "input.txt"
         source_path.write_text("alpha\nbeta\n", encoding="utf-8")
-        session_id = uuid4()
         mock_settings.data_dir = data_dir
         mock_session_service.get_current_state.return_value = _composition_state_record(
             session_id=session_id,
@@ -1186,10 +2912,19 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
-            pytest.raises(ExecutionFanoutGuardRequired) as raised,
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
-            await service.execute(session_id=session_id)
+            # The wired OPENROUTER_API_KEY trips the secret-approval guard
+            # first (elspeth-f3c1aafd25); acknowledge it to reach the fanout
+            # guard under test.
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await _execute(service, session_id=session_id)
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await _execute(
+                    service,
+                    session_id=session_id,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
 
         guard = raised.value.guard
         assert guard.ack_token
@@ -1252,24 +2987,41 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
-            pytest.raises(ExecutionFanoutGuardRequired) as raised,
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
-            await service.execute(session_id=session_id)
+            # Secret approval (elspeth-f3c1aafd25) gates first, then fanout.
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await _execute(service, session_id=session_id)
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await _execute(
+                    service,
+                    session_id=session_id,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
 
         run_id = uuid4()
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
-        await service.execute(
-            session_id=session_id,
-            fanout_ack_token=raised.value.guard.ack_token,
-        )
+        # This test isolates fanout acknowledgement. Direct source ->
+        # line_explode now correctly fails the independent UNKNOWN semantic
+        # contract gate, so keep that sibling gate stubbed on the accepted
+        # retry just as it is on the initial guard-producing call above.
+        with patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())):
+            await _execute(
+                service,
+                session_id=session_id,
+                fanout_ack_token=raised.value.guard.ack_token,
+                secret_ack_token=secret_raised.value.guard.ack_token,
+            )
 
         create_call = mock_session_service.create_run.await_args_list[-1]
         persisted_yaml = create_call.kwargs["pipeline_yaml"]
         assert "elspeth_execution_fanout_guard" in persisted_yaml
+        assert "elspeth_execution_secret_approval" in persisted_yaml
         assert '"accepted":true' in persisted_yaml
         assert raised.value.guard.ack_token in persisted_yaml
+        assert secret_raised.value.guard.ack_token in persisted_yaml
         assert '"node_id":"classify_line"' in persisted_yaml
+        assert '"secret_name":"OPENROUTER_API_KEY"' in persisted_yaml
 
     @pytest.mark.asyncio
     async def test_direct_small_text_source_to_llm_executes_without_ack(
@@ -1312,13 +3064,22 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
-            run_id = await service.execute(session_id=session_id)
+            # The wired secret still requires its own out-of-band approval
+            # (elspeth-f3c1aafd25); low cardinality only removes the FANOUT ack.
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await _execute(service, session_id=session_id)
+            run_id = await _execute(
+                service,
+                session_id=session_id,
+                secret_ack_token=secret_raised.value.guard.ack_token,
+            )
 
         assert isinstance(run_id, UUID)
         persisted_yaml = mock_session_service.create_run.await_args.kwargs["pipeline_yaml"]
         assert "elspeth_execution_fanout_guard" not in persisted_yaml
+        assert "elspeth_execution_secret_approval" in persisted_yaml
 
     @pytest.mark.asyncio
     async def test_non_first_named_source_to_llm_uses_its_own_cardinality(
@@ -1332,15 +3093,15 @@ class TestExecutionFanoutGuard:
         from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
 
         data_dir = tmp_path
-        blob_dir = data_dir / "blobs"
-        output_dir = data_dir / "outputs"
-        blob_dir.mkdir()
-        output_dir.mkdir()
+        session_id = uuid4()
+        blob_dir = data_dir / "blobs" / str(session_id)
+        output_dir = data_dir / "outputs" / str(session_id)
+        blob_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
         orders_path = blob_dir / "orders.txt"
         refunds_path = blob_dir / "refunds.txt"
         orders_path.write_text("one\n", encoding="utf-8")
         refunds_path.write_text("\n".join(f"refund-{i}" for i in range(101)) + "\n", encoding="utf-8")
-        session_id = uuid4()
         mock_settings.data_dir = data_dir
         mock_session_service.get_current_state.return_value = _composition_state_record(
             session_id=session_id,
@@ -1379,15 +3140,97 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
-            pytest.raises(ExecutionFanoutGuardRequired) as raised,
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
-            await service.execute(session_id=session_id)
+            # Acknowledge the wired-secret approval first (elspeth-f3c1aafd25).
+            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                await _execute(service, session_id=session_id)
+            with pytest.raises(ExecutionFanoutGuardRequired) as raised:
+                await _execute(
+                    service,
+                    session_id=session_id,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
 
         risk = raised.value.guard.risks[0]
         assert risk.estimated_provider_calls == 101
         assert risk.upstream_fanout == ("source:refunds:text:estimated_rows=101",)
         assert mock_session_service.create_run.await_count == 0
+
+    def test_coalesce_mapping_traverses_values_once_across_nesting_and_cycles(self, tmp_path: Path) -> None:
+        """Mapping values remain reachable and duplicate/cyclic paths are visited once."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        rows = tmp_path / "rows.txt"
+        rows.write_text("\n".join(f"row-{i}" for i in range(101)) + "\n", encoding="utf-8")
+        inner = _coalesce_node(
+            node_id="inner",
+            on_success="inner_rows",
+            branches={
+                "primary_branch": "actual_source_rows",
+                "duplicate_branch": "actual_source_rows",
+                "cycle_branch": "outer_rows",
+            },
+        )
+        outer = _coalesce_node(
+            node_id="outer",
+            on_success="outer_rows",
+            branches={"nested_branch": "inner_rows"},
+        )
+        state = CompositionState(
+            sources={"rows": _text_source(rows, "actual_source_rows")},
+            nodes=(inner, outer, _fanout_llm_node("outer_rows")),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None, "101 reachable rows must require a guard"
+        risk = guard.risks[0]
+        assert risk.estimated_provider_calls == 101
+        assert risk.upstream_fanout == ("source:rows:text:estimated_rows=101",)
+
+    def test_row_union_traverses_every_branch_for_provider_cost(self, tmp_path: Path) -> None:
+        """A downstream LLM sees the summed cardinality of every released branch."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        control = tmp_path / "control.txt"
+        treatment = tmp_path / "treatment.txt"
+        control.write_text("\n".join(f"control-{i}" for i in range(60)) + "\n", encoding="utf-8")
+        treatment.write_text("\n".join(f"treatment-{i}" for i in range(60)) + "\n", encoding="utf-8")
+        state = CompositionState(
+            sources={
+                "control": _text_source(control, "control_done"),
+                "treatment": _text_source(treatment, "treatment_done"),
+            },
+            nodes=(
+                _row_union_node(
+                    branches={
+                        "control": "control_done",
+                        "treatment": "treatment_done",
+                    }
+                ),
+                _fanout_llm_node("unioned_rows"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None
+        assert guard.risks[0].estimated_provider_calls == 120
+        assert set(guard.risks[0].upstream_fanout) == {
+            "source:control:text:estimated_rows=60",
+            "source:treatment:text:estimated_rows=60",
+        }
 
     # ── Queue fan-in provider-cost guard (elspeth-6421ffa028) ───────────
     # A declared queue fans multiple upstream sources into one LLM. The
@@ -1514,6 +3357,115 @@ class TestExecutionFanoutGuard:
         assert guard_reverse.risks[0].estimated_provider_calls == 120
         assert sorted(guard_forward.risks[0].upstream_fanout) == sorted(guard_reverse.risks[0].upstream_fanout)
 
+    # ── Deterministic fork fan-out arithmetic (elspeth session 39578c6f) ─
+    # A fork gate duplicates each row exactly once per branch, so fork-only
+    # topologies keep provable per-row and total call counts. Only genuinely
+    # unbounded expansion (creates_tokens / collector / transform-mode
+    # aggregation) or a fork recombined by a combining fan-in stays unknown.
+
+    def test_fork_gate_keeps_estimate_and_reports_per_row_calls(self, tmp_path: Path) -> None:
+        """Fork-only topology: per-node estimate = rows x 1, risk graded by magnitude."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        rows = tmp_path / "rows.txt"
+        rows.write_text("\n".join(f"row-{i}" for i in range(5)) + "\n", encoding="utf-8")
+        state = CompositionState(
+            sources={"rows": _text_source(rows, "raw_rows")},
+            nodes=(
+                _fork_gate_node(node_id="fan_out", input_label="raw_rows", fork_to=("branch_a", "branch_b")),
+                _fanout_llm_node("branch_a", node_id="assess_a"),
+                _fanout_llm_node("branch_b", node_id="assess_b"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None, "fork markers still require an acknowledgement"
+        assert len(guard.risks) == 2
+        for risk in guard.risks:
+            # Each source row reaches each leaf exactly once: 5 rows x 1 call.
+            assert risk.estimated_provider_calls == 5
+            assert risk.provider_calls_per_row == 1
+            # A known, small estimate is graded by magnitude, not by the mere
+            # presence of a fork marker.
+            assert risk.risk_level == "medium"
+            assert "per source row" in risk.message
+        assert guard.risk_level == "medium"
+        # The pipeline-level per-row cost is the number an operator can
+        # sanity-check against intent: 2 calls per source row, 10 total.
+        assert "2 provider call(s) per source row" in guard.summary
+        assert "estimated 10 total" in guard.summary
+
+    def test_fork_gate_with_unknown_rows_reports_per_row_calls(self, tmp_path: Path) -> None:
+        """Unknown row count + deterministic forks: say the per-row cost, stay high."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        unknown = SourceSpec(
+            plugin="csv",
+            on_success="raw_rows",
+            options={"schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+        state = CompositionState(
+            sources={"rows": unknown},
+            nodes=(
+                _fork_gate_node(node_id="fan_out", input_label="raw_rows", fork_to=("branch_a", "branch_b")),
+                _fanout_llm_node("branch_a", node_id="assess_a"),
+                _fanout_llm_node("branch_b", node_id="assess_b"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None
+        for risk in guard.risks:
+            assert risk.estimated_provider_calls is None
+            assert risk.risk_level == "high", "unknown row count keeps spend unbounded"
+            assert "1 openrouter model openai/gpt-4o-mini call(s) per source row" in risk.message
+        assert "2 provider call(s) per source row" in guard.summary
+        assert "could not be estimated" in guard.summary
+
+    def test_fork_recombined_by_row_union_refuses_the_arithmetic(self, tmp_path: Path) -> None:
+        """Fork copies rejoined by a row_union would double-count the deduped source."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        rows = tmp_path / "rows.txt"
+        rows.write_text("\n".join(f"row-{i}" for i in range(5)) + "\n", encoding="utf-8")
+        state = CompositionState(
+            sources={"rows": _text_source(rows, "raw_rows")},
+            nodes=(
+                _fork_gate_node(node_id="fan_out", input_label="raw_rows", fork_to=("branch_a", "branch_b")),
+                _row_union_node(branches={"a": "branch_a", "b": "branch_b"}),
+                _fanout_llm_node("unioned_rows"),
+            ),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=tmp_path)
+
+        assert guard is not None
+        risk = guard.risks[0]
+        # The truth is 10 calls (2 copies x 5 rows) but the source dedup
+        # counts 5; the guard must refuse the estimate rather than publish it.
+        assert risk.estimated_provider_calls is None
+        assert risk.risk_level == "high"
+        assert "unknown number" in risk.message
+        assert "per source row" not in risk.message
+
 
 class TestWebRuntimeInfrastructure:
     """Regression coverage for web execution's orchestrator runtime wiring."""
@@ -1569,7 +3521,7 @@ landscape:
             patch("elspeth.core.secrets.resolve_secret_refs") as resolve_secret_refs,
             pytest.raises(SinkEffectCapabilityError, match="export lane"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), user_id="alice")
+            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), user_id="alice", session_operation_lease=_execute_lease())
 
         assert purposes == [SinkEffectExecutionPurpose.FRESH, SinkEffectExecutionPurpose.AUDIT_EXPORT]
         secret_service.list_refs.assert_not_called()
@@ -1598,7 +3550,7 @@ sinks:
             patch("elspeth.web.execution.service.FilesystemPayloadStore") as make_payload_store,
             pytest.raises(SinkEffectCapabilityError, match="effect protocol"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_session_service.update_run_status.assert_not_called()
         open_database.assert_not_called()
@@ -1650,6 +3602,7 @@ sinks:
             threading.Event(),
             user_id="alice",
             auth_provider_type="local",
+            session_operation_lease=_execute_lease(),
         )
 
         db = LandscapeDB.from_url(mock_settings.landscape_url, create_tables=False)
@@ -1677,7 +3630,15 @@ sinks:
         source_path.write_text("alpha\n", encoding="utf-8")
         output_path = tmp_path / "out.jsonl"
         run_id = str(uuid4())
+
+        def _external_session_db_url() -> str:
+            return "postgresql+psycopg://db.invalid/elspeth_sessions"
+
         mock_settings.deployment_target = "aws-ecs"
+        mock_settings.deployment_state_mode = "external-postgresql"
+        mock_settings.get_session_db_url = _external_session_db_url
+        mock_settings.landscape_url = "postgresql+psycopg2://db.invalid/elspeth_landscape"
+        assert resolve_deployment_state_mode(mock_settings) == "external-postgresql"
         mock_settings.operator_telemetry_service_name = "elspeth-web-test"
         mock_settings.operator_telemetry_environment = "test"
         mock_settings.operator_telemetry_release = "git-test"
@@ -1686,9 +3647,9 @@ sinks:
         mock_settings.operator_telemetry_task_definition_family = "elspeth-web-task"
         mock_settings.operator_telemetry_task_definition_revision = "1"
         mock_settings.operator_pipeline_telemetry_granularity = "lifecycle"
-        mock_settings.landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        test_landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"
         mock_settings.payload_store_path = tmp_path / "payloads"
-        initialized_db = LandscapeDB.from_url(mock_settings.landscape_url)
+        initialized_db = LandscapeDB.from_url(test_landscape_url)
         initialized_db.close()
         pipeline_yaml = f"""
 sources:
@@ -1729,16 +3690,26 @@ telemetry:
         # transport delivery itself is covered by test_operator_telemetry.py.
         telemetry_manager = create_autospec(TelemetryManager, instance=True)
         telemetry_manager.health_metrics = {"events_dropped": 3, "queue_drops": 1}
+
+        def _open_test_landscape_db(settings: _WebSettingsStub) -> LandscapeDB:
+            assert settings is mock_settings
+            assert resolve_deployment_state_mode(settings) == "external-postgresql"
+            return LandscapeDB.from_url(test_landscape_url, create_tables=False)
+
         with (
+            patch(
+                "elspeth.web.execution.service.open_landscape_db",
+                side_effect=_open_test_landscape_db,
+            ),
             patch("elspeth.telemetry.create_telemetry_manager", return_value=telemetry_manager),
             patch("elspeth.web.operator_telemetry.record_operator_pipeline_queue_drops") as record_queue_drops,
         ):
-            service._run_pipeline(run_id, pipeline_yaml, threading.Event())
+            service._run_pipeline(run_id, pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         telemetry_manager.close.assert_called_once_with()
         record_queue_drops.assert_called_once_with(1)
 
-        db = LandscapeDB.from_url(mock_settings.landscape_url, create_tables=False)
+        db = LandscapeDB.from_url(test_landscape_url, create_tables=False)
         try:
             with db.read_only_connection() as conn:
                 row = conn.execute(select(runs_table.c.settings_json, runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).one()
@@ -1898,7 +3869,7 @@ sinks:
         mode: observed
 """
 
-        service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event())
+        service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         completed_calls = [
             call for call in mock_session_service.update_run_status.await_args_list if call.kwargs.get("status") == "completed"
@@ -1950,7 +3921,7 @@ class TestB2ShutdownEvent:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(run_id), "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(str(run_id), "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # B2 invariant: shutdown_event was passed
         orch_run_call = mock_orch.run.call_args
@@ -2010,7 +3981,7 @@ class TestB2ShutdownEvent:
                 return_value=_run_accounting_for_status(RunStatus.COMPLETED),
             ),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         create_store.assert_called_once_with(export_settings)
         assert mock_orch.run.call_args.kwargs["audit_export_content_store"] is store
@@ -2056,7 +4027,7 @@ class TestB3Construction:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # B3: LandscapeDB opened through the deployment-gated factory.
         mock_open_landscape.assert_called_once_with(service._settings)
@@ -2099,7 +4070,7 @@ class TestB3Construction:
                 return_value=_run_accounting_for_status(RunStatus.COMPLETED),
             ),
         ):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_from_settings.assert_called_once_with(mock_load.return_value.rate_limit, state_dir=Path("/tmp/custom-web-state"))
 
@@ -2152,11 +4123,11 @@ class TestInlineBlobRuntimePreflight:
         async def link_blob_to_run(*_args: Any, **_kwargs: Any) -> None:
             order.append("link")
 
-        async def read_blob_content(_blob_id: UUID) -> bytes:
+        async def read_blob_content(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
             order.append("read")
             return content
 
-        async def get_blob(_blob_id: UUID) -> Any:
+        async def get_blob(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
             order.append("metadata")
             return blob_record
 
@@ -2222,12 +4193,14 @@ sinks:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         assert order.index("link") < order.index("read")
         assert order.index("metadata") < order.index("record") < order.index("load")
-        blob_service.link_blob_to_run.assert_awaited_once_with(blob_id=blob_id, run_id=run_id, direction="input")
-        blob_service.read_blob_content.assert_awaited_once_with(blob_id)
+        blob_service.link_blob_to_run.assert_awaited_once_with(
+            blob_id=blob_id, run_id=run_id, direction="input", session_operation_context=_execute_lease().context
+        )
+        blob_service.read_blob_content.assert_awaited_once_with(blob_id, session_operation_context=_execute_lease().context)
         mock_session_service.record_blob_inline_resolutions.assert_awaited_once()
         resolutions = mock_session_service.record_blob_inline_resolutions.await_args.kwargs["resolutions"]
         assert len(resolutions) == 1
@@ -2292,7 +4265,7 @@ sinks:
 """
 
         with pytest.raises(AuditIntegrityError, match="audit write refused"):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
@@ -2356,7 +4329,7 @@ sinks:
 """
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         assert exc_info.value.oversized == (("node:classify.options.system_prompt", 256 * 1024 + 1, 256 * 1024),)
         blob_service.read_blob_content.assert_not_awaited()
@@ -2398,7 +4371,7 @@ sinks:
                 size_bytes=220 * 1024,
             )
 
-        async def get_blob(blob_id: UUID) -> Any:
+        async def get_blob(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
             if blob_id in records_by_id:
                 return records_by_id[blob_id]
             raise AssertionError(f"unexpected blob_id {blob_id}")
@@ -2436,7 +4409,7 @@ sinks:
 """
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         assert exc_info.value.oversized == (("(aggregate)", 5 * 220 * 1024, 1024 * 1024),)
         blob_service.read_blob_content.assert_not_awaited()
@@ -2508,7 +4481,7 @@ sinks:
 """
 
         with pytest.raises(BlobIntegrityError):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         hash_counter.add.assert_called_once_with(1)
         mock_load.assert_not_called()
@@ -2566,7 +4539,7 @@ sinks:
 
         if case == "missing":
             # get_blob raises for a genuinely-missing blob (the control surface).
-            async def get_blob(_blob_id: UUID) -> Any:
+            async def get_blob(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
                 raise BlobNotFoundError(str(_blob_id))
 
             blob_service = _blob_service_stub()
@@ -2607,13 +4580,454 @@ sinks:
 """
 
         with pytest.raises(BlobNotFoundError):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         # No metadata of the cross-session blob is ever consumed: the run never
         # links or reads it, and never records an inline resolution.
         blob_service.link_blob_to_run.assert_not_awaited()
         blob_service.read_blob_content.assert_not_awaited()
         mock_session_service.record_blob_inline_resolutions.assert_not_called()
+
+
+def _blob_rows_pipeline_yaml(entries: list[dict[str, Any]], *, singular: bool = False) -> str:
+    """Build a blob_rows pipeline config as JSON (a YAML subset)."""
+    source_block = {
+        "plugin": "blob_rows",
+        "on_success": "docs",
+        "options": {
+            "blobs": entries,
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        },
+    }
+    config: dict[str, Any] = {
+        "sinks": {"primary": {"plugin": "json", "options": {"path": "output.jsonl"}}},
+    }
+    if singular:
+        config["source"] = source_block
+    else:
+        config["sources"] = {"documents": source_block}
+    return json.dumps(config)
+
+
+def _blob_rows_entry(content: bytes, *, blob_id: UUID, filename: str = "page-1.png", mime_type: str = "image/png") -> dict[str, Any]:
+    return {
+        "blob_id": str(blob_id),
+        "payload_ref": hashlib.sha256(content).hexdigest(),
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": len(content),
+    }
+
+
+def _blob_rows_record_for_entry(entry: dict[str, Any], *, session_id: UUID, **overrides: Any) -> BlobRecord:
+    values: dict[str, Any] = {
+        "blob_id": UUID(entry["blob_id"]),
+        "session_id": session_id,
+        "filename": entry["filename"],
+        "mime_type": entry["mime_type"],
+        "size_bytes": entry["size_bytes"],
+        "content_hash": entry["payload_ref"],
+        "status": "ready",
+    }
+    values.update(overrides)
+    return _blob_record_stub(**values)
+
+
+class TestBlobRowsDiscoveryReadsFrozenConfig:
+    """``_discover_blob_rows_sources`` decides whether ADMISSION runs at all.
+
+    Its answer gates the whole ``blob_rows`` admission block — session
+    ownership, ``ready`` status, payload-hash and metadata-divergence checks.
+    A source block it fails to recognise is therefore not a conservative
+    abstention; it is a silent skip of every one of those controls, and one
+    that no existing test would catch, because a skipped block asserts
+    nothing.
+
+    ``FrozenRunSettings.__post_init__`` deep-freezes ``executable_config``,
+    which renders every nested source block as a ``mappingproxy``. These pins
+    are built through that real producer (never ``deep_freeze`` on a literal,
+    which would keep passing if the producer stopped freezing) and assert the
+    frozen and thawed forms of the SAME config yield the SAME discovery — so
+    the pin survives any future improvement rather than encoding today's bug.
+    """
+
+    @staticmethod
+    def _frozen_and_thawed(config: dict[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        settings = FrozenRunSettings(
+            plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
+            executable_config=config,
+            audit_safe_config={},
+        )
+        frozen = settings.executable_config
+        # The producer really did freeze: without this the pin degrades to
+        # comparing two thawed mappings and proves nothing.
+        assert type(frozen) is MappingProxyType
+        return frozen, cast(Mapping[str, Any], deep_thaw(frozen))
+
+    @pytest.mark.parametrize("singular", [False, True])
+    def test_declared_blob_rows_source_is_discovered_frozen_and_thawed(self, singular: bool) -> None:
+        entry = _blob_rows_entry(b"page", blob_id=uuid4())
+        config = json.loads(_blob_rows_pipeline_yaml([entry], singular=singular))
+        frozen, thawed = self._frozen_and_thawed(config)
+
+        from_frozen = _discover_blob_rows_sources(frozen)
+        from_thawed = _discover_blob_rows_sources(thawed)
+
+        expected_label = "source" if singular else "source:documents"
+        assert [label for label, _options in from_frozen] == [expected_label]
+        assert [label for label, _options in from_thawed] == [expected_label]
+        assert [(label, deep_thaw(options)) for label, options in from_frozen] == from_thawed
+
+    @pytest.mark.parametrize("singular", [False, True])
+    def test_config_without_blob_rows_discovers_nothing_frozen_or_thawed(self, singular: bool) -> None:
+        """The untouched arm: recognising the frozen form must not invent sources."""
+        source_block = {"plugin": "csv", "on_success": "rows", "options": {"path": "in.csv"}}
+        config: dict[str, Any] = {"sinks": {"primary": {"plugin": "json", "options": {"path": "out.jsonl"}}}}
+        if singular:
+            config["source"] = source_block
+        else:
+            config["sources"] = {"documents": source_block}
+        frozen, thawed = self._frozen_and_thawed(config)
+
+        assert _discover_blob_rows_sources(frozen) == []
+        assert _discover_blob_rows_sources(thawed) == []
+
+
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+class TestBlobRowsRuntimeAdmission:
+    """Run admission re-resolves persisted blob_rows entries and stages bytes.
+
+    The sessions DB persists the plural binding's entries, but the session's
+    blob records stay the run-time authority: every entry is re-resolved
+    session-scoped (foreign == missing), any divergence fails admission
+    before linking, and admitted content is staged into the run's payload
+    store — integrity-checked at read and hash-bound at store — before the
+    orchestrator runs (elspeth-0c6a343921).
+    """
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_admits_links_and_stages_blob_rows_in_order(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        del mock_landscape_cls
+        owner_session = uuid4()
+        run_id = uuid4()
+        contents = [b"\x89PNG\r\n\x1a\npayload-one", b"\xff\xd8\xff\xe0payload-two"]
+        blob_ids = [uuid4(), uuid4()]
+        entries = [
+            _blob_rows_entry(contents[0], blob_id=blob_ids[0], filename="page-1.png", mime_type="image/png"),
+            _blob_rows_entry(contents[1], blob_id=blob_ids[1], filename="page-2.jpg", mime_type="image/jpeg"),
+        ]
+        records_by_id = {blob_ids[i]: _blob_rows_record_for_entry(entries[i], session_id=owner_session) for i in range(2)}
+        content_by_id = dict(zip(blob_ids, contents, strict=True))
+        order: list[str] = []
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+
+        async def get_blob(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+            order.append("metadata")
+            return records_by_id[blob_id]
+
+        async def link_blob_to_run(**_kwargs: Any) -> None:
+            order.append("link")
+
+        async def read_blob_content(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
+            order.append("read")
+            return content_by_id[blob_id]
+
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.side_effect = get_blob
+        blob_service.link_blob_to_run.side_effect = link_blob_to_run
+        blob_service.read_blob_content.side_effect = read_blob_content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        stored_contents: list[bytes] = []
+
+        def store(content: bytes) -> str:
+            order.append("store")
+            stored_contents.append(content)
+            return hashlib.sha256(content).hexdigest()
+
+        mock_payload_cls.return_value.store.side_effect = store
+
+        def load_settings(_config_dict: dict[str, Any], *, expand_env_vars: bool = True) -> SimpleNamespace:
+            del expand_env_vars
+            order.append("load")
+            return _mock_pipeline_settings()
+
+        mock_load.side_effect = load_settings
+        mock_runtime_graph.return_value = SimpleNamespace(
+            plugin_bundle=_plugin_bundle_stub(),
+            graph=_execution_graph_stub(),
+        )
+        mock_orch_cls.return_value = _orchestrator_stub(_orchestrator_result_stub(run_id=str(run_id), rows_processed=2, rows_succeeded=2))
+
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(RunStatus.COMPLETED),
+        ):
+            service._run_pipeline(
+                str(run_id), _blob_rows_pipeline_yaml(entries), threading.Event(), session_operation_lease=_execute_lease()
+            )
+
+        # Both blobs linked as inputs, both staged, in authoring order.
+        assert blob_service.link_blob_to_run.await_count == 2
+        linked_ids = [call.kwargs["blob_id"] for call in blob_service.link_blob_to_run.await_args_list]
+        assert sorted(linked_ids, key=str) == sorted(blob_ids, key=str)
+        assert all(call.kwargs["direction"] == "input" for call in blob_service.link_blob_to_run.await_args_list)
+        assert all(call.kwargs["run_id"] == run_id for call in blob_service.link_blob_to_run.await_args_list)
+        assert stored_contents == contents
+        # Admission (metadata + link) precedes settings/plugin construction;
+        # staging (read + store) happens after, against the run's own store.
+        assert max(i for i, step in enumerate(order) if step == "link") < order.index("load")
+        assert order.index("load") < order.index("read") < order.index("store")
+
+    @pytest.mark.parametrize("case", ["missing", "cross_session"])
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_cross_session_blob_rows_entry_reads_as_missing(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        case: str,
+    ) -> None:
+        """IDOR contract: a foreign blob is byte-identical in *type* to a
+        genuinely-missing one, and no foreign metadata (status/hash/size) is
+        ever compared, linked, or read — so nothing about another session's
+        blob is an oracle."""
+        del mock_landscape_cls, mock_load, mock_runtime_graph, mock_orch_cls
+        owner_session = uuid4()
+        content = b"\x89PNG\r\n\x1a\nforeign-payload"
+        blob_id = uuid4()
+        entry = _blob_rows_entry(content, blob_id=blob_id)
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        if case == "missing":
+
+            async def get_blob(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+                raise BlobNotFoundError(str(_blob_id))
+
+            blob_service.get_blob.side_effect = get_blob
+        else:
+            # Fully consistent record — hash, filename, size all match — but
+            # owned by a DIFFERENT session. Must be indistinguishable from missing.
+            blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=uuid4())
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(BlobNotFoundError):
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
+
+        blob_service.link_blob_to_run.assert_not_awaited()
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected_error", "match"),
+        [
+            ({"content_hash": "b" * 64}, BlobIntegrityError, None),
+            ({"status": "pending"}, BlobStateError, "expected 'ready'"),
+            ({"filename": "renamed.png"}, BlobRowsSourceAdmissionError, "filename"),
+            ({"mime_type": "image/jpeg"}, BlobRowsSourceAdmissionError, "mime_type"),
+            ({"size_bytes": 1}, BlobRowsSourceAdmissionError, "size_bytes"),
+            # The plural resolver refuses LLM-authored blobs at authoring
+            # time, but generic writers (set_source/set_pipeline/patch) can
+            # also produce blob_rows options — admission is the authority
+            # that holds for every authoring path (elspeth-0c6a343921 review).
+            ({"creation_modality": CreationModality.LLM_GENERATED}, BlobRowsSourceAdmissionError, "LLM-authored"),
+            ({"creation_modality": CreationModality.LLM_GENERATED_THEN_AMENDED}, BlobRowsSourceAdmissionError, "LLM-authored"),
+        ],
+    )
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_divergent_blob_rows_entry_fails_admission_before_link(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        overrides: dict[str, Any],
+        expected_error: type[Exception],
+        match: str | None,
+    ) -> None:
+        del mock_landscape_cls, mock_load, mock_runtime_graph, mock_orch_cls
+        owner_session = uuid4()
+        content = b"\x89PNG\r\n\x1a\ndiverged-payload"
+        entry = _blob_rows_entry(content, blob_id=uuid4())
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session, **overrides)
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(expected_error, match=match):
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
+
+        blob_service.link_blob_to_run.assert_not_awaited()
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_malformed_blob_rows_entry_fails_before_any_blob_access(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        del mock_landscape_cls, mock_load, mock_runtime_graph, mock_orch_cls
+        content = b"\x89PNG\r\n\x1a\nmalformed-entry"
+        entry = _blob_rows_entry(content, blob_id=uuid4())
+        del entry["payload_ref"]
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=uuid4())
+        blob_service = _blob_service_stub()
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(BlobRowsSourceAdmissionError, match=r"blobs\[0\] failed validation"):
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
+
+        blob_service.get_blob.assert_not_awaited()
+        blob_service.link_blob_to_run.assert_not_awaited()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_singular_source_form_is_admitted(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        del mock_landscape_cls
+        owner_session = uuid4()
+        run_id = uuid4()
+        content = b"\x89PNG\r\n\x1a\nsingular-form"
+        blob_id = uuid4()
+        entry = _blob_rows_entry(content, blob_id=blob_id)
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session)
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+        mock_payload_cls.return_value.store.return_value = hashlib.sha256(content).hexdigest()
+        mock_load.return_value = _mock_pipeline_settings()
+        mock_runtime_graph.return_value = SimpleNamespace(
+            plugin_bundle=_plugin_bundle_stub(),
+            graph=_execution_graph_stub(),
+        )
+        mock_orch_cls.return_value = _orchestrator_stub(_orchestrator_result_stub(run_id=str(run_id), rows_processed=1, rows_succeeded=1))
+
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(RunStatus.COMPLETED),
+        ):
+            service._run_pipeline(
+                str(run_id), _blob_rows_pipeline_yaml([entry], singular=True), threading.Event(), session_operation_lease=_execute_lease()
+            )
+
+        blob_service.link_blob_to_run.assert_awaited_once_with(
+            blob_id=blob_id, run_id=run_id, direction="input", session_operation_context=_execute_lease().context
+        )
+        mock_payload_cls.return_value.store.assert_called_once_with(content)
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_store_hash_divergence_fails_the_run(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Tier-1 bind between the two stores: if the payload store reports a
+        different content hash than the admitted payload_ref, the run fails
+        before the orchestrator ever starts."""
+        owner_session = uuid4()
+        content = b"\x89PNG\r\n\x1a\nstore-divergence"
+        entry = _blob_rows_entry(content, blob_id=uuid4())
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session)
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+        mock_payload_cls.return_value.store.return_value = "c" * 64
+        mock_load.return_value = _mock_pipeline_settings()
+        mock_runtime_graph.return_value = SimpleNamespace(
+            plugin_bundle=_plugin_bundle_stub(),
+            graph=_execution_graph_stub(),
+        )
+        orchestrator = _orchestrator_stub()
+        mock_orch_cls.return_value = orchestrator
+
+        with pytest.raises(BlobIntegrityError):
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
+
+        orchestrator.run.assert_not_called()
 
 
 class TestWebRuntimeConfigLoading:
@@ -2659,7 +5073,7 @@ sinks:
             patch("elspeth.web.execution.service.validate_sink_effect_eligibility_from_raw_config"),
             pytest.raises(ValueError, match="template_file"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_runtime_graph.assert_not_called()
 
@@ -2691,7 +5105,7 @@ class TestB7ExceptionHandling:
         mock_landscape.side_effect = KeyboardInterrupt("ctrl-c")
 
         with _admitted_runtime_setup(), pytest.raises(KeyboardInterrupt):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # R6: The 'running' update went through, but the 'failed' update was skipped
         calls = mock_session_service.update_run_status.call_args_list
@@ -2711,7 +5125,7 @@ class TestB7ExceptionHandling:
         mock_landscape.side_effect = SystemExit(1)
 
         with _admitted_runtime_setup(), pytest.raises(SystemExit):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # R6: The 'running' update went through, but the 'failed' update was skipped
         calls = mock_session_service.update_run_status.call_args_list
@@ -2730,21 +5144,24 @@ class TestB7ExceptionHandling:
         with _admitted_runtime_setup(), patch("elspeth.web.execution.service.open_landscape_db") as mock_db:
             mock_db.side_effect = RuntimeError("boom")
             with pytest.raises(RuntimeError):
-                service._run_pipeline(run_id, _TEST_PIPELINE_YAML, event)
+                service._run_pipeline(run_id, _TEST_PIPELINE_YAML, event, session_operation_lease=_execute_lease())
 
         # finally must have removed the event
         assert run_id not in service._shutdown_events
 
-    def test_done_callback_logs_last_resort_on_exception(self, service: ExecutionServiceImpl) -> None:
+    def test_done_callback_logs_last_resort_on_exception(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """Callback logs a last-resort diagnostic when the pipeline future
         carries an exception.  This covers the edge case where _run_pipeline's
         own except block failed (e.g. update_run_status raised).
         """
         future: Future[None] = Future()
         future.set_exception(RuntimeError("unhandled"))
+        service._loop = real_loop
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future)
+            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
             mock_slog.error.assert_called_once()
             call_kwargs = mock_slog.error.call_args
             assert call_kwargs[0][0] == "pipeline_done_callback_exception"
@@ -2758,7 +5175,41 @@ class TestB7ExceptionHandling:
             assert "exc_msg" not in call_kwargs[1]
             assert call_kwargs[1]["exc_class_chain"] == ["RuntimeError"]
 
-    def test_done_callback_walks_exception_chain(self, service: ExecutionServiceImpl) -> None:
+    @pytest.mark.parametrize(
+        "signal_factory",
+        [lambda: KeyboardInterrupt("ctrl-c"), lambda: SystemExit(1)],
+        ids=["keyboard_interrupt", "system_exit"],
+    )
+    def test_done_callback_skips_the_last_resort_diagnostic_for_shutdown_signals(
+        self,
+        service: ExecutionServiceImpl,
+        real_loop: asyncio.AbstractEventLoop,
+        signal_factory: Callable[[], BaseException],
+    ) -> None:
+        """A signal is an interpreter-directed shutdown, not a run failure.
+
+        ``_run_pipeline`` already treats KeyboardInterrupt / SystemExit as
+        shutdown: it skips the failed-status write and the
+        ``run_pipeline_failed`` operator diagnostic and emits
+        ``skipping_status_update_on_signal`` instead. This callback mirrors
+        that decision, and the mirroring is only safe because authority
+        release does NOT hang off the classification — the lease is closed on
+        every path before the branch is reached.
+        """
+        lease = _execute_lease()
+        future: Future[Any] = Future()
+        future.set_exception(signal_factory())
+        service._loop = real_loop
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            service._on_pipeline_done(future, session_operation_lease=lease)
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            mock_slog.error.assert_not_called()
+
+        assert lease.closed
+
+    def test_done_callback_walks_exception_chain(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """Chained exceptions surface as a class-name chain — no payloads.
 
         Regression: ``exc_msg=str(exc)[:200]`` leaked truncated-but-still-
@@ -2774,8 +5225,11 @@ class TestB7ExceptionHandling:
             future: Future[None] = Future()
             future.set_exception(outer)
 
+        service._loop = real_loop
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future)
+            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
             call_kwargs = mock_slog.error.call_args[1]
             assert call_kwargs["exc_type"] == "RuntimeError"
             assert call_kwargs["exc_class_chain"] == ["RuntimeError", "ValueError"]
@@ -2785,13 +5239,16 @@ class TestB7ExceptionHandling:
                     assert "secret" not in value
                     assert "deadbeef" not in value
 
-    def test_done_callback_noop_on_success(self, service: ExecutionServiceImpl) -> None:
+    def test_done_callback_noop_on_success(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """done_callback does not log on successful completion."""
         future: Future[None] = Future()
         future.set_result(None)
+        service._loop = real_loop
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future)
+            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
             mock_slog.error.assert_not_called()
 
     @patch("elspeth.web.execution.service.open_landscape_db")
@@ -2828,7 +5285,7 @@ class TestB7ExceptionHandling:
             patch("elspeth.web.execution.service.slog") as mock_slog,
             pytest.raises(PydanticValidationError),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv\n", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv\n", threading.Event(), session_operation_lease=_execute_lease())
 
         schema_calls = [call for call in mock_slog.error.call_args_list if call.args[0] == "run_schema_contract_violation"]
         assert len(schema_calls) == 1
@@ -2840,8 +5297,678 @@ class TestB7ExceptionHandling:
 
         failed_calls = [call for call in mock_session_service.update_run_status.call_args_list if call.kwargs.get("status") == "failed"]
         assert failed_calls
-        assert failed_calls[-1].kwargs["error"] == "Pipeline execution failed (ValidationError)"
-        assert "internal_required_field" not in failed_calls[-1].kwargs["error"]
+        # F15 split: the CLIENT surface stays sanitized, the OPERATOR surface
+        # carries the detail.  Before the split both were the same 39-char
+        # string, so this test could only assert one of them; the
+        # "validation structure must not reach the client" intent now lives
+        # on the ``failed`` event's ``detail`` where it actually applies.
+        failed_events = [
+            call.kwargs for call in mock_session_service.append_run_event.call_args_list if call.kwargs.get("event_type") == "failed"
+        ]
+        assert failed_events
+        assert failed_events[-1]["data"]["detail"] == "Pipeline execution failed (ValidationError)"
+        assert "internal_required_field" not in failed_events[-1]["data"]["detail"]
+
+        # runs.error is the operator surface: it names the class and, because
+        # a schema-contract breach IS the diagnostic, the offending field.
+        operator_error = failed_calls[-1].kwargs["error"]
+        assert operator_error.startswith("Pipeline execution failed (ValidationError)")
+        assert "internal_required_field" in operator_error
+
+
+# ── Operator failure diagnostics (F15) ─────────────────────────────────
+
+_DIAGNOSTIC_OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
+# A secret-shaped token, kept in one place so the scrub assertions and the
+# raised exception can never drift apart.
+_SECRET_SHAPED_TOKEN = "sk-" + "abcd1234efgh5678ijkl9012mnop3456"  # secret-scan: allow-this-line
+
+
+def _seed_run_with_node_state(
+    db: LandscapeDB,
+    *,
+    run_id: str,
+    node_id: str = "extract",
+    state_id: str = "state-0",
+    token_id: str = "token-0",
+    row_id: str = "row-0",
+    ingest_sequence: int = 0,
+    status: NodeStateStatus = NodeStateStatus.FAILED,
+    begin_run: bool = True,
+) -> None:
+    """Write a real Landscape node_states row for the failing-node lookup.
+
+    Deliberately goes through ``RecorderFactory`` — the same writer the
+    engine uses — so the persisted ``status`` string comes from
+    ``NodeStateStatus`` rather than a literal duplicated in the test. A test
+    that hardcoded the same wrong literal as the query would pass while
+    production returned ``None`` forever.
+    """
+    factory = RecorderFactory(db)
+    if begin_run:
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+        factory.data_flow.register_node(
+            run_id=run_id,
+            node_id="source",
+            plugin_name="csv",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0",
+            config={},
+            schema_config=_DIAGNOSTIC_OBSERVED_SCHEMA,
+        )
+    factory.data_flow.register_node(
+        run_id=run_id,
+        node_id=node_id,
+        plugin_name="llm_extract",
+        node_type=NodeType.TRANSFORM,
+        plugin_version="1.0",
+        config={},
+        schema_config=_DIAGNOSTIC_OBSERVED_SCHEMA,
+    )
+    row = factory.data_flow.create_row(
+        run_id,
+        "source",
+        ingest_sequence,
+        {"html": "<h1>A</h1>"},
+        row_id=row_id,
+        source_row_index=ingest_sequence,
+        ingest_sequence=ingest_sequence,
+    )
+    token = factory.data_flow.create_token(row.row_id, token_id=token_id)
+    state = factory.execution.begin_node_state(
+        token.token_id,
+        node_id,
+        run_id,
+        1,
+        {"html": "<h1>A</h1>"},
+        state_id=state_id,
+    )
+    factory.execution.complete_node_state(
+        state.state_id,
+        status,
+        output_data={},
+        duration_ms=0.0,
+        error=(
+            ExecutionError(exception="node blew up", exception_type="ValueError", phase="transform")
+            if status is NodeStateStatus.FAILED
+            else None
+        ),
+    )
+
+
+class TestFailedNodeIdLookup:
+    """``_lookup_failed_node_id`` reads the failing node back from Landscape.
+
+    The engine already writes a FAILED ``node_states`` row naming the node
+    that died; before F15 the web layer never read it, so both ``runs.error``
+    and the ``failed`` SSE event reported only *that* the run failed.
+
+    These run against a real SQLite Landscape DB so the SQL, the persisted
+    status literal, and the ordering are all genuinely exercised.
+    """
+
+    def test_returns_failed_node_id(self, service: ExecutionServiceImpl, tmp_path: Path) -> None:
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            _seed_run_with_node_state(db, run_id="web-run-1", node_id="extract")
+            assert service._lookup_failed_node_id(db, run_id="web-run-1").node_id == "extract"
+        finally:
+            db.close()
+
+    def test_returns_newest_failed_node_when_several_failed(self, service: ExecutionServiceImpl, tmp_path: Path) -> None:
+        """Ordering contract: the most recently completed FAILED state wins.
+
+        ``completed_at`` is set explicitly rather than relying on wall-clock
+        ordering — two writes in the same millisecond would otherwise make
+        this assertion decide nothing.
+        """
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            _seed_run_with_node_state(db, run_id="web-run-1", node_id="early", state_id="state-early")
+            _seed_run_with_node_state(
+                db,
+                run_id="web-run-1",
+                node_id="late",
+                state_id="state-late",
+                token_id="token-1",
+                row_id="row-1",
+                ingest_sequence=1,
+                begin_run=False,
+            )
+            with db.write_connection() as conn:
+                conn.execute(text("UPDATE node_states SET completed_at = '2026-01-01 00:00:00' WHERE state_id = 'state-early'"))
+                conn.execute(text("UPDATE node_states SET completed_at = '2026-01-02 00:00:00' WHERE state_id = 'state-late'"))
+
+            assert service._lookup_failed_node_id(db, run_id="web-run-1").node_id == "late"
+        finally:
+            db.close()
+
+    def test_returns_none_when_no_node_state_failed(self, service: ExecutionServiceImpl, tmp_path: Path) -> None:
+        """A COMPLETED-only run has no failing node — the answer is None, not a guess."""
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            _seed_run_with_node_state(db, run_id="web-run-1", status=NodeStateStatus.COMPLETED)
+            outcome = service._lookup_failed_node_id(db, run_id="web-run-1")
+            assert outcome.node_id is None
+            # A healthy read that simply found no FAILED node is NOT a
+            # degraded audit read — the counterpart to the
+            # ``failed is True`` assertion below.
+            assert outcome.failed is False
+        finally:
+            db.close()
+
+    def test_returns_none_for_other_runs_failed_node(self, service: ExecutionServiceImpl, tmp_path: Path) -> None:
+        """Run scoping: another run's failure must never be attributed here."""
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            _seed_run_with_node_state(db, run_id="web-run-1", node_id="extract")
+            assert service._lookup_failed_node_id(db, run_id="web-run-2").node_id is None
+        finally:
+            db.close()
+
+    def test_returns_none_without_landscape_db(self, service: ExecutionServiceImpl) -> None:
+        """Pre-init failures (raise before ``open_landscape_db``) degrade cleanly."""
+        assert service._lookup_failed_node_id(None, run_id="web-run-1").node_id is None
+
+    def test_degrades_to_none_when_audit_db_unavailable(self, service: ExecutionServiceImpl) -> None:
+        """Audit-system degradation must not replace the original pipeline exception."""
+        broken_db = MagicMock(spec=LandscapeDB)
+        broken_db.read_only_connection.side_effect = SQLAlchemyError("audit db gone")
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            outcome = service._lookup_failed_node_id(broken_db, run_id="web-run-1")
+
+        assert outcome.node_id is None
+        # The explicit ``failed`` flag is what distinguishes audit-read failure
+        # from "no FAILED node recorded" — a bare None would conflate them.
+        assert outcome.failed is True
+
+        warnings = [call for call in mock_slog.warning.call_args_list if call.args and call.args[0] == "failed_node_id_lookup_failed"]
+        assert len(warnings) == 1
+        assert warnings[0].kwargs["run_id"] == "web-run-1"
+
+
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+class TestOperatorFailureDiagnostic:
+    """F15: web run failures must persist the operator diagnostic, not the 39-char client string.
+
+    Before this fix, ``runs.error``, the ``failed`` SSE ``detail``, and the
+    structured log all collapsed to ``"Pipeline execution failed (X)"`` — the
+    exception message, the failing node, and the fault location were all
+    discarded even though Landscape already held them. The client surface
+    stays sanitized; the operator surface does not.
+    """
+
+    @staticmethod
+    def _run_failing_pipeline(
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        *,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        mock_landscape: MagicMock,
+        exc: BaseException,
+        landscape_db: LandscapeDB | None = None,
+        run_id: str | None = None,
+    ) -> tuple[str, str, list[Any], MagicMock]:
+        """Drive ``_run_pipeline`` to the except-BaseException path.
+
+        Returns ``(run_id, runs_error, failed_event_payloads, slog_mock)``.
+        """
+        _configure_runtime_success(
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+        )
+
+        def raise_from_named_frame(*_args: Any, **_kwargs: Any) -> None:
+            raise exc
+
+        mock_orch_cls.return_value.run.side_effect = raise_from_named_frame
+        if landscape_db is not None:
+            mock_landscape.return_value = landscape_db
+        # Run still 'running' — the non-terminal recovery branch, where the
+        # failed status update and the failed SSE event both fire.
+        mock_session_service.get_run.return_value = _run_record_stub(status="running")
+
+        run_id = run_id or str(uuid4())
+        with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(type(exc)):
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
+
+        failed_status_calls = [
+            call for call in mock_session_service.update_run_status.call_args_list if call.kwargs.get("status") == "failed"
+        ]
+        assert failed_status_calls, "the non-terminal recovery branch must record status=failed"
+        failed_events = [
+            call.kwargs for call in mock_session_service.append_run_event.call_args_list if call.kwargs.get("event_type") == "failed"
+        ]
+        return run_id, failed_status_calls[-1].kwargs["error"], failed_events, mock_slog
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_runs_error_carries_class_message_and_structural_frames(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Test (a): the persisted error names the class, the message, and where it surfaced."""
+        _run_id, runs_error, failed_events, _slog = self._run_failing_pipeline(
+            service,
+            mock_session_service,
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            mock_landscape=mock_landscape,
+            exc=ValueError("boom"),
+        )
+
+        assert runs_error.startswith("Pipeline execution failed (ValueError)")
+        assert "Message: boom" in runs_error
+        assert "Structural traceback (most recent call last):" in runs_error
+
+        frame_lines = [line.strip().lstrip("• ").strip() for line in runs_error.splitlines() if line.startswith("  • ")]
+        assert frame_lines, "the diagnostic must carry at least one structural frame"
+        # Every frame is file:line:function — code structure, no source text.
+        for frame in frame_lines:
+            path, lineno, func = frame.rsplit(":", 2)
+            assert path and func
+            assert lineno.isdigit()
+        assert any(frame.endswith(":raise_from_named_frame") for frame in frame_lines), frame_lines
+        assert any("execution/service.py" in frame and frame.endswith(":_run_pipeline") for frame in frame_lines), frame_lines
+
+        # Path-disclosure guarantee: no absolute paths, no deployment layout.
+        assert "/home/" not in runs_error
+        assert ".venv" not in runs_error
+        for frame in frame_lines:
+            assert not frame.startswith("/"), frame
+            assert frame.count("/") < _MAX_FRAME_PATH_PARTS, frame
+
+        # The client surface is unchanged by all of the above.
+        assert failed_events[-1]["data"]["detail"] == "Pipeline execution failed (ValueError)"
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_failed_node_id_reaches_event_and_runs_error(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Test (b), present: a FAILED node_states row populates FailedData.node_id."""
+        run_id = str(uuid4())
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            _seed_run_with_node_state(db, run_id=run_id, node_id="extract")
+            _run_id, runs_error, failed_events, mock_slog = self._run_failing_pipeline(
+                service,
+                mock_session_service,
+                mock_load=mock_load,
+                mock_instantiate=mock_instantiate,
+                mock_graph_cls=mock_graph_cls,
+                mock_orch_cls=mock_orch_cls,
+                mock_landscape=mock_landscape,
+                exc=ValueError("boom"),
+                landscape_db=db,
+                run_id=run_id,
+            )
+        finally:
+            db.close()
+
+        assert failed_events, "a non-terminal failure must broadcast a failed event"
+        assert failed_events[-1]["data"]["node_id"] == "extract"
+        assert "Most recent recorded node failure: extract" in runs_error
+
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        assert failure_logs[0].kwargs["failed_node_id"] == "extract"
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_absent_failed_node_state_yields_none_not_a_guess(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Test (b), absent: no FAILED node state → node_id None, and the text says so."""
+        run_id = str(uuid4())
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            _seed_run_with_node_state(db, run_id=run_id, status=NodeStateStatus.COMPLETED)
+            _run_id, runs_error, failed_events, mock_slog = self._run_failing_pipeline(
+                service,
+                mock_session_service,
+                mock_load=mock_load,
+                mock_instantiate=mock_instantiate,
+                mock_graph_cls=mock_graph_cls,
+                mock_orch_cls=mock_orch_cls,
+                mock_landscape=mock_landscape,
+                exc=ValueError("boom"),
+                landscape_db=db,
+                run_id=run_id,
+            )
+        finally:
+            db.close()
+
+        assert failed_events[-1]["data"]["node_id"] is None
+        assert "Most recent recorded node failure: none recorded" in runs_error
+
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        assert failure_logs[0].kwargs["failed_node_id"] is None
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_secret_shaped_message_is_scrubbed_before_persist_and_log(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Test (c): a candidate secret in the message never reaches the audit row OR the log.
+
+        The whole message is replaced rather than partially masked — partial
+        redaction leaks structure, and truncation is not redaction.
+        """
+        _run_id, runs_error, _failed_events, mock_slog = self._run_failing_pipeline(
+            service,
+            mock_session_service,
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            mock_landscape=mock_landscape,
+            exc=RuntimeError(f"provider rejected token {_SECRET_SHAPED_TOKEN}"),
+        )
+
+        assert _SECRET_SHAPED_TOKEN not in runs_error
+        assert "Message: <redacted-secret>" in runs_error
+        # The class chain still identifies the fault.
+        assert runs_error.startswith("Pipeline execution failed (RuntimeError)")
+
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        assert failure_logs[0].kwargs["exc_message"] == "<redacted-secret>"
+        for value in failure_logs[0].kwargs.values():
+            assert _SECRET_SHAPED_TOKEN not in str(value)
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_pydantic_input_values_never_reach_runs_error(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Test (d): a Pydantic ``input_value`` payload never reaches ``runs.error``.
+
+        ``str(ValidationError)`` interleaves ``input_value=...`` into every
+        error line, and the sentinel below is deliberately NOT secret-shaped,
+        so scrubbing alone would wave it straight through into the audit row.
+        The persisted diagnostic must carry the field name and error type
+        instead of the input echo.
+        """
+        from pydantic import BaseModel
+        from pydantic import ValidationError as PydanticValidationError
+
+        sentinel = "ROW-PAYLOAD-SENTINEL-9c4e1"
+
+        class _ContractProbe(BaseModel):
+            rows: int
+
+        try:
+            _ContractProbe(rows=sentinel)  # type: ignore[arg-type]
+        except PydanticValidationError as exc:
+            pydantic_exc = exc
+        else:
+            raise AssertionError("expected _ContractProbe to raise")
+        # Precondition for the guard to be non-vacuous: the raw str() DOES
+        # embed the sentinel, and the scrubber does NOT redact it.
+        assert sentinel in str(pydantic_exc)
+        from elspeth.web.execution.service import _scrubbed_exception_message
+
+        assert sentinel in _scrubbed_exception_message(pydantic_exc)
+
+        _run_id, runs_error, failed_events, mock_slog = self._run_failing_pipeline(
+            service,
+            mock_session_service,
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            mock_landscape=mock_landscape,
+            exc=pydantic_exc,
+        )
+
+        assert sentinel not in runs_error
+        assert runs_error.startswith("Pipeline execution failed (ValidationError)")
+        # Field-name diagnostics survive: the offending loc and error type.
+        assert "rows" in runs_error
+        assert "int_parsing" in runs_error
+        assert "schema contract violation" in runs_error
+
+        # The operator log channel carries the same input-free message.
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        for value in failure_logs[0].kwargs.values():
+            assert sentinel not in str(value)
+
+        # The client surface stays sanitized as ever.
+        assert failed_events[-1]["data"]["detail"] == "Pipeline execution failed (ValidationError)"
+        assert sentinel not in failed_events[-1]["data"]["detail"]
+        for payload in failed_events:
+            assert _SECRET_SHAPED_TOKEN not in str(payload)
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_slog_record_carries_chain_message_node_and_frames(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Test (d): the structured log gains the fields the audit row gained."""
+        try:
+            raise ValueError("inner cause")
+        except ValueError as inner:
+            wrapped = RuntimeError("outer wrapper")
+            wrapped.__cause__ = inner
+
+        run_id, _runs_error, _failed_events, mock_slog = self._run_failing_pipeline(
+            service,
+            mock_session_service,
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            mock_landscape=mock_landscape,
+            exc=wrapped,
+        )
+
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        kwargs = failure_logs[0].kwargs
+        assert kwargs["run_id"] == run_id
+        assert kwargs["exc_class"] == "RuntimeError"
+        assert kwargs["exc_class_chain"] == ["RuntimeError", "ValueError"]
+        assert kwargs["exc_message"] == "outer wrapper"
+        assert kwargs["failed_node_id"] is None
+        assert isinstance(kwargs["traceback_frames"], list)
+        assert kwargs["traceback_frames"], "frames must be present, not an empty list"
+        for frame in kwargs["traceback_frames"]:
+            assert not frame.startswith("/"), frame
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_diagnostic_log_fires_even_when_audit_row_is_already_terminal(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """The diagnostic log is the ONLY channel on the post-audit-terminal path.
+
+        When the probe finds the audit row already terminal, audit primacy
+        forbids both the ``failed`` status update and the ``failed`` SSE
+        event — so ``runs.error`` never receives the diagnostic. This test
+        pins the claim that justifies not adding a log at that branch:
+        ``run_pipeline_failed`` fires BEFORE the terminality split, so the
+        message, node, and frames are recorded against the run regardless.
+        """
+        _configure_runtime_success(
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+        )
+        mock_orch_cls.return_value.run.side_effect = ValueError("boom")
+        mock_session_service.get_run.return_value = _run_record_stub(status="completed")
+
+        run_id = str(uuid4())
+        with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(ValueError, match="boom"):
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
+
+        # Audit primacy holds: no failed status update, no failed SSE event.
+        statuses = [call.kwargs.get("status") for call in mock_session_service.update_run_status.call_args_list]
+        assert "failed" not in statuses, statuses
+        failed_events = [
+            call.kwargs for call in mock_session_service.append_run_event.call_args_list if call.kwargs.get("event_type") == "failed"
+        ]
+        assert failed_events == []
+
+        # ...and the diagnostic still reached the operator via the log.
+        failure_logs = [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"]
+        assert len(failure_logs) == 1
+        assert failure_logs[0].kwargs["run_id"] == run_id
+        assert failure_logs[0].kwargs["exc_message"] == "boom"
+        assert failure_logs[0].kwargs["traceback_frames"]
+
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_signal_failure_skips_landscape_read_and_diagnostic_log(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        service: ExecutionServiceImpl,
+    ) -> None:
+        """Signals are excluded deliberately: the event loop is shutting down.
+
+        Pairs with ``test_keyboard_interrupt_skips_failed_status_update`` —
+        the same posture that skips the status update also skips the audit
+        read, so a signal-killed run does no avoidable work during teardown.
+        """
+        mock_landscape.side_effect = KeyboardInterrupt("ctrl-c")
+
+        with (
+            _admitted_runtime_setup(),
+            patch.object(service, "_lookup_failed_node_id", side_effect=AssertionError("must not query Landscape on a signal")),
+            patch("elspeth.web.execution.service.slog") as mock_slog,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
+
+        assert [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"] == []
+
+
+class TestStructuralFramePath:
+    """``_structural_frame_path`` must never emit an absolute or unbounded path."""
+
+    @pytest.mark.parametrize(
+        ("filename", "expected"),
+        [
+            # Package frames render from the package root.
+            ("/opt/venv/lib/python3.12/site-packages/elspeth/web/execution/service.py", "elspeth/web/execution/service.py"),
+            # A checkout directory sharing the package name must not widen the path.
+            ("/home/dev/elspeth/src/elspeth/engine/coalesce_executor.py", "elspeth/engine/coalesce_executor.py"),
+            # Non-package frames degrade to the bare filename.
+            ("/usr/lib/python3.12/json/decoder.py", "decoder.py"),
+            ("/opt/venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", "base.py"),
+        ],
+    )
+    def test_renders_bounded_relative_paths(self, filename: str, expected: str) -> None:
+        from elspeth.web.execution.service import _structural_frame_path
+
+        assert _structural_frame_path(filename) == expected
+
+    def test_caps_components_when_anchor_over_matches(self) -> None:
+        """The trailing-component cap, not the anchor, is the disclosure guarantee."""
+        from elspeth.web.execution.service import _MAX_FRAME_PATH_PARTS, _structural_frame_path
+
+        rendered = _structural_frame_path("/home/dev/elspeth/.claude/worktrees/wt/tests/unit/web/test_x.py")
+        assert not rendered.startswith("/")
+        assert "/home/" not in rendered
+        assert ".claude" not in rendered
+        assert len(rendered.split("/")) <= _MAX_FRAME_PATH_PARTS
 
 
 # ── Cancel Mechanism ───────────────────────────────────────────────────
@@ -2884,16 +6011,26 @@ class TestCancelMechanism:
         assert status.cancel_requested is True
 
     @pytest.mark.asyncio
-    async def test_cancel_pending_run_updates_status(
+    async def test_cancel_pending_run_without_local_execute_authority_fails_closed(
         self,
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """When no shutdown event exists (pending), update status directly."""
+        """A pending run with no local shutdown event is not ours to cancel.
+
+        The shutdown event is registered by the instance that holds the run's
+        EXECUTE lease. Its absence means this process has no authority over the
+        run, so ``cancel()`` must refuse (``service.py``, the pending arm of
+        ``cancel``) rather than write a ``cancelled`` status another instance's
+        worker would then race. Terminal runs stay an idempotent no-op; that is
+        pinned separately by ``test_cancel_terminal_run_is_noop``.
+        """
         run_id = uuid4()
-        # No event in _shutdown_events — run is pending
-        await service.cancel(run_id)
-        mock_session_service.update_run_status.assert_called()
+        assert mock_session_service.get_run.return_value.status == "pending"
+        # No event in _shutdown_events — no local EXECUTE authority for this run.
+        with pytest.raises(RuntimeError, match="Cannot cancel a non-terminal run without local EXECUTE authority"):
+            await service.cancel(run_id)
+        mock_session_service.update_run_status.assert_not_called()
 
     @pytest.mark.parametrize("terminal_status", ["completed", "completed_with_failures", "failed", "empty", "cancelled"])
     @pytest.mark.asyncio
@@ -2968,7 +6105,7 @@ class TestCancelMechanism:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED_WITH_FAILURES),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # The test sets shutdown_event BEFORE _run_pipeline, so the early
         # shutdown check (line 534) fires — no orchestrator runs, no row counts.
@@ -3028,7 +6165,7 @@ class TestCancelMechanism:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED_WITH_FAILURES),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         status_calls = mock_session_service.update_run_status.call_args_list
         # Second call is the GSE handler (first is running transition)
@@ -3096,7 +6233,7 @@ class TestCancelMechanism:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED_WITH_FAILURES),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # Must be "completed", NOT "cancelled"
         status_calls = mock_session_service.update_run_status.call_args_list
@@ -3125,7 +6262,7 @@ class TestCancelMechanism:
 
         # Should NOT raise — graceful exit
         with _admitted_runtime_setup():
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # No Orchestrator or LandscapeDB instantiated (early return)
         mock_landscape.assert_not_called()
@@ -3150,7 +6287,7 @@ class TestCancelMechanism:
         shutdown_event = threading.Event()
         shutdown_event.set()
 
-        service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+        service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # No LandscapeDB or PayloadStore constructed (skipped setup)
         mock_landscape.assert_not_called()
@@ -3178,7 +6315,7 @@ class TestCancelMechanism:
         mock_session_service.get_run.return_value = _run_record_stub(status="completed")
 
         with _admitted_runtime_setup(), pytest.raises(ValueError, match="completed"):
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
@@ -3227,7 +6364,7 @@ class TestCancelMechanism:
         service._broadcaster.broadcast = spy_broadcast  # type: ignore[assignment]
 
         with _admitted_runtime_setup(), pytest.raises(ValueError, match="sentinel-existing-id") as exc_info:
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # Discriminator #1: the propagating exception is bare ValueError, not the
         # narrow subclass — proves the catch did not match.
@@ -3252,7 +6389,11 @@ class TestCancelMechanism:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
 
         async def tracking_link(*args: Any, **kwargs: Any) -> None:
             # At the time blob linkage runs, the event MUST already exist
@@ -3274,7 +6415,7 @@ class TestCancelMechanism:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_shutdown_event_cleaned_up_on_blob_linkage_failure(
@@ -3291,7 +6432,11 @@ class TestCancelMechanism:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         blob_service.link_blob_to_run.side_effect = RuntimeError("blob storage unavailable")
         cast(Any, service)._blob_service = blob_service
 
@@ -3307,7 +6452,7 @@ class TestCancelMechanism:
         }
 
         with pytest.raises(RuntimeError, match="blob storage unavailable"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert str(run_id) not in service._shutdown_events
 
@@ -3359,7 +6504,7 @@ class TestP2aCleanupCatchNarrowing:
             patch("elspeth.web.execution.service.slog") as mock_slog,
             pytest.raises(RuntimeError, match="pool shutdown"),
         ):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         # slog.error was called for the cleanup failure.
         slog_calls = [c for c in mock_slog.error.call_args_list if c[0] and c[0][0] == "run_cleanup_status_update_failed"]
@@ -3406,7 +6551,7 @@ class TestP2aCleanupCatchNarrowing:
         # We accept either RuntimeError here — the key invariant is that
         # a RuntimeError propagates rather than being swallowed.
         with pytest.raises(RuntimeError):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
 
 # ── Completion-Path Guard ─────────────────────────────────────────────
@@ -3468,7 +6613,7 @@ class TestCompletionPathExternalCancellation:
         mock_session_service.get_run.return_value = _run_record_stub(status="cancelled")
 
         # Should NOT raise — graceful exit
-        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # The "failed" path should NOT have been entered: check that
         # update_run_status was called exactly twice (running + completed),
@@ -3532,7 +6677,7 @@ class TestCompletionPathExternalCancellation:
 
         service._broadcaster.broadcast = spy_broadcast  # type: ignore[assignment]
 
-        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         event_types = [call[1].event_type for call in broadcast_calls]
         terminal_types = [et for et in event_types if et in ("completed", "failed", "cancelled")]
@@ -3573,8 +6718,10 @@ class TestCompletionPathExternalCancellation:
         blob_state = {"status": "pending"}
         blob_calls: list[bool] = []
 
-        async def finalize_run_output_blobs(run_id: UUID, success: bool) -> BlobFinalizationResult:
-            del run_id
+        async def finalize_run_output_blobs(
+            run_id: UUID, success: bool, *, session_operation_context: SessionOperationContext
+        ) -> BlobFinalizationResult:
+            del run_id, session_operation_context
             blob_calls.append(success)
             if blob_state["status"] == "pending":
                 blob_state["status"] = "ready" if success else "error"
@@ -3595,7 +6742,7 @@ class TestCompletionPathExternalCancellation:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         assert blob_calls == [False]
         assert blob_state["status"] == "error"
@@ -3642,7 +6789,7 @@ class TestCompletionPathExternalCancellation:
         mock_session_service.get_run.return_value = _run_record_stub(status="completed")
 
         with pytest.raises(ValueError, match="completed"):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.preflight.ExecutionGraph")
@@ -3718,7 +6865,7 @@ class TestCompletionPathExternalCancellation:
         service._broadcaster.broadcast = spy_broadcast  # type: ignore[assignment]
 
         with pytest.raises(ValueError, match="sentinel-existing-id") as exc_info:
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Discriminator #1: bare ValueError, not the narrow subclass.
         assert not isinstance(exc_info.value, IllegalRunTransitionError)
@@ -3861,7 +7008,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError, match="simulated SSE crash"),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Exactly two status updates: "running" (line 650) and the terminal
         # "completed" (line 857).  No third "failed" call.
@@ -3872,17 +7019,20 @@ class TestPostCompletionExceptionRecovery:
         #   1. No third update_run_status (asserted above).
         #   2. No "failed" SSE broadcast (asserted below) — would contradict
         #      the audit row's true terminal status.
-        # Post-audit-exception observability is provided by two channels
-        # outside _run_pipeline (see service.py post-terminal-exception
-        # comment block):
+        # Post-audit-exception observability is provided by three channels
+        # (see service.py post-terminal-exception comment block):
         #   - The audit ``runs`` row (status="completed" — verified by the
         #     ``statuses`` assertion above by transitive proof).
+        #   - ``run_pipeline_failed`` — emitted at the TOP of the except
+        #     handler, before the terminality split, so it carries the
+        #     diagnostic even here.  Pinned by
+        #     ``test_diagnostic_log_fires_even_when_audit_row_is_already_terminal``.
         #   - ``_on_pipeline_done``'s safety-net slog
         #     (``pipeline_done_callback_exception``) — fires against the
         #     re-raised exc once the Future completes.  Tested separately
         #     in the _on_pipeline_done test class.
         # This test must NOT pin a slog at the post-terminal-exception
-        # site itself: per ``logging-telemetry-policy`` the logger is
+        # branch itself: per ``logging-telemetry-policy`` the logger is
         # not the correct surface for post-audit operational signal.
         post_terminal_logs = [
             c for c in mock_slog.error.call_args_list if c.args and c.args[0] == "post_terminal_exception_in_run_pipeline"
@@ -3950,7 +7100,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         statuses = [c.kwargs.get("status") for c in mock_session_service.update_run_status.call_args_list]
         assert statuses == ["running", "completed_with_failures"], f"Expected [running, completed_with_failures], got {statuses}"
@@ -4022,7 +7172,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError, match="simulated SSE crash"),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # The probe failure must surface as a structured log so it's observable.
         probe_failed_logs = [c for c in mock_slog.error.call_args_list if c.args and c.args[0] == "post_exception_run_state_probe_failed"]
@@ -4140,7 +7290,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError, match="simulated SSE crash"),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Audit-primacy completion: branch 3 must NOT have broadcast a
         # ``failed`` SSE event (the audit row is in a real terminal status
@@ -4230,7 +7380,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(ValueError, match="Run not found") as exc_info,
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Exception chain pins the original cause — the probe ValueError
         # is raised while handling the RuntimeError, so __context__ MUST
@@ -4293,7 +7443,7 @@ class TestPostCompletionExceptionRecovery:
 
         run_id = str(uuid4())
         with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(RuntimeError, match="orchestrator blew up"):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         statuses = [c.kwargs.get("status") for c in mock_session_service.update_run_status.call_args_list]
         assert statuses == ["running", "failed"], f"Non-terminal path must still record failure; got {statuses}"
@@ -4369,6 +7519,22 @@ class TestBlobRefPreValidation:
     """Malformed blob_ref must raise BEFORE create_run() to avoid
     orphaning a pending run that blocks future executions."""
 
+    @pytest.mark.parametrize("blob_ref", [None, 42, "not-a-uuid", "AAAAAAAA-1111-4111-8111-111111111111"])
+    def test_proof_resolver_rejects_malformed_present_binding(self, service: ExecutionServiceImpl, blob_ref: object) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.execution.errors import MalformedBlobRefError
+
+        state = _proof_gate_state(source_path=Path("/tmp/source.csv"), blob_id=None)
+        source = state.sources["source"]
+        state = replace(state, sources={"source": replace(source, options={**source.options, "blob_ref": blob_ref})})
+        with pytest.raises(MalformedBlobRefError, match=r"sources\.source\.blob_ref"):
+            service._authoritative_proof_blob_resolver(
+                state,
+                session_id=uuid4(),
+                session_operation_context=_execute_lease().context,
+            )
+
     @pytest.mark.asyncio
     async def test_malformed_blob_ref_raises_before_run_creation(
         self,
@@ -4391,7 +7557,7 @@ class TestBlobRefPreValidation:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(MalformedBlobRefError):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         # The critical invariant: create_run() was never called,
         # so no stale pending run exists.
@@ -4412,7 +7578,11 @@ class TestBlobRefPreValidation:
 
         blob_service = _blob_service_stub()
         # get_blob returns a record matching the executing session
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         # path must equal blob.storage_path to satisfy the Tier 1 read
@@ -4425,13 +7595,15 @@ class TestBlobRefPreValidation:
             "on_validation_failure": "quarantine",
         }
 
+        authority = RecordingSessionOperationAuthority()
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id, authority=authority)
 
         blob_service.link_blob_to_run.assert_called_once_with(
             blob_id=UUID(blob_ref),
             run_id=run_id,
             direction="input",
+            session_operation_context=authority.calls[0][1],
         )
 
     @pytest.mark.asyncio
@@ -4443,11 +7615,12 @@ class TestBlobRefPreValidation:
         """Malformed blob_ref on any named source is rejected before create_run()."""
         from elspeth.web.execution.errors import MalformedBlobRefError
 
+        session_id = uuid4()
         state = mock_session_service.get_current_state.return_value
         state.source = {
             "plugin": "csv",
             "on_success": "orders_rows",
-            "options": {"path": "/tmp/data/blobs/orders.csv"},
+            "options": {"path": f"/tmp/data/blobs/{session_id}/orders.csv"},
             "on_validation_failure": "quarantine",
         }
         state.sources = {
@@ -4455,7 +7628,7 @@ class TestBlobRefPreValidation:
             "refunds": {
                 "plugin": "csv",
                 "on_success": "refunds_rows",
-                "options": {"blob_ref": "not-a-uuid", "path": "/tmp/data/blobs/refunds.csv"},
+                "options": {"blob_ref": "not-a-uuid", "path": f"/tmp/data/blobs/{session_id}/refunds.csv"},
                 "on_validation_failure": "quarantine",
             },
         }
@@ -4464,7 +7637,7 @@ class TestBlobRefPreValidation:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(MalformedBlobRefError, match=r"sources\.refunds\.blob_ref"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=session_id)
 
         mock_session_service.create_run.assert_not_called()
         blob_service.get_blob.assert_not_called()
@@ -4485,12 +7658,10 @@ class TestBlobRefPreValidation:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: SimpleNamespace(
+        blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: _ready_csv_blob_for_execution(
+            blob_ref=str(blob_id),
             session_id=session_id,
-            storage_path={
-                orders_blob: orders_path,
-                refunds_blob: refunds_path,
-            }[str(blob_id)],
+            storage_path={orders_blob: orders_path, refunds_blob: refunds_path}[str(blob_id)],
         )
         cast(Any, service)._blob_service = blob_service
 
@@ -4512,7 +7683,7 @@ class TestBlobRefPreValidation:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         linked_blob_ids = [call.kwargs["blob_id"] for call in blob_service.link_blob_to_run.await_args_list]
         assert linked_blob_ids == [UUID(orders_blob), UUID(refunds_blob)]
@@ -4557,7 +7728,11 @@ class TestBlobOwnership:
 
         blob_service = _blob_service_stub()
         # Blob belongs to other_session_id, not executing_session_id
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=other_session_id)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=other_session_id,
+            storage_path=f"/tmp/data/blobs/{other_session_id}/{blob_ref}_input.csv",
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -4569,7 +7744,7 @@ class TestBlobOwnership:
         }
 
         with pytest.raises(BlobNotFoundError):
-            await service.execute(session_id=executing_session_id)
+            await _execute(service, session_id=executing_session_id)
 
         # Critical: create_run was never called (rejected before run creation)
         mock_session_service.create_run.assert_not_called()
@@ -4588,10 +7763,11 @@ class TestBlobOwnership:
         orders_blob = str(uuid4())
         refunds_blob = str(uuid4())
         orders_path = f"/tmp/data/blobs/{executing_session_id}/{orders_blob}_orders.csv"
-        refunds_path = f"/tmp/data/blobs/{other_session_id}/{refunds_blob}_refunds.csv"
+        refunds_path = f"/tmp/data/blobs/{executing_session_id}/{refunds_blob}_refunds.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: SimpleNamespace(
+        blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: _ready_csv_blob_for_execution(
+            blob_ref=str(blob_id),
             session_id=executing_session_id if str(blob_id) == orders_blob else other_session_id,
             storage_path=orders_path if str(blob_id) == orders_blob else refunds_path,
         )
@@ -4615,7 +7791,7 @@ class TestBlobOwnership:
         }
 
         with pytest.raises(BlobNotFoundError):
-            await service.execute(session_id=executing_session_id)
+            await _execute(service, session_id=executing_session_id)
 
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
@@ -4632,7 +7808,11 @@ class TestBlobOwnership:
         canonical_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_input.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         # path must equal blob.storage_path to satisfy the Tier 1 read
@@ -4646,7 +7826,7 @@ class TestBlobOwnership:
         }
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
 
@@ -4702,7 +7882,11 @@ class TestBlobSourcePathReadGuard:
         diverging_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -4714,7 +7898,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.stored_path == diverging_path
         assert exc_info.value.canonical_path == canonical_path
@@ -4749,7 +7933,11 @@ class TestBlobSourcePathReadGuard:
         canonical_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_input.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -4762,7 +7950,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.stored_path is None
         assert exc_info.value.canonical_path == canonical_path
@@ -4782,7 +7970,11 @@ class TestBlobSourcePathReadGuard:
         diverging_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -4797,7 +7989,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.stored_path == diverging_path
         assert exc_info.value.canonical_path == canonical_path
@@ -4821,7 +8013,8 @@ class TestBlobSourcePathReadGuard:
         refunds_diverging_path = f"/tmp/data/blobs/{session_id}/{refunds_blob}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: SimpleNamespace(
+        blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: _ready_csv_blob_for_execution(
+            blob_ref=str(blob_id),
             session_id=session_id,
             storage_path=orders_path if str(blob_id) == orders_blob else refunds_canonical_path,
         )
@@ -4845,7 +8038,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.blob_id == refunds_blob
         assert exc_info.value.stored_path == refunds_diverging_path
@@ -4869,7 +8062,7 @@ class TestOneActiveRun:
         mock_session_service.get_active_run.return_value = _run_record_stub(status="running")
 
         with pytest.raises(RunAlreadyActiveError):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_execute_after_completed_run_succeeds(
@@ -4880,7 +8073,7 @@ class TestOneActiveRun:
         """After a run completes, a new one can start."""
         mock_session_service.get_active_run.return_value = None
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
 
@@ -4890,6 +8083,33 @@ class TestOneActiveRun:
 class TestEventBusBridge:
     """Verify that ProgressEvent from the Orchestrator's EventBus
     is translated to RunEvent and broadcast via the ProgressBroadcaster."""
+
+    @pytest.mark.parametrize("error_type", [OSError, SQLAlchemyError])
+    def test_failed_event_persistence_never_broadcasts(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        error_type: type[Exception],
+    ) -> None:
+        from elspeth.contracts.cli import ProgressEvent
+
+        failure = error_type("event storage unavailable")
+        mock_session_service.append_run_event.side_effect = failure
+        progress = ProgressEvent(
+            rows_processed=1,
+            rows_succeeded=1,
+            rows_failed=0,
+            rows_quarantined=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            elapsed_seconds=1.0,
+        )
+        run_id = str(uuid4())
+        event = service._to_run_event(run_id, progress)
+        with patch.object(service._broadcaster, "broadcast") as broadcast, pytest.raises(error_type) as caught:
+            service._persist_and_broadcast_run_event(run_id, event, session_operation_lease=_execute_lease())
+        assert caught.value is failure
+        broadcast.assert_not_called()
 
     def test_progress_event_translated_to_run_event(self, service: ExecutionServiceImpl) -> None:
         """_to_run_event maps ProgressEvent fields to RunEvent.data.
@@ -4948,6 +8168,7 @@ class TestEventBusBridge:
                 rows_routed_failure=2,
                 elapsed_seconds=10.5,
             ),
+            session_operation_lease=_execute_lease(),
         )
 
         mock_session_service.append_run_event.assert_awaited_once()
@@ -4979,6 +8200,7 @@ class TestEventBusBridge:
                     rows_routed_failure=2,
                     elapsed_seconds=10.5,
                 ),
+                session_operation_lease=_execute_lease(),
             )
         finally:
             if not loop.is_closed():
@@ -5130,7 +8352,13 @@ class TestAsyncShutdown:
         def worker() -> None:
             shutdown_event.wait()
             try:
-                svc._call_async(mock_session_service.update_run_status(uuid4(), status="cancelled"))
+                svc._call_async(
+                    mock_session_service.update_run_status(
+                        uuid4(),
+                        status="cancelled",
+                        session_operation_context=_execute_lease().context,
+                    )
+                )
             except BaseException as exc:
                 worker_errors.append(type(exc).__name__)
             finally:
@@ -5177,7 +8405,7 @@ class TestRunningStatusFailure:
         cast(Any, service)._call_async = failing_call_async
 
         with _admitted_runtime_setup(), pytest.raises(ConnectionError):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # The except block tried to set "failed" via the second _call_async call
         assert call_count >= 2
@@ -5365,7 +8593,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_sink_path_traversal_rejected(
@@ -5392,7 +8620,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_sink_path_under_outputs_accepted(
@@ -5403,13 +8631,14 @@ class TestSinkPathRestriction:
     ) -> None:
         """Sink with path under data_dir/outputs is allowed."""
         mock_settings.data_dir = "/tmp/elspeth_data"
+        session_id = uuid4()
         state = mock_session_service.get_current_state.return_value
         state.source = None
         state.outputs = [
             {
                 "name": "primary",
                 "plugin": "csv",
-                "options": {"path": "/tmp/elspeth_data/outputs/result.csv"},
+                "options": {"path": f"/tmp/elspeth_data/outputs/{session_id}/result.csv"},
                 "on_write_failure": "discard",
             }
         ]
@@ -5417,7 +8646,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -5448,7 +8677,39 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
+
+    @pytest.mark.asyncio
+    async def test_sink_path_in_other_session_outputs_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        mock_settings: MagicMock,
+    ) -> None:
+        """A shared output root is infrastructure, not cross-session write authority."""
+        mock_settings.data_dir = "/tmp/elspeth_data"
+        executing_session = uuid4()
+        other_session = uuid4()
+        state = mock_session_service.get_current_state.return_value
+        state.source = None
+        state.outputs = [
+            {
+                "name": "append_foreign",
+                "plugin": "csv",
+                "options": {
+                    "path": f"/tmp/elspeth_data/outputs/{other_session}/shared.csv",
+                    "mode": "append",
+                },
+                "on_write_failure": "discard",
+            }
+        ]
+        state.nodes = None
+        state.edges = None
+
+        from elspeth.web.execution.errors import PathAllowlistViolationError
+
+        with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
+            await _execute(service, session_id=executing_session)
 
     @pytest.mark.asyncio
     async def test_sink_path_in_own_session_blobs_accepted(
@@ -5475,7 +8736,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=own_session)
+            run_id = await _execute(service, session_id=own_session)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -5501,7 +8762,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
 
@@ -5573,7 +8834,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_transform_persist_directory_traversal_rejected(
@@ -5606,7 +8867,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_transform_persist_directory_under_outputs_accepted(
@@ -5617,6 +8878,7 @@ class TestTransformProviderConfigPathRestriction:
     ) -> None:
         """Transform with provider_config.persist_directory under data_dir/outputs is allowed."""
         mock_settings.data_dir = "/tmp/elspeth_data"
+        session_id = uuid4()
         state = mock_session_service.get_current_state.return_value
         state.source = None
         state.outputs = None
@@ -5630,15 +8892,67 @@ class TestTransformProviderConfigPathRestriction:
                 "on_error": "discard",
                 "options": {
                     "provider": "chroma",
-                    "provider_config": {"persist_directory": "/tmp/elspeth_data/outputs/chroma"},
+                    "provider_config": {"persist_directory": f"/tmp/elspeth_data/outputs/{session_id}/chroma"},
                 },
             }
         ]
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
+
+    @pytest.mark.asyncio
+    async def test_non_mapping_provider_config_is_skipped_without_disarming_the_scan(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        mock_settings: MagicMock,
+    ) -> None:
+        """A non-Mapping ``provider_config`` is skipped, and the scan keeps going.
+
+        Pins the ``continue`` arm of the nested path allowlist scan: a value
+        that is not a Mapping cannot carry ``persist_directory`` at all, so it
+        is outside this gate's subject set — but skipping it must not abandon
+        the remaining nodes. The offending node is ordered SECOND so a
+        ``break``/``return`` in place of ``continue`` turns this test red.
+        """
+        mock_settings.data_dir = "/tmp/elspeth_data"
+        state = mock_session_service.get_current_state.return_value
+        state.source = None
+        state.outputs = None
+        state.nodes = [
+            {
+                "id": "rag-malformed",
+                "node_type": "transform",
+                "plugin": "rag_retrieval",
+                "input": "transform_in",
+                "on_success": "results",
+                "on_error": "discard",
+                "options": {
+                    "provider": "chroma",
+                    "provider_config": "/etc/cron.d/backdoor",
+                },
+            },
+            {
+                "id": "rag-escaping",
+                "node_type": "transform",
+                "plugin": "rag_retrieval",
+                "input": "transform_in",
+                "on_success": "results",
+                "on_error": "discard",
+                "options": {
+                    "provider": "chroma",
+                    "provider_config": {"persist_directory": "/etc/cron.d/backdoor"},
+                },
+            },
+        ]
+        state.edges = None
+
+        from elspeth.web.execution.errors import PathAllowlistViolationError
+
+        with pytest.raises(PathAllowlistViolationError, match="rag-escaping"):
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_azure_search_managed_identity_provider_config_rejected_before_run(
@@ -5676,7 +8990,7 @@ class TestTransformProviderConfigPathRestriction:
             patch.object(service, "_run_pipeline") as run_pipeline,
             pytest.raises(PipelineValidationError, match="managed identity"),
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         run_pipeline.assert_not_called()
 
@@ -5725,7 +9039,7 @@ class TestTransformProviderConfigPathRestriction:
             patch.object(service, "_run_pipeline") as run_pipeline,
             pytest.raises(PipelineValidationError, match="sequential multi-query LLM"),
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         run_pipeline.assert_not_called()
 
@@ -5772,7 +9086,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -5801,7 +9115,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
 
@@ -5823,6 +9137,7 @@ class TestExecuteSemanticContractViolation:
     def _set_web_scrape_line_explode_state(
         mock_session_service: MagicMock,
         *,
+        session_id: UUID,
         scrape_options: dict[str, Any] | None = None,
     ) -> None:
         state = mock_session_service.get_current_state.return_value
@@ -5845,7 +9160,7 @@ class TestExecuteSemanticContractViolation:
             "plugin": "text",
             "on_success": "scrape_in",
             "options": {
-                "path": "blobs/urls.txt",
+                "path": f"blobs/{session_id}/urls.txt",
                 "column": "url",
                 "schema": {"mode": "fixed", "fields": ["url: str"]},
             },
@@ -5903,13 +9218,14 @@ class TestExecuteSemanticContractViolation:
         mock_settings: MagicMock,
     ) -> None:
         mock_settings.data_dir = "/tmp/elspeth_data"
-        self._set_web_scrape_line_explode_state(mock_session_service)
+        session_id = uuid4()
+        self._set_web_scrape_line_explode_state(mock_session_service, session_id=session_id)
 
         # SemanticContractViolationError IS a ValueError, so legacy
         # ``except ValueError`` paths still catch it. New callers should
         # catch the specific type and read .entries/.contracts.
         with pytest.raises(ValueError, match="line_explode"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=session_id)
 
         mock_session_service.create_run.assert_not_awaited()
 
@@ -5929,10 +9245,11 @@ class TestExecuteSemanticContractViolation:
         from elspeth.web.execution.errors import SemanticContractViolationError
 
         mock_settings.data_dir = "/tmp/elspeth_data"
-        self._set_web_scrape_line_explode_state(mock_session_service)
+        session_id = uuid4()
+        self._set_web_scrape_line_explode_state(mock_session_service, session_id=session_id)
 
         with pytest.raises(SemanticContractViolationError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=session_id)
 
         exc = excinfo.value
         assert len(exc.entries) >= 1
@@ -5948,13 +9265,15 @@ class TestExecuteSemanticContractViolation:
         mock_settings: MagicMock,
     ) -> None:
         mock_settings.data_dir = "/tmp/elspeth_data"
+        session_id = uuid4()
         self._set_web_scrape_line_explode_state(
             mock_session_service,
+            session_id=session_id,
             scrape_options={"text_separator": "\n"},
         )
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=session_id)
 
         assert isinstance(run_id, UUID)
 
@@ -6120,7 +9439,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_unresolved_placeholder_state(mock_session_service)
 
         with pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         # The typed payload carries (node_id, term) — no prompt_template.
         assert excinfo.value.placeholders == (("rate_node", "cool"),)
@@ -6146,7 +9465,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_structured_pending_interpretation_state(mock_session_service)
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         assert excinfo.value.placeholders == (("rate_node", "cool"),)
         mock_session_service.create_run.assert_not_awaited()
@@ -6268,12 +9587,63 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_drifted_invented_source_state(mock_session_service)
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         source_sites = [s for s in excinfo.value.sites if s.component_type == "source"]
         assert len(source_sites) == 1
         assert source_sites[0].kind.value == "invented_source"
         assert source_sites[0].component_id == "source"
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_pending_named_invented_source_before_creating_run(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        mock_settings: MagicMock,
+    ) -> None:
+        from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
+        from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+
+        mock_settings.data_dir = "/tmp/elspeth_data"
+        state = mock_session_service.get_current_state.return_value
+        state.source = None
+        state.sources = {
+            "orders": {
+                "plugin": "json",
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {
+                    SOURCE_AUTHORING_KEY: {
+                        "modality": "llm_generated",
+                        "content_hash": "a" * 64,
+                        "review_event_id": None,
+                        "resolved_kind": None,
+                    },
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "id": "source-review",
+                            "kind": "invented_source",
+                            "user_term": "inline_source_data",
+                            "status": "pending",
+                            "draft": "generated rows",
+                            "event_id": None,
+                            "accepted_value": None,
+                            "accepted_artifact_hash": None,
+                            "resolved_prompt_template_hash": None,
+                        }
+                    ],
+                },
+            }
+        }
+        state.nodes = []
+        state.edges = []
+        state.outputs = []
+
+        with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
+            await _execute(service, session_id=uuid4())
+
+        assert [(site.component_id, site.kind.value) for site in excinfo.value.sites] == [("source:orders", "invented_source")]
         mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -6296,7 +9666,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_unresolved_placeholder_state(mock_session_service)
 
         with pytest.raises(UnresolvedInterpretationPlaceholderError):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         counter = service._telemetry.interpretation_placeholder_unresolved_at_runtime_total
         # Test fixture uses fake counters — type-narrow to access ``calls``.
@@ -6343,12 +9713,13 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         from elspeth.web.sessions.telemetry import _FakeCounter
 
         mock_settings.data_dir = "/tmp/elspeth_data"
+        session_id = uuid4()
         prompt = "Rate visually-appealing aspects."
         state = mock_session_service.get_current_state.return_value
         state.source = {
             "plugin": "csv",
             "on_success": "rate_in",
-            "options": {"path": "blobs/rows.csv"},
+            "options": {"path": f"blobs/{session_id}/rows.csv"},
             "on_validation_failure": "discard",
         }
         state.nodes = [
@@ -6414,7 +9785,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.evaluate_execution_fanout_guard", return_value=None),
         ):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=session_id)
 
         assert isinstance(run_id, UUID)
         # Counter was NOT incremented.
@@ -6456,7 +9827,7 @@ class TestRelativePathResolution:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -6468,11 +9839,12 @@ class TestRelativePathResolution:
     ) -> None:
         """Source with a relative path under blobs/ passes when resolved against data_dir."""
         mock_settings.data_dir = "/tmp/elspeth_data"
+        session_id = uuid4()
         state = mock_session_service.get_current_state.return_value
         state.source = {
             "plugin": "csv",
             "on_success": "continue",
-            "options": {"path": "blobs/data.csv"},
+            "options": {"path": f"blobs/{session_id}/data.csv"},
             "on_validation_failure": "quarantine",
         }
         state.outputs = None
@@ -6480,7 +9852,7 @@ class TestRelativePathResolution:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -6492,11 +9864,12 @@ class TestRelativePathResolution:
     ) -> None:
         """Every named source path must pass the direct /execute allowlist."""
         mock_settings.data_dir = "/tmp/elspeth_data"
+        session_id = uuid4()
         state = mock_session_service.get_current_state.return_value
         state.source = {
             "plugin": "csv",
             "on_success": "orders_out",
-            "options": {"path": "blobs/orders.csv"},
+            "options": {"path": f"blobs/{session_id}/orders.csv"},
             "on_validation_failure": "quarantine",
         }
         state.sources = {
@@ -6515,7 +9888,7 @@ class TestRelativePathResolution:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match=r"Source 'refunds'.*resolves outside allowed directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_relative_traversal_still_blocked(
@@ -6540,7 +9913,7 @@ class TestRelativePathResolution:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
 
 # ── Edge Compatibility in _run_pipeline ───────────────────────────────
@@ -6582,7 +9955,7 @@ class TestEdgeCompatibility:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         mock_graph.validate.assert_called_once()
         mock_graph.validate_edge_compatibility.assert_called_once()
@@ -6613,7 +9986,7 @@ class TestEdgeCompatibility:
         )
 
         with pytest.raises(GraphValidationError, match="Schema mismatch"):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
 
 # ── Blob Finalization Catch Widening ──────────────────────────────────
@@ -6678,7 +10051,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobNotFoundError("missing-blob")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
-        svc._finalize_output_blobs(str(uuid4()), success=True)
+        svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_propagates_runtime_error_from_blob_lifecycle(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         """RuntimeError is no longer suppressed — it's too broad and would
@@ -6689,7 +10062,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service.finalize_run_output_blobs.side_effect = RuntimeError("Cannot finalize — status is 'ready', expected 'pending'")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
         with pytest.raises(RuntimeError, match="Cannot finalize"):
-            svc._finalize_output_blobs(str(uuid4()), success=True)
+            svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_suppresses_blob_quota_exceeded_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         from elspeth.web.blobs.protocol import BlobQuotaExceededError
@@ -6697,7 +10070,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobQuotaExceededError("sess-1", current_bytes=100, limit_bytes=50)
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
-        svc._finalize_output_blobs(str(uuid4()), success=True)
+        svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_propagates_type_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         """Programmer bugs (TypeError, AttributeError, etc.) must still crash."""
@@ -6705,7 +10078,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service.finalize_run_output_blobs.side_effect = TypeError("unexpected keyword argument")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
         with pytest.raises(TypeError, match="unexpected keyword argument"):
-            svc._finalize_output_blobs(str(uuid4()), success=True)
+            svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_propagates_attribute_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         """AttributeError is a programmer bug — must crash."""
@@ -6713,7 +10086,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service.finalize_run_output_blobs.side_effect = AttributeError("'NoneType' object has no attribute 'id'")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
         with pytest.raises(AttributeError):
-            svc._finalize_output_blobs(str(uuid4()), success=True)
+            svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
 
 # ── Terminal Ordering Invariant ───────────────────────────────────────
@@ -6792,7 +10165,7 @@ class TestTerminalOrderingInvariant:
             cast(Any, svc)._call_async = lambda coro: _real_loop.run_until_complete(coro)
 
             with contextlib.suppress(Exception):
-                svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+                svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
             terminals = _collect_terminal_types(mock_broadcaster)
             assert len(terminals) == 1, (
@@ -6858,7 +10231,7 @@ class TestTerminalOrderingInvariant:
         try:
             cast(Any, svc)._call_async = lambda coro: _real_loop.run_until_complete(coro)
 
-            svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
             terminals = _collect_terminal_types(mock_broadcaster)
             assert len(terminals) == 1, (
@@ -7007,8 +10380,8 @@ class TestResolveYamlPaths:
             "      mode: persistent\n"
             "      persist_directory: outputs/chroma-store\n"
         )
-        result = _resolve_yaml_paths(yaml_str, "/srv/data")
-        assert "/srv/data/outputs/chroma-store" in result
+        result = _resolve_yaml_paths(yaml_str, "/srv/data", session_id="sess-a")
+        assert "/srv/data/outputs/sess-a/chroma-store" in result
 
     def test_transform_provider_persist_directory_relative_path_rewritten(self) -> None:
         from elspeth.web.execution.preflight import resolve_runtime_yaml_paths as _resolve_yaml_paths
@@ -7026,8 +10399,8 @@ class TestResolveYamlPaths:
             "      provider_config:\n"
             "        persist_directory: outputs/chroma-index\n"
         )
-        result = _resolve_yaml_paths(yaml_str, "/srv/data")
-        assert "/srv/data/outputs/chroma-index" in result
+        result = _resolve_yaml_paths(yaml_str, "/srv/data", session_id="sess-a")
+        assert "/srv/data/outputs/sess-a/chroma-index" in result
 
     def test_transform_provider_persist_directory_absolute_path_unchanged(self) -> None:
         from elspeth.web.execution.preflight import resolve_runtime_yaml_paths as _resolve_yaml_paths
@@ -7293,3 +10666,410 @@ class TestSetOpenrouterCatalogSnapshotValidation:
     def test_setter_rejects_bad_source(self, service: ExecutionServiceImpl) -> None:
         with pytest.raises(RuntimeError, match="must be 'live' or 'bundled'"):
             service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="oops")
+
+
+# ── elspeth-30416e67cc: Tier-3 per-row failure text must not egress ───
+
+_EGRESS_CANARY_ROW = "CANARY_ROW_SECRET_9f3a"
+_EGRESS_CANARY_PROVIDER = "CANARY_PROVIDER_ERROR_7b21"
+
+
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+class TestFailureSampleClientEgress:
+    """The inline run-level summary is category + node + count, never row text.
+
+    ``transform_errors.error_details_json`` is written through
+    ``canonical_or_recorded_error_details_json``, which self-declares a
+    **Tier-3** boundary: the payload "may carry arbitrary row-derived data"
+    and nothing in it is validated at write time.  Before elspeth-30416e67cc
+    the run-level enrichment inlined that free text verbatim (truncated only)
+    into three surfaces that all live OUTSIDE the audit boundary:
+
+    1. the non-audit sessions DB ``runs.error`` column,
+    2. ``RunStatusResponse.error`` on ``GET /api/runs/{id}``, and
+    3. the SSE ``failed`` event's ``FailedData.detail``.
+
+    All three derive from one ``session_error`` string, so all three are
+    asserted here — the mechanism, not one symptom.  Per-row free text stays
+    available only behind the authenticated, ownership-verified
+    ``GET /api/runs/{id}/diagnostics``, which reads its own tables.
+    """
+
+    @staticmethod
+    def _seed_run_with_canary_failures(
+        db: LandscapeDB,
+        *,
+        transform_id: str = "fetch",
+        rows: int = 3,
+    ) -> str:
+        """Record ``rows`` per-row transform errors whose text carries canaries."""
+        factory = RecorderFactory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        dynamic_schema = SchemaConfig.from_dict({"mode": "observed"})
+        factory.data_flow.register_node(
+            run_id=run.run_id,
+            plugin_name="test_source",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0",
+            config={},
+            schema_config=dynamic_schema,
+            node_id="source_test",
+            sequence=0,
+        )
+        factory.data_flow.register_node(
+            run_id=run.run_id,
+            plugin_name="web_scrape",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config={},
+            schema_config=dynamic_schema,
+            node_id=transform_id,
+            sequence=1,
+        )
+        for index in range(rows):
+            row = factory.data_flow.create_row(
+                run_id=run.run_id,
+                source_node_id="source_test",
+                row_index=index,
+                data={"url": f"row-{index}"},
+                source_row_index=index,
+                ingest_sequence=index,
+            )
+            token_id = f"canary_tok_{index}"
+            with db.write_connection() as conn:
+                conn.execute(
+                    tokens_table.insert().values(
+                        token_id=token_id,
+                        row_id=row.row_id,
+                        run_id=run.run_id,
+                        step_in_pipeline=0,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+                conn.commit()
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token_id, run_id=run.run_id),
+                transform_id=transform_id,
+                row_data={"url": f"row-{index}"},
+                error_details={
+                    "reason": "decode_failed",
+                    # Distinct per row: the pre-fix aggregation keyed on the
+                    # message, so distinct texts also mean the top-N slice was
+                    # taken over messages rather than over categories.
+                    "error": f"gzip: incorrect header check for {_EGRESS_CANARY_ROW}-{index}",
+                    "error_type": f"BadGzipFile: {_EGRESS_CANARY_PROVIDER}",
+                },
+                destination="discard",
+            )
+        return run.run_id
+
+    @staticmethod
+    def _drive_terminal_run(
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        *,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        mock_landscape: MagicMock,
+        landscape_db: LandscapeDB,
+        result: RunResult,
+        session_status: str,
+    ) -> tuple[str, str, list[Any]]:
+        """Run ``_run_pipeline`` to the engine-decided terminal branch.
+
+        Returns ``(run_id, persisted_runs_error, failed_event_payloads)``.
+        """
+        _configure_runtime_success(
+            mock_load=mock_load,
+            mock_instantiate=mock_instantiate,
+            mock_graph_cls=mock_graph_cls,
+            mock_orch_cls=mock_orch_cls,
+            result=result,
+        )
+        mock_landscape.return_value = landscape_db
+        run_id = str(uuid4())
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(result.status),
+        ):
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
+
+        status_calls = [
+            call for call in mock_session_service.update_run_status.call_args_list if call.kwargs.get("status") == session_status
+        ]
+        assert status_calls, f"the terminal branch must record status={session_status!r}"
+        persisted_error = status_calls[-1].kwargs["error"]
+        assert persisted_error is not None, "the terminal branch must persist a run-level error summary"
+        failed_events = [
+            call.kwargs for call in mock_session_service.append_run_event.call_args_list if call.kwargs.get("event_type") == "failed"
+        ]
+        return run_id, persisted_error, failed_events
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_failed_run_egresses_category_and_node_but_never_row_text(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """FAILED: all three client surfaces carry the summary, none the canary."""
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            landscape_run_id = self._seed_run_with_canary_failures(db)
+            run_id, persisted_error, failed_events = self._drive_terminal_run(
+                service,
+                mock_session_service,
+                mock_load=mock_load,
+                mock_instantiate=mock_instantiate,
+                mock_graph_cls=mock_graph_cls,
+                mock_orch_cls=mock_orch_cls,
+                mock_landscape=mock_landscape,
+                landscape_db=db,
+                result=_orchestrator_result_stub(
+                    run_id=landscape_run_id,
+                    status=RunStatus.FAILED,
+                    rows_processed=3,
+                    rows_succeeded=0,
+                    rows_failed=3,
+                ),
+                session_status="failed",
+            )
+        finally:
+            db.close()
+
+        # Surface 1 — the non-audit sessions DB ``runs.error`` column.
+        assert _EGRESS_CANARY_ROW not in persisted_error, persisted_error
+        assert _EGRESS_CANARY_PROVIDER not in persisted_error, persisted_error
+        assert "incorrect header check" not in persisted_error, persisted_error
+        # …and it still names the category, the node, and the count.
+        assert "decode_failed" in persisted_error, persisted_error
+        assert "fetch" in persisted_error, persisted_error
+        assert "3x" in persisted_error, persisted_error
+
+        # Surface 2 — the SSE ``failed`` event detail is the SAME string.
+        assert failed_events, "a FAILED terminal branch must broadcast a failed event"
+        sse_detail = failed_events[-1]["data"]["detail"]
+        assert sse_detail == persisted_error
+        assert _EGRESS_CANARY_ROW not in sse_detail
+        assert _EGRESS_CANARY_PROVIDER not in sse_detail
+
+        # Surface 3 — ``RunStatusResponse.error`` on GET /api/runs/{id}.
+        run_uuid = UUID(run_id)
+        record = _run_record_stub(
+            id=run_uuid,
+            status="failed",
+            error=persisted_error,
+            finished_at=datetime.now(tz=UTC),
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            status_response = loop.run_until_complete(service.get_status(run_uuid, run_record=record))
+        finally:
+            loop.close()
+        assert status_response.error == persisted_error
+        assert status_response.error is not None
+        assert _EGRESS_CANARY_ROW not in status_response.error
+        assert _EGRESS_CANARY_PROVIDER not in status_response.error
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.preflight.ExecutionGraph")
+    @patch("elspeth.web.execution.preflight.instantiate_plugins_from_config")
+    @patch("elspeth.web.execution.service.load_settings_from_yaml_string")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_completed_with_failures_run_never_egresses_row_text(
+        self,
+        mock_payload: MagicMock,
+        mock_landscape: MagicMock,
+        mock_load: MagicMock,
+        mock_instantiate: MagicMock,
+        mock_graph_cls: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """The partial-completion sibling leaks identically and is fixed with it.
+
+        This branch emits no ``failed`` SSE event, so it is two surfaces
+        (``runs.error`` and ``RunStatusResponse.error``) rather than three.
+        """
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        try:
+            landscape_run_id = self._seed_run_with_canary_failures(db, transform_id="summarise", rows=2)
+            _run_id, persisted_error, _failed_events = self._drive_terminal_run(
+                service,
+                mock_session_service,
+                mock_load=mock_load,
+                mock_instantiate=mock_instantiate,
+                mock_graph_cls=mock_graph_cls,
+                mock_orch_cls=mock_orch_cls,
+                mock_landscape=mock_landscape,
+                landscape_db=db,
+                result=_orchestrator_result_stub(
+                    run_id=landscape_run_id,
+                    status=RunStatus.COMPLETED_WITH_FAILURES,
+                    rows_processed=10,
+                    rows_succeeded=8,
+                    rows_failed=2,
+                ),
+                session_status="completed_with_failures",
+            )
+        finally:
+            db.close()
+
+        assert _EGRESS_CANARY_ROW not in persisted_error, persisted_error
+        assert _EGRESS_CANARY_PROVIDER not in persisted_error, persisted_error
+        assert "incorrect header check" not in persisted_error, persisted_error
+        assert "decode_failed" in persisted_error, persisted_error
+        assert "summarise" in persisted_error, persisted_error
+        assert "2x" in persisted_error, persisted_error
+
+
+# ---------------------------------------------------------------------------
+# Collector arm of the fanout marker dispatch (elspeth-df8082552d, site b2).
+#
+# ``_fanout_marker_for_node`` had arms for transform, aggregation and gate and
+# NONE for collector, so a collector never contributed a fanout marker — the
+# same plugin marked on an aggregation went unmarked on a collector, and a
+# collector that genuinely multiplies rows into an LLM node was invisible to
+# the guard.
+#
+# The gap was previously assessed as masked, because a collector's mandatory
+# ``scope_opener`` is a multi-row transform the trace marks anyway. That mask
+# is not load-bearing here: these tests assert the COLLECTOR's own marker is
+# present, not merely that some guard fires. (The mask itself is unsound for a
+# separate reason — nothing enforces that an opener creates tokens; see
+# elspeth-da3032d197.)
+# ---------------------------------------------------------------------------
+
+
+def _collector_marker_node(node_type: str, plugin: str = "batch_replicate") -> Any:
+    """One node hosting ``plugin``, shaped for ``node_type``."""
+    from elspeth.web.composer.state import NodeSpec
+
+    kind_fields: dict[str, Any] = {}
+    if node_type == "aggregation":
+        kind_fields = {"trigger": {"count": 5}, "output_mode": "transform"}
+    elif node_type == "collector":
+        kind_fields = {"scope_name": "s", "scope_opener": "op", "scope_policy": "require_all"}
+    return NodeSpec(
+        id="c1",
+        node_type=node_type,
+        plugin=plugin,
+        input="op_out",
+        on_success="c1_out",
+        on_error="errors",
+        options={"copies": 3},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        **kind_fields,
+    )
+
+
+class TestFanoutMarkerCollectorArm:
+    def test_collector_contributes_a_fanout_marker(self) -> None:
+        from elspeth.web.execution.fanout_guard import _fanout_marker_for_node
+
+        marker = _fanout_marker_for_node(_collector_marker_node("collector"))
+
+        assert marker == "collector:c1:batch_replicate"
+
+    def test_collector_is_no_longer_asymmetric_with_aggregation(self) -> None:
+        """The defect in one line: the SAME collector-eligible plugin was
+        marked on an aggregation and unmarked on a collector. Both kinds
+        release plugin-authored output rows, so both must be visible.
+        """
+        from elspeth.web.execution.fanout_guard import _fanout_marker_for_node
+
+        assert _fanout_marker_for_node(_collector_marker_node("aggregation")) is not None
+        assert _fanout_marker_for_node(_collector_marker_node("collector")) is not None
+
+    def test_collector_arm_does_not_key_on_creates_tokens(self) -> None:
+        """Pins the trap the arm's comment names.
+
+        ``batch_replicate`` declares ``creates_tokens=False`` yet multiplies
+        M = sum(copies), and it is collector-eligible. Narrowing the collector
+        arm to ``transform_cls.creates_tokens`` by analogy with the transform
+        arm would return None here and silently reinstate the gap. This test
+        fails if anyone does that.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.execution.fanout_guard import _fanout_marker_for_node
+
+        plugin_cls = get_shared_plugin_manager().get_transform_by_name("batch_replicate")
+        assert plugin_cls.creates_tokens is False, "premise: the counter-example still declares creates_tokens=False"
+        assert plugin_cls.is_batch_aware is True, "premise: the counter-example is still collector-eligible"
+
+        assert _fanout_marker_for_node(_collector_marker_node("collector")) is not None
+
+    def test_collector_marker_reaches_the_guard_trace(self, tmp_path: Path) -> None:
+        """End to end: the collector's marker must appear in the risk row's
+        ``upstream_fanout``, not merely somewhere in the guard. The opener's
+        marker is present too and is the control — before the fix the tuple
+        held only the opener.
+        """
+        import csv
+
+        from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        source_path = tmp_path / "in.csv"
+        with source_path.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["a"])
+            for index in range(20):
+                writer.writerow([f"r{index}"])
+
+        opener = NodeSpec(
+            id="op",
+            node_type="transform",
+            plugin="json_explode",
+            input="src_out",
+            on_success="op_out",
+            on_error="errors",
+            options={"source_field": "a"},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="src_out",
+                options={"path": "in.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(opener, _collector_marker_node("collector"), _fanout_llm_node("c1_out", node_id="gen")),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        guard = evaluate_execution_fanout_guard(state, data_dir=str(tmp_path))
+
+        assert guard is not None
+        upstream = guard.risks[0].upstream_fanout
+        assert "collector:c1:batch_replicate" in upstream
+        assert "transform:op:json_explode" in upstream  # control: the opener was always marked

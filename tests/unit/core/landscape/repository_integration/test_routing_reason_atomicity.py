@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
+from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import NodeType, RoutingMode, RoutingSpec, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, ConfigGateReason
@@ -340,7 +341,9 @@ def test_spawned_identical_writers_converge_and_export_exact_reason(tmp_path: Pa
         assert rows[0].reason_ref == expected_ref
         assert store.retrieve(rows[0].reason_ref) == b'{"condition":"row[\'route\'] == \'accepted\'","result":"true"}'
 
-        RecorderFactory(db).run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED)
+        RecorderFactory(db).run_lifecycle.complete_run(
+            RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID)
+        )
         routing_exports = [record for record in LandscapeExporter(db).export_run(RUN_ID) if record["record_type"] == "routing_event"]
         assert len(routing_exports) == 1
         assert routing_exports[0]["event_id"] == rows[0].event_id
@@ -806,7 +809,9 @@ def test_sqlite_backup_restore_preserves_exported_reason_and_retry_identity(tmp_
             RoutingMode.MOVE,
             reason=REASON,
         )
-        RecorderFactory(db).run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED)
+        RecorderFactory(db).run_lifecycle.complete_run(
+            RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID)
+        )
         source_export = [record for record in LandscapeExporter(db).export_run(RUN_ID) if record["record_type"] == "routing_event"]
 
     backup_path = tmp_path / "audit.backup.db"

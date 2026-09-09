@@ -24,7 +24,9 @@ const BADGE_TOKEN_KINDS = [
   "sink",
   "aggregation",
   "coalesce",
+  "row_union",
   "queue",
+  "collector",
 ] as const;
 
 it("loads inspected CSS through the runtime stylesheet barrel", () => {
@@ -148,6 +150,33 @@ describe("light theme colour contrast", () => {
     expect(contrastRatio(mutedText, background)).toBeGreaterThanOrEqual(4.5);
   });
 
+  it("keeps classification-banner marking text at WCAG AA on every fixed ground", () => {
+    // The classification tokens are deliberately theme-invariant (a
+    // protective marking must not restyle with the viewer's theme), so only
+    // the :root definitions exist and one pin covers both themes. The white
+    // ink covers every ground except OFFICIAL: Sensitive yellow, which
+    // pairs with the dark ink (header.css flips it per-modifier).
+    const markingText = extractRootToken("--color-classification-text");
+    const darkMarkingText = extractRootToken("--color-classification-text-dark");
+    const whiteInkGrounds = [
+      "--color-classification-unofficial-bg",
+      "--color-classification-official-bg",
+      "--color-classification-protected-bg",
+    ];
+
+    for (const ground of whiteInkGrounds) {
+      expect(
+        contrastRatio(markingText, extractRootToken(ground)),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(
+      contrastRatio(
+        darkMarkingText,
+        extractRootToken("--color-classification-official-sensitive-bg"),
+      ),
+    ).toBeGreaterThanOrEqual(4.5);
+  });
+
   it("keeps the dark theme focus ring distinct from gate badges", () => {
     const background = extractRootToken("--color-bg");
     const gateBadge = extractRootToken("--color-badge-gate");
@@ -262,31 +291,6 @@ describe("disabled button contrast", () => {
     expect(body).not.toMatch(/opacity:\s*0\.[0-9]+/);
   });
 
-  // F4: side-rail buttons sit on the warm inspection surface, where the global
-  // --color-bg disabled fill reads as a raised chip rather than "inactive". A
-  // rail-scoped override re-merges disabled rail buttons into
-  // --color-surface-inspector so they read as recessed/outlined. These gate
-  // both that the override exists and that its muted text stays AA on the rail.
-  it("re-merges disabled side-rail buttons into the inspector surface", () => {
-    const railMatch =
-      /\.layout-siderail \.btn:disabled,[\s\S]*?\{([\s\S]*?)\n\}/.exec(appCss);
-    expect(
-      railMatch,
-      "rail-scoped disabled rule must exist in shared.css",
-    ).not.toBeNull();
-    expect(railMatch![1]).toContain(
-      "background-color: var(--color-surface-inspector)",
-    );
-  });
-
-  it("keeps disabled rail-button text at AA on the inspector surface in both themes", () => {
-    const darkText = extractRootToken("--color-text-muted");
-    const darkSurface = extractRootToken("--color-surface-inspector");
-    const lightText = extractLightThemeToken("--color-text-muted");
-    const lightSurface = extractLightThemeToken("--color-surface-inspector");
-    expect(contrastRatio(darkText, darkSurface)).toBeGreaterThanOrEqual(4.5);
-    expect(contrastRatio(lightText, lightSurface)).toBeGreaterThanOrEqual(4.5);
-  });
 });
 
 describe("form input placeholder contrast", () => {
@@ -465,8 +469,9 @@ describe("role-family surface contrast", () => {
 
   it("uses opaque badge background tokens with non-text contrast in both themes", () => {
     for (const kind of BADGE_TOKEN_KINDS) {
-      const foregroundToken = `--color-badge-${kind}`;
-      const backgroundToken = `--color-badge-${kind}-bg`;
+      const cssKind = kind.replace("_", "-");
+      const foregroundToken = `--color-badge-${cssKind}`;
+      const backgroundToken = `--color-badge-${cssKind}-bg`;
 
       const darkForeground = extractRootToken(foregroundToken);
       const darkBackground = extractRootToken(backgroundToken);
@@ -511,6 +516,38 @@ describe("queue badge tokens (composer-queue-exposure)", () => {
   });
 });
 
+describe("row_union badge tokens", () => {
+  it("keeps row_union distinct from every existing badge in both themes", () => {
+    for (const kind of [
+      "source",
+      "transform",
+      "gate",
+      "sink",
+      "aggregation",
+      "coalesce",
+      "queue",
+    ] as const) {
+      expect(extractRootToken("--color-badge-row-union")).not.toBe(
+        extractRootToken(`--color-badge-${kind}`),
+      );
+      expect(extractLightThemeToken("--color-badge-row-union")).not.toBe(
+        extractLightThemeToken(`--color-badge-${kind}`),
+      );
+    }
+  });
+
+  it("keeps row_union text comfortably legible on its badge background", () => {
+    expect(contrastRatio(
+      extractRootToken("--color-badge-row-union"),
+      extractRootToken("--color-badge-row-union-bg"),
+    )).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(
+      extractLightThemeToken("--color-badge-row-union"),
+      extractLightThemeToken("--color-badge-row-union-bg"),
+    )).toBeGreaterThanOrEqual(4.5);
+  });
+});
+
 describe("forced-colors accessibility fallbacks", () => {
   it("defines system-color fallbacks for stateful high-contrast surfaces", () => {
     const forcedColorsBlock = extractForcedColorsBlock();
@@ -524,6 +561,7 @@ describe("forced-colors accessibility fallbacks", () => {
     expect(forcedColorsBlock).toContain(".type-badge-sink");
     expect(forcedColorsBlock).toContain(".type-badge-aggregation");
     expect(forcedColorsBlock).toContain(".type-badge-coalesce");
+    expect(forcedColorsBlock).toContain(".type-badge-row_union");
     expect(forcedColorsBlock).toContain(".type-badge-queue");
     expect(forcedColorsBlock).toContain(".react-flow__edge-path");
     expect(forcedColorsBlock).toContain(".yaml-toolbar-btn[data-copied=\"true\"]");
@@ -532,6 +570,18 @@ describe("forced-colors accessibility fallbacks", () => {
     expect(forcedColorsBlock).toContain(".tutorial-progress-dot");
     expect(forcedColorsBlock).toContain(".tutorial-progress-dot--active");
     expect(forcedColorsBlock).toContain(".tutorial-progress-bar");
+  });
+
+  it("lets forced-colors badges use effective system foreground and surface colors", () => {
+    const forcedColorsBlock = extractForcedColorsBlock();
+    const badgeRule = /\.type-badge-source,[\s\S]*?\.type-badge-queue\s*\{(?<declarations>[^}]*)\}/
+      .exec(forcedColorsBlock);
+    const declarations = badgeRule?.groups?.declarations ?? "";
+
+    expect(declarations).toContain("color: ButtonText");
+    expect(declarations).toContain("background-color: Canvas");
+    expect(declarations).toContain("border-color: ButtonText");
+    expect(declarations).not.toContain("forced-color-adjust: none");
   });
 });
 
@@ -616,9 +666,17 @@ describe("design-review contrast remediation (2026-06-29)", () => {
     // var(--color-X-bg). The tint's real contrast depends on the surface BEHIND
     // it — so gate every such surface, not just --color-bg. (The paper modal
     // was the instance the first remediation pass missed; sign-off caught it.)
+    // The raised/elevated pair was the SECOND instance this enumeration
+    // missed. A tint placed on them measured 4.30:1 while this gate stayed
+    // green, because a surface absent from this list is a defect shape the run
+    // never exercises — the green certified nothing about it. Any new
+    // --color-surface-* that can sit behind a tint belongs here on the day it
+    // is defined.
     const surfaces = [
       "--color-bg",
       "--color-surface",
+      "--color-surface-raised",
+      "--color-surface-elevated",
       "--color-surface-inspector",
       "--color-surface-paper",
     ];
@@ -703,6 +761,21 @@ describe("design-review contrast remediation (2026-06-29)", () => {
       ).toBeGreaterThanOrEqual(3);
     }
   });
+
+  it("gives the workspace pane toggles a resting boundary clearing WCAG 1.4.11 (3:1)", () => {
+    // .workspace-pane-toggle (collapse/restore, 2026-08-15 recut) has a
+    // transparent fill, so its --color-input-border boundary is the only
+    // resting affordance. It sits on --color-surface (the pane band and the
+    // collapsed strip), a step darker than the elevated surface M04 proves
+    // against — pin the actual ground. workspaceChrome.test.ts pins that the
+    // class really uses this token.
+    for (const theme of themes) {
+      expect(
+        contrastRatio(resolveHex(theme, "--color-input-border"), resolveHex(theme, "--color-surface")),
+        `pane-toggle border on surface (${theme})`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -773,5 +846,59 @@ describe("muted text on every panel surface (elspeth-dae08efdc9)", () => {
         contrastRatio(resolveHex(theme, "--color-text-secondary"), bg),
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rendered markdown anchors (elspeth-05fef62901, 2026-08-09).
+// MarkdownRenderer emits <a> via SafeLink with no class, and no stylesheet
+// rule targeted anchors at all, so Chromium's UA default (rgb(0,0,238))
+// measured ~1.18:1 against the dark assistant bubble. The .markdown-body a
+// rule must deliver --color-link plus a non-color affordance (underline);
+// contrast is gated over the composed bubble tints, not just the page
+// background, because the bubbles are rgba() washes over --color-bg.
+// ---------------------------------------------------------------------------
+
+describe("rendered markdown links (elspeth-05fef62901)", () => {
+  const themes: Array<"dark" | "light"> = ["dark", "light"];
+
+  function markdownAnchorRule(): string {
+    const match = /\.markdown-body a\s*\{([^}]*)\}/.exec(appCss);
+    if (!match) {
+      throw new Error("No .markdown-body a rule found in the stylesheet barrel");
+    }
+    return match[1];
+  }
+
+  it("delivers the link token and an underline to rendered markdown anchors", () => {
+    const rule = markdownAnchorRule();
+    expect(rule).toContain("var(--color-link)");
+    expect(rule).toContain("underline");
+  });
+
+  it("keeps the link token at AA over every chat bubble tint in both themes", () => {
+    const bubbleTints = [
+      "--color-bubble-user",
+      "--color-bubble-assistant",
+      "--color-bubble-system",
+    ];
+    for (const theme of themes) {
+      const link = resolveHex(theme, "--color-link");
+      for (const tint of bubbleTints) {
+        const bg = resolveTintOver(theme, tint, "--color-bg");
+        expect(
+          contrastRatio(link, bg),
+          `link on ${tint} (${theme})`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it("keeps anchors covered by the global keyboard focus ring", () => {
+    // Anchors rely on base.css's global :focus-visible reset for their focus
+    // treatment — guard it so a reset refactor cannot silently strip it.
+    expect(appCss).toMatch(
+      /^:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/m,
+    );
   });
 });

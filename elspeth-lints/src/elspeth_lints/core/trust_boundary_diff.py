@@ -17,8 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from elspeth_lints.rules.trust_boundary.shared import extract_keywords
-from elspeth_lints.rules.trust_tier.tier_model.trust_boundary_suppress import find_trust_boundary_calls
+from elspeth_lints.rules.trust_boundary.shared import extract_keywords, iter_boundary_decorators
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,15 +156,23 @@ def _records_from_source(*, source: str, source_file: str) -> tuple[TrustBoundar
         tree = ast.parse(source, filename=source_file)
     except SyntaxError as exc:
         raise TrustBoundaryDiffError(f"could not parse {source_file}: {exc}") from exc
-    visitor = _TrustBoundaryDecoratorVisitor(source_file=source_file)
-    visitor.visit(tree)
-    return tuple(visitor.records)
+    symbol_visitor = _FunctionSymbolVisitor()
+    symbol_visitor.visit(tree)
+    return tuple(
+        _record_from_call(
+            source_file=source_file,
+            symbol=symbol_visitor.symbols[id(match.function)],
+            call=match.call,
+        )
+        for match in iter_boundary_decorators(tree)
+    )
 
 
-class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
-    def __init__(self, *, source_file: str) -> None:
-        self.source_file = source_file
-        self.records: list[TrustBoundaryDecoratorRecord] = []
+class _FunctionSymbolVisitor(ast.NodeVisitor):
+    """Map shared resolver matches back to stable nested symbols."""
+
+    def __init__(self) -> None:
+        self.symbols: dict[int, str] = {}
         self._symbol_stack: list[str] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -182,8 +189,7 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         symbol = ".".join([*self._symbol_stack, node.name])
-        for call in find_trust_boundary_calls(node.decorator_list):
-            self.records.append(_record_from_call(source_file=self.source_file, symbol=symbol, call=call))
+        self.symbols[id(node)] = symbol
         self._symbol_stack.append(node.name)
         for statement in node.body:
             self.visit(statement)

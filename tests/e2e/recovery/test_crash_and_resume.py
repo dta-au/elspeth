@@ -27,6 +27,7 @@ from elspeth.contracts import (
     NodeType,
     PipelineRow,
     PluginSchema,
+    ResumePoint,
     RoutingMode,
     RunStatus,
     SourceRow,
@@ -72,7 +73,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 # ---------------------------------------------------------------------------
@@ -469,8 +470,13 @@ def _start_interrupted_multi_source_run(tmp_path: Path) -> _MultiSourceResumeCon
     run_id = exc_info.value.run_id
     assert run_id is not None
     assert checkpoint_mgr.get_latest_checkpoint(run_id) is not None
+    # elspeth-1f5b83cd28: the refunds source was interrupted mid-load, so the
+    # advisory gate refuses — matching the IncompleteSourceResumeError the
+    # enforcing guard raises in every test below.
     check = recovery_mgr.can_resume(run_id, graph)
-    assert check.can_resume, f"Expected interrupted multi-source run to be resumable: {check.reason}"
+    assert not check.can_resume
+    assert check.reason is not None
+    assert "refunds=interrupted" in check.reason
     with db.engine.connect() as conn:
         refunds_source_node_id = conn.execute(
             select(run_sources_table.c.source_node_id).where(
@@ -508,8 +514,13 @@ def _append_crashed_refund_row(ctx: _MultiSourceResumeContext) -> str:
 
 def _resume_multi_source_run(ctx: _MultiSourceResumeContext) -> Any:
     resume_config, resume_graph = _build_multi_source_resume_pipeline(output_path=ctx.output_path)
-    resume_point = ctx.recovery_mgr.get_resume_point(ctx.run_id, resume_graph)
-    assert resume_point is not None
+    # elspeth-1f5b83cd28: the advisory gate refuses interrupted sources, so
+    # get_resume_point returns None. Hand-build the resume point — these tests
+    # prove the enforcing guard refuses (and stays side-effect-free) on its
+    # own authority.
+    checkpoint = ctx.checkpoint_mgr.get_latest_checkpoint(ctx.run_id)
+    assert checkpoint is not None
+    resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number)
     return Orchestrator(
         ctx.db,
         checkpoint_manager=ctx.checkpoint_mgr,
@@ -808,12 +819,12 @@ class TestResumeIdempotence:
         # from the per-source ``run_sources`` record. Mirror what the
         # production orchestrator writes via ``_emit_source_loading``.
         factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id="source",
             source_name="source",
             plugin_name="list_source",
             config_hash="crash-and-resume",
             lifecycle_state="loaded",
+            coordination_token=leader_coordination_token(factory, run_id),
             source_schema_json=json.dumps(
                 {
                     "properties": {
@@ -897,7 +908,7 @@ class TestResumeIdempotence:
         )
 
         # Mark run as failed (simulating crash)
-        factory.run_lifecycle.complete_run(run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
 
         # Epoch 21 (ADR-030 §B.4): begin_run minted this run's leader seat
         # (uniformity rule), and a hard-killed leader never releases it — the
@@ -1167,6 +1178,10 @@ class TestCheckpointRecovery:
                     openrouter_catalog_source="bundled",
                 )
             )
+            # A raw-SQL run has no seat; the checkpoint below is written under the
+            # lapsed seat its crashed leader left (ADR-048 §5 read-back), which is
+            # also what the resume takeover CAS requires.
+            insert_crashed_leader_seat(conn, run_id=run_id)
 
             conn.execute(
                 nodes_table.insert().values(
@@ -1305,6 +1320,10 @@ class TestCheckpointRecovery:
                     openrouter_catalog_source="bundled",
                 )
             )
+            # A raw-SQL run has no seat; the checkpoint below is written under the
+            # lapsed seat its crashed leader left (ADR-048 §5 read-back), which is
+            # also what the resume takeover CAS requires.
+            insert_crashed_leader_seat(conn, run_id=run_id)
 
             conn.execute(
                 nodes_table.insert().values(
@@ -1537,7 +1556,6 @@ class TestAggregationRecovery:
         # path was deleted; readers and writers are now symmetric on
         # ``run_sources``).
         factory.run_lifecycle.record_run_source(
-            run_id=run.run_id,
             source_node_id="source",
             source_name="source",
             plugin_name="test_source",
@@ -1545,6 +1563,7 @@ class TestAggregationRecovery:
             lifecycle_state="loaded",
             source_schema_json='{"properties": {"test_field": {"type": "string"}}, "required": ["test_field"]}',
             schema_contract=test_contract,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create the scalar barrier metadata for the in-flight aggregation —
@@ -1564,7 +1583,7 @@ class TestAggregationRecovery:
         )
 
         # Simulate crash
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify can resume
         check = recovery_mgr.can_resume(run.run_id, mock_graph)

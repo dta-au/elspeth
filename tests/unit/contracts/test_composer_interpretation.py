@@ -40,7 +40,7 @@ def _resolved_record_kwargs() -> dict[str, object]:
         "choice": InterpretationChoice.ACCEPTED_AS_DRAFTED,
         "created_at": datetime(2026, 5, 18, 12, 0, 0, tzinfo=UTC),
         "resolved_at": datetime(2026, 5, 18, 12, 0, 30, tzinfo=UTC),
-        "actor": "john@pgpl.net",
+        "actor": "noreply@dta.gov.au",
         "model_identifier": "anthropic/claude-opus-4-7",
         "model_version": "2026-01-15",
         "provider": "anthropic",
@@ -69,7 +69,7 @@ def _opted_out_record_kwargs() -> dict[str, object]:
         "choice": InterpretationChoice.OPTED_OUT,
         "created_at": datetime(2026, 5, 18, 12, 0, 0, tzinfo=UTC),
         "resolved_at": datetime(2026, 5, 18, 12, 0, 0, tzinfo=UTC),
-        "actor": "john@pgpl.net",
+        "actor": "noreply@dta.gov.au",
         "model_identifier": None,
         "model_version": None,
         "provider": None,
@@ -130,8 +130,8 @@ def _surface_opt_out_record_kwargs() -> dict[str, object]:
     }
 
 
-def test_interpretation_choice_has_exactly_five_values() -> None:
-    """InterpretationChoice is a closed enum with exactly 5 members."""
+def test_interpretation_choice_has_exactly_six_values() -> None:
+    """InterpretationChoice is a closed enum with exactly 6 members."""
     members = {member.value for member in InterpretationChoice}
     assert members == {
         "pending",
@@ -139,8 +139,9 @@ def test_interpretation_choice_has_exactly_five_values() -> None:
         "amended",
         "opted_out",
         "abandoned",
+        "superseded",
     }
-    assert len(InterpretationChoice) == 5
+    assert len(InterpretationChoice) == 6
 
 
 def test_interpretation_source_has_exactly_three_values() -> None:
@@ -161,6 +162,7 @@ def test_interpretation_kind_closed_set() -> None:
         "llm_prompt_template",
         "pipeline_decision",
         "llm_model_choice",
+        "source_data_contract",
     ]
 
 

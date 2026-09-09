@@ -39,11 +39,13 @@ from elspeth_lints.core.cli import (
 )
 from elspeth_lints.core.judge import (
     DEFAULT_AGENT_JUDGE_MODEL,
+    DEFAULT_CODEX_JUDGE_MODEL,
     DEFAULT_JUDGE_MODEL,
     JUDGE_EXCERPT_CONTEXT_LINES,
     JUDGE_POLICY_HASH,
     JUDGE_SURROUNDING_CODE_CHAR_LIMIT,
     TRANSPORT_AGENT,
+    TRANSPORT_CODEX_CLI,
     TRANSPORT_OPENROUTER,
     JudgeConfigurationError,
     JudgeContractError,
@@ -51,6 +53,8 @@ from elspeth_lints.core.judge import (
     JudgeResponse,
     JudgeTransportError,
     SimilarAllowlistEntry,
+    _extract_cache_accounting,
+    _extract_text_block,
     call_judge,
 )
 from elspeth_lints.core.override_rate import judge_decision_events_path
@@ -605,6 +609,46 @@ def test_call_judge_rejects_length_truncated_completion() -> None:
         call_judge(request)
 
 
+def test_call_judge_accepts_completion_missing_finish_reason() -> None:
+    request = JudgeRequest(
+        file_path="plugins/widget.py",
+        rule_id="R1",
+        symbol="Widget.lookup",
+        fingerprint="abc",
+        rationale="...",
+        surrounding_code="...",
+    )
+    fake_completion = _mock_openrouter_completion(verdict="ACCEPTED", rationale="ok")
+    del fake_completion.choices[0].finish_reason
+    fake_client = _OpenAIClientDouble(fake_completion)
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False),
+        patch("openai.OpenAI", return_value=fake_client),
+    ):
+        response = call_judge(request)
+
+    assert response.verdict is JudgeVerdict.ACCEPTED
+
+
+def test_provider_choice_finish_reason_is_read_once_at_admission() -> None:
+    class _Choice:
+        def __init__(self) -> None:
+            self.message = SimpleNamespace(content='{"verdict":"ACCEPTED"}')
+            self.reads = 0
+
+        @property
+        def finish_reason(self) -> str:
+            self.reads += 1
+            return "stop"
+
+    choice = _Choice()
+    completion = SimpleNamespace(choices=[choice])
+
+    assert _extract_text_block(completion) == '{"verdict":"ACCEPTED"}'
+    assert choice.reads == 1
+
+
 def test_call_judge_wraps_raw_httpx_connect_error() -> None:
     """Raw httpx transport exceptions fail closed as judge transport errors."""
     import httpx
@@ -648,7 +692,14 @@ def test_call_judge_wraps_openrouter_status_errors(error_cls: str, status: int) 
         surrounding_code="...",
     )
     response = httpx.Response(status, request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"))
-    exc = getattr(openai, error_cls)(f"status {status}", response=response, body={"error": "test"})
+    # Explicit table instead of resolving the class name off the SDK module:
+    # the two status errors under test are named, so a rename fails loudly here
+    # rather than at the parametrise string (ADR-032).
+    error_classes: dict[str, type[openai.APIStatusError]] = {
+        "AuthenticationError": openai.AuthenticationError,
+        "RateLimitError": openai.RateLimitError,
+    }
+    exc = error_classes[error_cls](f"status {status}", response=response, body={"error": "test"})
     fake_client = _OpenAIClientDouble(side_effect=exc)
 
     with (
@@ -921,6 +972,31 @@ def test_justify_agent_transport_flag_selects_agent(tmp_path: Path) -> None:
     assert len(loaded.entries) == 1
     assert loaded.entries[0].judge_transport == "claude_agent_sdk"
     assert loaded.entries[0].judge_signature_version == 2
+
+
+def test_justify_codex_cli_transport_flag_selects_codex(tmp_path: Path) -> None:
+    """``--judge-transport codex-cli`` persists the explicit Codex identity."""
+    root, _target = _build_source_tree(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    captured: dict[str, str] = {}
+
+    argv = [
+        *_justify_argv(root, allowlist_dir, owner="test-codex-transport"),
+        "--judge-transport",
+        "codex-cli",
+        "--judge-tools",
+        "readonly",
+    ]
+    with _capture_call_judge_transport(
+        captured,
+        response_transport=TRANSPORT_CODEX_CLI,
+        model_id=DEFAULT_CODEX_JUDGE_MODEL,
+    ):
+        assert main(argv) == 0
+
+    assert captured["transport"] == TRANSPORT_CODEX_CLI
+    assert captured["transport"] == "codex_cli"
+    assert "judge_transport: codex_cli" in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
 
 
 def test_justify_default_transport_is_openrouter(tmp_path: Path) -> None:
@@ -2219,6 +2295,7 @@ def test_call_judge_static_policy_sections_not_accidentally_dropped(tmp_path: Pa
     fake_client = client_class.return_value
     create_call = fake_client.chat.completions.create.call_args
     sys_text = create_call.kwargs["messages"][0]["content"][0]["text"]
+    normalized = " ".join(sys_text.split())
 
     # Tier-model vocabulary
     assert "Tier 1: Our Data" in sys_text
@@ -2227,10 +2304,11 @@ def test_call_judge_static_policy_sections_not_accidentally_dropped(tmp_path: Pa
     assert "FULL TRUST" in sys_text
     assert "ZERO TRUST" in sys_text
 
-    # Persistence / second-order boundary rule (a validated value re-read from
-    # our own store is Tier-3 again — load-bearing for the persisted-config
-    # misclassification the judge must catch).
-    assert "Validation is in-flight, not permanent" in sys_text
+    # Serialization is a courier, not an author. It must not demote Tier 1 or
+    # promote unowned content merely because either crossed storage.
+    assert "Serialization preserves authorship and trust tier" in sys_text
+    assert "Serialization never demotes Tier 1" in sys_text
+    assert "Trace who authored the value and whether a declared boundary contract promoted it" in normalized
 
     # Fabrication-decision test (load-bearing for §6 of the heuristic)
     assert "fabrication-decision test" in sys_text
@@ -2255,7 +2333,6 @@ def test_call_judge_static_policy_sections_not_accidentally_dropped(tmp_path: Pa
     # Wrap-insensitive: this canonical phrase can straddle a line break, so
     # check it against whitespace-normalized text (a drop-guard should detect
     # presence, not pin the exact reflow).
-    normalized = " ".join(sys_text.split())
     assert "conservative prior: lean toward BLOCKED" in normalized
     assert "rationale_duplicate_count" in sys_text
 
@@ -2439,6 +2516,72 @@ def test_call_judge_returns_cache_accounting_when_provider_reports_it() -> None:
         response = call_judge(request)
     assert response.prompt_tokens_total == 4000
     assert response.prompt_tokens_cached == 3500
+
+
+def test_call_judge_rejects_boolean_cached_token_accounting() -> None:
+    request = JudgeRequest(
+        file_path="plugins/widget.py",
+        rule_id="R1",
+        symbol="Widget.lookup",
+        fingerprint="fp",
+        rationale="...",
+        surrounding_code="...",
+    )
+    with (
+        _mock_judge_call(verdict="ACCEPTED", rationale="ok", prompt_tokens=4000, cached_tokens=True),
+        pytest.raises(JudgeContractError, match="cached_tokens must be int or None"),
+    ):
+        call_judge(request)
+
+
+def test_provider_cache_accounting_fields_are_read_once_at_admission() -> None:
+    class _Details:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def cached_tokens(self) -> int:
+            self.reads += 1
+            return 7
+
+    class _Usage:
+        prompt_tokens = 11
+
+        def __init__(self, details: _Details) -> None:
+            self._details = details
+            self.reads = 0
+
+        @property
+        def prompt_tokens_details(self) -> _Details:
+            self.reads += 1
+            return self._details
+
+    details = _Details()
+    usage = _Usage(details)
+
+    assert _extract_cache_accounting(SimpleNamespace(usage=usage)) == (11, 7)
+    assert usage.reads == 1
+    assert details.reads == 1
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "cached_tokens"),
+    ((-1, None), (10, -1), (10, 11)),
+)
+def test_provider_cache_accounting_rejects_impossible_bounds(
+    prompt_tokens: int,
+    cached_tokens: int | None,
+) -> None:
+    details = None if cached_tokens is None else SimpleNamespace(cached_tokens=cached_tokens)
+    completion = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            prompt_tokens_details=details,
+        )
+    )
+
+    with pytest.raises(JudgeContractError, match="prompt token accounting"):
+        _extract_cache_accounting(completion)
 
 
 def test_call_judge_distinguishes_cached_zero_from_cached_none() -> None:
@@ -3149,6 +3292,33 @@ def test_pop_then_restore_round_trip_on_single_entry_file(tmp_path: Path) -> Non
     data = yaml.safe_load(written)
     assert [entry["key"] for entry in data["allow_hits"]] == [key]
     assert data["allow_hits"][0]["reason"] == "only entry"
+
+
+def test_pop_then_restore_round_trip_preserves_middle_entry_position(tmp_path: Path) -> None:
+    """Drift repair must not turn a middle-row replacement into YAML reorder churn."""
+    from elspeth_lints.core.cli import _append_entry_to_yaml, _pop_allow_hits_entry_with_position
+
+    target_yaml = tmp_path / "plugins.yaml"
+    middle_key = "plugins/middle.py:R1:Widget:lookup:fp=bbb"
+    original = """\
+allow_hits:
+- key: plugins/first.py:R1:Widget:lookup:fp=aaa
+  owner: john
+  reason: first entry
+- key: plugins/middle.py:R1:Widget:lookup:fp=bbb
+  owner: john
+  reason: middle entry
+- key: plugins/last.py:R1:Widget:lookup:fp=ccc
+  owner: john
+  reason: last entry
+"""
+    target_yaml.write_text(original, encoding="utf-8")
+
+    removed = _pop_allow_hits_entry_with_position(target_yaml, middle_key)
+    _append_entry_to_yaml(target_yaml, removed.text, entry_index=removed.index)
+
+    assert removed.index == 1
+    assert target_yaml.read_text(encoding="utf-8") == original
 
 
 def test_justify_readonly_tools_scrubs_judge_rationale_before_persist(

@@ -1,23 +1,38 @@
-import { createHash } from "node:crypto";
-
 import { test, type APIRequestContext, type APIResponse, type Locator, type Page } from "@playwright/test";
 
 import {
   OIDC_EVIDENCE_PHASES,
   OidcEvidenceError,
   buildOidcEvidence,
-  validateAccessToken,
   validateAuthConfig,
+  validateAuthorizationRequest,
+  validateCallbackLanding,
+  validateSessionToken,
   writeOidcBearerHandoff,
   writeOidcEvidence,
-  type OidcAudienceClaim,
   type OidcEvidencePhase,
 } from "./harness/oidc-evidence";
 
+/**
+ * Real-browser evidence for the backend-for-frontend SSO walk (spec D2):
+ *
+ *   SPA button → GET /api/auth/sso/start (302) → IdP authorization request
+ *   → IdP login → GET /api/auth/sso/callback (backend redeems the code as a
+ *   confidential client) → `#/auth/callback?code=<handoff>` on the SPA →
+ *   POST /api/auth/sso/complete → ELSPETH session token → API round trip.
+ *
+ * What is asserted is what the browser can observe: the authorization
+ * request's shape, that the callback lands with a handoff code in the
+ * FRAGMENT and nothing else, that the SPA scrubs the fragment BEFORE it
+ * calls complete, that complete carries the code in a JSON body with no
+ * bearer header, and that the token the SPA adopts is ELSPETH's for THIS
+ * deployment. The IdP's tokens never reach the browser and are not looked
+ * for. The IdP issuer is pinned by the backend, not observable here, and is
+ * therefore not recorded as evidence.
+ */
+
 const MAX_API_RESPONSE_BYTES = 1024 * 1024;
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
-const PKCE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name];
@@ -90,18 +105,17 @@ async function apiCall(
   });
 }
 
-test("completes public-client OIDC and session round trip", async ({ page, request }) => {
+test("completes confidential-client SSO through the handoff and a session round trip", async ({ page, request }) => {
   const stagingOrigin = exactStagingOrigin(requiredEnvironment("STAGING_BASE_URL"));
   const username = requiredEnvironment("OIDC_TEST_USERNAME");
   const password = requiredEnvironment("OIDC_TEST_PASSWORD");
-  const issuer = requiredEnvironment("OIDC_EXPECTED_ISSUER");
   const audience = requiredEnvironment("OIDC_EXPECTED_AUDIENCE");
   const authorizationOrigin = requiredEnvironment("OIDC_EXPECTED_AUTHORIZATION_ORIGIN");
-  const audienceClaim = requiredEnvironment("OIDC_EXPECTED_AUDIENCE_CLAIM") as OidcAudienceClaim;
   const evidencePhase = requiredEnvironment("OIDC_EVIDENCE_PHASE") as OidcEvidencePhase;
   const evidenceFile = requiredEnvironment("OIDC_EVIDENCE_FILE");
   const bearerHandoffFile = process.env.OIDC_BEARER_HANDOFF_FILE;
   requireOidc(OIDC_EVIDENCE_PHASES.includes(evidencePhase), "oidc_evidence_phase");
+  const expected = { audience, authorizationOrigin, stagingOrigin };
 
   const configResponse = await request.get(`${stagingOrigin}/api/auth/config`, {
     failOnStatusCode: false,
@@ -109,67 +123,69 @@ test("completes public-client OIDC and session round trip", async ({ page, reque
     timeout: 15_000,
   });
   requireOidc(configResponse.status() === 200, "oidc_auth_config_status");
-  const authConfig = validateAuthConfig(await boundedJson(configResponse, "oidc_auth_config_body"), {
-    issuer,
-    audience,
-    authorizationOrigin,
-  });
+  const authConfig = validateAuthConfig(await boundedJson(configResponse, "oidc_auth_config_body"), expected);
 
-  let callbackObserved = false;
-  let callbackHadCode = false;
-  let callbackHadState = false;
-  let callbackHadToken = false;
+  // The callback landing: the backend's callback redirects the browser to
+  // the SPA with the handoff code in the fragment. Observed on the frame,
+  // validated for shape only — the code itself is never retained.
+  let callbackLanding: string | null = null;
+  let callbackLandingError: unknown = null;
   page.on("framenavigated", (frame) => {
-    if (frame !== page.mainFrame()) return;
+    if (frame !== page.mainFrame() || callbackLanding !== null) return;
+    const navigated = frame.url();
+    let origin: string;
     try {
-      const navigated = new URL(frame.url());
-      if (navigated.origin === stagingOrigin && (navigated.search !== "" || navigated.hash !== "")) {
-        const fragment = new URLSearchParams(navigated.hash.replace(/^#/, ""));
-        callbackObserved = true;
-        callbackHadCode = navigated.searchParams.has("code");
-        callbackHadState = navigated.searchParams.has("state");
-        callbackHadToken =
-          navigated.searchParams.has("token") ||
-          navigated.searchParams.has("access_token") ||
-          fragment.has("token") ||
-          fragment.has("access_token");
-      }
+      origin = new URL(navigated).origin;
     } catch {
-      // Non-URL intermediate browser states are not callback evidence.
+      return;
+    }
+    if (origin !== stagingOrigin) return;
+    if (!navigated.includes("#/auth/callback")) return;
+    callbackLanding = navigated;
+    try {
+      validateCallbackLanding(navigated, expected);
+    } catch (error) {
+      callbackLandingError = error;
     }
   });
 
-  let expectedChallenge = "";
-  let tokenExchangeChecked = false;
-  let resolveExchange!: () => void;
-  const exchangeObserved = new Promise<void>((resolve) => {
-    resolveExchange = resolve;
+  // The exchange: the SPA posts the handoff code to complete. By then the
+  // fragment must already be gone from the address bar, the body must be
+  // the code alone, and no bearer header may accompany it (there is no
+  // token yet). The response is the ELSPETH token, checked below.
+  let completeChecked = false;
+  let resolveComplete!: () => void;
+  const completeObserved = new Promise<void>((resolve) => {
+    resolveComplete = resolve;
   });
-  await page.route(authConfig.tokenEndpoint, async (route) => {
+  await page.route(`${stagingOrigin}/api/auth/sso/complete`, async (route) => {
     try {
-      const tokenRequest = route.request();
-      const headers = await tokenRequest.allHeaders();
-      const form = new URLSearchParams(tokenRequest.postData() ?? "");
+      const completeRequest = route.request();
+      const headers = await completeRequest.allHeaders();
       const current = new URL(page.url());
-      const transactionRemoved = await page.evaluate(() => sessionStorage.getItem("oidc_transaction") === null);
-      requireOidc(tokenRequest.method() === "POST", "oidc_token_method");
+      let body: unknown = null;
+      try {
+        body = JSON.parse(completeRequest.postData() ?? "null");
+      } catch {
+        body = null;
+      }
+      requireOidc(completeRequest.method() === "POST", "oidc_complete_method");
       requireOidc(current.origin === stagingOrigin && current.search === "" && current.hash === "", "oidc_callback_scrub");
-      requireOidc(transactionRemoved, "oidc_transaction_cleanup");
-      requireOidc(!("authorization" in headers), "oidc_token_authorization");
-      requireOidc(!form.has("client_secret"), "oidc_client_secret");
-      requireOidc(form.get("grant_type") === "authorization_code", "oidc_token_grant");
-      requireOidc(form.get("client_id") === audience, "oidc_token_client");
-      requireOidc(form.get("redirect_uri") === `${stagingOrigin}/`, "oidc_token_redirect");
-      const verifier = form.get("code_verifier") ?? "";
-      requireOidc(PKCE_VERIFIER.test(verifier), "oidc_pkce_verifier");
-      const derivedChallenge = createHash("sha256").update(verifier).digest("base64url");
-      requireOidc(derivedChallenge === expectedChallenge, "oidc_pkce_binding");
-      tokenExchangeChecked = true;
+      requireOidc(!("authorization" in headers), "oidc_complete_authorization");
+      requireOidc(
+        body !== null &&
+          typeof body === "object" &&
+          !Array.isArray(body) &&
+          Object.keys(body).join(",") === "code" &&
+          typeof (body as { code: unknown }).code === "string",
+        "oidc_complete_body",
+      );
+      completeChecked = true;
       await route.continue();
     } catch {
       await route.abort("blockedbyclient");
     } finally {
-      resolveExchange();
+      resolveComplete();
     }
   });
 
@@ -184,18 +200,13 @@ test("completes public-client OIDC and session round trip", async ({ page, reque
     },
     { timeout: 15_000 },
   );
+  const startRequestPromise = page.waitForRequest(authConfig.ssoStartUrl, { timeout: 15_000 });
   await page.getByRole("button", { name: "Sign in with single sign-on", exact: true }).click();
+  // The button is a navigation to the BACKEND's start route; the IdP request
+  // is the backend's 302, not something the page built.
+  await startRequestPromise;
   const authorizationRequest = await authorizationRequestPromise;
-  const authorizationUrl = new URL(authorizationRequest.url());
-  requireOidc(authorizationUrl.origin === authorizationOrigin, "oidc_authorization_origin");
-  requireOidc(authorizationUrl.searchParams.get("response_type") === "code", "oidc_authorization_flow");
-  requireOidc(authorizationUrl.searchParams.get("client_id") === audience, "oidc_authorization_client");
-  requireOidc(authorizationUrl.searchParams.get("code_challenge_method") === "S256", "oidc_pkce_method");
-  expectedChallenge = authorizationUrl.searchParams.get("code_challenge") ?? "";
-  requireOidc(PKCE_CHALLENGE.test(expectedChallenge), "oidc_pkce_challenge");
-  requireOidc(!authorizationUrl.searchParams.has("code_verifier"), "oidc_authorization_verifier");
-  requireOidc(!authorizationUrl.searchParams.has("client_secret"), "oidc_authorization_secret");
-  requireOidc(authorizationUrl.searchParams.get("redirect_uri") === `${stagingOrigin}/`, "oidc_authorization_redirect");
+  validateAuthorizationRequest(authorizationRequest.url(), expected);
 
   await (await firstVisible(page, 'input[name="username"], input#signInFormUsername', "oidc_username_control")).fill(username);
   await (await firstVisible(page, 'input[name="password"], input#signInFormPassword', "oidc_password_control")).fill(password);
@@ -207,15 +218,16 @@ test("completes public-client OIDC and session round trip", async ({ page, reque
     )
   ).click();
 
-  await exchangeObserved;
-  requireOidc(tokenExchangeChecked, "oidc_token_exchange");
+  await completeObserved;
+  requireOidc(completeChecked, "oidc_complete_exchange");
+  requireOidc(callbackLanding !== null, "oidc_callback_observation");
+  if (callbackLandingError !== null) throw callbackLandingError;
   await page.waitForFunction(() => typeof localStorage.getItem("auth_token") === "string", undefined, { timeout: 30_000 });
-  const accessToken = await page.evaluate(() => localStorage.getItem("auth_token"));
-  requireOidc(typeof accessToken === "string" && accessToken.length > 0, "oidc_access_token");
-  requireOidc(callbackObserved && callbackHadCode && callbackHadState && !callbackHadToken, "oidc_callback_observation");
-  const claims = validateAccessToken(accessToken, { issuer, audience, authorizationOrigin, audienceClaim });
+  const sessionToken = await page.evaluate(() => localStorage.getItem("auth_token"));
+  requireOidc(typeof sessionToken === "string" && sessionToken.length > 0, "oidc_session_token");
+  const claims = validateSessionToken(sessionToken, expected);
 
-  const authMe = await apiCall(request, "get", `${stagingOrigin}/api/auth/me`, accessToken);
+  const authMe = await apiCall(request, "get", `${stagingOrigin}/api/auth/me`, sessionToken);
   const authMeStatus = authMe.status();
   requireOidc(authMeStatus === 200, "oidc_auth_me");
 
@@ -225,13 +237,13 @@ test("completes public-client OIDC and session round trip", async ({ page, reque
   let sessionDeleteStatus = 0;
   let sessionFailure: unknown = null;
   try {
-    const created = await apiCall(request, "post", `${stagingOrigin}/api/sessions`, accessToken, {});
+    const created = await apiCall(request, "post", `${stagingOrigin}/api/sessions`, sessionToken, {});
     sessionCreateStatus = created.status();
     requireOidc(sessionCreateStatus === 201, "oidc_session_create");
     const createdPayload = await boundedJson(created, "oidc_session_create_body");
     requireOidc(typeof createdPayload.id === "string" && SESSION_ID.test(createdPayload.id), "oidc_session_identity");
     sessionId = createdPayload.id;
-    const read = await apiCall(request, "get", `${stagingOrigin}/api/sessions/${sessionId}`, accessToken);
+    const read = await apiCall(request, "get", `${stagingOrigin}/api/sessions/${sessionId}`, sessionToken);
     sessionReadStatus = read.status();
     requireOidc(sessionReadStatus === 200, "oidc_session_read");
     const readPayload = await boundedJson(read, "oidc_session_read_body");
@@ -240,7 +252,7 @@ test("completes public-client OIDC and session round trip", async ({ page, reque
     sessionFailure = error;
   } finally {
     if (sessionId !== null) {
-      const deleted = await apiCall(request, "delete", `${stagingOrigin}/api/sessions/${sessionId}`, accessToken);
+      const deleted = await apiCall(request, "delete", `${stagingOrigin}/api/sessions/${sessionId}`, sessionToken);
       sessionDeleteStatus = deleted.status();
     }
   }
@@ -248,16 +260,13 @@ test("completes public-client OIDC and session round trip", async ({ page, reque
   requireOidc(sessionDeleteStatus === 204, "oidc_session_delete");
 
   if (bearerHandoffFile !== undefined && bearerHandoffFile !== "") {
-    writeOidcBearerHandoff(bearerHandoffFile, accessToken);
+    writeOidcBearerHandoff(bearerHandoffFile, sessionToken);
   }
 
   const evidence = buildOidcEvidence({
     phase: evidencePhase,
     timestamp: new Date().toISOString(),
-    issuer,
-    authorizationOrigin,
-    audienceClaim,
-    audience,
+    ...expected,
     subjectSha256: claims.subjectSha256,
     authMeStatus,
     sessionCreateStatus,

@@ -49,11 +49,12 @@ class _LiveAuditRecorder:
 
 
 @pytest.mark.live_aws
+@pytest.mark.live_provider
 @pytest.mark.parametrize("plugin_id", tuple(_LIVE_INPUTS))
 def test_operator_approved_bedrock_guardrail_profile_live(plugin_id: str) -> None:
     gate = os.getenv(_RUN_GATE)
     if gate is None:
-        pytest.skip("live Bedrock Guardrail proof is opt-in")
+        pytest.fail("live Bedrock Guardrail proof gate is required", pytrace=False)
     if gate != "1":
         pytest.fail("live Bedrock Guardrail proof gate is invalid", pytrace=False)
 

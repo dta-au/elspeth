@@ -27,8 +27,31 @@ from elspeth.contracts.types import GateName, NodeID, SinkName
 from elspeth.engine.processor import DAGTraversalContext
 
 # Node types that legitimately appear in traversal with no plugin to execute.
-# Closed vocabulary — extend deliberately, never derive by complement.
-_STRUCTURAL_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE})
+# Closed vocabulary — extend deliberately, never derive by complement. A
+# COLLECTOR node carries a batch-transform plugin, but the traversal never
+# runs it: arrivals are held at the node and the CollectorExecutor invokes
+# the plugin at intake (spec §5), so for traversal it is a barrier exactly
+# like coalesce/row_union.
+# Named for the PREDICATE it answers — "node kinds with nothing for the
+# traversal to execute" — not for a family. The guided lane's plugin-free
+# teaching set shares no members with this beyond coincidence and answers a
+# different question (elspeth-ea38638721): same name there once invited a
+# symbol-name unification that would have handed the traversal invariant the
+# wrong membership.
+_TRAVERSAL_INERT_NODE_TYPES = frozenset({NodeType.SOURCE, NodeType.QUEUE, NodeType.COALESCE, NodeType.ROW_UNION, NodeType.COLLECTOR})
+
+
+def _unaccounted_traversal_nodes_message(unaccounted: Sequence[str]) -> str:
+    """Derived from the set it reports on, so the text cannot drift from the
+    membership test (elspeth-1768ad240c drift 1 named three of five kinds)."""
+
+    inert = ", ".join(sorted(kind.value for kind in _TRAVERSAL_INERT_NODE_TYPES))
+    return (
+        f"DAG traversal contains node(s) with neither a plugin mapping nor a structural role: {unaccounted}. "
+        f"Every traversal node must be plugin-bearing (transform/gate) or traversal-inert ({inert}). "
+        "This indicates graph/config construction drift."
+    )
+
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol, SourceProtocol
@@ -177,6 +200,10 @@ def build_dag_traversal_context(
         node_to_next[node_id] = graph.get_next_node(node_id)
     for coalesce_node_id in graph.get_coalesce_id_map().values():
         node_to_next[coalesce_node_id] = graph.get_next_node(coalesce_node_id)
+    for row_union_node_id in graph.get_row_union_id_map().values():
+        node_to_next[row_union_node_id] = graph.get_next_node(row_union_node_id)
+    for collector_node_id in graph.get_collector_id_map().values():
+        node_to_next[collector_node_id] = graph.get_next_node(collector_node_id)
 
     # Structural nodes are the explicit closed set of node types that carry no
     # plugin: sources (traversal origins), queues (ADR-025 fan-in primitives),
@@ -184,14 +211,12 @@ def build_dag_traversal_context(
     # — a transform/gate missing from node_to_plugin means the graph and the
     # config have drifted, and skipping it would bypass whatever that node
     # enforced (elspeth-c522931bd1).
-    structural_node_ids = frozenset(node_id for node_id in node_to_next if graph.get_node_info(node_id).node_type in _STRUCTURAL_NODE_TYPES)
+    structural_node_ids = frozenset(
+        node_id for node_id in node_to_next if graph.get_node_info(node_id).node_type in _TRAVERSAL_INERT_NODE_TYPES
+    )
     unaccounted = sorted(node_id for node_id in node_to_next if node_id not in node_to_plugin and node_id not in structural_node_ids)
     if unaccounted:
-        raise OrchestrationInvariantError(
-            f"DAG traversal contains node(s) with neither a plugin mapping nor a structural role: {unaccounted}. "
-            "Every traversal node must be plugin-bearing (transform/gate) or structural (source/queue/coalesce). "
-            "This indicates graph/config construction drift."
-        )
+        raise OrchestrationInvariantError(_unaccounted_traversal_nodes_message(unaccounted))
 
     return DAGTraversalContext(
         node_step_map=node_step_map,
@@ -199,5 +224,7 @@ def build_dag_traversal_context(
         node_to_next=node_to_next,
         coalesce_node_map=graph.get_coalesce_id_map(),
         branch_first_node=graph.get_branch_first_nodes(),
+        row_union_node_map=graph.get_row_union_id_map(),
+        collector_node_map=graph.get_collector_id_map(),
         structural_node_ids=structural_node_ids,
     )

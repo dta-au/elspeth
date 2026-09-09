@@ -1,9 +1,7 @@
 """HTTP lifecycle adapter for retry-safe composer mutations.
 
-This module deliberately sits outside ``composer/guided.py``.  Several legacy
-guided handlers carry governance fingerprints whose AST locations are stable;
-centralising the retry protocol here avoids inserting module-level definitions
-above those handlers while the pre-release cutover replaces them.
+This module centralises the retry protocol shared by guided mutation routes:
+lease admission, replay, takeover, settlement, and stable HTTP failure mapping.
 """
 
 from __future__ import annotations
@@ -18,8 +16,12 @@ from uuid import UUID
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.protocol import (
     GuidedOperationActive,
@@ -27,26 +29,33 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationCompleted,
     GuidedOperationConflictError,
     GuidedOperationFailed,
+    GuidedOperationFailureCode,
     GuidedOperationFence,
+    GuidedOperationFenceLostError,
     GuidedOperationKind,
     GuidedOperationOutcome,
     GuidedOperationResult,
+    GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
     SessionServiceProtocol,
 )
 
+from ._helpers import _log_last_resort_diagnostic, slog
+
 _ACTOR = "composer_route"
+# The lease guard's audit-free terminal writes carry their own actor so the
+# durable record says WHO terminalised the operation: a guard-authored
+# ``failed`` event (empty evidence cohort) is the route's own evidence
+# settlement having failed or never run, not a route-recorded failure.
+_GUARD_ACTOR = "guided_operation_lease_guard"
+
+
 _LEASE_SECONDS = 300
+
+
 _POLL_SECONDS = 0.05
 
-# Ceiling for a NEW guided operation waiting on the per-session admission
-# lock. The admission lock is held across the whole respond settlement —
-# including the in-request pipeline planner, observed at 200s+ live — so an
-# unbounded wait turns a competing different-body request (double-click race,
-# second tab) into a silent multi-minute hang that then dies stale. Same-body
-# retries never wait here: they join or replay via the pre-admission lookup.
-# The ceiling absorbs ordinary quick settlements; a planner-length hold
-# answers fast with the coded conflict below.
+
 GUIDED_RESPOND_ADMISSION_WAIT_SECONDS: float = 10.0
 
 
@@ -83,7 +92,31 @@ async def bounded_admission_guard(lock: asyncio.Lock) -> AsyncIterator[None]:
 _SAFE_FAILURES: dict[str, tuple[int, str]] = {
     "provider_unavailable": (503, "The provider is unavailable. Retry with a new operation id."),
     "provider_timeout": (504, "The operation timed out. Retry with a new operation id."),
-    "invalid_provider_response": (502, "The provider returned an invalid response. Retry with a new operation id."),
+    # "Retry the request." rather than "Retry with a new operation id.": the
+    # client already mints a fresh operation id on every re-click, so naming the
+    # id taught the reader an internal protocol detail they cannot act on.
+    "invalid_provider_response": (502, "The provider returned an invalid response. Retry the request."),
+    # Planner-owned non-convergence (elspeth-5904b1683a): the provider
+    # answered every repair turn — presenting exhaustion as the 502 above
+    # blamed the wrong actor. 500 (our planning loop, not a gateway fault)
+    # with an honest retry offer, since the first candidate is
+    # model-stochastic. Kept in lockstep with the freeform mirror
+    # (``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP``).
+    "planner_repair_exhausted": (
+        500,
+        "The composer could not produce a valid pipeline within its repair budget. Retry the request, or revise it if this recurs.",
+    ),
+    # PERMANENT by construction — a deployment policy refused this pipeline, so
+    # the copy must not offer a retry and must not blame the provider. Kept in
+    # lockstep with the freeform mirror
+    # (``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP``) up to one word:
+    # "highlighted" is guided-only, because only the guided review UI pins the
+    # blocked component; freeform has no component highlight.
+    "policy_blocked": (
+        422,
+        "This pipeline is blocked by a deployment policy and cannot be built as configured. "
+        "Change the highlighted component — retrying will fail the same way.",
+    ),
     "stale_conflict": (409, "The guided state changed before settlement. Reload the authoritative state."),
     "integrity_error": (500, "The operation failed an integrity check."),
     "custody_error": (500, "The operation could not establish result custody."),
@@ -95,9 +128,18 @@ _SAFE_FAILURES: dict[str, tuple[int, str]] = {
 
 @dataclass(frozen=True, slots=True)
 class GuidedOperationLease:
-    """A route owns the only fence authorised to perform durable writes."""
+    """A route owns both renewable authorities for one guided operation."""
 
     fence: GuidedOperationFence
+    session_lease: SessionOperationLease
+
+    @property
+    def session_operation_context(self) -> SessionOperationContext:
+        return self.session_lease.context
+
+    async def close(self) -> None:
+        """Release session authority after the guided row is terminal."""
+        await self.session_lease.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +153,7 @@ def guided_response_hash(response: BaseModel) -> str:
     """Hash the complete strict HTTP response domain used for replay."""
 
     config = type(response).model_config
-    if config.get("strict") is not True or config.get("extra") != "forbid":
+    if "strict" not in config or config["strict"] is not True or "extra" not in config or config["extra"] != "forbid":
         raise AuditIntegrityError("Guided operation replay requires a strict, extra-forbid response DTO")
     # Re-validate the emitted representation strictly.  Constructed Pydantic
     # instances can bypass validation through ``model_construct``; a replay
@@ -121,30 +163,267 @@ def guided_response_hash(response: BaseModel) -> str:
 
 
 def raise_guided_operation_failure(outcome: GuidedOperationFailed) -> Never:
-    """Raise the closed HTTP failure represented by a terminal operation."""
+    """Raise the closed HTTP failure represented by a terminal operation.
 
-    safe = _SAFE_FAILURES.get(outcome.failure_code)
-    if safe is None:
-        raise AuditIntegrityError("Guided operation returned an unknown failure code")
-    status_code, detail = safe
-    raise HTTPException(
-        status_code=status_code,
-        detail={
-            "error_type": "guided_operation_terminal_failure",
-            "failure_code": outcome.failure_code,
-            "detail": detail,
-        },
-    )
+    The envelope itself is built by ``guided_operation_failure_error`` at the
+    end of this module; a handler that must show its own raise (a broad
+    ``except`` whose only outcome is this envelope) raises that directly.
+    """
+    raise guided_operation_failure_error(outcome)
 
 
 async def _replay_completed[ResponseT: BaseModel](
     outcome: GuidedOperationCompleted,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
 ) -> ResponseT:
+    """Project the stored response, verify it, and only then repair any debt.
+
+    ``replay`` MUST be side-effect-free: it runs before the integrity check,
+    so a corrupt projection that wrote anything would mutate audit-primary
+    state and only afterwards be rejected. Every write a replay owes belongs
+    in ``after_verified``, which runs solely once the projected response has
+    been proven identical to the stored one.
+    """
+
     response = await replay(outcome.result)
     if guided_response_hash(response) != outcome.response_hash:
         raise AuditIntegrityError("Guided operation replay response hash does not match its stored response hash")
+    if after_verified is not None:
+        await after_verified(outcome.result)
     return response
+
+
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T:
+    """Join owned cleanup despite repeated cancellation of the caller."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+def _record_guided_cleanup_failure(error: BaseException, *, site: str, session_lease: SessionOperationLease) -> None:
+    """Record secondary failures even when HTTP/cancellation hides notes."""
+    _log_last_resort_diagnostic(
+        slog.error,
+        "guided.operation_cleanup_failed",
+        site=site,
+        session_id=session_lease.context.fence.session_id,
+        operation_id=session_lease.context.fence.operation_id,
+        exc_class=type(error).__name__,
+    )
+
+
+def _is_guided_integrity_failure(error: BaseException) -> bool:
+    """Recognise live registered fatal classes, including nested cleanup groups."""
+    if isinstance(error, BaseExceptionGroup):
+        return error.subgroup(contract_errors.TIER_1_ERRORS) is not None
+    return isinstance(error, contract_errors.TIER_1_ERRORS)
+
+
+def _finish_guided_cleanup(
+    primary: BaseException | None,
+    diagnostics: list[tuple[BaseException, str]],
+    session_lease: SessionOperationLease,
+) -> None:
+    """Propagate integrity failures after cleanup, before fallible diagnostics.
+
+    Ordinary cleanup failures retain their bounded last-resort diagnostic. An
+    integrity failure is itself the mandatory error channel; a logger must not
+    replace it. Keep every distinct fatal exception if several phases failed.
+    """
+    fatal: list[BaseException] = []
+    if primary is not None and _is_guided_integrity_failure(primary):
+        fatal.append(primary)
+    for error, _site in diagnostics:
+        if _is_guided_integrity_failure(error) and all(error is not existing for existing in fatal):
+            fatal.append(error)
+    if fatal:
+        if len(fatal) == 1:
+            if fatal[0] is primary:
+                raise fatal[0]
+            raise fatal[0] from primary
+        raise BaseExceptionGroup("Guided operation integrity failures during cleanup", fatal) from primary
+    for error, site in diagnostics:
+        _record_guided_cleanup_failure(error, site=site, session_lease=session_lease)
+
+
+async def run_guided_reconciliation_mutation[T](
+    session_lease: SessionOperationLease,
+    mutation: Awaitable[T],
+) -> T:
+    """Finish one atomic reconciliation before releasing its session fence."""
+
+    async def execute_mutation() -> T:
+        return await mutation
+
+    mutation_task: asyncio.Task[T] = asyncio.create_task(
+        execute_mutation(),
+        name="guided-reconciliation-mutation",
+    )
+    try:
+        result = await asyncio.shield(mutation_task)
+    except asyncio.CancelledError as cancellation:
+        cleanup_diagnostics: list[tuple[BaseException, str]] = []
+        try:
+            await _join_shielded_task_after_cancellation(mutation_task)
+        except BaseException as cleanup_error:
+            cleanup_diagnostics.append((cleanup_error, "reconciliation_mutation"))
+            cancellation.add_note(f"Guided reconciliation cancellation cleanup also failed with {type(cleanup_error).__name__}.")
+        close_task = asyncio.create_task(session_lease.close(), name="guided-reconciliation-session-close")
+        try:
+            await _join_shielded_task_after_cancellation(close_task)
+        except BaseException as close_error:
+            cleanup_diagnostics.append((close_error, "reconciliation_cancelled_close"))
+            cancellation.add_note(f"Guided reconciliation session cleanup also failed with {type(close_error).__name__}.")
+        try:
+            raise cancellation from None
+        finally:
+            _finish_guided_cleanup(cancellation, cleanup_diagnostics, session_lease)
+    except BaseException as primary:
+        cleanup_diagnostics = []
+        try:
+            close_task = asyncio.create_task(session_lease.close(), name="guided-reconciliation-failed-close")
+            await _join_shielded_task_after_cancellation(close_task)
+        except BaseException as close_error:
+            if close_error is not primary:
+                cleanup_diagnostics.append((close_error, "reconciliation_failed_close"))
+                primary.add_note(f"Guided reconciliation session cleanup also failed with {type(close_error).__name__}.")
+        _finish_guided_cleanup(primary, cleanup_diagnostics, session_lease)
+        raise
+    await session_lease.close()
+    return result
+
+
+def _guided_failure_code_for_exception(error: BaseException) -> GuidedOperationFailureCode:
+    if isinstance(error, asyncio.CancelledError):
+        return "request_cancelled"
+    if isinstance(error, GuidedOperationSettlementConflictError) or (isinstance(error, HTTPException) and error.status_code == 409):
+        return "stale_conflict"
+    if isinstance(error, (AuditIntegrityError, InvariantError)):
+        return "integrity_error"
+    return "operation_failed"
+
+
+@dataclass(slots=True)
+class _GuidedOperationLeaseGuard:
+    service: SessionServiceProtocol
+    lease: GuidedOperationLease
+
+    async def __aenter__(self) -> _GuidedOperationLeaseGuard:
+        return self
+
+    async def finish(self, primary: BaseException | None) -> None:
+        """Run exit cleanup from an existing route try/finally envelope."""
+        await self.__aexit__(
+            type(primary) if primary is not None else None,
+            primary,
+            primary.__traceback__ if primary is not None else None,
+        )
+
+    async def finish_active_exception(self) -> None:
+        """Finish using the exception, if any, currently crossing ``finally``."""
+        import sys
+
+        await self.finish(sys.exception())
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        guard_error: BaseException | None = None
+        cleanup_diagnostics: list[tuple[BaseException, str]] = []
+        guided_authority_lost = False
+        if exc_value is None:
+            fail_task = asyncio.create_task(
+                self.service.fail_guided_operation(
+                    self.lease.fence,
+                    failure_code="operation_failed",
+                    actor=_GUARD_ACTOR,
+                    session_operation_context=self.lease.session_operation_context,
+                ),
+                name="guided-operation-guard-prove-terminal",
+            )
+            try:
+                await _join_shielded_task_after_cancellation(fail_task)
+            except GuidedOperationFenceLostError:
+                guided_authority_lost = True
+            except BaseException as proof_error:
+                guard_error = proof_error
+            else:
+                guard_error = AuditIntegrityError("Guided route returned before its guided operation became terminal")
+        elif not isinstance(exc_value, GuidedOperationFenceLostError):
+            fail_task = asyncio.create_task(
+                self.service.fail_guided_operation(
+                    self.lease.fence,
+                    failure_code=_guided_failure_code_for_exception(exc_value),
+                    actor=_GUARD_ACTOR,
+                    session_operation_context=self.lease.session_operation_context,
+                ),
+                name="guided-operation-guard-fail",
+            )
+            try:
+                await _join_shielded_task_after_cancellation(fail_task)
+            except GuidedOperationFenceLostError:
+                guided_authority_lost = True
+            except BaseException as cleanup_error:
+                if cleanup_error is not exc_value:
+                    cleanup_diagnostics.append((cleanup_error, "guard_fail"))
+                    exc_value.add_note(f"Guided-operation failure cleanup also failed with {type(cleanup_error).__name__}.")
+
+        close_task = asyncio.create_task(self.lease.close(), name="guided-operation-guard-close")
+        try:
+            await _join_shielded_task_after_cancellation(close_task)
+        except SessionOperationFenceLost as close_error:
+            primary = exc_value or guard_error
+            if primary is not None:
+                cleanup_diagnostics.append((close_error, "guard_close_fence_lost"))
+                primary.add_note(f"Session-operation guided cleanup also failed with {type(close_error).__name__}.")
+            elif not guided_authority_lost:
+                raise
+        except BaseException as close_error:
+            primary = exc_value or guard_error
+            if primary is None:
+                raise
+            if close_error is not primary:
+                cleanup_diagnostics.append((close_error, "guard_close"))
+                primary.add_note(f"Session-operation guided cleanup also failed with {type(close_error).__name__}.")
+        try:
+            if guard_error is not None:
+                raise guard_error from None
+            caller_task = asyncio.current_task()
+            if exc_value is None and caller_task is not None and caller_task.cancelling() > 0:
+                # Normal route completion has no primary cancellation to re-raise.
+                # The shielded joins still owe cancellation received during cleanup.
+                raise asyncio.CancelledError
+            return False
+        finally:
+            _finish_guided_cleanup(exc_value or guard_error, cleanup_diagnostics, self.lease.session_lease)
+
+
+def guided_operation_lease_guard(
+    *,
+    service: SessionServiceProtocol,
+    lease: GuidedOperationLease,
+) -> _GuidedOperationLeaseGuard:
+    """Encompass all post-claim work and close guided authority first on error."""
+    return _GuidedOperationLeaseGuard(service=service, lease=lease)
+
+
+@contextlib.asynccontextmanager
+async def guided_operation_lock_guard(
+    *,
+    service: SessionServiceProtocol,
+    lease: GuidedOperationLease,
+    lock: asyncio.Lock,
+) -> AsyncIterator[None]:
+    """Enter cleanup authority before awaiting the route's compose lock."""
+    async with guided_operation_lease_guard(service=service, lease=lease), lock:
+        yield
 
 
 @overload
@@ -155,6 +434,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: Literal[False],
     takeover_expired: Literal[False],
 ) -> GuidedOperationLease | GuidedOperationExpired | ResponseT | None: ...
@@ -168,6 +448,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: bool = True,
     takeover_expired: Literal[True] = True,
 ) -> GuidedOperationLease | ResponseT | None: ...
@@ -181,6 +462,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: Literal[True] = True,
     takeover_expired: Literal[False],
 ) -> Never: ...
@@ -193,10 +475,15 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: bool = True,
     takeover_expired: bool = True,
 ) -> GuidedOperationLease | GuidedOperationExpired | ResponseT | None:
     """Claim one operation or synchronously join its immutable terminal result.
+
+    ``replay`` projects the stored response and MUST NOT write: it runs
+    before the response-hash integrity check. Writes a replay owes go in
+    ``after_verified``, which runs only after that check passes.
 
     Active requests are polled to a terminal result.  Once a lease expires the
     caller returns to the atomic reserve primitive, which either performs the
@@ -212,12 +499,15 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     if not takeover_expired and reserve_if_absent:
         raise AuditIntegrityError("Non-taking-over guided operation lookup must not reserve an absent operation")
 
-    operation_id = request.model_dump(mode="python").get("operation_id")
-    if not isinstance(operation_id, str):
+    dumped_request = request.model_dump(mode="python")
+    if "operation_id" not in dumped_request:
+        raise AuditIntegrityError("Strict guided operation request has no operation_id")
+    operation_id = dumped_request["operation_id"]
+    if type(operation_id) is not str:
         raise AuditIntegrityError("Strict guided operation request has a non-string operation_id")
     request_hash = guided_operation_request_hash(session_id=session_id, kind=kind, request=request)
 
-    async def reserve() -> GuidedOperationOutcome:
+    async def reserve(session_lease: SessionOperationLease) -> GuidedOperationOutcome:
         try:
             return await service.reserve_guided_operation(
                 session_id=session_id,
@@ -226,6 +516,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                 request_hash=request_hash,
                 actor=_ACTOR,
                 lease_seconds=_LEASE_SECONDS,
+                session_operation_context=session_lease.context,
             )
         except GuidedOperationConflictError as exc:
             raise HTTPException(
@@ -233,35 +524,120 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                 detail="Operation id is already bound to a different request.",
             ) from exc
 
-    if reserve_if_absent:
-        outcome: GuidedOperationOutcome = await reserve()
-        observed_by_get = False
-    else:
+    try:
+        existing = await service.get_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind=kind,
+            request_hash=request_hash,
+        )
+    except GuidedOperationConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Operation id is already bound to a different request.",
+        ) from exc
+    outcome: GuidedOperationOutcome | None = existing
+    observed_by_get = True
+    session_lease: SessionOperationLease | None = None
+
+    async def acquire_and_reserve() -> GuidedOperationOutcome:
+        nonlocal session_lease
+        operation_kind = SessionOperationKind.SESSION_FORK if kind == "session_fork" else SessionOperationKind.COMPOSE
+        session_lease = await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        reserve_task = asyncio.create_task(reserve(session_lease), name="guided-operation-reserve")
         try:
-            existing = await service.get_guided_operation(
-                session_id=session_id,
-                operation_id=operation_id,
-                kind=kind,
-                request_hash=request_hash,
-            )
-        except GuidedOperationConflictError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="Operation id is already bound to a different request.",
-            ) from exc
-        if existing is None:
+            return await asyncio.shield(reserve_task)
+        except asyncio.CancelledError as cancellation:
+            # Cancellation cleanup must all run and must all be seen. The
+            # reserve task is drained, a claim this caller now owns is failed
+            # as ``request_cancelled``, and the session lease is closed in a
+            # ``finally`` so the close is attempted even when the status write
+            # fails. A cleanup failure is not a footnote to the cancellation:
+            # it escapes in its own right with the cancellation as its
+            # ``__context__`` (and a second failure chains the first), so a
+            # lease this process could not release, or a status row it could
+            # not write, is never reduced to a note or a log line. Only a
+            # fully clean cleanup re-raises the plain cancellation.
+            closed_lease = session_lease
+            session_lease = None
+            try:
+                cancellation_outcome = await _join_shielded_task_after_cancellation(reserve_task)
+                if isinstance(cancellation_outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
+                    fail_task = asyncio.create_task(
+                        service.fail_guided_operation(
+                            cancellation_outcome.fence,
+                            failure_code="request_cancelled",
+                            actor=_ACTOR,
+                            session_operation_context=closed_lease.context,
+                        ),
+                        name="guided-operation-cancelled-reserve-fail",
+                    )
+                    await _join_shielded_task_after_cancellation(fail_task)
+            finally:
+                close_task = asyncio.create_task(closed_lease.close(), name="guided-operation-cancelled-reserve-close")
+                await _join_shielded_task_after_cancellation(close_task)
+            raise cancellation from None
+        except BaseException as primary:
+            closed_lease = session_lease
+            session_lease = None
+            close_task = asyncio.create_task(closed_lease.close(), name="guided-operation-failed-reserve-close")
+            try:
+                await _join_shielded_task_after_cancellation(close_task)
+            except BaseException as close_error:
+                # A session lease this process could not release is a fault of
+                # its own, not a footnote to the reservation failure it
+                # interrupted: raise both. The group keeps an integrity primary
+                # recognisable to ``_is_guided_integrity_failure`` and leaves
+                # nothing riding under a log line. (The cancellation arm above
+                # lets its cleanup failure escape directly, with the
+                # cancellation as ``__context__``; the group form here is for
+                # two independent failures that both deserve the top level.)
+                raise BaseExceptionGroup(
+                    "Guided operation reservation failed and its session lease could not be released",
+                    [primary, close_error],
+                ) from None
+            raise
+
+    if outcome is None:
+        if not reserve_if_absent:
             return None
-        outcome = existing
-        observed_by_get = True
+        outcome = await acquire_and_reserve()
+        observed_by_get = False
     while True:
-        if isinstance(outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
-            return GuidedOperationLease(fence=outcome.fence)
-        if isinstance(outcome, GuidedOperationCompleted):
-            return await _replay_completed(outcome, replay)
-        if isinstance(outcome, GuidedOperationFailed):
+        # ``GuidedOperationOutcome`` is a closed union of five exact,
+        # unsubclassed frozen dataclasses this package owns, so the exact-type
+        # form is the house idiom for the positive arms. The terminal guard
+        # below is the nominal fail-closed check (ADR-032) over that closed
+        # union: anything that is not the one surviving member raises
+        # ``AuditIntegrityError`` rather than being polled. (Both ``isinstance``
+        # and ``type(x) is`` narrow the survivor under mypy; the choice is
+        # house form, not a typing constraint.)
+        if type(outcome) is GuidedOperationClaimed or type(outcome) is GuidedOperationTakenOver:
+            if session_lease is None:
+                raise AuditIntegrityError("Guided operation claim has no owning session lease")
+            return GuidedOperationLease(fence=outcome.fence, session_lease=session_lease)
+        if type(outcome) is GuidedOperationCompleted:
+            if session_lease is not None:
+                await session_lease.close()
+                session_lease = None
+            return await _replay_completed(outcome, replay, after_verified)
+        if type(outcome) is GuidedOperationFailed:
+            if session_lease is not None:
+                await session_lease.close()
+                session_lease = None
             raise_guided_operation_failure(outcome)
         if not isinstance(outcome, GuidedOperationActive):
             raise AuditIntegrityError("Guided operation reserve returned an unknown outcome")
+
+        if session_lease is not None:
+            await session_lease.close()
+            session_lease = None
 
         if outcome.expired and observed_by_get:
             if not takeover_expired:
@@ -269,7 +645,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
             # ``expired`` is computed against the database clock by the read
             # primitive. Never compare the persisted timestamp with the web
             # host clock: even modest skew can create a tight reserve loop.
-            outcome = await reserve()
+            outcome = await acquire_and_reserve()
             observed_by_get = False
             continue
         await asyncio.sleep(_POLL_SECONDS)
@@ -289,3 +665,52 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
             raise AuditIntegrityError("Guided operation disappeared while a caller was joining it")
         outcome = observed
         observed_by_get = True
+
+
+def guided_operation_failure_error(outcome: GuidedOperationFailed) -> HTTPException:
+    """Build the closed HTTP failure represented by a terminal operation.
+
+    ``raise_guided_operation_failure`` is the ``Never`` form most call sites
+    want; a handler that must show its own raise (a broad ``except`` whose
+    only outcome is this envelope) raises the built error directly instead.
+
+    ``unproducible_output_fields`` names the reviewed output fields no reviewed
+    source declares or observes, when the planner exhausted its budget on a
+    request that carried that gap (R2-F4). Without it the operator reads only
+    "the provider returned an invalid response" — a dead end — while the server
+    holds the exact, actionable cause. Guided-only by construction: freeform has
+    no reviewed output, so the mirrored freeform table in
+    ``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP`` deliberately has no
+    counterpart. That is the same guided-only divergence as "highlighted" in the
+    ``policy_blocked`` copy, and for the same reason — this surface knows a fact
+    the other cannot.
+
+    The names are the operator's own step-2 ``custom_inputs`` strings (field
+    review admits ``chosen`` only from the reviewed sources' observed columns
+    and forbids custom names from overlapping them), so returning them to the
+    same operator discloses nothing. They ride BOTH as a structured field for
+    API consumers and appended to ``detail``, because the web client projects
+    only a fixed set of envelope keys and would otherwise drop the structured
+    form silently.
+    """
+
+    if outcome.failure_code not in _SAFE_FAILURES:
+        raise AuditIntegrityError("Guided operation returned an unknown failure code")
+    status_code, detail = _SAFE_FAILURES[outcome.failure_code]
+    body: dict[str, object] = {
+        "error_type": "guided_operation_terminal_failure",
+        "failure_code": outcome.failure_code,
+        "detail": detail,
+    }
+    if outcome.unproducible_output_fields:
+        body["unproducible_output_fields"] = list(outcome.unproducible_output_fields)
+        # States only what is known — that nothing reviewed supplies these
+        # fields — never that the pipeline "would fail at runtime", which this
+        # surface cannot prove for a source whose field inventory is unknown
+        # rather than empty.
+        body["detail"] = (
+            f"{detail} No reviewed source declares or observes these output fields: "
+            f"{', '.join(outcome.unproducible_output_fields)}. Add a step that produces them, or remove them "
+            "from the output's fields."
+        )
+    return HTTPException(status_code=status_code, detail=body)

@@ -20,17 +20,26 @@ Contract:
 from __future__ import annotations
 
 import csv
+import hmac
 import io
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
+from elspeth.contracts.blobs import (
+    BlobContentMissingError,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobServiceProtocol,
+    BlobStateError,
+)
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.sources.field_normalization import resolve_field_names
@@ -43,6 +52,7 @@ SourceKind = Literal["csv", "jsonl", "json", "text", "unknown"]
 
 InferredType = Literal["int", "float", "bool", "str", "null"]
 DeclaredFieldSpec = str | Mapping[str, Any]
+SOURCE_INSPECTION_INTEGRITY_ERRORS = (BlobContentMissingError, BlobIntegrityError)
 
 
 _URL_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bhttps?://[^\s<>\"']+")
@@ -96,6 +106,120 @@ class SourceInspectionFacts:
             raise ValueError(f"SourceInspectionFacts.byte_range_inspected must satisfy 0 <= start <= end; got ({start}, {end})")
         if self.sample_row_count < 0:
             raise ValueError(f"SourceInspectionFacts.sample_row_count must be non-negative; got {self.sample_row_count}")
+
+
+class SourceInspectionBlobLifecycleError(ValueError):
+    """A selected ready blob changed lifecycle state before inspection."""
+
+
+def resolve_source_inspection_blob_id(
+    *,
+    selected_blob_id: UUID | None,
+    ready_blob_ids: Sequence[UUID],
+) -> UUID | None:
+    """Resolve one immutable ready-blob identity for guided source inspection.
+
+    An explicit selection is authoritative when it names a ready blob in the
+    current session. The legacy no-selection path remains usable only when the
+    ready set contains exactly one blob. Multiple ready blobs are deliberately
+    ambiguous: their order is temporal session state, not source intent.
+    """
+    if selected_blob_id is not None and type(selected_blob_id) is not UUID:
+        raise TypeError("selected_blob_id must be UUID or None")
+    ready = tuple(ready_blob_ids)
+    if any(type(blob_id) is not UUID for blob_id in ready):
+        raise TypeError("ready_blob_ids must contain UUID values")
+    if len(set(ready)) != len(ready):
+        raise InvariantError("ready_blob_ids must contain unique blob identities")
+    if selected_blob_id is not None:
+        if selected_blob_id not in ready:
+            raise ValueError("selected source blob is not ready in this session")
+        return selected_blob_id
+    return ready[0] if len(ready) == 1 else None
+
+
+async def inspect_selected_ready_session_blob(
+    blob_service: BlobServiceProtocol,
+    session_id: UUID,
+    *,
+    selected_blob_id: UUID | None,
+    session_operation_context: SessionOperationContext,
+) -> SourceInspectionFacts | None:
+    """Inspect one explicit or unambiguous ready blob owned by a session.
+
+    An explicit ``selected_blob_id`` resolves with a direct, session-qualified
+    ``get_blob`` lookup rather than listing every blob in the session and
+    filtering in Python — a session can accumulate an unbounded number of
+    blobs, and every guided selection previously paid the cost of
+    materializing all of them just to find the one the caller named.
+
+    The no-selection legacy path (exactly one ready blob resolves
+    unambiguously) still needs the full listing, and deliberately keeps
+    ``limit=None``: ready-status filtering happens in Python after the
+    fetch, so passing a numeric page limit here could return a page of
+    non-ready blobs and miss the one ready blob further down — silently
+    turning an unambiguous inspection into a false ``None``.
+    """
+    if selected_blob_id is not None and type(selected_blob_id) is not UUID:
+        raise TypeError("selected_blob_id must be UUID or None")
+
+    if selected_blob_id is not None:
+        try:
+            record = await blob_service.get_blob(selected_blob_id, session_operation_context=session_operation_context)
+        except BlobNotFoundError as exc:
+            raise ValueError("selected source blob is not ready in this session") from exc
+        if record.session_id != session_id or record.status != "ready":
+            raise ValueError("selected source blob is not ready in this session")
+    else:
+        records = await blob_service.list_blobs(session_id, limit=None)
+        ready_records = tuple(r for r in records if r.status == "ready")
+        resolved_blob_id = resolve_source_inspection_blob_id(
+            selected_blob_id=None,
+            ready_blob_ids=tuple(r.id for r in ready_records),
+        )
+        if resolved_blob_id is None:
+            return None
+        record = next(r for r in ready_records if r.id == resolved_blob_id)
+
+    try:
+        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(
+            record.id,
+            prefix_bytes=_MAX_BYTES,
+            session_operation_context=session_operation_context,
+        )
+    except (BlobNotFoundError, BlobStateError) as exc:
+        raise SourceInspectionBlobLifecycleError from exc
+    if record.content_hash is None:
+        raise AuditIntegrityError("ready source-inspection blob has no content hash")
+    # Not redundant with the store's own internal verification, even though
+    # every compliant implementation already verifies bytes against its own
+    # freshly-read row before returning them: `record` here is a separately
+    # obtained snapshot (from `get_blob`/`list_blobs`, taken before this
+    # read), so this independently certifies that *this* module's own audit
+    # claim — the `content_hash_prefix` stamped into redacted_identity below
+    # — matches the bytes actually inspected, rather than relaying an
+    # unverified claim about a `BlobServiceProtocol` implementation's
+    # internals. `read_blob_content_prefix_verified` streams the blob in
+    # bounded chunks and verifies one full-content sha256 incrementally —
+    # `verified_hash` below is that single digest, checked against
+    # `record.content_hash`. Exactly one hash pass over the bytes, with
+    # memory bounded to chunk size + the inspection prefix regardless of
+    # blob size — a prefix/bounded read alone could never serve this check,
+    # since a partial digest can never validate a full-content hash.
+    if not hmac.compare_digest(verified_hash, record.content_hash):
+        raise BlobIntegrityError(
+            str(record.id),
+            expected=record.content_hash,
+            actual=verified_hash,
+        )
+    return inspect_blob_content(
+        content=prefix,
+        filename=record.filename,
+        mime_type=record.mime_type,
+        blob_id=record.id,
+        content_hash=record.content_hash,
+        total_size_bytes=total_size,
+    )
 
 
 def inspect_blob_content(
@@ -171,25 +295,6 @@ def observed_columns_from_content(*, content: bytes, filename: str, mime_type: s
     """
     facts = inspect_blob_content(content=content, filename=filename, mime_type=mime_type)
     return facts.observed_headers or ()
-
-
-def observed_columns_from_path(*, path: Path, filename: str, mime_type: str) -> tuple[str, ...]:
-    """Bounded-read variant of :func:`observed_columns_from_content` for a file.
-
-    Reads at most ``_MAX_BYTES`` from ``path`` — the exact window
-    :func:`inspect_blob_content` would inspect — instead of slurping the whole
-    file, so backfilling a header from a large blob does not allocate the entire
-    upload. A missing or unreadable file (``OSError`` — not found, permission
-    denied, is-a-directory, or a mid-read I/O failure) degrades to ``()``:
-    column backfill is best-effort enrichment, never a gate on committing the
-    source. The read bound stays private to this module.
-    """
-    try:
-        with path.open("rb") as handle:
-            prefix = handle.read(_MAX_BYTES)
-    except OSError:
-        return ()
-    return observed_columns_from_content(content=prefix, filename=filename, mime_type=mime_type)
 
 
 def inspect_csv_source_content(
@@ -324,7 +429,12 @@ def _redact_url_candidate(raw_url: str) -> str:
     matches those — so the port access is guarded and a bad port is simply
     dropped (host hint preserved) rather than propagated up through inspection.
     """
-    parts = urlsplit(raw_url)
+    try:
+        parts = urlsplit(raw_url)
+    except ValueError:
+        # An invalid authority (brackets or NFKC-sensitive delimiters) has
+        # no trustworthy host hint. Preserve an explicit redaction marker.
+        return _REDACTED_URL_PART
     host = parts.hostname
     if not parts.scheme or not host:
         return _REDACTED_URL_PART
@@ -515,14 +625,23 @@ def _inspect_csv(
 
     # CSV duplicate headers: pandas / csv.DictReader collapse duplicates
     # silently (last-write-wins), which fabricates a single column from
-    # multiple source columns. Surface the duplicates as a warning so the
-    # operator can rename or use field_mapping; do not fabricate a
+    # multiple source columns. Surface only the duplicate equivalence-class
+    # count and affected positions: a malformed or headerless CSV can make
+    # the first data row look like headers, so the raw values must not cross
+    # the blob metadata-only boundary in a warning copied to model diagnostics
+    # or persisted in durable guided inspection state. Do not fabricate a
     # disambiguated key here.
     if len(set(headers)) < len(headers):
         counts = Counter(headers)
-        dupes = sorted(name for name, count in counts.items() if count > 1)
+        duplicate_values = {name for name, count in counts.items() if count > 1}
+        duplicate_positions = [index for index, name in enumerate(headers, start=1) if name in duplicate_values]
         warnings.append(
-            f"csv_duplicate_headers: header(s) {dupes} appear multiple times — downstream consumers may collapse them; rename or use field_mapping"
+            f"csv_duplicate_headers: {len(duplicate_values)} duplicate header value class(es) "
+            f"across {len(duplicate_positions)} column position(s) {duplicate_positions} of "
+            f"{len(headers)}; header values redacted — downstream consumers may collapse "
+            "them; for a genuine header row, correct the source so every header is unique "
+            "and re-upload it. If the source is genuinely headerless and its first data "
+            "row was misclassified as headers, declare explicit unique columns instead"
         )
 
     # If the first row looks like data (every cell parseable as int/float/bool),
@@ -549,6 +668,27 @@ def _inspect_csv(
             types_per_column[header].append(_infer_scalar_type(value))
 
     inferred = {h: _merge_types(types_per_column[h]) for h in headers}
+
+    lexical_typed_count = sum(1 for t in inferred.values() if t in ("int", "float", "bool"))
+    if lexical_typed_count:
+        # The inferred int/float/bool hints are LEXICAL observations of quoted
+        # CSV text. At runtime the csv source delivers every value as str
+        # unless the source schema declares the field's type (declared fields
+        # are coerced at ingestion). Without this framing, planners transcribe
+        # the lexical hint into a downstream node's declared input type and
+        # every row dies at that node's preflight (elspeth-e6e552ce34).
+        # Column names are withheld — headerless/malformed CSV can make a data
+        # row look like headers, and this warning is mirrored into
+        # model-visible proof diagnostics; the names are readable from
+        # inferred_types itself where that surface is appropriate.
+        warnings.append(
+            f"csv_lexical_types_advisory: {lexical_typed_count} column(s) have "
+            "int/float/bool inferred_types — these are lexical observations of CSV "
+            "text. At runtime every csv value arrives as str unless the SOURCE "
+            "schema declares the field's type (declared source fields are coerced "
+            "at ingestion). Do not copy an inferred type into a downstream node's "
+            "schema without declaring it on the source or inserting a type_coerce."
+        )
 
     # URL hints inside data cells — sometimes a CSV has a URL column that
     # downstream needs to feed web_scrape.
@@ -797,11 +937,11 @@ def _inspect_text(
 
     if len(lines) == 1 and url_candidates and url_candidates[0] == lines[0].strip():
         warnings.append(
-            "text content is a single URL — pipeline must wire web_scrape to fetch the URL "
+            "text content is a single URL — pipeline must wire a compatible HTTP fetch transform "
             "(text source emits the URL string itself, not the URL's content)"
         )
     elif url_candidates:
-        warnings.append("text content contains URL(s); consider web_scrape downstream if URL fetch is intended")
+        warnings.append("text content contains URL(s); consider a compatible HTTP fetch transform if URL fetch is intended")
 
     return SourceInspectionFacts(
         source_kind="text",
@@ -992,9 +1132,13 @@ def derive_extra_column_risk(
     """
     if declared_fields is None or facts.observed_headers is None:
         return ()
-    declared_lower = {name.lower() for field in declared_fields if (name := _declared_field_name(field)) is not None}
-    resolved_headers = _csvsource_resolved_observed_headers(facts, field_mapping=field_mapping)
-    missing = tuple(h for h in resolved_headers if h.lower() not in declared_lower)
+    # Compare in the runtime's name space (elspeth-3664e213c4): observed
+    # headers resolved through the same normalization the source applies,
+    # against declared names verbatim. Case-folding here hid exactly the
+    # mismatch this check exists to flag — the runtime never folds case.
+    declared = {name for field in declared_fields if (name := _declared_field_name(field)) is not None}
+    resolved_headers = _runtime_resolved_observed_headers(facts, field_mapping=field_mapping)
+    missing = tuple(h for h in resolved_headers if h not in declared)
     return missing
 
 
@@ -1021,25 +1165,42 @@ def derive_required_header_mismatch_risk(
     if not required_names:
         return ()
 
-    observed_lower = {header.lower() for header in _csvsource_resolved_observed_headers(facts, field_mapping=field_mapping)}
-    required_lower = {name.lower() for name in required_names}
-    if observed_lower & required_lower:
+    # Compare in the runtime's name space (elspeth-3664e213c4): resolved
+    # observed headers against declared names verbatim, exactly as the
+    # source's model_validate will. Case-folding here reported "no risk" for
+    # a declaration that discards 100% of rows.
+    observed = set(_runtime_resolved_observed_headers(facts, field_mapping=field_mapping))
+    if observed & set(required_names):
         return ()
     return tuple(required_names)
 
 
-def _csvsource_resolved_observed_headers(
+def _runtime_resolved_observed_headers(
     facts: SourceInspectionFacts,
     *,
     field_mapping: Mapping[str, str] | None,
 ) -> tuple[str, ...]:
+    """Observed headers as the source plugin's resolution would produce them.
+
+    The risk gates above compare declared names against these, so they must be
+    in the runtime's final name space (elspeth-3664e213c4). CSV headers and
+    JSON object keys are both normalized at the source boundary; JSON-family
+    sources resolve sparsely (``require_all_mapping_keys=False``), so a mapped
+    key absent from the sample is not a config error here either. Other kinds
+    (text/unknown) have no observed headers to resolve.
+    """
     if facts.observed_headers is None:
         return ()
-    if facts.source_kind != "csv":
+    if facts.source_kind == "csv":
+        require_all_mapping_keys = True
+    elif facts.source_kind in ("json", "jsonl"):
+        require_all_mapping_keys = False
+    else:
         return facts.observed_headers
     resolution = resolve_field_names(
         raw_headers=list(facts.observed_headers),
         field_mapping=dict(field_mapping) if field_mapping is not None else None,
         columns=None,
+        require_all_mapping_keys=require_all_mapping_keys,
     )
     return resolution.final_headers

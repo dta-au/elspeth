@@ -7,14 +7,16 @@ from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.protocol import SessionRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.helpers.session_fences import RecordingSessionOperationAuthority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # Phase 8 Sub-task 7f (Q7 FastAPI route-table probe). Verifies the
@@ -28,7 +30,7 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 # audit-trail gap the policy forbids. Decoupled from the production
 # app so test discovery doesn't pay full-app-import cost.
 _router_for_probe = create_audit_readiness_router()
-if not any(getattr(r, "path", "").endswith("/audit-readiness") for r in _router_for_probe.routes):
+if not any(isinstance(route, APIRoute) and route.path.endswith("/audit-readiness") for route in _router_for_probe.routes):
     raise RuntimeError(
         "Phase 2C audit-readiness endpoint not mounted on "
         "create_audit_readiness_router(). The four Sub-task 7f "
@@ -41,6 +43,12 @@ _SESSION_ID = UUID("11111111-1111-1111-1111-111111111111")
 
 
 class _SessionService:
+    # The snapshot route acquires a real BLOB_READ SessionOperationLease
+    # through these three members before calling the readiness service.
+    session_operation_authority = RecordingSessionOperationAuthority()
+    session_operation_owner_instance_id = "audit-readiness-route-test"
+    session_operation_lease_seconds = 30
+
     async def get_session(self, session_id: UUID) -> SessionRecord:
         return SessionRecord(
             id=session_id,
@@ -53,7 +61,9 @@ class _SessionService:
 
 
 class _ExplodingReadinessService:
-    async def compute_snapshot(self, *, session_id: UUID, user_id: str):
+    # Mirrors ReadinessService.compute_snapshot's REQUIRED keyword-only context;
+    # a fake that defaulted it would pass even if the route stopped threading it.
+    async def compute_snapshot(self, *, session_id: UUID, user_id: str, session_operation_context: SessionOperationContext):
         raise LookupError("internal dict lookup exploded")
 
 
@@ -76,7 +86,6 @@ def _client() -> TestClient:
     )
     app.state.session_service = _SessionService()
     app.state.readiness_service = _ExplodingReadinessService()
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
     # Phase 8 Sub-task 7f. The route reads ``app.state.sessions_telemetry``
     # in the exception path to emit ``composer.audit.fetch_failure_total``.
     # Tests use the fake-counter container so ``observed_value`` can
@@ -134,7 +143,7 @@ def test_snapshot_composition_state_not_found_does_not_emit_fetch_failure() -> N
     from elspeth.web.audit_readiness.service import CompositionStateNotFoundError
 
     class _NotFoundReadinessService:
-        async def compute_snapshot(self, *, session_id: UUID, user_id: str):
+        async def compute_snapshot(self, *, session_id: UUID, user_id: str, session_operation_context: SessionOperationContext):
             raise CompositionStateNotFoundError(str(session_id))
 
     app = FastAPI()
@@ -152,7 +161,6 @@ def test_snapshot_composition_state_not_found_does_not_emit_fetch_failure() -> N
     )
     app.state.session_service = _SessionService()
     app.state.readiness_service = _NotFoundReadinessService()
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.sessions_telemetry = build_sessions_telemetry()
     app.include_router(create_audit_readiness_router())
     with TestClient(app) as client:
@@ -240,7 +248,6 @@ def _explain_app(session_service: object) -> FastAPI:
     )
     app.state.session_service = session_service
     app.state.readiness_service = _ExplodingReadinessService()
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.sessions_telemetry = build_sessions_telemetry()
     app.include_router(create_audit_readiness_router())
     return app

@@ -17,6 +17,28 @@ def test_plugin_id_is_kind_qualified_and_strict() -> None:
             PluginId.parse(raw)
 
 
+def test_plugin_id_for_name_returns_none_instead_of_raising_on_untrusted_names() -> None:
+    """``for_name`` is the non-raising parse the web policy layer authors against."""
+    assert PluginId.for_name("transform", "llm") == PluginId("transform", "llm")
+
+    # Malformed authored names, and names that are not strings at all, are an
+    # explicit absence rather than a ValueError driven as control flow.
+    for name in ("LLM", "llm-v2", "", "1llm", "transform:llm"):
+        assert PluginId.for_name("transform", name) is None
+    for value in (None, 7, b"llm", ["llm"], {"name": "llm"}):
+        assert PluginId.for_name("source", value) is None
+
+    # for_name must reject EXACTLY what the constructor rejects. It re-states the
+    # grammar rather than driving __post_init__, so this pairing is what stops the
+    # two from drifting into a ValueError escaping an interface typed `| None`.
+    for name in ("llm", "aws_s3", "field_mapper", "LLM", "llm-v2", "", "1llm", "transform:llm", "llm "):
+        try:
+            constructed: PluginId | None = PluginId("transform", name)
+        except ValueError:
+            constructed = None
+        assert PluginId.for_name("transform", name) == constructed
+
+
 def test_policy_is_deeply_immutable() -> None:
     policy = WebPluginPolicy.create(
         required=frozenset({PluginId("transform", "llm")}),

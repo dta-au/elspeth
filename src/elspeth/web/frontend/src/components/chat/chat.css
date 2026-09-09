@@ -4,13 +4,15 @@
    .message-bubble-content*, .bubble-action-overlay*, .message-edit-*,
    .message-failed-*, .message-retry-btn, .message-pending, .message-tools*,
    .message-sources-created*, .inline-source-created-turn*,
+   .inline-source-disambiguation-turn*,
    .message-group-separator, .tool-call-*, .pending-proposals-banner*,
    .inline-source-fallback-prompt*, .pending-overlay-pill, .spec-pending-proposal,
    .yaml-pending-summary, .runs-pending-proposal, .composing-*,
-   .freeform-introduction, .chat-model-chip*, .proposal-diff*.
-   Tenants (execution-named but chat-mounted — they render inside the chat
-   panel via inline run results):
-     .inline-run-results*, .run-outputs-panel*, .run-output-artifact*. */
+   .freeform-introduction, .proposal-diff*.
+   Tenants (execution- or composer-named but chat-mounted — they render
+   inside the chat panel via inline run results):
+     .inline-run-results*, .run-outputs-panel*, .run-output-artifact*,
+     .narrative-results*. */
 
 /* ---------------------------------------------------------------------------
    Chat Bubble Base Styles
@@ -32,6 +34,16 @@
 
 .bubble .markdown-body {
   line-height: inherit;
+  /* Size inherits from the bubble for the same reason leading does
+     (elspeth-b6e82c12bb): common.css sets .markdown-body { font-size:
+     var(--font-size-sm) }, which is a DESCENDANT of .bubble, so the markdown
+     path governed the assistant's type regardless of what
+     .message-bubble-content set on the bubble box — operator prose rendered
+     16px against the composer's 13px in one column. Binding size to the
+     bubble makes .message-bubble-content the single place the transcript's
+     size is chosen, and keeps .bubble-system / .trusted-system-notice
+     markdown at their own declared 13px. */
+  font-size: inherit;
   /* The bubble uses white-space: pre-wrap so plain-text content (e.g. user
      messages, system notices) preserves authored newlines. Markdown-rendered
      content already structures its breaks via block elements, and the
@@ -65,6 +77,19 @@
   margin: 0;
 }
 
+/* First/last block flush with the bubble's own padding (elspeth-f17c7a819f) —
+   the same reset .trusted-system-notice carries below. Without it the 12px
+   paragraph margins above stacked on top of the bubble's 12px block padding,
+   so an assistant bubble carried a 24px internal inset against the user
+   bubble's 12px and the two speakers had no shared rhythm. */
+.bubble .markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.bubble .markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
 .bubble-user {
   align-self: flex-end;
   background-color: var(--color-bubble-user);
@@ -77,9 +102,11 @@
   border: 1px solid var(--color-bubble-assistant-border);
   /* Left-edge accent: lifts the assistant bubble's visual containment without
      touching its background saturation or the user-bubble visual weight. The
-     2px accent reads as "system attestation" against the workspace canvas
-     where the 18%-alpha border alone fell to ~2:1 and was barely visible. */
-  border-left: 2px solid var(--color-border-strong);
+     accent reads as "system attestation" against the workspace canvas where
+     the 18%-alpha border alone fell to ~2:1 and was barely visible.
+     3px is the ONE transcript accent width (elspeth-ed88648dee) — see the
+     note on .tool-call-card. */
+  border-left: 3px solid var(--color-border-strong);
 }
 
 .bubble-system {
@@ -91,6 +118,84 @@
   color: var(--color-text-muted);
   font-style: italic;
   font-size: var(--font-size-sm);
+}
+
+.trusted-system-notice {
+  margin-top: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--color-border-strong);
+  border-left: 3px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-bubble-system);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.trusted-system-notice .markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.trusted-system-notice .markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+/* Interpretation-approval register (elspeth-3574f87208). A resolve
+   confirmation is a SYSTEM attestation of an operator decision, not
+   assistant speech — it must never compose .bubble-assistant, which asserts
+   an assistant reply (unanchorable confirmations at the transcript tail read
+   as replies to the newest message). Same third-register move as
+   .trusted-system-notice: muted, bordered, left-edge accent (3px is the ONE
+   transcript accent width, elspeth-ed88648dee), success tokens because the
+   note attests a completed approval. */
+.message-row--interpretation-approval {
+  justify-content: flex-start;
+}
+
+.interpretation-approval-note {
+  max-width: min(92%, 74ch);
+  padding: var(--space-xs) var(--space-md);
+  border: 1px solid var(--color-success-border);
+  border-left: 3px solid var(--color-success);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-success-bg);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-snug);
+  word-break: break-word;
+}
+
+.interpretation-approval-check {
+  color: var(--color-success);
+}
+
+.interpretation-approval-time {
+  margin-left: var(--space-sm);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+/* Labeled home for approvals that cannot anchor beside a turn — sentinel
+   (backend-auto-surfaced), guided-raised, and seed/revert/import rows
+   (elspeth-3574f87208). The border-top + heading segment the block away from
+   the dialogue so it stops reading as a reply to the newest turn; the count
+   lives in the heading, the per-row node clause stays (elspeth-52be5924d7). */
+.interpretation-approvals-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-top: var(--space-lg);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--color-border);
+}
+
+.interpretation-approvals-heading {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 /* A guided synthetic-failure turn (C-2, composer first-principles review
@@ -105,11 +210,19 @@
   align-self: flex-start;
   background-color: var(--color-error-bg);
   border: 1px solid var(--color-error-border);
-  border-left: 2px solid var(--color-error);
+  border-left: 3px solid var(--color-error);
   color: var(--color-text);
 }
 
-/* Action buttons on message bubbles — subtly visible, then emphasized on hover/focus */
+/* Action buttons on message bubbles — legible at rest, emphasized on
+   hover/focus.
+
+   Cascade note (elspeth-8174010851): MessageBubble applies BOTH this class
+   and .bubble-action-overlay to ONE element, at equal specificity (0,1,0), so
+   the later .bubble-action-overlay rule wins every property the two share.
+   The 36×36 compact floor below is therefore the size of record only because
+   .bubble-action-overlay was brought onto the same token — do not reintroduce
+   a 44px override there, and do not re-split these declarations. */
 .bubble-copy-btn,
 .bubble-edit-btn {
   /* Base sizing: previously only opacity was declared and intrinsic content
@@ -126,7 +239,11 @@
   color: var(--color-text-muted);
   border-radius: var(--radius-sm);
   cursor: pointer;
-  opacity: 0.3;
+  /* Resting opacity was 0.3, which put the glyph far below any legible
+     threshold: a control invisible until hover is undiscoverable. Paired with
+     the resting chip on .bubble-action-overlay, 0.7 reads as a quiet button
+     without competing with the prose beside it. */
+  opacity: 0.7;
   transition: opacity var(--transition-fast);
 }
 .bubble:hover .bubble-copy-btn,
@@ -136,16 +253,20 @@
   opacity: 1;
 }
 @media (hover: none) {
+  /* No hover to raise it on touch, so the resting state IS the only state. */
   .bubble-copy-btn,
   .bubble-edit-btn {
-    opacity: 0.6;
+    opacity: 1;
   }
 }
 
-/* Scroll-to-bottom floating button */
+/* Scroll-to-bottom floating button. Anchored to .chat-panel-messages-region
+   (elspeth-4ad68a3769) — the region ends at the messages area's bottom edge,
+   so the pill clears ChatInput, the ComposingIndicator, and the banners at
+   every pane width without a hard-coded input-height guess. */
 .scroll-to-bottom-btn {
   position: absolute;
-  bottom: 80px;
+  bottom: var(--space-md);
   left: 50%;
   transform: translateX(-50%);
   z-index: var(--z-panel-controls);
@@ -163,10 +284,6 @@
   background-color: var(--color-surface-hover);
 }
 
-.chat-panel:has(.inline-run-results) .scroll-to-bottom-btn {
-  bottom: calc(120px + min(260px, 32vh));
-}
-
 /* ---------------------------------------------------------------------------
    Chat Input
    --------------------------------------------------------------------------- */
@@ -175,26 +292,18 @@
   margin: 0 var(--space-lg) var(--space-sm);
   padding: var(--space-sm);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent),
-    rgba(0, 0, 0, 0.08);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  /* Card radius (8px), not the 6px button radius: this is a frame around a
+     toolbar of 6px buttons and 4px inner boxes (elspeth-f7c1b5e2a9). */
+  border-radius: var(--radius-lg);
+  /* Was a dark-derived white-gradient-over-black-wash recipe with a white
+     inset highlight (elspeth-fb5fda0795). Light theme is delivered ONLY by
+     token redefinition, so all three layers rendered as a neutral grey wash
+     on white that belonged to no surface family. The panel is a recessed
+     surface with its raised artifact cards above it — express that with the
+     surface tokens, which Wave A made a real step apart in BOTH themes. */
+  background-color: var(--color-surface);
   max-height: min(260px, 32vh);
   overflow: auto;
-}
-
-/* The completed surface is a vertical evidence stack: Pipeline ready first,
-   then its run evidence. Keep the two cards visually adjacent while allowing
-   expanded results to consume the rest of the panel instead of leaving an
-   unstructured void below. The :not() preserves the collapse affordance's
-   content-height contract. */
-.chat-panel--completed > .inline-run-results:not(.inline-run-results--collapsed) {
-  flex: 1 1 auto;
-  min-height: 6rem;
-  max-height: none;
-  margin-top: var(--space-xs);
-  margin-bottom: 0;
 }
 
 .inline-run-results--collapsed {
@@ -302,6 +411,51 @@
   color: var(--color-text-muted);
 }
 
+/* NarrativeResults — the narrative-mode XOR sibling of .run-outputs-panel in
+   the same inline-run-results slot, so it mirrors that panel's xs register
+   and heading treatment. The whole component previously had NO stylesheet
+   section (elspeth-729872658a): headings, empty state and lists rendered at
+   UA defaults, including disc bullets with 40px indents in the
+   interpretation overlay. "Overlay" in the class names is the component's
+   data-layering vocabulary (Phase 5b events over the Phase 6B summary), not
+   a positioned surface — these are in-flow sections on purpose. */
+.narrative-results {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+}
+
+.narrative-results h3,
+.narrative-results h4 {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: var(--line-height-tight);
+}
+
+.narrative-results-empty,
+.narrative-results-download,
+.narrative-results-interpretations p {
+  margin: 0;
+}
+
+.narrative-results-empty {
+  color: var(--color-text-muted);
+}
+
+.narrative-results-interpretation-overlay,
+.narrative-results-interpretations {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.narrative-results-interpretation-overlay ul {
+  margin: 0;
+  padding-left: var(--space-lg);
+}
+
 .run-output-artifact-list {
   display: grid;
   gap: var(--space-xs);
@@ -315,12 +469,27 @@
   padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  background-color: rgba(255, 255, 255, 0.025);
+  /* Raised card on the recessed .inline-run-results panel. The former
+     rgba(255,255,255,0.025) was a dark-theme lift that is mathematically
+     invisible on white, so the cards lost their fill entirely in the light
+     theme (elspeth-fb5fda0795). */
+  background-color: var(--color-surface-elevated);
 }
 
 .run-output-artifact-row {
   display: grid;
-  grid-template-columns: auto minmax(10rem, 1fr) auto auto auto auto;
+  /* Every artifact is its own <li>, so no shared grid spans the rows: the
+     size / timestamp / hash columns can only line up down the list if their
+     tracks are FIXED (elspeth-31b4b41ae7). With `auto` they sized to each
+     row's own content and the column's left edge moved per row, which also
+     wasted the tabular-nums on .run-output-artifact-time. Only the three
+     metadata tracks are pinned: `1fr` on the name column right-anchors them,
+     so the leading kind badge stays content-sized without moving them. The
+     trailing action cluster stays `auto` too — it renders the same pair of
+     buttons on every file artifact, and pinning it would leave a wide dead
+     track on manifests whose artifacts carry no actions at all. */
+  grid-template-columns:
+    auto minmax(8rem, 1fr) 4.5rem 8.5rem 6.5rem auto;
   align-items: center;
   gap: var(--space-sm);
   min-width: 0;
@@ -384,10 +553,6 @@
 }
 
 @media (max-width: 760px) {
-  .chat-panel:has(.inline-run-results) .scroll-to-bottom-btn {
-    bottom: calc(128px + min(300px, 36vh));
-  }
-
   .inline-run-results {
     margin-inline: var(--space-sm);
     max-height: min(300px, 36vh);
@@ -413,46 +578,101 @@
 .chat-input {
   padding: var(--space-sm) var(--space-lg);
   border-top: 1px solid var(--color-border);
+
+  /* The composer never yields — DECLARED, not inherited from a default
+     (elspeth-ecf973fb9f, systems review of b4405257a). This rule carried no
+     flex declaration at all; the composer survived a squeeze only because
+     flex-shrink defaults to 1 while min-height:auto froze it at its
+     content-based minimum. Emergent, unstated, and untested — and the one
+     line that breaks it is this codebase's own most-repeated idiom, spelled
+     out verbatim two rules away on .chat-panel-messages-region. Adding
+     `min-height: 0` here (the natural move the first time a textarea
+     overflows) collapsed the composer from 169px to 54px — about one control
+     row — with every test still green. The symptom MUTATES rather than
+     returning, so it reads as a new bug rather than this one.
+
+     flex-shrink: 0 states the invariant the dock's whole design rests on. */
+  flex-shrink: 0;
+
+  /* The authoring pane's width is independent of the viewport (resizable
+     separator; 360px is the shipped default at 1280-1535px viewports), so
+     the wrap rule below must key off the pane's own width — a viewport
+     media query cannot see either case (elspeth-8fa71e6d15, IA spec §3). */
+  container-type: inline-size;
 }
 
-.chat-input-upload-alert {
+/* The chat-input notice slot (elspeth-b3f4ecefee). Three states share one
+   position above the input row, so they share ONE chrome — a bordered notice
+   card — and vary only the tone tokens. Previously each state invented its
+   own species: a bordered card for the upload error, and loose unframed text
+   with 6/10px of padding around no frame for the other two, so two messages
+   in the same error register read as unrelated kinds of event and neither
+   loose variant aligned with anything. */
+.chat-input-upload-alert,
+.chat-input-bootstrapping,
+.chat-input-composer-unavailable {
   padding: var(--space-1-5) var(--space-2-5);
   margin-bottom: var(--space-sm);
-  background-color: var(--color-error-bg);
-  color: var(--color-error);
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  font-size: var(--font-size-xs);
-  border: 1px solid var(--color-error-border);
-}
-
-/* Compose-timeout bootstrap notice: a soft, transient "connecting" status
-   shown while the backend wall clock is still landing. Muted (not error)
-   register — it explains why Send is briefly disabled without alarming. */
-.chat-input-bootstrapping {
-  padding: var(--space-1-5) var(--space-2-5);
-  margin-bottom: var(--space-sm);
+  background-color: var(--color-surface-elevated);
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
 }
 
-/* Compose-timeout stuck state: backend reachable but it reported no usable
-   compose wall clock, so Send can never ungate. Error register (not the muted
-   "connecting" one) — this is a misconfiguration to notice, not a transient. */
+/* Error register: a rejected upload, and the stuck compose-timeout state
+   (backend reachable but it reported no usable compose wall clock, so Send
+   can never ungate — a misconfiguration to notice, not a transient). */
+.chat-input-upload-alert,
 .chat-input-composer-unavailable {
-  padding: var(--space-1-5) var(--space-2-5);
-  margin-bottom: var(--space-sm);
+  border-color: var(--color-error-border);
+  background-color: var(--color-error-bg);
   color: var(--color-error);
-  font-size: var(--font-size-xs);
 }
 
+/* .chat-input-bootstrapping — the compose-timeout bootstrap notice, a soft,
+   transient "connecting" status shown while the backend wall clock is still
+   landing — deliberately takes NO tone override: the shared rule's muted
+   neutral IS its register. It explains why Send is briefly disabled without
+   alarming, so it must not borrow the error tone above. */
+
 .chat-input-row {
+  /* The keyboard hint's containing block: at ordinary pane widths the hint is
+     positioned inside this row (see .chat-input-hint), so the row — and with
+     it the composer region — is exactly the textarea's height. */
+  position: relative;
   display: flex;
+  /* Wrap is on at EVERY pane width (elspeth-1b7227936c) so the keyboard hint
+     can join the wrapped attachment row under the narrow-pane container query
+     below (where it is a flex item again). The control items themselves never
+     wrap without the forced break: their combined min-content width (~402px)
+     fits every pane at or above the 430px threshold where the break is
+     display:none. */
+  flex-wrap: wrap;
   gap: var(--space-sm);
   align-items: flex-end;
+  /* Floor = the buttons plus one hint line above them. `resize: vertical`
+     lets the user drag the textarea shorter than that, and the row must not
+     follow it below the height its own hint occupies, or the hint would
+     escape the row's top edge into the transcript above. Inert at the
+     shipped four-row textarea (107px against a 74px floor). */
+  min-height: calc(
+    var(--size-control) + var(--space-sm) + var(--space-xs) +
+      var(--font-size-xs) * var(--line-height-normal)
+  );
 }
 
 .chat-input-textarea {
   flex: 1;
+
+  /* Hard floor (IA spec §3): flex:1 alone let fixed-width siblings squeeze
+     the textarea to ~56px in the composing state. The container query below
+     is what actually holds the floor by wrapping Upload/More to their own
+     row; this min-width is the backstop that makes a wrap-rule bug visible
+     (textarea pinned at the floor) instead of silently collapsing. */
+  min-width: 160px;
+  max-height: min(28dvh, 240px);
+  overflow-y: auto;
   resize: vertical;
   padding: var(--space-sm) var(--space-md);
   border: 1px solid var(--color-border-strong);
@@ -462,6 +682,117 @@
   line-height: 1.4;
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
+}
+
+@media (min-width: 761px) and (max-height: 800px) {
+  .chat-panel-header,
+  .chat-input {
+    padding-block: var(--space-xs);
+  }
+}
+
+/* Hidden at ordinary pane widths; the narrow-pane container query flips it
+   to a full-width flex break so Upload/More wrap below the primary row. */
+.chat-input-row-break {
+  display: none;
+}
+
+/* Rare-action overflow trigger + menu (elspeth-8fa71e6d15): one persistent
+   trigger, rare actions in a popover, instead of a permanent 44px slot per
+   action. (The workspace bar once used the same idiom; its popover retired
+   2026-08-15 when its last item moved to the artifact toolbar.) */
+.chat-input-more {
+  position: relative;
+  display: inline-flex;
+}
+
+.chat-input-more-menu {
+  position: absolute;
+  z-index: 5;
+  right: 0;
+  bottom: calc(100% + 0.25rem);
+  display: grid;
+  gap: 0.25rem;
+  min-width: 14rem;
+  padding: 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  /* Tokenised tier, not a raw black wash: the token carries a tinted-navy
+     light-theme override, which a pure-black shadow on a light surface does
+     not (elspeth-fb5fda0795). */
+  box-shadow: var(--shadow-dropdown);
+}
+
+/* Menu items compose .btn-compact; left-align their icon+label register. */
+.chat-input-more-item {
+  justify-content: flex-start;
+  gap: var(--space-sm);
+}
+
+/* Narrow authoring pane (360px is the shipped default at the 1280px minimum
+   supported width): Upload and More drop to their own row below
+   textarea/Stop/Send. Stop and Send never wrap — they track the live
+   send/cancel action; the pair the user is not using right now gives up its
+   place when width is scarce (IA spec §3 MUST wrap rule). */
+@container (max-width: 429px) {
+  .chat-input-row {
+    flex-wrap: wrap;
+    /* The forced break below is a zero-height flex LINE of its own, so a
+       row-gap is paid twice across it — the declared 8px rendered as 16px
+       of inter-line gap (elspeth-1b7227936c). Zero the line gap here and
+       let the wrapped items carry exactly one --space-sm of margin instead,
+       so the gap is paid once. (The ≤760px viewport rule later in this file
+       restores its own gap by source order and resets these margins.) */
+    row-gap: 0;
+    /* The base rule's floor exists for the positioned hint; with the hint
+       back in flow (below) the row is content-sized again. */
+    min-height: 0;
+  }
+
+  .chat-input-row-break {
+    display: block;
+    order: 1;
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  .chat-input-upload-btn,
+  .chat-input-more {
+    order: 2;
+    /* The single paid inter-line gap — see the row-gap note above. */
+    margin-top: var(--space-sm);
+  }
+
+  /* Flip the overflow popover's anchor with the trigger. The base rule pins
+     the menu's RIGHT edge to the trigger and grows leftward, which is correct
+     while "…" sits at the right end of the single control row. Here the
+     trigger has wrapped to the pane's LEFT edge, so growing leftward threw a
+     14rem menu to x=-112 at the shipped 360px pane — the file-manager and
+     secrets items rendered half off the viewport, their visible sliver lying
+     over the textarea. Anchor left and grow rightward instead; 14rem clears
+     the 360px pane with room to spare. */
+  .chat-input-more-menu {
+    right: auto;
+    left: 0;
+  }
+
+  /* The hint rejoins the flow and fills the attachment row's gutter
+     (elspeth-1b7227936c): in guided mode Upload has no More sibling, so
+     without the hint the wrapped row was one 44px button and ~344px of
+     nothing. position: static undoes the ordinary-width placement above the
+     buttons — here the attachment row IS a second line, and the hint has a
+     place on it. Specificity (0,2,0) on purpose — the base .chat-input-hint
+     rule appears LATER in this file, so an unqualified (0,1,0) rule here
+     would lose its overrides to source order. */
+  .chat-input-row .chat-input-hint {
+    position: static;
+    order: 2;
+    flex: 1 1 auto;
+    align-self: center;
+    margin-top: var(--space-sm);
+    padding-block: 0;
+  }
 }
 
 .chat-input-icon-btn {
@@ -477,6 +808,8 @@
   justify-content: center;
   min-width: 44px;
   min-height: var(--size-control);
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
 }
 
 .chat-input-icon {
@@ -489,12 +822,47 @@
   stroke-linejoin: round;
 }
 
+/* State surface for Upload and the "…" overflow trigger (elspeth-90d8528b23).
+   These were hand-rolled instead of composing .btn-compact, and their entire
+   state surface was `cursor: not-allowed` — no hover to confirm the pointer
+   is on target, no visual difference between an enabled and a disabled
+   Upload (which is the STANDING state in guided mode), and an open overflow
+   menu whose trigger looked exactly like a closed one.
+
+   Guards live inside :where() for the same cascade reason as .btn:hover in
+   shared.css: it keeps this rule at (0,2,0) so the pressed rule below, also
+   (0,2,0) but later in source order, wins on an open-and-hovered trigger
+   only where it should. */
+.chat-input-icon-btn:hover:where(:not(:disabled)) {
+  background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
+}
+
+/* Same tokenised disabled recipe as .btn:disabled (shared.css) rather than an
+   opacity dim: the muted-on-page-background pair is a known contrast value in
+   both themes instead of a composite against whatever chrome sits behind. */
 .chat-input-icon-btn:disabled {
+  background-color: var(--color-bg);
+  color: var(--color-text-muted);
+  border-color: var(--color-border-strong);
   cursor: not-allowed;
 }
 
-.chat-input-icon-btn--active {
+/* Pressed trigger. Replaces the dead .chat-input-icon-btn--active class,
+   which no component ever applied — this keys off the aria-expanded the
+   overflow trigger already publishes (ChatInput.tsx), so the rule cannot
+   drift out of sync with the state it depicts. */
+.chat-input-icon-btn[aria-expanded="true"] {
   background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-input-icon-btn,
+  .chat-input-cancel-btn,
+  .chat-input-send-btn {
+    transition: none;
+  }
 }
 
 .chat-input-cancel-btn {
@@ -509,6 +877,10 @@
   font: inherit;
   font-size: var(--font-size-sm);
   font-weight: 600;
+  /* Same 100ms ease as every sibling control in this row and .btn itself
+     (elspeth-616a236fc3): the hover boundary change snapped while the
+     buttons beside it eased, so one gesture gave two answers. */
+  transition: border-color var(--transition-fast);
 }
 
 .chat-input-cancel-btn:hover,
@@ -528,9 +900,18 @@
   border: none;
   border-radius: var(--radius-md);
   cursor: not-allowed;
+  /* No stylesheet carries a bare `button` element rule, and the UA default for
+     a <button> is its own font — not the inherited one. Declaring only
+     font-size left the product's most-clicked control set in Arial while
+     everything around it (including the adjacent textarea, which declares
+     font-family: inherit) rendered Inter (elspeth-e2116cf7d0). */
+  font-family: inherit;
   font-size: var(--font-size-base);
   min-width: 44px;
   min-height: var(--size-control);
+  /* One motion answer for the whole input row (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .chat-input-send-btn:not(:disabled) {
@@ -539,10 +920,39 @@
   cursor: pointer;
 }
 
+.chat-input-send-btn:hover:not(:disabled) {
+  background-color: var(--color-btn-primary-bg-hover);
+}
+
 .chat-input-hint {
+  /* At ordinary pane widths (container ≥ 430px) the hint sits INSIDE the
+     control line's height, right-aligned above Upload/More/Send in the space
+     the four-row textarea leaves over the 44px buttons, so the composer
+     region ends flush with the textarea's bottom edge (operator request,
+     2026-08-16). It used to be the row's last flex item at flex-basis:100%,
+     taking a full-width line of its own BELOW the controls (elspeth-
+     1b7227936c) — one text row of region height under the box, at every
+     pane width. Positioned rather than placed by grid or a wrapper: the
+     controls are conditional siblings (Upload/More absent read-only, Stop
+     present only while composing), so a per-column grid would pay gaps for
+     empty columns, and a right-column wrapper would break the narrow-pane
+     rule that Send stays beside the textarea while Upload/More wrap. bottom
+     = one control height plus --space-xs, and the padding-bottom below is
+     --space-xs, so the text clears the buttons by the row's --space-sm gap.
+     The row carries a min-height floor so a user-shortened textarea cannot
+     let this escape upward. Two regimes put it back in flow, each with a
+     line of its own to sit on: the narrow-pane container query (it fills the
+     wrapped attachment row's gutter — ~344px of nothing beside a lone 44px
+     Upload in guided mode) and the ≤760px viewport regime (the buttons are
+     already on a second line there); flex-basis:100% is what gives it its
+     own full-width line in the latter, and is inert while positioned. */
+  position: absolute;
+  right: 0;
+  bottom: calc(var(--size-control) + var(--space-xs));
+  flex-basis: 100%;
+  padding: 0 0 var(--space-xs);
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
-  padding: var(--space-2xs) 0 var(--space-xs);
   text-align: right;
 }
 
@@ -555,6 +965,8 @@
     flex-wrap: wrap;
     align-items: stretch;
     gap: var(--space-xs);
+    /* Hint back in flow here (below), so no floor. */
+    min-height: 0;
   }
 
   .chat-input-textarea {
@@ -580,6 +992,35 @@
     overflow-wrap: anywhere;
   }
 
+  /* This regime restores its own line gap (the `gap` shorthand above wins
+     the narrow-pane container query's row-gap:0 by source order), so the
+     single-paid-gap margins from that block must come off or the two
+     mechanisms would stack to 16px. Same-specificity source-order win for
+     the buttons; the hint reset matches the (0,2,0) qualified rule. */
+  .chat-input-upload-btn,
+  .chat-input-more {
+    margin-top: 0;
+  }
+
+  /* Same left-anchor flip as the narrow-pane container query above, for the
+     other regime that wraps the trigger to the left. This one is keyed to the
+     VIEWPORT, so it catches the wide-pane/narrow-window case the container
+     query cannot see (a 700px window puts the 44px trigger at x=56 while the
+     pane itself is 700px wide, so the container query is inactive and the
+     base right-edge anchor still threw the menu to x=-124). */
+  .chat-input-more-menu {
+    right: auto;
+    left: 0;
+  }
+
+  .chat-input-row .chat-input-hint {
+    /* Back in flow on its full-width line (flex-basis:100% in the base rule):
+       the buttons already occupy a second line here, and the positioned
+       placement would land on the textarea's bottom-right corner. */
+    position: static;
+    margin-top: 0;
+  }
+
   .chat-input-hint {
     text-align: left;
   }
@@ -592,8 +1033,81 @@
   display: flex;
   flex-direction: column;
   height: 100%;
-  overflow: hidden;
+  /* `clip`, NOT `hidden` (elspeth-ecf973fb9f). Both paint identically; they differ in one property
+     that is invisible until it bites — an `overflow: hidden` box IS a scroll
+     container, it merely has no scrollbar, so anything that scrolls by
+     ancestor walk (scrollIntoView, focus(), find-in-page, an AT caret) can
+     move this panel's content and leave it moved. That is not hypothetical:
+     scrollIntoView on the transcript's end sentinel was measured driving this
+     box to scrollTop 130, carrying .chat-panel-header to -49 and stranding
+     the composer above a void that survived every re-render, because a scroll
+     offset is DOM state React does not own. A `clip` box is not a scroll
+     container at all, so the offset cannot exist to begin with. The panel's
+     one intended scroller is .chat-panel-messages.
+
+     The clip is also why .chat-panel-messages:focus-visible draws its ring
+     inset — see that rule. */
+  overflow: clip;
   position: relative;
+}
+
+/* Docked chrome between the transcript and the composer (elspeth-ecf973fb9f): the composer-progress
+   card, the blob drawer, the proposal banner, the inline-source prompt
+   (ChatPanel's .chat-panel-dock).
+
+   This box exists to make the panel's vertical budget a two-party negotiation.
+   .chat-panel-messages-region is `flex: 1` with a ZERO basis, which makes it
+   greedy for surplus and — because shrinkage is distributed across basis, not
+   height — completely unable to give anything back. So once the dock grew past
+   the surplus, the only claimant left to take space from was .chat-input, and
+   the composer was pushed clean through the panel's bottom edge: measured 130px
+   below it, clipped out of existence, with the transcript at 0 as well. The
+   operator lost the transcript AND the one control that could recover the
+   session.
+
+   The composer never yields; the dock does. `flex: 0 1 auto` gives this box a
+   content-sized basis — a NON-zero scaled shrink factor — so it is the one
+   that absorbs the deficit. It wins that role because its floor is 0 while
+   .chat-input's is its min-content height; document order has nothing to do
+   with it (flex shrinkage is simultaneous and proportional, then redistributed
+   as items freeze at their clamps).
+
+   `overflow-y: auto` is the load-bearing declaration, and it does two jobs:
+   it keeps every docked surface reachable while the box is squeezed, AND it
+   is what zeroes this item's automatic minimum size. `min-height: 0` states
+   the same zero explicitly and is, on its own, REDUNDANT here — measured:
+   restoring min-height:auto with the scroller in place leaves the geometry
+   identical. It is kept as the declaration of intent, since a future author
+   who drops the scroller would otherwise silently reinstate a min-content
+   floor and with it the overflow. Do not read it as the mechanism.
+
+   `overscroll-behavior: contain` stops a wheel gesture that bottoms out here
+   from chaining into the transcript above — the same treatment, for the same
+   reason, as .chat-panel > .ack-stack. */
+.chat-panel-dock {
+  --scroll-owner: authoring-dock;
+
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* The dock is keyboard-focusable (tabIndex={0} in ChatPanel) because it can
+   scroll and its hidden content need not contain anything focusable: measured
+   67px below the last focusable control, reachable by wheel or drag alone —
+   a WCAG 2.1.1 failure. Same ruling, same idiom, as .chat-panel-messages and
+   .tool-call-details pre. The ring is drawn inset because .chat-panel clips
+   overflow, so an offset ring would be invisible on all four sides.
+
+   The cost is one extra tab stop between the transcript and the composer, on
+   a path operators traverse constantly. Accepted deliberately: the
+   alternative is content no keyboard user can reach at all. */
+.chat-panel-dock:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
 }
 
 /* Composing-state cursors. While the agent is thinking, the cursor over the
@@ -621,7 +1135,22 @@
 }
 
 .chat-panel-header {
-  padding: var(--space-sm) var(--space-lg);
+  /* Shared band-height contract with .artifact-workspace-toolbar across the
+     pane seam (see tokens.css): height comes from the token, content centers
+     via the flex row below — no vertical padding, so the short-screen
+     density regime (workspace.css) can compress this band through the token.
+     Before the contract this row stayed 53px inside the ≤800px-tall compact
+     regime while the toolbar dropped to 45px.
+     The inline gutter is the shared band-row gutter (elspeth-dfc207f341):
+     this band and .artifact-workspace-toolbar are ONE row across the pane
+     divider, and when the toolbar sat at --space-sm the divider had 16px of
+     clearance on its left against 8px on its right — visibly off-centre in
+     its own row. The toolbar now reads --artifact-gutter, which resolves to
+     --space-lg (workspace.css, elspeth-87195dda2c), so the two halves agree
+     at 16px; chatBubbleGutter.test.ts pins the agreement, spelled either
+     way. */
+  min-height: var(--size-workspace-band);
+  padding: 0 var(--space-lg);
   border-bottom: 1px solid var(--color-border);
   font-size: var(--font-size-sm);
   font-weight: 600;
@@ -632,39 +1161,55 @@
   gap: var(--space-md);
 }
 
-/* Persistent composer-model identity chip in the chat header
-   (elspeth-e9f7678de8). Quiet reference chrome: mono + muted so it reads as
-   provenance metadata, not a control. --color-text-muted passes 4.5:1 on
-   both themes' page backgrounds (pinned by colorContrast.test.ts). */
-.chat-model-chip {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 400;
-  color: var(--color-text-muted);
-  white-space: nowrap;
-}
-
-.chat-model-chip-label {
-  font-weight: 600;
-  color: var(--color-text-secondary);
-}
-
-.chat-panel-header-title {
-  margin: 0;
-  font-size: inherit;
-  font-weight: inherit;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1 1 auto;
+/* Header action cluster: authority chip + mode switch (the session title and
+   model chip moved to AppHeader, elspeth-8fa71e6d15 — this column keeps only
+   compose-state chrome). margin-left:auto right-aligns the cluster now that
+   no flex-1 title occupies the left side. Was an inline style prop on
+   ChatPanel's header (elspeth-0b70269ccc), which outranked every stylesheet
+   rule and made the row unresponsive at any breakpoint. */
+.chat-panel-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
   min-width: 0;
+  flex: 0 1 auto;
+  margin-left: auto;
+}
+
+/* Composer-authority chip (elspeth-f5e6723133) — names whether this session
+   auto-applies mutations or gates them behind proposals. Sibling of
+   the mode switch in the header actions row; the left accent is the
+   recurring edge motif. Auto-apply carries the warning accent because it is
+   the mode where the composer acts without asking — the one fact a user
+   must be able to see at a glance. */
+.chat-authority-chip {
+  flex: 0 0 auto;
+  padding: 2px var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-authority-chip--auto_commit {
+  border-left-color: var(--color-warning);
+}
+
+.chat-authority-chip--explicit_approve {
+  border-left-color: var(--color-success);
 }
 
 /* ModeSwitchButton — the symmetric guided<->freeform toggle in BOTH body
    headers ("Switch to guided" / "Exit to freeform"). Quiet outline at rest with
-   a hover lift and WCAG 2.5.8 target height. The confirm primary is slightly
-   stronger (accent border) but NOT danger-styled, because switching is
-   non-destructive (the session keeps both modes' state). */
+   a hover lift and WCAG 2.5.8 target height (36px compact — the chrome-row
+   size; this is the control that sets the header's 52px canonical height,
+   matching .artifact-workspace-toolbar across the pane divider). The confirm
+   primary is slightly stronger (accent border) but NOT danger-styled, because
+   switching is non-destructive (the session keeps both modes' state). */
 .mode-switch-btn {
   padding: var(--space-sm) var(--space-md);
   background-color: transparent;
@@ -675,10 +1220,10 @@
   font-family: inherit;
   font-weight: 500;
   cursor: pointer;
-  min-height: var(--size-control);
+  min-height: var(--size-control-compact);
   flex-shrink: 0;
-  transition: background-color 0.1s ease, border-color 0.1s ease,
-    color 0.1s ease;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast), color var(--transition-fast);
 }
 
 .mode-switch-btn:hover {
@@ -692,15 +1237,18 @@
   outline-offset: 2px;
 }
 
-.mode-switch-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
+/* Tokenised disabled pair, not opacity (elspeth-37b6c47145). shared.css:167
+   documents rejecting exactly this mechanism: an opacity dim composites
+   against whatever chrome sits behind the control, so the resulting text
+   contrast is unbounded and can silently fail WCAG 1.4.3. The muted-on-page
+   -background pair .btn:disabled uses is a known value in both themes
+   (dark 6.45:1, light 6.32:1). */
+.mode-switch-btn:disabled,
 .mode-switch-btn:disabled:hover {
-  background-color: transparent;
-  border-color: var(--color-border);
-  color: var(--color-text-secondary);
+  background-color: var(--color-bg);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
 }
 
 /* Confirm primary (shown only when the current chat has work). */
@@ -716,7 +1264,7 @@
    buttons to the same row every time — its "auto" columns can't fall below
    the combined min-content width of BOTH buttons, so next to the
    nowrap ModelChip in .chat-panel-header-actions the Cancel button was
-   clipped by .chat-panel's overflow:hidden on narrow viewports (~320-400px).
+   clipped by .chat-panel's clip on narrow viewports (~320-400px).
    flex-wrap lets a single button occupy a line on its own, so the floor is
    one button's min-content width, not the pair's. */
 .mode-switch-confirm {
@@ -754,6 +1302,35 @@
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
   line-height: var(--line-height-normal);
+}
+
+/* Goal field on the fresh-wizard confirm card (goal-first,
+   elspeth-378cfa0e18). Given a full row of the wrapped flex layout for the
+   same reason the note above is: it must read (and be filled in) BEFORE the
+   confirm/cancel buttons. The <label> is the flex item and stacks its own text
+   above the control, so the question is a real accessible name rather than a
+   placeholder that vanishes on the first keystroke. */
+.mode-switch-goal {
+  display: flex;
+  flex-basis: 100%;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+/* Sizing only. The control composes the shared `.textarea` primitive
+   (shared.css) for its border, background, focus ring and AA-gated
+   placeholder colour, so this card does not introduce a second input skin
+   with its own contrast story. chat.css is imported AFTER shared.css in the
+   styles barrel, so these equal-specificity declarations win the overrides
+   they make: a one-sentence answer wants the smaller type and tighter
+   padding of the header's register, not the full form-field rung. */
+.mode-switch-goal-input {
+  padding: var(--space-xs) var(--space-sm);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
 }
 
 /* Disabled mode switch + adjacent plain-language reason so the affordance never
@@ -814,6 +1391,7 @@
 .chat-panel-error-dismiss {
   background: none;
   border: none;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: var(--font-size-lg);
   color: var(--color-error);
@@ -824,10 +1402,64 @@
   justify-content: center;
 }
 
+.chat-panel-error-dismiss:hover {
+  background-color: var(--color-surface-hover);
+}
+
+/* Positioning containing block for the jump-to-latest pill: wraps ONLY the
+   messages scroll container (freeform branch), so an absolutely-positioned
+   pill anchored to its bottom edge sits just above whatever renders below
+   the messages (ComposingIndicator, banners, ChatInput) at every pane
+   width. min-height: 0 keeps the flex column shrinkable — without it the
+   region refuses to shrink below content height and the whole panel
+   overflows its height:100% / clip chain. */
+.chat-panel-messages-region {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+
+  /* Floor the conversation (elspeth-ecf973fb9f, UX review of b4405257a).
+     `flex: 1` carries a ZERO basis, and flex shrinkage is distributed in
+     proportion to flex-shrink x flex-basis — so this region's scaled shrink
+     factor is zero and it takes NO part in absorbing a deficit. That is an
+     ordering, not a magnitude: the transcript is driven to exactly 0 BEFORE
+     the dock below gives up its first pixel. Measured in the default desktop
+     state (1280x900, a terminal composer card with its details open at 241px
+     plus a proposal banner at 248px): region 0, 1000px of conversation
+     hidden, dock already scrolling internally — and the operator being asked
+     to Accept or Reject a pipeline mutation with NO visible conversation.
+     For an audit-first product, approving a mutation blind is the failure
+     mode, not a comfort issue.
+
+     `min` clamps it, and the clamp is load-bearing: a bare 160px floor at a
+     367px panel clipped the composer by 7px and overflowed the panel — the
+     original defect returning. 30% yields ~110px where 160px would not fit.
+     Verified across 367 / 426 / 755px, which IS the product's full panel
+     range (the workspace floors at 367px even at a 350px viewport).
+
+     Safe only BECAUSE .chat-panel-dock is a scroll container: that zeroes the
+     dock's automatic minimum size, so it can absorb the whole deficit and the
+     composer still never yields. The floor and the dock are one mechanism. */
+  min-height: min(160px, 30%);
+}
+
 .chat-panel-messages {
+  --scroll-owner: authoring;
+
   flex: 1;
   overflow-y: auto;
   padding: var(--space-lg) 0;
+  /* Marked bottom boundary (elspeth-1f4b60a492): the "How pipelines work"
+     teaching panel is genuinely taller than the pane, and its text was cut
+     dead mid-word where the composer begins — no fade, no scrollbar cue —
+     so a clipped panel read as broken rather than scrollable. Same alpha
+     ramp as .guided-authoring-scroll's top edge (guided.css), mirrored to
+     the bottom: gradient colours are ALPHA data, not theme colours. The
+     ramp is shorter than this scroller's 24px bottom padding, so when the
+     transcript is scrolled to the end nothing visible is faded. */
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--space-md)), transparent);
 }
 
 /* The message list is keyboard-focusable (tabIndex=0 in ChatPanel,
@@ -853,16 +1485,21 @@
    --------------------------------------------------------------------------- */
 .message-row {
   display: flex;
-  padding: var(--space-xs) var(--space-lg);
+  /* 8px block padding => a 16px gap between adjacent turns, which must stay
+     ABOVE the 12px a bubble uses internally (elspeth-f17c7a819f). At the
+     previous 4px the inter-turn gap was 8px against a 12px internal inset,
+     so Gestalt proximity inverted: separate turns bound together while each
+     bubble's own content floated apart. */
+  padding: var(--space-sm) var(--space-lg);
   /* Cap the conversation to a centred column so a right-aligned (user) and a
      left-aligned (assistant) bubble stay near each other instead of pinning to
      opposite edges of a wide chat column. On WQHD+ the chat column is ~2240px,
      which left a ~1100px dead gulf down the middle and forced the eye to jump
      left↔right to follow the thread. 56rem keeps a comfortable reading measure
      while giving consecutive bubbles a generous horizontal overlap.
-     Applies to freeform AND guided/tutorial — both emit .message-row. The
-     guided workspace widgets (.guided-workspace-*) and full-width run-result
-     panels (.inline-run-results) are NOT .message-row, so they keep full width. */
+     Applies to freeform AND guided/tutorial — both emit .message-row. Guided
+     authoring cards and common-workspace artifact panels are NOT .message-row,
+     so they keep their containing pane's width. */
   max-width: min(100%, 56rem);
   margin-inline: auto;
   width: 100%;
@@ -893,7 +1530,23 @@
      specificity to .bubble and appears later in source order, so this
      rule wins for every user and assistant bubble. */
   max-width: min(92%, 74ch);
-  font-size: var(--font-size-base);
+  /* The transcript's ONE size (elspeth-b6e82c12bb). This was
+     --font-size-base (16px) while the assistant's markdown path rendered at
+     --font-size-sm (13px) from common.css, so the two speakers in one
+     conversation differed by 23%. Harmonised DOWN rather than up: 13px is
+     already the register of .bubble-system, .trusted-system-notice and every
+     .markdown-body in the app, and raising the bubble to 16px would have put
+     markdown h2 (16px) at body size with h3/h4 below it — trading a size
+     divergence for a heading-hierarchy collapse. `.bubble .markdown-body`
+     takes `font-size: inherit`, so this declaration governs both paths. */
+  font-size: var(--font-size-sm);
+  /* Reserve the action-overlay gutter (elspeth-e6db9519d2). The copy overlay
+     is absolutely positioned at right:0 and 36px wide, and absolutely
+     positioned children contribute nothing to the parent's padding, so at the
+     inherited 16px right padding it painted directly on the message's own
+     first line of text. 16px + 36px puts a full --space-lg gutter between the
+     prose and the control. User bubbles reserve for BOTH overlays below. */
+  padding-right: calc(var(--space-lg) + var(--size-control-compact));
   /* Was --line-height-normal (1.5). .message-bubble-content has the same
      specificity as .bubble but appears later in source, so it overrides
      the .bubble line-height. Aligning both to --line-height-snug (1.35)
@@ -906,21 +1559,41 @@
 
 .message-bubble-content--user {
   white-space: pre-wrap;
+  /* User turns are the only ones that render the edit overlay as well as the
+     copy overlay (MessageBubble.tsx guards it on isUser), and the pair spans
+     36 + 4 + 36 = 76px from the right edge. Reserving 16 + 4 + 72 = 92px
+     leaves the same --space-lg gutter between prose and control as the
+     assistant case, and — because padding DOES contribute to a shrink-to-fit
+     flex item's intrinsic width — guarantees the bubble is at least
+     16 + 92 = 108px wide, so the edit overlay can never resolve to a negative
+     left edge and float off onto the canvas (elspeth-eb3a875f4d). */
+  padding-right: calc(
+    var(--space-lg) + var(--space-xs) + var(--size-control-compact) * 2
+  );
 }
 
-/* Action overlay buttons (copy, edit) — positioned inside the bubble */
+/* Action overlay buttons (copy, edit) — positioned inside the bubble.
+   Sizing is the 36px compact control rung, NOT the 44px canvas rung: these
+   sit on top of the message's own text column, and the .bubble-copy-btn /
+   .bubble-edit-btn rule above has documented 36×36 as the intent since it was
+   written. It lost silently — this rule carries the same classes at equal
+   specificity and appears later — so the control shipped at 44×44 while its
+   own comment described 36 (elspeth-8174010851). Adopting 36 here makes the
+   two rules agree, and every gutter above is derived from this token. */
 .bubble-action-overlay {
   position: absolute;
   top: 0;
-  background: none;
+  /* Resting chip so the control reads as a button rather than as a smudge on
+     the prose; it is what lets the resting opacity stay quiet. */
+  background-color: var(--color-surface-hover);
   border: none;
   cursor: pointer;
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
   padding: var(--space-2xs) var(--space-1-5);
   border-radius: var(--radius-sm);
-  min-width: 44px;
-  min-height: var(--size-control);
+  min-width: var(--size-control-compact);
+  min-height: var(--size-control-compact);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -931,7 +1604,8 @@
 }
 
 .bubble-action-overlay--edit {
-  right: 44px;
+  /* Clears the copy overlay (36px) plus a 4px separation. */
+  right: calc(var(--space-xs) + var(--size-control-compact));
 }
 
 .message-edit-form {
@@ -940,9 +1614,25 @@
   gap: var(--space-sm);
 }
 
+/* While editing, give the bubble a definite width. The bubble is a
+   shrink-to-fit flex item (no explicit width, only the max-width cap above),
+   and a percentage-width child cannot resolve against a shrink-to-fit parent
+   — the edit textarea fell back to its intrinsic UA width (~20ch), so the
+   whole bubble collapsed far below the width it had as rendered text. Pin
+   the editing bubble to the same cap .message-bubble-content already uses,
+   so the textarea's width: 100% has a real basis. */
+.message-bubble-content:has(.message-edit-form) {
+  width: min(92%, 74ch);
+}
+
 .message-edit-textarea {
   width: 100%;
   min-height: 60px;
+  /* Bound growth the same way .chat-input-textarea does — rows scale with
+     the edited content (capped in JSX), and this caps the box itself for
+     very long messages and user drags via resize: vertical. */
+  max-height: min(28dvh, 240px);
+  overflow-y: auto;
   padding: var(--space-sm);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
@@ -1010,6 +1700,10 @@
   min-height: var(--size-control-compact);
 }
 
+.message-retry-btn:hover {
+  background-color: var(--color-surface-hover);
+}
+
 .message-pending {
   margin-top: var(--space-sm);
   font-size: var(--font-size-xs);
@@ -1065,13 +1759,20 @@
   word-break: break-word;
 }
 
-/* Sources-created group inside the assistant bubble — visually parallel to
-   .message-tools (same border-top, same toggle styling via shared
-   .message-tools-toggle class) so the two groups read as siblings in the
-   bubble. The horizontal ruler (.message-group-separator) is only painted
-   when both groups are present; see MessageBubble.tsx for the guard. */
+/* Sources-created group inside the assistant bubble — parallel to
+   .message-tools in its toggle styling (via the shared .message-tools-toggle
+   class) so the two groups read as siblings in the bubble.
+   The seam is now genuinely parallel too (elspeth-4dc660d56f): the same
+   border-top + margin/padding trio as .message-tools, so a sources-ONLY
+   turn — the audit-bearing group naming what the composer drew on — gets a
+   real rule against the prose above it instead of 12px of undifferentiated
+   gap. When BOTH groups render, MessageBubble.tsx paints the
+   .message-group-separator ruler between them, and the adjacent-sibling
+   rule below strips this border (with the margin/padding) so the seam is
+   never double-ruled — one rule per seam in every configuration. */
 .message-sources-created {
-  margin-top: var(--space-1-5);
+  margin-top: var(--space-sm);
+  border-top: 1px solid var(--color-border-strong);
   padding-top: var(--space-1-5);
 }
 
@@ -1093,6 +1794,57 @@
 .inline-source-created-turn {
   display: grid;
   gap: var(--space-sm);
+}
+
+/* InlineSourceDisambiguationTurn — the "confirm row count" decision widget.
+   Unlike its sibling .inline-source-created-turn (which renders inside a
+   message bubble), this section mounts directly in the transcript, so it
+   carries the .ack-card frame recipe to read as a decision card. The whole
+   widget previously had NO stylesheet section (elspeth-729872658a): the
+   card had no surface, the <blockquote> echo of the user's input rendered
+   at the UA's 1em/40px margins, the row <ol> at UA indents, and the three
+   action buttons sat with no gap. */
+.inline-source-disambiguation-turn {
+  display: grid;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.inline-source-disambiguation-turn-title {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: var(--line-height-tight);
+}
+
+.inline-source-disambiguation-turn-explainer {
+  margin: 0;
+}
+
+/* Quote treatment for the echoed user input — the .markdown-body blockquote
+   recipe, with the grid gap supplying the vertical rhythm. */
+.inline-source-disambiguation-turn-input {
+  margin: 0;
+  padding: var(--space-xs) var(--space-md);
+  border-left: 3px solid var(--color-border-strong);
+  color: var(--color-text-secondary);
+}
+
+/* Decimal markers are content here (the parsed row numbering), so the list
+   keeps its counters and only the UA margins/indent are disciplined. */
+.inline-source-disambiguation-turn-rows {
+  margin: 0;
+  padding-left: var(--space-lg);
+}
+
+.inline-source-disambiguation-turn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
 }
 
 .inline-source-created-turn-title,
@@ -1142,7 +1894,11 @@
   padding: var(--space-sm);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  background-color: rgba(0, 0, 0, 0.1);
+  /* Tokenised code surface, matching .message-tools-pre and the markdown code
+     block. The former rgba(0,0,0,0.1) was a dark-theme recess that carries
+     over unchanged into the light theme, where no component rule is ever
+     re-toned (elspeth-fb5fda0795). */
+  background-color: var(--color-surface-elevated);
   color: var(--color-text-secondary);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
@@ -1161,11 +1917,27 @@
   font-size: var(--font-size-xs);
 }
 
+/* The seam between Tool calls and Sources created (elspeth-1255015f8f).
+   Symmetric in its own gap, and drawn at the SAME weight as the other
+   in-bubble seam six lines up (.message-tools' border-top): it was
+   --color-border at opacity 0.6 against that rule's full-strength
+   --color-border-strong, so the transcript carried two divider weights with
+   no rule saying which meant what. The gap was 6px above and 12px below —
+   margin collapse against the following group's own margin plus padding — so
+   the ruler read as belonging to the group beneath rather than dividing the
+   two; the adjacent-sibling rule below resolves that collapse and leaves 6/6. */
 .message-group-separator {
-  margin: var(--space-1-5) 0 0;
+  margin: var(--space-1-5) 0;
   border: 0;
-  border-top: 1px solid var(--color-border);
-  opacity: 0.6;
+  border-top: 1px solid var(--color-border-strong);
+}
+
+.message-group-separator + .message-sources-created {
+  margin-top: 0;
+  /* The ruler owns this seam; the group's own border would double it
+     (the elspeth-4dc660d56f exclusivity). */
+  border-top: 0;
+  padding-top: 0;
 }
 
 .tool-call-ribbon {
@@ -1179,6 +1951,46 @@
   background: var(--color-surface);
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
+}
+
+/* Server-authenticated outcome accents (elspeth-f5e6723133). The label text
+   carries the meaning; the left edge only reinforces it, so an unstamped
+   ribbon (no modifier) stays neutral. */
+.tool-call-ribbon--applied,
+.tool-call-ribbon--rejected,
+.tool-call-ribbon--failed,
+.tool-call-ribbon--cancelled {
+  border-left-width: 3px;
+}
+
+.tool-call-ribbon--applied {
+  border-left-color: var(--color-success);
+}
+
+.tool-call-ribbon--rejected {
+  border-left-color: var(--color-warning);
+}
+
+.tool-call-ribbon--failed {
+  border-left-color: var(--color-error);
+}
+
+.tool-call-ribbon--cancelled {
+  border-left-color: var(--color-border);
+}
+
+.tool-call-ribbon-version {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
+}
+
+.tool-call-ribbon-text {
+  min-width: 0;
+}
+.tool-call-ribbon-name {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--color-text-secondary);
 }
 
 /* Tool-call info trigger + tooltip.
@@ -1232,11 +2044,17 @@
   box-shadow: var(--shadow-popover);
   /* Hidden until the trigger is hovered or focused. visibility +
      opacity transition together so the bubble can fade in but still be
-     pointer-event-inert until visible. */
+     pointer-event-inert until visible.
+     The fade rides the motion scale (elspeth-616a236fc3): 0.12s sat on no
+     rung of the 100/150ms ladder, on the transcript's only popover. The
+     visibility DELAY must numerically match the fade duration but cannot
+     consume the token — var(--transition-fast) expands to `100ms ease`,
+     and a delay cannot take a timing function — so it is a bare 100ms;
+     retune it in step if the token's duration ever moves. */
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.12s ease, visibility 0s linear 0.12s;
+  transition: opacity var(--transition-fast), visibility 0s linear 100ms;
 }
 
 /* Hover-bridge: invisible 6px hit-zone that fills the visual gap between
@@ -1274,15 +2092,37 @@
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transition: opacity 0.12s ease, visibility 0s linear 0s;
+  transition: opacity var(--transition-fast), visibility 0s linear 0s;
+}
+
+/* Per-selector guard, mirroring the animations.css convention (its global
+   block is an enumeration, not a `*` reset). Killing the transition also
+   removes the hidden-direction visibility delay, so the bubble simply
+   appears/disappears — the hover-bridge pseudo keeps it reachable. */
+@media (prefers-reduced-motion: reduce) {
+  .tool-call-info-bubble {
+    transition: none;
+  }
 }
 
 .tool-call-card {
   margin-top: var(--space-sm);
   padding: var(--space-sm);
   border: 1px solid var(--color-border-strong);
-  border-left: 4px solid var(--color-warning);
-  border-radius: var(--radius-md);
+  /* One accent width for the whole transcript column (elspeth-ed88648dee).
+     2px, 3px and 4px all ran down a single column, so width carried no
+     meaning, and the two --color-warning "something is pending" surfaces
+     (this card and .ack-stack) differed by exactly one pixel — too small to
+     read as intentional, too large to be invisible. 3px is the settled
+     width: it is what .trusted-system-notice, the .tool-call-ribbon outcome
+     accents, .ack-stack and .chat-authority-chip already used, i.e. the
+     modal value, so the fewest surfaces move. The 4px DASHED accents on
+     .spec-pending-proposal and its siblings are a different species (dashed
+     = "not yet applied") and stay as they are. */
+  border-left: 3px solid var(--color-warning);
+  /* Card radius (8px). Buttons 6px, cards 8px, modals 8px, badges 4px — at
+     6px this card was rounded like the buttons inside it (elspeth-9e863afc1b). */
+  border-radius: var(--radius-lg);
   background: var(--color-surface-elevated);
   color: var(--color-text);
 }
@@ -1344,6 +2184,19 @@
   margin: 0;
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
+}
+
+/* Completeness caveat for a projection that had to SKIP a comparison rather
+   than make it. Sits under the rows (or under the empty-state line) because it
+   qualifies the whole list, not any single row: option values are redacted
+   before this surface sees them, so a change confined to them cannot appear
+   above. Muted like the empty-state text — it is a limit on the evidence, not
+   a warning about the proposal. */
+.proposal-diff-caveat {
+  margin: var(--space-xs) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  font-style: italic;
 }
 
 .proposal-diff-list {
@@ -1439,7 +2292,8 @@
   margin: 0 var(--space-md) var(--space-sm);
   padding: var(--space-sm) var(--space-md);
   border: 1px solid var(--color-border-strong);
-  border-left: 4px solid var(--color-warning);
+  /* Settled transcript accent width — see .tool-call-card. */
+  border-left: 3px solid var(--color-warning);
   border-radius: var(--radius-md);
   background: var(--color-surface-elevated);
   color: var(--color-text);
@@ -1515,7 +2369,8 @@
   margin: 0 var(--space-lg) var(--space-sm);
   padding: var(--space-sm) var(--space-md);
   border: 1px solid var(--color-border-strong);
-  border-left: 4px solid var(--color-accent);
+  /* Settled transcript accent width — see .tool-call-card. */
+  border-left: 3px solid var(--color-accent);
   border-radius: var(--radius-md);
   background: var(--color-surface-elevated);
   color: var(--color-text);
@@ -1639,15 +2494,26 @@
   color: var(--color-text-muted);
 }
 
+/* Shaped as an assistant bubble, not merely coloured like one
+   (elspeth-69fc27eeb3). It is a docked sibling directly BELOW the message
+   log, so it sits next to the surfaces it borrows --color-bubble-assistant
+   from; at 6px radius, 10/12 padding, no left accent and a raw 640px measure
+   it read as a broken bubble rather than as a distinct state. Radius,
+   padding, accent, measure and size now all come from .bubble /
+   .message-bubble-content. The raw min(640px, calc(100vw - 48px)) also keyed
+   off the VIEWPORT while this surface lives in a pane whose width is
+   independent of it, so it never bound at shipping pane widths. */
 .composing-bubble {
-  padding: var(--space-2-5) var(--space-md);
-  border-radius: var(--radius-md);
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--radius-lg);
   background-color: var(--color-bubble-assistant);
   border: 1px solid var(--color-bubble-assistant-border);
+  border-left: 3px solid var(--color-border-strong);
   display: flex;
   align-items: flex-start;
   gap: var(--space-sm);
-  max-width: min(640px, calc(100vw - 48px));
+  font-size: var(--font-size-sm);
+  max-width: min(92%, 74ch);
 }
 
 .composing-pulse {
@@ -1739,6 +2605,46 @@
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
   line-height: 1.45;
+}
+
+/* Live tool-call log (elspeth-3c2caf56a7): one line per mid-flight tool
+   call, always visible under the status summary. Kept OUTSIDE the
+   role="status" node in the TSX so per-poll appends never announce. */
+.composing-tool-log-caption {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.composing-tool-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2xs);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.composing-tool-log li {
+  display: grid;
+  gap: 0;
+}
+
+/* Plain-language line: what the composer is doing. Primary because the
+   audience waiting on this log is not reading tool identifiers. */
+.composing-tool-log-what {
+  color: var(--color-text);
+  line-height: 1.4;
+}
+
+/* Evidential label + machine tool name, demoted to the secondary line.
+   Never dropped: the prefix is what stops a failed mutation reading as a
+   completed one. */
+.composing-tool-log-call {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
 }
 
 
@@ -1838,9 +2744,23 @@
 /* In freeform mode the stack sits above the scrolling message list; pin it so
    pending decisions stay visible while the operator scrolls the conversation. */
 .chat-panel > .ack-stack {
+  --scroll-owner: authoring-ack;
+
   position: sticky;
   top: 0;
   z-index: 2;
+  /* Bound the pinned stack (elspeth-0b70269ccc). Sticky with no height cap is
+     safe only while the stack stays short. At 390px the decision cards reflow
+     tall — five of them measured 1213px against an 844px viewport — so the
+     stack consumed the whole flex column and .chat-panel's clip
+     occluded the composer-update card and the Files section beneath it.
+     Capping with internal scroll keeps the intent ("pending decisions stay
+     visible while the operator scrolls the conversation") while guaranteeing
+     the conversation below it always has room. Applies at every width: the
+     same overrun happens on desktop with enough pending decisions. */
+  max-height: 45vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .ack-stack-header {
@@ -1905,7 +2825,9 @@
   padding: var(--space-sm) var(--space-md);
   background-color: var(--color-surface);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* Card radius (8px), matching the .ack-stack that contains it — at the 6px
+     button radius it was rounded like its own buttons (elspeth-9e863afc1b). */
+  border-radius: var(--radius-lg);
 }
 
 /* Title row: humanised step label · kind. De-emphasised; secondary (not muted)
@@ -1945,7 +2867,11 @@
 
 .ack-card-model {
   font-family: var(--font-mono, monospace);
-  font-size: 0.95em;
+  /* On-scale, not relative (elspeth-586fbe926c). 0.95em was the corpus's only
+     relative font-size: inside .ack-card-line's 13px it computed to 12.35px,
+     a fractional value on no step of the 12/13/15/16/18 scale, and it would
+     land somewhere different again if the chip were ever reused elsewhere. */
+  font-size: var(--font-size-xs);
 }
 
 .ack-card-actions {
@@ -1955,8 +2881,12 @@
   gap: var(--space-sm);
 }
 
+/* Full-width row inside .ack-card-main: the disclosure precedes the gated
+   primary in DOM/tab order (ux-review 2026-08-13), so it must not share the
+   wrap row with the card line and the action buttons. */
 .ack-card-value {
   display: flex;
+  flex: 1 1 100%;
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-xs);
@@ -1964,7 +2894,20 @@
 
 .ack-card-view-toggle {
   align-self: flex-start;
-  padding: var(--space-2xs) var(--space-sm);
+  /* Compact control floor (36px, same rung as .bubble-copy-btn above): with
+     only 2px block padding and no min-height the intrinsic box sat around
+     20px — under the WCAG 2.5.8 AA 24×24 target floor. Deliberately NOT the
+     44px .btn rung: the full-size filled button is reserved for the control
+     that resolves a card (Approve/Acknowledge), and this toggle must stay
+     dimensionally subordinate to it in both its quiet and gated-emphasis
+     states (ux review 2026-08-16). The explicit floor also keeps the box
+     height constant across the gated→unlocked colour handoff — no reflow
+     under the pointer inside the scrolling stack. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--size-control-compact);
+  padding: var(--space-xs) var(--space-md);
   background: none;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
@@ -1973,8 +2916,33 @@
   cursor: pointer;
 }
 
-.ack-card-view-toggle:hover {
+/* :where() zeroes the class selector, holding this at (0,1,0) against the
+   --next hover's (0,2,0) below — the emphasis hover wins by specificity, not
+   source order (the same fragility .btn's base hover documents in
+   shared.css, guarded the same way). The :not() inside also keeps this
+   text-colour hover off the filled state entirely. */
+:where(.ack-card-view-toggle:not(.ack-card-view-toggle--next)):hover {
   color: var(--color-text);
+}
+
+/* Gated-primary phase: while Approve is locked, View prompt is the card's one
+   live action, so it carries the filled active-control treatment the sibling
+   cards' Acknowledge buttons have. The first view latches the unlock and the
+   component drops this class, returning the toggle to the quiet outline above
+   while the now-active Approve takes the emphasis (one filled control per
+   card at a time). */
+.ack-card-view-toggle--next {
+  background: var(--color-btn-primary-bg);
+  border-color: var(--color-btn-primary-bg);
+  color: var(--color-text-inverse);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.ack-card-view-toggle--next:hover {
+  background: var(--color-btn-primary-bg-hover);
+  border-color: var(--color-btn-primary-bg-hover);
+  color: var(--color-text-inverse);
 }
 
 .ack-card-prompt-template {
@@ -1994,6 +2962,106 @@
   font-size: var(--font-size-sm);
   line-height: 1.5;
   color: var(--color-text);
+}
+
+/* Interpretation slots substituted into the displayed prompt
+   (elspeth-990f5ea562).  Resolved slots carry the accepted value; pending
+   slots carry the sibling review's draft.  <mark> keeps the UA's
+   forced-colors treatment for free — no forced-colors block here. */
+.ack-card-prompt-slot {
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+}
+
+.ack-card-prompt-slot--resolved {
+  background-color: var(--color-highlight);
+}
+
+.ack-card-prompt-slot--pending {
+  background-color: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+}
+
+/* Visible key for the two slot tints (ux-review 2026-08-13).  The swatches
+   reuse the slot modifier classes so a tint change can never desynchronise
+   the key from the thing it keys.  They are decoration only — under
+   forced-colors the backgrounds are stripped, so the DISTINCTION lives in
+   each item's text, which is why no forced-colors block belongs here. */
+.ack-card-prompt-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs) var(--space-sm);
+  margin: 0 0 var(--space-2xs);
+  padding: 0;
+  list-style: none;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.ack-card-prompt-legend li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.ack-card-prompt-legend-swatch {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: var(--radius-sm);
+}
+
+.ack-card-prompt-pending-note {
+  margin: var(--space-2xs) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+/* Data-contract card body (source_data_contract): the demanded columns the
+   pipeline counts on from this source, with per-field sample warnings and
+   the quarantine-consequence note. */
+.ack-card-data-contract {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
+.ack-card-data-contract-fields {
+  margin: var(--space-2xs) 0 0;
+  padding-left: var(--space-md);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-normal);
+  color: var(--color-text);
+}
+
+.ack-card-data-contract-fields code {
+  font-weight: 600;
+}
+
+.ack-card-data-contract-warning {
+  color: var(--color-error);
+  font-size: var(--font-size-xs);
+}
+
+.ack-card-data-contract-note {
+  margin: var(--space-2xs) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+/* Secondary disclosure for the frozen staging-time template, shown only
+   when it differs from the resolved render. */
+.ack-card-original-template {
+  margin-top: var(--space-2xs);
+}
+
+.ack-card-original-template summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
 }
 
 /* Visible scroll-gate explanation for the prompt-template card: says WHY

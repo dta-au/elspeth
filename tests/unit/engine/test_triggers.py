@@ -968,27 +968,43 @@ class TestCheckpointRestoreStateFidelity:
         assert evaluator.should_trigger() is True
         assert evaluator.which_triggered() == "count"
 
-    def test_zero_batch_count_valid(self) -> None:
-        """batch_count=0 is valid (empty batch restore after flush).
-
-        Kills line 277: ``batch_count < 0`` → ``<= 0``.
-        """
+    def test_zero_batch_restore_is_reset_equivalent(self) -> None:
+        """An empty checkpoint has no timeout anchor until the next accept."""
         from elspeth.core.config import TriggerConfig
         from elspeth.engine.clock import MockClock
         from elspeth.engine.triggers import TriggerEvaluator
 
         clock = MockClock(start=0.0)
-        config = TriggerConfig(count=10)
+        config = TriggerConfig(count=2, timeout_seconds=10.0)
         evaluator = TriggerEvaluator(config, clock=clock)
 
-        # Should NOT raise — 0 is a valid batch count
+        evaluator.record_accept()
+        evaluator.record_accept()
+        assert evaluator.should_trigger() is True
+        assert evaluator.which_triggered() == "count"
+
         evaluator.restore_from_checkpoint(
             batch_count=0,
             elapsed_age_seconds=0.0,
             count_fire_offset=None,
             condition_fire_offset=None,
         )
+
         assert evaluator.batch_count == 0
+        assert evaluator.which_triggered() is None
+        assert evaluator.get_count_fire_offset() is None
+        assert evaluator.get_condition_fire_offset() is None
+
+        clock.advance(20.0)
+        assert evaluator.should_trigger() is False
+
+        evaluator.record_accept()
+        assert evaluator.batch_age_seconds == 0.0
+        clock.advance(9.0)
+        assert evaluator.should_trigger() is False
+        clock.advance(1.0)
+        assert evaluator.should_trigger() is True
+        assert evaluator.which_triggered() == "timeout"
 
     def test_zero_elapsed_age_valid(self) -> None:
         """elapsed_age_seconds=0.0 is valid (checkpoint taken immediately).

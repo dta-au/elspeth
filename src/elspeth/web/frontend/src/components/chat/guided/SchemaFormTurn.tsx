@@ -1,7 +1,19 @@
-import { useId, useState, type ReactNode } from "react";
-import type { GuidedRespondAction, KnobField, SchemaFormPayload } from "@/types/guided";
+import { useEffect, useId, useState, type ReactNode } from "react";
+
+import { Button, Input } from "@/components/ui";
+import type { GuidedRespondAction, GuidedSourceBlobCandidate, KnobField, SchemaFormPayload } from "@/types/guided";
 import { TUTORIAL_VALIDATION_FAILURE_CAVEAT } from "@/components/tutorial/copy";
+import { useShowAdvanced } from "@/stores/preferencesStore";
+import { DISCARD_CONNECTION } from "@/lib/graphTopology";
 import { CodeBlock } from "../CodeBlock";
+
+// Advanced-tier knobs (Task 4's `KnobField.tier`) are grouped behind a
+// `<details>` disclosure rather than rendered inline — an absent tier reads
+// as "common" (older payloads predate the tier annotation), so only an
+// EXPLICIT "advanced" tier is ever hidden by default (elspeth-9cca900d41).
+function isAdvanced(field: KnobField): boolean {
+  return field.tier === "advanced";
+}
 
 interface SchemaFormTurnProps {
   payload: SchemaFormPayload;
@@ -13,16 +25,58 @@ interface SchemaFormTurnProps {
    * on_validation_failure="discard"). Off for the normal composer flow.
    */
   isTutorial?: boolean;
+  /**
+   * A source blob uploaded AFTER this form's turn was emitted
+   * (elspeth-c70909c13a). The persisted turn payload is immutable replay
+   * authority, so a late upload can only land in the local draft — the same
+   * ``blob:<id>`` sentinel the user would legally type into ``path``. Applied
+   * once, and only into an EMPTY path (a value the user or the server prefill
+   * already set is never overwritten). Mirrors the backend's upload-first
+   * prefill (emitters._merge_inspection_into_prefill): path plus
+   * on_validation_failure = "discard" when that knob is also unanswered.
+   */
+  sourceFormPathPrefill?: GuidedSourceBlobCandidate | null;
 }
 
 type FormValues = Record<string, unknown>;
 
-export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial = false }: SchemaFormTurnProps) {
+export function SchemaFormTurn({
+  payload,
+  onSubmit,
+  disabled = false,
+  isTutorial = false,
+  sourceFormPathPrefill = null,
+}: SchemaFormTurnProps) {
   const reactId = useId();
   const [view, setView] = useState<"summary" | "edit">("summary");
   const [values, setValues] = useState<FormValues>(() =>
     initialValues(payload.knobs.fields, payload.prefilled),
   );
+
+  const prefillBlobId = sourceFormPathPrefill?.id ?? null;
+  const hasPathKnob = payload.knobs.fields.some((field) => field.name === "path");
+  const showAdvanced = useShowAdvanced();
+  const hasValidationFailureKnob = payload.knobs.fields.some(
+    (field) => field.name === "on_validation_failure",
+  );
+  useEffect(() => {
+    if (prefillBlobId === null || !hasPathKnob) return;
+    setValues((prev) => {
+      const currentPath = prev["path"];
+      if (currentPath !== undefined && currentPath !== null && currentPath !== "") {
+        return prev;
+      }
+      const next: FormValues = { ...prev, path: `blob:${prefillBlobId}` };
+      const currentFailure = prev["on_validation_failure"];
+      if (
+        hasValidationFailureKnob &&
+        (currentFailure === undefined || currentFailure === null || currentFailure === "")
+      ) {
+        next["on_validation_failure"] = DISCARD_CONNECTION;
+      }
+      return next;
+    });
+  }, [prefillBlobId, hasPathKnob, hasValidationFailureKnob]);
 
   function isVisible(field: KnobField, state: FormValues = values): boolean {
     if (!field.visible_when) return true;
@@ -57,7 +111,7 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
       // value rode silently through to submit because canSubmit only inspected
       // required fields and never checked validity.
       if (fieldHasError(field, value)) return true;
-      if (!field.required) return false;
+      if (!isRequiredNow(field, values)) return false;
       if (field.kind === "checkbox") return false;
       if (value === undefined || value === null || value === "") return true;
       return Array.isArray(value) && value.length === 0;
@@ -82,7 +136,7 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
       // string "null" that submittedValue parses to null, so we test the resolved
       // value, not the raw input. Required-field validation is unaffected;
       // nullable optional fields still send null (null is meaningful there).
-      if (value === null && !field.required && !field.nullable) {
+      if (value === null && !isRequiredNow(field, values) && !field.nullable) {
         continue;
       }
       submitted[field.name] = value;
@@ -120,40 +174,52 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
         // no value stays visible as a muted "Not set" (the needs-edit banner
         // below names it too).
         (() => {
-          const summaryRows = visibleFields().filter(
-            (f) => f.required || !isEmptyValue(f, values[f.name]),
+          const rows = visibleFields().filter(
+            (f) => isRequiredNow(f, values) || !isEmptyValue(f, values[f.name]),
           );
-          if (summaryRows.length === 0) {
+          const primaryRows = rows.filter((f) => !isAdvanced(f));
+          const advancedRows = rows.filter(isAdvanced);
+          if (rows.length === 0) {
             return (
               <p className="guided-schema-summary-defaults">
                 No settings need review for this step.
               </p>
             );
           }
+          const renderRow = (f: KnobField) => (
+            <div className="guided-schema-summary-row" key={f.name}>
+              <dt className="guided-schema-summary-label">{f.label}</dt>
+              <dd className="guided-schema-summary-value">
+                {summaryValueNode(f, values[f.name])}
+                {showValidationFailureTeaching && f.name === "on_validation_failure" && (
+                  <p className="guided-schema-summary-caveat" role="note">
+                    {TUTORIAL_VALIDATION_FAILURE_CAVEAT}
+                  </p>
+                )}
+              </dd>
+            </div>
+          );
           return (
-            <dl className="guided-schema-summary">
-              {summaryRows.map((f) => (
-                <div className="guided-schema-summary-row" key={f.name}>
-                  <dt className="guided-schema-summary-label">{f.label}</dt>
-                  <dd className="guided-schema-summary-value">
-                    {summaryValueNode(f, values[f.name])}
-                    {showValidationFailureTeaching && f.name === "on_validation_failure" && (
-                      <p className="guided-schema-summary-caveat" role="note">
-                        {TUTORIAL_VALIDATION_FAILURE_CAVEAT}
-                      </p>
-                    )}
-                  </dd>
-                </div>
-              ))}
-            </dl>
+            <>
+              {primaryRows.length > 0 && (
+                <dl className="guided-schema-summary">{primaryRows.map(renderRow)}</dl>
+              )}
+              {advancedRows.length > 0 && (
+                <details className="guided-schema-advanced" open={showAdvanced}>
+                  <summary>Advanced settings ({advancedRows.length})</summary>
+                  <dl className="guided-schema-summary">{advancedRows.map(renderRow)}</dl>
+                </details>
+              )}
+            </>
           );
         })()
       ) : (
         <div className="guided-schema-fields">
-          {visibleFields().map((field) => (
+          {visibleFields().filter((f) => !isAdvanced(f)).map((field) => (
             <KnobFieldRenderer
               key={field.name}
               field={field}
+              required={isRequiredField(field, values)}
               value={values[field.name]}
               onChange={(value) => onChange(field.name, value)}
               idPrefix={reactId}
@@ -161,6 +227,23 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
               isTutorial={isTutorial}
             />
           ))}
+          {visibleFields().some(isAdvanced) && (
+            <details className="guided-schema-advanced" open={showAdvanced}>
+              <summary>Advanced settings ({visibleFields().filter(isAdvanced).length})</summary>
+              {visibleFields().filter(isAdvanced).map((field) => (
+                <KnobFieldRenderer
+                  key={field.name}
+                  field={field}
+                  required={isRequiredField(field, values)}
+                  value={values[field.name]}
+                  onChange={(value) => onChange(field.name, value)}
+                  idPrefix={reactId}
+                  disabled={disabled}
+                  isTutorial={isTutorial}
+                />
+              ))}
+            </details>
+          )}
         </div>
       )}
       {/* The Edit affordance and this needs-edit banner are non-tutorial only.
@@ -187,32 +270,32 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
         })()}
       <div className="guided-schema-actions">
         {!isTutorial && view === "summary" && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-turn-secondary guided-schema-edit-toggle"
             onClick={() => setView("edit")}
           >
             Edit
-          </button>
+          </Button>
         )}
         {!isTutorial && view === "edit" && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-turn-secondary guided-schema-edit-toggle"
             onClick={() => setView("summary")}
             disabled={visibleFields().some((f) => fieldHasError(f, values[f.name]))}
           >
             Done editing
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-turn-primary"
           onClick={handleContinue}
           disabled={disabled || !canSubmit()}
         >
           Continue
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -317,13 +400,30 @@ function submittedValue(field: KnobField, value: unknown): unknown {
   return value;
 }
 
+// Whether a field must be filled GIVEN the current form state. `required` is
+// the plugin model's own field-level requiredness; `required_when` carries a
+// rule the model cannot express but the composer enforces anyway — a local file
+// sink must choose a `collision_policy` under `mode='write'`, though the field
+// is `default=None` and lowers `required: false` (R2-F2). Reading only
+// `field.required` let the form report such a knob optional and hand the user a
+// Continue button that walked straight into a backend rejection.
+//
+// The predicate reads sibling form state, so unlike `visible_when` its target
+// may be declared LATER in the field list (`collision_policy` lives on
+// LocalFileSinkConfig, `mode` on the concrete sink subclass).
+function isRequiredNow(field: KnobField, state: FormValues): boolean {
+  if (field.required) return true;
+  if (!field.required_when) return false;
+  return state[field.required_when.field] === field.required_when.equals;
+}
+
 // Whether a field participates in the required-marker / aria-required treatment.
 // Mirrors canSubmit's required predicate: a checkbox always carries a boolean
 // value, so the form never treats one as unmet — marking it required (visibly or
 // programmatically) would contradict that, so the marker tracks exactly the
 // predicate the gate enforces.
-function isRequiredField(field: KnobField): boolean {
-  return field.required && field.kind !== "checkbox";
+function isRequiredField(field: KnobField, state: FormValues): boolean {
+  return isRequiredNow(field, state) && field.kind !== "checkbox";
 }
 
 // True when the field's current value is in a state the form already knows is
@@ -360,11 +460,16 @@ function describedBy(...ids: Array<string | undefined>): string | undefined {
 // not read "star") while the screen-reader-only "(required)" carries the cue in
 // the accessible name; aria-required on the control (set per branch) conveys the
 // state programmatically. Non-required fields render the label alone.
-function FieldLabel({ field, htmlFor }: { field: KnobField; htmlFor: string }) {
+//
+// `required` arrives as a prop rather than being derived here: with
+// `required_when` the answer depends on current form state, which only the
+// component holds. One boolean computed once per render keeps the marker, the
+// aria state, and the submit gate reading the same predicate.
+function FieldLabel({ field, htmlFor, required }: { field: KnobField; htmlFor: string; required: boolean }) {
   return (
     <label htmlFor={htmlFor} className="guided-schema-label">
       {field.label}
-      {isRequiredField(field) && (
+      {required && (
         <>
           <span className="guided-schema-required-marker" aria-hidden="true">
             {" *"}
@@ -378,6 +483,7 @@ function FieldLabel({ field, htmlFor }: { field: KnobField; htmlFor: string }) {
 
 function KnobFieldRenderer({
   field,
+  required,
   value,
   onChange,
   idPrefix,
@@ -385,6 +491,7 @@ function KnobFieldRenderer({
   isTutorial = false,
 }: {
   field: KnobField;
+  required: boolean;
   value: unknown;
   onChange: (value: unknown) => void;
   idPrefix: string;
@@ -393,7 +500,6 @@ function KnobFieldRenderer({
 }) {
   const id = `${idPrefix}-${field.name}`;
   const descriptionId = field.description ? `${id}-description` : undefined;
-  const required = isRequiredField(field);
 
   switch (field.kind) {
     case "text":
@@ -439,8 +545,12 @@ function KnobFieldRenderer({
       const displayString = maskPathLeak ? friendlyBlobRef(rawString) : rawString;
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
-          <input
+          <FieldLabel field={field} htmlFor={id} required={required} />
+          {/* bare: .guided-schema-input is a complete bespoke recipe
+              (--color-border-strong, font-family inherit); .input's chrome
+              would restyle it. Same applies to the number field below. */}
+          <Input
+            bare
             id={id}
             type="text"
             className="guided-schema-input"
@@ -459,14 +569,14 @@ function KnobFieldRenderer({
             </p>
           )}
           {field.nullable && value !== null && (
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="guided-turn-secondary"
               onClick={() => onChange(null)}
               disabled={disabled}
             >
               Clear {field.label}
-            </button>
+            </Button>
           )}
         </div>
       );
@@ -477,8 +587,9 @@ function KnobFieldRenderer({
       const errorId = hasError ? `${id}-error` : undefined;
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
-          <input
+          <FieldLabel field={field} htmlFor={id} required={required} />
+          <Input
+            bare
             id={id}
             type="number"
             className={`guided-schema-input${hasError ? " guided-schema-input--error" : ""}`}
@@ -522,7 +633,7 @@ function KnobFieldRenderer({
     case "checkbox":
       return (
         <div className="guided-schema-field-row guided-schema-checkbox-row">
-          <input
+          <Input
             id={id}
             type="checkbox"
             className="guided-schema-checkbox"
@@ -531,7 +642,7 @@ function KnobFieldRenderer({
             onChange={(event) => onChange(event.target.checked)}
             disabled={disabled}
           />
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           {field.description && (
             <p id={descriptionId} className="guided-schema-hint">
               {field.description}
@@ -542,7 +653,7 @@ function KnobFieldRenderer({
     case "enum":
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <select
             id={id}
             className="guided-schema-select"
@@ -553,7 +664,7 @@ function KnobFieldRenderer({
             onChange={(event) => onChange(event.target.value)}
             disabled={disabled}
           >
-            <option value="" disabled={field.required}>
+            <option value="" disabled={required}>
               Select...
             </option>
             {(field.enum ?? []).map((option) => (
@@ -572,7 +683,7 @@ function KnobFieldRenderer({
     case "string-list":
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <textarea
             id={id}
             className="guided-schema-textarea"
@@ -603,11 +714,12 @@ function KnobFieldRenderer({
       const errorId = hasError ? `${id}-error` : undefined;
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <textarea
             id={id}
             className={`guided-schema-textarea${hasError ? " guided-schema-textarea--error" : ""}`}
             value={jsonText(value, field.kind)}
+            placeholder={field.placeholder}
             required={required}
             aria-required={required || undefined}
             aria-invalid={hasError || undefined}

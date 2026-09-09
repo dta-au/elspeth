@@ -6,30 +6,42 @@ POST /verify-email consumes a local-auth email verification token.
 POST /token re-issues a JWT from a valid existing token (local only).
 GET /config returns auth configuration for frontend discovery (unauthenticated).
 GET /me returns the full UserProfile for any auth provider.
+POST /logout records the end of a session for any auth provider; the client discards the token.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import cast
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter, classify_authentication_failure
-from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict, bcrypt_password_bytes
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
 from elspeth.web.auth.protocol import AuthProvider, CredentialAuthProvider
+from elspeth.web.auth.sso import (
+    COOKIE_NAME,
+    AdmittedIdentity,
+    CallbackQuery,
+    SsoLoginError,
+    SsoRuntime,
+    authorization_redirect,
+    complete_login,
+    cookie_attributes,
+    failure_category,
+    failure_location,
+    login_callback,
+)
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import check_auth_rate_limit
 from elspeth.web.validation import has_visible_content
@@ -57,6 +69,12 @@ class LoginRequest(BaseModel):
     username: str = Field(max_length=AUTH_AUDIT_PRINCIPAL_MAX_LENGTH)
     password: str
 
+    @field_validator("password")
+    @classmethod
+    def _password_must_fit_bcrypt(cls, v: str) -> str:
+        bcrypt_password_bytes(v)
+        return v
+
 
 class RegisterRequest(BaseModel):
     """Request body for POST /api/auth/register."""
@@ -65,6 +83,12 @@ class RegisterRequest(BaseModel):
     password: str
     display_name: str
     email: str | None = None
+
+    @field_validator("password")
+    @classmethod
+    def _password_must_fit_bcrypt(cls, v: str) -> str:
+        bcrypt_password_bytes(v)
+        return v
 
     @field_validator("username", "password", "display_name")
     @classmethod
@@ -122,6 +146,9 @@ class UserProfileResponse(_StrictResponse):
     display_name: str | None = None
     email: str | None = None
     groups: list[str] = []
+    # True only for the local-auth user named by WebSettings.dev_admin_user;
+    # the frontend uses it to reveal the dev user-management menu entry.
+    dev_admin: bool = False
 
 
 class AuthConfigResponse(_StrictResponse):
@@ -129,10 +156,22 @@ class AuthConfigResponse(_StrictResponse):
 
     provider: AuthProviderType
     registration_mode: str
-    oidc_issuer: str | None = None
-    oidc_client_id: str | None = None
-    authorization_endpoint: str | None = None
-    token_endpoint: str | None = None
+    # The browser never learns the IdP's endpoints or the client id: the code
+    # exchange is the backend's, as a confidential client (spec D2).
+    # Where the SPA's "Sign in with SSO" button navigates. Only local-auth
+    # deployments omit it; nonlocal runtime wiring is required at startup.
+    sso_start_url: str | None = None
+
+
+class SsoCompleteRequest(BaseModel):
+    """Request body for POST /api/auth/sso/complete: the handoff code from the fragment."""
+
+    # A handoff code is 43 characters (token_urlsafe(32)). The bound is
+    # generous but present: the code is hashed as-is, and an unauthenticated
+    # caller must not be able to make the hash the expensive part.
+    code: str = Field(min_length=1, max_length=128)
+
+    model_config = ConfigDict(strict=True, extra="forbid")
 
 
 def _mark_sensitive_auth_response_uncacheable(response: Response) -> None:
@@ -145,7 +184,72 @@ def _auth_audit_recorder(request: Request) -> AuthAuditWriter:
     return cast(AuthAuditWriter, request.app.state.auth_audit_recorder)
 
 
-@trust_boundary(
+def _sso_runtime_if_wired(request: Request) -> SsoRuntime | None:
+    """Return the required nonlocal runtime, or None for local authentication.
+
+    The app factory rejects incomplete nonlocal wiring and lifespan resolves
+    ``app.state.sso`` before serving requests. Missing or invalid state is an
+    application contract failure, never an ordinary provider outage.
+    """
+    settings: WebSettings = request.app.state.settings
+    if settings.auth_provider == "local":
+        return None
+    candidate = request.app.state.sso
+    if not isinstance(candidate, SsoRuntime):
+        raise FrameworkBugError("Nonlocal authentication requires app.state.sso to be an SsoRuntime")
+    return candidate
+
+
+async def _sso_runtime(request: Request) -> SsoRuntime:
+    """Return the required SSO runtime; local deployments have no SSO route."""
+    runtime = _sso_runtime_if_wired(request)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return runtime
+
+
+def _single_query_value(request: Request, key: str) -> str | None:
+    """Exactly one occurrence of ``key`` in the query string, else ``None``.
+
+    The callback's query is written by whoever redirected the browser. A
+    duplicated ``state`` or ``code`` is not a value with a tie-break rule; it
+    is a request that does not match the one the IdP sends, and absence is
+    what the walk refuses on.
+    """
+    values = request.query_params.getlist(key)
+    if len(values) != 1:
+        return None
+    return values[0]
+
+
+def _route_auth_failure(
+    request: Request,
+    *,
+    detail: str,
+    failure_category: str,
+    failure_stage: str,
+    user: UserIdentity | None = None,
+    exc: AuthenticationError | None = None,
+) -> HTTPException:
+    """Record one route-owned auth failure before constructing its 401."""
+    settings: WebSettings = request.app.state.settings
+    _auth_audit_recorder(request).record_auth_failure(
+        request,
+        provider=settings.auth_provider,
+        failure_category=failure_category,
+        failure_stage=failure_stage,
+        # ``user_id`` is the principal as the request named it; the
+        # identity_id goes in its own column. Splitting them keeps one query
+        # per question instead of a column that means two things.
+        user_id=None if user is None else user.username,
+        username=None if user is None else user.username,
+        identity_id=None if user is None else user.user_id,
+        exception_class=None if exc is None else type(exc).__name__,
+    )
+    return HTTPException(status_code=401, detail=detail)
+
+
+@observation_boundary(
     tier=3,
     source="browser-supplied Origin request header",
     source_param="request",
@@ -154,7 +258,6 @@ def _auth_audit_recorder(request: Request) -> AuthAuditWriter:
         "returns None on an absent, non-allowlisted, non-HTTPS-safe, or non-bare-origin "
         "Origin header; only a normalised, allowlisted, credential-safe origin is returned"
     ),
-    non_raising=True,
 )
 def _trusted_request_origin(settings: WebSettings, request: Request) -> str | None:
     origin = request.headers.get("origin")
@@ -190,33 +293,6 @@ def _email_verification_origin(settings: WebSettings, request: Request) -> str:
     return f"http://{host}:{settings.port}"
 
 
-def _write_email_verification_outbox(
-    outbox_path: Path,
-    *,
-    origin: str,
-    user_id: str,
-    email: str,
-    token: str,
-) -> None:
-    outbox_path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "user_id": user_id,
-        "email": email,
-        "token": token,
-        "verification_url": f"{origin}/?{urlencode({'verify_token': token})}",
-    }
-    fd = os.open(outbox_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fp:
-            fd = -1
-            fp.write(json.dumps(record, sort_keys=True))
-            fp.write("\n")
-    finally:
-        if fd != -1:
-            os.close(fd)
-
-
 def create_auth_router() -> APIRouter:
     """Create the auth router with /api/auth prefix."""
     router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -250,7 +326,12 @@ def create_auth_router() -> APIRouter:
                 request,
                 provider=settings.auth_provider,
                 username=body.username,
-                failure_category="invalid_credentials",
+                # Classified, not hardcoded. Login can now fail for reasons
+                # that are not a bad credential — an identity awaiting
+                # approval, or one that has been disabled — and recording
+                # those as invalid_credentials would hide an approval queue
+                # inside the trail that is supposed to surface brute force.
+                failure_category=classify_authentication_failure(exc),
             )
             raise HTTPException(status_code=401, detail=exc.detail) from exc
 
@@ -296,60 +377,50 @@ def create_auth_router() -> APIRouter:
             )
 
         provider: LocalAuthProvider = request.app.state.auth_provider
-        try:
-            await run_sync_in_worker(
-                provider.create_user,
-                body.username,
-                body.password,
-                body.display_name,
-                body.email,
-                email_verified=settings.registration_mode != "email_verified",
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
         if settings.registration_mode == "email_verified":
             assert body.email is not None
             outbox_path = settings.data_dir / "email-verifications.jsonl"
             origin = _email_verification_origin(settings, request)
             try:
-                token = await run_sync_in_worker(
-                    provider.create_email_verification_token,
-                    body.username,
-                )
                 await run_sync_in_worker(
-                    _write_email_verification_outbox,
-                    outbox_path,
-                    origin=origin,
-                    user_id=body.username,
+                    provider.register_email_verified_user,
+                    body.username,
+                    body.password,
+                    body.display_name,
                     email=body.email,
-                    token=token,
+                    verification_origin=origin,
+                    outbox_path=outbox_path,
                 )
-            except ValueError as exc:
-                await run_sync_in_worker(provider.delete_user, body.username)
+            except LocalAuthRegistrationConflict as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except OSError as exc:
-                await run_sync_in_worker(provider.delete_user, body.username)
                 raise HTTPException(status_code=500, detail="Email verification outbox could not be written") from exc
             response.status_code = 202
             return RegistrationPendingResponse(email=body.email)
 
-        token = await provider.login(body.username, body.password)
         recorder = _auth_audit_recorder(request)
-        try:
+
+        def record_registration_token(access_token: str) -> None:
             recorder.record_token_issued(
                 request,
                 provider=settings.auth_provider,
                 user_id=body.username,
                 username=body.username,
-                access_token=token,
+                access_token=access_token,
                 issuance_path="register",
             )
-        except Exception as audit_exc:
-            deleted = await run_sync_in_worker(provider.delete_user, body.username)
-            if not deleted:
-                raise AuditIntegrityError("Registration audit failed and user creation could not be compensated") from audit_exc
-            raise
+
+        try:
+            token = await run_sync_in_worker(
+                provider.register_open_user_with_audit,
+                body.username,
+                body.password,
+                body.display_name,
+                body.email,
+                record_token_issued=record_registration_token,
+            )
+        except LocalAuthRegistrationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=token)
 
@@ -366,31 +437,32 @@ def create_auth_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="Not found")
 
         provider: LocalAuthProvider = request.app.state.auth_provider
-        try:
-            identity = await run_sync_in_worker(provider.verify_email_token, body.token)
-        except AuthenticationError as exc:
-            raise HTTPException(status_code=401, detail=exc.detail) from exc
-
-        token = provider.issue_token_for_user(identity.user_id, identity.username)
         recorder = _auth_audit_recorder(request)
-        try:
+
+        def record_verification_token(identity: UserIdentity, access_token: str) -> None:
             recorder.record_token_issued(
                 request,
                 provider=settings.auth_provider,
-                user_id=identity.user_id,
+                user_id=identity.username,
                 username=identity.username,
-                access_token=token,
+                access_token=access_token,
                 issuance_path="email_verification",
             )
-        except Exception as audit_exc:
-            restored = await run_sync_in_worker(
-                provider.restore_email_verification_token,
+
+        try:
+            token = await run_sync_in_worker(
+                provider.verify_email_and_issue_token,
                 body.token,
-                identity.user_id,
+                record_token_issued=record_verification_token,
             )
-            if not restored:
-                raise AuditIntegrityError("Email verification audit failed and verification state could not be compensated") from audit_exc
-            raise
+        except AuthenticationError as exc:
+            raise _route_auth_failure(
+                request,
+                detail=exc.detail,
+                failure_category="invalid_token",
+                failure_stage="verify_email",
+                exc=exc,
+            ) from exc
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=token)
 
@@ -399,49 +471,64 @@ def create_auth_router() -> APIRouter:
         request: Request,
         response: Response,
     ) -> TokenResponse:
-        """Re-issue a JWT from a valid existing token (local auth only).
+        """Re-issue a session token from a valid existing one (local auth only).
 
-        Passes the original ``iat`` claim through so the provider can
-        enforce a maximum refresh chain lifetime.
+        Hands the provider the TOKEN. The chain bound used to be enforced
+        against an ``iat`` read here from the middleware's unverified decode;
+        the provider's issuer now reads it from its own verified decode, so
+        the route no longer stands between a signature and a security bound.
         """
         settings: WebSettings = request.app.state.settings
         if settings.auth_provider != "local":
             raise HTTPException(status_code=404, detail="Not found")
 
         user = await get_current_user(request)
-
-        # Extract iat from claims parsed by the auth middleware.
-        # The middleware decodes claims without signature verification for
-        # downstream use, then verifies the signature via authenticate().
-        # If authenticate() fails, this route handler never executes.
-        #
-        # If claims are None (decode failed despite valid signature), refuse
-        # the refresh — we cannot enforce chain lifetime without iat.
-        claims = request.state.auth_claims
-        if claims is None:
-            raise HTTPException(status_code=401, detail="Token claims could not be parsed — re-authenticate")
-        if "iat" not in claims:
-            raise HTTPException(status_code=401, detail="Token missing required iat claim — re-authenticate")
-        original_iat = claims["iat"]
-        if type(original_iat) is not int:
-            raise HTTPException(status_code=401, detail="Token missing required iat claim — re-authenticate")
+        token = request.state.auth_token
 
         provider: CredentialAuthProvider = request.app.state.auth_provider
         try:
-            new_token = await provider.refresh(user.user_id, user.username, original_iat=original_iat)
+            new_token = await provider.refresh(token)
         except AuthenticationError as exc:
-            raise HTTPException(status_code=401, detail=exc.detail) from exc
+            raise _route_auth_failure(
+                request,
+                detail=exc.detail,
+                failure_category=classify_authentication_failure(exc),
+                failure_stage="refresh",
+                user=user,
+                exc=exc,
+            ) from exc
         recorder = _auth_audit_recorder(request)
         recorder.record_token_issued(
             request,
             provider=settings.auth_provider,
-            user_id=user.user_id,
+            user_id=user.username,
             username=user.username,
             access_token=new_token,
             issuance_path="refresh",
         )
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=new_token)
+
+    @router.post("/logout", status_code=204, response_class=Response)
+    async def logout(request: Request) -> Response:
+        """Record that a session ended on purpose; the client discards the token.
+
+        Mounted for every provider. Server-side revocation is a future
+        ``jti`` denylist (spec rev2), so the row is the whole effect: the
+        audit trail reads it alongside the ``login`` and ``token_issued``
+        rows it closes, and it is written before the response.
+        """
+        settings: WebSettings = request.app.state.settings
+        user = await get_current_user(request)
+        _auth_audit_recorder(request).record_logout(
+            request,
+            provider=settings.auth_provider,
+            identity_id=user.user_id,
+            username=user.username,
+        )
+        response = Response(status_code=204)
+        _mark_sensitive_auth_response_uncacheable(response)
+        return response
 
     @router.get("/config", response_model=AuthConfigResponse)
     async def auth_config(request: Request, response: Response) -> AuthConfigResponse:
@@ -452,14 +539,154 @@ def create_auth_router() -> APIRouter:
         """
         settings: WebSettings = request.app.state.settings
         _mark_sensitive_auth_response_uncacheable(response)
+        sso_runtime = _sso_runtime_if_wired(request)
         return AuthConfigResponse(
             provider=settings.auth_provider,
             registration_mode=settings.registration_mode,
-            oidc_issuer=settings.oidc_issuer,
-            oidc_client_id=settings.oidc_client_id,
-            authorization_endpoint=request.app.state.oidc_authorization_endpoint,
-            token_endpoint=request.app.state.oidc_token_endpoint,
+            sso_start_url=None if sso_runtime is None else sso_runtime.client.start_url,
         )
+
+    # ── the SSO walk ─────────────────────────────────────────────────────
+    #
+    # Three routes, one service (web/auth/sso.py). Nonlocal deployments bind
+    # app.state.sso during startup. These routes read the request, hand it to
+    # the service, and write the audit rows the service leaves to them.
+
+    @router.get("/sso/start")
+    async def sso_start(
+        request: Request,
+        _rate_limit: None = Depends(check_auth_rate_limit),
+    ) -> RedirectResponse:
+        """Begin a login: seal a transaction cookie and send the browser to the IdP.
+
+        Accepts NO query parameters (spec §2 [rev2]): a return path here
+        would be an open-redirect parameter on the one route guaranteed to
+        be reachable unauthenticated. Anything supplied is ignored.
+        """
+        runtime = await _sso_runtime(request)
+        client = runtime.client
+        redirect = authorization_redirect(
+            authorization_endpoint=client.endpoints.authorization_endpoint,
+            client_id=client.client_id,
+            redirect_uri=client.redirect_uri,
+            scopes=client.scopes,
+            transaction_secret=client.transaction_secret,
+            provider=client.provider,
+        )
+        response = RedirectResponse(redirect.location, status_code=302)
+        response.set_cookie(**cookie_attributes(redirect.cookie_value))
+        _mark_sensitive_auth_response_uncacheable(response)
+        return response
+
+    @router.get("/sso/callback")
+    async def sso_callback(
+        request: Request,
+        _rate_limit: None = Depends(check_auth_rate_limit),
+    ) -> RedirectResponse:
+        """The IdP sent the browser back. Verify everything, hand back a handoff.
+
+        Every outcome is a redirect to the SPA's ``#/auth/callback`` route
+        with either ``code`` or ``error`` in the FRAGMENT, and every outcome
+        clears the transaction cookie — a cookie that survived a failed
+        callback would be a state the next login compares against.
+        """
+        runtime = await _sso_runtime(request)
+        settings: WebSettings = request.app.state.settings
+        client = runtime.client
+        recorder = _auth_audit_recorder(request)
+        query = CallbackQuery(
+            code=_single_query_value(request, "code"),
+            state=_single_query_value(request, "state"),
+            error=_single_query_value(request, "error"),
+        )
+        cookie_value = request.cookies[COOKIE_NAME] if COOKIE_NAME in request.cookies else None
+
+        def record_login(identity: AdmittedIdentity) -> None:
+            recorder.record_login_success(
+                request,
+                provider=settings.auth_provider,
+                user_id=identity.identity_id,
+                username=identity.username,
+                identity_id=identity.identity_id,
+            )
+
+        try:
+            location = await login_callback(
+                query,
+                cookie_value,
+                client=client,
+                validator=runtime.validator,
+                claim_checks=runtime.claim_checks,
+                map_identity=runtime.map_identity,
+                upsert_identity=runtime.upsert_identity,
+                record_login=record_login,
+                handoffs=runtime.handoffs,
+                request_id=request.state.request_id,
+                transport=runtime.transport,
+            )
+        except (SsoLoginError, AuthProviderUnavailable) as exc:
+            category = failure_category(exc)
+            recorder.record_auth_failure(
+                request,
+                provider=settings.auth_provider,
+                failure_category=category,
+                failure_stage="sso_callback",
+                user_id=None,
+                username=None,
+                exception_class=type(exc).__name__,
+            )
+            location = failure_location(client.public_base_url, category)
+
+        response = RedirectResponse(location, status_code=302)
+        response.set_cookie(**cookie_attributes(None))
+        _mark_sensitive_auth_response_uncacheable(response)
+        return response
+
+    @router.post("/sso/complete", response_model=TokenResponse)
+    async def sso_complete(
+        body: SsoCompleteRequest,
+        request: Request,
+        response: Response,
+        _rate_limit: None = Depends(check_auth_rate_limit),
+    ) -> TokenResponse:
+        """Trade the handoff code for the session token. The only place one is minted."""
+        runtime = await _sso_runtime(request)
+        settings: WebSettings = request.app.state.settings
+        recorder = _auth_audit_recorder(request)
+
+        def record_token_issued(identity: AdmittedIdentity, token: str, login_request_id: str) -> None:
+            recorder.record_token_issued(
+                request,
+                provider=settings.auth_provider,
+                user_id=identity.identity_id,
+                username=identity.username,
+                access_token=token,
+                issuance_path="sso_complete",
+                login_request_id=login_request_id,
+            )
+
+        try:
+            session = complete_login(
+                body.code,
+                handoffs=runtime.handoffs,
+                read_identity=runtime.read_identity,
+                issuer=runtime.issuer,
+                record_token_issued=record_token_issued,
+            )
+        except SsoLoginError as exc:
+            recorder.record_auth_failure(
+                request,
+                provider=settings.auth_provider,
+                failure_category=exc.category,
+                failure_stage="sso_complete",
+                user_id=None,
+                username=None,
+                exception_class=type(exc).__name__,
+            )
+            raise HTTPException(status_code=401, detail=exc.detail) from exc
+
+        _mark_sensitive_auth_response_uncacheable(response)
+        return TokenResponse(access_token=session.access_token)
 
     @router.get("/me", response_model=UserProfileResponse)
     async def me(
@@ -488,8 +715,9 @@ def create_auth_router() -> APIRouter:
                 provider=settings.auth_provider,
                 failure_category="provider_unavailable",
                 failure_stage="profile_lookup",
-                user_id=user.user_id,
+                user_id=user.username,
                 username=user.username,
+                identity_id=user.user_id,
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=503, detail=exc.detail) from exc
@@ -500,8 +728,9 @@ def create_auth_router() -> APIRouter:
                 provider=settings.auth_provider,
                 failure_category=classify_authentication_failure(exc),
                 failure_stage="profile_lookup",
-                user_id=user.user_id,
+                user_id=user.username,
                 username=user.username,
+                identity_id=user.user_id,
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=401, detail=exc.detail) from exc
@@ -512,6 +741,13 @@ def create_auth_router() -> APIRouter:
             display_name=profile.display_name,
             email=profile.email,
             groups=list(profile.groups),
+            # Username, not user_id: ``dev_admin_user`` names a local account,
+            # while user_id is the identity_id. Must agree with the same
+            # comparison in admin_routes._require_dev_admin, or the frontend
+            # shows an admin surface the backend then 404s.
+            dev_admin=(
+                settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.username == settings.dev_admin_user
+            ),
         )
 
     return router

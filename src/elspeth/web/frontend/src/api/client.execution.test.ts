@@ -46,6 +46,7 @@ describe("api/client execution state binding", () => {
     await executePipeline(
       "session-1",
       { accepted: true, token: "ack-token" },
+      undefined,
       "state-1",
     );
 
@@ -54,6 +55,53 @@ describe("api/client execution state binding", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ fanout_ack_token: "ack-token" }),
+      }),
+    );
+  });
+
+  it("carries the secret acknowledgement token alongside the fanout token", async () => {
+    fetchSpy.mockResolvedValue({
+      ok: true,
+      json: async () => ({ run_id: "run-1" }),
+    } as Response);
+
+    await executePipeline(
+      "session-1",
+      { accepted: true, token: "fanout-token" },
+      { accepted: true, token: "secret-token" },
+      "state-1",
+    );
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "/api/sessions/session-1/execute?state_id=state-1",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          fanout_ack_token: "fanout-token",
+          secret_ack_token: "secret-token",
+        }),
+      }),
+    );
+  });
+
+  it("sends the secret acknowledgement token on its own", async () => {
+    fetchSpy.mockResolvedValue({
+      ok: true,
+      json: async () => ({ run_id: "run-1" }),
+    } as Response);
+
+    await executePipeline(
+      "session-1",
+      undefined,
+      { accepted: true, token: "secret-token" },
+      "state-1",
+    );
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "/api/sessions/session-1/execute?state_id=state-1",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ secret_ack_token: "secret-token" }),
       }),
     );
   });

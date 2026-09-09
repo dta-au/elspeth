@@ -7,11 +7,12 @@ The manifest endpoint is the authoritative full-list of every sink-write
 artefact produced by a run (distinct from the diagnostics endpoint's
 20-artifact preview). The content endpoint streams the bytes of one
 artefact, gated by a path-allowlist guard that enforces
-``allowed_sink_directories(data_dir)``.
+``allowed_sink_directories(data_dir, session_id=run.session_id)``.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from starlette.requests import Request
 from starlette.routing import Route
 
 from elspeth.web.auth.models import UserIdentity
@@ -36,6 +38,110 @@ from elspeth.web.execution.schemas import (
 )
 
 _TEST_USER_ID = "test-user-123"
+_TEST_SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+def _candidate_artifact(path: Path) -> RunOutputArtifact:
+    return RunOutputArtifact(
+        artifact_id="artifact",
+        sink_node_id="sink",
+        producer_kind="node_state",
+        produced_by_state_id="state",
+        sink_effect_id=None,
+        artifact_type="file",
+        path_or_uri=str(path),
+        content_hash="0" * 64,
+        size_bytes=0,
+        publication_performed=True,
+        publication_evidence_kind="legacy_returned",
+        created_at=datetime.now(UTC),
+        exists_now=True,
+        downloadable=True,
+        storage_kind="sink_file",
+    )
+
+
+def _request_with_headers(headers: dict[str, str]) -> Request:
+    """Build a minimal ASGI request carrying only the given request headers."""
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/runs/x/outputs/y/content",
+            "headers": [(key.lower().encode("latin-1"), value.encode("latin-1")) for key, value in headers.items()],
+        }
+    )
+
+
+def test_requested_byte_range_rejects_a_malformed_range_header() -> None:
+    """A present-but-unparsable Range header must 416, never fall back to the whole file."""
+    request = _request_with_headers({"Range": "rows=2-5"})
+    with pytest.raises(HTTPException) as caught:
+        execution_routes._requested_byte_range(request=request, size_bytes=10)
+    assert caught.value.status_code == 416
+    detail: object = caught.value.detail
+    assert detail == {"error_type": "range_not_satisfiable"}
+
+
+def test_requested_byte_range_returns_none_when_the_client_sent_no_range_header() -> None:
+    """Absence of the optional header is legal and must read as 'no range'."""
+    assert execution_routes._requested_byte_range(_request_with_headers({}), size_bytes=10) is None
+
+
+def test_requested_byte_range_parses_a_satisfiable_range_header() -> None:
+    byte_range = execution_routes._requested_byte_range(_request_with_headers({"Range": "bytes=2-5"}), size_bytes=10)
+    assert byte_range is not None
+    assert (byte_range.start, byte_range.end_inclusive) == (2, 5)
+
+
+def test_artifact_path_resolution_fault_is_not_reported_as_allowlist_rejection(monkeypatch, tmp_path) -> None:
+    artifact = _candidate_artifact(tmp_path / "outputs" / "data.csv")
+    failure = OSError("private filesystem detail")
+    monkeypatch.setattr(execution_routes, "allowed_sink_directories", lambda *args, **kwargs: (tmp_path,))
+
+    def fail_resolve(self: Path) -> Path:
+        raise failure
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    with pytest.raises(HTTPException) as caught:
+        execution_routes._resolved_allowed_artifact_paths(
+            artifact,
+            data_dir=tmp_path,
+            session_id=None,
+            object_store_error_type="not_supported",
+        )
+    assert caught.value.status_code == 500
+    assert caught.value.detail == {"error_type": "artifact_path_resolution_failed"}
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preview", [False, True])
+async def test_structural_artifact_error_impostor_is_not_used_for_candidate_fallback(monkeypatch, tmp_path, preview) -> None:
+    artifact = _candidate_artifact(tmp_path / "outputs" / "data.csv")
+    impostor = HTTPException(status_code=500, detail={"error_type": "artifact_purged_or_moved"})
+    monkeypatch.setattr(execution_routes, "_resolved_allowed_artifact_paths", lambda *args, **kwargs: (tmp_path, tmp_path))
+    attempts = []
+
+    async def fail_snapshot(*args, **kwargs):
+        attempts.append(args)
+        raise impostor
+
+    if preview:
+        monkeypatch.setattr(execution_routes, "_verified_artifact_preview_head", fail_snapshot)
+        with pytest.raises(HTTPException) as caught:
+            await execution_routes._verified_artifact_preview_head_from_candidates(artifact, data_dir=tmp_path, session_id=None)
+    else:
+        monkeypatch.setattr(execution_routes, "_verified_artifact_file_snapshot", fail_snapshot)
+        with pytest.raises(HTTPException) as caught:
+            await execution_routes._verified_artifact_file_snapshot_from_candidates(
+                artifact,
+                data_dir=tmp_path,
+                session_id=None,
+                snapshot_dir=tmp_path,
+            )
+    assert caught.value is impostor
+    assert len(attempts) == 1
 
 
 @dataclass
@@ -53,7 +159,7 @@ class _FakeSession:
 
 @dataclass
 class _FakeRun:
-    session_id: UUID = field(default_factory=uuid4)
+    session_id: UUID = field(default_factory=lambda: _TEST_SESSION_ID)
     landscape_run_id: str | None = None
 
 
@@ -241,8 +347,8 @@ class TestRunOutputContentEndpoint:
     @pytest.mark.asyncio
     async def test_streams_file_bytes_when_inside_sink_allowlist(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / 'results "é".jsonl'
         sink_bytes = b'{"interaction_id":"INT-1001"}\n'
         sink_file.write_bytes(sink_bytes)
@@ -294,8 +400,8 @@ class TestRunOutputContentEndpoint:
     @pytest.mark.asyncio
     async def test_content_serves_decoded_file_uri_candidate_when_raw_percent_file_also_exists(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         decoded_file = outputs_dir / "results?token=literal.csv"
         raw_percent_file = outputs_dir / "results%3Ftoken%3Dliteral.csv"
         audited_bytes = b"id,name\n1,alice\n"
@@ -340,8 +446,8 @@ class TestRunOutputContentEndpoint:
     async def test_content_streams_verified_bytes_when_file_rewritten_after_integrity_check(self, monkeypatch, tmp_path) -> None:
         """The bytes returned must be the bytes that passed artifact integrity verification."""
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         original = b'{"interaction_id":"INT-1001"}\n'
         sink_file.write_bytes(original)
@@ -406,8 +512,8 @@ class TestRunOutputContentEndpoint:
     @pytest.mark.asyncio
     async def test_content_supports_single_range_request_from_verified_snapshot(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         sink_bytes = b"0123456789"
         sink_file.write_bytes(sink_bytes)
@@ -462,8 +568,8 @@ class TestRunOutputContentEndpoint:
     @pytest.mark.asyncio
     async def test_content_removes_temp_snapshot_when_send_fails(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         sink_bytes = b'{"interaction_id":"INT-1001"}\n'
         sink_file.write_bytes(sink_bytes)
@@ -566,8 +672,8 @@ class TestRunOutputContentEndpoint:
         hash and reject drift with 409.
         """
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         original = b'{"interaction_id":"INT-1001"}\n'
         sink_file.write_bytes(original)
@@ -672,7 +778,7 @@ class TestRunOutputContentEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.run_sync_in_worker", fake_to_thread)
 
         # data_dir does not contain elsewhere/, so rogue_file is outside
-        # allowed_sink_directories(data_dir) = (data_dir/outputs, data_dir/blobs).
+        # The path is outside both session-owned output and blob subtrees.
         settings = _FakeSettings(data_dir=str(tmp_path))
 
         app = _create_test_app(execution_service=svc, settings=settings)
@@ -827,8 +933,8 @@ class TestRunOutputContentEndpoint:
     @pytest.mark.asyncio
     async def test_410_when_artifact_path_no_longer_exists(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         sink_file.write_bytes(b"will-purge\n")
         sink_file.unlink()  # File was purged after the run
@@ -932,8 +1038,8 @@ class TestRunOutputPreviewEndpoint:
     async def test_preview_uses_verified_bytes_when_file_rewritten_after_integrity_check(self, monkeypatch, tmp_path) -> None:
         """Preview must be built from the bytes that passed artifact integrity verification."""
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         original = b'{"interaction_id":"INT-1001"}\n'
         sink_file.write_bytes(original)
@@ -994,8 +1100,8 @@ class TestRunOutputPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_preview_serves_legacy_raw_percent_candidate_when_it_matches_audit(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         legacy_raw_file = outputs_dir / "results%3Ftoken=literal.jsonl"
         decoded_decoy = outputs_dir / "results?token=literal.jsonl"
         audited_bytes = b'{"legacy":true}\n'
@@ -1037,11 +1143,107 @@ class TestRunOutputPreviewEndpoint:
         assert response.json()["preview_text"] == '{"legacy":true}\n'
 
     @pytest.mark.asyncio
+    async def test_preview_skips_an_absent_candidate_and_serves_the_later_spelling(self, monkeypatch, tmp_path) -> None:
+        """An absent earlier candidate must not mask a later spelling that exists.
+
+        Pins the missing-file arm of the candidate loop in
+        ``_verified_artifact_preview_head_from_candidates``: the decoded
+        spelling of a percent-encoded ``file://`` row does not exist on disk at
+        all (no decoy), so ``_verified_artifact_preview_head`` raises
+        ``_ArtifactPurgedOrMovedError`` for it; the loop must retain that error
+        and try the raw spelling rather than re-raising immediately.
+        """
+        run_id = uuid4()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
+        legacy_raw_file = outputs_dir / "results%3Ftoken=literal.jsonl"
+        decoded_candidate = outputs_dir / "results?token=literal.jsonl"
+        audited_bytes = b'{"legacy":true}\n'
+        legacy_raw_file.write_bytes(audited_bytes)
+        assert not decoded_candidate.exists()
+
+        svc = _execution_service_for_status(run_id)
+        _install_manifest_loader(
+            monkeypatch,
+            artifacts=[
+                RunOutputArtifact(
+                    artifact_id="art-legacy",
+                    sink_node_id="results",
+                    artifact_type="file",
+                    path_or_uri=f"file://{outputs_dir}/results%3Ftoken=literal.jsonl",
+                    content_hash=hashlib.sha256(audited_bytes).hexdigest(),
+                    size_bytes=len(audited_bytes),
+                    created_at=datetime.now(UTC),
+                    exists_now=True,
+                    downloadable=True,
+                    storage_kind="sink_file",
+                    producer_kind="node_state",
+                    produced_by_state_id="state-legacy",
+                    sink_effect_id=None,
+                    publication_performed=True,
+                    publication_evidence_kind="legacy_returned",
+                )
+            ],
+            run_id=run_id,
+        )
+
+        settings = _FakeSettings(data_dir=str(tmp_path))
+
+        app = _create_test_app(execution_service=svc, settings=settings)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/api/runs/{run_id}/outputs/art-legacy/preview")
+
+        assert response.status_code == 200
+        assert response.json()["preview_text"] == '{"legacy":true}\n'
+
+    @pytest.mark.asyncio
+    async def test_preview_reports_purged_when_every_candidate_is_absent(self, monkeypatch, tmp_path) -> None:
+        """With no candidate present the retained missing-file error must surface as 410."""
+        run_id = uuid4()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
+        audited_bytes = b'{"legacy":true}\n'
+
+        svc = _execution_service_for_status(run_id)
+        _install_manifest_loader(
+            monkeypatch,
+            artifacts=[
+                RunOutputArtifact(
+                    artifact_id="art-legacy",
+                    sink_node_id="results",
+                    artifact_type="file",
+                    path_or_uri=f"file://{outputs_dir}/results%3Ftoken=literal.jsonl",
+                    content_hash=hashlib.sha256(audited_bytes).hexdigest(),
+                    size_bytes=len(audited_bytes),
+                    created_at=datetime.now(UTC),
+                    exists_now=True,
+                    downloadable=True,
+                    storage_kind="sink_file",
+                    producer_kind="node_state",
+                    produced_by_state_id="state-legacy",
+                    sink_effect_id=None,
+                    publication_performed=True,
+                    publication_evidence_kind="legacy_returned",
+                )
+            ],
+            run_id=run_id,
+        )
+
+        settings = _FakeSettings(data_dir=str(tmp_path))
+
+        app = _create_test_app(execution_service=svc, settings=settings)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/api/runs/{run_id}/outputs/art-legacy/preview")
+
+        assert response.status_code == 410
+        assert response.json()["detail"]["error_type"] == "artifact_purged_or_moved"
+
+    @pytest.mark.asyncio
     async def test_409_when_preview_file_content_drifts_under_same_size(self, monkeypatch, tmp_path) -> None:
         """Preview must not expose bytes that no longer match the artifact audit row."""
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.jsonl"
         original = b'{"interaction_id":"INT-1001"}\n'
         sink_file.write_bytes(original)
@@ -1089,8 +1291,8 @@ class TestRunOutputPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_returns_csv_preview_for_small_file(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "results.csv"
         sink_file.write_text("col1,col2\n1,2\n3,4\n")
 
@@ -1112,10 +1314,57 @@ class TestRunOutputPreviewEndpoint:
         assert body["total_size_bytes"] == sink_file.stat().st_size
 
     @pytest.mark.asyncio
+    async def test_csv_preview_transport_preserves_five_120_line_records(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        run_id = uuid4()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
+        sink_file = outputs_dir / "llm_results.csv"
+        with sink_file.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=("id", "answer"))
+            writer.writeheader()
+            for record_index in range(5):
+                writer.writerow(
+                    {
+                        "id": record_index,
+                        "answer": "\n".join(f"record {record_index} line {line_index}" for line_index in range(120)),
+                    }
+                )
+
+        svc = _execution_service_for_status(run_id)
+        _install_manifest_loader(
+            monkeypatch,
+            artifacts=[_file_artifact_in_outputs(sink_file)],
+            run_id=run_id,
+        )
+        app = _create_test_app(
+            execution_service=svc,
+            settings=_FakeSettings(data_dir=str(tmp_path)),
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                f"/api/runs/{run_id}/outputs/art-1/preview",
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        parsed_rows = list(csv.reader(body["preview_text"].splitlines(keepends=True)))
+        assert len(parsed_rows) == 6
+        assert body["row_count_preview"] == len(parsed_rows)
+        assert body["truncated"] is False
+
+    @pytest.mark.asyncio
     async def test_text_file_under_cap_returns_full_content(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "log.txt"
         sink_file.write_text("hello world\n")
 
@@ -1137,8 +1386,8 @@ class TestRunOutputPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_binary_file_returns_binary_content_type(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "blob.bin"
         sink_file.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 200)
 
@@ -1211,8 +1460,8 @@ class TestRunOutputPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_410_when_file_purged_between_manifest_and_preview(self, monkeypatch, tmp_path) -> None:
         run_id = uuid4()
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
         sink_file = outputs_dir / "gone.csv"
         sink_file.write_text("data\n")
         sink_file.unlink()

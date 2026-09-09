@@ -983,8 +983,10 @@ class TestTokenOutcome:
         assert outcome.path == TerminalPath.GATE_ROUTED
         assert outcome.sink_name == "quarantine_sink"
 
-    def test_token_outcome_forked_with_fork_group(self) -> None:
-        """FORK_PARENT path includes fork_group_id for lineage tracking."""
+    def test_token_outcome_forked_has_no_fork_group_field(self) -> None:
+        """FORK_PARENT path carries no roster field (D2 flip: fork_group_id
+        retired from token_outcomes — the roster of record moved to
+        token_lineage_frames + group_records)."""
         outcome = TokenOutcome(
             outcome_id="out-1",
             run_id="run-1",
@@ -993,11 +995,12 @@ class TestTokenOutcome:
             path=TerminalPath.FORK_PARENT,
             completed=True,
             recorded_at=datetime.now(UTC),
-            fork_group_id="fork-456",
         )
+        import dataclasses
+
         assert outcome.outcome == TerminalOutcome.TRANSIENT
         assert outcome.path == TerminalPath.FORK_PARENT
-        assert outcome.fork_group_id == "fork-456"
+        assert "fork_group_id" not in {f.name for f in dataclasses.fields(outcome)}
 
     def test_token_outcome_error_with_hash(self) -> None:
         """QUARANTINED_AT_SOURCE outcomes can have error_hash."""
@@ -1135,6 +1138,62 @@ class TestTokenOutcomeTwoAxis:
             recorded_at=datetime.now(UTC),
         )
 
+    def test_abandoned_outcome_has_null_outcome_abandoned_path(self) -> None:
+        """ADR-038: an abandoned TokenOutcome is non-terminal — outcome=None,
+        path=ABANDONED, completed=False, no discriminator fields."""
+        record = TokenOutcome(
+            outcome_id="out_test_abandoned",
+            run_id="run_001",
+            token_id="tok_001",
+            outcome=None,
+            path=TerminalPath.ABANDONED,
+            completed=False,
+            recorded_at=datetime.now(UTC),
+        )
+        assert record.outcome is None
+        assert record.path == TerminalPath.ABANDONED
+        assert record.completed is False
+
+    def test_abandoned_rejects_completed_true(self) -> None:
+        """ADR-038: ABANDONED is non-terminal; completed=True with any outcome
+        never forms a legal pair with it."""
+        with pytest.raises(ValueError, match="_LEGAL_TERMINAL_PAIRS"):
+            TokenOutcome(
+                outcome_id="out_test_abandoned_terminal",
+                run_id="run_001",
+                token_id="tok_001",
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.ABANDONED,
+                completed=True,
+                recorded_at=datetime.now(UTC),
+            )
+
+    def test_persisted_field_validator_accepts_abandoned_without_discriminators(self) -> None:
+        """ADR-038: (None, ABANDONED) persists with every discriminator NULL."""
+        validate_token_outcome_persisted_fields(
+            "out_public_abandoned",
+            None,
+            TerminalPath.ABANDONED,
+            False,
+            sink_name=None,
+            batch_id=None,
+            error_hash=None,
+        )
+
+    def test_persisted_field_validator_rejects_abandoned_with_discriminator(self) -> None:
+        """ADR-038: abandonment is not attributable to a batch, sink, or error
+        site — every discriminator column is forbidden."""
+        with pytest.raises(ValueError, match="forbids batch_id"):
+            validate_token_outcome_persisted_fields(
+                "out_public_abandoned_batch",
+                None,
+                TerminalPath.ABANDONED,
+                False,
+                sink_name=None,
+                batch_id="batch_001",
+                error_hash=None,
+            )
+
     def test_persisted_field_validator_accepts_valid_default_flow(self) -> None:
         """The public persisted-row validator owns ADR-019 discriminator shape."""
         validate_token_outcome_persisted_fields(
@@ -1144,9 +1203,6 @@ class TestTokenOutcomeTwoAxis:
             True,
             sink_name="primary",
             batch_id=None,
-            fork_group_id=None,
-            join_group_id=None,
-            expand_group_id=None,
             error_hash=None,
         )
 
@@ -1160,9 +1216,6 @@ class TestTokenOutcomeTwoAxis:
                 True,
                 sink_name=None,
                 batch_id=None,
-                fork_group_id=None,
-                join_group_id=None,
-                expand_group_id=None,
                 error_hash=None,
             )
 

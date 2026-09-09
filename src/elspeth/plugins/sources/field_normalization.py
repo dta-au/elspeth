@@ -18,6 +18,7 @@ from __future__ import annotations
 import keyword
 import re
 import unicodedata
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -66,29 +67,13 @@ def _replace_non_identifier_chars(value: str) -> str:
     return "".join(char if _is_identifier_continue(char) else "_" for char in value)
 
 
-def normalize_field_name(raw: str) -> str:
-    """Normalize messy header to valid Python identifier.
+def _normalize_field_name_or_empty(raw: str) -> str:
+    """Steps 1-8 of :func:`normalize_field_name`; empty means no header produces a name.
 
-    Rules applied in order:
-    1. Unicode NFC normalization (canonical composition)
-    2. Strip leading/trailing whitespace
-    3. Lowercase
-    4. Replace non-identifier chars with underscore
-    5. Collapse consecutive underscores
-    6. Strip leading/trailing underscores
-    7. Prefix with underscore if starts with digit
-    8. Append underscore if result is Python keyword
-    9. Raise error if result is empty
-
-    Args:
-        raw: Original messy header name
-
-    Returns:
-        Valid Python identifier
-
-    Raises:
-        ExternalHeaderError: If header normalizes to empty string.
-        ValueError: If the normalization algorithm produces an invalid identifier.
+    Callers that need "does anything normalize to this?" as data — the
+    declared-field reachability check and the declarable-form lookup — read
+    the empty result here instead of catching the ``ExternalHeaderError`` the
+    public entry point raises for it.
     """
     # Step 1: Unicode NFC normalization
     normalized = unicodedata.normalize("NFC", raw)
@@ -117,18 +102,62 @@ def normalize_field_name(raw: str) -> str:
     if keyword.iskeyword(normalized):
         normalized = f"{normalized}_"
 
-    # Step 9: Validate non-empty result
-    # Tier 3: an external header that normalizes away to nothing is bad source data.
-    if not normalized:
-        raise ExternalHeaderError(f"Header '{raw}' normalizes to empty string")
-
-    # Defense-in-depth: verify result is valid identifier
-    if not normalized.isidentifier():
+    # Defense-in-depth: verify a non-empty result is a valid identifier
+    if normalized and not normalized.isidentifier():
         raise ValueError(
             f"Header '{raw}' normalized to '{normalized}' which is not a valid identifier. This is a bug in the normalization algorithm."
         )
 
     return normalized
+
+
+def normalize_field_name(raw: str) -> str:
+    """Normalize messy header to valid Python identifier.
+
+    Rules applied in order:
+    1. Unicode NFC normalization (canonical composition)
+    2. Strip leading/trailing whitespace
+    3. Lowercase
+    4. Replace non-identifier chars with underscore
+    5. Collapse consecutive underscores
+    6. Strip leading/trailing underscores
+    7. Prefix with underscore if starts with digit
+    8. Append underscore if result is Python keyword
+    9. Raise error if result is empty
+
+    Args:
+        raw: Original messy header name
+
+    Returns:
+        Valid Python identifier
+
+    Raises:
+        ExternalHeaderError: If header normalizes to empty string.
+        ValueError: If the normalization algorithm produces an invalid identifier.
+    """
+    normalized = _normalize_field_name_or_empty(raw)
+
+    # Step 9: Validate non-empty result
+    # Tier 3: an external header that normalizes away to nothing is bad source data.
+    if not normalized:
+        raise ExternalHeaderError(f"Header '{raw}' normalizes to empty string")
+
+    return normalized
+
+
+def is_normalized_field_name(name: str) -> bool:
+    """Return whether ``name`` is a normalization fixed point.
+
+    A fixed point names a row key construction-time contract math can state.
+    A non-fixed-point may instead be an original-header spelling whose actual
+    row key is known only from runtime lineage, so callers must abstain rather
+    than use the literal as a removal name. Headers that normalize to nothing
+    cannot name a row key and return ``False``.
+    """
+    try:
+        return normalize_field_name(name) == name
+    except ExternalHeaderError:
+        return False
 
 
 def check_normalization_collisions(raw_headers: list[str], normalized_headers: list[str]) -> None:
@@ -396,3 +425,207 @@ def extend_field_resolution(
         normalization_version=resolution.normalization_version,
         effective_headers=(*resolution.effective_headers, *new_effective_headers),
     )
+
+
+def check_declared_fields_reachable(
+    declared_names: Sequence[str],
+    *,
+    columns: Sequence[str] | None,
+    field_mapping: Mapping[str, str] | None,
+    header_kind: str = "headers",
+) -> None:
+    """Reject declared schema field names that resolution can never produce.
+
+    Sources that route external names through :func:`resolve_field_names` build
+    row keys as ``mapping[h] if h in mapping else h`` over ``normalize_field_name``
+    of each raw header (headered mode) or over ``columns`` verbatim (headerless
+    mode). Declared schema names are used verbatim, so a declared name outside
+    the producible set can never match a row: required fields silently discard
+    every row and optional fields crash contract inference with
+    ``Duplicate original_name`` (elspeth-3664e213c4). Both are config faults,
+    caught here at config-validation time.
+
+    Reachability per mode:
+
+    - Headerless (``columns`` provided): final names are exactly computable via
+      :func:`resolve_field_names`; a declared name must be a member.
+    - Headered (``columns is None``): a declared name ``n`` is reachable iff it
+      is a ``field_mapping`` value (mapping values bypass normalization), or it
+      is its own normalized form — ``normalize_field_name`` is idempotent, so
+      exactly the fixed points are producible by some header — AND it is not a
+      ``field_mapping`` key. A mapping key is renamed on every row where a
+      header produces it, so it never survives as a final name unless it is
+      also a mapping value.
+
+    Sparse JSON-like sources (``require_all_mapping_keys=False``) share this
+    predicate unchanged: relaxing the mapping-key presence check only allows a
+    mapped key to be absent from a given record — every path that introduces a
+    key (:func:`resolve_field_names`, :func:`extend_field_resolution`, and the
+    per-row late-key branches in the JSON-family sources) still applies
+    ``field_mapping`` after normalization, so a mapping key never appears as a
+    final name and mapping values remain reachable.
+
+    Args:
+        declared_names: Schema names the config commits to (declared fields
+            plus guaranteed_fields/required_fields entries), already validated
+            as Python identifiers.
+        columns: Explicit headerless column names, or None for headered mode.
+        field_mapping: Optional effective-name -> final-name overrides.
+        header_kind: Noun for error messages (e.g. "CSV headers",
+            "JSON object keys").
+
+    Raises:
+        ValueError: If any declared name is unreachable, listing every
+            unreachable name with the remedy that makes it reachable.
+    """
+    problems: list[str] = []
+
+    if columns is not None:
+        final_names = set(
+            resolve_field_names(
+                raw_headers=None,
+                field_mapping=dict(field_mapping) if field_mapping else None,
+                columns=list(columns),
+            ).final_headers
+        )
+        for name in declared_names:
+            if name in final_names:
+                continue
+            if field_mapping and name in field_mapping:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"field_mapping renames '{name}' to '{field_mapping[name]}'. "
+                    f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
+                )
+            else:
+                resolved = ", ".join(f"'{header}'" for header in sorted(final_names))
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"the resolved column names are {resolved}. "
+                    f"Declare one of the resolved names, or adjust columns/field_mapping."
+                )
+    else:
+        mapping_values = set(field_mapping.values()) if field_mapping else set()
+        for name in declared_names:
+            if name in mapping_values:
+                continue
+            if field_mapping and name in field_mapping:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"field_mapping renames '{name}' to '{field_mapping[name]}'. "
+                    f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
+                )
+                continue
+            normalized = _normalize_field_name_or_empty(name)
+            if not normalized:
+                # e.g. '_' — normalization strips it to nothing, so no external
+                # header can produce it and it is not a mapping value.
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"no {header_kind[:-1] if header_kind.endswith('s') else header_kind} normalizes to it. "
+                    f"Use field_mapping to produce it."
+                )
+                continue
+            if normalized != name:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"{header_kind} are normalized to lowercase identifiers ('{name}' -> '{normalized}'). "
+                    f"Declare '{normalized}', or add field_mapping: {{{normalized}: {name}}} to preserve the original name."
+                )
+
+    if problems:
+        raise ValueError("\n".join(problems))
+
+
+def declarable_field_name(name: str) -> str | None:
+    """The ``required_input_fields`` entry that covers a template row field.
+
+    ``is_valid_field_name`` (the acceptance set ``validate_field_name`` applies
+    to a declaration entry) admits only a non-keyword Python identifier, while
+    a bracket read returns its literal verbatim — so
+    ``{{ row["Original Header"] }}`` reads a name no declaration can carry.
+    Returns the name itself when it is already declarable, else the canonical
+    row key it resolves to at render, else None when it has no declarable form
+    at all (``"!!!"`` normalizes to nothing and so names no field).
+
+    Whatever this returns, ``undeclared_row_fields`` must then accept: the two
+    are the repair and the check for one contract, and they disagreed once
+    already (elspeth-a9ba80cb0b).
+    """
+    from elspeth.contracts.identifiers import is_valid_field_name
+
+    if is_valid_field_name(name.strip()):
+        return name.strip()
+    canonical = _normalize_field_name_or_empty(name)
+    if not canonical or not is_valid_field_name(canonical):
+        return None
+    return canonical
+
+
+def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[str]) -> tuple[str, ...]:
+    """Row fields a template reads that a required-fields declaration does not cover.
+
+    The config-time half of the ``required_input_fields`` contract: a caller
+    passes the concrete row fields its template reads (from
+    ``extract_jinja2_field_usage``) and the names the node declared, and gets
+    back the sorted shortfall it may honestly report. Shared by
+    ``LLMConfig._validate_template_variable_bindings`` and the composer's
+    ``_validate_prompt_template_variable_bindings`` so the two authoring
+    surfaces cannot drift (elspeth-a9ba80cb0b).
+
+    Coverage is EXACT, because render-time resolution is. ``PipelineRow``
+    resolves through ``SchemaContract.find_name``, which matches a field's
+    ``normalized_name`` or its ``original_name`` — two exact spellings, and
+    config time knows NEITHER. So the only provable coverage is a literal
+    match against a declared name, which is a ``normalized_name`` by
+    construction.
+
+    That rules out a general "canonical key" bridge, and measurement says so
+    plainly: with ``required_input_fields: ["a_b"]`` against a row whose one
+    column is ``a_b``, twelve declarable spellings (``A_B``, ``a__b``,
+    ``A_B_``, ...) render only if the producer's ``original_name`` happens to
+    match, and otherwise raise on every row. ``{{ row.a__b }}`` is a plain
+    typo of the declared name — the very class this check exists to catch.
+    Bridging by ``normalize_field_name`` would silence all twelve.
+
+    The ONE sound inference is the reverse: a literal that is not a legal
+    declaration entry can never be a ``normalized_name``, so it can only be an
+    ``original_name``, and the row key it resolves to is its canonical form.
+    Those are bridged — ``{{ row["Original Header"] }}`` is covered by a
+    declared ``original_header`` — and REPORTED when that canonical name is
+    not declared. Dropping them unconditionally was the first version's bug: it
+    accepted a declaration omitting the field entirely, which then failed at
+    render, while the sibling declared-fields validator was already telling
+    authors to declare exactly the canonical name.
+
+    A literal with no declarable form at all is dropped, not reported: there is
+    nothing to ask for.
+
+    Dynamic accesses (``row[expr]``) never reach here — callers fail closed on
+    them separately, with their own opt-out.
+    """
+    declared_literals = {name.strip() for name in declared_fields}
+
+    undeclared: set[str] = set()
+    for field in row_fields:
+        covering = declarable_field_name(field)
+        if covering is None:
+            continue
+        if covering not in declared_literals:
+            undeclared.add(field)
+    return tuple(sorted(undeclared))
+
+
+def describe_undeclared_row_fields(fields: Sequence[str]) -> str:
+    """Render an ``undeclared_row_fields`` shortfall, naming the declarable form.
+
+    A bracket literal is not a legal ``required_input_fields`` entry, so a
+    message naming only the literal advertises a repair rejected on
+    application — the same defect this change removed from the LLM
+    declared-fields validator's suggestion (elspeth-a9ba80cb0b).
+    """
+    parts: list[str] = []
+    for name in fields:
+        covering = declarable_field_name(name)
+        parts.append(f"'{name}' (declare as '{covering}')" if covering != name else f"'{name}'")
+    return ", ".join(parts)

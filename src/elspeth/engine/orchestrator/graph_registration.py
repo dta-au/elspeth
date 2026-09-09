@@ -46,6 +46,7 @@ from elspeth.engine.orchestrator.validation import (
 )
 
 if TYPE_CHECKING:
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.core.dag import ExecutionGraph
     from elspeth.core.events import EventBusProtocol
     from elspeth.core.landscape.factory import RecorderFactory
@@ -66,6 +67,7 @@ class GraphRegistrationService:
         run_id: str,
         config: PipelineConfig,
         graph: ExecutionGraph,
+        coordination_token: CoordinationToken,
     ) -> GraphArtifacts:
         """Register all graph nodes and edges in Landscape. Returns artifacts for subsequent phases.
 
@@ -114,6 +116,8 @@ class GraphRegistrationService:
             config_gate_node_ids=config_gate_node_ids,
             aggregation_node_ids=aggregation_node_ids,
             coalesce_node_ids=coalesce_node_ids,
+            collector_id_map=graph.get_collector_id_map(),
+            collector_transforms=graph.get_collector_transform_map(),
         )
         source_contracts_by_node_id = resolve_source_contracts_by_node_id(
             config,
@@ -146,9 +150,9 @@ class GraphRegistrationService:
             )
             self._record_declared_sources_ready(
                 factory=factory,
-                run_id=run_id,
                 config=config,
                 source_id_map=source_id_map,
+                coordination_token=coordination_token,
             )
 
             # Register edges from graph - key by (from_node, label) for lookup
@@ -187,6 +191,7 @@ class GraphRegistrationService:
                 route_resolution_map=graph.get_route_resolution_map(),
                 transform_id_map=transform_id_map,
                 config_gate_id_map=config_gate_id_map,
+                closer_names=frozenset(graph.get_error_routable_closer_names()),
             )
 
             self._events.emit(PhaseCompleted(phase=PipelinePhase.GRAPH, duration_seconds=time.perf_counter() - phase_start))
@@ -208,9 +213,9 @@ class GraphRegistrationService:
         self,
         *,
         factory: RecorderFactory,
-        run_id: str,
         config: PipelineConfig,
         source_id_map: Mapping[str, NodeID],
+        coordination_token: CoordinationToken,
     ) -> None:
         """Seed run_sources for every declared source before iteration starts.
 
@@ -223,7 +228,6 @@ class GraphRegistrationService:
         for source_name, source_node_id in source_id_map.items():
             source = config.sources[source_name]
             factory.run_lifecycle.record_run_source(
-                run_id=run_id,
                 source_node_id=source_node_id,
                 source_name=source_name,
                 plugin_name=source.name,
@@ -231,4 +235,5 @@ class GraphRegistrationService:
                 source_schema_json=json.dumps(source.output_schema.model_json_schema()),
                 schema_contract=source.get_schema_contract(),
                 lifecycle_state="ready",
+                coordination_token=coordination_token,
             )

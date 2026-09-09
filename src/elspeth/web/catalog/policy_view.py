@@ -12,6 +12,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginI
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
 if TYPE_CHECKING:
+    from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.plugin_policy.validation import PluginPolicyValidationResult, ProfileAwareValidationResult
 
@@ -26,6 +27,7 @@ class PolicyCatalogView:
         self._full = full
         self.snapshot = snapshot
         self._profiles: OperatorProfileRegistry | None = profiles
+        self._full_items_cache: dict[PluginKind, list[PluginSummary]] = {}
 
     @classmethod
     def for_trained_operator(
@@ -34,25 +36,129 @@ class PolicyCatalogView:
         snapshot: PluginAvailabilitySnapshot,
     ) -> PolicyCatalogView:
         """Return the explicit full-catalog projection for the local MCP."""
-        if snapshot.principal_scope != "local:trained-operator":
+        if not snapshot.is_trained_operator:
             raise ValueError("trained_operator_snapshot_required")
         view = cls.__new__(cls)
         view._full = full
         view.snapshot = snapshot
         view._profiles = None
+        view._full_items_cache = {}
         return view
 
+    def _full_items(self, kind: PluginKind) -> list[PluginSummary]:
+        """Return this kind's unrestricted catalog listing, fetched at most once per view.
+
+        ``list_*`` and ``list_prohibited_*`` both need the same unrestricted
+        listing (one to keep only ``snapshot.available``, the other to keep
+        only the ``WEB_SURFACE_PROHIBITED`` entries) — a discovery tool
+        dispatch calls both back-to-back, so caching here is what keeps a
+        single ``list_sources`` call from re-deriving every ``PluginSummary``
+        twice. Pinned by ``test_cacheable_tool_returns_cached_result`` /
+        ``test_cache_hit_rebuilds_result_envelope_from_current_state``
+        (exact ``catalog.list_sources.call_count``) in test_service.py.
+        """
+        if kind not in self._full_items_cache:
+            if kind == "source":
+                self._full_items_cache[kind] = self._full.list_sources()
+            elif kind == "transform":
+                self._full_items_cache[kind] = self._full.list_transforms()
+            else:
+                self._full_items_cache[kind] = self._full.list_sinks()
+        return self._full_items_cache[kind]
+
+    def _usable_profile_aliases(self, plugin_id: PluginId) -> tuple[str, ...]:
+        """Return the operator-profile aliases this principal may author for ``plugin_id``.
+
+        ``build_plugin_snapshot`` records an entry in
+        ``snapshot.usable_profile_aliases`` only for a plugin whose
+        ``web_config_authority`` is ``WebConfigAuthority.OPERATOR_PROFILED``,
+        so for anything this view can reach, absence means "not
+        operator-profiled" and the explicit empty answer is the RESTRICTIVE
+        one: no alias is offered on the wire, ``public_summary`` /
+        ``public_schema`` are never asked to project a binding that does not
+        exist, and ``lower_operator_profile_options`` refuses every alias.
+        A profiled plugin whose principal has no usable alias is recorded
+        present-with-``()`` *and* declined ``PROFILE_UNAVAILABLE`` by the same
+        producer, so it does not enter ``snapshot.available``. That is not a
+        reachability precondition, though: the guided schema-form path
+        (``_schema8_schema_authority`` in
+        ``web/sessions/routes/composer/guided.py``) lowers whenever the
+        authored options carry a ``profile`` key, so a present-but-``()``
+        plugin can still reach ``lower_operator_profile_options`` - where
+        ``alias not in ()`` fails for every alias and the answer is the same
+        fail-closed ``ValueError("profile_unavailable")``.
+
+        Never widen the absent branch to anything but ``()``: crediting a
+        plugin with aliases the snapshot did not grant it would hand an
+        unprofiled plugin the operator's private binding. Pinned by
+        ``test_unprofiled_plugin_is_granted_no_operator_profile_alias``.
+        """
+        aliases_by_plugin = dict(self.snapshot.usable_profile_aliases)
+        if plugin_id not in aliases_by_plugin:
+            return ()
+        return aliases_by_plugin[plugin_id]
+
     def _visible(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
-        return [item for item in items if PluginId(kind, item.name) in self.snapshot.available]
+        visible = [item for item in items if PluginId(kind, item.name) in self.snapshot.available]
+        if self._profiles is None:
+            return visible
+        projected: list[PluginSummary] = []
+        for item in visible:
+            plugin_id = PluginId(kind, item.name)
+            aliases = self._usable_profile_aliases(plugin_id)
+            if not aliases:
+                projected.append(item)
+                continue
+            projected.append(
+                self._profiles.public_summary(
+                    plugin_id,
+                    item,
+                    self._full.get_schema(kind, item.name),
+                    available_aliases=aliases,
+                )
+            )
+        return projected
 
     def list_sources(self) -> list[PluginSummary]:
-        return self._visible("source", self._full.list_sources())
+        return self._visible("source", self._full_items("source"))
 
     def list_transforms(self) -> list[PluginSummary]:
-        return self._visible("transform", self._full.list_transforms())
+        return self._visible("transform", self._full_items("transform"))
 
     def list_sinks(self) -> list[PluginSummary]:
-        return self._visible("sink", self._full.list_sinks())
+        return self._visible("sink", self._full_items("sink"))
+
+    def _prohibited(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
+        """Return items closed by the categorical ``WEB_SURFACE_PROHIBITED`` ban.
+
+        The ONLY unavailable reason this surfaces. Every other reason (not
+        installed, not authorized, missing credential, no operator profile)
+        stays silent here — those describe ordinary "not selectable *yet*"
+        gaps an operator can close, so they belong to the attempt-failure
+        path (``set_source`` etc.), not a standing discovery listing. This
+        reason is different in kind: nothing an operator does in this
+        deployment can clear it, so a user asking "why can't I use X"
+        deserves the answer without first attempting and failing. See
+        R2-F18 / elspeth-28a695d7f4.
+        """
+        banned = {
+            availability.plugin_id
+            for availability in self.snapshot.unavailable
+            if availability.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+        }
+        return [item for item in items if PluginId(kind, item.name) in banned]
+
+    def list_prohibited_sources(self) -> list[PluginSummary]:
+        """Return source plugins categorically banned from the web surface."""
+        return self._prohibited("source", self._full_items("source"))
+
+    def list_prohibited_transforms(self) -> list[PluginSummary]:
+        """Return transform plugins categorically banned from the web surface."""
+        return self._prohibited("transform", self._full_items("transform"))
+
+    def list_prohibited_sinks(self) -> list[PluginSummary]:
+        """Return sink plugins categorically banned from the web surface."""
+        return self._prohibited("sink", self._full_items("sink"))
 
     def capability_groups(self) -> dict[PluginCapability, tuple[PluginId, ...]]:
         """Return safe visible plugin IDs grouped by declared capability."""
@@ -90,7 +196,7 @@ class PolicyCatalogView:
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
         plugin_id = PluginId(plugin_type, name)
         self._require_available(plugin_id)
-        aliases = dict(self.snapshot.usable_profile_aliases).get(plugin_id, ())
+        aliases = self._usable_profile_aliases(plugin_id)
         if self._profiles is None:
             return self._full.get_schema(plugin_type, name)
         return self._profiles.public_schema(
@@ -98,6 +204,22 @@ class PolicyCatalogView:
             self._full.get_schema(plugin_type, name),
             available_aliases=aliases,
         )
+
+    def project_agent_assistance(
+        self,
+        plugin_type: PluginKind,
+        name: str,
+        assistance: PluginAssistance,
+    ) -> PluginAssistance:
+        """Project raw plugin guidance through request-scoped profile policy."""
+        plugin_id = PluginId(plugin_type, name)
+        self._require_available(plugin_id)
+        if self._profiles is None:
+            return assistance
+        aliases = self._usable_profile_aliases(plugin_id)
+        if not aliases:
+            return assistance
+        return self._profiles.public_assistance(plugin_id, assistance)
 
     def lower_operator_profile_options(
         self,
@@ -113,7 +235,7 @@ class PolicyCatalogView:
         """
         if self._profiles is None:
             raise ValueError("plugin_has_no_operator_profile")
-        available_aliases = dict(self.snapshot.usable_profile_aliases).get(plugin_id, ())
+        available_aliases = self._usable_profile_aliases(plugin_id)
         if alias not in available_aliases:
             raise ValueError("profile_unavailable")
         return self._profiles.lower_options(plugin_id, alias=alias, safe_options=safe_options)

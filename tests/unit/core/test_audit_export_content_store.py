@@ -149,3 +149,54 @@ def test_orphan_marker_writer_enforces_the_size_bound(
 
     with pytest.raises(ValueError, match="orphan marker"):
         store.mark_candidate_orphans("candidate-bound", (descriptor,))
+
+
+def test_owned_marker_collision_rejects_divergent_existing_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create-only marker collision must verify the Tier-1 marker already on disk."""
+    monkeypatch.chdir(tmp_path)
+    root = Path(".elspeth/audit-export-content-store/test")
+    store = FilesystemAuditExportContentStore(_store_settings(root))
+    content = b'{"record_type":"run"}\n'
+    digest = sha256(content).hexdigest()
+    owned_dir = root / "audit" / "export" / "candidates" / "candidate-collision" / "owned"
+    owned_dir.mkdir(parents=True)
+    (owned_dir / digest).write_bytes(b"divergent\n")
+
+    with pytest.raises(OSError, match="owned marker"):
+        store.put_immutable(content, candidate_id="candidate-collision", object_kind="data_chunk")
+
+
+def test_orphan_marker_collision_rejects_divergent_existing_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loser marker must not silently accept evidence for different content."""
+    monkeypatch.chdir(tmp_path)
+    root = Path(".elspeth/audit-export-content-store/test")
+    store = FilesystemAuditExportContentStore(_store_settings(root))
+    content = b'{"record_type":"run"}\n'
+    digest = sha256(content).hexdigest()
+    descriptor = AuditExportContentDescriptor(
+        store.put_immutable(content, candidate_id="candidate-collision", object_kind="data_chunk"),
+        digest,
+        len(content),
+        "data_chunk",
+    )
+    marker_path = root / "audit" / "export" / "candidates" / "candidate-collision" / "orphan.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "candidate_id": "candidate-collision",
+                "content_refs": ["sha256:" + ("f" * 64)],
+                "marked_at": "2026-07-28T00:00:00.000000Z",
+                "schema": "elspeth.audit-export-orphan-candidate.v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OSError, match="orphan marker"):
+        store.mark_candidate_orphans("candidate-collision", (descriptor,))

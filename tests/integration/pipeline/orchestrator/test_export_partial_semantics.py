@@ -12,6 +12,7 @@ Covers bead scug.2:
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -24,6 +25,7 @@ from elspeth.contracts import (
     SinkEffectRuntimeBinding,
 )
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.events import (
     PhaseCompleted,
     PhaseError,
@@ -89,7 +91,13 @@ def _audit_sink_factory(_name: str) -> SinkEffectRuntimeBinding:
 
 
 def _make_export_enabled_settings() -> ElspethSettings:
-    """Create minimal settings with export enabled to the default sink."""
+    """Create minimal settings with export enabled to the default sink.
+
+    ``spool_root`` and ``content_store.root`` MUST stay CWD-relative under
+    ``.elspeth/``: ``LandscapeExportSettings`` rejects absolute paths so these
+    stay code-owned locations. Callers therefore chdir into ``tmp_path`` to keep
+    the roots out of the checkout.
+    """
     return ElspethSettings(
         sources={"primary": SourceSettings(plugin="list_source", on_success="default", options={})},
         sinks={
@@ -143,8 +151,14 @@ def _event_index(events: list[object], predicate: Callable[[object], bool]) -> i
 class TestExportFailurePartialRunSemantics:
     """Regression coverage for run/export split-status behavior."""
 
-    def test_export_failure_emits_partial_summary_and_keeps_run_completed(self, payload_store) -> None:
+    def test_export_failure_emits_partial_summary_and_keeps_run_completed(
+        self,
+        payload_store,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """If export fails after run completion, run is COMPLETED but summary is PARTIAL."""
+        monkeypatch.chdir(tmp_path)
         db = make_landscape_db()
         event_bus, events = _capture_orchestrator_events()
 
@@ -165,21 +179,21 @@ class TestExportFailurePartialRunSemantics:
 
         def record_export_status(
             self: RunLifecycleRepository,
-            run_id: str,
             status: ExportStatus,
             *,
             error: str | None = None,
             export_format: str | None = None,
             export_sink: str | None = None,
+            coordination_token: CoordinationToken,
         ) -> None:
-            export_status_calls.append((run_id, status))
+            export_status_calls.append((coordination_token.run_id, status))
             original_set_export_status(
                 self,
-                run_id,
                 status,
                 error=error,
                 export_format=export_format,
                 export_sink=export_sink,
+                coordination_token=coordination_token,
             )
 
         with (
@@ -238,8 +252,14 @@ class TestExportFailurePartialRunSemantics:
         assert export_started_idx < export_error_idx < summary_idx
         assert not any(isinstance(event, PhaseCompleted) and event.phase == PipelinePhase.EXPORT for event in events)
 
-    def test_precompletion_execution_error_emits_failed_summary_exit_code_2(self, payload_store) -> None:
+    def test_precompletion_execution_error_emits_failed_summary_exit_code_2(
+        self,
+        payload_store,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """If execution fails before completion, summary is FAILED with exit_code=2."""
+        monkeypatch.chdir(tmp_path)
         db = make_landscape_db()
         event_bus, events = _capture_orchestrator_events()
 
@@ -263,21 +283,21 @@ class TestExportFailurePartialRunSemantics:
 
         def record_export_status(
             self: RunLifecycleRepository,
-            run_id: str,
             status: ExportStatus,
             *,
             error: str | None = None,
             export_format: str | None = None,
             export_sink: str | None = None,
+            coordination_token: CoordinationToken,
         ) -> None:
-            export_status_calls.append((run_id, status))
+            export_status_calls.append((coordination_token.run_id, status))
             original_set_export_status(
                 self,
-                run_id,
                 status,
                 error=error,
                 export_format=export_format,
                 export_sink=export_sink,
+                coordination_token=coordination_token,
             )
 
         with (

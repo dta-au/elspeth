@@ -33,9 +33,10 @@ Lifecycle Contract (all hooks called on main thread by orchestrator):
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping
-from typing import TYPE_CHECKING, Any, ClassVar
+from collections.abc import Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
 from elspeth.contracts import (
     DeclaredAuditCharacteristics,
@@ -47,11 +48,13 @@ from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
+    ContentTrust,
     ControlRole,
     PluginCapability,
     WebConfigAuthority,
 )
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
@@ -66,10 +69,125 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
 
-from elspeth.contracts.sink_effects import ResolvedSinkEffectMode, SinkEffectExecutionPurpose, SinkEffectInputKind
+from elspeth.contracts.sink_effects import (
+    AuditExportFormat,
+    ResolvedSinkEffectMode,
+    SinkEffectContract,
+    SinkEffectExecutionPurpose,
+    SinkEffectInputKind,
+)
 from elspeth.plugins.infrastructure.results import (
     TransformResult,
 )
+
+# Provenance label for a required input field the base class cannot trace to a
+# specific option. It is reached when a config property DERIVED the name (see
+# _reject_unreachable_configured_input_fields) and no column-naming option in
+# the raw config accounts for it. Deliberately generic: naming a specific key
+# here would be a guess, and a wrong key sends the author to edit config they
+# never wrote.
+_DERIVED_INPUT_FIELD_PROVENANCE = "this transform's own options"
+
+
+def is_column_naming_config_option(key: str) -> bool:
+    """Whether a config option names a ROW COLUMN rather than an ordinary value.
+
+    Shared by ``BaseTransform.consumed_input_fields`` and the architecture test
+    that checks every such option is classified read-or-write, so the two cannot
+    drift apart. Naming alone cannot say WHICH: ``batch_top_k.field`` reads a
+    column and ``web_scrape.content_field`` writes one, with identical shape.
+    That classification is the plugin's job via ``output_naming_config_keys``.
+    """
+    return key in ("field", "fields", "group_by") or key.endswith(("_field", "_fields"))
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one authored plugin config option value — settings YAML or a Web Composer "
+        "proposal — read either raw or through a per-plugin validated model whose "
+        "field types the base class does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns exactly the column names the option value spells: a str is one name, "
+        "a list/tuple contributes only its str items, and every other shape yields (); "
+        "never raises and never coerces a non-str into a name"
+    ),
+    non_raising=True,
+)
+def _column_names_in_option_value(value: Any) -> tuple[str, ...]:
+    """Column names one column-naming config option value points at.
+
+    Plural options hold a LIST of column names (``keyword_filter.fields``,
+    ``batch_data_quality_report.inspect_fields``); skipping non-str values
+    inside them once made every one invisible to demotion, so list/tuple
+    items are admitted individually. Non-name shapes contribute nothing:
+    per-plugin config validation, not this helper, owns rejecting them.
+    """
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        return tuple(item for item in value if isinstance(item, str))
+    return ()
+
+
+def _demote_required_model_fields(
+    model: type[PluginSchema],
+    field_names: frozenset[str],
+) -> type[PluginSchema]:
+    """Return ``model`` with ``field_names`` no longer REQUIRED — and nothing else.
+
+    ``field_names`` are fields the transform CREATES, so demanding them on input
+    is unsatisfiable (elspeth-d6eeb3a71d). Only the presence requirement is
+    dropped: each field keeps its declared annotation AND its FieldInfo
+    metadata, so a value that IS supplied is validated exactly as declared.
+
+    Preserving metadata is not incidental. ``FIELD_TYPE_MAP["float"]`` is
+    ``FiniteFloat``, i.e. ``Annotated[float, Field(allow_inf_nan=False)]``, and
+    pydantic hoists that constraint OUT of the annotation into the FieldInfo.
+    Rebuilding a field from ``.annotation`` alone therefore silently accepts
+    NaN and Infinity — in a codebase that maintains a dedicated
+    ``_find_non_finite_value_path`` walker to reject exactly those.
+
+    The field is deliberately KEPT in the model rather than removed: ``mode:
+    fixed`` builds ``extra="forbid"``, so dropping it would reject rows that
+    legitimately carry it.
+
+    Every other field, the extra-field mode, and strictness are inherited
+    unchanged. Returns ``model`` itself when nothing needs demoting, preserving
+    schema class identity for transforms that create no declared fields.
+    """
+    from pydantic import create_model
+
+    demoted = {name for name in field_names if name in model.model_fields}
+    if not demoted:
+        return model
+
+    overrides: dict[str, Any] = {}
+    for name in sorted(demoted):
+        field_info = model.model_fields[name]
+        # An unannotated field is already unconstrained; Any keeps that honest.
+        annotation: Any = Any if field_info.annotation is None else field_info.annotation
+        if field_info.metadata:
+            # Re-attach constraints pydantic hoisted out of the annotation.
+            annotation = Annotated[(annotation, *field_info.metadata)]
+        overrides[name] = (annotation, None)
+
+    # cast: __base__ is a variable, so mypy's pydantic plugin cannot see that the
+    # generated model subclasses `model` and is therefore a PluginSchema.
+    return cast(
+        "type[PluginSchema]",
+        create_model(
+            # Distinct name: a demoted model and its declared original are two
+            # classes, and an edge error naming both 'FooInput' would be unreadable.
+            f"{model.__name__}DemotedInput",
+            __base__=model,
+            __module__=model.__module__,
+            **overrides,
+        ),
+    )
 
 
 class BaseTransform(ABC):
@@ -89,8 +207,14 @@ class BaseTransform(ABC):
 
         class MyTransform(BaseTransform):
             name = "my_transform"
-            input_schema = InputSchema
+            input_schema = InputSchema      # redirected; see note below
             output_schema = OutputSchema
+
+    ``input_schema`` is a property, so a class-body assignment like the one
+    above is moved by ``__init_subclass__`` into the property's backing store.
+    The pattern stays valid and reads still return your schema — with fields
+    the transform CREATES demoted, which is the point (elspeth-d6eeb3a71d).
+    Assigning ``self.input_schema = ...`` in ``__init__`` works identically.
 
             def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
                 return TransformResult.success(
@@ -155,8 +279,18 @@ class BaseTransform(ABC):
     """
 
     name: str
-    input_schema: type[PluginSchema]
-    output_schema: type[PluginSchema]
+    # input_schema is a property (see below): assignment stores the declared
+    # model, reads return it with self-created fields demoted to optional.
+    _declared_input_schema: type[PluginSchema] | None = None
+    # The validated config, captured by _initialize_declared_input_fields so that
+    # consumed_input_fields sees option DEFAULTS, not only authored keys.
+    _validated_config: TransformDataConfig | None = None
+    _input_schema_cache: tuple[type[PluginSchema], frozenset[str], type[PluginSchema]] | None = None
+    # Memo for _config_named_input_columns, keyed on the config object identity.
+    _config_columns_cache: tuple[object, frozenset[str]] | None = None
+    # Declared nominally so direct access is safe while a transform is still
+    # constructing its schemas. Concrete transforms populate it before use.
+    output_schema: type[PluginSchema] | None = None
     node_id: str | None = None  # Set by orchestrator after registration
 
     # Audit metadata
@@ -164,16 +298,15 @@ class BaseTransform(ABC):
     plugin_version: str = "0.0.0"
     source_file_hash: str | None = None
 
-    # ── Reference content (Phase 7A) ────────────────────────────────────
+    # ── Catalogue reference content ─────────────────────────────────────
     # These fields populate the catalog's reference cards. They are
     # documentation, not configuration — authors fill them in to explain
     # to a human reader (compliance, research, ops) what this plugin
     # does, when it's the right choice, when it isn't, and what audit
-    # characteristics it has. Empty / None values render as a generic
-    # "see the technical description" fallback in the catalog UI rather
-    # than blocking display. See docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md for the per-field semantics and the
-    # canonical csv_source.py example.
+    # characteristics it has. Base defaults remain optional for third-party
+    # and legacy compatibility; repository tests require every registered
+    # built-in to be complete. See
+    # docs/contracts/plugin-catalogue-reference-content.md.
 
     usage_when_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
@@ -183,26 +316,36 @@ class BaseTransform(ABC):
 
     usage_when_not_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
-    *not* pick this plugin?" — gracefully redirecting users with the
-    wrong shape of problem to the right plugin. The Marcus persona (per
-    project_composer_personas) reads this to discover the plugin isn't
-    a fit for his Zapier-shaped expectations."""
+    *not* pick this plugin?" State a hard limitation or unsafe fit and
+    redirect the reader to a concrete alternative where one exists."""
 
     example_use: str | None = None
-    """One-or-two-line YAML snippet showing realistic use. Format
-    matches the pipeline YAML so a developer (Dev persona) can copy and
-    paste into a composer session as a starting point. Indent under
-    `source:` / `transform:` / `sink:` as appropriate for the plugin
-    kind. Renders inside a <pre> block in the UI; preserve whitespace."""
+    """One bounded YAML component fragment with realistic options and
+    non-secret values. Use top-level ``sources`` for sources, ``transform``
+    for ordinary transforms, ``aggregations`` for batch-aware transforms,
+    and ``sinks`` for sinks. Preserve whitespace for preformatted rendering."""
 
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+    fetches_http: bool = False
+    """Whether the transform performs a direct HTTP(S) fetch governed by its
+    top-level ``options.http`` policy. Web admission derives its complete
+    fetcher vocabulary from this closed declaration; catalogue tags and
+    determinism are deliberately not policy authorities."""
+
+    content_trust: ContentTrust = ContentTrust.TRUSTED_INTERNAL
+    """Trust classification of content the transform itself produces."""
+
+    @classmethod
+    def check_web_local_requirements(cls) -> bool:
+        """Return whether this transform's local optional dependencies exist."""
+        return True
 
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
-    are non-exhaustive; pick the two or three most useful for a user
+    are non-exhaustive; pick the two to six most useful for a user
     who is searching the catalog.
 
     **Open vocabulary — deliberate.** ``capability_tags`` is typed as
@@ -264,7 +407,7 @@ class BaseTransform(ABC):
         options: Mapping[str, object],
     ) -> bool:
         """Evaluate whether this concrete config can enforce a declared control."""
-        if options.get("detect_only") is True:
+        if "detect_only" in options and options["detect_only"] is True:
             return False
         return any(
             declaration.capability is capability and declaration.control_role is role and declaration.blocks_positive_detection
@@ -326,12 +469,94 @@ class BaseTransform(ABC):
     # cross-check; mis-annotation raises PassThroughContractViolation (TIER_1).
     passes_through_input: bool = False
 
+    # Field-forwarding declaration for the EXTRAS direction (elspeth-15c72686f2).
+    #
+    # `passes_through_input` is all-or-nothing: it demands that EVERY input
+    # field survive, so a transform that forwards the whole row except one
+    # column it consumed cannot declare it. That left a class of transforms —
+    # line_explode, json_explode, field_mapper(select_only=false),
+    # batch_outlier_annotator — invisible to the guarantee/emit walks, which
+    # then stopped at them and hid upstream fields from a locked (extra=forbid)
+    # downstream consumer. The pipeline built green on BOTH gates and every row
+    # died at the consumer's per-row input preflight.
+    #
+    # True means: every SUCCESS row this transform emits carries every field
+    # present on its input row, EXCEPT the names in `removed_input_fields`.
+    # It says nothing about which rows are emitted — batch_outlier_annotator
+    # declares True while dropping whole rows, which is why this is a separate
+    # declaration rather than a relaxation of `passes_through_input`.
+    # With an extras-allowing output contract, presence-guarantee walks may
+    # therefore propagate predecessor guarantees through this declaration
+    # after subtracting ``removed_input_fields``; every successful row carries
+    # that lower bound. A fixed output contract is a firewall. Extras-direction
+    # walks use the same presence fact with the opposite safety polarity.
+    #
+    # `removed_input_fields` is per-INSTANCE (it is computed from config —
+    # line_explode's `source_field`, field_mapper's rename sources), so
+    # declarers set it in `__init__`, not in the class body. It is a lower
+    # bound on what survives, so OVER-stating removals is safe (it shrinks the
+    # predicted set) and under-stating them is not. A transform that cannot
+    # name its removals at construction time — field_mapper mapping an
+    # unnormalized original header, resolved only against the runtime
+    # contract — must leave `forwards_input_fields` False rather than guess.
+    #
+    # Deliberately NOT defaulted to `passes_through_input`: those nodes already
+    # reach the extras check through `compose_propagation`, whose abstainer-skip
+    # treats a dynamic predecessor as no-vote. This walk unions upstream
+    # unconditionally, so defaulting would silently change the verdict for
+    # every pass-through behind a dynamic producer.
+    #
+    # Truth-tested by the ADR-009 probe harness
+    # (tests/invariants/test_pass_through_invariants.py), NOT by a runtime
+    # cross-check: generalizing PassThroughDeclarationContract over these
+    # plugins is a separate change with live-crash risk.
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
+
+    # Value-preservation declaration (elspeth-e6e552ce34).
+    #
+    # `passes_through_input` and `forwards_input_fields` are PRESENCE
+    # contracts: they promise which fields survive, and say nothing about
+    # whether the plugin rewrote a surviving field's VALUE in place
+    # (type_coerce and value_transform both declare passes_through_input=True
+    # while doing exactly that). This flag carries the value half:
+    #
+    # True means process() NEVER changes the value of any input field that
+    # survives on its output row — it may ADD new fields, remove the fields
+    # named by ``removed_input_fields``, and drop whole rows. Under that promise the build-time
+    # type-resolution walk (resolve_guaranteed_field_type,
+    # core/dag/guarantees.py) may recurse through this transform even when its
+    # schema config declares no fields (observed mode), instead of abstaining.
+    # Forwarding recursion additionally requires the field not be removed and
+    # the output contract remain open.
+    # That recursion is what lets a provably-wrong downstream type declaration
+    # fail at build rather than killing every row at the consumer's input
+    # preflight.
+    #
+    # Declare True only after checking process() end to end: any in-place
+    # mutation, coercion, truncation, or normalization of an input field's
+    # value makes True a LIE that manufactures false build-time rejections
+    # (and false acceptances) for downstream declarations. Fail-closed
+    # default: False costs only abstention — the historical per-row verdict.
+    # Truth-tested by the value-preservation probe in
+    # tests/invariants/test_pass_through_invariants.py for hostable declarers.
+    preserves_input_values: bool = False
+
     # Empty-emission governance declaration (ADR-012).
     # True means the transform may intentionally emit zero rows on success.
     # False means empty success output is governance-significant for
     # passes_through_input=True transforms and is checked by the
     # can_drop_rows declaration contract.
     can_drop_rows: bool = False
+
+    # Config options that NAME AN OUTPUT FIELD rather than a consumed input
+    # column. `consumed_input_fields` treats every other column-naming option
+    # (`field`, `group_by`, `*_field`) as an input the transform READS, so its
+    # value is never demoted. Declare an option here only after checking the
+    # config field's own description says it chooses where the plugin WRITES;
+    # leaving a genuine output option undeclared makes the parity probe fail,
+    # and mis-declaring a consumed one silently drops a real requirement.
+    output_naming_config_keys: frozenset[str] = frozenset()
 
     # Field collision enforcement (centralized in TransformExecutor).
     # Transforms that add fields to the output row declare WHAT fields they add
@@ -344,6 +569,15 @@ class BaseTransform(ABC):
     # time via _initialize_declared_input_fields(). Empty frozenset means the
     # transform declares no pre-emission required-input contract.
     declared_input_fields: frozenset[str] = frozenset()
+
+    # Fail-closed string-scan declaration (elspeth-b19dfe41fb).
+    # Transforms that quarantine a row when an explicitly configured scan field
+    # is missing or non-string set this to those field names at construction.
+    # Consumed only at build time by
+    # validate_transform_string_typed_input_fields, which rejects a pipeline
+    # whose producer schema provably types such a field int/float/bool. Empty
+    # frozenset means the transform makes no string-typed input claim.
+    declared_string_input_fields: frozenset[str] = frozenset()
 
     # Runtime preflight opt-in. Transforms that need an engine-time external
     # readiness check before source iteration set this True and override
@@ -370,6 +604,16 @@ class BaseTransform(ABC):
     # None = no output contract provided (acceptable for shape-preserving transforms).
     _output_schema_config: SchemaConfig | None
 
+    # The transform's INPUT schema config. Captured centrally by
+    # `_initialize_declared_input_fields` from the validated config, so every
+    # transform on that path has it; a transform that rewrites its schema config
+    # assigns over the capture afterwards. The base default keeps it nominally
+    # present so `consumed_input_fields` can read `required_fields` without
+    # probing for the attribute (ADR-032). `None` therefore means a transform
+    # that never validated a config — not "declares no schema block", which is
+    # unrepresentable: `TransformDataConfig.schema_config` is required.
+    _schema_config: SchemaConfig | None = None
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         # Enforces the contract documented in contracts/enums.py:Determinism —
         # every plugin MUST declare a Determinism value at registration. The
@@ -384,6 +628,52 @@ class BaseTransform(ABC):
         # Intermediate ABCs (e.g. BaseAzureSafetyTransform) redeclare too —
         # the contract is uniform, not "concrete classes only".
         super().__init_subclass__(**kwargs)
+
+        # `input_schema` is a property on BaseTransform, but the documented
+        # authoring pattern assigns it in the subclass BODY (see this class's
+        # docstring). A class-body assignment lands in `cls.__dict__`, which
+        # wins the MRO lookup ahead of the property — so reads would return the
+        # UNDEMOTED model, silently reintroducing elspeth-d6eeb3a71d through the
+        # path the docs recommend. Redirect the declaration to the property's
+        # backing store so the documented pattern stays valid AND correct.
+        #
+        # Only plain values are moved: a descriptor here is a subclass
+        # deliberately overriding the property, which must be left alone.
+        # Annotation-only declarations never reach `__dict__` and need nothing.
+        # Presence, not truthiness: `input_schema = None` in a class body would
+        # otherwise be skipped and left shadowing the property, so reads would
+        # return None and defer the failure to `None.model_validate(...)`.
+        if "input_schema" in cls.__dict__:
+            declared_schema = cls.__dict__["input_schema"]
+            # Descriptor-ness exactly as class-attribute lookup decides it: a
+            # descriptor's `__get__` lives in a class dict on its TYPE's MRO
+            # (instance state never participates). This is the same search the
+            # attribute machinery performs when `cls.input_schema` is read, so
+            # the guard cannot disagree with the runtime behavior it protects.
+            is_descriptor = any("__get__" in klass.__dict__ for klass in type(declared_schema).__mro__)
+            if not is_descriptor:
+                delattr(cls, "input_schema")
+                cls._declared_input_schema = declared_schema
+
+        # The redirect above only sees `cls.__dict__`. A MIXIN ahead of
+        # BaseTransform in the MRO shadows the property without ever appearing
+        # there, so reads would silently return the UNDEMOTED model. Assert the
+        # property still wins, so that shape fails at class creation rather than
+        # per row — the same posture as the determinism check below. No default:
+        # BaseTransform itself defines the property, so the static lookup cannot
+        # miss on any subclass; a default would only be dead code.
+        resolved = inspect.getattr_static(cls, "input_schema")
+        if not isinstance(resolved, property):
+            raise TypeError(
+                f"{cls.__qualname__} resolves `input_schema` to "
+                f"{type(resolved).__name__} instead of BaseTransform's property, so "
+                f"self-created fields would never be demoted (elspeth-d6eeb3a71d). A "
+                f"base or mixin ahead of BaseTransform in the MRO is shadowing it. "
+                f"Assign the schema on the instance (`self.input_schema = ...`) or in "
+                f"this class's own body, and list BaseTransform before any mixin that "
+                f"declares input_schema."
+            )
+
         if "determinism" not in cls.__dict__:
             raise TypeError(
                 f"{cls.__qualname__} inherits from BaseTransform but does not "
@@ -436,6 +726,20 @@ class BaseTransform(ABC):
         immediately after ``<Config>.from_dict(...)`` succeeds. This preserves
         existing per-plugin validation/error semantics while centralizing the
         runtime normalization and batch-aware fail-closed guard.
+
+        Also captures the INPUT ``schema:`` block, for the same reason and at the
+        same seam. ``consumed_input_fields`` reads ``_schema_config``'s
+        ``required_fields`` as one of its two NON-NEGOTIABLE members, so a
+        transform that passed its ``schema_config`` to the schema factory without
+        storing it kept the ``None`` class default and lost that limb — demoting
+        at runtime a field ``get_raw_node_required_fields`` still enforced at
+        build time (elspeth-3790106260). Capturing here rather than per plugin
+        makes the limb unconditional on every transform that validates a config.
+
+        ``TransformDataConfig.schema_config`` is required and non-None, and this
+        runs BEFORE any plugin-specific assignment, so a transform that rewrites
+        its schema config — ``BatchStats`` unions ``group_by`` into
+        ``required_fields`` — still overwrites this with the wider set.
         """
         declared_input_fields = validated_config.declared_input_fields
         if declared_input_fields and self.is_batch_aware:
@@ -446,7 +750,104 @@ class BaseTransform(ABC):
                 f"DeclaredRequiredFieldsContract to non-batch transforms until "
                 f"an ADR-010 amendment lands."
             )
+        self._validated_config = validated_config
         self.declared_input_fields = declared_input_fields
+        self._schema_config = validated_config.schema_config
+        self._reject_fixed_schema_omitting_consumed_fields()
+
+    def _reject_fixed_schema_omitting_consumed_fields(self) -> None:
+        """Reject a fixed input schema that forbids an AUTHORED input column.
+
+        An input column the author explicitly configured this transform to
+        read, omitted from ``mode: fixed`` fields, is incoherent: the input
+        model is ``extra='forbid'`` over the declared fields, so any row
+        carrying the column is rejected before the transform runs — the
+        configured read can never succeed (elspeth-d3958d90f5).
+
+        Only AUTHORED option values participate, read from the raw config
+        rather than the validated model. Option DEFAULTS are deliberately
+        excluded: ``batch_replicate.copies_field`` defaults to ``"copies"``
+        with documented row-absence fallback semantics, so a user who never
+        mentioned the option must not be forced to declare its default
+        column. This is the inverse of ``_config_named_input_columns``'s
+        choice — demotion protection wants defaults visible (fail-closed
+        toward requiredness); construction rejection must not fire on intent
+        the author never expressed. ADR-013 ``declared_input_fields`` always
+        participates: it is a requiredness claim wherever it came from.
+
+        Fires only for fixed mode. Flexible schemas admit the column as an
+        extra and observed schemas declare nothing to contradict — odd
+        configs, not incoherent ones. Dotted paths and other non-identifier
+        spellings resolve at runtime only (the source boundary rejects such
+        headers as schema fields), so they are exempt.
+
+        This runs at the one seam every registered transform crosses right
+        after config validation — BEFORE the batch family injects its
+        consumed column into ``required_fields`` on a rebuilt SchemaConfig,
+        which is why the check reads the authored-option surface rather than
+        ``required_fields``: the same fact is visible earlier there.
+        """
+        schema_config = self._schema_config
+        if schema_config is None or schema_config.mode != "fixed" or schema_config.fields is None:
+            return
+
+        authored_by: dict[str, list[str]] = {}
+        for key, value in self.config.items():
+            if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
+                continue
+            for item in _column_names_in_option_value(value):
+                authored_by.setdefault(item, []).append(key)
+        # PROVENANCE, honestly. ``declared_input_fields`` is multi-provenance:
+        # the author's own ``required_input_fields`` list, and — for the plugins
+        # whose config derives it (web_scrape's ``url_field``, blob_fetch's
+        # ``url_field``, blob_csv_expand's ``blob_ref_field``, textract's
+        # ``key_field``/``bucket_field``/``version_field``, azure document
+        # intelligence's ``source_field``, rag's ``query_field``, field_mapper's
+        # ``mapping``) — an ordinary option the author wrote instead. Naming
+        # ``required_input_fields`` for every member sent the author to edit a
+        # key that is not in their config at all: blob_csv_expand's
+        # ``blob_ref_field`` DEFAULTS to ``blob_ref``, so the message named a
+        # key the author never wrote for a column they never mentioned.
+        #
+        # Claim ``required_input_fields`` only when the author actually wrote
+        # the name there. Otherwise defer to whichever column-naming option the
+        # scan above already matched — that is how ``url_field`` and
+        # ``value_field`` come to be named correctly — and fall back to a
+        # GENERIC BUT TRUE phrase when nothing explains it. The base class
+        # cannot see which option a config property derived a name from, and a
+        # plausible-but-wrong key is worse than an honest vague one: the rest of
+        # the message already names the offending FIELD, which is what the
+        # author searches their options for.
+        #
+        # PRESENCE comes from the authored dict (did the author write the key at
+        # all); the NAMES come from the validated model, which has already
+        # checked and stripped every entry — the same normalization
+        # ``declared_input_fields`` was built from, so the comparison below is
+        # like-for-like. ``_initialize_declared_input_fields`` stores the
+        # validated config before calling here.
+        validated_config = self._validated_config
+        assert validated_config is not None, "validated config must be captured before the fixed-schema check"
+        authored_required_names = set(validated_config.required_input_fields or ()) if "required_input_fields" in self.config else set()
+        for name in self.declared_input_fields:
+            if name in authored_required_names:
+                authored_by.setdefault(name, []).append("required_input_fields")
+            elif name not in authored_by:
+                authored_by[name] = [_DERIVED_INPUT_FIELD_PROVENANCE]
+
+        declared = {field.name for field in schema_config.fields}
+        missing = sorted(name for name in authored_by if name not in declared and name.isidentifier())
+        if not missing:
+            return
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        described = "; ".join(f"{name!r} (named by {', '.join(sorted(set(authored_by[name])))})" for name in missing)
+        raise PluginConfigError(
+            f"Transform {self.name!r} is configured to read input field(s) its fixed schema "
+            f"forbids: {described}. A 'mode: fixed' schema rejects every row carrying an "
+            f"undeclared field, so the configured read can never succeed. Declare the "
+            f"field(s) in schema.fields, or use 'mode: flexible' / 'mode: observed'."
+        )
 
     def effective_static_contract(self) -> frozenset[str]:
         """Return the transform's public static output guarantee surface.
@@ -633,6 +1034,299 @@ class BaseTransform(ABC):
         )
         return PipelineRow(output, contract)
 
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Fields this transform CREATES, which must never be required on input.
+
+        A transform's ``schema:`` block is its INPUT contract, but authors also
+        use it to name the shape the transform emits. Requiring a field the
+        transform exists to create is unsatisfiable: every row is rejected at
+        ``TransformExecutor``'s ``input_schema.model_validate(..., strict=True)``
+        (elspeth-d6eeb3a71d).
+
+        ``input_schema`` demotes these to optional in the DERIVED INPUT pydantic
+        model only. The ``SchemaConfig`` is left untouched, so the OUTPUT
+        contract still guarantees them and ``guaranteed_fields`` stays legal at
+        ``contracts/schema.py``.
+
+        Note the limit of that: a single ``SchemaConfig`` still cannot be
+        DECLARED input-optional and output-guaranteed — ``contracts/schema.py``
+        rejects ``required: false`` alongside ``guaranteed_fields``. The
+        framework DERIVES the combination here, below that layer; an author
+        writing the config cannot express it directly and must declare
+        ``required: true``.
+
+        Defaults to ``declared_output_fields``. Override when the emitted set is
+        not the right demotion set — ``ValueTransform`` keeps
+        ``declared_output_fields`` empty (its targets may be overwrites, and a
+        non-empty value would force the executor's collision check) yet still
+        creates its operation targets.
+
+        OVERRIDE AS A PROPERTY, not an assignment. This is a property, so
+        ``self.self_created_input_fields = frozenset(...)`` in ``__init__``
+        raises ``AttributeError: property has no setter``. It fails fast, but
+        the shape is easy to get wrong, so: compute the set in ``__init__``,
+        store it on a private attribute, and return that from a property
+        override. ``FieldMapper`` is the reference shape. (``BatchStats`` and
+        ``BatchDistributionProfile`` return an existing module constant or
+        precomputed attribute directly, which is the same pattern without the
+        extra field.)
+
+        This answers "what does the transform WRITE", which on its own does not
+        say whether the transform also READS the field. ``consumed_input_fields``
+        supplies that half, and is subtracted before anything is demoted.
+        """
+        return self.declared_output_fields
+
+    def _reject_input_options_naming_created_fields(self, input_naming_options: Mapping[str, str | None]) -> None:
+        """Reject config options that point an INPUT column at a field this transform creates.
+
+        An option like ``web_scrape.url_field`` names a column the transform
+        READS; the transform then writes its created fields onto the same row.
+        Aiming one at the other makes the transform consume its own output —
+        it reads the column for a URL and immediately overwrites it with the
+        scraped content — which is never what an author means.
+
+        Nothing else rejects the shape. ``TransformExecutor``'s collision check
+        compares ``declared_output_fields`` against the input keys OF A ROW, so
+        it cannot fire until a row actually carries the column, and under
+        ``mode: observed`` there is no declared field for DAG validation to
+        carry either. Both authoring surfaces accepted it silently
+        (elspeth-09dc6407f1).
+
+        Call at the END of ``__init__``, after ``declared_output_fields`` (or a
+        ``self_created_input_fields`` override) is populated — the created set
+        is read here, not captured, so an earlier call sees an empty set and
+        passes vacuously. Pass the option NAME with its resolved column so the
+        error can say which option to repoint; that is the actionable half, and
+        the created field is rarely the one to rename. ``None`` values are
+        skipped, so optional locator options can be passed unconditionally.
+
+        Every offending option is reported at once: repointing one must not
+        merely reveal the next.
+
+        Raises:
+            PluginConfigError: If any option names a created field. This is the
+                type the composer's probe tolerance recognizes
+                (``_is_config_probe_exception``), so a draft pipeline surfaces
+                a validation error rather than crashing validation.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        created = self.self_created_input_fields
+        offenders = sorted((option, column) for option, column in input_naming_options.items() if column is not None and column in created)
+        if not offenders:
+            return
+
+        validated_config = self._validated_config
+        cause = (
+            "; ".join(f"{option} names {column!r}, which {self.name} itself creates" for option, column in offenders)
+            + ". Point "
+            + " and ".join(option for option, _ in offenders)
+            + " at a column that ARRIVES on the row, or rename the created field."
+        )
+        raise PluginConfigError(
+            f"Invalid configuration for {self.name}: {cause}",
+            cause=cause,
+            plugin_class=None if validated_config is None else type(validated_config).__name__,
+            plugin_name=self.name,
+            component_type="transform",
+        )
+
+    @property
+    def consumed_input_fields(self) -> frozenset[str]:
+        """Fields this transform READS from the row, which must stay required.
+
+        A field can be both consumed and created — a second-stage aggregation
+        reading an upstream ``mean`` while emitting its own is the canonical
+        case, because batch output names are generic. Demoting such a field
+        would silently drop a genuine input requirement, turning a contract
+        violation that was caught and audited at the transform boundary into an
+        untyped failure deeper in the pipeline. So consumption always wins:
+        ``input_schema`` demotes only ``self_created_input_fields`` MINUS this.
+
+        The default reads three surfaces. Two already existed for declaring
+        consumption — ADR-013's ``declared_input_fields`` (from
+        ``required_input_fields``) and ``SchemaConfig.required_fields``; eleven
+        of the twelve batch transforms already route their configured input
+        columns through the latter.
+
+        THOSE TWO ARE NON-NEGOTIABLE MEMBERS, and the reason is a layering
+        invariant that is easy to destroy by "simplifying" them out. They are
+        exactly what ``get_raw_node_required_fields`` (contracts/schema.py:861)
+        reads to build the DAG's build-time required-field contract, and
+        ``fields[].required`` — the surface demotion touches — is deliberately
+        NOT part of it (core/dag/guarantees.py:96). So demotion changes only the
+        surface the DAG does not check, and leaves untouched exactly the surface
+        it does. Compile-time and runtime contracts therefore cannot diverge. Drop
+        either surface from this union and a field the DAG still enforces at build
+        time becomes demotable at runtime, silently splitting the two layers.
+
+        That holds only while both surfaces are POPULATED, which is the harder
+        half. Deleting a member is visible; leaving one empty is not. Ten
+        transforms passed their validated ``schema_config`` to the schema factory
+        and never stored it, so ``_schema_config`` kept its ``None`` class default
+        and this limb contributed an empty frozenset — the same split, reached
+        without touching this method (elspeth-3790106260). Both surfaces are now
+        populated centrally in ``_initialize_declared_input_fields``, and
+        ``tests/invariants/test_input_schema_config_is_captured.py`` asserts the
+        build-time and runtime required sets agree across the live registry.
+        The third is this transform's own config:
+        any option that NAMES A COLUMN (``field``, ``group_by``, ``*_field``)
+        contributes its value, unless the option is listed in
+        ``output_naming_config_keys``.
+
+        That third surface is deliberately fail-closed in the safe direction. An
+        unclassified column option is treated as CONSUMED, so the worst case is
+        a field that stays required rather than one whose requirement vanishes —
+        and if the option really named an output, the parity probe and the
+        registry sweep fail loudly, because the created field is then still
+        demanded on input. Silence is not a possible outcome either way.
+
+        RESIDUAL TRADE, stated so it is not silent: for a field the transform
+        creates and does NOT declare as consumed, an author's ``required: true``
+        is overruled and the presence requirement is dropped. That is deliberate
+        — honouring it is the original elspeth-d6eeb3a71d trap, where every row
+        was rejected for missing the field the transform exists to create — but
+        it does mean the author's declaration is not the last word. A plugin
+        that reads such a field MUST surface it here; the registry sweep in
+        ``tests/unit/plugins/infrastructure/test_self_created_input_demotion.py``
+        fails closed when a configured input column is demoted, so a new plugin
+        in this shape is forced to declare its intent rather than lose the
+        requirement quietly.
+        """
+        schema_config = self._schema_config
+        declared_required = frozenset(schema_config.required_fields or ()) if schema_config is not None else frozenset()
+        return self.declared_input_fields | declared_required | self._config_named_input_columns()
+
+    def _config_named_input_columns(self) -> frozenset[str]:
+        """Column names this transform's own config options point at for READING.
+
+        Reads the VALIDATED config when one has been captured, so an option the
+        author omitted still contributes its default. Reading the raw authored
+        dict instead would make a defaulted input column invisible — e.g.
+        ``blob_csv_expand.blob_ref_field`` defaults to ``"blob_ref"`` — and a
+        column nobody can see is a column that gets demoted.
+        """
+        cached = self._config_columns_cache
+        source: object = self.config if self._validated_config is None else self._validated_config
+        if cached is not None and cached[0] is source:
+            return cached[1]
+
+        validated = self._validated_config
+        if validated is None:
+            options: Mapping[str, Any] = self.config
+        else:
+            # Read declared model fields rather than __dict__: that resolves
+            # aliases and defaults the way pydantic itself does, and does not
+            # depend on how the instance happens to store its attributes. Every
+            # declared field is present on a validated instance, so no default.
+            options = {name: getattr(validated, name) for name in type(validated).model_fields}
+        named: set[str] = set()
+        for key, value in options.items():
+            if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
+                continue
+            named.update(_column_names_in_option_value(value))
+        resolved = frozenset(named)
+        # Config is fixed once construction finishes, so this is recompute-once
+        # work; without the memo it was rebuilt on EVERY input_schema read, i.e.
+        # once per row at the executor's validation site.
+        self._config_columns_cache = (source, resolved)
+        return resolved
+
+    @property
+    def demoted_input_fields(self) -> frozenset[str]:
+        """Fields whose declared input contract this transform overrides.
+
+        The framework demotes a field the transform CREATES even when the author
+        declared it required, because honouring that declaration rejects every
+        row (elspeth-d6eeb3a71d). That is a deliberate disagreement with the
+        authored config, so it must be inspectable rather than implicit.
+
+        Deliberately NOT written to the audit trail, and this is not debt. The
+        value is a pure function of (plugin class, plugin config), and the run
+        config is already captured in the audit record — so the override is
+        RECONSTRUCTIBLE from what is stored. Audit records what cannot be
+        re-derived (a token's fate, an operation that did or did not happen);
+        this can be. Recording it would also mean an audit-table change, an epoch
+        bump and a store wipe, for a fact already implied by the record.
+        """
+        declared = self._declared_input_schema
+        if declared is None:
+            return frozenset()
+        return self._effective_demoted_fields(declared)
+
+    def _effective_demoted_fields(self, declared: type[PluginSchema]) -> frozenset[str]:
+        """The fields demotion will ACTUALLY change on ``declared``.
+
+        Created-minus-consumed intersected with the model's own fields. The
+        intersection matters: an observed-mode schema declares no fields at all,
+        so a transform can create plenty and still change nothing here. Every
+        consumer — the identity guard, the demotion itself, and the audit
+        accessor — uses this one quantity so they cannot disagree.
+        """
+        demote = self.self_created_input_fields - self.consumed_input_fields
+        return frozenset(demote & declared.model_fields.keys())
+
+    @property
+    def input_schema(self) -> type[PluginSchema]:
+        """The derived input model, with self-created fields demoted to optional.
+
+        Demotion happens here rather than at schema-construction time because
+        transforms build their input model by several routes — ``_create_schemas``,
+        a direct ``create_schema_from_config`` call — and some populate
+        ``declared_output_fields`` only AFTER building it. Resolving lazily on
+        read makes the invariant independent of both construction path and
+        ordering.
+
+        Only fields the transform creates and does NOT read are demoted, and
+        demotion drops the PRESENCE requirement alone — a supplied value is
+        still validated against the declared annotation and constraints.
+
+        Returns the assigned model unchanged when there is nothing to demote.
+        That keeps schema class identity stable for the overwhelming majority of
+        transforms, which matters because identity is what distinguishes a
+        shape-preserving transform (input and output are literally the same
+        object) from a shape-changing one — the invariant asserted below.
+        """
+        declared = self._declared_input_schema
+        if declared is None:
+            # Name the public attribute, not the property's backing store: an
+            # author reading this never assigned `_declared_input_schema`.
+            raise AttributeError(
+                f"{type(self).__name__} has no input_schema. Assign one in __init__ "
+                f"(`self.input_schema = ...`, usually via `self._create_schemas(...)`) "
+                f"or declare it in the class body."
+            )
+        demote = self._effective_demoted_fields(declared)
+        # Unset output_schema means nothing is shared yet, so nothing to violate.
+        if demote and self.output_schema is declared:
+            # Shape-preserving transforms (_create_schemas with adds_fields=False)
+            # share ONE model between input and output. Demoting would hand back a
+            # subclass for input while output kept the original, silently splitting
+            # a contract the DAG compares by identity. No shipped transform is in
+            # this shape — a transform that creates fields is not shape-preserving —
+            # so fail loudly rather than rely on that staying true.
+            raise FrameworkBugError(
+                f"{type(self).__name__} shares one schema object between input and "
+                f"output (shape-preserving) but declares self-created fields "
+                f"{sorted(demote)}. A transform that creates fields must build its "
+                f"output schema separately (_create_schemas(..., adds_fields=True))."
+            )
+        cached = self._input_schema_cache
+        # Re-derive whenever either input changes: a transform may populate the
+        # fields backing self_created_input_fields after assigning the schema.
+        if cached is not None and cached[0] is declared and cached[1] == demote:
+            return cached[2]
+        resolved = _demote_required_model_fields(declared, demote)
+        self._input_schema_cache = (declared, demote, resolved)
+        return resolved
+
+    @input_schema.setter
+    def input_schema(self, schema: type[PluginSchema]) -> None:
+        self._declared_input_schema = schema
+        self._input_schema_cache = None
+
     @staticmethod
     def _create_schemas(
         schema_config: Any,
@@ -692,7 +1386,7 @@ class BaseTransform(ABC):
         Returns:
             SchemaConfig with guaranteed_fields including declared output fields.
         """
-        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
 
         base_guaranteed = set(schema_config.guaranteed_fields or ())
         output_fields = base_guaranteed | self.declared_output_fields
@@ -707,7 +1401,7 @@ class BaseTransform(ABC):
 
         return SchemaConfig(
             mode=schema_config.mode,
-            fields=schema_config.fields,
+            fields=declare_missing_guaranteed_fields(schema_config.fields, guaranteed_fields_result),
             guaranteed_fields=guaranteed_fields_result,
             audit_fields=schema_config.audit_fields,
             required_fields=schema_config.required_fields,
@@ -887,7 +1581,19 @@ class BaseTransform(ABC):
         return ()
 
 
-class BaseSink(ABC):
+def declares_discriminated_config_variants(
+    plugin_type: type[BaseSource] | type[BaseTransform] | type[BaseSink],
+) -> bool:
+    """Return whether a nominal plugin class declares the variants protocol.
+
+    Derive this fact from the live MRO instead of caching a mutable marker on
+    the subclass. That keeps inherited and mixin-provided declarations aligned
+    with the Composer's structural ``DiscriminatedPlugin`` admission path.
+    """
+    return any("discriminated_variants" in owner.__dict__ for owner in plugin_type.__mro__)
+
+
+class BaseSink(ABC, SinkEffectContract):
     """Base class for sink plugins.
 
     Subclass and implement write(), flush(), close().
@@ -958,7 +1664,6 @@ class BaseSink(ABC):
     supported_effect_modes: ClassVar[frozenset[str]] = frozenset()
     supported_effect_input_kinds: ClassVar[frozenset[SinkEffectInputKind]] = frozenset()
     effect_mode_remediation: ClassVar[str | None] = None
-    supports_member_effects: ClassVar[bool] = False
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -971,16 +1676,38 @@ class BaseSink(ABC):
         del cls, config, purpose
         return None
 
-    # ── Reference content (Phase 7A) ────────────────────────────────────
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        """Validate adapter-specific state against effect admission.
+
+        Adapters whose live state can diverge from their resolved options
+        override this hook. The base implementation is an explicit no-op for
+        adapters whose validated configuration has no second representation.
+        """
+        del mode, required_input_kind
+
+    def _resolve_audit_export_publication_preflight(
+        self,
+        export_format: AuditExportFormat,
+    ) -> Callable[[], None] | None:
+        """Bind any plugin-owned publication probe from validated instance state."""
+        if type(export_format) is not AuditExportFormat:
+            raise TypeError("audit export format must be an exact AuditExportFormat")
+        return None
+
+    # ── Catalogue reference content ─────────────────────────────────────
     # These fields populate the catalog's reference cards. They are
     # documentation, not configuration — authors fill them in to explain
     # to a human reader (compliance, research, ops) what this plugin
     # does, when it's the right choice, when it isn't, and what audit
-    # characteristics it has. Empty / None values render as a generic
-    # "see the technical description" fallback in the catalog UI rather
-    # than blocking display. See docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md for the per-field semantics and the
-    # canonical csv_source.py example.
+    # characteristics it has. Base defaults remain optional for third-party
+    # and legacy compatibility; repository tests require every registered
+    # built-in to be complete. See
+    # docs/contracts/plugin-catalogue-reference-content.md.
 
     usage_when_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
@@ -990,25 +1717,28 @@ class BaseSink(ABC):
 
     usage_when_not_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
-    *not* pick this plugin?" — gracefully redirecting users with the
-    wrong shape of problem to the right plugin. The Marcus persona (per
-    project_composer_personas) reads this to discover the plugin isn't
-    a fit for his Zapier-shaped expectations."""
+    *not* pick this plugin?" State a hard limitation or unsafe fit and
+    redirect the reader to a concrete alternative where one exists."""
 
     example_use: str | None = None
-    """One-or-two-line YAML snippet showing realistic use. Format
-    matches the pipeline YAML so a developer (Dev persona) can copy and
-    paste into a composer session as a starting point. Indent under
-    `source:` / `transform:` / `sink:` as appropriate for the plugin
-    kind. Renders inside a <pre> block in the UI; preserve whitespace."""
+    """One bounded YAML component fragment with realistic options and
+    non-secret values. Use top-level ``sources`` for sources, ``transform``
+    for ordinary transforms, ``aggregations`` for batch-aware transforms,
+    and ``sinks`` for sinks. Preserve whitespace for preformatted rendering."""
 
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+
+    @classmethod
+    def check_web_local_requirements(cls) -> bool:
+        """Return whether this sink's local optional dependencies exist."""
+        return True
+
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
-    are non-exhaustive; pick the two or three most useful for a user
+    are non-exhaustive; pick the two to six most useful for a user
     who is searching the catalog.
 
     See ``BaseTransform.capability_tags`` for the open-vocabulary
@@ -1296,6 +2026,46 @@ class BaseSink(ABC):
         """
         self._on_complete_called = True
 
+    # ── Plugin-declared semantics (mirrors BaseTransform's hook) ──
+    # A sink is a semantic CONSUMER: it reads configured fields and can
+    # require properties of them. It is never a producer, so it gains
+    # input_semantic_requirements() only — there is no output_semantics()
+    # counterpart because nothing downstream reads a sink.
+
+    def input_semantic_requirements(self) -> InputSemanticRequirements:
+        """Return semantic requirements for fields this sink consumes.
+
+        Default returns no requirements. Override to declare that a
+        configured input field must satisfy specific ContentKind /
+        TextFraming / SemanticValueType acceptance sets — for example
+        ``TextSink``, whose one-record-per-row invariant makes any
+        newline-bearing framing a hard conflict.
+
+        A sink that overrides this MUST also provide ``probe_config()``:
+        ``tests/invariants/test_semantic_requirements_are_satisfiable``
+        fails loudly rather than silently skipping a declarer it cannot
+        instantiate.
+        """
+        from elspeth.contracts.plugin_semantics import InputSemanticRequirements
+
+        return InputSemanticRequirements()
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Return a minimal config dict sufficient to instantiate this sink.
+
+        Same contract as ``BaseTransform.probe_config``: the dict is passed
+        directly to ``cls(...)`` and must not require external services,
+        network calls, or credentials. Required of any sink that declares
+        ``input_semantic_requirements()``.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__}.probe_config() is not implemented. "
+            "Sinks that declare input_semantic_requirements() must declare how "
+            "to instantiate in isolation so the satisfiability invariant can "
+            "read their requirements."
+        )
+
     @classmethod
     def get_agent_assistance(
         cls,
@@ -1374,16 +2144,15 @@ class BaseSource(ABC):
     plugin_version: str = "0.0.0"
     source_file_hash: str | None = None
 
-    # ── Reference content (Phase 7A) ────────────────────────────────────
+    # ── Catalogue reference content ─────────────────────────────────────
     # These fields populate the catalog's reference cards. They are
     # documentation, not configuration — authors fill them in to explain
     # to a human reader (compliance, research, ops) what this plugin
     # does, when it's the right choice, when it isn't, and what audit
-    # characteristics it has. Empty / None values render as a generic
-    # "see the technical description" fallback in the catalog UI rather
-    # than blocking display. See docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md for the per-field semantics and the
-    # canonical csv_source.py example.
+    # characteristics it has. Base defaults remain optional for third-party
+    # and legacy compatibility; repository tests require every registered
+    # built-in to be complete. See
+    # docs/contracts/plugin-catalogue-reference-content.md.
 
     usage_when_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
@@ -1393,25 +2162,28 @@ class BaseSource(ABC):
 
     usage_when_not_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
-    *not* pick this plugin?" — gracefully redirecting users with the
-    wrong shape of problem to the right plugin. The Marcus persona (per
-    project_composer_personas) reads this to discover the plugin isn't
-    a fit for his Zapier-shaped expectations."""
+    *not* pick this plugin?" State a hard limitation or unsafe fit and
+    redirect the reader to a concrete alternative where one exists."""
 
     example_use: str | None = None
-    """One-or-two-line YAML snippet showing realistic use. Format
-    matches the pipeline YAML so a developer (Dev persona) can copy and
-    paste into a composer session as a starting point. Indent under
-    `source:` / `transform:` / `sink:` as appropriate for the plugin
-    kind. Renders inside a <pre> block in the UI; preserve whitespace."""
+    """One bounded YAML component fragment with realistic options and
+    non-secret values. Use top-level ``sources`` for sources, ``transform``
+    for ordinary transforms, ``aggregations`` for batch-aware transforms,
+    and ``sinks`` for sinks. Preserve whitespace for preformatted rendering."""
 
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+
+    @classmethod
+    def check_web_local_requirements(cls) -> bool:
+        """Return whether this source's local optional dependencies exist."""
+        return True
+
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
-    are non-exhaustive; pick the two or three most useful for a user
+    are non-exhaustive; pick the two to six most useful for a user
     who is searching the catalog.
 
     See ``BaseTransform.capability_tags`` for the open-vocabulary
@@ -1432,6 +2204,22 @@ class BaseSource(ABC):
     discovery_secret_requirements: Mapping[str, tuple[str, ...]] = {}
     """Credential-bearing config fields that must have a configured secret ref
     before composer discovery advertises the plugin. See BaseTransform."""
+
+    # Structural observed-cell type (elspeth-e6e552ce34).
+    #
+    # Non-None means: under an OBSERVED schema (no declared fields, so no
+    # coercion targets) every cell this source emits has this SchemaConfig
+    # base type BY CONSTRUCTION of the format it parses. csv declares "str" —
+    # csv.reader yields strings and observed schemas preserve parsed cells
+    # untouched (see csv_source.py module docstring). Sources whose observed
+    # values carry format-native types (json, database rows) must stay None:
+    # the fact must hold for EVERY field on EVERY row, or build-time
+    # rejections built on it are unsound. Consumed by
+    # resolve_guaranteed_field_type's structural source arm, which answers
+    # only for fields in the source's own guaranteed set. Declared-fields
+    # modes (fixed/flexible) are unaffected — a declared field's type comes
+    # from the declaration, and sources coerce into it at ingest.
+    observed_value_type: ClassVar[str | None] = None
 
     # Config model — each subclass sets this to its Pydantic config class.
     # NullSource sets this to None (no config validation needed).
@@ -1472,6 +2260,14 @@ class BaseSource(ABC):
     # Sources set this from schema_config.get_effective_guaranteed_fields() at init.
     # Empty frozenset = no guaranteed-field contract.
     declared_guaranteed_fields: frozenset[str] = frozenset()
+
+    # Plugin-computed output contract, recorded by
+    # _initialize_declared_guaranteed_fields(). The DAG builder prefers this
+    # over re-parsing the raw options dict — the source-side mirror of
+    # BaseTransform._output_schema_config — so source-specific schema rewrites
+    # (e.g. the LLM source's guaranteed-field augmentation) reach build-time
+    # graph validation, not just per-row enforcement (elspeth-db98d3f660).
+    _output_schema_config: SchemaConfig | None
 
     # Schema contract for row validation
     _schema_contract: SchemaContract | None = None
@@ -1516,6 +2312,7 @@ class BaseSource(ABC):
         self._on_complete_called: bool = False
         self._schema_contract = None
         self.declared_guaranteed_fields = frozenset()
+        self._output_schema_config: SchemaConfig | None = None
 
     @abstractmethod
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
@@ -1580,9 +2377,12 @@ class BaseSource(ABC):
 
         Call this after any source-specific schema rewrite so the runtime
         contract surface matches the source's effective guarantees, not the
-        caller's raw config dict.
+        caller's raw config dict. Also records the schema as the source's
+        plugin-computed output contract, which the DAG builder prefers over
+        re-parsing raw options (elspeth-db98d3f660).
         """
         self.declared_guaranteed_fields = schema_config.get_effective_guaranteed_fields()
+        self._output_schema_config = schema_config
 
     # === Lifecycle Hooks ===
     # Call ordering: on_start -> load -> on_complete -> close
@@ -1633,6 +2433,24 @@ class BaseSource(ABC):
             is a dict mapping original header name → final field name.
         """
         return None  # Default: no field resolution metadata
+
+    # ── Plugin-declared semantics (mirrors BaseTransform's hook) ──
+    # A source is a semantic PRODUCER: it is the root of every pipeline and
+    # can declare facts about the fields it emits. It consumes nothing, so
+    # it gains output_semantics() only.
+
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        """Return semantic facts for the fields this source emits.
+
+        Default returns an empty declaration: the source makes no semantic
+        claims beyond what the schema contract already expresses. Override
+        to declare ContentKind / TextFraming / SemanticValueType for
+        configured output fields — ``LLMSource`` does, because a generated
+        response is unconstrained free text (ADR-039).
+        """
+        from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
+
+        return OutputSemanticDeclaration()
 
     # === Composer assistance hooks ===
 

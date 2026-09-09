@@ -15,7 +15,9 @@ Fenced verbs covered: ``complete_run``, ``update_run_status``,
 strict F1 arm and the legacy partial-release wrapper arm),
 ``ingest_row_with_initial_claim`` (woken-mid-ingest: atomic rollback, no
 orphan ``rows`` row), the fenced ``create_row_with_token`` arm,
-``recover_expired_leases``,
+``reset_adoption_marker_to_pending`` (the §E.3 crash-window reset: fenced
+because a SECOND takeover deposes a leader still inside ``restore_from_journal``
+— elspeth-ee18e446ff), ``recover_expired_leases``,
 ``terminalize_pending_sinks_with_terminal_outcomes``, and the §C.4 row-7
 per-terminalization-batch fences on ``mark_pending_sink_terminal``/``_many``.
 
@@ -33,41 +35,73 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import event, insert, select, update
 
-from elspeth.contracts import CheckpointDraft, NodeType, RunStatus
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts import CallType, CheckpointDraft, ExportStatus, NodeType, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import SecretResolutionInput
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipLost, WorkerMembershipToken
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
     RunLeadershipLostError,
+    RunMembershipLostError,
 )
+from elspeth.contracts.preflight import CommencementGateResult, PreflightResult
+from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.sink_effects import (
+    SINK_EFFECT_PROTOCOL_VERSION,
+    SinkEffectAttemptAction,
+    SinkEffectCommitResult,
+    SinkEffectDescriptorMode,
+    SinkEffectFinalizationMember,
+    SinkEffectFinalizeRequest,
+    SinkEffectInputKind,
+    SinkEffectInspectionMode,
+    SinkEffectLease,
+    SinkEffectPlan,
+)
 from elspeth.core.checkpoint.manager import CheckpointManager
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectAttemptRequest, SinkEffectAttemptResult
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.run_coordination_repository import (
+    RunCoordinationRepository,
+    fenced_member_transaction,
+)
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     batch_members_table,
     batches_table,
     checkpoints_table,
-    coalesce_branch_losses_table,
+    group_losses_table,
     nodes_table,
+    preflight_results_table,
     rows_table,
     run_coordination_events_table,
     run_coordination_table,
+    run_sources_table,
     run_workers_table,
     runs_table,
     scheduler_events_table,
+    secret_resolutions_table,
+    sink_effect_attempts_table,
+    sink_effect_export_snapshots_table,
+    sink_effect_members_table,
+    sink_effect_streams_table,
+    sink_effects_table,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
+from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 
 RUN_ID = "run-fence-1"
 OTHER_RUN_ID = "run-fence-2"
@@ -125,7 +159,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                     registered_at=NOW,
                 )
             )
-    return RunCoordinationRepository(db.engine).register_run_leader(run_id=RUN_ID, worker_id=WORKER, now=NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
 
 
 def _bump_epoch(db: LandscapeDB) -> None:
@@ -136,6 +170,126 @@ def _bump_epoch(db: LandscapeDB) -> None:
             .where(run_coordination_table.c.run_id == RUN_ID)
             .values(leader_epoch=run_coordination_table.c.leader_epoch + 1)
         )
+
+
+def _run_lifecycle_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """Every table a RunLifecycleRepository writer can touch, as a complete image."""
+    snapshot: dict[str, tuple[tuple[object, ...], ...]] = {}
+    with db.engine.connect() as conn:
+        for table in (runs_table, run_sources_table, secret_resolutions_table, preflight_results_table):
+            snapshot[table.name] = tuple(tuple(row) for row in conn.execute(select(table).order_by(*table.primary_key.columns)).all())
+    return snapshot
+
+
+_STALE_EFFECT_ID = "a" * 64
+_STALE_ATTEMPT_ID = "b" * 64
+
+
+def _bump_epoch_for(db: LandscapeDB, run_id: str) -> None:
+    """Depose the leader of an arbitrary run (the RUN_ID-bound sibling of :func:`_bump_epoch`)."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(run_coordination_table)
+            .where(run_coordination_table.c.run_id == run_id)
+            .values(leader_epoch=run_coordination_table.c.leader_epoch + 1)
+        )
+
+
+def _fence_refusals_for(db: LandscapeDB, run_id: str, verb: str) -> list[dict[str, object]]:
+    """:func:`_fence_refusals` for a run other than ``RUN_ID``."""
+    with db.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(run_coordination_events_table)
+                .where(run_coordination_events_table.c.run_id == run_id)
+                .where(run_coordination_events_table.c.event_type == "fence_refusal")
+            )
+            .mappings()
+            .all()
+        )
+    return [dict(row) for row in rows if json.loads(str(row["context_json"]))["verb"] == verb]
+
+
+def _stale_plan() -> SinkEffectPlan:
+    return SinkEffectPlan(
+        effect_id=_STALE_EFFECT_ID,
+        protocol_version=SINK_EFFECT_PROTOCOL_VERSION,
+        input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        descriptor_mode=SinkEffectDescriptorMode.RESULT_DERIVED,
+        inspection_mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
+        target="file:///tmp/stale.jsonl",
+        plan_hash="e" * 64,
+        payload_hash="f" * 64,
+        expected_descriptor=None,
+        safe_evidence={"inspection_reference": "no-inspection-required:v1"},
+    )
+
+
+def _stale_lease() -> SinkEffectLease:
+    return SinkEffectLease(effect_id=_STALE_EFFECT_ID, owner="worker-a", generation=1, expires_at=NOW)
+
+
+def _stale_descriptor() -> ArtifactDescriptor:
+    return ArtifactDescriptor(
+        artifact_type="file",
+        path_or_uri="file:///tmp/stale.jsonl",
+        content_hash="1" * 64,
+        size_bytes=7,
+    )
+
+
+def _stale_attempt_request() -> SinkEffectAttemptRequest:
+    return SinkEffectAttemptRequest(
+        effect_id=_STALE_EFFECT_ID,
+        member_ordinal=None,
+        generation=1,
+        action=SinkEffectAttemptAction.COMMIT,
+        call_kind=CallType.FILESYSTEM,
+        request_hash="2" * 64,
+    )
+
+
+def _stale_attempt_result() -> SinkEffectAttemptResult:
+    return SinkEffectAttemptResult(attempt_id=_STALE_ATTEMPT_ID, evidence={}, latency_ms=1.0)
+
+
+def _stale_commit_result() -> SinkEffectCommitResult:
+    return SinkEffectCommitResult(
+        descriptor=_stale_descriptor(),
+        evidence={},
+        accepted_ordinals=(),
+        diverted_ordinals=(),
+    )
+
+
+def _stale_finalize_request() -> SinkEffectFinalizeRequest:
+    return SinkEffectFinalizeRequest(
+        effect_id=_STALE_EFFECT_ID,
+        lease_owner="worker-a",
+        generation=1,
+        descriptor=_stale_descriptor(),
+        publication_performed=True,
+        publication_evidence_kind="returned",
+        accepted_ordinals=(),
+        diverted_ordinals=(),
+        evidence={},
+        members=(),
+    )
+
+
+def _sink_effect_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """Every table a sink-effect writer can touch, as a complete image."""
+    snapshot: dict[str, tuple[tuple[object, ...], ...]] = {}
+    with db.engine.connect() as conn:
+        for table in (
+            sink_effects_table,
+            sink_effect_members_table,
+            sink_effect_attempts_table,
+            sink_effect_streams_table,
+            sink_effect_export_snapshots_table,
+        ):
+            snapshot[table.name] = tuple(tuple(row) for row in conn.execute(select(table).order_by(*table.primary_key.columns)).all())
+    return snapshot
 
 
 def _fence_refusals(db: LandscapeDB, verb: str) -> list[dict[str, object]]:
@@ -151,6 +305,38 @@ def _fence_refusals(db: LandscapeDB, verb: str) -> list[dict[str, object]]:
             .all()
         )
     return [dict(row) for row in rows if json.loads(str(row["context_json"])).get("verb") == verb]
+
+
+def _seat_image(db: LandscapeDB) -> tuple[object, ...]:
+    """The seat row as a whole tuple — the zero-mutation witness for a refused seat write."""
+    with db.engine.connect() as conn:
+        return tuple(conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID)).one())
+
+
+def _worker_image(db: LandscapeDB, worker_id: str) -> tuple[object, ...]:
+    """A ``run_workers`` row as a whole tuple — the zero-mutation witness for a refused member write."""
+    with db.engine.connect() as conn:
+        return tuple(conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == worker_id)).one())
+
+
+def _depart_member(db: LandscapeDB, worker_id: str) -> None:
+    """Leave ``active`` by the follower's own exit; single-use identity — it never returns."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == worker_id)
+            .values(status="departed", departed_at=read_landscape_transaction_time(conn))
+        )
+
+
+def _evict_member(db: LandscapeDB, worker_id: str) -> None:
+    """Leave ``active`` by the leader's §C.2 housekeeping sweep — the other stale-membership cause."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == worker_id)
+            .values(status="evicted", evicted_at=read_landscape_transaction_time(conn), evicted_by_worker_id="worker:sweep")
+        )
 
 
 def _seed_row_and_token(db: LandscapeDB, *, sequence: int) -> tuple[str, str]:
@@ -189,7 +375,7 @@ def _ensure_active_worker(db: LandscapeDB, worker_id: str) -> None:
                 role="follower",
                 status="active",
                 registered_at=NOW,
-                heartbeat_expires_at=NOW + timedelta(hours=1),
+                heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1),
             )
         )
 
@@ -209,7 +395,7 @@ def _barrier_mutation_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object,
         scheduler_events_table,
         run_coordination_table,
         run_coordination_events_table,
-        coalesce_branch_losses_table,
+        group_losses_table,
         batches_table,
         batch_members_table,
         token_outcomes_table,
@@ -293,10 +479,10 @@ def _seed_other_run_expired_lease(db: LandscapeDB, repo: TokenSchedulerRepositor
         step_index=1,
         ingest_sequence=0,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
-    claimed = repo.claim_ready(run_id=OTHER_RUN_ID, lease_owner="other-run-crashed-worker", lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=OTHER_RUN_ID, lease_owner="other-run-crashed-worker", lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
+    expire_lease(db.engine, claimed.work_item_id)
     return token_id
 
 
@@ -311,10 +497,9 @@ def _enqueue_and_claim(db: LandscapeDB, repo: TokenSchedulerRepository, *, seque
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
     _ensure_active_worker(db, owner)
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
     return token_id, row_id, claimed.work_item_id
 
@@ -325,7 +510,7 @@ class TestMissingTokenBarrierRefusals:
     def test_complete_barrier_runtime_none_refuses_before_transaction(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", now=NOW, expected_lease_owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
         before = _barrier_mutation_snapshot(db)
         transactions: list[object] = []
 
@@ -341,7 +526,6 @@ class TestMissingTokenBarrierRefusals:
                     consumed_token_ids=(token_id,),
                     emitted_pending_sink=(),
                     emitted_ready=(),
-                    now=NOW,
                     coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
                 )
         finally:
@@ -367,7 +551,6 @@ class TestMissingTokenBarrierRefusals:
         try:
             with pytest.raises(TypeError, match="coordination_token"):
                 repo.recover_expired_leases(
-                    now=NOW + timedelta(seconds=120),
                     coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
                 )
         finally:
@@ -382,11 +565,11 @@ class TestMissingTokenBarrierRefusals:
         token: CoordinationToken,
     ) -> None:
         repo = TokenSchedulerRepository(db.engine)
-        token_id, _row_id, _work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="direct-harness")
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="direct-harness")
+        expire_lease(db.engine, work_item_id)
 
         recovered = repo.recover_expired_leases_legacy_unfenced(
             run_id=RUN_ID,
-            now=NOW + timedelta(seconds=120),
             caller_owner=WORKER,
         )
 
@@ -396,7 +579,7 @@ class TestMissingTokenBarrierRefusals:
     def test_terminal_wrapper_runtime_none_refuses_before_transaction(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", now=NOW, expected_lease_owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
         before = _barrier_mutation_snapshot(db)
         transactions: list[object] = []
 
@@ -410,7 +593,6 @@ class TestMissingTokenBarrierRefusals:
                     run_id=RUN_ID,
                     barrier_key="b1",
                     token_ids=(token_id,),
-                    now=NOW,
                     coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
                 )
         finally:
@@ -422,7 +604,7 @@ class TestMissingTokenBarrierRefusals:
     def test_pending_sink_wrapper_runtime_none_refuses_before_transaction(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", now=NOW, expected_lease_owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
         before = _barrier_mutation_snapshot(db)
         transactions: list[object] = []
 
@@ -445,7 +627,6 @@ class TestMissingTokenBarrierRefusals:
                             error_message=None,
                         )
                     },
-                    now=NOW,
                     coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
                 )
         finally:
@@ -460,7 +641,8 @@ class TestStrictRecoveryScopeBinding:
 
     def test_supported_call_only_recovers_token_run(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
-        run_token_id, _row_id, _work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        run_token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        expire_lease(db.engine, work_item_id)
         with db.engine.begin() as conn:
             conn.execute(
                 update(run_workers_table)
@@ -472,7 +654,6 @@ class TestStrictRecoveryScopeBinding:
         other_run_before = _lease_recovery_run_snapshot(db, OTHER_RUN_ID)
 
         recovered = repo.recover_expired_leases(
-            now=NOW + timedelta(seconds=61),
             coordination_token=token,
         )
 
@@ -504,7 +685,6 @@ class TestStrictRecoveryScopeBinding:
             with pytest.raises(TypeError, match="run_id"):
                 repo.recover_expired_leases(
                     run_id=OTHER_RUN_ID,
-                    now=NOW + timedelta(seconds=61),
                     caller_owner=WORKER,
                     coordination_token=token,
                 )
@@ -534,7 +714,6 @@ class TestStrictRecoveryScopeBinding:
         try:
             with pytest.raises(TypeError, match="caller_owner"):
                 repo.recover_expired_leases(
-                    now=NOW + timedelta(seconds=61),
                     caller_owner="different-leader-identity",
                     coordination_token=token,
                 )
@@ -552,7 +731,7 @@ class TestStaleTokenFenceRefusals:
         factory = RecorderFactory(db)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
-            factory.run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED, token=token)
+            factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token)
         with db.engine.connect() as conn:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one()
         assert status == RunStatus.RUNNING.value, "a deposed leader must not stamp a terminal status"
@@ -562,11 +741,104 @@ class TestStaleTokenFenceRefusals:
         factory = RecorderFactory(db)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
-            factory.run_lifecycle.update_run_status(RUN_ID, RunStatus.FAILED, token=token)
+            factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=token)
         with db.engine.connect() as conn:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one()
         assert status == RunStatus.RUNNING.value
         assert len(_fence_refusals(db, "update_run_status")) == 1
+
+    @pytest.mark.parametrize(
+        ("verb", "call"),
+        (
+            pytest.param(
+                "record_source_field_resolution",
+                lambda lifecycle, token: lifecycle.record_source_field_resolution({"a": "a"}, "v1", coordination_token=token),
+                id="record_source_field_resolution",
+            ),
+            pytest.param(
+                "record_run_source",
+                lambda lifecycle, token: lifecycle.record_run_source(
+                    source_node_id=SOURCE_NODE_ID,
+                    source_name="source",
+                    plugin_name="test",
+                    config_hash="cfg",
+                    lifecycle_state="ready",
+                    coordination_token=token,
+                ),
+                id="record_run_source",
+            ),
+            pytest.param(
+                "update_run_source_contract",
+                lambda lifecycle, token: lifecycle.update_run_source_contract(
+                    source_node_id=SOURCE_NODE_ID,
+                    schema_contract=SchemaContract(mode="OBSERVED", fields=(), locked=True),
+                    coordination_token=token,
+                ),
+                id="update_run_source_contract",
+            ),
+            pytest.param(
+                "record_secret_resolutions",
+                lambda lifecycle, token: lifecycle.record_secret_resolutions(
+                    [
+                        SecretResolutionInput(
+                            timestamp=NOW.timestamp(),
+                            env_var_name="KEY",
+                            source="env",
+                            vault_url=None,
+                            secret_name=None,
+                            fingerprint="0" * 64,
+                            resolution_latency_ms=1,
+                        )
+                    ],
+                    coordination_token=token,
+                ),
+                id="record_secret_resolutions",
+            ),
+            pytest.param(
+                "record_preflight_results",
+                lambda lifecycle, token: lifecycle.record_preflight_results(
+                    PreflightResult(
+                        dependency_runs=(),
+                        gate_results=(CommencementGateResult(name="gate", condition="x", result=True, context_snapshot={}),),
+                    ),
+                    coordination_token=token,
+                ),
+                id="record_preflight_results",
+            ),
+            pytest.param(
+                "record_readiness_check",
+                lambda lifecycle, token: lifecycle.record_readiness_check(
+                    name="probe", collection="docs", reachable=True, count=1, message="ok", coordination_token=token
+                ),
+                id="record_readiness_check",
+            ),
+            pytest.param(
+                "set_export_status",
+                lambda lifecycle, token: lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=token),
+                id="set_export_status",
+            ),
+            pytest.param(
+                "set_export_failed_unless_completed",
+                lambda lifecycle, token: lifecycle.set_export_failed_unless_completed(error="boom", coordination_token=token),
+                id="set_export_failed_unless_completed",
+            ),
+            pytest.param(
+                "set_export_pending_unless_completed",
+                lambda lifecycle, token: lifecycle.set_export_pending_unless_completed(coordination_token=token),
+                id="set_export_pending_unless_completed",
+            ),
+        ),
+    )
+    def test_run_lifecycle_verb_refused(self, db: LandscapeDB, token: CoordinationToken, verb: str, call: Any) -> None:
+        """ADR-048 D8.1: every RunLifecycleRepository writer fences FIRST — a deposed leader writes nothing."""
+        factory = RecorderFactory(db)
+        before = _run_lifecycle_snapshot(db)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            call(factory.run_lifecycle, token)
+        assert raised.value.verb == verb
+        assert _run_lifecycle_snapshot(db) == before, "a deposed leader must leave every run-lifecycle table untouched"
+        assert len(_fence_refusals(db, verb)) == 1
 
     def test_create_checkpoint_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         manager = CheckpointManager(db)
@@ -589,7 +861,7 @@ class TestStaleTokenFenceRefusals:
         )
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
-            manager.delete_checkpoints(RUN_ID, coordination_token=token)
+            manager.delete_checkpoints(coordination_token=token)
         with db.engine.connect() as conn:
             count = len(conn.execute(select(checkpoints_table.c.checkpoint_id)).all())
         assert count == 1, "a deposed leader must not destroy the new leader's resume anchors"
@@ -598,7 +870,7 @@ class TestStaleTokenFenceRefusals:
     def test_complete_barrier_strict_arm_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", now=NOW, expected_lease_owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
             repo.complete_barrier(
@@ -607,7 +879,6 @@ class TestStaleTokenFenceRefusals:
                 consumed_token_ids=(token_id,),
                 emitted_pending_sink=(),
                 emitted_ready=(),
-                now=NOW,
                 coordination_token=token,
             )
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.BLOCKED.value, "refusal before any journal mutation"
@@ -616,14 +887,13 @@ class TestStaleTokenFenceRefusals:
     def test_complete_barrier_legacy_wrapper_arm_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", now=NOW, expected_lease_owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
             repo.mark_blocked_barrier_terminal(
                 run_id=RUN_ID,
                 barrier_key="b1",
                 token_ids=(token_id,),
-                now=NOW,
                 coordination_token=token,
             )
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.BLOCKED.value
@@ -632,7 +902,7 @@ class TestStaleTokenFenceRefusals:
     def test_pending_sink_barrier_wrapper_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", now=NOW, expected_lease_owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
             repo.mark_blocked_barrier_pending_sink_many(
@@ -648,20 +918,47 @@ class TestStaleTokenFenceRefusals:
                         error_message=None,
                     )
                 },
-                now=NOW,
                 coordination_token=token,
             )
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.BLOCKED.value
         assert len(_fence_refusals(db, "complete_barrier")) == 1
 
+    def test_reset_adoption_marker_to_pending_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """elspeth-ee18e446ff: the §E.3 crash-window reset is fenced, not CAS-implied.
+
+        The two-takeover window this refuses: WE took the seat at this epoch and
+        adopted the row, then stalled inside ``restore_from_journal``; our lease
+        lapsed and a successor took over and is adopting. Our own takeover CAS
+        committed before any of that and gates nothing — only the fence can stop
+        the in-flight reset from clearing the successor's markers.
+        """
+        repo = TokenSchedulerRepository(db.engine)
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
+        adoption = repo.adopt_blocked_barrier_item(
+            run_id=RUN_ID,
+            work_item_id=work_item_id,
+            token_id=token_id,
+            barrier_key="b1",
+            membership=None,
+            buffered_outcome=None,
+            coordination_token=token,
+        )
+        assert adoption.barrier_adopted_epoch == token.leader_epoch, "the marker this reset would clear must really be set"
+        adopted_row = _work_item_row(db, token_id)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError):
+            repo.reset_adoption_marker_to_pending(work_item_ids=[work_item_id], coordination_token=token)
+        assert _work_item_row(db, token_id) == adopted_row, "a deposed leader must not reset a live successor's adoption marker"
+        assert len(_fence_refusals(db, "reset_adoption_marker_to_pending")) == 1
+
     def test_recover_expired_leases_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
-        token_id, _row_id, _work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        expire_lease(db.engine, work_item_id)  # the peer lease is expired: only the fence can refuse
         _bump_epoch(db)
-        sweep_time = NOW + timedelta(seconds=120)  # the peer lease (60 s) is expired
         with pytest.raises(RunLeadershipLostError):
             repo.recover_expired_leases(
-                now=sweep_time,
                 coordination_token=token,
             )
         row = _work_item_row(db, token_id)
@@ -680,7 +977,6 @@ class TestStaleTokenFenceRefusals:
             path="default_flow",
             error_hash=None,
             error_message=None,
-            now=NOW,
             expected_lease_owner=WORKER,
         )
         # Durable terminal outcome witness: without the fence this row WOULD
@@ -702,7 +998,6 @@ class TestStaleTokenFenceRefusals:
         with pytest.raises(RunLeadershipLostError):
             repo.terminalize_pending_sinks_with_terminal_outcomes(
                 run_id=RUN_ID,
-                now=NOW,
                 caller_owner=WORKER,
                 coordination_token=token,
             )
@@ -722,7 +1017,6 @@ class TestStaleTokenFenceRefusals:
             path="default_flow",
             error_hash=None,
             error_message=None,
-            now=NOW,
             expected_lease_owner=WORKER,
         )
         _bump_epoch(db)
@@ -730,7 +1024,6 @@ class TestStaleTokenFenceRefusals:
             repo.mark_pending_sink_terminal(
                 run_id=RUN_ID,
                 token_id=token_id,
-                now=NOW,
                 expected_lease_owner=WORKER,
                 coordination_token=token,
             )
@@ -748,7 +1041,6 @@ class TestStaleTokenFenceRefusals:
             path="default_flow",
             error_hash=None,
             error_message=None,
-            now=NOW,
             expected_lease_owner=WORKER,
         )
         _bump_epoch(db)
@@ -756,7 +1048,6 @@ class TestStaleTokenFenceRefusals:
             repo.mark_pending_sink_terminal_many(
                 run_id=RUN_ID,
                 token_ids=(token_id,),
-                now=NOW,
                 expected_lease_owner=WORKER,
                 coordination_token=token,
             )
@@ -785,7 +1076,6 @@ class TestStaleTokenFenceRefusals:
         with pytest.raises(RunLeadershipLostError):
             repo.ingest_row_with_initial_claim(
                 coordination_token=token,
-                now=NOW,
                 insert_row_and_token=insert_row_and_token,
                 token_id="token-ingest",
                 row_id="row-ingest",
@@ -821,6 +1111,260 @@ class TestStaleTokenFenceRefusals:
         assert rows == []
         assert len(_fence_refusals(db, "create_row_with_token")) == 1
 
+    def test_release_seat_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The seat is a RUN-scoped row, so vacating it is a LEADER write (ADR-030 D4).
+
+        A deposed leader's teardown must not vacate the seat its usurper now
+        holds. The refusal is swallowed at the verb (release is a ``finally``
+        arm where a second leadership-lost signal would mask the first), so
+        the contract here is zero mutation plus the fence's own evidence.
+        """
+        repo = RunCoordinationRepository(db.engine)
+        _bump_epoch(db)
+        seat_before = _seat_image(db)
+        worker_before = _worker_image(db, WORKER)
+
+        repo.release_seat(token=token)  # declared no-op, never raises
+
+        assert _seat_image(db) == seat_before, "a deposed leader must not vacate the usurper's seat"
+        assert _worker_image(db, WORKER) == worker_before
+        refusals = _fence_refusals(db, "release_seat")
+        assert len(refusals) == 1
+        assert refusals[0]["leader_epoch"] == token.leader_epoch
+
+
+class TestStaleMembershipTokenFenceRefusals:
+    """ADR-030 D4's SECOND fence: a departed or evicted member is refused.
+
+    The member-scoped analogue of :class:`TestStaleTokenFenceRefusals`. The
+    stale authority here is a :class:`WorkerMembershipToken` whose
+    ``run_workers`` row left ``active`` — the single-use identity doctrine
+    means it never returns — and the contract is the same three parts:
+    the refusal, exactly one ``fence_refusal`` event naming the verb and the
+    membership fence, and ZERO payload mutation because
+    :func:`verify_membership_fence` is the FIRST statement of the verb's
+    IMMEDIATE transaction.
+
+    Both member-fenced verbs are teardown/liveness writes that REIFY the
+    refusal as a declared outcome rather than propagating it
+    (``WorkerMembershipLost``; the idempotent departure no-op), so the raise
+    itself is pinned once on the helper.
+    """
+
+    def test_fenced_member_transaction_raises_and_rolls_back(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The helper's own contract: the payload never runs, one refusal event."""
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+        _depart_member(db, WORKER)
+        seat_before = _seat_image(db)
+
+        with (
+            pytest.raises(RunMembershipLostError) as excinfo,
+            fenced_member_transaction(db.engine, member_token=member, verb="probe") as conn,
+        ):
+            conn.execute(update(run_coordination_table).values(leader_worker_id="usurper"))
+
+        assert (excinfo.value.run_id, excinfo.value.worker_id, excinfo.value.verb) == (RUN_ID, WORKER, "probe")
+        assert _seat_image(db) == seat_before, "the payload rolled back with the fence"
+        refusals = _fence_refusals(db, "probe")
+        assert len(refusals) == 1
+        assert refusals[0]["leader_epoch"] is None, "a member holds no epoch"
+        assert json.loads(str(refusals[0]["context_json"]))["fence"] == "membership"
+
+    def test_worker_heartbeat_refused_for_evicted_member(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """A zombie beat cannot revive membership, and cannot extend the seat."""
+        repo = RunCoordinationRepository(db.engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+        _evict_member(db, WORKER)
+        seat_before = _seat_image(db)
+        worker_before = _worker_image(db, WORKER)
+
+        snapshot = repo.worker_heartbeat(member_token=member, window_seconds=80.0)
+
+        assert snapshot == WorkerMembershipLost(member_token=member)
+        assert _worker_image(db, WORKER) == worker_before, "an evicted row never returns to active"
+        assert _seat_image(db) == seat_before, "a refused beat must not extend the seat it no longer holds"
+        assert len(_fence_refusals(db, "worker_heartbeat")) == 1
+
+    def test_depart_worker_refused_for_departed_member(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The second departure writes nothing and emits no second ``worker_depart``."""
+        repo = RunCoordinationRepository(db.engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+        _depart_member(db, WORKER)
+        worker_before = _worker_image(db, WORKER)
+
+        repo.depart_worker(member_token=member)  # declared idempotent no-op
+
+        assert _worker_image(db, WORKER) == worker_before
+        with db.engine.connect() as conn:
+            departs = conn.execute(
+                select(run_coordination_events_table.c.event_id)
+                .where(run_coordination_events_table.c.run_id == RUN_ID)
+                .where(run_coordination_events_table.c.event_type == "worker_depart")
+            ).all()
+        assert departs == [], "the fence refused before the departure CAS could write its event"
+        assert len(_fence_refusals(db, "depart_worker")) == 1
+
+    def test_member_fence_admits_an_active_member(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The positive arm: an active row passes and the payload commits.
+
+        Without this, every arm above would still pass if the fence refused
+        unconditionally — the failure mode that turns a fence into an outage.
+        """
+        repo = RunCoordinationRepository(db.engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+
+        snapshot = repo.worker_heartbeat(member_token=member, window_seconds=80.0)
+
+        assert snapshot.worker_active is True
+        assert snapshot.worker_role == "leader", "the leader IS a member (CoordinationToken.membership)"
+        assert _fence_refusals(db, "worker_heartbeat") == []
+
+    @pytest.mark.parametrize(
+        ("verb", "call"),
+        (
+            pytest.param(
+                "claim_preparation",
+                lambda effects, token: effects.claim_preparation(
+                    _STALE_EFFECT_ID, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="claim_preparation",
+            ),
+            pytest.param(
+                "complete_plan",
+                lambda effects, token: effects.complete_plan(
+                    _STALE_EFFECT_ID, _stale_plan(), claim=_stale_lease(), coordination_token=token
+                ),
+                id="complete_plan",
+            ),
+            pytest.param(
+                "acquire_lease",
+                lambda effects, token: effects.acquire_lease(
+                    _STALE_EFFECT_ID, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="acquire_lease",
+            ),
+            pytest.param(
+                "heartbeat_lease",
+                lambda effects, token: effects.heartbeat_lease(
+                    _STALE_EFFECT_ID, owner="worker-a", generation=1, ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="heartbeat_lease",
+            ),
+            pytest.param(
+                "takeover_expired",
+                lambda effects, token: effects.takeover_expired(
+                    _STALE_EFFECT_ID, owner="worker-b", ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="takeover_expired",
+            ),
+            pytest.param(
+                "begin_attempt",
+                lambda effects, token: effects.begin_attempt(_stale_attempt_request(), coordination_token=token),
+                id="begin_attempt",
+            ),
+            pytest.param(
+                "record_attempt_result",
+                lambda effects, token: effects.record_attempt_result(_stale_attempt_result(), coordination_token=token),
+                id="record_attempt_result",
+            ),
+            pytest.param(
+                "complete_member_result",
+                lambda effects, token: effects.complete_member_result(
+                    _STALE_ATTEMPT_ID, _stale_commit_result(), lease=_stale_lease(), coordination_token=token
+                ),
+                id="complete_member_result",
+            ),
+            pytest.param(
+                "mark_response_lost",
+                lambda effects, token: effects.mark_response_lost(_STALE_ATTEMPT_ID, coordination_token=token),
+                id="mark_response_lost",
+            ),
+        ),
+    )
+    def test_sink_effect_verb_refused(self, db: LandscapeDB, token: CoordinationToken, verb: str, call: Any) -> None:
+        """ADR-048 D8.5: every SinkEffectRepository writer fences FIRST — a deposed leader writes nothing.
+
+        The arguments name rows that do not exist. That is the point: the
+        fence is the first statement of the verb's IMMEDIATE transaction, so
+        a deposed leader is refused BEFORE any effect lookup could report
+        "no such effect". A verb that reported the missing row instead would
+        prove the fence had moved off first position.
+        """
+        factory = RecorderFactory(db)
+        before = _sink_effect_snapshot(db)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            call(factory.execution.sink_effects, token)
+        assert raised.value.verb == verb
+        assert _sink_effect_snapshot(db) == before, "a deposed leader must leave every sink-effect table untouched"
+        assert len(_fence_refusals(db, verb)) == 1
+
+    def test_sink_effect_reserve_refused(self, db: LandscapeDB) -> None:
+        """``reserve`` fences before it writes the effect, its members or its stream.
+
+        Reserve validates a real member set before the fence, so this arm
+        builds one: the refusal has to come from the deposed epoch, not from
+        a request the constructor would have rejected anyway.
+        """
+        factory = RecorderFactory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        request = _pipeline_request(run_id, sink_id, members)
+        stale = leader_coordination_token(factory, run_id)
+        before = _sink_effect_snapshot(db)
+        _bump_epoch_for(db, run_id)
+
+        with pytest.raises(RunLeadershipLostError) as raised:
+            factory.execution.sink_effects.reserve(request, coordination_token=stale)
+
+        assert raised.value.verb == "reserve"
+        assert _sink_effect_snapshot(db) == before, "a deposed leader must reserve nothing"
+        assert len(_fence_refusals_for(db, run_id, "reserve")) == 1
+
+    def test_sink_effect_finalize_refused(self, db: LandscapeDB) -> None:
+        """``finalize`` fences before the artifact, the member outcomes and the terminal state.
+
+        The optimistic witness is a read-only pre-pass, so the effect must
+        exist for this arm to reach the fence at all; the fence is still the
+        first statement of the write transaction, which is what the refusal
+        proves.
+        """
+        factory = RecorderFactory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        valid = leader_coordination_token(factory, run_id)
+        effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members), coordination_token=valid).new_effect
+        assert effect is not None
+        request = SinkEffectFinalizeRequest(
+            effect_id=effect.effect_id,
+            lease_owner=None,
+            generation=effect.generation,
+            descriptor=_stale_descriptor(),
+            publication_performed=True,
+            publication_evidence_kind="returned",
+            accepted_ordinals=(0,),
+            diverted_ordinals=(),
+            evidence={},
+            members=(
+                SinkEffectFinalizationMember(
+                    ordinal=0,
+                    output_data={"ordinal": 0},
+                    duration_ms=1.0,
+                    outcome=TerminalOutcome.SUCCESS,
+                    path=TerminalPath.DEFAULT_FLOW,
+                    sink_name="sink",
+                ),
+            ),
+        )
+        stale = leader_coordination_token(factory, run_id)
+        before = _sink_effect_snapshot(db)
+        _bump_epoch_for(db, run_id)
+
+        with pytest.raises(RunLeadershipLostError) as raised:
+            factory.execution.sink_effects.finalize(request, coordination_token=stale)
+
+        assert raised.value.verb == "finalize"
+        assert _sink_effect_snapshot(db) == before, "a deposed leader must finalize nothing"
+        assert len(_fence_refusals_for(db, run_id, "finalize")) == 1
+
 
 class TestStrictPendingSinkOwnerCAS:
     """Strict owner CAS on pending-sink terminalization.
@@ -838,9 +1382,9 @@ class TestStrictPendingSinkOwnerCAS:
         not a silent owner-blind terminalization."""
         repo, token_id = self._parked_handoff(db, owner=WORKER)
         with pytest.raises(TypeError, match="expected_lease_owner"):
-            repo.mark_pending_sink_terminal(run_id=RUN_ID, token_id=token_id, now=NOW)  # type: ignore[call-arg]
+            repo.mark_pending_sink_terminal(run_id=RUN_ID, token_id=token_id)  # type: ignore[call-arg]
         with pytest.raises(TypeError, match="expected_lease_owner"):
-            repo.mark_pending_sink_terminal_many(run_id=RUN_ID, token_ids=(token_id,), now=NOW)  # type: ignore[call-arg]
+            repo.mark_pending_sink_terminal_many(run_id=RUN_ID, token_ids=(token_id,))  # type: ignore[call-arg]
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.PENDING_SINK.value
 
     def _parked_handoff(self, db: LandscapeDB, *, owner: str) -> tuple[TokenSchedulerRepository, str]:
@@ -854,7 +1398,6 @@ class TestStrictPendingSinkOwnerCAS:
             path="default_flow",
             error_hash=None,
             error_message=None,
-            now=NOW,
             expected_lease_owner=owner,
         )
         return repo, token_id
@@ -870,7 +1413,7 @@ class TestStrictPendingSinkOwnerCAS:
         repo, token_id = self._parked_handoff(db, owner=WORKER)
         # Epoch fence passes (valid token), owner CAS refuses (wrong owner) → 0.
         terminalized = repo.mark_pending_sink_terminal(
-            run_id=RUN_ID, token_id=token_id, now=NOW, expected_lease_owner="some-other-worker", coordination_token=token
+            run_id=RUN_ID, token_id=token_id, expected_lease_owner="some-other-worker", coordination_token=token
         )
         assert terminalized == 0
         row = _work_item_row(db, token_id)
@@ -883,7 +1426,7 @@ class TestStrictPendingSinkOwnerCAS:
         with db.engine.begin() as conn:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.token_id == token_id).values(lease_owner=None))
         terminalized = repo.mark_pending_sink_terminal(
-            run_id=RUN_ID, token_id=token_id, now=NOW, expected_lease_owner=WORKER, coordination_token=token
+            run_id=RUN_ID, token_id=token_id, expected_lease_owner=WORKER, coordination_token=token
         )
         assert terminalized == 0, "the historical NULL-owner acceptance arm is deleted"
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.PENDING_SINK.value
@@ -891,7 +1434,7 @@ class TestStrictPendingSinkOwnerCAS:
     def test_matching_owner_terminalizes(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo, token_id = self._parked_handoff(db, owner=WORKER)
         terminalized = repo.mark_pending_sink_terminal(
-            run_id=RUN_ID, token_id=token_id, now=NOW, expected_lease_owner=WORKER, coordination_token=token
+            run_id=RUN_ID, token_id=token_id, expected_lease_owner=WORKER, coordination_token=token
         )
         assert terminalized == 1
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.TERMINAL.value
@@ -900,7 +1443,7 @@ class TestStrictPendingSinkOwnerCAS:
         repo, token_id = self._parked_handoff(db, owner=WORKER)
         with pytest.raises(AuditIntegrityError, match="strict owner CAS"):
             repo.mark_pending_sink_terminal_many(
-                run_id=RUN_ID, token_ids=(token_id,), now=NOW, expected_lease_owner="some-other-worker", coordination_token=token
+                run_id=RUN_ID, token_ids=(token_id,), expected_lease_owner="some-other-worker", coordination_token=token
             )
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.PENDING_SINK.value
 
@@ -910,7 +1453,7 @@ class TestStrictPendingSinkOwnerCAS:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.token_id == token_id).values(lease_owner=None))
         with pytest.raises(AuditIntegrityError, match="strict owner CAS"):
             repo.mark_pending_sink_terminal_many(
-                run_id=RUN_ID, token_ids=(token_id,), now=NOW, expected_lease_owner=WORKER, coordination_token=token
+                run_id=RUN_ID, token_ids=(token_id,), expected_lease_owner=WORKER, coordination_token=token
             )
 
     def test_reclaim_restores_attribution_for_reaped_handoff(self, db: LandscapeDB, token: CoordinationToken) -> None:
@@ -919,10 +1462,10 @@ class TestStrictPendingSinkOwnerCAS:
         with db.engine.begin() as conn:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.token_id == token_id).values(lease_owner=None))
         _ensure_active_worker(db, "resume-worker")
-        reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="resume-worker", lease_seconds=60, now=NOW)
+        reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="resume-worker", lease_seconds=60)
         assert reclaimed is not None and reclaimed.token_id == token_id
         terminalized = repo.mark_pending_sink_terminal(
-            run_id=RUN_ID, token_id=token_id, now=NOW, expected_lease_owner="resume-worker", coordination_token=token
+            run_id=RUN_ID, token_id=token_id, expected_lease_owner="resume-worker", coordination_token=token
         )
         assert terminalized == 1
 
@@ -951,6 +1494,84 @@ class TestValidTokenFenceSemantics:
         assert after.replace(tzinfo=UTC) > before, "every fenced verb doubles as the seat heartbeat (verify-AND-EXTEND)"
         assert _fence_refusals(db, "create_checkpoint") == []
 
+    def _adopt_blocked_row(
+        self, db: LandscapeDB, repo: TokenSchedulerRepository, *, sequence: int, token: CoordinationToken
+    ) -> tuple[str, str]:
+        """BLOCKED barrier hold adopted through the real fenced verb; returns (token_id, work_item_id)."""
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=sequence, owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key=f"b{sequence}", expected_lease_owner=WORKER)
+        adoption = repo.adopt_blocked_barrier_item(
+            run_id=RUN_ID,
+            work_item_id=work_item_id,
+            token_id=token_id,
+            barrier_key=f"b{sequence}",
+            membership=None,
+            buffered_outcome=None,
+            coordination_token=token,
+        )
+        assert adoption.barrier_adopted_epoch == token.leader_epoch
+        return token_id, work_item_id
+
+    def test_reset_adoption_marker_to_pending_resets_only_blocked_rows(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """Behaviour preservation: adding the fence must not change WHICH rows the verb resets.
+
+        A fence that also changes the write is two changes wearing one commit,
+        so the live-token arm pins the selection, not merely that something
+        happened. Three adopted rows, all three ids passed, ONLY the two still
+        BLOCKED are reset; the terminal row keeps its marker (§E.4 treats
+        adopted-at-any-epoch rows as restorable members).
+        """
+        repo = TokenSchedulerRepository(db.engine)
+        blocked: list[tuple[str, str]] = []
+        for sequence in (0, 1):
+            token_id, work_item_id = self._adopt_blocked_row(db, repo, sequence=sequence, token=token)
+            blocked.append((token_id, work_item_id))
+        terminal_token_id, terminal_work_item_id = self._adopt_blocked_row(db, repo, sequence=2, token=token)
+        with db.engine.begin() as conn:
+            conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == terminal_work_item_id)
+                .values(status=TokenWorkStatus.TERMINAL.value)
+            )
+        adopted_epoch = token.leader_epoch
+        assert _work_item_row(db, terminal_token_id)["barrier_adopted_epoch"] == adopted_epoch
+
+        reset = repo.reset_adoption_marker_to_pending(
+            work_item_ids=[work_item_id for _token_id, work_item_id in blocked] + [terminal_work_item_id],
+            coordination_token=token,
+        )
+
+        assert reset == 2, "only the BLOCKED rows are reset, even though three ids were passed"
+        for token_id, _work_item_id in blocked:
+            assert _work_item_row(db, token_id)["barrier_adopted_epoch"] is None, "the BLOCKED row is intake-pending again"
+        assert _work_item_row(db, terminal_token_id)["barrier_adopted_epoch"] == adopted_epoch, (
+            "a non-BLOCKED row keeps its adoption marker: the fence must not widen the write set"
+        )
+        assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
+
+    def test_reset_adoption_marker_to_pending_empty_ids_opens_no_transaction(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """No ids means no database effect, so the early return precedes the fence entirely.
+
+        Even a deposed leader is not refused here: there is nothing to refuse.
+        """
+        repo = TokenSchedulerRepository(db.engine)
+        _bump_epoch(db)
+        before = _barrier_mutation_snapshot(db)
+        transactions: list[object] = []
+
+        def record_begin(conn: object) -> None:
+            transactions.append(conn)
+
+        event.listen(db.engine, "begin", record_begin)
+        try:
+            assert repo.reset_adoption_marker_to_pending(work_item_ids=[], coordination_token=token) == 0
+        finally:
+            event.remove(db.engine, "begin", record_begin)
+
+        assert transactions == [], "an empty reset must return before opening a transaction"
+        assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
+        assert _barrier_mutation_snapshot(db) == before
+
     def test_complete_run_quiescence_predicate_refuses_residual_work(self, db: LandscapeDB, token: CoordinationToken) -> None:
         """§D: a SUCCESS finalize over residual scheduler work is refused in-statement."""
         repo = TokenSchedulerRepository(db.engine)
@@ -963,21 +1584,20 @@ class TestValidTokenFenceSemantics:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=_payload_json(),
-            available_at=NOW,
         )
         factory = RecorderFactory(db)
         with pytest.raises(OrchestrationInvariantError, match="residual scheduler work"):
-            factory.run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED, token=token)
+            factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token)
         with db.engine.connect() as conn:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one()
         assert status == RunStatus.RUNNING.value
         # FAILED is exempt from quiescence: the journal stays intact for resume.
-        run = factory.run_lifecycle.complete_run(RUN_ID, RunStatus.FAILED, token=token)
+        run = factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=token)
         assert run.status == RunStatus.FAILED
 
     def test_complete_run_writes_finalize_event(self, db: LandscapeDB, token: CoordinationToken) -> None:
         factory = RecorderFactory(db)
-        factory.run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED, token=token)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token)
         with db.engine.connect() as conn:
             events = (
                 conn.execute(

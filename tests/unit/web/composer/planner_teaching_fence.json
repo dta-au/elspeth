@@ -1,0 +1,11 @@
+{
+ "_doc": "Repair-feedback fact keys deliberately left untaught, each with a checkable reason. Read by tests/unit/web/composer/test_planner_teaching_gate.py, which fails on any 'pending' reason: every entry is an adjudicated decision (elspeth-68721c71d7). A fence must not outlive what it fences — the gate also fails when a fenced key becomes taught or stops shipping.",
+ "fenced": [
+  {
+   "surface": "guided",
+   "code": "guided_collector_opener_unresolved",
+   "key": "connectivity.component_kind",
+   "reason": "Single-site code (guided/planning.py bind_guided_reviewed_components) whose component_kind has exactly one possible value ('nodes'): it discriminates nothing for the model and exists only as a repeat-notice fingerprint label. The actionable keys, 'dangling_scope_openers' and 'candidate_node_ids', are taught; naming this one would invite the model to echo a label it cannot act on."
+  }
+ ]
+}

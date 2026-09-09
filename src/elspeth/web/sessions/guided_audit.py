@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
-from elspeth.web.composer.audit import chat_turn_audit_envelope, llm_call_audit_envelope
+from elspeth.web.composer.audit import (
+    chat_turn_audit_envelope,
+    interleave_planner_audit_records,
+    llm_call_audit_envelope,
+    llm_call_audit_summary,
+    planner_attempt_audit_envelope,
+    planner_attempt_audit_summary,
+)
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, TurnType
 from elspeth.web.composer.guided.state_machine import TerminalReason
@@ -118,7 +126,15 @@ def is_authentic_guided_synthetic_invocation(invocation: ComposerToolInvocation)
         return False
     try:
         arguments = json.loads(invocation.arguments_canonical)
-    except (TypeError, ValueError):
+    except json.JSONDecodeError:
+        # An undecodable ``arguments_canonical`` is simply "not an authentic
+        # server synthetic event" — the predicate's declared negative verdict,
+        # which the sole caller (service._require_exact_guided_intent_cancellation_audit)
+        # enforces fail-closed by raising AuditIntegrityError. Only the JSON
+        # parse verdict is absorbed: ``arguments_canonical`` is typed ``str``
+        # on the owned contract, so a TypeError here would be first-party
+        # corruption and now propagates instead of masquerading as
+        # inauthenticity.
         return False
     return (
         invocation.tool_name in _GUIDED_SYNTHETIC_TOOLS
@@ -137,8 +153,9 @@ def prepare_guided_audit_rows(
     invocations: tuple[ComposerToolInvocation, ...],
     llm_calls: tuple[ComposerLLMCall, ...],
     chat_turns: tuple[ComposerChatTurn, ...],
+    planner_attempts: tuple[ComposerPlannerAttempt, ...] = (),
 ) -> tuple[PreparedGuidedAuditRow, ...]:
-    """Apply existing redaction/public projections to all three audit channels."""
+    """Apply bounded public projections to all four guided audit channels."""
 
     if type(invocations) is not tuple or any(type(item) is not ComposerToolInvocation for item in invocations):
         raise TypeError("invocations must be an exact tuple[ComposerToolInvocation, ...]")
@@ -146,10 +163,41 @@ def prepare_guided_audit_rows(
         raise TypeError("llm_calls must be an exact tuple[ComposerLLMCall, ...]")
     if type(chat_turns) is not tuple or any(type(item) is not ComposerChatTurn for item in chat_turns):
         raise TypeError("chat_turns must be an exact tuple[ComposerChatTurn, ...]")
+    if type(planner_attempts) is not tuple or any(type(item) is not ComposerPlannerAttempt for item in planner_attempts):
+        raise TypeError("planner_attempts must be an exact tuple[ComposerPlannerAttempt, ...]")
 
     rows: list[PreparedGuidedAuditRow] = []
     for invocation in invocations:
-        content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+        content: str
+        envelope: dict[str, Any]
+        authentic_guided_synthetic = is_authentic_guided_synthetic_invocation(invocation)
+        if authentic_guided_synthetic:
+            # These are closed, server-authored event schemas whose exact
+            # hashes and bounded values were validated above. They are not
+            # model-dispatched Composer tools and intentionally do not live
+            # in MANIFEST, so the generic unknown-tool sentinel would destroy
+            # their payload custody (including payload-reference binding).
+            #
+            # ``_kind`` discriminator: every sibling content shape in this
+            # module carries one (guided_tool_audit / guided_tool_failure_
+            # audit / llm_call_audit / chat_turn_audit). Without it these
+            # rows rendered as bare '{"error_class": null, "error_message":
+            # null}' — "empty audit rows" that misled incident diagnosis.
+            # Safe to add: the failure-cohort commitment hashes are computed
+            # from these prepared rows at the same settlement write, so row
+            # bytes and commitment stay coherent for new writes, and stored
+            # rows verify against their own stored bytes.
+            content = json.dumps(
+                {
+                    "_kind": "guided_synthetic_audit",
+                    "tool_name": invocation.tool_name,
+                    "error_class": None,
+                    "error_message": None,
+                }
+            )
+            envelope = {"_kind": "audit", "invocation": invocation.to_dict()}
+        else:
+            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
         if invocation.status is not ComposerToolStatus.SUCCESS:
             omitted_arguments = canonical_json({"_redaction_status": "guided_failure_payload_omitted"})
             invocation_projection = deep_thaw(envelope["invocation"])
@@ -166,22 +214,14 @@ def prepare_guided_audit_rows(
                     "error_class": invocation.error_class,
                 }
             )
-        elif invocation.tool_name not in MANIFEST:
-            if not is_authentic_guided_synthetic_invocation(invocation):
-                content, envelope = _omitted_success_invocation(invocation)
+        elif invocation.tool_name not in MANIFEST and not authentic_guided_synthetic:
+            content, envelope = _omitted_success_invocation(invocation)
         rows.append(PreparedGuidedAuditRow(kind="tool", content=content, envelope=envelope))
+    planner_calls = tuple(call for call in llm_calls if call.planner_call_ordinal is not None)
+    paired_records = interleave_planner_audit_records(planner_calls, planner_attempts)
+    attempt_by_physical = {record.planner_call_ordinal: record for record in paired_records if type(record) is ComposerPlannerAttempt}
     for call in llm_calls:
-        content = json.dumps(
-            {
-                "_kind": "llm_call_audit",
-                "status": call.status.value,
-                "model_requested": call.model_requested,
-                "model_returned": call.model_returned,
-                "total_tokens": call.total_tokens,
-                "reasoning_tokens": call.reasoning_tokens,
-                "provider_cost": call.provider_cost,
-            }
-        )
+        content = llm_call_audit_summary(call)
         envelope = llm_call_audit_envelope(call)
         if call.status is not ComposerLLMCallStatus.SUCCESS:
             public_call = deep_thaw(envelope["call"])
@@ -197,6 +237,18 @@ def prepare_guided_audit_rows(
                 envelope=envelope,
             )
         )
+        if call.planner_call_ordinal is not None:
+            attempt: ComposerPlannerAttempt | None = None
+            if call.planner_call_ordinal in attempt_by_physical:
+                attempt = attempt_by_physical[call.planner_call_ordinal]
+            if attempt is not None:
+                rows.append(
+                    PreparedGuidedAuditRow(
+                        kind="planner",
+                        content=planner_attempt_audit_summary(attempt),
+                        envelope=planner_attempt_audit_envelope(attempt),
+                    )
+                )
     for turn in chat_turns:
         content = json.dumps(
             {
@@ -207,6 +259,7 @@ def prepare_guided_audit_rows(
                 "chat_turn_seq": turn.chat_turn_seq,
                 "model": turn.model,
                 "latency_ms": turn.latency_ms,
+                "turn_token": turn.turn_token,
                 "error_class": turn.error_class,
             }
         )
@@ -265,13 +318,30 @@ def validate_guided_audit_payload_references(
     for row in rows:
         if row.kind != "tool":
             continue
-        invocation = row.envelope.get("invocation")
-        if not isinstance(invocation, Mapping):
+        # Every "tool" envelope this module builds is
+        # ``{"_kind": "audit", "invocation": <projection>}`` and every
+        # projection carries ``tool_name`` and ``arguments_canonical``
+        # (``prepare_guided_audit_rows``, ``_omitted_success_invocation``),
+        # so an absent key is malformed evidence, not a row to skip.
+        if "invocation" not in row.envelope:
             raise AuditIntegrityError("guided tool audit invocation envelope is malformed")
-        tool_name = invocation.get("tool_name")
+        invocation = row.envelope["invocation"]
+        # ``PreparedGuidedAuditRow.__post_init__`` runs
+        # ``freeze_fields(self, "envelope")``, so ``deep_freeze`` has already
+        # rendered this nested projection a ``mappingproxy`` — measured, not
+        # inferred — and ``type(invocation) is dict`` would be permanently
+        # False. Name deep_freeze's output pair, exactly as the dataclass's
+        # own envelope guard does.
+        if type(invocation) not in (dict, MappingProxyType):
+            raise AuditIntegrityError("guided tool audit invocation envelope is malformed")
+        if "tool_name" not in invocation:
+            raise AuditIntegrityError("guided tool audit invocation envelope is malformed")
+        tool_name = invocation["tool_name"]
         if tool_name not in {"guided_turn_emitted", "guided_turn_answered"}:
             continue
-        raw_arguments = invocation.get("arguments_canonical")
+        if "arguments_canonical" not in invocation:
+            raise AuditIntegrityError("guided synthetic audit arguments are malformed")
+        raw_arguments = invocation["arguments_canonical"]
         if type(raw_arguments) is not str:
             raise AuditIntegrityError("guided synthetic audit arguments are malformed")
         arguments = json.loads(raw_arguments)
@@ -283,8 +353,10 @@ def validate_guided_audit_payload_references(
             payload_id = arguments["response_payload_id"]
             expected_purpose = "turn_response"
             hash_field = "response_hash"
-        payload = by_id.get(payload_id)
-        if payload is None or payload.purpose != expected_purpose or arguments[hash_field] != payload_id:
+        if payload_id not in by_id:
+            raise AuditIntegrityError("guided synthetic audit payload reference is absent or purpose-mismatched")
+        payload = by_id[payload_id]
+        if payload.purpose != expected_purpose or arguments[hash_field] != payload_id:
             raise AuditIntegrityError("guided synthetic audit payload reference is absent or purpose-mismatched")
 
 

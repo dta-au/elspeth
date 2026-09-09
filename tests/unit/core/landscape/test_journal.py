@@ -215,6 +215,13 @@ class TestNormalizeParameters:
         assert LandscapeJournal._normalize_parameters("hello") == "hello"
         assert LandscapeJournal._normalize_parameters(None) is None
 
+    def test_non_finite_float_parameter_raises(self) -> None:
+        """Malformed driver parameters (NaN/Infinity) are rejected with AuditIntegrityError."""
+        with pytest.raises(AuditIntegrityError, match="NaN values are not allowed"):
+            LandscapeJournal._normalize_parameters({"value": float("nan")})
+        with pytest.raises(AuditIntegrityError, match="Infinity values are not allowed"):
+            LandscapeJournal._normalize_parameters([float("inf")])
+
 
 # ===========================================================================
 # Record serialization

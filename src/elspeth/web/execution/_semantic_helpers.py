@@ -51,6 +51,45 @@ def serialize_semantic_contracts(
     ]
 
 
+# Sink consumers are addressed as ``output:<name>`` on both the validation
+# entry and the semantic contract, matching the id the schema-contract layer
+# already gives a sink edge (``EdgeContract.to_id``). Transform nodes are
+# addressed by bare node id, which cannot carry this prefix — composer node ids
+# and connection names are validated as disjoint from sink names, and
+# ``output:`` is not a legal node id.
+_SINK_COMPONENT_PREFIX = "output:"
+
+
+def _is_sink_contract(contract: SemanticEdgeContract) -> bool:
+    """Return whether a semantic contract's consumer is a sink, not a transform."""
+    return contract.to_id.startswith(_SINK_COMPONENT_PREFIX)
+
+
+def semantic_component_attribution(component: str) -> tuple[str, str]:
+    """Split a semantic ValidationEntry component into (component_id, component_type).
+
+    ``node:<id>`` -> (``<id>``, "transform"); ``output:<name>`` ->
+    (``<name>``, "sink"). Hardcoding "transform" here mis-attributed every
+    sink finding in the validation ledger to a node that does not exist.
+    """
+    if component.startswith(_SINK_COMPONENT_PREFIX):
+        return component.removeprefix(_SINK_COMPONENT_PREFIX), "sink"
+    return component.removeprefix("node:"), "transform"
+
+
+def semantic_affected_component_id(component: str) -> str:
+    """Return the id to record in ``affected_nodes`` for a semantic finding.
+
+    A transform node contributes its bare id; a sink KEEPS its ``output:``
+    qualifier. ``affected_nodes`` carries no type column, so dropping the
+    qualifier would make a sink advisory indistinguishable from a node
+    advisory — and a sink sharing a name with a node would silently merge
+    with it. ``output:<name>`` is the same qualified id the schema-contract
+    layer uses, so the two evidence surfaces stay readable together.
+    """
+    return component.removeprefix("node:")
+
+
 def assistance_suggestion_for(
     entry: ValidationEntry,
     contracts: tuple[SemanticEdgeContract, ...],
@@ -63,9 +102,13 @@ def assistance_suggestion_for(
     order dependent — fixed by carrying the plugin names on the
     contract (Phase 1 Task 1.3).
     """
-    from elspeth.plugins.infrastructure.base import BaseTransform
+    from elspeth.plugins.infrastructure.base import BaseSink, BaseTransform
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
+    # A node entry is ``node:<id>`` against a contract ``to_id`` of ``<id>``; a
+    # sink entry is ``output:<name>`` on both sides (the id convention the
+    # schema-contract layer already uses for a sink edge). Stripping only the
+    # ``node:`` prefix therefore matches both.
     component_id = entry.component.removeprefix("node:")
     matching = next((c for c in contracts if c.to_id == component_id), None)
     if matching is None:
@@ -75,13 +118,20 @@ def assistance_suggestion_for(
     issue_code = matching.requirement.requirement_code
 
     # Consumer plugin owns the requirement, so it's the authoritative
-    # source for guidance about the requirement_code. Verified method
-    # name: get_transform_by_name (manager.py:183), NOT get_transform_class.
-    # The registry returns type[TransformProtocol]; assistance lives on
-    # BaseTransform — every in-tree plugin is a BaseTransform subclass,
-    # so the cast is sound (per CLAUDE.md plugin-as-system-code policy).
-    consumer_cls = cast(type[BaseTransform], manager.get_transform_by_name(matching.consumer_plugin))
-    consumer_assistance = consumer_cls.get_agent_assistance(issue_code=issue_code)
+    # source for guidance about the requirement_code. Sinks and transforms
+    # live in SEPARATE registries under names that may collide, so the
+    # lookup must be routed by what the consumer actually is — asking
+    # get_transform_by_name for the "text" sink raises PluginNotFoundError.
+    # Verified method names: get_transform_by_name (manager.py:183) and
+    # get_sink_by_name (manager.py:200). Both registries return protocol
+    # types; assistance lives on BaseTransform/BaseSink and every in-tree
+    # plugin subclasses one of them, so the casts are sound (per CLAUDE.md
+    # plugin-as-system-code policy).
+    consumer_assistance = (
+        cast(type[BaseSink], manager.get_sink_by_name(matching.consumer_plugin)).get_agent_assistance(issue_code=issue_code)
+        if _is_sink_contract(matching)
+        else cast(type[BaseTransform], manager.get_transform_by_name(matching.consumer_plugin)).get_agent_assistance(issue_code=issue_code)
+    )
     if consumer_assistance is not None:
         return consumer_assistance.summary
 

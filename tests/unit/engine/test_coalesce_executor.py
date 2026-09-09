@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Literal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 from uuid import uuid4
 
 import pytest
@@ -23,18 +23,21 @@ import pytest
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.barrier_scalars import CoalescePendingScalars
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CoalesceCollisionError,
     OrchestrationInvariantError,
 )
+from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import (
@@ -89,8 +92,22 @@ def _next_state_id() -> str:
 
 def _restore_reads_from_execution_double(execution: MagicMock) -> SimpleNamespace:
     return SimpleNamespace(
-        get_completed_row_ids_for_nodes=execution.get_completed_row_ids_for_nodes,
-        has_completed_row_for_node=execution.has_completed_row_for_node,
+        # WS4 Task 8: _check_landscape_for_completion now queries the
+        # group-keyed sibling. SimpleNamespace has no auto-attribute
+        # creation, so a production call the double doesn't bind raises
+        # AttributeError rather than silently stubbing a truthy default —
+        # this attribute must be present for accept()'s late-arrival path
+        # to run at all under the new keying.
+        has_completed_group_for_node=execution.has_completed_group_for_node,
+        # WS4 Task 10: restore_from_journal's completed-key reconstruction
+        # now queries the group-keyed sibling too.
+        get_completed_group_ids_for_nodes=execution.get_completed_group_ids_for_nodes,
+        # WS6 Task 6 (ADR-042): the late-arrival arm resolves the closure
+        # FLAVOR for a key whose in-memory flavor is unknown (restore-seeded
+        # or Landscape-backfilled) through the released-status point lookup.
+        # Default False = "completed but not released" = scope_group_failed;
+        # a test modelling a MERGED group sets return_value = True.
+        has_released_group_for_node=execution.has_released_group_for_node,
     )
 
 
@@ -139,13 +156,14 @@ def _coalesce_tokens_impl(
     node_id: NodeID,
     run_id: str,
     **_kwargs: Any,
-) -> TokenInfo:
-    return TokenInfo(
+) -> tuple[TokenInfo, str]:
+    join_group_id = f"join_{uuid4().hex[:8]}"
+    merged = TokenInfo(
         row_id=parents[0].row_id,
         token_id=f"merged_{uuid4().hex[:8]}",
         row_data=merged_data,
-        join_group_id=f"join_{uuid4().hex[:8]}",
     )
+    return merged, join_group_id
 
 
 def _make_contract(
@@ -175,21 +193,35 @@ def _make_contract(
 def _make_token(
     row_id: str = "row_1",
     token_id: str = "tok_1",
-    branch_name: str = "branch_a",
+    branch_name: str | None = "branch_a",
     data: dict[str, Any] | None = None,
     contract: SchemaContract | None = None,
+    fork_group_id: str | None = None,
 ) -> TokenInfo:
-    """Build a TokenInfo suitable for coalesce testing."""
+    """Build a TokenInfo suitable for coalesce testing.
+
+    ``fork_group_id`` defaults to mirroring ``row_id`` (WS4 Task 8): the vast
+    majority of this file's tests vary ``row_id`` to express "a distinct
+    pending group" under the pre-Task-8 row-keyed scheme, and never override
+    ``fork_group_id`` — a fixed default there would collide every one of
+    them into ONE key under the new fork_group_id keying. The one test that
+    exercises TWO distinct fork groups sharing ONE row_id (the arch-M1
+    discriminator this task's Step 1 adds) passes ``fork_group_id``
+    explicitly and does not rely on this default.
+    """
+    if fork_group_id is None:
+        fork_group_id = row_id
     if data is None:
         data = {"amount": 100}
     if contract is None:
         contract = _make_contract(mode="FLEXIBLE")
     row_data = make_row(data, contract=contract)
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenInfo(
         row_id=row_id,
         token_id=token_id,
         row_data=row_data,
-        branch_name=branch_name,
+        lineage_path=lineage_path,
     )
 
 
@@ -204,8 +236,25 @@ def _make_executor(
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
     # Default: Landscape returns no completed coalesces (unit tests don't have a real DB).
     # Tests that exercise Landscape-based restoration override this per-test.
-    execution.get_completed_row_ids_for_nodes.return_value = set()
-    execution.has_completed_row_for_node.return_value = False
+    # has_completed_group_for_node/get_completed_group_ids_for_nodes live on
+    # BarrierRestoreReadModel, not on ExecutionRepository (spec-checked
+    # here), so they cannot be pulled off `execution` as spec-generated
+    # attributes. A fully autospec'd read-model INSTANCE
+    # (not a bare `spec=` on the unbound function, which would require every
+    # call site to also pass `self`) gives correctly bound-method-shaped
+    # mocks — assign the bound methods explicitly (spec=, unlike spec_set=,
+    # allows setting attributes absent from the spec class; only unset
+    # access is fenced) before _restore_reads_from_execution_double reads
+    # them below.
+    _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+    execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+    execution.has_completed_group_for_node.return_value = False
+    execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+    execution.has_released_group_for_node.return_value = False
+    # WS4 Task 10: restore's completed-key reconstruction now queries the
+    # group-keyed sibling too.
+    execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+    execution.get_completed_group_ids_for_nodes.return_value = set()
     data_flow = MagicMock(spec=DataFlowRepository)
     span_factory = _SpanFactorySentinel()
     token_manager = _TokenManagerDouble()
@@ -236,8 +285,25 @@ def _make_raw_executor(
     """Build the production CoalesceExecutor without the test on_success shim."""
     execution = MagicMock(spec=ExecutionRepository)
     execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=_next_state_id())
-    execution.get_completed_row_ids_for_nodes.return_value = set()
-    execution.has_completed_row_for_node.return_value = False
+    # has_completed_group_for_node/get_completed_group_ids_for_nodes live on
+    # BarrierRestoreReadModel, not on ExecutionRepository (spec-checked
+    # here), so they cannot be pulled off `execution` as spec-generated
+    # attributes. A fully autospec'd read-model INSTANCE
+    # (not a bare `spec=` on the unbound function, which would require every
+    # call site to also pass `self`) gives correctly bound-method-shaped
+    # mocks — assign the bound methods explicitly (spec=, unlike spec_set=,
+    # allows setting attributes absent from the spec class; only unset
+    # access is fenced) before _restore_reads_from_execution_double reads
+    # them below.
+    _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+    execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+    execution.has_completed_group_for_node.return_value = False
+    execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+    execution.has_released_group_for_node.return_value = False
+    # WS4 Task 10: restore's completed-key reconstruction now queries the
+    # group-keyed sibling too.
+    execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+    execution.get_completed_group_ids_for_nodes.return_value = set()
     data_flow = MagicMock(spec=DataFlowRepository)
     span_factory = _SpanFactorySentinel()
     token_manager = _TokenManagerDouble()
@@ -285,19 +351,6 @@ def _settings(
         select_branch=select_branch,
         union_collision_policy=union_collision_policy,
     )
-
-
-def _assert_collision_fingerprints(
-    entries: list[tuple[str, Any]],
-    branches: list[str],
-    *,
-    value_type: str = "str",
-) -> None:
-    assert [branch for branch, _fingerprint in entries] == branches
-    fingerprints = [dict(fingerprint) for _branch, fingerprint in entries]
-    assert [fingerprint["value_type"] for fingerprint in fingerprints] == [value_type] * len(branches)
-    assert all(set(fingerprint) == {"value_hash", "value_type"} for fingerprint in fingerprints)
-    assert all(isinstance(fingerprint["value_hash"], str) and len(fingerprint["value_hash"]) == 64 for fingerprint in fingerprints)
 
 
 # Reference instant for journal-restore tests (tz-aware, like barrier_blocked_at).
@@ -350,6 +403,10 @@ def _blocked_item(
     expand_group_id: str | None = None,
 ) -> TokenWorkItem:
     """Build a BLOCKED journal row as list_blocked_barrier_items returns them."""
+    if not branch_name:
+        lineage_path: tuple[LineageFrame, ...] = ()
+    else:
+        lineage_path = (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id or "fg-journal-test", member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="run_1",
@@ -365,10 +422,8 @@ def _blocked_item(
         created_at=_JOURNAL_T0,
         updated_at=_JOURNAL_T0,
         barrier_key=coalesce_name,
-        branch_name=branch_name,
-        fork_group_id=fork_group_id,
         join_group_id=join_group_id,
-        expand_group_id=expand_group_id,
+        lineage_path=lineage_path,
         coalesce_node_id=node_id,
         coalesce_name=coalesce_name,
         barrier_blocked_at=blocked_at,
@@ -381,7 +436,7 @@ def _blocked_item(
 
 
 class TestBuildCoalesceMerge:
-    def test_union_first_wins_plan_contains_data_metadata_and_consumed_tokens(self) -> None:
+    def test_union_first_wins_plan_canonicalizes_consumed_tokens_but_preserves_arrival_order(self) -> None:
         settings = _settings(
             branches=["a", "b"],
             merge="union",
@@ -429,15 +484,12 @@ class TestBuildCoalesceMerge:
 
         assert isinstance(plan, CoalesceMergePlan)
         assert plan.merged_data.to_dict() == {"shared": "from_a", "a_only": 1, "b_only": 2}
-        assert plan.consumed_tokens == (token_b, token_a)
+        assert plan.consumed_tokens == (token_a, token_b)
         assert plan.metadata.wait_duration_ms == 5000.0
         assert [entry.branch for entry in plan.metadata.arrival_order] == ["b", "a"]
         assert plan.metadata.union_field_origins == {"shared": "a", "a_only": "a", "b_only": "b"}
-        assert plan.metadata.union_field_collision_values is not None
-        _assert_collision_fingerprints(
-            list(plan.metadata.union_field_collision_values["shared"]),
-            ["a", "b"],
-        )
+        assert plan.metadata.union_field_collisions == {"shared": ("a", "b")}
+        assert "union_field_collision_values" not in plan.metadata.to_dict()
 
     def test_nested_plan_records_lost_branch_expected_fields(self) -> None:
         settings = _settings(
@@ -483,7 +535,6 @@ class TestCoalesceOutcome:
         assert outcome.coalesce_metadata is None
         assert outcome.failure_reason is None
         assert outcome.coalesce_name is None
-        assert outcome.outcomes_recorded is False
 
     def test_merged_outcome(self):
         from elspeth.contracts.coalesce_metadata import CoalesceMetadata
@@ -496,6 +547,7 @@ class TestCoalesceOutcome:
             consumed_tokens=(token,),
             coalesce_metadata=metadata,
             coalesce_name="merge",
+            join_group_id="join-1",
         )
         assert outcome.held is False
         assert outcome.merged_token is token
@@ -503,7 +555,7 @@ class TestCoalesceOutcome:
         assert outcome.coalesce_metadata.policy == CoalescePolicy.REQUIRE_ALL
         assert outcome.failure_reason is None
         assert outcome.coalesce_name == "merge"
-        assert outcome.outcomes_recorded is False
+        assert outcome.join_group_id == "join-1"
 
     def test_failure_outcome(self):
         from elspeth.contracts.coalesce_metadata import CoalesceMetadata
@@ -516,13 +568,11 @@ class TestCoalesceOutcome:
             coalesce_metadata=metadata,
             failure_reason="late_arrival_after_merge",
             coalesce_name="merge",
-            outcomes_recorded=True,
         )
         assert outcome.held is False
         assert outcome.merged_token is None
         assert outcome.consumed_tokens == (token,)
         assert outcome.failure_reason == "late_arrival_after_merge"
-        assert outcome.outcomes_recorded is True
 
     def test_invalid_held_with_merged_token(self):
         from elspeth.contracts.errors import OrchestrationInvariantError
@@ -580,7 +630,6 @@ class TestAcceptBasics:
             row_id="row_1",
             token_id="tok_1",
             row_data=make_row({"amount": 1}),
-            branch_name=None,
         )
         with pytest.raises(OrchestrationInvariantError, match="no branch_name"):
             executor.accept(token, "merge")
@@ -615,6 +664,50 @@ class TestAcceptBasics:
         token = _make_token(branch_name="a")
         outcome = executor.accept(token, "my_merge")
         assert outcome.coalesce_name == "my_merge"
+
+    def test_sibling_fork_groups_sharing_row_id_are_distinct_pending_groups(self):
+        """spec §5 (arch-M1): EXPAND siblings share row_id; each forks into the
+        same coalesce NODE as a DISTINCT concurrent FORK group. Under the old
+        (coalesce_name, row_id) key the second group's first arrival collides
+        with the first group's ("Duplicate arrival for branch 'left'"); under
+        the (coalesce_name, fork_group_id) key both merge independently.
+
+        Fork-INSIDE-fork (not an EXPAND base): every token also shares one
+        OUTER FORK frame (group_id="g-outer-shared") — this kills the mutant
+        that derives the key from the outermost FORK frame
+        (token.lineage_path[0]) instead of the innermost
+        (token.fork_group_id): under that mutant, family A's and family B's
+        "left" tokens would both resolve to the SAME outer group id and
+        collide on the second accept(), exactly the bug this test exists to
+        catch. A single-FORK-frame token can't distinguish the two readings.
+        """
+        executor, *_ = _make_executor()
+        executor.register_coalesce(_settings(name="merge_x", branches=["left", "right"]), "node_1")
+
+        def _sibling_token(token_id: str, fork_group_id: str, branch: str) -> TokenInfo:
+            outer = LineageFrame(kind=FrameKind.FORK, group_id="g-outer-shared", member_key="outer")
+            inner = LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch)
+            return TokenInfo(
+                row_id="row-1",
+                token_id=token_id,
+                row_data=make_row({"amount": 1}, contract=_make_contract(mode="FLEXIBLE")),
+                lineage_path=(outer, inner),
+            )
+
+        t_al = _sibling_token("t-al", "g-fork-a", "left")
+        t_ar = _sibling_token("t-ar", "g-fork-a", "right")
+        t_bl = _sibling_token("t-bl", "g-fork-b", "left")
+        t_br = _sibling_token("t-br", "g-fork-b", "right")
+
+        o1 = executor.accept(t_al, "merge_x")
+        assert o1.held is True
+        o2 = executor.accept(t_bl, "merge_x")  # OLD key: raises "Duplicate arrival for branch 'left'"
+        assert o2.held is True
+        merged_a = executor.accept(t_ar, "merge_x")
+        merged_b = executor.accept(t_br, "merge_x")
+        assert merged_a.merged_token is not None
+        assert merged_b.merged_token is not None
+        assert merged_a.merged_token.token_id != merged_b.merged_token.token_id
 
 
 # ===========================================================================
@@ -655,7 +748,7 @@ class TestRequireAllPolicy:
         o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
         assert o.merged_token is not None
         assert o.merged_token.row_id == "row_1"
-        assert o.merged_token.join_group_id is not None
+        assert o.join_group_id is not None
 
     def test_consumed_tokens_list(self):
         executor, _, _, _, _ = self._setup()
@@ -881,9 +974,11 @@ class TestLateArrival:
         o = executor.accept(late_token, "merge")
         assert o.held is False
         assert o.failure_reason == "late_arrival_after_merge"
-        assert o.outcomes_recorded is True
 
-    def test_late_arrival_records_failed_state_and_outcome(self):
+    def test_late_arrival_records_failed_state_but_not_token_outcome(self):
+        """Node-state audit stays the executor's job; the token terminal does
+        not (Task 6, spec §6.1) — the caller records it through the
+        settlement channel now."""
         executor, execution, data_flow, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
         executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
@@ -899,14 +994,8 @@ class TestLateArrival:
         fail_call = execution.complete_node_state.call_args
         assert fail_call.kwargs["status"] == NodeStateStatus.FAILED
 
-        # Should record a terminal FAILED token outcome immediately
-        data_flow.record_token_outcome.assert_called_once()
-        outcome_call = data_flow.record_token_outcome.call_args
-        assert outcome_call.kwargs["ref"].token_id == "t_late"
-        assert outcome_call.kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert outcome_call.kwargs["path"] == TerminalPath.UNROUTED
-        assert isinstance(outcome_call.kwargs["error_hash"], str)
-        assert len(outcome_call.kwargs["error_hash"]) == 16
+        # Must NOT record the terminal token outcome itself anymore.
+        assert data_flow.record_token_outcome.call_count == 0
 
     def test_late_arrival_consumed_tokens(self):
         executor, _, _, _, _ = _make_executor()
@@ -994,7 +1083,7 @@ class TestUnionMerge:
         assert "c" in collision_branches
 
     # ------------------------------------------------------------------
-    # Field-level provenance: field_origins + collision_values
+    # Field-level provenance: field_origins + collision branches
     # ------------------------------------------------------------------
 
     def test_union_merge_records_field_origins_for_all_fields(self):
@@ -1013,25 +1102,23 @@ class TestUnionMerge:
         assert origins["x"] == "a"
         assert origins["y"] == "b"
         assert origins["z"] == "c"
-        # No collisions -> collision_values should be absent (None).
-        assert o.coalesce_metadata.union_field_collision_values is None
+        assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
 
-    def test_union_merge_collision_records_ordered_value_fingerprints(self):
-        """When branches collide, ordered branch/value fingerprints are recorded."""
+    def test_union_merge_collision_records_ordered_branch_provenance(self):
+        """When branches collide, ordered branch provenance is recorded."""
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"], merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
         executor.accept(t1, "merge")
         o = executor.accept(t2, "merge")
-        collision_values = o.coalesce_metadata.union_field_collision_values
-        assert collision_values is not None
-        _assert_collision_fingerprints(list(collision_values["shared"]), ["a", "b"])
+        assert o.coalesce_metadata.union_field_collisions == {"shared": ("a", "b")}
+        assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
         # Default last_wins: winner in merged data is the last branch.
         assert o.coalesce_metadata.union_field_origins["shared"] == "b"
 
-    def test_union_merge_collision_metadata_serializes_value_hashes_not_raw_values(self):
-        """Collision audit metadata must preserve provenance without leaking branch payload values."""
+    def test_union_merge_collision_metadata_omits_value_derived_material(self):
+        """Collision audit metadata preserves branches without value hashes or types."""
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"], merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "secret-from-a"})
@@ -1044,15 +1131,14 @@ class TestUnionMerge:
         serialized_json = json.dumps(serialized, sort_keys=True)
         assert "secret-from-a" not in serialized_json
         assert "secret-from-b" not in serialized_json
+        assert stable_hash("secret-from-a") not in serialized_json
+        assert stable_hash("secret-from-b") not in serialized_json
+        assert "value_type" not in serialized_json
+        assert serialized["union_field_collisions"] == {"shared": ["a", "b"]}
+        assert "union_field_collision_values" not in serialized
 
-        collision_entries = serialized["union_field_collision_values"]["shared"]
-        assert [entry[0] for entry in collision_entries] == ["a", "b"]
-        assert [entry[1]["value_type"] for entry in collision_entries] == ["str", "str"]
-        assert [set(entry[1]) for entry in collision_entries] == [{"value_hash", "value_type"}, {"value_hash", "value_type"}]
-        assert collision_entries[0][1]["value_hash"] != collision_entries[1][1]["value_hash"]
-
-    def test_union_merge_three_way_collision_preserves_all_branch_fingerprints(self):
-        """Three-way collisions preserve every branch fingerprint in declaration order."""
+    def test_union_merge_three_way_collision_preserves_all_branches(self):
+        """Three-way collisions preserve every branch in declaration order."""
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b", "c"], merge="union", policy="require_all")
         executor.register_coalesce(s, "node_1")
@@ -1062,8 +1148,8 @@ class TestUnionMerge:
         executor.accept(t1, "merge")
         executor.accept(t2, "merge")
         o = executor.accept(t3, "merge")
-        entries = list(o.coalesce_metadata.union_field_collision_values["f"])
-        _assert_collision_fingerprints(entries, ["a", "b", "c"])
+        assert o.coalesce_metadata.union_field_collisions == {"f": ("a", "b", "c")}
+        assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
 
     def test_union_merge_field_origins_flow_to_metadata(self):
         """field_origins returned from _merge_data must be reflected in CoalesceMetadata."""
@@ -1123,9 +1209,8 @@ class TestUnionMerge:
         assert merged["shared"] == "from_a"
         # Origins reflect the winner.
         assert o.coalesce_metadata.union_field_origins["shared"] == "a"
-        # Collision fingerprints still record every contributing branch in order.
-        entries = list(o.coalesce_metadata.union_field_collision_values["shared"])
-        _assert_collision_fingerprints(entries, ["a", "b"])
+        assert o.coalesce_metadata.union_field_collisions == {"shared": ("a", "b")}
+        assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
 
     def test_union_collision_policy_first_wins_three_way(self):
         """first_wins: first branch in settings.branches order wins for 3-way collisions."""
@@ -1152,7 +1237,14 @@ class TestUnionMerge:
     # ------------------------------------------------------------------
 
     def test_union_collision_policy_fail_raises_on_collision(self):
-        """fail: CoalesceCollisionError raised with redacted metadata attached."""
+        """fail: CoalesceCollisionError raised with redacted metadata attached.
+
+        Propagation only — see the sibling
+        test_union_collision_policy_fail_records_every_consumed_terminal_and_still_raises
+        below for the paired WS3 Task 6 (Ruling 36) pin: every consumed
+        token's durable terminal by set equality, in the SAME test as this
+        exception's propagation.
+        """
         executor, _, _, _, _ = _make_executor()
         s = _settings(
             branches=["a", "b"],
@@ -1166,12 +1258,11 @@ class TestUnionMerge:
         with pytest.raises(CoalesceCollisionError) as exc_info:
             executor.accept(t2, "merge")
         # Metadata must be attached so the orchestrator's failure path
-        # can persist redacted collision provenance to the audit trail.
+        # can persist value-independent collision provenance to the audit trail.
         md = exc_info.value.metadata
         assert md.union_field_origins is not None
-        assert md.union_field_collision_values is not None
-        entries = list(md.union_field_collision_values["shared"])
-        _assert_collision_fingerprints(entries, ["a", "b"])
+        assert md.union_field_collisions == {"shared": ("a", "b")}
+        assert "union_field_collision_values" not in md.to_dict()
 
     def test_union_collision_policy_fail_no_collisions_is_noop(self):
         """fail: non-overlapping branches merge successfully without raising."""
@@ -1188,8 +1279,7 @@ class TestUnionMerge:
         o = executor.accept(t2, "merge")
         merged = tm.coalesce_tokens.call_args.kwargs["merged_data"].to_dict()
         assert merged == {"x": 1, "y": 2}
-        # No collisions: collision_values absent.
-        assert o.coalesce_metadata.union_field_collision_values is None
+        assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
         # field_origins always populated.
         assert o.coalesce_metadata.union_field_origins == {"x": "a", "y": "b"}
 
@@ -1198,8 +1288,8 @@ class TestUnionMerge:
 
         Without this propagation, the audit trail loses the field-level provenance
         that union_collision_policy=fail exists to capture. The stringified exception
-        message preserves only the field name — every branch/value fingerprint would
-        be lost, defeating the whole point of opting into hard-fail enforcement.
+        message preserves only the field name, so the structured branch provenance
+        is still required without storing any material derived from branch values.
         """
         executor, execution, _, _, _ = _make_executor()
         s = _settings(
@@ -1222,29 +1312,38 @@ class TestUnionMerge:
         metadata_calls = [
             call
             for call in fail_calls
-            if call.kwargs.get("context_after") is not None and call.kwargs["context_after"].union_field_collision_values is not None
+            if call.kwargs.get("context_after") is not None and call.kwargs["context_after"].union_field_collisions is not None
         ]
         assert metadata_calls, (
-            "expected fail-path audit record to carry union_field_collision_values; "
-            "without this, the Landscape audit trail loses the branch/value fingerprints "
+            "expected fail-path audit record to carry union_field_collisions; "
+            "without this, the Landscape audit trail loses the branch provenance "
             "that union_collision_policy=fail is specifically designed to preserve"
         )
 
         md = metadata_calls[0].kwargs["context_after"]
-        # Every branch's contributing value fingerprint must survive into the audit record.
-        entries = list(md.union_field_collision_values["shared"])
-        _assert_collision_fingerprints(entries, ["a", "b"])
+        assert md.union_field_collisions == {"shared": ("a", "b")}
+        assert "union_field_collision_values" not in md.to_dict()
         # field_origins must also be present (last_wins default before the raise).
         assert md.union_field_origins is not None
         assert md.union_field_origins["shared"] == "b"
 
-    def test_union_collision_policy_fail_records_terminal_failed_outcomes(self):
+    def test_union_collision_policy_fail_records_every_consumed_terminal_and_still_raises(self):
         """union_collision_policy=fail must record FAILURE/UNROUTED for consumed tokens.
 
         Bug: The exception handler in _execute_merge only calls complete_node_state(FAILED)
         but never calls record_token_outcome(FAILED). Without terminal outcomes:
         - Recovery treats the row as incomplete (key remains in _pending)
         - Lineage resolution can't find a terminal token
+
+        WS3 Task 6, Ruling 36: this merge-exception cleanup arm is the ONE
+        direct-write site Task 6 deliberately keeps (crash-path cleanup
+        ahead of a re-raise nothing catches — no live caller to hand a
+        settlement-channel record to). This test pins BOTH halves in ONE
+        test, as the ruling's condition requires: every consumed token gets
+        a durable FAILED terminal by SET EQUALITY (not just no-duplicates,
+        not just presence), AND the exception still propagates — the
+        assertions below only execute because pytest.raises caught exactly
+        the expected exception from the same call whose writes they check.
         """
         executor, _, data_flow, _, _ = _make_executor()
         s = _settings(
@@ -1392,8 +1491,7 @@ class TestUnionMerge:
         assert outcome.merged_token is not None
         origins = outcome.coalesce_metadata.union_field_origins
         assert origins == {"x": "a"}
-        # No collisions (only one branch contributed).
-        assert outcome.coalesce_metadata.union_field_collision_values is None
+        assert "union_field_collision_values" not in outcome.coalesce_metadata.to_dict()
 
     def test_union_collision_policy_first_wins_with_timeout(self):
         """first_wins with timeout: collision resolution uses settings.branches order, not arrival.
@@ -1442,12 +1540,9 @@ class TestUnionMerge:
         assert origins["only_a"] == "a"
         assert origins["only_b"] == "b"
 
-        # collision_values: records both contributing branch fingerprints for "shared".
-        collision_values = outcome.coalesce_metadata.union_field_collision_values
-        assert collision_values is not None
-        entries = list(collision_values["shared"])
-        # Order in collision_values is branch order, not arrival order.
-        _assert_collision_fingerprints(entries, ["a", "b"])
+        # Collision branch order follows configuration, not arrival order.
+        assert outcome.coalesce_metadata.union_field_collisions == {"shared": ("a", "b")}
+        assert "union_field_collision_values" not in outcome.coalesce_metadata.to_dict()
 
 
 # ===========================================================================
@@ -1532,7 +1627,6 @@ class TestSelectMerge:
         executor.accept(t1, "merge")
         o = executor.accept(t2, "merge")
         assert o.failure_reason == "select_branch_not_arrived"
-        assert o.outcomes_recorded is True
 
     def test_select_ignores_other_branch_data(self):
         """Select merge returns only the selected branch's data."""
@@ -1606,7 +1700,6 @@ class TestCheckTimeouts:
         results = executor.check_timeouts("merge")
         assert len(results) == 1
         assert results[0].failure_reason == "quorum_not_met_at_timeout"
-        assert results[0].outcomes_recorded is True
 
     def test_require_all_expired_fails(self):
         executor, _, _, _, clock = _make_executor()
@@ -1617,7 +1710,6 @@ class TestCheckTimeouts:
         results = executor.check_timeouts("merge")
         assert len(results) == 1
         assert results[0].failure_reason == "incomplete_branches"
-        assert results[0].outcomes_recorded is True
 
     def test_multiple_pending_some_expired(self):
         executor, _, _, _, clock = _make_executor()
@@ -1761,6 +1853,50 @@ class TestNotifyBranchLost:
         with pytest.raises(OrchestrationInvariantError, match="not in expected branches"):
             executor.notify_branch_lost("merge", "row_1", "c", "reason")
 
+    def test_loss_notification_is_group_scoped(self):
+        """spec §5 (arch-M1), Task 11 discriminator (plan Step 1 / review-prep
+        mutant #11): a loss in fork group A must not settle sibling fork
+        group B on the same row_id, and a query about group B's loss state
+        must not see group A's recorded loss either.
+
+        best_effort with 3 branches, losing only 1: group A stays PENDING
+        (2 of 3 accounted, not all) with a real lost_branches entry still in
+        `_pending` — this is deliberate, not require_all's immediate fail/
+        remove. A mutant that makes `has_recorded_branch_loss` scan ALL
+        pending groups for this coalesce_name (ignoring which group the
+        caller asked about) would find "right" recorded lost in group A's
+        STILL-LIVE entry and wrongly answer True for group B's query too;
+        require_all would have already deleted group A's entry by the time
+        of the query, letting that exact mutant pass by coincidence.
+        """
+        executor, *_ = _make_executor()
+        executor.register_coalesce(
+            _settings(name="merge_x", branches=["left", "mid", "right"], policy="best_effort", timeout_seconds=60.0), "node_1"
+        )
+        a_left = _make_token(row_id="row-1", branch_name="left", token_id="t-al", fork_group_id="g-a")
+        b_left = _make_token(row_id="row-1", branch_name="left", token_id="t-bl", fork_group_id="g-b")
+        executor.accept(a_left, "merge_x")
+        executor.accept(b_left, "merge_x")
+
+        outcome = executor.notify_branch_lost("merge_x", "g-a", "right", "quarantined")
+
+        # best_effort with 2 of 3 branches accounted ("left" arrived, "right"
+        # lost, "mid" still outstanding) does not resolve — group A stays
+        # pending, group B is untouched.
+        assert outcome is None
+        # M-1 (T11 review) insurance: the aliveness precondition this test
+        # relies on is currently pinned only by has_recorded_branch_loss's
+        # non-pending paths returning False -- a property of the method
+        # under test, not an independent check. If a later change gives it
+        # the durable-ledger fallback its collector sibling
+        # has_recorded_member_loss got in I-4, the g-a assertion below could
+        # satisfy from the ledger with group A's in-memory entry gone,
+        # silently re-vacuating the discriminator. Assert group A is still
+        # genuinely PENDING before trusting the queries.
+        assert ("merge_x", "g-a") in executor._pending
+        assert executor.has_recorded_branch_loss("merge_x", "g-a", "right") is True
+        assert executor.has_recorded_branch_loss("merge_x", "g-b", "right") is False
+
     def test_require_all_any_loss_fails(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"], policy="require_all"), "node_1")
@@ -1889,14 +2025,14 @@ class TestMarkCompleted:
         executor, *_ = _make_executor()
         executor._max_completed_keys = 5
         for i in range(10):
-            executor._mark_completed(("c", f"row_{i}"))
+            executor._mark_completed(("c", f"row_{i}"), merged=True)
         assert len(executor._completed_keys) == 5
 
     def test_fifo_eviction_oldest_removed(self):
         executor, *_ = _make_executor()
         executor._max_completed_keys = 3
         for i in range(5):
-            executor._mark_completed(("c", f"row_{i}"))
+            executor._mark_completed(("c", f"row_{i}"), merged=True)
         # Oldest (row_0, row_1) should be evicted; row_2, row_3, row_4 remain
         assert ("c", "row_0") not in executor._completed_keys
         assert ("c", "row_1") not in executor._completed_keys
@@ -1907,8 +2043,8 @@ class TestMarkCompleted:
     def test_idempotent_mark(self):
         """Marking the same key twice does not create duplicates."""
         executor, *_ = _make_executor()
-        executor._mark_completed(("c", "row_1"))
-        executor._mark_completed(("c", "row_1"))
+        executor._mark_completed(("c", "row_1"), merged=True)
+        executor._mark_completed(("c", "row_1"), merged=True)
         assert len(executor._completed_keys) == 1
 
     def test_default_max_is_10000(self):
@@ -1933,7 +2069,15 @@ class TestContractHandling:
         bad_row = MagicMock(spec=PipelineRow)
         bad_row.contract = None
         bad_row.to_dict.return_value = {"amount": 2}
-        t2 = TokenInfo(row_id="row_1", token_id="t2", row_data=bad_row, branch_name="b")
+        t2 = TokenInfo(
+            row_id="row_1",
+            token_id="t2",
+            row_data=bad_row,
+            # group_id matches t1's _make_token(row_id="row_1") default
+            # fork_group_id (WS4 Task 8: defaults to mirroring row_id) so
+            # both tokens land in the SAME pending group, as the test intends.
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="row_1", member_key="b"),),
+        )
         executor.accept(t1, "merge")
         with pytest.raises(OrchestrationInvariantError, match="has no contract"):
             executor.accept(t2, "merge")
@@ -2077,7 +2221,6 @@ class TestContractHandling:
         assert "contract_type_conflict" in outcome.failure_reason
         assert outcome.held is False
         assert outcome.merged_token is None
-        assert outcome.outcomes_recorded is True  # Tokens properly terminated
 
     def test_observed_schema_type_conflict_fails_gracefully(self):
         """Observed schemas with runtime type conflicts fail gracefully.
@@ -2120,7 +2263,6 @@ class TestContractHandling:
         assert "count" in outcome.failure_reason  # Field name
         assert "int" in outcome.failure_reason  # Type info
         assert "str" in outcome.failure_reason  # Type info
-        assert outcome.outcomes_recorded is True
 
 
 # ===========================================================================
@@ -2259,6 +2401,13 @@ class TestDefaultClock:
 
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id="s1")
+        _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+        execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
+        execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+        execution.has_released_group_for_node.return_value = False
+        execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+        execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
             execution,
             _SpanFactorySentinel(),
@@ -2275,6 +2424,13 @@ class TestDefaultClock:
         clock = MockClock(start=42.0)
         execution = MagicMock(spec=ExecutionRepository)
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id="s1")
+        _read_model_autospec = create_autospec(BarrierRestoreReadModel, instance=True)
+        execution.has_completed_group_for_node = _read_model_autospec.has_completed_group_for_node
+        execution.has_completed_group_for_node.return_value = False
+        execution.has_released_group_for_node = _read_model_autospec.has_released_group_for_node
+        execution.has_released_group_for_node.return_value = False
+        execution.get_completed_group_ids_for_nodes = _read_model_autospec.get_completed_group_ids_for_nodes
+        execution.get_completed_group_ids_for_nodes.return_value = set()
         executor = CoalesceExecutor(
             execution,
             _SpanFactorySentinel(),
@@ -2341,17 +2497,18 @@ class TestFailPendingDetails:
         fail_calls = [c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED]
         assert len(fail_calls) == 1
 
-    def test_failure_records_token_outcomes_failed(self):
+    def test_failure_does_not_record_token_outcomes_itself(self):
+        """Task 6, spec §6.1: _fail_pending's failure arm no longer writes the
+        consumed tokens' terminal outcomes — the caller does, through the
+        settlement channel."""
         executor, _, data_flow, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
         executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
         clock.advance(6.0)
-        executor.check_timeouts("merge")
-        outcome_calls = data_flow.record_token_outcome.call_args_list
-        assert len(outcome_calls) == 1
-        assert outcome_calls[0].kwargs["outcome"] == TerminalOutcome.FAILURE
-        assert outcome_calls[0].kwargs["path"] == TerminalPath.UNROUTED
+        results = executor.check_timeouts("merge")
+        assert data_flow.record_token_outcome.call_count == 0
+        assert len(results) == 1
 
     def test_failure_metadata_includes_policy(self):
         executor, _, _, _, clock = _make_executor()
@@ -2410,20 +2567,6 @@ class TestFailPendingDetails:
         clock.advance(9.0)
         results = executor.check_timeouts("merge")
         assert results[0].coalesce_metadata.timeout_seconds == 8.0
-
-    def test_failure_error_hash_is_deterministic(self):
-        """The error_hash recorded for failed tokens should be consistent."""
-        executor, _, data_flow, _, clock = _make_executor()
-        s = _settings(policy="require_all", timeout_seconds=5.0)
-        executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        clock.advance(6.0)
-        executor.check_timeouts("merge")
-        # record_token_outcome should have been called with an error_hash
-        kw = data_flow.record_token_outcome.call_args.kwargs
-        assert "error_hash" in kw
-        assert isinstance(kw["error_hash"], str)
-        assert len(kw["error_hash"]) == 16  # sha256[:16]
 
     def test_failure_branches_arrived_in_metadata(self):
         """Failure metadata includes which branches had actually arrived."""
@@ -2707,7 +2850,6 @@ class TestBestEffortTimeoutZeroArrivals:
         assert outcome.held is False
         assert outcome.merged_token is None
         assert outcome.failure_reason == "best_effort_timeout_no_arrivals"
-        assert outcome.outcomes_recorded is True
 
         # The key should be removed from _pending
         assert ("merge", "row_1") not in executor._pending
@@ -2768,7 +2910,6 @@ class TestBestEffortTimeoutZeroArrivals:
         assert len(results) == 1
         outcome = results[0]
         assert outcome.failure_reason == "best_effort_timeout_no_arrivals"
-        assert outcome.outcomes_recorded is True
         assert ("merge", "row_1") not in executor._pending
 
     def test_best_effort_timeout_zero_arrivals_does_not_leave_entry_in_pending(self):
@@ -2828,16 +2969,27 @@ class TestLandscapeCompletedKeys:
         assert ("merge", "row_2") in executor._completed_keys
 
         # Late arrival for evicted row_0 — exact Landscape fallback should catch it
-        # without materializing every completed row for node_1.
+        # without materializing every completed group for node_1. Asserts
+        # WHICH read-model method fired (WS4 Task 8) and with which key.
         execution.reset_mock()
-        execution.has_completed_row_for_node.return_value = True
+        # has_completed_group_for_node is an autospec'd BarrierRestoreReadModel
+        # instance's bound method assigned onto `execution` (mock-discipline
+        # gate: no unspecced Mock() constructors) — execution.reset_mock()
+        # does not recurse into it (it isn't execution's own child mock the
+        # way a spec-generated attribute is), so it needs its own reset.
+        execution.has_completed_group_for_node.reset_mock()
+        execution.has_completed_group_for_node.return_value = True
+        # The backfilled key's flavor is unknown in memory; the Landscape says
+        # the group RELEASED (ADR-042 discriminator), so the reason is merge.
+        execution.has_released_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
         outcome = executor.accept(late, "merge")
 
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
-        execution.has_completed_row_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", row_id="row_0")
-        execution.get_completed_row_ids_for_nodes.assert_not_called()
+        execution.has_released_group_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", group_id="row_0")
+        assert executor._completed_keys[("merge", "row_0")] is True
+        execution.has_completed_group_for_node.assert_called_once_with(run_id="run_1", node_id="node_1", group_id="row_0")
         # Key should now be in the FIFO cache (backfilled from Landscape)
         assert ("merge", "row_0") in executor._completed_keys
 
@@ -2996,7 +3148,6 @@ class TestSelectBranchNotArrivedFailure:
         assert outcome is not None
         assert outcome.held is False
         assert outcome.failure_reason == "select_branch_not_arrived"
-        assert outcome.outcomes_recorded is True
 
 
 # ===========================================================================
@@ -3047,14 +3198,14 @@ class TestRestoreFromJournal:
 
         executor.restore_from_journal(
             items=items,
-            scalars={("merge", "r1"): CoalescePendingScalars(lost_branches={"mid": "lost"})},
+            scalars={("merge", "fg-1"): CoalescePendingScalars(lost_branches={"mid": "lost"})},
             state_ids={"tA": "st-1", "tB": "st-2"},  # derived from node_states (Task 3.1's caller)
             attempt_offsets={"tA": 1, "tB": 1},  # max_attempt+1 discipline (D5)
             resume_checkpoint_id="cp-0",
             now=t0 + timedelta(seconds=10),
         )
 
-        pending = executor._pending[("merge", "r1")]
+        pending = executor._pending[("merge", "fg-1")]
         assert set(pending.branches) == {"left", "right"}
         assert pending.lost_branches == {"mid": "lost"}
         assert pending.branches["left"].state_id == "st-1"
@@ -3087,7 +3238,10 @@ class TestRestoreFromJournal:
         executor.register_coalesce(s, NodeID("co-1"))
 
         executor.restore_from_journal(
-            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0)],
+            # fork_group_id matches _make_token's default fork_group_id
+            # mirror-of-row_id ("row_1") below, so the accept() lands in the
+            # SAME restored group (WS4 Task 10 re-key).
+            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0, fork_group_id="row_1")],
             scalars={},
             state_ids={"t1": "st-1"},
             attempt_offsets={"t1": 2},
@@ -3107,7 +3261,9 @@ class TestRestoreFromJournal:
         executor.register_coalesce(s, NodeID("co-1"))
 
         executor.restore_from_journal(
-            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="b", blocked_at=_JOURNAL_T0)],
+            # fork_group_id="row_1" matches both the scalars key below and
+            # the accept() call's default fork_group_id mirror (WS4 Task 10).
+            items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="b", blocked_at=_JOURNAL_T0, fork_group_id="row_1")],
             scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"a": "error_routed"})},
             state_ids={"t1": "st-1"},
             attempt_offsets={"t1": 1},
@@ -3146,14 +3302,27 @@ class TestRestoreFromJournal:
         assert outcome.merged_token is not None
 
     def test_restore_from_journal_groups_items_per_pending_key(self) -> None:
-        """Items group by (coalesce_name, row_id) — keys restore independently."""
+        """Items group by (coalesce_name, fork_group_id) — keys restore independently."""
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
         executor.register_coalesce(_settings(name="other", branches=["a", "b"]), NodeID("co-2"))
+        # Distinct fork_group_id per intended-independent key — two items
+        # sharing coalesce_name AND fork_group_id would land in ONE group
+        # (that's the point of the arch-M1 fix); this test's point is the
+        # OPPOSITE (independent keys stay independent), so each of the three
+        # intended groups gets its own fork_group_id.
         items = [
-            _blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0),
-            _blocked_item(token_id="t2", row_id="row_2", branch_name="b", blocked_at=_JOURNAL_T0),
-            _blocked_item(token_id="t3", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0, coalesce_name="other", node_id="co-2"),
+            _blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0, fork_group_id="fg-1"),
+            _blocked_item(token_id="t2", row_id="row_2", branch_name="b", blocked_at=_JOURNAL_T0, fork_group_id="fg-2"),
+            _blocked_item(
+                token_id="t3",
+                row_id="row_1",
+                branch_name="a",
+                blocked_at=_JOURNAL_T0,
+                coalesce_name="other",
+                node_id="co-2",
+                fork_group_id="fg-1",
+            ),
         ]
 
         executor.restore_from_journal(
@@ -3165,7 +3334,7 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0,
         )
 
-        assert set(executor._pending) == {("merge", "row_1"), ("merge", "row_2"), ("other", "row_1")}
+        assert set(executor._pending) == {("merge", "fg-1"), ("merge", "fg-2"), ("other", "fg-1")}
 
     def test_restore_from_journal_missing_scalars_entry_means_no_lost_branches(self) -> None:
         """A pending key absent from scalars restores with empty lost_branches.
@@ -3185,7 +3354,8 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0,
         )
 
-        assert executor._pending[("merge", "row_1")].lost_branches == {}
+        # key is the item's fork_group_id (default "fg-journal-test").
+        assert executor._pending[("merge", "fg-journal-test")].lost_branches == {}
 
     def test_restore_from_journal_ignores_stale_scalars(self) -> None:
         """A completed scalars-only key is stale — ignored, never rejected.
@@ -3197,12 +3367,16 @@ class TestRestoreFromJournal:
         """
         executor, execution, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        execution.get_completed_row_ids_for_nodes.return_value = {("co-1", "row_gone")}
+        execution.get_completed_group_ids_for_nodes.return_value = {("co-1", "row_gone")}
 
         executor.restore_from_journal(
+            # First scalar key matches the item's default fork_group_id
+            # ("fg-journal-test") — the empty-lost_branches merge case; the
+            # second ("row_gone") is an independent, genuinely-stale key
+            # (WS4 Task 10).
             items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0)],
             scalars={
-                ("merge", "row_1"): CoalescePendingScalars(lost_branches={}),
+                ("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={}),
                 ("merge", "row_gone"): CoalescePendingScalars(lost_branches={"b": "lost"}),
             },
             state_ids={"t1": "s1"},
@@ -3212,7 +3386,7 @@ class TestRestoreFromJournal:
         )
 
         # Only the journal-backed key is restored; the stale key is dropped
-        assert set(executor._pending) == {("merge", "row_1")}
+        assert set(executor._pending) == {("merge", "fg-journal-test")}
 
     def test_restore_from_journal_clamps_wall_clock_backstep(self) -> None:
         """A wall-clock backward step must not put first_arrival in the monotonic future."""
@@ -3236,13 +3410,14 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0,  # wall clock stepped backward
         )
 
-        assert executor._pending[("merge", "row_1")].first_arrival == pytest.approx(100.0)
+        # key is the item's fork_group_id (default "fg-journal-test").
+        assert executor._pending[("merge", "fg-journal-test")].first_arrival == pytest.approx(100.0)
 
     def test_restore_from_journal_reconstructs_completed_keys_from_landscape(self) -> None:
         """Completed keys rebuild from the Landscape so late arrivals are detected post-resume."""
         executor, execution, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        execution.get_completed_row_ids_for_nodes.return_value = {("co-1", "row_0"), ("co-1", "row_9")}
+        execution.get_completed_group_ids_for_nodes.return_value = {("co-1", "row_0"), ("co-1", "row_9")}
 
         executor.restore_from_journal(
             items=[],
@@ -3255,18 +3430,30 @@ class TestRestoreFromJournal:
 
         assert ("merge", "row_0") in executor._completed_keys
         assert ("merge", "row_9") in executor._completed_keys
+        # Restore seeds COMPLETED keys with the flavor UNKNOWN (None), never
+        # as merged — the enumeration cannot tell a merge from a failure.
+        assert executor._completed_keys[("merge", "row_0")] is None
 
+        # Flavor resolved lazily: this group RELEASED, so the reason is merge.
+        execution.has_released_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
         outcome = executor.accept(late, "merge")
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
-        assert outcome.outcomes_recorded is True
+
+        # The failed twin: a restore-seeded key whose group never released
+        # answers scope_group_failed (ADR-042 / spec §2).
+        execution.has_released_group_for_node.return_value = False
+        late_failed = _make_token(branch_name="a", token_id="t_late_failed", row_id="row_9")
+        failed_outcome = executor.accept(late_failed, "merge")
+        assert failed_outcome.held is False
+        assert failed_outcome.failure_reason == "scope_group_failed"
 
     def test_restore_from_journal_keeps_completed_keys_bounded(self) -> None:
         """Restore seeds the FIFO cache through the bounded completion path."""
         executor, execution, _, _, _ = _make_executor(max_completed_keys=2)
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        execution.get_completed_row_ids_for_nodes.return_value = {("co-1", f"row_{i}") for i in range(5)}
+        execution.get_completed_group_ids_for_nodes.return_value = {("co-1", f"row_{i}") for i in range(5)}
 
         executor.restore_from_journal(
             items=[],
@@ -3302,7 +3489,7 @@ class TestRestoreFromJournal:
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
 
-        with pytest.raises(AuditIntegrityError, match="branch_name"):
+        with pytest.raises(AuditIntegrityError, match="no innermost FORK frame"):
             executor.restore_from_journal(
                 items=[_blocked_item(token_id="t1", row_id="row_1", branch_name=bad_branch, blocked_at=_JOURNAL_T0)],
                 scalars={},
@@ -3448,8 +3635,13 @@ class TestRestoreFromJournal:
 
         with pytest.raises(AuditIntegrityError, match="both arrived and lost"):
             executor.restore_from_journal(
+                # Scalar key matches the item's default fork_group_id
+                # ("fg-journal-test") so the cross-check compares the SAME
+                # group's arrived vs. lost branches (WS4 Task 10) — a
+                # mismatched key would put them in separate groups and this
+                # raise would never fire.
                 items=[_blocked_item(token_id="t1", row_id="row_1", branch_name="a", blocked_at=_JOURNAL_T0)],
-                scalars={("merge", "row_1"): CoalescePendingScalars(lost_branches={"a": "error_routed"})},
+                scalars={("merge", "fg-journal-test"): CoalescePendingScalars(lost_branches={"a": "error_routed"})},
                 state_ids={"t1": "s1"},
                 attempt_offsets={"t1": 1},
                 resume_checkpoint_id="cp-0",
@@ -3577,7 +3769,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result.failure_reason is not None
         assert "branch_lost" in result.failure_reason
         assert "a" in result.failure_reason
-        assert result.outcomes_recorded is True
 
     def test_require_all_loss_after_partial_arrivals_fails(self):
         """require_all: loss after some branches arrived still fails immediately."""
@@ -3592,7 +3783,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result is not None
         assert "branch_lost" in result.failure_reason
         assert "c" in result.failure_reason
-        assert result.outcomes_recorded is True
         # Consumed tokens should include the arrived branches
         assert len(result.consumed_tokens) == 2
 
@@ -3698,7 +3888,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result is not None
         assert result.failure_reason == "all_branches_lost"
         assert result.merged_token is None
-        assert result.outcomes_recorded is True
 
     # --- first policy ---
 
@@ -3717,7 +3906,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert result_b.held is False
         assert result_b.merged_token is None
         assert result_b.failure_reason == "all_branches_lost"
-        assert result_b.outcomes_recorded is True
         assert ("merge", "row_1") not in executor._pending
         assert ("merge", "row_1") in executor._completed_keys
 
@@ -3735,7 +3923,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert results[0].held is False
         assert results[0].merged_token is None
         assert results[0].failure_reason == "all_branches_lost"
-        assert results[0].outcomes_recorded is True
         assert ("merge", "row_1") not in executor._pending
 
     def test_first_policy_timeout_zero_arrivals_from_loss_fails_and_cleans_up(self):
@@ -3753,7 +3940,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         assert results[0].held is False
         assert results[0].merged_token is None
         assert results[0].failure_reason == "first_timeout_no_arrivals"
-        assert results[0].outcomes_recorded is True
         assert ("merge", "row_1") not in executor._pending
         assert ("merge", "row_1") in executor._completed_keys
 
@@ -3880,7 +4066,6 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
         assert result is not None
         assert "quorum_impossible" in result.failure_reason
-        assert result.outcomes_recorded is True
 
 
 class TestPrecomputedOutputSchema:
@@ -4235,3 +4420,35 @@ class TestObservedUnionCoalesce:
         assert outcome.held is False
         assert outcome.merged_token is not None
         assert any(f.normalized_name == "y" for f in outcome.merged_token.row_data.contract.fields)
+
+
+class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
+    """META-40 (spec §6.3): a survivor of a FAILING coalesce group keeps the
+    group's CAUSE (``failure_reason``) on its own hold node_state beside its
+    settlement disposition ``scope_group_failed`` — the closed vocabulary the
+    settle seam also writes on its terminal."""
+
+    def test_require_all_failure_payload_carries_cause_and_scope_group_failed(self):
+        executor, execution, _, _, clock = _make_executor()
+        s = _settings(policy="require_all", timeout_seconds=5.0)
+        executor.register_coalesce(s, "node_1")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        clock.advance(6.0)
+        executor.check_timeouts("merge")
+        fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
+        error = fail_call.kwargs["error"]
+        assert error.failure_reason == "incomplete_branches"
+        assert error.member_disposition == GroupSettlementReason.SCOPE_GROUP_FAILED.value
+        assert error.to_dict()["member_disposition"] == "scope_group_failed"
+
+    def test_late_arrival_payload_disposition_is_its_own_settlement_reason(self):
+        executor, execution, _, _, _ = _make_executor()
+        s = _settings(policy="first")
+        executor.register_coalesce(s, "node_1")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        late = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        assert late.failure_reason == GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value
+        fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
+        error = fail_call.kwargs["error"]
+        # A late arrival's failure_reason IS its disposition — carried on both fields.
+        assert (error.failure_reason, error.member_disposition) == (late.failure_reason, late.failure_reason)

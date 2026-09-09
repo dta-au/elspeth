@@ -2,7 +2,8 @@
 
 **Date:** 2026-04-19
 **Status:** Accepted
-**Deciders:** Architecture Critic (SME agent), Systems Thinker (SME agent), Python Code Reviewer (SME agent), Quality Engineer (SME agent), Claude (synthesis/lead)
+**Deciders:** ELSPETH maintainer
+**Review evidence:** Advisory architecture, systems-thinking, Python-engineering, and quality review
 **Tags:** engine, executor, schema-contract, tier-1, audit-integrity, validation
 
 > **Amended by [ADR-009](009-pass-through-pathway-fusion.md) on 2026-04-19.**
@@ -18,6 +19,12 @@
 > **Amended by ADR-010 (Declaration-trust framework, 2026-04-19).**
 > Normative in this ADR: §Explicit scope boundary (each new declaration still requires its own ADR).
 > Superseded: the direct-call executor integration pattern — replaced by ADR-010 §Decision 3's `run_runtime_checks` dispatcher. Cross-check scope "per-row in executor" remains correct; the mechanism is now registry-driven.
+
+> **Current implementation note (2026-08-29).** The accepted decision below
+> records the original median/P99 non-functional requirement. Commit
+> `2db281c12` changed the executable benchmark to assert median ≤ 25 µs and a
+> Tukey upper fence (`q3 + 3×IQR`) ≤ 50 µs. This note reports current
+> enforcement without rewriting the criterion accepted in this ADR.
 
 ## Context
 
@@ -37,7 +44,7 @@ This is the bug-class the original v2 plan was reaching for but left implicit: "
 Add a per-row runtime cross-check to `TransformExecutor.execute_transform`:
 
 1. After `transform.process()` returns a successful `TransformResult`, if `transform.passes_through_input` is True, compute `input_fields = frozenset(input_row.contract.fields)` for every emitted row.
-2. Compute `runtime_observed = frozenset(emitted_row.contract.fields) & frozenset(emitted_row.keys())` — the **intersection** of the emitted row's contract-set and its payload-set. `PipelineRow.__init__` accepts any `dict` and any `SchemaContract` as independent references and does not enforce `data.keys() ⊆ contract.fields`, so a field is "kept" at runtime iff the row simultaneously declares it in its contract AND carries it in its payload. Reading either side alone creates a one-sided blind spot: a buggy plugin can shrink the contract while keeping the payload (caught by the contract side), or shrink the payload while reusing the input contract (caught by the payload side). Using the intersection catches both vectors. The payload-side cost is `frozenset(emitted_row.keys())`, which reads the frozen `MappingProxyType` directly — no `deep_thaw` — so the NFR budget (median ≤ 25 µs / P99 ≤ 50 µs on a 200-field row) remains comfortable.
+2. Compute `runtime_observed = frozenset(emitted_row.contract.fields) & frozenset(emitted_row.keys())` — the **intersection** of the emitted row's contract-set and its payload-set. `PipelineRow.__init__` accepts any `dict` and any `SchemaContract` as independent references and does not enforce `data.keys() ⊆ contract.fields`, so a field is "kept" at runtime iff the row simultaneously declares it in its contract AND carries it in its payload. Reading either side alone creates a one-sided blind spot: a buggy plugin can shrink the contract while keeping the payload (caught by the contract side), or shrink the payload while reusing the input contract (caught by the payload side). Using the intersection catches both vectors. The payload-side cost is `frozenset(emitted_row.keys())`, which reads the frozen `MappingProxyType` directly — no `deep_thaw` — so the NFR gate (median ≤ 25 µs / P99 ≤ 50 µs on a 200-field row) remains comfortable.
 3. If `divergence_set = input_fields - runtime_observed` is non-empty, raise `PassThroughContractViolation` with the full set of audit fields (transform, node_id, run_id, row_id, token_id, static_contract, runtime_observed, divergence_set, message).
 4. Before raising, increment `pass_through_cross_check_violations_total{transform=...}` — a telemetry counter acquired at `TransformExecutor.__init__`. This is the operational signal SRE sees even when Landscape recording itself fails.
 
@@ -46,6 +53,25 @@ Add a per-row runtime cross-check to `TransformExecutor.execute_transform`:
 `PassThroughContractViolation` is registered in `TIER_1_ERRORS` alongside `AuditIntegrityError`, `FrameworkBugError`, and `OrchestrationInvariantError`. This registration is not cosmetic — it is the mechanism that prevents `on_error` routing from silently absorbing audit-integrity violations.
 
 Without the registration: a transform with `on_error="quarantine_sink"` would catch the violation via the executor's `except Exception:` block, route the row to the error sink, and continue. The Landscape would record a row-level FAILED state, the quarantine sink would accept the evidence, and the mis-annotation would survive to corrupt the next row. With the registration: the executor's `except TIER_1_ERRORS: raise` fires first, the `NodeStateGuard.__exit__` auto-completes the state as FAILED with the full structured context, and the exception propagates out of `execute_transform` so the orchestrator sees the crash.
+
+> **Correction 2026-08-21 (elspeth-181db83da7).** The paragraph above was
+> accurate about the PURPOSE of registration and wrong about the mechanism, in
+> a way that hid a live defect for months. The executor's `except Exception:`
+> block records FAILED and **re-raises**; it has never routed anything. Only
+> the `result.status == "error"` branch routes, and that branch is reached by a
+> transform RETURNING an error, never by one raising. So an unregistered
+> violation was not "absorbed by `on_error`" — it escaped every catch site and
+> aborted the run, with `on_error` never firing and the row counted as neither
+> succeeded nor failed. The routing this ADR describes now genuinely exists,
+> implemented in `RowProcessor._convert_contract_violation_to_error_result`.
+>
+> Two limits on the wording, for anyone citing this section as authority:
+> **(1)** the claim generalises only over the `PluginContractViolation`
+> hierarchy. `DeclarationContractViolation` is a SIBLING of it, not a child, so
+> non-registration there (e.g. `UnexpectedEmptyEmissionViolation`) does NOT
+> imply routing — those still abort. **(2)** it holds at the TRANSFORM seam
+> only. The sink and aggregation-flush seams record and re-raise regardless of
+> tier; whether `AggregationSettings.on_error` means anything is open.
 
 ### Audit-recording path
 
@@ -105,7 +131,10 @@ Future ADRs may extend the pattern. This ADR establishes the architectural templ
 
 ### Negative Consequences
 
-- Per-row overhead on the executor hot path. Bounded by NFR gate: median ≤ 25 µs, P99 ≤ 50 µs on a 200-field input row (measured via `pytest-benchmark` in `tests/performance/benchmarks/test_cross_check_overhead.py`). Only fires for annotated transforms — non-annotated transforms pay zero.
+- Per-row overhead on the executor hot path. Bounded by the benchmark gate:
+  median ≤ 25 µs and P99 ≤ 50 µs on a 200-field input row
+  (`tests/performance/benchmarks/test_cross_check_overhead.py`). Only annotated
+  transforms run the cross-check.
 - `TIER_1_ERRORS` membership change affects ~40+ `isinstance()` call sites. Verified non-load-bearing by the §Verification grep step: no caller hardcodes the tuple length; all use `isinstance(exc, TIER_1_ERRORS)` which accepts the expanded tuple transparently.
 - `ExecutionError` extension (new `context` field) ripples through any custom serializer of audit error data. Mitigated by the field being optional with `None` default — pre-existing serializers continue to emit the same keys they did before.
 
@@ -152,7 +181,7 @@ parent-class change does not weaken it.
 
 ## References
 
-- Plan: `/home/john/.claude/plans/elspeth-87f6d5dea5-snazzy-swing.md`
+- Decision and implementation record: commits `329213880` and `d22115c5c`
 - Companion ADR: `ADR-007: Pass-through contract propagation — declaration, semantics, and composer parity`
 - Related bug report: `elspeth-87f6d5dea5` (composer/runtime schema-contract divergence)
 - CLAUDE.md §Three-Tier Trust Model (tier boundary rules)

@@ -5,12 +5,16 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.engine.url import make_url
 
+from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME
+from elspeth.contracts.enums import TerminalPath
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
+    node_states_table,
+    nodes_table,
     token_outcomes_table,
     transform_errors_table,
     validation_errors_table,
@@ -62,6 +66,7 @@ def load_discard_summaries_from_db(
         run_id: {
             "validation_errors": 0,
             "transform_errors": 0,
+            "gate_errors": 0,
             "sink_discards": 0,
         }
         for run_id in run_ids
@@ -113,27 +118,118 @@ def load_discard_summaries_from_db(
                 )
             )
 
-        sink_query = (
-            select(token_outcomes_table.c.run_id, func.count().label("count"))
+        gate_error_query = (
+            select(
+                token_outcomes_table.c.run_id,
+                node_states_table.c.node_id,
+                func.count(func.distinct(token_outcomes_table.c.token_id)).label("count"),
+            )
+            .select_from(
+                token_outcomes_table.join(
+                    node_states_table,
+                    and_(
+                        token_outcomes_table.c.run_id == node_states_table.c.run_id,
+                        token_outcomes_table.c.token_id == node_states_table.c.token_id,
+                    ),
+                ).join(
+                    nodes_table,
+                    and_(
+                        node_states_table.c.run_id == nodes_table.c.run_id,
+                        node_states_table.c.node_id == nodes_table.c.node_id,
+                    ),
+                )
+            )
             .where(token_outcomes_table.c.run_id.in_(run_ids))
-            .where(token_outcomes_table.c.sink_name == DISCARD_SINK_NAME)
+            .where(token_outcomes_table.c.path == TerminalPath.GATE_ERROR_DISCARDED)
             .where(token_outcomes_table.c.completed == 1)
-            .group_by(token_outcomes_table.c.run_id)
+            .where(node_states_table.c.status == NodeStateStatus.FAILED)
+            .where(nodes_table.c.node_type == NodeType.GATE)
+            .group_by(token_outcomes_table.c.run_id, node_states_table.c.node_id)
+            .order_by(token_outcomes_table.c.run_id.asc(), node_states_table.c.node_id.asc())
         )
-        for run_id, count in conn.execute(sink_query):
+        for run_id, node_id, count in conn.execute(gate_error_query):
             count_value = int(count)
-            counts[run_id]["sink_discards"] = count_value
+            counts[run_id]["gate_errors"] += count_value
             stages[run_id].append(
                 DiscardStageSummary(
-                    stage="sink_discard",
-                    node_id=None,
+                    stage="gate_evaluation",
+                    node_id=node_id,
                     count=count_value,
                 )
             )
 
+        # Attribute each sink discard to the sink that refused the row, as every
+        # other stage above does (elspeth-9595abb7b0: the only stage entry named
+        # no node, so the summary could not even say which sink discarded).
+        #
+        # A correlated scalar subquery, not a join: the discard sentinel lives on
+        # token_outcomes while the node lives on the token's FAILED sink state,
+        # and nothing in the schema constrains a token to one of those. Joining
+        # would emit one row per state and inflate the stage total past the
+        # category count DiscardSummary cross-checks, turning an attribution
+        # question into a rejected response. Reducing to one node per token keeps
+        # the total exactly what the unattributed query returned, whatever the
+        # states say. To be clear about how much is claimed: this is defensive,
+        # not observed — a discarded token is terminal, so no such shape has been
+        # reproduced. The ordering picks the deepest state and is therefore a
+        # best-effort ATTRIBUTION; only the COUNT is exact.
+        #
+        # LEFT-join semantics (a NULL node_id when no failed sink state exists)
+        # are deliberate for the same reason: a discard whose primary anchor is
+        # missing must still be counted, unattributed, rather than dropped.
+        discard_node_id = (
+            select(node_states_table.c.node_id)
+            .select_from(
+                node_states_table.join(
+                    nodes_table,
+                    and_(
+                        node_states_table.c.run_id == nodes_table.c.run_id,
+                        node_states_table.c.node_id == nodes_table.c.node_id,
+                    ),
+                )
+            )
+            .where(node_states_table.c.run_id == token_outcomes_table.c.run_id)
+            .where(node_states_table.c.token_id == token_outcomes_table.c.token_id)
+            .where(node_states_table.c.status == NodeStateStatus.FAILED)
+            .where(nodes_table.c.node_type == NodeType.SINK)
+            .order_by(node_states_table.c.step_index.desc(), node_states_table.c.node_id.asc())
+            .limit(1)
+            .scalar_subquery()
+            .label("node_id")
+        )
+        attributed_discards = (
+            select(token_outcomes_table.c.run_id.label("run_id"), discard_node_id)
+            .where(token_outcomes_table.c.run_id.in_(run_ids))
+            .where(token_outcomes_table.c.sink_name == DISCARD_SINK_NAME)
+            .where(token_outcomes_table.c.completed == 1)
+            .subquery()
+        )
+        sink_query = select(
+            attributed_discards.c.run_id,
+            attributed_discards.c.node_id,
+            func.count().label("count"),
+        ).group_by(attributed_discards.c.run_id, attributed_discards.c.node_id)
+        sink_stages: dict[str, list[DiscardStageSummary]] = {run_id: [] for run_id in run_ids}
+        for run_id, node_id, count in conn.execute(sink_query):
+            count_value = int(count)
+            counts[run_id]["sink_discards"] += count_value
+            sink_stages[run_id].append(
+                DiscardStageSummary(
+                    stage="sink_discard",
+                    node_id=node_id,
+                    count=count_value,
+                )
+            )
+        # Ordered here rather than in SQL: node_id is now nullable, and backends
+        # disagree on where NULL sorts, so an ORDER BY would make the projection
+        # differ between SQLite and PostgreSQL.
+        for run_id, run_sink_stages in sink_stages.items():
+            run_sink_stages.sort(key=lambda stage: (stage.node_id is None, stage.node_id or ""))
+            stages[run_id].extend(run_sink_stages)
+
     summaries: dict[str, DiscardSummary] = {}
     for run_id, run_counts in counts.items():
-        total = run_counts["validation_errors"] + run_counts["transform_errors"] + run_counts["sink_discards"]
+        total = run_counts["validation_errors"] + run_counts["transform_errors"] + run_counts["gate_errors"] + run_counts["sink_discards"]
         if total > 0:
             summaries[run_id] = DiscardSummary(total=total, stages=tuple(stages[run_id]), **run_counts)
     return summaries

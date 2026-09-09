@@ -22,10 +22,12 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import PendingOutcome, TokenInfo
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
 from elspeth.engine.orchestrator.types import ExecutionCounters
+from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_token_info
 
 
@@ -43,6 +45,7 @@ class _SinkFake:
 @dataclass(frozen=True)
 class _PipelineConfigFake:
     sinks: dict[str, _SinkFake]
+    sink_effect_modes: dict[str, str]
 
 
 def _recorder_factory_fake() -> _RecorderFactoryFake:
@@ -157,11 +160,13 @@ class TestPendingSortKey:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             scheduler_pending_sink=True,
+            join_group_id="join-1",
         )
         generated_pending = PendingOutcome(
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             scheduler_pending_sink=False,
+            join_group_id="join-1",
         )
 
         assert _pending_sort_key((tok_scheduler, scheduler_pending)) != _pending_sort_key((tok_generated, generated_pending))
@@ -395,8 +400,8 @@ class TestSinkNameValidation:
         orchestrator = self._make_orchestrator()
 
         recorder = _recorder_factory_fake()
-        config = _PipelineConfigFake(sinks={"output": _SinkFake()})  # Only "output" exists
-        ctx = object()
+        config = _PipelineConfigFake(sinks={"output": _SinkFake()}, sink_effect_modes={"output": "write"})  # Only "output" exists
+        ctx = SimpleNamespace(shutdown_event=None)
 
         tok = make_token_info(token_id="tok-1")
         pending_tokens = {
@@ -422,8 +427,8 @@ class TestSinkNameValidation:
 
         recorder = _recorder_factory_fake()
         # Even if the sink doesn't exist in config, empty list means we skip before checking
-        config = _PipelineConfigFake(sinks={})
-        ctx = object()
+        config = _PipelineConfigFake(sinks={}, sink_effect_modes={})
+        ctx = SimpleNamespace(shutdown_event=None)
 
         pending_tokens: dict[str, list[tuple[TokenInfo, PendingOutcome | None]]] = {
             "nonexistent_sink": [],
@@ -448,7 +453,7 @@ class TestPendingTokenConsumption:
 
     def _make_orchestrator(self) -> SinkFlushCoordinator:
         """Build a coordinator with inert dependencies for direct method tests."""
-        return SinkFlushCoordinator(span_factory=object(), checkpoints=object())
+        return SinkFlushCoordinator(span_factory=SpanFactory(), checkpoints=object())
 
     def test_successful_write_consumes_live_pending_tokens(self) -> None:
         """Successfully written groups are removed from the live pending map."""
@@ -456,8 +461,8 @@ class TestPendingTokenConsumption:
 
         orchestrator = self._make_orchestrator()
         recorder = _recorder_factory_fake()
-        config = _PipelineConfigFake(sinks={"output": _SinkFake()})
-        ctx = object()
+        config = _PipelineConfigFake(sinks={"output": _SinkFake()}, sink_effect_modes={"output": "write"})
+        ctx = SimpleNamespace(shutdown_event=None)
         tok_1 = make_token_info(token_id="tok-1")
         tok_2 = make_token_info(token_id="tok-2")
         pending_tokens = {
@@ -497,8 +502,8 @@ class TestPendingTokenConsumption:
 
         orchestrator = self._make_orchestrator()
         recorder = _recorder_factory_fake()
-        config = _PipelineConfigFake(sinks={"output": _SinkFake()})
-        ctx = object()
+        config = _PipelineConfigFake(sinks={"output": _SinkFake()}, sink_effect_modes={"output": "write"})
+        ctx = SimpleNamespace(shutdown_event=None)
         tok = make_token_info(token_id="tok-1")
         pending_pair = (tok, _completed_pending())
         pending_tokens = {"output": [pending_pair]}
@@ -529,6 +534,50 @@ class TestPendingTokenConsumption:
         assert pending_tokens == {"output": [pending_pair]}
 
 
+@pytest.mark.parametrize(
+    ("sinks", "effect_modes"),
+    [
+        ({"output": _SinkFake()}, {}),
+        (
+            {
+                "output": _SinkFake(_on_write_failure="failsink"),
+                "failsink": _SinkFake(),
+            },
+            {"output": "write"},
+        ),
+    ],
+    ids=["missing-primary-mode", "missing-failsink-mode"],
+)
+def test_sink_effect_mode_partition_must_cover_runtime_sinks_before_executor_construction(
+    sinks: dict[str, _SinkFake],
+    effect_modes: dict[str, str],
+) -> None:
+    from elspeth.engine.executors.sink import DiversionCounts
+
+    coordinator = SinkFlushCoordinator(span_factory=object(), checkpoints=object())
+    token = make_token_info(token_id="tok-1")
+    edge_map = {("node-output", "__failsink__"): "edge-failsink"} if "failsink" in sinks else {}
+
+    with (
+        patch("elspeth.engine.executors.sink.SinkExecutor", autospec=True) as sink_executor_cls,
+        pytest.raises(OrchestrationInvariantError, match="effect modes"),
+    ):
+        sink_executor_cls.return_value.write.return_value = (None, DiversionCounts())
+        coordinator.write_pending_to_sinks(
+            factory=_recorder_factory_fake(),
+            run_id="run-1",
+            config=_PipelineConfigFake(sinks=sinks, sink_effect_modes=effect_modes),
+            ctx=SimpleNamespace(shutdown_event=None),
+            counters=ExecutionCounters(),
+            pending_tokens={"output": [(token, _completed_pending())]},
+            sink_id_map={"output": "node-output", "failsink": "node-failsink"},
+            edge_map=edge_map,
+            sink_step=5,
+        )
+
+    sink_executor_cls.assert_not_called()
+
+
 def test_flush_threads_live_coordination_worker_into_sink_effects() -> None:
     from elspeth.engine.executors.sink import DiversionCounts
 
@@ -539,8 +588,8 @@ def test_flush_threads_live_coordination_worker_into_sink_effects() -> None:
     )
     loop_ctx = SimpleNamespace(
         counters=ExecutionCounters(),
-        config=_PipelineConfigFake(sinks={}),
-        ctx=object(),
+        config=_PipelineConfigFake(sinks={}, sink_effect_modes={}),
+        ctx=SimpleNamespace(shutdown_event=None),
         pending_tokens={},
         processor=processor,
     )
@@ -553,6 +602,7 @@ def test_flush_threads_live_coordination_worker_into_sink_effects() -> None:
             sink_id_map={},
             edge_map={},
             interrupted_by_shutdown=False,
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:process-unique", leader_epoch=1),
         )
 
     assert write_pending.call_args.kwargs["worker_id"] == "worker:run-1:process-unique"

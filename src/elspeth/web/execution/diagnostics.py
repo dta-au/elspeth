@@ -8,12 +8,16 @@ JSON; those are audit/debug payloads, not safe default UI material.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Final, Literal, get_args
 
 from sqlalchemy import and_, func, select
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, make_url
 
+from elspeth.contracts.errors import TransformErrorCategory
+from elspeth.contracts.secret_scrub import REDACTED_SECRET_TEXT
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.export_mappers import artifact_producer_kind, validate_artifact_publication_projection
 from elspeth.core.landscape.schema import (
@@ -21,14 +25,18 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     operations_table,
     rows_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     tokens_table,
+    validation_errors_table,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.execution.discard_summary import _sqlite_database_file_missing
+from elspeth.web.execution.discard_summary import DISCARD_DESTINATION, _sqlite_database_file_missing
 from elspeth.web.execution.schemas import (
     RunDiagnosticArtifact,
+    RunDiagnosticDiscard,
     RunDiagnosticFailureDetail,
+    RunDiagnosticLineageFrame,
     RunDiagnosticNodeState,
     RunDiagnosticOperation,
     RunDiagnosticsResponse,
@@ -41,6 +49,96 @@ _DEFAULT_DIAGNOSTIC_LIMIT = 50
 _MAX_DIAGNOSTIC_LIMIT = 100
 _OPERATION_PREVIEW_LIMIT = 20
 _ARTIFACT_PREVIEW_LIMIT = 20
+
+# How many of the most recent failed node_states to consider when correlating a
+# failed operation to the node that raised it. A run can accumulate many failed
+# states that never failed the run (rows diverted by on_error), so the scan is
+# bounded rather than unbounded, and finding no match is a normal outcome.
+# A residual neither bound closes: with the true-cause state evicted from this
+# window while a coincidental candidate clearing the substring floor below stays
+# inside it, ranking still names the bystander — narrowing either limit only
+# shrinks the odds, and a schema-level operation -> state linkage is what would
+# remove the failure mode.
+_FAILED_STATE_CORRELATION_SCAN_LIMIT = 50
+
+# A correlating exception shorter than the operation's whole message must be at
+# least this long. A rendered exception message identifies the failure it came
+# from; a bare token ("2", "None", "Error", "Timeout") turns up inside unrelated
+# error text by coincidence, and one coincidence is enough to name a bystander.
+# Exact matches are exempt at any length: a candidate equal to the whole message
+# is positive identification, not a fragment that happens to appear in one.
+_MINIMUM_SUBSTRING_CORRELATION_LENGTH = 12
+# ExecutionError.exception_type values written by SinkExecutor's diversion
+# anchors (discard mode and the failsink primary anchor respectively).
+_DIVERSION_ERROR_TYPES = frozenset({"SinkDiscard", "SinkDiversion"})
+
+_SafeFailureClassification = Literal[
+    "authentication_failed",
+    "authorization_denied",
+    "connectivity_failure",
+    "provider_unavailable",
+    "rate_limited",
+    "source_object_unreadable",
+    "timeout",
+]
+_SAFE_TRANSFORM_ERROR_REASONS: Final[frozenset[object]] = frozenset(get_args(TransformErrorCategory))
+_PROVIDER_FAILURE_CLASSIFICATIONS: Final[dict[tuple[str, str, str], _SafeFailureClassification]] = {
+    ("submit_failed", "service_error", "AccessDeniedException"): "authorization_denied",
+    ("submit_failed", "service_error", "ThrottlingException"): "rate_limited",
+    ("poll_failed", "service_error", "AccessDeniedException"): "authorization_denied",
+    ("poll_failed", "service_error", "ThrottlingException"): "rate_limited",
+}
+_EXCEPTION_FAILURE_CLASSIFICATIONS: Final[dict[str, _SafeFailureClassification]] = {
+    "ConnectionResetError": "connectivity_failure",
+    "PermissionError": "authorization_denied",
+    "TimeoutError": "timeout",
+}
+_TEXTRACT_OBJECT_UNREADABLE_TUPLE: Final[tuple[str, str, str, str]] = (
+    "submit_failed",
+    "service_error",
+    "InvalidS3ObjectException",
+    "s3_object_unreadable",
+)
+_TEXTRACT_OBJECT_UNREADABLE_REMEDIATION: Final = (
+    "Check that the pipeline AWS role can read the referenced S3 object and that the object is in the Amazon Textract endpoint region."
+)
+_STATUS_FAILURE_CLASSIFICATIONS: Final[dict[int, _SafeFailureClassification]] = {
+    401: "authentication_failed",
+    403: "authorization_denied",
+    408: "timeout",
+    429: "rate_limited",
+}
+_JSON_PAYLOAD_TYPE_NAMES: Final[dict[type[object], str]] = {
+    bool: "bool",
+    dict: "dict",
+    float: "float",
+    int: "int",
+    list: "list",
+    str: "str",
+}
+
+
+class RunDiagnosticsAuditUnavailableError(RuntimeError):
+    """Raised when a linked run's expected Landscape store cannot be read.
+
+    Sibling of ``outputs.RunOutputsAuditUnavailableError``. A run row that
+    carries a ``landscape_run_id`` was admitted to Landscape, so the store
+    existed; a missing file now is deleted, unmounted, or misconfigured audit
+    storage. Rendering that as a zero-record diagnostics projection would be
+    indistinguishable from a genuinely clean run and would conceal evidence
+    loss (elspeth-1d24bb0d96), so the read raises instead and the routes
+    translate it to an explicit 503.
+    """
+
+    def __init__(self, *, landscape_run_id: str, landscape_url: str) -> None:
+        parsed = make_url(landscape_url)
+        if parsed.drivername.startswith("sqlite"):
+            audit_location = parsed.database or landscape_url
+        else:
+            audit_location = parsed.render_as_string(hide_password=True)
+        self.landscape_run_id = landscape_run_id
+        self.audit_location = audit_location
+        super().__init__(f"Run diagnostics audit database is unavailable for landscape_run_id={landscape_run_id!r} at {audit_location!r}")
 
 
 def llm_safe_diagnostics_snapshot(diagnostics: RunDiagnosticsResponse) -> dict[str, Any]:
@@ -69,18 +167,68 @@ def _redacted_error_message_for_llm(error_message: str | None) -> str | None:
     return f"[diagnostic error text redacted before LLM prompt; chars={len(error_message)}; lines={len(error_message.splitlines()) or 1}]"
 
 
+@trust_boundary(
+    tier=3,
+    source="RunDiagnosticNodeState.error (typed Any) — the JSON-decoded node_states.error_json audit column, "
+    "whose body is an ExecutionError envelope carrying provider/runtime error bodies and arbitrary exception "
+    "to_audit_dict() content; no first-party contract guarantees its keys or their value types",
+    source_param="error_payload",
+    suppresses=("R1",),
+    invariant="never raises on error_payload shape; returns None only for an absent payload, and otherwise a "
+    "fixed-key summary envelope that emits reason/status/classification/remediation only for values passing "
+    "their own exact-type and membership checks, so an unrecognised or malformed payload degrades to the "
+    "redacted shape-only summary rather than leaking payload text",
+    non_raising=True,
+)
 def _summarize_error_payload_for_llm(error_payload: Any | None) -> dict[str, object] | None:
     if error_payload is None:
         return None
     try:
-        serialized_chars = len(json.dumps(error_payload, sort_keys=True, allow_nan=False, default=str))
-    except (TypeError, ValueError):
+        serialized_chars = len(json.dumps(error_payload, sort_keys=True, allow_nan=False))
+    except (RecursionError, TypeError, UnicodeError, ValueError):
         serialized_chars = None
-    return {
+    summary: dict[str, object] = {
         "redacted": True,
-        "payload_type": type(error_payload).__name__,
+        "payload_type": _JSON_PAYLOAD_TYPE_NAMES.get(type(error_payload), "unknown"),
         "serialized_chars": serialized_chars,
     }
+    if type(error_payload) is dict:
+        reason = error_payload.get("reason")
+        if type(reason) is str and reason in _SAFE_TRANSFORM_ERROR_REASONS:
+            summary["reason"] = reason
+
+        valid_statuses: list[int] = []
+        for field_name in ("status_code", "http_status"):
+            status = error_payload.get(field_name)
+            if type(status) is int and 100 <= status <= 599:
+                summary[field_name] = status
+                valid_statuses.append(status)
+
+        classification: _SafeFailureClassification | None = None
+        remediation: str | None = None
+        error_type = error_payload.get("error_type")
+        code = error_payload.get("code")
+        cause = error_payload.get("cause")
+        if type(reason) is str and type(error_type) is str and type(code) is str:
+            if type(cause) is str and (reason, error_type, code, cause) == _TEXTRACT_OBJECT_UNREADABLE_TUPLE:
+                classification = "source_object_unreadable"
+                remediation = _TEXTRACT_OBJECT_UNREADABLE_REMEDIATION
+            else:
+                classification = _PROVIDER_FAILURE_CLASSIFICATIONS.get((reason, error_type, code))
+        if classification is None and "reason" not in error_payload:
+            exception_type = error_payload.get("type")
+            if type(exception_type) is str and type(error_payload.get("exception")) is str:
+                classification = _EXCEPTION_FAILURE_CLASSIFICATIONS.get(exception_type)
+        if classification is None and valid_statuses and all(status == valid_statuses[0] for status in valid_statuses):
+            status = valid_statuses[0]
+            classification = _STATUS_FAILURE_CLASSIFICATIONS.get(status)
+            if classification is None and 500 <= status <= 599:
+                classification = "provider_unavailable"
+        if classification is not None:
+            summary["failure_classification"] = classification
+            if remediation is not None:
+                summary["remediation"] = remediation
+    return summary
 
 
 def _bounded_limit(limit: int) -> int:
@@ -93,6 +241,127 @@ def _decode_json(value: str | None) -> Any | None:
     if value is None:
         return None
     return json.loads(value)
+
+
+@dataclass(frozen=True, slots=True)
+class _NodeStateErrorEnvelope:
+    """The two correlation-relevant fields of one decoded ``node_states.error_json`` value.
+
+    An ELSPETH-owned projection of a Tier-3 envelope, constructed only by
+    :func:`_node_state_error_envelope`. Both fields are normalised to "a
+    non-blank ``str``, or ``None``" so the correlation policy that consumes
+    them reads owned attributes nominally instead of re-checking payload
+    shapes — and so ``error_type`` is always hashable, which a raw
+    ``payload["type"]`` is not (a list or mapping there would raise
+    ``TypeError`` on the ``_DIVERSION_ERROR_TYPES`` membership test).
+    """
+
+    error_type: str | None
+    exception_text: str | None
+
+
+@trust_boundary(
+    tier=3,
+    source="the JSON-decoded body of node_states.error_json — a Landscape Text column holding a serialised "
+    "ExecutionError envelope whose shape is not schema-enforced, predates the current envelope guarantees, "
+    "and carries exception text originating in third-party driver and provider exceptions",
+    source_param="payload",
+    suppresses=("R1", "R5"),
+    invariant="never raises on payload shape; returns None for any non-mapping payload and otherwise a "
+    "_NodeStateErrorEnvelope whose every field is a non-blank str or None, so an unrecognised envelope "
+    "degrades to 'this state does not correlate' rather than propagating an unvalidated value",
+    non_raising=True,
+)
+def _node_state_error_envelope(payload: Any | None) -> _NodeStateErrorEnvelope | None:
+    """Project a decoded error envelope onto the fields correlation reads.
+
+    ``exception`` is the field to key on — ``ExecutionError`` requires it
+    non-empty, whereas ``context`` is an optional structured payload only
+    populated for exceptions exposing ``to_audit_dict()``. It is read as a
+    fallback for envelopes predating that guarantee.
+    """
+    if not isinstance(payload, dict):
+        return None
+    error_type = payload.get("type")
+    exception_text = payload.get("exception")
+    if not isinstance(exception_text, str) or not exception_text.strip():
+        context = payload.get("context")
+        exception_text = context.get("message") if isinstance(context, dict) else None
+    if not isinstance(exception_text, str) or not exception_text.strip():
+        exception_text = None
+    return _NodeStateErrorEnvelope(
+        error_type=error_type if isinstance(error_type, str) else None,
+        exception_text=exception_text,
+    )
+
+
+def _node_state_error_correlating_exception(error_json: str | None, operation_error_message: str | None) -> str | None:
+    """The exception this failed node_state records, when it explains the operation.
+
+    There is no persisted linkage from an operation to the node_state that
+    aborted it, so correlate on the recorded error instead. Both sides render
+    the same exception through the same scrubber: ``operations.error_message``
+    is ``scrub_text_for_audit(str(exc))`` (``core/operations.py``
+    ``_render_exception``) and ``ExecutionError.exception`` is the same scrub of
+    the same string (``contracts/errors.py`` ``__post_init__``). So when the
+    state is the operation's cause, its ``exception`` appears verbatim inside
+    the operation's message. Substring rather than equality: the operation
+    message may carry wrapper/cause chain text around it. A substring that is
+    not the whole message must clear ``_MINIMUM_SUBSTRING_CORRELATION_LENGTH``.
+
+    The matched text is returned rather than a verdict because correlation does
+    not decide attribution on its own: several states can correlate to one
+    operation, and the caller ranks them by how specifically each matches.
+
+    Envelope shape is not this function's problem:
+    :func:`_node_state_error_envelope` is the Tier-3 boundary that parses the
+    decoded payload into an owned ``_NodeStateErrorEnvelope``, so everything
+    below reads normalised owned attributes.
+
+    Returns None for anything it cannot positively correlate — an absent,
+    malformed, or unrecognised envelope, an empty message that would match
+    indiscriminately, or a fragment too short to identify a failure. A false
+    negative costs scope-owner attribution (the prior behaviour); a false
+    positive names an unrelated node, which is the defect this exists to
+    prevent.
+    """
+    if not operation_error_message:
+        return None
+    try:
+        payload = _decode_json(error_json)
+    except (TypeError, ValueError):
+        # error_json is a Text column: a malformed value must degrade this
+        # projection to scope attribution, never fail the diagnostics read.
+        return None
+    envelope = _node_state_error_envelope(payload)
+    if envelope is None:
+        return None
+    if envelope.error_type in _DIVERSION_ERROR_TYPES:
+        # A diverted row is never the cause of a failed operation: its batch
+        # effect published, and the operation that failed is a different one.
+        # This was structurally unreachable while these states recorded only
+        # `effect-diversion:<hash>`, which could not appear inside another
+        # exception's message. Now that they disclose the sink's own prose
+        # (elspeth-9595abb7b0), a diversion sharing a driver-error phrase with a
+        # genuinely failed operation could out-rank the true raiser and point
+        # the operator at a sink that merely dropped a row. Excluded by kind
+        # rather than left to the substring gate, because the kind is exactly
+        # what makes it a non-cause.
+        return None
+    candidate = envelope.exception_text
+    if candidate is None:
+        return None
+    if candidate == REDACTED_SECRET_TEXT:
+        # The scrubber replaces a whole secret-bearing message with one
+        # constant, so two unrelated exceptions can become byte-identical here.
+        # That equality carries no causal information — and it would otherwise
+        # take the exact-match rank, naming a bystander confidently.
+        return None
+    if candidate == operation_error_message:
+        return candidate
+    if len(candidate) < _MINIMUM_SUBSTRING_CORRELATION_LENGTH:
+        return None
+    return candidate if candidate in operation_error_message else None
 
 
 def _max_datetime(values: list[datetime | None]) -> datetime | None:
@@ -125,6 +394,7 @@ def _empty_diagnostics(
             token_count=0,
             preview_limit=preview_limit,
             preview_truncated=False,
+            discard_count=0,
             state_counts={},
             operation_counts={},
             latest_activity_at=None,
@@ -132,6 +402,7 @@ def _empty_diagnostics(
         tokens=[],
         operations=[],
         artifacts=[],
+        discards=[],
     )
 
 
@@ -139,17 +410,31 @@ def load_run_diagnostics_for_settings(
     settings: WebSettings,
     *,
     run_id: str,
-    landscape_run_id: str,
+    landscape_run_id: str | None,
     run_status: SessionRunStatus,
     cancel_requested: bool = False,
     limit: int = _DEFAULT_DIAGNOSTIC_LIMIT,
 ) -> RunDiagnosticsResponse:
-    """Open Landscape from web settings and return a bounded run snapshot."""
+    """Open Landscape from web settings and return a bounded run snapshot.
+
+    ``landscape_run_id`` is the raw link from the sessions run row — ``None``
+    when the engine has not admitted the run to Landscape. That distinction is
+    what makes a missing store file classifiable: a linked run's store existed
+    when the link was written, so its absence is evidence loss and raises
+    :class:`RunDiagnosticsAuditUnavailableError`; an unlinked run has nothing
+    recorded yet, so the empty projection is the honest answer (and querying
+    would create an empty audit database on fresh deployments). The service
+    links the run row moments before it opens the store for writing, so a
+    poll racing that window sees a retryable 503 rather than a false clean.
+    """
+    effective_landscape_run_id = landscape_run_id or run_id
     landscape_url = settings.get_landscape_url()
     if _sqlite_database_file_missing(landscape_url):
+        if landscape_run_id is not None:
+            raise RunDiagnosticsAuditUnavailableError(landscape_run_id=landscape_run_id, landscape_url=landscape_url)
         return _empty_diagnostics(
             run_id=run_id,
-            landscape_run_id=landscape_run_id,
+            landscape_run_id=effective_landscape_run_id,
             run_status=run_status,
             cancel_requested=cancel_requested,
             limit=limit,
@@ -165,7 +450,7 @@ def load_run_diagnostics_for_settings(
         return load_run_diagnostics_from_db(
             db,
             run_id=run_id,
-            landscape_run_id=landscape_run_id,
+            landscape_run_id=effective_landscape_run_id,
             run_status=run_status,
             cancel_requested=cancel_requested,
             limit=limit,
@@ -196,10 +481,7 @@ def load_run_diagnostics_from_db(
                 tokens_table.c.token_id,
                 tokens_table.c.row_id,
                 rows_table.c.row_index,
-                tokens_table.c.branch_name,
-                tokens_table.c.fork_group_id,
                 tokens_table.c.join_group_id,
-                tokens_table.c.expand_group_id,
                 tokens_table.c.step_in_pipeline,
                 tokens_table.c.created_at,
                 token_outcomes_table.c.outcome.label("terminal_outcome"),
@@ -226,6 +508,25 @@ def load_run_diagnostics_from_db(
         )
         token_rows = list(conn.execute(token_stmt))
         token_ids = tuple(row.token_id for row in token_rows)
+
+        lineage_by_token: dict[str, list[RunDiagnosticLineageFrame]] = {token_id: [] for token_id in token_ids}
+        if token_ids:
+            lineage_stmt = (
+                select(
+                    token_lineage_frames_table.c.token_id,
+                    token_lineage_frames_table.c.depth,
+                    token_lineage_frames_table.c.kind,
+                    token_lineage_frames_table.c.group_id,
+                    token_lineage_frames_table.c.member_key,
+                )
+                .where(token_lineage_frames_table.c.run_id == landscape_run_id)
+                .where(token_lineage_frames_table.c.token_id.in_(token_ids))
+                .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
+            )
+            for frame_row in conn.execute(lineage_stmt):
+                lineage_by_token[frame_row.token_id].append(
+                    RunDiagnosticLineageFrame(kind=frame_row.kind, group_id=frame_row.group_id, member_key=frame_row.member_key)
+                )
 
         states_by_token: dict[str, list[RunDiagnosticNodeState]] = {token_id: [] for token_id in token_ids}
         if token_ids:
@@ -336,9 +637,91 @@ def load_run_diagnostics_from_db(
         failure_detail: RunDiagnosticFailureDetail | None = None
         if failure_row is not None:
             failed_at = failure_row.completed_at or failure_row.started_at
+            failure_node_id = failure_row.node_id
+
+            # Attribution: operations.node_id names the node OWNING the
+            # operation scope, not the node that raised. A source_load scope
+            # spans the whole row loop, so a transform crash propagating up
+            # through it lands on an operation row carrying the SOURCE node
+            # (elspeth-8e5cc5ced0). The failed node_state written by
+            # NodeStateGuard carries the true raising node, so prefer it.
+            # Queried independently of the preview-limited token query above:
+            # the failing token may sort outside the preview window.
+            #
+            # But ONLY when that state is the operation's own cause. "Latest
+            # failed node_state" is a positional guess, not a causal link, and
+            # a run can hold a failed state that never failed the run at all —
+            # a row diverted by on_error, say — while the operation aborted for
+            # an unrelated reason. Attributing the source's own crash to a
+            # discarded row's transform is the original defect in the opposite
+            # direction. There is no persisted operation->state linkage to join
+            # on, so correlate on the recorded error: both sides render the
+            # SAME exception through the audit scrubber, so the state's message
+            # appears verbatim in operations.error_message when it is the cause.
+            # No correlated state => keep the operation's owner, which is at
+            # least the scope that aborted.
+            failed_state_stmt = (
+                select(
+                    node_states_table.c.node_id,
+                    node_states_table.c.completed_at,
+                    node_states_table.c.error_json,
+                )
+                .where(
+                    and_(
+                        node_states_table.c.run_id == landscape_run_id,
+                        node_states_table.c.status == "failed",
+                    )
+                )
+                .order_by(
+                    node_states_table.c.completed_at.desc().nulls_last(),
+                    node_states_table.c.started_at.desc(),
+                    node_states_table.c.state_id.asc(),
+                )
+                .limit(_FAILED_STATE_CORRELATION_SCAN_LIMIT)
+            )
+            # Rank the correlated states; do not take the first one found. One
+            # exception can terminalize several nodes' states with the same
+            # message — a failsink boundary failure terminalizes the failsink
+            # states that raised AND the primary divert anchors that did not
+            # (executors/sink.py, elspeth-2a75af7f8f) — and a substring match
+            # can correlate a state that shares no exception at all, so the
+            # scan's recency order alone picks whichever was written last,
+            # which need not be the raiser.
+            #
+            # Ordering, strongest term first: the operation's OWN node recorded
+            # a correlating failure; the candidate is the operation's whole
+            # message rather than a fragment of it; the candidate is longer,
+            # so the more specific match; then scan order, which leaves
+            # equally-specific candidates resolved by recency as before.
+            #
+            # Matching the operation's node is positive evidence when present;
+            # its ABSENCE is not evidence, because for a scope-owning operation
+            # (source_load) no failed state carries the source's node at all —
+            # the case this correlation was built for. So no term can be
+            # settled early and the scan runs to completion: a node match found
+            # first is not evidence that no better candidate follows it.
+            correlated_state = None
+            correlated_rank: tuple[bool, bool, int] | None = None
+            for failed_state_row in conn.execute(failed_state_stmt):
+                candidate = _node_state_error_correlating_exception(failed_state_row.error_json, failure_row.error_message)
+                if candidate is None:
+                    continue
+                rank = (
+                    failed_state_row.node_id == failure_row.node_id,
+                    candidate == failure_row.error_message,
+                    len(candidate),
+                )
+                if correlated_rank is None or rank > correlated_rank:
+                    correlated_state = failed_state_row
+                    correlated_rank = rank
+            if correlated_state is not None:
+                failure_node_id = correlated_state.node_id
+                if correlated_state.completed_at is not None:
+                    failed_at = correlated_state.completed_at
+
             failure_detail = RunDiagnosticFailureDetail(
                 operation_id=failure_row.operation_id,
-                node_id=failure_row.node_id,
+                node_id=failure_node_id,
                 operation_type=failure_row.operation_type,
                 error_message=failure_row.error_message,
                 failed_at=failed_at,
@@ -388,6 +771,48 @@ def load_run_diagnostics_from_db(
                 )
             )
 
+        # Source-validation discards (elspeth-43f52d69a4). A row discarded at
+        # source validation was never admitted: no rows entry, no token, no
+        # node_state, and the source_load operation COMPLETES — so every
+        # token- and operation-anchored query above is structurally blind to
+        # it, and failure_detail (which requires a FAILED operation) is the
+        # wrong carrier. validation_errors is the one table holding the
+        # reason; project it directly, scoped to the 'discard' sentinel —
+        # a quarantined row (destination = a sink name) has a token trail
+        # that already discloses its reason through `tokens`.
+        discard_count = int(
+            conn.execute(
+                select(func.count())
+                .select_from(validation_errors_table)
+                .where(validation_errors_table.c.run_id == landscape_run_id)
+                .where(validation_errors_table.c.destination == DISCARD_DESTINATION)
+            ).scalar_one()
+        )
+        discards: list[RunDiagnosticDiscard] = []
+        if discard_count:
+            discard_stmt = (
+                select(
+                    validation_errors_table.c.node_id,
+                    validation_errors_table.c.schema_mode,
+                    validation_errors_table.c.error,
+                    validation_errors_table.c.created_at,
+                )
+                .where(validation_errors_table.c.run_id == landscape_run_id)
+                .where(validation_errors_table.c.destination == DISCARD_DESTINATION)
+                .order_by(validation_errors_table.c.created_at.asc(), validation_errors_table.c.error_id.asc())
+                .limit(preview_limit)
+            )
+            discards = [
+                RunDiagnosticDiscard(
+                    stage="source_validation",
+                    node_id=row.node_id,
+                    schema_mode=row.schema_mode,
+                    error=row.error,
+                    created_at=row.created_at,
+                )
+                for row in conn.execute(discard_stmt)
+            ]
+
         latest_candidates: list[datetime | None] = [
             conn.execute(select(func.max(tokens_table.c.created_at)).where(tokens_table.c.run_id == landscape_run_id)).scalar_one_or_none(),
             conn.execute(
@@ -419,6 +844,7 @@ def load_run_diagnostics_from_db(
             token_count=token_count,
             preview_limit=preview_limit,
             preview_truncated=token_count > preview_limit,
+            discard_count=discard_count,
             state_counts=state_counts,
             operation_counts=operation_counts,
             latest_activity_at=_max_datetime(latest_candidates),
@@ -428,10 +854,8 @@ def load_run_diagnostics_from_db(
                 token_id=row.token_id,
                 row_id=row.row_id,
                 row_index=row.row_index,
-                branch_name=row.branch_name,
-                fork_group_id=row.fork_group_id,
+                lineage=lineage_by_token[row.token_id],
                 join_group_id=row.join_group_id,
-                expand_group_id=row.expand_group_id,
                 step_in_pipeline=row.step_in_pipeline,
                 created_at=row.created_at,
                 terminal_outcome=row.terminal_outcome,
@@ -441,5 +865,6 @@ def load_run_diagnostics_from_db(
         ],
         operations=operations,
         artifacts=artifacts,
+        discards=discards,
         failure_detail=failure_detail,
     )

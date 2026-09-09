@@ -20,6 +20,7 @@
 // ============================================================================
 
 import { useState, useEffect, useMemo } from "react";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import * as api from "@/api/client";
 import type { ApiError } from "@/types/index";
@@ -58,6 +59,14 @@ export function YamlView() {
   const setExportedYamlBlobBinding = useSessionStore(
     (s) => s.setExportedYamlBlobBinding,
   );
+  const storedBlobBinding = useSessionStore(
+    (s) => s.exportedYamlBlobBinding,
+  );
+  const blobBinding =
+    storedBlobBinding !== null &&
+    storedBlobBinding.sessionId === activeSessionId
+      ? storedBlobBinding
+      : null;
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
   const proposalActionPendingIds = useSessionStore(
     (s) => s.proposalActionPendingIds,
@@ -83,6 +92,11 @@ export function YamlView() {
   const hasPipelineContent = hasCompositionContent(compositionState);
 
   useEffect(() => {
+    // The sidecar is valid only for the exact YAML returned by the most recent
+    // successful export. Any new export inputs invalidate the prior pair
+    // immediately, including while the replacement request is in flight.
+    setExportedYamlBlobBinding(null);
+
     if (!activeSessionId || version === null || !hasPipelineContent) {
       setYaml(null);
       setYamlError(null);
@@ -122,6 +136,7 @@ export function YamlView() {
           setYaml(null);
           setYamlError(describeYamlFetchError(error));
           setIsLoading(false);
+          setExportedYamlBlobBinding(null);
         }
       });
 
@@ -147,30 +162,30 @@ export function YamlView() {
             </span>
           ) : (
             <span className="tool-call-actions">
-              <button
-                type="button"
-                className="btn btn-primary btn-small"
+              <Button
+                variant="primary"
+                className="btn-small"
                 disabled={pendingYamlProposalIsBusy}
                 onClick={() => void acceptProposal(pendingYamlProposal.id)}
                 aria-label={`Accept YAML proposal: ${pendingYamlProposal.summary}`}
               >
                 Accept
-              </button>
-              <button
-                type="button"
-                className="btn btn-danger btn-small"
+              </Button>
+              <Button
+                variant="danger"
+                className="btn-small"
                 disabled={pendingYamlProposalIsBusy}
                 onClick={() => setRejectConfirmId(pendingYamlProposal.id)}
                 aria-label={`Reject YAML proposal: ${pendingYamlProposal.summary}`}
               >
                 Reject
-              </button>
+              </Button>
             </span>
           )}
         </div>
         {rejectConfirmId !== null && (
           <ConfirmDialog
-            title="Reject this YAML proposal?"
+            title="Reject YAML proposal"
             message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
             confirmLabel="Reject proposal"
             cancelLabel="Keep open"
@@ -187,6 +202,17 @@ export function YamlView() {
 
   // Empty state
   if (!compositionState || version === null || !hasPipelineContent) {
+    if (pendingYamlProposal !== null) {
+      return (
+        <div className="yaml-view">
+          {pendingYamlProposalPanel}
+          <div className="empty-state">
+            This pipeline proposal has not been applied yet. Review and accept
+            it to generate the authoritative YAML here.
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="empty-state">
         YAML will appear here once your pipeline has components.
@@ -236,6 +262,21 @@ export function YamlView() {
   return (
     <div className="yaml-view">
       {pendingYamlProposalPanel}
+      <div className="yaml-modal-note" data-testid="yaml-export-scope-note">
+        This is the pipeline definition only. Deployment-owned configuration —
+        including the <code>landscape</code> audit destination — is supplied by
+        the environment at run time and is never written here.
+      </div>
+      {blobBinding !== null && (
+        <div
+          className="yaml-modal-note yaml-modal-note--warn"
+          data-testid="yaml-export-blob-note"
+        >
+          Source data is session-bound: this pipeline reads an uploaded file
+          held in this session, so the path is not in the YAML. To run it
+          elsewhere, bind an uploaded file on import.
+        </div>
+      )}
       <YamlDisplay
         yaml={yaml}
         filename={`pipeline-v${compositionState?.version ?? 1}.yaml`}

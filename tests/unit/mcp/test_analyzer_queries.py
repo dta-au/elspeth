@@ -37,7 +37,9 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAttemptRequest
 from elspeth.core.landscape.lineage import explain
 from elspeth.mcp.analyzer import LandscapeAnalyzer
@@ -51,10 +53,12 @@ from elspeth.mcp.analyzers.queries import (
     list_operations,
     list_rows,
     list_runs,
+    list_tokens,
 )
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.mcp.types import ErrorResult
 from tests.fixtures.landscape import (
+    leader_coordination_token,
     make_factory,
     make_landscape_db,
     make_recorder_with_run,
@@ -158,7 +162,7 @@ def _build_linear_pipeline(
 
     if complete_run:
         status = RunStatus.FAILED if fail_transform else RunStatus.COMPLETED
-        factory.run_lifecycle.complete_run(run_id, status)
+        factory.run_lifecycle.complete_run(status, coordination_token=leader_coordination_token(factory, run_id))
 
     return {
         "db": db,
@@ -251,9 +255,12 @@ def test_get_sink_effect_history_exposes_recovery_state_without_provider_bodies(
                 action=SinkEffectAttemptAction.COMMIT,
                 call_kind=CallType.FILESYSTEM,
                 request_hash="f" * 64,
-            )
+            ),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
         )
-        lost = factory.execution.sink_effects.mark_response_lost(attempt.attempt_id)
+        lost = factory.execution.sink_effects.mark_response_lost(
+            attempt.attempt_id, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
         history = get_sink_effect_history(db, factory, effect.effect_id)
 
@@ -276,6 +283,33 @@ def test_get_sink_effect_history_exposes_recovery_state_without_provider_bodies(
 # ===========================================================================
 # explain_token tests — via underlying explain() function
 # ===========================================================================
+
+
+class TestListTokensLineagePath:
+    """Pins list_tokens' lineage_path projection and derived legacy names (ruling 21)."""
+
+    def test_list_tokens_projects_lineage_path_and_derived_names(self) -> None:
+        setup = make_recorder_with_run(run_id="run-fork-lineage", source_node_id="src")
+        db, factory, run_id = setup.db, setup.factory, setup.run_id
+
+        row = factory.data_flow.create_row(run_id, "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token(
+            row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+        )
+
+        records = list_tokens(db, factory, run_id=run_id, row_id=None, limit=50)
+        fork_children = [r for r in records if r["lineage_path"]]
+        assert fork_children, "fork run must project frames"
+        for record in fork_children:
+            frame = record["lineage_path"][0]
+            assert frame["depth"] == 0
+            assert frame["kind"] == "fork"
+            # ruling 21 (ratified): legacy names stay on the wire, DERIVED from the path.
+            assert record["branch_name"] == frame["member_key"]
+            assert record["fork_group_id"] == frame["group_id"]
+            assert record["expand_group_id"] is None
+            assert "join_group_id" in record
 
 
 class TestExplainTokenLineage:
@@ -385,7 +419,7 @@ class TestExplainTokenLineage:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="b" * 64,
         )
-        factory.run_lifecycle.complete_run(run_id, RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
 
         result = explain(factory.query, factory.data_flow, run_id, token_id=token.token_id)
 
@@ -518,7 +552,7 @@ class TestGetFailureContext:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="c" * 64,
         )
-        factory.run_lifecycle.complete_run("terr-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "terr-run"))
 
         result = get_failure_context(db, factory, "terr-run")
 
@@ -543,7 +577,7 @@ class TestGetFailureContext:
             "observed",
             "quarantine",
         )
-        factory.run_lifecycle.complete_run("verr-run", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "verr-run"))
 
         result = get_failure_context(db, factory, "verr-run")
 
@@ -597,7 +631,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="d" * 64,
         )
-        factory.run_lifecycle.complete_run("retry-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "retry-run"))
 
         result = get_failure_context(db, factory, "retry-run")
 
@@ -640,7 +674,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="e" * 64,
         )
-        factory.run_lifecycle.complete_run("first-retry-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "first-retry-run"))
 
         result = get_failure_context(db, factory, "first-retry-run")
 
@@ -684,7 +718,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="e" * 64,
         )
-        factory.run_lifecycle.complete_run("run-X", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-X"))
 
         # Run Y: same node_id "xform" but different plugin "field_mapper"
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-Y")
@@ -707,7 +741,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="f" * 64,
         )
-        factory.run_lifecycle.complete_run("run-Y", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Y"))
 
         # Query run-X failure context
         result_x = get_failure_context(db, factory, "run-X")
@@ -749,7 +783,7 @@ class TestGetFailureContext:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("run-P", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-P"))
 
         # Run Q: same node_id "xform" but "fast_transform"
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-Q")
@@ -771,7 +805,7 @@ class TestGetFailureContext:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="b" * 64,
         )
-        factory.run_lifecycle.complete_run("run-Q", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Q"))
 
         result_p = get_failure_context(db, factory, "run-P")
         assert len(result_p["transform_errors"]) == 1  # type: ignore[typeddict-item]  # FailureContextReport variant
@@ -806,7 +840,7 @@ class TestGetFailureContext:
                 error_hash="a" * 64,
             )
 
-        factory.run_lifecycle.complete_run("limit-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "limit-run"))
 
         result = get_failure_context(db, factory, "limit-run", limit=2)
 
@@ -856,7 +890,7 @@ class TestGetFailureContext:
             error_hash="b" * 64,
         )
 
-        factory.run_lifecycle.complete_run("pattern-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "pattern-run"))
 
         result = get_failure_context(db, factory, "pattern-run")
 
@@ -974,7 +1008,7 @@ class TestGetRunSummary:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("err-run", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "err-run"))
 
         result = get_run_summary(db, factory, "err-run")
 
@@ -1080,7 +1114,7 @@ class TestGetRunSummary:
             error_hash="c" * 64,
         )
 
-        factory.run_lifecycle.complete_run("dist-run", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "dist-run"))
 
         result = get_run_summary(db, factory, "dist-run")
 
@@ -1114,7 +1148,7 @@ class TestListRuns:
         """list_runs returns runs in the database."""
         setup = make_recorder_with_run(run_id="list-run-1")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("list-run-1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "list-run-1"))
 
         result = list_runs(setup.db, factory)
 
@@ -1126,7 +1160,7 @@ class TestListRuns:
         """list_runs filters by status when provided."""
         setup = make_recorder_with_run(run_id="filter-run")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("filter-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "filter-run"))
 
         # Should find it with "failed" filter
         result = list_runs(setup.db, factory, status="failed")
@@ -1213,7 +1247,7 @@ class TestFailureContextCorruptionGuards:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("corrupt-te", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-te"))
 
         _delete_node(db, "corrupt-te", "xform")
 
@@ -1226,7 +1260,7 @@ class TestFailureContextCorruptionGuards:
         db, factory = setup.db, setup.factory
 
         factory.data_flow.record_validation_error("corrupt-ve", "src", {"bad": "data"}, "missing field", "observed", "quarantine")
-        factory.run_lifecycle.complete_run("corrupt-ve", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "corrupt-ve"))
 
         _delete_node(db, "corrupt-ve", "src")
 
@@ -1272,7 +1306,7 @@ class TestErrorAnalysisCorruptionGuard:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("corrupt-ea", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-ea"))
 
         _delete_node(db, "corrupt-ea", "xform")
 
@@ -1302,7 +1336,7 @@ class TestErrorAnalysisCorruptionGuard:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("clean-ea", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "clean-ea"))
 
         result = get_error_analysis(db, factory, "clean-ea")
 
@@ -1321,7 +1355,7 @@ class TestExplainTokenErrorHandling:
         """explain_token returns ErrorResult when neither token_id nor row_id given."""
         setup = make_recorder_with_run(run_id="et-err")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("et-err", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "et-err"))
 
         # Use the analyzer facade directly (not the underlying function)
         analyzer = LandscapeAnalyzer.__new__(LandscapeAnalyzer)
@@ -1357,7 +1391,7 @@ class TestExplainTokenErrorHandling:
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink_b",
         )
-        factory.run_lifecycle.complete_run("et-ambig", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "et-ambig"))
 
         analyzer = LandscapeAnalyzer.__new__(LandscapeAnalyzer)
         analyzer._db = db
@@ -1381,7 +1415,7 @@ class TestQueryDuplicateColumns:
 
         setup = make_recorder_with_run(run_id="dup-col")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("dup-col", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "dup-col"))
 
         # Self-join produces duplicate column names (e.g., run_id, run_id)
         sql = "SELECT a.run_id, b.run_id FROM runs a, runs b WHERE a.run_id = b.run_id"
@@ -1395,7 +1429,7 @@ class TestQueryDuplicateColumns:
 
         setup = make_recorder_with_run(run_id="alias-col")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("alias-col", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "alias-col"))
 
         sql = "SELECT a.run_id AS a_run_id, b.run_id AS b_run_id FROM runs a, runs b WHERE a.run_id = b.run_id"
         results = query(setup.db, factory, sql)
@@ -1511,6 +1545,75 @@ class TestListCollisions:
         results = list_collisions(setup.db, setup.factory, "nonexistent-run")
 
         assert results == []
+
+    def test_branch_only_collision_records_remain_queryable_without_value_material(self) -> None:
+        """New collision records expose branches and winner, never value fingerprints."""
+        from sqlalchemy import text
+
+        from elspeth.mcp.analyzers.queries import list_collisions
+
+        setup = make_recorder_with_run(run_id="branch-only")
+        register_test_node(
+            setup.factory.data_flow,
+            "branch-only",
+            "coalesce-node",
+            node_type=NodeType.COALESCE,
+            plugin_name="coalesce:merge",
+        )
+        row = setup.factory.data_flow.create_row(
+            "branch-only",
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        token = setup.factory.data_flow.create_token(row.row_id)
+        state = setup.factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            "branch-only",
+            step_index=1,
+            input_data={"x": 1},
+        )
+        context_json = json.dumps(
+            {
+                "union_field_collisions": {"score": ["branch1", "branch2"]},
+                "union_field_origins": {"score": "branch2"},
+            }
+        )
+        with setup.db.write_connection() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE node_states
+                    SET status = :status,
+                        completed_at = datetime('now'),
+                        context_after_json = :context_after
+                    WHERE state_id = :state_id
+                    """
+                ),
+                {
+                    "state_id": state.state_id,
+                    "status": NodeStateStatus.COMPLETED.value,
+                    "context_after": context_json,
+                },
+            )
+
+        results = list_collisions(setup.db, setup.factory, "branch-only")
+
+        assert len(results) == 1
+        [field] = results[0]["collision_fields"]
+        assert field == {
+            "field": "score",
+            "contributing_branches": ["branch1", "branch2"],
+            "winner_branch": "branch2",
+            "winner_value_fingerprint": None,
+            "competing_value_fingerprints": [],
+        }
+        serialized = json.dumps(results, sort_keys=True)
+        assert "value_hash" not in serialized
+        assert "value_type" not in serialized
 
     def test_matches_plain_coalesce_plugin_name(self) -> None:
         """list_collisions must find collisions with plain 'coalesce' plugin_name.
@@ -1702,6 +1805,7 @@ class TestListCollisions:
         assert winner_fingerprint is not None
         _assert_value_fingerprint(winner_fingerprint, value_type="int")
         competing = score_field["competing_value_fingerprints"]
+        assert score_field["contributing_branches"] == ["branch1", "branch2"]
         assert [branch for branch, _fingerprint in competing] == ["branch1", "branch2"]
         assert competing[0][1]["value_hash"] != competing[1][1]["value_hash"]
 

@@ -26,7 +26,8 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.schema import FieldDefinition
+from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.knob_schema import KnobSchema
 from elspeth.web.composer._producer_resolver import source_producer_id
 from elspeth.web.composer.guided._display import plugin_display_label
@@ -52,7 +53,10 @@ from elspeth.web.composer.guided.protocol import (
     _WireSchemaField,
     _WireSourceReview,
     _WireStructuredOutputField,
+    node_options_summary,
 )
+from elspeth.web.composer.guided.stage_transitions import source_plugin_accepts_blob_inspection
+from elspeth.web.composer.guided.state_machine import reviewed_component_ledger
 from elspeth.web.composer.tools._common import _semantic_contracts_payload
 
 if TYPE_CHECKING:
@@ -61,7 +65,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved, SourceResolved
     from elspeth.web.composer.guided.state_machine import GuidedSession, SourceIntent
     from elspeth.web.composer.source_inspection import SourceInspectionFacts
-    from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.web.composer.state import CompositionState, SourceSpec, ValidationSummary
 
 
 def build_initial_step_1_turn(
@@ -177,6 +181,11 @@ def _merge_inspection_into_prefill(
         if fields is not None:
             prefilled["schema"] = {"mode": "flexible", "fields": fields}
         else:
+            # Deliberately NO observed+guaranteed_fields fallback here (John's
+            # ruling, 2026-08-27): guided inspection works from a USER-PROVIDED
+            # (uploaded/path-bound) source, so its header is a SAMPLE — it may
+            # feed the ask-the-user interpretation flow (elspeth-da68332faf
+            # work item 2), never a silent guarantee prefill.
             prefilled["schema"] = {"mode": "observed"}
     elif facts.observed_headers:
         prefilled["schema"] = {"mode": "observed"}
@@ -255,6 +264,7 @@ def build_step_2_single_select_turn(
         "question": "What format should the output be in?",
         "options": options,
         "allow_custom": False,
+        "source_blob_compatible_option_ids": [],
     }
     return Turn(
         type=TurnType.SINGLE_SELECT.value,
@@ -289,10 +299,15 @@ def build_step_2_schema_form_turn(
     prefilled: dict[str, Any] = {"schema": {"mode": "observed"}}
     if prefilled_options is not None:
         prefilled.update(deep_thaw(prefilled_options))
+    # Seed the wrapper knob's default only when the staged chat-resolution
+    # options did not carry one: an explicit first-wins choice, not a hidden
+    # missing-key recovery — the form renders the value for operator review.
+    if "on_write_failure" not in prefilled:
+        prefilled["on_write_failure"] = "discard"
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": plugin,
-        "knobs": cast(KnobSchema, schema_info.knob_schema),
+        "knobs": _sink_knobs_with_write_failure(cast(KnobSchema, schema_info.knob_schema)),
         "prefilled": prefilled,
     }
     return Turn(
@@ -300,6 +315,29 @@ def build_step_2_schema_form_turn(
         step_index=_step_index(GuidedStep.STEP_2_SINK),
         payload=payload,
     )
+
+
+def _sink_knobs_with_write_failure(knobs: KnobSchema) -> KnobSchema:
+    """Expose the sink wrapper's write-failure route beside plugin knobs."""
+
+    fields = list(knobs["fields"])
+    if not any(field["name"] == "on_write_failure" for field in fields):
+        fields.append(
+            {
+                "name": "on_write_failure",
+                "label": "On Write Failure",
+                "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
+                "kind": "text",
+                # ``tier`` is required on KnobField; "common" matches the
+                # catalog's own wrapper-synthesized knobs, so this core
+                # write-failure route renders untucked like every required
+                # wrapper knob instead of shipping an untiered projection.
+                "tier": "common",
+                "required": False,
+                "nullable": False,
+            }
+        )
+    return {"fields": fields}
 
 
 def build_component_review_turn(
@@ -328,6 +366,10 @@ def build_component_review_turn(
     if len(order) > 1:
         actions.append("remove")
     actions.extend(("reorder", "finish"))
+    # One derivation for the card and the wire ledger: the same entries this
+    # card publishes are what ``reviewed_components`` carries on every guided
+    # response (guided_replay.project_reviewed_components), so the two
+    # surfaces cannot name different components, orders, or plugins.
     return Turn(
         type=TurnType.REVIEW_COMPONENTS.value,
         step_index=_step_index(expected_step),
@@ -335,18 +377,35 @@ def build_component_review_turn(
             "component_kind": component_kind,
             "items": [
                 {
-                    "stable_id": stable_id,
-                    "name": reviewed[stable_id].name,
-                    "plugin": reviewed[stable_id].plugin,
-                    "status": "reviewed",
+                    "stable_id": entry.stable_id,
+                    "name": entry.name,
+                    "plugin": entry.plugin,
+                    "status": entry.status,
                 }
-                for stable_id in order
+                for entry in reviewed_component_ledger(guided, component_kind)
             ],
             "allowed_actions": actions,
         },
     )
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "reviewed source options carried on SourceResolved: free-form plugin configuration authored through "
+        "the composer (planner tool calls or the schema_form), stored verbatim and never schema-validated by "
+        "the composer, so 'blob_ref' and 'path' presence and shape are not guaranteed here"
+    ),
+    source_param="source",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "renders the authored options into the schema_form prefill unchanged (still externally authored, for "
+        "the form and downstream validation to adjudicate) except that a blob-backed source's absolute "
+        "storage path is masked behind the stable blob:<ref> sentinel — only when both 'blob_ref' is present "
+        "and 'path' is a string, so an operator-typed path knob is left untouched; absence of either is a "
+        "normal non-blob shape, and this emitter never raises on malformed source options"
+    ),
+)
 def build_step_1_schema_form_turn_from_resolved(
     source: SourceResolved,
     catalog: CatalogServiceProtocol,
@@ -414,7 +473,7 @@ def build_step_2_schema_form_turn_from_resolved(
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": output.plugin,
-        "knobs": cast(KnobSchema, schema_info.knob_schema),
+        "knobs": _sink_knobs_with_write_failure(cast(KnobSchema, schema_info.knob_schema)),
         "prefilled": prefilled,
     }
     return Turn(
@@ -430,9 +489,19 @@ def build_step_2_multi_select_turn(
     """Build a ``multi_select_with_custom`` Turn for declaring required fields.
 
     Emitted after the user fills in sink options (Step 2 ``schema_form``).
-    The options are pre-populated from Step 1's observed columns; the user
-    ticks which fields must appear in the output, adds custom fields, or
-    clicks the escape label to let the source decide.
+    The options are Step 1's observed columns; the user ticks which fields
+    must be present on every output row, adds custom fields, or clicks the
+    escape label to let the source decide.
+
+    Nothing is pre-pinned (``default_chosen`` is empty; design review
+    2026-09-02 I-3). This turn runs before any transform exists, so the
+    fields the pipeline is about to produce are never among its options, and
+    a pre-ticked source column made the one-click answer assert a per-row
+    presence contract derived from a bounded inspection sample — the
+    "validation theatre" elspeth-1318049ffe rejects. Pass-through is the
+    designed default; pinning is a deliberate tick. What "keep" means once a
+    field is pinned is adjudicated in
+    docs/plans/2026-08-19-invert-guided-sink-field-keep.md and unchanged here.
 
     ``escape_label`` wire contract (elspeth-948eb9c0b8 C-3(a)): clicking the
     escape action MUST submit ``control_signal: "passthrough"`` (see
@@ -458,7 +527,7 @@ def build_step_2_multi_select_turn(
     payload: MultiSelectWithCustomPayload = {
         "question": "Which fields must appear in the output?",
         "options": options,
-        "default_chosen": list(observed_columns),
+        "default_chosen": [],
         "escape_label": "Let source decide (pass all fields through)",
     }
     return Turn(
@@ -507,22 +576,39 @@ def build_step_4_wire_turn(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored output plugin options, including an absent or malformed schema declaration",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "observes only; projects field definitions through the canonical schema parser and omits the "
+        "field list when schema parsing rejects it; independent CompositionState validation records "
+        "invalid schema declarations as blockers rather than permitting confirmation"
+    ),
+)
 def _wire_schema(options: Mapping[str, Any]) -> _WireBusinessSchema:
-    """Project only the business schema, never adjacent path/secret options."""
+    """Project only the business schema, never adjacent path/secret options.
+
+    The candidate's plugin options remain externally authored, including on
+    invalid proposals. Use the same schema parser as CompositionState's schema
+    syntax validation so supported field spellings cannot disappear from review.
+    Invalid schemas contribute no parsed fields here; the wire turn separately
+    carries validation blockers and derives ``can_confirm`` from that validation.
+    """
 
     raw = options.get("schema", options.get("schema_config", {}))
     schema = raw if isinstance(raw, Mapping) else {}
     fields: list[_WireSchemaField] = []
-    raw_fields = schema.get("fields")
-    if isinstance(raw_fields, Sequence) and not isinstance(raw_fields, str | bytes):
-        for field in raw_fields:
-            if not isinstance(field, str | Mapping):
-                continue
-            try:
-                parsed = FieldDefinition.parse(field)
-            except ValueError:
-                continue
-            fields.append(cast(_WireSchemaField, parsed.to_dict()))
+    try:
+        parsed = SchemaConfig.from_dict(schema)
+    except ValueError:
+        # Presentation does not turn a rejected declaration into valid fields.
+        # build_step_4_wire_turn publishes the separate validation failure.
+        pass
+    else:
+        if parsed.fields is not None:
+            fields = [cast(_WireSchemaField, field.to_dict()) for field in parsed.fields]
 
     def names(key: str) -> list[str]:
         value = schema.get(key)
@@ -539,8 +625,24 @@ def _wire_schema(options: Mapping[str, Any]) -> _WireBusinessSchema:
     }
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored llm node plugin options (free-form Tier-3 payload, never schema-validated by the composer)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "observes only; skips any query or output-field entry whose shape it "
+        "cannot read and returns the fields it could project, never raising on "
+        "a malformed options payload"
+    ),
+)
 def _structured_output_fields(options: Mapping[str, Any]) -> list[_WireStructuredOutputField]:
-    """Return typed LLM result fields without prompts, templates, or values."""
+    """Return typed LLM result fields without prompts, templates, or values.
+
+    Same Tier-3 provenance as :func:`_wire_schema`: ``options`` is the llm
+    node's free-form ``NodeSpec.options``, stored verbatim by the composer and
+    validated only by the plugin at execution time.
+    """
 
     queries = options.get("queries")
     if isinstance(queries, Mapping):
@@ -580,27 +682,70 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
         return {"input": "batch", "output": "zero_or_many", "expected_output_count": None}
     if node.node_type == "coalesce":
         return {"input": "branches", "output": "one_per_branch_set", "expected_output_count": None}
+    if node.node_type == "row_union":
+        return {"input": "branches", "output": "one_per_branch", "expected_output_count": None}
     if node.node_type == "queue":
         return {"input": "many_producers", "output": "one_per_item", "expected_output_count": None}
     if node.node_type == "gate":
         return {"input": "one", "output": "one", "expected_output_count": None}
+    if node.node_type == "collector":
+        # A collector buffers its opener's whole EXPAND group and runs its
+        # batch-aware plugin once over the members — the same batch-in shape
+        # as an aggregation, with the plugin free to emit any row count.
+        return {"input": "batch", "output": "zero_or_many", "expected_output_count": None}
+    if node.node_type != "transform":
+        # Typed fail-closed dispatch: the arms above are exhaustive for the
+        # guided lane's node kinds, and the fall-through below is the
+        # TRANSFORM arm — any future kind must never silently render a
+        # transform-shaped cardinality claim.
+        raise InvariantError(f"wire projection has no row-cardinality arm for node kind {node.node_type!r}")
     if executable_node.plugin is None:
         raise InvariantError("wire projection transform lost its plugin")
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 
-    transform = get_shared_plugin_manager().create_transform(
-        executable_node.plugin,
-        prepare_validation_probe_options(executable_node.options),
-    )
-    output: Literal["one", "zero_or_one", "zero_or_many"]
-    if transform.creates_tokens:
-        output = "zero_or_many"
-    elif transform.can_drop_rows:
-        output = "zero_or_one"
+    # Function-local like its neighbours above: ``state`` imports this package
+    # (``guided.state_machine``) at module level, so the reverse edge stays
+    # deferred. One taxonomy — the wire review tolerates exactly the draft
+    # configs /validate does, e.g. operator-profile options never lowered
+    # because authored validation already errs.
+    from elspeth.web.composer.state import _is_config_probe_exception
+
+    try:
+        transform = get_shared_plugin_manager().create_transform(
+            executable_node.plugin,
+            prepare_validation_probe_options(executable_node.options, plugin=executable_node.plugin),
+        )
+    except Exception as exc:
+        if not _is_config_probe_exception(exc):
+            raise
+        # Conservative fallback: render the weakest honest row-cardinality
+        # claim instead of crashing the whole wire review over a config the
+        # validation summary already reports as unrunnable.
+        return {"input": "one", "output": "zero_or_many", "expected_output_count": None}
+    try:
+        output: Literal["one", "zero_or_one", "zero_or_many"]
+        if transform.creates_tokens:
+            output = "zero_or_many"
+        elif transform.can_drop_rows:
+            output = "zero_or_one"
+        else:
+            output = "one"
+    except BaseException as primary_exc:
+        try:
+            transform.close()
+        except BaseException as cleanup_exc:
+            primary_exc.add_note(f"transform.close failed during cardinality inspection: {type(cleanup_exc).__name__}")
+        raise
     else:
-        output = "one"
-    return {"input": "one", "output": output, "expected_output_count": None}
+        transform.close()
+        return {"input": "one", "output": output, "expected_output_count": None}
+
+
+def _source_cardinality(source: SourceSpec) -> _WireRowCardinality:
+    if source.plugin == "llm":
+        return {"input": "none", "output": "zero_or_one", "expected_output_count": None}
+    return {"input": "none", "output": "zero_or_many", "expected_output_count": None}
 
 
 def _build_wire_projection(
@@ -641,7 +786,7 @@ def _build_wire_projection(
             "plugin": source.plugin,
             "on_validation_failure": source.on_validation_failure,
             "guaranteed_fields": fields_for(public["stable_id"], produced=True),
-            "row_cardinality": {"input": "none", "output": "zero_or_many", "expected_output_count": None},
+            "row_cardinality": _source_cardinality(source),
         }
         for public, source in zip(public_sources, state.sources.values(), strict=True)
     ]
@@ -657,6 +802,10 @@ def _build_wire_projection(
             "guaranteed_fields": fields_for(public["stable_id"], produced=True),
             "row_cardinality": _node_cardinality(node, executable_nodes[node.id]),
             "structured_output_fields": _structured_output_fields(node.options) if node.plugin == "llm" else [],
+            # Derived from the same authored options the proposal projection
+            # reads, so the two review surfaces cannot disagree about what a
+            # node does (R2-F3).
+            "node_options_summary": node_options_summary(node.plugin, node.options),
         }
         for public, node in zip(public_nodes, state.nodes, strict=True)
     ]
@@ -696,8 +845,10 @@ def _build_inspect_and_confirm_turn(
     ``samples`` is intentionally empty: ``SourceInspectionFacts`` carries
     ``sample_row_count`` (a count) but not the actual row payloads — the
     inspection layer deliberately redacts row content to avoid passing
-    user data through the audit trail.  The UI renders the count + column
-    list; full row previews are handled by the blob preview endpoint.
+    user data through the audit trail.  The wire payload carries only the
+    column list (no count field); the UI renders the column headers with an
+    explanatory row-content note.  Full row previews are handled by the
+    blob preview endpoint.
     """
     observed: _Observed = {
         "columns": list(inspection.observed_headers or ()),
@@ -742,6 +893,7 @@ def _build_step_1_single_select_turn(
         "question": "Which data source would you like to use?",
         "options": options,
         "allow_custom": False,
+        "source_blob_compatible_option_ids": [option["id"] for option in options if source_plugin_accepts_blob_inspection(option["id"])],
     }
     return Turn(
         type=TurnType.SINGLE_SELECT.value,

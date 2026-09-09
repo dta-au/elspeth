@@ -12,20 +12,22 @@ explicit write-transaction boundary.
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.engine import Connection, RowMapping
 
-from elspeth.contracts import CoalesceParentCompletion, Row, Token
+from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, CommittedChild, CommittedCollect, Row, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
-from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.enums import FrameKind, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
+from elspeth.contracts.identity import LineageFrame, innermost_own_frame, pop_fork_frame, truncate_at_closer_frame
+from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
@@ -44,10 +46,14 @@ from elspeth.core.landscape.schema import (
     batches_table,
     coalesce_effect_members_table,
     coalesce_effects_table,
+    group_losses_table,
+    group_records_table,
     node_states_table,
     rows_table,
+    token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
+    token_work_items_table,
     tokens_table,
 )
 
@@ -57,6 +63,56 @@ if TYPE_CHECKING:
     from elspeth.core.landscape.execution.node_states import NodeStateRepository
 
 __all__ = ["RowTokenRepository"]
+
+
+def _expected_child_frames(
+    parent_path: tuple[LineageFrame, ...],
+    *,
+    kind: FrameKind,
+    group_id: str,
+    member_key: str,
+) -> tuple[LineageFrame, ...]:
+    """The child's expected persisted path: the parent's path plus one closer frame."""
+    return (*parent_path, LineageFrame(kind=kind, group_id=group_id, member_key=member_key))
+
+
+def is_release_group(conn: Connection, *, run_id: str, group_id: str) -> bool:
+    """THE release-group predicate (META-38), defined once, read from the durable fact.
+
+    A collector release group is the EXPAND group ``collect_tokens`` mints
+    for the released children; its ``group_records.closes_group_id`` names
+    the group it closed. A real fork/expand opener's row carries NULL. This
+    is the only discriminator — a WRITTEN fact, never derived from lineage
+    shape, terminal-path vocabulary, or binding config (none of which a
+    durable-twin reader holds, and none of which survive nesting).
+
+    Failure direction, pinned (META-38 amendment 2): True ONLY for a row
+    whose ``closes_group_id`` IS NOT NULL; a row with NULL is a real
+    opener's group — False, not skippable, so a merging closer's truncation
+    RAISES on it; a MISSING row raises ``AuditIntegrityError`` — an audit
+    inconsistency (every group is minted with its row in the same
+    transaction as its frames), never answered False, because a False
+    would let a closer silently truncate past a frame nobody minted.
+
+    Why a WRITTEN fact beats the two derived alternatives the panel found:
+    (1) deriving release-ness from ``token_outcomes`` paths is fail-OPEN —
+    an absent terminal reads as "release" and becomes truncatable — and it
+    depends on a four-value terminal-path vocabulary replicated in two
+    implementations; (2) the node_state-at-declared-opener derivation
+    (``RowProcessor._rederive_expand_binding``) is config-dependent and
+    cannot run in this durable twin, which holds no bindings.
+    """
+    row = conn.execute(
+        select(group_records_table.c.closes_group_id).where(
+            group_records_table.c.run_id == run_id,
+            group_records_table.c.group_id == group_id,
+        )
+    ).one_or_none()
+    if row is None:
+        raise AuditIntegrityError(
+            f"is_release_group: group {group_id!r} (run {run_id!r}) has no group_records row — a lineage frame names a group the audit trail never minted."
+        )
+    return row.closes_group_id is not None
 
 
 class RowTokenRepository:
@@ -82,6 +138,133 @@ class RowTokenRepository:
         self._payload_store = payload_store
         self._outcomes = outcomes
         self._node_states = node_states
+
+    @staticmethod
+    def _load_lineage_frames(conn: Connection, *, token_id: str, run_id: str) -> tuple[LineageFrame, ...]:
+        """The token's durable lineage frames, outermost first, as typed frames."""
+        rows = conn.execute(
+            select(
+                token_lineage_frames_table.c.kind,
+                token_lineage_frames_table.c.group_id,
+                token_lineage_frames_table.c.member_key,
+            )
+            .where(token_lineage_frames_table.c.token_id == token_id)
+            .where(token_lineage_frames_table.c.run_id == run_id)
+            .order_by(token_lineage_frames_table.c.depth)
+        ).fetchall()
+        return tuple(LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)) for row in rows)
+
+    _LOAD_LINEAGE_PATHS_CHUNK_SIZE = 500
+
+    def load_lineage_paths(
+        self, run_id: str, token_ids: Sequence[str], *, conn: Connection | None = None
+    ) -> dict[str, tuple[LineageFrame, ...]]:
+        """Batch-load lineage paths from token_lineage_frames (outermost first).
+
+        Every requested token_id is a key; tokens with no frames rows map to ().
+        Depth gaps or duplicate depths are audit corruption (the frames are
+        written atomically with the token INSERT — WS1a Task 6).
+
+        ``conn``: reuse an ALREADY-OPEN transaction (e.g. a replay predicate
+        running inside ``fork_token``'s write transaction) instead of opening
+        a fresh one — SQLite refuses a nested BEGIN on the same connection.
+        ``None`` (the default, external callers) opens its own read scope.
+        """
+        token_id_list = list(token_ids)
+        paths: dict[str, list[tuple[int, LineageFrame]]] = {token_id: [] for token_id in token_id_list}
+
+        def _load(active_conn: Connection) -> None:
+            for offset in range(0, len(token_id_list), self._LOAD_LINEAGE_PATHS_CHUNK_SIZE):
+                chunk = token_id_list[offset : offset + self._LOAD_LINEAGE_PATHS_CHUNK_SIZE]
+                rows = active_conn.execute(
+                    select(
+                        token_lineage_frames_table.c.token_id,
+                        token_lineage_frames_table.c.depth,
+                        token_lineage_frames_table.c.kind,
+                        token_lineage_frames_table.c.group_id,
+                        token_lineage_frames_table.c.member_key,
+                    )
+                    .where(token_lineage_frames_table.c.run_id == run_id)
+                    .where(token_lineage_frames_table.c.token_id.in_(chunk))
+                    .order_by(token_lineage_frames_table.c.token_id, token_lineage_frames_table.c.depth)
+                ).fetchall()
+                for row in rows:
+                    paths[str(row.token_id)].append(
+                        (
+                            int(row.depth),
+                            LineageFrame(kind=FrameKind(row.kind), group_id=str(row.group_id), member_key=str(row.member_key)),
+                        )
+                    )
+
+        if token_id_list:
+            if conn is not None:
+                _load(conn)
+            else:
+                with self._db.connection() as scoped_conn:
+                    _load(scoped_conn)
+        result: dict[str, tuple[LineageFrame, ...]] = {}
+        for token_id, entries in paths.items():
+            depths = [depth for depth, _frame in entries]
+            if depths != list(range(len(depths))):
+                raise AuditIntegrityError(
+                    f"token_lineage_frames for token {token_id!r} (run {run_id!r}) has non-dense depths {depths} — audit corruption"
+                )
+            result[token_id] = tuple(frame for _depth, frame in entries)
+        return result
+
+    @staticmethod
+    def _insert_lineage_frames(conn: Connection, *, token_id: str, run_id: str, frames: Sequence[LineageFrame]) -> None:
+        for depth, frame in enumerate(frames):
+            result = conn.execute(
+                token_lineage_frames_table.insert().values(
+                    token_id=token_id,
+                    run_id=run_id,
+                    depth=depth,
+                    kind=frame.kind.value,
+                    group_id=frame.group_id,
+                    member_key=frame.member_key,
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"lineage frame INSERT affected zero rows (token_id={token_id}, depth={depth})")
+
+    def _assert_parent_lineage(self, conn: Connection, *, parent_ref: TokenRef, supplied: tuple[LineageFrame, ...]) -> None:
+        """Cross-check a parent's supplied current path against its durable mint frames.
+
+        Exact equality, with ONE sanctioned divergence (ruling 27): a row_union
+        release pops the parent's FORK frame via contracts.identity.pop_fork_frame
+        — from wherever it sits in the mint path, not necessarily innermost (a
+        row-multiplying transform inside the branch, e.g. an expand, stacks an
+        EXPAND frame on top of the branch's FORK frame before the token reaches
+        the union) — so a released token's current path is its mint frames minus
+        that ONE FORK frame, symmetric with the pop itself. The release is
+        journal-first, so the durable witness is the token's own row_union
+        work-item row having left BLOCKED.
+        """
+        mint = self._load_lineage_frames(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
+        if supplied == mint:
+            return
+        if mint and self._row_union_release_witness(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id):
+            for frame in mint:
+                if frame.kind is FrameKind.FORK and supplied == pop_fork_frame(mint, group_id=frame.group_id):
+                    return
+        raise AuditIntegrityError(
+            f"parent lineage divergence for token {parent_ref.token_id!r} (run {parent_ref.run_id!r}): "
+            f"supplied={supplied!r} mint={mint!r} and no completed row_union release explains the difference"
+        )
+
+    @staticmethod
+    def _row_union_release_witness(conn: Connection, *, token_id: str, run_id: str) -> bool:
+        """Durable evidence a row_union closer released this token (ruling 27)."""
+        count = conn.execute(
+            select(func.count())
+            .select_from(token_work_items_table)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.token_id == token_id)
+            .where(token_work_items_table.c.row_union_name.is_not(None))
+            .where(token_work_items_table.c.status != TokenWorkStatus.BLOCKED.value)
+        ).scalar()
+        return bool(count)
 
     def _prepare_source_row_record(
         self,
@@ -237,27 +420,7 @@ class RowTokenRepository:
         ``ingest_row_with_initial_claim`` instead). ``None`` preserves the
         unfenced legacy arm for direct repository-level callers.
         """
-        if coordination_token is None:
-            with self._db.write_connection() as conn:
-                return self.insert_row_with_token_on(
-                    conn,
-                    run_id=run_id,
-                    source_node_id=source_node_id,
-                    row_index=row_index,
-                    data=data,
-                    source_row_index=source_row_index,
-                    ingest_sequence=ingest_sequence,
-                    row_id=row_id,
-                    token_id=token_id,
-                    quarantined=quarantined,
-                )
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            now=now(),
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="create_row_with_token",
-        ) as conn:
+        with self.create_row_with_token_transaction(coordination_token) as conn:
             return self.insert_row_with_token_on(
                 conn,
                 run_id=run_id,
@@ -270,6 +433,20 @@ class RowTokenRepository:
                 token_id=token_id,
                 quarantined=quarantined,
             )
+
+    def create_row_with_token_transaction(
+        self,
+        coordination_token: CoordinationToken | None,
+    ) -> AbstractContextManager[Connection]:
+        """Return the row/token write boundary for caller-owned composition."""
+        if coordination_token is None:
+            return self._db.write_connection()
+        return fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="create_row_with_token",
+        )
 
     def insert_row_with_token_on(
         self,
@@ -317,14 +494,14 @@ class RowTokenRepository:
                 token_id=token.token_id,
                 row_id=token.row_id,
                 run_id=token.run_id,
-                fork_group_id=token.fork_group_id,
                 join_group_id=token.join_group_id,
-                branch_name=token.branch_name,
                 created_at=token.created_at,
             )
         )
         if result.rowcount == 0:
             raise AuditIntegrityError(f"create_row_with_token: token INSERT affected zero rows (token_id={token.token_id})")
+        # Root tokens have an empty lineage_path — no frames rows needed
+        # (_insert_lineage_frames no-ops on an empty frame sequence).
 
         return row, token
 
@@ -333,21 +510,23 @@ class RowTokenRepository:
         row_id: str,
         *,
         token_id: str | None = None,
-        branch_name: str | None = None,
-        fork_group_id: str | None = None,
+        lineage_path: tuple[LineageFrame, ...] = (),
         join_group_id: str | None = None,
     ) -> Token:
         """Create a token (row instance in DAG path).
 
-        Derives run_id from the row record to guarantee run ownership
-        consistency. The tokens table stores run_id to enable composite
-        FK enforcement on downstream tables.
+        lineage_path frames are written to token_lineage_frames in the SAME
+        transaction as the token INSERT (the sole lineage write path).
+        join_group_id is the merge-event column and is set only by coalesce
+        writers (kept column, anchors the coalesce_effects composite FK).
 
         Args:
             row_id: Source row this token represents
             token_id: Optional token ID (generated if not provided)
-            branch_name: Optional branch name (for forked tokens)
-            fork_group_id: Optional fork group (links siblings)
+            lineage_path: Typed lineage-frame stack (crafted-token seam for
+                tests and recovery tooling — production forks/expands write
+                frames via their own transactions: fork_token / expand_token /
+                coalesce_tokens).
             join_group_id: Optional join group (links merged tokens)
 
         Returns:
@@ -358,51 +537,32 @@ class RowTokenRepository:
         """
         token_id = token_id or generate_id()
         timestamp = now()
-
-        # Derive run_id from the row record (Tier 1 -- our data, must exist)
         run_id = self._ownership.resolve_run_id_for_row(row_id)
 
-        # Validate lineage metadata invariants (Tier 1 write-side enforcement)
-        # The read side (explain) assumes these are mutually exclusive.
-        group_ids = [gid for gid in (fork_group_id, join_group_id) if gid is not None]
-        if len(group_ids) > 1:
-            raise AuditIntegrityError(
-                f"create_token: conflicting lineage metadata — at most one of "
-                f"fork_group_id, join_group_id may be set. "
-                f"Got fork_group_id={fork_group_id!r}, join_group_id={join_group_id!r}"
-            )
-
-        # branch_name requires fork_group_id (it names which fork branch this token is on)
-        if branch_name is not None and fork_group_id is None:
-            raise AuditIntegrityError(f"create_token: branch_name={branch_name!r} requires fork_group_id to be set")
-
-        # Reject empty-string group IDs (should be None, not "")
-        for name, value in [("fork_group_id", fork_group_id), ("join_group_id", join_group_id)]:
-            if value is not None and not value.strip():
-                raise AuditIntegrityError(f"create_token: {name} must be None or non-empty, got {value!r}")
+        if join_group_id is not None and not join_group_id.strip():
+            raise AuditIntegrityError(f"create_token: join_group_id must be None or non-empty, got {join_group_id!r}")
 
         token = Token(
             token_id=token_id,
             row_id=row_id,
-            fork_group_id=fork_group_id,
             join_group_id=join_group_id,
-            branch_name=branch_name,
+            lineage_path=lineage_path,
             created_at=timestamp,
             run_id=run_id,
         )
-
-        self._ops.execute_insert(
-            tokens_table.insert().values(
-                token_id=token.token_id,
-                row_id=token.row_id,
-                run_id=run_id,
-                fork_group_id=token.fork_group_id,
-                join_group_id=token.join_group_id,
-                branch_name=token.branch_name,
-                created_at=token.created_at,
+        with self._db.write_connection() as conn:
+            result = conn.execute(
+                tokens_table.insert().values(
+                    token_id=token.token_id,
+                    row_id=token.row_id,
+                    run_id=run_id,
+                    join_group_id=token.join_group_id,
+                    created_at=token.created_at,
+                )
             )
-        )
-
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"create_token: token INSERT affected zero rows (token_id={token.token_id})")
+            self._insert_lineage_frames(conn, token_id=token.token_id, run_id=run_id, frames=lineage_path)
         return token
 
     def fork_token(
@@ -412,11 +572,11 @@ class RowTokenRepository:
         branches: list[str],
         *,
         step_in_pipeline: int | None = None,
+        parent_lineage_path: tuple[LineageFrame, ...] | None = None,
     ) -> tuple[list[Token], str]:
         """Fork a token to multiple branches.
 
         ATOMIC: Creates children AND records parent FORKED outcome in single transaction.
-        Stores branch contract for recovery validation.
 
         Validates that parent token belongs to the specified row_id and run_id
         before any writes. Cross-run/cross-row contamination crashes immediately
@@ -427,6 +587,14 @@ class RowTokenRepository:
             row_id: Row ID (same for all children)
             branches: List of branch names (must have at least one)
             step_in_pipeline: Step in the DAG where the fork occurs
+            parent_lineage_path: The caller's (TokenManager's) in-memory
+                current path for the parent, post-any-pop (decision D8). When
+                supplied, cross-checked against the durable mint frames via
+                ``_assert_parent_lineage`` and used — not the mint frames — to
+                stack the child frame (ruling 27: a row_union-released parent's
+                current path is its mint frames minus the popped FORK frame).
+                ``None`` (direct/low-level callers) falls back to the durable
+                mint frames with no cross-check.
 
         Returns:
             Tuple of (child Token models, fork_group_id)
@@ -455,8 +623,6 @@ class RowTokenRepository:
                     select(
                         token_outcomes_table.c.outcome,
                         token_outcomes_table.c.path,
-                        token_outcomes_table.c.fork_group_id,
-                        token_outcomes_table.c.expected_branches_json,
                     )
                     .where(token_outcomes_table.c.token_id == parent_ref.token_id)
                     .where(token_outcomes_table.c.run_id == parent_ref.run_id)
@@ -476,6 +642,11 @@ class RowTokenRepository:
                 )
 
             fork_group_id = generate_id()
+            if parent_lineage_path is None:
+                parent_frames = self._load_lineage_frames(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
+            else:
+                self._assert_parent_lineage(conn, parent_ref=parent_ref, supplied=parent_lineage_path)
+                parent_frames = parent_lineage_path
             children = []
             # 1. Create child tokens
             for ordinal, branch_name in enumerate(branches):
@@ -488,8 +659,6 @@ class RowTokenRepository:
                         token_id=child_id,
                         row_id=row_id,
                         run_id=parent_ref.run_id,
-                        fork_group_id=fork_group_id,
-                        branch_name=branch_name,
                         step_in_pipeline=step_in_pipeline,
                         created_at=timestamp,
                     )
@@ -513,17 +682,34 @@ class RowTokenRepository:
                         f"fork_token: token_parent INSERT affected zero rows (child={child_id}, parent={parent_ref.token_id})"
                     )
 
+                child_path = (*parent_frames, LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name))
+                self._insert_lineage_frames(conn, token_id=child_id, run_id=parent_ref.run_id, frames=child_path)
+
                 children.append(
                     Token(
                         token_id=child_id,
                         row_id=row_id,
-                        fork_group_id=fork_group_id,
-                        branch_name=branch_name,
+                        lineage_path=child_path,
                         step_in_pipeline=step_in_pipeline,
                         created_at=timestamp,
                         run_id=parent_ref.run_id,
                     )
                 )
+
+            # Mint the durable group record for the fork opener (spec §4.3
+            # canon: group_records mints for BOTH FORK and EXPAND openers).
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=parent_ref.run_id,
+                    group_id=fork_group_id,
+                    kind=FrameKind.FORK.value,
+                    opener_token_id=parent_ref.token_id,
+                    member_count=len(branches),
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"fork_token: group_records INSERT affected zero rows (group_id={fork_group_id})")
 
             # 2. Record parent FORKED outcome in SAME transaction (atomic)
             outcome_id = f"out_{generate_id()[:12]}"
@@ -536,8 +722,6 @@ class RowTokenRepository:
                     path=TerminalPath.FORK_PARENT.value,
                     completed=1,
                     recorded_at=now(),
-                    fork_group_id=fork_group_id,
-                    expected_branches_json=json.dumps(branches, allow_nan=False),
                 )
             )
             if result.rowcount == 0:
@@ -557,51 +741,57 @@ class RowTokenRepository:
         step_in_pipeline: int | None,
         outcome: RowMapping,
     ) -> tuple[list[Token], str]:
-        """Return a previously committed exact fork or refuse divergent replay."""
-        fork_group_id = outcome["fork_group_id"]
-        try:
-            recorded_branches = json.loads(outcome["expected_branches_json"])
-        except (TypeError, ValueError):
-            recorded_branches = None
+        """Return a previously committed exact fork or refuse divergent replay.
+
+        The recorded roster is DERIVED from the children's persisted FORK
+        frames (written atomically with the FORKED outcome — decision D2
+        retired expected_branches_json): child i's innermost frame must be
+        (FORK, fork_group_id, branches[i]) appended to the parent's own path.
+        """
         children = self._load_children_for_parent(conn, parent_ref=parent_ref)
+        parent_path = self.load_lineage_paths(parent_ref.run_id, [parent_ref.token_id], conn=conn)[parent_ref.token_id]
+        child_paths = self.load_lineage_paths(parent_ref.run_id, [child.token_id for child, _ordinal in children], conn=conn)
+        fork_group_ids = {
+            child_paths[child.token_id][-1].group_id
+            for child, _ordinal in children
+            if child_paths[child.token_id] and child_paths[child.token_id][-1].kind is FrameKind.FORK
+        }
+        fork_group_id = next(iter(fork_group_ids)) if len(fork_group_ids) == 1 else None
         exact = (
             outcome["outcome"] == TerminalOutcome.TRANSIENT.value
             and outcome["path"] == TerminalPath.FORK_PARENT.value
-            and isinstance(fork_group_id, str)
-            and bool(fork_group_id)
-            and recorded_branches == list(branches)
+            and fork_group_id is not None
             and len(children) == len(branches)
             and all(
                 child.row_id == row_id
                 and child.run_id == parent_ref.run_id
-                and child.fork_group_id == fork_group_id
                 and child.join_group_id is None
-                and child.expand_group_id is None
-                and child.branch_name == branch
                 and child.step_in_pipeline == step_in_pipeline
                 and ordinal == expected_ordinal
+                and child_paths[child.token_id]
+                == _expected_child_frames(parent_path, kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch)
                 for expected_ordinal, ((child, ordinal), branch) in enumerate(zip(children, branches, strict=True))
             )
         )
         if not exact:
             raise AuditIntegrityError(
                 f"fork_token: divergent fork replay for parent token {parent_ref.token_id!r}; "
-                "the requested branches or lineage metadata do not match the committed fork"
+                "the requested branches or persisted lineage frames do not match the committed fork"
             )
+        if fork_group_id is None:
+            # Unreachable: `exact` already required `fork_group_id is not None` above.
+            # Narrowing guard only — mypy cannot follow that through `exact`.
+            raise AuditIntegrityError(f"fork_token: exact replay for parent token {parent_ref.token_id!r} lost its fork_group_id")
         return [child for child, _ordinal in children], fork_group_id
 
-    @staticmethod
-    def _load_children_for_parent(conn: Connection, *, parent_ref: TokenRef) -> list[tuple[Token, int]]:
+    def _load_children_for_parent(self, conn: Connection, *, parent_ref: TokenRef) -> list[tuple[Token, int]]:
         rows = (
             conn.execute(
                 select(
                     tokens_table.c.token_id,
                     tokens_table.c.row_id,
                     tokens_table.c.run_id,
-                    tokens_table.c.fork_group_id,
                     tokens_table.c.join_group_id,
-                    tokens_table.c.expand_group_id,
-                    tokens_table.c.branch_name,
                     tokens_table.c.step_in_pipeline,
                     tokens_table.c.token_data_ref,
                     tokens_table.c.created_at,
@@ -623,16 +813,15 @@ class RowTokenRepository:
             .mappings()
             .all()
         )
+        lineage_paths = self.load_lineage_paths(parent_ref.run_id, [str(row["token_id"]) for row in rows], conn=conn)
         return [
             (
                 Token(
                     token_id=str(row["token_id"]),
                     row_id=str(row["row_id"]),
                     run_id=str(row["run_id"]),
-                    fork_group_id=row["fork_group_id"],
                     join_group_id=row["join_group_id"],
-                    expand_group_id=row["expand_group_id"],
-                    branch_name=row["branch_name"],
+                    lineage_path=lineage_paths[str(row["token_id"])],
                     step_in_pipeline=row["step_in_pipeline"],
                     token_data_ref=row["token_data_ref"],
                     created_at=row["created_at"],
@@ -652,8 +841,16 @@ class RowTokenRepository:
         parent_state_ids: Sequence[str] | None = None,
         merged_contract: SchemaContract,
         step_in_pipeline: int | None = None,
+        parent_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
     ) -> Token:
         """Coalesce multiple tokens into one (join operation).
+
+        ``parent_lineage_paths`` (decision D8, keyed by token_id): the
+        caller's (TokenManager's) in-memory current path per parent,
+        post-any-pop. When supplied, each parent is cross-checked against its
+        durable mint frames via ``_assert_parent_lineage`` and the supplied
+        path is popped — not the mint frames (ruling 27). ``None`` falls back
+        to the durable mint frames with no cross-check.
 
         Creates a new token representing the merged result.
         Records all parent relationships.
@@ -789,6 +986,52 @@ class RowTokenRepository:
                     expected_token_data_ref=expected_token_data_ref,
                 )
 
+            if parent_lineage_paths is None:
+                parent_paths = [self._load_lineage_frames(conn, token_id=ref.token_id, run_id=run_id) for ref in parent_refs]
+            else:
+                for ref in parent_refs:
+                    self._assert_parent_lineage(conn, parent_ref=ref, supplied=parent_lineage_paths[ref.token_id])
+                parent_paths = [parent_lineage_paths[ref.token_id] for ref in parent_refs]
+            # Anchor (META-38 amendment 1 B): the first parent's OWN frame via
+            # the guarded walk, reading the written fact in THIS transaction.
+            own = innermost_own_frame(parent_paths[0], is_release_group=lambda gid: is_release_group(conn, run_id=run_id, group_id=gid))
+            if own is None or own[1].kind is not FrameKind.FORK:
+                raise AuditIntegrityError(
+                    f"coalesce_tokens: parent token {parent_refs[0].token_id!r} has no innermost FORK lineage frame "
+                    f"to close (searched below collector release-group frames; frames={parent_paths[0]!r}); a closer "
+                    "closes exactly its own frame (spec rulings 24/28)"
+                )
+            shared_group_id = own[1].group_id
+            remaining_paths: set[tuple[LineageFrame, ...]] = set()
+            for ref, path in zip(parent_refs, parent_paths, strict=True):
+                try:
+                    # META-38 guarded truncation, PER PARENT before the
+                    # equality check: only collector release-group frames
+                    # (the written closes_group_id fact, read in THIS
+                    # transaction) may sit above the FORK frame.
+                    remaining_paths.add(
+                        truncate_at_closer_frame(
+                            path,
+                            kind=FrameKind.FORK,
+                            group_id=shared_group_id,
+                            is_release_group=lambda gid: is_release_group(conn, run_id=run_id, group_id=gid),
+                        )
+                    )
+                except OrchestrationInvariantError as exc:
+                    # truncate_at_closer_frame refuses empty paths, a missing
+                    # FORK frame, cross-group parents and a non-release frame
+                    # above the closer's frame in one place; this layer
+                    # re-raises as the Tier-1 audit error it owes.
+                    raise AuditIntegrityError(
+                        f"coalesce_tokens: durable strict pop refused for parent token {ref.token_id!r}: {exc}"
+                    ) from exc
+            if len(remaining_paths) != 1:
+                raise AuditIntegrityError(
+                    "coalesce_tokens: parents do not share their remaining lineage path after the pop; "
+                    f"distinct remaining paths={len(remaining_paths)}"
+                )
+            merged_frames = remaining_paths.pop()
+
             join_group_id = generate_id()
             token_id = generate_id()
             effect_id = generate_id()
@@ -806,6 +1049,7 @@ class RowTokenRepository:
             )
             if result.rowcount == 0:
                 raise AuditIntegrityError(f"coalesce_tokens: merged token INSERT affected zero rows (token_id={token_id})")
+            self._insert_lineage_frames(conn, token_id=token_id, run_id=run_id, frames=merged_frames)
 
             # Record all parent relationships
             for ordinal, ref in enumerate(parent_refs):
@@ -828,6 +1072,12 @@ class RowTokenRepository:
                     run_id=run_id,
                     coalesce_node_id=resolved_node_id,
                     row_id=row_id,
+                    # elspeth-8655045f98: the closing FORK group, captured
+                    # pre-pop above (shared_group_id) — NOT re-derived from
+                    # merged_frames, which no longer carries this frame once
+                    # the closer pops it (that re-derivation is the known
+                    # trap: it silently returns the enclosing group or None).
+                    group_id=shared_group_id,
                     parent_set_hash=parent_set_hash,
                     effect_hash=effect_hash,
                     expected_token_data_ref=expected_token_data_ref,
@@ -860,6 +1110,7 @@ class RowTokenRepository:
                 token_id=token_id,
                 row_id=row_id,
                 join_group_id=join_group_id,
+                lineage_path=merged_frames,
                 step_in_pipeline=step_in_pipeline,
                 created_at=timestamp,
                 run_id=run_id,
@@ -949,7 +1200,6 @@ class RowTokenRepository:
                         ref=item.parent_ref,
                         outcome=TerminalOutcome.SUCCESS,
                         path=TerminalPath.COALESCED,
-                        join_group_id=merged.join_group_id,
                         conn=conn,
                         dependencies_prelocked=True,
                     )
@@ -1070,14 +1320,13 @@ class RowTokenRepository:
         )
         if parent_links != tuple(ordered_parent_ids):
             raise AuditIntegrityError("coalesce effect result token has divergent ordered parent links")
+        merged_path = self.load_lineage_paths(str(token_row["run_id"]), [str(token_row["token_id"])], conn=conn)[str(token_row["token_id"])]
         return Token(
             token_id=str(token_row["token_id"]),
             row_id=str(token_row["row_id"]),
             run_id=str(token_row["run_id"]),
-            fork_group_id=token_row["fork_group_id"],
             join_group_id=token_row["join_group_id"],
-            expand_group_id=token_row["expand_group_id"],
-            branch_name=token_row["branch_name"],
+            lineage_path=merged_path,
             step_in_pipeline=token_row["step_in_pipeline"],
             token_data_ref=token_row["token_data_ref"],
             created_at=token_row["created_at"],
@@ -1096,19 +1345,24 @@ class RowTokenRepository:
         ).all()
         if len(states) != len(state_ids) or any(row.status != NodeStateStatus.COMPLETED.value for row in states):
             raise AuditIntegrityError("completed coalesce effect has incomplete parent node-state evidence")
+        # join_group_id retired from token_outcomes (D2): the merge-event
+        # identity now lives solely on the result token's tokens.join_group_id
+        # column (kept — the composite FK is the durable anchor for THIS
+        # merge). This check verifies each parent has a terminal (SUCCESS,
+        # COALESCED) outcome recorded; it can no longer cross-check that
+        # outcome against a specific merge's join_group_id.
         token_ids = [item.parent_ref.token_id for item in parent_completions]
         outcomes = conn.execute(
             select(
                 token_outcomes_table.c.token_id,
                 token_outcomes_table.c.outcome,
                 token_outcomes_table.c.path,
-                token_outcomes_table.c.join_group_id,
             )
             .where(token_outcomes_table.c.token_id.in_(token_ids))
             .where(token_outcomes_table.c.completed == 1)
         ).all()
-        expected = {(token_id, TerminalOutcome.SUCCESS.value, TerminalPath.COALESCED.value, merged.join_group_id) for token_id in token_ids}
-        observed = {(row.token_id, row.outcome, row.path, row.join_group_id) for row in outcomes}
+        expected = {(token_id, TerminalOutcome.SUCCESS.value, TerminalPath.COALESCED.value) for token_id in token_ids}
+        observed = {(row.token_id, row.outcome, row.path) for row in outcomes}
         if observed != expected:
             raise AuditIntegrityError("completed coalesce effect has divergent parent outcome evidence")
 
@@ -1122,8 +1376,18 @@ class RowTokenRepository:
         step_in_pipeline: int | None = None,
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
         parent_batch_id: str | None = None,
+        aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
+        parent_lineage_path: tuple[LineageFrame, ...] | None = None,
     ) -> tuple[list[Token], str]:
         """Expand a token into multiple child tokens (deaggregation).
+
+        ``parent_lineage_path`` (decision D8): the caller's (TokenManager's)
+        in-memory current path for the parent, post-any-pop. When supplied,
+        cross-checked against the durable mint frames via
+        ``_assert_parent_lineage`` and used — not the mint frames — to stack
+        each child's EXPAND frame (ruling 27: a row_union-released parent's
+        current path is its mint frames minus the popped FORK frame). ``None``
+        falls back to the durable mint frames with no cross-check.
 
         ATOMIC: Creates children and records the parent's explicit terminal
         disposition in one transaction.
@@ -1181,6 +1445,50 @@ class RowTokenRepository:
         else:
             raise ValueError(f"expand_token parent_path must be EXPAND_PARENT or BATCH_CONSUMED, got {parent_path.value!r}")
 
+        dispositions = tuple(aggregation_parent_dispositions)
+        if parent_path == TerminalPath.EXPAND_PARENT and dispositions:
+            raise ValueError("expand_token EXPAND_PARENT forbids aggregation_parent_dispositions")
+        if parent_path == TerminalPath.BATCH_CONSUMED:
+            if not dispositions:
+                assert parent_batch_id is not None  # validated above
+                member_rows = self._ops.execute_fetchall(
+                    select(batch_members_table.c.token_id)
+                    .where(batch_members_table.c.batch_id == parent_batch_id)
+                    .where(batch_members_table.c.run_id == parent_ref.run_id)
+                    .order_by(batch_members_table.c.ordinal)
+                )
+                dispositions = tuple(
+                    AggregationParentDisposition(
+                        parent_ref=TokenRef(token_id=str(row.token_id), run_id=parent_ref.run_id),
+                        outcome=TerminalOutcome.TRANSIENT,
+                        path=TerminalPath.BATCH_CONSUMED,
+                    )
+                    for row in member_rows
+                )
+                if not dispositions:
+                    raise AuditIntegrityError(
+                        f"expand_token: parent token {parent_ref.token_id!r} is not a member of an existing non-empty batch"
+                    )
+            disposition_refs = tuple(item.parent_ref for item in dispositions)
+            if len({ref.token_id for ref in disposition_refs}) != len(disposition_refs):
+                raise AuditIntegrityError("batch expansion parent dispositions contain duplicate tokens")
+            if parent_ref.token_id not in {ref.token_id for ref in disposition_refs}:
+                raise AuditIntegrityError("batch expansion parent dispositions omit the expansion parent")
+            for item in dispositions:
+                if item.parent_ref.run_id != parent_ref.run_id:
+                    raise AuditIntegrityError("batch expansion parent dispositions cross run identity")
+                consumed = (
+                    item.outcome is TerminalOutcome.TRANSIENT and item.path is TerminalPath.BATCH_CONSUMED and item.error_hash is None
+                )
+                quarantined = (
+                    item.outcome is TerminalOutcome.FAILURE
+                    and item.path is TerminalPath.QUARANTINED_AT_SOURCE
+                    and type(item.error_hash) is str
+                    and bool(item.error_hash)
+                )
+                if not (consumed or quarantined):
+                    raise AuditIntegrityError("batch expansion parent disposition is not BATCH_CONSUMED or quarantined")
+
         if self._payload_store is None:
             raise AuditIntegrityError(
                 "expand_token requires a configured payload store — each expanded child's "
@@ -1219,15 +1527,14 @@ class RowTokenRepository:
             # SQLite's write_connection() already holds BEGIN IMMEDIATE.  The
             # completed-outcome check is the durable claim shared by normal and
             # batch expansion paths.
-            self._outcomes.lock_token_outcome_dependencies((parent_ref,), conn=conn)
+            locked_refs = tuple(item.parent_ref for item in dispositions) if dispositions else (parent_ref,)
+            self._outcomes.lock_token_outcome_dependencies(locked_refs, conn=conn)
             existing_terminal = (
                 conn.execute(
                     select(
                         token_outcomes_table.c.outcome,
                         token_outcomes_table.c.path,
                         token_outcomes_table.c.batch_id,
-                        token_outcomes_table.c.expand_group_id,
-                        token_outcomes_table.c.expected_branches_json,
                     )
                     .where(token_outcomes_table.c.token_id == parent_ref.token_id)
                     .where(token_outcomes_table.c.run_id == parent_ref.run_id)
@@ -1245,11 +1552,11 @@ class RowTokenRepository:
                         child_data_refs=child_data_refs,
                         step_in_pipeline=step_in_pipeline,
                         outcome=existing_terminal,
-                        expand_group_id=existing_terminal["expand_group_id"],
+                        expand_group_id=None,
                         expected_path=TerminalPath.EXPAND_PARENT,
-                        require_recorded_count=True,
                     )
                 if parent_path == TerminalPath.BATCH_CONSUMED and existing_terminal["path"] == TerminalPath.BATCH_CONSUMED.value:
+                    assert parent_batch_id is not None  # validated above
                     batch_claim = conn.execute(
                         select(batches_table.c.run_id, batches_table.c.expansion_group_id).where(
                             batches_table.c.batch_id == parent_batch_id
@@ -1260,6 +1567,11 @@ class RowTokenRepository:
                             f"expand_token: divergent expansion replay for parent token {parent_ref.token_id!r}; "
                             "the committed batch claim does not match the requested batch"
                         )
+                    self._verify_aggregation_parent_dispositions(
+                        conn,
+                        batch_id=parent_batch_id,
+                        dispositions=dispositions,
+                    )
                     return self._reconcile_expansion_replay(
                         conn,
                         parent_ref=parent_ref,
@@ -1269,11 +1581,16 @@ class RowTokenRepository:
                         outcome=existing_terminal,
                         expand_group_id=batch_claim.expansion_group_id,
                         expected_path=TerminalPath.BATCH_CONSUMED,
-                        require_recorded_count=False,
                     )
                 raise AuditIntegrityError(
                     f"expand_token: parent token {parent_ref.token_id!r} already has a terminal outcome ({existing_terminal.path!r})"
                 )
+
+            if parent_lineage_path is None:
+                parent_frames = self._load_lineage_frames(conn, token_id=parent_ref.token_id, run_id=parent_ref.run_id)
+            else:
+                self._assert_parent_lineage(conn, parent_ref=parent_ref, supplied=parent_lineage_path)
+                parent_frames = parent_lineage_path
 
             stored_refs = [self._payload_store.store(payload_bytes) for payload_bytes in child_payload_bytes]
             if stored_refs != child_data_refs:
@@ -1284,15 +1601,16 @@ class RowTokenRepository:
             if parent_path == TerminalPath.BATCH_CONSUMED:
                 assert parent_batch_id is not None  # validated above
                 membership = conn.execute(
-                    select(batch_members_table.c.token_id)
+                    select(batch_members_table.c.token_id, batch_members_table.c.ordinal)
                     .where(batch_members_table.c.batch_id == parent_batch_id)
                     .where(batch_members_table.c.run_id == parent_ref.run_id)
-                    .where(batch_members_table.c.token_id == parent_ref.token_id)
-                ).one_or_none()
-                if membership is None:
+                    .order_by(batch_members_table.c.ordinal)
+                ).all()
+                member_ids = tuple(str(row.token_id) for row in membership)
+                if member_ids != tuple(item.parent_ref.token_id for item in dispositions):
                     raise AuditIntegrityError(
-                        f"expand_token: parent token {parent_ref.token_id!r} is not a member of batch {parent_batch_id!r} "
-                        f"in run {parent_ref.run_id!r}"
+                        f"expand_token: parent dispositions do not match the exact ordered membership of batch "
+                        f"{parent_batch_id!r} in run {parent_ref.run_id!r}"
                     )
 
                 claim = conn.execute(
@@ -1322,13 +1640,12 @@ class RowTokenRepository:
                 child_id = generate_id()
                 timestamp = now()
 
-                # Create child token with expand_group_id (run_id from parent -- already validated)
+                # Create child token (run_id from parent -- already validated)
                 result = conn.execute(
                     tokens_table.insert().values(
                         token_id=child_id,
                         row_id=row_id,
                         run_id=parent_ref.run_id,
-                        expand_group_id=expand_group_id,
                         step_in_pipeline=step_in_pipeline,
                         created_at=timestamp,
                         token_data_ref=payload_ref,
@@ -1353,17 +1670,36 @@ class RowTokenRepository:
                         f"expand_token: token_parent INSERT affected zero rows (child={child_id}, parent={parent_ref.token_id})"
                     )
 
+                child_path = (*parent_frames, LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=child_id))
+                self._insert_lineage_frames(conn, token_id=child_id, run_id=parent_ref.run_id, frames=child_path)
+
                 children.append(
                     Token(
                         token_id=child_id,
                         row_id=row_id,
-                        expand_group_id=expand_group_id,
+                        lineage_path=child_path,
                         step_in_pipeline=step_in_pipeline,
                         created_at=timestamp,
                         run_id=parent_ref.run_id,
                         token_data_ref=payload_ref,
                     )
                 )
+
+            # Mint the durable group record for the expand opener (spec §4.3
+            # canon: BATCH_CONSUMED flushes included — one row per aggregation
+            # flush is accepted audit enrichment).
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=parent_ref.run_id,
+                    group_id=expand_group_id,
+                    kind=FrameKind.EXPAND.value,
+                    opener_token_id=parent_ref.token_id,
+                    member_count=len(child_data_refs),
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"expand_token: group_records INSERT affected zero rows (group_id={expand_group_id})")
 
             # Record the explicit parent disposition in the SAME transaction.
             # No successful expansion path may leave a reprocessable parent.
@@ -1378,9 +1714,6 @@ class RowTokenRepository:
                         path=TerminalPath.EXPAND_PARENT.value,
                         completed=1,
                         recorded_at=now(),
-                        expand_group_id=expand_group_id,
-                        # Store expected count for recovery validation
-                        expected_branches_json=json.dumps({"count": count}, allow_nan=False),
                     )
                 )
                 if result.rowcount == 0:
@@ -1388,16 +1721,419 @@ class RowTokenRepository:
                         f"expand_token: EXPANDED outcome INSERT affected zero rows (parent={parent_ref.token_id}, outcome_id={outcome_id})"
                     )
             else:
-                self._outcomes.record_token_outcome(
-                    ref=parent_ref,
-                    outcome=TerminalOutcome.TRANSIENT,
-                    path=TerminalPath.BATCH_CONSUMED,
-                    batch_id=parent_batch_id,
-                    conn=conn,
-                    dependencies_prelocked=True,
-                )
+                for item in dispositions:
+                    self._outcomes.record_token_outcome(
+                        ref=item.parent_ref,
+                        outcome=item.outcome,
+                        path=item.path,
+                        batch_id=parent_batch_id if item.path is TerminalPath.BATCH_CONSUMED else None,
+                        error_hash=item.error_hash,
+                        conn=conn,
+                        dependencies_prelocked=True,
+                    )
 
         return children, expand_group_id
+
+    def collect_tokens(
+        self,
+        member_refs: Sequence[TokenRef],
+        group_id: str,
+        collector_node_id: str,
+        output_payloads: Sequence[Mapping[str, object]],
+        output_contracts: Sequence[SchemaContract],
+        step_in_pipeline: int | None = None,
+        member_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
+    ) -> CommittedCollect:
+        """Close a bound EXPAND group: strict-pop the closer's frame, mint the release.
+
+        The durable Tier-1 twin of ``TokenManager.collect_tokens`` (spec
+        §4.2/§4.4; WS1a's single-frame-write-path guard, spec §11). Every
+        member must carry an ``(EXPAND, group_id, ...)`` frame — innermost,
+        or below only collector release-group frames (META-38) — closed via
+        the shared ``truncate_at_closer_frame`` contract and cross-checked
+        for a shared remaining path exactly like ``coalesce_tokens``' FORK
+        truncation above. The frame's ``member_key`` is NOT checked here
+        (it never was — the executor's roster cross-check owns member
+        identity); only kind and group_id are.
+
+        ``member_lineage_paths`` (decision D8, keyed by token_id, mirroring
+        ``coalesce_tokens``/``expand_token``): when supplied, each member's
+        CURRENT path is cross-checked against its durable mint frames via
+        ``_assert_parent_lineage`` and used — not the mint frames — to compute
+        the pop. This is load-bearing, not cosmetic: a row_union-released
+        member's current path can differ from its mint frames by one popped
+        FORK frame (ruling 27), reachable via
+        ``expand → member → fork → row_union release → collector``. Re-deriving
+        the pop from mint frames alone (the pre-fix behaviour) silently
+        accepts a stale path in that shape. ``None`` (no caller context) falls
+        back to mint frames with no cross-check, the same fallback
+        coalesce_tokens/expand_token use.
+
+        The pop — and the replay-frame check in ``_reconcile_collect_replay``
+        below — run on EVERY drive, replay included (spec §4.4 names collector
+        replay explicitly): the existing-group short-circuit sits AFTER the
+        pop, never before it.
+
+        Idempotency mirrors expand_token/fork_token's opener-uniqueness
+        discipline (``uq_group_records_opener``): the release group's opener
+        is the REPRESENTATIVE member (``member_refs[0]``), so a re-drive is
+        detected by that opener already holding a committed group_records row
+        for the release, never by a second natural-key INSERT racing to fail.
+        ``collector_node_id`` identifies the caller for error messages only —
+        ``group_records`` carries no node column (a group_id is globally
+        unique per run, spec §5).
+
+        M=0 (``output_payloads`` empty) is a LEGAL close, not an arity error:
+        spec §4.3/§5 requires an empty release to leave the same durable
+        footprint a non-empty one does (``record_empty_expansion``'s
+        already-opened-group guard shape, mirrored below) — zero footprint on
+        M=0 is the rev-2 bug class ``group_records`` exists to kill. The
+        arity guard below is deliberately narrower than that: it only refuses
+        a caller that hands mismatched payload/contract list lengths, which is
+        a programming error in the caller (like ``expand_token``'s arity
+        guards), not an audit-completeness question.
+        """
+        if not member_refs:
+            raise AuditIntegrityError("collect_tokens requires at least one member token")
+        if len(output_payloads) != len(output_contracts):
+            raise ValueError("collect_tokens requires output_payloads and output_contracts to align one-for-one")
+        ordered_member_ids = tuple(ref.token_id for ref in member_refs)
+        duplicate_member_ids = sorted(token_id for token_id, count in Counter(ordered_member_ids).items() if count > 1)
+        if duplicate_member_ids:
+            raise AuditIntegrityError(
+                f"collect_tokens received duplicate member tokens for collector {collector_node_id!r}; "
+                f"a group roster requires distinct members: {duplicate_member_ids!r}"
+            )
+        if output_payloads and self._payload_store is None:
+            raise AuditIntegrityError(
+                "collect_tokens requires a configured payload store — each released child's "
+                "payload must be persisted for resume correctness (epoch 11 invariant). "
+                "Pass payload_store= to DataFlowRepository or RecorderFactory."
+            )
+        if self._outcomes is None:
+            raise RuntimeError("collect_tokens requires the token-outcome repository capability")
+
+        representative = member_refs[0]
+        row_id, run_id = self._ownership.resolve_token_ownership(representative.token_id)
+        for ref in member_refs:
+            self._ownership.validate_token_run_ownership(ref)
+            self._ownership.validate_token_row_ownership(ref.token_id, row_id)
+            if ref.run_id != run_id:
+                raise AuditIntegrityError(
+                    f"Cross-run contamination prevented in collect: member token {ref.token_id!r} "
+                    f"belongs to run {ref.run_id!r}, but the group belongs to run {run_id!r}."
+                )
+
+        # Content-addressed envelopes, same discipline as coalesce/expand:
+        # checkpoint_dumps is type-faithful (datetime survives, unlike
+        # canonical_json) — Tier-1 fidelity for resume reconstruction.
+        output_envelopes = [
+            checkpoint_dumps({"data": dict(payload), "contract": contract.to_checkpoint_format()}).encode("utf-8")
+            for payload, contract in zip(output_payloads, output_contracts, strict=True)
+        ]
+        output_data_refs = [sha256(envelope).hexdigest() for envelope in output_envelopes]
+
+        with self._db.write_connection() as conn:
+            self._outcomes.lock_token_outcome_dependencies(member_refs, conn=conn)
+
+            if member_lineage_paths is None:
+                member_paths = {ref.token_id: self._load_lineage_frames(conn, token_id=ref.token_id, run_id=run_id) for ref in member_refs}
+            else:
+                for ref in member_refs:
+                    self._assert_parent_lineage(conn, parent_ref=ref, supplied=member_lineage_paths[ref.token_id])
+                member_paths = {ref.token_id: member_lineage_paths[ref.token_id] for ref in member_refs}
+            base_paths: set[tuple[LineageFrame, ...]] = set()
+            for ref in member_refs:
+                try:
+                    # META-38 guarded truncation, PER MEMBER before the
+                    # equality check (a collector-in-collector member carries
+                    # its own release-group frame above this group's frame).
+                    base_paths.add(
+                        truncate_at_closer_frame(
+                            member_paths[ref.token_id],
+                            kind=FrameKind.EXPAND,
+                            group_id=group_id,
+                            is_release_group=lambda gid: is_release_group(conn, run_id=run_id, group_id=gid),
+                        )
+                    )
+                except OrchestrationInvariantError as exc:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: durable strict pop refused for member token {ref.token_id!r}: {exc}"
+                    ) from exc
+            if len(base_paths) != 1:
+                raise AuditIntegrityError(
+                    "collect_tokens: members do not share their remaining lineage path after the pop; "
+                    f"distinct remaining paths={len(base_paths)}"
+                )
+            base_path = base_paths.pop()
+
+            existing = conn.execute(
+                select(group_records_table.c.group_id, group_records_table.c.member_count)
+                .where(group_records_table.c.run_id == run_id)
+                .where(group_records_table.c.opener_token_id == representative.token_id)
+            ).one_or_none()
+            if existing is not None:
+                return self._reconcile_collect_replay(
+                    conn,
+                    representative=representative,
+                    run_id=run_id,
+                    base_path=base_path,
+                    release_group_id=str(existing.group_id),
+                    committed_member_count=int(existing.member_count),
+                    output_data_refs=output_data_refs,
+                )
+
+            if not output_payloads:
+                # M=0 durable footprint (spec §4.3/§5 authority; mirrors
+                # record_empty_expansion's already-opened-group guard shape,
+                # keyed on the representative member rather than a single
+                # expansion parent). No children, no lineage frames to write —
+                # the empty group_records row IS the release.
+                release_group_id = generate_id()
+                result = conn.execute(
+                    group_records_table.insert().values(
+                        run_id=run_id,
+                        group_id=release_group_id,
+                        kind=FrameKind.EXPAND.value,
+                        opener_token_id=representative.token_id,
+                        member_count=0,
+                        created_at=now(),
+                        # META-38: the written release fact (see is_release_group).
+                        closes_group_id=group_id,
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: empty-release group_records INSERT affected zero rows (group_id={release_group_id})"
+                    )
+                return CommittedCollect(release_group_id=release_group_id, children=())
+
+            assert self._payload_store is not None  # guarded above whenever output_payloads is non-empty
+            stored_refs = [self._payload_store.store(envelope) for envelope in output_envelopes]
+            if stored_refs != output_data_refs:
+                raise AuditIntegrityError(
+                    "collect_tokens: payload store returned an identity other than the required SHA-256 content address"
+                )
+
+            release_group_id = generate_id()
+            children: list[CommittedChild] = []
+            for ordinal, payload_ref in enumerate(output_data_refs):
+                child_id = generate_id()
+                timestamp = now()
+                result = conn.execute(
+                    tokens_table.insert().values(
+                        token_id=child_id,
+                        row_id=row_id,
+                        run_id=run_id,
+                        step_in_pipeline=step_in_pipeline,
+                        created_at=timestamp,
+                        token_data_ref=payload_ref,
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: child token INSERT affected zero rows (token_id={child_id}, ordinal={ordinal})"
+                    )
+
+                result = conn.execute(
+                    token_parents_table.insert().values(
+                        token_id=child_id,
+                        parent_token_id=representative.token_id,
+                        run_id=run_id,
+                        ordinal=ordinal,
+                    )
+                )
+                if result.rowcount == 0:
+                    raise AuditIntegrityError(
+                        f"collect_tokens: token_parent INSERT affected zero rows (child={child_id}, parent={representative.token_id})"
+                    )
+
+                child_path = (*base_path, LineageFrame(kind=FrameKind.EXPAND, group_id=release_group_id, member_key=child_id))
+                self._insert_lineage_frames(conn, token_id=child_id, run_id=run_id, frames=child_path)
+                children.append(CommittedChild(token_id=child_id))
+
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=run_id,
+                    group_id=release_group_id,
+                    kind=FrameKind.EXPAND.value,
+                    opener_token_id=representative.token_id,
+                    member_count=len(output_data_refs),
+                    created_at=now(),
+                    # META-38: the written release fact (see is_release_group) —
+                    # committed in the SAME transaction as the release frames.
+                    closes_group_id=group_id,
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"collect_tokens: group_records INSERT affected zero rows (group_id={release_group_id})")
+
+        return CommittedCollect(release_group_id=release_group_id, children=tuple(children))
+
+    def _reconcile_collect_replay(
+        self,
+        conn: Connection,
+        *,
+        representative: TokenRef,
+        run_id: str,
+        base_path: tuple[LineageFrame, ...],
+        release_group_id: str,
+        committed_member_count: int,
+        output_data_refs: Sequence[str],
+    ) -> CommittedCollect:
+        """Return a previously committed exact collect release or refuse divergence.
+
+        Spec §4.4 names collector replay explicitly: a replay asserts the same
+        strict-pop invariant a fresh drive does (the caller already computed
+        ``base_path`` before branching here) and additionally verifies each
+        committed child's PERSISTED frame equals ``base_path`` plus the
+        release EXPAND frame — the same discipline
+        ``_reconcile_fork_replay``/``_reconcile_expansion_replay`` apply to
+        their own children. A pre-fix version of this method skipped that
+        frame check entirely, silently accepting a replay whose caller-derived
+        base_path had drifted from what was actually minted.
+        """
+        if committed_member_count == 0:
+            if output_data_refs:
+                raise AuditIntegrityError(
+                    f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
+                    "the committed release was an empty (M=0) close but this drive requests output"
+                )
+            return CommittedCollect(release_group_id=release_group_id, children=())
+        if not output_data_refs:
+            raise AuditIntegrityError(
+                f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
+                "the committed release had output but this drive requests an empty (M=0) close"
+            )
+        children = self._load_children_for_parent(conn, parent_ref=representative)
+        child_paths = self.load_lineage_paths(run_id, [child.token_id for child, _ordinal in children], conn=conn)
+        exact = (
+            committed_member_count == len(output_data_refs)
+            and len(children) == len(output_data_refs)
+            and all(
+                child.run_id == run_id
+                and child.token_data_ref == expected_ref
+                and ordinal == expected_ordinal
+                and child_paths[child.token_id]
+                == _expected_child_frames(base_path, kind=FrameKind.EXPAND, group_id=release_group_id, member_key=child.token_id)
+                for expected_ordinal, ((child, ordinal), expected_ref) in enumerate(zip(children, output_data_refs, strict=True))
+            )
+        )
+        if not exact:
+            raise AuditIntegrityError(
+                f"collect_tokens: divergent collect replay for opener token {representative.token_id!r}; "
+                "the requested outputs or persisted lineage frames do not match the committed release"
+            )
+        return CommittedCollect(
+            release_group_id=release_group_id,
+            children=tuple(CommittedChild(token_id=child.token_id) for child, _ordinal in children),
+        )
+
+    def is_release_group(self, *, run_id: str, group_id: str) -> bool:
+        """Durable read of the META-38 release fact — see the module-level
+        :func:`is_release_group` (the one definition; this opens the read
+        connection for out-of-transaction callers, e.g. the engine's
+        ``TokenManager`` memo, which is populated ONLY through this read)."""
+        with self._db.connection() as conn:
+            return is_release_group(conn, run_id=run_id, group_id=group_id)
+
+    def get_group_records_for_run(self, run_id: str) -> list[RowMapping]:
+        """All group_records rows for a run, ordered by group_id (export surface)."""
+        with self._db.connection() as conn:
+            return list(
+                conn.execute(
+                    select(group_records_table).where(group_records_table.c.run_id == run_id).order_by(group_records_table.c.group_id)
+                )
+                .mappings()
+                .all()
+            )
+
+    def get_group_losses_for_run(self, run_id: str) -> list[RowMapping]:
+        """All group_losses rows for a run, ordered by loss_id (export surface, WS3 writes the ledger)."""
+        with self._db.connection() as conn:
+            return list(
+                conn.execute(select(group_losses_table).where(group_losses_table.c.run_id == run_id).order_by(group_losses_table.c.loss_id))
+                .mappings()
+                .all()
+            )
+
+    def record_empty_expansion(self, parent_ref: TokenRef) -> str:
+        """Mint the durable group record for a zero-row expansion (spec §4.3).
+
+        The zero-row multi-row-transform path never calls expand_token, so a
+        require_all empty group previously had no durable referent. Idempotent
+        per opener (uq_group_records_opener: one token opens at most one
+        group): a re-driven claim returns the committed group_id. An opener
+        that already opened a NON-empty group is a divergent replay — Tier-1.
+        """
+        self._ownership.validate_token_run_ownership(parent_ref)
+        with self._db.write_connection() as conn:
+            existing = conn.execute(
+                select(group_records_table.c.group_id, group_records_table.c.member_count)
+                .where(group_records_table.c.run_id == parent_ref.run_id)
+                .where(group_records_table.c.opener_token_id == parent_ref.token_id)
+            ).one_or_none()
+            if existing is not None:
+                if int(existing.member_count) != 0:
+                    raise AuditIntegrityError(
+                        f"record_empty_expansion: opener {parent_ref.token_id!r} already opened group "
+                        f"{existing.group_id!r} with member_count={existing.member_count}; divergent empty-expansion replay"
+                    )
+                return str(existing.group_id)
+            group_id = generate_id()
+            result = conn.execute(
+                group_records_table.insert().values(
+                    run_id=parent_ref.run_id,
+                    group_id=group_id,
+                    kind=FrameKind.EXPAND.value,
+                    opener_token_id=parent_ref.token_id,
+                    member_count=0,
+                    created_at=now(),
+                )
+            )
+            if result.rowcount == 0:
+                raise AuditIntegrityError(f"record_empty_expansion: INSERT affected zero rows (group_id={group_id})")
+            return group_id
+
+    def _verify_aggregation_parent_dispositions(
+        self,
+        conn: Connection,
+        *,
+        batch_id: str,
+        dispositions: Sequence[AggregationParentDisposition],
+    ) -> None:
+        """Refuse a replay unless every batch parent terminal is exact."""
+        token_ids = tuple(item.parent_ref.token_id for item in dispositions)
+        rows: list[Any] = []
+        for i in range(0, len(token_ids), 500):
+            chunk = token_ids[i : i + 500]
+            rows.extend(
+                conn.execute(
+                    select(
+                        token_outcomes_table.c.token_id,
+                        token_outcomes_table.c.outcome,
+                        token_outcomes_table.c.path,
+                        token_outcomes_table.c.batch_id,
+                        token_outcomes_table.c.error_hash,
+                    )
+                    .where(token_outcomes_table.c.run_id == dispositions[0].parent_ref.run_id)
+                    .where(token_outcomes_table.c.token_id.in_(chunk))
+                    .where(token_outcomes_table.c.completed == 1)
+                ).all()
+            )
+        observed = {str(row.token_id): row for row in rows}
+        if len(rows) != len(dispositions) or len(observed) != len(dispositions):
+            raise AuditIntegrityError("batch expansion replay lacks exact terminal parent dispositions")
+        for item in dispositions:
+            row = observed[item.parent_ref.token_id]
+            expected_batch_id = batch_id if item.path is TerminalPath.BATCH_CONSUMED else None
+            if (
+                row.outcome != item.outcome.value
+                or row.path != item.path.value
+                or row.batch_id != expected_batch_id
+                or row.error_hash != item.error_hash
+            ):
+                raise AuditIntegrityError("batch expansion replay has divergent terminal parent dispositions")
 
     def _reconcile_expansion_replay(
         self,
@@ -1408,40 +2144,63 @@ class RowTokenRepository:
         child_data_refs: Sequence[str],
         step_in_pipeline: int | None,
         outcome: RowMapping,
-        expand_group_id: object,
+        expand_group_id: str | None,
         expected_path: TerminalPath,
-        require_recorded_count: bool,
     ) -> tuple[list[Token], str]:
-        """Return a previously committed exact expansion or refuse divergence."""
-        try:
-            recorded_contract = json.loads(outcome["expected_branches_json"])
-        except (TypeError, ValueError):
-            recorded_contract = None
+        """Return a previously committed exact expansion or refuse divergence.
+
+        ``expand_group_id``: known-good for BATCH_CONSUMED (the batch's own
+        durable claim, ``batches.expansion_group_id`` — unrelated column,
+        kept); ``None`` for EXPAND_PARENT, where the group id is instead
+        DERIVED from the children's persisted EXPAND frames (decision D2
+        retired expected_branches_json — its count evidence is replaced by
+        the group_records.member_count idempotency check below).
+        """
         children = self._load_children_for_parent(conn, parent_ref=parent_ref)
+        parent_path = self.load_lineage_paths(parent_ref.run_id, [parent_ref.token_id], conn=conn)[parent_ref.token_id]
+        child_paths = self.load_lineage_paths(parent_ref.run_id, [child.token_id for child, _ordinal in children], conn=conn)
+        if expand_group_id is None:
+            expand_group_ids = {
+                child_paths[child.token_id][-1].group_id
+                for child, _ordinal in children
+                if child_paths[child.token_id] and child_paths[child.token_id][-1].kind is FrameKind.EXPAND
+            }
+            expand_group_id = next(iter(expand_group_ids)) if len(expand_group_ids) == 1 else None
         exact = (
             outcome["outcome"] == TerminalOutcome.TRANSIENT.value
             and outcome["path"] == expected_path.value
-            and isinstance(expand_group_id, str)
-            and bool(expand_group_id)
-            and (not require_recorded_count or recorded_contract == {"count": len(child_data_refs)})
+            and expand_group_id is not None
             and len(children) == len(child_data_refs)
             and all(
                 child.row_id == row_id
                 and child.run_id == parent_ref.run_id
-                and child.fork_group_id is None
                 and child.join_group_id is None
-                and child.expand_group_id == expand_group_id
-                and child.branch_name is None
                 and child.step_in_pipeline == step_in_pipeline
                 and child.token_data_ref == expected_payload_ref
                 and ordinal == expected_ordinal
+                and child_paths[child.token_id]
+                == _expected_child_frames(parent_path, kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=child.token_id)
                 for expected_ordinal, ((child, ordinal), expected_payload_ref) in enumerate(zip(children, child_data_refs, strict=True))
             )
         )
         if not exact:
             raise AuditIntegrityError(
                 f"expand_token: divergent expansion replay for parent token {parent_ref.token_id!r}; "
-                "the requested payloads or lineage metadata do not match the committed expansion"
+                "the requested payloads or persisted lineage frames do not match the committed expansion"
             )
-        assert isinstance(expand_group_id, str)  # narrowed by the exact-replay predicate above
+        group_row = conn.execute(
+            select(group_records_table.c.opener_token_id, group_records_table.c.member_count)
+            .where(group_records_table.c.run_id == parent_ref.run_id)
+            .where(group_records_table.c.group_id == expand_group_id)
+        ).one_or_none()
+        if group_row is None or group_row.opener_token_id != parent_ref.token_id or int(group_row.member_count) != len(children):
+            raise AuditIntegrityError(
+                f"expand_token: divergent expansion replay for parent token {parent_ref.token_id!r}; "
+                f"group_records for group {expand_group_id!r} does not match the committed expansion "
+                "(a re-drive can never mint a second group)"
+            )
+        if expand_group_id is None:
+            # Unreachable: `exact` already required `expand_group_id is not None` above.
+            # Narrowing guard only — mypy cannot follow that through `exact`.
+            raise AuditIntegrityError(f"expand_token: exact replay for parent token {parent_ref.token_id!r} lost its expand_group_id")
         return [child for child, _ordinal in children], expand_group_id

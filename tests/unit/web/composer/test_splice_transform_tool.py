@@ -7,17 +7,22 @@ from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
+from pydantic import TypeAdapter
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import NodeType
+from elspeth.core.config import RuntimeNodeName
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import MANIFEST, SpliceTransformArgumentsModel, redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools._common import ToolContext
-from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools._dispatch import execute_tool, get_tool_definitions
 from elspeth.web.composer.tools.transforms import _execute_splice_transform
+from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 
@@ -52,7 +57,7 @@ def _state() -> CompositionState:
         source=SourceSpec(
             plugin="csv",
             on_success="rows",
-            options={"path": "rows.csv", "schema": {"mode": "observed"}},
+            options={"path": "rows.csv", "schema": {"mode": "flexible", "fields": ["text: str"]}},
             on_validation_failure="discard",
         ),
         nodes=(
@@ -113,6 +118,91 @@ def test_splice_transform_is_declared_through_the_public_registry() -> None:
         "successor_id",
         "node",
     ]
+
+
+def test_splice_transform_public_node_id_schema_matches_runtime_contract() -> None:
+    definitions = {definition["name"]: definition for definition in get_tool_definitions()}
+    node_id_schema = definitions["splice_transform"]["parameters"]["properties"]["node"]["properties"]["id"]
+    runtime_schema = TypeAdapter(RuntimeNodeName).json_schema()
+
+    assert runtime_schema == {
+        "maxLength": 38,
+        "minLength": 1,
+        "pattern": r"^[a-zA-Z][a-zA-Z0-9_-]*$",
+        "type": "string",
+    }
+    assert {key: node_id_schema[key] for key in runtime_schema} == runtime_schema
+
+
+def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() -> None:
+    state = _state()
+    arguments = _arguments(
+        options={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o",
+            "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+            "prompt_template": "Summarise {{ row.text }}.",
+            "required_input_fields": ["text"],
+            "resolved_prompt_template_hash": None,
+            "schema": {"mode": "observed"},
+        }
+    )
+    arguments["node"]["plugin"] = "llm"  # type: ignore[index]
+
+    context = _context()
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert "resolved_prompt_template_hash" in result.data["error"]
+    assert "retry splice_transform" in result.data["error"]
+
+
+def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomically() -> None:
+    state = _state()
+    arguments = _arguments(
+        options={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o",
+            "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+            "prompt_template": "Summarise {{ row.text }}.",
+            "required_input_fields": ["text"],
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "llm_prompt_template",
+                    "user_term": "llm_prompt_template:inserted",
+                    "draft": "Summarise {{ row.text }}.",
+                    "status": "resolved",
+                }
+            ],
+            "schema": {"mode": "observed"},
+        }
+    )
+    arguments["node"]["plugin"] = "llm"  # type: ignore[index]
+    context = _context()
+
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+    assert "retry splice_transform" in result.data["error"]
+    assert "request_interpretation_review" in result.data["error"]
+    assert "resolve_interpretation_event" not in result.data["error"]
 
 
 def test_splice_transform_manifest_is_type_driven() -> None:
@@ -176,9 +266,10 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Summarise {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
             "on_error": "discard",
@@ -196,6 +287,163 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
     assert replay.data["already_applied"] is True
     assert replay.updated_state is first.updated_state
     assert replay.updated_state.version == first.updated_state.version
+
+
+def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None:
+    state = _state()
+    arguments = {
+        **_arguments(),
+        "node": {
+            "id": "inserted",
+            "plugin": "llm",
+            "options": {
+                "provider": "openrouter",
+                "model": "openai/gpt-4o",
+                "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                # The server derives prompt_template from the parts (a pending
+                # ref renders as "pending interpretation"); the submitted
+                # literal must match the derivation or the replay projection
+                # diverges.
+                "prompt_template": "Summarise using pending interpretation: {{ row.text }}.",
+                "required_input_fields": ["text"],
+                "schema": {"mode": "observed"},
+                # Wired form: with a vague_term row staged, only a
+                # prompt_template_parts interpretation_ref counts as wiring
+                # (the ref names the id the server synthesizes for the shell:
+                # user_term + ":" + node id).
+                PROMPT_TEMPLATE_PARTS_KEY: [
+                    {"kind": "text", "text": "Summarise using "},
+                    {"kind": "interpretation_ref", "requirement_id": "summary_style:inserted"},
+                    {"kind": "text", "text": ": {{ row.text }}."},
+                ],
+                INTERPRETATION_REQUIREMENTS_KEY: [
+                    {
+                        "kind": "vague_term",
+                        "user_term": "summary_style",
+                        "draft": "Use one concise sentence.",
+                    }
+                ],
+            },
+            "on_error": "discard",
+        },
+    }
+    first = _execute_splice_transform(arguments, state, _context())
+    assert first.success, first.data
+    before, inserted, after = first.updated_state.nodes
+    custom_ids = {
+        "vague_term": "trusted-authored-review-id",
+        "llm_prompt_template": "trusted-prompt-review-id",
+        "llm_model_choice": "trusted-model-review-id",
+    }
+    trusted_requirements = [
+        {
+            **requirement,
+            "id": custom_ids[requirement["kind"]],
+        }
+        for requirement in inserted.options[INTERPRETATION_REQUIREMENTS_KEY]
+    ]
+    # A coherent trusted-id rewrite also rewrites the prompt_template_parts
+    # interpretation_ref that names the vague_term row: rows and refs move
+    # together, or the wired review would dangle.
+    trusted_parts = [
+        {**part, "requirement_id": custom_ids["vague_term"]} if part.get("kind") == "interpretation_ref" else dict(part)
+        for part in inserted.options[PROMPT_TEMPLATE_PARTS_KEY]
+    ]
+    retained = replace(
+        first.updated_state,
+        nodes=(
+            before,
+            replace(
+                inserted,
+                options={
+                    **inserted.options,
+                    INTERPRETATION_REQUIREMENTS_KEY: trusted_requirements,
+                    PROMPT_TEMPLATE_PARTS_KEY: trusted_parts,
+                },
+            ),
+            after,
+        ),
+    )
+
+    # The realistic replay payload is the server's own round-trip
+    # (get_pipeline_state), whose parts carry the trusted ref verbatim; row
+    # shells stay id-free and recover the trusted id via authored-id
+    # continuity against the existing node.
+    replay_arguments = {
+        **arguments,
+        "node": {
+            **arguments["node"],
+            "options": {
+                **arguments["node"]["options"],
+                PROMPT_TEMPLATE_PARTS_KEY: trusted_parts,
+            },
+        },
+    }
+
+    replay = _execute_splice_transform(replay_arguments, retained, _context())
+
+    assert replay.success, replay.data
+    assert replay.data["already_applied"] is True
+    assert replay.updated_state is retained
+    requirements = replay.updated_state.nodes[1].options[INTERPRETATION_REQUIREMENTS_KEY]
+    assert {requirement["kind"]: requirement["id"] for requirement in requirements} == custom_ids
+
+
+def test_splice_transform_identical_replay_rejects_noncanonical_retained_requirements() -> None:
+    state = _state()
+    arguments = {
+        **_arguments(),
+        "node": {
+            "id": "inserted",
+            "plugin": "llm",
+            "options": {
+                "provider": "openrouter",
+                "model": "openai/gpt-4o",
+                "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "prompt_template": "Summarise {{ row.text }}.",
+                "required_input_fields": ["text"],
+                "schema": {"mode": "observed"},
+            },
+            "on_error": "discard",
+        },
+    }
+    first = _execute_splice_transform(arguments, state, _context())
+    assert first.success, first.data
+    before, inserted, after = first.updated_state.nodes
+    legacy_requirements = [
+        {
+            field: requirement[field]
+            for field in (
+                "id",
+                "kind",
+                "user_term",
+                "status",
+                "draft",
+            )
+        }
+        for requirement in inserted.options[INTERPRETATION_REQUIREMENTS_KEY]
+    ]
+    retained = replace(
+        first.updated_state,
+        nodes=(
+            before,
+            replace(
+                inserted,
+                options={
+                    **inserted.options,
+                    INTERPRETATION_REQUIREMENTS_KEY: legacy_requirements,
+                },
+            ),
+            after,
+        ),
+    )
+
+    replay = _execute_splice_transform(arguments, retained, _context())
+
+    assert not replay.success
+    assert replay.data["error_code"] == "interpretation_requirements_invalid"
+    assert replay.updated_state is retained
+    assert replay.updated_state.version == retained.version
 
 
 def test_splice_transform_same_id_divergent_retry_is_atomic() -> None:
@@ -239,18 +487,99 @@ def test_splice_transform_same_id_non_transform_retry_is_atomic() -> None:
     assert replay.updated_state.version == noncanonical.version
 
 
-def test_splice_transform_bounds_derived_edge_identity() -> None:
-    long_id = "inserted" * 40
+def test_splice_transform_accepts_max_length_runtime_node_id_and_round_trips() -> None:
+    max_length_id = "a" * 38
     arguments = {
         **_arguments(),
-        "node": {**_arguments()["node"], "id": long_id},
+        "node": {**_arguments()["node"], "id": max_length_id},
     }
+    state = _state()
+    context = _context()
 
-    result = _execute_splice_transform(arguments, _state(), _context())
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
 
     assert result.success, result.data
-    assert len(result.data["new_edge_id"]) <= 160
+    settings = load_settings_from_yaml_string(generate_public_yaml(result.updated_state), expand_env_vars=False)
+    assert settings.transforms[1].name == max_length_id
+
+
+def test_splice_transform_bounds_derived_edge_identity_with_long_direct_edge_id() -> None:
+    state = _state()
+    long_direct_edge = replace(state.edges[1], id="e" * 160)
+    state = replace(state, edges=(state.edges[0], long_direct_edge, state.edges[2]))
+
+    result = _execute_splice_transform(_arguments(), state, _context())
+
+    assert result.success, result.data
+    assert len(result.data["new_edge_id"]) == 160
+    assert result.data["new_edge_id"].endswith("__splice__inserted")
     assert result.updated_state.edges[2].id == result.data["new_edge_id"]
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    (
+        "",
+        "   ",
+        "1bad",
+        "é",
+        "bad.name",
+        "_bad",
+        "continue",
+        "fork",
+        "on_success",
+        "a" * 39,
+    ),
+)
+def test_splice_transform_public_dispatch_rejects_runtime_invalid_node_id_atomically(node_id: str) -> None:
+    state = _state()
+    state_before = state.to_dict()
+    context = _context()
+    arguments = {
+        **_arguments(),
+        "node": {**_arguments()["node"], "id": node_id},
+    }
+
+    with pytest.raises(ToolArgumentError, match="splice_transform arguments"):
+        execute_tool(
+            "splice_transform",
+            arguments,
+            state,
+            context.catalog,
+            plugin_snapshot=context.plugin_snapshot,
+        )
+
+    assert state.to_dict() == state_before
+    assert state.version == 4
+
+
+@pytest.mark.parametrize("node_id", ("a", "valid_id-1", "Z9"))
+def test_splice_transform_public_dispatch_accepts_runtime_valid_node_id_and_round_trips(node_id: str) -> None:
+    state = _state()
+    context = _context()
+    arguments = {
+        **_arguments(),
+        "node": {**_arguments()["node"], "id": node_id},
+    }
+
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success, result.data
+    assert result.updated_state.nodes[1].id == node_id
+    settings = load_settings_from_yaml_string(generate_public_yaml(result.updated_state), expand_env_vars=False)
+    assert settings.transforms[1].name == node_id
 
 
 @pytest.mark.parametrize(

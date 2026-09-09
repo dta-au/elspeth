@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -11,7 +11,7 @@ from sqlalchemy import event, insert, select, update
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -23,9 +23,23 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 RUN_ID = "run-pending-sink-admission"
 NOW = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
+
+# Explicit accessors for every column a legal PENDING_SINK bundle may carry. The
+# parametrized bundles below are keyed by column name (they are written straight
+# into the table), so the readback resolves through this table rather than a
+# reflective attribute lookup on the owned TokenWorkItem: an unlisted key raises
+# KeyError here instead of silently reading nothing.
+_BUNDLE_FIELD_READERS: dict[str, Callable[[TokenWorkItem], object]] = {
+    "pending_outcome": lambda item: item.pending_outcome,
+    "pending_path": lambda item: item.pending_path,
+    "pending_error_hash": lambda item: item.pending_error_hash,
+    "pending_error_message": lambda item: item.pending_error_message,
+    "join_group_id": lambda item: item.join_group_id,
+}
 
 
 @pytest.fixture
@@ -101,7 +115,7 @@ def test_claim_pending_sink_rejects_incomplete_bundle_without_mutation(
     before = _durable_image(engine, work_item_id)
 
     with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-        repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30, now=NOW + timedelta(seconds=3))
+        repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30)
 
     assert _durable_image(engine, work_item_id) == before
 
@@ -156,23 +170,24 @@ def test_claim_pending_sink_accepts_complete_legal_bundle(
     with engine.begin() as conn:
         conn.execute(update(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id).values(**bundle_values))
 
+    before = landscape_database_now(engine)
     claimed = repo.claim_pending_sink(
         run_id=RUN_ID,
         lease_owner="redrive-worker",
         lease_seconds=30,
-        now=NOW + timedelta(seconds=3),
     )
+    after = landscape_database_now(engine)
 
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
     assert claimed.lease_owner == "redrive-worker"
-    assert claimed.lease_expires_at == NOW + timedelta(seconds=33)
+    assert_stamped_between(claimed.lease_expires_at, start=before, end=after, offset=timedelta(seconds=30))
     assert claimed.work_item_id == work_item_id
     assert claimed.attempt == 1
     assert claimed.row_payload_json == payload
     assert claimed.pending_sink_name == "sink-a"
     for field_name, expected in bundle_values.items():
-        assert getattr(claimed, field_name) == expected
+        assert _BUNDLE_FIELD_READERS[field_name](claimed) == expected, field_name
 
 
 def test_claim_pending_sink_update_rechecks_bundle_atomically(
@@ -194,7 +209,7 @@ def test_claim_pending_sink_update_rechecks_bundle_atomically(
 
     try:
         with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-            repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30, now=NOW + timedelta(seconds=3))
+            repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30)
     finally:
         event.remove(engine, "before_cursor_execute", invalidate_bundle_between_select_and_update)
 
@@ -262,10 +277,9 @@ def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=NOW,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="producer-worker", lease_seconds=30, now=NOW + timedelta(seconds=1))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="producer-worker", lease_seconds=30)
     assert claimed is not None
     repo.mark_pending_sink(
         work_item_id=item.work_item_id,
@@ -275,7 +289,6 @@ def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=2),
         expected_lease_owner="producer-worker",
     )
     return item.work_item_id
@@ -289,9 +302,7 @@ def _durable_image(engine: Tier1Engine, work_item_id: str) -> tuple[dict[str, An
         events = tuple(
             dict(event_row)
             for event_row in conn.execute(
-                select(scheduler_events_table)
-                .where(scheduler_events_table.c.run_id == RUN_ID)
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                select(scheduler_events_table).where(scheduler_events_table.c.run_id == RUN_ID).order_by(scheduler_events_table.c.seq)
             ).mappings()
         )
     return row, events

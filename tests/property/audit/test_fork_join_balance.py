@@ -20,6 +20,7 @@ Fork terminology:
 
 from __future__ import annotations
 
+from dataclasses import fields as dataclass_fields
 from datetime import UTC
 from typing import Any
 
@@ -30,7 +31,8 @@ from sqlalchemy import text
 
 from elspeth.contracts import CoalesceName, GateName, RoutingAction, RoutingMode, SinkName
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, Determinism, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, Determinism, FrameKind, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.identity import LineageFrame, path_branch_name, path_expand_group_id, path_fork_group_id
 from elspeth.contracts.run_result import RunResult
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.checkpoint.serialization import checkpoint_loads
@@ -45,7 +47,8 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.group_lineage import ensure_fork_group_record
+from tests.fixtures.landscape import make_landscape_db, reseat_crashed_leader
 from tests.fixtures.plugins import (
     CollectSink,
     ListSource,
@@ -59,6 +62,34 @@ from tests.helpers.checkpoint import create_checkpoint
 # =============================================================================
 
 
+def counter_reconciliation_pairs(uninterrupted: RunResult, resumed: RunResult) -> tuple[tuple[str, int, int], ...]:
+    """Explicit ``(field, uninterrupted, resumed)`` triples for every RunResult counter.
+
+    The table is written out rather than reflected so a masquerading run result
+    (one missing a counter) raises ``AttributeError`` here instead of silently
+    skipping a comparison. The exact-set assertion below keeps the table honest:
+    adding a counter to ``RunResult`` fails this helper until it is listed.
+    """
+    pairs: tuple[tuple[str, int, int], ...] = (
+        ("rows_processed", uninterrupted.rows_processed, resumed.rows_processed),
+        ("rows_succeeded", uninterrupted.rows_succeeded, resumed.rows_succeeded),
+        ("rows_failed", uninterrupted.rows_failed, resumed.rows_failed),
+        ("rows_routed_success", uninterrupted.rows_routed_success, resumed.rows_routed_success),
+        ("rows_routed_failure", uninterrupted.rows_routed_failure, resumed.rows_routed_failure),
+        ("rows_quarantined", uninterrupted.rows_quarantined, resumed.rows_quarantined),
+        ("rows_forked", uninterrupted.rows_forked, resumed.rows_forked),
+        ("rows_coalesced", uninterrupted.rows_coalesced, resumed.rows_coalesced),
+        ("rows_coalesce_failed", uninterrupted.rows_coalesce_failed, resumed.rows_coalesce_failed),
+        ("rows_expanded", uninterrupted.rows_expanded, resumed.rows_expanded),
+        ("rows_buffered", uninterrupted.rows_buffered, resumed.rows_buffered),
+        ("rows_diverted", uninterrupted.rows_diverted, resumed.rows_diverted),
+    )
+    covered = {name for name, _, _ in pairs}
+    expected = {field.name for field in dataclass_fields(RunResult)} - {"run_id", "status", "routed_destinations"}
+    assert covered == expected, f"counter table drifted from RunResult: missing={expected - covered}, extra={covered - expected}"
+    return pairs
+
+
 def count_fork_children_missing_parents(db: LandscapeDB, run_id: str) -> int:
     """Count fork children that lack parent links.
 
@@ -68,12 +99,12 @@ def count_fork_children_missing_parents(db: LandscapeDB, run_id: str) -> int:
     with db.connection() as conn:
         result = conn.execute(
             text("""
-                SELECT COUNT(*)
+                SELECT COUNT(DISTINCT t.token_id)
                 FROM tokens t
                 JOIN rows r ON r.row_id = t.row_id
+                JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                 LEFT JOIN token_parents p ON p.token_id = t.token_id
                 WHERE r.run_id = :run_id
-                  AND t.fork_group_id IS NOT NULL
                   AND p.token_id IS NULL
             """),
             {"run_id": run_id},
@@ -112,11 +143,10 @@ def get_fork_group_stats(db: LandscapeDB, run_id: str) -> dict[str, int]:
         total_groups = (
             conn.execute(
                 text("""
-                SELECT COUNT(DISTINCT t.fork_group_id)
-                FROM tokens t
-                JOIN rows r ON r.row_id = t.row_id
-                WHERE r.run_id = :run_id
-                  AND t.fork_group_id IS NOT NULL
+                SELECT COUNT(DISTINCT f.group_id)
+                FROM token_lineage_frames f
+                WHERE f.run_id = :run_id
+                  AND f.kind = 'fork'
             """),
                 {"run_id": run_id},
             ).scalar()
@@ -127,11 +157,11 @@ def get_fork_group_stats(db: LandscapeDB, run_id: str) -> dict[str, int]:
         total_children = (
             conn.execute(
                 text("""
-                SELECT COUNT(*)
+                SELECT COUNT(DISTINCT t.token_id)
                 FROM tokens t
                 JOIN rows r ON r.row_id = t.row_id
+                JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                 WHERE r.run_id = :run_id
-                  AND t.fork_group_id IS NOT NULL
             """),
                 {"run_id": run_id},
             ).scalar()
@@ -142,12 +172,12 @@ def get_fork_group_stats(db: LandscapeDB, run_id: str) -> dict[str, int]:
         with_parents = (
             conn.execute(
                 text("""
-                SELECT COUNT(*)
+                SELECT COUNT(DISTINCT t.token_id)
                 FROM tokens t
                 JOIN rows r ON r.row_id = t.row_id
+                JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                 JOIN token_parents p ON p.token_id = t.token_id
                 WHERE r.run_id = :run_id
-                  AND t.fork_group_id IS NOT NULL
             """),
                 {"run_id": run_id},
             ).scalar()
@@ -199,13 +229,13 @@ def count_fork_groups_with_unexpected_children(db: LandscapeDB, run_id: str, exp
             text("""
                 SELECT COUNT(*)
                 FROM (
-                    SELECT t.fork_group_id, COUNT(*) AS child_count
+                    SELECT f.group_id, COUNT(DISTINCT t.token_id) AS child_count
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
+                    JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                     WHERE r.run_id = :run_id
-                      AND t.fork_group_id IS NOT NULL
-                    GROUP BY t.fork_group_id
-                    HAVING COUNT(*) != :expected_children
+                    GROUP BY f.group_id
+                    HAVING COUNT(DISTINCT t.token_id) != :expected_children
                 ) bad_groups
             """),
             {"run_id": run_id, "expected_children": expected_children},
@@ -748,7 +778,9 @@ class TestForkRecoveryInvariant:
             conn.commit()
 
         _scrub_scheduler_work_for_outcomeless_tokens(db, run.run_id)
-        # Create a checkpoint (required for recovery to work)
+        # Create a checkpoint (required for recovery to work) as the crashed
+        # leader's last act: the completed run vacated its seat on teardown.
+        reseat_crashed_leader(db, run.run_id)
         checkpoint_manager = CheckpointManager(db)
         create_checkpoint(
             checkpoint_manager,
@@ -962,9 +994,22 @@ class TestForkRecoveryInvariant:
             locked=True,
         )
 
-        # Create two branch tokens to coalesce
-        token_a = factory.data_flow.create_token(row_id=row.row_id)
-        token_b = factory.data_flow.create_token(row_id=row.row_id)
+        # Create two branch tokens to coalesce. coalesce_tokens' durable strict
+        # pop (spec rulings 24/28) requires an innermost shared FORK lineage
+        # frame on every parent — crafted here via the
+        # create_token(..., lineage_frames=) seam to model the shape a real
+        # fork_token would have produced.
+        token_a = factory.data_flow.create_token(
+            row_id=row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="a"),),
+        )
+        token_b = factory.data_flow.create_token(
+            row_id=row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="b"),),
+        )
+        # META-38: the crafted fork group needs the group_records row a real
+        # fork mints — coalesce_tokens reads the written release fact for it.
+        ensure_fork_group_record(factory, run_id=run.run_id, group_id="fork-join-balance-grp", opener_token_id=token_a.token_id)
 
         # Merged payload includes a datetime to verify type fidelity.
         # canonical_json would stringify datetime; checkpoint_dumps preserves it.
@@ -1091,8 +1136,10 @@ class TestForkRecoveryInvariant:
                     SELECT t.token_id AS token_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
+                    JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id
                     WHERE r.run_id = :run_id
-                      AND t.branch_name = 'sink_a'
+                      AND f.kind = 'fork'
+                      AND f.member_key = 'sink_a'
                 """),
                 {"run_id": run_id},
             ).fetchall()
@@ -1131,8 +1178,8 @@ class TestForkRecoveryInvariant:
 
         spec = all_specs[0]
         assert spec.token_id == incomplete_token_id, f"Spec token_id {spec.token_id!r} != expected {incomplete_token_id!r}"
-        assert spec.branch_name == "sink_a", f"Spec branch_name {spec.branch_name!r} != 'sink_a'"
-        assert spec.fork_group_id is not None, "fork child must carry fork_group_id (set by the gate on fork)"
+        assert path_branch_name(spec.lineage_path) == "sink_a", f"Spec branch_name {path_branch_name(spec.lineage_path)!r} != 'sink_a'"
+        assert path_fork_group_id(spec.lineage_path) is not None, "fork child must carry fork_group_id (set by the gate on fork)"
         assert spec.token_data_ref is None, "fork child shares the source payload (retrieval by row_id); token_data_ref must be NULL"
         # The fork child visited a sink node → node_states written → max_attempt should be 0.
         # If this fires at -1 it means fork children don't write node_states, which is a
@@ -1322,10 +1369,8 @@ class TestForkRecoveryInvariant:
         fork_spec = IncompleteTokenSpec(
             token_id="fork-child-token",
             row_id=row.row_id,
-            branch_name="sink_a",
-            fork_group_id="fg-1",
             join_group_id=None,
-            expand_group_id=None,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="sink_a"),),
             token_data_ref=None,
             step_in_pipeline=1,
             max_attempt=0,
@@ -1375,10 +1420,8 @@ class TestForkRecoveryInvariant:
         envelope_spec = IncompleteTokenSpec(
             token_id=child.token_id,
             row_id=row.row_id,
-            branch_name=None,
-            fork_group_id=None,
             join_group_id=None,
-            expand_group_id=child.expand_group_id,
+            lineage_path=child.lineage_path,
             token_data_ref=child.token_data_ref,
             step_in_pipeline=2,
             max_attempt=-1,
@@ -1455,10 +1498,8 @@ class TestForkRecoveryInvariant:
             return IncompleteTokenSpec(
                 token_id="malformed-token",
                 row_id="row-malformed",
-                branch_name=None,
-                fork_group_id=None,
                 join_group_id=None,
-                expand_group_id="eg-malformed",
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-malformed", member_key="malformed-token"),),
                 token_data_ref=ref,
                 step_in_pipeline=2,
                 max_attempt=-1,
@@ -1667,14 +1708,15 @@ class TestForkRecoveryInvariant:
                     JOIN rows r ON r.row_id = t.row_id
                     WHERE r.run_id = :run_id
                       AND t.join_group_id IS NOT NULL
-                      AND t.branch_name IS NULL
-                      AND t.fork_group_id IS NULL
+                      AND t.token_id NOT IN (
+                          SELECT f.token_id FROM token_lineage_frames f
+                          WHERE f.run_id = t.run_id AND f.kind = 'fork'
+                      )
                 """),
                 {"run_id": run_id},
             ).fetchall()
         assert len(merged_rows) == 1, f"Expected exactly one merged token (join_group_id set, branch/fork NULL); got {len(merged_rows)}"
         merged_token_id = merged_rows[0].token_id
-        join_group_id = merged_rows[0].join_group_id
 
         # ── Interrupt: undo the barrier entirely ───────────────────────────────────
         # A pre-barrier crash means: the barrier code never ran.  In production this
@@ -1691,8 +1733,8 @@ class TestForkRecoveryInvariant:
         #   5. branch tokens' COALESCED outcomes (path='coalesced', jgid=join_group_id)
         #   6. branch tokens' COMPLETED node_states at the coalesce node —
         #      CoalesceExecutor._check_landscape_for_completion queries
-        #      get_completed_row_ids_for_nodes which joins node_states→tokens and
-        #      checks completed_at IS NOT NULL; if these remain, accept() sees
+        #      has_completed_group_for_node which joins node_states→lineage
+        #      frames and checks completed_at IS NOT NULL; if these remain, accept() sees
         #      "already completed" and records a spurious UNROUTED outcome instead
         #      of holding/merging the re-driven branch tokens.
         #
@@ -1739,7 +1781,17 @@ class TestForkRecoveryInvariant:
             # 5. merged token row (FK deps removed above)
             conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
             # 6. branch COALESCED outcomes (recorded by the barrier, path='coalesced')
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.join_group_id == join_group_id))
+            conn.execute(
+                text("""
+                    DELETE FROM token_outcomes
+                    WHERE path = 'coalesced'
+                      AND token_id IN (
+                          SELECT token_id FROM token_lineage_frames
+                          WHERE run_id = :run_id AND kind = 'fork'
+                      )
+                """),
+                {"run_id": run_id},
+            )
             # 7. branch tokens' COMPLETED node_states at the coalesce node.
             #    CoalesceExecutor._check_landscape_for_completion (called by accept())
             #    queries completed_at IS NOT NULL for the coalesce node.  If these
@@ -1766,7 +1818,7 @@ class TestForkRecoveryInvariant:
             f"pre-barrier state); got {len(all_specs)}: {[s.token_id for s in all_specs]}"
         )
         for spec in all_specs:
-            assert spec.branch_name is not None, (
+            assert path_branch_name(spec.lineage_path) is not None, (
                 f"Before-barrier spec must have branch_name set (Case 2); got None for token {spec.token_id!r}"
             )
             assert spec.join_group_id is None, (
@@ -1777,6 +1829,7 @@ class TestForkRecoveryInvariant:
             )
 
         # ── Resume ────────────────────────────────────────────────────────────────
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -1907,24 +1960,26 @@ class TestForkRecoveryInvariant:
                     JOIN rows r ON r.row_id = t.row_id
                     WHERE r.run_id = :run_id
                       AND t.join_group_id IS NOT NULL
-                      AND t.branch_name IS NULL
-                      AND t.fork_group_id IS NULL
+                      AND t.token_id NOT IN (
+                          SELECT f.token_id FROM token_lineage_frames f
+                          WHERE f.run_id = t.run_id AND f.kind = 'fork'
+                      )
                 """),
                 {"run_id": run_id},
             ).fetchall()
             branch_rows = conn.execute(
                 text("""
-                    SELECT t.token_id AS token_id, t.branch_name AS branch_name, t.row_id AS row_id,
-                           t.fork_group_id AS fork_group_id
+                    SELECT t.token_id AS token_id, f.member_key AS branch_name, t.row_id AS row_id,
+                           f.group_id AS fork_group_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
-                    WHERE r.run_id = :run_id AND t.branch_name IN ('path_a', 'path_b')
+                    JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
+                    WHERE r.run_id = :run_id AND f.member_key IN ('path_a', 'path_b')
                 """),
                 {"run_id": run_id},
             ).fetchall()
         assert len(merged_rows) == 1, f"Expected exactly one merged token; got {len(merged_rows)}"
         merged_token_id = merged_rows[0].token_id
-        join_group_id = merged_rows[0].join_group_id
         by_branch = {b.branch_name: b for b in branch_rows}
         assert set(by_branch) == {"path_a", "path_b"}, f"expected path_a + path_b; got {set(by_branch)}"
         # Hold the branch that dispatches FIRST so the held-branch re-drive is the FIRST
@@ -1986,7 +2041,17 @@ class TestForkRecoveryInvariant:
             conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
             conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
             # Branch COALESCED outcomes (recorded by the barrier on both branches)
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.join_group_id == join_group_id))
+            conn.execute(
+                text("""
+                    DELETE FROM token_outcomes
+                    WHERE path = 'coalesced'
+                      AND token_id IN (
+                          SELECT token_id FROM token_lineage_frames
+                          WHERE run_id = :run_id AND kind = 'fork'
+                      )
+                """),
+                {"run_id": run_id},
+            )
             # HELD branch (path_a): revert its coalesce-node node_state to the held/open
             # state (status='open', completed_at NULL) — the genuine pre-barrier state that
             # CoalesceExecutor.accept's begin_node_state writes on arrival (the barrier never
@@ -2033,9 +2098,9 @@ class TestForkRecoveryInvariant:
             step_index=1,
             ingest_sequence=sibling_ingest_sequence,
             row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
-            available_at=datetime.now(UTC),
-            branch_name=incomplete_branch.branch_name,
-            fork_group_id=incomplete_branch.fork_group_id,
+            lineage_path=(
+                LineageFrame(kind=FrameKind.FORK, group_id=incomplete_branch.fork_group_id, member_key=incomplete_branch.branch_name),
+            ),
             coalesce_node_id=coalesce_node_id,
             coalesce_name="merge",
         )
@@ -2047,7 +2112,7 @@ class TestForkRecoveryInvariant:
         # row carries the branch's row payload — resume restores _pending from it
         # (BarrierRecoveryCoordinator.restore_from_journal ← list_blocked_barrier_items).
         held_first_node = str(graph.get_transform_id_map()[branch_index_by_name[held_branch_name]])
-        seed_now = datetime.now(UTC)
+        datetime.now(UTC)
         held_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
             run_id=run_id,
             token_id=held_branch.token_id,
@@ -2056,12 +2121,9 @@ class TestForkRecoveryInvariant:
             step_index=1,
             ingest_sequence=sibling_ingest_sequence,
             row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
-            available_at=seed_now,
             lease_owner="test-harness",
             lease_seconds=60,
-            now=seed_now,
-            branch_name=held_branch_name,
-            fork_group_id=held_branch.fork_group_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=held_branch.fork_group_id, member_key=held_branch_name),),
             coalesce_node_id=coalesce_node_id,
             coalesce_name="merge",
         )
@@ -2069,11 +2131,11 @@ class TestForkRecoveryInvariant:
             work_item_id=held_item.work_item_id,
             queue_key=None,
             barrier_key="merge",  # coalesce barrier_key == coalesce NAME (restore partition D1)
-            now=seed_now,
             expected_lease_owner="test-harness",
         )
 
         # ── Create the checkpoint (F1: scalars only — no barrier blob) ──
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -2286,14 +2348,15 @@ class TestForkRecoveryInvariant:
                     JOIN rows r ON r.row_id = t.row_id
                     WHERE r.run_id = :run_id
                       AND t.join_group_id IS NOT NULL
-                      AND t.branch_name IS NULL
-                      AND t.fork_group_id IS NULL
+                      AND t.token_id NOT IN (
+                          SELECT f.token_id FROM token_lineage_frames f
+                          WHERE f.run_id = t.run_id AND f.kind = 'fork'
+                      )
                 """),
                 {"run_id": run_id},
             ).fetchall()
         assert len(merged_rows) == 1, f"Expected exactly one merged token; got {len(merged_rows)}"
         merged_token_id = merged_rows[0].token_id
-        join_group_id = merged_rows[0].join_group_id
         coalesce_node_id = graph.get_coalesce_id_map()[CoalesceName("merge")]
 
         # ── Interrupt: undo the barrier (same pattern as test_resume_fork_to_coalesce_before_barrier) ──
@@ -2326,7 +2389,17 @@ class TestForkRecoveryInvariant:
             # 5. merged token row
             conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
             # 6. branch COALESCED outcomes
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.join_group_id == join_group_id))
+            conn.execute(
+                text("""
+                    DELETE FROM token_outcomes
+                    WHERE path = 'coalesced'
+                      AND token_id IN (
+                          SELECT token_id FROM token_lineage_frames
+                          WHERE run_id = :run_id AND kind = 'fork'
+                      )
+                """),
+                {"run_id": run_id},
+            )
             # 7. branch tokens' completed coalesce node_states
             conn.execute(
                 text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
@@ -2337,6 +2410,7 @@ class TestForkRecoveryInvariant:
 
         _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
         # ── Checkpoint + mark failed ──────────────────────────────────────────
+        reseat_crashed_leader(db, run_id)
         checkpoint_mgr = CheckpointManager(db)
         create_checkpoint(
             checkpoint_mgr,
@@ -2558,14 +2632,15 @@ class TestForkRecoveryInvariant:
                     JOIN rows r ON r.row_id = t.row_id
                     WHERE r.run_id = :run_id
                       AND t.join_group_id IS NOT NULL
-                      AND t.branch_name IS NULL
-                      AND t.fork_group_id IS NULL
+                      AND t.token_id NOT IN (
+                          SELECT f.token_id FROM token_lineage_frames f
+                          WHERE f.run_id = t.run_id AND f.kind = 'fork'
+                      )
                 """),
                 {"run_id": run_id},
             ).fetchall()
         assert len(merged_rows) == 1, f"Expected exactly one merged token (join_group_id set, branch/fork NULL); got {len(merged_rows)}"
         merged_token_id = merged_rows[0].token_id
-        join_group_id = merged_rows[0].join_group_id
 
         # ── Interrupt: undo the barrier entirely (pre-barrier crash state) ────
         # Verbatim from test_resume_fork_to_coalesce_before_barrier: reverse
@@ -2603,7 +2678,17 @@ class TestForkRecoveryInvariant:
             # 5. merged token row
             conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
             # 6. branch COALESCED outcomes (recorded by the barrier, path='coalesced')
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.join_group_id == join_group_id))
+            conn.execute(
+                text("""
+                    DELETE FROM token_outcomes
+                    WHERE path = 'coalesced'
+                      AND token_id IN (
+                          SELECT token_id FROM token_lineage_frames
+                          WHERE run_id = :run_id AND kind = 'fork'
+                      )
+                """),
+                {"run_id": run_id},
+            )
             # 7. branch tokens' COMPLETED node_states at the coalesce node
             conn.execute(
                 text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
@@ -2614,6 +2699,7 @@ class TestForkRecoveryInvariant:
 
         _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
         # ── Resume ────────────────────────────────────────────────────────────
+        reseat_crashed_leader(db, run_id)
         checkpoint_mgr = CheckpointManager(db)
         recovery_mgr = RecoveryManager(db, checkpoint_mgr)
         create_checkpoint(
@@ -2657,23 +2743,7 @@ class TestForkRecoveryInvariant:
             f"that arm regressed or the barrier failed to re-fire on resume."
         )
 
-        counter_fields = (
-            "rows_processed",
-            "rows_succeeded",
-            "rows_failed",
-            "rows_routed_success",
-            "rows_routed_failure",
-            "rows_quarantined",
-            "rows_forked",
-            "rows_coalesced",
-            "rows_coalesce_failed",
-            "rows_expanded",
-            "rows_buffered",
-            "rows_diverted",
-        )
-        for field in counter_fields:
-            a_val = getattr(run_a, field)
-            b_val = getattr(run_b_resume, field)
+        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
             assert b_val == a_val, (
                 f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
                 f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
@@ -2733,6 +2803,8 @@ class TestForkRecoveryInvariant:
             output_schema = _TestSchema
             is_batch_aware = True
             passes_through_input = False
+            forwards_input_fields = False
+            removed_input_fields = frozenset()
             on_success = "output"
             on_error = "discard"
 
@@ -2877,6 +2949,7 @@ class TestForkRecoveryInvariant:
         # already has its terminal (or non-completed BUFFERED) record, so resume's
         # get_unprocessed_rows is empty → the all-rows-already-processed branch
         # reconstructs the cumulative counters from the intact audit trail.
+        reseat_crashed_leader(db, run_id)
         checkpoint_mgr = CheckpointManager(db)
         recovery_mgr = RecoveryManager(db, checkpoint_mgr)
         create_checkpoint(
@@ -2918,23 +2991,7 @@ class TestForkRecoveryInvariant:
             f"arm regressed or the BUFFERED records were not preserved across resume."
         )
 
-        counter_fields = (
-            "rows_processed",
-            "rows_succeeded",
-            "rows_failed",
-            "rows_routed_success",
-            "rows_routed_failure",
-            "rows_quarantined",
-            "rows_forked",
-            "rows_coalesced",
-            "rows_coalesce_failed",
-            "rows_expanded",
-            "rows_buffered",
-            "rows_diverted",
-        )
-        for field in counter_fields:
-            a_val = getattr(run_a, field)
-            b_val = getattr(run_b_resume, field)
+        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
             assert b_val == a_val, (
                 f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
                 f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
@@ -2990,6 +3047,7 @@ class TestForkRecoveryInvariant:
         run_id = run_b1.run_id
         checkpoint_mgr = CheckpointManager(db)
         recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(checkpoint_mgr, run_id=run_id, sequence_number=1, barrier_scalars=None, graph=graph)
         with db.engine.connect() as conn:
             conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
@@ -3023,23 +3081,7 @@ class TestForkRecoveryInvariant:
         )
 
         # ── EVERY counter field must reconcile (no divergent field remains) ────
-        all_fields = (
-            "rows_processed",
-            "rows_succeeded",
-            "rows_failed",
-            "rows_routed_success",
-            "rows_routed_failure",
-            "rows_quarantined",
-            "rows_forked",
-            "rows_coalesced",
-            "rows_coalesce_failed",
-            "rows_expanded",
-            "rows_buffered",
-            "rows_diverted",
-        )
-        for field in all_fields:
-            a_val = getattr(run_a, field)
-            b_val = getattr(run_b_resume, field)
+        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
             assert b_val == a_val, (
                 f"'{field}' must reconcile on the count==N topology (live/derive unification, "
                 f"elspeth-e1dd5e1303). uninterrupted={a_val}, resumed={b_val}."
@@ -3147,6 +3189,7 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import CheckpointSettings
 
         checkpoint_mgr = CheckpointManager(db)
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -3245,7 +3288,8 @@ class TestForkRecoveryInvariant:
                         FROM token_outcomes o
                         JOIN tokens t ON t.token_id = o.token_id
                         JOIN rows r ON r.row_id = t.row_id
-                        WHERE r.run_id = :run_id AND t.branch_name = 'sink_bad' AND o.completed = 1
+                        JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
+                        WHERE r.run_id = :run_id AND f.member_key = 'sink_bad' AND o.completed = 1
                     """),
                     {"run_id": run_id},
                 ).fetchall()
@@ -3261,7 +3305,8 @@ class TestForkRecoveryInvariant:
                 text("""
                     SELECT t.token_id AS token_id FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
-                    WHERE r.run_id = :run_id AND t.branch_name = 'sink_bad'
+                    JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
+                    WHERE r.run_id = :run_id AND f.member_key = 'sink_bad'
                 """),
                 {"run_id": run_id},
             ).fetchall()
@@ -3288,7 +3333,7 @@ class TestForkRecoveryInvariant:
         by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
         all_specs = [s for specs in by_row.values() for s in specs]
         assert len(all_specs) == 1 and all_specs[0].token_id == bad_token_id, (
-            f"only the sink_bad branch must be incomplete; got {[(s.token_id, s.branch_name) for s in all_specs]}"
+            f"only the sink_bad branch must be incomplete; got {[(s.token_id, path_branch_name(s.lineage_path)) for s in all_specs]}"
         )
 
         resume_result = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
@@ -3410,11 +3455,13 @@ class TestForkRecoveryInvariant:
         all_specs = [s for specs in by_row.values() for s in specs]
         assert len(all_specs) == 1, f"linear interrupt must surface one incomplete token; got {len(all_specs)}"
         linear_spec = all_specs[0]
-        assert linear_spec.branch_name is None and linear_spec.fork_group_id is None, (
-            f"linear token must have NO branch/fork lineage; got branch={linear_spec.branch_name!r} fork={linear_spec.fork_group_id!r}"
+        assert path_branch_name(linear_spec.lineage_path) is None and path_fork_group_id(linear_spec.lineage_path) is None, (
+            f"linear token must have NO branch/fork lineage; got branch={path_branch_name(linear_spec.lineage_path)!r} "
+            f"fork={path_fork_group_id(linear_spec.lineage_path)!r}"
         )
-        assert linear_spec.expand_group_id is None and linear_spec.join_group_id is None, (
-            f"linear token must have NO expand/join lineage; got expand={linear_spec.expand_group_id!r} join={linear_spec.join_group_id!r}"
+        assert path_expand_group_id(linear_spec.lineage_path) is None and linear_spec.join_group_id is None, (
+            f"linear token must have NO expand/join lineage; got expand={path_expand_group_id(linear_spec.lineage_path)!r} "
+            f"join={linear_spec.join_group_id!r}"
         )
 
         # Count tokens before resume so we can prove a FRESH token was minted (the
@@ -3512,11 +3559,12 @@ class TestForkRecoveryInvariant:
         with db.engine.connect() as conn:
             children = conn.execute(
                 text("""
-                    SELECT t.token_id AS token_id, t.branch_name AS branch_name, t.row_id AS row_id,
-                           t.fork_group_id AS fork_group_id
+                    SELECT t.token_id AS token_id, f.member_key AS branch_name, t.row_id AS row_id,
+                           f.group_id AS fork_group_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
-                    WHERE r.run_id = :run_id AND t.branch_name IN ('sink_a', 'sink_b')
+                    JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
+                    WHERE r.run_id = :run_id AND f.member_key IN ('sink_a', 'sink_b')
                 """),
                 {"run_id": run_id},
             ).fetchall()
@@ -3573,7 +3621,7 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
-        seed_now = datetime.now(UTC)
+        datetime.now(UTC)
         seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
             run_id=run_id,
             token_id=buffered_child.token_id,
@@ -3582,23 +3630,20 @@ class TestForkRecoveryInvariant:
             step_index=1,
             ingest_sequence=row_ingest_sequence,
             row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 0}, contract=source_contract)),
-            available_at=seed_now,
             lease_owner="test-harness",
             lease_seconds=60,
-            now=seed_now,
-            branch_name="sink_a",
-            fork_group_id=buffered_child.fork_group_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=buffered_child.fork_group_id, member_key="sink_a"),),
         )
         scheduler_repo.mark_blocked(
             work_item_id=seeded_item.work_item_id,
             queue_key=None,
             barrier_key=barrier_key_for_seed,
-            now=seed_now,
             expected_lease_owner="test-harness",
         )
 
         # A checkpoint is the resume precondition (get_unprocessed_rows returns []
         # for a run with no checkpoint). F1: it carries scalars only — no blob.
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -3831,12 +3876,13 @@ class TestForkRecoveryInvariant:
         with db.engine.connect() as conn:
             children = conn.execute(
                 text("""
-                    SELECT DISTINCT t.token_id AS token_id, t.row_id AS row_id, t.expand_group_id AS expand_group_id,
+                    SELECT DISTINCT t.token_id AS token_id, t.row_id AS row_id, f.group_id AS expand_group_id,
                            t.token_data_ref AS token_data_ref
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
+                    JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'expand'
                     JOIN token_outcomes o ON o.token_id = t.token_id
-                    WHERE r.run_id = :run_id AND t.expand_group_id IS NOT NULL
+                    WHERE r.run_id = :run_id
                       AND o.path = :consumed AND o.completed = 1
                     ORDER BY t.token_id
                 """),
@@ -3884,7 +3930,7 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
-        seed_now = datetime.datetime.now(datetime.UTC)
+        datetime.datetime.now(datetime.UTC)
         for c in children:
             env = _envelope(c.token_data_ref)
             leaf_payload = _PipelineRow(dict(env["data"]), _SchemaContract.from_checkpoint(dict(env["contract"])))
@@ -3896,17 +3942,14 @@ class TestForkRecoveryInvariant:
                 step_index=2,
                 ingest_sequence=row_ingest_sequence,
                 row_payload_json=scheduler_repo.serialize_row_payload(leaf_payload),
-                available_at=seed_now,
                 lease_owner="test-harness",
                 lease_seconds=60,
-                now=seed_now,
-                expand_group_id=c.expand_group_id,
+                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=c.expand_group_id, member_key=c.token_id),),
             )
             scheduler_repo.mark_blocked(
                 work_item_id=seeded_item.work_item_id,
                 queue_key=None,
                 barrier_key=str(agg_node_id),
-                now=seed_now,
                 expected_lease_owner="test-harness",
             )
 
@@ -4132,8 +4175,18 @@ class TestForkRecoveryInvariant:
         assert expand_child.token_data_ref is not None, "expand child must carry token_data_ref"
 
         # ── (2) COALESCE path: merged token_data_ref envelope carries the full domain ──
-        token_x = factory.data_flow.create_token(row_id=row.row_id)
-        token_y = factory.data_flow.create_token(row_id=row.row_id)
+        # coalesce_tokens' durable strict pop (spec rulings 24/28) requires an
+        # innermost shared FORK lineage frame on every parent — crafted here via
+        # the create_token(..., lineage_frames=) seam.
+        token_x = factory.data_flow.create_token(
+            row_id=row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="x"),),
+        )
+        token_y = factory.data_flow.create_token(
+            row_id=row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="y"),),
+        )
+        ensure_fork_group_record(factory, run_id=run.run_id, group_id="fork-join-balance-domain-grp", opener_token_id=token_x.token_id)
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[
                 TokenRef(token_id=token_x.token_id, run_id=run.run_id),
@@ -4154,10 +4207,8 @@ class TestForkRecoveryInvariant:
         expand_spec = IncompleteTokenSpec(
             token_id=expand_child.token_id,
             row_id=row.row_id,
-            branch_name=None,
-            fork_group_id=None,
             join_group_id=None,
-            expand_group_id=expand_child.expand_group_id,
+            lineage_path=expand_child.lineage_path,
             token_data_ref=expand_child.token_data_ref,
             step_in_pipeline=1,
             max_attempt=-1,
@@ -4170,10 +4221,8 @@ class TestForkRecoveryInvariant:
         merged_spec = IncompleteTokenSpec(
             token_id=merged.token_id,
             row_id=row.row_id,
-            branch_name=None,
-            fork_group_id=None,
             join_group_id=merged.join_group_id,
-            expand_group_id=None,
+            lineage_path=merged.lineage_path,
             token_data_ref=merged.token_data_ref,
             step_in_pipeline=2,
             max_attempt=-1,

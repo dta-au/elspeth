@@ -40,8 +40,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from elspeth.contracts.errors import FailedTurnMetadata
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
@@ -51,6 +53,105 @@ _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
 class _ToolBatchCancellationRequested(Exception):
     """Internal sentinel: cancellation landed before any tool dispatched."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedAssistantMessage:
+    """Validated provider prose copied into an ELSPETH-owned message."""
+
+    content: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolFunction:
+    """Immutable copy of execution-relevant provider function metadata."""
+
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolCall:
+    """Immutable provider call admitted for this dispatch batch."""
+
+    id: str
+    function: _AdmittedToolFunction
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolBatch:
+    """Immutable batch used exclusively after provider-boundary admission."""
+
+    calls: tuple[_AdmittedToolCall, ...]
+    call_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedLLMProviderMetadata:
+    """Minimal provider projection retained for audit and provenance."""
+
+    model_returned: str | None
+    finish_reason: str | None
+    usage: TokenUsage
+    provider_cost: float | None
+    provider_cost_source: ComposerLLMProviderCostSource
+    provider_request_id: str | None
+    reasoning_content: str | None
+    reasoning_details: Any | None
+    thinking_blocks: Any | None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "reasoning_details", "thinking_blocks")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedLLMCompletion:
+    """Read-once, owned snapshot of one successful provider completion."""
+
+    message: _AdmittedAssistantMessage
+    tool_batch: _AdmittedToolBatch
+    provider_metadata: _AdmittedLLMProviderMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorReviewState:
+    """Bounded END-checkpoint context carried across compose-loop iterations."""
+
+    completed_passes: int = 0
+    previous_findings: tuple[str, ...] = ()
+    previous_evidence_hash: str | None = None
+    successful_mutating_actions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "previous_findings", "successful_mutating_actions")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorCallSuccess:
+    """Successfully admitted advisor guidance and its accounting metadata."""
+
+    guidance: str
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorProviderFailure:
+    """Recognised Tier-3 provider failure that may become tool feedback."""
+
+    error_class: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorFirstPartyFailure:
+    """Unclassified controlled-code failure that must propagate after P4."""
+
+    original_exc: Exception
+
+
+_AdvisorCallOutcome = _AdvisorCallSuccess | _AdvisorProviderFailure | _AdvisorFirstPartyFailure
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,12 +171,11 @@ class _ToolOutcome:
     * ``None`` for argument-error and plugin-crash paths, where
       ``error_class`` / ``error_message`` carry the outcome.
 
-    ``call`` remains ``Any`` because it is a LiteLLM ToolCall object (or a
-    frozen mapping in tests) and this carrier deliberately avoids coupling to
-    provider-specific response classes.
+    ``call`` is the ELSPETH-owned tool-call projection admitted before the raw
+    provider response is discarded.
     """
 
-    call: Any  # ToolCall — typed in protocol module
+    call: _AdmittedToolCall
     response: _ToolOutcomeResponse
     error_class: str | None
     error_message: str | None
@@ -90,30 +190,13 @@ class _ToolOutcome:
 class _CallModelOutcome:
     """Result of one LLM call in the compose loop (Phase P1).
 
-    P2 (``_try_terminate_no_tools``) reads ``has_tool_calls`` and the full
-    ``assistant_message`` to decide whether to short-circuit. P3
-    (``_dispatch_tool_batch``) reads ``assistant_tool_calls`` and
-    ``raw_assistant_content``. P5's B-4D-3 last-chance path produces a
-    second instance per iteration.
-
-    ``response``, ``assistant_message`` and the ``assistant_tool_calls``
-    entries are LiteLLM-owned objects; ELSPETH treats them as opaque
-    Tier-3 values. ``response`` is threaded into the session-aware
-    dispatch helper, which writes its ``model`` field into interpretation
-    events. ``raw_assistant_content`` is the assistant text *before* any
-    augmentation by ``_finalize_no_tool_response`` (scalar string-or-None).
+    The sole field is the frozen completion admitted before the provider
+    object leaves the Tier-3 boundary. P2 reads its owned message, P3 consumes
+    its already-admitted tool batch and provider metadata, and P5's B-4D-3
+    last-chance path consumes the same carrier directly.
     """
 
-    response: Any
-    assistant_message: Any
-    raw_assistant_content: str | None
-    assistant_tool_calls: tuple[Any, ...]
-    has_tool_calls: bool
-
-    # No freeze_fields: response and assistant_message are opaque (Tier-3
-    # LiteLLM values), assistant_tool_calls is already a tuple,
-    # raw_assistant_content is str|None, has_tool_calls is bool. frozen=True
-    # alone is sufficient.
+    completion: _AdmittedLLMCompletion
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +220,15 @@ class _TerminateOutcome:
     # flagged advisor repair-continue (or a fail-closed end-gate return)
     # increments this, never the repair counter; the driver folds it into
     # ``advisor_checkpoint_passes_used``.
-    advisor_passes_delta: int = 0  # 0 or 1
+    advisor_passes_delta: int = 0  # bounded non-negative delta; retries may consume more than one
+    # Set only when this "continue" was produced by a FLAGGED END advisor
+    # pass: the index of the synthetic advisor sign-off message just
+    # appended to ``llm_messages``. The driver elides it once a genuine
+    # repair tool call lands (Task 6 Step 3, elspeth-bff8fe6864) so the
+    # eventual CLEAN finalize turn cannot anchor on advisor text the real
+    # user never saw.
+    advisor_injection_index: int | None = None
+    advisor_review_state: _AdvisorReviewState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,11 +271,20 @@ class _DispatchOutcome:
     plugin_crash: ComposerPluginCrashError | None
     plugin_crash_cause: BaseException | None
 
-    # LLM call result threaded through — P4 reads .content and .tool_calls
-    # for redaction / persist; P5 unused.
-    assistant_message: Any
+    # First-party advisor failure — unlike plugin_crash this keeps the
+    # original exception type, but follows the same persist-before-propagate
+    # discipline so the request_advisor_hint row is never left OPEN.
+    advisor_failure: Exception | None
+
+    # Advisor-tool compose timeout — the tool envelope is already closed in
+    # P3, but P4 must persist/redact the current assistant+tool turn before the
+    # driver raises the ordinary convergence-timeout recovery carrier.
+    advisor_compose_timeout: Literal["pre_call", "in_flight"] | None
+
+    # Owned LLM completion fields threaded through for P4 persistence.
+    assistant_message: _AdmittedAssistantMessage
     raw_assistant_content: str | None
-    assistant_tool_calls: tuple[Any, ...]
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...]
 
     # mutation_success_seen rebinds inside dispatch's success path; carry
     # the delta so the driver can fold it into its multi-iteration
@@ -207,17 +307,59 @@ class _DispatchOutcome:
 class _PersistOutcome:
     """Result of redact-and-persist (Phase P4 → P5).
 
-    When the dispatch carried a plugin crash AND persistence succeeded,
-    the driver raises *after* constructing this carrier — so the carrier
-    never represents a "post-crash" state. If construction happens at all,
-    persist completed (or session_id was None so no persist was attempted)
-    and no plugin crash propagation is pending.
+    When the dispatch carried a plugin crash, the carrier distinguishes a
+    committed unwind audit from a rolled-back unwind attempt through
+    ``persisted_tool_call_turn``. The driver then propagates the crash with
+    either no invocation rows (committed) or exactly the current unpersisted
+    suffix (rolled back).
     """
 
     current_state_id: str | None
     persisted_assistant_message_id: str | None
+    # The assistant content actually committed for that row — not the turn's
+    # prose. The two diverge on the advisor-repair branch, which persists a
+    # fixed public message with ``raw_content=None``
+    # (``service._persist_turn_audit``). The turn-end writer compares against
+    # this to avoid re-emitting a row it already committed
+    # (elspeth-d581b3da7f); comparing against the turn prose would miss that
+    # branch. REQUIRED (no default) so a threading site that adds the id
+    # without it fails at construction rather than silently duplicating.
+    persisted_assistant_content: str | None
     persisted_tool_call_turn: bool
+    # True only when P4 persisted the current dispatch's assistant prose
+    # without substituting backend-owned content. REQUIRED (no default): P5
+    # must not infer turn identity from row presence or byte equality.
+    persisted_assistant_matches_current_dispatch: bool
+    unwind_audit_failed: bool
     failed_turn: FailedTurnMetadata | None
+
+    def __post_init__(self) -> None:
+        # Biconditional, not a one-way check: the id names a row and the
+        # content is what that row holds, so one without the other is a
+        # half-threaded state. Setting the id alone is the dangerous
+        # direction (the turn-end writer can no longer tell a re-emission
+        # from genuine later prose, and duplicates); the reverse is
+        # incoherent. Both are unrepresentable here.
+        if (self.persisted_assistant_message_id is None) != (self.persisted_assistant_content is None):
+            raise AuditIntegrityError(
+                "Tier 1: _PersistOutcome pairing invariant violated — "
+                "persisted_assistant_message_id and persisted_assistant_content "
+                "must be set or unset together. The id names the committed "
+                "assistant row and the content is what that row holds; a "
+                "half-threaded pair leaves the turn-end writer unable to "
+                "distinguish a re-emission of that row from genuine later "
+                "prose (elspeth-d581b3da7f). "
+                f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
+                f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
+            )
+        if self.persisted_assistant_matches_current_dispatch and (
+            self.persisted_assistant_message_id is None or self.persisted_assistant_content is None or not self.persisted_tool_call_turn
+        ):
+            raise AuditIntegrityError(
+                "Tier 1: _PersistOutcome current-dispatch invariant violated — "
+                "persisted_assistant_matches_current_dispatch requires a complete "
+                "persisted assistant pair and persisted_tool_call_turn=True."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,4 +384,9 @@ class _ClassifyOutcome:
     # END-gate advisor budget (the P5 last-chance gate). Folded into the
     # driver's ``advisor_checkpoint_passes_used`` after P5, mirroring the
     # P2 ``_TerminateOutcome.advisor_passes_delta`` field.
-    advisor_passes_delta: int = 0  # 0 or 1
+    advisor_passes_delta: int = 0  # bounded non-negative delta; retries may consume more than one
+    # Staged-review verified-handoff repair (elspeth-85f3cc3022): the P5
+    # staged-handoff branch can spend a repair turn instead of completing
+    # the handoff. Folded into the driver's ``repair_turns_used`` after P5,
+    # mirroring the P2 ``_TerminateOutcome.repair_turns_delta`` field.
+    repair_turns_delta: int = 0  # 0 or 1

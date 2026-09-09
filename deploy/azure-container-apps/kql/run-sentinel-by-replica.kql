@@ -1,0 +1,11 @@
+// RunStarted / RunFinished structlog lines carrying the probe's sentinel hash,
+// summarised by revision and replica: proves which replica executed which run.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated between (datetime(__WINDOW_START__) .. datetime(__WINDOW_END__))
+| where ContainerAppName_s == "__APP_NAME__"
+| where Log_s has "__SENTINEL_HASH__"
+| where Log_s has_any ("RunStarted", "RunFinished")
+| extend Event = iff(Log_s has "RunStarted", "RunStarted", "RunFinished")
+| summarize Count = count(), First = min(TimeGenerated), Last = max(TimeGenerated)
+    by RevisionName_s, ContainerGroupName_g, Event
+| order by First asc

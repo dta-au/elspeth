@@ -22,9 +22,10 @@
 import { useEffect, useId, useMemo, useRef } from "react";
 
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "../../stores/sessionStore";
 import type { ReadinessRow, ValidationError } from "../../types/api";
-import { resolveNodePlugin, stepLabelForPlugin } from "../chat/interpretationStepLabel";
+import { stepLabelForNodeId } from "../chat/interpretationStepLabel";
 import {
   humaniseValidationMessage,
   makePhraseFor,
@@ -37,10 +38,16 @@ export interface ReadinessRowDetailProps {
    *  engine-grade dumps never render raw on this novice surface. Absent for
    *  every other row (which carry display-ready backend prose). */
   validationErrors?: readonly ValidationError[];
+  onSelectComponent?: (componentId: string) => void;
   onClose: () => void;
 }
 
-export function ReadinessRowDetail({ row, validationErrors, onClose }: ReadinessRowDetailProps) {
+export function ReadinessRowDetail({
+  row,
+  validationErrors,
+  onSelectComponent,
+  onClose,
+}: ReadinessRowDetailProps) {
   const compositionState = useSessionStore((s) => s.compositionState);
   const selectNode = useSessionStore((s) => s.selectNode);
   const labelId = useId();
@@ -53,10 +60,8 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
   // Memoised (elspeth-40d6efac2b): avoids rebuilding + re-tokenising the
   // phrase map on every render of this drawer.
   const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
-  const stepLabelFor = (componentId: string): string | null => {
-    const plugin = resolveNodePlugin(compositionState, componentId);
-    return plugin === null ? null : stepLabelForPlugin(plugin);
-  };
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
 
   // Humanise the validation row's findings; leave other rows' prose untouched.
   const humanisedFindings =
@@ -79,6 +84,10 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
   }, []);
 
   function handleJump(componentId: string) {
+    if (onSelectComponent !== undefined) {
+      onSelectComponent(componentId);
+      return;
+    }
     selectNode(componentId);
     // P0.3: GraphModal is mounted unconditionally at App.tsx near the
     // app root, so this CustomEvent always reaches its listener — the
@@ -121,7 +130,8 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
         <h3 id={labelId} className="readiness-row-detail-title">
           {row.label}
         </h3>
-        <button
+        <Button
+          variant="bare"
           ref={closeBtnRef}
           type="button"
           className="readiness-row-detail-close"
@@ -129,7 +139,7 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
           aria-label="Close detail"
         >
           ×
-        </button>
+        </Button>
       </header>
 
       <p className="readiness-row-detail-summary">{row.summary}</p>
@@ -181,14 +191,14 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
               return (
                 <li key={id}>
                   {resolvable ? (
-                    <button
+                    <Button
                       type="button"
-                      className="btn readiness-row-detail-jump-btn"
+                      className="readiness-row-detail-jump-btn"
                       onClick={() => handleJump(id)}
                       aria-label={`Jump to ${jumpTargetLabel(id)}`}
                     >
                       Jump to {jumpTargetLabel(id)}
-                    </button>
+                    </Button>
                   ) : (
                     // Not a composition node: a source/sink name or YAML
                     // fragment. Show its plain phrase when the gloss resolves

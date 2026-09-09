@@ -504,3 +504,82 @@ class TestGetBranchFirstNodes:
         # Both branches must resolve despite coming from different gates
         assert result["path_a"] == NodeID("t_a")
         assert result["path_b"] == NodeID("t_b")
+
+    def test_get_branch_first_nodes_nested_coalesce_in_coalesce(self) -> None:
+        """A branch whose declared value names ANOTHER coalesce resolves to the inner opener.
+
+        Regression (elspeth-0bd2cde19a, E1a): a coalesce branch bound to an
+        outer coalesce whose declared branches: value names an INNER
+        coalesce (coalesce-feeds-coalesce, spec §7 rules 2/5) has no literal
+        transform chain between the outer fork gate and the outer coalesce —
+        an inner bound region sits between them. _trace_branch_endpoints's
+        backward MOVE walk can never cross the inner coalesce's identity
+        (COPY) in-edges, and raised GraphValidationError. The fix resolves
+        such a branch declaratively via the one-hop gate->consumer edge
+        instead (mirroring the unbound-branch spec §7 E2 mechanism), never
+        patching the backward walk itself.
+
+        Graph (Task 8a's nested-fork-in-fork shape):
+          source -> outer_fork -[outer_a MOVE]-> inner_fork -[inner_a1/inner_a2 COPY]-> merge_inner
+                 outer_fork -[outer_b COPY]-> merge_outer
+                 merge_inner -[continue MOVE]-> merge_outer -> sink
+        """
+        from elspeth.contracts import RoutingMode
+
+        graph = ExecutionGraph()
+
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="test-source", config={})
+        graph.add_node("outer_fork", node_type=NodeType.GATE, plugin_name="test-gate", config={})
+        graph.add_node("inner_fork", node_type=NodeType.GATE, plugin_name="test-gate", config={})
+        graph.add_node("merge_inner", node_type=NodeType.COALESCE, plugin_name="coalesce", config={})
+        graph.add_node("merge_outer", node_type=NodeType.COALESCE, plugin_name="coalesce", config={})
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="test-sink", config={})
+
+        graph.add_edge("source", "outer_fork", label="continue")
+        graph.add_edge("outer_fork", "inner_fork", label="outer_a", mode=RoutingMode.MOVE)
+        graph.add_edge("outer_fork", "merge_outer", label="outer_b", mode=RoutingMode.COPY)
+        graph.add_edge("inner_fork", "merge_inner", label="inner_a1", mode=RoutingMode.COPY)
+        graph.add_edge("inner_fork", "merge_inner", label="inner_a2", mode=RoutingMode.COPY)
+        graph.add_edge("merge_inner", "merge_outer", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("merge_outer", "sink", label="continue")
+
+        graph.set_branch_info(
+            {
+                BranchName("outer_a"): BranchInfo(
+                    coalesce_name=CoalesceName("merge_outer"),
+                    gate_node_id=NodeID("outer_fork"),
+                    input_connection="merge_inner",
+                    uses_transform_chain=True,
+                ),
+                BranchName("outer_b"): BranchInfo(
+                    coalesce_name=CoalesceName("merge_outer"),
+                    gate_node_id=NodeID("outer_fork"),
+                    input_connection="outer_b",
+                ),
+                BranchName("inner_a1"): BranchInfo(
+                    coalesce_name=CoalesceName("merge_inner"),
+                    gate_node_id=NodeID("inner_fork"),
+                    input_connection="inner_a1",
+                ),
+                BranchName("inner_a2"): BranchInfo(
+                    coalesce_name=CoalesceName("merge_inner"),
+                    gate_node_id=NodeID("inner_fork"),
+                    input_connection="inner_a2",
+                ),
+            }
+        )
+        graph.set_coalesce_id_map(
+            {
+                CoalesceName("merge_inner"): NodeID("merge_inner"),
+                CoalesceName("merge_outer"): NodeID("merge_outer"),
+            }
+        )
+
+        result = graph.get_branch_first_nodes()
+
+        # The nested branch resolves to the inner region's own opener
+        # (inner_fork) — never a coalesce-crossing trace, never a raise.
+        assert result["outer_a"] == NodeID("inner_fork")
+        assert result["outer_b"] == NodeID("merge_outer")
+        assert result["inner_a1"] == NodeID("merge_inner")
+        assert result["inner_a2"] == NodeID("merge_inner")

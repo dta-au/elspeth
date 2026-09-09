@@ -385,10 +385,8 @@ class TestSchemaCompatibilityGuards:
             "pending_path",
             "pending_error_hash",
             "pending_error_message",
-            "branch_name",
-            "fork_group_id",
             "join_group_id",
-            "expand_group_id",
+            "lineage_path_json",
             "coalesce_node_id",
             "coalesce_name",
             "attempt",
@@ -458,6 +456,10 @@ class TestSchemaCompatibilityGuards:
 
         instance = _make_instance(f"sqlite:///{db_path}")
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"token_work_items": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_CHECK_CONSTRAINTS", ())
@@ -467,7 +469,7 @@ class TestSchemaCompatibilityGuards:
             instance._validate_schema()
 
         msg = str(exc_info.value)
-        assert "token_work_items.branch_name" in msg
+        assert "token_work_items.lineage_path_json" in msg
         assert "Landscape database schema is outdated" in msg
         assert "Pre-1.0 schemas are not migrated in place" in msg
         instance.close()
@@ -578,7 +580,7 @@ class TestSchemaCompatibilityGuards:
             ("run_coordination", "run_id", "runs"),
             ("run_workers", "run_id", "runs"),
             ("run_coordination_events", "run_id", "runs"),
-            ("coalesce_branch_losses", "run_id", "runs"),
+            ("group_losses", "run_id", "runs"),
         } <= required_fks
         required_checks = set(database_module._REQUIRED_CHECK_CONSTRAINTS)
         assert {
@@ -593,10 +595,10 @@ class TestSchemaCompatibilityGuards:
             ("run_workers", "ix_run_workers_liveness"),
             ("run_coordination_events", "uq_run_coordination_events_event_id"),
             ("run_coordination_events", "ix_run_coordination_events_run"),
-            ("coalesce_branch_losses", "uq_coalesce_branch_losses_natural"),
+            ("group_losses", "uq_group_losses_natural"),
         } <= required_indexes
         # Coordination tables are mandatory, never tolerated-as-absent.
-        assert not {"run_coordination", "run_workers", "run_coordination_events", "coalesce_branch_losses"} & set(
+        assert not {"run_coordination", "run_workers", "run_coordination_events", "group_losses"} & set(
             database_module._ADDITIVE_TABLE_NAMES
         )
 
@@ -672,38 +674,34 @@ class TestSchemaCompatibilityGuards:
         assert "Landscape database schema is outdated" in msg
         instance.close()
 
-    def test_validate_schema_rejects_coalesce_branch_losses_missing_run_fk(self, tmp_path: Path) -> None:
-        """The branch-loss ledger must point at its owning run in stale DBs too."""
-        db_path = tmp_path / "missing_branch_losses_run_fk.db"
+    def test_validate_schema_rejects_group_losses_missing_run_fk(self, tmp_path: Path) -> None:
+        """The group-loss ledger must point at its owning run in stale DBs too."""
+        db_path = tmp_path / "missing_group_losses_run_fk.db"
         engine = create_engine(f"sqlite:///{db_path}")
         metadata.create_all(engine)
         with engine.begin() as conn:
             conn.exec_driver_sql(f"PRAGMA user_version = {SQLITE_SCHEMA_EPOCH}")
-            conn.execute(text("DROP TABLE coalesce_branch_losses"))
+            conn.execute(text("DROP TABLE group_losses"))
             conn.execute(
                 text(
                     """
-                    CREATE TABLE coalesce_branch_losses (
+                    CREATE TABLE group_losses (
                         loss_id TEXT PRIMARY KEY,
                         run_id TEXT NOT NULL,
-                        coalesce_name TEXT NOT NULL,
-                        row_id TEXT NOT NULL,
-                        branch_name TEXT NOT NULL,
+                        closer_name TEXT NOT NULL,
+                        group_id TEXT NOT NULL,
+                        member_key TEXT NOT NULL,
                         token_id TEXT NOT NULL,
                         reason TEXT NOT NULL,
                         recorded_by TEXT NOT NULL,
                         recorded_at TIMESTAMP NOT NULL,
-                        adopted_epoch INTEGER
+                        adopted_epoch INTEGER,
+                        FOREIGN KEY (token_id, run_id) REFERENCES tokens (token_id, run_id)
                     )
                     """
                 )
             )
-            conn.execute(
-                text(
-                    "CREATE UNIQUE INDEX uq_coalesce_branch_losses_natural "
-                    "ON coalesce_branch_losses (run_id, coalesce_name, row_id, branch_name)"
-                )
-            )
+            conn.execute(text("CREATE UNIQUE INDEX uq_group_losses_natural ON group_losses (run_id, closer_name, group_id, member_key)"))
         engine.dispose()
 
         instance = _make_instance(f"sqlite:///{db_path}")
@@ -712,7 +710,7 @@ class TestSchemaCompatibilityGuards:
             instance._validate_schema()
 
         msg = str(exc_info.value)
-        assert "coalesce_branch_losses.run_id → runs" in msg
+        assert "group_losses.run_id → runs" in msg
         assert "Landscape database schema is outdated" in msg
         instance.close()
 
@@ -838,6 +836,10 @@ class TestSchemaCompatibilityGuards:
 
         instance = _make_instance(f"sqlite:///{db_path}")
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"token_outcomes": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", (("token_outcomes", "completed"), ("token_outcomes", "path")))
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
@@ -882,6 +884,10 @@ class TestSchemaCompatibilityGuards:
 
         instance = _make_instance(f"sqlite:///{db_path}")
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"token_outcomes": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", (("token_outcomes", "completed"), ("token_outcomes", "path")))
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
@@ -927,6 +933,10 @@ class TestSchemaCompatibilityGuards:
 
         instance = _make_instance(f"sqlite:///{db_path}")
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"token_outcomes": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", (("token_outcomes", "completed"), ("token_outcomes", "path")))
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
@@ -976,6 +986,10 @@ class TestSchemaCompatibilityGuards:
             "metadata",
             SimpleNamespace(tables={"runs": object(), "token_outcomes": object()}),
         )
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", (("token_outcomes", "completed"), ("token_outcomes", "path")))
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
@@ -1034,6 +1048,10 @@ class TestSchemaCompatibilityGuards:
         )
         monkeypatch.setattr(sqlalchemy, "inspect", lambda engine: inspector)
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"runs": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", (("runs", "source_schema_json"),))
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
@@ -1102,6 +1120,10 @@ class TestSchemaCompatibilityGuards:
 
         instance = _make_instance(f"sqlite:///{db_path}")
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"tokens": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", [("tokens", "expand_group_id")])
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", [])
 
@@ -1123,6 +1145,10 @@ class TestSchemaCompatibilityGuards:
 
         instance = _make_instance(f"sqlite:///{db_path}")
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"transform_errors": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", [])
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", [("transform_errors", "token_id", "tokens")])
 
@@ -1180,6 +1206,10 @@ class TestSchemaCompatibilityGuards:
                 }
             ),
         )
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_CHECK_CONSTRAINTS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_INDEXES", ())
@@ -1224,6 +1254,10 @@ class TestSchemaCompatibilityGuards:
 
         monkeypatch.setattr(sqlalchemy, "inspect", lambda engine: inspector)
         monkeypatch.setattr(database_module, "metadata", SimpleNamespace(tables={"node_states": object(), "checkpoints": object()}))
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
@@ -1263,6 +1297,10 @@ class TestSchemaCompatibilityGuards:
             "metadata",
             SimpleNamespace(tables={"runs": object(), "checkpoints": object()}),
         )
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_CHECK_CONSTRAINTS", ())
@@ -1470,6 +1508,10 @@ class TestRequiredCompositeForeignKeysExhaustive:
             "metadata",
             SimpleNamespace(tables={tbl: object() for tbl in columns_per_table}),
         )
+        # The name-only ``tables`` sentinel above is not a SQLAlchemy ``MetaData``, so full
+        # shape collection cannot run against it; this focused guard asserts the named
+        # high-signal diagnostic instead.
+        monkeypatch.setattr(database_module, "collect_metadata_shape_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(database_module, "_REQUIRED_COLUMNS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_FOREIGN_KEYS", ())
         monkeypatch.setattr(database_module, "_REQUIRED_COMPOSITE_FOREIGN_KEYS", (fk_entry,))

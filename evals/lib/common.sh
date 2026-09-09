@@ -27,7 +27,7 @@
 #   evals_poll_run_terminal <run_id> <timeout_sec> <interval_sec> <out_file>
 #
 # Required environment (loaded by evals_load_env from $EVALS_ENV_FILE if present, else process env):
-#   ELSPETH_EVAL_BASE_URL    - e.g. https://elspeth.foundryside.dev
+#   ELSPETH_EVAL_BASE_URL    - e.g. https://elspeth.example.gov.au
 #   ELSPETH_EVAL_USER        - login username
 #   ELSPETH_EVAL_PASS        - login password
 # Optional:

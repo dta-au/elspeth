@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 from uuid import UUID
 
 import pytest
+from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -16,21 +18,73 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.secrets import SecretInventoryItem
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.audit_readiness.service import ReadinessService
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
+    NodeType,
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.coordination import repository as coordination_repository
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
+    ValidationReadinessBlocker,
     ValidationResult,
 )
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.schema import initialize_session_schema
+
+_TEST_SESSION_ID = UUID("11111111-1111-1111-1111-111111111111")
+_session_operation_context: SessionOperationContext | None = None
+
+
+def _blob_read_context() -> SessionOperationContext:
+    if _session_operation_context is None:
+        raise RuntimeError("live session-operation context fixture is not active")
+    return _session_operation_context
+
+
+@pytest.fixture(autouse=True)
+def _live_blob_read_context(monkeypatch: pytest.MonkeyPatch):
+    """Acquire the exact context used by every readiness behaviour test."""
+    global _session_operation_context
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    initialize_session_schema(engine)
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: _TEST_SESSION_ID)
+    created = authority.create_session_with_initial_fence(
+        user_id="alice",
+        title="Readiness context",
+        auth_provider_type="local",
+        owner_instance_id="readiness-test",
+        lease_seconds=30,
+    )
+    assert created.id == _TEST_SESSION_ID
+    context = authority.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id="readiness-test",
+        lease_seconds=30,
+    )
+    _session_operation_context = context
+    try:
+        yield
+    finally:
+        _session_operation_context = None
+        authority.release(context)
+        engine.dispose()
+
 
 # ── Test factories ────────────────────────────────────────────────────────────
 # Co-located here; if this conftest grows, extract to
@@ -225,12 +279,15 @@ class _SessionServiceDouble:
         self.list_interpretation_events = _InterpretationEventRecordsDispatch(events_by_source_and_state or {})
 
 
-def _make_session_service(events_by_source_and_state=None):
+def _make_session_service(events_by_source_and_state=None, composer_meta=None):
     record = type("CompositionStateRecordDouble", (), {})()
     # record.id is read by ReadinessService.compute_snapshot as a UUID
     # (CompositionStateRecord.id — protocol.py:369). Pin a deterministic
     # value so test events bound to this id are correctly scoped.
     record.id = _TEST_COMPOSITION_STATE_ID
+    # record.composer_meta feeds parse_completion_gates — Tier-1 direct
+    # attribute access in compute_snapshot, so the double must carry it.
+    record.composer_meta = composer_meta
     return _SessionServiceDouble(record, events_by_source_and_state or {})
 
 
@@ -387,13 +444,40 @@ def _row(snap, row_id):
     return matches[0]
 
 
-def _policy_readiness_snapshot(*, tutorial_profile: str | None, profile_usable: bool = True, required_prompt_shield: bool = False):
+def _policy_readiness_snapshot(
+    *,
+    tutorial_profile: str | None,
+    profile_usable: bool = True,
+    required_prompt_shield: bool = False,
+    declare_optional_plugin: bool = False,
+    optional_plugin_reason=None,
+    required_content_safety: bool = False,
+    select_content_safety: bool = True,
+    llm_alias_entry: bool = True,
+):
+    """Project one plugin-policy readiness snapshot over controlled inputs.
+
+    The keyword flags exist to reach branches the default fixture cannot:
+    ``declare_optional_plugin`` puts a plugin in ``policy.configured_optional``
+    and ``optional_plugin_reason`` gives it a reason in
+    ``snapshot.unavailable`` (``None`` leaves it available),
+    ``select_content_safety=False`` drops a capability out of
+    ``snapshot.selected`` entirely, and ``llm_alias_entry=False`` omits the
+    LLM's row from ``usable_profile_aliases`` rather than giving it an empty
+    alias tuple.  Each of those is a distinct absent-input case that readiness
+    must report on rather than default past.
+    """
     from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.audit_readiness.service import build_plugin_policy_readiness
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+    from elspeth.web.plugin_policy.models import (
+        PluginAvailability,
+        PluginAvailabilitySnapshot,
+        PluginId,
+        WebPluginPolicy,
+    )
     from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 
     settings = WebSettings.model_validate(
@@ -411,25 +495,36 @@ def _policy_readiness_snapshot(*, tutorial_profile: str | None, profile_usable: 
     )
     llm_id = PluginId("transform", "llm")
     shield_id = PluginId("transform", "azure_prompt_shield")
+    optional_id = PluginId("transform", "reference_join")
+    if declare_optional_plugin:
+        # The deployment's compiled allowlist is empty, so re-compile the same
+        # policy with one optional plugin declared; ``create`` re-derives
+        # ``authorized`` and the policy hash from it.
+        policy = WebPluginPolicy.create(
+            required=policy.required,
+            configured_optional=frozenset({optional_id}),
+            preferences=policy.preferences,
+            control_modes=policy.control_modes,
+            plugin_code_identities=policy.plugin_code_identities,
+        )
     available = set(policy.authorized)
     if required_prompt_shield:
         available.add(shield_id)
+    selected = [(PluginCapability.LLM, llm_id), (PluginCapability.PROMPT_SHIELD, shield_id if required_prompt_shield else None)]
+    if select_content_safety:
+        selected.append((PluginCapability.CONTENT_SAFETY, None))
     snapshot = PluginAvailabilitySnapshot.create(
         policy_hash=policy.policy_hash,
         principal_scope="local:alice",
         available=frozenset(available),
-        unavailable=(),
-        selected=(
-            (PluginCapability.LLM, llm_id),
-            (PluginCapability.PROMPT_SHIELD, shield_id if required_prompt_shield else None),
-            (PluginCapability.CONTENT_SAFETY, None),
-        ),
-        usable_profile_aliases=((llm_id, ("tutorial",) if profile_usable else ()),),
+        unavailable=(() if optional_plugin_reason is None else (PluginAvailability(optional_id, optional_plugin_reason),)),
+        selected=tuple(selected),
+        usable_profile_aliases=(((llm_id, ("tutorial",) if profile_usable else ()),) if llm_alias_entry else ()),
         selected_profile_aliases=((llm_id, "tutorial" if profile_usable else None),),
         binding_generation_fingerprint="a" * 64,
         control_modes=(
             (PluginCapability.PROMPT_SHIELD, ControlMode.REQUIRED if required_prompt_shield else ControlMode.RECOMMEND),
-            (PluginCapability.CONTENT_SAFETY, ControlMode.RECOMMEND),
+            (PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED if required_content_safety else ControlMode.RECOMMEND),
         ),
     )
     tutorial_state = _state(
@@ -491,6 +586,97 @@ def test_tutorial_required_control_coverage_uses_policy_validator() -> None:
     assert readiness.tutorial_ready is False
 
 
+def test_optional_plugin_absent_from_the_unavailable_index_is_reported_available() -> None:
+    """Absence from ``snapshot.unavailable`` is a positive availability fact.
+
+    ``snapshot.unavailable`` enumerates every plugin this principal cannot
+    use, so a configured-optional plugin missing from it is available.  The
+    row must say so rather than treating the miss as unknown.
+    """
+    readiness = _policy_readiness_snapshot(tutorial_profile="tutorial", declare_optional_plugin=True)
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "ok"
+    assert local_row.summary == "Enabled capability configuration is available"
+
+
+def test_locally_repairable_unavailable_reason_faults_capability_configuration() -> None:
+    from elspeth.web.plugin_policy.models import PluginUnavailableReason
+
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        declare_optional_plugin=True,
+        optional_plugin_reason=PluginUnavailableReason.NOT_INSTALLED,
+    )
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "error"
+    assert "transform:reference_join" in (local_row.detail or "")
+    assert readiness.tutorial_ready is False
+
+
+def test_unavailable_for_a_non_local_reason_leaves_capability_configuration_ok() -> None:
+    """Only locally repairable reasons fault the local-configuration row.
+
+    A plugin present in the unavailable index for an authorization reason is
+    not a local misconfiguration, so this row stays ok while the plugin stays
+    unusable.  The membership read keeps that distinction visible; a defaulted
+    read collapsed it into the same miss as "not in the index at all".
+    """
+    from elspeth.web.plugin_policy.models import PluginUnavailableReason
+
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        declare_optional_plugin=True,
+        optional_plugin_reason=PluginUnavailableReason.NOT_AUTHORIZED,
+    )
+
+    assert _row(readiness, "local_capability_configuration").status == "ok"
+
+
+def test_required_control_missing_from_the_selection_reports_not_ready() -> None:
+    """A REQUIRED capability with no ``selected`` entry has no implementation."""
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        required_content_safety=True,
+        select_content_safety=False,
+    )
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "error"
+    assert "content_safety" in (local_row.detail or "")
+    assert readiness.tutorial_ready is False
+
+
+def test_required_control_selected_as_none_reports_not_ready() -> None:
+    """An explicit ``None`` selection is unimplemented, like an absent entry."""
+    readiness = _policy_readiness_snapshot(
+        tutorial_profile="tutorial",
+        required_content_safety=True,
+        select_content_safety=True,
+    )
+
+    local_row = _row(readiness, "local_capability_configuration")
+    assert local_row.status == "error"
+    assert "content_safety" in (local_row.detail or "")
+    assert readiness.tutorial_ready is False
+
+
+def test_llm_with_no_usable_alias_entry_is_not_credential_ready() -> None:
+    """An LLM absent from ``usable_profile_aliases`` has no ready profile.
+
+    Distinct from the empty-alias-tuple case: here the plugin has no row in
+    the alias index at all, and readiness must still refuse the tutorial
+    profile instead of defaulting to a value it could match against.
+    """
+    readiness = _policy_readiness_snapshot(tutorial_profile="tutorial", llm_alias_entry=False)
+
+    profile_row = _row(readiness, "tutorial_profile")
+    assert profile_row.status == "error"
+    assert profile_row.summary == "Tutorial LLM profile is not credential-ready"
+    assert readiness.tutorial_ready is False
+
+
 _OK = ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness(), semantic_contracts=[])
 
 
@@ -500,9 +686,56 @@ def test_validation_row_ok_when_no_errors():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "validation").status == "ok"
+
+
+def test_validation_row_warns_when_advisor_completion_is_pending():
+    persisted_detail = "private persisted advisor response"
+    result = ValidationResult(
+        is_valid=True,
+        checks=[
+            ValidationCheck(
+                name="advisor_signoff",
+                passed=False,
+                detail=persisted_detail,
+                affected_nodes=(),
+                outcome_code=None,
+            )
+        ],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code="advisor_signoff_blocked",
+                    component_id="pipeline",
+                    component_type="pipeline",
+                    detail=persisted_detail,
+                )
+            ],
+        ),
+    )
+    svc = _make_service(_state(transforms=(("t", "passthrough"),)), result)
+
+    snap = asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+        )
+    )
+
+    row = _row(snap, "validation")
+    assert row.status == "warning"
+    assert row.summary == "Completion advisory review pending"
+    assert row.detail == ("This pipeline can run, but Composer completion is withheld until the evidence-scoped advisor review clears.")
+    assert persisted_detail not in (row.detail or "")
+    assert result.readiness.execution_ready is True
 
 
 def test_compute_snapshot_populates_utc_checked_at():
@@ -512,6 +745,7 @@ def test_compute_snapshot_populates_utc_checked_at():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     after = datetime.now(UTC)
@@ -530,6 +764,7 @@ def test_compute_snapshot_validates_already_read_state():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -538,7 +773,52 @@ def test_compute_snapshot_validates_already_read_state():
         state,
         user_id="alice",
         session_id=UUID("11111111-1111-1111-1111-111111111111"),
+        session_operation_context=_blob_read_context(),
+        completion_gates=None,
     )
+
+
+def test_compute_snapshot_passes_persisted_completion_gates():
+    """The record's completion_gates envelope reaches the readiness recompute."""
+    from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
+    state = _state(transforms=(("t", "passthrough"),))
+    exec_svc = _ExecutionServiceDouble(_OK)
+    svc = ReadinessService(
+        execution_service=exec_svc,
+        session_service=_make_session_service(
+            composer_meta={
+                "completion_gates": {
+                    "advisor_signoff": {
+                        "status": "blocked",
+                        "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                        "for_graph": "0" * 64,
+                    }
+                }
+            }
+        ),
+        scoped_secret_resolver=_ScopedSecretResolverDouble(()),
+        settings=_SettingsDouble(payload_store_retention_days=90),
+        state_from_record=lambda _record: state,
+    )
+
+    asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+        )
+    )
+
+    ((args, kwargs),) = exec_svc.validate_state.calls
+    assert args == (state,)
+    assert kwargs["completion_gates"] == CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+            for_graph="0" * 64,
+        )
+    )
+    assert kwargs["session_operation_context"] is _blob_read_context()
 
 
 def test_snapshot_preserves_raw_validation_result():
@@ -570,6 +850,7 @@ def test_snapshot_preserves_raw_validation_result():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -597,6 +878,7 @@ def test_validation_row_error_lists_component_ids():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "validation")
@@ -628,6 +910,7 @@ def test_validation_row_drops_engineer_prefix_and_uses_problem_wording():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "validation")
@@ -664,6 +947,7 @@ def test_validation_row_pluralizes_and_joins_messages_only():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "validation")
@@ -685,6 +969,7 @@ def test_plugin_trust_row_ok_summary_when_boundary_plugins_present():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "plugin_trust")
@@ -692,6 +977,47 @@ def test_plugin_trust_row_ok_summary_when_boundary_plugins_present():
     assert "external-boundary" in row.summary
     assert "source" in row.component_ids
     assert row.component_ids != ()
+
+
+def test_llm_source_is_a_nondeterministic_external_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth.plugins.sources.llm.source import LLMSource
+    from elspeth.web.audit_readiness import service as service_module
+
+    catalog = service_module._plugin_catalog_snapshot()
+    isolated_catalog = {kind: dict(plugins) for kind, plugins in catalog.items()}
+    isolated_catalog["source"]["llm"] = LLMSource
+    monkeypatch.setattr(service_module, "_plugin_catalog_snapshot", lambda: isolated_catalog)
+    state = CompositionState(
+        sources={
+            "briefing": SourceSpec(
+                plugin="llm",
+                on_success="out",
+                options={},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+    snap = asyncio.run(
+        _make_service(state, _OK).compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+        )
+    )
+
+    row = _row(snap, "plugin_trust")
+    assert LLMSource.determinism.value == "non_deterministic"
+    assert row.status == "ok"
+    assert "[source] source:briefing (llm)" in (row.detail or "")
+    assert row.component_ids == ("source:briefing", "out")
 
 
 def test_plugin_trust_row_ok_summary_when_no_boundary_plugins():
@@ -711,6 +1037,7 @@ def test_plugin_trust_row_ok_summary_when_no_boundary_plugins():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "plugin_trust")
@@ -731,6 +1058,7 @@ def test_plugin_trust_row_error_on_unknown_plugin():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "plugin_trust")
@@ -760,6 +1088,7 @@ def test_provenance_warning_on_identity_advisory():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "provenance")
@@ -797,6 +1126,7 @@ def test_provenance_not_applicable_when_identity_advisory_check_was_skipped():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -835,6 +1165,7 @@ def test_provenance_not_applicable_when_validation_failed_before_identity_adviso
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -850,6 +1181,7 @@ def test_retention_row_reports_system_value():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "retention")
@@ -870,6 +1202,7 @@ def test_llm_interpretations_not_applicable_when_no_llm_transforms():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -879,6 +1212,30 @@ def test_llm_interpretations_not_applicable_when_no_llm_transforms():
     # No interpretation-events query was issued (short-circuit).
     sess_svc = svc._session_service  # type: ignore[attr-defined]
     sess_svc.list_interpretation_events.assert_not_called()
+
+
+def test_llm_interpretations_are_source_specific_and_not_applicable_for_source_only() -> None:
+    """A rowless LLM source has no row/model interpretation-event lifecycle."""
+    svc = _make_service(_state(source_plugin="llm", transforms=()), _OK)
+    snap = asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+        )
+    )
+
+    row = _row(snap, "llm_interpretations")
+    assert row.status == "not_applicable"
+    assert row.summary == "LLM source prompts do not use interpretation review"
+    assert row.detail is not None
+    assert "one authored prompt" in row.detail
+    assert "row interpretation events" in row.detail
+    assert "transform" not in row.summary.lower()
+    assert "transform" not in row.detail.lower()
+    assert row.component_ids == ()
+    session_service = svc._session_service  # type: ignore[attr-defined]
+    session_service.list_interpretation_events.assert_not_called()
 
 
 def test_llm_interpretations_not_applicable_when_llm_present_but_no_events():
@@ -893,12 +1250,30 @@ def test_llm_interpretations_not_applicable_when_llm_present_but_no_events():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
     assert row.status == "not_applicable"
     assert row.summary == "No interpretation events yet for this composition"
     assert row.component_ids == ()
+
+
+def test_llm_source_does_not_override_transform_interpretation_semantics() -> None:
+    svc = _make_service(_state(source_plugin="llm", transforms=(("j", "llm"),)), _OK)
+    snap = asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+        )
+    )
+
+    row = _row(snap, "llm_interpretations")
+    assert row.status == "not_applicable"
+    assert row.summary == "No interpretation events yet for this composition"
+    session_service = svc._session_service  # type: ignore[attr-defined]
+    assert len(session_service.list_interpretation_events.calls) == 2
 
 
 def test_llm_interpretations_warning_when_pending_events_present():
@@ -918,6 +1293,7 @@ def test_llm_interpretations_warning_when_pending_events_present():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -950,6 +1326,7 @@ def test_llm_interpretations_ok_when_all_events_resolved():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -983,6 +1360,7 @@ def test_llm_interpretations_not_applicable_when_session_opted_out():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1018,6 +1396,7 @@ def test_llm_interpretations_ok_when_auto_interpreted_no_surfaces_baked_in():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1051,6 +1430,7 @@ def test_llm_interpretations_ok_when_composer_and_runtime_models_differ():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1082,6 +1462,7 @@ def test_llm_interpretations_ok_when_runtime_model_matches_recorded():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1111,6 +1492,7 @@ def test_llm_interpretations_opt_out_overrides_runtime_model_drift():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     row = _row(snap, "llm_interpretations")
@@ -1123,6 +1505,7 @@ def test_secrets_not_applicable_when_no_refs():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "not_applicable"
@@ -1149,6 +1532,7 @@ def test_secrets_not_applicable_when_secret_refs_check_reports_no_refs():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1182,12 +1566,88 @@ def test_secrets_not_applicable_when_no_ref_check_has_unrelated_inventory():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
     row = _row(snap, "secrets")
     assert row.status == "not_applicable"
     assert row.summary == "No secret references in this composition"
+
+
+def test_resolved_secret_row_is_invariant_to_unrelated_owner_inventory():
+    """Shared readiness is composition-scoped, never an owner inventory report."""
+    result = ValidationResult(
+        is_valid=True,
+        checks=[
+            ValidationCheck(
+                name="secret_refs",
+                passed=True,
+                detail="All referenced secrets resolved",
+                affected_nodes=("llm",),
+                outcome_code="secret_refs.resolved",
+            )
+        ],
+        errors=[],
+        readiness=_ready_readiness(),
+        semantic_contracts=[],
+    )
+    inventories = (
+        (SecretInventoryItem(name="PIPELINE_KEY", scope="user", available=True),),
+        (
+            SecretInventoryItem(name="PIPELINE_KEY", scope="user", available=True),
+            SecretInventoryItem(name="UNRELATED_ONE", scope="user", available=True),
+            SecretInventoryItem(name="UNRELATED_TWO", scope="server", available=True),
+        ),
+    )
+
+    rows = []
+    for inventory in inventories:
+        snapshot = asyncio.run(
+            _make_service(_state(), result, inventory=inventory).compute_snapshot(
+                session_id=UUID("11111111-1111-1111-1111-111111111111"),
+                user_id="alice",
+                session_operation_context=_blob_read_context(),
+            )
+        )
+        rows.append(_row(snapshot, "secrets"))
+
+    assert rows[0] == rows[1]
+    assert rows[0].status == "ok"
+    assert rows[0].summary == "All secret references resolve"
+    assert rows[0].detail is None
+
+
+def test_absent_secret_check_is_inventory_invariant_and_does_not_read_inventory():
+    """An absent composition check cannot be inferred from owner-global refs."""
+    inventories = (
+        (),
+        (
+            SecretInventoryItem(name="UNRELATED_ONE", scope="user", available=True),
+            SecretInventoryItem(name="UNRELATED_TWO", scope="server", available=True),
+        ),
+    )
+    services = [_make_service(_state(), _OK, inventory=inventory) for inventory in inventories]
+    rows = []
+    for service in services:
+        snapshot = asyncio.run(
+            service.compute_snapshot(
+                session_id=UUID("11111111-1111-1111-1111-111111111111"),
+                user_id="alice",
+                session_operation_context=_blob_read_context(),
+            )
+        )
+        rows.append(_row(snapshot, "secrets"))
+
+    content = [row.model_dump_json() for row in rows]
+    digests = [hashlib.sha256(item.encode()).hexdigest() for item in content]
+    assert content[0] == content[1]
+    assert digests[0] == digests[1]
+    assert rows[0].summary == "Secret reference check did not run"
+    for service in services:
+        resolver = service._scoped_secret_resolver
+        assert isinstance(resolver, _ScopedSecretResolverDouble)
+        assert resolver.list_refs.calls == []
 
 
 def test_secrets_error_on_missing_refs():
@@ -1219,6 +1679,7 @@ def test_secrets_error_on_missing_refs():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "error"
@@ -1245,6 +1706,7 @@ def test_secrets_error_when_secret_refs_check_failed_without_typed_error():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1283,6 +1745,7 @@ def test_secrets_error_on_fabricated_secret():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "error"
@@ -1309,6 +1772,7 @@ def test_secrets_error_on_disallowed_secret_ref():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
     assert _row(snap, "secrets").status == "error"
@@ -1350,6 +1814,7 @@ def test_secrets_not_applicable_when_secret_check_was_skipped():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1368,6 +1833,7 @@ def test_plugin_trust_row_errors_on_non_catalog_plugin_name():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1393,6 +1859,7 @@ def test_snapshot_raises_when_no_state():
             svc.compute_snapshot(
                 session_id=UUID("11111111-1111-1111-1111-111111111111"),
                 user_id="alice",
+                session_operation_context=_blob_read_context(),
             )
         )
 
@@ -1510,3 +1977,159 @@ class TestPluginCatalogHelpers:
         assert call_count == 1, (
             f"PluginManager instantiated {call_count} times; the shared-snapshot contract requires exactly 1 per cache lifetime."
         )
+
+
+# ---------------------------------------------------------------------------
+# Node-kind widening of the boundary inventory (elspeth-1c8a4b6199).
+#
+# The panel used to enumerate ``node_type == "transform"`` alone, so a
+# boundary plugin hosted on a collector or an aggregation was silently
+# dropped from the inventory — from the summary count, from ``detail``, and
+# from ``component_ids``. These tests pin the widening at the level the
+# defect lived: the row builder, called directly.
+#
+# ``web_scrape`` is a real registered transform declaring
+# ``Determinism.EXTERNAL_CALL``, so no registry patching is needed and the
+# ``@lru_cache``d ``_plugin_catalog_snapshot`` is never disturbed.
+#
+# "Latent, not live" is TRUE OF COLLECTORS ONLY — the two halves of this
+# fix have different reachability, and conflating them understates it:
+#
+#   - COLLECTOR: latent. ``web_scrape`` on a collector is Stage-1 INVALID
+#     (``collector_plugin_not_batch_aware``), and no shipped batch-aware
+#     plugin declares a boundary determinism, so no runnable composition
+#     reaches this classifier through a collector today.
+#   - AGGREGATION: **LIVE.** That constraint is collector-only (it lives in
+#     ``state.py``'s ``_collector_intrinsic_errors``); ``validate()``'s
+#     aggregation arm never checks ``is_batch_aware``. Measured: both
+#     ``web_scrape`` and ``llm`` on an aggregation node validate with ZERO
+#     errors. So an EXTERNAL_CALL plugin on an aggregation was a real,
+#     authorable composition whose boundary crossing this panel silently
+#     omitted — not a defect waiting on a future plugin.
+#
+# The row builder never validates and reads only ``.determinism``,
+# so it classifies the node regardless; these tests pin the classifier's
+# contract, not a composition an operator can run today.
+# ---------------------------------------------------------------------------
+
+
+def _boundary_state(node_type: str) -> CompositionState:
+    """csv source -> one ``web_scrape`` node of ``node_type`` -> csv sink."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="src_out",
+            options={},
+            on_validation_failure="quarantine",
+        ),
+        nodes=(make_node_spec("n1", "web_scrape", input="src_out", on_success="n1_out", node_type=node_type),),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+
+class TestPluginTrustNodeKindWidening:
+    @pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+    def test_boundary_plugin_on_batch_node_kind_is_inventoried(self, node_type: str) -> None:
+        """The defect, directly: the node must reach both ``detail`` and
+        ``component_ids``. Before the widening it reached neither, and the
+        summary undercounted by exactly one.
+        """
+        row = _service_mod._build_plugin_trust_row(_boundary_state(node_type))
+
+        assert row.summary == "3 external-boundary plugin(s) recorded"
+        assert "n1" in row.component_ids
+        assert f"[{node_type}] n1 (web_scrape)" in (row.detail or "")
+
+    @pytest.mark.parametrize("node_type", ["collector", "aggregation"])
+    def test_batch_node_kind_matches_the_transform_control(self, node_type: str) -> None:
+        """Same plugin, same wiring, only ``node_type`` differs. The
+        inventory must be identical except for the node-kind label — the
+        control is what proves the counts differ by exactly the widened
+        node and not by some other effect of the edit.
+        """
+        widened = _service_mod._build_plugin_trust_row(_boundary_state(node_type))
+        control = _service_mod._build_plugin_trust_row(_boundary_state("transform"))
+
+        assert widened.status == control.status
+        assert widened.summary == control.summary
+        assert widened.component_ids == control.component_ids
+        assert (widened.detail or "").replace(f"[{node_type}]", "[transform]") == (control.detail or "")
+
+    def test_detail_reports_the_node_kind_not_the_registry_kind(self) -> None:
+        """Collector-hosted plugins resolve through the TRANSFORM registry,
+        so the naive detail line reads ``[transform] n1`` for a collector.
+        The operator locates the component by the vocabulary they authored
+        it in, so the label is the node kind.
+        """
+        detail = _service_mod._build_plugin_trust_row(_boundary_state("collector")).detail or ""
+
+        assert "[collector] n1" in detail
+        assert "[transform] n1" not in detail
+
+    def test_plugin_less_structural_node_is_not_enumerated(self) -> None:
+        """A gate carries ``plugin=None`` by contract. Enumerating it would
+        route it to the ``unknown`` branch and flip the whole row to
+        ``error`` — the regression the exclusion set exists to prevent.
+        """
+        state = CompositionState(
+            source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+            nodes=(make_node_spec("g1", None, input="src_out", on_success="g1_out", node_type="gate"),),
+            edges=(),
+            outputs=(make_output_spec("out", "csv"),),
+            metadata=PipelineMetadata(name="t", description=""),
+            version=1,
+        )
+
+        row = _service_mod._build_plugin_trust_row(state)
+
+        assert row.status == "ok"
+        assert row.component_ids == ("source", "out")
+
+    def test_node_type_vocabulary_is_an_exhaustive_partition(self) -> None:
+        """The property that makes step 5 of ``boundary_expectations.py``'s
+        checklist true: a NEW node type is enumerated by default, and
+        opting one OUT of the audit inventory requires an explicit entry in
+        ``_PLUGINLESS_NODE_TYPES``. Fails the day someone adds a node type
+        without deciding which side it falls on.
+        """
+        declared = frozenset(get_args(NodeType))
+        hosting = _service_mod.PLUGIN_HOSTING_NODE_TYPES
+        pluginless = _service_mod._PLUGINLESS_NODE_TYPES
+
+        assert hosting | pluginless == declared
+        assert hosting & pluginless == frozenset()
+        assert hosting == frozenset({"transform", "aggregation", "collector"})
+
+    def test_llm_predicate_shares_the_node_kind_vocabulary(self) -> None:
+        """``_composition_has_llm_transform`` is the third enumeration site,
+        and its widening is a LIVE behaviour change — not the no-op an
+        earlier revision of this docstring claimed.
+
+        ``llm`` on an AGGREGATION node validates with zero composer errors:
+        the batch-aware constraint is collector-only
+        (``collector_plugin_not_batch_aware``, inside
+        ``_collector_intrinsic_errors``), and the aggregation arm never
+        checks ``is_batch_aware``. Before the widening that composition made
+        the predicate return False, which rendered the
+        ``llm_interpretations`` row ``not_applicable`` — "No LLM transforms
+        in this pipeline" — a second false all-clear of this ticket's own
+        shape on a different row.
+
+        Reverting the widening fails THIS test (measured: exactly one
+        failure), so the site is mutation-checked, not merely asserted.
+        """
+        assert _service_mod._composition_has_llm_transform(_boundary_state("transform")) is False
+
+        for node_type in sorted(_service_mod.PLUGIN_HOSTING_NODE_TYPES):
+            state = CompositionState(
+                source=SourceSpec(plugin="csv", on_success="src_out", options={}, on_validation_failure="quarantine"),
+                nodes=(make_node_spec("n1", "llm", input="src_out", on_success="n1_out", node_type=node_type),),
+                edges=(),
+                outputs=(make_output_spec("out", "csv"),),
+                metadata=PipelineMetadata(name="t", description=""),
+                version=1,
+            )
+            assert _service_mod._composition_has_llm_transform(state) is True, node_type

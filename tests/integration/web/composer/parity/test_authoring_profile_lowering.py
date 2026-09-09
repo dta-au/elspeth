@@ -48,7 +48,7 @@ def _profiled_multi_query_options() -> dict[str, Any]:
         "profile": "task-role",
         "temperature": 0.0,
         "required_input_fields": ["color_name"],
-        "prompt_template": "Assess {{ color_name }}.",
+        "prompt_template": "Assess {{ row.color_name }}.",
         "queries": {
             "blue": {
                 "input_fields": {"color_name": "color_name"},

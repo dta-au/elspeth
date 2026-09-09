@@ -1,0 +1,29 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: routing
+    options:
+      path: ${input_primary}
+      on_validation_failure: discard
+      schema: {mode: fixed, fields: ["id: int", "value: int"]}
+gates:
+  - name: select_failure_policy
+    input: routing
+    condition: "row['value'] >= 20"
+    routes: {"true": routed_error, "false": discard}
+transforms:
+  - name: fail_selected
+    plugin: dag_corpus_always_error
+    input: routed_error
+    on_success: errors
+    on_error: errors
+    options:
+      schema: {mode: observed}
+sinks:
+  errors:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: ${output_errors}
+      format: jsonl
+      schema: {mode: observed}

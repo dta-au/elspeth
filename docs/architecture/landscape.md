@@ -1,6 +1,6 @@
 # Landscape System Architecture
 
-Current as of 2026-07-23 for the 0.7.1 release line.
+Current as of 2026-09-08 for the 0.8.0 release line.
 
 Landscape is ELSPETH's audit database and lineage read model. It records run
 configuration, source rows, DAG nodes and edges, token lineage, node execution
@@ -14,15 +14,15 @@ Landscape subsystem.
 
 ## Current Inventory
 
-Measured from this checkout on 2026-07-23:
+Measured from this checkout on 2026-09-08:
 
 | Metric | Value |
 |--------|-------|
-| Python files in `src/elspeth/core/landscape/` | 63 |
-| Python lines in `src/elspeth/core/landscape/` | 32,137 |
-| SQLAlchemy Core tables | 41 |
-| MCP Landscape analysis tools | 29 |
-| Schema epoch | 29 |
+| Python files in `src/elspeth/core/landscape/` | 65 |
+| Python lines in `src/elspeth/core/landscape/` | 37,417 |
+| SQLAlchemy Core tables | 46 |
+| MCP Landscape analysis tools | 32 |
+| Schema epoch | 38 |
 
 The inventory above is intentionally date-stamped. Re-run these checks before
 using the numbers in release material:
@@ -166,10 +166,23 @@ another commit; an `UNKNOWN` result remains blocked. Epochs 26–28 introduced
 the effect ledger, durable coalesce receipts, and per-member failsink
 provenance. Epoch 29 adds run-scoped ancestry/error links, output-contract
 hashes, durable batch-expansion claims, and the transaction-owned sidecar
-journal outbox.
+journal outbox. Epoch 30 adds `token_work_items.row_union_name` so a recovered
+scheduler can attribute a blocked work item to its declared row_union barrier.
+Epoch 31 closes `token_work_items.status` over the public scheduler status enum.
+Epoch 33 adds a composite (run_id, token_id) index to `token_outcomes` so a
+run-scoped per-token read resolves through one index instead of choosing
+between two single-column candidates the planner cannot separate. Epoch 34
+adds the unified-lineage groundwork tables (`token_lineage_frames`,
+`group_records`, `group_losses`) and `token_work_items.lineage_path_json`.
+Epoch 35 flips lineage onto that groundwork: the tri-column
+`fork_group_id`/`expand_group_id`/`branch_name` discriminators are retired
+from `tokens`, `token_outcomes`, and `token_work_items` (plus
+`token_outcomes.expected_branches_json`), and `token_lineage_frames` /
+`lineage_path_json` become the sole lineage truth. `join_group_id` stays — it
+is a merge-event identity, not a lineage-path field.
 
 ELSPETH is pre-1.0. An older Landscape database is archived or exported as
-required and recreated at epoch 29; startup and read-only inspection do not
+required and recreated at epoch 35; startup and read-only inspection do not
 transform a predecessor store in place.
 
 ### Multi-source ingestion (ADR-025)

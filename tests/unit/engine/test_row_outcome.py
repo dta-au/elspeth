@@ -7,7 +7,7 @@ from elspeth.testing import make_pipeline_row
 
 
 def _token() -> TokenInfo:
-    return TokenInfo(row_id="r1", token_id="t1", row_data=make_pipeline_row({}), branch_name=None)
+    return TokenInfo(row_id="r1", token_id="t1", row_data=make_pipeline_row({}))
 
 
 def _sink_name_for(path: TerminalPath) -> str | None:
@@ -22,6 +22,12 @@ def _error_for(path: TerminalPath) -> FailureInfo | None:
             exception_type="ValueError",
             message="upstream transform raised",
         )
+    return None
+
+
+def _join_group_id_for(path: TerminalPath) -> str | None:
+    if path == TerminalPath.COALESCED:
+        return "jg-1"
     return None
 
 
@@ -50,6 +56,7 @@ class TestRowResultOutcome:
                 path=path,
                 sink_name=_sink_name_for(path),
                 error=_error_for(path),
+                join_group_id=_join_group_id_for(path),
             )
             assert result.outcome is outcome
             assert result.path is path

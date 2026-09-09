@@ -8,7 +8,7 @@ import importlib.util
 import os
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Literal
@@ -16,7 +16,7 @@ from typing import Any, Literal
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
 
 _fcntl: Any
@@ -27,6 +27,8 @@ else:
 
 _SQLITE_SESSION_LOCKS_GUARD = threading.RLock()
 _SQLITE_SESSION_LOCKS: dict[tuple[tuple[str, ...], str], threading.RLock] = {}
+_FILESYSTEM_SESSION_LOCKS_GUARD = threading.RLock()
+_FILESYSTEM_SESSION_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 
 
 class _SQLiteFlockLeaseState(threading.local):
@@ -37,6 +39,100 @@ class _SQLiteFlockLeaseState(threading.local):
 
 
 _SQLITE_FLOCK_LEASE_STATE = _SQLiteFlockLeaseState()
+
+
+def _run_lock_cleanup(
+    action: Callable[[], None],
+    *,
+    label: str,
+    primary_exc: BaseException | None,
+) -> None:
+    """Run one lock cleanup without replacing an active primary failure."""
+    try:
+        action()
+    except BaseException as cleanup_exc:
+        if primary_exc is None:
+            raise
+        primary_exc.add_note(f"{label} also failed ({type(cleanup_exc).__name__})")
+
+
+class _FilesystemFlockLeaseState(threading.local):
+    """Per-thread depth for re-entrant data-directory lock leases."""
+
+    def __init__(self) -> None:
+        self.leases: dict[tuple[str, str], tuple[int, int]] = {}
+
+
+_FILESYSTEM_FLOCK_LEASE_STATE = _FilesystemFlockLeaseState()
+
+
+@contextlib.contextmanager
+def filesystem_session_lock(root: Path, session_id: str) -> Iterator[None]:
+    """Exclude filesystem phases for one session without a DB connection.
+
+    This lock is dialect-independent: PostgreSQL transaction locks cannot span
+    a closed database phase and subsequent local filesystem I/O. Callers must
+    acquire this file-only lock before any database/session lock.
+    """
+    resolved_root = root.expanduser().resolve()
+    resolved_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_dir = resolved_root / ".session-file-locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    lock_dir_stat = lock_dir.lstat()
+    if stat.S_ISLNK(lock_dir_stat.st_mode) or not stat.S_ISDIR(lock_dir_stat.st_mode):
+        raise AuditIntegrityError("Filesystem session lock directory is not a real directory")
+    if lock_dir.resolve().parent != resolved_root:
+        raise AuditIntegrityError("Filesystem session lock directory escaped its configured root")
+    session_digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    lease_key = (str(resolved_root), session_digest)
+    with _FILESYSTEM_SESSION_LOCKS_GUARD:
+        mutex = _FILESYSTEM_SESSION_LOCKS.setdefault(lease_key, threading.RLock())
+    with mutex:
+        if _fcntl is None:
+            raise AuditIntegrityError("Filesystem session locking requires POSIX flock support")
+        leases = _FILESYSTEM_FLOCK_LEASE_STATE.leases
+        if lease_key in leases:
+            descriptor, depth = leases[lease_key]
+            leases[lease_key] = (descriptor, depth + 1)
+            try:
+                yield
+            finally:
+                leases[lease_key] = (descriptor, depth)
+            return
+        lock_path = lock_dir / f"{session_digest}.lock"
+        flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        descriptor_primary_exc: BaseException | None = None
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise AuditIntegrityError("Filesystem session lock sidecar is not a regular file")
+            try:
+                _fcntl.flock(descriptor, _fcntl.LOCK_EX)
+            except OSError as exc:
+                raise AuditIntegrityError("Unable to acquire filesystem session lock") from exc
+            leases[lease_key] = (descriptor, 1)
+            lease_primary_exc: BaseException | None = None
+            try:
+                yield
+            except BaseException as exc:
+                lease_primary_exc = exc
+                raise
+            finally:
+                del leases[lease_key]
+                _run_lock_cleanup(
+                    lambda: _fcntl.flock(descriptor, _fcntl.LOCK_UN),
+                    label="Filesystem session lock release",
+                    primary_exc=lease_primary_exc,
+                )
+        except BaseException as exc:
+            descriptor_primary_exc = exc
+            raise
+        finally:
+            _run_lock_cleanup(
+                lambda: os.close(descriptor),
+                label="Filesystem session lock descriptor close",
+                primary_exc=descriptor_primary_exc,
+            )
 
 
 def database_lock_identity(engine: Engine) -> tuple[str, ...]:
@@ -108,6 +204,7 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
             return
         flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = os.open(lock_path, flags, 0o600)
+        descriptor_primary_exc: BaseException | None = None
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise AuditIntegrityError("SQLite session lock sidecar is not a regular file")
@@ -116,13 +213,28 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
             except OSError as exc:
                 raise AuditIntegrityError("Unable to acquire SQLite process-shared session lock") from exc
             leases[lease_key] = (descriptor, 1)
+            lease_primary_exc: BaseException | None = None
             try:
                 yield
+            except BaseException as exc:
+                lease_primary_exc = exc
+                raise
             finally:
                 del leases[lease_key]
-                _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+                _run_lock_cleanup(
+                    lambda: _fcntl.flock(descriptor, _fcntl.LOCK_UN),
+                    label="SQLite session lock release",
+                    primary_exc=lease_primary_exc,
+                )
+        except BaseException as exc:
+            descriptor_primary_exc = exc
+            raise
         finally:
-            os.close(descriptor)
+            _run_lock_cleanup(
+                lambda: os.close(descriptor),
+                label="SQLite session lock descriptor close",
+                primary_exc=descriptor_primary_exc,
+            )
 
 
 @contextlib.contextmanager
@@ -177,16 +289,28 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
     lock_stack = ExitStack()
     lock_stack.enter_context(sqlite_process_session_lock(engine, session_id))
     release_state = {"released": False}
+    release_primary_exc: BaseException | None = None
 
     def _release(_conn: Connection) -> None:
         if release_state["released"]:
             return
         release_state["released"] = True
-        lock_stack.close()
+        _run_lock_cleanup(
+            lock_stack.close,
+            label="SQLite transaction session lock release",
+            primary_exc=release_primary_exc,
+        )
 
     def _remove_listener(identifier: Literal["commit", "rollback"], fn: Any) -> None:
-        if event.contains(conn, identifier, fn):
-            event.remove(conn, identifier, fn)
+        def _discard_listener() -> None:
+            if event.contains(conn, identifier, fn):
+                event.remove(conn, identifier, fn)
+
+        _run_lock_cleanup(
+            _discard_listener,
+            label=f"SQLite transaction {identifier} listener cleanup",
+            primary_exc=release_primary_exc,
+        )
 
     def _release_on_commit(_conn: Connection) -> None:
         _release(_conn)
@@ -201,28 +325,63 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
         event.listen(conn, "rollback", _release_on_rollback, once=True)
     try:
         yield
+    except BaseException as exc:
+        release_primary_exc = exc
+        raise
     finally:
         if not conn.in_transaction():
             _release(conn)
 
 
 @contextlib.contextmanager
-def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
-    """Hold a PostgreSQL session-level lock across multiple transactions."""
+def _postgres_advisory_session_lock(conn: Connection, classid: int, key: str, *, label: str) -> Iterator[None]:
+    """Hold one PostgreSQL session-level advisory lock across multiple transactions."""
     conn.exec_driver_sql(
         "SELECT pg_catalog.pg_advisory_lock(%s, pg_catalog.hashtext(%s))",
-        (ELSPETH_SESSIONS_LOCK_CLASSID, session_id),
+        (classid, key),
     )
     conn.commit()
-    try:
-        yield
-    finally:
+
+    def _release() -> None:
         if conn.in_transaction():
             conn.rollback()
         unlocked = conn.exec_driver_sql(
             "SELECT pg_catalog.pg_advisory_unlock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_SESSIONS_LOCK_CLASSID, session_id),
+            (classid, key),
         ).scalar_one()
         conn.commit()
         if unlocked is not True:
-            raise AuditIntegrityError("PostgreSQL session advisory lock was not held during release")
+            raise AuditIntegrityError(f"{label} was not held during release")
+
+    primary_exc: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        primary_exc = exc
+        raise
+    finally:
+        _run_lock_cleanup(
+            _release,
+            label=f"{label} release",
+            primary_exc=primary_exc,
+        )
+
+
+@contextlib.contextmanager
+def postgres_blob_custody_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
+    """Hold the blob custody session-level lock across multiple transactions.
+
+    Its own classid namespace: session-operation fence operations take
+    transaction-scoped locks on the same session key in
+    ``ELSPETH_SESSIONS_LOCK_CLASSID``, and a lease renew must never queue
+    behind a blob's filesystem persistence. This is the only session-level
+    advisory lock ELSPETH holds; the sessions class is taken
+    transaction-scoped only (``acquire_session_advisory_xact_lock``).
+    """
+    with _postgres_advisory_session_lock(
+        conn,
+        ELSPETH_BLOB_CUSTODY_LOCK_CLASSID,
+        session_id,
+        label="PostgreSQL blob custody advisory lock",
+    ):
+        yield

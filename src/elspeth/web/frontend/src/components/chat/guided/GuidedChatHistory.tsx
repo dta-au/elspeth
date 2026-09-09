@@ -34,9 +34,13 @@
 // produced in the same request share a wall-clock second (slice 5
 // guarantee).
 
+import { Button } from "@/components/ui";
 import type { ChatTurn } from "@/types/guided";
 import { MarkdownRenderer } from "../MarkdownRenderer";
-import { GUIDED_STEP_LABELS } from "./stepLabels";
+import {
+  GUIDED_AFTER_CONFIRMATION_LABEL,
+  GUIDED_STEP_LABELS,
+} from "./stepLabels";
 
 interface Props {
   /** Server-authoritative chat history from GuidedSession.chat_history. */
@@ -50,6 +54,37 @@ interface Props {
    */
   onRetrySyntheticFailure?: (turn: ChatTurn) => void;
   retryDisabled?: boolean;
+  /**
+   * Replay rendering (elspeth-2554bff719): the freeform transcript replays a
+   * TERMINAL guided session's conversation inside its own role="log" region.
+   * The replayed history is settled — no new guided turns can arrive — so a
+   * nested live log there would be dishonest semantics and risks
+   * double-announcing in the enclosing region. `replay` swaps the root to a
+   * labelled static group and changes nothing else about the rows.
+   */
+  replay?: boolean;
+  /**
+   * Confirmation hash of a build this transcript was committed under
+   * (elspeth-986801d218) — `afterConfirmationChatToken(session)`, null on a
+   * session that never confirmed one. When set, an "After confirmation"
+   * divider opens at the FIRST user turn carrying it as `turn_token`: every
+   * post-commit question is submitted under that one token, so it is the
+   * transcript's own record of where the build ended and the advisory
+   * conversation began.
+   *
+   * The per-step divider cannot mark this boundary — post-commit turns are
+   * persisted with `step="step_4_wire"`, identical to the pre-commit wire
+   * turns, so `turn.step !== previousStep` never fires there.
+   *
+   * The TRANSCRIPT derivation, deliberately not the channel's
+   * `completedGuidedChatToken`: a fork, a `/guided/reenter` after a content
+   * change, and an exit all keep these turns while ending the completed-chat
+   * channel, and a boundary that vanished with the channel would render the
+   * inherited post-commit conversation as ordinary build turns under a
+   * step_4_wire divider on a session parked at Step 2. Applies in replay mode
+   * too (the freeform transcript replays a terminal session).
+   */
+  afterConfirmationToken?: string | null;
 }
 
 /**
@@ -76,6 +111,8 @@ export function GuidedChatHistory({
   chatHistory,
   onRetrySyntheticFailure,
   retryDisabled = false,
+  replay = false,
+  afterConfirmationToken = null,
 }: Props): React.ReactElement | null {
   if (chatHistory.length === 0) {
     return null;
@@ -92,6 +129,9 @@ export function GuidedChatHistory({
 
   const rows: React.ReactNode[] = [];
   let previousStep: ChatTurn["step"] | null = null;
+  // One-shot latch: every post-commit question carries the SAME confirmation
+  // hash, so without it the divider would repeat before each one.
+  let afterConfirmationOpened = false;
 
   for (const turn of sorted) {
     if (turn.step !== previousStep) {
@@ -116,6 +156,30 @@ export function GuidedChatHistory({
       previousStep = turn.step;
     }
 
+    // "After confirmation" boundary — same divider markup as the stage
+    // divider (no new class, no new live region: the parent log's
+    // aria-relevant="additions" announces it once when the first
+    // post-commit turn lands). Ordered after the stage divider so a
+    // coincident step change still reads stage-then-boundary.
+    if (
+      !afterConfirmationOpened &&
+      afterConfirmationToken !== null &&
+      turn.role === "user" &&
+      turn.turn_token === afterConfirmationToken
+    ) {
+      afterConfirmationOpened = true;
+      rows.push(
+        <div
+          key={`after-confirmation-${turn.seq}`}
+          className="message-row message-row--system"
+        >
+          <div className="bubble bubble-system bubble-system--stage">
+            {GUIDED_AFTER_CONFIRMATION_LABEL}
+          </div>
+        </div>,
+      );
+    }
+
     const isUser = turn.role === "user";
     // C-2ii: a synthetic-failure assistant turn (scaffold-guard rejection or
     // provider unavailability) renders as a distinct error turn, NOT an
@@ -129,6 +193,15 @@ export function GuidedChatHistory({
     // handled by the parent transcript's aria-live="polite" log; the sr-only
     // "Error:" prefix still conveys the kind on read. (fp-review a11y follow-up.)
     if (turn.role === "assistant" && turn.assistant_message_kind === "synthetic_failure") {
+      // Reason-aware Retry (inv-f1 D4): "not_applied" is the deterministic
+      // set — the user's input was processed and its application rejected
+      // (config invalid, upload/type mismatch, transition rejected), so
+      // resending the SAME message is a guaranteed dead end and the turn's
+      // own copy already directs the real next step. The other reasons are
+      // retry-able by nature: provider weather ("unavailable"), a scaffold
+      // leak ("quality_guard"), or a malformed model reply ("model_defect" —
+      // whose copy explicitly invites Retry).
+      const retryInvited = turn.synthetic_failure_reason !== "not_applied";
       rows.push(
         <div
           key={`turn-${turn.seq}`}
@@ -138,16 +211,16 @@ export function GuidedChatHistory({
           <div className="bubble bubble-error message-bubble-content">
             <span className="sr-only">Error:</span>
             {turn.content}
-            {onRetrySyntheticFailure && turn.seq === lastSeq && (
+            {onRetrySyntheticFailure && retryInvited && turn.seq === lastSeq && (
               <div className="message-failed-row">
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="message-retry-btn"
                   onClick={() => onRetrySyntheticFailure(turn)}
                   disabled={retryDisabled}
                 >
                   Retry
-                </button>
+                </Button>
               </div>
             )}
           </div>
@@ -173,6 +246,18 @@ export function GuidedChatHistory({
           {isUser ? turn.content : <MarkdownRenderer content={turn.content} />}
         </div>
       </div>,
+    );
+  }
+
+  if (replay) {
+    return (
+      <div
+        className="guided-chat-bubbles"
+        role="group"
+        aria-label="Guided build conversation"
+      >
+        {rows}
+      </div>
     );
   }
 

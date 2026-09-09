@@ -7,7 +7,7 @@ Handles raw HTTP transport with full Tier 3 boundary validation:
 - Non-finite usage values → LLMClientError
 - HTTP status code → typed exception mapping
 
-Client caching is per-state_id with a threading lock. Uses AuditedHTTPClient
+Client caching is per-audit-parent with a threading lock. Uses AuditedHTTPClient
 for transport-level HTTP audit recording and records a logical LLM call row for
 chat-completion semantics.
 """
@@ -17,18 +17,21 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Sequence
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+import structlog
 from pydantic import Field, field_validator
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
+from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
 from elspeth.contracts.token_usage import TokenUsage
-from elspeth.contracts.value_source import CatalogValueSource, ValueSource
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
@@ -39,13 +42,21 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
+from elspeth.plugins.llm.config_validation import (
+    OPENROUTER_BASE_URL,
+    OPENROUTER_BASE_URL_APPLIES_WHEN,
+    OPENROUTER_MODEL_VALUE_SOURCES,
+    normalize_openrouter_base_url,
+    validate_openrouter_base_url,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.model_catalog import MODEL_CATALOG_OPENROUTER
-from elspeth.plugins.transforms.llm.provider import LLMQueryResult, ParsedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = [
@@ -59,17 +70,13 @@ __all__ = [
 ]
 
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-"""Canonical OpenRouter HTTP API base URL used by direct OpenRouter providers."""
-
-OPENROUTER_BASE_URL_APPLIES_WHEN = (("base_url", OPENROUTER_BASE_URL),)
-"""Value-source predicate for configs targeting the canonical OpenRouter API."""
-
-OPENROUTER_APP_REFERER = "https://github.com/johnm-dta/elspeth"
+OPENROUTER_APP_REFERER = "https://github.com/dta-au/elspeth"
 """Canonical public project URL used for OpenRouter app attribution."""
 
 OPENROUTER_APP_TITLE = "Elspeth"
 """Canonical OpenRouter app display title."""
+
+logger = structlog.get_logger(__name__)
 
 
 def _http_error_body_text(error: httpx.HTTPStatusError) -> str:
@@ -94,75 +101,81 @@ def _summarize_http_error_body(error: httpx.HTTPStatusError) -> str:
     return f" | provider error body redacted (body_present=true; chars={len(body)})"
 
 
-def normalize_openrouter_base_url(value: str) -> str:
-    """Normalize base URL spellings that runtime HTTP joining treats as identical."""
-    parsed = urlsplit(value)
-    path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+def _decode_openrouter_json(response: httpx.Response) -> Any:
+    """Decode an OpenRouter body as JSON, rejecting non-finite constants.
 
-
-def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, TokenUsage, ParsedFinishReason, str]:
-    """Parse and validate an OpenRouter chat-completion response body."""
+    Transport-level only: ``_validate_chat_completion_response`` owns every
+    shape check on the decoded value. Only the exception type name reaches the
+    failure message; the decoded content is never interpolated.
+    """
     try:
-        data = json.loads(response.content, parse_constant=reject_nonfinite_constant)
+        return json.loads(response.content, parse_constant=reject_nonfinite_constant)
     except (ValueError, TypeError) as e:
-        raise LLMClientError(
-            f"Response is not valid JSON: {e}",
-            retryable=False,
-        ) from e
+        raise LLMClientError(f"Response is not valid JSON: {type(e).__name__}", retryable=False) from e
 
+
+@trust_boundary(
+    tier=3,
+    source="OpenRouter chat-completion success body (externally derived)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises LLMClientError (or a typed subclass of it) unless the body is a JSON object whose first choice carries "
+        "non-empty str content, whose usage values are finite, and whose model is a non-empty str; never echoes body "
+        "content into an exception message"
+    ),
+    test_ref="tests/unit/plugins/llm/test_provider_openrouter.py::test_validate_chat_completion_response_rejects_malformed_bodies",
+    test_fingerprint="848eb27c7567682ffdaa9fd292309b8629b1d76799e5e8507e7ec1cdc1f33fef",
+)
+def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, TokenUsage, ParsedFinishReason, str]:
+    """Parse and validate an OpenRouter chat-completion response body.
+
+    Structural diagnostics such as type and member names are safe to surface;
+    response *content* (keys, values, finish_reason text) is never echoed into
+    an exception message.
+    """
+    data = _decode_openrouter_json(response)
     if not isinstance(data, dict):
-        raise LLMClientError(
-            f"Empty or missing choices in response: {type(data).__name__}",
-            retryable=False,
-        )
+        raise LLMClientError(f"Response is not a JSON object: {type(data).__name__}", retryable=False)
 
     choices = data.get("choices")
     if not choices:
-        raise LLMClientError(
-            f"Empty or missing choices in response: {list(data.keys())}",
-            retryable=False,
-        )
+        # Fixed text only — the top-level JSON keys are provider-controlled
+        # data and must never be interpolated into an exception message.
+        raise LLMClientError("Empty or missing choices in response", retryable=False)
 
-    try:
-        content = choices[0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise LLMClientError(
-            f"Malformed response structure: {type(e).__name__}: {e}",
-            retryable=False,
-        ) from e
+    # Shape is asserted member by member (never by catching KeyError/
+    # TypeError): only the member NAME reaches the message, never a value.
+    first_choice = choices[0] if isinstance(choices, list) else None
+    if not isinstance(first_choice, dict):
+        raise LLMClientError("Malformed response structure: choices[0]", retryable=False)
+    message = first_choice.get("message")
+    if not isinstance(message, dict) or "content" not in message:
+        raise LLMClientError("Malformed response structure: message.content", retryable=False)
+    content = message["content"]
+    raw_finish_reason = first_choice.get("finish_reason")
 
     if content is None:
         raise ContentPolicyError("LLM returned null content (likely content-filtered by provider)")
 
     if not isinstance(content, str):
-        raise LLMClientError(
-            f"Expected string content, got {type(content).__name__}",
-            retryable=False,
-        )
+        raise LLMClientError(f"Expected string content, got {type(content).__name__}", retryable=False)
 
     if not content.strip():
-        raw_fr = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
-        if raw_fr == "tool_calls":
-            raise LLMClientError(
-                "LLM returned tool_calls response (not supported by ELSPETH)",
-                retryable=False,
-            )
-        raise ContentPolicyError(
-            f"LLM returned empty content (finish_reason={raw_fr})",
-        )
+        if raw_finish_reason == "tool_calls":
+            raise LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)", retryable=False)
+        # finish_reason is provider-controlled data — never interpolated.
+        raise ContentPolicyError("LLM returned empty content")
 
     raw_usage = data.get("usage")
     if isinstance(raw_usage, dict):
-        for usage_key, usage_val in raw_usage.items():
+        for usage_val in raw_usage.values():
             if isinstance(usage_val, float) and not math.isfinite(usage_val):
-                raise LLMClientError(
-                    f"Non-finite value in usage.{usage_key}: {usage_val}",
-                    retryable=False,
-                )
+                # The usage key name is provider-controlled data — never
+                # interpolated, even though it's "just a key name".
+                raise LLMClientError("Non-finite value in usage", retryable=False)
     usage = TokenUsage.from_dict(raw_usage)
 
-    raw_finish_reason = choices[0].get("finish_reason") if isinstance(choices[0], dict) else None
     finish_reason = parse_finish_reason(str(raw_finish_reason)) if raw_finish_reason is not None else None
 
     # The provider MUST report which model served the request. Substituting the
@@ -214,7 +227,7 @@ class OpenRouterConfig(LLMConfig):
         # (http://127.0.0.1:8199/v1, used by the shipped examples) validate and
         # run. The bearer token never leaves the local machine, so this does not
         # weaken the "no bearer over plaintext to a remote host" guarantee.
-        return normalize_openrouter_base_url(validate_credential_safe_https_url(value, field_name="base_url", allow_http_loopback=True))
+        return validate_openrouter_base_url(value)
 
     # Catalog membership for ``model`` is enforced as a value-source concern,
     # NOT in config construction: the ``CatalogValueSource`` declaration below
@@ -245,20 +258,14 @@ class OpenRouterConfig(LLMConfig):
     # slug list. The ``applies_when`` predicate keeps the catalog check
     # in lock-step with the actual HTTP boundary the runtime targets.
     # ClassVar so Pydantic v2 ignores it.
-    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = (
-        CatalogValueSource(
-            field_name="model",
-            catalog_id=MODEL_CATALOG_OPENROUTER,
-            applies_when=OPENROUTER_BASE_URL_APPLIES_WHEN,
-        ),
-    )
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = OPENROUTER_MODEL_VALUE_SOURCES
 
 
 class OpenRouterLLMProvider:
     """OpenRouter provider — raw HTTP with Tier 3 validation.
 
     Responsibilities:
-    1. Create/cache AuditedHTTPClient per state_id (thread-safe)
+    1. Create/cache AuditedHTTPClient per audit parent (thread-safe)
     2. Make HTTP POST to /chat/completions
     3. Parse JSON response with NaN rejection
     4. Validate content, usage, finish_reason at Tier 3 boundary
@@ -294,9 +301,7 @@ class OpenRouterLLMProvider:
         # loopback dev servers (ChaosLLM at http://127.0.0.1:8199/v1) are
         # permitted; the bearer token stays on the local machine. Remote hosts
         # still require HTTPS.
-        self._base_url = normalize_openrouter_base_url(
-            validate_credential_safe_https_url(base_url, field_name="base_url", allow_http_loopback=True)
-        )
+        self._base_url = validate_openrouter_base_url(base_url)
         self._timeout = timeout_seconds
         self._recorder = recorder
         self._run_id = run_id
@@ -308,7 +313,7 @@ class OpenRouterLLMProvider:
         self._resolved_prompt_template_hash = resolved_prompt_template_hash
 
         # Client cache with reference counting for parallel multi-query safety.
-        # Multiple parallel queries share the same state_id, so _get_http_client()
+        # Multiple parallel queries share the same row parent, so _get_http_client()
         # returns the same cached client. Reference counting ensures the client is
         # only closed when the last query releases it.
         self._http_clients: dict[str, AuditedHTTPClient] = {}
@@ -317,13 +322,12 @@ class OpenRouterLLMProvider:
 
     def execute_query(
         self,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         *,
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
         """Execute LLM query via OpenRouter HTTP API.
@@ -346,7 +350,7 @@ class OpenRouterLLMProvider:
             ContentPolicyError: Null content from provider (not retryable)
             LLMClientError: Other failures (not retryable)
         """
-        snapshot_state_id = state_id
+        cache_key = audit_parent.cache_key
         llm_request_payload = self._build_llm_request_payload(
             model=model,
             messages=messages,
@@ -356,12 +360,14 @@ class OpenRouterLLMProvider:
         )
         logical_start = time.perf_counter()
 
-        http_client = self._get_http_client(snapshot_state_id, token_id=token_id)
+        http_client = self._get_http_client(audit_parent)
+        primary_error: BaseException | None = None
         try:
             # Build request body
+            wire = wire_messages(messages)
             request_body: dict[str, Any] = {
                 "model": model,
-                "messages": messages,
+                "messages": wire,
                 "temperature": temperature,
             }
             if max_tokens is not None:
@@ -410,7 +416,7 @@ class OpenRouterLLMProvider:
                 finish_reason=finish_reason,
             )
             self._record_logical_llm_success(
-                state_id=snapshot_state_id,
+                audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 content=content,
@@ -420,21 +426,40 @@ class OpenRouterLLMProvider:
             )
             return result
         except LLMClientError as exc:
+            primary_error = exc
             self._record_logical_llm_error(
-                state_id=snapshot_state_id,
+                audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
             )
             raise
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self._release_http_client(snapshot_state_id)
+            cleanup_failures: list[BaseException] = []
+            self._release_http_client(cache_key, on_close_error=cleanup_failures.append)
+            if cleanup_failures:
+                cleanup_error = cleanup_failures[0]
+                emit_resource_cleanup_failed(
+                    self._telemetry_emit,
+                    run_id=self._run_id,
+                    component="openrouter_provider",
+                    resource="audited_http_client",
+                    error=cleanup_error,
+                    suppressed=primary_error is not None,
+                    logger=logger,
+                    **audit_parent.client_kwargs(),
+                )
+                if primary_error is None:
+                    raise cleanup_error
 
     def _build_llm_request_payload(
         self,
         *,
         model: str,
-        messages: list[dict[str, str]],
+        messages: Sequence[ChatMessage],
         temperature: float,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
@@ -444,7 +469,7 @@ class OpenRouterLLMProvider:
             extra_kwargs["response_format"] = response_format
         return LLMCallRequest(
             model=model,
-            messages=messages,
+            messages=audit_messages(messages),
             temperature=temperature,
             provider="openrouter",
             max_tokens=max_tokens,
@@ -454,7 +479,7 @@ class OpenRouterLLMProvider:
     def _record_logical_llm_success(
         self,
         *,
-        state_id: str,
+        audit_parent: LLMAuditParent,
         started_at: float,
         request_payload: LLMCallRequest,
         content: str,
@@ -463,9 +488,9 @@ class OpenRouterLLMProvider:
         raw_response: dict[str, Any],
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
-        call_index = self._recorder.allocate_call_index(state_id)
-        self._recorder.record_call(
-            state_id=state_id,
+        call_index = audit_parent.allocate_call_index(self._recorder)
+        audit_parent.record_call(
+            self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -483,15 +508,15 @@ class OpenRouterLLMProvider:
     def _record_logical_llm_error(
         self,
         *,
-        state_id: str,
+        audit_parent: LLMAuditParent,
         started_at: float,
         request_payload: LLMCallRequest,
         exc: LLMClientError,
     ) -> None:
-        call_index = self._recorder.allocate_call_index(state_id)
+        call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
-        self._recorder.record_call(
-            state_id=state_id,
+        audit_parent.record_call(
+            self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.ERROR,
@@ -499,7 +524,7 @@ class OpenRouterLLMProvider:
             error=LLMCallError(
                 type=type(exc).__name__,
                 message=message,
-                retryable=bool(getattr(exc, "retryable", False)),
+                retryable=exc.retryable,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
             resolved_prompt_template_hash=self._resolved_prompt_template_hash,
@@ -521,7 +546,7 @@ class OpenRouterLLMProvider:
         try:
             request_body: dict[str, Any] = {
                 "model": model,
-                "messages": [{"role": "user", "content": "This is a pre-flight smoke test. Please reply with ok."}],
+                "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
                 "temperature": 0.0,
                 # Underlying providers behind OpenRouter enforce different minimums
                 # on max_output_tokens. Azure-backed routes require >= 16; values
@@ -549,46 +574,59 @@ class OpenRouterLLMProvider:
         finally:
             http_client.close()
 
-    def _get_http_client(self, state_id: str, *, token_id: str | None = None) -> AuditedHTTPClient:
-        """Get or create AuditedHTTPClient for a state_id (thread-safe).
+    def _get_http_client(self, audit_parent: LLMAuditParent) -> AuditedHTTPClient:
+        """Get or create AuditedHTTPClient for an audit parent (thread-safe).
 
-        Increments reference count so parallel queries sharing a state_id
+        Increments reference count so parallel queries sharing an audit parent
         keep the client alive until the last query releases it.
         """
+        cache_key = audit_parent.cache_key
         with self._http_clients_lock:
-            if state_id not in self._http_clients:
-                self._http_clients[state_id] = AuditedHTTPClient(
+            if cache_key not in self._http_clients:
+                self._http_clients[cache_key] = AuditedHTTPClient(
                     execution=self._recorder,
-                    state_id=state_id,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
                     timeout=self._timeout,
                     base_url=self._base_url,
                     headers=self._request_headers,
                     limiter=self._limiter,
-                    token_id=token_id,
+                    **audit_parent.client_kwargs(),
                 )
-                self._http_client_refs[state_id] = 0
-            self._http_client_refs[state_id] += 1
-            return self._http_clients[state_id]
+                self._http_client_refs[cache_key] = 0
+            self._http_client_refs[cache_key] += 1
+            return self._http_clients[cache_key]
 
-    def _release_http_client(self, state_id: str) -> None:
+    def _release_http_client(
+        self,
+        cache_key: str,
+        *,
+        on_close_error: Callable[[BaseException], None] | None = None,
+    ) -> None:
         """Decrement reference count and close client when last user releases it."""
         client_to_close: AuditedHTTPClient | None = None
         with self._http_clients_lock:
-            if state_id not in self._http_client_refs:
+            if cache_key not in self._http_client_refs:
                 raise RuntimeError(
-                    f"_release_http_client called for unknown state_id={state_id!r}. "
+                    f"_release_http_client called for unknown cache_key={cache_key!r}. "
                     f"This is a refcount underflow — _get_http_client() was never called "
-                    f"for this state_id, or it was already fully released."
+                    f"for this audit parent, or it was already fully released."
                 )
-            count = self._http_client_refs[state_id] - 1
-            self._http_client_refs[state_id] = count
+            count = self._http_client_refs[cache_key] - 1
+            self._http_client_refs[cache_key] = count
             if count <= 0:
-                client_to_close = self._http_clients.pop(state_id, None)
-                self._http_client_refs.pop(state_id, None)
+                # Both maps are written together in _get_http_client and the
+                # refcount presence was asserted above, so a missing entry
+                # here is a real invariant break, not an idempotent release.
+                client_to_close = self._http_clients.pop(cache_key)
+                del self._http_client_refs[cache_key]
         if client_to_close is not None:
-            client_to_close.close()
+            try:
+                client_to_close.close()
+            except BaseException as exc:
+                if on_close_error is None:
+                    raise
+                on_close_error(exc)
 
     def close(self) -> None:
         """Release all cached clients."""

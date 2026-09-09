@@ -15,9 +15,13 @@ if TYPE_CHECKING:
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.contracts.scheduler import GroupLossSpec
     from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.contracts.types import CoalesceName, NodeID
     from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
+    from elspeth.engine.executors.collector import CollectorExecutor
+    from elspeth.engine.row_union_executor import RowUnionExecutor
+    from elspeth.engine.work_items import WorkItem
 
 
 class TelemetryManagerProtocol(Protocol):
@@ -158,7 +162,13 @@ class BarrierIntakePort(RunIdentityPort, Protocol):
 class CoalesceCompletionPort(Protocol):
     """Processor surface for durable coalesce barrier completion."""
 
-    def mark_blocked_barrier_terminal(self, barrier_key: str, token_ids: tuple[str, ...]) -> int:
+    def mark_blocked_barrier_terminal(
+        self,
+        barrier_key: str,
+        token_ids: tuple[str, ...],
+        *,
+        group_losses: tuple[GroupLossSpec, ...] = (),
+    ) -> int:
         """Mark durable scheduler work consumed by a barrier as terminal."""
         ...
 
@@ -172,6 +182,34 @@ class CoalesceCompletionPort(Protocol):
         ctx: PluginContext,
     ) -> list[RowResult]:
         """Atomically consume coalesce inputs, emit the merge, and continue."""
+        raise NotImplementedError
+
+    def record_group_member_terminals(
+        self,
+        consumed_tokens: tuple[TokenInfo, ...],
+        *,
+        group_id: str,
+        failure_reason: str,
+        child_items: list[WorkItem],
+        group_failed: bool,
+    ) -> list[RowResult]:
+        """Terminalize a closer's consumed members (spec §6.1, Task 6) — the
+        caller names the closer's own group (``group_id``, META-38: never
+        re-derived from a consumed token's innermost frame, which may be a
+        collector release-group frame) and the
+        executor no longer writes their outcomes itself. When
+        ``group_failed`` (this call IS the group's failure, never a late
+        arrival against an already-closed group) it also walks the members'
+        REMAINING lineage for an enclosing bound frame; any cascaded
+        RowResults/child_items surface via the out params."""
+        raise NotImplementedError
+
+    def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
+        """Drain any group losses staged (but not yet durably committed) by
+        the caller's own prior work (Ruling 39): the out-of-claim sweep
+        counterpart to `take_claim_group_losses`. The caller must commit the
+        drained spec(s) durably in the same transaction as its own
+        disposition (e.g. `mark_blocked_barrier_terminal(group_losses=...)`)."""
         raise NotImplementedError
 
 
@@ -220,10 +258,34 @@ class SinkStepResolver(Protocol):
         raise NotImplementedError
 
 
+class RowUnionExecutorSource(Protocol):
+    """Processor surface exposing the leader's row_union barrier executor.
+
+    ``None`` on followers and on pipelines with no row_union nodes — the
+    timeout/EOF sweep arms treat that as nothing-to-sweep.
+    """
+
+    @property
+    def row_union_executor(self) -> RowUnionExecutor | None: ...
+
+
+class CollectorExecutorSource(Protocol):
+    """Processor surface exposing the leader's collector barrier executor.
+
+    ``None`` on followers and on pipelines with no collector nodes — the
+    end-of-input flush loop treats that as no collector holds to wait for.
+    """
+
+    @property
+    def collector_executor(self) -> CollectorExecutor | None: ...
+
+
 class EndOfInputBarrierProcessorPort(
     AggregationProcessorPort,
     BarrierIntakePort,
     CoalesceCompletionPort,
+    RowUnionExecutorSource,
+    CollectorExecutorSource,
     Protocol,
 ):
     """Combined surface needed by the end-of-input barrier flush loop."""
@@ -236,6 +298,8 @@ class RowProcessorHandle(
     SchedulerJournalPort,
     BarrierIntakePort,
     CoalesceCompletionPort,
+    RowUnionExecutorSource,
+    CollectorExecutorSource,
     SinkTerminalizationPort,
     BarrierScalarsSource,
     ResumeContinuationPort,

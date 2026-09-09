@@ -4,7 +4,7 @@ Centralises:
 
 - ``ToolResult`` (the canonical response shape every handler returns) and the
   leaf response helpers (``_failure_result`` / ``_discovery_result`` /
-  ``_mutation_result`` / ``_prepend_rejection_entry`` / ``_attach_post_call_hints``).
+  ``_mutation_result`` / ``_rejection_only_validation`` / ``_attach_post_call_hints``).
 - Validation-delta and graph-repair-suggestion synthesis used by
   ``ToolResult.to_dict`` and the high-level ``diff_states`` reporter.
 - The Pydantic mutation-argument validator and merge-patch helper used by every
@@ -23,9 +23,10 @@ from __future__ import annotations
 # Slice 4 — additional imports for shared validation/repair helpers.
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Final, TypedDict, cast
+from types import MappingProxyType
+from typing import Any, Final, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -33,18 +34,23 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.plugin_protocols import PluginConfigProtocol
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import TriggerConfig
 from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
     parse_secret_ref_marker,
+    redact_secret_refs_for_validation,
 )
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.config_base import PluginConfig, PluginConfigError
 from elspeth.plugins.infrastructure.validation import (
     UnknownPluginTypeError,
     get_sink_config_model,
@@ -53,8 +59,15 @@ from elspeth.plugins.infrastructure.validation import (
 )
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
-from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._producer_resolver import published_success_connection
+from elspeth.web.composer.plugin_policy_disclosure import (
+    WEB_PROHIBITED_PLUGIN_EXPLANATION,
+    ProhibitedPluginDisclosure,
+    prohibited_plugin_section,
+)
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -69,12 +82,21 @@ from elspeth.web.composer.state import (
     _coalesce_branch_names,
     _serialize_branches,
 )
+from elspeth.web.composer.tool_result_envelope import APPLIED_COMPONENT_KEYS, ValidationGuidance
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
     SOURCE_AUTHORING_KEY,
+    SOURCE_COMPONENT_ID,
     InterpretationRequirement,
+    ServerStagedRequiredControlUserTerm,
+    composer_pipeline_decision_user_term_error,
+    parse_interpretation_requirements,
+    project_planner_context_interpretation_requirement,
+    resolved_review_evidence_is_coherent,
     serialize_authoring_review_options,
+    source_name_from_component_id,
     strip_authoring_options,
 )
 from elspeth.web.paths import (
@@ -84,13 +106,16 @@ from elspeth.web.paths import (
     allowed_sink_directories,
     allowed_source_directories,
     resolve_data_path,
+    resolve_sink_data_path,
 )
+from elspeth.web.plugin_policy.coverage import transform_plugin_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
 from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields,
     allowed_secret_ref_fields_text,
 )
+from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
@@ -99,14 +124,113 @@ _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pip
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
 _DATA_ERROR_KEY: Final[str] = "error"
 _RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
+_SOURCE_BLOB_REF_OPTION_KEY: Final[str] = "blob_ref"
+_SOURCE_BLOBS_OPTION_KEY: Final[str] = "blobs"
+_SERVER_OWNED_SOURCE_OPTION_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        SOURCE_AUTHORING_KEY,
+        _SOURCE_BLOB_REF_OPTION_KEY,
+        _SOURCE_BLOBS_OPTION_KEY,
+    }
+)
 _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {
+        "id",
+        "status",
         "event_id",
         "accepted_value",
         "accepted_artifact_hash",
         "resolved_prompt_template_hash",
     }
 )
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER: Final[tuple[str, ...]] = (
+    "kind",
+    "user_term",
+    "draft",
+)
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER)
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = ", ".join(
+    (
+        *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
+        f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+    )
+)
+_INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
+    "Then call request_interpretation_review for an authorable staged site; "
+    "backend-owned review kinds are surfaced automatically. The user resolves "
+    "the card and ELSPETH writes resolved review metadata."
+)
+_INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Inside interpretation_requirements, only " + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT + " are authorable. "
+    "Resolver-owned fields are not settable: "
+    + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
+    + ". Omit those fields. Persist an authorable pending review with the current mutation tool, then call "
+    "request_interpretation_review for that staged site; backend-owned review kinds are surfaced automatically. "
+    "The user resolves the card and ELSPETH writes resolved review metadata."
+)
+_LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Runtime-owned LLM option fields are not settable: "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + ". Omit them; ELSPETH re-derives them during review reconciliation or execution."
+    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+)
+_BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    f" The {INTERPRETATION_REQUIREMENTS_KEY} option root is not settable on any source, node, or output path. "
+    "On source paths, these server/resolver-owned roots are also not settable: "
+    + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    + ". Bind sources with set_source_from_blob or set_source_from_blobs instead. "
+    "When field_path targets an LLM node, its runtime-owned top-level option is also not settable: "
+    + ", ".join(sorted(_RUNTIME_OWNED_LLM_OPTION_KEYS))
+    + ". For author-owned LLM option edits use patch_node_options, or upsert_node for a full node edit; "
+    "blob wiring cannot author those values."
+)
+_OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    f" The {INTERPRETATION_REQUIREMENTS_KEY} option root is not settable on outputs. "
+    "Stage an authorable review on its source or node instead."
+)
+_CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "id",
+        "kind",
+        "user_term",
+        "draft",
+        "status",
+        "event_id",
+        "accepted_value",
+        "accepted_artifact_hash",
+        "resolved_prompt_template_hash",
+    }
+)
+
+
+def _authored_interpretation_requirement_id(
+    *,
+    component_id: str,
+    user_term: str,
+    source: bool = False,
+) -> str:
+    """Project one admitted author shell onto its canonical server-owned ID."""
+    normalized_user_term = user_term.strip()
+    return f"source_review:{normalized_user_term}" if source else f"{normalized_user_term}:{component_id}"
+
+
+def _source_review_requirement_id(user_term: str) -> str:
+    """Return the canonical source-review ID for one normalized review term."""
+    return _authored_interpretation_requirement_id(
+        component_id="source",
+        user_term=user_term,
+        source=True,
+    )
+
+
+def _prompt_template_review_requirement_id(node_id: str) -> str:
+    """Return the canonical ID used by prompt-template auto-staging."""
+    return f"prompt_template_review:{node_id}"
+
+
+def _model_choice_review_requirement_id(node_id: str) -> str:
+    """Return the canonical ID used by model-choice auto-staging."""
+    return f"model_choice_review:{node_id}"
 
 
 def _pending_interpretation_requirement(
@@ -142,18 +266,47 @@ def _requirement_matches_field_value(requirement: Mapping[str, Any], field_value
     """
     status = requirement["status"] if "status" in requirement else None
     if status == "pending":
-        return requirement.get("draft") == field_value
+        return "draft" in requirement and requirement["draft"] == field_value
     if status != "resolved":
         return False
-    return requirement.get("resolved_prompt_template_hash") == stable_hash(field_value)
+    return "resolved_prompt_template_hash" in requirement and requirement["resolved_prompt_template_hash"] == stable_hash(field_value)
 
 
+def _trusted_requirement_id_for_kind(
+    existing_options: Mapping[str, Any] | None,
+    kind: InterpretationKind,
+) -> str | None:
+    """Return one unambiguous trusted current ID for an auto-staged kind."""
+    if existing_options is None:
+        return None
+    try:
+        existing_requirements = parse_interpretation_requirements(existing_options)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if existing_requirements is None:
+        return None
+    matching_ids = [requirement["id"] for requirement in existing_requirements if requirement["kind"] == kind.value]
+    return matching_ids[0] if len(matching_ids) == 1 else None
+
+
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node or source options mapping (Tier-3) whose "
+    "interpretation_requirements entry is an untyped list of untyped rows: an untrusted "
+    "upsert_node / patch_node_options / set_source payload, a YAML import, or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns a shallow copy of options carrying the requirement list; a non-list "
+    "interpretation_requirements value and a non-mapping row both abstain (the row is copied through "
+    "unchanged for the admission validators to reject), never raises",
+)
 def _options_with_pending_requirement(
     options: Mapping[str, Any],
     *,
     requirement: Mapping[str, Any],
     replace_kind: InterpretationKind | None = None,
     current_field_value: str | None = None,
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Append or refresh a pending requirement without mutating ``options``.
 
@@ -167,6 +320,11 @@ def _options_with_pending_requirement(
     requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     if requirements_value is not None and not isinstance(requirements_value, (list, tuple)):
         return dict(options)
+
+    if replace_kind is not None:
+        trusted_id = _trusted_requirement_id_for_kind(existing_options, replace_kind)
+        if trusted_id is not None:
+            requirement = {**requirement, "id": trusted_id}
 
     requirements: list[Any] = list(requirements_value or ())
     if replace_kind is not None:
@@ -193,11 +351,22 @@ def _options_with_pending_requirement(
     return patched
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node options mapping (Tier-3) whose prompt_template value is "
+    "untyped: an untrusted upsert_node / patch_node_options payload, a YAML import, or a "
+    "sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
+    "string prompt_template, otherwise a copy with the review requirement staged; never raises",
+)
 def _options_with_default_prompt_template_review(
     *,
     node_id: str,
     plugin: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Ensure LLM-authored prompt templates carry a Class 3 review gate."""
     if plugin != "llm":
@@ -206,7 +375,7 @@ def _options_with_default_prompt_template_review(
     if not isinstance(prompt_template, str) or not prompt_template:
         return options
     requirement = _pending_interpretation_requirement(
-        requirement_id=f"prompt_template_review:{node_id}",
+        requirement_id=_prompt_template_review_requirement_id(node_id),
         kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         user_term=f"llm_prompt_template:{node_id}",
         draft=prompt_template,
@@ -216,14 +385,25 @@ def _options_with_default_prompt_template_review(
         requirement=requirement,
         replace_kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         current_field_value=prompt_template,
+        existing_options=existing_options,
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node options mapping (Tier-3) whose model value is untyped: an "
+    "untrusted upsert_node / patch_node_options payload, a YAML import, or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
+    "string model, otherwise a copy with the review requirement staged; never raises",
+)
 def _options_with_default_model_choice_review(
     *,
     node_id: str,
     plugin: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Ensure LLM-authored model choices carry a review gate.
 
@@ -254,7 +434,7 @@ def _options_with_default_model_choice_review(
     if not isinstance(model, str) or not model:
         return options
     requirement = _pending_interpretation_requirement(
-        requirement_id=f"model_choice_review:{node_id}",
+        requirement_id=_model_choice_review_requirement_id(node_id),
         kind=InterpretationKind.LLM_MODEL_CHOICE,
         user_term=f"llm_model_choice:{node_id}",
         draft=model,
@@ -264,6 +444,7 @@ def _options_with_default_model_choice_review(
         requirement=requirement,
         replace_kind=InterpretationKind.LLM_MODEL_CHOICE,
         current_field_value=model,
+        existing_options=existing_options,
     )
 
 
@@ -301,6 +482,16 @@ _TYPOGRAPHIC_TRANSLATION = str.maketrans(_TYPOGRAPHIC_TO_ASCII)
 _WIRE_VISIBLE_SCRAPE_HEADER_FIELDS = ("scraping_reason", "abuse_contact")
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored node options mapping (Tier-3) whose nested http block and header "
+    "field values are untyped: an untrusted upsert_node / patch_node_options payload, a YAML import, "
+    "or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns the input mapping unchanged or a shallow copy with folded header strings; every "
+    "malformed-shape branch abstains and returns the input, never raises",
+)
 def _options_with_ascii_safe_scrape_headers(
     *,
     plugin: str | None,
@@ -341,6 +532,7 @@ def _options_with_default_llm_reviews(
     node_id: str,
     plugin: str | None,
     options: Mapping[str, Any],
+    existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Apply every default review auto-stager for an LLM node, in order.
 
@@ -353,8 +545,18 @@ def _options_with_default_llm_reviews(
     Adding a new default auto-stager here is the canonical extension point —
     callers stay on the composite and acquire the new gate automatically.
     """
-    staged = _options_with_default_prompt_template_review(node_id=node_id, plugin=plugin, options=options)
-    staged = _options_with_default_model_choice_review(node_id=node_id, plugin=plugin, options=staged)
+    staged = _options_with_default_prompt_template_review(
+        node_id=node_id,
+        plugin=plugin,
+        options=options,
+        existing_options=existing_options,
+    )
+    staged = _options_with_default_model_choice_review(
+        node_id=node_id,
+        plugin=plugin,
+        options=staged,
+        existing_options=existing_options,
+    )
     staged = _options_with_ascii_safe_scrape_headers(plugin=plugin, options=staged)
     return staged
 
@@ -401,7 +603,6 @@ class _FullPipelineStatePayload(TypedDict):
     outputs: list[dict[str, Any]]
     edges: list[dict[str, Any]]
     metadata: _FullPipelineStateMetadataPayload
-    version: int
     inspection: _FullPipelineStateInspectionPayload
 
 
@@ -430,9 +631,11 @@ def _semantic_contracts_payload(
 ) -> list[_SemanticEdgeContractPayload]:
     """Serialize a SemanticEdgeContract tuple to JSON-friendly dicts.
 
-    Centralized so ToolResult.to_dict and _execute_preview_pipeline
-    emit identical shapes — and so adding a field updates both
-    surfaces in one place.
+    Centralized so ToolResult.to_dict and the guided stage emitter
+    (guided/emitters.py) emit identical shapes — and so adding a field
+    updates both surfaces in one place. (preview_pipeline no longer
+    co-emits it: its data stopped carrying a copy of the envelope's
+    validation in elspeth-e405ad7cd2 R4.)
 
     SemanticEdgeContract intentionally has no .to_dict() of its own:
     serialization happens at consumption sites so L0 stays free of
@@ -515,8 +718,18 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
 
     for node in state.nodes:
         names.add(node.input)
-        if node.on_success is not None:
-            names.add(node.on_success)
+        # DERIVED, not restated. An implicit self-publisher (a non-terminal
+        # coalesce, an aggregation omitting on_success, every queue) publishes
+        # under its own node id, so that id IS an occupied connection name.
+        # Reading ``node.on_success`` alone left a DANGLING one unreserved --
+        # a consumed publisher is covered by its consumer's ``input`` above,
+        # which is why the hole only opens when nothing consumes it -- and the
+        # duplicate-consumer fork repair then minted a branch name equal to
+        # that id, producing a fresh ``duplicate_connection_producer`` the
+        # moment the planner applied its own repair (elspeth-8190d4e4cf family).
+        published = published_success_connection(node)
+        if published is not None:
+            names.add(published)
         if node.on_error is not None and node.on_error != "discard":
             names.add(node.on_error)
         if node.routes is not None:
@@ -534,21 +747,30 @@ def _duplicate_consumer_repair_suggestions(
     validation: ValidationSummary,
 ) -> list[_GraphRepairSuggestion]:
     """Build copyable repair skeletons for duplicate-consumer validation failures."""
-    duplicate_error_components = {
-        error.component
-        for error in validation.errors
-        if error.component.startswith("connection:") and error.message.startswith("Duplicate consumer for connection ")
-    }
+    duplicate_error_components = {error.component for error in validation.errors if error.error_code == "duplicate_connection_consumer"}
     if not duplicate_error_components:
         return []
 
-    consumers_by_connection: dict[str, list[NodeSpec]] = {}
+    # ``branch_alias`` is None for an ordinary ``node.input`` consumer and
+    # names the branch slot for a row_union consumer. The row_union's own
+    # ``input`` is only an adapter placeholder and must never be repaired as
+    # though it were an independent consumption edge.
+    consumers_by_connection: dict[str, list[tuple[NodeSpec, str | None]]] = {}
     for node in state.nodes:
-        if node.node_type == "coalesce":
+        if node.node_type in ("coalesce", "queue", "row_union"):
             continue
-        if node.input not in consumers_by_connection:
-            consumers_by_connection[node.input] = []
-        consumers_by_connection[node.input].append(node)
+        consumers_by_connection.setdefault(node.input, []).append((node, None))
+    for node in state.nodes:
+        if node.node_type != "row_union":
+            continue
+        for row_union_branch_alias, branch_connection in zip(
+            _coalesce_branch_names(node.branches),
+            _coalesce_branch_connections(node.branches),
+            strict=True,
+        ):
+            if row_union_branch_alias == branch_connection:
+                continue
+            consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
 
     reserved_node_ids = {node.id for node in state.nodes}
     reserved_connection_names = _reserved_connection_names(state)
@@ -562,10 +784,10 @@ def _duplicate_consumer_repair_suggestions(
         gate_id = _unique_name(f"fork_{connection_fragment}", reserved_node_ids)
         branch_names = [
             _unique_name(
-                f"{connection_fragment}_to_{_repair_identifier_fragment(node.id, fallback='node')}",
+                f"{connection_fragment}_to_{_repair_identifier_fragment(binding[0].id, fallback='node')}",
                 reserved_connection_names,
             )
-            for node in consumer_nodes
+            for binding in consumer_nodes
         ]
         gate_args: dict[str, object] = {
             "id": gate_id,
@@ -576,7 +798,7 @@ def _duplicate_consumer_repair_suggestions(
             "on_error": None,
             "options": {},
             "condition": "True",
-            "routes": {},
+            "routes": {"true": "fork", "false": "fork"},
             "fork_to": branch_names,
             "branches": None,
             "policy": None,
@@ -587,10 +809,40 @@ def _duplicate_consumer_repair_suggestions(
         }
         tool_sequence: list[_RepairToolCall] = []
         affected_consumers: list[_AffectedConsumer] = []
-        for node, branch_name in zip(consumer_nodes, branch_names, strict=True):
-            patched_consumer = _serialize_node(node)
-            patched_consumer["input"] = branch_name
-            tool_sequence.append({"tool": "upsert_node", "arguments": patched_consumer})
+        # One row_union can contribute two (node, alias) bindings when two of
+        # its aliases share a connection. Every patch for a node must land on
+        # one running payload: re-serializing the original node per binding
+        # emits two upsert_node calls for the same id, and the second reverts
+        # the first. Insertion order preserves the cross-node sequence.
+        patched_consumers: dict[str, dict[str, Any]] = {}
+        for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
+            if node.id not in patched_consumers:
+                # Widened deliberately: this is a repair-call argument the loop
+                # below re-keys, not the node payload the census reports, so it
+                # must not borrow ``_SetPipelineNodePayload``'s closed key set.
+                patched_consumers[node.id] = dict(_serialize_node(node))
+            patched_consumer = patched_consumers[node.id]
+            if consumer_branch_alias is None:
+                patched_consumer["input"] = branch_name
+            else:
+                # _serialize_node writes "branches" as exactly ``dict`` (mapping
+                # form), exactly ``list`` (alias form), or None — a closed owned
+                # union built by _serialize_branches, so the nominal check is exact.
+                patched_branches = patched_consumer["branches"]
+                if type(patched_branches) is not dict:
+                    patched_branches = dict(
+                        zip(
+                            _coalesce_branch_names(node.branches),
+                            _coalesce_branch_connections(node.branches),
+                            strict=True,
+                        )
+                    )
+                patched_branches[consumer_branch_alias] = branch_name
+                patched_consumer["branches"] = patched_branches
+                # ``input`` is only the adapter placeholder for the first
+                # branch connection; re-derive it from the accumulated mapping
+                # so it stays consistent no matter which aliases were repaired.
+                patched_consumer["input"] = next(iter(patched_branches.values()))
             affected_consumers.append(
                 {
                     "id": node.id,
@@ -598,6 +850,7 @@ def _duplicate_consumer_repair_suggestions(
                     "new_input": branch_name,
                 }
             )
+        tool_sequence.extend({"tool": "upsert_node", "arguments": patched_consumer} for patched_consumer in patched_consumers.values())
         tool_sequence.append({"tool": "upsert_node", "arguments": gate_args})
         tool_sequence.append({"tool": "preview_pipeline", "arguments": {}})
         suggestions.append(
@@ -622,6 +875,73 @@ def _graph_repair_suggestions(
     return _duplicate_consumer_repair_suggestions(state, validation)
 
 
+ToolResultData = Mapping[str, object] | Sequence[object] | BaseModel
+"""The closed shapes a tool's ``data`` payload may take on the wire: a JSON object, a JSON array, or
+a pydantic model that ``serialize_tool_result`` dumps. Each tool's own TypedDict says which keys."""
+
+_DATA_CONTAINER_TYPES: Final[tuple[type, ...]] = (dict, MappingProxyType, list, tuple)
+_MAPPING_TYPES: Final[tuple[type, ...]] = (dict, MappingProxyType)
+
+
+class AppliedComponentEcho(TypedDict, total=False):
+    """The post-change components a successful incremental mutation echoes (``_applied_component_echo``).
+
+    Every key is optional and present only when non-empty; the key set is the
+    registry's ``APPLIED_COMPONENT_KEYS`` and the constructor refuses any other.
+    """
+
+    source: dict[str, JsonValue]
+    sources: dict[str, dict[str, JsonValue]]
+    nodes: list[_SetPipelineNodePayload]
+    outputs: list[dict[str, JsonValue]]
+    edges: list[dict[str, JsonValue]]
+
+
+def _require_tool_result_data(value: object) -> None:
+    """Nominal admission (ADR-032): exact container types or a pydantic model; a dict subclass is refused."""
+    if value is None or isinstance(value, BaseModel) or type(value) in _DATA_CONTAINER_TYPES:
+        return
+    raise AuditIntegrityError(f"ToolResult.data is not a closed payload shape: {type(value).__name__}")
+
+
+def _exact_mapping(value: object) -> Mapping[str, object] | None:
+    """The value when it is EXACTLY a dict or mappingproxy; a subclass or anything else yields None.
+
+    ``isinstance`` gives mypy the narrowing; the ``type(...) in`` test gives the
+    nominal exactness ADR-032 asks for (a dict subclass is an impostor here).
+    """
+    if isinstance(value, (dict, MappingProxyType)) and type(value) in _MAPPING_TYPES:
+        return value
+    return None
+
+
+def _require_validation_guidance(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None or "codes" not in mapping or _exact_mapping(mapping["codes"]) is None:
+        raise AuditIntegrityError("ToolResult.validation_guidance must carry a 'codes' mapping")
+
+
+def _require_applied_component(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None:
+        raise AuditIntegrityError(f"ToolResult.applied_component is not a mapping: {type(value).__name__}")
+    extra = sorted(set(mapping) - set(APPLIED_COMPONENT_KEYS))
+    if extra:
+        raise AuditIntegrityError(f"ToolResult.applied_component keys outside the registry: {extra}")
+
+
+def _require_plugin_schemas(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None or any(_exact_mapping(schema) is None for schema in mapping.values()):
+        raise AuditIntegrityError("ToolResult.plugin_schemas must map '<kind>/<plugin>' to a schema mapping")
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     """Result of a tool execution.
@@ -643,33 +963,71 @@ class ToolResult:
             *only when non-empty* so existing tool consumers see no
             schema change.
         plugin_schemas: Inline ``get_plugin_schema`` payloads for every
-            plugin named in a validation error of the form
-            ``Invalid options for <kind> '<plugin>'``. Populated only on
-            failed mutations (``success=False``) for the option-shape
-            tools by ``execute_tool``. Keys are ``"<kind>/<plugin>"``
+            plugin a validation error carries in its structural
+            ``ValidationEntry.plugin_identity`` (stamped by the producer of
+            a plugin-option rejection; never read from the message).
+            Populated only on failed mutations (``success=False``) for the
+            option-shape tools by ``execute_tool``. Keys are ``"<kind>/<plugin>"``
             strings sorted deterministically. ``to_dict`` emits this
             field *only when non-empty*. Eliminates the second
             round-trip the LLM would otherwise burn calling
             ``get_plugin_schema`` separately after each rejection.
+        validation_guidance: Inline repair guidance for a failed mutation —
+            the closed catalogue's ``(explanation, suggested_fix)`` for every
+            resolvable ``error_code`` in ``validation.errors``, plus the
+            ``explain_validation_error`` pointer when some entry resolved to
+            nothing. Built by ``generation.build_validation_guidance`` and
+            populated only on failed mutations by ``execute_tool``. Every
+            value is STATIC catalogue text; nothing per-request rides here.
+            ``to_dict`` emits this field *only when non-empty*. Saves the
+            turn the LLM would otherwise burn calling
+            ``explain_validation_error`` after a rejection — the same trade
+            ``plugin_schemas`` makes for option-shape failures.
+        applied_component: Post-finalizer projection of the components a
+            successful mutation applied — the exact ``set_pipeline``
+            arguments ``get_pipeline_state(component="set_pipeline_arguments")``
+            serves, narrowed to what the mutation touched (see
+            ``_applied_component_echo``). Populated only on successful
+            incremental mutations by ``_mutation_result``; never on failures
+            and never on a full replacement. ``to_dict`` emits this field
+            *only when set*. Eliminates the ``get_pipeline_state`` round-trip
+            the LLM would otherwise burn to see what the server stored.
     """
 
     success: bool
     updated_state: CompositionState
     validation: ValidationSummary
     affected_nodes: tuple[str, ...]
-    data: Any = None
+    data: ToolResultData | None = None
     prior_validation: ValidationSummary | None = None
     runtime_preflight: ValidationResult | None = None
     post_call_hints: tuple[str, ...] = ()
-    plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
+    plugin_schemas: Mapping[str, Mapping[str, JsonValue]] | None = None
+    validation_guidance: ValidationGuidance | None = None
+    applied_component: AppliedComponentEcho | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
+    # True when this failure envelope deliberately withheld the pre-mutation
+    # state's validate() entries (full-replacement rejections,
+    # elspeth-e89e6bf47a). normalize_tool_result_validation honors it so a
+    # snapshot change cannot reattach the withheld stale-state errors.
+    # Private framing — never serialized by to_dict().
+    _state_validation_withheld: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Admission before freezing: a refusal must leave nothing half-frozen behind.
+        _require_tool_result_data(self.data)
+        _require_plugin_schemas(self.plugin_schemas)
+        _require_validation_guidance(self.validation_guidance)
+        _require_applied_component(self.applied_component)
         freeze_fields(self, "affected_nodes", "post_call_hints")
         if self.data is not None:
             freeze_fields(self, "data")
         if self.plugin_schemas is not None:
             freeze_fields(self, "plugin_schemas")
+        if self.validation_guidance is not None:
+            freeze_fields(self, "validation_guidance")
+        if self.applied_component is not None:
+            freeze_fields(self, "applied_component")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a dict suitable for LLM tool response.
@@ -719,6 +1077,12 @@ class ToolResult:
         if self.plugin_schemas:
             result["plugin_schemas"] = deep_thaw(self.plugin_schemas)
 
+        if self.validation_guidance:
+            result["validation_guidance"] = deep_thaw(self.validation_guidance)
+
+        if self.applied_component:
+            result["applied_component"] = deep_thaw(self.applied_component)
+
         return result
 
 
@@ -738,9 +1102,13 @@ def diff_states(
         baseline_validation: Pre-computed validation for the baseline state.
         current_validation: Pre-computed validation for the current state.
     """
+    # No ``to_version``: the handler passes ``current`` as the result's state,
+    # so the envelope's own ``version`` IS the "to" side and a copy under
+    # ``data`` would be a twin — the same shape 3a20129be removed from
+    # get_pipeline_state one file away (systems seat SYS-R3-5).
+    # ``from_version`` stays: it is a fact the envelope does not carry.
     changes: dict[str, Any] = {
         "from_version": baseline.version,
-        "to_version": current.version,
         "sources_changed": False,
         "metadata_changed": False,
         "nodes": {"added": [], "removed": [], "modified": []},
@@ -877,22 +1245,49 @@ def _failure_result(
     error_msg: str,
     *,
     error_code: str | None = None,
+    with_state_validation: bool = True,
+    plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a failed mutation.
 
-    The rejection reason (``error_msg``) is also prepended to
-    ``validation.errors`` as a synthetic ``ValidationEntry`` with
-    component ``"rejected_mutation"``. State-level errors from
-    ``state.validate()`` (e.g. "No source configured.") describe the
-    *unchanged* state and follow the rejection reason. This puts the
-    action-rejection signal ahead of the stale-state signal for any
-    consumer that reads ``validation.errors`` in array order — closing
-    the convergence gap surfaced by composer session 58d7ede3 where the
-    LLM repeated a near-identical ``set_pipeline`` because the array led
-    with "No source configured." instead of the real option-shape
-    error.
+    The rejection reason (``error_msg``) leads ``validation.errors`` as a
+    synthetic ``ValidationEntry`` with component ``"rejected_mutation"``.
+
+    ``with_state_validation`` decides whether ``state.validate()`` of the
+    *unchanged* state follows it. Default True: for discovery tools and
+    incremental mutations the standing state is what survives the rejection,
+    and restricted planner surfaces rely on failure results to disclose its
+    errors (see the pipeline-state disclosure tests). Full-replacement
+    rejections (``set_pipeline``) pass False: there the unchanged state's
+    errors are phantom repair targets — on an empty session they read
+    ``no_source_configured`` / ``no_sinks_configured`` for a candidate whose
+    source and sinks were configured correctly, and the raw-result surfaces
+    (freeform chat tool messages, composer MCP responses) serialize
+    ``ToolResult.to_dict()`` verbatim (elspeth-e89e6bf47a; tutorial session
+    38e3e7f8 burned its repair budget on exactly that noise).
+
+    ``plugin_identity`` records the ``(kind, plugin)`` this rejection is about,
+    for the in-process planner consumer that attaches the plugin's contract.
+    Pass it ONLY when the identity has already been resolved through the
+    request's policy view — the caller knows; the message does not, and cannot
+    be made to. Omitting it costs an enrichment, never correctness.
     """
-    validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code)
+    if with_state_validation:
+        validation = _prepend_rejection_entry(
+            state.validate(),
+            error_msg,
+            error_code=error_code,
+            plugin_identity=plugin_identity,
+            rejected_component=rejected_component,
+        )
+    else:
+        validation = _rejection_only_validation(
+            error_msg,
+            error_code=error_code,
+            plugin_identity=plugin_identity,
+            rejected_component=rejected_component,
+        )
     data = {_DATA_ERROR_KEY: error_msg}
     if error_code is not None:
         data["error_code"] = error_code
@@ -902,19 +1297,40 @@ def _failure_result(
         validation=validation,
         affected_nodes=(),
         data=data,
+        _state_validation_withheld=not with_state_validation,
     )
 
 
-# Regex matching the option-shape failure messages emitted by
-# ``_prevalidate_plugin_options`` (see ``_prevalidate_source`` /
-# ``_prevalidate_transform`` / ``_prevalidate_sink``). The kind token is
-# pinned to the three valid PluginKind values so an unrelated message
-# containing ``Invalid options for ...`` text cannot trigger augmentation.
-# The plugin name group accepts any non-apostrophe characters because
-# plugin names are validated upstream.
-_INVALID_OPTIONS_PLUGIN_RE: Final[re.Pattern[str]] = re.compile(
-    r"Invalid options for (source|transform|sink) '([^']+)'",
-)
+REVIEW_RECONCILIATION_FAILURE_PREFIX: Final[str] = "Authoritative interpretation-review reconciliation failed"
+
+
+def review_reconciliation_failure_message(exc: BaseException, *, retry_hint: str) -> str:
+    """Name the invariant that failed inside ``reconcile_authoritative_reviews``.
+
+    Ten distinct invariants raise out of that call — duplicate review
+    identity, missing ``event_id`` / ``accepted_value``, a drifted artifact
+    hash, an ``invented_source`` review on a transform node, a vague-term
+    review that cannot round-trip without ``prompt_template_parts``, and the
+    rest. Every ``set_pipeline`` / ``upsert_node`` / ``splice_transform`` /
+    ``patch_node_options`` / ``patch_source_options`` boundary used to
+    discard the exception and answer with one identical "re-inspect and
+    retry" sentence, which names no repair. Session f33fa7c3 (2026-09-01)
+    wedged on exactly that: the planner resubmitted a byte-identical payload
+    twice and was rejected identically, the REPAIR_BLIND_REPEAT shape of the
+    2026-08-19 withdrawal.
+
+    Interpolating is redaction-safe. ``reconcile_authoritative_reviews``
+    reads only the composition's own options — the raise sites quote pipeline
+    identifiers (node ids, server-owned requirement ids), closed
+    ``InterpretationKind`` values, and planner-authored user terms. None of
+    them can reach row content, and the surrounding boundary already quotes
+    rejected option keys and VALUES from plugin prevalidation (the
+    ``_prevalidate_plugin_options`` message family).
+    """
+    reason = str(exc).strip().rstrip(".")
+    if not reason:
+        return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}. {retry_hint}"
+    return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}: {reason}. {retry_hint}"
 
 
 def build_plugin_schemas_for_failure(
@@ -922,49 +1338,104 @@ def build_plugin_schemas_for_failure(
     catalog: CatalogService,
     *,
     schema_unavailable_message: Callable[[PluginSchemaInfo], str | None] | None = None,
-) -> Mapping[str, Mapping[str, Any]] | None:
+) -> Mapping[str, Mapping[str, JsonValue]] | None:
     """Build the ``plugin_schemas`` augmentation dict for a failed mutation.
 
-    Scans every entry in ``result.validation.errors`` (including both the
-    leading ``rejected_mutation`` entry and any state-level errors that
-    follow). Each entry's ``message`` is regex-matched against
-    ``_INVALID_OPTIONS_PLUGIN_RE``; every distinct ``(kind, plugin)`` pair
-    is resolved through ``catalog.get_schema`` and dumped to a plain dict
-    via ``PluginSchemaInfo.model_dump()`` so the payload is byte-identical
-    to what the LLM would otherwise receive from a discrete
+    Reads ``ValidationEntry.plugin_identity`` from every entry in
+    ``result.validation.errors`` (the leading ``rejected_mutation`` entry and
+    any state-level errors that follow). The identity is a structural fact
+    the PRODUCER stamped at the moment it built the failure, from the plugin
+    it had already resolved through the request's policy view — never
+    recovered from ``message``. Those messages quote model-authored text in
+    three places (rejected option VALUES in the details tail, option KEYS in
+    the secret_ref-placement head, the component NAME in the ``set_pipeline``
+    attribution prefix), and each was enough to plant a plugin identity that
+    no validator had admitted; ``catalog.get_schema`` on such a name raised
+    out of ``execute_tool`` as a model-triggerable 500. Three successive
+    message parsers were each defeated by a different one of those, so the
+    parser is deleted rather than re-anchored (elspeth-f60d638661).
+
+    Fails closed on absence: an entry with ``plugin_identity=None`` attaches
+    nothing, whatever its message says. The model cannot plant an identity
+    through message text because no text is read.
+
+    Every distinct ``(kind, plugin)`` pair is resolved through
+    ``catalog.get_schema`` and dumped to a plain dict via
+    ``PluginSchemaInfo.model_dump()`` so the payload is byte-identical to
+    what the LLM would otherwise receive from a discrete
     ``get_plugin_schema`` tool call. When ``schema_unavailable_message`` is
     supplied, plugins hidden by the same availability gate as
-    ``get_plugin_schema`` are omitted rather than inlining a forbidden schema.
+    ``get_plugin_schema`` are omitted rather than inlining a forbidden
+    schema. Keys are ``"<kind>/<plugin>"``, sorted, deduplicated.
 
-    Returns ``None`` when the result is successful or when no error
-    message matches the option-shape pattern. The caller is responsible
-    for restricting the call to declarations that set
-    ``augments_on_failure=True`` (gated by
+    Returns ``None`` when the result is successful or when no entry carries
+    an identity. The caller is responsible for restricting the call to
+    declarations that set ``augments_on_failure=True`` (gated by
     ``_registry.should_augment_with_plugin_schemas``).
 
-    Trust tier: server-controlled response shaping. A regex match implies
-    the validator already resolved the plugin in the catalog (the unknown
-    -plugin path emits ``"Unknown <kind> plugin '<name>'"`` instead).
-    Therefore ``catalog.get_schema`` returning ``ValueError`` here is a
-    Tier-1 anomaly — propagate, do not silently omit.
+    Trust tier: server-controlled response shaping. A stamped identity was
+    resolved by the producer, so ``catalog.get_schema`` raising here is a
+    Tier-1 anomaly (a producer stamped a name it never resolved) —
+    propagate, do not silently omit.
     """
     if result.success:
         return None
     discovered: dict[tuple[str, str], Mapping[str, Any]] = {}
     for entry in result.validation.errors:
-        for match in _INVALID_OPTIONS_PLUGIN_RE.finditer(entry.message):
-            kind = cast(PluginKind, match.group(1))
-            plugin_name = match.group(2)
-            key = (kind, plugin_name)
-            if key in discovered:
-                continue
-            schema = catalog.get_schema(kind, plugin_name)
-            if schema_unavailable_message is not None and schema_unavailable_message(schema) is not None:
-                continue
-            discovered[key] = schema.model_dump()
+        if entry.plugin_identity is None:
+            continue
+        kind, plugin_name = entry.plugin_identity
+        key = (kind, plugin_name)
+        if key in discovered:
+            continue
+        schema = catalog.get_schema(cast(PluginKind, kind), plugin_name)
+        if schema_unavailable_message is not None and schema_unavailable_message(schema) is not None:
+            continue
+        discovered[key] = schema.model_dump()
     if not discovered:
         return None
     return {f"{kind}/{plugin_name}": payload for (kind, plugin_name), payload in sorted(discovered.items())}
+
+
+def rejected_component_ref(component_type: str, component_id: str) -> str:
+    """The canonical validation-component ref for a component a rejection is about.
+
+    ``source`` ids already carry the canonical form (``source`` /
+    ``source:<name>``, minted by ``source_component_id``); node and output ids
+    are bare and take the ``node:`` / ``output:`` prefix. This is the one
+    place the ``rejected_component`` grammar is minted for rejections, so the
+    prose prefix (:func:`rejected_component_prefix`) and the structural fact
+    cannot disagree (elspeth-e405ad7cd2, F10).
+    """
+    # ``component_type`` arrives in two vocabularies: the component family
+    # (``source`` / ``node`` / ``output``, what the mutation tools pass) and the
+    # plugin kind (``transform`` / ``sink``, what the credential payload's
+    # ``components[].component_type`` historically carried). Both map onto the
+    # same three ref families.
+    if component_type == "source":
+        return component_id
+    if component_type in {"node", "transform"}:
+        return f"node:{component_id}"
+    if component_type in {"output", "sink"}:
+        return f"output:{component_id}"
+    raise AuditIntegrityError(f"unknown component_type {component_type!r} for a rejection subject")
+
+
+def rejected_component_prefix(rejected_component: str) -> str:
+    """The message prefix a set_pipeline rejection about one component carries.
+
+    ``Source '<name>': `` / ``Node '<id>': `` / ``Output '<name>': `` — the
+    same prose the per-component loops used to hand-write beside the stamp.
+    """
+    if rejected_component.startswith("node:"):
+        return f"Node '{rejected_component.removeprefix('node:')}': "
+    if rejected_component.startswith("output:"):
+        return f"Output '{rejected_component.removeprefix('output:')}': "
+    if rejected_component == "source":
+        return "Source 'source': "
+    if rejected_component.startswith("source:"):
+        return f"Source '{rejected_component.removeprefix('source:')}': "
+    raise AuditIntegrityError(f"not a validation-component ref: {rejected_component!r}")
 
 
 def _prepend_rejection_entry(
@@ -972,6 +1443,8 @@ def _prepend_rejection_entry(
     error_msg: str,
     *,
     error_code: str | None = None,
+    plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary with a leading rejected_mutation entry.
 
@@ -985,6 +1458,8 @@ def _prepend_rejection_entry(
         message=error_msg,
         severity="high",
         error_code=error_code,
+        plugin_identity=plugin_identity,
+        rejected_component=rejected_component,
     )
     return ValidationSummary(
         is_valid=False,
@@ -996,6 +1471,94 @@ def _prepend_rejection_entry(
     )
 
 
+def _rejection_only_validation(
+    error_msg: str,
+    *,
+    error_code: str | None = None,
+    plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
+) -> ValidationSummary:
+    """Return a ValidationSummary holding only a rejected_mutation entry.
+
+    Full-replacement rejections leave the state untouched AND replace it
+    wholesale on success, so every field derived from validating that state
+    (errors, warnings, suggestions, contracts) describes a state the caller
+    is not editing and is withheld (elspeth-e89e6bf47a). ``is_valid`` is
+    False because a rejection entry is by construction a high-severity
+    error.
+    """
+    rejection = ValidationEntry(
+        component="rejected_mutation",
+        message=error_msg,
+        severity="high",
+        error_code=error_code,
+        plugin_identity=plugin_identity,
+        rejected_component=rejected_component,
+    )
+    return ValidationSummary(is_valid=False, errors=(rejection,))
+
+
+# Key under which a merged rejection envelope reports the components it
+# collected but did not list. Present only when the cap actually truncated,
+# so a reader never has to distinguish "no overflow" from "not counted".
+COMPONENTS_WITHHELD_KEY: Final[str] = "components_withheld"
+
+
+def _merged_component_rejection_result(
+    results: Sequence[ToolResult],
+    *,
+    components_withheld: int,
+) -> ToolResult:
+    """Merge one full-replacement candidate's per-component rejections.
+
+    A full-replacement candidate is validated component by component; each
+    failing component produces its own single-entry rejection envelope. This
+    joins them into ONE envelope so a single repair turn names every defective
+    component instead of the first (elspeth-4fad98a453): three defective
+    components used to cost three turns, which is deterministic
+    REPAIR_EXHAUSTED against the default repair budget.
+
+    The FIRST failing component's envelope is the base — its ``data`` payload
+    (including the credential-rejection repair block) and its leading entry
+    stay exactly what a single-component rejection would have produced, so
+    ordering is stable and no response shape moves. This is also the one
+    place where ``data["error_code"]`` agreeing with ``errors[0].error_code``
+    is NOT structural: ``data`` comes from ``results[0]`` while ``errors``
+    concatenates every result's entries. Agreement therefore rests on an
+    unstated precondition — ``results[0]`` must carry a leading
+    ``rejected_mutation`` entry. Every current feeder satisfies it because
+    all of them construct through ``_failure_result`` /
+    ``_plugin_policy_failure``; a future feeder that does not would publish
+    two disagreeing codes in one envelope. Later components
+    contribute their rejection entries only. ``components_withheld`` records
+    the components the caller's reporting cap dropped; truncation is never
+    silent.
+    """
+    base = results[0]
+    entries = tuple(entry for result in results for entry in result.validation.errors if entry.component == "rejected_mutation")
+    data = base.data
+    merged_data: Any = data
+    if components_withheld:
+        # KEEP `isinstance(..., Mapping)`. `ToolResult.__post_init__` runs
+        # `freeze_fields(self, "data")`, so `base.data` is a MappingProxyType,
+        # never an exact dict. Converging this on the house `type(x) is dict`
+        # scalar idiom makes the test permanently False, sends every merge to
+        # the else branch, and drops `error_code` and every detail from the
+        # rejection envelope the model receives. Pinned by
+        # tests/unit/web/composer/test_frozen_state_nominal_type_guards.py::
+        # test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_result
+        merged_data = (
+            {**data, COMPONENTS_WITHHELD_KEY: components_withheld}
+            if isinstance(data, Mapping)
+            else {COMPONENTS_WITHHELD_KEY: components_withheld}
+        )
+    return replace(
+        base,
+        validation=ValidationSummary(is_valid=False, errors=entries),
+        data=merged_data,
+    )
+
+
 def _mutation_result(
     new_state: CompositionState,
     affected: tuple[str, ...],
@@ -1003,6 +1566,7 @@ def _mutation_result(
     prior_validation: ValidationSummary | None = None,
     data: Any = None,
     post_call_hints: tuple[str, ...] = (),
+    full_replacement: bool = False,
 ) -> ToolResult:
     """Build a ToolResult for a successful mutation.
 
@@ -1013,6 +1577,15 @@ def _mutation_result(
     ``affected_nodes``. See ``contracts/plugin_assistance.py`` for
     the discipline; ``ToolResult.to_dict`` emits the field only when
     non-empty.
+
+    ``affected`` is also what scopes the applied-component echo, so every
+    mutating tool gets it from the identifiers it already reports — node ids,
+    source component ids, and sink names — with no per-tool wiring.
+    ``full_replacement`` suppresses that echo for the whole-document authoring
+    tools (``set_pipeline``): there every component
+    is affected, so the echo would be the whole-state read it exists to
+    replace, and the model already holds those bytes verbatim in the call it
+    just made.
     """
     validation = new_state.validate()
     return ToolResult(
@@ -1023,6 +1596,7 @@ def _mutation_result(
         prior_validation=prior_validation,
         data=data,
         post_call_hints=post_call_hints,
+        applied_component=None if full_replacement else _applied_component_echo(new_state, affected),
     )
 
 
@@ -1071,19 +1645,51 @@ def _apply_merge_patch(
 
 
 def _serialize_source(source: SourceSpec) -> dict[str, Any]:
-    """Serialize a SourceSpec to a plain dict for LLM consumption."""
+    """Serialize a SourceSpec to a plain dict for LLM consumption.
+
+    A DIAGNOSTIC view: ``options`` is emitted verbatim, server-owned keys
+    (``source_authoring``, ``blob_ref``) included. Both inspection arms of
+    ``get_pipeline_state`` land here — the whole-document
+    ``_serialize_full_pipeline_state`` and the ``component="source"`` slice
+    — and neither is a ``set_pipeline`` payload. The round-trippable
+    projection is a separate component the tool schema names,
+    ``get_pipeline_state(component="set_pipeline_arguments")``
+    (``_serialize_set_pipeline_arguments``), which rebinds a blob-backed
+    source through ``blob_id``.
+
+    Keeping ``source_authoring`` here is the scoping elspeth-c67fbbbd83
+    chose, not an oversight it missed. The leak that cost a planner turn
+    was the per-turn state context block, projected by
+    ``prompts.project_server_owned_option_metadata``; stripping this view
+    would not have prevented it. Nor would a strip buy round-trippability:
+    a blob-bound source replayed verbatim rejects on ``blob_ref`` first,
+    because that guard cannot enforce ``path`` against the blob's canonical
+    storage_path. Echoing the block costs nothing in any case —
+    ``_drop_echoed_source_authoring`` accepts an exact echo of the stored
+    value, and only a non-matching one rejects.
+    """
     return {
         "plugin": source.plugin,
         "on_success": source.on_success,
         "options": deep_thaw(source.options),
         "on_validation_failure": source.on_validation_failure,
+        "description": source.description,
     }
 
 
-def _serialize_node(node: NodeSpec) -> dict[str, Any]:
-    """Serialize a NodeSpec to a plain dict for LLM consumption.
+def _serialize_node(node: NodeSpec) -> _SetPipelineNodePayload:
+    """Serialize a NodeSpec to the exact node payload for LLM consumption.
 
     Includes all fields (even None) so the LLM sees the full schema.
+
+    Typed rather than ``dict[str, Any]`` because the envelope census reports
+    ``_SetPipelineNodePayload``'s keys as this function's wire (through
+    ``_serialize_set_pipeline_node``). While the type was only asserted over
+    the result, a key added to the literal below shipped while the census kept
+    reporting the TypedDict's — measured: 22 keys on the wire against 21
+    censused, gate green, mypy clean (red-team RED5-2). The annotation is what
+    holds the two equal; consumers wanting a plain mapping widen at their own
+    call site.
     """
     return {
         "id": node.id,
@@ -1102,6 +1708,11 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "trigger": deep_thaw(node.trigger) if node.trigger else None,
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
+        "timeout_seconds": node.timeout_seconds,
+        "description": node.description,
+        "scope_name": node.scope_name,
+        "scope_opener": node.scope_opener,
+        "scope_policy": node.scope_policy,
     }
 
 
@@ -1112,6 +1723,7 @@ def _serialize_output(output: OutputSpec) -> dict[str, Any]:
         "plugin": output.plugin,
         "options": deep_thaw(output.options),
         "on_write_failure": output.on_write_failure,
+        "description": output.description,
     }
 
 
@@ -1130,11 +1742,14 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
     """Serialize the full state and expose accepted full-state spellings."""
     return {
         "sources": {name: _serialize_source(source) for name, source in state.sources.items()},
-        "nodes": [_serialize_node(n) for n in state.nodes],
+        # Widened to the declared ``list[dict[str, Any]]``: this payload is
+        # censused from ``_FullPipelineStatePayload``, which stops at ``nodes``.
+        # Narrowing the field would enumerate 21 sub-keys none of these surfaces
+        # teaches yet — the opaque-reference residue on elspeth-657f603fcd.
+        "nodes": [dict(_serialize_node(n)) for n in state.nodes],
         "outputs": [_serialize_output(o) for o in state.outputs],
         "edges": [_serialize_edge(e) for e in state.edges],
         "metadata": {"name": state.metadata.name, "description": state.metadata.description},
-        "version": state.version,
         "inspection": {
             "requested_component": requested_component,
             "resolved_component": "full",
@@ -1151,9 +1766,43 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
 _DEFAULT_SOURCE_VALIDATION_FAILURE: Final[str] = "discard"
 
 _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
-    "How to handle source validation failures. Use 'discard' to drop invalid rows without routing. "
-    "Any other value, including 'quarantine', must match a configured output/sink name."
+    "'discard' drops rows that fail source validation. Any other value, including 'quarantine', must match a configured output/sink name."
 )
+
+_STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
+    "One short sentence of plain prose saying what this step does, shown to reviewers "
+    "on the Spec tab. Supply it when creating the step and refresh it whenever you "
+    "change what the step does. Informational only — never affects validation or execution."
+)
+
+
+def canonicalize_source_validation_failure(value: str | None) -> str:
+    """Fold unspecified spellings of ``on_validation_failure`` into 'discard'.
+
+    THE single owner of what an authored empty-string route means
+    (elspeth-bcd7051143). ``None`` (not specified) and ``""`` (specified but
+    naming no route — a sink name can never be the empty string, so "" carries
+    no distinct routing intent) both canonicalize to the 'discard' default.
+    Every composer seam that admits an authored ``on_validation_failure``
+    routes through here: ``set_source``, ``set_source_from_blob``, both
+    ``set_pipeline`` source branches, runtime-YAML import
+    (``yaml_importer._source_from_runtime_entry``), and the required-control
+    auto-wire projection (``required_controls._parse_source``). Before this
+    owner existed the seams disagreed — ``set_pipeline`` truthiness-coerced
+    "", ``set_source``/``set_source_from_blob`` passed it through to the
+    engine plugin-config rejection, and the auto-wire pass refused the whole
+    candidate as non-discard — an accepted-then-wedged repair defect. The
+    guided surface's hard reject of "" (``guided/resolved.py``
+    ``SourceResolved``) stays as an internal invariant, not a second owner:
+    with boundary canonicalization "" can no longer lawfully reach it. The
+    engine-side plugin-config validator
+    (``plugins/infrastructure/config_base.py``) still rejects "" for
+    non-composer-authored configs; composer-persisted state is always
+    canonical before it gets there.
+    """
+    if value is None or value == "":
+        return _DEFAULT_SOURCE_VALIDATION_FAILURE
+    return value
 
 
 def _credential_wiring_contract_failure(
@@ -1164,6 +1813,7 @@ def _credential_wiring_contract_failure(
     plugin_type: PluginKind | None = None,
     plugin_name: str | None = None,
     options: Any,
+    with_state_validation: bool = True,
 ) -> ToolResult | None:
     """Reject literal credentials before a mutation writes them into state.
 
@@ -1175,9 +1825,9 @@ def _credential_wiring_contract_failure(
       rolls back — meaning ``wire_secret_ref`` cannot be used to attach
       the secret post-hoc (the node never lands in state).
     - ``collect_credential_field_violations`` short-circuits on
-      ``{secret_ref: NAME}`` markers and ``set_pipeline`` strips those
-      markers before pydantic validation, so passing the marker inline
-      in the node's options is the supported new-node path.
+      ``{secret_ref: NAME}`` markers and ``set_pipeline`` validates those
+      deferred fields without resolving their values, so passing the marker
+      inline in the node's options is the supported new-node path.
 
     The post-hoc ``wire_secret_ref`` sequence is still documented as
     the secondary path for nodes that already exist in state.
@@ -1202,8 +1852,9 @@ def _credential_wiring_contract_failure(
     repair_text = "list_secret_refs -> validate_secret_ref -> wire_secret_ref"
     inline_instruction = (
         "Set `<field>: {secret_ref: NAME}` directly in the node's options "
-        "when calling set_pipeline / upsert_node. (The marker is stripped "
-        "before option validation and resolved at execution time.) This "
+        "when calling set_pipeline / upsert_node. (The marker is handled "
+        "without resolving its value during option validation and resolved at "
+        "execution time.) This "
         "rejection left pipeline state unchanged: repair by re-issuing only "
         "the rejected call with the marker substituted for the literal "
         "value — do not rebuild the pipeline from scratch. For a component "
@@ -1217,15 +1868,25 @@ def _credential_wiring_contract_failure(
         f"Literal credential values were not stored. {inline_instruction} "
         f"{post_hoc_instruction}"
     )
-    # Symmetric with _failure_result: lead validation.errors with the
-    # rejection reason so LLMs reading the array in order see the
-    # actionable message before any stale-state errors.
-    validation = _prepend_rejection_entry(state.validate(), error_msg)
+    # Symmetric with _failure_result: the rejection reason leads
+    # validation.errors; with_state_validation decides whether the unchanged
+    # state's errors follow it (False for full-replacement set_pipeline,
+    # elspeth-e89e6bf47a).
+    # The builder already receives the subject structurally (``component_type``
+    # + ``component_id``), so it stamps ``rejected_component`` itself — every
+    # caller, incremental tools included, gets attribution with no edit
+    # (elspeth-e405ad7cd2, F10 round 2).
+    subject = rejected_component_ref(component_type, component_id)
+    if with_state_validation:
+        validation = _prepend_rejection_entry(state.validate(), error_msg, rejected_component=subject)
+    else:
+        validation = _rejection_only_validation(error_msg, rejected_component=subject)
     return ToolResult(
         success=False,
         updated_state=state,
         validation=validation,
         affected_nodes=(),
+        _state_validation_withheld=not with_state_validation,
         data={
             _DATA_ERROR_KEY: error_msg,
             "credential_fields": credential_fields,
@@ -1276,6 +1937,7 @@ _PLUGIN_UNAVAILABLE_EXPLANATIONS: Final[dict[PluginUnavailableReason, str]] = {
         "the plugin is installed but not turned on in this deployment — no operator profile is "
         "configured for it; an operator must enable one before it can be used"
     ),
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: WEB_PROHIBITED_PLUGIN_EXPLANATION,
 }
 
 
@@ -1283,10 +1945,26 @@ def _plugin_unavailable_message(plugin_type: PluginKind, reason: PluginUnavailab
     return f"{plugin_type} plugin selection is unavailable ({reason.value}): {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}"
 
 
-# gate/coalesce/queue are built-in node_types wired with plugin=null — they do
-# not exist in the plugin registry, and answering a registry probe for them
-# with "not installed" invites a false honest decline ("this deployment cannot
-# merge branches"). These names are closed composer vocabulary, safe to echo.
+def _prohibited_section(items: Sequence[PluginSummary]) -> tuple[ProhibitedPluginDisclosure, ...]:
+    """Shape ``PolicyCatalogView.list_prohibited_*`` entries for chat discovery.
+
+    Every ``item`` here already cleared ``PolicyCatalogView._prohibited`` —
+    i.e. it carries ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``, the
+    one closed reason this section ever names (R2-F18 / elspeth-28a695d7f4).
+    Reuses the same static policy prose the attempt path
+    (``_plugin_unavailable_message``) already shows on a rejected
+    ``set_source`` — no new disclosure surface, just an earlier one, so a
+    user naming a prohibited plugin gets the reason without first trying and
+    failing.
+    """
+    return prohibited_plugin_section(items)
+
+
+# gate/coalesce/row_union/queue are built-in node_types wired with plugin=null —
+# they do not exist in the plugin registry, and answering a registry probe for
+# them with "not installed" invites a false honest decline ("this deployment
+# cannot merge branches"). These names are closed composer vocabulary, safe to
+# echo.
 _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
     "coalesce": (
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
@@ -1298,7 +1976,18 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
     "gate": (
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
         "with node_type='gate', plugin=null, a `condition` row expression and routes={'true': ..., "
-        "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches."
+        "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches. "
+        "Its optional node-level `on_error` handles expression-evaluation errors: set it to 'discard' or a declared sink; "
+        "omit it for fail-fast behavior. Do not represent gate on_error as an edge."
+    ),
+    "row_union": (
+        "'row_union' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
+        "node with node_type='row_union', plugin=null, at least two ordered `branches` mapping each "
+        "fork branch alias to its incoming connection, `input` equal to the first mapped connection "
+        "as a serialization placeholder, and `on_success` naming a downstream processing connection. "
+        "It has fixed require_all N-to-N semantics: it waits for every branch, then releases every "
+        "original row unchanged in declared branch order; an optional finite positive "
+        "`timeout_seconds` is supported."
     ),
     "queue": (
         "'queue' is not a plugin — it is a built-in node_type that needs no plugin, used for fan-in: "
@@ -1311,9 +2000,20 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
 def _validate_plugin_name(
     context: ToolContext,
     plugin_type: PluginKind,
-    name: str,
+    name: object,
 ) -> PluginPolicyViolation | None:
-    """Validate a new plugin selection against one request policy view."""
+    """Validate a new plugin selection against one request policy view.
+
+    ``name`` is Tier-3 (an LLM tool-call argument), so the exact-``str`` check
+    is fail-closed on purpose: a ``str`` subclass whose ``__eq__`` / ``__hash__``
+    disagree with its bytes would otherwise reach the registry and catalog
+    lookups below under one identity and be compared under another.
+    """
+    if type(name) is not str:
+        return PluginPolicyViolation(
+            error_code=PluginUnavailableReason.NOT_INSTALLED,
+            message=_plugin_unavailable_message(plugin_type, PluginUnavailableReason.NOT_INSTALLED),
+        )
     if plugin_type == "transform" and name in _STRUCTURAL_NODE_TYPE_GUIDANCE:
         return PluginPolicyViolation(
             error_code=PluginUnavailableReason.NOT_INSTALLED,
@@ -1347,9 +2047,17 @@ def _plugin_policy_failure(
     violation: PluginPolicyViolation,
     *,
     component: str | None = None,
+    with_state_validation: bool = True,
+    rejected_component: str | None = None,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
-    return _failure_result(state, message, error_code=violation.error_code.value)
+    return _failure_result(
+        state,
+        message,
+        error_code=violation.error_code.value,
+        with_state_validation=with_state_validation,
+        rejected_component=rejected_component,
+    )
 
 
 def _validate_aggregation_trigger(trigger: Any) -> str | None:
@@ -1368,9 +2076,10 @@ def _validate_source_path(
     options: Mapping[str, Any],
     data_dir: str | None,
     *,
+    session_id: str | None,
     require_data_dir: bool = False,
 ) -> str | None:
-    """S2: Validate that path/file options are under allowed source directories.
+    """S2: Validate path/file options under the caller's blob subtree.
 
     Returns an error message if validation fails, None if OK.
     Uses Path.resolve() + is_relative_to() to defeat ../ traversal.
@@ -1385,13 +2094,13 @@ def _validate_source_path(
                     "for allowlist enforcement. Bind uploaded files through "
                     "set_source_from_blob or provide the dispatcher data_dir."
                 )
-            allowed = allowed_source_directories(data_dir)
+            allowed = allowed_source_directories(data_dir, session_id=session_id)
             resolved = resolve_data_path(options[key], data_dir)
             if not any(resolved.is_relative_to(d) for d in allowed):
                 return (
                     f"Path violation (S2): '{options[key]}' is outside the "
                     f"allowed directories. Source file paths "
-                    f"must be under {data_dir}/blobs/."
+                    f"must be under this session's {data_dir}/blobs/<session>/ subtree."
                 )
     return None
 
@@ -1416,13 +2125,13 @@ def _validate_sink_path(
 
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
         if key in options:
-            resolved = resolve_data_path(options[key], data_dir)
+            resolved = resolve_sink_data_path(options[key], data_dir, session_id=session_id)
             if not any(resolved.is_relative_to(d) for d in allowed):
                 return (
                     f"Path violation (S2): '{key}' value '{options[key]}' is outside the "
                     f"allowed directories. Sink output paths "
-                    f"must be under {data_dir}/outputs/ or this session's own "
-                    f"{data_dir}/blobs/<session>/ subtree."
+                    f"must be under this session's {data_dir}/outputs/<session>/ "
+                    f"or {data_dir}/blobs/<session>/ subtree."
                 )
     return None
 
@@ -1448,7 +2157,7 @@ def _validate_transform_provider_config_path(
     if data_dir is None:
         return None
 
-    provider_config = options.get("provider_config")
+    provider_config = options["provider_config"] if "provider_config" in options else None
     if not isinstance(provider_config, Mapping):
         return None
 
@@ -1463,13 +2172,13 @@ def _validate_transform_provider_config_path(
         # ``value is not None`` before resolving.
         if value is None:
             continue
-        resolved = resolve_data_path(value, data_dir)
+        resolved = resolve_sink_data_path(value, data_dir, session_id=session_id)
         if not any(resolved.is_relative_to(d) for d in allowed):
             return (
                 f"Path violation (S2): provider_config '{key}' value "
                 f"'{value}' is outside the allowed directories. "
-                f"Transform provider paths must be under {data_dir}/outputs/ "
-                f"or this session's own {data_dir}/blobs/<session>/ subtree."
+                f"Transform provider paths must be under this session's "
+                f"{data_dir}/outputs/<session>/ or {data_dir}/blobs/<session>/ subtree."
             )
     return None
 
@@ -1479,7 +2188,69 @@ def _validate_transform_provider_config_policy(options: Mapping[str, Any], *, pl
     provider_policy_error = web_rag_provider_config_policy_error(options)
     if provider_policy_error is not None:
         return provider_policy_error
-    return web_llm_retry_budget_policy_error(plugin, options)
+    if transform_plugin_has_capability(plugin, PluginCapability.LLM):
+        return web_llm_retry_budget_policy_error(options)
+    return None
+
+
+_DEFERRED_FIELD_SHAPE_PLACEHOLDER: Final[str] = "deferred value withheld from authoring validation"
+
+
+def _value_source_error(config: object, plugin_type: PluginKind, plugin_name: str) -> str | None:
+    """Format the config's ``VALUE_SOURCES`` findings, or None when it declares none/passes."""
+    findings = check_config_value_sources(config, component_id=plugin_name)
+    if not findings:
+        return None
+    return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in findings)
+
+
+def _deferred_value_source_error(
+    config_cls: type[PluginConfigProtocol],
+    options: dict[str, Any],
+    deferred_keys: set[str],
+    plugin_type: PluginKind,
+    plugin_name: str,
+) -> str | None:
+    """Enforce ``VALUE_SOURCES`` when a deferred value made validated construction impossible.
+
+    A deferred field (``secret_ref`` marker, ``inline_content`` blob) is withheld
+    before construction, so a config model that requires it cannot be built and
+    the caller's normal value-source pass is unreachable. Catalog membership does
+    not depend on that field, though: ``check_config_value_sources`` only reads
+    the field names a declaration names. Build a SHAPE-ONLY config with
+    ``model_construct`` — no validators run, so nothing here can invent a verdict
+    about the deferred content — and run the declarations against the authored
+    values.
+
+    ``model_construct`` is deliberate, not a shortcut past validation: the caller
+    has already established that every non-deferred field validates. Filling the
+    deferred keys keeps every attribute present, because ``_read_field`` reads
+    without a default and treats a missing declared field as a plugin contract
+    bug. A finding ON a deferred key is dropped: its real value lives in a blob
+    or a secret store, so its catalog membership is unknowable here and claiming
+    otherwise would reject valid authoring. The shaped config is read by the
+    declarations and discarded — it never reaches CompositionState.
+    """
+    if not issubclass(config_cls, PluginConfig):
+        # ``PluginConfigProtocol`` promises only from_dict/model_json_schema.
+        # Building without validation needs the pydantic model API, which only
+        # ELSPETH's own PluginConfig base guarantees (ADR-032: narrow nominally
+        # against a class we define, never structurally). A config model from
+        # outside that tree cannot be shaped here, so its declarations stay
+        # unknowable while a field is deferred — the same answer this path gave
+        # before, and not a claim that they pass.
+        return None
+
+    shaped_options = dict(options)
+    for key in deferred_keys:
+        shaped_options[key] = _DEFERRED_FIELD_SHAPE_PLACEHOLDER
+    shaped = config_cls.model_construct(**shaped_options)
+    findings = tuple(
+        finding for finding in check_config_value_sources(shaped, component_id=plugin_name) if finding.field_name not in deferred_keys
+    )
+    if not findings:
+        return None
+    return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in findings)
 
 
 def _prevalidate_plugin_options(
@@ -1500,11 +2271,12 @@ def _prevalidate_plugin_options(
     function asks the plugin what it needs rather than hardcoding
     knowledge about individual plugins.
 
-    Secret-ref markers (``{"secret_ref": "NAME"}``) are stripped before
-    validation. The underlying Pydantic errors are filtered to exclude
-    errors on secret-ref'd fields — those fields ARE provisioned, just
-    deferred to execution time when ``resolve_secret_refs`` replaces them
-    with actual values.
+    Secret-ref markers (``{"secret_ref": "NAME"}``) are withheld from the
+    primary config-model validation and field-level errors on those fields are
+    filtered because they ARE provisioned. If a model-level validator needs to
+    observe paired or conditional credential presence, validation is retried
+    with the shared non-secret placeholder. Real secret values remain
+    unavailable to authoring and are resolved only at execution time.
 
     Args:
         plugin_type: "source", "transform", or "sink".
@@ -1521,7 +2293,7 @@ def _prevalidate_plugin_options(
 
     try:
         if plugin_type == "source":
-            config_cls = get_source_config_model(plugin_name)
+            config_cls = get_source_config_model(plugin_name, options)
         elif plugin_type == "transform":
             config_cls = get_transform_config_model(plugin_name, options)
         elif plugin_type == "sink":
@@ -1548,13 +2320,13 @@ def _prevalidate_plugin_options(
     if plugin_type == "transform" and plugin_name == "llm":
         _mask_pending_interpretation_placeholders_for_authoring_validation(merged)
 
-    # Strip secret_ref markers before validation.  A secret-ref'd field
-    # IS provisioned (the user called wire_secret_ref, or operator-profile
-    # lowering injected the credential as a scoped marker), just deferred to
-    # execution time.  Stripping it may cause Pydantic to report
-    # "field required" — we filter those errors out below.  The canonical
-    # parser accepts both the bare {"secret_ref"} form and the scoped
-    # {"secret_ref", "secret_scope"} form profile lowering emits.
+    # Withhold secret_ref markers from the primary validation pass. A
+    # secret-ref'd field IS provisioned (the user called wire_secret_ref, or
+    # operator-profile lowering injected the credential as a scoped marker),
+    # just deferred to execution time. The canonical parser accepts both the
+    # bare {"secret_ref"} form and the scoped {"secret_ref", "secret_scope"}
+    # form profile lowering emits.
+    placeholder_options = redact_secret_refs_for_validation(merged)
     secret_ref_keys: set[str] = set()
     for key, value in list(merged.items()):
         if parse_secret_ref_marker(value) is not None:
@@ -1571,6 +2343,7 @@ def _prevalidate_plugin_options(
         if shape is not None and shape.mode == "inline_content":
             blob_inline_ref_keys.add(key)
             del merged[key]
+            del placeholder_options[key]
 
     try:
         config = config_cls.from_dict(merged, plugin_name=plugin_name)
@@ -1580,21 +2353,52 @@ def _prevalidate_plugin_options(
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        # Secret refs were stripped.  Filter out errors on those fields.
-        cause = exc.__cause__
-        if not isinstance(cause, PydanticValidationError):
-            # ValueError path (model validators) — can't filter per-field.
-            msg = exc.cause if exc.cause is not None else str(exc)
-            return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
+        if secret_ref_keys:
+            # A missing deferred credential can prevent Pydantic from running
+            # EVERY model validator, so the primary error shape cannot tell us
+            # whether unrelated model-level errors exist. Retry with the same
+            # non-secret placeholder used by export preflight regardless of the
+            # primary error locations. A successful retry yields a real config
+            # that must continue into value-source validation below.
+            try:
+                config = config_cls.from_dict(placeholder_options, plugin_name=plugin_name)
+            except PluginConfigError as placeholder_exc:
+                # Inline blob content is another deferred value, but it has no
+                # type-safe generic placeholder. Preserve its established
+                # field-level filtering while retaining every unrelated error
+                # discovered after the secret placeholder unblocked validation.
+                if blob_inline_ref_keys:
+                    placeholder_cause = placeholder_exc.__cause__
+                    if isinstance(placeholder_cause, PydanticValidationError):
+                        remaining = [
+                            error for error in placeholder_cause.errors() if not (error["loc"] and error["loc"][0] in blob_inline_ref_keys)
+                        ]
+                        if not remaining:
+                            return _deferred_value_source_error(
+                                config_cls, placeholder_options, secret_ref_keys | blob_inline_ref_keys, plugin_type, plugin_name
+                            )
+                        lines = "; ".join(f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in remaining)
+                        return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
+                msg = placeholder_exc.cause if placeholder_exc.cause is not None else str(placeholder_exc)
+                return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        stripped_keys = secret_ref_keys | blob_inline_ref_keys
-        remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in stripped_keys)]
-        if not remaining:
-            return None
+        if not secret_ref_keys:
+            # Only inline blob refs were withheld. Filter out field-level
+            # errors on those deferred fields while retaining every unrelated
+            # validation failure.
+            cause = exc.__cause__
+            if not isinstance(cause, PydanticValidationError):
+                # ValueError path (model validators) — can't filter per-field.
+                msg = exc.cause if exc.cause is not None else str(exc)
+                return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        # Re-format only the non-secret errors.
-        lines = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in remaining)
-        return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
+            remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in blob_inline_ref_keys)]
+            if not remaining:
+                return _deferred_value_source_error(config_cls, placeholder_options, blob_inline_ref_keys, plugin_type, plugin_name)
+
+            # Re-format only the non-deferred errors.
+            lines = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in remaining)
+            return f"Invalid options for {plugin_type} '{plugin_name}': {lines}"
 
     # Construction passed type/required validation. Now enforce the config's
     # VALUE_SOURCES declarations (e.g. OpenRouter ``model`` catalog membership)
@@ -1603,12 +2407,19 @@ def _prevalidate_plugin_options(
     # hallucinated catalog value here, with an actionable ``list_models`` hint,
     # instead of letting it slip through prevalidation. Catalog membership is a
     # value-source concern, deliberately NOT enforced in config construction.
-    value_source_findings = check_config_value_sources(config, component_id=plugin_name)
-    if value_source_findings:
-        return f"Invalid options for {plugin_type} '{plugin_name}': " + "; ".join(f.reason for f in value_source_findings)
-    return None
+    return _value_source_error(config, plugin_type, plugin_name)
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored llm node options mapping (Tier-3) whose prompt_template value is "
+    "untyped, taken from an untrusted upsert_node / patch_node_options payload before plugin "
+    "config prevalidation",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="rewrites options['prompt_template'] in place only when it is present and holds a str; "
+    "any other shape (absent, non-str, or already resolved) is left untouched, never raises",
+)
 def _mask_pending_interpretation_placeholders_for_authoring_validation(
     options: dict[str, Any],
 ) -> None:
@@ -1633,18 +2444,136 @@ def _mask_pending_interpretation_placeholders_for_authoring_validation(
     )
 
 
+# Advisories served through the ``_mutation_result`` data channel (under the
+# ``server_owned_metadata_note`` key) when echoed server-owned metadata was
+# accepted and re-derived rather than rejected (elspeth-c67fbbbd83).
+_ECHOED_REVIEW_METADATA_NOTE: Final[str] = (
+    "interpretation_requirements rows matching the server's stored review state "
+    "were accepted as an echo; resolver-owned review metadata is re-derived "
+    "server-side and does not need to be sent back. Omit those rows (or send "
+    "only pending {kind, user_term, draft} shells) on future writes."
+)
+_ECHOED_SOURCE_AUTHORING_NOTE: Final[str] = (
+    "source_authoring matched the server's stored provenance block exactly and "
+    "was ignored: it is server-stamped and does not need to be sent back. Omit "
+    "source_authoring from future writes."
+)
+
+
+def _echoed_metadata_note(*, requirement_echo: bool, authoring_echo: bool = False) -> str | None:
+    """Compose the advisory for echoed server-owned metadata, or ``None``."""
+    notes: list[str] = []
+    if authoring_echo:
+        notes.append(_ECHOED_SOURCE_AUTHORING_NOTE)
+    if requirement_echo:
+        notes.append(_ECHOED_REVIEW_METADATA_NOTE)
+    return " ".join(notes) if notes else None
+
+
+@observation_boundary(
+    tier=3,
+    source="the untrusted composer tool-call delta's options mapping (Tier-3) whose "
+    "interpretation_requirements entry carries rows the planner echoed back from a serialized state",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns (options, False) unchanged for every echoed row that does not hash-match a "
+    "stored row, so a row this boundary cannot read is left verbatim for the admission gate to "
+    "reject; never raises",
+)
+def _normalize_echoed_interpretation_requirements(
+    options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any], bool]:
+    """Reduce echoed server-owned requirement rows back to author shells.
+
+    A planner doing read-modify-write over a serialized state echoes the
+    stored ``interpretation_requirements`` rows — the canonical persisted rows
+    or the reduced planner-context projection
+    (:func:`project_planner_context_interpretation_requirement`). Those rows
+    carry resolver-owned fields, so
+    :func:`_resolver_owned_interpretation_requirement_error` would reject the
+    whole call even though the write asserts nothing new
+    (elspeth-c67fbbbd83). An echoed row that EXACTLY matches a stored row
+    (``stable_hash``-equal to the deep-thawed canonical row or to its
+    planner-context projection) is therefore reduced to its author-owned
+    pending shell ``{kind, user_term, draft}``: the shell passes admission,
+    canonicalization re-keys it to the stored id, and
+    ``reconcile_authoritative_reviews`` restores the resolved server row —
+    the same round trip a well-behaved planner performs by hand. Any row that
+    does NOT match — a single differing field included — is left verbatim for
+    the gate to reject, so the elspeth-4496f61e30 forgery guard is untouched
+    for non-matching values, and a forged "resolved" row on a component with
+    no stored counterpart never matches anything. The server-staged
+    required-control disclosure row is never normalized: only the
+    required-control finalizer may stage its user_term.
+
+    Returns the (possibly rewritten) options and whether any row was reduced.
+    """
+    if stored_options is None or INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options, False
+    if INTERPRETATION_REQUIREMENTS_KEY not in stored_options:
+        return options, False
+    supplied_rows = options[INTERPRETATION_REQUIREMENTS_KEY]
+    stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(supplied_rows) is not list or type(stored_rows) not in (list, tuple):
+        return options, False
+    shells_by_echo_hash: dict[str, dict[str, Any]] = {}
+    for stored in stored_rows:
+        if not isinstance(stored, Mapping):
+            continue
+        kind = stored["kind"] if "kind" in stored else None
+        user_term = stored["user_term"] if "user_term" in stored else None
+        draft = stored["draft"] if "draft" in stored else None
+        if type(kind) is not str or type(user_term) is not str or type(draft) is not str:
+            continue
+        if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
+            continue
+        shell = {"kind": kind, "user_term": user_term, "draft": draft}
+        shells_by_echo_hash[stable_hash(deep_thaw(stored))] = shell
+        shells_by_echo_hash[stable_hash(project_planner_context_interpretation_requirement(stored))] = shell
+    if not shells_by_echo_hash:
+        return options, False
+    normalized_rows: list[Any] = []
+    normalized_any = False
+    for supplied in supplied_rows:
+        if isinstance(supplied, Mapping):
+            echo_hash = stable_hash(deep_thaw(supplied))
+            matched_shell = shells_by_echo_hash[echo_hash] if echo_hash in shells_by_echo_hash else None
+            if matched_shell is not None:
+                normalized_rows.append(dict(matched_shell))
+                normalized_any = True
+                continue
+        normalized_rows.append(supplied)
+    if not normalized_any:
+        return options, False
+    return {**options, INTERPRETATION_REQUIREMENTS_KEY: normalized_rows}, True
+
+
+@observation_boundary(
+    tier=3,
+    source="the untrusted composer tool-call delta's options mapping (Tier-3) whose "
+    "interpretation_requirements entry is an untyped list of untyped rows authored by the planner",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns an admission error string for every row shape it does not accept and None "
+    "only for a fully accepted list; never raises, so a malformed delta becomes a recoverable "
+    "tool rejection rather than a terminal failure in the candidate_finalizer seam",
+)
 def _resolver_owned_interpretation_requirement_error(
     options: Mapping[str, Any],
     *,
     tool_name: str,
+    component_id: str | None = None,
+    source: bool = False,
 ) -> str | None:
-    """Reject LLM-supplied ``interpretation_requirements`` carrying resolver-owned review metadata.
+    """Validate the complete authoring shape for ``interpretation_requirements``.
 
-    Composer tool input may stage only PENDING review requirements; a resolved
-    ``status`` or any resolver-owned field (``event_id`` / ``accepted_value`` /
-    ``accepted_artifact_hash`` / ``resolved_prompt_template_hash``) may be written
-    ONLY by ``resolve_interpretation_event``, which records a real human
-    resolution in the interpretation-events audit DB.
+    Composer input may supply only the compact unresolved shell
+    ``{kind, user_term, draft}``. Identity, status, event linkage, accepted
+    values, and artifact hashes are all resolver-owned even when the supplied
+    value is null. Presence is therefore the authority violation; inspecting
+    or reflecting the untrusted value would create a tool-error leak channel.
 
     This check is PLUGIN-AGNOSTIC and must guard every write path to a spec's
     ``options`` — both LLM-node options (``vague_term`` / ``llm_prompt_template``
@@ -1658,33 +2587,369 @@ def _resolver_owned_interpretation_requirement_error(
     LLM-SUPPLIED delta (full options on a create, the ``patch`` on a merge) so a
     legitimately-resolved requirement already in stored state is not re-flagged.
     """
-    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-    if not isinstance(requirements_value, (list, tuple)):
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
         return None
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    malformed_error = (
+        f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of "
+        "review entry objects, each carrying non-empty string fields "
+        f"{_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit the field entirely "
+        "when no review is being staged. "
+        f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
+    )
+    if type(requirements_value) is not list:
+        return malformed_error
 
+    seen_kind_terms: set[tuple[str, str]] = set()
+    seen_normalized_user_terms: set[str] = set()
+    seen_projected_ids: set[str] = set()
+    collision_error = (
+        f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY} contains duplicate or "
+        "colliding interpretation requirement identities. Each authored row must "
+        "have a unique normalized kind/user_term and server-projected ID; remove "
+        "duplicate or colliding rows and retry."
+    )
+    registration_error: str | None = None
     for index, requirement in enumerate(requirements_value):
         if not isinstance(requirement, Mapping):
-            continue
+            return malformed_error
         status = requirement["status"] if "status" in requirement else None
-        if status not in (None, "pending"):
+        if type(status) is str and status == "resolved":
+            # Preserve the established repair text for the common resolved-row
+            # exploit without reflecting arbitrary untrusted status values.
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
-                f"resolver-owned status {status!r}. Composer tool input may stage pending "
-                "review requirements only; resolved review metadata may only be written by "
-                "resolve_interpretation_event."
+                "resolver-owned status 'resolved'. Composer tool input may stage pending "
+                f"review requirements only. Omit resolver-owned fields and retry {tool_name} "
+                f"with exactly {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
-        resolver_owned_fields = sorted(
-            field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if requirement.get(field) is not None
-        )
+        resolver_owned_fields = sorted(field for field in _RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS if field in requirement)
         if resolver_owned_fields:
             field_names = ", ".join(resolver_owned_fields)
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] includes "
-                f"resolver-owned field(s): {field_names}. Composer tool input may stage "
-                "pending review requirements only; resolved review metadata may only be "
-                "written by resolve_interpretation_event."
+                f"resolver-owned field(s): {field_names}. Composer tool input may supply "
+                f"only {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit resolver-owned "
+                f"fields and retry {tool_name}. {_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
+        if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
+            return malformed_error
+        kind = requirement["kind"]
+        user_term = requirement["user_term"]
+        draft = requirement["draft"]
+        server_staged_auto_wire = type(user_term) is ServerStagedRequiredControlUserTerm
+        if (
+            type(kind) is not str
+            or not kind.strip()
+            or (type(user_term) is not str and not server_staged_auto_wire)
+            or not user_term.strip()
+            or type(draft) is not str
+            or not draft.strip()
+        ):
+            return malformed_error
+        if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM and not server_staged_auto_wire:
+            return (
+                f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] uses "
+                f"server-owned user_term '{REQUIRED_CONTROL_AUTO_WIRED_USER_TERM}'. "
+                "Only the required-control finalizer may stage this disclosure."
+            )
+        try:
+            parsed_kind = InterpretationKind(kind)
+        except ValueError:
+            return malformed_error
+        if parsed_kind is InterpretationKind.PIPELINE_DECISION and not server_staged_auto_wire:
+            current_registration_error = composer_pipeline_decision_user_term_error(
+                user_term=user_term,
+                context=f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}]",
+            )
+            if registration_error is None:
+                registration_error = current_registration_error
+        normalized_user_term = user_term.strip()
+        kind_term = (kind, normalized_user_term)
+        if kind_term in seen_kind_terms:
+            return collision_error
+        seen_kind_terms.add(kind_term)
+        if component_id is None and normalized_user_term in seen_normalized_user_terms:
+            # Without a component ID the exact projection suffix is unknown,
+            # but the projection omits kind, so equal normalized terms always
+            # collide for every component.
+            return collision_error
+        seen_normalized_user_terms.add(normalized_user_term)
+        if component_id is not None:
+            projected_id = _authored_interpretation_requirement_id(
+                component_id=component_id,
+                user_term=user_term,
+                source=source,
+            )
+            if projected_id in seen_projected_ids:
+                return collision_error
+            seen_projected_ids.add(projected_id)
+    return registration_error
+
+
+@observation_boundary(
+    tier=3,
+    source="a component options mapping (Tier-3) whose interpretation_requirements entry is an "
+    "untyped list of untyped rows: composer tool-call output, trusted proposal replay, reviewed "
+    "settlement, or a sessions.db round-trip",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns the canonical-invariant error string for every row shape it does not accept "
+    "and None only for a fully accepted list; never raises",
+)
+def _canonical_interpretation_requirement_error(
+    options: Mapping[str, Any],
+    *,
+    tool_name: str,
+) -> str | None:
+    """Enforce the canonical per-component interpretation-review invariant.
+
+    This is stage B of authoring admission. Unlike the raw compact-shell gate,
+    it is unconditional: public writes, trusted proposal replay, reviewed
+    sources, and internal reconciliation must all pass after canonicalization,
+    merging, and automatic review staging.
+    """
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return None
+
+    error = f"{tool_name}: interpretation_requirements_invalid: canonical interpretation requirements failed invariant validation."
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(requirements_value) not in (list, tuple):
+        return error
+
+    for requirement in requirements_value:
+        if not isinstance(requirement, Mapping):
+            return error
+        if set(requirement) != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+            return error
+        if type(requirement["id"]) is not str or not requirement["id"].strip():
+            return error
+        if type(requirement["kind"]) is not str:
+            return error
+        if type(requirement["user_term"]) is not str or not requirement["user_term"].strip():
+            return error
+        if type(requirement["status"]) is not str:
+            return error
+        draft = requirement["draft"]
+        if draft is not None and type(draft) is not str:
+            return error
+        for field_name in (
+            "event_id",
+            "accepted_value",
+            "accepted_artifact_hash",
+            "resolved_prompt_template_hash",
+        ):
+            field_value = requirement[field_name]
+            if field_value is not None and type(field_value) is not str:
+                return error
+
+    try:
+        requirements = parse_interpretation_requirements(options)
+    except (KeyError, TypeError, ValueError):
+        return error
+    if requirements is None:
+        return error
+
+    seen_ids: set[str] = set()
+    seen_kind_terms: set[tuple[str, str]] = set()
+    for requirement in requirements:
+        requirement_id = requirement["id"]
+        kind_term = (requirement["kind"], requirement["user_term"].strip())
+        if requirement_id in seen_ids or kind_term in seen_kind_terms:
+            return error
+        seen_ids.add(requirement_id)
+        seen_kind_terms.add(kind_term)
+
+        if requirement["status"] == "pending":
+            if type(requirement["draft"]) is not str or not requirement["draft"].strip():
+                return error
+            if (
+                requirement["event_id"] is not None
+                or requirement["accepted_value"] is not None
+                or requirement["accepted_artifact_hash"] is not None
+                or requirement["resolved_prompt_template_hash"] is not None
+            ):
+                return error
+            continue
+
+        if type(requirement["event_id"]) is not str or not requirement["event_id"].strip():
+            return error
+        if type(requirement["accepted_value"]) is not str:
+            return error
+        if not resolved_review_evidence_is_coherent(requirement, InterpretationKind(requirement["kind"])):
+            return error
+
     return None
+
+
+def _composition_canonical_interpretation_requirement_error(
+    state: CompositionState,
+    *,
+    tool_name: str,
+) -> str | None:
+    """Apply canonical invariant B to every review-bearing component."""
+    for source in state.sources.values():
+        error = _canonical_interpretation_requirement_error(
+            source.options,
+            tool_name=tool_name,
+        )
+        if error is not None:
+            return error
+    for node in state.nodes:
+        error = _canonical_interpretation_requirement_error(
+            node.options,
+            tool_name=tool_name,
+        )
+        if error is not None:
+            return error
+    for output in state.outputs:
+        if INTERPRETATION_REQUIREMENTS_KEY in output.options:
+            return f"{tool_name}: interpretation_requirements_invalid: canonical interpretation requirements failed invariant validation."
+    return None
+
+
+@observation_boundary(
+    tier=3,
+    source="a trusted-path component options mapping (Tier-3 by shape) whose "
+    "interpretation_requirements rows may still carry the historical pre-canonical field set, "
+    "re-read from sessions.db storage or a YAML import",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="returns options unchanged for every row shape outside the eligible legacy subset "
+    "(including a parse failure, which is swallowed so unconditional invariant B rejects the row); "
+    "never raises",
+)
+def _normalize_trusted_legacy_interpretation_requirements(
+    options: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Expand trusted legacy pending rows to the exact canonical shape once.
+
+    Only rows whose keys are a strict subset of the canonical schema and that
+    already carry the five historical identity/state fields are eligible.
+    Public input never reaches this helper. Any unknown field or parse failure
+    is preserved unchanged so unconditional invariant B rejects it.
+    """
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options
+    requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(requirements_value) not in (list, tuple):
+        return options
+    required_legacy_fields = {"id", "kind", "user_term", "draft", "status"}
+    needs_normalization = False
+    for requirement in requirements_value:
+        if not isinstance(requirement, Mapping):
+            return options
+        fields = set(requirement)
+        if not required_legacy_fields <= fields or not fields <= _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+            return options
+        needs_normalization = needs_normalization or fields != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS
+    if not needs_normalization:
+        return options
+    try:
+        requirements = parse_interpretation_requirements(options)
+    except (KeyError, TypeError, ValueError):
+        return options
+    if requirements is None:
+        return options
+    normalized = dict(options)
+    normalized[INTERPRETATION_REQUIREMENTS_KEY] = [dict(requirement) for requirement in requirements]
+    return normalized
+
+
+@observation_boundary(
+    tier=3,
+    source="the STORED component's options mapping (Tier-3) re-read from sessions.db storage or a "
+    "YAML import, consulted only to recover the id a prior pending row already carries for the same "
+    "(kind, user_term)",
+    source_param="existing_options",
+    suppresses=("R1", "R5"),
+    invariant="every row of existing_options that is not an exact-str kind/user_term/id triple is "
+    "skipped, and an ambiguous (kind, user_term) yields no id at all — a stored row this boundary "
+    "cannot read only costs id continuity and never raises. The AssertionErrors below are control-"
+    "dependent on the ALREADY-ADMITTED options argument, not on existing_options",
+)
+def _canonicalize_authored_interpretation_requirements(
+    options: Mapping[str, Any],
+    *,
+    component_id: str,
+    source: bool = False,
+    existing_options: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Fill resolver-owned pending identity after authoring admission.
+
+    Callers must run :func:`_resolver_owned_interpretation_requirement_error`
+    against the untrusted delta first. This function is the trusted transition
+    from the compact authoring shell to the canonical persisted pending shape;
+    the resolver's later resolved output never passes back through authoring
+    admission.
+    """
+    if INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options
+    requirements = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if type(requirements) is not list:
+        raise AssertionError("interpretation requirements must be admitted before canonicalization")
+    existing_ids: dict[tuple[str, str], str] = {}
+    ambiguous_existing_keys: set[tuple[str, str]] = set()
+    existing_requirements = (
+        existing_options[INTERPRETATION_REQUIREMENTS_KEY]
+        if existing_options is not None and INTERPRETATION_REQUIREMENTS_KEY in existing_options
+        else None
+    )
+    if isinstance(existing_requirements, (list, tuple)):
+        for existing in existing_requirements:
+            if not isinstance(existing, Mapping):
+                continue
+            existing_kind = existing.get("kind")
+            existing_user_term = existing.get("user_term")
+            existing_id = existing.get("id")
+            if type(existing_kind) is not str or not existing_kind.strip():
+                continue
+            if type(existing_user_term) is not str or not existing_user_term.strip():
+                continue
+            if type(existing_id) is not str or not existing_id.strip():
+                continue
+            key = (existing_kind, existing_user_term.strip())
+            if key in existing_ids and existing_ids[key] != existing_id:
+                ambiguous_existing_keys.add(key)
+                continue
+            existing_ids[key] = existing_id
+    for key in ambiguous_existing_keys:
+        del existing_ids[key]
+
+    canonical_requirements: list[InterpretationRequirement] = []
+    for requirement in requirements:
+        if not isinstance(requirement, Mapping):
+            raise AssertionError("interpretation requirement entries must be admitted before canonicalization")
+        kind = requirement["kind"]
+        user_term = requirement["user_term"]
+        if type(kind) is not str or (type(user_term) is not str and type(user_term) is not ServerStagedRequiredControlUserTerm):
+            raise AssertionError("interpretation requirement kind/user_term must be admitted before canonicalization")
+        persisted_user_term = str(user_term)
+        existing_key = (kind, persisted_user_term.strip())
+        requirement_id = (
+            existing_ids[existing_key]
+            if existing_key in existing_ids
+            else _authored_interpretation_requirement_id(
+                component_id=component_id,
+                user_term=persisted_user_term,
+                source=source,
+            )
+        )
+        draft = requirement["draft"]
+        if type(draft) is not str:
+            raise AssertionError("interpretation requirement draft must be admitted before canonicalization")
+        canonical_requirements.append(
+            _pending_interpretation_requirement(
+                requirement_id=requirement_id,
+                kind=InterpretationKind(kind),
+                user_term=persisted_user_term,
+                draft=draft,
+            )
+        )
+    canonical_options = dict(options)
+    canonical_options[INTERPRETATION_REQUIREMENTS_KEY] = canonical_requirements
+    return canonical_options
 
 
 def _runtime_owned_llm_option_error(
@@ -1692,6 +2957,8 @@ def _runtime_owned_llm_option_error(
     options: Mapping[str, Any],
     *,
     tool_name: str,
+    interpretation_requirements_are_internal: bool = False,
+    component_id: str | None = None,
 ) -> str | None:
     """Reject composer-authored writes to runtime-owned LLM audit fields.
 
@@ -1702,6 +2969,14 @@ def _runtime_owned_llm_option_error(
     guards source write paths via
     :func:`_resolver_owned_interpretation_requirement_error`.
     """
+    if not interpretation_requirements_are_internal:
+        interpretation_error = _resolver_owned_interpretation_requirement_error(
+            options,
+            tool_name=tool_name,
+            component_id=component_id,
+        )
+        if interpretation_error is not None:
+            return interpretation_error
     if plugin_name != "llm":
         return None
     supplied = sorted(key for key in _RUNTIME_OWNED_LLM_OPTION_KEYS if key in options)
@@ -1709,11 +2984,11 @@ def _runtime_owned_llm_option_error(
         field_names = ", ".join(supplied)
         return (
             f"{tool_name} options include runtime-owned LLM option(s): {field_names}. "
-            "These audit-link fields may only be written by resolve_interpretation_event, "
-            "not by composer tool input."
+            f"Omit {field_names} and retry {tool_name} with only the author-owned option change; "
+            "ELSPETH re-derives these audit-link fields during review reconciliation or execution."
         )
 
-    return _resolver_owned_interpretation_requirement_error(options, tool_name=tool_name)
+    return None
 
 
 def _secret_ref_placement_error(
@@ -1747,7 +3022,9 @@ def _source_options_for_prevalidation(options: Mapping[str, Any]) -> dict[str, A
     for key in _WEB_ONLY_SOURCE_KEYS:
         if key in filtered:
             del filtered[key]
-    if options.get("blob_ref") is not None and options.get("mode") == "bind_source" and "mode" in filtered:
+    blob_ref = options["blob_ref"] if "blob_ref" in options else None
+    mode = options["mode"] if "mode" in options else None
+    if blob_ref is not None and mode == "bind_source" and "mode" in filtered:
         del filtered["mode"]
     return filtered
 
@@ -1755,6 +3032,74 @@ def _source_options_for_prevalidation(options: Mapping[str, Any]) -> dict[str, A
 _WRITE_COLLISION_POLICIES = frozenset({"fail_if_exists", "auto_increment"})
 
 _APPEND_COLLISION_POLICIES = frozenset({"append_or_create"})
+
+
+_FIELD_OPTION_PLACEHOLDER = "line_text"
+
+
+def _sink_required_option_keys(plugin_name: str) -> frozenset[str]:
+    """Return the option keys this sink's own config model marks required.
+
+    Read from ``model_json_schema()`` — the accessor ``PluginConfigProtocol``
+    actually declares — rather than from ``model_fields``, which the protocol
+    does not promise. It also returns keys in the OPTION namespace the repair
+    object is written in: ``TextSinkConfig``/``DocumentSinkConfig`` name the
+    attribute ``schema_config`` but the option key is ``schema``, and the JSON
+    Schema carries the latter.
+    """
+    config_model = get_sink_config_model(plugin_name)
+    if config_model is None:
+        return frozenset()
+    json_schema = config_model.model_json_schema()
+    required = json_schema["required"] if "required" in json_schema else ()
+    return frozenset(key for key in required if type(key) is str)
+
+
+class _FileSinkRepairOptions(TypedDict):
+    """The options object a file-sink repair hint suggests.
+
+    ``field`` is ``NotRequired`` because it is genuinely conditional: only a
+    single-value sink (``text``, ``document``) requires one, and that is read
+    from the sink's own config model rather than fixed here.
+    """
+
+    path: str
+    schema: dict[str, str]
+    mode: str
+    collision_policy: str
+    field: NotRequired[str]
+
+
+def _file_sink_repair_options(plugin_name: str, *, path: str) -> _FileSinkRepairOptions:
+    """Build repair options for a file sink that actually pass validation.
+
+    DERIVED, not enumerated. The two gates whose rejection produces this hint
+    are ``_prevalidate_sink`` (the sink's own config model) and
+    ``validate_composer_file_sink_collision_policy``; a suggestion that cannot
+    clear both is the authoring-surface defect this hint exists to repair, so
+    it is built from what those gates actually demand:
+
+    * ``field`` comes from the config model's own required set, so ``text`` and
+      ``document`` both get it and the NEXT single-field sink inherits it for
+      free. Naming the sinks instead is what silently rotted: ``document``
+      shipped requiring ``field``, fell through to the generic branch that
+      omitted it, and the suggested repair could not validate.
+    * ``mode`` is emitted even though every file-sink config model defaults it,
+      because ``validate_composer_file_sink_collision_policy`` requires it
+      EXPLICITLY for every ``FILE_SINK_PLUGINS`` member — a deliberate
+      operator decision (truncate vs. append), not an inferable one. The
+      generic branch omitted it, so the csv and json suggestions were invalid
+      on that gate too.
+    """
+    options: _FileSinkRepairOptions = {
+        "path": path,
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "auto_increment",
+    }
+    if "field" in _sink_required_option_keys(plugin_name):
+        options["field"] = _FIELD_OPTION_PLACEHOLDER
+    return options
 
 
 def _missing_output_options_repair_error(
@@ -1765,45 +3110,26 @@ def _missing_output_options_repair_error(
     validation_error: str | None,
 ) -> str:
     """Return an exact output-object repair hint for omitted sink options."""
-    if plugin_name == "text":
-        path_fragment = _repair_identifier_fragment(sink_name, fallback="output")
-        repair_output = {
-            "sink_name": sink_name,
-            "plugin": plugin_name,
-            "options": {
-                "path": f"outputs/{path_fragment}.txt",
-                "schema": {"mode": "observed"},
-                "field": "line_text",
-                "mode": "write",
-                "collision_policy": "auto_increment",
-            },
-            "on_write_failure": on_write_failure,
-        }
-        detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
-        return (
-            f"Output '{sink_name}' is missing options. For the text file sink, include path, schema, field, mode, "
-            f"and collision_policy. Use this runnable output object and replace line_text with the actual selected "
-            f"string field: {json.dumps(repair_output)}.{detail}"
-        )
-
     if plugin_name in FILE_SINK_REPAIR_EXTENSIONS:
         path_fragment = _repair_identifier_fragment(sink_name, fallback="output")
         extension = FILE_SINK_REPAIR_EXTENSIONS[plugin_name]
+        options = _file_sink_repair_options(
+            plugin_name,
+            path=f"outputs/{path_fragment}.{extension}",
+        )
         repair_output = {
             "sink_name": sink_name,
             "plugin": plugin_name,
-            "options": {
-                "path": f"outputs/{path_fragment}.{extension}",
-                "schema": {"mode": "observed"},
-                "collision_policy": "auto_increment",
-            },
+            "options": options,
             "on_write_failure": on_write_failure,
         }
         detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
+        option_list = ", ".join(options)
+        field_note = f" Replace {_FIELD_OPTION_PLACEHOLDER} with the actual selected string field." if "field" in options else ""
         return (
-            f"Output '{sink_name}' is missing options. For {plugin_name} file sinks, include "
-            f"an options object with path, schema, and collision_policy. Use this output object "
-            f"shape and adjust the path/schema if needed: {json.dumps(repair_output)}.{detail}"
+            f"Missing options. For {plugin_name} file sinks, include "
+            f"an options object with {option_list}. Use this runnable output object and adjust "
+            f"the path/schema if needed: {json.dumps(repair_output)}.{field_note}{detail}"
         )
 
     repair_output = {
@@ -1814,7 +3140,7 @@ def _missing_output_options_repair_error(
     }
     detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
     return (
-        f"Output '{sink_name}' is missing options. Include the sink plugin's options object. "
+        "Missing options. Include the sink plugin's options object. "
         f"If this sink accepts empty configuration, use: {json.dumps(repair_output)}; otherwise "
         f"call get_plugin_schema for sink '{plugin_name}' and fill the required options.{detail}"
     )
@@ -1885,6 +3211,65 @@ def _prevalidate_source(
     )
 
 
+def _prevalidate_source_for_context(
+    context: ToolContext,
+    plugin_name: str,
+    options: Mapping[str, Any],
+    on_validation_failure: str = _DEFAULT_SOURCE_VALIDATION_FAILURE,
+    *,
+    source_name: str = "source",
+) -> str | None:
+    """Validate one candidate source through the shared profile adapter.
+
+    Profile lowering is an in-memory validation projection only.  The caller
+    persists its original authored ``options``; this helper validates the
+    corresponding executable provider binding without returning or exposing
+    that private projection.
+    """
+    if "on_validation_failure" in options and options["on_validation_failure"] != on_validation_failure:
+        return (
+            f"Invalid options for source '{plugin_name}': options.on_validation_failure conflicts with "
+            "the source routing field on_validation_failure"
+        )
+    profile_options = {
+        **deep_thaw(options),
+        "on_validation_failure": on_validation_failure,
+    }
+    candidate = CompositionState(
+        sources={
+            source_name: SourceSpec(
+                plugin=plugin_name,
+                on_success="discard",
+                options=profile_options,
+                on_validation_failure=on_validation_failure,
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    try:
+        profile_validation = context.catalog.validate_composition_state(candidate)
+    except ValueError as exc:
+        return f"Invalid options for source '{plugin_name}': {exc}"
+    blocking = tuple(
+        finding for finding in profile_validation.policy_findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
+    )
+    if blocking:
+        return f"Invalid options for source '{plugin_name}': {blocking[0].error_code} — {blocking[0].message}"
+    executable_source = profile_validation.executable_state.sources[source_name]
+    if type(executable_source.on_validation_failure) is not str or executable_source.on_validation_failure != on_validation_failure:
+        return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure"
+    executable_options = deep_thaw(executable_source.options)
+    if "on_validation_failure" in executable_options:
+        executable_on_validation_failure = executable_options.pop("on_validation_failure")
+        if type(executable_on_validation_failure) is not str or executable_on_validation_failure != on_validation_failure:
+            return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure"
+    return _prevalidate_source(plugin_name, executable_options, on_validation_failure)
+
+
 def _prevalidate_transform(plugin_name: str, options: Mapping[str, Any]) -> str | None:
     """Pre-validate transform options."""
     return _prevalidate_plugin_options("transform", plugin_name, strip_authoring_options(options))
@@ -1952,7 +3337,7 @@ def _prevalidate_transform_for_context(
         # what is actually switched off.
         return f"Invalid options for transform '{plugin_name}': {blocking[0].error_code} — {blocking[0].message}"
     alias = options["profile"] if "profile" in options else plugin_name
-    if not isinstance(alias, str):
+    if type(alias) is not str:
         return f"Invalid options for transform '{plugin_name}': profile_unavailable"
     return _prevalidate_transform(plugin_name, profile_validation.executable_state.nodes[0].options)
 
@@ -1987,13 +3372,13 @@ class ReviewedSourceAuthority:
             raise TypeError("ReviewedSourceAuthority.session_id must be a non-empty exact str")
         if type(self.reviewed_anchor_hash) is not str or not re.fullmatch(r"[0-9a-f]{64}", self.reviewed_anchor_hash):
             raise TypeError("ReviewedSourceAuthority.reviewed_anchor_hash must be a SHA-256 hash")
-        if not isinstance(self.reviewed_sources, Mapping):
+        if type(self.reviewed_sources) not in (dict, MappingProxyType):
             raise TypeError("ReviewedSourceAuthority.reviewed_sources must be a mapping")
         if any(type(stable_id) is not str or not stable_id for stable_id in self.reviewed_sources):
             raise TypeError("ReviewedSourceAuthority.reviewed_sources keys must be non-empty exact strings")
-        if any(not isinstance(source, Mapping) for source in self.reviewed_sources.values()):
+        if any(type(source) not in (dict, MappingProxyType) for source in self.reviewed_sources.values()):
             raise TypeError("ReviewedSourceAuthority.reviewed_sources values must be mappings")
-        if not isinstance(self.verified_blob_paths, Mapping):
+        if type(self.verified_blob_paths) not in (dict, MappingProxyType):
             raise TypeError("ReviewedSourceAuthority.verified_blob_paths must be a mapping")
         if any(
             type(locator) is not str or not locator.startswith("blob:") or type(storage_path) is not str or not storage_path
@@ -2001,6 +3386,61 @@ class ReviewedSourceAuthority:
         ):
             raise TypeError("ReviewedSourceAuthority.verified_blob_paths is malformed")
         freeze_fields(self, "reviewed_sources", "verified_blob_paths")
+
+
+@dataclass(frozen=True, slots=True)
+class PendingCustodyBlobView:
+    """One deferred inline-custody blob, resolvable before it is settled.
+
+    Guided-full defers inline-custody finalization into the atomic staging
+    settlement (elspeth-1e3ad83d89), so at custody-safe revalidation time the
+    proposal's ``source.blob_id`` names a blob with no row and no storage
+    file yet. This view carries the settlement-equivalent row fields plus the
+    content bytes so ``_resolve_source_blob`` can resolve exactly that one
+    blob (elspeth-282f392fae). Every field is derived server-side from the
+    planner's own ``PipelineCustodyPreparation`` — never from tool arguments —
+    and resolution requires an exact ``blob_id`` AND ``session_id`` match; any
+    other reference falls through to the normal fail-closed database path.
+    """
+
+    blob_id: str
+    session_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    content_hash: str
+    storage_path: str
+    source_description: str | None
+    creation_modality: str
+    created_from_message_id: str
+    creating_model_identifier: str | None
+    creating_model_version: str | None
+    creating_provider: str | None
+    creating_composer_skill_hash: str | None
+    creating_arguments_hash: str | None
+    content: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.blob_id) is not str or not self.blob_id:
+            raise TypeError("PendingCustodyBlobView.blob_id must be a non-empty exact string")
+        if type(self.session_id) is not str or not self.session_id:
+            raise TypeError("PendingCustodyBlobView.session_id must be a non-empty exact string")
+        if type(self.filename) is not str or not self.filename:
+            raise TypeError("PendingCustodyBlobView.filename must be a non-empty exact string")
+        if type(self.mime_type) is not str or not self.mime_type:
+            raise TypeError("PendingCustodyBlobView.mime_type must be a non-empty exact string")
+        if type(self.content_hash) is not str or not self.content_hash:
+            raise TypeError("PendingCustodyBlobView.content_hash must be a non-empty exact string")
+        if type(self.storage_path) is not str or not self.storage_path:
+            raise TypeError("PendingCustodyBlobView.storage_path must be a non-empty exact string")
+        if type(self.creation_modality) is not str or not self.creation_modality:
+            raise TypeError("PendingCustodyBlobView.creation_modality must be a non-empty exact string")
+        if type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise TypeError("PendingCustodyBlobView.size_bytes must be a non-negative exact integer")
+        if type(self.content) is not bytes:
+            raise TypeError("PendingCustodyBlobView.content must be exact bytes")
+        if len(self.content) != self.size_bytes:
+            raise ValueError("PendingCustodyBlobView.size_bytes must equal len(content)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2036,6 +3476,10 @@ class ToolContext:
             composer plane never has to know about it.  Required for
             secret tools (``list_secret_refs`` / ``validate_secret_ref``
             / ``wire_secret_ref``); ``None`` for non-secret-aware callers.
+        secret_wiring_policy: Server-authored secret→destination allowlist
+            (elspeth-f3c1aafd25). ``wire_secret_ref`` denies every wiring
+            not covered by an exact rule; ``None`` is the deny-by-default
+            posture, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for ``diff_pipeline`` comparisons.
         current_validation: Pre-computed validation of the live state, used
@@ -2045,6 +3489,15 @@ class ToolContext:
             preflight, applied only to ``preview_pipeline``. Pre-computed in
             the async compose loop and injected here as a cheap synchronous
             callback so ``execute_tool`` stays synchronous.
+        structural_preflight: Optional callback for the interpretation-
+            tolerant (authoring-masked) preflight, applied only to
+            ``preview_pipeline`` and only wired by callers whose strict
+            Stage-2 result is handoff-shaped (invalid with the
+            ``interpretation_review_pending`` blocker). Same precompute-
+            then-close-over shape as ``runtime_preflight``. The handler
+            surfaces it as the additive ``data["structural_preview"]``
+            block (elspeth-229e9e8195); it never participates in
+            ``is_valid``.
         max_blob_storage_per_session_bytes: Configured per-session blob
             storage quota for assistant-created session artifacts. Defaults
             to ``None`` (no override) so the blob plane can fall back to its
@@ -2068,6 +3521,15 @@ class ToolContext:
         reviewed_source_authority: Private session-bound reviewed source
             authority. Generic/manual callers leave this unset and therefore
             remain subject to the normal fail-closed custody checks.
+        executing_proposal_id: The pending proposal this dispatch is
+            executing (proposal-accept replay). The blob retention guard
+            excludes exactly this proposal so an update_blob proposal can
+            be accepted without being blocked by its own retention edge;
+            every OTHER pending proposal still blocks.
+        _interpretation_requirements_are_internal: Private server-owned
+            allowance for revalidating a proposal that already crossed the
+            public compact-shell admission boundary. Public tool arguments
+            cannot set context fields.
     """
 
     catalog: PolicyCatalogView
@@ -2077,10 +3539,12 @@ class ToolContext:
     session_engine: Engine | None = None
     session_id: str | None = None
     secret_service: WebSecretResolver | None = None
+    secret_wiring_policy: SecretWiringPolicy | None = None
     user_id: str | None = None
     baseline: CompositionState | None = None
     current_validation: ValidationSummary | None = None
     runtime_preflight: RuntimePreflight | None = None
+    structural_preflight: RuntimePreflight | None = None
     max_blob_storage_per_session_bytes: int | None = None
     user_message_id: str | None = None
     user_message_content: str | None = None
@@ -2090,6 +3554,14 @@ class ToolContext:
     composer_skill_hash: str | None = None
     tool_arguments_hash: str | None = None
     reviewed_source_authority: ReviewedSourceAuthority | None = None
+    executing_proposal_id: str | None = None
+    _interpretation_requirements_are_internal: bool = False
+    # Private server-owned field, set ONLY by the planner's deferred
+    # custody-safe revalidation (elspeth-282f392fae): the one inline-custody
+    # blob this plan will settle atomically at staging. _resolve_source_blob
+    # may resolve exactly this blob_id/session_id pair from the view; every
+    # other blob reference keeps the fail-closed database path.
+    _pending_custody: PendingCustodyBlobView | None = None
 
 
 ToolHandler = Callable[
@@ -2115,8 +3587,19 @@ def normalize_tool_result_validation(
     snapshot_hash = catalog.snapshot.snapshot_hash
     if result._validation_snapshot_hash == snapshot_hash:
         return result
-    shared = catalog.validate_composition_state(result.updated_state).validation
     rejections = tuple(entry for entry in result.validation.errors if entry.component == "rejected_mutation")
+    if rejections and result._state_validation_withheld:
+        # Full-replacement rejection: updated_state is the untouched input
+        # state whose validate() entries the producer deliberately withheld,
+        # so re-validating it here would reattach exactly those stale-state
+        # errors (elspeth-e89e6bf47a). The rejection entries are
+        # snapshot-independent.
+        return replace(
+            result,
+            validation=ValidationSummary(is_valid=False, errors=rejections),
+            _validation_snapshot_hash=snapshot_hash,
+        )
+    shared = catalog.validate_composition_state(result.updated_state).validation
     if rejections:
         shared = replace(
             shared,
@@ -2145,17 +3628,122 @@ class _SetPipelineNodePayload(TypedDict):
     trigger: dict[str, JsonValue] | None
     output_mode: str | None
     expected_output_count: int | None
+    timeout_seconds: float | None
+    description: str | None
+    scope_name: str | None
+    scope_opener: str | None
+    scope_policy: str | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
-    """Strip resolver-owned review evidence while retaining pending shells."""
-    return cast(dict[str, JsonValue], deep_thaw(serialize_authoring_review_options(options)))
+    """Strip all resolver-owned review fields from public authoring shells."""
+    serialized = cast(dict[str, JsonValue], deep_thaw(serialize_authoring_review_options(options)))
+    if INTERPRETATION_REQUIREMENTS_KEY in serialized:
+        requirements = cast(list[dict[str, JsonValue]], serialized[INTERPRETATION_REQUIREMENTS_KEY])
+        serialized[INTERPRETATION_REQUIREMENTS_KEY] = [
+            {
+                "kind": requirement["kind"],
+                "user_term": requirement["user_term"],
+                "draft": requirement["draft"],
+            }
+            for requirement in requirements
+        ]
+    return serialized
 
 
 def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:
-    payload = cast(_SetPipelineNodePayload, _serialize_node(node))
+    """The node payload with authoring-only options, the shape the census attributes to this name.
+
+    No ``cast``: ``_serialize_node`` is annotated with this very TypedDict, so
+    the attribution is derived from what mypy holds the producer to rather than
+    asserted over it (red-team RED5-2).
+    """
+    payload = _serialize_node(node)
     payload["options"] = _serialize_authoring_options(node.options)
     return payload
+
+
+_ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "row_union_config_invalid",
+        "row_union_branches_invalid",
+        "row_union_branch_invalid",
+        "row_union_input_mismatch",
+        "row_union_on_success_invalid",
+        "row_union_timeout_invalid",
+    }
+)
+
+_MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC_ERROR_CODES | {
+    "row_union_on_success_must_be_connection",
+    # Coalesce options have no runtime contract and are dropped by YAML
+    # lowering; rejecting the mutation prevents misleading state from ever
+    # persisting through either upsert_node or set_pipeline.
+    "coalesce_config_invalid",
+    "node_timeout_unsupported",
+    # A plugin on a gate or coalesce must never persist: upsert_node's
+    # post-call hint lookup would resolve the authored token against the
+    # transform catalog, and downstream readers of ``plugin or node_type``
+    # would classify the node by it (state.structural_node_plugin_error).
+    "structural_node_plugin_forbidden",
+}
+
+
+def _post_mutation_invariant_error(
+    proposed_state: CompositionState,
+) -> tuple[str, str] | None:
+    """Return an invariant a mutation must not persist.
+
+    Composer permits incomplete topology during incremental authoring, so a
+    mutation cannot require the entire pipeline to validate. This shared
+    preflight selects only intrinsic node-shape and namespace invariants whose
+    persistence would make later generic mutation tools violate their own
+    contracts. Callers return the original state on failure, giving the tools
+    one rollback discipline without weakening ordinary validation telemetry.
+    """
+    for entry in proposed_state.validate().errors:
+        if entry.error_code in _MUTATION_BLOCKING_INVARIANT_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
+
+
+def _row_union_node_contract_error(
+    node: NodeSpec,
+    *,
+    output_names: frozenset[str] = frozenset(),
+) -> tuple[str, str] | None:
+    """Return the first intrinsic row-union authoring failure.
+
+    Reuse ``CompositionState.validate`` as the contract authority rather than
+    maintaining a second structural validator in the tool layer. Topology
+    findings (unreachable branches and a not-yet-consumed output connection)
+    remain incremental-authoring telemetry. A configured sink target is
+    rejected here because row_union v1 may release only to processing.
+    """
+    if node.node_type != "row_union":
+        return None
+    if node.on_success in output_names:
+        return (
+            (
+                f"row_union '{node.id}' on_success '{node.on_success}' names a sink. "
+                "A released group must continue on a processing connection."
+            ),
+            "row_union_on_success_must_be_connection",
+        )
+    probe = CompositionState(
+        source=None,
+        nodes=(node,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    for entry in probe.validate().errors:
+        if entry.component == f"node:{node.id}" and entry.error_code in _ROW_UNION_INTRINSIC_ERROR_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
 
 
 def _serialize_set_pipeline_source(
@@ -2180,6 +3768,7 @@ def _serialize_set_pipeline_source(
                 "blob_id": blob_ref,
                 "options": options,
                 "on_validation_failure": source.on_validation_failure,
+                "description": source.description,
             },
             None,
         )
@@ -2197,6 +3786,7 @@ def _serialize_set_pipeline_source(
             "on_success": source.on_success,
             "options": options,
             "on_validation_failure": source.on_validation_failure,
+            "description": source.description,
         },
         None,
     )
@@ -2251,3 +3841,107 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
         serialized_sources[source_name] = source_payload
     payload["sources"] = serialized_sources
     return payload, None
+
+
+# Ceiling on one applied-component echo, canonically encoded. Sized against
+# the provider-payload budget family in ``planner_authoring_aids`` (8 KiB
+# expression grammar, 28 KiB discovery digest, 48 KiB plugin contract) rather
+# than the blob-reading caps: this is a provider response surface, not a file
+# read. The echo replaces a ``get_pipeline_state`` call whose payload is the
+# WHOLE state in the wider diagnostic serialization, so the cap bounds a
+# pathological single response — it is not a parsimony budget.
+_APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES: Final[int] = 16 * 1024
+
+
+def _applied_component_echo(
+    state: CompositionState,
+    affected: tuple[str, ...],
+) -> AppliedComponentEcho | None:
+    """Project the components a successful mutation applied, post-finalizer.
+
+    The echo is the exact ``set_pipeline`` arguments that
+    ``get_pipeline_state(component="set_pipeline_arguments")`` already serves
+    to this same surface, narrowed to the components named in ``affected``
+    plus the edges on their endpoints. After a successful mutation the model
+    knows THAT it worked and which errors remain, but not what the server
+    stored where it transformed the input — canonicalized routes, merged
+    defaults, reconciled sink-mirror edges. Echoing the applied component
+    closes that gap without the model spending a ``get_pipeline_state`` turn
+    reading the whole document back.
+
+    Component scope is the natural bound: an incremental mutation touches one
+    component and the edges on it. Full-replacement mutations do not echo at
+    all (see ``_mutation_result``'s ``full_replacement``) — there "the applied
+    component" is the entire document, which is the whole-state read this
+    exists to avoid.
+
+    Returns ``None`` when nothing resolves (a removal whose subject is gone
+    from the new state), when the state cannot be represented as exact
+    ``set_pipeline`` arguments, or when the canonical projection exceeds
+    ``_APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES``. An oversized echo is
+    dropped WHOLE, never truncated: half a component reads as a complete one
+    and would author a wrong repair.
+    """
+    if not affected:
+        return None
+    payload, round_trip_error = _serialize_set_pipeline_arguments(state)
+    if round_trip_error is not None:
+        # The public authoring payload is unavailable for this state; the
+        # model can still get the diagnostic view (and the exact reason) from
+        # get_pipeline_state. An echo is never worth a second projection.
+        return None
+    assert payload is not None
+    # Storage-path redaction runs on the full authoring payload before the echo
+    # is narrowed: same bytes redacted, and the echo is then assembled directly
+    # in its closed shape (AppliedComponentEcho) with no round-trip through an
+    # open dict.
+    payload = redact_source_storage_path(payload)
+
+    state_node_ids = {node.id for node in state.nodes}
+    state_output_names = {output.name for output in state.outputs}
+    source_names: list[str] = []
+    node_ids: set[str] = set()
+    output_names: set[str] = set()
+    for component in affected:
+        # Source component ids are a closed spelling ('source' / 'source:<name>'),
+        # so they resolve first exactly as _execute_get_pipeline_state resolves
+        # its 'source' argument ahead of node and output lookup.
+        source_name = source_name_from_component_id(component)
+        if source_name is not None:
+            if source_name in state.sources and source_name not in source_names:
+                source_names.append(source_name)
+            continue
+        if component in state_node_ids:
+            node_ids.add(component)
+        elif component in state_output_names:
+            output_names.add(component)
+
+    echo: AppliedComponentEcho = {}
+    if "source" in payload and SOURCE_COMPONENT_ID in source_names:
+        echo["source"] = payload["source"]
+    if "sources" in payload:
+        serialized_sources = payload["sources"]
+        selected = {name: serialized_sources[name] for name in source_names if name in serialized_sources}
+        if selected:
+            echo["sources"] = selected
+    nodes = [node for node in payload["nodes"] if node["id"] in node_ids]
+    if nodes:
+        echo["nodes"] = nodes
+    outputs = [output for output in payload["outputs"] if output["sink_name"] in output_names]
+    if outputs:
+        echo["outputs"] = outputs
+    # Sink-targeting edges name an OUTPUT on one endpoint, so the endpoint set
+    # spans all three component kinds. These edges are the mirror the mutation
+    # tools reconcile server-side (_reconcile_node_sink_mirror_edges); without
+    # them the echo would restate bytes the model already authored and hide the
+    # one thing it did not write.
+    edge_endpoints = node_ids | output_names | set(source_names)
+    edges = [edge for edge in payload["edges"] if edge["from_node"] in edge_endpoints or edge["to_node"] in edge_endpoints]
+    if edges:
+        echo["edges"] = edges
+    if not echo:
+        return None
+
+    if len(canonical_json(echo).encode("utf-8")) > _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES:
+        return None
+    return echo

@@ -11,8 +11,11 @@ The judge-metadata signature is an **HMAC** — a symmetric MAC. Any holder of
 `ELSPETH_JUDGE_METADATA_HMAC_KEY` can forge a signature: hand-write
 `judge_verdict: ACCEPTED` with a fabricated rationale over a publicly-computable
 fingerprint, sign it, and pass every gate. The whole design follows from that
-single fact (invariant elspeth-b3a3335c9f, *[O1] operator-only HMAC custody*;
-the CI-exposure corollary is elspeth-2b351cd004):
+single fact (invariant elspeth-fa00de6ec1, *[O1] operator-only HMAC custody*).
+The CI-exposure corollary is mitigated in `.github/workflows/ci.yaml`: every
+step that injects `ELSPETH_JUDGE_METADATA_HMAC_KEY` gates it on
+`github.event_name != 'pull_request'`, so PR-controlled code never runs with the
+secret present.
 
 - **An agent never holds the key.** Agents may *propose* work — survey the tree,
   stage a bundle, run a non-authoritative preview judge — but the authoritative
@@ -30,12 +33,36 @@ keys re-key) is an assertion the operator step re-derives from the live source
 tree before it writes anything. The bundle is a worklist and an audit record,
 not a grant.
 
-## Judging runs on the agentic harness with tool access (2026-07-09 policy)
+## Judging runs on the Codex CLI harness with tool access (updated 2026-07-27)
 
 All judging — including the **final signature verdict** — runs via the agentic
-harness (`--judge-transport agent`) with read-only tool access
-(`--judge-tools readonly`). The judge may Read/Grep/Glob within the source tree
-and allowlist dir (fail-closed PreToolUse containment guard) before ruling.
+harness (`--judge-transport codex-cli`) with read-only tool access
+(`--judge-tools readonly`). The judge may Read/Grep/Glob throughout the entire
+checkout, including tests, docs, scripts, configuration, and hidden tracked
+code such as `.github` and `.agents`, through a read-only MCP reader before
+ruling. Its working directory is the checkout root, so repository-relative
+test nodeids and pathless searches work. An externally located allowlist
+directory remains readable too. Codex searches enumerate tracked files and
+new unignored working files through fixed read-only Git arguments, with
+fsmonitor hooks and optional locks disabled. Repository ignore rules keep
+runtime data, caches, and nested worktrees from exhausting the scan budget;
+tracked evidence stays searchable even under an ignored directory name.
+Unpacked trees and external allowlists use a filesystem walk that skips
+conventional tooling artifacts. Explicit
+in-scope reads remain available, except for Git administrative data and `.env`
+files (including `.env.*`); content is still secret-scrubbed.
+
+The Codex subprocess authenticates from the installed CLI account state, not
+from a provider key passed by the signing shell. Its environment is reduced to
+executable/home/locale/TLS essentials: the HMAC key, override tokens, provider
+API keys, cloud credentials, and arbitrary application environment do not cross
+the process boundary. User config and repo rules are ignored; web, apps,
+hooks, goals, memories, remote plugins, and subagents are disabled. In tool
+mode the child runs in the checkout root with Codex's own shell available under
+the `read-only` sandbox (operator ruling 2026-09-09: a 24-call, 400-line MCP
+ration starved the judge three rounds running on a 3,000-line test file), plus
+the three-tool read-only MCP server as a scrubbed supplement. Read-only
+sandboxing is the write control; credential stripping is the [O1] control.
 
 Why: the excerpt-blinded judge systematically misjudged boundary code it could
 not see — verdicts flipped on whether a function's `def` line happened to fall
@@ -54,8 +81,9 @@ What this does NOT change:
   moved from input blinding to output scrubbing: in readonly mode the judge's
   rationale passes through `scrub_secrets` (the same curated pattern set the
   excerpt goes through) before it is printed or persisted.
-- `--judge-tools readonly` still requires `--judge-transport agent`; the
-  OpenRouter path has no tool loop and is rejected.
+- `--judge-tools readonly` accepts `--judge-transport codex-cli` and the legacy
+  Claude Agent SDK spelling `agent`; the OpenRouter path has no tool loop and
+  is rejected. `codex-cli` is the normal signing transport.
 
 Blinded mode (`--judge-tools none`) remains available and byte-identical to the
 historical behavior; entries signed before 2026-07-09 were produced under it.
@@ -69,8 +97,8 @@ historical behavior; entries signed before 2026-07-09 were produced under it.
     stage_scan   -> worklist bundle  -->  sign-bundle <bundle.json>
     stage_preview (advisory verdict)        (re-verifies the bundle against the
     stage_status (paste-ready cmd)           tree, THEN fires the real judge /
-    stage_rekey  -> rekey bundle     -->     re-keys; aborts on any staleness
-    verify_signatures (shape-only)           BEFORE a single write)
+    stage_rekey  -> rekey bundle     -->     re-keys in a private transaction;
+    verify_signatures (shape-only)           active bytes publish coherently)
                                           rekey --in <bundle.json>
 ```
 
@@ -80,21 +108,31 @@ side is structurally key-free: the MCP server refuses to start a tool handler if
 checked *before* any optional import), so the agent surface can never co-locate
 with the key.
 
+Review bundles use schema v2 and are exact-source-bound at the envelope level:
+`source_rev` is the full Git HEAD, `source_dirty` records tracked source changes,
+and `source_snapshot_sha256` covers every scannable Python file plus every
+top-level `*.yaml` byte consumed by the allowlist loader. Every consumed input
+must map lexically to a tracked Git path and must not be a symlink; relevant
+untracked inputs are rejected even when ignored. The envelope and
+whole-bundle hash bind all actions, so actions do not repeat these fields. V1
+and incomplete bundles are rejected and must be re-staged.
+
 ## The `elspeth-judge` MCP server (agent side)
 
 Registered in `.mcp.json` as `elspeth-judge`, launched as
 `python -m elspeth_lints.mcp --root src/elspeth --allowlist-dir
 config/cicd/enforce_tier_model --staged-dir .elspeth/staged-reviews` (with
-`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra; `stage_preview`
-additionally needs `[judge-agent]`. All five tools fail closed when the HMAC key
-is present in the environment.
+`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra and an installed
+and authenticated Codex CLI. All six tools fail closed when the HMAC key is
+present in the environment.
 
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
-| `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment`. Args: optional `bundle_id`, `staged_by`. |
-| `stage_status` | yes | no | Summarise a staged bundle (per-lane/kind counts, preview outcomes) and emit the paste-ready operator `sign-bundle` command. Arg: `bundle_id` (required). |
-| `stage_preview` | yes | yes (read-only agent judge) | Run the read-only agent judge over each `new_judgment` action and record a **non-authoritative** preview verdict (`authoritative=False`); surfaces BLOCKED reasons. Never signs. Arg: `bundle_id` (required). Needs `[judge-agent]`. |
+| `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
+| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, preview outcomes, and which `justify` actions still lack a draft rationale) and emit the paste-ready operator command plus the `sign_bundle_plan` that prices it. Arg: `bundle_id` (required). |
+| `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
+| `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries
@@ -102,31 +140,148 @@ is present in the environment.
 pre-judge entries and never the 388 judge-gated ones; an fp-shifted judge-gated
 entry routes to `drift_repair` only.
 
+### The rendered command prices its own scope
+
+Every tool that emits `sign_bundle_command` also emits `sign_bundle_plan`, and
+both are derived from what the bundle actually contains rather than from a fixed
+string. `judge_calls` counts only the kinds that reach a real judge —
+`justify` and `drift_repair`, which both route through `_run_justify`;
+`rotation` and `stale_delete` are mechanical YAML rewrites with no judge in the
+path. So a lane's price is not its size: a 366-action `resign` lane of
+rotations costs nothing, while a 2,339-action `new_judgment` lane costs 2,339
+judge calls.
+
+`sign_bundle_command` stays the whole-bundle form — fire everything that was
+staged. `sign_bundle_plan.per_lane` lists each staged lane cheapest-first with
+its action count, its judge-call count, and a `--lanes`-scoped command that
+fires only that lane; unselected actions are never attempted, never judged, and
+stay exactly as they are in the allowlist. The staging surface prices the
+options and does not choose between them.
+
+Any scope costing more than ten judge calls renders `--continue-on-block`, so
+one judged BLOCK does not end an unattended run. Ten is a command-noise
+threshold, not a safety one: the flag changes nothing when nothing blocks, since
+exit 3 is reached only after a BLOCK. `sign_bundle_plan.notes` states each
+choice inline, and flags a bundle whose `justify` actions carry no
+`draft_rationale` — that run spends a judge call per action to have the judge
+rule on a generic placeholder, which is expensive and near-certain to BLOCK.
+Annotate with `stage_annotate` and check with `stage_preview` first.
+
+Every rendered command carries `--dry-run`, so pasting one spends nothing; the
+`judge_calls` figures are what that scope costs once `--dry-run` is dropped.
+
 ## Operator commands (key-bearing shell)
 
 Run these only in an operator-controlled shell that holds
-`ELSPETH_JUDGE_METADATA_HMAC_KEY` (and, for the LLM lanes, `OPENROUTER_API_KEY`).
-Both commands re-derive every binding from the live tree and abort on any
-staleness *before* the first write.
+`ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
+installed CLI account and does not need a provider API key in that shell. Both
+commands re-derive every binding from the live tree and abort on any staleness
+before touching the configured active allowlist.
 
 ### `sign-bundle` — fire a staged review bundle
 
 ```
-elspeth-lints sign-bundle <bundle.json> --owner <operator-id> [options]
+elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
+  --judge-transport codex-cli --judge-tools readonly --dry-run \
+  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
 ```
 
+`--judge-concurrency N` (1–8, default 1) runs up to N judge calls at once for
+`justify` actions. Only the judge subprocess overlaps: each action's reads and
+judge call run in a worker that then parks at a *write gate*, and the
+transaction's single writer still visits actions in bundle order, opening one
+gate at a time — so every decision event, candidate write, and journal entry
+happens exactly as it does sequentially, and crash/resume semantics are
+unchanged. A verdict fetched for an action the loop never reaches (a BLOCK
+without `--continue-on-block` stopped it, or ^C) is discarded, never written,
+and re-judged on resume, like any in-flight verdict. `drift_repair` pops its
+stale entry before judging and therefore always runs one at a time, as do
+`rotation` and `stale_delete`. A `resign`-only fire gains nothing from the flag.
+
+`--lanes` scopes the transaction to a subset of the bundle's lanes: `resign`
+(`drift_repair` + `rotation` + `stale_delete`, with an optional revised drift rationale) and/or
+`new_judgment` (`justify`, which judges the staged rationale). Unselected
+actions are never attempted, never judged, and stay exactly as they are in the
+allowlist; the coherent publish covers the selected lanes only. The selection is
+journalled, and a resume must use the same value (omitting the flag on resume
+inherits it). `--continue-on-block` journals a judged BLOCK and keeps firing
+instead of stopping, leaving each blocked entry fail-closed and exiting 3.
+Prefer the forms `stage_status` renders in `sign_bundle_plan` — they are derived
+from the bundle and carry each scope's judge-call price — over hand-writing
+either flag.
+
 This is the **only** place a judge signature is minted from a bundle. The verify
-phase (re-check the whole bundle against the tree) is the all-or-nothing gate; on
-any mismatch it aborts before writing anything. The execute phase is per-action,
-non-transactional (a mid-bundle real-judge BLOCK after confirmation leaves
-earlier-accepted actions written and restores/skips the blocked one), and exits
-non-zero with a per-action report.
+phase first binds the CLI roots to the roots recorded in the bundle, then runs a
+stable exact-source check before and after a full empty-allowlist census over
+every scannable Python file. Git HEAD, tracked-source dirty state, the exact
+Python/YAML digest, input tracking, and repository/root identity must all match.
+Every uncovered
+target must have a staged `new_judgment` action, and every live signed-entry
+drift or orphan and every non-judge rotation must have its corresponding
+repair/delete/rotation action. This catches an incomplete or deliberately
+narrowed bundle even when every action it did include is individually valid.
+Bundles carrying v1, incomplete, or legacy relative root paths are rejected and must be re-staged;
+otherwise changing the operator's working directory could silently retarget the
+census.
+The whole-bundle re-check is the all-or-nothing gate; on any mismatch it aborts
+before creating a transaction. Execution happens in a
+private same-filesystem copy under a sibling `.sign-bundle-transactions/`
+directory. `stale_delete` and safe `rotation` actions run before paid judge
+calls. Each accepted authoritative decision is journalled, but the configured
+active allowlist remains byte-identical until every action succeeds, the bundle
+and live tree are re-verified, and every recovered signature verifies
+authoritatively. The transaction manifest is HMAC-authenticated with a
+purpose-separated key derived from the operator signing key; candidate,
+checkpoint, and staged-audit bytes are fsynced before their hashes are recorded,
+so scratch bytes and journal claims cannot be changed together by a keyless
+process. Publication shares a stable sibling mutation lock with the ordinary
+allowlist writers and rechecks both trees while holding it. Any staged rotation
+audit records are conflict-checked before the coherent candidate publishes with
+one Linux `renameat2(RENAME_EXCHANGE)` directory swap, then the exact staged
+audit delta is appended idempotently with the durable publish-start timestamp.
+The private transaction is the pending record for the narrow cross-resource
+window: if publication commits before the audit append, resume detects the
+published bytes and finishes that append without repeating judge work.
+
+A real-judge BLOCK, ordinary action failure, unexpected exception, or
+interruption exits non-zero (interrupts return 130) and preserves the private
+transaction. A paste-ready command containing `--resume <transaction-dir>` is
+printed only when resuming can still make progress — never on an outcome that is
+already terminal, because following it there reproduces the same exit code and
+the same guidance indefinitely. The three terminal outcomes are exit 3
+(`--continue-on-block` published the survivors and the transaction is complete;
+the skipped BLOCKs owe remediation, not a resume), an all-blocked run that signed
+nothing, and a stale `drift_repair` claim; the first two are re-staged after
+remediation, the third after re-running `stage_scan`. Resume does not trust the
+scratch copy: it
+authenticates the journal, then re-checks the exact bundle bytes,
+source/bindings, active/candidate state, action evidence, and previously
+produced HMAC signatures before skipping completed judge work. The manifest
+authenticates the original active and candidate directory identities
+(`st_dev`/`st_ino`). Recovery accepts their original orientation before
+publication, or their exact swapped orientation as causal proof that
+`RENAME_EXCHANGE` committed. In the swapped orientation, the active contents may
+equal the authenticated candidate or may have advanced under a later coordinated
+writer while the private candidate still contains the exact base. Any other
+identity or content state refuses recovery. On
+successful completion the
+coherent active tree is diagnosed and the canonical override-rate counter
+snapshot is refreshed. Resume also binds the original non-secret signing policy
+(owner, override mode, judge transport/tools, token setting, roots, environment
+file, and output format); changing any of it requires a new transaction.
 
 Per lane:
+
 - `drift_repair` and `new_judgment` run the **real judge** — re-judging, never
   carrying a stale verdict forward over changed content (that would be the [O1]
   forgery). A contradicting BLOCK is surfaced and **not** signed; on BLOCK the
   popped stale entry is restored intact.
+- To revise a previously blocked drift explanation, stage a fresh bundle and
+  annotate its `drift_repair` action before starting a new transaction. The
+  annotation changes only the proposed rationale; fresh diagnosis still chooses
+  the finding and stale entry. Never edit signed YAML or an existing transaction
+  journal: a recorded BLOCK is not re-judged on resume, and changing bundle bytes
+  invalidates that transaction's resume binding.
 - `rotation` re-binds non-judge-gated keys with no judge.
 - `stale_delete` removes an orphaned entry, surgically.
 
@@ -141,11 +296,13 @@ Flags:
 | `--allowlist-dir` | `config/cicd/enforce_tier_model` | Per-module allowlist YAML to repair in place. |
 | `--operator-override` | off | Forward `--operator-override` to each justify call (requires the override-token env, exactly like `justify`). |
 | `--max-tokens` | none | Override judge response `max_tokens` per call. |
-| `--dry-run` | off | Print verify + per-lane plan; no judge call, no writes. |
-| `--yes` | off | Skip the interactive confirm before the destructive write phase. |
+| `--dry-run` | off | Print verify + per-lane plan; no judge call and no transaction or other writes. |
+| `--yes` | off | Skip the interactive confirm before creating/resuming the private transaction. |
+| `--resume` | none | Resume the printed transaction directory after re-verifying bundle bytes, source/bindings, active bytes, journaled effects, and prior signatures. |
+| `--rotation-log` | `.elspeth/rotations.log` | Rotation audit JSONL finalized only with coherent publish. |
 | `--format` | `text` | Per-entry justify output (`text`/`json`). |
-| `--judge-transport` | `openrouter` | Provider that produces the verdict. |
-| `--judge-tools` | — | Judge tool configuration (mirrors `justify`). |
+| `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is the required normal signing choice; `agent` is the legacy Claude SDK path). |
+| `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `codex-cli` for signing. |
 
 Override-token environment (only when `--operator-override` is passed):
 `ELSPETH_JUDGE_OVERRIDE_TOKEN` + `ELSPETH_JUDGE_OVERRIDE_TOKEN_SHA256`.
@@ -200,10 +357,35 @@ provenance only**, not a contract:
 Read the lists as a preview of scope, never as the set that will actually be
 acted on.
 
-## Staleness: when the operator must re-run `stage_scan`
+## Recovery versus re-staging
 
-A bundle is a point-in-time assertion about the tree. The verify gate aborts
-(and the operator simply re-stages) in two expected situations:
+Use the printed `--resume` command when the bundle and live source/bindings are
+still current and the authenticated directory identities have either their
+original orientation (publication has not happened) or their exact swapped
+orientation (publication committed). In the swapped orientation, resume also
+supports a later coordinated writer having advanced the active contents while
+the private candidate retains the exact base; it finalizes the pending audit
+without repeating judge work. This reuses accepted authoritative decisions and
+retries only unfinished work. Do not re-run the judge merely because a later
+action BLOCKed or the process was interrupted.
+
+A BLOCK decision event is retained in the private transaction even though the
+active allowlist is unchanged. A later successful resume publishes the
+accumulated event history with the coherent candidate. If the transaction is
+abandoned, its BLOCK evidence remains visible only in that printed transaction
+directory; retain or remove that directory deliberately according to the
+operator's audit policy. `sign-bundle` does not silently prune it.
+
+Re-run `stage_scan` when live source/bindings changed, when pre-publication
+active contents drifted, when directory identities or contents cannot be
+reconciled to one of those two authenticated orientations, or when the original
+preflight itself rejected the bundle. A bundle is a point-in-time assertion
+about the tree. The verify gate aborts in two expected situations:
+
+- **Relevant byte or Git identity drift.** A harmless comment, allowlist byte
+  change, HEAD advance, newly relevant untracked input, or tracked-dirty-state
+  change invalidates the v2 binding even if the action inventory is unchanged.
+  `stage_status` and `stage_preview` refuse the same stale bundle.
 
 - **AST-position cascade staleness (by design).** A bundle staged *before* an
   edit that shifts AST positions in a covered `src/elspeth` source — for example
@@ -213,7 +395,7 @@ A bundle is a point-in-time assertion about the tree. The verify gate aborts
   once in a file, `sign-bundle` refuses (`return 2`, both copies preserved).
   Resolve the duplicate in the YAML, re-run `stage_scan`, and fire again.
 
-In both cases the safe action is the same: re-stage, do not force.
+In those cases re-stage; never force or edit the transaction journal.
 
 ## What replaced the one-off signing scripts
 

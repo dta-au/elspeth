@@ -1,0 +1,6 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "usage_data": false
+  }
+}

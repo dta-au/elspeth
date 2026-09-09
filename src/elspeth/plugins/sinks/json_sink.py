@@ -12,7 +12,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
@@ -102,11 +102,31 @@ class JSONSinkConfig(SinkPathConfig):
         description="Output JSON format. When omitted, the sink auto-detects JSONL from a .jsonl filename and JSON otherwise.",
     )
     indent: int | None = Field(default=None, description="Indentation level for JSON array output; null writes compact JSON.")
-    encoding: str = Field(default="utf-8", description="Text encoding used when writing JSON output.")
+    encoding: str = Field(
+        default="utf-8",
+        strict=True,
+        description="Text encoding used when writing JSON output.",
+    )
     mode: Literal["write", "append"] = Field(
         default="write",
         description="Whether to create/replace the JSON output file or append JSONL rows.",
     )
+
+    @field_validator("encoding")
+    @classmethod
+    def _validate_encoding(cls, value: str) -> str:
+        try:
+            codecs.lookup(value)
+        except LookupError as exc:
+            raise ValueError("unknown encoding for JSON sink") from exc
+        try:
+            encoded = "".encode(value)
+            incremental = codecs.getincrementalencoder(value)().encode("", final=True)
+        except (LookupError, TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError("encoding is not a supported text codec for JSON sink") from exc
+        if type(encoded) is not bytes or type(incremental) is not bytes:
+            raise ValueError("encoding is not a supported text codec for JSON sink")
+        return value
 
     @model_validator(mode="after")
     def _validate_mode_format_compatibility(self) -> "JSONSinkConfig":
@@ -147,13 +167,34 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8eaa85553aae688d"
+    source_file_hash: str | None = "sha256:2629742182442969"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"append", "write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS, SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
     supported_audit_export_formats = frozenset({AuditExportFormat.JSON})
+
+    usage_when_to_use: str = (
+        "Use for structured JSON output: choose JSONL for resumable append, or a JSON array when each run should publish "
+        "one complete artifact."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use JSON arrays for resume or long append workloads, do not publish non-finite values, and prefer CSV or "
+        "text for consumers that require a flat table or line."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: json
+    options:
+      path: outputs/results.jsonl
+      format: jsonl
+      mode: write
+      collision_policy: auto_increment
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("json", "jsonl", "file", "structured")
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -426,9 +467,21 @@ class JSONSink(BaseSink):
             source_rows = [deep_thaw(member.row) for member in emitted_members]
             output_rows = apply_display_headers(self, source_rows)
             for snapshot_member, original, output in zip(emitted_members, source_rows, output_rows, strict=True):
-                current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+                # A predecessor snapshot member is not in this effect's members:
+                # it re-emits but has no ordinal here to accept or divert.
+                member_effect_id = snapshot_member.member_effect_id
+                current_member = current_by_effect_id[member_effect_id] if member_effect_id in current_by_effect_id else None
                 try:
                     serialized = json.dumps(output, indent=self._indent if self._format == "json" else None, allow_nan=False)
+                    serialized.encode(self._encoding)
+                except UnicodeEncodeError as exc:
+                    reason = f"JSON encoding ({self._encoding}) failed: {exc}"
+                    if current_member is None:
+                        raise ValueError(f"Predecessor JSON snapshot is incompatible: {reason}") from exc
+                    self._divert_row(original, row_index=current_member.ordinal, reason=reason)
+                    diverted.append(current_member.ordinal)
+                    diversion_attribution.append(build_diversion_attribution(ordinal=current_member.ordinal, reason=reason))
+                    continue
                 except (ValueError, TypeError) as exc:
                     reason = f"JSON serialization failed: {exc}"
                     if current_member is None:
@@ -439,7 +492,6 @@ class JSONSink(BaseSink):
                     continue
                 if current_member is not None:
                     accepted.append(current_member.ordinal)
-                serialized.encode(self._encoding)
                 yield snapshot_member.ordinal, serialized
 
         def jsonl_chunks() -> Iterator[bytes]:

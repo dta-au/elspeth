@@ -17,8 +17,9 @@ Dependencies held by the factory:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from elspeth.contracts import BatchTransformProtocol
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.errors import (
     FrameworkBugError,
@@ -27,7 +28,9 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.types import (
     CoalesceName,
+    CollectorName,
     NodeID,
+    RowUnionName,
 )
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
@@ -39,20 +42,22 @@ from elspeth.engine.scheduler_drain import ProcessorMode
 if TYPE_CHECKING:
     from elspeth.contracts import RouteDestination
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.types import (
         BranchName,
         GateName,
     )
-    from elspeth.core.config import AggregationSettings, ElspethSettings
+    from elspeth.core.config import AggregationSettings, ElspethSettings, ScopeSettings
     from elspeth.core.dag import ExecutionGraph
     from elspeth.engine.clock import Clock
     from elspeth.engine.coalesce_executor import CoalesceExecutor
+    from elspeth.engine.executors.collector import CollectorExecutor
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
     from elspeth.engine.orchestrator.types import (
         PipelineConfig,
     )
+    from elspeth.engine.row_union_executor import RowUnionExecutor
     from elspeth.engine.spans import SpanFactory
 
 
@@ -156,6 +161,7 @@ def build_row_processor(
     scheduler_heartbeat_seconds: int = 60,
     barrier_restore: BarrierJournalRestoreContext | None = None,
     coordination_token: CoordinationToken | None = None,
+    member_token: WorkerMembershipToken | None = None,
 ) -> tuple[RowProcessor, dict[CoalesceName, NodeID], CoalesceExecutor | None]:
     """Build a RowProcessor with all supporting infrastructure.
 
@@ -186,6 +192,10 @@ def build_row_processor(
     - run_coordination: derived from token presence — a follower passes
       ``coordination_token=None``, so it never receives the §C.2 housekeeping
       repository. RowProcessor validates the FOLLOWER invariants fail-closed.
+    - member_token: passed through unchanged (bound once in RowProcessor's
+      ``__init__``). A follower supplies the ``WorkerMembershipToken`` its
+      admission returned; the leader path leaves it None (ADR-030 D4 type
+      split — RowProcessor rejects a leader carrying one).
 
     Returns:
         Tuple of (processor, coalesce_node_map, coalesce_executor).
@@ -202,6 +212,14 @@ def build_row_processor(
     # regardless of whether settings is available.
     branch_to_coalesce: dict[BranchName, CoalesceName] = graph.get_branch_to_coalesce_map()
     coalesce_node_map: dict[CoalesceName, NodeID] = graph.get_coalesce_id_map()
+    branch_to_row_union: dict[BranchName, RowUnionName] = graph.get_branch_to_row_union_map()
+    row_union_node_map: dict[RowUnionName, NodeID] = graph.get_row_union_id_map()
+    # THE settle-member walk's frame resolver (spec §6.1) — stored by
+    # reference on the graph (graph.py:877's docstring), never copied, so
+    # this same instance is also threaded to the processor's own
+    # TokenManager (via RowProcessor.__init__) for register_expand_group's
+    # mint-path writes (WS3 Task 5 step 3b) to stay visible to this read.
+    group_bindings = graph.get_group_bindings()
 
     # Build traversal context BEFORE CoalesceExecutor/TokenManager so that
     # node_step_map is available for the step_resolver closure they require.
@@ -271,6 +289,101 @@ def build_row_processor(
         # F1: no blob restore here — on resume the RowProcessor rebuilds
         # coalesce pendings from journal BLOCKED rows (barrier_restore).
 
+    row_union_executor: RowUnionExecutor | None = None
+    if row_union_node_map and mode is not ProcessorMode.FOLLOWER:
+        from elspeth.engine.row_union_executor import RowUnionExecutor
+
+        if settings is None or not settings.row_unions:
+            raise OrchestrationInvariantError(
+                "Graph contains row_union nodes but settings.row_unions is missing. "
+                "row_union settings are required when fork branches release through a union barrier."
+            )
+        row_union_executor = RowUnionExecutor(
+            execution=factory.execution,
+            span_factory=span_factory,
+            run_id=run_id,
+            step_resolver=step_resolver,
+            clock=clock,
+            max_completed_keys=coalesce_completed_keys_limit,
+            data_flow=factory.data_flow,
+            barrier_restore_reads=factory.barrier_restore,
+        )
+        for row_union_settings_entry in settings.row_unions:
+            row_union_executor.register_row_union(
+                row_union_settings_entry,
+                row_union_node_map[RowUnionName(row_union_settings_entry.name)],
+            )
+
+    # Collector plane (EXPAND-group closers, barrier-scopes spec §5): the same
+    # coalesce/row_union shape — node ids from the graph, settings from
+    # ElspethSettings — never a PipelineConfig field (META-29). The transform
+    # instance rides the graph's own accessor beside the id map.
+    collector_executor: CollectorExecutor | None = None
+    collector_node_map: dict[CollectorName, NodeID] = graph.get_collector_id_map()
+    if collector_node_map and mode is not ProcessorMode.FOLLOWER:
+        from elspeth.engine.executors.collector import CollectorExecutor
+
+        if settings is None or not settings.collectors:
+            raise OrchestrationInvariantError(
+                "Graph contains collector nodes but settings.collectors is missing. "
+                "Collector settings are required when a scope's members close through a collector barrier."
+            )
+        scopes_by_closer: dict[str, ScopeSettings] = {scope.closer: scope for scope in settings.scopes}
+        collector_transform_map = graph.get_collector_transform_map()
+        # collect_tokens never calls register_expand_group (the release-group
+        # mint is durable, in data_flow), so the executor's own TokenManager
+        # needs no group_bindings — same as the coalesce executor's above.
+        collector_executor = CollectorExecutor(
+            execution=factory.execution,
+            span_factory=span_factory,
+            token_manager=TokenManager(factory.data_flow, step_resolver=step_resolver),
+            run_id=run_id,
+            step_resolver=step_resolver,
+            data_flow=factory.data_flow,
+            clock=clock,
+            max_completed_keys=coalesce_completed_keys_limit,
+            barrier_restore_reads=factory.barrier_restore,
+        )
+        for collector_settings_entry in settings.collectors:
+            collector_name = CollectorName(collector_settings_entry.name)
+            if collector_name not in collector_node_map:
+                raise OrchestrationInvariantError(
+                    f"settings.collectors names {collector_settings_entry.name!r} but the graph has no such collector node "
+                    f"(graph collectors: {sorted(str(name) for name in collector_node_map)})."
+                )
+            if collector_settings_entry.name not in scopes_by_closer:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_settings_entry.name!r} has no scopes: entry naming it as closer; "
+                    "a collector cannot register without its scope binding (spec §7 rule 1)."
+                )
+            if collector_name not in collector_transform_map:
+                raise OrchestrationInvariantError(
+                    f"Collector {collector_settings_entry.name!r} (node {collector_node_map[collector_name]!r}) is in the graph's "
+                    "collector id map but has no transform instance in its collector transform map; the builder populates both together."
+                )
+            collector_executor.register_collector(
+                collector_settings_entry,
+                scopes_by_closer[collector_settings_entry.name],
+                collector_node_map[collector_name],
+                # The builder rejected any collector plugin with is_batch_aware=False
+                # at graph construction, so the instance IS batch-shaped here — the
+                # same narrowing _process_batch_aggregation_node applies to an
+                # aggregation transform after its own is_batch_aware check.
+                cast(BatchTransformProtocol, collector_transform_map[collector_name]),
+            )
+        # The row_union precedent stops at "settings present". The per-entry
+        # raise above already guarantees registered ⊆ graph; this equality
+        # covers the OTHER direction — a settings list naming only SOME of
+        # the graph's collectors would register that subset and silently
+        # strand every group bound to the rest. Both guards are load-bearing.
+        registered = {CollectorName(name) for name in collector_executor.get_registered_names()}
+        if registered != set(collector_node_map):
+            raise OrchestrationInvariantError(
+                f"settings.collectors registered {sorted(str(name) for name in registered)} but the graph's collector "
+                f"nodes are {sorted(str(name) for name in collector_node_map)}; every graph collector needs exactly "
+                "one settings entry."
+            )
+
     # Derive coalesce on_success from graph's terminal sink map (graph-authoritative),
     # falling back to settings for non-terminal coalesce nodes. Followers never
     # complete a coalesce merge locally, so their map is empty (§B.2).
@@ -285,7 +398,18 @@ def build_row_processor(
                     if CoalesceName(coalesce_settings_entry.name) == cname and coalesce_settings_entry.on_success is not None:
                         coalesce_on_success_map[cname] = coalesce_settings_entry.on_success
 
+    # A terminal collector (on_success names a sink) releases straight to that
+    # sink; graph-authoritative like coalesce_on_success_map above. Followers
+    # never complete a collector flush locally, so their map is empty.
+    collector_on_success_map: dict[CollectorName, str] = {}
+    if mode is not ProcessorMode.FOLLOWER:
+        terminal_sink_map = graph.get_terminal_sink_map()
+        for collector_name, collector_node_id in collector_node_map.items():
+            if collector_node_id in terminal_sink_map:
+                collector_on_success_map[collector_name] = terminal_sink_map[collector_node_id]
+
     branch_to_sink = graph.get_branch_to_sink_map()
+    unbound_branch_first_node = graph.get_unbound_branch_first_nodes()
 
     # ADR-030 §B (slice 5): a follower runs no trigger evaluation
     # (aggregation_settings={}) — instead follower_barrier_node_ids carries
@@ -335,9 +459,19 @@ def build_row_processor(
         retry_manager=retry_manager,
         coalesce_executor=coalesce_executor,
         branch_to_coalesce=branch_to_coalesce,
+        row_union_executor=row_union_executor,
+        branch_to_row_union=branch_to_row_union,
+        collector_executor=collector_executor,
+        collector_on_success_map=collector_on_success_map,
+        group_bindings=group_bindings,
         branch_to_sink=branch_to_sink,
+        unbound_branch_first_node=unbound_branch_first_node,
         sink_names=frozenset(config.sinks),
         coalesce_on_success_map=coalesce_on_success_map,
+        # The expand-width fence (elspeth-258bd49d81). settings is None only on
+        # repository-level direct constructions; the width stays unfenced there
+        # exactly like the other settings-derived maps above.
+        max_expand_group_width=settings.max_expand_group_width if settings is not None else None,
         barrier_restore=barrier_restore,
         barrier_restore_reads=factory.barrier_restore,
         payload_store=payload_store,
@@ -349,6 +483,7 @@ def build_row_processor(
         scheduler_lease_seconds=scheduler_lease_seconds,
         scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
         coordination_token=coordination_token,
+        member_token=member_token,
         # §C.2 path 1 (slice 4): leader housekeeping sweep — evict dead
         # non-leader members then reap their expired item leases. None for a
         # follower or tokenless direct construction; absence never selects

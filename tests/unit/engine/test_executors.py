@@ -26,9 +26,10 @@ Transform Exception (plugin crash):
   → exception propagates → pipeline CRASH
 
 Gate Error:
-  Expression exception   → node_state=FAILED + re-raise → pipeline CRASH
+  Expression exception + no policy → node_state=FAILED + re-raise → pipeline CRASH
+  Expression exception + on_error  → node_state=FAILED + per-row DIVERT/discard
   Unknown route label    → node_state=FAILED + ValueError → pipeline CRASH
-  Non-string/bool result → str() conversion, then route lookup (may fail as above)
+  Non-string/bool result → node_state=FAILED + TypeError → pipeline CRASH (no coercion/lookup)
   Missing edge           → node_state=FAILED + MissingEdgeError → pipeline CRASH
 
 Aggregation Error:
@@ -70,8 +71,11 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.enums import (
+    AggregationMemberAction,
     BatchStatus,
+    FrameKind,
     NodeStateStatus,
+    OutputMode,
     RoutingKind,
     RoutingMode,
     TerminalOutcome,
@@ -90,6 +94,8 @@ from elspeth.contracts.errors import (
     TransformErrorReason,
     ZeroEmissionSuccessContractViolation,
 )
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.results import ArtifactDescriptor, GateResult
 from elspeth.contracts.routing import RouteDestination, RoutingAction
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
@@ -261,11 +267,11 @@ def _blocked_item(
     ingest_sequence: int = 0,
     attempt: int = 0,
     branch_name: str | None = None,
-    fork_group_id: str | None = None,
+    fork_group_id: str = "fg-executors-test",
     join_group_id: str | None = None,
-    expand_group_id: str | None = None,
 ) -> TokenWorkItem:
     """Build a BLOCKED journal row as list_blocked_barrier_items returns them."""
+    lineage_path = () if branch_name is None else (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch_name),)
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="test-run",
@@ -281,10 +287,8 @@ def _blocked_item(
         created_at=_JOURNAL_T0,
         updated_at=_JOURNAL_T0,
         barrier_key=f"aggregation:{node_id}",
-        branch_name=branch_name,
-        fork_group_id=fork_group_id,
+        lineage_path=lineage_path,
         join_group_id=join_group_id,
-        expand_group_id=expand_group_id,
         barrier_blocked_at=blocked_at,
     )
 
@@ -356,6 +360,7 @@ def _make_transform(
     on_error: str | None = None,
     declared_output_fields: frozenset[str] | None = None,
     passes_through_input: bool = False,
+    forwards_input_fields: bool = False,
     can_drop_rows: bool = False,
     declared_input_fields: frozenset[str] | None = None,
     is_batch_aware: bool = False,
@@ -374,6 +379,7 @@ def _make_transform(
             "_on_start_called",
             "process",
             "passes_through_input",
+            "forwards_input_fields",
             "can_drop_rows",
             "is_batch_aware",
             "_output_schema_config",
@@ -389,6 +395,7 @@ def _make_transform(
     t.output_schema = _PermissiveSchema  # Accepts any row — validation is a no-op
     t._on_start_called = True
     t.passes_through_input = passes_through_input
+    t.forwards_input_fields = forwards_input_fields
     t.can_drop_rows = can_drop_rows
     t.is_batch_aware = is_batch_aware
     t._output_schema_config = None
@@ -617,6 +624,88 @@ class TestTransformExecutor:
         with pytest.raises(OrchestrationInvariantError, match="without node_id"):
             executor.execute_transform(transform, token, ctx)
 
+    def test_ownership_loss_after_plugin_return_leaves_attempt_open(self) -> None:
+        """A stale worker cannot terminalize node audit after its plugin returns."""
+        from elspeth.contracts.errors import SchedulerLeaseLostError
+
+        factory = _make_factory()
+        ownership_loss = SchedulerLeaseLostError(work_item_id="work-old", lease_owner="worker-old", run_id="run_1")
+
+        def heartbeat_seam() -> None:
+            """Spec target matching TransformExecutor's ``before_terminal_audit: Callable[[], None]``."""
+
+        before_terminal_audit = MagicMock(spec=heartbeat_seam, side_effect=ownership_loss)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            before_terminal_audit=before_terminal_audit,
+        )
+        transform = _make_transform(on_error="discard")
+        transform.process.return_value = TransformResult.success(
+            make_row({"value": "processed"}, contract=_make_contract()),
+            success_reason={"action": "test"},
+        )
+
+        with pytest.raises(SchedulerLeaseLostError):
+            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"))
+
+        before_terminal_audit.assert_called_once_with()
+        factory.execution.begin_node_state.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
+
+    def test_post_invocation_output_validation_failure_marks_transform_span_error(self) -> None:
+        """The transform span covers validation and terminal audit after process()."""
+        from elspeth.contracts import PluginSchema
+
+        class StrictOutputSchema(PluginSchema):
+            count: int
+
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, spans, _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+        transform.output_schema = StrictOutputSchema
+        transform.process.return_value = TransformResult.success(
+            make_row({"count": "not-an-int"}, contract=_make_contract()),
+            success_reason={"action": "test"},
+        )
+
+        with (
+            spans.trace_scope("run_1", datetime.now(UTC)),
+            pytest.raises(PluginContractViolation, match="output validation failed"),
+        ):
+            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"))
+
+        assert len(events) == 1
+        assert events[0].name is EngineSpanName.TRANSFORM
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "PluginContractViolation"
+
+    def test_handled_transform_error_result_marks_transform_span_error(self) -> None:
+        """A routed TransformResult.error remains a failed transform operation."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, spans, _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform(on_error="discard")
+        transform.process.return_value = TransformResult.error(reason={"reason": "rejected"})
+
+        with spans.trace_scope("run_1", datetime.now(UTC)):
+            result, _token, error_sink = executor.execute_transform(
+                transform,
+                _make_token(),
+                make_context(run_id="run_1"),
+            )
+
+        assert result.status == "error"
+        assert error_sink == "discard"
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "TransformResultError"
+
     # --- Input validation (centralized) ---
 
     def test_unconditional_input_validation_rejects_wrong_type(self) -> None:
@@ -663,6 +752,38 @@ class TestTransformExecutor:
 
         transform.process.assert_not_called()
 
+    def test_input_validation_contract_violation_leaves_the_outcome_to_the_router(self) -> None:
+        """A Tier-2 input-validation failure is the ROUTER's token to terminalize.
+
+        The violation still propagates out of the executor, but it no longer
+        ends the run: ``RowProcessor._convert_contract_violation_to_error_result``
+        converts it into a routable transform error, and the token's single
+        ``token_outcomes`` row is written wherever ``on_error`` sends it
+        (elspeth-181db83da7). The executor pre-recorded FAILURE/UNROUTED here
+        while the violation was still terminal (elspeth-82d4c5146c); doing so
+        now is a second write for the same token, which the audit store
+        rejects. Tier-1 violations DO still crash and still record — see
+        ``test_declared_input_fields_violation_precedes_generic_input_validation``
+        directly below, which is the paired control.
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+
+        from elspeth.contracts import PluginSchema
+
+        class StrictSchema(PluginSchema):
+            count: int
+
+        transform.input_schema = StrictSchema
+        token = _make_token(data={"count": "not_an_int"}, token_id="tok_input_violation")
+        ctx = make_context()
+
+        with pytest.raises(PluginContractViolation, match="input validation failed"):
+            executor.execute_transform(transform, token, ctx)
+
+        factory.data_flow.record_token_outcome.assert_not_called()
+
     def test_declared_input_fields_violation_precedes_generic_input_validation(self) -> None:
         """Missing declared fields surface as ADR-013 violations before schema validation."""
         factory = _make_factory()
@@ -689,6 +810,57 @@ class TestTransformExecutor:
         factory.data_flow.record_token_outcome.assert_called_once()
         kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
         assert kwargs["ref"].token_id == "tok_declared_required"
+        assert kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert kwargs["path"] == TerminalPath.UNROUTED
+        assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
+
+    def test_field_mapper_missing_mapping_source_never_reaches_non_strict_process(self) -> None:
+        """A derived mapping-source requirement closes the original silent-skip seam."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "schema": {"mode": "observed"},
+                "mapping": {
+                    "colour": "colour",
+                    "complementary_colour": "recommended_pairing",
+                },
+                "strict": False,
+            }
+        )
+        transform.node_id = "tidy_output"
+        transform.on_error = "discard"
+        token = _make_token(
+            data={"colour": "blue"},
+            contract=SchemaContract(
+                mode="FLEXIBLE",
+                fields=(
+                    make_field(
+                        "colour",
+                        python_type=str,
+                        original_name="colour",
+                        required=True,
+                        source="declared",
+                    ),
+                ),
+                locked=True,
+            ),
+            token_id="tok_missing_mapping_source",
+        )
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with (
+            patch.object(FieldMapper, "process", autospec=True) as process,
+            pytest.raises(DeclaredRequiredInputFieldsViolation, match=r"missing \['complementary_colour'\]"),
+        ):
+            executor.execute_transform(transform, token, ctx)
+
+        process.assert_not_called()
+        factory.data_flow.record_token_outcome.assert_called_once()
+        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
         assert kwargs["outcome"] == TerminalOutcome.FAILURE
         assert kwargs["path"] == TerminalPath.UNROUTED
         assert kwargs["context"]["exception_type"] == "DeclaredRequiredInputFieldsViolation"
@@ -910,6 +1082,11 @@ class TestTransformExecutor:
         assert kwargs["state_id"] == "state_001"
         assert kwargs["error"].exception_type == "PluginContractViolation"
 
+        # The node state is the executor's to fail; the TOKEN outcome is not.
+        # This Tier-2 violation reaches the transform's on_error, so the
+        # routing path writes its single terminal row (elspeth-181db83da7).
+        factory.data_flow.record_token_outcome.assert_not_called()
+
     def test_output_schema_validation_rejects_coercible_wrong_runtime_type_before_completed(self) -> None:
         """Transform output validation must reject coercible schema-wrong values before audit completion."""
         factory = _make_factory()
@@ -1128,7 +1305,7 @@ class TestTransformExecutor:
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["status"] == NodeStateStatus.FAILED
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
 
     # --- Exception path ---
 
@@ -1254,20 +1431,353 @@ class TestTransformExecutor:
         """Transform with declared_output_fields that collide with input raises PluginContractViolation.
 
         The executor checks declared_output_fields against input row keys BEFORE
-        calling transform.process(). Collisions crash the pipeline (not graceful error)
-        because field collision is a pipeline configuration bug, not a data issue.
+        calling transform.process(), so no provider call is wasted on a row that
+        cannot be emitted. The violation is Tier 2: it propagates out of the
+        executor, but the collision is a per-row fact and the processor routes
+        it through the transform's on_error rather than aborting the run
+        (elspeth-181db83da7). The terminal token_outcome therefore belongs to
+        the routing path, not here.
         """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        # passes_through_input=True models the enricher class truthfully (the
+        # real llm transform passes input through): the collision gate is
+        # capability-keyed — it arms only for a transform whose write path
+        # preserves the input row (elspeth-6ea3619737).
         transform = _make_transform(
             declared_output_fields=frozenset({"llm_response", "llm_response_model"}),
+            passes_through_input=True,
         )
         # Input row already has "llm_response" — collision!
-        token = _make_token(data={"value": "test", "llm_response": "pre-existing"})
+        token = _make_token(data={"value": "test", "llm_response": "pre-existing"}, token_id="tok_collision")
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
             executor.execute_transform(transform, token, ctx)
+
+        transform.process.assert_not_called()
+        factory.data_flow.record_token_outcome.assert_not_called()
+
+    def test_fresh_row_transform_with_colliding_declaration_is_not_collision_checked(self) -> None:
+        """A transform that does not preserve input fields cannot overwrite one.
+
+        ``declared_output_fields`` is a GUARANTEE claim ("this field is on
+        every successful output row"), not a write-path claim. A transform with
+        ``passes_through_input=False`` and ``forwards_input_fields=False``
+        builds its output from a fresh dict, so a declared name that is also on
+        the input row is consumed-and-replaced, never overwritten — arming the
+        gate there was the elspeth-6ea3619737 false positive (100% row loss on
+        a select_only field_mapper).
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("value", python_type=str, original_name="value", required=False, source="inferred"),
+                make_field("llm_response", python_type=str, original_name="llm_response", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        transform = _make_transform(
+            declared_output_fields=frozenset({"llm_response"}),
+            passes_through_input=False,
+            forwards_input_fields=False,
+        )
+        transform.process.return_value = TransformResult.success(
+            make_row({"llm_response": "fresh"}, contract=contract),
+            success_reason={"action": "test"},
+        )
+        token = _make_token(data={"value": "test", "llm_response": "pre-existing"}, token_id="tok_fresh_row", contract=contract)
+        ctx = make_context()
+
+        result, _updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+
+        assert result.status == "success"
+        assert error_sink is None
+        transform.process.assert_called_once()
+
+    def test_forwarding_transform_collision_still_raises(self) -> None:
+        """``forwards_input_fields`` alone arms the gate — the second limb.
+
+        The open-branch field_mapper (and both explode transforms) declare
+        ``passes_through_input=False`` but ``forwards_input_fields=True``: the
+        input row survives onto the output, so a declared output name the row
+        already carries IS a real overwrite. A capability key of
+        ``passes_through_input`` alone would disarm those true positives; this
+        pin kills that mutation.
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform(
+            declared_output_fields=frozenset({"item"}),
+            passes_through_input=False,
+            forwards_input_fields=True,
+        )
+        token = _make_token(data={"item": "pre-existing", "items": "[1]"}, token_id="tok_forwarding")
+        ctx = make_context()
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+        transform.process.assert_not_called()
+
+    def test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight(self) -> None:
+        """End-to-end FP cure (elspeth-6ea3619737 family 1): strict + select_only.
+
+        ``select_only`` builds its output from a fresh ``{}`` — it CANNOT
+        overwrite an input field; a rename onto a name the input also carries
+        DROPS that input, which is what select_only means. Under ``strict:
+        true`` the target is declared (an honest guarantee), and before the
+        capability key this armed the collision gate: 0/5 rows survived a real
+        run, quarantined with "would overwrite existing input fields" — false
+        by construction.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "tgt"},
+                "select_only": True,
+                "strict": True,
+                "schema": {"mode": "observed"},
+            }
+        )
+        transform.node_id = "fm_select_only"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("a", python_type=str, original_name="a", required=False, source="inferred"),
+                make_field("tgt", python_type=str, original_name="tgt", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"a": "1", "tgt": "occupied"}, token_id="tok_select_only", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        result, updated_token, error_sink = executor.execute_transform(transform, token, ctx)
+
+        assert result.status == "success"
+        assert error_sink is None
+        assert updated_token.row_data.to_dict() == {"tgt": "1"}
+
+    def test_open_branch_field_mapper_fixed_schema_rename_onto_required_field_collides(self) -> None:
+        """End-to-end FN cure (elspeth-0d1da6dc44): declaration-channel stability.
+
+        Under ``select_only: false`` the mapper deep-copies the input row and
+        then writes the target — a rename onto a field the schema guarantees
+        DESTROYS that field's value on every row. Declaring the guarantee as
+        ``mode: fixed`` required fields used to leave ``declared_output_fields``
+        empty (abstain collapsed into explicit-zero), so all three collision
+        gates slept while ``guaranteed_fields: [a, c]`` — the same promise in
+        the other channel — was rejected. Same runtime behavior, opposite
+        verdicts, keyed on spelling.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "c"},
+                "schema": {"mode": "fixed", "fields": ["a: str", "c: str"]},
+            }
+        )
+        transform.node_id = "fm_open_fixed"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="FIXED",
+            fields=(
+                make_field("a", python_type=str, original_name="a", required=True, source="declared"),
+                make_field("c", python_type=str, original_name="c", required=True, source="declared"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"a": "1", "c": "2"}, token_id="tok_open_fixed", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+    def test_open_branch_field_mapper_required_fields_rename_also_collides(self) -> None:
+        """Third declaration channel (adversarial review of a7c783423): required_fields.
+
+        ``schema.required_fields`` feeds the build-time edge contract, which
+        fail-closes against every upstream that does not guarantee the field —
+        so on any runnable graph the field is on every row, the same promise
+        as ``guaranteed_fields``, and the same rename must get the same
+        verdict.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"email": "username"},
+                "schema": {"mode": "observed", "required_fields": ["email", "username"]},
+            }
+        )
+        transform.node_id = "fm_open_required"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("email", python_type=str, original_name="email", required=True, source="declared"),
+                make_field("username", python_type=str, original_name="username", required=True, source="declared"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"email": "a@b", "username": "u"}, token_id="tok_open_required", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+    def test_open_branch_field_mapper_guaranteed_rename_still_collides(self) -> None:
+        """Control: the explicit-``guaranteed_fields`` channel keeps its true positive.
+
+        This is the shape that was ALREADY rejected before the capability key —
+        the fix must equalize the two declaration channels by arming the fixed
+        schema one, not by disarming this one.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"a": "c"},
+                "schema": {"mode": "observed", "guaranteed_fields": ["a", "c"]},
+            }
+        )
+        transform.node_id = "fm_open_guaranteed"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("a", python_type=str, original_name="a", required=False, source="inferred"),
+                make_field("c", python_type=str, original_name="c", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        token = _make_token(data={"a": "1", "c": "2"}, token_id="tok_open_guaranteed", contract=contract)
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+    def test_open_branch_unresolved_original_header_collision_still_raises(self) -> None:
+        """Removal-name abstention must not disarm the independent write gate.
+
+        An original-header source is resolved only against row lineage, so the
+        mapper cannot truthfully declare which input key it removes and leaves
+        ``forwards_input_fields`` false. The open branch still deep-copies the
+        row before writing ``full_name``; an existing target is therefore a
+        real silent overwrite, not the fresh-dict behavior of ``select_only``.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"Name": "full_name"},
+                "select_only": False,
+                "schema": {"mode": "observed"},
+            }
+        )
+        transform.node_id = "fm_open_original"
+        transform.on_error = "discard"
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("name", python_type=str, original_name="Name", required=False, source="inferred"),
+                make_field("full_name", python_type=str, original_name="full_name", required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        token = _make_token(
+            data={"name": "Ada", "full_name": "Existing"},
+            token_id="tok_open_original",
+            contract=contract,
+        )
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        assert transform.forwards_input_fields is False
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            executor.execute_transform(transform, token, ctx)
+
+    def test_field_mapper_mapping_source_is_dispatched_as_a_required_input(self) -> None:
+        """The executor enforces d4's derived source before non-strict process()."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = FieldMapper(
+            {
+                "mapping": {"maybe_field": "output"},
+                "select_only": True,
+                "strict": False,
+                "schema": {"mode": "observed"},
+            }
+        )
+        transform.node_id = "fm_required_source"
+        transform.on_error = "discard"
+        ctx = make_context()
+        transform.on_start(ctx)
+
+        missing_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(make_field("other", python_type=str, original_name="other", required=False, source="inferred"),),
+            locked=True,
+        )
+        present_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field(
+                    "maybe_field",
+                    python_type=str,
+                    original_name="maybe_field",
+                    required=False,
+                    source="inferred",
+                ),
+            ),
+            locked=True,
+        )
+
+        with pytest.raises(DeclaredRequiredInputFieldsViolation, match="maybe_field"):
+            executor.execute_transform(
+                transform,
+                _make_token(
+                    data={"other": "value"},
+                    token_id="tok_missing_mapping_source",
+                    contract=missing_contract,
+                ),
+                ctx,
+            )
+
+        result, updated_token, error_sink = executor.execute_transform(
+            transform,
+            _make_token(
+                data={"maybe_field": "value"},
+                token_id="tok_present_mapping_source",
+                contract=present_contract,
+            ),
+            ctx,
+        )
+
+        assert result.status == "success"
+        assert error_sink is None
+        assert updated_token.row_data.to_dict() == {"output": "value"}
 
     def test_empty_declared_output_fields_skips_collision_check(self) -> None:
         """Transform with empty declared_output_fields passes through without collision check.
@@ -1301,6 +1811,7 @@ class TestTransformExecutor:
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         transform = _make_transform(
             declared_output_fields=frozenset({"value"}),
+            passes_through_input=True,
         )
         token = _make_token(data={"value": "test"})
         ctx = make_context()
@@ -1584,17 +2095,33 @@ class TestTransformExecutor:
 
     # --- Invariant guard tests (elspeth-8c9b58a679) ---
 
-    def test_on_start_not_called_raises_plugin_contract_violation(self) -> None:
-        """Lifecycle guard: executing a transform before on_start() raises PluginContractViolation."""
+    def test_on_start_not_called_raises_orchestration_invariant_not_a_routable_violation(self) -> None:
+        """The lifecycle guard is a RUN-scoped fault and must stay fatal.
+
+        Every other preflight check is a function of the row, so routing it
+        per-row through ``on_error`` is honest. This one is a function of the
+        run: ``on_start()`` either ran for this transform or it did not,
+        identically for every row. As a Tier-2 ``PluginContractViolation`` it
+        became routable with elspeth-181db83da7, which quarantined the whole
+        dataset and reported PARTIAL — the disposition ADR-008 §Alternative 3
+        rejects. It is an ``OrchestrationInvariantError`` (TIER_1-registered)
+        so the run crashes instead.
+        """
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         transform = _make_transform()
         transform._on_start_called = False  # Simulate missing lifecycle call
-        token = _make_token()
+        token = _make_token(token_id="tok_lifecycle")
         ctx = make_context()
 
-        with pytest.raises(PluginContractViolation, match="before on_start"):
+        with pytest.raises(OrchestrationInvariantError, match="before on_start") as exc_info:
             executor.execute_transform(transform, token, ctx)
+
+        # The tier is the load-bearing property, not the class name: it is what
+        # makes the processor re-raise instead of converting.
+        assert isinstance(exc_info.value, TIER_1_ERRORS)
+        assert not isinstance(exc_info.value, PluginContractViolation)
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_on_error_none_raises_orchestration_invariant_error(self) -> None:
         """on_error=None invariant: last-line defense if config layer regresses."""
@@ -1660,6 +2187,14 @@ class TestTransformExecutor:
 
         assert exc_info.value.passes_through_input is False
         assert exc_info.value.can_drop_rows is can_drop_rows
+        # This class is Tier 2 and therefore ROUTED, so the on_error
+        # destination — not the executor — writes the token's terminal outcome
+        # (elspeth-181db83da7). The executor keeps it out of
+        # ``_record_terminal_contract_failure`` via a dedicated ``except``
+        # ahead of the recording clause. Folding that clause back into the
+        # tuple below it is caught by mypy (the recording method's annotation
+        # excludes this class), but NOT by any assertion — until this one.
+        factory.data_flow.record_token_outcome.assert_not_called()
 
 
 # =============================================================================
@@ -1901,7 +2436,59 @@ class TestGateExecutor:
                 ctx,
             )
 
-        _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].phase == "gate_evaluation_routing"
+
+    def test_post_evaluation_route_failure_marks_gate_span_error(self) -> None:
+        """The gate span stays open through route admission and guard failure audit."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = GateExecutor(factory.execution, spans, _make_step_resolver())
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="'unknown_label'",
+            routes={"known": "next_conn"},
+        )
+
+        with (
+            spans.trace_scope("run_1", datetime.now(UTC)),
+            pytest.raises(ValueError, match="unknown_label"),
+        ):
+            executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"))
+
+        assert len(events) == 1
+        assert events[0].name is EngineSpanName.GATE
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "ValueError"
+
+    def test_handled_gate_expression_error_marks_gate_span_error(self) -> None:
+        """A configured expression-error route remains a failed gate operation."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            spans,
+            _make_step_resolver(),
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['missing'] > 0",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="discard",
+        )
+
+        with spans.trace_scope("run_1", datetime.now(UTC)):
+            outcome = executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"))
+
+        assert outcome.discarded is True
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "ExpressionEvaluationError"
 
     def test_config_gate_unknown_route_label_error_redacts_row_derived_value(self) -> None:
         """Unknown row-derived route labels must not leak raw values to audit text."""
@@ -2071,6 +2658,127 @@ class TestGateExecutor:
                 ctx,
             )
 
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].phase == "gate_evaluation_routing"
+
+    def test_config_gate_expression_error_routes_one_row_with_divert_evidence(self) -> None:
+        """A configured expression failure returns a per-row failure outcome."""
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['nonexistent_field'] > 0",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+
+        outcome = executor.execute_config_gate(
+            config,
+            "cg_1",
+            _make_token(contract=_make_contract()),
+            make_context(),
+        )
+
+        assert outcome.sink_name == "gate_errors"
+        assert outcome.discarded is False
+        assert outcome.error is not None
+        assert outcome.error.exception_type == "ExpressionEvaluationError"
+        assert outcome.result.action.mode == RoutingMode.DIVERT
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].exception_type == "ExpressionEvaluationError"
+        factory.execution.record_routing_event.assert_called_once_with(
+            state_id="state_001",
+            edge_id="edge_gate_error",
+            mode=RoutingMode.DIVERT,
+            reason={
+                "condition": "row['nonexistent_field'] > 0",
+                "error_type": "ExpressionEvaluationError",
+                "error": "gate expression evaluation failed: missing key",
+            },
+        )
+
+    @pytest.mark.parametrize(
+        ("condition", "row", "row_derived_text", "classification"),
+        [
+            (
+                "row[row['selector']]",
+                {"value": "x", "selector": "customer-private-field-7f31"},
+                "customer-private-field-7f31",
+                "gate expression evaluation failed: missing key",
+            ),
+            (
+                "row['items'][row['index']] > 0",
+                {"value": "x", "items": [1], "index": 918273},
+                "918273",
+                "gate expression evaluation failed: index out of range",
+            ),
+        ],
+    )
+    def test_config_gate_handled_error_evidence_never_persists_row_derived_key_or_index(
+        self,
+        condition: str,
+        row: dict[str, Any],
+        row_derived_text: str,
+        classification: str,
+    ) -> None:
+        """Handled row failures carry only closed, bounded classifications."""
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition=condition,
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+
+        outcome = executor.execute_config_gate(
+            config,
+            "cg_1",
+            _make_token(data=row, contract=_make_contract()),
+            make_context(),
+        )
+
+        assert outcome.error is not None
+        assert outcome.error.message == classification
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].exception == classification
+        routing_reason = factory.execution.record_routing_event.call_args.kwargs["reason"]
+        assert routing_reason["error"] == classification
+        persisted_evidence = repr((outcome.error, failed_kwargs["error"], routing_reason))
+        assert row_derived_text not in persisted_evidence
+
+    def test_config_gate_error_route_without_divert_edge_fails_closed(self) -> None:
+        """Missing structural audit evidence must not silently route the row."""
+        factory = _make_factory()
+        executor = GateExecutor(factory.execution, _make_span_factory(), _make_step_resolver())
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['nonexistent_field'] > 0",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+
+        with pytest.raises(OrchestrationInvariantError, match="no DIVERT edge registered"):
+            executor.execute_config_gate(
+                config,
+                "cg_1",
+                _make_token(contract=_make_contract()),
+                make_context(),
+            )
+
         _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
 
     def test_config_gate_runtime_error_in_dispatch_records_failed_state(self) -> None:
@@ -2122,7 +2830,8 @@ class TestGateExecutor:
                 token_manager=None,  # Triggers OrchestrationInvariantError in dispatch
             )
 
-        _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].phase == "gate_evaluation_routing"
 
     # --- Error routing edge cases (exd audit) ---
 
@@ -2545,11 +3254,13 @@ class TestAggregationExecutor:
         node_id: str = "agg_1",
         count: int = 3,
         clock: MockClock | None = None,
+        span_factory: SpanFactory | None = None,
     ) -> tuple[AggregationExecutor, MagicMock, NodeID]:
         """Create an AggregationExecutor with a single configured node."""
         if factory is None:
             factory = _make_factory()
-        span_factory = _make_span_factory()
+        if span_factory is None:
+            span_factory = _make_span_factory()
         nid = NodeID(node_id)
         settings = AggregationSettings(
             name="test_agg",
@@ -2728,7 +3439,13 @@ class TestAggregationExecutor:
         pass
 
     def test_execute_flush_success_completes_batch_and_state(self) -> None:
-        """Successful flush transitions batch to COMPLETED and state to COMPLETED."""
+        """Successful flush commits node, batch, and result receipt in ONE atomic call.
+
+        Every successful aggregation completion owns a durable result receipt:
+        the node state, batch completion, ordered output payloads, and exact
+        member actions commit together via complete_aggregation_result — never
+        through the legacy complete_batch/complete_node_state pair.
+        """
         executor, factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
@@ -2755,9 +3472,27 @@ class TestAggregationExecutor:
         assert len(tokens) == 2
         assert batch_id == "batch_001"
 
-        # Verify batch completed
-        complete_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.COMPLETED]
-        assert len(complete_calls) == 1
+        factory.execution.complete_aggregation_result.assert_called_once()
+        receipt_kwargs = factory.execution.complete_aggregation_result.call_args.kwargs
+        assert receipt_kwargs["batch_id"] == "batch_001"
+        assert receipt_kwargs["run_id"] == "test-run"
+        assert receipt_kwargs["aggregation_node_id"] == "agg_1"
+        assert receipt_kwargs["state_id"] == "state_001"
+        assert receipt_kwargs["trigger_type"] == TriggerType.COUNT
+        assert receipt_kwargs["output_mode"] is OutputMode.TRANSFORM
+        assert receipt_kwargs["output_shape"] == "single"
+        assert receipt_kwargs["output_rows"] == (result.row,)
+        assert_stable_hash(receipt_kwargs["output_hash"], result.row)
+        assert receipt_kwargs["expansion_parent_token_id"] == "t1"
+        assert receipt_kwargs["success_reason"] == {"action": "aggregated"}
+        assert [(member.member_ref.token_id, member.action, member.error_hash) for member in receipt_kwargs["members"]] == [
+            ("t1", AggregationMemberAction.CONSUME_BATCH, None),
+            ("t2", AggregationMemberAction.CONSUME_BATCH, None),
+        ]
+        # No separate legacy completion writes on success — replaying them
+        # would break the single-transaction receipt guarantee.
+        factory.execution.complete_batch.assert_not_called()
+        factory.execution.complete_node_state.assert_not_called()
 
     def test_execute_flush_success_passes_aggregation_flush_context(self) -> None:
         """Successful flush passes AggregationFlushContext as context_after."""
@@ -2780,13 +3515,12 @@ class TestAggregationExecutor:
 
         executor.execute_flush(nid, transform, ctx, TriggerType.COUNT)
 
-        # Find the COMPLETED call to complete_node_state (success path)
-        completed_calls = [
-            c for c in factory.execution.complete_node_state.call_args_list if c[1].get("status") == NodeStateStatus.COMPLETED
-        ]
-        assert len(completed_calls) == 1
+        # The flush context rides the atomic result receipt; the success path
+        # never issues a separate complete_node_state write.
+        factory.execution.complete_aggregation_result.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
 
-        context_after = completed_calls[0][1]["context_after"]
+        context_after = factory.execution.complete_aggregation_result.call_args.kwargs["context_after"]
         assert isinstance(context_after, AggregationFlushContext)
         assert context_after.trigger_type == "count"
         assert context_after.buffer_size == 2
@@ -2853,6 +3587,35 @@ class TestAggregationExecutor:
         failed_batches = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.FAILED]
         assert len(failed_batches) == 1
 
+    def test_post_invocation_output_validation_failure_marks_aggregation_span_error(self) -> None:
+        """The aggregation span covers output validation and receipt audit."""
+        from elspeth.contracts import PluginSchema
+
+        class StrictOutputSchema(PluginSchema):
+            count: int
+
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        executor, _factory, nid = self._make_agg_executor(count=1, span_factory=spans)
+        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
+        transform = _make_aggregation_transform("agg_transform")
+        transform.output_schema = StrictOutputSchema
+        transform.process.return_value = TransformResult.success(
+            make_row({"count": "not-an-int"}, contract=_make_contract()),
+            success_reason={"action": "aggregated"},
+        )
+
+        with (
+            spans.trace_scope("test-run", datetime.now(UTC)),
+            pytest.raises(PluginContractViolation, match="output validation failed"),
+        ):
+            executor.execute_flush(nid, transform, make_context(run_id="test-run"), TriggerType.COUNT)
+
+        assert len(events) == 1
+        assert events[0].name is EngineSpanName.AGGREGATION
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "PluginContractViolation"
+
     def test_execute_flush_error_result_marks_batch_failed(self) -> None:
         """Error result from transform marks batch as FAILED."""
         executor, factory, nid = self._make_agg_executor(count=2)
@@ -2879,6 +3642,28 @@ class TestAggregationExecutor:
         # Verify batch marked failed
         failed_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.FAILED]
         assert len(failed_calls) == 1
+
+    def test_handled_aggregation_error_result_marks_aggregation_span_error(self) -> None:
+        """A TransformResult.error marks the flush span even though routing returns."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        executor, _factory, nid = self._make_agg_executor(count=1, span_factory=spans)
+        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
+        transform = _make_aggregation_transform("agg_transform")
+        transform.process.return_value = TransformResult.error(reason={"reason": "rejected"})
+
+        with spans.trace_scope("test-run", datetime.now(UTC)):
+            result, _tokens, _batch_id = executor.execute_flush(
+                nid,
+                transform,
+                make_context(run_id="test-run"),
+                TriggerType.COUNT,
+            )
+
+        assert result.status == "error"
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "AggregationResultError"
 
     def test_execute_flush_exception_marks_batch_failed_and_reraises(self) -> None:
         """Exception from transform marks batch as FAILED and re-raises."""
@@ -3577,7 +4362,7 @@ class TestAggregationExecutor:
     def test_restore_from_journal_restores_trigger_fire_offsets(self) -> None:
         """Scalar trigger latches pass through to the TriggerEvaluator and read back."""
         clock = MockClock(start=50.0)
-        executor, _, nid = self._make_agg_executor(node_id="agg-1", count=10, clock=clock)
+        executor, _, nid = self._make_agg_executor(node_id="agg-1", count=1, clock=clock)
 
         executor.restore_from_journal(
             node_id=nid,
@@ -3645,6 +4430,51 @@ class TestNodeStateGuard:
     failures left node_states permanently OPEN in the audit trail.
     """
 
+    def test_auto_fail_phase_is_required_at_construction(self) -> None:
+        """Every caller must name its guarded scope; there is no safe fallback."""
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        with pytest.raises(TypeError, match="auto_fail_phase"):
+            NodeStateGuard(
+                factory.execution,
+                token_id="tok_1",
+                node_id="node_1",
+                run_id="run_1",
+                step_index=1,
+                input_data={"v": 1},
+            )
+
+        factory.execution.begin_node_state.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "invalid_phase",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="whitespace"),
+            pytest.param(17, id="truthy-non-string"),
+            pytest.param("transform_execuion", id="unknown-string"),
+        ],
+    )
+    def test_auto_fail_phase_rejects_values_outside_closed_vocabulary(self, invalid_phase: Any) -> None:
+        """Invalid phase attribution fails before opening or completing audit state."""
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        with pytest.raises(OrchestrationInvariantError, match="auto_fail_phase"):
+            NodeStateGuard(
+                factory.execution,
+                token_id="tok_1",
+                node_id="node_1",
+                run_id="run_1",
+                step_index=1,
+                input_data={"v": 1},
+                auto_fail_phase=invalid_phase,
+            )
+
+        factory.execution.begin_node_state.assert_not_called()
+        factory.execution.complete_node_state.assert_not_called()
+
     def test_normal_exit_without_complete_crashes_and_records_failed(self) -> None:
         """Clean exit without complete() records FAILED and raises.
 
@@ -3664,6 +4494,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(OrchestrationInvariantError, match="exited without complete"), guard:
             pass  # Don't call complete()
@@ -3688,6 +4519,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError, match="test crash"), guard:
             raise ValueError("test crash")
@@ -3699,8 +4531,51 @@ class TestNodeStateGuard:
         assert kwargs["state_id"] == "state_001"
         assert "test crash" in kwargs["error"].exception
         assert kwargs["error"].exception_type == "ValueError"
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
         assert kwargs["duration_ms"] >= 0
+
+    def test_explicit_ownership_abandonment_preserves_open_state(self) -> None:
+        """Ownership loss leaves the stale attempt OPEN and propagates."""
+        from elspeth.contracts.errors import SchedulerLeaseLostError
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        guard = NodeStateGuard(
+            factory.execution,
+            token_id="tok_1",
+            node_id="node_1",
+            run_id="run_1",
+            step_index=1,
+            input_data={"v": 1},
+            auto_fail_phase="transform_execution",
+        )
+        with pytest.raises(SchedulerLeaseLostError), guard:
+            guard.abandon_open_state()
+            raise SchedulerLeaseLostError(work_item_id="work-old", lease_owner="worker-old", run_id="run_1")
+
+        factory.execution.begin_node_state.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
+
+    def test_abandonment_rejects_non_ownership_exception(self) -> None:
+        """Only scheduler ownership loss may preserve an OPEN attempt."""
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        guard = NodeStateGuard(
+            factory.execution,
+            token_id="tok_1",
+            node_id="node_1",
+            run_id="run_1",
+            step_index=1,
+            input_data={"v": 1},
+            auto_fail_phase="transform_execution",
+        )
+        with pytest.raises(OrchestrationInvariantError, match="nominal ownership-loss exception"), guard:
+            guard.abandon_open_state()
+            raise ValueError("not an ownership verdict")
+
+        factory.execution.begin_node_state.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
 
     def test_empty_exception_message_still_records_failed(self) -> None:
         """A bare `raise ValueError()` must not abort terminal persistence.
@@ -3720,6 +4595,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError), guard:
             raise ValueError()
@@ -3742,6 +4618,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(RuntimeError), guard:
             raise RuntimeError("   ")
@@ -3771,6 +4648,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(_HostileStr), guard:
             raise _HostileStr("unrenderable")
@@ -3798,6 +4676,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(TypeError, match="abstract"), guard:
@@ -3809,7 +4688,7 @@ class TestNodeStateGuard:
         assert kwargs["state_id"] == "state_001"
         assert kwargs["error"].exception_type == "TypeError"
         assert "abstract" in kwargs["error"].exception
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
 
     def test_explicit_complete_prevents_auto_fail(self) -> None:
         """If caller calls complete() before exception, guard is no-op."""
@@ -3823,6 +4702,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(RuntimeError, match="post-complete crash"), guard:
             guard.complete(NodeStateStatus.COMPLETED, duration_ms=10.0)
@@ -3845,6 +4725,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(OrchestrationInvariantError, match="terminal"), guard:
@@ -3869,6 +4750,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with guard:
             assert guard.state_id == "state_001"
@@ -3887,6 +4769,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(OrchestrationInvariantError, match="before __enter__"):
             _ = guard.state_id
@@ -3912,6 +4795,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         # AuditIntegrityError must be raised — DB failure is more critical than original error
         with pytest.raises(AuditIntegrityError, match=r"Cannot record FAILED.*DB is down"), guard:
@@ -3930,6 +4814,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError, match="execution repo bug"), guard:
             raise RuntimeError("original processing error")
@@ -3946,6 +4831,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=2,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
             attempt=3,
         ) as guard:
             guard.complete(NodeStateStatus.COMPLETED, duration_ms=1.0)
@@ -3975,6 +4861,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         # Must propagate FrameworkBugError, NOT OrchestrationInvariantError
         with pytest.raises(FrameworkBugError, match="internal inconsistency"), guard:
@@ -3998,6 +4885,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(AuditIntegrityError, match="corrupt state table"), guard:
             pass
@@ -4023,6 +4911,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(AuditIntegrityError, match=r"Cannot record FAILED.*DB connection lost"), guard:
             pass
@@ -4040,6 +4929,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError, match="execution repo bug"), guard:
             pass
@@ -4065,6 +4955,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         # FrameworkBugError supersedes the original ValueError
         with pytest.raises(FrameworkBugError, match="broken invariant"), guard:
@@ -4087,6 +4978,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(AuditIntegrityError, match="state table corrupt"), guard:
             raise ValueError("original error, now masked by corruption")
@@ -4123,6 +5015,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(LandscapePostCommitError, match="post-commit validation"), guard:
             guard.complete(NodeStateStatus.COMPLETED, output_data={"v": 1}, duration_ms=0.0)
@@ -4153,6 +5046,7 @@ class TestNodeStateGuard:
             run_id=setup.run_id,
             step_index=1,
             input_data={"name": "test"},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(rfc8785.CanonicalizationError, match="unsupported type"), guard:
@@ -4194,6 +5088,7 @@ class TestNodeStateGuard:
             run_id=setup.run_id,
             step_index=1,
             input_data={"name": "test"},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(AuditIntegrityError, match="audit evidence serialization failed"), guard:
@@ -4217,6 +5112,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         violation = PassThroughContractViolation(
             transform="t",
@@ -4260,6 +5156,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError), guard:
             raise ValueError("just a ValueError")
@@ -4486,7 +5383,15 @@ class TestTransformExecutorTerminality:
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["status"] == NodeStateStatus.FAILED
-        assert "executor_post_process" in kwargs["error"].phase
+        assert kwargs["error"].phase == "transform_execution"
+
+        # ...while the token's fate is decided one layer up. A canonicalization
+        # violation is Tier 2, so the processor converts it into a routable
+        # transform error and the on_error destination writes the token's single
+        # terminal outcome (elspeth-181db83da7). Recording FAILURE/UNROUTED here
+        # as well — which is what elspeth-82d4c5146c added while the violation
+        # still aborted the run — is a duplicate the audit store rejects.
+        factory.data_flow.record_token_outcome.assert_not_called()
 
     def test_contract_evolution_failure_marks_state_failed(self) -> None:
         """Contract evolution failure → state FAILED, not COMPLETED-then-crash.
@@ -4527,7 +5432,7 @@ class TestTransformExecutorTerminality:
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["status"] == NodeStateStatus.FAILED
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
 
     def test_successful_transform_still_completes_normally(self) -> None:
         """Sanity: guard does not interfere with normal success path."""
@@ -4630,7 +5535,7 @@ class TestAggregationExecutorTerminality:
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         assert failed_kwargs["state_id"] == "state_001"
-        assert getattr(failed_kwargs["error"], "phase", None) == "executor_post_process"
+        assert failed_kwargs["error"].phase == "aggregation_flush"
 
         # Batch: FAILED (outer except handler)
         factory.execution.complete_batch.assert_called_once()
@@ -4685,9 +5590,15 @@ class TestAggregationExecutorTerminality:
         assert result.status == "success"
         assert len(tokens) == 1
 
-        # Verify batch completed (not failed)
-        completed_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.COMPLETED]
-        assert len(completed_calls) == 1
+        # Guard stands down after the atomic result receipt: exactly one
+        # completion write, and no legacy batch/node-state writes (a guard
+        # auto-FAIL after the receipt would show up here as complete_node_state).
+        factory.execution.complete_aggregation_result.assert_called_once()
+        receipt_kwargs = factory.execution.complete_aggregation_result.call_args.kwargs
+        assert receipt_kwargs["batch_id"] == "batch_001"
+        assert receipt_kwargs["state_id"] == "state_001"
+        factory.execution.complete_batch.assert_not_called()
+        factory.execution.complete_node_state.assert_not_called()
 
 
 # =============================================================================
@@ -4787,12 +5698,15 @@ class TestGateExecutorExecutionErrorFieldRename:
 
 
 class TestReRaiseGuardPattern:
-    """Structural test: every except (FrameworkBugError, AuditIntegrityError) is a bare re-raise.
+    """Structural test: no except (FrameworkBugError, AuditIntegrityError) swallows or substitutes.
 
     The re-raise pattern is a safety-critical invariant across the codebase:
     system-level exceptions must NEVER be caught and wrapped, logged-and-swallowed,
-    or transformed into a different exception.  The only valid body for these
-    handlers is a bare ``raise`` statement.
+    or transformed into a different exception. Nearly every handler says that as a
+    lone bare ``raise``, but a body that records the terminal outcome first and
+    then re-raises the SAME exception is equally valid and is what
+    ``post_guided_plan`` does — so the gate measures the invariant (never return,
+    always end in a raise, never substitute) rather than the statement count.
 
     This test uses AST parsing to verify the pattern is applied consistently
     across all source files, catching drift when someone refactors a try/except
@@ -4811,50 +5725,110 @@ class TestReRaiseGuardPattern:
     _HANDLER_ALLOWLIST = frozenset({"cli.py", "sink.py", "heartbeat.py"})
 
     def test_all_reraise_guards_have_bare_raise(self) -> None:
-        """Every except (FrameworkBugError, AuditIntegrityError) must contain only 'raise'.
+        """A TIER_1_ERRORS handler may never swallow or substitute the failure.
 
-        Exception: cli.py is the outermost boundary and intentionally formats
-        these errors for operator display with distinct exit codes.
+        ADR-008: a registered Tier-1 error bubbles typed and aborts. Most
+        handlers say that as a lone bare ``raise``, and this gate used to
+        require exactly that shape. Recording the terminal outcome first is
+        also legitimate, and adjudicated: ``post_guided_plan`` has no
+        enclosing lease guard to settle for it (unlike ``post_guided_start``,
+        which delegates to ``lease_guard.finish_active_exception``), so its
+        arm settles the operation row with its audit evidence, publishes the
+        terminal progress event, and only then re-raises.
+
+        What the shape is measured for is the invariant, not the statement
+        count. No handler may:
+
+        * ``return`` out of the handler, or end on any statement other than a
+          ``raise`` — either way a path leaves the handler without the Tier-1
+          failure and the caller reads a success or a lesser fault; or
+        * ``raise`` some *other* exception, substituting for the integrity
+          failure the caller must see.
+
+        ``raise <caught name> from <secondary>`` is fine: the Tier-1 exception
+        is still what escapes, with the secondary chained beneath it. A
+        handler that binds no name (``except TIER_1_ERRORS:``) can therefore
+        only re-raise bare. Nested ``def``/``lambda`` bodies are not this
+        handler's control flow and are not inspected.
+
+        Exception: the ``_HANDLER_ALLOWLIST`` files above are outermost
+        boundaries that deliberately latch or format these errors rather than
+        re-raising them in place.
         """
         import ast
         from pathlib import Path
 
+        from tests.helpers.tree_gate import iter_gate_sources
+
         src_root = Path("src/elspeth")
         violations: list[str] = []
 
-        for py_file in sorted(src_root.rglob("*.py")):
+        for parsed in iter_gate_sources(src_root):
+            py_file = parsed.path
             if py_file.name in self._HANDLER_ALLOWLIST:
                 continue
 
-            source = py_file.read_text()
-            try:
-                tree = ast.parse(source, filename=str(py_file))
-            except SyntaxError:
-                continue
-
-            for node in ast.walk(tree):
+            for node in ast.walk(parsed.tree):
                 if not isinstance(node, ast.ExceptHandler):
                     continue
 
-                # Match: except (FrameworkBugError, AuditIntegrityError)
+                # Match: except TIER_1_ERRORS / except contract_errors.TIER_1_ERRORS
                 if not _is_framework_audit_handler(node):
                     continue
 
-                # Body must be exactly: [Raise()] or [Expr(comment), Raise()]
-                # (allowing a comment-like string expression before the raise)
-                stmts = [s for s in node.body if not isinstance(s, ast.Expr)]
-                if len(stmts) != 1 or not isinstance(stmts[0], ast.Raise):
+                where = f"{py_file.relative_to('src')}:{node.lineno}"
+                owned = _handler_owned_nodes(node)
+
+                for stmt in owned:
+                    if isinstance(stmt, ast.Return):
+                        violations.append(
+                            f"{where}: except TIER_1_ERRORS handler returns at line {stmt.lineno} "
+                            f"instead of re-raising — the Tier-1 failure is swallowed"
+                        )
+
+                # ``return`` is not the only way out. When the ``try`` sits in a
+                # loop, a ``break``/``continue`` bound to THAT loop leaves the
+                # handler while its last statement is still a ``raise``, so the
+                # check below cannot see it.
+                for stmt in _handler_escaping_jumps(node):
                     violations.append(
-                        f"{py_file.relative_to('src')}:{node.lineno}: "
-                        f"except (FrameworkBugError, AuditIntegrityError) handler "
-                        f"has non-trivial body (expected bare 'raise')"
+                        f"{where}: except TIER_1_ERRORS handler leaves via "
+                        f"{type(stmt).__name__.lower()} at line {stmt.lineno} instead of "
+                        f"re-raising — the Tier-1 failure is swallowed by the enclosing loop"
                     )
-                elif stmts[0].exc is not None:
-                    # Bare raise has exc=None; raise SomeError(...) has exc set
+
+                # A handler whose last statement is not a raise has a path that
+                # falls out of it, which swallows the failure just as quietly.
+                last = node.body[-1]
+                if not isinstance(last, ast.Raise):
                     violations.append(
-                        f"{py_file.relative_to('src')}:{node.lineno}: "
-                        f"except (FrameworkBugError, AuditIntegrityError) handler "
-                        f"raises a new exception instead of bare re-raise"
+                        f"{where}: except TIER_1_ERRORS handler ends on {type(last).__name__} "
+                        f"at line {last.lineno} rather than a re-raise — a path falls out of "
+                        f"the handler carrying no Tier-1 failure"
+                    )
+
+                for stmt in owned:
+                    if not isinstance(stmt, ast.Raise) or stmt.exc is None:
+                        continue  # a bare ``raise`` re-raises the caught exception
+                    if node.name is not None and isinstance(stmt.exc, ast.Name) and stmt.exc.id == node.name:
+                        continue  # ``raise <caught name> [from ...]`` keeps the Tier-1 primary
+                    violations.append(
+                        f"{where}: except TIER_1_ERRORS handler raises a substituted exception "
+                        f"at line {stmt.lineno} instead of the caught Tier-1 failure"
+                    )
+
+                # ``raise <caught name>`` is a re-raise only while that name still
+                # binds the caught exception, so any rebinding of it is refused
+                # outright rather than tracked. The check asks the OVER-
+                # approximating question — is this name bound anywhere under the
+                # handler, by any binding form? — because enumerating the
+                # spellings a reviewer thinks of is how the previous version let
+                # ``match ... as exc`` and ``import x as exc`` through.
+                if node.name is not None and node.name in _names_bound_anywhere_in(node):
+                    violations.append(
+                        f"{where}: except TIER_1_ERRORS handler rebinds its caught name "
+                        f"'{node.name}' — a later `raise {node.name}` would no longer "
+                        f"re-raise the Tier-1 failure (rename the inner binding)"
                     )
 
         assert not violations, f"Re-raise guard violations found ({len(violations)}):\n" + "\n".join(f"  - {v}" for v in violations)
@@ -4868,17 +5842,13 @@ class TestReRaiseGuardPattern:
         import ast
         from pathlib import Path
 
+        from tests.helpers.tree_gate import iter_gate_sources
+
         src_root = Path("src/elspeth")
         count = 0
 
-        for py_file in sorted(src_root.rglob("*.py")):
-            source = py_file.read_text()
-            try:
-                tree = ast.parse(source, filename=str(py_file))
-            except SyntaxError:
-                continue
-
-            for node in ast.walk(tree):
+        for parsed in iter_gate_sources(src_root):
+            for node in ast.walk(parsed.tree):
                 if isinstance(node, ast.ExceptHandler) and _is_framework_audit_handler(node):
                     count += 1
 
@@ -4901,21 +5871,25 @@ class TestReRaiseGuardPattern:
 class TestTransformExecutorBatchPath:
     """Tests for the row-pipelined batch runtime path in TransformExecutor.
 
-    The executor has an entirely separate branch for transforms that implement
-    BatchTransformRuntimeProtocol: adapter creation, register(), accept(),
-    waiter.wait(), and timeout-eviction. These tests verify that branch at the
-    executor level.
+    The executor has an entirely separate branch for transforms that inherit
+    the nominal BatchTransformRuntime contract: adapter creation, register(),
+    accept(), waiter.wait(), and timeout-eviction. These tests verify that
+    branch at the executor level.
     """
 
-    def test_transform_executor_uses_contract_protocol_not_plugin_mixin_import(self) -> None:
+    def test_transform_executor_uses_contract_class_not_plugin_mixin_import(self) -> None:
         source = Path("src/elspeth/engine/executors/transform.py").read_text(encoding="utf-8")
 
         assert "elspeth.plugins.infrastructure.batching.mixin" not in source
-        assert "BatchTransformRuntimeProtocol" in source
+        assert "BatchTransformRuntime" in source
 
-    def test_batch_transform_mixin_satisfies_runtime_protocol(self) -> None:
-        from elspeth.contracts import BatchTransformRuntimeProtocol
+    def test_batch_transform_mixin_is_nominal_runtime_subclass(self) -> None:
+        """Dispatch is nominal (ADR-032): the mixin inherits BatchTransformRuntime,
+        and a structural look-alike that does NOT inherit it is refused."""
+        from elspeth.contracts import BatchTransformRuntime
         from elspeth.plugins.infrastructure.batching.mixin import BatchTransformMixin
+
+        assert issubclass(BatchTransformMixin, BatchTransformRuntime)
 
         class _ConcreteBatchTransform(BatchTransformMixin):
             def __init__(self) -> None:
@@ -4931,9 +5905,28 @@ class TestTransformExecutorBatchPath:
 
         transform = _ConcreteBatchTransform()
 
-        assert isinstance(transform, BatchTransformRuntimeProtocol)
+        assert isinstance(transform, BatchTransformRuntime)
         assert transform.batch_pool_size == 4
         assert transform.batch_wait_timeout == 2.5
+
+        class _StructuralImpostor:
+            """Implements every member structurally without inheriting."""
+
+            node_id = "node_batch"
+            batch_runtime_enabled = True
+            batch_pool_size = 4
+            batch_wait_timeout = 2.5
+
+            def accept(self, row: PipelineRow, ctx: Any) -> None:
+                pass
+
+            def connect_output(self, output: Any, max_pending: int = 30) -> None:
+                pass
+
+            def evict_submission(self, token_id: str, state_id: str) -> bool:
+                return True
+
+        assert not isinstance(_StructuralImpostor(), BatchTransformRuntime)
 
     # --- Helpers ---
 
@@ -4945,10 +5938,10 @@ class TestTransformExecutorBatchPath:
         pool_size: int = 5,
         batch_wait_timeout: float = 10.0,
     ) -> MagicMock:
-        """Create a mock transform that satisfies BatchTransformRuntimeProtocol.
+        """Create a mock transform that inherits the nominal batch runtime contract.
 
-        Uses spec on a real mixin subclass so protocol checks succeed while
-        all methods remain mockable.
+        Built on a real mixin subclass so nominal isinstance dispatch succeeds
+        while all methods remain mockable.
         """
         from elspeth.plugins.infrastructure.batching.mixin import BatchTransformMixin
 
@@ -5270,6 +6263,110 @@ def _is_framework_audit_handler(handler: object) -> bool:
     if isinstance(handler.type, ast.Name):
         return handler.type.id == "TIER_1_ERRORS"
     return isinstance(handler.type, ast.Attribute) and handler.type.attr == "TIER_1_ERRORS"
+
+
+def _handler_owned_nodes(handler: object) -> list[object]:
+    """Every node on an except handler's OWN path out, closures excluded.
+
+    A ``return`` or ``raise`` inside a ``def``/``lambda`` the handler happens
+    to declare belongs to that callable, not to the handler's control flow,
+    so descending into one would report a violation the handler never commits.
+    """
+    import ast
+
+    if not isinstance(handler, ast.ExceptHandler):
+        return []
+
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    owned: list[object] = []
+    # The seed is filtered too: a ``def`` declared directly in the handler body
+    # is as much someone else's control flow as one nested deeper, and skipping
+    # it only on the recursive step would attribute a closure's ``return`` to
+    # the handler that merely declares it.
+    stack: list[ast.AST] = [stmt for stmt in handler.body if not isinstance(stmt, nested)]
+    while stack:
+        node = stack.pop()
+        owned.append(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, nested):
+                continue
+            stack.append(child)
+    return owned
+
+
+def _handler_escaping_jumps(handler: object) -> list[object]:
+    """``break``/``continue`` statements that leave the handler without raising.
+
+    A jump bound to a loop the handler ITSELF opens is ordinary control flow.
+    One with no such loop around it binds to a loop outside the ``try``, so it
+    carries the Tier-1 failure out of the handler silently — and because the
+    handler can still END on a ``raise``, the last-statement check alone reads
+    green. ``return`` is covered separately; these are the other two ways out.
+    """
+    import ast
+
+    if not isinstance(handler, ast.ExceptHandler):
+        return []
+
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    loops = (ast.For, ast.AsyncFor, ast.While)
+    escaping: list[object] = []
+    # Each entry is (node, is a handler-internal loop already around it?).
+    stack: list[tuple[ast.AST, bool]] = [(stmt, False) for stmt in handler.body if not isinstance(stmt, nested)]
+    while stack:
+        node, enclosed = stack.pop()
+        if not enclosed and isinstance(node, (ast.Break, ast.Continue)):
+            escaping.append(node)
+        # Only a loop's BODY is covered by it. A jump in its ``else`` binds to
+        # an outer loop just as one written before the loop does, so ``orelse``
+        # (and the iterable/test) inherit the enclosing state unchanged.
+        covered = {id(child) for child in node.body} if isinstance(node, loops) else frozenset()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, nested):
+                continue
+            stack.append((child, enclosed or id(child) in covered))
+    return escaping
+
+
+def _names_bound_anywhere_in(handler: object) -> set[str]:
+    """Every name bound by any binding form anywhere under the handler.
+
+    Deliberately OVER-approximating: it descends into nested callables and
+    comprehensions whose own scope could not really touch the caught name, and
+    it enumerates binding FORMS rather than the two spellings that come to mind.
+    A gate that trusts ``raise <name>`` is only as sound as this set is
+    complete, and the cost of the two errors is not symmetric — an extra name
+    here is a loud failure the author fixes by renaming, while a missing form
+    is a silent escape (``match ... as exc`` and ``import x as exc`` both were).
+    """
+    import ast
+
+    if not isinstance(handler, ast.ExceptHandler):
+        return set()
+
+    bound: set[str] = set()
+    for node in ast.walk(handler):
+        if node is handler:
+            continue  # the ``except ... as exc`` clause is the binding we trust
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                bound.add(node.rest)
+        elif isinstance(node, ast.alias):
+            # ``import a.b`` binds ``a``; ``import a.b as c`` binds ``c``.
+            bound.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+    return bound
 
 
 # =============================================================================

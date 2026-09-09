@@ -1,0 +1,785 @@
+"""PostgreSQL proof for release-seat/takeover lock ordering (RC-04)."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, closing
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from sqlalchemy import event, func, insert, select, update
+from tests.fixtures.landscape import assert_stamped_between, expire_leader_seat, landscape_database_now, stamp_inside_next_transaction
+from tests.helpers.postgres_target import postgres_test_target
+from tests.helpers.run_coordination import register_run_leader
+from tests.helpers.state_engine import capture_state_engine_image
+
+from elspeth.contracts.coordination import (
+    CoordinationSnapshot,
+    CoordinationToken,
+    WorkerMembershipLost,
+    WorkerMembershipToken,
+    mint_worker_id,
+)
+from elspeth.core.checkpoint.recovery import NonResumableRunError
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.schema import run_coordination_events_table, run_coordination_table, run_workers_table, runs_table
+
+pytestmark = pytest.mark.testcontainer
+
+NOW = datetime(2026, 7, 23, tzinfo=UTC)
+RUN_ID = "release-seat-vs-takeover"
+
+
+@pytest.fixture(scope="module")
+def postgres_url() -> Iterator[str]:
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
+
+
+def _seed_run(db: LandscapeDB, *, run_id: str, now: datetime, status: str = "running") -> None:
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(runs_table).values(
+                run_id=run_id,
+                started_at=now,
+                config_hash="config",
+                settings_json="{}",
+                canonical_version="v1",
+                status=status,
+                openrouter_catalog_sha256="0" * 64,
+                openrouter_catalog_source="bundled",
+            )
+        )
+
+
+def _coordination_events(db: LandscapeDB, *, run_id: str) -> list[dict[str, object]]:
+    with db.read_only_connection() as conn:
+        rows = (
+            conn.execute(
+                select(run_coordination_events_table)
+                .where(run_coordination_events_table.c.run_id == run_id)
+                .order_by(run_coordination_events_table.c.seq)
+            )
+            .mappings()
+            .all()
+        )
+    return [dict(row) for row in rows]
+
+
+def _set_postgresql_transaction_timeouts(conn: Any) -> None:
+    conn.exec_driver_sql("SET LOCAL statement_timeout = '15000ms'")
+    conn.exec_driver_sql("SET LOCAL lock_timeout = '5000ms'")
+
+
+def _run_takeover_contenders(
+    first_db: LandscapeDB,
+    first: Callable[[], object],
+    second_db: LandscapeDB,
+    second: Callable[[], object],
+) -> tuple[object, object]:
+    release_update = threading.Event()
+    reached_update = {
+        "first": threading.Event(),
+        "second": threading.Event(),
+    }
+    outcomes: dict[str, object] = {}
+
+    def pause_before_seat_update(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        _params: Any,
+        _context: Any,
+        _many: bool,
+    ) -> None:
+        name = threading.current_thread().name
+        contender = {"first-takeover": "first", "second-takeover": "second"}.get(name)
+        if contender is None or reached_update[contender].is_set():
+            return
+        normalized = " ".join(statement.upper().split())
+        if normalized.startswith("UPDATE RUN_COORDINATION"):
+            reached_update[contender].set()
+            if not release_update.wait(timeout=15):
+                raise TimeoutError(f"{contender} takeover timed out at the pre-UPDATE race seam")
+
+    def invoke(name: str, operation: Callable[[], object]) -> None:
+        try:
+            outcomes[name] = operation()
+        except BaseException as exc:  # pragma: no cover - asserted by caller
+            outcomes[name] = exc
+
+    threads = (
+        threading.Thread(target=invoke, args=("first", first), name="first-takeover"),
+        threading.Thread(target=invoke, args=("second", second), name="second-takeover"),
+    )
+    engines = (first_db.engine, second_db.engine)
+    for engine in engines:
+        event.listen(engine, "begin", _set_postgresql_transaction_timeouts)
+        event.listen(engine, "before_cursor_execute", pause_before_seat_update)
+    started: list[threading.Thread] = []
+    teardown_failure: str | None = None
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+
+        deadline = time.monotonic() + 15
+        while not all(gate.is_set() for gate in reached_update.values()):
+            exited_early = [name for name, gate in reached_update.items() if name in outcomes and not gate.is_set()]
+            assert not exited_early, f"takeover contenders exited before the pre-UPDATE race seam: {exited_early!r}"
+            if time.monotonic() >= deadline:
+                missing = [name for name, gate in reached_update.items() if not gate.is_set()]
+                raise AssertionError(f"takeover contenders did not reach the pre-UPDATE race seam: {missing!r}")
+            time.sleep(0.01)
+
+        release_update.set()
+        for thread in threads:
+            thread.join(timeout=20)
+        assert all(not thread.is_alive() for thread in threads), "takeover contenders did not finish within the bounded wait"
+    finally:
+        release_update.set()
+        for thread in started:
+            thread.join(timeout=20)
+        alive = [thread.name for thread in started if thread.is_alive()]
+        if alive:
+            teardown_failure = f"takeover contender teardown remained live after bounded joins: {alive!r}"
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", pause_before_seat_update)
+            event.remove(engine, "begin", _set_postgresql_transaction_timeouts)
+    assert teardown_failure is None, teardown_failure
+    return outcomes["first"], outcomes["second"]
+
+
+@pytest.mark.timeout(120)
+def test_postgresql_initial_leader_registration_is_atomic(postgres_url: str) -> None:
+    """RC-01 seat, membership, and evidence roll back and commit together."""
+    now = datetime(2026, 8, 12, 6, 0, tzinfo=UTC)
+    run_id = "run-postgresql-register-atomic"
+    worker_id = mint_worker_id(run_id)
+    db = LandscapeDB.from_url(postgres_url)
+    repo = RunCoordinationRepository(db.engine)
+    _seed_run(db, run_id=run_id, now=now)
+    before = capture_state_engine_image(db, run_id=run_id)
+
+    def fail_first_evidence(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        _params: Any,
+        _context: Any,
+        _many: bool,
+    ) -> None:
+        if " ".join(statement.upper().split()).startswith("INSERT INTO RUN_COORDINATION_EVENTS"):
+            raise RuntimeError("forced PostgreSQL coordination evidence failure")
+
+    event.listen(db.engine, "before_cursor_execute", fail_first_evidence)
+    try:
+        with pytest.raises(RuntimeError, match="forced PostgreSQL coordination evidence failure"):
+            register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=30)
+    finally:
+        event.remove(db.engine, "before_cursor_execute", fail_first_evidence)
+
+    assert capture_state_engine_image(db, run_id=run_id) == before
+    registered_from = landscape_database_now(db.engine)
+    token = register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=30)
+    registered_until = landscape_database_now(db.engine)
+    try:
+        assert token == CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
+        with db.read_only_connection() as conn:
+            seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).mappings().one()
+            member = conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == worker_id)).mappings().one()
+        assert (seat["leader_worker_id"], seat["leader_epoch"]) == (worker_id, 1)
+        assert (member["run_id"], member["role"], member["status"]) == (run_id, "leader", "active")
+        # Both deadlines are the ONE database-time read of the registering
+        # transaction plus the window (ADR-047): identical, and inside the bracket.
+        assert seat["leader_heartbeat_expires_at"] == member["heartbeat_expires_at"]
+        assert_stamped_between(
+            seat["leader_heartbeat_expires_at"], start=registered_from, end=registered_until, offset=timedelta(seconds=30)
+        )
+        assert_stamped_between(seat["updated_at"], start=registered_from, end=registered_until)
+        assert_stamped_between(member["registered_at"], start=registered_from, end=registered_until)
+        events = _coordination_events(db, run_id=run_id)
+        assert [row["event_type"] for row in events] == ["worker_register", "leader_acquire"]
+        assert all(row["leader_epoch"] == 1 for row in events)
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_postgresql_takeover_excludes_exact_expiry_then_admits_after_boundary(postgres_url: str) -> None:
+    """RC-02 uses a strict-expiry conditional update at microsecond precision.
+
+    The CAS compares the seat against the Landscape database's transaction
+    time (ADR-047), so each boundary arm stamps the seat INSIDE the takeover's
+    own transaction from ``CURRENT_TIMESTAMP``: equal to it (not expired,
+    refused, rolled back with the refusal) and one microsecond before it
+    (strictly expired, admitted).
+    """
+    now = datetime(2026, 8, 12, 7, 0, tzinfo=UTC)
+    run_id = "run-postgresql-takeover-boundary"
+    incumbent_id = mint_worker_id(run_id)
+    db = LandscapeDB.from_url(postgres_url)
+    repo = RunCoordinationRepository(db.engine)
+    _seed_run(db, run_id=run_id, now=now, status="failed")
+    register_run_leader(repo, run_id=run_id, worker_id=incumbent_id, window_seconds=30)
+    before_equality = capture_state_engine_image(db, run_id=run_id)
+    equality_contender = mint_worker_id(run_id)
+    seat_deadline = update(run_coordination_table).where(run_coordination_table.c.run_id == run_id)
+
+    with (
+        stamp_inside_next_transaction(db.engine, seat_deadline.values(leader_heartbeat_expires_at=func.current_timestamp())),
+        pytest.raises(NonResumableRunError, match="run leadership is held by"),
+    ):
+        repo.acquire_run_leadership(
+            run_id=run_id,
+            worker_id=equality_contender,
+            window_seconds=30,
+        )
+    assert capture_state_engine_image(db, run_id=run_id) == before_equality
+
+    successor_id = mint_worker_id(run_id)
+    with stamp_inside_next_transaction(
+        db.engine, seat_deadline.values(leader_heartbeat_expires_at=func.current_timestamp() - timedelta(microseconds=1))
+    ):
+        token = repo.acquire_run_leadership(
+            run_id=run_id,
+            worker_id=successor_id,
+            window_seconds=30,
+        )
+    try:
+        assert token == CoordinationToken(run_id=run_id, worker_id=successor_id, leader_epoch=2)
+        with db.read_only_connection() as conn:
+            seat = conn.execute(
+                select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch).where(
+                    run_coordination_table.c.run_id == run_id
+                )
+            ).one()
+            workers: dict[str, str] = {
+                str(row["worker_id"]): str(row["status"])
+                for row in conn.execute(
+                    select(run_workers_table.c.worker_id, run_workers_table.c.status).where(run_workers_table.c.run_id == run_id)
+                ).mappings()
+            }
+        assert tuple(seat) == (successor_id, 2)
+        assert workers == {incumbent_id: "evicted", successor_id: "active"}
+        assert equality_contender not in workers
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_postgresql_concurrent_takeover_conditional_update_has_one_winner(postgres_url: str) -> None:
+    """Independent connections serialize on one expired seat without double epoch."""
+    now = datetime(2026, 8, 12, 8, 0, tzinfo=UTC)
+    run_id = "run-postgresql-concurrent-takeover"
+    incumbent_id = mint_worker_id(run_id)
+    first_id = mint_worker_id(run_id)
+    second_id = mint_worker_id(run_id)
+    with ExitStack() as resources:
+        first_db = LandscapeDB.from_url(postgres_url)
+        resources.callback(first_db.close)
+        second_db = LandscapeDB.from_url(postgres_url)
+        resources.callback(second_db.close)
+        _seed_run(first_db, run_id=run_id, now=now, status="failed")
+        register_run_leader(
+            RunCoordinationRepository(first_db.engine),
+            run_id=run_id,
+            worker_id=incumbent_id,
+            window_seconds=30,
+        )
+        expire_leader_seat(first_db, run_id)
+        outcomes = _run_takeover_contenders(
+            first_db,
+            lambda: RunCoordinationRepository(first_db.engine).acquire_run_leadership(
+                run_id=run_id,
+                worker_id=first_id,
+                window_seconds=30,
+            ),
+            second_db,
+            lambda: RunCoordinationRepository(second_db.engine).acquire_run_leadership(
+                run_id=run_id,
+                worker_id=second_id,
+                window_seconds=30,
+            ),
+        )
+        winners = [outcome for outcome in outcomes if isinstance(outcome, CoordinationToken)]
+        losers = [outcome for outcome in outcomes if isinstance(outcome, NonResumableRunError)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        winner = winners[0]
+        with first_db.read_only_connection() as conn:
+            seat = conn.execute(
+                select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch).where(
+                    run_coordination_table.c.run_id == run_id
+                )
+            ).one()
+            workers: dict[str, str] = {
+                str(row["worker_id"]): str(row["status"])
+                for row in conn.execute(
+                    select(run_workers_table.c.worker_id, run_workers_table.c.status).where(run_workers_table.c.run_id == run_id)
+                ).mappings()
+            }
+        assert tuple(seat) == (winner.worker_id, 2)
+        assert workers == {incumbent_id: "evicted", winner.worker_id: "active"}
+        assert len(_coordination_events(first_db, run_id=run_id)) == 5
+
+
+@pytest.mark.timeout(120)
+def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(postgres_url: str) -> None:
+    """RC-03 heartbeat keeps one active PostgreSQL leader live at equality.
+
+    The beat's transaction finds both deadlines EQUAL to its own transaction
+    time (stamped inside it from ``CURRENT_TIMESTAMP``) and moves both to
+    database time + window in one read (ADR-047), without an event.
+    """
+    now = datetime(2026, 8, 12, 9, 0, tzinfo=UTC)
+    run_id = "run-postgresql-active-heartbeat"
+    worker_id = mint_worker_id(run_id)
+    db = LandscapeDB.from_url(postgres_url)
+    repo = RunCoordinationRepository(db.engine)
+    _seed_run(db, run_id=run_id, now=now, status="failed")
+    token = register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=5)
+    events_before = _coordination_events(db, run_id=run_id)
+
+    at_equality = (
+        update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=func.current_timestamp())
+    )
+    beat_from = landscape_database_now(db.engine)
+    with stamp_inside_next_transaction(db.engine, at_equality):
+        snapshot = repo.worker_heartbeat(member_token=token.membership, window_seconds=5)
+    beat_until = landscape_database_now(db.engine)
+    try:
+        assert snapshot.worker_active is True
+        assert snapshot.leader_worker_id == worker_id
+        assert snapshot.leader_epoch == 1
+        assert snapshot.seat_live is True
+        with db.read_only_connection() as conn:
+            seat_expiry = conn.execute(
+                select(run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id)
+            ).scalar_one()
+            worker_expiry = conn.execute(
+                select(run_workers_table.c.heartbeat_expires_at).where(run_workers_table.c.worker_id == worker_id)
+            ).scalar_one()
+        assert seat_expiry == worker_expiry
+        assert_stamped_between(seat_expiry, start=beat_from, end=beat_until, offset=timedelta(seconds=5))
+        assert _coordination_events(db, run_id=run_id) == events_before
+
+        with pytest.raises(NonResumableRunError, match="run leadership is held by"):
+            repo.acquire_run_leadership(
+                run_id=run_id,
+                worker_id=mint_worker_id(run_id),
+                window_seconds=30,
+            )
+        assert _coordination_events(db, run_id=run_id) == events_before
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgres_url: str) -> None:
+    """RC-06: departure is terminal for the worker identity on PostgreSQL."""
+    now = datetime(2026, 8, 12, 9, 30, tzinfo=UTC)
+    run_id = "run-postgresql-follower-departure"
+    leader_id = "leader-follower-departure"
+    follower_id = "follower-departure"
+    db = LandscapeDB.from_url(postgres_url)
+    try:
+        repo = RunCoordinationRepository(db.engine)
+        _seed_run(db, run_id=run_id, now=now)
+        register_run_leader(repo, run_id=run_id, worker_id=leader_id, window_seconds=30)
+        follower = repo.admit_follower(
+            run_id=run_id,
+            worker_id=follower_id,
+            config_hash="config",
+            window_seconds=30,
+        )
+        with db.read_only_connection() as conn:
+            follower_before = dict(
+                conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == follower_id)).mappings().one()
+            )
+        events_before = _coordination_events(db, run_id=run_id)
+
+        departed_from = landscape_database_now(db.engine)
+        repo.depart_worker(member_token=follower)
+        departed_until = landscape_database_now(db.engine)
+
+        with db.read_only_connection() as conn:
+            follower_after = dict(
+                conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == follower_id)).mappings().one()
+            )
+        departed_at = follower_after["departed_at"]
+        assert_stamped_between(departed_at, start=departed_from, end=departed_until)
+        expected_follower = dict(follower_before)
+        expected_follower["status"] = "departed"
+        expected_follower["departed_at"] = departed_at
+        assert follower_after == expected_follower
+        events_after_depart = _coordination_events(db, run_id=run_id)
+        assert events_after_depart[:-1] == events_before
+        depart_event = events_after_depart[-1]
+        assert (
+            depart_event["event_type"],
+            depart_event["worker_id"],
+            depart_event["leader_epoch"],
+            depart_event["recorded_at"],
+            depart_event["context_json"],
+        ) == ("worker_depart", follower_id, None, departed_at, "{}")
+        departed_image = capture_state_engine_image(db, run_id=run_id)
+
+        snapshot = repo.worker_heartbeat(
+            member_token=follower,
+            window_seconds=30,
+        )
+
+        assert snapshot == WorkerMembershipLost(member_token=follower)
+        # Zero mutation on PostgreSQL too: the departed row and the seat are
+        # byte-identical; the only new row is the membership fence's refusal
+        # evidence (leader_epoch NULL — a member holds no epoch).
+        events_after_beat = _coordination_events(db, run_id=run_id)
+        assert events_after_beat[:-1] == events_after_depart
+        refusal = events_after_beat[-1]
+        assert (refusal["event_type"], refusal["worker_id"], refusal["leader_epoch"]) == ("fence_refusal", follower_id, None)
+        assert json.loads(str(refusal["context_json"])) == {"fence": "membership", "verb": "worker_heartbeat"}
+        assert departed_image.diff(capture_state_engine_image(db, run_id=run_id)).changed_tables == {"run_coordination_events"}
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url: str) -> None:
+    """A release racing a takeover completes or loses silently, never deadlocks."""
+    db = LandscapeDB.from_url(postgres_url)
+    repo = RunCoordinationRepository(db.engine)
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(runs_table).values(
+                run_id=RUN_ID,
+                started_at=NOW,
+                config_hash="config",
+                settings_json="{}",
+                canonical_version="v1",
+                status="failed",
+                openrouter_catalog_sha256="0" * 64,
+                openrouter_catalog_source="bundled",
+            )
+        )
+    incumbent_id = mint_worker_id(RUN_ID)
+    token = register_run_leader(repo, run_id=RUN_ID, worker_id=incumbent_id, window_seconds=30)
+    expire_leader_seat(db, RUN_ID)  # the takeover arm needs an expired seat; the release arm ignores expiry
+    successor_id = mint_worker_id(RUN_ID)
+
+    release_has_first_lock = threading.Event()
+    release_attempting_seat = threading.Event()
+    acquire_attempting_seat = threading.Event()
+    acquire_has_seat = threading.Event()
+    allow_release = threading.Event()
+    allow_acquire = threading.Event()
+    release_lock_kind: list[str] = []
+    outcomes: dict[str, object] = {}
+
+    def before_sql(_conn: Any, _cursor: Any, statement: str, _params: Any, _context: Any, _many: bool) -> None:
+        normalized = " ".join(statement.upper().split())
+        name = threading.current_thread().name
+        if name == "release" and normalized.startswith("UPDATE RUN_COORDINATION"):
+            release_attempting_seat.set()
+        elif name == "acquire" and normalized.startswith("UPDATE RUN_COORDINATION"):
+            acquire_attempting_seat.set()
+
+    def after_sql(_conn: Any, _cursor: Any, statement: str, _params: Any, _context: Any, _many: bool) -> None:
+        normalized = " ".join(statement.upper().split())
+        name = threading.current_thread().name
+        if name == "release" and not release_lock_kind:
+            if normalized.startswith("SELECT") and "FROM RUN_WORKERS" in normalized and "FOR UPDATE" in normalized:
+                release_lock_kind.append("membership")
+            elif normalized.startswith("UPDATE RUN_COORDINATION"):
+                release_lock_kind.append("seat")
+            if release_lock_kind:
+                release_has_first_lock.set()
+                if not allow_release.wait(timeout=30):
+                    raise TimeoutError("release interleaving gate timed out")
+        elif name == "acquire" and normalized.startswith("UPDATE RUN_COORDINATION"):
+            acquire_has_seat.set()
+            if not allow_acquire.wait(timeout=30):
+                raise TimeoutError("acquire interleaving gate timed out")
+
+    event.listen(db.engine, "before_cursor_execute", before_sql)
+    event.listen(db.engine, "after_cursor_execute", after_sql)
+
+    def release() -> None:
+        try:
+            repo.release_seat(token=token)
+            outcomes["release"] = "returned"
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcomes["release"] = exc
+
+    def acquire() -> None:
+        try:
+            outcomes["acquire"] = repo.acquire_run_leadership(
+                run_id=RUN_ID,
+                worker_id=successor_id,
+                window_seconds=30,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcomes["acquire"] = exc
+
+    release_thread = threading.Thread(target=release, name="release")
+    acquire_thread = threading.Thread(target=acquire, name="acquire")
+    try:
+        release_thread.start()
+        assert release_has_first_lock.wait(timeout=30), "release never acquired its first coordination lock"
+        acquire_thread.start()
+        assert acquire_attempting_seat.wait(timeout=30), "takeover never attempted its seat CAS"
+
+        if release_lock_kind == ["membership"]:
+            assert acquire_has_seat.wait(timeout=30), "takeover never acquired the seat behind membership-first release"
+            allow_release.set()
+            assert release_attempting_seat.wait(timeout=30), "release never attempted the seat behind takeover"
+            allow_acquire.set()
+        else:
+            assert release_lock_kind == ["seat"]
+            allow_release.set()
+            assert acquire_has_seat.wait(timeout=30), "takeover never acquired the seat after release committed"
+            allow_acquire.set()
+
+        release_thread.join(timeout=60)
+        acquire_thread.join(timeout=60)
+        assert not release_thread.is_alive() and not acquire_thread.is_alive(), "coordination race threads wedged"
+    finally:
+        allow_release.set()
+        allow_acquire.set()
+        if release_thread.ident is not None:
+            release_thread.join(timeout=30)
+        if acquire_thread.ident is not None:
+            acquire_thread.join(timeout=30)
+        event.remove(db.engine, "before_cursor_execute", before_sql)
+        event.remove(db.engine, "after_cursor_execute", after_sql)
+
+    try:
+        assert outcomes["release"] == "returned"
+        acquired = outcomes["acquire"]
+        assert isinstance(acquired, CoordinationToken), f"takeover returned {acquired!r}"
+        assert acquired.worker_id == successor_id
+        with db.engine.connect() as conn:
+            seat = conn.execute(
+                select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch).where(
+                    run_coordination_table.c.run_id == RUN_ID
+                )
+            ).one()
+            workers: dict[str, str] = {
+                str(row["worker_id"]): str(row["status"])
+                for row in conn.execute(
+                    select(run_workers_table.c.worker_id, run_workers_table.c.status).where(run_workers_table.c.run_id == RUN_ID)
+                ).mappings()
+            }
+        assert tuple(seat) == (successor_id, 2)
+        assert workers == {incumbent_id: "departed", successor_id: "active"}
+    finally:
+        db.close()
+
+
+_MEMBERSHIP_RACE_REPETITIONS = 8
+
+
+def _seed_run_with_follower(db: LandscapeDB, *, run_id: str) -> WorkerMembershipToken:
+    """A RUNNING run with a live leader seat and one admitted follower."""
+    _seed_run(db, run_id=run_id, now=NOW, status="running")
+    repo = RunCoordinationRepository(db.engine)
+    register_run_leader(repo, run_id=run_id, worker_id=mint_worker_id(run_id), window_seconds=300)
+    return repo.admit_follower(
+        run_id=run_id,
+        worker_id=mint_worker_id(run_id),
+        config_hash="config",
+        window_seconds=300,
+    )
+
+
+def _race_two_member_writers(
+    first_db: LandscapeDB,
+    first: Callable[[], object],
+    second_db: LandscapeDB,
+    second: Callable[[], object],
+) -> tuple[object, object]:
+    """Hold both threads at their membership verify-UPDATE, then release together.
+
+    The seam is the fence's own statement, so both writers have opened their
+    IMMEDIATE transaction and are about to contend for the SAME ``run_workers``
+    row. Under the D7 verify-UPDATE form one of them takes the row lock and the
+    other blocks until it commits; under a snapshot-only EXISTS predicate both
+    would read ``active`` and proceed. That difference is invisible on SQLite,
+    where one writer runs at a time regardless.
+    """
+    release = threading.Event()
+    reached = {"first": threading.Event(), "second": threading.Event()}
+    outcomes: dict[str, object] = {}
+
+    def pause_before_membership_update(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        _params: Any,
+        _context: Any,
+        _many: bool,
+    ) -> None:
+        contender = {"first-member": "first", "second-member": "second"}.get(threading.current_thread().name)
+        if contender is None or reached[contender].is_set():
+            return
+        normalized = " ".join(statement.upper().split())
+        if normalized.startswith("UPDATE RUN_WORKERS"):
+            reached[contender].set()
+            if not release.wait(timeout=15):
+                raise TimeoutError(f"{contender} timed out at the pre-fence race seam")
+
+    def invoke(name: str, operation: Callable[[], object]) -> None:
+        try:
+            outcomes[name] = operation()
+        except BaseException as exc:  # pragma: no cover - asserted by the caller
+            outcomes[name] = exc
+
+    threads = (
+        threading.Thread(target=invoke, args=("first", first), name="first-member"),
+        threading.Thread(target=invoke, args=("second", second), name="second-member"),
+    )
+    engines = (first_db.engine, second_db.engine)
+    for engine in engines:
+        event.listen(engine, "begin", _set_postgresql_transaction_timeouts)
+        event.listen(engine, "before_cursor_execute", pause_before_membership_update)
+    started: list[threading.Thread] = []
+    teardown_failure: str | None = None
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+        deadline = time.monotonic() + 15
+        while not all(gate.is_set() for gate in reached.values()):
+            exited_early = [name for name, gate in reached.items() if name in outcomes and not gate.is_set()]
+            assert not exited_early, f"member writers exited before the pre-fence race seam: {exited_early!r}"
+            if time.monotonic() >= deadline:
+                missing = [name for name, gate in reached.items() if not gate.is_set()]
+                raise AssertionError(f"member writers did not reach the pre-fence race seam: {missing!r}")
+            time.sleep(0.01)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=20)
+        assert all(not thread.is_alive() for thread in threads), "member writers did not finish within the bounded wait"
+    finally:
+        release.set()
+        for thread in started:
+            thread.join(timeout=20)
+        alive = [thread.name for thread in started if thread.is_alive()]
+        if alive:
+            teardown_failure = f"member writer teardown remained live after bounded joins: {alive!r}"
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", pause_before_membership_update)
+            event.remove(engine, "begin", _set_postgresql_transaction_timeouts)
+    assert teardown_failure is None, teardown_failure
+    return outcomes["first"], outcomes["second"]
+
+
+@pytest.mark.timeout(300)
+def test_postgresql_two_concurrent_departs_serialise_on_the_membership_fence(postgres_url: str) -> None:
+    """ADR-030 D4's second fence under real contention: exactly one departure wins.
+
+    Both threads hold the SAME valid ``WorkerMembershipToken`` and both fence on
+    the same ``run_workers`` row. The row lock the verify-UPDATE takes is what
+    makes the loser see ``departed`` rather than the ``active`` its own snapshot
+    began with, so the contract is: one ``worker_depart`` event, one
+    ``fence_refusal``, and NEITHER thread raising.
+
+    Repeated because a race cannot be told from luck in a single pass; each
+    repetition gets its own run so no state carries between them.
+    """
+    for repetition in range(_MEMBERSHIP_RACE_REPETITIONS):
+        run_id = f"member-fence-depart-race-{repetition}"
+        with ExitStack() as stack:
+            db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            first_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            second_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            member = _seed_run_with_follower(db, run_id=run_id)
+            first_repo = RunCoordinationRepository(first_db.engine)
+            second_repo = RunCoordinationRepository(second_db.engine)
+
+            def _depart_first(repo: RunCoordinationRepository = first_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.depart_worker(member_token=token)
+
+            def _depart_second(repo: RunCoordinationRepository = second_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.depart_worker(member_token=token)
+
+            first, second = _race_two_member_writers(first_db, _depart_first, second_db, _depart_second)
+
+            for name, outcome in (("first", first), ("second", second)):
+                assert not isinstance(outcome, BaseException), (
+                    f"repetition {repetition}: {name} depart raised {type(outcome).__name__}: {outcome!r} — "
+                    "the membership fence reifies its refusal as a no-op and must never surface a database error"
+                )
+            events = _coordination_events(db, run_id=run_id)
+            departs = [e for e in events if e["event_type"] == "worker_depart"]
+            refusals = [e for e in events if e["event_type"] == "fence_refusal"]
+            assert len(departs) == 1, f"repetition {repetition}: expected exactly one worker_depart, got {len(departs)}"
+            assert len(refusals) == 1, f"repetition {repetition}: expected exactly one fence_refusal, got {len(refusals)}"
+            assert json.loads(str(refusals[0]["context_json"])) == {"fence": "membership", "verb": "depart_worker"}
+            assert refusals[0]["leader_epoch"] is None, "a member holds no epoch"
+            with db.engine.connect() as conn:
+                status = conn.execute(
+                    select(run_workers_table.c.status).where(run_workers_table.c.worker_id == member.worker_id)
+                ).scalar_one()
+            assert status == "departed", f"repetition {repetition}: the row ended {status!r}"
+
+
+@pytest.mark.timeout(300)
+def test_postgresql_heartbeat_racing_depart_never_leaves_a_departed_member_live(postgres_url: str) -> None:
+    """A beat and a departure contend for one row; the row never ends ``active``.
+
+    The dangerous interleaving is the beat committing its liveness extension
+    AFTER the departure, which would leave a departed identity looking fresh to
+    the leader's housekeeping sweep. The membership fence's row lock forbids it:
+    whichever writer takes the lock first, the other fences against the
+    committed state, not against its own opening snapshot.
+    """
+    for repetition in range(_MEMBERSHIP_RACE_REPETITIONS):
+        run_id = f"member-fence-beat-depart-race-{repetition}"
+        with ExitStack() as stack:
+            db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            beat_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            depart_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            member = _seed_run_with_follower(db, run_id=run_id)
+            beat_repo = RunCoordinationRepository(beat_db.engine)
+            depart_repo = RunCoordinationRepository(depart_db.engine)
+
+            def _beat(repo: RunCoordinationRepository = beat_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.worker_heartbeat(member_token=token, window_seconds=300)
+
+            def _depart(repo: RunCoordinationRepository = depart_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.depart_worker(member_token=token)
+
+            beat, departed = _race_two_member_writers(beat_db, _beat, depart_db, _depart)
+
+            for name, outcome in (("heartbeat", beat), ("depart", departed)):
+                assert not isinstance(outcome, BaseException), (
+                    f"repetition {repetition}: {name} raised {type(outcome).__name__}: {outcome!r}"
+                )
+            with db.engine.connect() as conn:
+                status = conn.execute(
+                    select(run_workers_table.c.status).where(run_workers_table.c.worker_id == member.worker_id)
+                ).scalar_one()
+            assert status == "departed", (
+                f"repetition {repetition}: the member ended {status!r} — a beat must never revive or hold open a departed membership"
+            )
+            events = _coordination_events(db, run_id=run_id)
+            assert len([e for e in events if e["event_type"] == "worker_depart"]) == 1
+            beat_refusals = [
+                e for e in events if e["event_type"] == "fence_refusal" and json.loads(str(e["context_json"]))["verb"] == "worker_heartbeat"
+            ]
+            # Whichever order the lock granted: a beat that fenced FIRST reports
+            # active and leaves no refusal; a beat that fenced after the commit
+            # is refused and leaves exactly one. Both are correct; a beat that
+            # reported active AFTER the departure committed would be neither.
+            if isinstance(beat, CoordinationSnapshot):
+                assert beat.worker_active
+                assert beat_refusals == [], "a beat that won the lock must not also record a refusal"
+            else:
+                assert beat == WorkerMembershipLost(member_token=member)
+                assert len(beat_refusals) == 1, "a refused beat records exactly one fence_refusal"

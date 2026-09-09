@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC
 from typing import TYPE_CHECKING
 
+from tests.fixtures.landscape import leader_coordination_token
+
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 
@@ -310,7 +312,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.COMPLETED)
+        factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         loaded = factory.run_lifecycle.get_run(run.run_id)
 
@@ -331,7 +333,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.PENDING)
+        factory.run_lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=leader_coordination_token(factory, run.run_id))
 
         runs = factory.run_lifecycle.list_runs()
 
@@ -352,13 +354,15 @@ class TestExportStatusEnumCoercion:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         # First fail with an error
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.FAILED, error="export failed")
+        factory.run_lifecycle.set_export_status(
+            ExportStatus.FAILED, error="export failed", coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         r1 = factory.run_lifecycle.get_run(run.run_id)
         assert r1 is not None
         assert r1.export_error == "export failed"
 
         # Now complete - error should be cleared
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.COMPLETED)
+        factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
         r2 = factory.run_lifecycle.get_run(run.run_id)
         assert r2 is not None
         assert r2.export_error is None, f"export_error should be cleared on completed, got {r2.export_error!r}"
@@ -375,10 +379,12 @@ class TestExportStatusEnumCoercion:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         # First fail with an error
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.FAILED, error="export failed")
+        factory.run_lifecycle.set_export_status(
+            ExportStatus.FAILED, error="export failed", coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         # Now set to pending - error should be cleared
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.PENDING)
+        factory.run_lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=leader_coordination_token(factory, run.run_id))
         r = factory.run_lifecycle.get_run(run.run_id)
         assert r is not None
         assert r.export_error is None
@@ -395,7 +401,7 @@ class TestExportStatusEnumCoercion:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         # Pass enum directly
-        factory.run_lifecycle.set_export_status(run.run_id, ExportStatus.COMPLETED)
+        factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         r = factory.run_lifecycle.get_run(run.run_id)
         assert r is not None

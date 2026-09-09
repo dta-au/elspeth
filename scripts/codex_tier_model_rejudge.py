@@ -195,7 +195,7 @@ class _ScopeIndex:
                 def walk(node: ast.AST, prefix: list[str]) -> None:
                     for ch in ast.iter_child_nodes(node):
                         if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                            spans.append((ch.lineno, getattr(ch, "end_lineno", ch.lineno), [*prefix, ch.name]))
+                            spans.append((ch.lineno, ch.end_lineno or ch.lineno, [*prefix, ch.name]))
                             walk(ch, [*prefix, ch.name])
                         else:
                             walk(ch, prefix)

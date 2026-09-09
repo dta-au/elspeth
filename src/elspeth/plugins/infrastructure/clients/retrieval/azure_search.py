@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 _AZURE_SEARCH_MANAGED_IDENTITY_SUFFIX = ".search.windows.net"
 _AZURE_SEARCH_TOKEN_SCOPE = "https://search.azure.com/.default"
 
+AzureSearchAuthMode = Literal["api_key", "managed_identity"]
+
 
 class _ManagedIdentityCredential(Protocol):
     def get_token(self, *scopes: str) -> Any:
@@ -55,6 +57,7 @@ class AzureSearchProviderConfig(BaseModel):
     endpoint: str
     index: str
 
+    auth_mode: AzureSearchAuthMode | None = None
     api_key: str | None = None
     use_managed_identity: bool = False
     api_version: str = "2024-07-01"
@@ -123,6 +126,10 @@ class AzureSearchProviderConfig(BaseModel):
                     f"{_AZURE_SEARCH_MANAGED_IDENTITY_SUFFIX!r}; use api_key auth or add an operator-controlled "
                     "endpoint allowlist before enabling managed identity for other hosts"
                 )
+        inferred_mode: AzureSearchAuthMode = "managed_identity" if self.use_managed_identity else "api_key"
+        if self.auth_mode is not None and self.auth_mode != inferred_mode:
+            raise ValueError(f"auth_mode {self.auth_mode!r} does not match configured authentication method {inferred_mode!r}")
+        object.__setattr__(self, "auth_mode", inferred_mode)
         return self
 
     @model_validator(mode="after")

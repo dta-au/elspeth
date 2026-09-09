@@ -135,9 +135,10 @@ class ToolDeclaration:
         augments_on_failure: True if a failure result from this tool should be
             decorated with inline plugin schemas via
             ``build_plugin_schemas_for_failure``. Set on mutation tools that
-            route through ``_prevalidate_plugin_options`` and therefore emit
-            ``Invalid options for <kind> '<plugin>'`` rejection messages the
-            augmentation walker can parse. Closing the SSOT loop — previously
+            route through ``_prevalidate_plugin_options`` and therefore
+            build rejections stamped with ``ValidationEntry.plugin_identity``,
+            the structural fact the augmentation reads (never the message
+            text). Closing the SSOT loop — previously
             this was a shadow ``Final[frozenset[str]]`` in ``_common.py`` that
             would have drifted on rename. Only meaningful for ``MUTATION`` /
             ``BLOB_MUTATION`` (DISCOVERY tools never write plugin config to
@@ -301,10 +302,11 @@ def derive_cacheable_names(tools: Iterable[ToolDeclaration]) -> frozenset[str]:
     """Return the names of declarations marked cacheable.
 
     Today only ``DISCOVERY``-kind tools may set ``cacheable=True``; the
-    ``ToolDeclaration`` constructor enforces this. ``discovery.py`` separately
-    asserts the cacheable set is a subset of the discovery name-set and
-    disjoint from the session-mutable forbidden set; this derivation feeds
-    those assertions during the migration.
+    ``ToolDeclaration`` constructor enforces this. ``_registry.py`` separately
+    asserts the cacheable set is a subset of the discovery name-set. (It no
+    longer asserts disjointness from the session-mutable set: that set is the
+    subtraction complement of this one, so the two are disjoint by
+    construction and the check could never fire — elspeth-235861ee32.)
     """
     return frozenset(decl.name for decl in tools if decl.cacheable)
 

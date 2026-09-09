@@ -66,9 +66,19 @@ class TelemetryTestExporter:
             if type(event).__name__ != type_name:
                 continue
 
+            # ``TelemetryEvent`` is a frozen slots dataclass whose owned
+            # ``to_dict()`` accessor keys by declared field name, so filters
+            # resolve through an explicit mapping rather than by attribute
+            # probe. An unknown filter key is a typo in the caller and is
+            # reported as such, instead of silently reading ``None`` and
+            # degrading into a confusing "no matching event" failure.
+            field_values = event.to_dict() if filters else {}
+            unknown_keys = sorted(set(filters) - set(field_values))
+            assert not unknown_keys, f"{type_name} declares no field(s) {unknown_keys}; declared fields: {sorted(field_values)}"
+
             all_match = True
             for key, expected in filters.items():
-                actual = getattr(event, key, None)
+                actual = field_values[key]
                 if isinstance(actual, Enum):
                     actual = actual.value
                 if isinstance(expected, Enum):

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any, cast
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.errors import FailedTurnMetadata
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ComposerRuntimePreflightError
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -20,8 +21,21 @@ _PLUGIN_SNAPSHOT = PluginAvailabilitySnapshot.for_trained_operator(_CATALOG)
 _PROFILE_REGISTRY = MagicMock(spec=OperatorProfileRegistry)
 
 
+def _compose_context(session_id: UUID) -> SessionOperationContext:
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=str(session_id),
+            operation_id="operation_1",
+            lease_token="lease_1",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_convergence_error_returns_failed_turn() -> None:
+    session_id = uuid4()
     failed_turn = FailedTurnMetadata(
         assistant_message_id="assistant_1",
         tool_calls_attempted=2,
@@ -30,7 +44,7 @@ async def test_handle_convergence_error_returns_failed_turn() -> None:
     body = await _handle_convergence_error(
         ComposerConvergenceError(3, failed_turn=failed_turn),
         service=cast(Any, object()),
-        session_id=uuid4(),
+        session_id=session_id,
         user_id="user_1",
         log_prefix="test",
         llm_composition_state_id=None,
@@ -39,6 +53,7 @@ async def test_handle_convergence_error_returns_failed_turn() -> None:
         plugin_snapshot=_PLUGIN_SNAPSHOT,
         profile_registry=_PROFILE_REGISTRY,
         catalog=_CATALOG,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert body["failed_turn"] == {
@@ -51,6 +66,7 @@ async def test_handle_convergence_error_returns_failed_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_plugin_crash_returns_failed_turn() -> None:
+    session_id = uuid4()
     failed_turn = FailedTurnMetadata(
         assistant_message_id="assistant_2",
         tool_calls_attempted=3,
@@ -59,7 +75,7 @@ async def test_handle_plugin_crash_returns_failed_turn() -> None:
     body = await _handle_plugin_crash(
         ComposerPluginCrashError(RuntimeError("boom"), failed_turn=failed_turn),
         service=cast(Any, object()),
-        session_id=uuid4(),
+        session_id=session_id,
         user_id="user_1",
         log_prefix="test",
         llm_composition_state_id=None,
@@ -68,6 +84,7 @@ async def test_handle_plugin_crash_returns_failed_turn() -> None:
         plugin_snapshot=_PLUGIN_SNAPSHOT,
         profile_registry=_PROFILE_REGISTRY,
         catalog=_CATALOG,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert body["failed_turn"] == {
@@ -80,6 +97,8 @@ async def test_handle_plugin_crash_returns_failed_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_plugin_crash_counts_persisted_tool_responses() -> None:
+    session_id = uuid4()
+
     class _CountingService:
         async def count_tool_responses_for_assistant_async(
             self,
@@ -99,7 +118,7 @@ async def test_handle_plugin_crash_counts_persisted_tool_responses() -> None:
     body = await _handle_plugin_crash(
         ComposerPluginCrashError(RuntimeError("boom"), failed_turn=failed_turn),
         service=cast(Any, _CountingService()),
-        session_id=uuid4(),
+        session_id=session_id,
         user_id="user_1",
         log_prefix="test",
         llm_composition_state_id=None,
@@ -108,6 +127,7 @@ async def test_handle_plugin_crash_counts_persisted_tool_responses() -> None:
         plugin_snapshot=_PLUGIN_SNAPSHOT,
         profile_registry=_PROFILE_REGISTRY,
         catalog=_CATALOG,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert body["failed_turn"] == {
@@ -120,6 +140,7 @@ async def test_handle_plugin_crash_counts_persisted_tool_responses() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_runtime_preflight_failure_returns_failed_turn() -> None:
+    session_id = uuid4()
     failed_turn = FailedTurnMetadata(
         assistant_message_id=None,
         tool_calls_attempted=1,
@@ -132,7 +153,7 @@ async def test_handle_runtime_preflight_failure_returns_failed_turn() -> None:
             failed_turn=failed_turn,
         ),
         service=cast(Any, object()),
-        session_id=uuid4(),
+        session_id=session_id,
         user_id="user_1",
         log_prefix="test",
         llm_composition_state_id=None,
@@ -141,6 +162,7 @@ async def test_handle_runtime_preflight_failure_returns_failed_turn() -> None:
         plugin_snapshot=_PLUGIN_SNAPSHOT,
         profile_registry=_PROFILE_REGISTRY,
         catalog=_CATALOG,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert body["failed_turn"] == {

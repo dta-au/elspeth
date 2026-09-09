@@ -88,9 +88,31 @@ coordination event in the same transaction as the attempt rotation, so the
 rotation is reconstructable from the ledger.
 
 In N>1, `recover_expired_leases` is **leader-only and epoch-fenced**
-(`scheduler_repository.py:1279`): only the elected leader reaps, which gives
+(`scheduler/leases.py:439`, reached through the `scheduler_repository.py:380`
+facade): only the elected leader reaps, which gives
 every attempt rotation a single attributable author and avoids an
 O(workers²) sweep storm.
+
+#### Long plugin calls and the external replay boundary
+
+The hard stall budget is an intentional takeover boundary, even when the old
+worker's process heartbeat remains live. If a synchronous transform call is
+still running when the leader rotates its item, a replacement worker may run
+the same logical transform attempt. When the old call later returns or raises,
+the drain performs a post-call item heartbeat: the missing/reassigned attempt
+records `lease_lost` and the old worker abandons both its result and scheduler
+disposition. Exactly one claimant can therefore commit the internal
+`mark_*` transition.
+
+That fence does not transact with work the plugin already performed outside
+the Landscape database. `IO_WRITE` and `EXTERNAL_CALL` transforms are
+**at-least-once across item takeover**: one rotation can produce one call from
+the old claimant and one replay by its replacement, and repeated stalls can
+produce further attempts. Such plugins must use a provider/application
+idempotency key, reconcile an already-applied effect, or move publication to a
+supported durable sink-effect boundary. `worker_stalled` plus `lease_lost`
+explains the internal winner/loser sequence; neither event proves that an
+external effect happened only once.
 
 **Two design notes that bite operators in incidents:**
 
@@ -558,9 +580,14 @@ recovery, source-position recovery) and continues the run.
 **Followers during a leader death** idle and then exit; they **never
 auto-promote** (ADR-030 D3). A follower that observes a dead seat finishes or
 abandons its current item, takes no new claims, departs cleanly, and exits
-with `FollowerSeatDeadError` (CLI exit code 2 — "no live leader; use `elspeth
-resume`", `follower.py:320-322`, `cli.py:2591-2612`). Takeover requires the
-full resume reconstruction, which only `elspeth resume` performs.
+with `FollowerSeatDeadError` (CLI exit code 2). The CLI then consults the
+shared resume gates and prints the verb that can succeed: `elspeth resume
+<run_id> --execute` when the run is resumable, otherwise the refuse reason and
+`elspeth abandon <run_id> --execute` (elspeth-5dd23f4df9 — a leader that dies
+before its source is recorded `exhausted` leaves a run resume must refuse;
+`abandon` takes the dead seat and finalizes it INTERRUPTED, recording the
+undecided tokens ABANDONED per ADR-038). Takeover requires the full resume
+reconstruction, which only `elspeth resume` performs.
 
 **Racing resumes:** if two operators run `elspeth resume` against the same run
 at once, exactly one wins the seat CAS. The loser gets
@@ -686,10 +713,10 @@ checks **all three** preconditions or refuses:
    `elspeth resume`);
 2. the joiner's resolved settings hash equals `runs.config_hash` (else
    refused);
-3. the leader seat is **live** (else "no live leader — use `elspeth resume` to
-   take the seat"). A follower must never be the first process on an abandoned
-   run — barrier and ingest state need a leader. **Join and takeover are
-   disjoint verbs.**
+3. the leader seat is **live** (else "no live leader — take the seat with
+   `elspeth resume`, or finalize the run with `elspeth abandon`"). A follower
+   must never be the first process on an abandoned run — barrier and ingest
+   state need a leader. **Join and takeover are disjoint verbs.**
 
 A **filesystem-writability preflight runs first** (before the registry is
 touched): the follower verifies write access to the DB file, its directory,
@@ -738,7 +765,7 @@ heartbeat**. Critically, under two-level liveness `scheduler_lease_seconds`
 stuck in a long LLM call keeps its item via the registry even after the item
 lease lapses, because its next `heartbeat_lease` CAS revives it. The hard
 **stall budget** is `item_stall_budget_seconds = 600 s` (2 × the item lease;
-`contracts/coordination.py:60`, `scheduler_repository.py:1287`) — past it, even
+`contracts/coordination.py:66`, `scheduler/leases.py:444`) — past it, even
 a registry-live worker's item is rotated with a `worker_stalled` event.
 
 ### Worker count: recommended 2–8 (the write-lock convoy)
@@ -814,17 +841,41 @@ worker's settings/environment).
 
 ### Shared clock
 
-All liveness timestamps are **wall-clock UTC written by whichever process
-acts** (ADR-030 D1; design §A.4). The one-host shape makes this sound: one host
-⇒ one system clock ⇒ cross-worker comparisons are exact to within NTP slew,
-orders of magnitude below the 80 s liveness window and the seconds-to-minutes
-barrier-timeout granularity. Seat liveness, item-lease expiry, and
-`barrier_blocked_at` timeout math all compare absolute timestamps.
+Every liveness and expiry decision is stamped and compared on the **Landscape
+database's own clock**, never on a worker's process clock (ADR-047). The seat
+deadline is written in SQL from `CURRENT_TIMESTAMP`
+(`run_coordination_repository.py:358-376`); worker heartbeat, item-lease expiry
+and `barrier_blocked_at` are stamped from
+`read_landscape_transaction_time(conn)` (`scheduler/leases.py:186-187`,
+`engine/barrier_coordination.py:345`). One database ⇒ one clock ⇒ those
+comparisons are exact however the workers' own clocks are set.
 
-**Containerized workers MUST share the host clock** (ADR-030 D6) — this is a
-runbook-stated operator requirement, not something the engine probes. Do not
-run pack members against independent container clocks; a skewed clock can cause
-a false eviction or a mis-timed barrier flush.
+**Container clock skew therefore cannot cause a false eviction or a mis-timed
+barrier flush.** Until 0.8.0 each process stamped its own liveness timestamps
+(ADR-030 D1), and this runbook required pack members to share a host clock
+(ADR-030 D6). ADR-047 replaced that model: no process clock and no
+caller-supplied `now` reaches the seat, so the requirement no longer governs
+any liveness decision.
+
+What skew still affects is **forensics, not correctness**. Record columns keep
+the process clock deliberately: `recorded_at` on `run_coordination_events`
+(`run_coordination_repository.py:164`, `:426`) and `started_at` on
+`sink_effect_attempts` (`sink_effect_lifecycle.py:618`) are both process
+wall-clock. For the coordination ledger that is already handled — order it by
+`seq`, not `recorded_at`, as the ledger section above says.
+
+**`sink_effect_attempts` has no such sequence column.** Its primary key is a
+hash, both readers order by `started_at`
+(`sink_effect_lifecycle.py:659`, `sink_effect_diagnostics.py:56`), and attempts
+change hands between workers whenever a lease is taken over. Skew can therefore
+misorder attempts *across generations* when you reconstruct a sink-effect
+timeline. `generation` is monotonic per effect and would resolve it — within one
+generation there is one owner and one clock — but neither the readers nor the
+runbooks order by it today.
+
+So keep pack members' clocks roughly aligned — ordinary NTP is ample — so
+attempt timelines reconstruct correctly. Nothing in the engine probes or
+requires it, and no eviction, lease or barrier decision depends on it.
 
 ### Quick reference: leader vs follower death
 

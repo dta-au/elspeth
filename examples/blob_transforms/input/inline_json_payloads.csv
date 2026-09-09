@@ -1,0 +1,3 @@
+record_id,source_label,json_text
+bulletin-a,Weekly bulletin A,"[{""entry_id"": ""e-101"", ""headline"": ""Grid upgrade approved"", ""tags"": [""infrastructure"", ""budget""]}, {""entry_id"": ""e-102"", ""headline"": ""Consultation opens, closes 30 June"", ""tags"": [""consultation""]}]"
+bulletin-b,Weekly bulletin B,"[{""entry_id"": ""e-203"", ""headline"": ""Report titled \""Water Security\"" tabled"", ""tags"": [""water"", ""report"", ""tabled""]}]"
